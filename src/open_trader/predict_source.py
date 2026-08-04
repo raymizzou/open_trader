@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 import websockets
@@ -33,17 +33,19 @@ class PredictMarket:
     condition_id: str
     question: str
     rules: str
-    resolution_source: str
-    close_at: datetime
-    settlement_at: datetime
-    yes_token_id: str
-    no_token_id: str
-    settlement_asset: str
-    minimum_order_size: Decimal
-    tick_size: Decimal
-    fee_rate_bps: Decimal
-    polymarket_condition_ids: tuple[str, ...]
-    rules_fingerprint: str
+    market_slug: str = ""
+    category_slug: str = ""
+    event_start_at: datetime | None = None
+    event_end_at: datetime | None = None
+    resolution_provider: str = ""
+    yes_token_id: str = ""
+    no_token_id: str = ""
+    settlement_asset: str = ""
+    minimum_order_size: Decimal = Decimal("0")
+    tick_size: Decimal = Decimal("0")
+    fee_rate_bps: Decimal = Decimal("0")
+    polymarket_condition_ids: tuple[str, ...] = ()
+    rules_fingerprint: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +77,7 @@ class PredictSource:
         self._now_fn = now_fn
         self._sleep_fn = sleep_fn
         self._markets: dict[str, PredictMarket] = {}
+        self._categories: dict[str, dict[str, object]] = {}
         self._books: dict[str, dict[str, PredictBook]] = {"rest": {}, "ws": {}}
         self._versions: dict[str, dict[str, int]] = {"rest": {}, "ws": {}}
         self._rest_status = "unknown"
@@ -83,14 +86,16 @@ class PredictSource:
         self._failure_reason: dict[str, str | None] = {"rest": None, "ws": None}
         self._ws_generation = 0
 
-    async def list_open_markets(self) -> tuple[PredictMarket, ...]:
+    async def list_open_markets(self, *, limit: int | None = None) -> tuple[PredictMarket, ...]:
+        if limit is not None and (type(limit) is not int or limit <= 0):
+            raise ValueError("limit must be a positive integer")
         cursor: str | None = None
         seen_cursors: set[str] = set()
         markets: list[PredictMarket] = []
         while True:
             query: dict[str, str] = {"first": "100", "status": "OPEN"}
             if cursor:
-                query["cursor"] = cursor
+                query["after"] = cursor
             payload = await self._rest_json("/v1/markets", query)
             if payload is None:
                 return ()
@@ -99,13 +104,29 @@ class PredictSource:
                 self._mark_stale("rest")
                 return ()
             for row in rows:
-                market = _normalise_market(row)
+                if _explicitly_out_of_scope(row):
+                    continue
+                category_slug = _text(row.get("categorySlug")) if isinstance(row, dict) else ""
+                category = await self._category(category_slug) if category_slug else None
+                market = _normalise_market(row, category)
                 if market is not None:
                     self._markets[market.market_id] = market
                     markets.append(market)
+                    if limit is not None and len(markets) >= limit:
+                        return tuple(markets)
+                else:
+                    self._mark_stale("rest")
+                    return ()
             next_cursor = payload.get("cursor")
-            if not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen_cursors:
+            if next_cursor is None:
                 return tuple(markets)
+            if (
+                not isinstance(next_cursor, str)
+                or not next_cursor
+                or next_cursor in seen_cursors
+            ):
+                self._mark_stale("rest")
+                return ()
             seen_cursors.add(next_cursor)
             cursor = next_cursor
 
@@ -113,12 +134,26 @@ class PredictSource:
         payload = await self._rest_json(f"/v1/markets/{market_id}")
         if payload is None:
             return None
-        market = _normalise_market(payload.get("data"))
+        row = payload.get("data")
+        category_slug = _text(row.get("categorySlug")) if isinstance(row, dict) else ""
+        category = await self._category(category_slug) if category_slug else None
+        market = _normalise_market(row, category)
         if market is None or market.market_id != str(market_id):
             self._mark_stale("rest")
             return None
         self._markets[market.market_id] = market
         return market
+
+    async def _category(self, slug: str) -> dict[str, object] | None:
+        cached = self._categories.get(slug)
+        if cached is not None:
+            return cached
+        payload = await self._rest_json(f"/v1/categories/{quote(slug, safe='')}")
+        row = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(row, dict) and row.get("slug") == slug:
+            self._categories[slug] = row
+            return row
+        return None
 
     async def get_order_book(self, market_id: str) -> PredictBook | None:
         market = self._markets.get(str(market_id)) or await self.get_market(str(market_id))
@@ -202,7 +237,10 @@ class PredictSource:
                 if _http_status(exc) in {401, 403}:
                     self._set_status("ws", "auth_blocked", "auth_blocked")
                     return
-                self._mark_stale("ws")
+                if _is_transport_error(exc):
+                    self._mark_unavailable("ws")
+                else:
+                    self._mark_stale("ws")
                 self._ws_generation += 1
                 attempt += 1
                 await _maybe_await(self._sleep_fn(min(2 ** (attempt - 1), _MAX_BACKOFF_SECONDS)))
@@ -251,7 +289,9 @@ class PredictSource:
         if query:
             url += "?" + urlencode(query)
         for attempt in range(6):
-            request = Request(url, headers={"x-api-key": api_key})
+            request = Request(
+                url, headers={"x-api-key": api_key, "User-Agent": "open-trader/0.1"}
+            )
             try:
                 payload = await asyncio.to_thread(self._read_json, request)
             except Exception as exc:
@@ -259,8 +299,12 @@ class PredictSource:
                 if status in {401, 403}:
                     self._set_status("rest", "auth_blocked", "auth_blocked")
                     return None
-                self._mark_stale("rest")
-                if status != 429 and not isinstance(exc, (OSError, URLError)):
+                transport_error = _is_transport_error(exc)
+                if transport_error:
+                    self._mark_unavailable("rest")
+                else:
+                    self._mark_stale("rest")
+                if status != 429 and not transport_error:
                     return None
                 if attempt == 5:
                     return None
@@ -285,15 +329,17 @@ class PredictSource:
         if not isinstance(payload, dict) or str(payload.get("marketId")) != market.market_id:
             self._mark_stale(source)
             return None
-        version = payload.get("version")
         previous = self._versions[source].get(market.market_id)
-        if not isinstance(version, int) or (
-            previous is not None
-            and (version < previous or (source == "ws" and version == previous))
+        timestamp_ms = payload.get("updateTimestampMs")
+        sequence = payload.get("version") if source == "ws" else timestamp_ms
+        if (
+            type(sequence) is not int
+            or previous is not None
+            and (sequence < previous or source == "ws" and sequence == previous)
         ):
             self._mark_stale(source)
             return None
-        timestamp = _timestamp(payload.get("updateTimestampMs"))
+        timestamp = _timestamp(timestamp_ms)
         asks = _levels(payload.get("asks"), market.tick_size, ascending=True)
         bids = _levels(payload.get("bids"), market.tick_size, ascending=False)
         if timestamp is None or not asks or not bids:
@@ -315,7 +361,7 @@ class PredictSource:
             source_timestamp=timestamp,
             received_at=self._now_fn(),
         )
-        self._versions[source][market.market_id] = version
+        self._versions[source][market.market_id] = sequence
         self._books[source][market.market_id] = book
         self._mark_ready(source, at=book.received_at)
         return book
@@ -327,6 +373,16 @@ class PredictSource:
         else:
             self._ws_status = "stale"
         self._failure_reason[source] = f"{source}_stale"
+
+    def _mark_unavailable(self, source: Literal["rest", "ws"]) -> None:
+        # Keep the existing stale status during reconnects; the explicit reason
+        # lets acceptance distinguish transport loss from malformed data.
+        self._books[source].clear()
+        if source == "rest":
+            self._rest_status = "stale"
+        else:
+            self._ws_status = "stale"
+        self._failure_reason[source] = "network_unavailable"
 
     def _mark_ready(self, source: Literal["rest", "ws"], *, at: datetime | None = None) -> None:
         if source == "rest":
@@ -346,24 +402,31 @@ class PredictSource:
         self._failure_reason[source] = reason
 
 
-def _normalise_market(payload: object) -> PredictMarket | None:
+def _normalise_market(
+    payload: object, category: dict[str, object] | None
+) -> PredictMarket | None:
     if not isinstance(payload, dict):
         return None
     if (
         payload.get("tradingStatus") != "OPEN"
+        or payload.get("status") != "REGISTERED"
+        or payload.get("isVisible") is not True
         or payload.get("isNegRisk") is not False
         or payload.get("isYieldBearing") is not False
-        or payload.get("marketType") != "BINARY"
-        or payload.get("marketVariant", "STANDARD") != "STANDARD"
+        or payload.get("marketVariant", "DEFAULT") not in {"DEFAULT", "STANDARD"}
     ):
         return None
     market_id = _text(payload.get("id"))
+    market_slug = _text(payload.get("slug"))
     condition_id = _text(payload.get("conditionId"))
+    oracle_question_id = _text(payload.get("oracleQuestionId"))
+    resolver_address = _text(payload.get("resolverAddress"))
     question = _text(payload.get("question"))
     rules = _text(payload.get("description"))
-    resolution_source = _text(payload.get("resolutionSource"))
-    close_at = _datetime(payload.get("closesAt"))
-    settlement_at = _datetime(payload.get("settlementAt"))
+    category_slug = _text(payload.get("categorySlug"))
+    event_start_at = _datetime(category.get("startsAt")) if category else None
+    event_end_at = _datetime(category.get("endsAt")) if category else None
+    resolution_provider = _text(category.get("resolutionProvider")) if category else ""
     outcomes = payload.get("outcomes")
     tokens: dict[str, str] = {}
     if isinstance(outcomes, list):
@@ -373,9 +436,8 @@ def _normalise_market(payload: object) -> PredictMarket | None:
                 token = _text(outcome.get("onChainId")) or _text(outcome.get("tokenId"))
                 if name and token and name not in tokens:
                     tokens[name] = token
-    collateral = payload.get("collateralToken")
-    settlement_asset = _text(collateral.get("symbol")) if isinstance(collateral, dict) else ""
-    minimum_order_size = _decimal(payload.get("minimumOrderSize"))
+    settlement_asset = "USDT"
+    minimum_order_size = Decimal("0.01")
     precision = payload.get("decimalPrecision")
     fee_rate_bps = _decimal(payload.get("feeRateBps"))
     external_ids = payload.get("polymarketConditionIds")
@@ -385,12 +447,23 @@ def _normalise_market(payload: object) -> PredictMarket | None:
         else ()
     )
     if (
-        not all((market_id, condition_id, question, rules, resolution_source, settlement_asset))
-        or close_at is None
-        or settlement_at is None
+        not all(
+            (
+                market_id,
+                condition_id,
+                oracle_question_id,
+                resolver_address,
+                question,
+                rules,
+                category_slug,
+                resolution_provider,
+                settlement_asset,
+            )
+        )
+        or event_start_at is None
+        or event_end_at is None
+        or event_end_at <= event_start_at
         or set(tokens) != {"YES", "NO"}
-        or minimum_order_size is None
-        or minimum_order_size <= 0
         or not isinstance(precision, int)
         or precision < 0
         or fee_rate_bps is None
@@ -398,17 +471,29 @@ def _normalise_market(payload: object) -> PredictMarket | None:
     ):
         return None
     tick_size = Decimal(1).scaleb(-precision)
+    fingerprint_input = {
+        "category_slug": category_slug,
+        "event_end_at": event_end_at.isoformat(),
+        "event_start_at": event_start_at.isoformat(),
+        "outcomes": sorted(tokens.items()),
+        "polymarket_condition_ids": polymarket_condition_ids,
+        "question": question,
+        "resolution_provider": resolution_provider,
+        "rules": rules,
+    }
     fingerprint = hashlib.sha256(
-        "\n".join((question, rules, resolution_source, close_at.isoformat(), settlement_at.isoformat())).encode()
+        json.dumps(fingerprint_input, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     return PredictMarket(
         market_id=market_id,
         condition_id=condition_id,
         question=question,
         rules=rules,
-        resolution_source=resolution_source,
-        close_at=close_at,
-        settlement_at=settlement_at,
+        market_slug=market_slug,
+        category_slug=category_slug,
+        event_start_at=event_start_at,
+        event_end_at=event_end_at,
+        resolution_provider=resolution_provider,
         yes_token_id=tokens["YES"],
         no_token_id=tokens["NO"],
         settlement_asset=settlement_asset,
@@ -417,6 +502,31 @@ def _normalise_market(payload: object) -> PredictMarket | None:
         fee_rate_bps=fee_rate_bps,
         polymarket_condition_ids=polymarket_condition_ids,
         rules_fingerprint=fingerprint,
+    )
+
+
+def _explicitly_out_of_scope(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    trading_status = payload.get("tradingStatus")
+    variant = payload.get("marketVariant")
+    outcomes = payload.get("outcomes")
+    outcome_names = (
+        {
+            name
+            for item in outcomes
+            if isinstance(item, dict) and (name := _text(item.get("name")).upper())
+        }
+        if isinstance(outcomes, list)
+        else set()
+    )
+    return (
+        payload.get("isNegRisk") is True
+        or payload.get("isYieldBearing") is True
+        or isinstance(trading_status, str) and trading_status != "OPEN"
+        or payload.get("isVisible") is False
+        or isinstance(variant, str) and bool(variant) and variant not in {"DEFAULT", "STANDARD"}
+        or bool(outcome_names - {"YES", "NO"})
     )
 
 
@@ -439,7 +549,7 @@ def _levels(value: object, tick_size: Decimal, *, ascending: bool) -> tuple[Book
 
 
 def _timestamp(value: object) -> datetime | None:
-    if not isinstance(value, int) or value < 0:
+    if type(value) is not int or value < 0:
         return None
     return datetime.fromtimestamp(value / 1000, UTC)
 
@@ -481,6 +591,13 @@ def _http_status(exc: BaseException) -> int | None:
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
     return status if isinstance(status, int) else None
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    status = _http_status(exc)
+    if status is not None:
+        return status == 429 or status >= 500
+    return isinstance(exc, (ConnectionError, OSError, TimeoutError, URLError))
 
 
 async def _maybe_await(value: object) -> None:

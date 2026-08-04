@@ -47,6 +47,120 @@ def preview_payload(*, market_id: str = "market-1") -> dict[str, object]:
     }
 
 
+def cross_preview_payload(
+    *,
+    market_id: str = "cross-market-1",
+    total_max_cost: Decimal = Decimal("20.00"),
+    net_quantity: Decimal = Decimal("5"),
+) -> dict[str, object]:
+    canonical_cutoff = "2026-09-03T00:00:00Z"
+    resolution_at = "2026-09-03T12:00:00Z"
+    predict_book_timestamp = "2026-08-03T00:00:00Z"
+    polymarket_book_timestamp = "2026-08-03T00:00:01Z"
+    return {
+        "execution_id": f"execution:{market_id}",
+        "opportunity_id": f"cross:{market_id}:PREDICT_YES_POLYMARKET_NO",
+        "event_id": "cross-event-1",
+        "market_id": market_id,
+        "market_type": "cross_venue_yes_no",
+        "signal_episode_id": f"signal:{market_id}",
+        "pair_id": market_id,
+        "direction": "PREDICT_YES_POLYMARKET_NO",
+        "quantity": net_quantity,
+        "total_max_cost": total_max_cost,
+        "minimum_payout": net_quantity,
+        "minimum_profit": Decimal("0.50"),
+        "annualized_yield": Decimal("0.16"),
+        "canonical_cutoff": canonical_cutoff,
+        "rules_fingerprints": {
+            "predict.fun": "predict-fingerprint",
+            "polymarket": "poly-fingerprint",
+        },
+        "approved_candidates": {
+            "predict.fun": {
+                "market_id": "predict-market",
+                "condition_id": "predict-condition",
+                "yes_token_id": "predict-yes",
+                "no_token_id": "predict-no",
+                "rules_fingerprint": "predict-fingerprint",
+            },
+            "polymarket": {
+                "market_id": "poly-market",
+                "condition_id": "poly-condition",
+                "yes_token_id": "poly-yes",
+                "no_token_id": "poly-no",
+                "rules_fingerprint": "poly-fingerprint",
+            },
+        },
+        "codex_approval": {
+            "decision": "APPROVE",
+            "cache_key": "cross-cache",
+            "direct_outcome_mapping": {
+                "predict_yes": "YES",
+                "predict_no": "NO",
+                "polymarket_yes": "YES",
+                "polymarket_no": "NO",
+            },
+            "evidence": [
+                {"exchange": "predict.fun", "quote": "same rules"},
+                {"exchange": "polymarket", "quote": "same rules"},
+            ],
+        },
+        "intent": {
+            "intent_type": "cross_venue",
+            "pair_id": market_id,
+            "direction": "PREDICT_YES_POLYMARKET_NO",
+            "quantity": net_quantity,
+            "calculable_gas": Decimal("0.10"),
+            "total_max_cost": total_max_cost,
+            "maximum_fee": Decimal("0.15"),
+            "minimum_payout": net_quantity,
+            "minimum_profit": Decimal("0.50"),
+            "annualized_yield": Decimal("0.16"),
+            "canonical_cutoff": canonical_cutoff,
+            "resolution_at": resolution_at,
+            "actionable": True,
+            "quote_available": True,
+            "legs": [
+                {
+                    "exchange": "predict.fun",
+                    "market_id": "predict-market",
+                    "condition_id": "predict-condition",
+                    "outcome": "YES",
+                    "token_id": "predict-yes",
+                    "settlement_asset": "USDT",
+                    "requested_quantity": net_quantity,
+                    "net_quantity": net_quantity,
+                    "max_price": Decimal("0.45"),
+                    "max_cost": Decimal("2.25"),
+                    "maximum_fee": Decimal("0.05"),
+                    "fee_asset": "USDT",
+                    "book_timestamp": predict_book_timestamp,
+                    "settlement_at": resolution_at,
+                    "minimum_order_size": Decimal("1"),
+                },
+                {
+                    "exchange": "polymarket",
+                    "market_id": "poly-market",
+                    "condition_id": "poly-condition",
+                    "outcome": "NO",
+                    "token_id": "poly-no",
+                    "settlement_asset": "USDC",
+                    "requested_quantity": net_quantity,
+                    "net_quantity": net_quantity,
+                    "max_price": Decimal("0.45"),
+                    "max_cost": Decimal("2.25"),
+                    "maximum_fee": Decimal("0.05"),
+                    "fee_asset": "USDC",
+                    "book_timestamp": polymarket_book_timestamp,
+                    "settlement_at": resolution_at,
+                    "minimum_order_size": Decimal("1"),
+                },
+            ],
+        },
+    }
+
+
 def create_execution(
     tmp_path: Path,
     *,
@@ -70,7 +184,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] > 0
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         names = {
             row[1]
             for row in connection.execute("PRAGMA table_list")
@@ -105,6 +219,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "llm_usage",
         "relation_state",
         "relation_scan_runs",
+        "cross_execution_reservations",
     }
     assert "signals_market_started_at" in indexes
     assert "signals_started_at" in indexes
@@ -386,7 +501,7 @@ def test_notification_attempts_stop_at_three_and_close_blocks_reservation(
     assert db.reserve_notification_attempt(signal_id)["state"] == "closed"
 
 
-def test_preview_expires_after_ten_seconds_and_is_single_use(tmp_path: Path) -> None:
+def test_preview_expires_after_ten_seconds_and_is_idempotent(tmp_path: Path) -> None:
     db = store(tmp_path)
     now = datetime.now(UTC)
     preview_id = db.create_preview(
@@ -394,8 +509,7 @@ def test_preview_expires_after_ten_seconds_and_is_single_use(tmp_path: Path) -> 
     )
     execution = db.consume_preview_and_create_execution(preview_id, "request-1")
     assert execution["preview_id"] == preview_id
-    with pytest.raises(ValueError, match="consumed"):
-        db.consume_preview_and_create_execution(preview_id, "request-2")
+    assert db.consume_preview_and_create_execution(preview_id, "request-2") == execution
 
     expired_id = db.create_preview(preview_payload(market_id="market-2"), expires_at=iso(now - timedelta(microseconds=1)))
     with pytest.raises(ValueError, match="expired"):
@@ -442,9 +556,566 @@ def test_concurrent_instances_consume_preview_once(tmp_path: Path) -> None:
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(consume, (0, 1)))
-    assert sum(isinstance(item, dict) for item in results) == 1
-    assert sum(isinstance(item, Exception) for item in results) == 1
+    assert all(isinstance(item, dict) for item in results)
+    assert results[0] == results[1]
     assert setup.active_execution() is not None
+
+
+def test_cross_preview_commits_one_execution_and_reservation_idempotently(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    now = datetime.now(UTC)
+    preview_id = db.create_preview(
+        cross_preview_payload(total_max_cost=Decimal("20.00")),
+        expires_at=iso(now + timedelta(seconds=10)),
+    )
+
+    first = db.consume_preview_and_create_execution(preview_id, "cross-request-1")
+    assert first["preview_id"] == preview_id
+    assert db.cross_unsettled_principal() == Decimal("20.00")
+    assert db.consume_preview_and_create_execution(preview_id, "cross-request-2") == first
+
+    duplicate_preview = db.create_preview(
+        cross_preview_payload(market_id="cross-market-2"),
+        expires_at=iso(now + timedelta(seconds=10)),
+    )
+    assert (
+        db.consume_preview_and_create_execution(duplicate_preview, "cross-request-1")
+        == first
+    )
+    with sqlite3.connect(db.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT amount, state FROM cross_execution_reservations"
+        ).fetchone() == ("20.00", "reserved")
+
+
+def test_cross_preview_no_ttl_keeps_legacy_expiry_and_consumes_valid_cross_payload(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    now = datetime.now(UTC)
+    legacy_id = db.create_preview(
+        preview_payload(),
+        expires_at=iso(now - timedelta(seconds=1)),
+    )
+    cross_id = db.create_preview(
+        cross_preview_payload(total_max_cost=Decimal("10.50")),
+        expires_at=iso(now - timedelta(hours=1)),
+    )
+
+    with pytest.raises(ValueError, match="preview_expired"):
+        db.consume_preview_and_create_execution(legacy_id, "legacy")
+
+    execution = db.consume_preview_and_create_execution(cross_id, "cross")
+
+    assert execution["state"] == "validating"
+    assert db.consume_preview_and_create_execution(cross_id, "cross-again") == execution
+
+
+def test_cross_preview_no_ttl_rejects_invalid_cross_payload_before_reserving(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    payload = cross_preview_payload(total_max_cost=Decimal("10.50"))
+    payload["signal_episode_id"] = ""
+    preview_id = db.create_preview(
+        payload,
+        expires_at=iso(datetime.now(UTC) + timedelta(hours=1)),
+    )
+
+    with pytest.raises(ValueError, match="cross_preview_invalid"):
+        db.consume_preview_and_create_execution(preview_id, "cross-invalid")
+
+    assert db.cross_unsettled_principal() == Decimal("0")
+    with sqlite3.connect(db.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM cross_execution_reservations"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate"),
+    [
+        ("opportunity_id", lambda payload: payload.pop("opportunity_id")),
+        ("execution_id", lambda payload: payload.pop("execution_id")),
+        ("signal_episode_id", lambda payload: payload.pop("signal_episode_id")),
+        ("pair_id", lambda payload: payload.pop("pair_id")),
+        ("direction", lambda payload: payload.pop("direction")),
+        ("canonical_cutoff", lambda payload: payload.pop("canonical_cutoff")),
+        ("rules_fingerprints", lambda payload: payload.pop("rules_fingerprints")),
+        ("approved_candidates", lambda payload: payload.pop("approved_candidates")),
+        ("codex_approval", lambda payload: payload.pop("codex_approval")),
+        ("minimum_payout", lambda payload: payload.pop("minimum_payout")),
+        ("minimum_profit", lambda payload: payload.pop("minimum_profit")),
+        ("annualized_yield", lambda payload: payload.pop("annualized_yield")),
+        ("intent_quantity", lambda payload: payload["intent"].pop("quantity")),
+        (
+            "intent_calculable_gas",
+            lambda payload: payload["intent"].pop("calculable_gas"),
+        ),
+        ("intent_maximum_fee", lambda payload: payload["intent"].pop("maximum_fee")),
+        (
+            "intent_resolution_at",
+            lambda payload: payload["intent"].pop("resolution_at"),
+        ),
+        ("intent_actionable", lambda payload: payload["intent"].pop("actionable")),
+        (
+            "intent_quote_available",
+            lambda payload: payload["intent"].pop("quote_available"),
+        ),
+        (
+            "intent_legs",
+            lambda payload: payload["intent"].__setitem__("legs", payload["intent"]["legs"][:1]),
+        ),
+        (
+            "intent_predict_market_id",
+            lambda payload: payload["intent"]["legs"][0].pop("market_id"),
+        ),
+        (
+            "intent_predict_requested_quantity",
+            lambda payload: payload["intent"]["legs"][0].pop("requested_quantity"),
+        ),
+        (
+            "intent_poly_max_cost",
+            lambda payload: payload["intent"]["legs"][1].pop("max_cost"),
+        ),
+    ],
+)
+def test_expired_incomplete_cross_preview_keeps_legacy_ttl_and_never_reserves(
+    tmp_path: Path,
+    label: str,
+    mutate,
+) -> None:
+    db = store(tmp_path)
+    payload = cross_preview_payload(total_max_cost=Decimal("10.50"))
+    mutate(payload)
+    preview_id = db.create_preview(
+        payload,
+        expires_at=iso(datetime.now(UTC) - timedelta(hours=1)),
+    )
+
+    with pytest.raises(ValueError, match="preview_expired"):
+        db.consume_preview_and_create_execution(preview_id, f"cross-expired-{label}")
+
+    assert db.cross_unsettled_principal() == Decimal("0")
+    with sqlite3.connect(db.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM cross_execution_reservations"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_cross_principal_cap_is_atomic_across_store_instances(tmp_path: Path) -> None:
+    setup = store(tmp_path)
+    now = datetime.now(UTC)
+    seed_preview = setup.create_preview(
+        cross_preview_payload(total_max_cost=Decimal("80.00")),
+        expires_at=iso(now + timedelta(seconds=10)),
+    )
+    seed = setup.consume_preview_and_create_execution(seed_preview, "cross-seed")
+    setup.transition_execution(
+        str(seed["execution_id"]),
+        state="holding_to_resolution",
+        evidence={"positions": "held"},
+    )
+    previews = [
+        setup.create_preview(
+            cross_preview_payload(market_id=f"cross-market-{index}"),
+            expires_at=iso(now + timedelta(seconds=10)),
+        )
+        for index in (2, 3)
+    ]
+    stores = [
+        PredictionArbitrageStore(tmp_path / "data"),
+        PredictionArbitrageStore(tmp_path / "data"),
+    ]
+
+    def consume(index: int) -> object:
+        try:
+            return stores[index].consume_preview_and_create_execution(
+                previews[index], f"cross-race-{index}"
+            )
+        except Exception as exc:  # noqa: BLE001 - both cap rejections are observed.
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(consume, (0, 1)))
+
+    assert sum(isinstance(item, dict) for item in results) == 1
+    assert sum(isinstance(item, ValueError) for item in results) == 1
+    assert next(str(item) for item in results if isinstance(item, ValueError)) == "cross_unsettled_cap"
+    assert setup.cross_unsettled_principal() == Decimal("100.00")
+    with sqlite3.connect(setup.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM cross_execution_reservations"
+        ).fetchone()[0] == 2
+
+
+def test_cross_reservation_remains_until_an_allowed_final_release(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    preview_id = db.create_preview(
+        cross_preview_payload(total_max_cost=Decimal("10.50")),
+        expires_at=iso(datetime.now(UTC) + timedelta(seconds=10)),
+    )
+    execution = db.consume_preview_and_create_execution(preview_id, "cross-final")
+    execution_id = str(execution["execution_id"])
+
+    for state in (
+        "holding_to_resolution",
+        "unknown_order",
+        "directional_incident",
+        "dust",
+    ):
+        db.transition_execution(execution_id, state=state, evidence={"state": state})
+        assert db.cross_unsettled_principal() == Decimal("10.50")
+    with pytest.raises(ValueError, match="release reason"):
+        db.release_cross_reservation(execution_id, reason="holding_to_resolution")
+    assert db.cross_unsettled_principal() == Decimal("10.50")
+
+    db.transition_execution(
+        execution_id,
+        state="both_rejected",
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "no_position_observed": True,
+        },
+    )
+    db.release_cross_reservation(execution_id, reason="both_rejected")
+    db.release_cross_reservation(execution_id, reason="both_rejected")
+    assert db.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_reservation_rejects_unproven_release_reason(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    preview_id = db.create_preview(
+        cross_preview_payload(total_max_cost=Decimal("10.50")),
+        expires_at=iso(datetime.now(UTC) + timedelta(seconds=10)),
+    )
+    execution_id = str(
+        db.consume_preview_and_create_execution(preview_id, "cross-unproven")["execution_id"]
+    )
+
+    with pytest.raises(ValueError, match="proof"):
+        db.release_cross_reservation(execution_id, reason="redeemed")
+    assert db.cross_unsettled_principal() == Decimal("10.50")
+
+    db.transition_execution(
+        execution_id,
+        state="both_rejected",
+        evidence={"positions": "proven_zero", "redemption": "observed"},
+    )
+    with pytest.raises(ValueError, match="proof"):
+        db.release_cross_reservation(execution_id, reason="both_rejected")
+    assert db.cross_unsettled_principal() == Decimal("10.50")
+
+
+def test_cross_reservation_releases_only_proven_no_submit_or_redemption(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    now = datetime.now(UTC)
+    no_submit_preview = db.create_preview(
+        cross_preview_payload(total_max_cost=Decimal("10.50")),
+        expires_at=iso(now + timedelta(seconds=10)),
+    )
+    no_submit_execution = db.consume_preview_and_create_execution(
+        no_submit_preview, "cross-no-submit"
+    )
+    db.transition_execution(
+        str(no_submit_execution["execution_id"]),
+        state="both_rejected",
+        evidence={
+            "submitted": False,
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+        },
+    )
+    db.release_cross_reservation(str(no_submit_execution["execution_id"]), reason="no_submit")
+    assert db.cross_unsettled_principal() == Decimal("0")
+
+    redeemed_preview = db.create_preview(
+        cross_preview_payload(market_id="cross-redeemed", total_max_cost=Decimal("10.50")),
+        expires_at=iso(now + timedelta(seconds=10)),
+    )
+    redeemed_execution = db.consume_preview_and_create_execution(
+        redeemed_preview, "cross-redeemed"
+    )
+    db.transition_execution(
+        str(redeemed_execution["execution_id"]),
+        state="holding_to_resolution",
+        evidence={
+            "phase": "holding_to_resolution",
+            "positions": {"predict.fun": "5", "polymarket": "5"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+        },
+    )
+    db.transition_execution(
+        str(redeemed_execution["execution_id"]),
+        state="complete",
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+            "redemption": {
+                "observed": True,
+                "winner": {
+                    "venue": "predict.fun",
+                    "condition_id": "predict-condition",
+                    "outcome": "YES",
+                    "token_id": "predict-yes",
+                    "quantity": "5",
+                },
+                "redeemed_collateral": {"predict.fun": "10.50"},
+            },
+        },
+    )
+    db.release_cross_reservation(str(redeemed_execution["execution_id"]), reason="redeemed")
+    assert db.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_redemption_release_requires_the_observed_winning_venue_delta(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    preview_id = db.create_preview(
+        cross_preview_payload(total_max_cost=Decimal("10.50")),
+        expires_at=iso(datetime.now(UTC) + timedelta(seconds=10)),
+    )
+    execution_id = str(
+        db.consume_preview_and_create_execution(preview_id, "cross-winner-proof")["execution_id"]
+    )
+    db.transition_execution(
+        execution_id,
+        state="complete",
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "redemption": {
+                "observed": True,
+                "winner": {
+                    "venue": "predict.fun",
+                    "condition_id": "predict-condition",
+                    "outcome": "YES",
+                    "token_id": "predict-yes",
+                    "quantity": "5",
+                },
+                "redeemed_collateral": {"predict.fun": "0", "polymarket": "5"},
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="proof"):
+        db.release_cross_reservation(execution_id, reason="redeemed")
+
+    assert db.cross_unsettled_principal() == Decimal("10.50")
+
+
+def test_cross_release_sweep_recovers_a_proven_complete_after_a_crash(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    preview_id = db.create_preview(
+        cross_preview_payload(total_max_cost=Decimal("10.50")),
+        expires_at=iso(datetime.now(UTC) + timedelta(seconds=10)),
+    )
+    execution_id = str(
+        db.consume_preview_and_create_execution(preview_id, "cross-crash-retry")["execution_id"]
+    )
+    db.transition_execution(
+        execution_id,
+        state="holding_to_resolution",
+        evidence={
+            "phase": "holding_to_resolution",
+            "positions": {"predict.fun": "5", "polymarket": "5"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+        },
+    )
+    db.transition_execution(
+        execution_id,
+        state="complete",
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+            "redemption": {
+                "observed": True,
+                "winner": {
+                    "venue": "predict.fun",
+                    "condition_id": "predict-condition",
+                    "outcome": "YES",
+                    "token_id": "predict-yes",
+                    "quantity": "5",
+                },
+                "redeemed_collateral": {"predict.fun": "5", "polymarket": "0"},
+            },
+        },
+    )
+
+    sweep = getattr(db, "release_proven_cross_completions", None)
+
+    assert callable(sweep)
+    assert sweep() == (execution_id,)
+    assert sweep() == ()
+    assert db.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_release_sweep_requires_exact_persisted_winner_net_quantity(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    payload = cross_preview_payload(
+        total_max_cost=Decimal("10.50"), net_quantity=Decimal("10")
+    )
+    preview_id = db.create_preview(
+        payload, expires_at=iso(datetime.now(UTC) + timedelta(seconds=10))
+    )
+    execution_id = str(
+        db.consume_preview_and_create_execution(preview_id, "cross-partial-sweep")["execution_id"]
+    )
+    db.transition_execution(
+        execution_id,
+        state="holding_to_resolution",
+        evidence={
+            "phase": "holding_to_resolution",
+            "positions": {"predict.fun": "10", "polymarket": "10"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+        },
+    )
+    db.transition_execution(
+        execution_id,
+        state="complete",
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+            "redemption": {
+                "observed": True,
+                "winner": {
+                    "venue": "predict.fun",
+                    "condition_id": "predict-condition",
+                    "outcome": "YES",
+                    "token_id": "predict-yes",
+                    "quantity": "5",
+                },
+                "redeemed_collateral": {"predict.fun": "5", "polymarket": "0"},
+            },
+        },
+    )
+
+    assert db.release_proven_cross_completions() == ()
+    assert db.cross_unsettled_principal() == Decimal("10.50")
+
+
+def test_cross_release_sweep_recovers_exact_ten_unit_settlement_after_a_crash(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    payload = cross_preview_payload(
+        total_max_cost=Decimal("10.50"), net_quantity=Decimal("10")
+    )
+    preview_id = db.create_preview(
+        payload, expires_at=iso(datetime.now(UTC) + timedelta(seconds=10))
+    )
+    execution_id = str(
+        db.consume_preview_and_create_execution(preview_id, "cross-exact-ten-sweep")["execution_id"]
+    )
+    db.transition_execution(
+        execution_id,
+        state="holding_to_resolution",
+        evidence={
+            "phase": "holding_to_resolution",
+            "positions": {"predict.fun": "10", "polymarket": "10"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+        },
+    )
+    db.transition_execution(
+        execution_id,
+        state="complete",
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+            "redemption": {
+                "observed": True,
+                "winner": {
+                    "venue": "predict.fun",
+                    "condition_id": "predict-condition",
+                    "outcome": "YES",
+                    "token_id": "predict-yes",
+                    "quantity": "10",
+                },
+                "redeemed_collateral": {"predict.fun": "10", "polymarket": "0"},
+            },
+        },
+    )
+
+    assert db.release_proven_cross_completions() == (execution_id,)
+    assert db.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_release_sweep_requires_the_persisted_post_fill_baseline(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    preview_id = db.create_preview(
+        cross_preview_payload(total_max_cost=Decimal("10.50")),
+        expires_at=iso(datetime.now(UTC) + timedelta(seconds=10)),
+    )
+    execution_id = str(
+        db.consume_preview_and_create_execution(preview_id, "cross-preorder-baseline")
+        ["execution_id"]
+    )
+    db.transition_execution(
+        execution_id,
+        state="complete",
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "redemption": {
+                "observed": True,
+                "winner": {
+                    "venue": "predict.fun",
+                    "condition_id": "predict-condition",
+                    "outcome": "YES",
+                    "token_id": "predict-yes",
+                    "quantity": "5",
+                },
+                "redeemed_collateral": {"predict.fun": "5", "polymarket": "0"},
+            },
+        },
+    )
+
+    assert db.release_proven_cross_completions() == ()
+    assert db.cross_unsettled_principal() == Decimal("10.50")
+
+
+def test_legacy_preview_execution_payload_has_no_cross_reservation(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    preview_id = db.create_preview(
+        preview_payload(), expires_at=iso(datetime.now(UTC) + timedelta(seconds=10))
+    )
+
+    execution = db.consume_preview_and_create_execution(preview_id, "legacy-request")
+
+    assert execution == {
+        "event_id": "event-1",
+        "market_id": "market-1",
+        "quantity": "20",
+        "yes_max_price": "0.45",
+        "no_max_price": "0.48",
+        "total_max_cost": "18.60",
+        "execution_id": execution["execution_id"],
+        "preview_id": preview_id,
+        "idempotency_key": "legacy-request",
+        "state": "validating",
+        "evidence": [],
+        "created_at": execution["created_at"],
+        "updated_at": execution["updated_at"],
+    }
+    assert db.cross_unsettled_principal() == Decimal("0")
 
 
 def test_transition_appends_evidence_before_state_and_survives_restart(tmp_path: Path) -> None:

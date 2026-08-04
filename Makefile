@@ -11,6 +11,9 @@ LEGACY_DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/legacy_dashboard/launchd.out.log
 ACCOUNT_API_URL ?= http://127.0.0.1:8768
 ACCOUNT_API_LOG ?= $(WORKTREE_ROOT)/logs/account_api/launchd.out.log
 SKIP_POLYMARKET_LIVE ?= 0
+ACCEPTANCE_DIR := $(WORKTREE_ROOT)/logs/acceptance
+ACCEPTANCE_HANDOFF := $(ACCEPTANCE_DIR)/prediction-market-browser-handoff.json
+ACCEPTANCE_NONCE := $(ACCEPTANCE_DIR)/prediction-market-browser-nonce
 test:
 	"$(PYTHON_BIN)" -m pytest -q
 
@@ -20,6 +23,13 @@ acceptance:
 		"$(PYTHON_BIN)" -m pytest "$(WORKTREE_ROOT)/tests" -q
 	@status=0; \
 	cd "$(WORKTREE_ROOT)" && \
+	umask 077; \
+	mkdir -p "$(ACCEPTANCE_DIR)"; \
+	run_nonce="$$($(PYTHON_BIN) -c 'import secrets; print(secrets.token_urlsafe(32))')"; \
+	printf '%s' "$$run_nonce" > "$(ACCEPTANCE_NONCE)"; \
+	PREDICTION_ACCEPTANCE_BROWSER_HANDOFF="$(WORKTREE_ROOT)/logs/acceptance/prediction-market-browser-handoff.json" \
+	PREDICTION_ACCEPTANCE_BROWSER_NONCE="$$run_nonce" \
+	PREDICTION_ACCEPTANCE_REVIEW_URL="$(DASHBOARD_URL)" \
 	OPEN_TRADER_PYTHON="$(PYTHON_BIN)" \
 		npm exec playwright test tests/e2e/prediction-market.spec.ts \
 		--project=chromium || status=$$?; \
@@ -29,10 +39,12 @@ ifeq ($(SKIP_POLYMARKET_LIVE),1)
 else
 	@status=0; \
 	cd "$(WORKTREE_ROOT)" && \
+	PREDICTION_ACCEPTANCE_BROWSER_NONCE_FILE="$(ACCEPTANCE_NONCE)" \
 	PYTHONPATH=src "$(PYTHON_BIN)" -m open_trader.prediction_arbitrage_acceptance \
 		--url "$(DASHBOARD_URL)" \
 		--expected-root "$(WORKTREE_ROOT)" \
-		--config "$(REPOSITORY_ROOT)/config/prediction_arbitrage.json" || status=$$?; \
+		--config "$(REPOSITORY_ROOT)/config/prediction_arbitrage.json" \
+		--browser-handoff "$(ACCEPTANCE_HANDOFF)" || status=$$?; \
 	if [ $$status -eq 2 ]; then echo BLOCKED; exit 2; fi; \
 	if [ $$status -ne 0 ]; then echo FAIL; exit $$status; fi
 endif

@@ -6,12 +6,21 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-08-04
 
 - #23 将生产 Account 消费者统一迁到带 `X-Open-Trader-Account-Route: production` 的 HTTP 快照和 accepted statement-facts 路由：Trend 每轮冻结一个 `account_input` generation，Legacy `/api/dashboard` 不再返回或读取 Account 字段且 `/api/quotes` 返回 404，浏览器以 exact `position_id`/`instrument_id` 合成持仓与 Backtest 选项。Premarket/T-signal CLI、launchd 路径和 watcher 已禁用；候选验收新增 Account/Legacy 独立请求、强制观察快照更新、三市场冻结 generation、受控 Account 故障时非 Account 模块可读及无通知路径，并从共享主仓库/运行根读取被 Git 忽略的预测市场凭据配置与验收 Python，受控 Account 停机后也以同一运行根和 Python 恢复，避免隔离 worktree 误报外部环境不可用、部署后指向缺失文件或门禁在测试前失败。部署先启动匹配的 Account Worker/API、验证两条生产路由，再同 SHA 重启 Gateway/Legacy/Trend；故障时整体回滚 #23，绝不将新消费者与 #22 Account 或 Legacy 原始读取混用。已完成专项验收回归与全量自动测试；最终状态仍以候选 SHA 的 `make acceptance` 与同 SHA 重部署证据为准。
+- 修复 Trend allocation 守护进程重启后把当天已生成的合法不可变快照重新计算、最终触发同日快照碰撞的问题；合法终态会原样恢复，`waiting/retrying` 状态也会直接从当天快照恢复为 `ready`，不再访问富途或 Trend Animals。仅显式 `--revision` 允许重新生成，损坏的状态、指针或快照继续失败关闭。
+- 修复 Predict 实时验收把明确范围外的 NegRisk、收益型、非 YES/NO 等市场误报为脏数据并逐条请求分类的问题；范围外记录现在先行跳过，普通 YES/NO 仍严格校验。Live readiness 只读取首个合格标的及盘口，不再等待 4,101 条市场全量扫描；正常 watcher 仍保持全量发现。只读 guard 改为直接拦截 SDK 变更方法和底层链上发送，不再代理破坏有状态的本地签名；盘口按 SDK 要求保留普通价格/数量单位，避免二次放大。真实 REST/WebSocket、账户与签名未提交预检通过且零变更调用。
+- 跨场执行最终防护确认：确认弹窗不设 TTL、提交前强制当前盘口刷新；Predict 只允许精确买入授权并在成交/失败后清零，残留授权清理由人工确认触发且不搬运 USDT；BNB gas signer 与 Predict 账户分开展示并提示人工充值；首笔跨场 canary 上限保持 5 USDT；过期漏斗与成功空扫描都按事实展示，历史按执行阶段分组；验收允许完整空扫描通过但仍要求零授权、零清理、零订单、零转账/赎回和零真实通知。
 - #22 把辉立与东方财富结单上传迁到 Account Module：浏览器仅经 Gateway 调用 Account API，验证后的 PDF 以内容 hash 原子暂存为不可变 generation，Account Sync Worker 验证后才 promotion 并在快照发布 accepted generation；Trend 控制器异步、幂等消费对应成交事实，失败不再回滚 Account。Legacy 上传路由和同步 Trend 副作用已删除；真实隔离 runtime 验证两份实际结单均返回 `202 staged`、四券商同步正常、两份 generation promotion 且 Trend 重复消费安全。
 - Account 当前估值改为由 Account Sync Worker 从已接受持仓构造 OpenD 报价范围，覆盖 Tiger/Futu 以及辉立、东方财富的港美 A 股票、ETF、基金、期权和未知资产；缺少当前或已保留报价时继续失败关闭，不以结单价冒充实时价。Account v1 与三市场模拟盘新增完整的 `current_valuation`，同时给出美元/港元市值；现金和货币基金保持原契约。Dashboard 仍显示“实时价”，优先渲染 owner 发布值，估值变化时仅对实时价、美元市值和港元市值短暂高亮，不改变页面布局或轮询。专项回归 815 个、全量测试 4,505 个通过；最终状态仍以合并 SHA 的 `make acceptance` 与同 SHA 重部署证据为准。
 - 修复 Account API 将 A 股 OpenD 行情键 `SH./SZ.` 误按业务市场 `CN.` 校验、导致完整行情发布返回 503 的问题；校验统一复用既有富途代码规范化规则。回归及账户发布相关测试 92 个、全量测试 4,506 个通过，当前真实发布数据直接读取恢复为 `200 healthy`；最终状态仍以修复合并 SHA 的完整验收为准。
 - Dashboard 验收中的辉立账户总资产改为用同一页面快照内的 OpenD 当前估值与现金重新求和，不再拿会随行情变化的当前资产和结单日总额比较；最新结单月份校验继续保留。Dashboard 验收回归 320 个通过，三市场控制器仍须随最终 SHA 一并重部署后重新运行完整门禁。
 
 ## 2026-08-03
+
+- 跨场 YES/NO 仅在 Predict.fun 与 Polymarket 的完整规则、直接 YES/NO 极性和统一 UTC 截止时间经 Codex 核准后进入监控；不确定、过期或不等价的候选保持可见但不可执行。
+- 受保护的人工跨场执行保留现有风险上限、双腿价格/成本上限、签名预检、幂等与对账边界；Predict 适配器、五阶段漏斗、顶部状态和确认弹窗只展示事实，不自动提交、撤单或赎回。
+- 预测市场验收现在分别报告 Predict REST/WS 盘口、Predict JWT/余额/授权、已签名未提交预检、Polymarket 来源/账户/预检，以及零变更调用和零真实通知；缺少外部、浏览器或 Keychain 环境明确为 `BLOCKED`，认证或读取异常明确为脱敏 `FAIL`。
+- Polymarket 预检现在由验收侧硬性拦截下单、赎回、其他变更和通知调用，并要求显式 `posted: false`；SDK 内部读取也通过代理 self 经过同一只读边界。Playwright 通过后写入带一次性 nonce、有效期、实际 `18766` fixture URL、`8766` review URL/healthz 和当前 Git SHA 的 handoff，registry 只消费一次匹配 nonce。
+- 修正验收只读边界对 SDK 底层 HTTP `request/send` 和本地 `create_market_order` 签名的误判：普通 GET/HEAD/OPTIONS 读取及未提交签名可以通过，通知、下单、撤单和赎回仍硬失败并计入安全计数。
 
 - #21 为 Account API 生产切换补齐验收与运维交接：浏览器经 `8766` 独立轮询带 ETag 的 `/api/v1/account/snapshot`，不再请求 `/api/quotes`；Legacy 继续提供其余模块，任一 owner 降级不覆盖另一方。验收会核对稳定 ID 关联、双上游健康、Worker/API 同一 SHA、listener/runtime 日志、ETag/304 与 API parity；Account API 启动日志同时记录候选 Git SHA 与源码洁净状态，浏览器取证后冻结 Legacy 与 Account 两个轮询，并从 Account 页面状态按标的匹配持仓和实时来源、识别 `healthy` 来源状态，不依赖 Legacy 快照或页面排序。Dashboard 风险校验从冻结参数读取资源排名目标仓位，允许第一名 6% 而不放宽 4% 组合风险预算；冻结报告投影校验复用 Dashboard 的双强度字段投影，历史执行缓存也会在同一 action 目录追加成交事件时立即失效，stack 安装失败关闭且不自动进入 single 模式。新增切换、逆向回滚、writer-lock 与 Account-only 故障恢复 runbook，并同步当前轮换比较、CN v12、HK/US v10 与预测市场历史窗口的验收夹具。最终状态仍以候选 SHA 的 `make acceptance` 和同 SHA 重部署证据为准。
 - Dashboard 冻结报告验收同步资源排名强度投影：报告快照中的大类内/全局强度现在与 API 动作列表按同一口径比对。

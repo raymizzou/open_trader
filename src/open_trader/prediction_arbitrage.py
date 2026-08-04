@@ -11,6 +11,7 @@ from typing import Literal, Mapping
 MIN_NET_EDGE = Decimal("0.01")
 MIN_ESTIMATED_PROFIT = Decimal("1.00")
 MAX_NORMAL_COST = Decimal("20.00")
+MAX_CROSS_UNSETTLED_PRINCIPAL = Decimal("100")
 MAX_WALLET_BALANCE = Decimal("65.00")
 MAX_EMERGENCY_LOSS = Decimal("2.00")
 MIN_THRESHOLD_ANNUALIZED_YIELD = Decimal("0.15")

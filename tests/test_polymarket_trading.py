@@ -1,21 +1,26 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from polymarket import PRODUCTION, SecureClient
 
 import open_trader.cli as cli
+import open_trader.polymarket_trading as polymarket_trading
 from open_trader.polymarket_trading import (
     KEYCHAIN_SERVICE,
     PREDICT_API_KEY_ACCOUNT,
     PREDICT_KEYCHAIN_SERVICE,
+    PREDICT_PRIVATE_KEY_ACCOUNT,
     PolymarketTradingClient,
     PredictConfig,
     ThresholdHedgeSubmission,
@@ -23,6 +28,7 @@ from open_trader.polymarket_trading import (
     TradingConfig,
     load_keychain_secret,
     load_predict_api_key,
+    load_predict_private_key,
     load_trading_config,
     store_keychain_secret,
     store_predict_api_key,
@@ -32,6 +38,7 @@ from open_trader.prediction_arbitrage import (
     ThresholdHedgeIntent,
     ThresholdHedgeLeg,
 )
+from open_trader.predict_cross_venue import CrossVenueLeg
 
 
 SIGNER = "0x1111111111111111111111111111111111111111"
@@ -93,6 +100,25 @@ def threshold_intent() -> ThresholdHedgeIntent:
     )
 
 
+def cross_polymarket_leg() -> CrossVenueLeg:
+    return CrossVenueLeg(
+        exchange="polymarket",
+        market_id="market-cross",
+        condition_id="condition-cross",
+        outcome="NO",
+        token_id="cross-no-token",
+        settlement_asset="pUSD",
+        requested_quantity=Decimal("5"),
+        net_quantity=Decimal("5"),
+        max_price=Decimal("0.48"),
+        max_cost=Decimal("2.40"),
+        maximum_fee=Decimal("0.05"),
+        fee_asset="pUSD",
+        book_timestamp=datetime.now(UTC),
+        settlement_at=None,
+    )
+
+
 def test_keychain_write_never_places_secret_in_process_arguments() -> None:
     calls: list[tuple[list[str], str | None]] = []
 
@@ -114,6 +140,48 @@ def test_keychain_write_never_places_secret_in_process_arguments() -> None:
     ]
     assert all("secret-sentinel" not in item for item in calls[0][0])
     assert calls[0][1] == "secret-sentinel\n"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS Keychain")
+def test_keychain_write_round_trips_through_real_security(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = f"com.open-trader.test.{uuid4()}"
+    account = "signing-private-key"
+    secret = f"secret-{uuid4()}"
+    monkeypatch.setattr(polymarket_trading, "KEYCHAIN_SERVICE", service)
+
+    try:
+        store_keychain_secret(account, secret)
+        stored = subprocess.run(
+            [
+                "/usr/bin/security",
+                "find-generic-password",
+                "-a",
+                account,
+                "-s",
+                service,
+                "-w",
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.rstrip("\r\n")
+        assert stored == secret
+    finally:
+        subprocess.run(
+            [
+                "/usr/bin/security",
+                "delete-generic-password",
+                "-a",
+                account,
+                "-s",
+                service,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
 
 def test_keychain_read_captures_stdout_without_exposing_secret() -> None:
@@ -243,6 +311,33 @@ def test_load_predict_api_key_strips_value_and_redacts_failures() -> None:
     with pytest.raises(Exception) as exc_info:
         load_predict_api_key(run=unavailable)
     assert "key-sentinel" not in str(exc_info.value)
+
+
+def test_load_predict_private_key_uses_predict_keychain_and_redacts_failures() -> None:
+    calls: list[list[str]] = []
+
+    def run(args: list[str], **kwargs: object) -> CompletedProcess[str]:
+        calls.append(args)
+        return CompletedProcess(args, 0, "private-sentinel\n", "")
+
+    assert load_predict_private_key(run=run) == "private-sentinel"
+    assert calls == [[
+        "/usr/bin/security",
+        "find-generic-password",
+        "-a",
+        PREDICT_PRIVATE_KEY_ACCOUNT,
+        "-s",
+        PREDICT_KEYCHAIN_SERVICE,
+        "-w",
+    ]]
+    assert all("private-sentinel" not in arg for arg in calls[0])
+
+    def unavailable(args: list[str], **kwargs: object) -> CompletedProcess[str]:
+        raise CalledProcessError(1, args, stderr="private-sentinel")
+
+    with pytest.raises(Exception) as exc_info:
+        load_predict_private_key(run=unavailable)
+    assert "private-sentinel" not in str(exc_info.value)
 
 
 def test_predict_setup_preserves_polymarket_config_and_hides_api_key(
@@ -829,6 +924,170 @@ def test_threshold_post_exception_is_ambiguous_without_retry(
     assert "signature-sentinel" not in repr(result)
 
 
+def test_cross_leg_preflight_signs_once_then_posts_one_order_with_leg_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, fake = make_adapter()
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+    def post_one(orders: tuple[FakeSignedOrder, ...]) -> tuple[object, ...]:
+        fake.post_calls.append(orders)
+        return (
+            SimpleNamespace(
+                ok=True,
+                status="matched",
+                order_id="cross-order",
+                taking_amount=Decimal("5"),
+                trade_ids=("cross-trade",),
+            ),
+        )
+
+    fake.post_orders = post_one  # type: ignore[method-assign]
+    leg = cross_polymarket_leg()
+
+    assert adapter.no_submit_cross_leg_preflight(leg)["result"] == "PASS"
+    assert fake.post_calls == []
+
+    result = adapter.submit_cross_leg_once(leg)
+
+    assert len(fake.post_calls) == 1
+    assert len(fake.post_calls[0]) == 1
+    assert (
+        result.label,
+        result.outcome,
+        result.condition_id,
+        result.token_id,
+        result.order_id,
+        result.trade_ids,
+        result.filled_quantity,
+    ) == (
+        "polymarket",
+        "NO",
+        "condition-cross",
+        "cross-no-token",
+        "cross-order",
+        ("cross-trade",),
+        Decimal("5"),
+    )
+
+
+def test_cross_leg_transport_failure_is_ambiguous_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeClient()
+    fake.post_error = RuntimeError("signature-sentinel")
+    adapter, _ = make_adapter(fake)
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+    leg = cross_polymarket_leg()
+
+    assert adapter.no_submit_cross_leg_preflight(leg)["result"] == "PASS"
+    result = adapter.submit_cross_leg_once(leg)
+
+    assert len(fake.post_calls) == 1
+    assert result.status == "ambiguous"
+    assert result.error_code == "ambiguous"
+    assert "signature-sentinel" not in repr(result)
+
+
+def test_cross_leg_reconciliation_uses_order_trade_and_position_proof() -> None:
+    adapter, fake = make_adapter()
+    leg = cross_polymarket_leg()
+    since = datetime.now(UTC) - timedelta(seconds=1)
+    fake.trade_rows = [
+        SimpleNamespace(
+            id="cross-trade", condition_id="condition-cross", token_id="cross-no-token",
+            taker_order_id="cross-order", size=Decimal("5"), status="CONFIRMED",
+            side="BUY", trader_side="TAKER", price=Decimal("0.48"),
+            fee_rate_bps=Decimal("200"),
+            matched_at=datetime.now(UTC),
+        )
+    ]
+    fake.position_rows = [
+        {"condition_id": "condition-cross", "token_id": "cross-no-token", "size": "5"}
+    ]
+    result = ThresholdLegResult(
+        "polymarket", "NO", "condition-cross", "cross-no-token", True,
+        "filled", "cross-order", Decimal("5"), ("cross-trade",), "none",
+    )
+
+    reconciled = adapter.reconcile_cross_leg(leg, result, since=since)
+
+    assert reconciled["verified"] is True
+    assert reconciled["position_quantity"] == Decimal("5")
+    assert reconciled["filled_quantity"] == Decimal("5")
+    assert reconciled["actual_fee"] == Decimal("0.024960")
+    assert reconciled["execution_proof"]["fee"] == Decimal("0.024960")
+    assert reconciled["execution_proof"]["matched_refs"] == {
+        "token_id": "cross-no-token",
+        "order_ids": ["cross-order"],
+        "trade_ids": ["cross-trade"],
+    }
+
+
+def test_cross_leg_reconciliation_does_not_invent_actual_fee_without_trade_fee_evidence() -> None:
+    adapter, fake = make_adapter()
+    leg = cross_polymarket_leg()
+    since = datetime.now(UTC) - timedelta(seconds=1)
+    fake.trade_rows = [
+        SimpleNamespace(
+            id="cross-trade", condition_id="condition-cross", token_id="cross-no-token",
+            taker_order_id="cross-order", size=Decimal("5"), status="CONFIRMED",
+            side="BUY", price=Decimal("0.48"), fee_rate_bps=Decimal("200"),
+            matched_at=datetime.now(UTC),
+        )
+    ]
+    fake.position_rows = [
+        {"condition_id": "condition-cross", "token_id": "cross-no-token", "size": "5"}
+    ]
+    result = ThresholdLegResult(
+        "polymarket", "NO", "condition-cross", "cross-no-token", True,
+        "filled", "cross-order", Decimal("5"), ("cross-trade",), "none",
+    )
+
+    reconciled = adapter.reconcile_cross_leg(leg, result, since=since)
+
+    assert reconciled["verified"] is True
+    assert "actual_fee" not in reconciled
+    assert "fee" not in reconciled["execution_proof"]
+
+
+def test_cross_leg_reconciliation_carries_venue_minimum_order_size() -> None:
+    adapter, fake = make_adapter()
+    leg = SimpleNamespace(
+        exchange="polymarket", market_id="market-cross", condition_id="condition-cross",
+        outcome="NO", token_id="cross-no-token", settlement_asset="pUSD",
+        requested_quantity=Decimal("5"), net_quantity=Decimal("5"),
+        max_price=Decimal("0.48"), max_cost=Decimal("2.40"),
+        maximum_fee=Decimal("0.05"), fee_asset="pUSD",
+        book_timestamp=datetime.now(UTC), settlement_at=None,
+        minimum_order_size=Decimal("1"),
+    )
+    since = datetime.now(UTC) - timedelta(seconds=1)
+    fake.trade_rows = [
+        SimpleNamespace(
+            id="cross-trade", condition_id="condition-cross", token_id="cross-no-token",
+            taker_order_id="cross-order", size=Decimal("5"), status="CONFIRMED",
+            side="BUY", matched_at=datetime.now(UTC),
+        )
+    ]
+    fake.position_rows = [
+        {"condition_id": "condition-cross", "token_id": "cross-no-token", "size": "5"}
+    ]
+    result = ThresholdLegResult(
+        "polymarket", "NO", "condition-cross", "cross-no-token", True,
+        "filled", "cross-order", Decimal("5"), ("cross-trade",), "none",
+    )
+
+    reconciled = adapter.reconcile_cross_leg(leg, result, since=since)
+
+    assert reconciled.get("minimum_order_size") == Decimal("1")
+
+
 def test_threshold_reconcile_keeps_condition_and_token_refs_separate() -> None:
     adapter, fake = make_adapter()
     since = datetime.now(UTC) - timedelta(seconds=1)
@@ -1343,6 +1602,18 @@ class FakeRemediationPublicClient(FakePublicClient):
         )
 
 
+class CrossRemediationPublicClient:
+    def get_order_book(self, *, token_id: str) -> object:
+        assert token_id == "cross-no-token"
+        return SimpleNamespace(
+            asks=(SimpleNamespace(price=Decimal("0.18"), size=Decimal("5")),),
+            bids=(SimpleNamespace(price=Decimal("0.82"), size=Decimal("5")),),
+            min_order_size=Decimal("1"),
+            tick_size=Decimal("0.01"),
+            timestamp=datetime.now(UTC),
+        )
+
+
 class StaleRemediationPublicClient(FakeRemediationPublicClient):
     def get_order_book(self, *, token_id: str) -> object:
         book = super().get_order_book(token_id=token_id)
@@ -1435,6 +1706,36 @@ def test_remediation_options_are_fresh_bounded_and_exact_quantity() -> None:
     assert complete["quantity"] == Decimal("10")
     assert complete["amount"] == complete["max_spend"]
     assert complete["loss"] <= Decimal("2")
+    assert fake.post_calls == []
+
+
+def test_cross_remediation_options_bind_a_fresh_book_to_the_exact_leg() -> None:
+    adapter, fake = make_adapter()
+    fake.position_rows = [
+        {"condition_id": "condition-cross", "token_id": "cross-no-token", "size": Decimal("5")}
+    ]
+    fake.list_open_orders = lambda **kwargs: []  # type: ignore[method-assign]
+    adapter = PolymarketTradingClient(
+        TradingConfig(SIGNER, WALLET), client=fake,
+        public_client_factory=CrossRemediationPublicClient,
+    )
+    leg = cross_polymarket_leg()
+
+    buy = adapter.cross_remediation_option(
+        venue="polymarket", market_id=leg.market_id, condition_id=leg.condition_id,
+        token_id=leg.token_id, outcome=leg.outcome, side="BUY",
+        quantity=leg.net_quantity, maximum_fee=leg.maximum_fee,
+    )
+    sell = adapter.cross_remediation_option(
+        venue="polymarket", market_id=leg.market_id, condition_id=leg.condition_id,
+        token_id=leg.token_id, outcome=leg.outcome, side="SELL",
+        quantity=leg.net_quantity, maximum_fee=leg.maximum_fee,
+    )
+
+    assert buy["fresh"] is True
+    assert buy["option"]["max_spend"] == Decimal("0.95")
+    assert sell["fresh"] is True
+    assert sell["option"]["min_price"] == Decimal("0.82")
     assert fake.post_calls == []
 
 

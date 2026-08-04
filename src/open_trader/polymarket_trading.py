@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import json
 import importlib.metadata
+import os
+import pty
 import re
 import subprocess
 import threading
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
-from typing import Callable, Literal, Mapping, Sequence, cast
+from typing import Callable, Literal, cast
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -37,6 +40,7 @@ SECURITY = "/usr/bin/security"
 KEYCHAIN_SERVICE = "com.open-trader.polymarket"
 PREDICT_KEYCHAIN_SERVICE = "com.open-trader.predict"
 PREDICT_API_KEY_ACCOUNT = "api-key"
+PREDICT_PRIVATE_KEY_ACCOUNT = "privy-private-key"
 KEYCHAIN_ACCOUNTS = (
     "signing-private-key",
     "builder-key",
@@ -166,18 +170,12 @@ def _validate_keychain_account(account: str) -> None:
         raise ValueError("unsupported polymarket keychain account")
 
 
-def store_keychain_secret(
+def _store_keychain_password(
     account: str,
+    service: str,
     secret: str,
-    *,
-    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None,
 ) -> None:
-    """Store one secret via stdin so it never appears in process arguments."""
-
-    _validate_keychain_account(account)
-    if not isinstance(secret, str) or not secret:
-        raise ValueError("keychain secret must not be empty")
-    runner = run or _run_security
     args = [
         SECURITY,
         "add-generic-password",
@@ -185,20 +183,55 @@ def store_keychain_secret(
         "-a",
         account,
         "-s",
-        KEYCHAIN_SERVICE,
+        service,
         "-w",
     ]
+    master_fd = slave_fd = -1
+    process: subprocess.Popen[bytes] | None = None
     try:
-        runner(
+        if run is not None:
+            run(args, input=f"{secret}\n", text=True, capture_output=True, check=True)
+            return
+
+        master_fd, slave_fd = pty.openpty()
+        process = subprocess.Popen(
             args,
-            input=f"{secret}\n",
-            text=True,
-            capture_output=True,
-            check=True,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
         )
-    except Exception as exc:
-        del exc
+        os.close(slave_fd)
+        slave_fd = -1
+        password_lines = (f"{secret}\n{secret}\n").encode()
+        if os.write(master_fd, password_lines) != len(password_lines):
+            raise OSError
+        if process.wait(timeout=5) != 0:
+            raise KeychainError()
+    except Exception:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
         raise KeychainError() from None
+    finally:
+        if master_fd >= 0:
+            os.close(master_fd)
+        if slave_fd >= 0:
+            os.close(slave_fd)
+
+
+def store_keychain_secret(
+    account: str,
+    secret: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> None:
+    """Store one secret without placing it in process arguments."""
+
+    _validate_keychain_account(account)
+    if not isinstance(secret, str) or not secret:
+        raise ValueError("keychain secret must not be empty")
+    _store_keychain_password(account, KEYCHAIN_SERVICE, secret, run)
 
 
 def load_keychain_secret(
@@ -209,6 +242,14 @@ def load_keychain_secret(
     """Read one secret from Keychain without including it in diagnostics."""
 
     _validate_keychain_account(account)
+    return _load_keychain_password(account, KEYCHAIN_SERVICE, run)
+
+
+def _load_keychain_password(
+    account: str,
+    service: str,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None,
+) -> str:
     runner = run or _run_security
     args = [
         SECURITY,
@@ -216,7 +257,7 @@ def load_keychain_secret(
         "-a",
         account,
         "-s",
-        KEYCHAIN_SERVICE,
+        service,
         "-w",
     ]
     try:
@@ -238,31 +279,13 @@ def store_predict_api_key(
     *,
     run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> None:
-    """Store the Predict API key via stdin, never process arguments."""
+    """Store the Predict API key without exposing it in process arguments."""
 
     if not isinstance(secret, str) or not secret:
         raise ValueError("keychain secret must not be empty")
-    runner = run or _run_security
-    try:
-        runner(
-            [
-                SECURITY,
-                "add-generic-password",
-                "-U",
-                "-a",
-                PREDICT_API_KEY_ACCOUNT,
-                "-s",
-                PREDICT_KEYCHAIN_SERVICE,
-                "-w",
-            ],
-            input=f"{secret}\n",
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-    except Exception as exc:
-        del exc
-        raise KeychainError() from None
+    _store_keychain_password(
+        PREDICT_API_KEY_ACCOUNT, PREDICT_KEYCHAIN_SERVICE, secret, run
+    )
 
 
 def load_predict_api_key(
@@ -271,32 +294,16 @@ def load_predict_api_key(
 ) -> str:
     """Load the Predict API key without exposing it in failures."""
 
-    runner = run or _run_security
-    try:
-        completed = runner(
-            [
-                SECURITY,
-                "find-generic-password",
-                "-a",
-                PREDICT_API_KEY_ACCOUNT,
-                "-s",
-                PREDICT_KEYCHAIN_SERVICE,
-                "-w",
-            ],
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        value = getattr(completed, "stdout", "")
-    except Exception as exc:
-        del exc
-        raise KeychainError() from None
-    if not isinstance(value, str):
-        raise KeychainError("keychain_empty")
-    value = value.rstrip("\r\n")
-    if not value:
-        raise KeychainError("keychain_empty")
-    return value
+    return _load_keychain_password(PREDICT_API_KEY_ACCOUNT, PREDICT_KEYCHAIN_SERVICE, run)
+
+
+def load_predict_private_key(
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> str:
+    """Load the Predict signer key without exposing it in failures."""
+
+    return _load_keychain_password(PREDICT_PRIVATE_KEY_ACCOUNT, PREDICT_KEYCHAIN_SERVICE, run)
 
 
 def _canonical_address(value: object, field: str) -> str:
@@ -342,6 +349,14 @@ def _safe_error_code(exc: BaseException) -> str:
     name = type(exc).__name__.lower()
     if isinstance(exc, KeychainError):
         return exc.error_code
+    if isinstance(exc, PolymarketTradingError):
+        return exc.error_code
+    status = getattr(exc, "code", None)
+    if isinstance(status, int):
+        if status in {401, 403}:
+            return "rejected"
+        if status == 429 or status >= 500:
+            return "network"
     if "timeout" in name:
         return "timeout"
     if "sign" in name:
@@ -493,6 +508,7 @@ class PolymarketTradingClient:
         self._public_client_factory = public_client_factory or PublicClient
         self._readiness_key: tuple[PairIntent, Decimal] | None = None
         self._threshold_readiness_key: ThresholdHedgeIntent | None = None
+        self._cross_leg_readiness_key: object | None = None
 
     @classmethod
     def from_keychain(
@@ -614,7 +630,10 @@ class PolymarketTradingClient:
             if callable(gasless_method):
                 try:
                     gasless_ready = gasless_method() is True
-                except Exception:
+                except Exception as exc:
+                    code = _safe_error_code(exc)
+                    if code in {"network", "timeout", "unavailable"}:
+                        raise PolymarketTradingError(code) from None
                     gasless_ready = False
         merge_ready = merge_capable and gasless_ready
         return {
@@ -664,7 +683,10 @@ class PolymarketTradingClient:
                 and bool(nonce)
                 and nonce.isdigit()
             )
-        except Exception:
+        except Exception as exc:
+            code = _safe_error_code(exc)
+            if code in {"network", "timeout", "unavailable"}:
+                raise PolymarketTradingError(code) from None
             return False
 
     def _identity_summary(self) -> tuple[str, str]:
@@ -1053,7 +1075,9 @@ class PolymarketTradingClient:
         except PolymarketTradingError:
             raise
         except Exception as exc:
-            del exc
+            code = _safe_error_code(exc)
+            if code in {"network", "timeout", "unavailable"}:
+                raise PolymarketTradingError(code) from None
             raise PolymarketTradingError("market_probe_unavailable") from None
 
     def preflight_report(self) -> dict[str, object]:
@@ -1068,6 +1092,8 @@ class PolymarketTradingClient:
             "merge_capability": "unavailable",
             "relayer_readiness": "fail",
             "secret_scan": "pass",
+            "posted": False,
+            "error_code": "none",
             "result": "BLOCKED",
         }
         try:
@@ -1078,13 +1104,22 @@ class PolymarketTradingClient:
         report["signer_match"] = signer_match
         report["wallet_match"] = wallet_match
         if signer_match != "yes" or wallet_match != "yes":
+            report["error_code"] = "auth"
             return report
         try:
             account = self.account_snapshot()
-        except PolymarketTradingError:
+        except PolymarketTradingError as exc:
+            report["error_code"] = exc.error_code
             return report
         report["account_reads"] = "pass"
-        readiness = self.readiness_snapshot()
+        try:
+            readiness = self.readiness_snapshot()
+        except PolymarketTradingError as exc:
+            report["error_code"] = exc.error_code
+            return report
+        except Exception as exc:
+            report["error_code"] = _safe_error_code(exc)
+            return report
         report["merge_capability"] = (
             "present_not_invoked" if readiness.get("merge_capability") is True else "unavailable"
         )
@@ -1092,10 +1127,12 @@ class PolymarketTradingClient:
             "pass" if readiness.get("ready") is True else "fail"
         )
         if report["relayer_readiness"] != "pass":
+            report["error_code"] = "sdk_error"
             return report
         try:
             intent, tick_size = self._discover_probe()
-        except PolymarketTradingError:
+        except PolymarketTradingError as exc:
+            report["error_code"] = exc.error_code
             return report
         summary = self.no_submit_preflight(
             intent,
@@ -1110,6 +1147,8 @@ class PolymarketTradingClient:
             "fok_pair_signed_not_submitted"
         ]
         report["equal_requested_shares"] = summary["equal_requested_shares"]
+        report["posted"] = summary.get("posted", False)
+        report["error_code"] = summary.get("error_code", "sdk_error")
         if (
             report["sdk_version"] == "0.2.0"
             and
@@ -1502,6 +1541,215 @@ class PolymarketTradingClient:
             leg_b=self._threshold_leg_result(intent.leg_b, responses[1]),
         )
 
+    @staticmethod
+    def _cross_leg_fields(
+        leg: object,
+    ) -> tuple[str, str, str, Decimal, Decimal] | None:
+        exchange = _field(leg, "exchange")
+        condition_id = _field(leg, "condition_id")
+        token_id = _field(leg, "token_id")
+        outcome = _field(leg, "outcome")
+        quantity = _field(leg, "net_quantity")
+        max_price = _field(leg, "max_price")
+        max_cost = _field(leg, "max_cost")
+        if (
+            exchange != "polymarket"
+            or not isinstance(condition_id, str)
+            or not condition_id
+            or not isinstance(token_id, str)
+            or not token_id
+            or outcome not in {"YES", "NO"}
+            or not isinstance(quantity, Decimal)
+            or not isinstance(max_price, Decimal)
+            or not isinstance(max_cost, Decimal)
+            or quantity <= 0
+            or max_price <= 0
+            or max_price > 1
+            or max_cost <= 0
+        ):
+            return None
+        return condition_id, token_id, outcome, quantity, max_price
+
+    @staticmethod
+    def _blocked_cross_leg(leg: object, error_code: str) -> ThresholdLegResult:
+        fields = PolymarketTradingClient._cross_leg_fields(leg)
+        if fields is None:
+            return ThresholdLegResult(
+                "polymarket", "YES", "", "", False, "blocked", "", Decimal("0"), (), "invalid"
+            )
+        condition_id, token_id, outcome, _quantity, _max_price = fields
+        return ThresholdLegResult(
+            "polymarket", outcome, condition_id, token_id, False, "blocked", "", Decimal("0"), (), error_code
+        )
+
+    def no_submit_cross_leg_preflight(
+        self, leg: object, *, account: AccountSnapshot | None = None
+    ) -> dict[str, object]:
+        self._cross_leg_readiness_key = None
+        summary: dict[str, object] = {
+            "posted": False,
+            "account_reads": "fail",
+            "fok_leg_signed_not_submitted": "fail",
+            "error_code": "none",
+            "result": "BLOCKED",
+        }
+        fields = self._cross_leg_fields(leg)
+        signer_match, wallet_match = self._identity_summary()
+        if fields is None:
+            summary["error_code"] = "invalid"
+            return summary
+        if signer_match != "yes" or wallet_match != "yes":
+            summary["error_code"] = "auth"
+            return summary
+        if account is None:
+            try:
+                account = self.account_snapshot()
+            except PolymarketTradingError as exc:
+                summary["error_code"] = exc.error_code
+                return summary
+        summary["account_reads"] = "pass"
+        if not self.geoblock_allowed():
+            summary["error_code"] = "geoblock_blocked"
+            return summary
+        condition_id, token_id, _outcome, quantity, max_price = fields
+        max_cost = _field(leg, "max_cost")
+        if (
+            not isinstance(max_cost, Decimal)
+            or max_cost > account.p_usd_balance
+            or max_cost > account.p_usd_allowance
+        ):
+            summary["error_code"] = "account_insufficient"
+            return summary
+        try:
+            signed = self._sign_leg(
+                token_id=token_id, amount=max_cost, max_price=max_price
+            )
+        except Exception as exc:
+            summary["error_code"] = _safe_error_code(exc)
+            return summary
+        if (
+            _field(signed, "order_type") != "FOK"
+            or _field(signed, "side") != "BUY"
+            or _field(signed, "token_id") not in (None, token_id)
+            or self._signed_quantity(signed, quantity) != quantity
+        ):
+            summary["error_code"] = "order_shape_mismatch"
+            return summary
+        del condition_id
+        summary["fok_leg_signed_not_submitted"] = "pass"
+        summary["result"] = "PASS"
+        self._cross_leg_readiness_key = leg
+        return summary
+
+    def submit_cross_leg_once(self, leg: object) -> ThresholdLegResult:
+        if self._cross_leg_readiness_key != leg:
+            return self._blocked_cross_leg(leg, "preflight_required")
+        fields = self._cross_leg_fields(leg)
+        if fields is None:
+            return self._blocked_cross_leg(leg, "invalid")
+        _condition_id, token_id, _outcome, quantity, max_price = fields
+        max_cost = _field(leg, "max_cost")
+        if not isinstance(max_cost, Decimal):
+            return self._blocked_cross_leg(leg, "invalid")
+        try:
+            signed = self._sign_leg(
+                token_id=token_id, amount=max_cost, max_price=max_price
+            )
+            if (
+                _field(signed, "order_type") != "FOK"
+                or _field(signed, "side") != "BUY"
+                or self._signed_quantity(signed, quantity) != quantity
+            ):
+                return self._blocked_cross_leg(leg, "order_shape_mismatch")
+            responses = tuple(self._client.post_orders((signed,)))
+        except Exception:
+            return ThresholdLegResult(
+                "polymarket", _outcome, _condition_id, token_id, False, "ambiguous", "", Decimal("0"), (), "ambiguous"
+            )
+        if len(responses) != 1:
+            return ThresholdLegResult(
+                "polymarket", _outcome, _condition_id, token_id, False, "ambiguous", "", Decimal("0"), (), "ambiguous"
+            )
+        return self._threshold_leg_result(
+            ThresholdHedgeLeg(
+                "polymarket",
+                _condition_id,
+                str(_field(leg, "market_id", _condition_id)),
+                _outcome,
+                token_id,
+                quantity,
+                max_price,
+                max_cost,
+                DEFAULT_TICK_SIZE,
+            ),
+            responses[0],
+        )
+
+    def reconcile_cross_leg(
+        self, leg: object, result: ThresholdLegResult, *, since: datetime
+    ) -> dict[str, object]:
+        fields = self._cross_leg_fields(leg)
+        if fields is None or not isinstance(result, ThresholdLegResult):
+            return {"status": "unknown", "verified": False, "conclusively_absent": False}
+        condition_id, token_id, outcome, quantity, max_price = fields
+        max_cost = _field(leg, "max_cost")
+        if not isinstance(max_cost, Decimal):
+            return {"status": "unknown", "verified": False, "conclusively_absent": False}
+        try:
+            minimum_order_size = _decimal(_field(leg, "minimum_order_size"))
+        except ValueError:
+            minimum_order_size = None
+        actual, proof = self._reconcile_threshold_leg(result, since=since)
+        position = proof.get("position_ref")
+        position_quantity = (
+            _decimal(position.get("quantity"))
+            if isinstance(position, Mapping)
+            else Decimal("0")
+        ) or Decimal("0")
+        if proof.get("positions_verified") is True and actual > 0:
+            reconciled: dict[str, object] = {
+                "status": "verified",
+                "verified": True,
+                "conclusively_absent": False,
+                "filled_quantity": actual,
+                "position_quantity": position_quantity,
+                "execution_proof": {"verified": True, "venue": "polymarket", **proof},
+            }
+            actual_fee = proof.get("fee")
+            if isinstance(actual_fee, Decimal) and actual_fee >= 0:
+                reconciled["actual_fee"] = actual_fee
+            if minimum_order_size is not None and minimum_order_size > 0:
+                reconciled["minimum_order_size"] = minimum_order_size
+            return reconciled
+        if not result.accepted and result.status != "ambiguous":
+            try:
+                positions = _collect(self._client.list_positions(market=[condition_id]))
+                for item in positions:
+                    if _field(item, "token_id", _field(item, "tokenId", "")) != token_id:
+                        continue
+                    amount = _decimal(
+                        _field(item, "size", _field(item, "quantity", _field(item, "shares")))
+                    )
+                    if amount is not None and amount > 0:
+                        return {"status": "unknown", "verified": False, "conclusively_absent": False}
+            except Exception:
+                return {"status": "unknown", "verified": False, "conclusively_absent": False}
+            return {
+                "status": "absent",
+                "verified": False,
+                "conclusively_absent": True,
+                "filled_quantity": Decimal("0"),
+                "position_quantity": Decimal("0"),
+            }
+        return {
+            "status": "unknown",
+            "verified": False,
+            "conclusively_absent": False,
+            "filled_quantity": actual,
+            "position_quantity": position_quantity,
+            "execution_proof": {"verified": False, "venue": "polymarket", **proof},
+        }
+
     def reconcile(
         self,
         *,
@@ -1729,6 +1977,8 @@ class PolymarketTradingClient:
             }
         since_utc = since.astimezone(UTC) if since.tzinfo else since.replace(tzinfo=UTC)
         quantity = Decimal("0")
+        actual_fee = Decimal("0")
+        fees_verified = True
         seen: set[tuple[str, str]] = set()
         try:
             trades = _collect(
@@ -1780,6 +2030,27 @@ class PolymarketTradingClient:
                 if raw_quantity is None or raw_quantity <= 0:
                     continue
                 quantity += raw_quantity
+                if _safe_string(_field(trade, "trader_side", "")).upper() != "TAKER":
+                    fees_verified = False
+                else:
+                    try:
+                        price = _decimal(_field(trade, "price"))
+                        fee_rate_bps = _decimal(
+                            _field(trade, "fee_rate_bps", _field(trade, "feeRateBps"))
+                        )
+                    except ValueError:
+                        fees_verified = False
+                    else:
+                        if not (Decimal("0") < price <= Decimal("1")) or fee_rate_bps < 0:
+                            fees_verified = False
+                        else:
+                            actual_fee += (
+                                raw_quantity
+                                * fee_rate_bps
+                                / Decimal("10000")
+                                * price
+                                * (Decimal("1") - price)
+                            )
                 if order_ref and order_ref not in matched["order_ids"]:
                     matched["order_ids"].append(order_ref)  # type: ignore[union-attr]
                 if trade_ref and trade_ref not in matched["trade_ids"]:
@@ -1819,12 +2090,15 @@ class PolymarketTradingClient:
                     "token_id": leg.token_id,
                     "quantity": format(position_quantity, "f"),
                 }
-            return quantity, {
+            proof = {
                 "matched_refs": matched,
                 "position_ref": position_ref,
                 "positions_verified": quantity > 0
                 and position_quantity >= quantity,
             }
+            if quantity > 0 and fees_verified:
+                proof["fee"] = actual_fee
+            return quantity, proof
         except Exception:
             return Decimal("0"), {
                 "matched_refs": matched,
@@ -2035,6 +2309,106 @@ class PolymarketTradingClient:
                     "loss": max(Decimal("0"), filled_quantity * (Decimal("1") - bid[0])),
                 },
             }
+        except Exception:
+            return {"fresh": False}
+
+    def cross_remediation_option(
+        self,
+        *,
+        venue: str,
+        market_id: str,
+        condition_id: str,
+        token_id: str,
+        outcome: str,
+        side: str,
+        quantity: Decimal,
+        maximum_fee: Decimal,
+    ) -> dict[str, object]:
+        """Return one current cross-venue completion or unwind option, never submit.
+
+        This is deliberately a narrow adapter callback rather than a second
+        venue abstraction.  The caller still chooses between this option and
+        the other venue's independently refreshed option.
+        """
+
+        if (
+            venue != "polymarket"
+            or not all(isinstance(value, str) and value.strip() for value in (market_id, condition_id, token_id, outcome))
+            or side not in {"BUY", "SELL"}
+            or self._positive_decimal(quantity) is None
+            or not isinstance(maximum_fee, Decimal)
+            or not maximum_fee.is_finite()
+            or maximum_fee < 0
+        ):
+            return {"fresh": False}
+        try:
+            account = self.account_snapshot()
+            account_stamp = _venue_timestamp(account.checked_at)
+            now = datetime.now(UTC)
+            if (
+                account_stamp is None
+                or account.open_order_ids
+                or (now - account_stamp).total_seconds() < 0
+                or (now - account_stamp).total_seconds() > REMEDIATION_BOOK_FRESHNESS_SECONDS
+            ):
+                return {"fresh": False}
+            if side == "BUY" and (
+                account.p_usd_balance <= 0 or account.p_usd_allowance <= 0
+            ):
+                return {"fresh": False}
+            if side == "SELL":
+                position = sum(
+                    (
+                        _decimal(row.get("size", row.get("quantity", row.get("shares")))) or Decimal("0")
+                        for row in account.positions
+                        if row.get("condition_id", row.get("conditionId")) == condition_id
+                        and row.get("token_id", row.get("tokenId", row.get("asset_id"))) == token_id
+                    ),
+                    Decimal("0"),
+                )
+                if position < quantity:
+                    return {"fresh": False}
+            book = self._public_client_factory().get_order_book(token_id=token_id)
+            stamp = _venue_timestamp(_field(book, "timestamp"))
+            now = datetime.now(UTC)
+            if (
+                stamp is None
+                or (now - stamp).total_seconds() < 0
+                or (now - stamp).total_seconds() > REMEDIATION_BOOK_FRESHNESS_SECONDS
+            ):
+                return {"fresh": False}
+            levels = _collect(_field(book, "asks" if side == "BUY" else "bids", ()))
+            valid: list[tuple[Decimal, Decimal]] = []
+            for row in levels:
+                price = _decimal(_field(row, "price"))
+                size = _decimal(_field(row, "size"))
+                if price is None or size is None or not (Decimal("0") < price <= Decimal("1")) or size < quantity:
+                    continue
+                valid.append((price, size))
+            if not valid:
+                return {"fresh": False}
+            price = min(valid, key=lambda item: item[0])[0] if side == "BUY" else max(valid, key=lambda item: item[0])[0]
+            option: dict[str, object] = {
+                "venue": venue,
+                "market_id": market_id,
+                "condition_id": condition_id,
+                "token_id": token_id,
+                "outcome": outcome,
+                "side": side,
+                "quantity": quantity,
+                "executable_price": price,
+                "fee": maximum_fee,
+                "slippage": Decimal("0"),
+                "residual_dust": Decimal("0"),
+            }
+            if side == "BUY":
+                max_spend = quantity * price + maximum_fee
+                if max_spend > account.p_usd_balance or max_spend > account.p_usd_allowance:
+                    return {"fresh": False}
+                option["max_spend"] = max_spend
+            else:
+                option.update({"shares": quantity, "min_price": price})
+            return {"fresh": True, "checked_at": min(account_stamp, stamp), "option": option}
         except Exception:
             return {"fresh": False}
 
@@ -2322,6 +2696,7 @@ __all__ = [
     "KEYCHAIN_ACCOUNTS",
     "KEYCHAIN_SERVICE",
     "PREDICT_API_KEY_ACCOUNT",
+    "PREDICT_PRIVATE_KEY_ACCOUNT",
     "PREDICT_KEYCHAIN_SERVICE",
     "KeychainError",
     "LegResult",
@@ -2334,6 +2709,7 @@ __all__ = [
     "TradingConfig",
     "load_keychain_secret",
     "load_predict_api_key",
+    "load_predict_private_key",
     "load_trading_config",
     "store_keychain_secret",
     "store_predict_api_key",

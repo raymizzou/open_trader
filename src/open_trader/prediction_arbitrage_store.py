@@ -8,8 +8,11 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterator, Literal, Mapping
+
+from open_trader.prediction_arbitrage import MAX_CROSS_UNSETTLED_PRINCIPAL
 
 
 StoreHistoryKind = Literal["signals", "executions", "incidents"]
@@ -56,7 +59,15 @@ _PRIVATE_FIELD_PARTS = (
     "order_payload",
 )
 _PUBLIC_RELATION_TOKEN_FIELDS = frozenset(
-    {"token_id", "yes_token_id", "no_token_id"}
+    {
+        "token_id",
+        "yes_token_id",
+        "no_token_id",
+        "predict_yes_token_id",
+        "predict_no_token_id",
+        "polymarket_yes_token_id",
+        "polymarket_no_token_id",
+    }
 )
 
 
@@ -310,6 +321,15 @@ class PredictionArbitrageStore:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS cross_execution_reservations (
+                execution_id TEXT PRIMARY KEY REFERENCES executions(execution_id),
+                amount TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('reserved', 'released')),
+                created_at TEXT NOT NULL,
+                released_at TEXT,
+                release_reason TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS execution_legs (
                 leg_id TEXT PRIMARY KEY,
                 execution_id TEXT NOT NULL REFERENCES executions(execution_id),
@@ -394,6 +414,9 @@ class PredictionArbitrageStore:
             version = 1
         if version < 2:
             connection.execute("PRAGMA user_version=2")
+            version = 2
+        if version < 3:
+            connection.execute("PRAGMA user_version=3")
 
     @staticmethod
     def _execution_fields(row: sqlite3.Row) -> dict[str, object]:
@@ -1041,6 +1064,426 @@ class PredictionArbitrageStore:
             )
         return preview_id
 
+    @staticmethod
+    def _reserved_cross_principal(connection: sqlite3.Connection) -> Decimal:
+        rows = connection.execute(
+            "SELECT amount FROM cross_execution_reservations WHERE state='reserved'"
+        ).fetchall()
+        return sum((Decimal(str(row["amount"])) for row in rows), Decimal("0"))
+
+    @staticmethod
+    def _cross_reservation_amount(payload: Mapping[str, object]) -> Decimal:
+        value = payload.get("total_max_cost")
+        if isinstance(value, bool):
+            raise ValueError("cross_unsettled_cost_invalid")
+        try:
+            amount = Decimal(str(value))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("cross_unsettled_cost_invalid") from exc
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("cross_unsettled_cost_invalid")
+        return amount
+
+    def cross_unsettled_principal(self) -> Decimal:
+        with self._read_connection() as connection:
+            return self._reserved_cross_principal(connection)
+
+    @staticmethod
+    def _nonempty_string(value: object) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    @staticmethod
+    def _valid_decimal(
+        value: object, *, allow_zero: bool = False, allow_negative: bool = False
+    ) -> bool:
+        if isinstance(value, bool):
+            return False
+        try:
+            amount = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return False
+        if not amount.is_finite():
+            return False
+        if allow_negative:
+            return True
+        if allow_zero:
+            return amount >= 0
+        return amount > 0
+
+    @staticmethod
+    def _valid_timestamp(value: object) -> bool:
+        try:
+            _parse_timestamp(value)
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _decimal_values_match(left: object, right: object) -> bool:
+        if isinstance(left, bool) or isinstance(right, bool):
+            return False
+        try:
+            left_value = Decimal(str(left))
+            right_value = Decimal(str(right))
+        except (InvalidOperation, ValueError):
+            return False
+        return left_value.is_finite() and right_value.is_finite() and left_value == right_value
+
+    @classmethod
+    def _valid_cross_preview_candidate(cls, candidate: object) -> bool:
+        return isinstance(candidate, Mapping) and all(
+            cls._nonempty_string(candidate.get(field))
+            for field in (
+                "market_id",
+                "condition_id",
+                "yes_token_id",
+                "no_token_id",
+                "rules_fingerprint",
+            )
+        )
+
+    @classmethod
+    def _valid_cross_preview_leg(
+        cls, leg: object, *, exchange: str, outcome: str
+    ) -> bool:
+        return (
+            isinstance(leg, Mapping)
+            and leg.get("exchange") == exchange
+            and leg.get("outcome") == outcome
+            and all(
+                cls._nonempty_string(leg.get(field))
+                for field in (
+                    "market_id",
+                    "condition_id",
+                    "token_id",
+                    "settlement_asset",
+                    "fee_asset",
+                )
+            )
+            and all(
+                cls._valid_decimal(leg.get(field))
+                for field in (
+                    "requested_quantity",
+                    "net_quantity",
+                    "max_price",
+                    "max_cost",
+                )
+            )
+            and cls._valid_decimal(leg.get("maximum_fee"), allow_zero=True)
+            and cls._valid_decimal(leg.get("minimum_order_size"), allow_zero=True)
+            and cls._valid_timestamp(leg.get("book_timestamp"))
+            and "settlement_at" in leg
+            and (
+                leg.get("settlement_at") is None
+                or cls._valid_timestamp(leg.get("settlement_at"))
+            )
+        )
+
+    @classmethod
+    def _valid_cross_preview_payload(
+        cls, payload: Mapping[str, object]
+    ) -> bool:
+        intent = payload.get("intent")
+        if not (
+            payload.get("market_type") == "cross_venue_yes_no"
+            and all(
+                cls._nonempty_string(payload.get(field))
+                for field in (
+                    "opportunity_id",
+                    "execution_id",
+                    "signal_episode_id",
+                    "pair_id",
+                    "direction",
+                    "canonical_cutoff",
+                )
+            )
+            and cls._valid_decimal(payload.get("total_max_cost"))
+            and cls._valid_decimal(payload.get("minimum_payout"))
+            and cls._valid_decimal(payload.get("minimum_profit"))
+            and cls._valid_decimal(payload.get("annualized_yield"))
+        ):
+            return False
+        if not cls._valid_timestamp(payload.get("canonical_cutoff")):
+            return False
+        if not isinstance(intent, Mapping) or intent.get("intent_type") != "cross_venue":
+            return False
+        if not (
+            intent.get("pair_id") == payload.get("pair_id")
+            and intent.get("direction") == payload.get("direction")
+            and intent.get("canonical_cutoff") == payload.get("canonical_cutoff")
+            and cls._valid_decimal(intent.get("quantity"))
+            and cls._valid_decimal(intent.get("calculable_gas"), allow_zero=True)
+            and cls._valid_decimal(intent.get("total_max_cost"))
+            and cls._valid_decimal(intent.get("maximum_fee"), allow_zero=True)
+            and cls._valid_decimal(intent.get("minimum_payout"))
+            and cls._valid_decimal(intent.get("minimum_profit"))
+            and cls._valid_decimal(intent.get("annualized_yield"))
+            and cls._valid_timestamp(intent.get("canonical_cutoff"))
+            and cls._valid_timestamp(intent.get("resolution_at"))
+            and intent.get("actionable") is True
+            and intent.get("quote_available") is True
+            and cls._decimal_values_match(
+                payload.get("total_max_cost"), intent.get("total_max_cost")
+            )
+            and cls._decimal_values_match(
+                payload.get("minimum_payout"), intent.get("minimum_payout")
+            )
+            and cls._decimal_values_match(
+                payload.get("minimum_profit"), intent.get("minimum_profit")
+            )
+            and cls._decimal_values_match(
+                payload.get("annualized_yield"), intent.get("annualized_yield")
+            )
+        ):
+            return False
+        legs = intent.get("legs")
+        if not isinstance(legs, list) or len(legs) != 2:
+            return False
+        if not (
+            cls._valid_cross_preview_leg(legs[0], exchange="predict.fun", outcome="YES")
+            and cls._valid_cross_preview_leg(legs[1], exchange="polymarket", outcome="NO")
+        ) and not (
+            cls._valid_cross_preview_leg(legs[0], exchange="predict.fun", outcome="NO")
+            and cls._valid_cross_preview_leg(legs[1], exchange="polymarket", outcome="YES")
+        ):
+            return False
+        rules_fingerprints = payload.get("rules_fingerprints")
+        if not (
+            isinstance(rules_fingerprints, Mapping)
+            and all(
+                cls._nonempty_string(rules_fingerprints.get(exchange))
+                for exchange in ("predict.fun", "polymarket")
+            )
+        ):
+            return False
+        approved_candidates = payload.get("approved_candidates")
+        if not (
+            isinstance(approved_candidates, Mapping)
+            and cls._valid_cross_preview_candidate(approved_candidates.get("predict.fun"))
+            and cls._valid_cross_preview_candidate(approved_candidates.get("polymarket"))
+        ):
+            return False
+        if any(
+            approved_candidates[exchange].get("rules_fingerprint")
+            != rules_fingerprints.get(exchange)
+            for exchange in ("predict.fun", "polymarket")
+        ):
+            return False
+        approval = payload.get("codex_approval")
+        return bool(
+            isinstance(approval, Mapping)
+            and approval.get("decision") == "APPROVE"
+            and cls._nonempty_string(approval.get("cache_key"))
+            and isinstance(approval.get("direct_outcome_mapping"), Mapping)
+            and isinstance(approval.get("evidence"), list)
+            and approval.get("evidence")
+        )
+
+    @staticmethod
+    def _has_zero_cross_positions(evidence: Mapping[str, object]) -> bool:
+        positions = evidence.get("positions")
+        if not isinstance(positions, Mapping):
+            return False
+        for venue in ("predict.fun", "polymarket"):
+            value = positions.get(venue)
+            if isinstance(value, bool):
+                return False
+            try:
+                amount = Decimal(str(value))
+            except (InvalidOperation, ValueError):
+                return False
+            if not amount.is_finite() or amount != 0:
+                return False
+        return True
+
+    @staticmethod
+    def _winner_matches_cross_payload(
+        winner: Mapping[str, object], payload: Mapping[str, object]
+    ) -> bool:
+        intent = payload.get("intent")
+        if not isinstance(intent, Mapping) or intent.get("intent_type") != "cross_venue":
+            return False
+        venue = winner.get("venue")
+        condition_id = winner.get("condition_id")
+        outcome = winner.get("outcome")
+        token_id = winner.get("token_id")
+        quantity = winner.get("quantity")
+        if (
+            venue not in {"predict.fun", "polymarket"}
+            or not all(isinstance(value, str) and value for value in (condition_id, outcome, token_id))
+            or outcome not in {"YES", "NO"}
+        ):
+            return False
+        try:
+            amount = Decimal(str(quantity))
+        except (InvalidOperation, ValueError):
+            return False
+        if not amount.is_finite() or amount <= 0:
+            return False
+        legs = intent.get("legs")
+        if not isinstance(legs, list):
+            return False
+        matches = 0
+        for leg in legs:
+            if not isinstance(leg, Mapping):
+                continue
+            if (
+                leg.get("exchange") != venue
+                or leg.get("condition_id") != condition_id
+                or leg.get("outcome") != outcome
+                or leg.get("token_id") != token_id
+            ):
+                continue
+            try:
+                maximum = Decimal(str(leg.get("net_quantity")))
+            except (InvalidOperation, ValueError):
+                continue
+            if maximum.is_finite() and amount == maximum:
+                matches += 1
+        return matches == 1
+
+    @classmethod
+    def _has_observed_redeemed_collateral(
+        cls,
+        evidence: Mapping[str, object],
+        payload: Mapping[str, object],
+        settlement_baseline: Mapping[str, object],
+    ) -> bool:
+        redemption = evidence.get("redemption")
+        if not isinstance(redemption, Mapping) or redemption.get("observed") is not True:
+            return False
+        winner = redemption.get("winner")
+        if not isinstance(winner, Mapping) or not cls._winner_matches_cross_payload(winner, payload):
+            return False
+        collateral = redemption.get("redeemed_collateral")
+        completed_baseline = evidence.get("settlement_baseline")
+        if not isinstance(collateral, Mapping) or not isinstance(completed_baseline, Mapping):
+            return False
+        venue = str(winner["venue"])
+        try:
+            amount = Decimal(str(collateral.get(venue)))
+            required = Decimal(str(winner["quantity"]))
+            prior = Decimal(str(settlement_baseline.get(venue)))
+            recorded = Decimal(str(completed_baseline.get(venue)))
+        except (InvalidOperation, ValueError):
+            return False
+        return (
+            amount.is_finite()
+            and required.is_finite()
+            and prior.is_finite()
+            and recorded.is_finite()
+            and prior >= 0
+            and recorded == prior
+            and amount >= required > 0
+        )
+
+    @staticmethod
+    def _post_fill_settlement_baseline(evidence: list[object]) -> Mapping[str, object] | None:
+        for item in reversed(evidence):
+            if not isinstance(item, Mapping) or item.get("phase") != "holding_to_resolution":
+                continue
+            baseline = item.get("settlement_baseline")
+            if not isinstance(baseline, Mapping):
+                continue
+            try:
+                values = {
+                    venue: Decimal(str(baseline.get(venue)))
+                    for venue in ("polymarket", "predict.fun")
+                }
+            except (InvalidOperation, ValueError):
+                continue
+            if all(value.is_finite() and value >= 0 for value in values.values()):
+                return baseline
+        return None
+
+    @classmethod
+    def _cross_release_is_proven(
+        cls, *, state: object, evidence: object, payload: Mapping[str, object], reason: str
+    ) -> bool:
+        if not isinstance(evidence, list):
+            return False
+        settlement_baseline = cls._post_fill_settlement_baseline(evidence)
+        for item in reversed(evidence):
+            if not isinstance(item, Mapping) or not cls._has_zero_cross_positions(item):
+                continue
+            if reason == "no_submit":
+                if state == "both_rejected" and item.get("submitted") is False:
+                    return True
+            elif reason == "both_rejected":
+                if state == "both_rejected" and item.get("no_position_observed") is True:
+                    return True
+            elif reason == "redeemed":
+                if (
+                    state == "complete"
+                    and settlement_baseline is not None
+                    and cls._has_observed_redeemed_collateral(
+                        item, payload, settlement_baseline
+                    )
+                ):
+                    return True
+        return False
+
+    def release_cross_reservation(self, execution_id: str, *, reason: str) -> None:
+        if reason not in {"no_submit", "both_rejected", "redeemed"}:
+            raise ValueError("unsupported cross reservation release reason")
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT reservation.state AS reservation_state, execution.state, execution.evidence, execution.payload
+                FROM cross_execution_reservations AS reservation
+                JOIN executions AS execution ON execution.execution_id=reservation.execution_id
+                WHERE reservation.execution_id=?
+                """,
+                (str(execution_id),),
+            ).fetchone()
+            if row is None or row["reservation_state"] == "released":
+                return
+            if not self._cross_release_is_proven(
+                state=row["state"], evidence=json.loads(str(row["evidence"])),
+                payload=_load_payload(str(row["payload"])), reason=reason,
+            ):
+                raise ValueError("cross reservation release proof missing")
+            connection.execute(
+                """
+                UPDATE cross_execution_reservations
+                SET state='released', released_at=?, release_reason=?
+                WHERE execution_id=? AND state='reserved'
+                """,
+                (_utc_now(), reason, str(execution_id)),
+            )
+
+    def release_proven_cross_completions(self) -> tuple[str, ...]:
+        """Recover only terminal cross reservations whose stored redemption proof is complete."""
+
+        released: list[str] = []
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT reservation.execution_id, execution.state, execution.evidence, execution.payload
+                FROM cross_execution_reservations AS reservation
+                JOIN executions AS execution ON execution.execution_id=reservation.execution_id
+                WHERE reservation.state='reserved' AND execution.state='complete'
+                """
+            ).fetchall()
+            for row in rows:
+                if not self._cross_release_is_proven(
+                    state=row["state"], evidence=json.loads(str(row["evidence"])),
+                    payload=_load_payload(str(row["payload"])), reason="redeemed",
+                ):
+                    continue
+                execution_id = str(row["execution_id"])
+                updated = connection.execute(
+                    """
+                    UPDATE cross_execution_reservations
+                    SET state='released', released_at=?, release_reason='redeemed'
+                    WHERE execution_id=? AND state='reserved'
+                    """,
+                    (_utc_now(), execution_id),
+                )
+                if updated.rowcount == 1:
+                    released.append(execution_id)
+        return tuple(released)
+
     def consume_preview_and_create_execution(
         self, preview_id: str, idempotency_key: str
     ) -> dict[str, object]:
@@ -1049,6 +1492,12 @@ class PredictionArbitrageStore:
             raise ValueError("idempotency_key is required")
         now = _parse_timestamp(_utc_now())
         with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM executions WHERE preview_id=?",
+                (preview_id,),
+            ).fetchone()
+            if existing is not None:
+                return self._execution_result(existing)
             existing = connection.execute(
                 "SELECT * FROM executions WHERE idempotency_key=?",
                 (key,),
@@ -1063,12 +1512,29 @@ class PredictionArbitrageStore:
                 raise ValueError("preview_not_found")
             if preview["consumed_at"] is not None:
                 raise ValueError("preview_consumed")
-            if now >= _parse_timestamp(preview["expires_at"]):
-                raise ValueError("preview_expired")
             payload = str(preview["payload"])
-            if _load_payload(payload).get("market_type") == "cross_venue_yes_no":
-                raise ValueError("cross_venue_observation_only")
-            execution_id = _new_id()
+            preview_payload = _load_payload(payload)
+            cross_amount: Decimal | None = None
+            if preview_payload.get("market_type") == "cross_venue_yes_no":
+                if not self._valid_cross_preview_payload(preview_payload):
+                    if now >= _parse_timestamp(preview["expires_at"]):
+                        raise ValueError("preview_expired")
+                    raise ValueError("cross_preview_invalid")
+                cross_amount = self._cross_reservation_amount(preview_payload)
+                if (
+                    self._reserved_cross_principal(connection) + cross_amount
+                    > MAX_CROSS_UNSETTLED_PRINCIPAL
+                ):
+                    raise ValueError("cross_unsettled_cap")
+            elif now >= _parse_timestamp(preview["expires_at"]):
+                raise ValueError("preview_expired")
+            execution_id = (
+                str(preview_payload["execution_id"])
+                if cross_amount is not None
+                and isinstance(preview_payload.get("execution_id"), str)
+                and preview_payload["execution_id"].strip()
+                else _new_id()
+            )
             created = _canonical_timestamp(now)
             try:
                 connection.execute(
@@ -1084,6 +1550,15 @@ class PredictionArbitrageStore:
                 if "one_nonterminal_execution" in str(exc):
                     raise ValueError("active execution already exists") from exc
                 raise
+            if cross_amount is not None:
+                connection.execute(
+                    """
+                    INSERT INTO cross_execution_reservations(
+                        execution_id, amount, state, created_at, released_at, release_reason
+                    ) VALUES (?, ?, 'reserved', ?, NULL, NULL)
+                    """,
+                    (execution_id, format(cross_amount, "f"), created),
+                )
             connection.execute(
                 "UPDATE previews SET consumed_at=? WHERE preview_id=? AND consumed_at IS NULL",
                 (created, preview_id),

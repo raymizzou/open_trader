@@ -15,6 +15,7 @@ import threading
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -2307,6 +2308,9 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
         def unacknowledged_incident(self) -> None:
             return None
 
+        def cross_unsettled_principal(self) -> Decimal:
+            return Decimal("35.20")
+
         def histories(self, kind: str) -> list[dict[str, object]]:
             assert kind == "signals"
             return [
@@ -2314,6 +2318,7 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
                     "signal_id": "cross-signal-1",
                     "opportunity_id": "cross:pair-1:PREDICT_YES_POLYMARKET_NO",
                     "market_type": "cross_venue_yes_no",
+                    "execution_mode": "manual_confirm",
                     "question": "Predict contract question / Polymarket contract question",
                     "predict_question": "Predict contract question",
                     "polymarket_question": "Polymarket contract question",
@@ -2385,10 +2390,30 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
                         "total_max_cost": "9.50",
                         "minimum_profit": "0.50",
                         "annualized_yield": "0.20",
+                        "canonical_cutoff": "2026-12-31T00:00:00Z",
                         "resolution_at": "2026-12-31T00:00:00Z",
                     }
                 ],
             }
+
+    class FakePredictTrading:
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet_address": "0xcE2300000000000000000000000000000000f435",
+                "available_usdt": "7.50",
+                "allowance": "0",
+                "scope_ready": True,
+                "gas_ready": True,
+                "allowance_breaker": False,
+                "open_orders": [],
+                "positions": [],
+                "checked_at": datetime.now(timezone.utc),
+            }
+
+    class FakeExecution:
+        _breaker_open = False
+        _cross_breaker_open = False
+        _predict_trading = FakePredictTrading()
 
     store = FakeStore()
     cross = FakeCrossMonitor()
@@ -2396,7 +2421,7 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
         store=store,
         monitor=FakeMonitor(),
         cross_venue_monitor=cross,
-        execution=type("Execution", (), {"_breaker_open": False})(),
+        execution=FakeExecution(),
         csrf_token="csrf",
     )
 
@@ -2417,10 +2442,25 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
             "rest": "ready",
             "ws": "ready",
             "wallet": "0xcE23…f435",
-            "balance": {"asset": "USDT", "value": None},
-            "mode": "只读",
+            "balance": {"asset": "USDT", "value": "7.50"},
+            "mode": "可以交易",
             "last_success": None,
             "reason": None,
+            "account": {
+                "role": "Predict Account · USDT/持仓/Allowance",
+                "address": "0xcE23…f435",
+                "available_usdt": "7.50",
+                "allowance": "0",
+            },
+            "gas": {
+                "role": "Privy signer · BNB Gas",
+                "address": "",
+                "bnb_balance": None,
+                "required_bnb": None,
+                "minimum_top_up": "0",
+            },
+            "reservation": {"reserved_usdt": None, "unsettled_usdt": None},
+            "canary": None,
         },
     ]
     assert state["cross_venue"]["funnel"] == {
@@ -2430,11 +2470,16 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
         "arbitrage_space_pairs": 2,
         "clear_signal_pairs": 1,
     }
+    assert state["cross_venue"]["unsettled"] == {"current": "35.20", "limit": "100"}
+    assert state["cross_venue"]["breaker"] == {"open": False, "scope": "cross_venue"}
     assert state["events"][-1]["legs"] == legs
     assert state["opportunities"][-1]["legs"] == legs
     assert state["opportunities"][-1]["question"] == "Predict contract question / Polymarket contract question"
     assert state["opportunities"][-1]["predict_question"] == "Predict contract question"
     assert state["opportunities"][-1]["polymarket_question"] == "Polymarket contract question"
+    assert state["opportunities"][-1]["unsettled"] == {
+        "current": "35.20", "after": "44.70", "limit": "100"
+    }
 
     history = _prediction_history_payload(
         store,
@@ -2443,7 +2488,7 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
         offset=0,
         monitor=FakeMonitor(),
         cross_venue_monitor=cross,
-        execution=type("Execution", (), {"_breaker_open": False})(),
+        execution=FakeExecution(),
     )
     assert history["items"][0]["legs"] == legs
     assert history["items"][0]["question"] == "Predict contract question / Polymarket contract question"
@@ -2451,6 +2496,172 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
     assert history["items"][0]["polymarket_question"] == "Polymarket contract question"
     assert history["items"][0]["signal_live_now"] is True
     assert history["items"][0]["actionable_now"] is False
+    assert history["items"][0]["execution_mode"] == "observe_only"
+
+
+def test_prediction_state_payload_accepts_legacy_predict_allowance_ready_fallback() -> None:
+    from open_trader.dashboard_web import _prediction_state_payload
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "health": {"status": "healthy", "degraded_reasons": []},
+                "heartbeat_at": "2026-08-02T01:00:00Z",
+                "readiness": {
+                    "status": "ready",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "p_usd_balance": "12.50",
+                },
+                "relation_discovery": {"websocket": {"status": "connected"}},
+                "events": [],
+                "opportunities": [],
+            }
+
+    class FakePredictSource:
+        def snapshot(self) -> dict[str, object]:
+            return {"wallet": "0xcE23…f435", "rest": "ready", "ws": "ready"}
+
+    class FakeCrossMonitor:
+        _predict = FakePredictSource()
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "mode": "observe_only",
+                "funnel": {
+                    "matched_pairs": 0,
+                    "monitored_pairs": 0,
+                    "codex_approved_pairs": 0,
+                    "arbitrage_space_pairs": 0,
+                    "clear_signal_pairs": 0,
+                },
+                "events": [],
+                "opportunities": [],
+            }
+
+    class FakePredictTrading:
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet_address": "0xcE2300000000000000000000000000000000f435",
+                "available_usdt": "7.50",
+                "allowance_ready": True,
+                "open_orders": [],
+                "positions": [],
+                "checked_at": datetime.now(timezone.utc),
+            }
+
+    class FakeExecution:
+        _breaker_open = False
+        _cross_breaker_open = False
+        _predict_trading = FakePredictTrading()
+
+    state = _prediction_state_payload(
+        store=None,
+        monitor=FakeMonitor(),
+        cross_venue_monitor=FakeCrossMonitor(),
+        execution=FakeExecution(),
+        csrf_token="csrf",
+    )
+
+    assert state["venues"][1]["mode"] == "可以交易"
+
+
+def test_predict_account_projection_labels_account_gas_and_masks_addresses() -> None:
+    from open_trader.dashboard_web import _prediction_state_payload
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "health": {"status": "healthy", "degraded_reasons": []},
+                "heartbeat_at": "2026-08-02T01:00:00Z",
+                "readiness": {
+                    "status": "ready",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "p_usd_balance": "12.50",
+                },
+                "relation_discovery": {"websocket": {"status": "connected"}},
+                "events": [],
+                "opportunities": [],
+            }
+
+    class FakePredictSource:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "wallet": "0xcE2300000000000000000000000000000000f435",
+                "rest": "ready",
+                "ws": "ready",
+            }
+
+    class FakeCrossMonitor:
+        _predict = FakePredictSource()
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "ready",
+                "mode": "manual_confirm",
+                "funnel": {
+                    "matched_pairs": 0,
+                    "monitored_pairs": 0,
+                    "codex_approved_pairs": 0,
+                    "arbitrage_space_pairs": 0,
+                    "clear_signal_pairs": 0,
+                },
+                "events": [],
+                "opportunities": [],
+            }
+
+    class FakePredictTrading:
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "wallet_address": "0xcE2300000000000000000000000000000000f435",
+                "predict_account": "0xcE2300000000000000000000000000000000f435",
+                "gas_signer": "0xA71000000000000000000000000000000000Aa71",
+                "available_usdt": "123456.789",
+                "allowance": "0",
+                "bnb_balance": "0.031",
+                "required_bnb": "0.003",
+                "minimum_top_up_bnb": "0",
+                "reserved_usdt": "4.70",
+                "unsettled_usdt": "35.20",
+                "canary_mode": "first_fill_5_usdt",
+                "scope_ready": True,
+                "gas_ready": True,
+                "allowance_breaker": False,
+                "open_orders": [],
+                "positions": [],
+                "checked_at": datetime.now(timezone.utc),
+            }
+
+    class FakeExecution:
+        _breaker_open = False
+        _cross_breaker_open = False
+        _predict_trading = FakePredictTrading()
+
+    state = _prediction_state_payload(
+        store=None,
+        monitor=FakeMonitor(),
+        cross_venue_monitor=FakeCrossMonitor(),
+        execution=FakeExecution(),
+        csrf_token="csrf",
+    )
+    predict = state["venues"][1]
+
+    assert predict["account"]["role"] == "Predict Account · USDT/持仓/Allowance"
+    assert predict["gas"]["role"] == "Privy signer · BNB Gas"
+    assert predict["account"]["address"] == "0xcE23…f435"
+    assert predict["gas"]["address"] == "0xA710…Aa71"
+    assert predict["account"]["allowance"] == "0"
+    assert predict["account"]["available_usdt"] == "123456.789"
+    assert predict["gas"]["bnb_balance"] == "0.031"
+    assert predict["gas"]["required_bnb"] == "0.003"
+    assert predict["gas"]["minimum_top_up"] == "0"
+    assert predict["reservation"] == {"reserved_usdt": "4.70", "unsettled_usdt": "35.20"}
+    assert predict["canary"] == "first_fill_5_usdt"
+    assert predict["mode"] == "可以交易"
+    assert "0xcE2300000000000000000000000000000000f435" not in repr(state["venues"])
+    assert "0xA71000000000000000000000000000000000Aa71" not in repr(state["venues"])
 
 
 def test_prediction_venue_pending_predict_does_not_degrade_polymarket() -> None:
@@ -2629,6 +2840,7 @@ def test_prediction_venue_construction_failure_keeps_dashboard_state_available(
         store=object(),
         execution=object(),
         codex_model="test-model",
+        predict_trading=object(),
     )
     state = dashboard_web._prediction_state_payload(
         store=None,
@@ -2644,7 +2856,55 @@ def test_prediction_venue_construction_failure_keeps_dashboard_state_available(
     assert state["cross_venue"]["status"] == "degraded"
 
 
-def test_prediction_cross_ids_are_rejected_by_server_before_execution(tmp_path: Path) -> None:
+def test_build_cross_venue_monitor_uses_fail_closed_server_execution_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    created: list[dict[str, object]] = []
+
+    class FakeCrossVenueMonitor:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(kwargs)
+
+    class FakeExecution:
+        def notify_ready_opportunity(self, *_args: object) -> None:
+            return None
+
+        def reconcile_cross_holdings_once(self) -> None:
+            return None
+
+    monkeypatch.setattr(dashboard_web, "PredictSource", lambda _config: object())
+    monkeypatch.setattr(
+        dashboard_web,
+        "CodexCrossVenueEquivalenceValidator",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(dashboard_web, "PredictCrossVenueMonitor", FakeCrossVenueMonitor)
+
+    for raw, expected in (
+        (None, "observe_only"),
+        ("manual_confirm", "manual_confirm"),
+        (" manual_confirm ", "observe_only"),
+        ("MANUAL_CONFIRM", "observe_only"),
+        ("invalid", "observe_only"),
+    ):
+        if raw is None:
+            monkeypatch.delenv("OPEN_TRADER_CROSS_EXECUTION_MODE", raising=False)
+        else:
+            monkeypatch.setenv("OPEN_TRADER_CROSS_EXECUTION_MODE", raw)
+        dashboard_web._build_cross_venue_monitor(
+            trading_config=type("Config", (), {"predict": object()})(),
+            prediction_monitor=object(),
+            store=object(),
+            execution=FakeExecution(),
+            codex_model="test-model",
+            predict_trading=object(),
+        )
+        assert created[-1]["execution_mode"] == expected
+
+
+def test_prediction_ids_cross_venue_reach_the_existing_preview_and_confirmation_routes(tmp_path: Path) -> None:
     from open_trader.dashboard_web import create_dashboard_server
 
     class FakeExecution:
@@ -2688,11 +2948,12 @@ def test_prediction_cross_ids_are_rejected_by_server_before_execution(tmp_path: 
                 headers=headers,
                 method="POST",
             )
-            with pytest.raises(urllib.error.HTTPError) as error:
-                urllib.request.urlopen(request, timeout=5)
-            assert error.value.code == 400
-            assert json.loads(error.value.read().decode("utf-8"))["message"] == "cross_venue_observation_only"
-        assert execution.calls == []
+            with urllib.request.urlopen(request, timeout=5) as response:
+                assert response.status == 200
+        assert execution.calls == [
+            ("preview", "cross:pair-1:PREDICT_YES_POLYMARKET_NO"),
+            ("confirm", "cross:preview-1", "key-1"),
+        ]
     finally:
         server.shutdown()
         server.server_close()
@@ -2733,8 +2994,11 @@ def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_firs
             pass
 
     class FakeExecution:
+        instances: list["FakeExecution"] = []
+
         def __init__(self, **_: object) -> None:
-            pass
+            self.cross_monitor: object | None = None
+            self.instances.append(self)
 
         def reconcile_startup(self) -> dict[str, object]:
             return {"status": "ready"}
@@ -2744,6 +3008,9 @@ def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_firs
 
         def notify_monitor_failure(self, *_: object) -> dict[str, object]:
             return {"status": "ignored"}
+
+        def set_cross_venue_monitor(self, monitor: object) -> None:
+            self.cross_monitor = monitor
 
         def close(self) -> None:
             order.append("execution.close")
@@ -2786,6 +3053,7 @@ def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_firs
 
     assert order.index("polymarket.start") < order.index("cross.start") < order.index("server.serve")
     assert order.index("cross.stop") < order.index("polymarket.stop") < order.index("server.close")
+    assert isinstance(FakeExecution.instances[0].cross_monitor, dashboard_web._CrossVenueRuntime)
 
 
 def test_cross_venue_runtime_marshals_snapshot_onto_its_monitor_loop() -> None:
@@ -2805,12 +3073,22 @@ def test_cross_venue_runtime_marshals_snapshot_onto_its_monitor_loop() -> None:
             self.snapshot_threads.append(threading.get_ident())
             return {"status": "ready", "funnel": {}, "events": [], "opportunities": []}
 
+        async def refresh_opportunity(
+            self, opportunity_id: str
+        ) -> dict[str, object]:
+            self.snapshot_threads.append(threading.get_ident())
+            return {"opportunity_id": opportunity_id, "source": "rest"}
+
     monitor = FakeCrossMonitor()
     runtime = dashboard_web._CrossVenueRuntime(monitor)
     runtime.start()
     try:
         assert runtime.snapshot()["status"] == "ready"
         assert monitor.snapshot_threads == [runtime._thread.ident]  # type: ignore[union-attr]
+        assert runtime.refresh_opportunity("cross:pair:direction") == {
+            "opportunity_id": "cross:pair:direction", "source": "rest"
+        }
+        assert monitor.snapshot_threads[-1] == runtime._thread.ident  # type: ignore[union-attr]
     finally:
         runtime.stop()
 
@@ -3719,6 +3997,201 @@ console.log(JSON.stringify({
     assert "正在读取两腿结果" in rendered["reconciling"]
 
 
+def test_prediction_cross_preview_uses_production_contract_and_fails_closed() -> None:
+    output = run_dashboard_js(r'''
+const preview = {
+  state:"previewed", preview_id:"cross-preview-real", market_type:"cross_venue_yes_no",
+  question:"Will Bitcoin close above $100,000 on December 31, 2026?",
+  buy_legs:[
+    {exchange:"predict.fun",market_id:"predict-market",condition_id:"predict-condition",outcome:"YES",token_id:"predict-yes",settlement_asset:"USDT",fee_asset:"USDT",net_quantity:"5",max_price:"0.470",max_cost:"2.35",maximum_fee:"0.02"},
+    {exchange:"polymarket",market_id:"poly-market",condition_id:"poly-condition",outcome:"NO",token_id:"poly-no",settlement_asset:"pUSD",fee_asset:"pUSD",net_quantity:"5",max_price:"0.490",max_cost:"2.45",maximum_fee:"0.00"},
+  ],
+  net_quantity:"5", total_max_cost:"4.80", minimum_payout:"5.00", minimum_profit:"0.20",
+  annualized_yield:"0.201", canonical_cutoff:"2099-12-31T23:59:00Z", direction:"PREDICT_YES_POLYMARKET_NO",
+  codex_approval:{decision:"APPROVE",summary:"server approval",evidence:[
+    {exchange:"predict.fun",field:"cutoff",quote:"server predict cutoff"},
+    {exchange:"polymarket",field:"cutoff",quote:"server polymarket cutoff"},
+  ],direct_outcome_mapping:{predict_yes:"YES",predict_no:"NO",polymarket_yes:"YES",polymarket_no:"NO"}},
+  balances:{
+    "predict.fun":{asset:"USDT",wallet_address:"0xcE23…f435",available_balance:"12.34",allowance_ready:true},
+    polymarket:{asset:"pUSD",wallet_address:"0x7A4E…91C2",available_balance:"50.00",allowance:"50.00"},
+  },
+  unsettled:{current:"35.20",after:"40.00",limit:"100"},
+  policy_limits:{max_normal_cost:"20",max_emergency_loss:"2"},
+};
+const html = predictionModalHtml("order", preview);
+console.log(JSON.stringify({
+  complete:predictionPreviewIsComplete(preview),
+  modal:html.includes('class="pm-modal"'),
+  legs:html.includes("Predict.fun · BUY YES") && html.includes("Polymarket · BUY NO"),
+  balances:html.includes("$12.34") && html.includes("$50.00"),
+  serverValues:["$100.00","$20.00","$2.00","+$0.20"].every((value)=>html.includes(value)),
+  missingLegs:predictionPreviewIsComplete({...preview,buy_legs:preview.buy_legs.slice(0,1)}),
+  missingFees:predictionPreviewIsComplete({...preview,buy_legs:[
+    {...preview.buy_legs[0],maximum_fee:undefined},preview.buy_legs[1],
+  ]}),
+  rejectDecision:predictionPreviewIsComplete({...preview,codex_approval:{...preview.codex_approval,decision:"REJECT"}}),
+  invalidMapping:predictionPreviewIsComplete({...preview,codex_approval:{...preview.codex_approval,direct_outcome_mapping:{...preview.codex_approval.direct_outcome_mapping,polymarket_no:"YES"}}}),
+  invalidCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"not-a-date"}),
+  expiredCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2020-01-01T00:00:00Z"}),
+  dateOnlyCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2099-12-31"}),
+  naiveCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2099-12-31T23:59:00"}),
+  offsetCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2099-12-31T23:59:00+08:00"}),
+  validFractionalUtcCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2099-12-31T23:59:00.123Z"}),
+  impossibleDateCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2099-02-30T23:59:00Z"}),
+  invalidLeapDayCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2100-02-29T23:59:00Z"}),
+  validLeapDayCutoff:predictionPreviewIsComplete({...preview,canonical_cutoff:"2096-02-29T23:59:00Z"}),
+  invertedOutcomes:predictionPreviewIsComplete({...preview,buy_legs:[preview.buy_legs[0],{...preview.buy_legs[1],outcome:"YES"}]}),
+  nonNumericFees:predictionPreviewIsComplete({...preview,buy_legs:[{...preview.buy_legs[0],maximum_fee:"fee"},preview.buy_legs[1]]}),
+  missingFeeAsset:predictionPreviewIsComplete({...preview,buy_legs:[{...preview.buy_legs[0],fee_asset:undefined},preview.buy_legs[1]]}),
+  missingIdentity:predictionPreviewIsComplete({...preview,buy_legs:[{...preview.buy_legs[0],condition_id:undefined},preview.buy_legs[1]]}),
+  missingBalances:predictionPreviewIsComplete({...preview,balances:undefined}),
+  missingPolicy:predictionPreviewIsComplete({...preview,policy_limits:{max_normal_cost:"20"}}),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert rendered == {
+        "complete": True,
+        "modal": True,
+        "legs": True,
+        "balances": True,
+        "serverValues": True,
+        "missingLegs": False,
+        "missingFees": False,
+        "rejectDecision": False,
+        "invalidMapping": False,
+        "invalidCutoff": False,
+        "expiredCutoff": False,
+        "dateOnlyCutoff": False,
+        "naiveCutoff": False,
+        "offsetCutoff": False,
+        "validFractionalUtcCutoff": True,
+        "impossibleDateCutoff": False,
+        "invalidLeapDayCutoff": False,
+        "validLeapDayCutoff": True,
+        "invertedOutcomes": False,
+        "nonNumericFees": False,
+        "missingFeeAsset": False,
+        "missingIdentity": False,
+        "missingBalances": False,
+        "missingPolicy": False,
+    }
+
+
+def test_prediction_allowance_gas_cleanup_and_cross_order_facts_render() -> None:
+    output = run_dashboard_js(r'''
+const payload = {
+  status:"healthy", health:{status:"healthy",degraded_reasons:[]}, breaker:{open:false},
+  policy_limits:{max_wallet_balance:"65",max_normal_cost:"5",max_emergency_loss:"2",max_cross_unsettled_principal:"100",min_estimated_profit:"1"},
+  readiness:{status:"ready",geoblock:"allowed",relayer:"ready"},
+  venues:[
+    {venue:"predict.fun",rest:"ready",ws:"ready",wallet:"0xcE23…f435",balance:{asset:"USDT",value:"12.34"},allowance:{asset:"USDT",value:"0",spender:"0xSpender…C0DE"},mode:"可以交易"},
+    {venue:"polymarket",rest:"ready",ws:"ready",wallet:"0x7A4E…91C2",balance:{asset:"pUSD",value:"50.00"},mode:"可以交易"},
+  ],
+  privy_signer:{address:"0xBnbSigner…BEEF",mode:"只读",bnb:{current:"0.001",required:"0.004",minimum:"0.006"},copy_text:"BNB top-up to 0xBnbSigner…BEEF on BNB Smart Chain",official_links:[{label:"Predict.fun",url:"https://predict.fun/"}]},
+  predict_allowance_cleanup:{owner:"0xcE23…f435",spender:"0xSpender…C0DE",before_allowance:"2.40",after_allowance:"0",gas_effect:"消耗 Privy signer BNB，不转移 USDT"},
+  cross_venue:{breaker:{open:false},funnel:{matched_pairs:12,monitored_pairs:8,codex_approved_pairs:5,arbitrage_space_pairs:2,clear_signal_pairs:0,retained_at:"2026-08-03T15:39:00Z"}},
+};
+const preview = {
+  state:"previewed", preview_id:"cross-preview-real", market_type:"cross_venue_yes_no",
+  question:"Will Bitcoin close above $100,000 on December 31, 2099?", direction:"PREDICT_YES_POLYMARKET_NO",
+  buy_legs:[
+    {exchange:"predict.fun",market_id:"predict-market",condition_id:"predict-condition",outcome:"YES",token_id:"predict-yes",official_url:"https://predict.fun/markets/predict-market",settlement_asset:"USDT",fee_asset:"USDT",net_quantity:"5",max_price:"0.470",max_cost:"2.35",maximum_fee:"0.02",quote_at:"2026-08-03T15:40:00Z"},
+    {exchange:"polymarket",market_id:"poly-market",condition_id:"poly-condition",outcome:"NO",token_id:"poly-no",official_url:"https://polymarket.com/event/poly-market",settlement_asset:"pUSD",fee_asset:"pUSD",net_quantity:"5",max_price:"0.490",max_cost:"2.45",maximum_fee:"0.00",quote_at:"2026-08-03T15:40:01Z"},
+  ],
+  net_quantity:"5", total_max_cost:"4.80", minimum_payout:"5.00", minimum_profit:"0.20",
+  annualized_yield:"0.201", canonical_cutoff:"2099-12-31T23:59:00Z",
+  codex_approval:{decision:"APPROVE",summary:"server approval",reviewed_at:"2026-08-03T15:41:00Z",evidence:[
+    {exchange:"predict.fun",field:"cutoff",quote:"server predict cutoff"},
+    {exchange:"polymarket",field:"cutoff",quote:"server polymarket cutoff"},
+  ],direct_outcome_mapping:{predict_yes:"YES",predict_no:"NO",polymarket_yes:"YES",polymarket_no:"NO"}},
+  balances:{"predict.fun":{asset:"USDT",wallet_address:"0xcE23…f435",available_balance:"12.34",allowance_ready:true},polymarket:{asset:"pUSD",wallet_address:"0x7A4E…91C2",available_balance:"50.00",allowance:"50.00"}},
+  unsettled:{current:"35.20",after:"40.00",limit:"100"}, policy_limits:payload.policy_limits,
+};
+const readiness = predictionReadinessStrip(payload);
+const safeguards = predictionSafeguardsHtml(payload);
+const cleanup = predictionModalHtml("allowance_cleanup", payload.predict_allowance_cleanup);
+const order = predictionModalHtml("order", preview);
+console.log(JSON.stringify({readiness,safeguards,cleanup,order}));
+''')
+    rendered = json.loads(output)
+
+    for text in ("Predict Account", "USDT", "授权 $0.00 USDT", "Privy signer", "BNB", "0xBnbSigner…BEEF", "只读"):
+        assert text in rendered["readiness"] + rendered["safeguards"]
+    assert "转账" not in rendered["safeguards"]
+    for text in ("owner", "0xcE23…f435", "spender", "0xSpender…C0DE", "$2.40 → $0.00", "消耗 Privy signer BNB", "不转移 USDT", "二次确认"):
+        assert text in rendered["cleanup"]
+    for text in (
+        "predict-market", "predict-condition", "predict-yes", "https://predict.fun/markets/predict-market",
+        "poly-market", "poly-condition", "poly-no", "https://polymarket.com/event/poly-market",
+        "冻结数量", "最高价冻结", "$5.00", "2026-08-03T15:40:00Z", "Codex 2026-08-03T15:41:00Z",
+        "统一截止", "待结算占用", "$100.00", "不是原子交易",
+    ):
+        assert text in rendered["order"]
+    assert "倒计时" not in rendered["order"] + rendered["readiness"] + rendered["safeguards"]
+
+
+def test_prediction_cross_execution_mode_is_required_for_actions() -> None:
+    output = run_dashboard_js(r'''
+const opportunity = {
+  opportunity_id:"cross-mode-fixture",title:"Cross mode fixture",market_type:"cross_venue_yes_no",
+  execution_mode:"manual_confirm",quantity:"5",net_quantity:"5",total_max_cost:"4.80",
+  minimum_payout:"5",minimum_profit:"0.20",annualized_yield:"0.20",canonical_cutoff:"2099-12-31T00:00:00Z",
+  actionable:true,clear_signal:true,funnel_stage:5,
+  legs:[
+    {exchange:"predict.fun",outcome:"YES",token_id:"predict-yes",settlement_asset:"USDT",net_quantity:"5",max_price:"0.47",max_cost:"2.35",maximum_fee:"0.02"},
+    {exchange:"polymarket",outcome:"NO",token_id:"poly-no",settlement_asset:"pUSD",net_quantity:"5",max_price:"0.49",max_cost:"2.45",maximum_fee:"0.00"},
+  ],
+};
+const payload = {
+  status:"healthy",health:{status:"healthy",degraded_reasons:[]},
+  readiness:{status:"ready",geoblock:"allowed",relayer:"ready",p_usd_balance:"50",wallet_address:"0x1234567890abcdef"},
+  policy_limits:{max_wallet_balance:"65",max_normal_cost:"20",max_emergency_loss:"2",min_estimated_profit:"1"},
+  breaker:{open:false},
+  venues:[
+    {venue:"predict.fun",rest:"ready",ws:"ready",mode:"可以交易",balance:{value:"12.34"}},
+    {venue:"polymarket",rest:"ready",ws:"ready",mode:"可以交易",balance:{value:"50"}},
+  ],
+  cross_venue:{breaker:{open:false}},
+};
+const rendered = (mode) => predictionCrossVenueCandidateHtml({...opportunity,execution_mode:mode},payload);
+const renderedCutoff = (cutoff) => predictionCrossVenueCandidateHtml({...opportunity,execution_mode:"manual_confirm",canonical_cutoff:cutoff},payload);
+console.log(JSON.stringify({
+  manual:rendered("manual_confirm").includes('data-action="participate"'),
+  observe:rendered("observe_only"),
+  missing:rendered(undefined),
+  blocked:rendered("blocked"),
+  spacePadded:rendered(" manual_confirm "),
+  uppercase:rendered("MANUAL_CONFIRM"),
+  unknown:rendered("future_mode"),
+  validFutureCutoff:renderedCutoff("2099-12-31T23:59:00.123Z").includes('data-action="participate"'),
+  impossibleDateCutoff:renderedCutoff("2099-02-30T23:59:00Z"),
+  invalidLeapDayCutoff:renderedCutoff("2100-02-29T23:59:00Z"),
+  validLeapDayCutoff:renderedCutoff("2096-02-29T23:59:00Z").includes('data-action="participate"'),
+  expiredCutoff:renderedCutoff("2020-01-01T00:00:00Z"),
+  dateOnlyCutoff:renderedCutoff("2099-12-31"),
+  naiveCutoff:renderedCutoff("2099-12-31T23:59:00"),
+  offsetCutoff:renderedCutoff("2099-12-31T23:59:00+08:00"),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert rendered["manual"] is True
+    for mode in ("observe", "missing", "blocked"):
+        assert 'data-action="participate"' not in rendered[mode]
+    assert "只观察模式" in rendered["observe"]
+    assert "执行模式未返回" in rendered["missing"]
+    assert "执行模式已阻断" in rendered["blocked"]
+    for mode in ("spacePadded", "uppercase", "unknown"):
+        assert 'data-action="participate"' not in rendered[mode]
+        assert "执行模式未知" in rendered[mode]
+    assert rendered["validFutureCutoff"] is True
+    for mode in ("expiredCutoff", "dateOnlyCutoff", "naiveCutoff", "offsetCutoff", "impossibleDateCutoff", "invalidLeapDayCutoff"):
+        assert 'data-action="participate"' not in rendered[mode]
+    assert rendered["validLeapDayCutoff"] is True
+
+
 def test_prediction_market_threshold_holding_is_not_presented_as_merged() -> None:
     output = run_dashboard_js(r'''
 console.log(predictionExecutionAlert({
@@ -4067,6 +4540,144 @@ def test_prediction_arbitrage_reset_schema_is_exact_and_calls_only_incident_id(
         with urllib.request.urlopen(request, timeout=5) as response:
             assert json.loads(response.read().decode("utf-8"))["status"] == "reset"
         assert execution.calls == ["incident-1"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_prediction_arbitrage_allowance_cleanup_schema_is_confirm_only(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    class FakeExecution:
+        calls: list[bool] = []
+
+        def cleanup_predict_allowance(self, *, confirm: bool) -> dict[str, object]:
+            self.calls.append(confirm)
+            return {
+                "state": "ready",
+                "before_allowance": "2.4",
+                "after_allowance": "0",
+                "usdt_moved": False,
+            }
+
+    execution = FakeExecution()
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        prediction_execution_service=execution,
+        prediction_session_token="session-token",
+        prediction_csrf_token="csrf-token",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        headers = {
+            "Content-Type": "application/json",
+            "Cookie": "ot_prediction_session=session-token",
+            "Origin": base,
+            "X-CSRF-Token": "csrf-token",
+        }
+        for payload in (
+            {},
+            {"confirm": False},
+            {"confirm": True, "owner": "0xabc"},
+            {"confirm": True, "spender": "0xdef"},
+            {"confirm": True, "amount": "0"},
+        ):
+            request = urllib.request.Request(
+                f"{base}/api/prediction-arbitrage/predict-allowance/cleanup",
+                data=json.dumps(payload).encode(),
+                headers=headers,
+                method="POST",
+            )
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(request, timeout=5)
+            assert error.value.code == 400
+        assert execution.calls == []
+
+        request = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/predict-allowance/cleanup",
+            data=b'{"confirm":true}',
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        assert result == {
+            "state": "ready",
+            "before_allowance": "2.4",
+            "after_allowance": "0",
+            "usdt_moved": False,
+        }
+        assert execution.calls == [True]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("failure", ["host", "origin", "cookie", "csrf", "address"])
+def test_prediction_arbitrage_allowance_cleanup_rejects_route_specific_mutation_security_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+    from open_trader.dashboard_web import create_dashboard_server
+
+    class FakeExecution:
+        calls = 0
+
+        def cleanup_predict_allowance(self, *, confirm: bool) -> dict[str, object]:
+            self.calls += 1
+            return {"state": "ready", "confirm": confirm}
+
+    execution = FakeExecution()
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        prediction_execution_service=execution,
+        prediction_session_token="session-token",
+        prediction_csrf_token="csrf-token",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        headers = {
+            "Content-Type": "application/json",
+            "Cookie": "ot_prediction_session=session-token",
+            "Origin": base,
+            "X-CSRF-Token": "csrf-token",
+        }
+        if failure == "host":
+            headers["Host"] = "not-the-listener"
+        elif failure == "origin":
+            headers["Origin"] = "http://127.0.0.1:9999"
+        elif failure == "cookie":
+            headers["Cookie"] = "ot_prediction_session=wrong"
+        elif failure == "csrf":
+            headers["X-CSRF-Token"] = "wrong"
+        elif failure == "address":
+            monkeypatch.setattr(dashboard_web, "_is_loopback_address", lambda _value: False)
+        request = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/predict-allowance/cleanup",
+            data=b"not-json",
+            headers=headers,
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=5)
+        assert error.value.code == 403
+        assert execution.calls == 0
     finally:
         server.shutdown()
         server.server_close()
@@ -6074,7 +6685,7 @@ def test_prediction_market_static_contract_is_present() -> None:
         assert copy in js
     for fabricated in (
         "$65.00", "$50.00 pUSD", "$49.40", "$18.80", "$20.00",
-        "+$1.20", "$0.60", "14:36:12", "1 秒前更新", "首单验证",
+        "+$1.20", "$0.60", "14:36:12", "1 秒前更新",
         "macOS 与飞书已发送",
     ):
         assert fabricated not in js

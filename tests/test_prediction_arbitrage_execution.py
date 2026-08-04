@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import inspect
+import json
 import sqlite3
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +19,7 @@ from open_trader.prediction_arbitrage import PairIntent, ThresholdHedgeIntent, T
 from open_trader.prediction_arbitrage_execution import PredictionExecutionService, _call
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_title_translation import prediction_title_cache_key
+from open_trader.predict_cross_venue import CrossVenueIntent, CrossVenueLeg
 from open_trader.polymarket_trading import (
     AccountSnapshot,
     LegResult,
@@ -23,6 +27,7 @@ from open_trader.polymarket_trading import (
     ThresholdHedgeSubmission,
     ThresholdLegResult,
 )
+from open_trader.predict_trading import PredictLegResult, PredictTradingClient
 
 
 def _intent() -> PairIntent:
@@ -221,6 +226,7 @@ class FakeTrading:
         self.account_fresh = True
         self.balance = None
         self.allowance = None
+        self.positions: tuple[object, ...] = ()
         self.geoblock = True
 
     def account_snapshot(self) -> AccountSnapshot:
@@ -235,7 +241,7 @@ class FakeTrading:
             p_usd_balance=balance,
             p_usd_allowance=allowance,
             open_order_ids=(),
-            positions=(),
+            positions=self.positions,  # type: ignore[arg-type]
             checked_at=checked_at,
         )
 
@@ -811,19 +817,61 @@ def _standard_notification_signal(
 
 def _cross_venue_notification_signal(store: PredictionArbitrageStore) -> str:
     now = datetime.now(UTC).isoformat()
+    cutoff = (datetime.now(UTC) + timedelta(days=30)).isoformat()
     return store.upsert_signal(
         {
             "opportunity_id": "cross:public-pair:PREDICT_YES_POLYMARKET_NO",
             "market_id": "cross:public-pair:PREDICT_YES_POLYMARKET_NO",
             "event_id": "public-pair",
+            "pair_id": "public-pair",
+            "direction": "PREDICT_YES_POLYMARKET_NO",
             "market_type": "cross_venue_yes_no",
             "execution_mode": "observe_only",
+            "funnel_stage": 5,
+            "actionable": True,
             "clear_signal": True,
+            "quote_available": True,
             "started_at": now,
             "first_positive_at": now,
             "total_max_cost": Decimal("9.45"),
             "minimum_profit": Decimal("0.55"),
             "estimated_profit": Decimal("0.55"),
+            "annualized_yield": Decimal("0.16"),
+            "canonical_cutoff": cutoff,
+            "notification_dedupe_identity": {
+                "pair_id": "public-pair",
+                "direction": "PREDICT_YES_POLYMARKET_NO",
+                "predict_fingerprint": "predict-fingerprint",
+                "polymarket_fingerprint": "poly-fingerprint",
+                "predict_market_id": "predict-market",
+                "predict_condition_id": "predict-condition",
+                "predict_yes_token_id": "predict-yes",
+                "predict_no_token_id": "predict-no",
+                "polymarket_market_id": "poly-market",
+                "polymarket_condition_id": "poly-condition",
+                "polymarket_yes_token_id": "poly-yes",
+                "polymarket_no_token_id": "poly-no",
+            },
+            "rules_fingerprints": {
+                "predict.fun": "predict-fingerprint",
+                "polymarket": "poly-fingerprint",
+            },
+            "approved_candidates": {
+                "predict.fun": {
+                    "market_id": "predict-market",
+                    "condition_id": "predict-condition",
+                    "yes_token_id": "predict-yes",
+                    "no_token_id": "predict-no",
+                    "rules_fingerprint": "predict-fingerprint",
+                },
+                "polymarket": {
+                    "market_id": "poly-market",
+                    "condition_id": "poly-condition",
+                    "yes_token_id": "poly-yes",
+                    "no_token_id": "poly-no",
+                    "rules_fingerprint": "poly-fingerprint",
+                },
+            },
             "legs": [
                 {
                     "exchange": "predict.fun",
@@ -924,13 +972,16 @@ def test_notify_ready_opportunity_standard_sends_feishu_observation_without_pref
     assert store.signal(signal_id)["notification_state"] == "sent"  # type: ignore[index]
 
 
-def test_notify_ready_opportunity_cross_venue_sends_without_prepare_or_trading(
-    tmp_path: Path,
+def test_cross_venue_notification_rechecks_stage_5_without_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    service, trading, store, _monitor, macos, feishu = standard_notification_fixture(tmp_path)
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    macos, feishu = service._notifier._notifiers  # type: ignore[attr-defined]
     signal_id = _cross_venue_notification_signal(store)
-    service._prepare_opportunity = lambda *_args: pytest.fail(  # type: ignore[method-assign]
-        "cross observation must not prepare an order"
+    monkeypatch.setattr(
+        store,
+        "create_preview",
+        lambda *_args, **_kwargs: pytest.fail("notification must not create a preview"),
     )
 
     result = service.notify_ready_opportunity(
@@ -940,48 +991,2377 @@ def test_notify_ready_opportunity_cross_venue_sends_without_prepare_or_trading(
     assert result == {"state": "sent", "signal_id": signal_id}
     assert feishu.calls == 1
     assert macos.calls == 0
-    assert trading.preflight_calls == 0
-    assert trading.batch_calls == 0
+    assert cross.refresh_calls == 1
+    assert trading.cross_preflight_calls == 0
+    assert predict.preflight_calls == 0
     assert store.active_execution() is None
+    assert store.cross_unsettled_principal() == Decimal("0")
+    assert "/?prediction_signal=" in feishu.messages[-1][1]
 
 
-def test_cross_venue_opportunities_cannot_be_previewed_or_confirmed(
+def test_cross_venue_notification_failure_keeps_signal_actionable(
     tmp_path: Path,
 ) -> None:
-    class CrossVenueMonitor(FakeMonitor):
-        def opportunity(self, opportunity_id: str) -> dict[str, object] | None:
-            return {
-                "opportunity_id": opportunity_id,
-                "market_type": "cross_venue_yes_no",
-                "execution_mode": "observe_only",
-                "clear_signal": True,
-            }
+    service, store, _trading, _cross, _predict = _cross_service(tmp_path)
+    _macos, feishu = service._notifier._notifiers  # type: ignore[attr-defined]
+    feishu.fail = True
+    signal_id = _cross_venue_notification_signal(store)
 
+    assert service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    ) == {"state": "failed", "reason": "notification_failed"}
+
+    signal = store.signal(signal_id)
+    assert signal is not None
+    assert signal["actionable"] is True
+    assert signal["funnel_stage"] == 5
+    assert signal["ended_at"] is None
+
+
+def test_gas_notification_only_for_blocked_stage_5_signal_episode(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, _cross, predict = _cross_service(tmp_path)
+    _macos, feishu = service._notifier._notifiers  # type: ignore[attr-defined]
+    predict.gas_ready = False
+    predict.minimum_top_up_bnb = "0.02"
+
+    assert feishu.calls == 0
+    signal_id = _cross_venue_notification_signal(store)
+
+    assert service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    ) == {"state": "sent", "signal_id": signal_id, "reason": "insufficient_bnb"}
+    assert service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    ) == {"state": "ignored", "reason": "already_sent"}
+    assert feishu.calls == 1
+    assert "BNB" in feishu.messages[-1][1]
+    assert "0.02" in feishu.messages[-1][1]
+
+    store.close_signal(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO",
+        ended_at=datetime.now(UTC),
+        reason="episode_rotated",
+    )
+    new_signal_id = store.upsert_signal(
+        {
+            **store.signal(signal_id),  # type: ignore[arg-type]
+            "ended_at": None,
+            "ended_reason": None,
+            "notification_state": "pending",
+            "notification_attempts": 0,
+        }
+    )
+    assert new_signal_id != signal_id
+    assert service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", new_signal_id
+    ) == {"state": "sent", "signal_id": new_signal_id, "reason": "insufficient_bnb"}
+    assert feishu.calls == 2
+
+
+def test_allowance_incident_notifies_once_per_generation(tmp_path: Path) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    _macos, feishu = service._notifier._notifiers  # type: ignore[attr-defined]
+    predict.allowance = "2.4"
+    predict.clear_results.extend(
+        [
+            {"status": "failed", "market_id": "predict-market", "allowance": "2.4"},
+            {"status": "failed", "market_id": "predict-market", "allowance": "2.4"},
+        ]
+    )
+
+    first = service.cleanup_predict_allowance(confirm=True)
+    second = service.cleanup_predict_allowance(confirm=True)
+
+    assert first == {"state": "locked", "reason": "predict_allowance_cleanup_failed"}
+    assert second == {"state": "locked", "reason": "predict_allowance_cleanup_failed"}
+    assert feishu.calls == 1
+
+
+def _cross_intent(*, predict_price: Decimal = Decimal("0.45")) -> CrossVenueIntent:
+    now = datetime.now(UTC)
+    return CrossVenueIntent(
+        pair_id="public-pair",
+        direction="PREDICT_YES_POLYMARKET_NO",
+        legs=(
+            CrossVenueLeg("predict.fun", "predict-market", "predict-condition", "YES", "predict-yes", "USDT", Decimal("5"), Decimal("5"), predict_price, Decimal("2.30"), Decimal("0.05"), "USDT", now, None, Decimal("1")),
+            CrossVenueLeg("polymarket", "poly-market", "poly-condition", "NO", "poly-no", "pUSD", Decimal("5"), Decimal("5"), Decimal("0.47"), Decimal("2.40"), Decimal("0.05"), "pUSD", now, now + timedelta(days=30), Decimal("1")),
+        ),
+        quantity=Decimal("5"), calculable_gas=Decimal("0.10"), total_max_cost=Decimal("4.80"),
+        maximum_fee=Decimal("0.10"), minimum_payout=Decimal("5"), minimum_profit=Decimal("0.20"),
+        annualized_yield=Decimal("0.16"), canonical_cutoff=now + timedelta(days=30),
+        resolution_at=now + timedelta(days=30), actionable=True, quote_available=True,
+    )
+
+
+def test_cross_holding_recognizes_canonical_predict_position() -> None:
+    leg = _cross_intent().legs[0]
+    snapshot = {
+        "positions": (
+            {
+                "market_id": leg.market_id,
+                "condition_id": leg.condition_id,
+                "token_id": leg.token_id,
+                "outcome": leg.outcome,
+                "quantity": "5",
+                "redeemable": True,
+            },
+        )
+    }
+
+    assert PredictionExecutionService._cross_position_quantity(snapshot, leg) == Decimal("5")
+    assert PredictionExecutionService._cross_redeemable_winner(snapshot, leg) == {
+        "venue": "predict.fun",
+        "condition_id": "predict-condition",
+        "outcome": "YES",
+        "token_id": "predict-yes",
+        "quantity": Decimal("5"),
+    }
+
+
+class CrossVenueMonitor:
+    def __init__(self, intent: CrossVenueIntent) -> None:
+        self.intent = intent
+        self.overrides: dict[str, object] = {}
+        self.refresh_calls = 0
+        self.refresh_requests: list[dict[str, object]] = []
+        self.refresh_intent_resolver: object | None = None
+        self.available = True
+        self.call_log: list[str] = []
+        self.max_normal_cost_requests: list[Decimal | None] = []
+
+    def _opportunity(self, intent: CrossVenueIntent) -> dict[str, object]:
+        now = datetime.now(UTC)
+        opportunity: dict[str, object] = {
+            "opportunity_id": f"cross:{intent.pair_id}:{intent.direction}",
+            "pair_id": intent.pair_id,
+            "market_type": "cross_venue_yes_no", "funnel_stage": 5,
+            "execution_mode": "manual_confirm",
+            "actionable": True, "clear_signal": True, "intent": intent,
+            "direction": intent.direction,
+            "confirmed_at": now, "confirmed_age_seconds": Decimal("1"),
+            "canonical_cutoff": intent.canonical_cutoff,
+            "signal_episode_id": "signal-episode-1",
+            "codex_approval": {"decision": "APPROVE", "cache_key": "cross-cache", "direct_outcome_mapping": {"predict_yes": "YES", "predict_no": "NO", "polymarket_yes": "YES", "polymarket_no": "NO"}, "evidence": [{"exchange": "predict.fun", "quote": "same rules"}, {"exchange": "polymarket", "quote": "same rules"}]},
+            "rules_fingerprints": {"predict.fun": "predict-fingerprint", "polymarket": "poly-fingerprint"},
+            "approved_candidates": {
+                "predict.fun": {"market_id": "predict-market", "condition_id": "predict-condition", "yes_token_id": "predict-yes", "no_token_id": "predict-no", "rules_fingerprint": "predict-fingerprint"},
+                "polymarket": {"market_id": "poly-market", "condition_id": "poly-condition", "yes_token_id": "poly-yes", "no_token_id": "poly-no", "rules_fingerprint": "poly-fingerprint"},
+            },
+        }
+        opportunity.update(self.overrides)
+        return opportunity
+
+    def refresh_opportunity(
+        self,
+        opportunity_id: str,
+        *,
+        target_quantity: Decimal | None = None,
+        max_total_cost: Decimal | None = None,
+        prefer_smallest: bool = False,
+    ) -> dict[str, object] | None:
+        self.refresh_calls += 1
+        self.call_log.append("refresh")
+        self.max_normal_cost_requests.append(max_total_cost)
+        self.refresh_requests.append(
+            {
+                "opportunity_id": opportunity_id,
+                "target_quantity": target_quantity,
+                "max_total_cost": max_total_cost,
+                "prefer_smallest": prefer_smallest,
+            }
+        )
+        if not self.available:
+            return None
+        intent = self.intent
+        resolver = self.refresh_intent_resolver
+        if callable(resolver):
+            intent = resolver(
+                opportunity_id=opportunity_id,
+                target_quantity=target_quantity,
+                max_total_cost=max_total_cost,
+                prefer_smallest=prefer_smallest,
+            )
+        value = self._opportunity(intent)
+        return value if value["opportunity_id"] == opportunity_id else None
+
+    def snapshot(self) -> dict[str, object]:
+        return {"opportunities": [self._opportunity(self.intent)]}
+
+
+class CrossPolymarketTrading(FakeTrading):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cross_preflight_calls = 0
+        self.cross_submit_calls = 0
+        self.cross_reconcile_calls = 0
+        self.submit_started = threading.Event()
+        self.submit_release = threading.Event()
+        self.submit_barrier: threading.Barrier | None = None
+        self.block_submit = False
+        self.submit_results: list[ThresholdLegResult] = []
+        self.reconcile_results: list[dict[str, object]] = []
+        self.balance_after_cross_submit: Decimal | None = None
+        self.cross_submitted_legs: list[CrossVenueLeg] = []
+        self.cross_remediation_options: dict[str, dict[str, object]] = {}
+        self.cross_remediation_option_calls: list[dict[str, object]] = []
+        self.cross_remediation_calls: list[dict[str, object]] = []
+        self.call_log: list[str] = []
+        self.omit_canary_fee_proof = False
+        self.omit_canary_order_proof = False
+
+    def no_submit_cross_leg_preflight(self, leg: CrossVenueLeg) -> dict[str, object]:
+        self.call_log.append("poly_preflight")
+        self.cross_preflight_calls += 1
+        return {"result": "PASS", "leg": leg}
+
+    def submit_cross_leg_once(self, leg: CrossVenueLeg) -> ThresholdLegResult:
+        self.call_log.append("poly_submit")
+        self.cross_submit_calls += 1
+        self.cross_submitted_legs.append(leg)
+        self.submit_started.set()
+        if self.submit_barrier is not None:
+            self.submit_barrier.wait(timeout=2)
+        if self.block_submit:
+            assert self.submit_release.wait(timeout=2)
+        if self.balance_after_cross_submit is not None:
+            self.balance = self.balance_after_cross_submit
+        if self.submit_results:
+            return self.submit_results.pop(0)
+        return ThresholdLegResult(
+            "polymarket", leg.outcome, leg.condition_id, leg.token_id,
+            True, "filled", "poly-order", leg.net_quantity, ("poly-trade",), "none",
+        )
+
+    def reconcile_cross_leg(
+        self, leg: CrossVenueLeg, result: ThresholdLegResult, *, since: datetime
+    ) -> dict[str, object]:
+        self.call_log.append("poly_reconcile")
+        self.cross_reconcile_calls += 1
+        if self.reconcile_results:
+            return {
+                **self.reconcile_results.pop(0),
+                "minimum_order_size": leg.minimum_order_size,
+            }
+        proof: dict[str, object] = {"verified": True, "venue": "polymarket"}
+        if not self.omit_canary_order_proof:
+            proof["matched_refs"] = {
+                "token_id": leg.token_id,
+                "order_ids": [result.order_id],
+                "trade_ids": list(result.trade_ids),
+            }
+        result_payload = {
+            "status": "verified", "verified": True,
+            "filled_quantity": result.filled_quantity,
+            "position_quantity": leg.net_quantity,
+            "minimum_order_size": leg.minimum_order_size,
+            "execution_proof": proof,
+        }
+        return result_payload
+
+    def cross_remediation_option(self, **kwargs: object) -> dict[str, object]:
+        self.cross_remediation_option_calls.append(dict(kwargs))
+        side = str(kwargs.get("side", ""))
+        return dict(self.cross_remediation_options.get(side, {"fresh": False}))
+
+    def submit_remediation_once(self, order: dict[str, object]) -> LegResult:
+        self.cross_remediation_calls.append(dict(order))
+        return LegResult(
+            str(order.get("leg", "NO")), True, "filled", "cross-unwind-order",
+            Decimal(str(order.get("quantity", order.get("shares", "0")))),
+            ("cross-unwind-trade",), "none",
+        )
+
+
+class CrossPredictTrading:
+    def __init__(self) -> None:
+        self.account_calls = 0
+        self.scope_ready = True
+        self.gas_ready = True
+        self.allowance_breaker = False
+        self.allowance = "0"
+        self.allowance_raw = "0"
+        self.use_legacy_allowance_ready = False
+        self.allowance_ready = True
+        self.account_available = True
+        self.balance = Decimal("5")
+        self.minimum_order_size = Decimal("1")
+        self.positions: tuple[object, ...] = ()
+        self.preflight_calls = 0
+        self.cross_entry_preflight_orders: list[dict[str, object]] = []
+        self.cross_entry_submit_orders: list[dict[str, object]] = []
+        self.cross_entry_allowed = True
+        self.submit_calls = 0
+        self.reconcile_calls = 0
+        self.submit_started = threading.Event()
+        self.submit_release = threading.Event()
+        self.submit_barrier: threading.Barrier | None = None
+        self.block_submit = False
+        self.submit_results: list[PredictLegResult] = []
+        self.reconcile_results: list[dict[str, object]] = []
+        self.balance_after_cross_submit: Decimal | None = None
+        self.cross_remediation_options: dict[str, dict[str, object]] = {}
+        self.cross_remediation_option_calls: list[dict[str, object]] = []
+        self.default_filled_quantity = Decimal("5")
+        self.call_log: list[str] = []
+        self.predict_account = "0xpredict-account"
+        self.gas_signer = "0xgas-signer"
+        self.chain = "bnb-mainnet"
+        self.sdk_version = "predict-sdk-1"
+        self.approval_step_id = "approval-step-buy"
+        self.bnb_balance = "0.01"
+        self.required_bnb = "0.003"
+        self.minimum_top_up_bnb = "0"
+        self.approval_calls: list[tuple[str, int]] = []
+        self.clear_calls: list[str] = []
+        self.approval_results: list[dict[str, object]] = []
+        self.clear_results: list[dict[str, object]] = []
+        self.omit_canary_fee_proof = False
+        self.omit_canary_order_proof = False
+
+    def account_snapshot(self) -> dict[str, object]:
+        self.call_log.append("predict_account")
+        self.account_calls += 1
+        if not self.account_available:
+            raise RuntimeError("account unavailable")
+        snapshot = {
+            "wallet_address": "0xpredict",
+            "available_usdt": str(self.balance),
+            "available_usdt_raw": str(int(self.balance * Decimal(10**18))),
+            "open_orders": (),
+            "positions": self.positions,
+            "checked_at": datetime.now(UTC),
+        }
+        if self.use_legacy_allowance_ready:
+            snapshot["allowance_ready"] = self.allowance_ready
+            return snapshot
+        snapshot.update(
+            {
+                "allowance": self.allowance,
+                "allowance_raw": self.allowance_raw,
+                "scope_ready": self.scope_ready,
+                "gas_ready": self.gas_ready,
+                "allowance_breaker": self.allowance_breaker,
+                "predict_account": self.predict_account,
+                "gas_signer": self.gas_signer,
+                "chain": self.chain,
+                "sdk_version": self.sdk_version,
+                "approval_step_id": self.approval_step_id,
+                "bnb_balance": self.bnb_balance,
+                "required_bnb": self.required_bnb,
+                "minimum_top_up_bnb": self.minimum_top_up_bnb,
+            }
+        )
+        return snapshot
+
+    def set_exact_buy_allowance(self, market_id: str, exact_debit_wei: int) -> dict[str, object]:
+        self.call_log.append("set_allowance")
+        self.approval_calls.append((market_id, exact_debit_wei))
+        if self.approval_results:
+            result = self.approval_results.pop(0)
+            if "allowance" in result:
+                self.allowance = str(result["allowance"])
+            if "allowance_raw" in result:
+                self.allowance_raw = str(result["allowance_raw"])
+            self.allowance_breaker = (
+                Decimal(self.allowance) != 0 or Decimal(self.allowance_raw) != 0
+            )
+            return result
+        self.allowance = str(Decimal(exact_debit_wei) / Decimal(10**18))
+        self.allowance_raw = str(exact_debit_wei)
+        self.allowance_breaker = exact_debit_wei != 0
+        return {
+            "status": "confirmed",
+            "market_id": market_id,
+            "exact_debit_wei": exact_debit_wei,
+            "allowance": self.allowance,
+            "allowance_raw": self.allowance_raw,
+            "transaction_hash": "0xapprove",
+        }
+
+    def clear_buy_allowance(self, market_id: str) -> dict[str, object]:
+        self.call_log.append("clear_allowance")
+        self.clear_calls.append(market_id)
+        if self.clear_results:
+            return self.clear_results.pop(0)
+        self.allowance = "0"
+        self.allowance_raw = "0"
+        self.allowance_breaker = False
+        return {
+            "status": "confirmed",
+            "market_id": market_id,
+            "allowance": "0",
+            "allowance_raw": "0",
+            "transaction_hash": "0xclear",
+        }
+
+    def no_submit_buy_preflight(
+        self, market_id: str, token_id: str, quantity_wei: int
+    ) -> PredictLegResult:
+        self.preflight_calls += 1
+        assert (market_id, token_id) == ("predict-market", "predict-yes")
+        assert quantity_wei > 0
+        return PredictLegResult(True, "preflight")
+
+    def no_submit_cross_buy_preflight(self, order: dict[str, object]) -> PredictLegResult:
+        self.call_log.append("predict_preflight")
+        self.preflight_calls += 1
+        self.cross_entry_preflight_orders.append(dict(order))
+        assert order["venue"] == "predict.fun"
+        assert order["market_id"] == "predict-market"
+        assert order["token_id"] == "predict-yes"
+        assert order["execution_id"] == order["idempotency_key"]
+        return PredictLegResult(
+            self.cross_entry_allowed,
+            "preflight" if self.cross_entry_allowed else "rejected",
+            error_code="none" if self.cross_entry_allowed else "rejected",
+        )
+
+    def submit_buy_once(
+        self, market_id: str, token_id: str, quantity_wei: int
+    ) -> PredictLegResult:
+        self.call_log.append("predict_submit")
+        self.submit_calls += 1
+        self.submit_started.set()
+        if self.submit_barrier is not None:
+            self.submit_barrier.wait(timeout=2)
+        if self.block_submit:
+            assert self.submit_release.wait(timeout=2)
+        if self.balance_after_cross_submit is not None:
+            self.balance = self.balance_after_cross_submit
+        if self.submit_results:
+            return self.submit_results.pop(0)
+        return PredictLegResult(True, "filled", "predict-order")
+
+    def submit_cross_buy_once(self, order: dict[str, object]) -> PredictLegResult:
+        self.cross_entry_submit_orders.append(dict(order))
+        return self.submit_buy_once(
+            str(order["market_id"]),
+            str(order["token_id"]),
+            int(Decimal(str(order["requested_quantity"])) * Decimal(10**18)),
+        )
+
+    def reconcile_buy(
+        self, market_id: str, token_id: str, order_hash: str
+    ) -> dict[str, object]:
+        self.call_log.append("predict_reconcile")
+        self.reconcile_calls += 1
+        assert (market_id, token_id) == ("predict-market", "predict-yes")
+        if self.reconcile_results:
+            return {
+                **self.reconcile_results.pop(0),
+                "minimum_order_size": self.minimum_order_size,
+            }
+        proof: dict[str, object] = {"verified": True, "venue": "predict.fun"}
+        if not self.omit_canary_order_proof:
+            proof.update({"order_ids": [order_hash], "trade_ids": ["predict-trade"]})
+        if not self.omit_canary_fee_proof:
+            proof["fee"] = Decimal("0.05")
+        result_payload = {
+            "status": "verified", "verified": True,
+            "filled_quantity": self.default_filled_quantity,
+            "position_quantity": self.default_filled_quantity,
+            "minimum_order_size": self.minimum_order_size,
+            "execution_proof": proof,
+        }
+        if not self.omit_canary_fee_proof:
+            result_payload["actual_fee"] = Decimal("0.05")
+        return result_payload
+
+    def cross_remediation_option(self, **kwargs: object) -> dict[str, object]:
+        self.cross_remediation_option_calls.append(dict(kwargs))
+        side = str(kwargs.get("side", ""))
+        return dict(self.cross_remediation_options.get(side, {"fresh": False}))
+
+    def submit_cross_remediation_once(self, order: dict[str, object]) -> PredictLegResult:
+        self.submit_calls += 1
+        return PredictLegResult(True, "filled", "predict-remediation-order")
+
+
+def _fresh_cross_option(
+    leg: CrossVenueLeg,
+    *,
+    side: str,
+    price: Decimal,
+    fee: Decimal = Decimal("0"),
+    slippage: Decimal = Decimal("0"),
+    residual_dust: Decimal = Decimal("0"),
+) -> dict[str, object]:
+    option: dict[str, object] = {
+        "venue": leg.exchange,
+        "market_id": leg.market_id,
+        "condition_id": leg.condition_id,
+        "token_id": leg.token_id,
+        "outcome": leg.outcome,
+        "side": side,
+        "quantity": leg.net_quantity,
+        "executable_price": price,
+        "fee": fee,
+        "slippage": slippage,
+        "residual_dust": residual_dust,
+    }
+    if side == "BUY":
+        option["max_spend"] = leg.net_quantity * price + fee + slippage
+    else:
+        option["shares"] = leg.net_quantity
+        option["min_price"] = price
+    return {"fresh": True, "checked_at": datetime.now(UTC), "option": option}
+
+
+def _cross_service(tmp_path: Path) -> tuple[PredictionExecutionService, PredictionArbitrageStore, CrossPolymarketTrading, CrossVenueMonitor, CrossPredictTrading]:
     store = PredictionArbitrageStore(tmp_path / "data")
-    trading = FakeTrading()
+    trading = CrossPolymarketTrading()
+    cross = CrossVenueMonitor(_cross_intent())
+    predict = CrossPredictTrading()
     service = PredictionExecutionService(
-        store=store,
-        monitor=CrossVenueMonitor(_intent()),
-        trading=trading,
+        store=store, monitor=FakeMonitor(_intent()), trading=trading, predict_trading=predict,
         notifier=CompositeTestNotifier(ChannelNotifier("macos"), ChannelNotifier("feishu")),
         lock_path=tmp_path / "execution.lock",
     )
+    call_log: list[str] = []
+    trading.call_log = predict.call_log = cross.call_log = call_log
+    service.set_cross_venue_monitor(cross)
     assert service.reconcile_startup()["state"] == "ready"
+    return service, store, trading, cross, predict
+
+
+def _cross_execution(
+    service: PredictionExecutionService, *, idempotency_key: str = "cross-submit"
+) -> tuple[dict[str, object], dict[str, object]]:
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    accepted = service.confirm(str(preview["preview_id"]), idempotency_key)
+    execution_id = str(accepted["execution_id"])
+    wait_until_terminal(service, execution_id)
+    deadline = time.monotonic() + 3
+    while execution_id in service._threads and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert execution_id not in service._threads
+    return accepted, service.execution(execution_id)
+
+
+def test_cross_exact_allowance_wraps_current_dual_rest_refresh_before_submit(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-exact-allowance")
+
+    assert final["state"] == "holding_to_resolution"
+    assert predict.approval_calls == [
+        ("predict-market", 2_300_000_000_000_000_000)
+    ]
+    assert predict.clear_calls == ["predict-market"]
+    set_allowance = cross.call_log.index("set_allowance")
+    refreshes = [index for index, item in enumerate(cross.call_log) if item == "refresh"]
+    first_refresh = max(index for index in refreshes if index < set_allowance)
+    second_refresh = min(index for index in refreshes if index > set_allowance)
+    predict_preflights = [
+        index for index, item in enumerate(cross.call_log) if item == "predict_preflight"
+    ]
+    poly_preflights = [
+        index for index, item in enumerate(cross.call_log) if item == "poly_preflight"
+    ]
+    predict_submit = cross.call_log.index("predict_submit")
+    poly_submit = cross.call_log.index("poly_submit")
+    predict_reconcile = cross.call_log.index("predict_reconcile")
+    poly_reconcile = cross.call_log.index("poly_reconcile")
+    clear_allowance = cross.call_log.index("clear_allowance")
+    assert first_refresh < set_allowance < second_refresh
+    assert predict_preflights[0] < poly_preflights[0] < set_allowance
+    assert second_refresh < predict_preflights[1] < poly_preflights[1]
+    assert poly_preflights[1] < predict_submit
+    assert poly_preflights[1] < poly_submit
+    assert predict_submit < predict_reconcile < clear_allowance
+    assert poly_submit < poly_reconcile < clear_allowance
+    assert final["evidence"][-1]["predict_allowance"] == {
+        "market_id": "predict-market",
+        "after": "0",
+        "zero_verified": True,
+    }
+    assert (trading.cross_submit_calls, predict.submit_calls) == (1, 1)
+
+
+@pytest.mark.parametrize("failed_venue", ("predict.fun", "polymarket"))
+def test_cross_refreshed_preflight_failure_clears_without_submit_or_retry(
+    tmp_path: Path, failed_venue: str,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    if failed_venue == "predict.fun":
+        original = predict.no_submit_cross_buy_preflight
+
+        def predict_preflight(order: dict[str, object]) -> PredictLegResult:
+            result = original(order)
+            return (
+                PredictLegResult(False, "rejected", error_code="rejected")
+                if predict.preflight_calls == 2
+                else result
+            )
+
+        predict.no_submit_cross_buy_preflight = predict_preflight  # type: ignore[method-assign]
+    else:
+        original = trading.no_submit_cross_leg_preflight
+
+        def polymarket_preflight(leg: CrossVenueLeg) -> dict[str, object]:
+            result = original(leg)
+            return {"result": "FAIL"} if trading.cross_preflight_calls == 2 else result
+
+        trading.no_submit_cross_leg_preflight = polymarket_preflight  # type: ignore[method-assign]
+
+    _accepted, final = _cross_execution(
+        service, idempotency_key=f"cross-refreshed-preflight-{failed_venue}"
+    )
+
+    assert final["state"] == "both_rejected"
+    assert (trading.cross_preflight_calls, predict.preflight_calls) == (2, 2)
+    assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
+    assert predict.clear_calls == ["predict-market"]
+    assert predict.allowance == "0"
+    assert store.cross_unsettled_principal() == Decimal("0")
+    evidence = final["evidence"][-1]
+    assert evidence["reason"] == "cross_preflight_failed"
+    assert evidence["submitted"] is False
+    assert evidence["status_text"] == "未下单 · 授权已清零"
+    assert evidence["predict_allowance"]["zero_verified"] is True
+    assert "predict_submit" not in cross.call_log
+    assert "poly_submit" not in cross.call_log
+
+
+def test_cross_exact_approval_failure_posts_neither_venue(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.approval_results.append(
+        {
+            "status": "failed",
+            "error_code": "receipt_failed",
+            "possible_mutation": False,
+            "market_id": "predict-market",
+            "allowance": "0",
+            "allowance_raw": "0",
+        }
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-approval-fails")
+
+    assert final["state"] == "both_rejected"
+    assert final["evidence"][-1]["status_text"] == "未下单"
+    assert predict.approval_calls == [
+        ("predict-market", 2_300_000_000_000_000_000)
+    ]
+    assert predict.clear_calls == []
+    assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_ambiguous_exact_approval_holds_reservation_and_opens_incident_without_submit(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.approval_results.append(
+        {
+            "status": "failed",
+            "error_code": "receipt_ambiguous",
+            "possible_mutation": True,
+            "market_id": "predict-market",
+            "allowance": "0",
+            "allowance_raw": "0",
+        }
+    )
+
+    _accepted, final = _cross_execution(
+        service, idempotency_key="cross-approval-ambiguous"
+    )
+
+    assert final["state"] == "directional_incident"
+    assert final["evidence"][-1]["reason"] == "predict_allowance_approval_unverified"
+    assert service._cross_breaker_open is True
+    assert predict.approval_calls == [
+        ("predict-market", 2_300_000_000_000_000_000)
+    ]
+    assert predict.clear_calls == []
+    assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
+    assert store.cross_unsettled_principal() == Decimal("4.80")
+    incidents = store.histories("incidents")
+    assert len(incidents) == 1
+    assert incidents[0]["reason"] == "predict_allowance_approval_unverified"
+
+
+def test_cross_malformed_success_like_receipt_opens_approval_incident_without_submit(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    sdk_calls: list[tuple[object, bool, int]] = []
+    step = SimpleNamespace(id="approval-step-buy", spender="0xspender")
+
+    def sdk_set_approval(
+        approval_step: object, *, approved: bool, amount: int
+    ) -> object:
+        sdk_calls.append((approval_step, approved, amount))
+        return SimpleNamespace(
+            success=True,
+            receipt={"status": 1.5, "transactionHash": "0xmalformed"},
+            cause=None,
+        )
+
+    adapter = PredictTradingClient.__new__(PredictTradingClient)
+    adapter._builder = SimpleNamespace(set_approval=sdk_set_approval)  # type: ignore[attr-defined]
+    adapter._approval_scope_for_market = lambda _market_id: object()  # type: ignore[method-assign]
+    adapter._approval_facts_for_scope = lambda _scope, *, exact_debit_wei: {  # type: ignore[method-assign]
+        "predict_account": predict.predict_account,
+        "gas_signer": predict.gas_signer,
+        "approval_step_id": predict.approval_step_id,
+        "approval_spender": step.spender,
+        "allowance": "0",
+        "allowance_raw": "0",
+        "allowance_breaker": False,
+        "exact_debit_wei": exact_debit_wei,
+    }
+    adapter._approval_step = lambda _scope: step  # type: ignore[method-assign]
+    adapter._raw_allowance = lambda _step: 2_300_000_000_000_000_000  # type: ignore[method-assign]
+
+    def malformed_approval(market_id: str, exact_debit_wei: int) -> Mapping[str, object]:
+        predict.call_log.append("set_allowance")
+        predict.approval_calls.append((market_id, exact_debit_wei))
+        result = adapter.set_exact_buy_allowance(market_id, exact_debit_wei)
+        if result.get("status") == "confirmed":
+            predict.allowance = str(Decimal(exact_debit_wei) / Decimal(10**18))
+            predict.allowance_raw = str(exact_debit_wei)
+            predict.allowance_breaker = True
+        return result
+
+    predict.set_exact_buy_allowance = malformed_approval  # type: ignore[method-assign]
+
+    _accepted, final = _cross_execution(
+        service, idempotency_key="cross-approval-malformed-success-status"
+    )
+
+    assert final["state"] == "directional_incident"
+    assert final["evidence"][-1]["reason"] == "predict_allowance_approval_unverified"
+    assert service._cross_breaker_open is True
+    assert sdk_calls == [(step, True, 2_300_000_000_000_000_000)]
+    assert predict.approval_calls == [
+        ("predict-market", 2_300_000_000_000_000_000)
+    ]
+    assert predict.clear_calls == []
+    assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
+    assert store.cross_unsettled_principal() == Decimal("4.80")
+
+
+def test_cross_post_approval_refresh_breach_clears_allowance_without_submit(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+    predict_leg, polymarket_leg = cross.intent.legs
+    refreshes = 0
+
+    def resolver(**_: object) -> CrossVenueIntent:
+        nonlocal refreshes
+        refreshes += 1
+        if refreshes < 3:
+            return cross.intent
+        return replace(
+            cross.intent,
+            legs=(replace(predict_leg, max_cost=Decimal("2.31")), polymarket_leg),
+            total_max_cost=Decimal("4.81"),
+            minimum_profit=Decimal("0.19"),
+        )
+
+    cross.refresh_intent_resolver = resolver
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-post-approval-breach")
+
+    assert final["state"] == "both_rejected"
+    assert final["evidence"][-1]["status_text"] == "未下单 · 授权已清零"
+    assert predict.approval_calls == [
+        ("predict-market", 2_300_000_000_000_000_000)
+    ]
+    assert predict.clear_calls == ["predict-market"]
+    assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
+
+
+def test_cross_post_approval_breach_cleanup_failure_persists_one_immediate_incident(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    predict_leg, polymarket_leg = cross.intent.legs
+    refreshes = 0
+
+    def resolver(**_: object) -> CrossVenueIntent:
+        nonlocal refreshes
+        refreshes += 1
+        if refreshes < 3:
+            return cross.intent
+        return replace(
+            cross.intent,
+            legs=(replace(predict_leg, max_cost=Decimal("2.31")), polymarket_leg),
+            total_max_cost=Decimal("4.81"),
+            minimum_profit=Decimal("0.19"),
+        )
+
+    cross.refresh_intent_resolver = resolver
+    predict.clear_results.append(
+        {"status": "confirmed", "market_id": "predict-market", "allowance": "0.01"}
+    )
+
+    _accepted, final = _cross_execution(
+        service, idempotency_key="cross-post-approval-breach-cleanup-fails"
+    )
+
+    assert final["state"] == "directional_incident"
+    assert final["evidence"][-1]["reason"] == "predict_allowance_cleanup_failed"
+    assert service._cross_breaker_open is True
+    assert predict.clear_calls == ["predict-market"]
+    assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
+    assert store.cross_unsettled_principal() == Decimal("4.80")
+    incidents = store.histories("incidents")
+    assert len(incidents) == 1
+    assert incidents[0]["reason"] == "predict_allowance_cleanup_failed"
+
+
+def test_cross_confirmed_approval_with_unverified_post_read_opens_incident_without_submit(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.approval_results.append(
+        {
+            "status": "confirmed",
+            "market_id": "predict-market",
+            "allowance": "2.30",
+            "transaction_hash": "0xapprove",
+        }
+    )
+
+    _accepted, final = _cross_execution(
+        service, idempotency_key="cross-approval-post-read-unverified"
+    )
+
+    assert final["state"] == "directional_incident"
+    assert final["evidence"][-1]["reason"] == "predict_allowance_approval_unverified"
+    assert service._cross_breaker_open is True
+    assert predict.approval_calls == [
+        ("predict-market", 2_300_000_000_000_000_000)
+    ]
+    assert predict.clear_calls == []
+    assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
+    assert store.cross_unsettled_principal() == Decimal("4.80")
+    incidents = store.histories("incidents")
+    assert len(incidents) == 1
+    assert incidents[0]["reason"] == "predict_allowance_approval_unverified"
+
+
+def test_cross_exact_approval_rejects_mismatched_raw_post_read_without_submit(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.approval_results.append(
+        {
+            "status": "confirmed",
+            "market_id": "predict-market",
+            "allowance": "2.3",
+            "allowance_raw": "2299999999999999999",
+            "transaction_hash": "0xapprove",
+        }
+    )
+
+    _accepted, final = _cross_execution(
+        service, idempotency_key="cross-approval-raw-post-read-mismatch"
+    )
+
+    assert final["state"] == "directional_incident"
+    assert final["evidence"][-1]["reason"] == "predict_allowance_approval_unverified"
+    assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
+    assert predict.clear_calls == []
+    assert store.cross_unsettled_principal() == Decimal("4.80")
+
+
+def test_cross_cleanup_failure_opens_breaker_and_persists_one_incident(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    predict.clear_results.append(
+        {"status": "confirmed", "market_id": "predict-market", "allowance": "0.01"}
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-cleanup-fails")
+
+    assert final["state"] == "directional_incident"
+    assert final["evidence"][-1]["reason"] == "predict_allowance_cleanup_failed"
+    assert service._cross_breaker_open is True
+    assert predict.clear_calls == ["predict-market"]
+    assert (trading.cross_submit_calls, predict.submit_calls) == (1, 1)
+    incidents = store.histories("incidents")
+    assert len(incidents) == 1
+    assert incidents[0]["reason"] == "predict_allowance_cleanup_failed"
+
+
+def test_cross_both_rejected_clears_allowance_before_releasing_capacity(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    trading.submit_results.append(
+        ThresholdLegResult(
+            "polymarket", "NO", "poly-condition", "poly-no", False,
+            "rejected", "", Decimal("0"), (), "rejected",
+        )
+    )
+    predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected"))
+    trading.reconcile_results.append(
+        {"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}
+    )
+    predict.reconcile_results.append(
+        {"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-both-rejects-clear")
+
+    assert final["state"] == "both_rejected"
+    assert predict.clear_calls == ["predict-market"]
+    assert cross.call_log.index("clear_allowance") < cross.call_log.index("predict_account", cross.call_log.index("clear_allowance"))
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_unknown_submit_keeps_allowance_and_breaker_fail_closed(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.submit_results.append(PredictLegResult(False, "ambiguous", "predict-order", "ambiguous"))
+    predict.reconcile_results.append(
+        {"status": "unknown", "verified": False, "conclusively_absent": False}
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-unknown-keeps-allowance")
+
+    assert final["state"] == "directional_incident"
+    assert final["evidence"][-1]["reason"] == "cross_reconciliation_unknown"
+    assert predict.clear_calls == []
+    assert service._cross_breaker_open is True
+    assert store.cross_unsettled_principal() == Decimal("4.80")
+
+
+def test_cross_predict_accepted_without_order_id_is_unknown_without_cleanup_or_remediation(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.submit_results.append(PredictLegResult(True, "accepted", "", "none"))
+
+    _accepted, final = _cross_execution(
+        service, idempotency_key="cross-predict-empty-order-id"
+    )
+
+    assert final["state"] == "directional_incident"
+    assert final["evidence"][-1]["reason"] == "cross_reconciliation_unknown"
+    assert predict.allowance == "2.3"
+    assert predict.clear_calls == []
+    assert predict.cross_remediation_option_calls == []
+    assert trading.cross_remediation_option_calls == []
+    assert store.cross_unsettled_principal() == Decimal("4.80")
+
+
+def test_residual_predict_allowance_startup_locks_and_operator_cleanup_is_read_only(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "2.4"
+    service._cross_breaker_open = False
+
+    result = service.reconcile_startup()
+
+    assert result["state"] == "locked"
+    assert result["reason"] == "residual_predict_allowance"
+    assert predict.clear_calls == []
+    assert trading.cross_submit_calls == 0
+    assert store.unacknowledged_incident()["reason"] == "residual_predict_allowance"
+
+    cleanup = service.cleanup_predict_allowance(confirm=True)
+
+    assert cleanup["state"] == "ready"
+    assert cleanup["before_allowance"] == "2.4"
+    assert cleanup["after_allowance"] == "0"
+    assert cleanup["usdt_moved"] is False
+    assert predict.clear_calls == ["predict-market"]
+
+
+@pytest.mark.parametrize("confirm", [False])
+def test_predict_allowance_cleanup_rejects_without_confirmation(
+    tmp_path: Path, confirm: bool,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "2.4"
+
+    result = service.cleanup_predict_allowance(confirm=confirm)
+
+    assert result == {"state": "locked", "reason": "confirmation_required"}
+    assert predict.clear_calls == []
+
+
+def test_predict_allowance_cleanup_rejects_active_execution_without_mutation(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, _cross, predict = _cross_service(tmp_path)
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    store.consume_preview_and_create_execution(str(preview["preview_id"]), "cleanup-active")
+    predict.allowance = "2.4"
+
+    result = service.cleanup_predict_allowance(confirm=True)
+
+    assert result == {"state": "locked", "reason": "active_execution"}
+    assert predict.clear_calls == []
+
+
+def test_predict_allowance_cleanup_uses_residual_breaker_as_reason_to_clear(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "2.4"
+    predict.allowance_breaker = True
+
+    result = service.cleanup_predict_allowance(confirm=True)
+
+    assert result == {
+        "state": "ready",
+        "before_allowance": "2.4",
+        "after_allowance": "0",
+        "usdt_moved": False,
+    }
+    assert predict.clear_calls == ["predict-market"]
+
+
+def test_predict_allowance_cleanup_clears_raw_residual_with_zero_human_projection(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "0"
+    predict.allowance_raw = "1"
+    predict.allowance_breaker = True
+
+    result = service.cleanup_predict_allowance(confirm=True)
+
+    assert result == {
+        "state": "ready",
+        "before_allowance": "0",
+        "after_allowance": "0",
+        "usdt_moved": False,
+    }
+    assert predict.clear_calls == ["predict-market"]
+
+
+def test_predict_allowance_cleanup_rejects_insufficient_bnb_without_mutation(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "2.4"
+    predict.minimum_top_up_bnb = "0.001"
+
+    result = service.cleanup_predict_allowance(confirm=True)
+
+    assert result == {
+        "state": "locked",
+        "reason": "insufficient_bnb",
+        "minimum_top_up_bnb": "0.001",
+    }
+    assert predict.clear_calls == []
+
+
+def test_predict_allowance_cleanup_rejects_already_zero_without_mutation(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+
+    result = service.cleanup_predict_allowance(confirm=True)
+
+    assert result == {"state": "locked", "reason": "allowance_already_zero"}
+    assert predict.clear_calls == []
+
+
+def test_predict_allowance_cleanup_rejects_changed_identity_after_clear(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "2.4"
+    original = predict.clear_buy_allowance
+
+    def changed_identity_clear(market_id: str) -> dict[str, object]:
+        result = original(market_id)
+        predict.gas_signer = "0xchanged"
+        return result
+
+    predict.clear_buy_allowance = changed_identity_clear  # type: ignore[method-assign]
+
+    result = service.cleanup_predict_allowance(confirm=True)
+
+    assert result == {"state": "locked", "reason": "predict_allowance_cleanup_failed"}
+    assert predict.clear_calls == ["predict-market"]
+
+
+def test_cross_canary_cap_stays_five_until_exact_zero_allowance_success_is_verified(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+    predict.reconcile_results.append(
+        {
+            "status": "verified",
+            "verified": True,
+            "filled_quantity": Decimal("5"),
+            "position_quantity": Decimal("5"),
+            "actual_fee": Decimal("0.05"),
+            "execution_proof": {
+                "verified": True,
+                "venue": "predict.fun",
+                "order_ids": ["predict-order"],
+                "trade_ids": ["predict-trade"],
+                "fee": Decimal("0.05"),
+            },
+        }
+    )
+    trading.reconcile_results.append(
+        {
+            "status": "verified",
+            "verified": True,
+            "filled_quantity": Decimal("5"),
+            "position_quantity": Decimal("5"),
+            "actual_fee": Decimal("0.05"),
+            "execution_proof": {
+                "verified": True,
+                "venue": "polymarket",
+                "fee": Decimal("0.05"),
+                "matched_refs": {
+                    "token_id": "poly-no",
+                    "order_ids": ["poly-order"],
+                    "trade_ids": ["poly-trade"],
+                },
+            },
+        }
+    )
+
+    first = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    _accepted, final = _cross_execution(service, idempotency_key="cross-canary-first")
+    second = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    predict.gas_signer = "0xchanged-gas-signer"
+    changed = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+
+    assert first["policy_limits"]["max_normal_cost"] == "5"
+    assert final["evidence"][-1]["canary_verified"] is True
+    assert second["policy_limits"]["max_normal_cost"] == "20"
+    assert changed["policy_limits"]["max_normal_cost"] == "5"
+    assert cross.max_normal_cost_requests[:2] == [Decimal("5"), Decimal("5")]
+    assert cross.max_normal_cost_requests[-2:] == [Decimal("20"), Decimal("5")]
+
+
+@pytest.mark.parametrize(
+    ("venue", "field"),
+    (
+        ("predict.fun", "filled_quantity"),
+        ("predict.fun", "position_quantity"),
+        ("polymarket", "filled_quantity"),
+        ("polymarket", "position_quantity"),
+    ),
+)
+def test_cross_canary_requires_each_adapter_quantity_to_equal_the_exact_intent(
+    venue: str, field: str,
+) -> None:
+    reconciled: dict[str, dict[str, object]] = {
+        "predict.fun": {
+            "verified": True,
+            "filled_quantity": Decimal("5"),
+            "position_quantity": Decimal("5"),
+            "actual_fee": Decimal("0.05"),
+            "execution_proof": {
+                "verified": True,
+                "venue": "predict.fun",
+                "order_ids": ["predict-order"],
+                "trade_ids": ["predict-trade"],
+                "fee": Decimal("0.05"),
+            },
+        },
+        "polymarket": {
+            "verified": True,
+            "filled_quantity": Decimal("5"),
+            "position_quantity": Decimal("5"),
+            "actual_fee": Decimal("0.02496"),
+            "execution_proof": {
+                "verified": True,
+                "venue": "polymarket",
+                "matched_refs": {
+                    "token_id": "poly-no",
+                    "order_ids": ["poly-order"],
+                    "trade_ids": ["poly-trade"],
+                },
+                "fee": Decimal("0.02496"),
+            },
+        },
+    }
+    reconciled[venue][field] = Decimal("4.9")
+
+    assert PredictionExecutionService._cross_canary_reconciliation_verified(
+        reconciled, Decimal("5")
+    ) is False
+
+
+@pytest.mark.parametrize(
+    ("name", "configure"),
+    [
+        (
+            "cancellation",
+            lambda trading, cross, predict: setattr(
+                cross,
+                "refresh_intent_resolver",
+                _post_approval_breach_resolver(cross),
+            ),
+        ),
+        (
+            "both_rejected",
+            lambda trading, _cross, predict: (
+                trading.submit_results.append(ThresholdLegResult("polymarket", "NO", "poly-condition", "poly-no", False, "rejected", "", Decimal("0"), (), "rejected")),
+                predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected")),
+                trading.reconcile_results.append({"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}),
+                predict.reconcile_results.append({"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}),
+            ),
+        ),
+        (
+            "one_leg_incident",
+            lambda _trading, _cross, predict: (
+                predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected")),
+                predict.reconcile_results.append({"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}),
+            ),
+        ),
+        (
+            "cleanup_failure",
+            lambda _trading, _cross, predict: predict.clear_results.append({"status": "confirmed", "market_id": "predict-market", "allowance": "0.01"}),
+        ),
+        (
+            "partial_reconciliation",
+            lambda _trading, _cross, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("4.9"), "actual_fee": Decimal("0.05"), "execution_proof": {"verified": True, "venue": "predict.fun", "order_ids": ["predict-order"], "trade_ids": ["predict-trade"], "fee": Decimal("0.05")}}),
+        ),
+        (
+            "equal_but_below_expected_quantity",
+            lambda _trading, _cross, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("4.9"), "position_quantity": Decimal("4.9"), "minimum_order_size": Decimal("1"), "actual_fee": Decimal("0.05"), "execution_proof": {"verified": True, "venue": "predict.fun", "order_ids": ["predict-order"], "trade_ids": ["predict-trade"], "fee": Decimal("0.05")}}),
+        ),
+        (
+            "fee_disagreement",
+            lambda _trading, _cross, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("5"), "actual_fee": Decimal("0.04"), "execution_proof": {"verified": True, "venue": "predict.fun", "order_ids": ["predict-order"], "trade_ids": ["predict-trade"], "fee": Decimal("0.05")}}),
+        ),
+        (
+            "missing_fee_proof",
+            lambda trading, _cross, predict: (
+                setattr(trading, "omit_canary_fee_proof", True),
+                setattr(predict, "omit_canary_fee_proof", True),
+            ),
+        ),
+        (
+            "polymarket_refs_only_under_predict_key",
+            lambda trading, _cross, _predict: trading.reconcile_results.append(
+                {
+                    "status": "verified",
+                    "verified": True,
+                    "filled_quantity": Decimal("5"),
+                    "position_quantity": Decimal("5"),
+                    "minimum_order_size": Decimal("1"),
+                    "actual_fee": Decimal("0.05"),
+                    "execution_proof": {
+                        "verified": True,
+                        "venue": "polymarket",
+                        "fee": Decimal("0.05"),
+                        "matched_refs": {
+                            "predict.fun": {
+                                "order_ids": ["predict-order"],
+                                "trade_ids": ["predict-trade"],
+                            }
+                        },
+                    },
+                }
+            ),
+        ),
+        (
+            "predict_refs_only_under_polymarket_key",
+            lambda _trading, _cross, predict: predict.reconcile_results.append(
+                {
+                    "status": "verified",
+                    "verified": True,
+                    "filled_quantity": Decimal("5"),
+                    "position_quantity": Decimal("5"),
+                    "minimum_order_size": Decimal("1"),
+                    "actual_fee": Decimal("0.05"),
+                    "execution_proof": {
+                        "verified": True,
+                        "venue": "predict.fun",
+                        "fee": Decimal("0.05"),
+                        "matched_refs": {
+                            "polymarket": {
+                                "order_ids": ["poly-order"],
+                                "trade_ids": ["poly-trade"],
+                            }
+                        },
+                    },
+                }
+            ),
+        ),
+        (
+            "polymarket_direct_refs_with_predict_venue",
+            lambda trading, _cross, _predict: trading.reconcile_results.append(
+                {
+                    "status": "verified",
+                    "verified": True,
+                    "filled_quantity": Decimal("5"),
+                    "position_quantity": Decimal("5"),
+                    "minimum_order_size": Decimal("1"),
+                    "actual_fee": Decimal("0.05"),
+                    "execution_proof": {
+                        "verified": True,
+                        "venue": "predict.fun",
+                        "fee": Decimal("0.05"),
+                        "order_ids": ["poly-order"],
+                        "trade_ids": ["poly-trade"],
+                    },
+                }
+            ),
+        ),
+        (
+            "predict_direct_refs_with_polymarket_venue",
+            lambda _trading, _cross, predict: predict.reconcile_results.append(
+                {
+                    "status": "verified",
+                    "verified": True,
+                    "filled_quantity": Decimal("5"),
+                    "position_quantity": Decimal("5"),
+                    "minimum_order_size": Decimal("1"),
+                    "actual_fee": Decimal("0.05"),
+                    "execution_proof": {
+                        "verified": True,
+                        "venue": "polymarket",
+                        "fee": Decimal("0.05"),
+                        "order_ids": ["predict-order"],
+                        "trade_ids": ["predict-trade"],
+                    },
+                }
+            ),
+        ),
+    ],
+)
+def test_cross_canary_cap_stays_five_after_non_graduating_outcomes(
+    tmp_path: Path,
+    name: str,
+    configure: object,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    first = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    configure(trading, cross, predict)  # type: ignore[operator]
+
+    _accepted, final = _cross_execution(service, idempotency_key=f"cross-canary-negative-{name}")
+    for incident in store.histories("incidents"):
+        if incident.get("acknowledged") is not True:
+            store.acknowledge_incident(str(incident["incident_id"]), {"operator": "test"})
+    service._breaker_open = False
+    service._cross_breaker_open = False
+    second = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+
+    assert first["policy_limits"]["max_normal_cost"] == "5"
+    assert final["evidence"][-1].get("canary_verified") is not True
+    if name == "cleanup_failure":
+        assert second == {"state": "rejected", "reason": "residual_predict_allowance"}
+    else:
+        assert second["policy_limits"]["max_normal_cost"] == "5"
+
+
+def _post_approval_breach_resolver(cross: CrossVenueMonitor) -> object:
+    predict_leg, polymarket_leg = cross.intent.legs
+    refreshes = 0
+
+    def resolver(**_: object) -> CrossVenueIntent:
+        nonlocal refreshes
+        refreshes += 1
+        if refreshes < 3:
+            return cross.intent
+        return replace(
+            cross.intent,
+            legs=(replace(predict_leg, max_cost=Decimal("2.31")), polymarket_leg),
+            total_max_cost=Decimal("4.81"),
+            minimum_profit=Decimal("0.19"),
+        )
+
+    return resolver
+
+
+def test_cross_venue_submits_both_legs_concurrently_and_deduplicates_preview(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, _cross, predict = _cross_service(tmp_path)
+    barrier = threading.Barrier(2)
+    trading.submit_barrier = predict.submit_barrier = barrier
+    trading.block_submit = predict.block_submit = True
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+
+    first = service.confirm(str(preview["preview_id"]), "same-ui-key")
+    assert trading.submit_started.wait(timeout=2)
+    assert predict.submit_started.wait(timeout=2)
+    duplicate = service.confirm(str(preview["preview_id"]), "same-ui-key")
+    different_key = service.confirm(str(preview["preview_id"]), "different-ui-key")
+    trading.submit_release.set()
+    predict.submit_release.set()
+    final = wait_until_terminal(service, str(first["execution_id"]))
+
+    assert {first["execution_id"], duplicate["execution_id"], different_key["execution_id"]} == {first["execution_id"]}
+    assert (trading.cross_submit_calls, predict.submit_calls) == (1, 1)
+    assert len(predict.cross_entry_preflight_orders) == 2
+    assert predict.cross_entry_preflight_orders[-1:] == predict.cross_entry_submit_orders
+    assert predict.cross_entry_submit_orders[0]["execution_id"] == first["execution_id"]
+    assert final["state"] == "holding_to_resolution"
+
+
+def test_cross_predict_entry_rejection_posts_neither_venue_and_stays_fail_closed(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.cross_entry_allowed = False
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-entry-bound-rejected")
+
+    assert final["state"] == "both_rejected"
+    assert predict.cross_entry_preflight_orders
+    assert predict.cross_entry_submit_orders == []
+    assert predict.submit_calls == 0
+    assert trading.cross_submit_calls == 0
+
+
+def test_cross_venue_uses_one_fresh_bounded_completion_only_below_emergency_limit(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, cross, predict = _cross_service(tmp_path)
+    predict_leg, polymarket_leg = cross.intent.legs
+    cross.intent = replace(
+        cross.intent,
+        legs=(replace(predict_leg, max_cost=Decimal("1.90")), polymarket_leg),
+        total_max_cost=Decimal("4.40"),
+        minimum_profit=Decimal("0.60"),
+    )
+    predict.submit_results.extend(
+        (
+            PredictLegResult(False, "rejected", "", "rejected"),
+        )
+    )
+    predict.cross_remediation_options["BUY"] = _fresh_cross_option(
+        predict_leg, side="BUY", price=Decimal("0.18"), fee=Decimal("0.10")
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-bounded-completion")
+
+    assert final["state"] == "holding_to_resolution"
+    assert predict.submit_calls == 2
+    assert final["evidence"][-1]["remediation_worst_case_loss"] == "1.10"
+    assert final["evidence"][-1].get("canary_verified") is not True
+
+
+def test_cross_venue_never_completes_an_opposite_partial_fill(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected"))
+    predict.reconcile_results.append(
+        {"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}
+    )
+    trading.reconcile_results.append(
+        {
+            "status": "verified",
+            "verified": True,
+            "filled_quantity": Decimal("4"),
+            "position_quantity": Decimal("4"),
+            "execution_proof": {"verified": True},
+        }
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-partial")
+
+    assert final["state"] == "directional_incident"
+    assert predict.submit_calls == 1
+    assert service._cross_breaker_open is True
+
+
+def test_cross_venue_never_completes_above_emergency_limit(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, cross, predict = _cross_service(tmp_path)
+    predict_leg, polymarket_leg = cross.intent.legs
+    cross.intent = replace(
+        cross.intent,
+        legs=(replace(predict_leg, max_cost=Decimal("2.01")), polymarket_leg),
+        total_max_cost=Decimal("4.51"),
+        minimum_profit=Decimal("0.49"),
+    )
+    predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected"))
+    predict.reconcile_results.append(
+        {"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-over-limit")
+
+    assert final["state"] == "directional_incident"
+    assert predict.submit_calls == 1
+    assert service._cross_breaker_open is True
+
+
+def test_cross_holding_settlement_uses_post_fill_baseline_not_preorder_balance(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    predict_leg, polymarket_leg = cross.intent.legs
+    cross.intent = replace(
+        cross.intent,
+        legs=(
+            replace(predict_leg, requested_quantity=Decimal("10"), net_quantity=Decimal("10")),
+            replace(polymarket_leg, requested_quantity=Decimal("10"), net_quantity=Decimal("10")),
+        ),
+        quantity=Decimal("10"),
+        minimum_payout=Decimal("10"),
+        minimum_profit=Decimal("5.20"),
+    )
+    predict.default_filled_quantity = Decimal("10")
+    trading.balance = Decimal("100")
+    predict.balance = Decimal("100")
+    trading.balance_after_cross_submit = Decimal("90")
+    predict.balance_after_cross_submit = Decimal("90")
+
+    accepted, holding = _cross_execution(service, idempotency_key="cross-post-fill-baseline")
+
+    assert holding["state"] == "holding_to_resolution"
+    assert holding["evidence"][-1]["settlement_baseline"] == {
+        "polymarket": "90", "predict.fun": "90",
+    }
+    predict.positions = (
+        {"tokenId": "predict-yes", "amount": "10", "redeemable": True, "outcome": "YES"},
+    )
+    assert service.reconcile_cross_holdings_once() == {
+        "complete": 0, "pending": 1, "unknown": 0,
+    }
+    predict.positions = ()
+    trading.balance = Decimal("100")
+    predict.balance = Decimal("100")
+
+    completed = service.reconcile_cross_holdings_once()
+
+    assert completed == {"complete": 1, "pending": 0, "unknown": 0}
+    assert service.execution(str(accepted["execution_id"]))["state"] == "complete"
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_holding_settlement_requires_exact_redeemable_net_quantity(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    predict_leg, polymarket_leg = cross.intent.legs
+    cross.intent = replace(
+        cross.intent,
+        legs=(
+            replace(predict_leg, requested_quantity=Decimal("10"), net_quantity=Decimal("10")),
+            replace(polymarket_leg, requested_quantity=Decimal("10"), net_quantity=Decimal("10")),
+        ),
+        quantity=Decimal("10"),
+        minimum_payout=Decimal("10"),
+        minimum_profit=Decimal("5.20"),
+    )
+    predict.default_filled_quantity = Decimal("10")
+    trading.balance = predict.balance = Decimal("100")
+    trading.balance_after_cross_submit = predict.balance_after_cross_submit = Decimal("90")
+    accepted, holding = _cross_execution(service, idempotency_key="cross-partial-redemption")
+
+    assert holding["state"] == "holding_to_resolution"
+    predict.positions = (
+        {"tokenId": "predict-yes", "amount": "5", "redeemable": True, "outcome": "YES"},
+    )
+    assert service.reconcile_cross_holdings_once() == {
+        "complete": 0, "pending": 1, "unknown": 0,
+    }
+    predict.positions = ()
+    predict.balance = Decimal("95")
+    trading.balance = Decimal("100")
+
+    assert service.reconcile_cross_holdings_once() == {
+        "complete": 0, "pending": 0, "unknown": 1,
+    }
+    assert service.execution(str(accepted["execution_id"]))["state"] == "holding_to_resolution"
+    assert store.cross_unsettled_principal() > Decimal("0")
+
+
+def test_cross_remediation_prefers_fresh_cheaper_polymarket_unwind_once(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    predict_leg, polymarket_leg = cross.intent.legs
+    predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected"))
+    predict.cross_remediation_options["BUY"] = _fresh_cross_option(
+        predict_leg, side="BUY", price=Decimal("0.20"), fee=Decimal("0.10"),
+    )
+    trading.cross_remediation_options["SELL"] = _fresh_cross_option(
+        polymarket_leg, side="SELL", price=Decimal("0.95"), fee=Decimal("0.05"),
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-cheaper-unwind")
+
+    assert final["state"] == "neutralized_incident"
+    assert [order["side"] for order in trading.cross_remediation_calls] == ["SELL"]
+    assert predict.submit_calls == 1
+    assert service._cross_breaker_open is True
+    assert store.cross_unsettled_principal() == Decimal("4.80")
+
+
+def test_cross_remediation_completes_from_fresh_bound_option_within_limit(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, cross, _predict = _cross_service(tmp_path)
+    _predict_leg, polymarket_leg = cross.intent.legs
+    cross.intent = replace(cross.intent, calculable_gas=Decimal("0.10"))
+    trading.submit_results.append(
+        ThresholdLegResult(
+            "polymarket", "NO", "poly-condition", "poly-no", False,
+            "rejected", "", Decimal("0"), (), "rejected",
+        )
+    )
+    trading.reconcile_results.append(
+        {"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}
+    )
+    trading.cross_remediation_options["BUY"] = _fresh_cross_option(
+        polymarket_leg,
+        side="BUY",
+        price=Decimal("0.18"),
+        fee=Decimal("0.05"),
+        residual_dust=Decimal("0.05"),
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-fresh-completion")
+
+    assert final["state"] == "holding_to_resolution"
+    assert trading.cross_submit_calls == 2
+    assert trading.cross_submitted_legs[-1].max_cost == Decimal("0.95")
+    assert final["evidence"][-1]["remediation_worst_case_loss"] == "1.10"
+    assert final["evidence"][-1].get("canary_verified") is not True
+
+
+@pytest.mark.parametrize("option_state", ("stale", "missing", "over_limit"))
+def test_cross_remediation_rejects_nonactionable_fresh_options_without_order(
+    tmp_path: Path, option_state: str,
+) -> None:
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+    predict_leg, polymarket_leg = cross.intent.legs
+    cross.intent = replace(
+        cross.intent,
+        legs=(replace(predict_leg, max_cost=Decimal("1.00")), polymarket_leg),
+        total_max_cost=Decimal("3.50"),
+        minimum_profit=Decimal("1.50"),
+    )
+    predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected"))
+    if option_state == "stale":
+        option = _fresh_cross_option(predict_leg, side="BUY", price=Decimal("0.10"))
+        option["checked_at"] = datetime.now(UTC) - timedelta(seconds=11)
+        predict.cross_remediation_options["BUY"] = option
+    elif option_state == "over_limit":
+        predict.cross_remediation_options["BUY"] = _fresh_cross_option(
+            predict_leg, side="BUY", price=Decimal("0.50"),
+        )
+
+    _accepted, final = _cross_execution(service, idempotency_key=f"cross-no-remediation-{option_state}")
+
+    assert final["state"] == "directional_incident"
+    assert predict.submit_calls == 1
+    assert trading.cross_submit_calls == 1
+    assert service._cross_breaker_open is True
+
+
+def test_cross_holding_reconciliation_releases_once_after_observed_redemption(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    trading.balance = Decimal("20")
+    accepted, holding = _cross_execution(service, idempotency_key="cross-redemption")
+    assert holding["state"] == "holding_to_resolution"
+    predict.positions = (
+        {"tokenId": "predict-yes", "amount": "5", "redeemable": True, "outcome": "YES"},
+    )
+
+    observed = service.reconcile_cross_holdings_once()
+    predict.positions = ()
+    predict.balance = Decimal("10")
+
+    first = service.reconcile_cross_holdings_once()
+    second = service.reconcile_cross_holdings_once()
+
+    assert observed == {"complete": 0, "pending": 1, "unknown": 0}
+    assert first == {"complete": 1, "pending": 0, "unknown": 0}
+    assert second == {"complete": 0, "pending": 0, "unknown": 0}
+    assert service.execution(str(accepted["execution_id"]))["state"] == "complete"
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_holding_reconciliation_accepts_expired_persisted_cutoff(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    trading.balance = Decimal("20")
+    accepted, holding = _cross_execution(service, idempotency_key="cross-expired-cutoff")
+    assert holding["state"] == "holding_to_resolution"
+
+    execution_id = str(accepted["execution_id"])
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT payload FROM executions WHERE execution_id = ?",
+            (execution_id,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(str(row[0]))
+        payload["intent"]["canonical_cutoff"] = "2020-01-01T00:00:00Z"
+        connection.execute(
+            "UPDATE executions SET payload = ? WHERE execution_id = ?",
+            (json.dumps(payload), execution_id),
+        )
+
+    predict.positions = (
+        {"tokenId": "predict-yes", "amount": "5", "redeemable": True, "outcome": "YES"},
+    )
+    observed = service.reconcile_cross_holdings_once()
+    predict.positions = ()
+    predict.balance = Decimal("10")
+
+    released = service.reconcile_cross_holdings_once()
+
+    assert observed == {"complete": 0, "pending": 1, "unknown": 0}
+    assert released == {"complete": 1, "pending": 0, "unknown": 0}
+    assert service.execution(execution_id)["state"] == "complete"
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_holding_keeps_capacity_when_only_losing_venue_collateral_grows(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    trading.balance = Decimal("20")
+    accepted, holding = _cross_execution(service, idempotency_key="cross-losing-bump")
+    assert holding["state"] == "holding_to_resolution"
+    predict.positions = (
+        {"tokenId": "predict-yes", "amount": "5", "redeemable": True, "outcome": "YES"},
+    )
+
+    observed = service.reconcile_cross_holdings_once()
+    predict.positions = ()
+    trading.balance = Decimal("25")
+
+    pending = service.reconcile_cross_holdings_once()
+    execution = service.execution(str(accepted["execution_id"]))
+
+    assert observed == {"complete": 0, "pending": 1, "unknown": 0}
+    assert pending == {"complete": 0, "pending": 0, "unknown": 1}
+    assert execution["state"] == "holding_to_resolution"
+    assert execution["evidence"][-1]["status_text"] == "待兑付"
+    assert store.cross_unsettled_principal() == Decimal("4.80")
+
+
+def test_cross_reservation_release_failure_becomes_an_incident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    trading.submit_results.append(
+        ThresholdLegResult(
+            "polymarket", "NO", "poly-condition", "poly-no", False,
+            "rejected", "", Decimal("0"), (), "rejected",
+        )
+    )
+    predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected"))
+    trading.reconcile_results.append(
+        {"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}
+    )
+    predict.reconcile_results.append(
+        {"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}
+    )
+    monkeypatch.setattr(
+        store,
+        "release_cross_reservation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("release failed")),
+    )
+
+    _accepted, final = _cross_execution(service, idempotency_key="cross-release-failure")
+
+    assert final["state"] == "directional_incident"
+    assert service._cross_breaker_open is True
+    assert store.cross_unsettled_principal() > Decimal("0")
+
+
+@pytest.mark.parametrize(
+    ("name", "configure", "state", "released", "breaker", "predict_calls", "dust_loss"),
+    [
+        ("both_filled", lambda trading, predict: None, "holding_to_resolution", False, False, 1, None),
+        (
+            "both_rejected",
+            lambda trading, predict: (
+                trading.submit_results.append(ThresholdLegResult("polymarket", "NO", "poly-condition", "poly-no", False, "rejected", "", Decimal("0"), (), "rejected")),
+                predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected")),
+                trading.reconcile_results.append({"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}),
+                predict.reconcile_results.append({"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}),
+            ),
+            "both_rejected", True, False, 1, None,
+        ),
+        (
+            "timeout_found",
+            lambda _trading, predict: predict.submit_results.append(PredictLegResult(False, "ambiguous", "predict-order", "ambiguous")),
+            "holding_to_resolution", False, False, 1, None,
+        ),
+        (
+            "absent_retry",
+            lambda _trading, predict: (
+                predict.submit_results.extend((PredictLegResult(False, "ambiguous", "predict-order", "ambiguous"), PredictLegResult(True, "filled", "predict-order"))),
+                predict.reconcile_results.extend(({"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}, {"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("5"), "execution_proof": {"verified": True}})),
+            ),
+            "holding_to_resolution", False, False, 2, None,
+        ),
+        (
+            "unknown",
+            lambda _trading, predict: (
+                predict.submit_results.append(PredictLegResult(False, "ambiguous", "predict-order", "ambiguous")),
+                predict.reconcile_results.append({"status": "unknown", "verified": False, "conclusively_absent": False}),
+            ),
+            "directional_incident", False, True, 1, None,
+        ),
+        (
+            "position_mismatch",
+            lambda _trading, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("4"), "execution_proof": {"verified": True}}),
+            "directional_incident", False, True, 1, None,
+        ),
+        (
+            "safe_dust",
+            lambda _trading, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("4.9"), "execution_proof": {"verified": True}}),
+            "holding_to_resolution", False, False, 1, Decimal("0.10"),
+        ),
+        (
+            "unsafe_dust",
+            lambda _trading, predict: predict.reconcile_results.append({"status": "verified", "verified": True, "filled_quantity": Decimal("5"), "position_quantity": Decimal("4.9"), "worst_case_loss": Decimal("2.01"), "execution_proof": {"verified": True}}),
+            "directional_incident", False, True, 1, None,
+        ),
+    ],
+)
+def test_cross_venue_reconciliation_contains_independent_outcomes(
+    tmp_path: Path,
+    name: str,
+    configure: object,
+    state: str,
+    released: bool,
+    breaker: bool,
+    predict_calls: int,
+    dust_loss: Decimal | None,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    configure(trading, predict)  # type: ignore[operator]
+
+    _accepted, final = _cross_execution(service, idempotency_key=f"cross-{name}")
+
+    assert final["state"] == state
+    assert predict.submit_calls == predict_calls
+    assert trading.cross_submit_calls == 1
+    assert service._cross_breaker_open is breaker
+    assert (store.cross_unsettled_principal() == Decimal("0")) is released
+    if dust_loss is not None:
+        evidence = final["evidence"][-1]
+        assert evidence["unhedged_units"] == "0.1"
+        assert evidence["worst_case_loss"] == "0.1"
+        assert evidence["reconciliation"]["predict.fun"]["minimum_order_size"] == "1"
+        assert evidence["reconciliation"]["polymarket"]["minimum_order_size"] == "1"
+        assert evidence.get("canary_verified") is not True
+
+
+def test_cross_preview_is_server_owned_without_expires_at_or_countdown(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, _cross, _predict = _cross_service(tmp_path)
+
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+
+    assert preview["market_type"] == "cross_venue_yes_no"
+    assert preview["signal_episode_id"] == "signal-episode-1"
+    assert [leg["exchange"] for leg in preview["buy_legs"]] == ["predict.fun", "polymarket"]
+    assert preview["net_quantity"] == "5"
+    assert preview["maximum_total_cost"] == "4.80"
+    assert preview["minimum_payout"] == "5"
+    assert preview["minimum_profit"] == "0.20"
+    assert preview["annualized_yield"] >= "0.15"
+    assert preview["canonical_cutoff"].endswith("Z")
+    assert preview["codex_approval"]["decision"] == "APPROVE"
+    assert preview["balances"]["predict.fun"]["asset"] == "USDT"
+    assert preview["balances"]["polymarket"]["asset"] == "pUSD"
+    assert preview["unsettled"]["limit"] == "100"
+    assert preview["policy_limits"]["max_normal_cost"] == "5"
+    assert preview["policy_limits"]["max_emergency_loss"] == "2"
+    assert "expires_at" not in preview
+
+
+def test_cross_venue_preview_requires_named_gas_inside_cost_and_profit(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, cross, _predict = _cross_service(tmp_path)
+    cross.intent = replace(
+        cross.intent,
+        calculable_gas=Decimal("0"),
+        total_max_cost=Decimal("4.70"),
+        minimum_profit=Decimal("0.30"),
+    )
 
     assert service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO") == {
         "state": "rejected",
-        "reason": "cross_venue_observation_only",
+        "reason": "cross_venue_economics",
     }
-    preview_id = store.create_preview(
-        {"market_type": "cross_venue_yes_no", "clear_signal": True},
-        expires_at=(datetime.now(UTC) + timedelta(seconds=5)).isoformat(),
+
+    cross.intent = replace(
+        cross.intent,
+        calculable_gas=Decimal("0.10"),
+        total_max_cost=Decimal("4.80"),
+        minimum_profit=Decimal("0.20"),
     )
-    assert service.confirm(preview_id, "crafted-cross-preview") == {
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+
+    assert preview["state"] == "previewed"
+    assert preview["maximum_total_cost"] == "4.80"
+    assert preview["minimum_profit"] == "0.20"
+
+
+def test_cross_venue_execution_mode_is_server_authority_for_preview_and_confirm(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+    opportunity_id = "cross:public-pair:PREDICT_YES_POLYMARKET_NO"
+
+    cross.overrides["execution_mode"] = "observe_only"
+    rejected = service.preview(opportunity_id)
+
+    assert rejected == {"state": "rejected", "reason": "cross_execution_mode"}
+    assert trading.cross_submit_calls == 0
+    assert predict.submit_calls == 0
+
+    cross.overrides["execution_mode"] = "manual_confirm"
+    preview = service.preview(opportunity_id)
+    assert preview["state"] == "previewed"
+
+    # A stale/forged preview cannot authorize a fresh observe-only opportunity.
+    cross.overrides["execution_mode"] = "observe_only"
+    accepted = service.confirm(str(preview["preview_id"]), "cross-observe-only")
+    final = wait_until_terminal(service, str(accepted["execution_id"]))
+
+    assert final["state"] == "both_rejected"
+    assert final["evidence"][-1]["reason"] == "cross_execution_mode"
+    assert trading.cross_submit_calls == 0
+    assert predict.submit_calls == 0
+
+
+@pytest.mark.parametrize(
+    "cutoff",
+    [
+        "2099-12-31 23:59:00Z",
+        "2099-12-31T23:59Z",
+        "2099-12-31T23:59:00",
+        "2099-12-31",
+        "2099-12-31T23:59:00+08:00",
+        "2020-01-01T00:00:00Z",
+    ],
+)
+def test_cross_venue_preview_rejects_noncanonical_server_cutoff(
+    tmp_path: Path, cutoff: str
+) -> None:
+    service, _store, _trading, cross, _predict = _cross_service(tmp_path)
+    cross.overrides["canonical_cutoff"] = cutoff
+
+    assert service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO") == {
         "state": "rejected",
-        "reason": "cross_venue_observation_only",
+        "reason": "canonical_cutoff_invalid",
     }
+
+
+@pytest.mark.parametrize(
+    "cutoff",
+    [
+        "2099-12-31 23:59:00Z",
+        "2099-12-31T23:59Z",
+        "2099-12-31T23:59:00",
+        "2099-12-31",
+        "2099-12-31T23:59:00+08:00",
+    ],
+)
+def test_cross_venue_intent_payload_rejects_noncanonical_cutoff(
+    cutoff: str,
+) -> None:
+    payload = PredictionExecutionService._intent_payload(_cross_intent())
+    payload["canonical_cutoff"] = cutoff
+
+    assert PredictionExecutionService._intent_from_payload(payload) is None
+
+
+def test_cross_venue_intent_payload_accepts_expired_exact_cutoff_for_holding() -> None:
+    payload = PredictionExecutionService._intent_payload(_cross_intent())
+    payload["canonical_cutoff"] = "2020-01-01T00:00:00Z"
+
+    intent = PredictionExecutionService._intent_from_payload(payload)
+
+    assert intent is not None
+    assert intent.canonical_cutoff == datetime(2020, 1, 1, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        (lambda cross, _trading, _predict: cross.overrides.update({"confirmed_age_seconds": Decimal("11")}), "books_stale"),
+        (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, legs=(replace(cross.intent.legs[0], book_timestamp=datetime.now(UTC) - timedelta(seconds=11)), cross.intent.legs[1]))), "books_stale"),
+        (lambda cross, _trading, _predict: cross.overrides.update({"codex_approval": {"decision": "REJECT"}}), "codex_not_approved"),
+        (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, canonical_cutoff=None)), "canonical_cutoff_invalid"),
+        (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, canonical_cutoff=datetime(2020, 1, 1, tzinfo=UTC))), "canonical_cutoff_invalid"),
+        (lambda _cross, trading, _predict: setattr(trading, "balance", Decimal("1")), "account_insufficient"),
+        (lambda _cross, _trading, predict: setattr(predict, "allowance_breaker", True), "residual_predict_allowance"),
+        (lambda cross, _trading, _predict: setattr(cross, "intent", replace(cross.intent, quote_available=False)), "opportunity_not_actionable"),
+    ],
+)
+def test_cross_venue_preview_fails_closed_on_current_admission_changes(
+    tmp_path: Path, change: object, reason: str
+) -> None:
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+    change(cross, trading, predict)  # type: ignore[operator]
+
+    assert service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO") == {
+        "state": "rejected", "reason": reason
+    }
+
+
+def test_cross_venue_preview_accepts_zero_allowance_snapshot_without_allowance_ready(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "0"
+    predict.scope_ready = True
+    predict.gas_ready = True
+    predict.allowance_breaker = False
+
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+
+    assert preview["state"] == "previewed"
+    assert preview["balances"]["predict.fun"]["available_balance"] == "5"
+
+
+def test_fresh_predict_account_snapshot_normalizes_legacy_allowance_ready_fallback(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.use_legacy_allowance_ready = True
+    predict.allowance_ready = True
+
+    snapshot = service._fresh_predict_account_snapshot()
+
+    assert snapshot is not None
+    assert snapshot["scope_ready"] is True
+    assert snapshot["gas_ready"] is True
+    assert snapshot["allowance_breaker"] is False
+
+
+def test_cross_venue_confirmation_rechecks_fingerprint_before_no_submit_release(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, _predict = _cross_service(tmp_path)
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    cross.overrides["rules_fingerprints"] = {
+        "predict.fun": "changed", "polymarket": "poly-fingerprint"
+    }
+
+    accepted = service.confirm(str(preview["preview_id"]), "cross-fingerprint-change")
+    assert accepted["execution_id"] == preview["execution_id"]
+    service._threads[str(accepted["execution_id"])].join(timeout=5)
+    execution = service.execution(str(accepted["execution_id"]))
+
+    assert execution["state"] == "both_rejected"
+    assert execution["evidence"][-1]["reason"] == "opportunity_changed"
+    assert store.cross_unsettled_principal() == Decimal("0")
     assert trading.preflight_calls == 0
     assert trading.batch_calls == 0
+
+
+@pytest.mark.parametrize("elapsed_seconds", (11, 3600))
+def test_cross_preview_no_ttl_accepts_same_episode_better_prices_after_elapsed_window(
+    tmp_path: Path, elapsed_seconds: int
+) -> None:
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    preview_id = str(preview["preview_id"])
+    with sqlite3.connect(service._store.path) as connection:  # type: ignore[attr-defined]
+        connection.execute(
+            "UPDATE previews SET expires_at=? WHERE preview_id=?",
+            (
+                (datetime.now(UTC) - timedelta(seconds=elapsed_seconds)).isoformat(),
+                preview_id,
+            ),
+        )
+    predict_leg, polymarket_leg = cross.intent.legs
+    cross.intent = replace(
+        cross.intent,
+        legs=(
+            replace(predict_leg, max_price=Decimal("0.44"), max_cost=Decimal("2.25")),
+            replace(polymarket_leg, max_price=Decimal("0.46"), max_cost=Decimal("2.35")),
+        ),
+        total_max_cost=Decimal("4.70"),
+        minimum_profit=Decimal("0.30"),
+        annualized_yield=Decimal("0.17"),
+    )
+
+    accepted = service.confirm(preview_id, f"cross-no-ttl-{elapsed_seconds}")
+    final = wait_until_terminal(service, str(accepted["execution_id"]))
+
+    assert final["state"] == "holding_to_resolution"
+    assert trading.cross_submit_calls == 1
+    assert predict.submit_calls == 1
+
+
+def test_cross_venue_confirmation_refreshes_and_releases_with_current_zero_position_proof(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    assert cross.refresh_calls == 1
+    cross.available = False
+
+    accepted = service.confirm(str(preview["preview_id"]), "cross-withdrawn")
+    service._threads[str(accepted["execution_id"])].join(timeout=5)
+    execution = service.execution(str(accepted["execution_id"]))
+
+    assert execution["state"] == "both_rejected"
+    assert execution["evidence"][-1]["reason"] == "opportunity_unavailable"
+    assert execution["evidence"][-1]["positions"] == {
+        "predict.fun": "0", "polymarket": "0"
+    }
+    assert store.cross_unsettled_principal() == Decimal("0")
+    assert trading.preflight_calls == 0
+    assert predict.account_calls >= 2
+    assert cross.refresh_calls >= 2
+
+
+def test_cross_venue_confirmation_retains_reservation_without_current_account_proof(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, cross, predict = _cross_service(tmp_path)
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    cross.available = False
+    predict.account_available = False
+
+    accepted = service.confirm(str(preview["preview_id"]), "cross-proof-unavailable")
+    service._threads[str(accepted["execution_id"])].join(timeout=5)
+
+    assert service.execution(str(accepted["execution_id"]))["state"] == "directional_incident"
+    assert store.cross_unsettled_principal() == Decimal("4.80")
+    assert service._cross_breaker_open is True
+
+
+def test_cross_venue_confirmation_rejects_when_cross_breaker_opens_after_preview(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, _cross, _predict = _cross_service(tmp_path)
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    service._cross_breaker_open = True
+
+    accepted = service.confirm(str(preview["preview_id"]), "cross-breaker-confirm")
+    service._threads[str(accepted["execution_id"])].join(timeout=5)
+
+    execution = service.execution(str(accepted["execution_id"]))
+    assert execution["state"] == "both_rejected"
+    assert execution["evidence"][-1]["reason"] == "cross_circuit_breaker_open"
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_venue_refresh_rejects_changed_ceilings_without_cached_snapshot(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, cross, _predict = _cross_service(tmp_path)
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    changed_predict = replace(
+        cross.intent.legs[0], max_price=Decimal("0.46"), max_cost=Decimal("2.35")
+    )
+    cross.intent = replace(
+        cross.intent,
+        legs=(changed_predict, cross.intent.legs[1]),
+        total_max_cost=Decimal("4.85"),
+        minimum_profit=Decimal("0.15"),
+    )
+
+    accepted = service.confirm(str(preview["preview_id"]), "cross-ceiling-change")
+    service._threads[str(accepted["execution_id"])].join(timeout=5)
+
+    execution = service.execution(str(accepted["execution_id"]))
+    assert execution["state"] == "both_rejected"
+    assert execution["evidence"][-1]["reason"] == "opportunity_changed"
+    assert cross.refresh_calls >= 2
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda opportunity, intent: (
+            {**opportunity, "signal_episode_id": "signal-episode-2"},
+            intent,
+        ),
+        lambda opportunity, intent: (
+            opportunity,
+            replace(
+                intent,
+                legs=tuple(
+                    replace(leg, requested_quantity=Decimal("6"), net_quantity=Decimal("6"))
+                    for leg in intent.legs
+                ),
+                quantity=Decimal("6"),
+                minimum_payout=Decimal("6"),
+            ),
+        ),
+        lambda opportunity, intent: (
+            opportunity,
+            replace(
+                intent,
+                legs=(
+                    replace(intent.legs[0], max_cost=Decimal("2.31")),
+                    intent.legs[1],
+                ),
+                total_max_cost=Decimal("4.81"),
+                minimum_profit=Decimal("0.19"),
+            ),
+        ),
+        lambda opportunity, intent: (
+            opportunity,
+            replace(intent, annualized_yield=Decimal("0.149999")),
+        ),
+    ),
+)
+def test_cross_preview_matches_rejects_full_frozen_envelope_changes(
+    tmp_path: Path, mutate: object
+) -> None:
+    service, _store, _trading, cross, _predict = _cross_service(tmp_path)
+    preview = dict(service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO"))
+    preview.setdefault("signal_episode_id", "signal-episode-1")
+    live = cross.refresh_opportunity("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    assert live is not None
+    live_intent = service._intent_from_opportunity(live)
+    assert isinstance(live_intent, CrossVenueIntent)
+
+    mutated_live, mutated_intent = mutate(live, live_intent)  # type: ignore[operator]
+
+    assert not service._cross_preview_matches(preview, mutated_live, mutated_intent)
+
+
+def test_cross_preview_canary_quantity_requests_smallest_and_freezes_exact_quantity(
+    tmp_path: Path,
+) -> None:
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+    small = cross.intent
+    predict_leg, polymarket_leg = small.legs
+    large = replace(
+        small,
+        legs=(
+            replace(
+                predict_leg,
+                requested_quantity=Decimal("10"),
+                net_quantity=Decimal("10"),
+                max_cost=Decimal("4.60"),
+            ),
+            replace(
+                polymarket_leg,
+                requested_quantity=Decimal("10"),
+                net_quantity=Decimal("10"),
+                max_cost=Decimal("4.80"),
+            ),
+        ),
+        quantity=Decimal("10"),
+        total_max_cost=Decimal("9.50"),
+        minimum_payout=Decimal("10"),
+        minimum_profit=Decimal("0.50"),
+        annualized_yield=Decimal("0.16"),
+    )
+    cross.intent = large
+    cross.refresh_intent_resolver = lambda **kwargs: (
+        small
+        if kwargs.get("target_quantity") == Decimal("5")
+        or (
+            kwargs.get("target_quantity") is None
+            and kwargs.get("max_total_cost") == Decimal("5")
+            and kwargs.get("prefer_smallest") is True
+        )
+        else large
+    )
+
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    accepted = service.confirm(str(preview["preview_id"]), "cross-canary-quantity")
+    final = wait_until_terminal(service, str(accepted["execution_id"]))
+
+    assert preview["net_quantity"] == "5"
+    assert cross.refresh_requests[0] == {
+        "opportunity_id": "cross:public-pair:PREDICT_YES_POLYMARKET_NO",
+        "target_quantity": None,
+        "max_total_cost": Decimal("5"),
+        "prefer_smallest": True,
+    }
+    assert cross.refresh_requests[1]["target_quantity"] == Decimal("5")
+    assert final["state"] == "holding_to_resolution"
+    assert predict.cross_entry_submit_orders[0]["requested_quantity"] == Decimal("5")
+    assert trading.cross_submitted_legs[0].net_quantity == Decimal("5")
+
+
+def test_cross_venue_confirmation_rejects_changed_approved_candidate_ids(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, cross, _predict = _cross_service(tmp_path)
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+    cross.overrides["approved_candidates"] = {
+        "predict.fun": {"market_id": "predict-market", "condition_id": "predict-condition", "yes_token_id": "predict-changed", "no_token_id": "predict-no", "rules_fingerprint": "predict-fingerprint"},
+        "polymarket": {"market_id": "poly-market", "condition_id": "poly-condition", "yes_token_id": "poly-yes", "no_token_id": "poly-no", "rules_fingerprint": "poly-fingerprint"},
+    }
+
+    accepted = service.confirm(str(preview["preview_id"]), "cross-candidate-change")
+    service._threads[str(accepted["execution_id"])].join(timeout=5)
+
+    execution = service.execution(str(accepted["execution_id"]))
+    assert execution["state"] == "both_rejected"
+    assert execution["evidence"][-1]["reason"] == "opportunity_changed"
+    assert store.cross_unsettled_principal() == Decimal("0")
+
+
+def test_cross_venue_preview_does_not_fall_back_to_cached_snapshot(tmp_path: Path) -> None:
+    service, _store, _trading, cross, _predict = _cross_service(tmp_path)
+    cross.refresh_opportunity = None  # type: ignore[method-assign]
+
+    assert service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO") == {
+        "state": "rejected", "reason": "opportunity_unavailable"
+    }
+
+
+@pytest.mark.parametrize(
+    ("intent", "approved_candidates"),
+    [
+        (
+            lambda intent: replace(intent, direction="POLYMARKET_YES_PREDICT_NO"),
+            None,
+        ),
+        (
+            lambda intent: intent,
+            {
+                "predict.fun": {"market_id": "predict-market", "condition_id": "predict-condition", "yes_token_id": "predict-no", "no_token_id": "predict-yes", "rules_fingerprint": "predict-fingerprint"},
+                "polymarket": {"market_id": "poly-market", "condition_id": "poly-condition", "yes_token_id": "poly-yes", "no_token_id": "poly-no", "rules_fingerprint": "poly-fingerprint"},
+            },
+        ),
+        (lambda intent: intent, {}),
+    ],
+)
+def test_cross_venue_preview_requires_direction_and_approved_candidate_identity(
+    tmp_path: Path, intent: object, approved_candidates: object
+) -> None:
+    service, _store, _trading, cross, _predict = _cross_service(tmp_path)
+    cross.intent = intent(cross.intent)  # type: ignore[operator]
+    if approved_candidates is not None:
+        cross.overrides["approved_candidates"] = approved_candidates
+
+    assert service.preview(
+        f"cross:public-pair:{cross.intent.direction}"
+    ) == {"state": "rejected", "reason": "cross_venue_identity"}
+
+
+def test_cross_venue_preview_respects_cross_only_breaker(tmp_path: Path) -> None:
+    service, _store, _trading, _cross, _predict = _cross_service(tmp_path)
+    service._cross_breaker_open = True
+
+    assert service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO") == {
+        "state": "locked", "reason": "cross_circuit_breaker_open"
+    }
 
 
 def test_standard_notification_uses_only_cached_title_translation(

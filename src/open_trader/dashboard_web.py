@@ -39,8 +39,10 @@ from .polymarket_relation_discovery import (
 from .predict_cross_venue import (
     CodexCrossVenueEquivalenceValidator,
     PredictCrossVenueMonitor,
+    validate_cross_execution_mode,
 )
 from .predict_source import PredictSource
+from .predict_trading import PredictTradingClient
 
 # Keep the old module attribute for downstream test fakes while production
 # wiring uses the catalog result contract above.
@@ -49,6 +51,7 @@ from .polymarket_trading import PolymarketTradingClient, load_trading_config
 from .daily_premarket import build_notifier
 from .notifications import NullNotifier
 from .prediction_arbitrage import (
+    MAX_CROSS_UNSETTLED_PRINCIPAL,
     MAX_EMERGENCY_LOSS,
     MAX_NORMAL_COST,
     MAX_WALLET_BALANCE,
@@ -514,6 +517,7 @@ def _prediction_unavailable_state(csrf_token: str, reason: str = "configuration_
             "min_estimated_profit": format(MIN_ESTIMATED_PROFIT, "f"),
             "min_net_edge": format(MIN_NET_EDGE, "f"),
             "max_emergency_loss": format(MAX_EMERGENCY_LOSS, "f"),
+            "max_cross_unsettled_principal": format(MAX_CROSS_UNSETTLED_PRINCIPAL, "f"),
         },
         "heartbeat": None,
         "heartbeat_at": None,
@@ -555,6 +559,8 @@ def _prediction_unavailable_state(csrf_token: str, reason: str = "configuration_
             },
             "events": [],
             "opportunities": [],
+            "unsettled": {"current": None, "limit": format(MAX_CROSS_UNSETTLED_PRINCIPAL, "f")},
+            "breaker": {"open": True, "scope": "cross_venue"},
         },
         "relation_discovery": {
             "status": "unavailable",
@@ -614,6 +620,116 @@ def _prediction_cross_snapshot(monitor: object | None) -> dict[str, object]:
     return result
 
 
+def _prediction_cross_unsettled(store: PredictionArbitrageStore | None) -> tuple[dict[str, object], Decimal | None]:
+    current: Decimal | None = None
+    method = getattr(store, "cross_unsettled_principal", None)
+    if callable(method):
+        try:
+            value = method()
+            parsed = Decimal(str(value))
+            if parsed.is_finite() and parsed >= 0:
+                current = parsed
+        except Exception:
+            current = None
+    return {
+        "current": format(current, "f") if current is not None else None,
+        "limit": format(MAX_CROSS_UNSETTLED_PRINCIPAL, "f"),
+    }, current
+
+
+def _prediction_cross_opportunity_runtime(
+    value: object,
+    *,
+    unsettled: Mapping[str, object],
+    current: Decimal | None,
+    cross_breaker_open: bool,
+) -> object:
+    if not isinstance(value, Mapping) or value.get("market_type") != "cross_venue_yes_no":
+        return value
+    result = dict(value)
+    result["cross_breaker"] = {"open": cross_breaker_open, "scope": "cross_venue"}
+    if current is None:
+        return result
+    try:
+        total = Decimal(str(result.get("total_max_cost")))
+    except Exception:
+        return result
+    if not total.is_finite() or total < 0:
+        return result
+    result["unsettled"] = {
+        **unsettled,
+        "after": format(current + total, "f"),
+    }
+    return result
+
+
+def _prediction_predict_account_snapshot(execution: object | None) -> Mapping[str, object]:
+    fresh = getattr(execution, "_fresh_predict_account_snapshot", None)
+    method = fresh if callable(fresh) else getattr(
+        getattr(execution, "_predict_trading", None), "account_snapshot", None
+    )
+    if not callable(method):
+        return {}
+    try:
+        value = method()
+    except Exception:
+        return {}
+    safe = _prediction_safe_value(value)
+    if not isinstance(safe, Mapping):
+        return {}
+    normalized = _prediction_normalize_predict_account_snapshot(safe)
+    return normalized if isinstance(normalized, Mapping) else {}
+
+
+def _prediction_normalize_predict_account_snapshot(
+    snapshot: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    normalized = dict(snapshot)
+    required = ("wallet_address", "available_usdt", "open_orders", "positions", "checked_at")
+    if not all(name in normalized for name in required):
+        return None
+    has_current = all(
+        name in normalized
+        for name in ("allowance", "scope_ready", "gas_ready", "allowance_breaker")
+    )
+    if has_current:
+        if (
+            not isinstance(normalized.get("scope_ready"), bool)
+            or not isinstance(normalized.get("gas_ready"), bool)
+            or not isinstance(normalized.get("allowance_breaker"), bool)
+            or normalized.get("allowance") in (None, "")
+        ):
+            return None
+        return normalized
+    if "allowance_ready" not in normalized:
+        return None
+    ready = normalized.get("allowance_ready") is True
+    normalized["allowance"] = "0" if ready else ""
+    normalized["scope_ready"] = ready
+    normalized["gas_ready"] = ready
+    normalized["allowance_breaker"] = not ready
+    return normalized
+
+
+def _prediction_predict_account_ready(snapshot: Mapping[str, object]) -> bool:
+    return (
+        snapshot.get("scope_ready") is True
+        and snapshot.get("gas_ready") is True
+        and _prediction_decimal(snapshot.get("minimum_top_up_bnb")) <= 0
+        and snapshot.get("allowance_breaker") is False
+        and snapshot.get("allowance") not in (None, "")
+        and snapshot.get("available_usdt") not in (None, "")
+    )
+
+
+def _prediction_decimal(value: object) -> Decimal:
+    try:
+        parsed = Decimal(str(value))
+    except Exception:
+        return Decimal("0")
+    return parsed if parsed.is_finite() else Decimal("0")
+
+
 def _prediction_venues_payload(
     *,
     snapshot: Mapping[str, object],
@@ -621,6 +737,8 @@ def _prediction_venues_payload(
     health: Mapping[str, object],
     masked_wallet: str,
     breaker_open: bool,
+    execution: object | None,
+    active_execution: Mapping[str, object] | None,
     cross_venue_monitor: object | None,
     cross_venue: Mapping[str, object],
 ) -> list[dict[str, object]]:
@@ -646,17 +764,75 @@ def _prediction_venues_payload(
     source_snapshot = source_snapshot if isinstance(source_snapshot, Mapping) else {}
     predict_rest = str(source_snapshot.get("rest") or cross_venue.get("status") or "unavailable")
     predict_ws = str(source_snapshot.get("ws") or predict_rest)
+    predict_account = (
+        _prediction_predict_account_snapshot(execution)
+        if predict_rest == "ready" and predict_ws == "ready"
+        else {}
+    )
     predict_wallet = str(source_snapshot.get("wallet") or "")
+    if not predict_wallet:
+        predict_wallet = str(predict_account.get("wallet_address") or "")
     if predict_wallet.startswith("0x") and "…" not in predict_wallet:
         predict_wallet = _prediction_mask_wallet(predict_wallet)
     predict_reason = source_snapshot.get("reason") or cross_venue.get("reason")
+    cross_breaker_open = bool(getattr(execution, "_cross_breaker_open", True))
+    predict_account_ready = _prediction_predict_account_ready(predict_account)
+    residual_allowance = _prediction_decimal(predict_account.get("allowance"))
+    gas_top_up = _prediction_decimal(predict_account.get("minimum_top_up_bnb"))
     if predict_rest == "pending" or predict_ws == "pending":
         predict_mode = "API Key 待分配"
         predict_reason = predict_reason or "api_key_pending"
+    elif residual_allowance > 0 and active_execution is None:
+        predict_mode = "熔断只读"
+        predict_reason = predict_reason or "residual_predict_allowance"
     else:
-        predict_mode = "只读"
+        predict_mode = "可以交易" if predict_account_ready and not breaker_open and not cross_breaker_open else "只读"
+        if gas_top_up > 0 and predict_reason in (None, ""):
+            predict_reason = "insufficient_bnb"
+        if predict_reason in (None, "") and not predict_account_ready and getattr(execution, "_predict_trading", None) is not None:
+            predict_reason = "predict_account_unavailable"
         if predict_reason in (None, "") and predict_rest not in {"ready", "unknown"}:
             predict_reason = f"predict_{predict_rest}"
+    predict_payload: dict[str, object] = {
+        "venue": "predict.fun",
+        "rest": predict_rest,
+        "ws": predict_ws,
+        "wallet": predict_wallet,
+        "balance": {
+            "asset": source_snapshot.get("settlement_asset", "USDT"),
+            "value": predict_account.get("available_usdt", source_snapshot.get("balance")),
+        },
+        "mode": predict_mode,
+        "last_success": source_snapshot.get("last_success"),
+        "reason": predict_reason,
+    }
+    if predict_account:
+        predict_payload.update(
+            {
+                "account": {
+                    "role": "Predict Account · USDT/持仓/Allowance",
+                    "address": _prediction_mask_wallet(
+                        predict_account.get("predict_account")
+                        or predict_account.get("wallet_address")
+                        or predict_wallet
+                    ),
+                    "available_usdt": predict_account.get("available_usdt"),
+                    "allowance": predict_account.get("allowance"),
+                },
+                "gas": {
+                    "role": "Privy signer · BNB Gas",
+                    "address": _prediction_mask_wallet(predict_account.get("gas_signer")),
+                    "bnb_balance": predict_account.get("bnb_balance"),
+                    "required_bnb": predict_account.get("required_bnb"),
+                    "minimum_top_up": predict_account.get("minimum_top_up_bnb", "0"),
+                },
+                "reservation": {
+                    "reserved_usdt": predict_account.get("reserved_usdt"),
+                    "unsettled_usdt": predict_account.get("unsettled_usdt"),
+                },
+                "canary": predict_account.get("canary_mode"),
+            }
+        )
     return [
         {
             "venue": "polymarket",
@@ -671,19 +847,7 @@ def _prediction_venues_payload(
             "last_success": snapshot.get("heartbeat_at"),
             "reason": poly_reason,
         },
-        {
-            "venue": "predict.fun",
-            "rest": predict_rest,
-            "ws": predict_ws,
-            "wallet": predict_wallet,
-            "balance": {
-                "asset": source_snapshot.get("settlement_asset", "USDT"),
-                "value": source_snapshot.get("balance"),
-            },
-            "mode": predict_mode,
-            "last_success": source_snapshot.get("last_success"),
-            "reason": predict_reason,
-        },
+        predict_payload,
     ]
 
 
@@ -741,6 +905,19 @@ def _prediction_state_payload(
             breaker_open = True
     elif execution is not None:
         breaker_open = bool(getattr(execution, "_breaker_open", True))
+    cross_breaker_open = bool(getattr(execution, "_cross_breaker_open", True))
+    cross_unsettled, cross_unsettled_current = _prediction_cross_unsettled(store)
+    cross_venue["unsettled"] = cross_unsettled
+    cross_venue["breaker"] = {"open": cross_breaker_open, "scope": "cross_venue"}
+    cross_venue["opportunities"] = [
+        _prediction_cross_opportunity_runtime(
+            row,
+            unsettled=cross_unsettled,
+            current=cross_unsettled_current,
+            cross_breaker_open=cross_breaker_open,
+        )
+        for row in cross_venue["opportunities"]
+    ]
     events = safe_snapshot.get("events")
     opportunities = safe_snapshot.get("opportunities")
     event_rows = [row for row in events if isinstance(row, Mapping)] if isinstance(events, (list, tuple)) else []
@@ -866,6 +1043,8 @@ def _prediction_state_payload(
         health=health,
         masked_wallet=masked_wallet,
         breaker_open=breaker_open,
+        execution=execution,
+        active_execution=active,
         cross_venue_monitor=cross_venue_monitor,
         cross_venue=cross_venue,
     )
@@ -1073,6 +1252,11 @@ def _prediction_history_payload(
                 )
                 if row_market_type != current_market_type or not same_market:
                     current = None
+            if (
+                isinstance(current, Mapping)
+                and str(current.get("market_type") or "") == "cross_venue_yes_no"
+            ):
+                projected["execution_mode"] = current.get("execution_mode")
             is_open = not projected.get("ended_at")
             complete = isinstance(current, Mapping) and _complete(current)
             current_usable = bool(is_open and state_usable and complete)
@@ -1457,6 +1641,7 @@ def create_dashboard_server(
                     "/api/prediction-arbitrage/preview",
                     "/api/prediction-arbitrage/executions",
                     "/api/prediction-arbitrage/circuit-breaker/reset",
+                    "/api/prediction-arbitrage/predict-allowance/cleanup",
                 }:
                     self._require_prediction_mutation()
                     payload = self._read_json_body()
@@ -1465,20 +1650,21 @@ def create_dashboard_server(
                     if path.endswith("/preview"):
                         self._require_prediction_schema(payload, {"opportunity_id"})
                         opportunity_id = self._required_prediction_string(payload, "opportunity_id")
-                        if opportunity_id.startswith("cross:"):
-                            raise ValueError("cross_venue_observation_only")
                         result = prediction_execution_service.preview(opportunity_id)
                     elif path.endswith("/executions"):
                         self._require_prediction_schema(payload, {"preview_id", "idempotency_key"})
                         preview_id = self._required_prediction_string(payload, "preview_id")
                         idempotency_key = self._required_prediction_string(payload, "idempotency_key")
-                        if preview_id.startswith("cross:"):
-                            raise ValueError("cross_venue_observation_only")
                         result = prediction_execution_service.confirm(preview_id, idempotency_key)
-                    else:
+                    elif path.endswith("/circuit-breaker/reset"):
                         self._require_prediction_schema(payload, {"incident_id"})
                         incident_id = self._required_prediction_string(payload, "incident_id")
                         result = prediction_execution_service.reset_breaker(incident_id)
+                    else:
+                        self._require_prediction_schema(payload, {"confirm"})
+                        if payload.get("confirm") is not True:
+                            raise ValueError("confirm must be true")
+                        result = prediction_execution_service.cleanup_predict_allowance(confirm=True)
                     self._send_json(_prediction_safe_value(result))
                     return
                 if path == "/api/research-chat/sessions":
@@ -1834,6 +2020,36 @@ class _CrossVenueRuntime:
     async def _snapshot_on_loop(self) -> dict[str, object]:
         return self._monitor.snapshot()
 
+    def refresh_opportunity(self, opportunity_id: str) -> dict[str, object] | None:
+        loop = self._loop
+        if (
+            loop is None
+            or loop.is_closed()
+            or self._thread is threading.current_thread()
+        ):
+            return None
+        coroutine = self._refresh_on_loop(opportunity_id)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        except Exception:
+            coroutine.close()
+            return None
+        try:
+            return future.result(timeout=15)
+        except Exception:
+            return None
+
+    async def _refresh_on_loop(
+        self, opportunity_id: str
+    ) -> dict[str, object] | None:
+        refresh = getattr(self._monitor, "refresh_opportunity", None)
+        if not callable(refresh):
+            return None
+        value = refresh(opportunity_id)
+        if inspect.isawaitable(value):
+            value = await value
+        return dict(value) if isinstance(value, Mapping) else None
+
     def stop(self) -> None:
         self._stop_requested.set()
         if self._thread is not None and self._thread is not threading.current_thread():
@@ -1870,10 +2086,13 @@ def _build_cross_venue_monitor(
     store: PredictionArbitrageStore,
     execution: PredictionExecutionService,
     codex_model: str,
+    predict_trading: object | None = None,
 ) -> PredictCrossVenueMonitor | _UnavailableCrossVenueMonitor:
     predict_config = getattr(trading_config, "predict", None)
     if predict_config is None:
         return _UnavailableCrossVenueMonitor("predict_not_configured")
+    if predict_trading is None:
+        return _UnavailableCrossVenueMonitor("predict_construction_failed")
     try:
         return PredictCrossVenueMonitor(
             predict_source=PredictSource(predict_config),
@@ -1881,8 +2100,13 @@ def _build_cross_venue_monitor(
             validator=CodexCrossVenueEquivalenceValidator(store, model=codex_model),
             gamma_lookup=_cross_venue_gamma_lookup,
             clob_lookup=_cross_venue_clob_lookup,
+            predict_quote_fn=getattr(predict_trading, "quote_market_buy", None),
             store=store,
             ready_observer=execution.notify_ready_opportunity,
+            holding_reconciler=execution.reconcile_cross_holdings_once,
+            execution_mode=validate_cross_execution_mode(
+                os.environ.get("OPEN_TRADER_CROSS_EXECUTION_MODE")
+            ),
         )
     except Exception:
         return _UnavailableCrossVenueMonitor("predict_construction_failed")
@@ -1921,6 +2145,7 @@ def serve_dashboard(
     prediction_monitor: object | None = None
     prediction_execution: object | None = None
     prediction_trading: object | None = None
+    predict_trading: object | None = None
     cross_runtime: _CrossVenueRuntime | None = None
     if config.prediction_config_path is not None:
         prediction_path = config.prediction_config_path.expanduser()
@@ -1928,6 +2153,10 @@ def serve_dashboard(
             prediction_store = PredictionArbitrageStore(config.data_dir)
             trading_config = load_trading_config(prediction_path)
             prediction_trading = PolymarketTradingClient.from_keychain(trading_config)
+            try:
+                predict_trading = PredictTradingClient.from_keychain(trading_config)
+            except Exception:
+                predict_trading = None
             codex_model = os.environ.get("OPEN_TRADER_CODEX_MODEL", "gpt-5.6-sol").strip()
             relation_validator = CodexRelationValidator(
                 prediction_store,
@@ -1948,6 +2177,7 @@ def serve_dashboard(
                 notifier=prediction_notifier or NullNotifier(),
                 lock_path=config.data_dir / "prediction_arbitrage" / "execution.lock",
                 dashboard_url=resolved_public_url,
+                predict_trading=predict_trading,
             )
             prediction_monitor.set_ready_observer(
                 prediction_execution.notify_ready_opportunity
@@ -1962,7 +2192,17 @@ def serve_dashboard(
                     store=prediction_store,
                     execution=prediction_execution,
                     codex_model=codex_model,
+                    predict_trading=predict_trading,
                 )
+            if cross_venue_monitor is not None and not isinstance(
+                cross_venue_monitor, _UnavailableCrossVenueMonitor
+            ):
+                cross_runtime = _CrossVenueRuntime(cross_venue_monitor)
+            set_cross_venue_monitor = getattr(
+                prediction_execution, "set_cross_venue_monitor", None
+            )
+            if callable(set_cross_venue_monitor):
+                set_cross_venue_monitor(cross_runtime or cross_venue_monitor)
         except Exception:
             # A missing Keychain/config must leave a visible, schema-valid locked
             # Dashboard rather than aborting the existing portfolio surface.
@@ -1971,7 +2211,7 @@ def serve_dashboard(
                     prediction_monitor.stop()
                 except Exception:
                     pass
-            for resource in (prediction_execution, prediction_trading, prediction_store):
+            for resource in (prediction_execution, prediction_trading, predict_trading, prediction_store):
                 close = getattr(resource, "close", None)
                 if callable(close):
                     try:
@@ -1993,10 +2233,7 @@ def serve_dashboard(
                 pass
             else:
                 prediction_monitor.start()
-                if cross_venue_monitor is not None and not isinstance(
-                    cross_venue_monitor, _UnavailableCrossVenueMonitor
-                ):
-                    cross_runtime = _CrossVenueRuntime(cross_venue_monitor)
+                if cross_runtime is not None:
                     cross_runtime.start()
     server = create_dashboard_server(
         config=config,
@@ -2025,7 +2262,7 @@ def serve_dashboard(
                 prediction_monitor.stop()
             except Exception:
                 pass
-        for resource in (prediction_execution, prediction_trading, prediction_store):
+        for resource in (prediction_execution, prediction_trading, predict_trading, prediction_store):
             close = getattr(resource, "close", None)
             if callable(close):
                 try:

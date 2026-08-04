@@ -7,6 +7,7 @@ from decimal import Decimal
 import pytest
 
 from open_trader.prediction_arbitrage import (
+    MAX_CROSS_UNSETTLED_PRINCIPAL,
     MAX_EMERGENCY_LOSS,
     PROTECTED_BUY_SHARE_PRECISION,
     BookLevel,
@@ -19,6 +20,10 @@ from open_trader.prediction_arbitrage import (
     _book_segments,
     _protected_buy_candidates,
 )
+
+
+def test_cross_venue_unsettled_principal_policy_is_one_hundred_usdt() -> None:
+    assert MAX_CROSS_UNSETTLED_PRINCIPAL == Decimal("100")
 from open_trader.polymarket_relation_discovery import (
     ThresholdBuyLeg,
     ThresholdMarket,
