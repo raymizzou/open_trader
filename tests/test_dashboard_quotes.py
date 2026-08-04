@@ -13,6 +13,12 @@ from open_trader.dashboard import DashboardConfig
 from open_trader.dashboard_acceptance import validate_quotes_payload
 from open_trader.dashboard_quotes import DashboardQuoteService, load_published_quotes
 from open_trader.futu_quote import DashboardQuoteSnapshot, FutuQuoteError
+from open_trader.futu_universe import (
+    FutuQuoteUniverse,
+    FutuUniverseItem,
+    SkippedFutuUniverseRow,
+    load_futu_quote_universe,
+)
 from open_trader.portfolio import PORTFOLIO_FIELDNAMES
 
 
@@ -228,7 +234,7 @@ def test_quote_service_selects_active_us_session_price(
         {"US.MSFT": state, "US.AAPL": state},
     )
 
-    result = DashboardQuoteService(config, client_factory=lambda: client).refresh()
+    result = DashboardQuoteService(config, client_factory=lambda: client).refresh(load_futu_quote_universe(config.portfolio_path))
     quote = result.quotes["US.MSFT"]
 
     assert quote["last_price"] == expected_price
@@ -255,7 +261,7 @@ def test_quote_service_normalizes_active_us_price_time_to_milliseconds(
         {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
     )
 
-    result = DashboardQuoteService(config, client_factory=lambda: client).refresh()
+    result = DashboardQuoteService(config, client_factory=lambda: client).refresh(load_futu_quote_universe(config.portfolio_path))
 
     assert result.quotes["US.MSFT"]["price_time"] == "2026-07-15 03:03:01.000"
 
@@ -285,7 +291,7 @@ def test_quote_service_preserves_non_naive_futu_price_time(
         {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
     )
 
-    result = DashboardQuoteService(config, client_factory=lambda: client).refresh()
+    result = DashboardQuoteService(config, client_factory=lambda: client).refresh(load_futu_quote_universe(config.portfolio_path))
 
     assert result.quotes["US.MSFT"]["price_time"] == expected_price_time
 
@@ -303,7 +309,7 @@ def test_quote_service_labels_active_session_fallback_without_fake_time(
         {"US.MSFT": "OVERNIGHT", "US.AAPL": "OVERNIGHT"},
     )
 
-    result = DashboardQuoteService(config, client_factory=lambda: client).refresh()
+    result = DashboardQuoteService(config, client_factory=lambda: client).refresh(load_futu_quote_universe(config.portfolio_path))
     quote = result.quotes["US.MSFT"]
 
     assert result.status == "partial"
@@ -326,7 +332,7 @@ def test_quote_service_treats_closed_fallback_as_normal(tmp_path: Path) -> None:
         {"US.MSFT": "CLOSED", "US.AAPL": "CLOSED"},
     )
 
-    result = DashboardQuoteService(config, client_factory=lambda: client).refresh()
+    result = DashboardQuoteService(config, client_factory=lambda: client).refresh(load_futu_quote_universe(config.portfolio_path))
 
     assert result.status == "ok"
     assert result.fallback_count == 0
@@ -350,7 +356,7 @@ def test_quote_service_degrades_to_regular_price_when_market_state_fails(
         {"US.MSFT": snapshot, "US.AAPL": snapshot}, state_error=error
     )
 
-    result = DashboardQuoteService(config, client_factory=lambda: client).refresh()
+    result = DashboardQuoteService(config, client_factory=lambda: client).refresh(load_futu_quote_universe(config.portfolio_path))
 
     assert result.status == "partial"
     assert result.us_session_status == "unknown"
@@ -373,7 +379,7 @@ def test_quote_service_degrades_when_any_us_market_state_is_missing(
         {"US.MSFT": "OVERNIGHT"},
     )
 
-    result = DashboardQuoteService(config, client_factory=lambda: client).refresh()
+    result = DashboardQuoteService(config, client_factory=lambda: client).refresh(load_futu_quote_universe(config.portfolio_path))
 
     assert result.status == "partial"
     assert result.us_session_status == "unknown"
@@ -401,7 +407,7 @@ def test_quote_service_reuses_cache_when_us_market_state_is_empty(
         {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: first_client)
-    first_result = service.refresh().to_dict()
+    first_result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
     cached_quotes = {symbol: dict(quote) for symbol, quote in service.last_quotes.items()}
     second_client = FakeQuoteClient(
         {
@@ -412,7 +418,7 @@ def test_quote_service_reuses_cache_when_us_market_state_is_empty(
     )
     service.client_factory = lambda: second_client
 
-    result = service.refresh().to_dict()
+    result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
 
     assert validate_quotes_payload(result) == []
     assert result["status"] == "partial"
@@ -437,7 +443,7 @@ def test_quote_service_reuses_last_good_us_sessions_when_market_state_refresh_fa
         {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: first_client)
-    first_result = service.refresh().to_dict()
+    first_result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
     state_error = FutuQuoteError(
         "state failed", error_type="market_state_failed", snapshot_ok=True
     )
@@ -450,7 +456,7 @@ def test_quote_service_reuses_last_good_us_sessions_when_market_state_refresh_fa
     )
     service.client_factory = lambda: second_client
 
-    result = service.refresh().to_dict()
+    result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
 
     assert result["status"] == "partial"
     assert result["stale"] is True
@@ -499,7 +505,7 @@ def test_quote_service_caches_complete_us_subset_despite_sh_failure(
         snapshot_errors={"SH": sh_error},
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: first_client)
-    first_result = service.refresh().to_dict()
+    first_result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
     state_error = FutuQuoteError(
         "state failed", error_type="market_state_failed", snapshot_ok=True
     )
@@ -510,7 +516,7 @@ def test_quote_service_caches_complete_us_subset_despite_sh_failure(
     )
     service.client_factory = lambda: second_client
 
-    result = service.refresh().to_dict()
+    result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
 
     assert validate_quotes_payload(result) == []
     assert first_result["last_success_at"] == ""
@@ -539,7 +545,7 @@ def test_quote_service_returns_ok_and_never_writes_portfolio(tmp_path: Path) -> 
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: client)
 
-    result = service.refresh().to_dict()
+    result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
 
     assert client.requested_symbols == ["US.AAPL", "US.MSFT"]
     assert result["status"] == "ok"
@@ -555,6 +561,71 @@ def test_quote_service_returns_ok_and_never_writes_portfolio(tmp_path: Path) -> 
     assert result["last_success_at"]
     assert client.closed is True
     assert config.portfolio_path.read_text(encoding="utf-8") == original_portfolio
+
+
+def test_quote_service_refreshes_the_explicit_account_universe_without_reading_portfolio(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_portfolio(config.portfolio_path)
+    original_portfolio = config.portfolio_path.read_text(encoding="utf-8")
+    client = FakeQuoteClient(
+        {"HK.02824": session_snapshot(last="48.38")},
+    )
+    universe = FutuQuoteUniverse(
+        items=[
+            FutuUniverseItem(
+                row_number=1,
+                market="HK",
+                asset_class="stock",
+                symbol="02824",
+                futu_symbol="HK.02824",
+                name="易方达黄金",
+            )
+        ],
+        skipped=[],
+    )
+
+    result = DashboardQuoteService(config=config, client_factory=lambda: client).refresh(
+        universe
+    )
+
+    assert client.requested_symbols == ["HK.02824"]
+    assert result.quotes["HK.02824"]["last_price"] == "48.38"
+    assert config.portfolio_path.read_text(encoding="utf-8") == original_portfolio
+
+
+def test_quote_service_preserves_hk_opend_update_time_with_market_timezone(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    write_portfolio(config.portfolio_path)
+    client = FakeQuoteClient(
+        {
+            "HK.02824": session_snapshot(
+                update_time="2026-08-04 10:30:05.123", last="48.38"
+            )
+        }
+    )
+    universe = FutuQuoteUniverse(
+        items=[
+            FutuUniverseItem(
+                row_number=1,
+                market="HK",
+                asset_class="stock",
+                symbol="02824",
+                futu_symbol="HK.02824",
+                name="易方达黄金",
+            )
+        ],
+        skipped=[],
+    )
+
+    result = DashboardQuoteService(config=config, client_factory=lambda: client).refresh(
+        universe
+    )
+
+    assert result.quotes["HK.02824"]["price_time"] == "2026-08-04T10:30:05.123+08:00"
 
 
 def test_quote_service_batches_holdings_by_futu_exchange_prefix(
@@ -602,7 +673,7 @@ def test_quote_service_batches_holdings_by_futu_exchange_prefix(
     result = DashboardQuoteService(
         config=config,
         client_factory=lambda: client,
-    ).refresh()
+    ).refresh(load_futu_quote_universe(config.portfolio_path))
 
     assert client.requested_symbols == [
         "BJ.920000",
@@ -644,7 +715,7 @@ def test_quote_service_retains_stale_quotes_for_a_failed_prefix(
         {"US.AAPL": "MORNING", "US.MSFT": "MORNING"},
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: full_client)
-    first_result = service.refresh().to_dict()
+    first_result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
     cached_quotes = {symbol: dict(quote) for symbol, quote in service.last_quotes.items()}
     with config.portfolio_path.open("a", encoding="utf-8", newline="") as handle:
         csv.DictWriter(handle, fieldnames=PORTFOLIO_FIELDNAMES).writerow(
@@ -681,7 +752,7 @@ def test_quote_service_retains_stale_quotes_for_a_failed_prefix(
 
     service.client_factory = client_factory
 
-    result = service.refresh().to_dict()
+    result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
 
     assert created_clients == [client]
     assert client.requested_batches == [
@@ -735,7 +806,7 @@ def test_quote_service_retains_stale_quotes_when_us_snapshot_prefix_fails(
         {"US.AAPL": "MORNING", "US.MSFT": "MORNING"},
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: first_client)
-    first_result = service.refresh().to_dict()
+    first_result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
     cached_quotes = {symbol: dict(quote) for symbol, quote in service.last_quotes.items()}
     us_snapshot_error = FutuQuoteError(
         "无权限获取美股行情",
@@ -750,7 +821,7 @@ def test_quote_service_retains_stale_quotes_when_us_snapshot_prefix_fails(
     )
     service.client_factory = lambda: client
 
-    result = service.refresh().to_dict()
+    result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
 
     assert client.requested_batches == [
         ["SH.600900"],
@@ -794,14 +865,14 @@ def test_quote_service_retains_all_stale_quotes_when_every_prefix_fails(
         {"US.AAPL": "MORNING", "US.MSFT": "MORNING"},
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: first_client)
-    first_result = service.refresh().to_dict()
+    first_result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
     us_error = FutuQuoteError(
         "美股 snapshot 失败", error_type="us_snapshot_failed", snapshot_ok=False
     )
     failed_client = FakeQuoteClient({}, snapshot_errors={"US": us_error})
     service.client_factory = lambda: failed_client
 
-    result = service.refresh().to_dict()
+    result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
 
     assert result["status"] == "failed"
     assert result["quotes"] == {
@@ -821,7 +892,7 @@ def test_quote_service_returns_partial_for_missing_quotes(tmp_path: Path) -> Non
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: client)
 
-    result = service.refresh().to_dict()
+    result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
 
     assert result["status"] == "partial"
     assert result["requested_count"] == 2
@@ -835,6 +906,25 @@ def test_quote_service_returns_partial_for_missing_quotes(tmp_path: Path) -> Non
     assert result["diagnostic"]["error_type"] == "missing_quotes"
 
 
+def test_quote_service_keeps_skipped_account_rows_in_diagnostics(tmp_path: Path) -> None:
+    config = dashboard_config(tmp_path)
+    universe = FutuQuoteUniverse(
+        items=[],
+        skipped=[SkippedFutuUniverseRow(4, "CN", "cash", "CNY_CASH", "excluded_asset_class")],
+    )
+
+    result = DashboardQuoteService(config).refresh(universe).to_dict()
+
+    assert result["status"] == "ok"
+    assert result["diagnostic"]["skipped"] == [{
+        "row_number": 4,
+        "market": "CN",
+        "asset_class": "cash",
+        "symbol": "CNY_CASH",
+        "reason": "excluded_asset_class",
+    }]
+
+
 def test_quote_service_returns_failed_and_keeps_last_success(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_portfolio(config.portfolio_path)
@@ -846,7 +936,7 @@ def test_quote_service_returns_failed_and_keeps_last_success(tmp_path: Path) -> 
         {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: first_client)
-    first_result = service.refresh().to_dict()
+    first_result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
 
     def raise_futu_error() -> FakeQuoteClient:
         raise FutuQuoteError(
@@ -859,7 +949,7 @@ def test_quote_service_returns_failed_and_keeps_last_success(tmp_path: Path) -> 
         )
 
     service.client_factory = raise_futu_error
-    failed_result = service.refresh().to_dict()
+    failed_result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
 
     assert failed_result["status"] == "failed"
     assert failed_result["stale"] is True
@@ -894,14 +984,14 @@ def test_partial_refresh_does_not_replace_complete_success_cache(
         {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: full_client)
-    first_result = service.refresh().to_dict()
+    first_result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
 
     partial_client = FakeQuoteClient(
         {"US.MSFT": session_snapshot(last="510.25")},
         {"US.MSFT": "MORNING", "US.AAPL": "MORNING"},
     )
     service.client_factory = lambda: partial_client
-    partial_result = service.refresh().to_dict()
+    partial_result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
     assert partial_result["status"] == "partial"
     assert partial_result["quotes"]["US.AAPL"]["last_price"] == ""
     assert partial_result["last_success_at"] == first_result["last_success_at"]
@@ -917,7 +1007,7 @@ def test_partial_refresh_does_not_replace_complete_success_cache(
         )
 
     service.client_factory = raise_futu_error
-    failed_result = service.refresh().to_dict()
+    failed_result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
 
     assert failed_result["status"] == "failed"
     assert failed_result["last_success_at"] == first_result["last_success_at"]
@@ -959,7 +1049,7 @@ def test_quote_service_all_prefix_batches_fail_with_first_error_and_stale_cache(
         {"US.AAPL": "MORNING", "US.MSFT": "MORNING"},
     )
     service = DashboardQuoteService(config=config, client_factory=lambda: first_client)
-    first_result = service.refresh().to_dict()
+    first_result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
     client = FakeQuoteClient(
         {},
         snapshot_errors={
@@ -976,7 +1066,7 @@ def test_quote_service_all_prefix_batches_fail_with_first_error_and_stale_cache(
     )
     service.client_factory = lambda: client
 
-    result = service.refresh().to_dict()
+    result = service.refresh(load_futu_quote_universe(config.portfolio_path)).to_dict()
 
     assert client.requested_batches == [
         ["SH.600900"],

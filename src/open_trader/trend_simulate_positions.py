@@ -105,12 +105,14 @@ class TrendSimulatePositionService:
                 trd_market=market,
             )
             snapshot = client.account_snapshot()
+            synced_at = self.now().isoformat(timespec="seconds")
             positions = _project_positions(
                 snapshot,
                 broker=broker,
                 market=market,
                 currency=currency,
                 fx_to_hkd=self.fx_to_hkd,
+                price_as_of=synced_at,
                 attributions=_position_attributions(
                     self.data_dir,
                     self.reports_dir,
@@ -122,7 +124,7 @@ class TrendSimulatePositionService:
                 "available": True,
                 "broker": broker,
                 "market": market,
-                "synced_at": self.now().isoformat(timespec="seconds"),
+                "synced_at": synced_at,
                 "positions": positions,
                 "error": "",
             }
@@ -151,6 +153,7 @@ def _project_positions(
     market: str,
     currency: str,
     fx_to_hkd: Mapping[str, Decimal],
+    price_as_of: str,
     attributions: Mapping[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     if not isinstance(snapshot, Mapping):
@@ -164,6 +167,9 @@ def _project_positions(
     fx = fx_to_hkd.get(currency)
     if fx is None or not fx.is_finite() or fx <= 0:
         raise ValueError(f"missing HKD conversion rate for {currency}")
+    usd_to_hkd = fx_to_hkd.get("USD")
+    if usd_to_hkd is None or not usd_to_hkd.is_finite() or usd_to_hkd <= 0:
+        raise ValueError("missing HKD conversion rate for USD")
 
     projected: list[dict[str, Any]] = []
     for position in positions:
@@ -217,6 +223,13 @@ def _project_positions(
                 "market_value": market_value_text,
                 "cost_value": _money(quantity * cost_price),
                 "market_value_hkd": _money(market_value * fx),
+                "current_valuation": {
+                    "price": last_price_text,
+                    "price_kind": "account_snapshot",
+                    "price_as_of": price_as_of,
+                    "market_value_usd": _money(market_value * fx / usd_to_hkd),
+                    "market_value_hkd": _money(market_value * fx),
+                },
                 "account_weight": weight,
                 "portfolio_weight": weight,
                 "unrealized_pnl_pct": f"{pnl_ratio_text}%",

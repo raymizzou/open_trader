@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -83,6 +84,63 @@ def load_futu_quote_universe(portfolio_path: Path) -> FutuQuoteUniverse:
                 )
             )
     return FutuQuoteUniverse(items=items, skipped=skipped)
+
+
+def build_futu_quote_universe(
+    positions: Sequence[Mapping[str, object]],
+) -> FutuQuoteUniverse:
+    """Build the production quote universe from accepted Account positions."""
+    items: list[FutuUniverseItem] = []
+    skipped: list[SkippedFutuUniverseRow] = []
+    for row_number, row in enumerate(positions, start=1):
+        market = str(row.get("market") or "").strip().upper()
+        asset_class = str(row.get("asset_class") or "").strip().lower()
+        symbol = str(row.get("symbol") or "").strip().upper()
+        name = str(row.get("name") or "").strip()
+        quantity_text = str(
+            row.get("quantity") if row.get("quantity") is not None else row.get("total_quantity") or ""
+        ).strip()
+        reason = _skip_reason(
+            market=market,
+            asset_class=asset_class,
+            symbol=symbol,
+            quantity_text=quantity_text,
+            brokers=set(),
+        )
+        if reason is not None:
+            skipped.append(
+                SkippedFutuUniverseRow(
+                    row_number=row_number,
+                    market=market,
+                    asset_class=asset_class,
+                    symbol=symbol,
+                    reason=reason,
+                )
+            )
+            continue
+        items.append(
+            FutuUniverseItem(
+                row_number=row_number,
+                market=market,
+                asset_class=asset_class,
+                symbol=symbol,
+                futu_symbol=to_futu_symbol(market, symbol),
+                name=name,
+            )
+        )
+    return FutuQuoteUniverse(items=items, skipped=skipped)
+
+
+def build_account_quote_universe(state: Mapping[str, object]) -> FutuQuoteUniverse:
+    positions: list[Mapping[str, object]] = []
+    brokers = state.get("brokers")
+    if isinstance(brokers, Mapping):
+        for broker in sorted(brokers):
+            source = brokers[broker]
+            rows = source.get("positions") if isinstance(source, Mapping) else None
+            if isinstance(rows, list):
+                positions.extend(row for row in rows if isinstance(row, Mapping))
+    return build_futu_quote_universe(positions)
 
 
 def _skip_reason(

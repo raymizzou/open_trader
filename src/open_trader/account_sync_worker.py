@@ -27,6 +27,7 @@ from .account_sync_state import (
 from .dashboard import DashboardConfig
 from .dashboard_quotes import DashboardQuoteService, load_published_quotes
 from .futu_account import FutuAccountClient, build_futu_account_candidate
+from .futu_universe import build_account_quote_universe
 from .fx import DEFAULT_RATES_TO_HKD
 from .statement_import import load_staged_statement_candidate
 from .tiger_account import (
@@ -202,20 +203,21 @@ class AccountSyncWorker:
                 },
             )
         try:
-            payload = self._quote_service.refresh().to_dict()
+            state_path = self.config.data_dir / "latest" / "account_sync_state.json"
+            state = load_account_sync_state(state_path)
+            payload = self._quote_service.refresh(
+                build_account_quote_universe(state)
+            ).to_dict()
         except Exception as exc:
             payload = self._quote_failure_payload(str(exc))
         write_json_atomic(self._quotes_path(), payload)
         if payload["status"] == "failed":
             return payload
         try:
-            state_path = self.config.data_dir / "latest" / "account_sync_state.json"
             write_json_atomic(
                 state_path,
                 with_dashboard_projection(
-                    load_account_sync_state(state_path),
-                    payload,
-                    generated_at=self.now_text(),
+                    state, payload, generated_at=self.now_text(),
                 ),
             )
         except OSError:

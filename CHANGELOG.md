@@ -6,6 +6,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-08-04
 
 - #22 把辉立与东方财富结单上传迁到 Account Module：浏览器仅经 Gateway 调用 Account API，验证后的 PDF 以内容 hash 原子暂存为不可变 generation，Account Sync Worker 验证后才 promotion 并在快照发布 accepted generation；Trend 控制器异步、幂等消费对应成交事实，失败不再回滚 Account。Legacy 上传路由和同步 Trend 副作用已删除；真实隔离 runtime 验证两份实际结单均返回 `202 staged`、四券商同步正常、两份 generation promotion 且 Trend 重复消费安全。
+- Account 当前估值改为由 Account Sync Worker 从已接受持仓构造 OpenD 报价范围，覆盖 Tiger/Futu 以及辉立、东方财富的港美 A 股票、ETF、基金、期权和未知资产；缺少当前或已保留报价时继续失败关闭，不以结单价冒充实时价。Account v1 与三市场模拟盘新增完整的 `current_valuation`，同时给出美元/港元市值；现金和货币基金保持原契约。Dashboard 仍显示“实时价”，优先渲染 owner 发布值，估值变化时仅对实时价、美元市值和港元市值短暂高亮，不改变页面布局或轮询。专项回归 815 个、全量测试 4,505 个通过；最终状态仍以合并 SHA 的 `make acceptance` 与同 SHA 重部署证据为准。
 
 ## 2026-08-03
 

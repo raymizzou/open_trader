@@ -4263,6 +4263,50 @@ console.log(renderAccountTable([{key:"futu:HK:02840:0",holding:{},display:{
     assert 'class="number-cell account-holding-pnl pnl-loss"' in output
 
 
+def test_dashboard_account_rows_prefer_owner_published_current_valuation() -> None:
+    output = run_dashboard_js(r'''
+const display = accountPositionDisplay({
+  market:"HK", symbol:"02824", name:"易方达黄金", quantity:"800",
+  cost_price:"47.32", last_price:"47.32", price_kind:"statement",
+  market_value_usd:"", market_value_hkd:"37856",
+  current_valuation:{price:"48.38",price_kind:"live",price_as_of:"2026-08-04T10:30:05+08:00",
+    market_value_usd:"4962.05",market_value_hkd:"38704.00"},
+});
+console.log(JSON.stringify({display,html:renderAccountHoldingRow({
+  key:"phillips:HK:02824:0",broker:"phillips",holding:{},display,
+})}));
+''')
+    rendered = json.loads(output)
+    assert rendered["display"]["last_price"] == "48.38"
+    assert rendered["display"]["market_value_usd"] == "4962.05"
+    assert rendered["display"]["market_value_hkd"] == "38704.00"
+    assert "48.38" in rendered["html"]
+    assert ">实时价</span>47.32" not in rendered["html"]
+    assert "USD 4,962.05" in rendered["html"]
+    assert "HKD 38,704" in rendered["html"]
+
+
+def test_dashboard_highlights_only_changed_valuation_cells_once() -> None:
+    output = run_dashboard_js(r'''
+const previous = {positions:[{position_id:"pos-1",current_valuation:{
+  price:"10",price_kind:"live",price_as_of:"2026-08-04T10:00:00+08:00",
+  market_value_usd:"100",market_value_hkd:"780"}}]};
+const next = {positions:[{position_id:"pos-1",broker:"tiger",market:"US",symbol:"TEST",
+  name:"Test",quantity:"1",cost_price:"9",unrealized_pnl_pct:"0",current_valuation:{
+  price:"11",price_kind:"live",price_as_of:"2026-08-04T10:00:05+08:00",
+  market_value_usd:"110",market_value_hkd:"858"}}]};
+state.accountValuationUpdates = accountValuationUpdates(previous, next);
+const html = renderAccountHoldingRow({key:"pos-1",broker:"tiger",holding:next.positions[0],
+  display:accountPositionDisplay(next.positions[0])},{simulated:true});
+state.accountValuationUpdates.clear();
+const plain = renderAccountHoldingRow({key:"pos-1",broker:"tiger",holding:next.positions[0],
+  display:accountPositionDisplay(next.positions[0])},{simulated:true});
+console.log(JSON.stringify({highlighted:(html.match(/account-valuation-updated/g)||[]).length,
+  plain:(plain.match(/account-valuation-updated/g)||[]).length}));
+''')
+    assert json.loads(output) == {"highlighted": 3, "plain": 0}
+
+
 def test_dashboard_labels_statement_price_instead_of_missing_live_quote() -> None:
     output = run_dashboard_js(r'''
 state.accountSnapshot = {status:"healthy",stale:false,
