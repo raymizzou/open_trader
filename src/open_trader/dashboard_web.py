@@ -23,8 +23,10 @@ from .backtest_prices import DailyKlineProvider, normalize_backtest_symbol
 from .dashboard import (
     DETAIL_FX_TO_HKD,
     DashboardConfig,
+    _build_backtest_universe,
     _backtest_holding_detail,
     _latest_backtests_by_holding,
+    _read_csv_rows,
     load_historical_trend_report,
     load_dashboard_state,
     load_trend_report_history,
@@ -1114,7 +1116,6 @@ def _prediction_history_payload(
 
 
 def build_standard_backtest_options_payload(config: DashboardConfig) -> dict[str, Any]:
-    state = load_dashboard_state(config).to_dict()
     return {
         "strategies": [definition.to_dict() for definition in strategy_catalog()],
         "ranges": list(STANDARD_BACKTEST_RANGES),
@@ -1122,7 +1123,9 @@ def build_standard_backtest_options_payload(config: DashboardConfig) -> dict[str
             "range": "1Y", "initial_cash": "100000", "max_strategy_weight": "0.10",
             "commission_bps": "10", "slippage_bps": "5",
         },
-        "universe": state["backtest_universe"],
+        "universe": _build_backtest_universe(
+            [], _read_csv_rows(config.data_dir / "latest" / "watchlist.csv")
+        ),
         "benchmarks": {"US": "SPY", "HK": "HK.02800", "CN": "000300"},
     }
 
@@ -1175,15 +1178,7 @@ def parse_standard_backtest_request(
             raise ValueError("开始日期必须早于结束日期")
     elif custom_start is not None or custom_end is not None:
         raise ValueError("预设区间不能同时提供自定义日期")
-    options = build_standard_backtest_options_payload(config)
-    universe = options["universe"]["holdings"] + options["universe"]["watchlist"]
     normalized = normalize_backtest_symbol(market, symbol)
-    allowed = {
-        (row["market"], row["symbol"].zfill(5) if row["market"] == "HK" and row["symbol"].isdigit() else row["symbol"])
-        for row in universe
-    }
-    if (market, normalized) not in allowed:
-        raise ValueError("所选标的不在可回测范围内")
     parsed = StandardBacktestRequest(
         data_dir=config.data_dir, reports_dir=config.reports_dir, market=market,
         symbol=normalized, strategy_id=strategy_id,

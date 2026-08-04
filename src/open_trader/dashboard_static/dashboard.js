@@ -505,7 +505,9 @@ function renderStandardBacktest() {
   elements["backtest-symbol-source"].innerHTML = [
     ["holdings", "当前持仓"], ["watchlist", "关注列表"],
   ].map(([key, label]) => `<button class="filter-button ${backtest.source === key ? "active" : ""}" type="button" data-backtest-source="${key}" aria-pressed="${backtest.source === key}">${label}</button>`).join("");
-  const universe = (options.universe && options.universe[backtest.source]) || [];
+  const universe = backtest.source === "holdings"
+    ? accountBacktestUniverse()
+    : (options.universe && options.universe[backtest.source]) || [];
   if (!universe.some((row) => `${row.market}:${row.symbol}` === backtest.symbolKey)) {
     backtest.symbolKey = universe.length ? `${universe[0].market}:${universe[0].symbol}` : "";
   }
@@ -527,6 +529,21 @@ function renderStandardBacktest() {
   elements["backtest-max-weight"].value = backtest.maxWeight;
   elements["backtest-commission"].value = backtest.commissionBps;
   elements["backtest-slippage"].value = backtest.slippageBps;
+}
+
+function accountBacktestUniverse() {
+  const seen = new Set();
+  return (state.accountSnapshot?.positions || []).flatMap((position) => {
+    const market = String(position.market || "").toUpperCase();
+    const symbol = String(position.symbol || "").toUpperCase();
+    const asset = String(position.asset_class || "").toLowerCase();
+    const key = `${market}:${symbol}`;
+    if (!["CN", "HK", "US"].includes(market)
+        || !["stock", "etf"].includes(asset)
+        || !symbol || seen.has(key)) return [];
+    seen.add(key);
+    return [{market, symbol, name: String(position.name || "")}];
+  });
 }
 
 function syncStandardBacktestInputs() {
@@ -979,6 +996,7 @@ async function loadAccountSnapshot() {
     renderSourceStatusListIntoHeader();
     renderConnectionPanel();
     renderHoldings();
+    if (state.workspaceView === "standard_backtest") renderStandardBacktest();
     state.accountValuationUpdates.clear();
   }
 }

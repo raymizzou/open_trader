@@ -1200,12 +1200,21 @@ def test_dashboard_final_tab_uses_plan_contract_and_deep_link_helpers() -> None:
     assert "history.replaceState" in js
 
 
-def test_backtest_options_payload_exposes_fixed_catalog_and_defaults(tmp_path) -> None:
-    from open_trader.dashboard_web import build_standard_backtest_options_payload
+def test_backtest_options_payload_exposes_fixed_catalog_and_defaults(tmp_path, monkeypatch) -> None:
+    import open_trader.dashboard_web as dashboard_web
 
     config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-    payload = build_standard_backtest_options_payload(config)
+    write_csv(
+        config.data_dir / "latest" / "watchlist.csv",
+        ["market", "symbol", "name", "asset_class"],
+        [{"market": "HK", "symbol": "700", "name": "腾讯", "asset_class": "stock"}],
+    )
+    monkeypatch.setattr(
+        dashboard_web, "load_dashboard_state", lambda _config: (_ for _ in ()).throw(
+            AssertionError("backtest options must not load Legacy dashboard state")
+        ),
+    )
+    payload = dashboard_web.build_standard_backtest_options_payload(config)
 
     assert [item["id"] for item in payload["strategies"]] == [
         "trend_pullback/v1", "breakout_momentum/v1", "range_mean_reversion/v1",
@@ -1216,6 +1225,10 @@ def test_backtest_options_payload_exposes_fixed_catalog_and_defaults(tmp_path) -
         "commission_bps": "10", "slippage_bps": "5",
     }
     assert payload["benchmarks"]["CN"] == "000300"
+    assert payload["universe"]["holdings"] == []
+    assert payload["universe"]["watchlist"] == [{
+        "market": "HK", "symbol": "700", "futu_symbol": "HK.00700",
+    }]
 
 
 def test_cn_standard_backtest_owns_futu_provider(tmp_path, monkeypatch) -> None:
@@ -1248,10 +1261,6 @@ def test_standard_backtest_request_parses_percent_and_normalizes_hk_symbol(tmp_p
     from open_trader.dashboard_web import parse_standard_backtest_request
 
     config = dashboard_config(tmp_path)
-    row = {field: "" for field in PORTFOLIO_FIELDNAMES}
-    row.update({"market": "HK", "symbol": "700", "asset_class": "stock"})
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [row])
-
     parsed = parse_standard_backtest_request(config, {
         "market": "hk", "symbol": "00700", "strategy_id": "trend_pullback/v1",
         "range_preset": "CUSTOM", "custom_start": "2025-01-01",
@@ -1277,6 +1286,17 @@ def test_standard_backtest_request_allows_custom_range_without_end_date(tmp_path
     })
     assert parsed.custom_start == date(2025, 1, 1)
     assert parsed.custom_end is None
+
+
+def test_standard_backtest_request_accepts_canonical_symbol_outside_options(tmp_path) -> None:
+    from open_trader.dashboard_web import parse_standard_backtest_request
+
+    parsed = parse_standard_backtest_request(dashboard_config(tmp_path), {
+        "market": "US", "symbol": "NVDA", "strategy_id": "trend_pullback/v1",
+        "range_preset": "1Y",
+    })
+
+    assert (parsed.market, parsed.symbol) == ("US", "NVDA")
 
 
 @pytest.mark.parametrize("symbol", ["../../outside", "..", "BAD/S", "BAD\\S", "BAD:S", "BAD S"])
@@ -1316,6 +1336,35 @@ def test_standard_backtest_http_routes_expose_options_and_map_validation_to_400(
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("payload", [
+    {"market": "JP", "symbol": "7203"},
+    {"market": "US", "symbol": "BAD/S"},
+    {"market": "US", "symbol": "NVDA", "strategy_id": "unknown/v1"},
+    {"market": "US", "symbol": "NVDA", "range_preset": "7Y"},
+    {"market": "US", "symbol": "NVDA", "range_preset": "CUSTOM", "custom_start": "2026-01-02", "custom_end": "2026-01-01"},
+    {"market": "US", "symbol": "NVDA", "initial_cash": "not-a-number"},
+])
+def test_standard_backtest_http_keeps_canonical_validation_errors_at_400(
+    tmp_path, payload
+) -> None:
+    from open_trader.dashboard_web import create_dashboard_server
+
+    server = create_dashboard_server(dashboard_config(tmp_path), "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    try:
+        status, _, _ = post_error_json(
+            f"http://{host}:{port}/api/backtests/standard/run",
+            json.dumps(payload).encode(),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert status == 400
 
 
 def test_dashboard_server_ignores_client_disconnect_while_writing_json(
@@ -1625,6 +1674,7 @@ const posts=[]; fetch=async(url,init={})=>{
  if(url==="/api/backtests/options")return{ok:true,json:async()=>({strategies:[{id:"trend_pullback/v1",name_zh:"趋势回调",description_zh:"说明"},{id:"breakout_momentum/v1",name_zh:"突破动量",description_zh:"说明"},{id:"range_mean_reversion/v1",name_zh:"区间均值回归",description_zh:"说明"}],ranges:["1Y","3Y","CUSTOM"],defaults:{range:"1Y",initial_cash:"100000",max_strategy_weight:"0.10",commission_bps:"10",slippage_bps:"5"},universe:{holdings:[{market:"US",symbol:"MSFT",name:"微软"}],watchlist:[{market:"HK",symbol:"00700",name:"腾讯"}]}})};
  posts.push({url,body:JSON.parse(init.body)});if(posts.length===2)return{ok:false,json:async()=>{throw new Error("html")}};return{ok:true,json:async()=>({status:"ok"})};};
 bindElements();bindEvents();state.brokerFilter="tiger";state.marketFilter="HK";
+state.accountSnapshot={positions:[{market:"US",symbol:"MSFT",name:"微软",asset_class:"stock"}]};
 const backtestNav=new E();backtestNav.dataset.workspace="standard_backtest";
 await elements["main-navigation"].click(backtestNav);
 if(elements["standard-backtest-workspace"].hidden||state.standardBacktest.symbolKey!=="US:MSFT")throw new Error("open failed");
@@ -1642,6 +1692,66 @@ elements["return-to-portfolio"].click();if(state.workspaceView!=="portfolio"||st
 console.log("ok");
 """)
     assert "ok" in output
+
+
+def test_standard_backtest_browser_composes_account_holdings_and_keeps_watchlist_independent() -> None:
+    output = run_dashboard_js(r'''
+const mount=()=>({innerHTML:"",value:"",hidden:false,required:false,classList:{toggle(){}},});
+for(const id of ["backtest-symbol-source","backtest-symbol","backtest-strategy-cards","backtest-range-controls","backtest-custom-range","backtest-custom-start","backtest-custom-end","backtest-initial-cash","backtest-max-weight","backtest-commission","backtest-slippage"]) elements[id]=mount();
+state.standardBacktest.options={strategies:[],ranges:[],defaults:{},universe:{holdings:[],watchlist:[{market:"HK",symbol:"00700",name:"腾讯"}]}};
+state.accountSnapshot={positions:[
+  {market:"us",symbol:"aapl",name:"Apple",asset_class:"stock"},
+  {market:"US",symbol:"AAPL",name:"Apple duplicate",asset_class:"etf"},
+  {market:"HK",symbol:"02800",name:"盈富",asset_class:"etf"},
+  {market:"CN",symbol:"510300",name:"沪深300",asset_class:"stock"},
+  {market:"US",symbol:"USD",name:"现金",asset_class:"cash"},
+  {market:"JP",symbol:"7203",name:"Toyota",asset_class:"stock"},
+]};
+renderStandardBacktest();
+const holdings=elements["backtest-symbol"].innerHTML;
+state.standardBacktest.source="watchlist";
+state.accountSnapshot=null;
+renderStandardBacktest();
+console.log(JSON.stringify({holdings,watchlist:elements["backtest-symbol"].innerHTML}));
+''')
+
+    rendered = json.loads(output)
+    assert rendered["holdings"].count("US · AAPL") == 1
+    for symbol in ("HK · 02800", "CN · 510300"):
+        assert symbol in rendered["holdings"]
+    for excluded in ("现金", "7203"):
+        assert excluded not in rendered["holdings"]
+    assert "HK · 00700 · 腾讯" in rendered["watchlist"]
+
+
+def test_standard_backtest_account_refresh_rerenders_without_refetching_options() -> None:
+    output = run_dashboard_js(r'''
+const mount=()=>({innerHTML:"",value:"",hidden:false,required:false,classList:{toggle(){}},});
+for(const id of ["backtest-symbol-source","backtest-symbol","backtest-strategy-cards","backtest-range-controls","backtest-custom-range","backtest-custom-start","backtest-custom-end","backtest-initial-cash","backtest-max-weight","backtest-commission","backtest-slippage"]) elements[id]=mount();
+globalThis.window={setTimeout(){return 1;},clearTimeout(){}};
+globalThis.AbortController=class {constructor(){this.signal={};}abort(){}};
+renderHoldings=()=>{};renderHeaderSummary=()=>{};renderSummary=()=>{};renderBrokerCards=()=>{};renderSourceStatusListIntoHeader=()=>{};renderConnectionPanel=()=>{};
+state.workspaceView="standard_backtest";
+state.standardBacktest.options={strategies:[],ranges:[],defaults:{},universe:{holdings:[],watchlist:[{market:"HK",symbol:"00700",name:"腾讯"}]}};
+const options=state.standardBacktest.options;
+const requests=[];
+let response={ok:true,status:200,headers:{get:()=>null},json:async()=>({status:"healthy",stale:false,positions:[{market:"US",symbol:"MSFT",name:"微软",asset_class:"stock"}]})};
+globalThis.fetch=async(url)=>{requests.push(url);return response;};
+await loadAccountSnapshot();
+const refreshed=elements["backtest-symbol"].innerHTML;
+response={ok:false,status:503,headers:{get:()=>null},json:async()=>({})};
+state.standardBacktest.source="watchlist";
+await loadAccountSnapshot();
+console.log(JSON.stringify({refreshed,watchlist:elements["backtest-symbol"].innerHTML,requests,sameOptions:options===state.standardBacktest.options,frozen:state.accountSnapshot.positions[0].symbol,enabled:accountActionsEnabled()}));
+''')
+
+    rendered = json.loads(output)
+    assert "US · MSFT · 微软" in rendered["refreshed"]
+    assert "HK · 00700 · 腾讯" in rendered["watchlist"]
+    assert rendered["requests"] == ["/api/v1/account/snapshot", "/api/v1/account/snapshot"]
+    assert rendered["sameOptions"] is True
+    assert rendered["frozen"] == "MSFT"
+    assert rendered["enabled"] is False
 
 
 def test_standard_backtest_result_renders_normalized_comparisons_and_details(tmp_path) -> None:
