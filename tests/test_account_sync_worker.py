@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import fcntl
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
@@ -61,11 +62,7 @@ def test_sync_accounts_publishes_full_tiger_generation_before_state(
     published = load_account_sync_state(data_dir / "latest/account_sync_state.json")
     assert published["brokers"]["tiger"]["summary"]["position_count"] == 14
     assert len(published["brokers"]["tiger"]["positions"]) == 14
-    assert published["dashboard_projection"]["broker_positions"]
-    assert all(
-        row["portfolio_weight_hkd"]
-        for row in published["dashboard_projection"]["broker_positions"]
-    )
+    assert published["dashboard_projection"] == {}
     symbols = _portfolio_symbols(portfolio_path)
     assert symbols >= all_14_symbols
     assert "OLD0" not in symbols
@@ -129,7 +126,7 @@ def test_sync_accounts_keeps_failed_source_data_and_later_clears_only_that_failu
         clock=lambda: clock[0],
         now_text=lambda: "2026-07-30T12:00:00+08:00",
     )
-    assert reloaded.sync_accounts_once()["status"] == "partial"
+    assert reloaded.sync_accounts_once()["status"] == "failed"
     assert load_account_sync_state(data_dir / "latest/account_sync_state.json") == failed
     assert worker.sync_accounts_once()["status"] == "skipped"
     assert load_account_sync_state(data_dir / "latest/account_sync_state.json") == failed
@@ -257,6 +254,64 @@ def test_quote_failure_restores_published_quotes_without_mutating_account_state(
     assert payload["last_success_at"] == previous_success
     assert payload["quotes"] == {"US.MSFT": {"last_price": "500", "stale": True}}
     assert account_before == state_path.read_bytes()
+
+
+def test_sync_quotes_uses_accepted_account_positions_instead_of_portfolio_csv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.account_sync_worker as worker_module
+
+    data_dir = tmp_path / "data"
+    portfolio_path = data_dir / "latest" / "portfolio.csv"
+    statement_candidate = _candidate("phillips", 1, "STATEMENT")
+    statement_position = replace(
+        statement_candidate.positions[0],
+        market=Market.HK,
+        symbol="02824",
+        currency="HKD",
+    )
+    _seed_state(
+        data_dir,
+        {"phillips": replace(statement_candidate, positions=(statement_position,))},
+    )
+    _write_quote_portfolio(portfolio_path)
+    captured: list[object] = []
+
+    class SpyQuoteService:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.last_success_at = ""
+            self.last_quotes: dict[str, dict[str, object]] = {}
+
+        def refresh(self, universe: object) -> object:
+            captured.append(universe)
+            return type(
+                "Result",
+                (),
+                {"to_dict": lambda _self: {
+                    "status": "ok",
+                    "requested_count": 1,
+                    "quote_count": 1,
+                    "missing_count": 0,
+                    "fetched_at": "2026-07-30T12:00:00+08:00",
+                    "last_success_at": "2026-07-30T12:00:00+08:00",
+                    "stale": False,
+                    "quotes": {},
+                    "diagnostic": {},
+                }},
+            )()
+
+    monkeypatch.setattr(worker_module, "DashboardQuoteService", SpyQuoteService)
+    monkeypatch.setattr(
+        worker_module,
+        "with_dashboard_projection",
+        lambda state, _quotes, generated_at: state,
+    )
+
+    result = AccountSyncWorker(_config(data_dir, portfolio_path)).sync_quotes_once()
+
+    assert result["status"] == "ok"
+    assert len(captured) == 1
+    assert [item.futu_symbol for item in captured[0].items] == ["HK.02824"]
 
 
 def test_account_failure_does_not_mutate_published_quotes(

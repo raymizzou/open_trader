@@ -6,6 +6,8 @@ from pathlib import Path
 from open_trader.futu_universe import (
     FutuUniverseItem,
     SkippedFutuUniverseRow,
+    build_account_quote_universe,
+    build_futu_quote_universe,
     load_futu_quote_universe,
 )
 
@@ -346,3 +348,81 @@ def test_load_futu_quote_universe_excludes_statement_only_holdings(
             reason="statement_only_source",
         ),
     ]
+
+
+def test_build_futu_quote_universe_uses_accepted_account_positions_regardless_of_broker() -> None:
+    universe = build_futu_quote_universe(
+        [
+            {
+                "broker": "eastmoney",
+                "market": "CN",
+                "asset_class": "stock",
+                "symbol": "600900",
+                "name": "长江电力",
+                "quantity": "2000",
+            },
+            {
+                "broker": "phillips",
+                "market": "HK",
+                "asset_class": "stock",
+                "symbol": "02824",
+                "name": "易方达黄金",
+                "quantity": "800",
+            },
+            {
+                "broker": "eastmoney",
+                "market": "US",
+                "asset_class": "money_market_fund",
+                "symbol": "USD_CASH",
+                "name": "现金类",
+                "quantity": "1",
+            },
+        ]
+    )
+
+    assert universe.items == [
+        FutuUniverseItem(
+            row_number=1,
+            market="CN",
+            asset_class="stock",
+            symbol="600900",
+            futu_symbol="SH.600900",
+            name="长江电力",
+        ),
+        FutuUniverseItem(
+            row_number=2,
+            market="HK",
+            asset_class="stock",
+            symbol="02824",
+            futu_symbol="HK.02824",
+            name="易方达黄金",
+        ),
+    ]
+    assert universe.skipped[0].reason == "excluded_asset_class"
+
+
+def test_build_account_quote_universe_reads_statement_positions_and_reports_skips() -> None:
+    universe = build_account_quote_universe({
+        "brokers": {
+            "eastmoney": {
+                "positions": [{
+                    "market": "CN", "asset_class": "stock", "symbol": "600519",
+                    "name": "贵州茅台", "quantity": "100",
+                }],
+            },
+            "phillips": {
+                "positions": [{
+                    "market": "HK", "asset_class": "etf", "symbol": "02800",
+                    "name": "盈富基金", "quantity": "500",
+                }, {
+                    "market": "HK", "asset_class": "money_market_fund",
+                    "symbol": "HK0000951506.HKD", "name": "现金类", "quantity": "1",
+                }],
+            },
+        },
+    })
+
+    assert [item.futu_symbol for item in universe.items] == [
+        "SH.600519", "HK.02800",
+    ]
+    assert universe.skipped[0].reason == "excluded_asset_class"

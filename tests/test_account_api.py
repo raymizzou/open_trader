@@ -126,8 +126,8 @@ def _write_publication(
         )
     quotes = {
         "status": "ok",
-        "requested_count": 2,
-        "quote_count": 2,
+        "requested_count": 4,
+        "quote_count": 4,
         "missing_count": 0,
         "fetched_at": quote_as_of,
         "last_success_at": quote_as_of,
@@ -143,7 +143,7 @@ def _write_publication(
                 "fetched_at": quote_as_of,
                 "stale": False,
             }
-            for index in (0, 1)
+            for index in range(4)
         },
         "diagnostic": {},
     }
@@ -866,6 +866,18 @@ def test_public_stable_id_helpers_match_position_rows() -> None:
     assert instrument_id != build_instrument_id("us", "STOCK", " vixy260821c22000 ")
 
 
+def test_snapshot_preserves_owner_published_current_valuation(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 200
+    position = next(row for row in result.payload["positions"] if row["broker"] == "phillips")
+    assert position["current_valuation"]["price"] == position["last_price"]
+    assert position["current_valuation"]["market_value_hkd"] == position["market_value_hkd"]
+
+
 def test_snapshot_whitelists_public_fields_and_requires_quote_publication_time(
     tmp_path: Path,
 ) -> None:
@@ -1097,6 +1109,7 @@ def test_snapshot_rejects_incomplete_retained_quotes(
     if updates["status"] == "partial":
         quotes = json.loads(quotes_path.read_text(encoding="utf-8"))
         quotes.update(updates)
+        quotes["quote_count"] = 3
         quotes["quotes"]["US.TEST0"].update(
             {"status": "missing_quote", "last_price": "", "price_time": ""}
         )
@@ -1192,7 +1205,8 @@ def test_snapshot_accepts_futu_active_us_price_time(tmp_path: Path) -> None:
     statement_position = next(
         row for row in result.payload["positions"] if row["broker"] == "phillips"
     )
-    assert statement_position["price_as_of"] == "2026-07-31"
+    assert statement_position["price_as_of"] == "2026-08-03T04:18:41.889-04:00"
+    assert statement_position["current_valuation"]["price_as_of"] == statement_position["price_as_of"]
 
 
 def test_snapshot_rejects_negative_quote_count(tmp_path: Path) -> None:
@@ -1231,8 +1245,8 @@ def test_snapshot_rejects_a_stable_phased_account_projection_pair(tmp_path: Path
     account["brokers"]["futu"]["positions"][0]["symbol"] = "TEST2"
     account["generation"] = "2026-08-03T12:00:05+08:00"
     quotes = json.loads(quotes_path.read_text(encoding="utf-8"))
-    quotes["quotes"]["US.TEST2"] = dict(quotes["quotes"].pop("US.TEST0"))
-    quotes["quotes"]["US.TEST2"]["symbol"] = "TEST2"
+    quotes["quotes"]["US.TEST4"] = dict(quotes["quotes"].pop("US.TEST0"))
+    quotes["quotes"]["US.TEST4"]["symbol"] = "TEST4"
     write_json_atomic(account_path, account)
     write_json_atomic(quotes_path, quotes)
 
@@ -1271,8 +1285,9 @@ def test_quote_age_alone_does_not_stale_a_successful_publication(tmp_path: Path)
     quotes["last_success_at"] = old_quote
     quotes["fetched_at"] = old_quote
     for row in account["dashboard_projection"]["broker_positions"]:
-        if row["broker"] in {"futu", "tiger"}:
-            row["price_as_of"] = old_quote
+        row["price_as_of"] = old_quote
+        if isinstance(row.get("current_valuation"), dict):
+            row["current_valuation"]["price_as_of"] = old_quote
     for row in quotes["quotes"].values():
         row["price_time"] = old_quote
         row["fetched_at"] = old_quote

@@ -502,7 +502,23 @@ def test_dashboard_projection_publishes_complete_live_and_statement_fields(
             "status": "ok",
             "last_success_at": "2026-07-31T08:30:05+08:00",
             "stale": False,
-            "quotes": {},
+            "quotes": {
+                symbol: {
+                    "market": market,
+                    "symbol": symbol,
+                    "status": "ok",
+                    "last_price": price,
+                    "price_session": "regular" if market == "US" else "",
+                    "price_time": "2026-07-31T08:30:05+08:00",
+                    "fetched_at": "2026-07-31T08:30:05+08:00",
+                }
+                for market, symbol, price in (
+                    ("US", "AAPL", "200.2"),
+                    ("US", "ADP", "260.1"),
+                    ("HK", "00200", "3.99"),
+                    ("CN", "000001", "11.9"),
+                )
+            },
         },
         generated_at="2026-07-31T08:30:05+08:00",
     )
@@ -512,17 +528,102 @@ def test_dashboard_projection_publishes_complete_live_and_statement_fields(
     phillips = rows[("phillips", "00200")]
     eastmoney = rows[("eastmoney", "000001")]
 
-    assert tiger["market_value_hkd"] == "22640.05"
-    assert tiger["price_kind"] == "account_snapshot"
-    assert phillips["market_value_hkd"] == "1973.16"
-    assert phillips["price_kind"] == "statement"
-    assert eastmoney["market_value_hkd"] == "1080.00"
+    assert tiger["market_value_hkd"] == "22316.58"
+    assert tiger["price_kind"] == "live"
+    assert phillips["market_value_hkd"] == "2082.78"
+    assert phillips["price_kind"] == "live"
+    assert eastmoney["market_value_hkd"] == "1285.20"
     assert all(row["account_weight_hkd"] for row in rows.values())
     assert all(row["portfolio_weight_hkd"] for row in rows.values())
     assert Decimal(projection["summary"]["portfolio_value_hkd"]) == sum(
         Decimal(row["portfolio_value_hkd"])
         for row in projection["broker_summaries"]
     )
+
+
+def test_dashboard_projection_publishes_current_valuation_for_every_quoteable_broker(
+    tmp_path: Path,
+) -> None:
+    projection = build_dashboard_projection(
+        _projection_state(tmp_path),
+        {
+            "status": "ok",
+            "last_success_at": "2026-07-31T08:30:05+08:00",
+            "stale": False,
+            "quotes": {
+                "US.AAPL": {
+                    "market": "US", "symbol": "AAPL", "status": "ok",
+                    "last_price": "180", "price_session": "regular",
+                    "price_time": "2026-07-31 04:30:05.000",
+                    "fetched_at": "2026-07-31T08:30:05+08:00",
+                },
+                "US.ADP": {
+                    "market": "US", "symbol": "ADP", "status": "ok",
+                    "last_price": "280", "price_session": "regular",
+                    "price_time": "2026-07-31 04:30:05.000",
+                    "fetched_at": "2026-07-31T08:30:05+08:00",
+                },
+                "HK.00200": {
+                    "market": "HK", "symbol": "00200", "status": "ok",
+                    "last_price": "4", "price_session": "",
+                    "price_time": "2026-07-31T16:30:05+08:00",
+                    "fetched_at": "2026-07-31T08:30:05+08:00",
+                },
+                "SZ.000001": {
+                    "market": "CN", "symbol": "000001", "status": "ok",
+                    "last_price": "12", "price_session": "",
+                    "price_time": "2026-07-31T16:30:05+08:00",
+                    "fetched_at": "2026-07-31T08:30:05+08:00",
+                },
+            },
+        },
+        generated_at="2026-07-31T08:30:05+08:00",
+    )
+
+    rows = {(row["broker"], row["symbol"]): row for row in projection["broker_positions"]}
+    phillips = rows[("phillips", "00200")]
+    eastmoney = rows[("eastmoney", "000001")]
+
+    assert phillips["last_price"] == "4"
+    assert phillips["price_kind"] == "live"
+    assert phillips["market_value_hkd"] == "2088.00"
+    assert phillips["market_value_usd"] == ""
+    assert phillips["current_valuation"] == {
+        "price": "4",
+        "price_kind": "live",
+        "price_as_of": "2026-07-31T16:30:05+08:00",
+        "market_value_usd": "267.69",
+        "market_value_hkd": "2088.00",
+    }
+    assert eastmoney["market_value_hkd"] == "1296.00"
+    assert eastmoney["current_valuation"]["market_value_usd"] == "166.15"
+
+
+def test_dashboard_projection_rejects_partial_or_mismatched_current_valuation(
+    tmp_path: Path,
+) -> None:
+    state = _projection_state(tmp_path)
+    projection = build_dashboard_projection(
+        state,
+        {
+            "status": "ok",
+            "last_success_at": "2026-07-31T08:30:05+08:00",
+            "stale": False,
+            "quotes": {
+                f"{market}.{symbol}": {
+                    "market": market, "symbol": symbol, "status": "ok",
+                    "last_price": "200", "price_session": "regular",
+                    "price_time": "2026-07-31T08:30:05+08:00",
+                    "fetched_at": "2026-07-31T08:30:05+08:00",
+                }
+                for market, symbol in (("US", "AAPL"), ("US", "ADP"), ("HK", "00200"), ("CN", "000001"))
+            },
+        },
+        generated_at="2026-07-31T08:30:05+08:00",
+    )
+    projection["broker_positions"][0]["current_valuation"]["market_value_hkd"] = ""
+
+    assert dashboard_projection_from_state({**state, "dashboard_projection": projection}) is None
 
 
 def test_mixed_broker_portfolio_rows_keep_the_deterministic_fx_fallback(tmp_path) -> None:

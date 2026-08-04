@@ -17,7 +17,10 @@ from urllib.parse import urlsplit
 
 from .a_share_trend import valid_frozen_report_contract
 from .account_api import check_account_api_parity
-from .account_sync_state import DASHBOARD_POSITION_FIELDS
+from .account_sync_state import (
+    DASHBOARD_POSITION_FIELDS,
+    _is_valid_current_valuation,
+)
 from .dashboard import (
     SHANGHAI,
     _is_dashboard_holding,
@@ -29,6 +32,7 @@ from .dashboard import (
 )
 from .daily_premarket import _optional_positive_tm_id, _read_env_file
 from .futu_symbols import to_futu_symbol
+from .futu_universe import build_account_quote_universe
 from .kelly_order_execution import FutuSimulateOrderExecutionClient
 from .parsers.phillips import PhillipsStatementParser
 from .trend_simulate_positions import (
@@ -47,6 +51,7 @@ CONTROLLER_DOM_FIELDS = {
     "cost_price": "data-cost-price",
     "last_price": "data-last-price",
     "price_kind": "data-price-kind",
+    "price_as_of": "data-price-as-of",
     "market_value_usd": "data-market-value-usd",
     "market_value_hkd": "data-market-value-hkd",
     "account_weight_hkd": "data-account-weight-hkd",
@@ -986,6 +991,42 @@ def _account_snapshot_errors(
         or release.get("worker_git_sha") != expected_sha
     ):
         errors.append("Account snapshot release Git SHA 不匹配")
+    positions = payload.get("positions")
+    if isinstance(positions, list):
+        errors.extend(_account_snapshot_valuation_errors(positions))
+    return errors
+
+
+def _account_snapshot_valuation_errors(
+    positions: list[object],
+) -> list[str]:
+    rows = [row for row in positions if isinstance(row, Mapping)]
+    universe = build_account_quote_universe({
+        "brokers": {"public": {"positions": rows}},
+    })
+    quoteable = {(item.market, item.symbol) for item in universe.items}
+    errors: list[str] = []
+    for index, row in enumerate(rows):
+        identity = (
+            str(row.get("market") or "").upper(),
+            str(row.get("symbol") or "").upper(),
+        )
+        if identity not in quoteable:
+            continue
+        valuation = row.get("current_valuation")
+        if not _is_valid_current_valuation(valuation):
+            errors.append(
+                f"Account snapshot 持仓第 {index + 1} 行 current_valuation 不完整"
+            )
+            continue
+        assert isinstance(valuation, Mapping)
+        for field in ("price", "price_kind", "price_as_of", "market_value_hkd"):
+            if valuation.get(field) != row.get(
+                "last_price" if field == "price" else field
+            ):
+                errors.append(
+                    f"Account snapshot 持仓第 {index + 1} 行 {field} 与平铺字段不一致"
+                )
     return errors
 
 
@@ -1032,6 +1073,28 @@ def _direct_simulate_facts(
             ),
         ))
     return tuple(sorted(facts))
+
+
+def _direct_simulate_prices(
+    snapshot: Mapping[str, Any], market: str,
+) -> dict[str, Decimal]:
+    positions = snapshot.get("positions")
+    assert isinstance(positions, list), "Futu 模拟盘持仓不可用"
+    prices: dict[str, Decimal] = {}
+    for position in positions:
+        assert isinstance(position, Mapping), "Futu 模拟盘持仓格式无效"
+        quantity = _position_decimal(
+            position.get("qty", position.get("quantity")), "Futu 持仓数量"
+        )
+        if quantity <= 0:
+            continue
+        code = str(position.get("code") or position.get("futu_code") or "").upper()
+        assert to_futu_symbol(market, code) == code, f"Futu 持仓代码无效：{code}"
+        prices[code.split(".", 1)[1]] = _position_decimal(
+            position.get("last_price", position.get("nominal_price", position.get("price"))),
+            "Futu 持仓实时价",
+        )
+    return prices
 
 
 def _api_simulate_facts(
@@ -1130,6 +1193,12 @@ def _validate_simulated_positions(
     assert _api_simulate_facts(payload, market) == _direct_simulate_facts(
         direct_snapshot, market
     ), f"{broker} 模拟盘持仓与 Futu 不匹配"
+    synced_at = payload.get("synced_at")
+    direct_prices = _direct_simulate_prices(direct_snapshot, market) if positions else {}
+    if positions:
+        assert isinstance(synced_at, str) and synced_at, (
+            f"{broker} 模拟盘缺少同步时间"
+        )
 
     expected_attributions = _current_simulate_attributions(
         data_dir, reports_dir, broker=broker, market=market
@@ -1138,6 +1207,22 @@ def _validate_simulated_positions(
     for position in positions:
         assert isinstance(position, Mapping)
         symbol = str(position.get("symbol") or "").strip().upper()
+        valuation = position.get("current_valuation")
+        assert _is_valid_current_valuation(valuation), (
+            f"{broker} {symbol} 模拟盘 current_valuation 不完整"
+        )
+        assert isinstance(valuation, Mapping)
+        assert valuation.get("price_kind") == "account_snapshot", (
+            f"{broker} {symbol} 模拟盘价格来源不正确"
+        )
+        assert _position_decimal(valuation.get("price"), "模拟盘实时价") == direct_prices[symbol], (
+            f"{broker} {symbol} 模拟盘实时价与 Futu 不匹配"
+        )
+        assert valuation.get("price_as_of") == synced_at, (
+            f"{broker} {symbol} 模拟盘实时价时间与同步时间不一致"
+        )
+        _position_decimal(valuation.get("market_value_usd"), "模拟盘美元市值")
+        _position_decimal(valuation.get("market_value_hkd"), "模拟盘港元市值")
         expected_status, expected_report = expected_attributions.get(
             symbol, ("unlinked", None)
         )
@@ -3156,7 +3241,7 @@ def _check_controller_owned_rows(page: Any, section: Any, broker: str) -> None:
     )
     assert isinstance(positions, list), "页面持仓状态无效"
     expected = [
-        row for row in positions
+        _controller_position_display(row) for row in positions
         if isinstance(row, Mapping)
         and row.get("broker") == broker
         and _is_accepted_dashboard_holding(row)
@@ -3201,6 +3286,21 @@ def _check_controller_owned_rows(page: Any, section: Any, broker: str) -> None:
             assert row.get_attribute(attribute) == expected_row[field], (
                 f"{broker} {expected_row.get('symbol', '-')} DOM 字段 {field} 不一致"
             )
+
+
+def _controller_position_display(row: Mapping[str, Any]) -> dict[str, Any]:
+    display = dict(row)
+    valuation = row.get("current_valuation")
+    if not isinstance(valuation, Mapping) or not _is_valid_current_valuation(valuation):
+        return display
+    display.update({
+        "last_price": valuation["price"],
+        "price_kind": valuation["price_kind"],
+        "price_as_of": valuation["price_as_of"],
+        "market_value_usd": valuation["market_value_usd"],
+        "market_value_hkd": valuation["market_value_hkd"],
+    })
+    return display
 
 
 def _check_account_holdings(

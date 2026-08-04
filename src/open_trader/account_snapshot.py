@@ -17,6 +17,7 @@ from .account_sync_state import (
     effective_source_status,
     is_valid_account_publication,
 )
+from .futu_universe import build_account_quote_universe
 
 
 MAX_STABLE_READ_ATTEMPTS = 3
@@ -516,7 +517,7 @@ def _public_broker_summary(row: object) -> dict[str, object]:
     }
 
 
-def _public_position(row: Mapping[str, str]) -> dict[str, str]:
+def _public_position(row: Mapping[str, object]) -> dict[str, object]:
     position = {
         key: row[key]
         for key in (
@@ -530,6 +531,11 @@ def _public_position(row: Mapping[str, str]) -> dict[str, str]:
     position["price_as_of"] = _normalize_public_price_as_of(
         position["market"], position["price_as_of"]
     )
+    if isinstance(row.get("current_valuation"), Mapping):
+        position["current_valuation"] = dict(row["current_valuation"])
+        position["current_valuation"]["price_as_of"] = _normalize_public_price_as_of(
+            position["market"], position["current_valuation"]["price_as_of"]
+        )
     return position
 
 
@@ -586,23 +592,12 @@ def _has_complete_quote_coverage(
     published = quotes["quotes"]
     assert isinstance(published, dict)
     required = {
-        (str(position["market"]), str(position["symbol"]))
-        for broker in REQUIRED_BROKERS
-        if isinstance(brokers[broker], Mapping) and brokers[broker].get("source_kind") == "live"
-        for position in brokers[broker]["positions"]
-        if isinstance(position, Mapping) and _is_quote_required_position(position)
+        (item.market, item.symbol)
+        for item in build_account_quote_universe({"brokers": brokers}).items
     }
     return all(
         any(_is_valid_quote_row(row, market, symbol) for row in published.values())
         for market, symbol in required
-    )
-
-
-def _is_quote_required_position(position: Mapping[str, object]) -> bool:
-    return (
-        str(position.get("market") or "").upper() != "CASH"
-        and str(position.get("asset_class") or "").lower()
-        not in {"cash", "money_market_fund"}
     )
 
 

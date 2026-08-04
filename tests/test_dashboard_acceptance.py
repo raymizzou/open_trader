@@ -5366,6 +5366,25 @@ def test_validate_dashboard_payload_requires_controller_owned_position_fields() 
     assert any("控制器持仓第 1 行缺少字段" in error for error in errors)
 
 
+def test_acceptance_requires_complete_current_valuation_for_quoteable_positions() -> None:
+    row = _controller_position()
+    row["current_valuation"] = {
+        "price": row["last_price"],
+        "price_kind": row["price_kind"],
+        "price_as_of": row["price_as_of"],
+        "market_value_usd": row["market_value_usd"],
+        "market_value_hkd": row["market_value_hkd"],
+    }
+
+    assert dashboard_acceptance._account_snapshot_valuation_errors([row]) == []
+    row["current_valuation"].pop("price_as_of")  # type: ignore[index]
+    assert "current_valuation 不完整" in dashboard_acceptance._account_snapshot_valuation_errors([row])[0]
+
+    cash = dict(_controller_position("USD_CASH"))
+    cash.update({"market": "CASH", "asset_class": "cash"})
+    assert dashboard_acceptance._account_snapshot_valuation_errors([cash]) == []
+
+
 def test_check_controller_owned_rows_uses_current_page_projection() -> None:
     stale_position = _controller_position("DRAM")
     stale_position["last_price"] = "53.38"
@@ -6121,10 +6140,12 @@ def simulate_snapshot(
     code: str = "US.NDAQ", quantity: str = "13", cost_price: str = "94.25",
 ) -> dict[str, object]:
     return {
+        "synced_at": "2026-08-04T10:00:00-04:00",
         "positions": [{
             "code": code,
             "qty": quantity,
             "cost_price": cost_price,
+            "last_price": "100",
         }],
     }
 
@@ -6141,11 +6162,19 @@ def simulate_api_payload(
         "available": True,
         "broker": "tiger",
         "market": "US",
+        "synced_at": "2026-08-04T10:00:00-04:00",
         "positions": [{
             "market": "US",
             "symbol": symbol,
             "quantity": quantity,
             "cost_price": cost_price,
+            "current_valuation": {
+                "price": "100",
+                "price_kind": "account_snapshot",
+                "price_as_of": "2026-08-04T10:00:00-04:00",
+                "market_value_usd": "1300.00",
+                "market_value_hkd": "10140.00",
+            },
             "attribution_status": attribution_status,
             "report": report,
         }],

@@ -169,6 +169,25 @@ publication 的时间。`reason` 是稳定机器码，不包含凭据、绝对�
 | `confidence` | string |
 | `notes` | string |
 
+可报价的 `US`、`HK`、`CN` 股票、ETF、基金、期权及未知资产在新建的完整
+publication 中还包含可选的 `current_valuation` 对象，字段固定为：
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `price` | decimal string | 当前选定的本币价格，必须等于 `last_price` |
+| `price_kind` | string | 当前价格来源，必须等于 `price_kind` |
+| `price_as_of` | ISO 8601 string | 当前价格时间，必须等于 `price_as_of` |
+| `market_value_usd` | decimal string | 当前市值折算美元 |
+| `market_value_hkd` | decimal string | 当前市值折算港元，必须等于 `market_value_hkd` |
+
+对象缺失仍可读取旧版 v1 publication，以支持独立回滚；启用本功能的
+publication 对每个可报价持仓必须一次性提供完整的五个字段。现金与
+`money_market_fund` 不属于可报价持仓，不得添加该对象。非美元持仓的平铺
+`market_value_usd` 仍保持为空；只有嵌套字段表示跨币种美元显示值。
+
+报价缺失且没有上一笔已接受报价时，仍按原契约返回 `503`，不得用结单或账户
+快照价格补齐当前估值。
+
 数组依次按 `broker`、`account_alias`、`market`、`asset_class`、`symbol`、
 `position_id` 的 Unicode code point 升序排列。
 
