@@ -1373,6 +1373,32 @@ def test_snapshot_accepts_futu_active_us_price_time(tmp_path: Path) -> None:
     assert statement_position["current_valuation"]["price_as_of"] == statement_position["price_as_of"]
 
 
+def test_snapshot_accepts_canonical_a_share_futu_quote_key(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_publication(data_dir)
+    account_path = data_dir / "latest/account_sync_state.json"
+    quotes_path = data_dir / "latest/quotes.json"
+    account = json.loads(account_path.read_text(encoding="utf-8"))
+    position = account["brokers"]["futu"]["positions"][0]
+    position.update({"market": "CN", "symbol": "600000"})
+    quotes = json.loads(quotes_path.read_text(encoding="utf-8"))
+    quote = quotes["quotes"].pop("US.TEST0")
+    quote.update({"market": "CN", "symbol": "600000"})
+    quotes["quotes"]["SH.600000"] = quote
+    account = with_dashboard_projection(
+        account,
+        quotes,
+        generated_at="2026-08-03T12:00:04+08:00",
+    )
+    write_json_atomic(account_path, account)
+    write_json_atomic(quotes_path, quotes)
+
+    result = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
+
+    assert result.status_code == 200
+    assert result.payload["status"] == "healthy"
+
+
 def test_snapshot_rejects_negative_quote_count(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     _write_publication(data_dir)

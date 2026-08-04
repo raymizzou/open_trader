@@ -17,6 +17,7 @@ from .account_sync_state import (
     effective_source_status,
     is_valid_account_publication,
 )
+from .futu_symbols import to_futu_symbol
 from .futu_universe import build_account_quote_universe
 
 
@@ -250,10 +251,14 @@ def _is_valid_quote_row_payload(symbol: object, row: object) -> bool:
         for field, kind in required.items()
     ):
         return False
+    try:
+        expected_symbol = to_futu_symbol(row["market"], row["symbol"])
+    except ValueError:
+        return False
     if (
         not row["market"]
         or not row["symbol"]
-        or row["market"] + "." + row["symbol"] != symbol
+        or expected_symbol != symbol
         or row["status"] not in {"ok", "missing_quote"}
         or not _is_aware_timestamp(row["fetched_at"])
         or not _is_valid_quote_price_time(row["market"], row["price_time"])
@@ -614,7 +619,7 @@ def _has_complete_quote_coverage(
 
 def _is_valid_quote_row(row: object, market: str, symbol: str) -> bool:
     return (
-        _is_valid_quote_row_payload(f"{market}.{symbol}", row)
+        _is_valid_quote_row_payload(to_futu_symbol(market, symbol), row)
         and isinstance(row, Mapping)
         and row.get("market") == market
         and row.get("symbol") == symbol

@@ -8,6 +8,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - 跨场执行最终防护确认：确认弹窗不设 TTL、提交前强制当前盘口刷新；Predict 只允许精确买入授权并在成交/失败后清零，残留授权清理由人工确认触发且不搬运 USDT；BNB gas signer 与 Predict 账户分开展示并提示人工充值；首笔跨场 canary 上限保持 5 USDT；过期漏斗与成功空扫描都按事实展示，历史按执行阶段分组；验收允许完整空扫描通过但仍要求零授权、零清理、零订单、零转账/赎回和零真实通知。
 - #22 把辉立与东方财富结单上传迁到 Account Module：浏览器仅经 Gateway 调用 Account API，验证后的 PDF 以内容 hash 原子暂存为不可变 generation，Account Sync Worker 验证后才 promotion 并在快照发布 accepted generation；Trend 控制器异步、幂等消费对应成交事实，失败不再回滚 Account。Legacy 上传路由和同步 Trend 副作用已删除；真实隔离 runtime 验证两份实际结单均返回 `202 staged`、四券商同步正常、两份 generation promotion 且 Trend 重复消费安全。
 - Account 当前估值改为由 Account Sync Worker 从已接受持仓构造 OpenD 报价范围，覆盖 Tiger/Futu 以及辉立、东方财富的港美 A 股票、ETF、基金、期权和未知资产；缺少当前或已保留报价时继续失败关闭，不以结单价冒充实时价。Account v1 与三市场模拟盘新增完整的 `current_valuation`，同时给出美元/港元市值；现金和货币基金保持原契约。Dashboard 仍显示“实时价”，优先渲染 owner 发布值，估值变化时仅对实时价、美元市值和港元市值短暂高亮，不改变页面布局或轮询。专项回归 815 个、全量测试 4,505 个通过；最终状态仍以合并 SHA 的 `make acceptance` 与同 SHA 重部署证据为准。
+- 修复 Account API 将 A 股 OpenD 行情键 `SH./SZ.` 误按业务市场 `CN.` 校验、导致完整行情发布返回 503 的问题；校验统一复用既有富途代码规范化规则。回归及账户发布相关测试 92 个、全量测试 4,506 个通过，当前真实发布数据直接读取恢复为 `200 healthy`；最终状态仍以修复合并 SHA 的完整验收为准。
 
 ## 2026-08-03
 
