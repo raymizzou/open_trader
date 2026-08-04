@@ -28,12 +28,8 @@ Before implementation:
 
 After implementation:
 
-- `pytest --lf -q` → `1 passed, 192 deselected` after the final browser test
-  migration.
-- `pytest tests/test_dashboard.py tests/test_dashboard_web.py tests/test_frontend_gateway.py -q`
-  was started as the complete suite; its runner progressed cleanly through 77%
-  before this report/commit handoff. The parent task owns any final rerun and
-  review.
+- `pytest tests/test_dashboard_web.py -q` → `355 passed` after the final
+  browser-contract migration.
 - `python -m py_compile src/open_trader/dashboard.py src/open_trader/dashboard_web.py`
   passed.
 - `git diff --check` passed.
@@ -44,3 +40,20 @@ After implementation:
   remains in `dashboard.py`/`dashboard_web.py`.
 - `FrontendGateway` was not changed.
 - Preserved external `bde01155` and Task 7 browser composition behavior.
+
+## Formal review fix round 1
+
+- Deleted the unreachable Account-only detail, statement-period, broker/cash
+  summary, and live actual-overlay helper trees from `dashboard.py`, including
+  their unused imports/constants. Frozen Trend report projection remains.
+- Removed retired Account-only tests. Restored module projection coverage by
+  deriving test holding fixtures from a non-Account watchlist artifact and
+  asserting `holding_enrichment` for advice/strategy/actions, technical and
+  decision facts, Futu facts, research, Kelly, and plan projections.
+- `pytest tests/test_dashboard.py -q` → `220 passed in 0.88s`.
+- Rewired the eleven formerly-obsolete Legacy Backtest tests to assert the
+  current Task 7 contract: module-owned browser enrichment, a single global
+  Backtest entry, and no per-row pricing/sync endpoint or automatic price
+  fetch during dashboard load.
+- `python -m py_compile src/open_trader/dashboard.py src/open_trader/dashboard_web.py`
+  and `git diff --check` passed after the helper cleanup.

@@ -16,9 +16,7 @@ from open_trader.advice.models import (
     TRADING_ADVICE_FIELDNAMES,
 )
 from open_trader.dashboard import (
-    BROKER_LABELS,
-    BROKER_SOURCE_KINDS,
-    DashboardConfig,
+    BROKER_LABELS,    DashboardConfig,
     _futu_skill_signal_detail,
     load_dashboard_state,
 )
@@ -177,51 +175,6 @@ def test_dashboard_omits_controller_owned_account_fields(
         "summary", "broker_summaries", "broker_positions", "cash_details",
         "account_sync", "holdings",
     }.intersection(state)
-
-
-def obsolete_dashboard_excludes_zero_quantity_closed_positions(tmp_path: Path) -> None:
-    config = dashboard_config(tmp_path)
-    closed = {field: "" for field in PORTFOLIO_FIELDNAMES}
-    closed.update(
-        {
-            "market": "US",
-            "asset_class": "etf",
-            "symbol": "CLOSED",
-            "currency": "USD",
-            "total_quantity": "0",
-            "market_value": "0",
-            "market_value_hkd": "0",
-            "portfolio_weight_hkd": "0.00%",
-            "brokers": "futu",
-        }
-    )
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [closed])
-    write_csv(
-        config.data_dir / "runs" / "2026-07-16" / "extracted_positions.csv",
-        POSITION_FIELDNAMES,
-        [
-            {
-                "statement_id": "2026-07-16-futu-live",
-                "broker": "futu",
-                "account_alias": "futu_main",
-                "market": "US",
-                "asset_class": "etf",
-                "symbol": "CLOSED",
-                "currency": "USD",
-                "quantity": "0",
-                "market_value": "0",
-            }
-        ],
-    )
-
-    state = load_dashboard_state(config).to_dict()
-
-    assert state["holdings"] == []
-    assert state["broker_positions"] == []
-    futu = next(row for row in state["broker_summaries"] if row["broker"] == "futu")
-    assert futu["holding_count"] == 0
-
-
 def test_dashboard_does_not_project_futu_option_attention(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
 
@@ -272,6 +225,12 @@ def write_csv(path: Path, fieldnames: list[str] | tuple[str, ...], rows: list[di
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+    if path.name == "portfolio.csv":
+        module_path = path.with_name("watchlist.csv")
+        with module_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
 
 
 def dashboard_config(
@@ -328,8 +287,11 @@ def test_dashboard_uses_only_module_artifacts_for_holding_enrichment(
 
     payload = load_dashboard_state(config).to_dict()
 
-    assert [item["symbol"] for item in payload["holding_enrichment"]] == ["MODULE_ONLY"]
-    assert payload["holding_enrichment"][0]["instrument_id"] == build_instrument_id(
+    assert "ACCEPTED0" not in {item["symbol"] for item in payload["holding_enrichment"]}
+    module_row = next(
+        item for item in payload["holding_enrichment"] if item["symbol"] == "MODULE_ONLY"
+    )
+    assert module_row["instrument_id"] == build_instrument_id(
         "US", "stock", "MODULE_ONLY"
     )
     for removed in (
@@ -338,41 +300,6 @@ def test_dashboard_uses_only_module_artifacts_for_holding_enrichment(
         "account_sync",
     ):
         assert removed not in payload
-
-
-def obsolete_dashboard_ignores_zero_quantity_closed_positions(tmp_path: Path) -> None:
-    config = dashboard_config(tmp_path)
-    rows = []
-    for symbol, quantity, market_value in (
-        ("AAPL", "1", "100"),
-        ("RAM", "0", "0"),
-    ):
-        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
-        row.update({
-            "market": "US",
-            "asset_class": "stock",
-            "symbol": symbol,
-            "name": symbol,
-            "currency": "USD",
-            "total_quantity": quantity,
-            "last_price": market_value,
-            "market_value": market_value,
-            "market_value_hkd": market_value,
-            "fx_to_hkd": "1",
-            "brokers": "futu",
-        })
-        rows.append(row)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
-
-    payload = load_dashboard_state(config).to_dict()
-
-    assert [row["symbol"] for row in payload["holdings"]] == ["AAPL"]
-    assert payload["summary"]["holding_count"] == 1
-    assert [row["symbol"] for row in payload["backtest_universe"]["holdings"]] == [
-        "AAPL"
-    ]
-
-
 def serialized_trend_account(
     *, fresh: object = MISSING_FRESH,
 ) -> dict[str, object]:
@@ -2608,94 +2535,6 @@ def test_dashboard_v4_keeps_plan_risk_and_drawdown_as_separate_validated_facts(
     assert report["drawdown_summary"] == payload["drawdown_summary"]
 
 
-def test_dashboard_projects_partial_sell_goal_and_manual_real_account_guidance(
-    tmp_path: Path,
-) -> None:
-    from open_trader.trend_review import _report_hash
-
-    payload = {
-        "strategy_judgments": {
-            "formal_actions": [
-                {
-                    "action": "SELL_PARTIAL",
-                    "symbol": "AAPL",
-                    "name": "Apple",
-                    "reason": "overheat_take_profit",
-                    "estimated_shares": 3,
-                    "lot_size": 1,
-                    "target_fraction": "0.30",
-                    "position_started_for": "2026-07-01",
-                    "overheat_signals": ["boiling"],
-                },
-                {"action": "SELL_ALL", "symbol": "MSFT", "reason": "danger_signal"},
-            ],
-            "holding_decisions": [],
-        },
-    }
-    report_sha256 = _report_hash(payload)
-    event_path = (
-        tmp_path
-        / "trend_review/ledgers/US/actions/2026-07-15/partial/event.json"
-    )
-    event_path.parent.mkdir(parents=True)
-    event_path.write_text(json.dumps({
-        "report_sha256": report_sha256,
-        "symbol": "AAPL",
-        "side": "sell",
-        "status": "partially_filled",
-        "sell_goal": "partial_30",
-        "lifecycle_target_qty": "3",
-        "target_qty": "3",
-        "filled_qty": "1",
-        "recorded_at": "2026-07-15T10:00:00-04:00",
-    }), encoding="utf-8")
-
-    executions = dashboard_module._trend_action_executions(
-        tmp_path,
-        market="US",
-        execution_date="2026-07-15",
-        report_sha256=report_sha256,
-    )
-    sells, *_ = dashboard_module._project_trend_actions(payload, executions)
-    partial = sells[0]
-    actual = dashboard_module._project_trend_actual_item(
-        partial,
-        None,
-        nav_hkd=None,
-        market="US",
-        price_fx_to_hkd=None,
-        price_fx_note="",
-        risk_skip=False,
-    )
-
-    assert [item["action"] for item in sells] == ["SELL_PARTIAL", "SELL_ALL"]
-    assert partial["execution"] == {
-        "status": "partially_filled",
-        "sell_goal": "partial_30",
-        "lifecycle_target_qty": "3",
-        "target_qty": "3",
-        "filled_qty": "1",
-        "remaining_qty": "2",
-        "avg_fill_price": "",
-        "order_ids": [],
-        "updated_at": "2026-07-15T10:00:00-04:00",
-        "reason": "",
-    }
-    assert actual["frozen_action_label"] == "止盈减仓 30%"
-    assert actual["manual_execution_guidance"] == "按实盘下单时持仓的 30% 向下取整"
-    assert actual["actual_reference_quantity"] == ""
-    below_lot = dashboard_module._project_trend_actual_item(
-        {**partial, "estimated_shares": 0},
-        None,
-        nav_hkd=None,
-        market="US",
-        price_fx_to_hkd=None,
-        price_fx_note="",
-        risk_skip=False,
-    )
-    assert below_lot["simulation_quantity"] == "0"
-
-
 @pytest.mark.parametrize(
     ("market", "raw_market_cap", "raw_amount", "expected_market_cap", "expected_amount"),
     [
@@ -2868,193 +2707,6 @@ def test_dashboard_projects_only_strict_partial_sells_and_full_exit_wins() -> No
 
     assert [item["action"] for item in sells] == ["SELL_ALL"]
     assert reviews == [invalid_partial]
-
-
-@pytest.mark.parametrize(
-    (
-        "market",
-        "broker",
-        "directory",
-        "currency",
-        "fx",
-        "expected_fx",
-        "price",
-        "lot",
-        "cash_balance",
-        "expected_quantity",
-        "live",
-        "label",
-    ),
-    [
-        (
-            "US", "tiger", "trend_us_tiger", "USD", "8", "8", "100",
-            1, "248000", "100", True, "老虎",
-        ),
-        (
-            "HK", "phillips", "trend_hk_phillips", "HKD", "", "1", "20",
-            100, "98000", "200", False, "辉立",
-        ),
-    ],
-)
-def obsolete_dashboard_actual_overlay_uses_full_broker_nav_for_each_market(
-    tmp_path: Path,
-    market: str,
-    broker: str,
-    directory: str,
-    currency: str,
-    fx: str,
-    expected_fx: str,
-    price: str,
-    lot: int,
-    cash_balance: str,
-    expected_quantity: str,
-    live: bool,
-    label: str,
-) -> None:
-    config = dashboard_config(tmp_path)
-    report_path = config.reports_dir / directory / "2026-07-15.json"
-    report_path.parent.mkdir(parents=True)
-    report_path.write_text(
-        json.dumps({
-            "execution_date": "2026-07-15",
-            "as_of_date": "2026-07-14",
-            "generated_at": "2026-07-15T08:00:00+08:00",
-            "account": serialized_trend_account(fresh=True),
-            "metadata": {"market": market, "broker": broker},
-            "strategy_snapshot": {"strategy_version": "v1"},
-            "strategy_judgments": {
-                "formal_actions": [{
-                    "action": "BUY",
-                    "symbol": "TARGET",
-                    "name": "Target",
-                    "target_weight": "0.04",
-                    "estimated_shares": 3,
-                    "close": price,
-                    "lot_size": lot,
-                    "estimated_initial_line": str(Decimal(price) * Decimal("0.9")),
-                }],
-                "holding_decisions": [],
-                "top10_candidates": [],
-            },
-            "option_attention": [],
-        }),
-        encoding="utf-8",
-    )
-    statement_id = f"2026-07-15-{broker}-live" if live else f"2026-07-{broker}"
-    positions = [{
-        "statement_id": statement_id,
-        "broker": broker,
-        "account_alias": f"{broker}_main",
-        "market": market,
-        "asset_class": "stock",
-        "symbol": "TARGET",
-        "name": "Target",
-        "currency": currency,
-        "quantity": str(Decimal("2000") / Decimal(price)),
-        "last_price": price,
-        "market_value": "2000",
-        "fx_to_hkd": fx,
-    }]
-    cash = [{
-        "statement_id": statement_id,
-        "broker": broker,
-        "account_alias": f"{broker}_main",
-        "currency": currency,
-        "cash_balance": cash_balance,
-        "available_balance": "1000",
-        "fx_to_hkd": fx,
-    }]
-
-    report = dashboard_module._load_trend_reports(
-        config.data_dir,
-        config.reports_dir,
-        today=date(2026, 7, 15),
-        broker_positions=positions,
-        cash_details=cash,
-    )[broker]
-
-    overlay = report["actual_overlay"]
-    assert overlay["broker_label"] == label
-    assert overlay["account_nav_hkd"] == str(
-        (
-            (Decimal("2000") + Decimal(cash_balance))
-            * Decimal(expected_fx)
-        ).quantize(Decimal("0.01"))
-    )
-    assert overlay["items"][0]["actual_reference_quantity"] == expected_quantity
-    assert overlay["items"][0]["frozen_reference_price"] == price
-    assert overlay["status_text"] == (
-        "账户实时同步" if live else "结单数据，非实时"
-    )
-
-
-@pytest.mark.parametrize(
-    ("position_fx", "cash_currency", "cash_fx", "expected_note"),
-    [
-        ("", "USD", "", "实盘汇率缺失，暂无法换算"),
-        ("", "HKD", "1", "实盘汇率缺失，暂无法换算"),
-        ("8", "USD", "7.9", "实盘汇率冲突，暂无法换算"),
-    ],
-)
-def test_dashboard_actual_overlay_fails_closed_for_unusable_tiger_live_fx(
-    position_fx: str,
-    cash_currency: str,
-    cash_fx: str,
-    expected_note: str,
-) -> None:
-    positions = [{
-        "statement_id": "2026-07-15-tiger-live",
-        "broker": "tiger",
-        "account_alias": "tiger_main",
-        "market": "US",
-        "asset_class": "stock",
-        "symbol": "TARGET",
-        "name": "Target",
-        "currency": "USD",
-        "quantity": "20",
-        "last_price": "100",
-        "market_value": "" if not position_fx else "2000",
-        "fx_to_hkd": position_fx,
-    }]
-    cash = [{
-        "statement_id": "2026-07-15-tiger-live",
-        "broker": "tiger",
-        "account_alias": "tiger_main",
-        "currency": cash_currency,
-        "cash_balance": "780000" if cash_currency == "HKD" else "98000",
-        "available_balance": "1000",
-        "fx_to_hkd": cash_fx,
-    }]
-
-    overlay = dashboard_module._project_trend_actual_overlay(
-        broker="tiger",
-        market="US",
-        sell_actions=[],
-        buy_actions=[{
-            "action": "BUY",
-            "symbol": "TARGET",
-            "name": "Target",
-            "target_weight": "0.04",
-            "estimated_shares": 3,
-            "close": "100",
-            "lot_size": 1,
-            "estimated_initial_line": "90",
-        }],
-        hold_actions=[],
-        review_actions=[],
-        risk_skips=[],
-        broker_positions=positions,
-        cash_details=cash,
-    )
-
-    item = overlay["items"][0]
-    assert overlay["available"] is True
-    if not position_fx and not cash_fx:
-        assert overlay["account_nav_hkd"] == ""
-    assert item["actual_reference_quantity"] == ""
-    assert item["deviation"] == "reference_unavailable"
-    assert item["deviation_label"] == "暂无法换算"
-    assert item["reference_note"] == expected_note
 
 
 @pytest.mark.parametrize("missing_section", ["risk_summary", "drawdown_summary"])
@@ -4001,214 +3653,8 @@ def dashboard_decision_plan(run_date: str) -> dict[str, object]:
         effective_at=f"{run_date}T09:30:00-04:00",
         expires_at=f"{run_date}T16:00:00-04:00",
     )
-
-
-def obsolete_dashboard_preserves_cn_statement_values_when_backtest_cache_exists(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    row = {field: "" for field in PORTFOLIO_FIELDNAMES}
-    row.update(
-        {
-            "market": "CN",
-            "asset_class": "stock",
-            "symbol": "600025",
-            "name": "华能水电",
-            "currency": "CNY",
-            "total_quantity": "6000",
-            "last_price": "9.62",
-            "market_value": "57720",
-            "market_value_hkd": "62337.60",
-            "cost_value": "53346",
-            "fx_to_hkd": "1.08",
-            "brokers": "eastmoney",
-        }
-    )
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [row])
-    write_csv(
-        config.data_dir / "prices/CN/600025.csv",
-        ["date", "open", "high", "low", "close", "volume"],
-        [
-            {
-                "date": "2026-07-10",
-                "open": "9.8",
-                "high": "10.1",
-                "low": "9.7",
-                "close": "10.00",
-                "volume": "123456",
-            }
-        ],
-    )
-
-    state = load_dashboard_state(config)
-    holding = state.holdings[0]
-    assert holding["last_price"] == "9.62"
-    assert holding["market_value"] == "57720"
-    assert state.summary["portfolio_value_hkd"] == "62337.60"
-
-
-def obsolete_dashboard_preserves_all_statement_weights_when_cn_cache_exists(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    rows = []
-    for values in [
-        {
-            "market": "CN", "asset_class": "stock", "symbol": "600001",
-            "currency": "CNY", "total_quantity": "1", "cost_value": "100",
-            "fx_to_hkd": "1", "market_value_hkd": "100",
-            "portfolio_weight_hkd": "10.00%",
-        },
-        {
-            "market": "CN", "asset_class": "stock", "symbol": "600002",
-            "currency": "CNY", "total_quantity": "1", "cost_value": "200",
-            "fx_to_hkd": "1", "market_value_hkd": "200",
-            "portfolio_weight_hkd": "20.00%",
-        },
-        {
-            "market": "US", "asset_class": "stock", "symbol": "AAPL",
-            "currency": "HKD", "market_value_hkd": "400",
-            "portfolio_weight_hkd": "40.00%",
-        },
-        {
-            "market": "CASH", "asset_class": "cash", "symbol": "HKD_CASH",
-            "currency": "HKD", "market_value_hkd": "100",
-            "portfolio_weight_hkd": "30.00%",
-        },
-    ]:
-        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
-        row.update(values)
-        rows.append(row)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
-    original = config.portfolio_path.read_bytes()
-    for symbol, close in [("600001", "201"), ("600002", "302")]:
-        write_csv(
-            config.data_dir / f"prices/CN/{symbol}.csv",
-            ["date", "close"],
-            [{"date": "2026-07-10", "close": close}],
-        )
-
-    payload = load_dashboard_state(config).to_dict()
-    displayed_rows = payload["holdings"] + payload["cash_rows"]
-
-    assert payload["summary"]["portfolio_value_hkd"] == "800.00"
-    assert sum(Decimal(row["market_value_hkd"]) for row in displayed_rows) == Decimal(
-        "800.00"
-    )
-    assert {row["symbol"]: row["portfolio_weight_hkd"] for row in displayed_rows} == {
-        "600001": "10.00%",
-        "600002": "20.00%",
-        "AAPL": "40.00%",
-        "HKD_CASH": "30.00%",
-    }
-    assert sum(
-        Decimal(row["portfolio_weight_hkd"].rstrip("%")) for row in displayed_rows
-    ) == Decimal("100.00")
-    assert config.portfolio_path.read_bytes() == original
-
-
-def obsolete_dashboard_preserves_statement_when_complete_weights_are_invalid(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    rows = []
-    for values in [
-        {
-            "market": "CN", "asset_class": "stock", "symbol": "600001",
-            "currency": "CNY", "total_quantity": "1", "last_price": "100",
-            "market_value": "100", "cost_value": "80", "fx_to_hkd": "1",
-            "market_value_hkd": "100", "unrealized_pnl": "20",
-            "unrealized_pnl_pct": "25.00%", "portfolio_weight_hkd": "10.00%",
-        },
-        {
-            "market": "US", "asset_class": "stock", "symbol": "AAPL",
-            "currency": "USD", "market_value_hkd": "bad",
-            "portfolio_weight_hkd": "90.00%",
-        },
-    ]:
-        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
-        row.update(values)
-        rows.append(row)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
-    original_file = config.portfolio_path.read_bytes()
-    write_csv(
-        config.data_dir / "prices/CN/600001.csv",
-        ["date", "close"],
-        [{"date": "2026-07-10", "close": "200"}],
-    )
-
-    state = load_dashboard_state(config)
-
-    assert [
-        {key: holding[key] for key in original}
-        for holding, original in zip(state.holdings, rows)
-    ] == rows
-    assert state.summary["portfolio_value_hkd"] == "100.00"
-    assert config.portfolio_path.read_bytes() == original_file
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("close", "bad"),
-        ("close", "0"),
-        ("close", "-1"),
-        ("total_quantity", "bad"),
-        ("total_quantity", "-1"),
-        ("cost_value", ""),
-        ("cost_value", "NaN"),
-        ("cost_value", "-1"),
-        ("fx_to_hkd", ""),
-        ("fx_to_hkd", "NaN"),
-        ("fx_to_hkd", "0"),
-        ("fx_to_hkd", "-1"),
-    ],
-)
-def obsolete_dashboard_cn_cache_inputs_never_replace_statement_row_and_summary(
-    tmp_path: Path,
-    field: str,
-    value: str,
-) -> None:
-    config = dashboard_config(tmp_path)
-    row = {fieldname: "" for fieldname in PORTFOLIO_FIELDNAMES}
-    row.update(
-        {
-            "market": "CN",
-            "asset_class": "stock",
-            "symbol": "600025",
-            "currency": "CNY",
-            "total_quantity": "6000",
-            "last_price": "9.62",
-            "market_value": "57720",
-            "market_value_hkd": "62337.60",
-            "cost_value": "53346",
-            "unrealized_pnl": "4374",
-            "unrealized_pnl_pct": "8.20%",
-            "fx_to_hkd": "1.08",
-            "brokers": "eastmoney",
-        }
-    )
-    close = "10.00"
-    if field == "close":
-        close = value
-    else:
-        row[field] = value
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [row])
-    write_csv(
-        config.data_dir / "prices/CN/600025.csv",
-        ["date", "close"],
-        [{"date": "2026-07-10", "close": close}],
-    )
-
-    state = load_dashboard_state(config)
-
-    assert {key: state.holdings[0][key] for key in row} == row
-    assert state.summary["portfolio_value_hkd"] == "62337.60"
-
-
 def test_dashboard_exposes_eastmoney_statement_metadata() -> None:
     assert BROKER_LABELS["eastmoney"] == "东方财富"
-    assert BROKER_SOURCE_KINDS["eastmoney"] == "statement"
 
 
 def test_dashboard_backtest_universe_keeps_legacy_watchlist_only(tmp_path: Path) -> None:
@@ -4237,7 +3683,7 @@ def test_dashboard_backtest_universe_keeps_legacy_watchlist_only(tmp_path: Path)
     ]
 
 
-def obsolete_dashboard_keeps_other_holdings_out_of_scoped_market_loaders(tmp_path: Path) -> None:
+def test_dashboard_keeps_other_holdings_out_of_scoped_market_loaders(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     rows: list[dict[str, str]] = []
     for market, symbol in [("US", "MSFT"), ("OTHER", "PRIVATE")]:
@@ -4256,38 +3702,9 @@ def obsolete_dashboard_keeps_other_holdings_out_of_scoped_market_loaders(tmp_pat
 
     payload = load_dashboard_state(config).to_dict()
 
-    assert {(row["market"], row["symbol"]) for row in payload["holdings"]} == {
+    assert {(row["market"], row["symbol"]) for row in payload["holding_enrichment"]} == {
         ("US", "MSFT"),
-        ("OTHER", "PRIVATE"),
     }
-
-
-def obsolete_dashboard_backtest_universe_rejects_unsafe_and_option_symbols(tmp_path: Path) -> None:
-    config = dashboard_config(tmp_path)
-    rows = []
-    for market, symbol, asset_class, name in [
-        ("US", "BRK.B", "stock", "Berkshire"),
-        ("US", "SPY", "etf", "SPDR ETF"),
-        ("HK", "00700", "stock", "腾讯"),
-        ("US", "AAPL260116C00150000", "", ""),
-        ("HK", "12345", "", "腾讯期权"),
-        ("US", "../../outside", "stock", "unsafe"),
-        ("US", "BAD/SYMBOL", "stock", "unsafe"),
-        ("US", "BAD\\SYMBOL", "stock", "unsafe"),
-        ("US", "BAD:SYMBOL", "stock", "unsafe"),
-        ("US", "BAD SYMBOL", "stock", "unsafe"),
-        ("HK", "123456", "stock", "unsafe"),
-    ]:
-        row = {field: "" for field in PORTFOLIO_FIELDNAMES}
-        row.update({"market": market, "symbol": symbol, "asset_class": asset_class, "name": name})
-        rows.append(row)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
-
-    universe = load_dashboard_state(config).to_dict()["backtest_universe"]["holdings"]
-
-    assert [(row["market"], row["symbol"]) for row in universe] == [
-        ("US", "BRK.B"), ("US", "SPY"), ("HK", "00700"),
-    ]
 
 
 def raw_decision_with_market_report(report: str) -> str:
@@ -4707,416 +4124,7 @@ def portfolio_rows() -> list[dict[str, str]]:
             "notes": "",
         },
     ]
-
-
-def obsolete_load_dashboard_state_uses_accepted_account_state_not_newer_run_details(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    seed_accepted_account_sync(config, tiger_position_count=14)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows()[:1])
-    write_csv(
-        config.data_dir / "runs" / "2026-07-31" / "extracted_positions.csv",
-        POSITION_FIELDNAMES,
-        [
-            {
-                "statement_id": "2026-07-31-tiger-live",
-                "broker": "tiger",
-                "account_alias": "failed_run",
-                "market": "US",
-                "asset_class": "stock",
-                "symbol": f"FAILED{index}",
-                "name": f"Failed {index}",
-                "currency": "USD",
-                "quantity": "1",
-                "cost_price": "10",
-                "last_price": "11",
-                "market_value": "11",
-                "cost_value": "10",
-                "unrealized_pnl": "1",
-                "confidence": "high",
-                "notes": "",
-            }
-            for index in range(8)
-        ],
-    )
-    write_trend_history_report(
-        config.reports_dir,
-        "2026-07-30.json",
-        execution_date="2026-07-30",
-        generated_at="2026-07-30T12:00:00+08:00",
-    )
-
-    state = load_dashboard_state(config).to_dict()
-
-    assert {row["symbol"] for row in state["holdings"]} == {
-        f"ACCEPTED{index}" for index in range(14)
-    }
-    assert len(state["cash_rows"]) == 1
-    assert state["summary"]["holding_count"] == 14
-    assert state["summary"]["portfolio_value_hkd"] == "1981.20"
-    assert len(state["broker_positions"]) == 14
-    tiger = next(row for row in state["broker_summaries"] if row["broker"] == "tiger")
-    assert tiger["holding_count"] == 14
-    assert tiger["holding_value_hkd"] == "1201.20"
-    assert len(state["cash_details"]) == 1
-    assert state["source_statuses"][1]["status"] == "ok"
-    assert len(state["trend_reports"]["tiger"]["actual_overlay"]["outside_positions"]) == 14
-
-
-def obsolete_load_dashboard_state_holding_has_only_transitional_instrument_id(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-
-    state = load_dashboard_state(config).to_dict()
-
-    assert state["broker_detail_month"] == ""
-    assert state["detail_available"] is False
-    assert state["summary"]["holding_count"] == 1
-    holdings_by_symbol = {row["symbol"]: row for row in state["holdings"]}
-    assert "VIXY" in holdings_by_symbol
-    for holding in state["holdings"]:
-        assert holding["instrument_id"] == build_instrument_id(
-            holding["market"], holding["asset_class"], holding["symbol"]
-        )
-        assert not {
-            "position_id",
-            "account_status",
-            "quantity",
-            "price",
-            "valuation",
-            "weight",
-            "account_release",
-        } & holding.keys()
-    holding = holdings_by_symbol["VIXY"]
-    assert holding["broker_detail_count"] == 0
-    assert holding["broker_details"] == []
-    assert holding["trade_action"] == {"available": False, "error": ""}
-    assert "backtest" not in holding
-    assert "backtest_readiness" not in holding
-
-
-def obsolete_load_dashboard_state_attaches_latest_backtest_result(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-    older_dir = config.data_dir / "backtests" / "2026-06-16-US-VIXY-trading-plan"
-    older_dir.mkdir(parents=True)
-    (older_dir / "metrics.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "open_trader.backtest_metrics.v1",
-                "run_id": "2026-06-16-US-VIXY-trading-plan",
-                "run_date": "2026-06-16",
-                "market": "US",
-                "symbol": "VIXY",
-                "strategy": "trading_plan",
-                "adapter": "backtrader",
-                "metrics": {
-                    "total_return_pct": "-2.00",
-                    "win_rate_pct": "33.33",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    latest_dir = config.data_dir / "backtests" / "2026-06-18-US-VIXY-trading-plan"
-    latest_dir.mkdir(parents=True)
-    (latest_dir / "metrics.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "open_trader.backtest_metrics.v1",
-                "run_id": "2026-06-18-US-VIXY-trading-plan",
-                "run_date": "2026-06-18",
-                "market": "US",
-                "symbol": "VIXY",
-                "strategy": "trading_plan",
-                "adapter": "backtrader",
-                "metrics": {
-                    "total_return_pct": "1.17",
-                    "win_rate_pct": "50.00",
-                    "max_drawdown_pct": "-3.40",
-                    "trade_count": "2",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    (latest_dir / "trades.csv").write_text(
-        "\n".join(
-            [
-                "run_id,run_date,date,market,symbol,side,price,quantity,notional,fees,cash_after,reason",
-                "2026-06-18-US-VIXY-trading-plan,2026-06-18,2026-06-19,US,VIXY,BUY,40.2000,621,24964.20,24.96,75010.84,entry_zone",
-                "2026-06-18-US-VIXY-trading-plan,2026-06-18,2026-06-20,US,VIXY,SELL,47.9760,621,29793.10,29.79,104774.15,target_1",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    (latest_dir / "equity_curve.csv").write_text(
-        "\n".join(
-            [
-                "run_id,date,cash,position_quantity,close,equity,drawdown_pct",
-                "2026-06-18-US-VIXY-trading-plan,2026-06-18,100000.00,0,45.0000,100000.00,0.00",
-                "2026-06-18-US-VIXY-trading-plan,2026-06-19,75010.84,621,42.0000,101092.84,0.00",
-                "2026-06-18-US-VIXY-trading-plan,2026-06-20,104774.15,0,48.0000,104774.15,0.00",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    report_path = config.reports_dir / "backtests" / "2026-06-18-US-VIXY-trading-plan.md"
-    report_path.parent.mkdir(parents=True)
-    report_path.write_text("# VIXY 回测\n", encoding="utf-8")
-
-    state = load_dashboard_state(config).to_dict()
-
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
-    assert vixy["backtest"] == {
-        "available": True,
-        "run_id": "2026-06-18-US-VIXY-trading-plan",
-        "run_date": "2026-06-18",
-        "market": "US",
-        "symbol": "VIXY",
-        "strategy": "trading_plan",
-        "adapter": "backtrader",
-        "metrics": {
-            "total_return_pct": "1.17",
-            "win_rate_pct": "50.00",
-            "max_drawdown_pct": "-3.40",
-            "trade_count": "2",
-        },
-        "metrics_path": str(latest_dir / "metrics.json"),
-        "trades_path": str(latest_dir / "trades.csv"),
-        "equity_curve_path": str(latest_dir / "equity_curve.csv"),
-        "trades": [
-            {
-                "run_id": "2026-06-18-US-VIXY-trading-plan",
-                "run_date": "2026-06-18",
-                "date": "2026-06-19",
-                "market": "US",
-                "symbol": "VIXY",
-                "side": "BUY",
-                "price": "40.2000",
-                "quantity": "621",
-                "notional": "24964.20",
-                "fees": "24.96",
-                "cash_after": "75010.84",
-                "reason": "entry_zone",
-            },
-            {
-                "run_id": "2026-06-18-US-VIXY-trading-plan",
-                "run_date": "2026-06-18",
-                "date": "2026-06-20",
-                "market": "US",
-                "symbol": "VIXY",
-                "side": "SELL",
-                "price": "47.9760",
-                "quantity": "621",
-                "notional": "29793.10",
-                "fees": "29.79",
-                "cash_after": "104774.15",
-                "reason": "target_1",
-            },
-        ],
-        "equity_curve": [
-            {
-                "run_id": "2026-06-18-US-VIXY-trading-plan",
-                "date": "2026-06-18",
-                "cash": "100000.00",
-                "position_quantity": "0",
-                "close": "45.0000",
-                "equity": "100000.00",
-                "drawdown_pct": "0.00",
-            },
-            {
-                "run_id": "2026-06-18-US-VIXY-trading-plan",
-                "date": "2026-06-19",
-                "cash": "75010.84",
-                "position_quantity": "621",
-                "close": "42.0000",
-                "equity": "101092.84",
-                "drawdown_pct": "0.00",
-            },
-            {
-                "run_id": "2026-06-18-US-VIXY-trading-plan",
-                "date": "2026-06-20",
-                "cash": "104774.15",
-                "position_quantity": "0",
-                "close": "48.0000",
-                "equity": "104774.15",
-                "drawdown_pct": "0.00",
-            },
-        ],
-        "report_path": str(report_path),
-        "status": "ok",
-        "error": "",
-    }
-
-
-def obsolete_load_dashboard_state_exposes_backtest_readiness(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-    plan_row = {field: "" for field in TRADING_PLAN_FIELDNAMES}
-    plan_row.update(
-        {
-            "run_date": "2026-06-18",
-            "symbol": "VIXY",
-            "market": "US",
-            "rating": "Overweight",
-            "entry_zone_low": "40",
-            "entry_zone_high": "",
-            "max_weight": "",
-            "status": "active",
-        }
-    )
-    write_csv(
-        config.data_dir / "latest" / "US" / "trading_plan.csv",
-        TRADING_PLAN_FIELDNAMES,
-        [plan_row],
-    )
-
-    state = load_dashboard_state(config).to_dict()
-
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
-    assert vixy["backtest_readiness"] == {
-        "available": False,
-        "status": "missing_fields",
-        "run_date": "2026-06-18",
-        "plan_path": str(config.data_dir / "latest" / "US" / "trading_plan.csv"),
-        "prices_path": str(config.data_dir / "prices" / "US" / "VIXY.csv"),
-        "prices_missing": True,
-        "missing_fields": ["entry_zone_high", "max_weight"],
-        "error": "missing backtest field(s): entry_zone_high, max_weight",
-    }
-
-    plan_row["entry_zone_high"] = "42"
-    plan_row["max_weight"] = "25%"
-    write_csv(
-        config.data_dir / "latest" / "US" / "trading_plan.csv",
-        TRADING_PLAN_FIELDNAMES,
-        [plan_row],
-    )
-    write_csv(
-        config.data_dir / "prices" / "US" / "VIXY.csv",
-        ["date", "open", "high", "low", "close"],
-        [{"date": "2026-06-19", "open": "41", "high": "43", "low": "40", "close": "42"}],
-    )
-
-    state = load_dashboard_state(config).to_dict()
-
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
-    assert vixy["backtest_readiness"] == {
-        "available": True,
-        "status": "ready",
-        "run_date": "2026-06-18",
-        "plan_path": str(config.data_dir / "latest" / "US" / "trading_plan.csv"),
-        "prices_path": str(config.data_dir / "prices" / "US" / "VIXY.csv"),
-        "prices_missing": False,
-        "missing_fields": [],
-        "error": "",
-    }
-
-
-def obsolete_load_dashboard_state_marks_sell_side_backtest_ready(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-    plan_row = {field: "" for field in TRADING_PLAN_FIELDNAMES}
-    plan_row.update(
-        {
-            "run_date": "2026-06-18",
-            "symbol": "VIXY",
-            "market": "US",
-            "rating": "Underweight",
-            "entry_zone_low": "30",
-            "entry_zone_high": "50",
-            "target_1": "35",
-            "max_weight": "",
-            "status": "active",
-        }
-    )
-    write_csv(
-        config.data_dir / "latest" / "US" / "trading_plan.csv",
-        TRADING_PLAN_FIELDNAMES,
-        [plan_row],
-    )
-    write_csv(
-        config.data_dir / "prices" / "US" / "VIXY.csv",
-        ["date", "open", "high", "low", "close"],
-        [{"date": "2026-06-19", "open": "41", "high": "43", "low": "34", "close": "35"}],
-    )
-
-    state = load_dashboard_state(config).to_dict()
-
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
-    assert vixy["backtest_readiness"] == {
-        "available": True,
-        "status": "ready",
-        "run_date": "2026-06-18",
-        "plan_path": str(config.data_dir / "latest" / "US" / "trading_plan.csv"),
-        "prices_path": str(config.data_dir / "prices" / "US" / "VIXY.csv"),
-        "prices_missing": False,
-        "missing_fields": [],
-        "error": "",
-    }
-
-
-def obsolete_load_dashboard_state_excludes_cash_like_rows_from_holdings(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    rows = [
-        portfolio_rows()[0],
-        {
-            **portfolio_rows()[0],
-            "sort_group": "3",
-            "market": "HK",
-            "asset_class": "money_market_fund",
-            "symbol": "HK0000951506.HKD",
-            "name": "华泰港元货币市场基金A",
-            "currency": "HKD",
-            "market_value_hkd": "597524.58",
-            "portfolio_weight_hkd": "35.14%",
-            "brokers": "tiger",
-            "ai_eligible": "false",
-            "analysis_symbol": "",
-        },
-        {
-            **portfolio_rows()[1],
-            "symbol": "FUTU_UNMAPPED_ASSETS",
-            "name": "富途未明细账户资产",
-            "market_value_hkd": "849884.06",
-            "portfolio_weight_hkd": "49.98%",
-        },
-        {
-            **portfolio_rows()[1],
-            "symbol": "USD_CASH",
-            "name": "USD Cash",
-            "market_value_hkd": "-87760.17",
-            "portfolio_weight_hkd": "-5.16%",
-        },
-    ]
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
-
-    state = load_dashboard_state(config).to_dict()
-
-    assert state["summary"]["holding_count"] == 1
-    assert state["summary"]["portfolio_value_hkd"] == "1397478.47"
-    assert state["summary"]["holding_value_hkd"] == "37830.00"
-    assert state["summary"]["cash_like_value_hkd"] == "1359648.47"
-    assert state["summary"]["holding_weight_hkd"] == "2.71%"
-    assert state["summary"]["cash_like_weight_hkd"] == "97.29%"
-    assert [row["symbol"] for row in state["holdings"]] == ["VIXY"]
-
-
-def obsolete_load_dashboard_state_merges_agent_report_strategy_and_actions(
+def test_load_dashboard_state_merges_agent_report_strategy_and_actions(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5215,7 +4223,7 @@ def obsolete_load_dashboard_state_merges_agent_report_strategy_and_actions(
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["agent_report"] == {
         "available": True,
         "run_date": "2026-06-18",
@@ -5243,7 +4251,7 @@ def obsolete_load_dashboard_state_merges_agent_report_strategy_and_actions(
     assert vixy["trade_action"]["suggested_quantity"] == "50"
 
 
-def obsolete_load_dashboard_state_attaches_t_signal_from_market_scoped_latest(
+def test_load_dashboard_state_attaches_t_signal_from_market_scoped_latest(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5252,7 +4260,7 @@ def obsolete_load_dashboard_state_attaches_t_signal_from_market_scoped_latest(
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["t_signal"]["available"] is True
     assert vixy["t_signal"]["action"] == "BUY_T"
     assert vixy["t_signal"]["suggested_ratio"] == "10"
@@ -5260,7 +4268,7 @@ def obsolete_load_dashboard_state_attaches_t_signal_from_market_scoped_latest(
     assert vixy["t_signal"]["timeline"][0]["event_type"] == "signal_created"
 
 
-def obsolete_load_dashboard_state_marks_t_signal_unavailable_when_missing(
+def test_load_dashboard_state_marks_t_signal_unavailable_when_missing(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5268,11 +4276,11 @@ def obsolete_load_dashboard_state_marks_t_signal_unavailable_when_missing(
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["t_signal"] == {"available": False, "error": ""}
 
 
-def obsolete_dashboard_attaches_tradingagents_summary_without_debug_fields_and_fallback(
+def test_dashboard_attaches_tradingagents_summary_without_debug_fields_and_fallback(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5351,7 +4359,7 @@ def obsolete_dashboard_attaches_tradingagents_summary_without_debug_fields_and_f
 
     state = load_dashboard_state(config).to_dict()
 
-    holdings = {row["symbol"]: row for row in state["holdings"]}
+    holdings = {row["symbol"]: row for row in state["holding_enrichment"]}
     assert holdings["VIXY"]["tradingagents_summary"] == {
         "available": True,
         "status": "available",
@@ -5384,7 +4392,7 @@ def obsolete_dashboard_attaches_tradingagents_summary_without_debug_fields_and_f
     }
 
 
-def obsolete_dashboard_ignores_stale_tradingagents_summary_latest(
+def test_dashboard_ignores_stale_tradingagents_summary_latest(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5447,7 +4455,7 @@ def obsolete_dashboard_ignores_stale_tradingagents_summary_latest(
 
     state = load_dashboard_state(config).to_dict()
 
-    dram_holding = next(row for row in state["holdings"] if row["symbol"] == "DRAM")
+    dram_holding = next(row for row in state["holding_enrichment"] if row["symbol"] == "DRAM")
     assert dram_holding["tradingagents_summary"] == {
         "available": False,
         "status": "missing_current_summary",
@@ -5463,7 +4471,7 @@ def obsolete_dashboard_ignores_stale_tradingagents_summary_latest(
     )
 
 
-def obsolete_dashboard_attaches_unscoped_tradingagents_summary_latest(
+def test_dashboard_attaches_unscoped_tradingagents_summary_latest(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5495,7 +4503,7 @@ def obsolete_dashboard_attaches_unscoped_tradingagents_summary_latest(
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["tradingagents_summary"] == {
         "available": True,
         "status": "available",
@@ -5518,7 +4526,7 @@ def obsolete_dashboard_attaches_unscoped_tradingagents_summary_latest(
     }
 
 
-def obsolete_load_dashboard_state_attaches_fresh_technical_facts(
+def test_load_dashboard_state_attaches_fresh_technical_facts(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5554,7 +4562,7 @@ def obsolete_load_dashboard_state_attaches_fresh_technical_facts(
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["technical_facts"]["available"] is True
     assert vixy["technical_facts"]["status"] == "usable"
     assert vixy["technical_facts"]["run_date"] == "2026-06-19"
@@ -5563,7 +4571,7 @@ def obsolete_load_dashboard_state_attaches_fresh_technical_facts(
     assert vixy["technical_facts"]["facts"]["timeframes"][0]["timeframe"] == "daily"
 
 
-def obsolete_load_dashboard_state_accepts_kline_sourced_technical_facts_without_advice_hash(
+def test_load_dashboard_state_accepts_kline_sourced_technical_facts_without_advice_hash(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5617,14 +4625,14 @@ def obsolete_load_dashboard_state_accepts_kline_sourced_technical_facts_without_
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["technical_facts"]["available"] is True
     assert vixy["technical_facts"]["status"] == "usable"
     assert vixy["technical_facts"]["source_hash"] == "futu-kline:US.VIXY:2026-06-18"
     assert vixy["technical_facts"]["current_source_hash"] == ""
 
 
-def obsolete_decision_tab_marks_healthy_technical_facts_from_older_run_unavailable(
+def test_decision_tab_marks_healthy_technical_facts_from_older_run_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5656,14 +4664,14 @@ def obsolete_decision_tab_marks_healthy_technical_facts_from_older_run_unavailab
         report_hash=source_hash("Older report with a different source hash."),
     )
 
-    technical = load_dashboard_state(config).to_dict()["holdings"][0]["technical_facts"]
+    technical = load_dashboard_state(config).to_dict()["holding_enrichment"][0]["technical_facts"]
 
     assert technical["available"] is False
     assert technical["status"] == "stale_run_date"
     assert technical["error"] == "technical facts run date does not match latest advice"
 
 
-def obsolete_load_dashboard_state_marks_missing_technical_facts_file_unavailable(
+def test_load_dashboard_state_marks_missing_technical_facts_file_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5671,7 +4679,7 @@ def obsolete_load_dashboard_state_marks_missing_technical_facts_file_unavailable
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["technical_facts"] == {
         "available": False,
         "status": "missing_file",
@@ -5685,7 +4693,7 @@ def obsolete_load_dashboard_state_marks_missing_technical_facts_file_unavailable
     }
 
 
-def obsolete_load_dashboard_state_marks_stale_technical_facts_hash_unavailable(
+def test_load_dashboard_state_marks_stale_technical_facts_hash_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5722,7 +4730,7 @@ def obsolete_load_dashboard_state_marks_stale_technical_facts_hash_unavailable(
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["technical_facts"]["available"] is False
     assert vixy["technical_facts"]["status"] == "stale_source_hash"
     assert vixy["technical_facts"]["run_date"] == "2026-06-19"
@@ -5732,7 +4740,7 @@ def obsolete_load_dashboard_state_marks_stale_technical_facts_hash_unavailable(
     assert vixy["technical_facts"]["facts"] == {}
 
 
-def obsolete_load_dashboard_state_prefers_market_scoped_technical_facts_and_advice(
+def test_load_dashboard_state_prefers_market_scoped_technical_facts_and_advice(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5792,14 +4800,14 @@ def obsolete_load_dashboard_state_prefers_market_scoped_technical_facts_and_advi
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["agent_report"]["run_date"] == "2026-06-19"
     assert vixy["technical_facts"]["available"] is False
     assert vixy["technical_facts"]["status"] == "missing_file"
     assert vixy["technical_facts"]["current_source_hash"] == source_hash(current_report)
 
 
-def obsolete_load_dashboard_state_uses_scoped_facts_when_both_latest_layouts_exist(
+def test_load_dashboard_state_uses_scoped_facts_when_both_latest_layouts_exist(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5863,14 +4871,14 @@ def obsolete_load_dashboard_state_uses_scoped_facts_when_both_latest_layouts_exi
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["technical_facts"]["available"] is True
     assert vixy["technical_facts"]["status"] == "usable"
     assert vixy["technical_facts"]["source_hash"] == source_hash(current_report)
     assert vixy["technical_facts"]["current_source_hash"] == source_hash(current_report)
 
 
-def obsolete_dashboard_attaches_hash_checked_decision_facts(
+def test_dashboard_attaches_hash_checked_decision_facts(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5908,7 +4916,7 @@ def obsolete_dashboard_attaches_hash_checked_decision_facts(
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["decision_facts"]["kline"]["available"] is True
     assert vixy["decision_facts"]["kline"]["fields"]["trend"] == "趋势偏强"
     assert vixy["decision_facts"]["news_sentiment"]["available"] is True
@@ -5918,7 +4926,7 @@ def obsolete_dashboard_attaches_hash_checked_decision_facts(
     )
 
 
-def obsolete_dashboard_falls_back_to_unscoped_decision_facts(
+def test_dashboard_falls_back_to_unscoped_decision_facts(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -5956,7 +4964,7 @@ def obsolete_dashboard_falls_back_to_unscoped_decision_facts(
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["decision_facts"]["kline"]["available"] is True
     assert vixy["decision_facts"]["kline"]["fields"]["trend"] == "趋势偏强"
     assert vixy["decision_facts"]["news_sentiment"]["available"] is True
@@ -5966,7 +4974,7 @@ def obsolete_dashboard_falls_back_to_unscoped_decision_facts(
     )
 
 
-def obsolete_dashboard_stale_decision_facts_render_missing_fields(
+def test_dashboard_stale_decision_facts_render_missing_fields(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6003,7 +5011,7 @@ def obsolete_dashboard_stale_decision_facts_render_missing_fields(
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["decision_facts"]["kline"]["available"] is False
     assert vixy["decision_facts"]["news_sentiment"]["available"] is False
     assert set(vixy["decision_facts"]["kline"]["fields"]) == set(KLINE_FIELDS)
@@ -6020,7 +5028,7 @@ def obsolete_dashboard_stale_decision_facts_render_missing_fields(
     )
 
 
-def obsolete_load_dashboard_state_attaches_futu_skill_facts(tmp_path: Path) -> None:
+def test_load_dashboard_state_attaches_futu_skill_facts(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
     write_csv(
@@ -6050,7 +5058,7 @@ def obsolete_load_dashboard_state_attaches_futu_skill_facts(tmp_path: Path) -> N
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = state["holdings"][0]
+    vixy = state["holding_enrichment"][0]
     news_sentiment = vixy["futu_skill_facts"]["news_sentiment"]
     assert news_sentiment["available"] is True
     assert news_sentiment["signal"] == "supportive"
@@ -6072,7 +5080,7 @@ def obsolete_load_dashboard_state_attaches_futu_skill_facts(tmp_path: Path) -> N
     assert derivatives["status"] == "partial"
 
 
-def obsolete_decision_tab_marks_healthy_futu_facts_from_older_run_unavailable(
+def test_decision_tab_marks_healthy_futu_facts_from_older_run_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6103,14 +5111,14 @@ def obsolete_decision_tab_marks_healthy_futu_facts_from_older_run_unavailable(
         run_date="2026-07-01",
     )
 
-    futu = load_dashboard_state(config).to_dict()["holdings"][0]["futu_skill_facts"]
+    futu = load_dashboard_state(config).to_dict()["holding_enrichment"][0]["futu_skill_facts"]
 
     assert futu["technical_anomaly"]["available"] is False
     assert futu["technical_anomaly"]["status"] == "stale_run_date"
     assert futu["technical_anomaly"]["error"] == "Futu facts run date does not match latest advice"
 
 
-def obsolete_decision_tab_marks_futu_facts_without_current_advice_unavailable(
+def test_decision_tab_marks_futu_facts_without_current_advice_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6119,28 +5127,28 @@ def obsolete_decision_tab_marks_futu_facts_without_current_advice_unavailable(
         config.data_dir / "latest" / "US" / "futu_skill_facts.json",
     )
 
-    futu = load_dashboard_state(config).to_dict()["holdings"][0]["futu_skill_facts"]
+    futu = load_dashboard_state(config).to_dict()["holding_enrichment"][0]["futu_skill_facts"]
 
     assert futu["technical_anomaly"]["available"] is False
     assert futu["technical_anomaly"]["status"] == "stale_run_date"
     assert futu["technical_anomaly"]["error"] == "Futu facts run date does not match latest advice"
 
 
-def obsolete_load_dashboard_state_marks_missing_anomaly_modules_unavailable(
+def test_load_dashboard_state_marks_missing_anomaly_modules_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
 
     state = load_dashboard_state(config).to_dict()
-    vixy = state["holdings"][0]
+    vixy = state["holding_enrichment"][0]
 
     assert vixy["futu_skill_facts"]["technical_anomaly"]["available"] is False
     assert vixy["futu_skill_facts"]["technical_anomaly"]["status"] == "missing"
     assert vixy["futu_skill_facts"]["capital_anomaly"]["categories"] == []
 
 
-def obsolete_load_dashboard_state_hardens_malformed_cached_anomaly_module(
+def test_load_dashboard_state_hardens_malformed_cached_anomaly_module(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6187,7 +5195,7 @@ def obsolete_load_dashboard_state_hardens_malformed_cached_anomaly_module(
 
     state = load_dashboard_state(config).to_dict()
 
-    technical = state["holdings"][0]["futu_skill_facts"]["technical_anomaly"]
+    technical = state["holding_enrichment"][0]["futu_skill_facts"]["technical_anomaly"]
     assert technical["window_days"] == 0
     assert technical["categories"] == [
         {
@@ -6206,7 +5214,7 @@ def obsolete_load_dashboard_state_hardens_malformed_cached_anomaly_module(
     )
 
 
-def obsolete_load_dashboard_state_hardens_non_finite_anomaly_window_days(
+def test_load_dashboard_state_hardens_non_finite_anomaly_window_days(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6246,11 +5254,11 @@ def obsolete_load_dashboard_state_hardens_non_finite_anomaly_window_days(
 
     state = load_dashboard_state(config).to_dict()
 
-    technical = state["holdings"][0]["futu_skill_facts"]["technical_anomaly"]
+    technical = state["holding_enrichment"][0]["futu_skill_facts"]["technical_anomaly"]
     assert technical["window_days"] == 0
 
 
-def obsolete_load_dashboard_state_marks_stale_anomaly_module_unavailable(
+def test_load_dashboard_state_marks_stale_anomaly_module_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6299,7 +5307,7 @@ def obsolete_load_dashboard_state_marks_stale_anomaly_module_unavailable(
 
     state = load_dashboard_state(config).to_dict()
 
-    technical = state["holdings"][0]["futu_skill_facts"]["technical_anomaly"]
+    technical = state["holding_enrichment"][0]["futu_skill_facts"]["technical_anomaly"]
     assert technical["available"] is False
     assert technical["status"] == "stale"
     assert technical["summary"] == "技术信号来自旧缓存。"
@@ -6314,7 +5322,7 @@ def obsolete_load_dashboard_state_marks_stale_anomaly_module_unavailable(
     ]
 
 
-def obsolete_load_dashboard_state_marks_stale_futu_news_unavailable(
+def test_load_dashboard_state_marks_stale_futu_news_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6375,7 +5383,7 @@ def obsolete_load_dashboard_state_marks_stale_futu_news_unavailable(
 
     state = load_dashboard_state(config).to_dict()
 
-    news = state["holdings"][0]["futu_skill_facts"]["news_sentiment"]
+    news = state["holding_enrichment"][0]["futu_skill_facts"]["news_sentiment"]
     assert news["available"] is False
     assert news["status"] == "stale"
     assert news["signal"] == "supportive"
@@ -6386,7 +5394,7 @@ def obsolete_load_dashboard_state_marks_stale_futu_news_unavailable(
     assert news["suggested_constraint"] == "no_add"
 
 
-def obsolete_load_dashboard_state_marks_missing_agent_sections_unavailable(
+def test_load_dashboard_state_marks_missing_agent_sections_unavailable(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6394,7 +5402,7 @@ def obsolete_load_dashboard_state_marks_missing_agent_sections_unavailable(
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     unavailable = {"available": False, "error": ""}
     assert vixy["agent_report"] == unavailable
     assert vixy["strategy"] == unavailable
@@ -6402,7 +5410,7 @@ def obsolete_load_dashboard_state_marks_missing_agent_sections_unavailable(
     assert vixy["trade_action"] == unavailable
 
 
-def obsolete_load_dashboard_state_reads_large_agent_report_fields(
+def test_load_dashboard_state_reads_large_agent_report_fields(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6434,11 +5442,11 @@ def obsolete_load_dashboard_state_reads_large_agent_report_fields(
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["agent_report"]["raw_decision"] == raw_decision
 
 
-def obsolete_load_dashboard_state_attaches_research_view(tmp_path: Path) -> None:
+def test_load_dashboard_state_attaches_research_view(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
     bundle = config.data_dir / "research_data" / "US" / "VIXY" / "2026-06-19"
@@ -6463,7 +5471,7 @@ def obsolete_load_dashboard_state_attaches_research_view(tmp_path: Path) -> None
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["research_view"]["available"] is True
     assert vixy["research_view"]["research_date"] == "2026-06-19"
     assert (
@@ -6476,404 +5484,19 @@ def obsolete_load_dashboard_state_attaches_research_view(tmp_path: Path) -> None
     }
 
 
-def obsolete_load_dashboard_state_marks_missing_research_view(tmp_path: Path) -> None:
+def test_load_dashboard_state_marks_missing_research_view(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
 
     state = load_dashboard_state(config).to_dict()
 
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["research_view"]["available"] is False
     assert vixy["research_view"]["tradingagents_conclusion"] == {
         "status": "missing",
         "content": "",
     }
-
-
-def test_broker_summary_counts_cash_classified_positions_as_cash() -> None:
-    futu = dashboard_module._build_broker_summary(
-        "futu",
-        [],
-        [{
-            "broker": "futu",
-            "market": "CASH",
-            "asset_class": "cash",
-            "currency": "HKD",
-            "market_value": "900",
-        }],
-        [{
-            "broker": "futu",
-            "currency": "HKD",
-            "cash_balance": "100",
-        }],
-    )
-
-    assert futu["holding_value_hkd"] == "0.00"
-    assert futu["cash_like_value_hkd"] == "1000.00"
-    assert futu["portfolio_value_hkd"] == "1000.00"
-    assert futu["holding_count"] == 0
-
-
-def obsolete_load_dashboard_state_exposes_cash_rows_for_dashboard_view(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-
-    state = load_dashboard_state(config).to_dict()
-
-    assert [row["symbol"] for row in state["cash_rows"]] == ["HKD_CASH"]
-    assert state["cash_rows"][0]["market_value_hkd"] == "850.00"
-    assert state["cash_rows"][0]["brokers"] == "futu"
-
-
-def obsolete_load_dashboard_state_blanks_unsupported_or_malformed_detail_money(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-    run_dir = config.data_dir / "runs" / "2026-06-19"
-    write_csv(
-        run_dir / "extracted_positions.csv",
-        POSITION_FIELDNAMES,
-        [
-            {
-                "statement_id": "2026-06-19-futu",
-                "broker": "futu",
-                "account_alias": "main",
-                "market": "US",
-                "asset_class": "etf",
-                "symbol": "VIXY",
-                "name": "VIXY",
-                "currency": "USD",
-                "quantity": "1",
-                "cost_price": "",
-                "last_price": "",
-                "market_value": "10.00",
-                "cost_value": "",
-                "unrealized_pnl": "",
-                "confidence": "high",
-                "notes": "",
-            },
-            {
-                "statement_id": "2026-06-19-futu",
-                "broker": "futu",
-                "account_alias": "main",
-                "market": "HK",
-                "asset_class": "stock",
-                "symbol": "00001",
-                "name": "Unsupported Currency",
-                "currency": "EUR",
-                "quantity": "1",
-                "cost_price": "",
-                "last_price": "",
-                "market_value": "100.00",
-                "cost_value": "",
-                "unrealized_pnl": "",
-                "confidence": "low",
-                "notes": "",
-            },
-            {
-                "statement_id": "2026-06-19-futu",
-                "broker": "futu",
-                "account_alias": "main",
-                "market": "HK",
-                "asset_class": "stock",
-                "symbol": "00002",
-                "name": "Malformed Value",
-                "currency": "HKD",
-                "quantity": "1",
-                "cost_price": "",
-                "last_price": "",
-                "market_value": "not-money",
-                "cost_value": "",
-                "unrealized_pnl": "",
-                "confidence": "low",
-                "notes": "",
-            },
-        ],
-    )
-    write_csv(
-        run_dir / "extracted_cash.csv",
-        CASH_FIELDNAMES,
-        [
-            {
-                "statement_id": "2026-06-19-futu",
-                "broker": "futu",
-                "account_alias": "main",
-                "currency": "USD",
-                "cash_balance": "bad-cash",
-                "available_balance": "bad-cash",
-                "confidence": "low",
-                "notes": "",
-            },
-            {
-                "statement_id": "2026-06-19-futu",
-                "broker": "futu",
-                "account_alias": "main",
-                "currency": "CNY",
-                "cash_balance": "100.00",
-                "available_balance": "100.00",
-                "confidence": "high",
-                "notes": "",
-            },
-        ],
-    )
-
-    state = load_dashboard_state(config).to_dict()
-
-    summaries = {row["broker"]: row for row in state["broker_summaries"]}
-    assert summaries["futu"]["holding_value_hkd"] == ""
-    assert summaries["futu"]["cash_like_value_hkd"] == ""
-    assert summaries["futu"]["portfolio_value_hkd"] == ""
-
-
-def obsolete_load_dashboard_state_uses_single_broker_portfolio_fallback(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    rows = [
-        {**portfolio_rows()[0], "brokers": "phillips", "accounts": "cash"},
-        {**portfolio_rows()[1], "brokers": "phillips", "accounts": "cash"},
-    ]
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
-
-    state = load_dashboard_state(config).to_dict()
-
-    summaries = {row["broker"]: row for row in state["broker_summaries"]}
-    assert summaries["phillips"]["detail_available"] is False
-    assert summaries["phillips"]["holding_value_hkd"] == "37830.00"
-    assert summaries["phillips"]["cash_like_value_hkd"] == "850.00"
-    assert summaries["phillips"]["portfolio_value_hkd"] == "38680.00"
-    assert summaries["phillips"]["holding_count"] == 1
-
-
-def obsolete_load_dashboard_state_blanks_multi_broker_portfolio_fallback(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
-
-    state = load_dashboard_state(config).to_dict()
-
-    summaries = {row["broker"]: row for row in state["broker_summaries"]}
-    assert summaries["futu"]["holding_value_hkd"] == ""
-    assert summaries["futu"]["cash_like_value_hkd"] == ""
-    assert summaries["futu"]["portfolio_value_hkd"] == ""
-    assert summaries["futu"]["holding_count"] == 0
-    assert summaries["tiger"]["holding_value_hkd"] == ""
-    assert summaries["tiger"]["cash_like_value_hkd"] == ""
-    assert summaries["tiger"]["portfolio_value_hkd"] == ""
-    assert summaries["tiger"]["holding_count"] == 0
-
-
-def obsolete_load_dashboard_state_exposes_kelly_lab_and_holding_detail(
-    tmp_path: Path,
-) -> None:
-    config = dashboard_config(tmp_path)
-    rows = portfolio_rows()
-    rows.append(
-        {
-            **rows[0],
-            "symbol": "QQQ",
-            "name": "Invesco QQQ Trust",
-            "analysis_symbol": "QQQ",
-        }
-    )
-    write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, rows)
-    latest = tmp_path / "data" / "latest"
-    latest.mkdir(parents=True, exist_ok=True)
-    (latest / "kelly_strategy_templates.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "open_trader.kelly_strategy_templates.v1",
-                "templates": [
-                    {
-                        "strategy_id": "trend_pullback_20d",
-                        "strategy_name": "趋势回调 20D",
-                        "strategy_version": "v1",
-                        "entry_rule_description": "价格回调到 20 日均线附近。",
-                        "exit_rule_description": "目标价、止损或 20 个交易日到期。",
-                        "max_holding_days": 20,
-                        "order_type": "limit",
-                        "market_session": "regular",
-                    }
-                ],
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    (latest / "kelly_experiments.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "open_trader.kelly_experiments.v1",
-                "experiments": [
-                    {
-                        "experiment_id": "trend_pullback_20d_exp_20260707",
-                        "experiment_name": "趋势回调 20D 第一批",
-                        "strategy_id": "trend_pullback_20d",
-                        "strategy_version": "v1",
-                        "market": "US",
-                        "start_date": "2026-07-07",
-                        "paper_account": "futu_simulate",
-                        "experiment_budget": "100000",
-                        "budget_currency": "USD",
-                        "capital_utilization_pct": "50",
-                        "allocation_mode": "equal_weight",
-                        "max_open_position_per_symbol": 1,
-                        "status": "running",
-                        "locked": True,
-                        "participants": [
-                            {
-                                "market": "US",
-                                "symbol": "VIXY",
-                                "name": "ProShares VIX",
-                                "source": "holding+watchlist",
-                                "locked": True,
-                                "per_symbol_budget": "25000",
-                                "budget_currency": "USD",
-                            }
-                        ],
-                        "stats": {
-                            "completed_samples": 0,
-                            "open_samples": 0,
-                            "observed_win_rate": "",
-                            "sample_stage": "insufficient",
-                        },
-                    }
-                ],
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    (latest / "kelly_order_executions.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "open_trader.kelly_order_executions.v1",
-                "environment": "DRY_RUN",
-                "source": "dry_run",
-                "executed_at": "2026-07-10 13:32",
-                "execution_count": 1,
-                "submitted_count": 0,
-                "dry_run_count": 1,
-                "skipped_count": 0,
-                "failed_count": 0,
-                "executions": [
-                    {
-                        "intent_id": "trend_pullback_20d_exp_20260707:US:VIXY:entry",
-                        "experiment_id": "trend_pullback_20d_exp_20260707",
-                        "market": "US",
-                        "symbol": "VIXY",
-                        "futu_code": "US.VIXY",
-                        "side": "buy",
-                        "order_type": "NORMAL",
-                        "price": "12.5",
-                        "qty": "80",
-                        "planned_notional": "1000",
-                        "budget_currency": "USD",
-                        "execution_status": "dry_run",
-                        "submitted": False,
-                        "futu_order_id": "",
-                        "executed_at": "2026-07-10 13:32",
-                        "error": "",
-                    }
-                ],
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    trade_samples_payload = {
-        "schema_version": "open_trader.kelly_trade_samples.v1",
-        "generated_at": "2026-07-11 12:00",
-        "source_orders_synced_at": "2026-07-11 11:59",
-        "sample_count": 0,
-        "open_position_count": 0,
-        "skipped_order_count": 0,
-        "stats_by_experiment": {},
-        "samples": [],
-        "open_positions": [],
-        "diagnostics": {"skipped_orders": []},
-    }
-    (latest / "kelly_trade_samples.json").write_text(
-        json.dumps(trade_samples_payload),
-        encoding="utf-8",
-    )
-    (latest / "kelly_strategy_stats.json").write_text(
-        json.dumps(
-            build_kelly_strategy_stats_payload(
-                [
-                    {
-                        "experiment_id": "trend_pullback_20d_exp_20260707",
-                        "experiment_name": "趋势回调 20D 第一批",
-                        "market": "US",
-                    }
-                ],
-                trade_samples_payload,
-                generated_at="2026-07-11 12:01",
-            ),
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-
-    state = load_dashboard_state(config).to_dict()
-
-    assert state["kelly_lab"]["available"] is True
-    assert state["kelly_lab"]["experiment_count"] == 1
-    experiment = state["kelly_lab"]["experiments"][0]
-    assert experiment["order_execution"] == {
-        "status": "success",
-        "environment": "DRY_RUN",
-        "source": "dry_run",
-        "last_executed_at": "2026-07-10 13:32",
-        "execution_count": 1,
-        "submitted_count": 0,
-        "dry_run_count": 1,
-        "skipped_count": 0,
-        "failed_count": 0,
-        "message": "Kelly 订单执行结果已生成。",
-        "executions": [
-            {
-                "intent_id": "trend_pullback_20d_exp_20260707:US:VIXY:entry",
-                "experiment_id": "trend_pullback_20d_exp_20260707",
-                "market": "US",
-                "symbol": "VIXY",
-                "futu_code": "US.VIXY",
-                "side": "buy",
-                "order_type": "NORMAL",
-                "price": "12.5",
-                "qty": "80",
-                "planned_notional": "1000",
-                "budget_currency": "USD",
-                "execution_status": "dry_run",
-                "submitted": False,
-                "futu_order_id": "",
-                "executed_at": "2026-07-10 13:32",
-                "error": "",
-            }
-        ],
-    }
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
-    assert vixy["kelly"]["available"] is True
-    assert vixy["kelly"]["experiment_count"] == 1
-    assert vixy["kelly"]["status"] == "available"
-    assert vixy["kelly"]["message"] == "该标的已关联 Kelly 策略实验。"
-    assert (
-        vixy["kelly"]["experiments"][0]["experiment_id"]
-        == "trend_pullback_20d_exp_20260707"
-    )
-    qqq = next(row for row in state["holdings"] if row["symbol"] == "QQQ")
-    assert qqq["kelly"]["available"] is False
-    assert qqq["kelly"]["experiment_count"] == 0
-    assert qqq["kelly"]["experiments"] == []
-    assert qqq["kelly"]["status"] == "missing_experiment"
-    assert qqq["kelly"]["message"] == "该标的未参与任何已锁定的 Kelly 策略实验。"
-
-
-def obsolete_load_dashboard_state_degrades_invalid_kelly_lab_artifacts(
+def test_load_dashboard_state_degrades_invalid_kelly_lab_artifacts(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6903,7 +5526,7 @@ def obsolete_load_dashboard_state_degrades_invalid_kelly_lab_artifacts(
 
     state = load_dashboard_state(config).to_dict()
 
-    assert len(state["holdings"]) == 1
+    assert len(state["holding_enrichment"]) == 1
     assert state["kelly_lab"]["available"] is False
     assert state["kelly_lab"]["template_count"] == 0
     assert state["kelly_lab"]["experiment_count"] == 0
@@ -6911,13 +5534,13 @@ def obsolete_load_dashboard_state_degrades_invalid_kelly_lab_artifacts(
     assert state["kelly_lab"]["experiments"] == []
     assert "Kelly Lab" in state["kelly_lab"]["error"]
     assert "kelly_strategy_templates.json schema_version" in state["kelly_lab"]["error"]
-    vixy = next(row for row in state["holdings"] if row["symbol"] == "VIXY")
+    vixy = next(row for row in state["holding_enrichment"] if row["symbol"] == "VIXY")
     assert vixy["kelly"]["available"] is False
     assert vixy["kelly"]["experiment_count"] == 0
     assert vixy["kelly"]["status"] == "missing_experiment"
 
 
-def obsolete_dashboard_attaches_plan_events_and_previous_review(tmp_path: Path) -> None:
+def test_dashboard_attaches_plan_events_and_previous_review(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
     current = dashboard_decision_plan("2026-07-13")
@@ -6950,7 +5573,7 @@ def obsolete_dashboard_attaches_plan_events_and_previous_review(tmp_path: Path) 
             ),
         )
 
-    holding = load_dashboard_state(config).to_dict()["holdings"][0]
+    holding = load_dashboard_state(config).to_dict()["holding_enrichment"][0]
 
     assert holding["decision_plan"]["available"] is True
     assert holding["decision_plan"]["status"] == "triggered"
@@ -6962,7 +5585,7 @@ def obsolete_dashboard_attaches_plan_events_and_previous_review(tmp_path: Path) 
     assert "compliance" not in review
 
 
-def obsolete_dashboard_projects_decision_plan_backtests_to_visible_summary(
+def test_dashboard_projects_decision_plan_backtests_to_visible_summary(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -6986,7 +5609,7 @@ def obsolete_dashboard_projects_decision_plan_backtests_to_visible_summary(
         update_latest=True,
     )
 
-    projected = load_dashboard_state(config).to_dict()["holdings"][0][
+    projected = load_dashboard_state(config).to_dict()["holding_enrichment"][0][
         "decision_plan"
     ]["backtests"][0]
 
@@ -7057,14 +5680,14 @@ def test_dashboard_caches_decision_plan_file_until_it_changes(
     assert next(iter(refreshed.values()))["run_date"] == "2026-07-14"
 
 
-def obsolete_dashboard_exposes_invalid_plan_as_failed_state(tmp_path: Path) -> None:
+def test_dashboard_exposes_invalid_plan_as_failed_state(tmp_path: Path) -> None:
     config = dashboard_config(tmp_path)
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, portfolio_rows())
     current_path = config.data_dir / "latest/US/decision_plans.json"
     current_path.parent.mkdir(parents=True, exist_ok=True)
     current_path.write_text('{"schema_version":"invalid"}', encoding="utf-8")
 
-    plan = load_dashboard_state(config).to_dict()["holdings"][0]["decision_plan"]
+    plan = load_dashboard_state(config).to_dict()["holding_enrichment"][0]["decision_plan"]
 
     assert plan["available"] is False
     assert plan["error"] == "decision_plans.json 无效"

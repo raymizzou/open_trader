@@ -21,7 +21,6 @@ from urllib.request import Request, urlopen
 from .backtest import run_backtest
 from .backtest_prices import DailyKlineProvider, normalize_backtest_symbol
 from .dashboard import (
-    DETAIL_FX_TO_HKD,
     DashboardConfig,
     _build_backtest_universe,
     _backtest_holding_detail,
@@ -80,6 +79,7 @@ STANDARD_BACKTEST_REQUEST_KEYS = {
     "initial_cash", "max_strategy_weight", "commission_bps", "slippage_bps",
 }
 MAX_JSON_BODY_BYTES = 1024 * 1024
+DEFAULT_FX_TO_HKD = {"HKD": Decimal("1"), "USD": Decimal("7.8"), "CNY": Decimal("1.08")}
 
 
 class RequestBodyTooLargeError(Exception):
@@ -1912,7 +1912,7 @@ def serve_dashboard(
             "tiger": config.trend_review_us_simulate_acc_id,
             "phillips": config.trend_review_hk_simulate_acc_id,
         },
-        fx_to_hkd=DETAIL_FX_TO_HKD,
+        fx_to_hkd=DEFAULT_FX_TO_HKD,
         data_dir=config.data_dir,
         reports_dir=config.reports_dir,
     )
