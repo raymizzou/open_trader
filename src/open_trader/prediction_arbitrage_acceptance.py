@@ -68,6 +68,7 @@ class ScenarioResult:
 class ReadinessCheck:
     status: str
     detail: str
+    facts: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,7 +478,11 @@ def _guard_polymarket_client(
 
 
 def _check_dict(check: ReadinessCheck) -> dict[str, str]:
-    return {"status": check.status, "detail": check.detail}
+    return {
+        "status": check.status,
+        "detail": check.detail,
+        **(dict(check.facts) if check.facts is not None else {}),
+    }
 
 
 def _blocked(detail: str) -> ReadinessCheck:
@@ -490,6 +495,10 @@ def _failed(detail: str) -> ReadinessCheck:
 
 def _ready(detail: str) -> ReadinessCheck:
     return ReadinessCheck(_READY, detail)
+
+
+def _ready_with_facts(detail: str, facts: Mapping[str, str]) -> ReadinessCheck:
+    return ReadinessCheck(_READY, detail, facts)
 
 
 def _not_applicable(detail: str) -> ReadinessCheck:
@@ -592,18 +601,20 @@ def _predict_quantity(market: object) -> int:
     return int(quantity)
 
 
+def _decimal_fact(facts: Mapping[str, object], key: str) -> Decimal:
+    value = Decimal(str(facts[key]))
+    if not value.is_finite() or value < 0:
+        raise ValueError(key)
+    return value
+
+
 def _predict_account_check(client: object, market: object | None) -> ReadinessCheck:
     try:
         jwt = client._authenticate()  # type: ignore[attr-defined]
-        if market is _NO_PREDICT_MARKET:
-            balance = Decimal(str(client._builder.balance_of("USDT")))  # type: ignore[attr-defined]
-            facts: Mapping[str, object] = {"available_usdt": balance, "allowance": 0, "scope_ready": True}
-        elif market is None:
+        if market is None:
             return _blocked("Predict market/account readiness unavailable")
-        else:
-            facts = client.approval_facts(  # type: ignore[attr-defined]
-                market.market_id, exact_debit_wei=0
-            )
+        market_id = "" if market is _NO_PREDICT_MARKET else market.market_id
+        facts = client.approval_facts(market_id, exact_debit_wei=0)  # type: ignore[attr-defined]
     except KeychainError:
         return _blocked("Predict Keychain environment unavailable")
     except Exception as exc:
@@ -611,21 +622,33 @@ def _predict_account_check(client: object, market: object | None) -> ReadinessCh
             return _blocked("Predict account environment unavailable")
         return _failed("predict account read failed")
     try:
-        balance = Decimal(str(facts["available_usdt"]))
-        allowance = Decimal(str(facts["allowance"]))
+        gas_signer = facts["gas_signer"]
+        balance = _decimal_fact(facts, "available_usdt")
+        allowance = _decimal_fact(facts, "allowance")
+        bnb_balance = _decimal_fact(facts, "bnb_balance")
+        required_bnb = _decimal_fact(facts, "required_bnb")
+        minimum_top_up_bnb = _decimal_fact(facts, "minimum_top_up_bnb")
     except (KeyError, InvalidOperation, ValueError):
         return _failed("predict account read failed")
     if (
         not isinstance(jwt, str)
         or not jwt
+        or not isinstance(gas_signer, str)
+        or not gas_signer
         or facts.get("scope_ready") is not True
-        or not balance.is_finite()
-        or balance < 0
-        or not allowance.is_finite()
-        or allowance < 0
     ):
         return _failed("predict account read failed")
-    return _ready("Predict JWT, balance, and allowance ready")
+    if minimum_top_up_bnb > 0 or bnb_balance < required_bnb:
+        return _failed("Predict signer BNB unavailable")
+    return _ready_with_facts(
+        "Predict JWT, balance, allowance, and signer gas ready",
+        {
+            "gas_signer": gas_signer,
+            "bnb_balance": str(facts["bnb_balance"]),
+            "required_bnb": str(facts["required_bnb"]),
+            "minimum_top_up_bnb": str(facts["minimum_top_up_bnb"]),
+        },
+    )
 
 
 def _predict_preflight_check(client: object, market: object) -> ReadinessCheck:

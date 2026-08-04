@@ -61,14 +61,20 @@ class Builder:
 class PredictClient:
     _builder = Builder()
 
+    def __init__(self) -> None:
+        self.approval_fact_calls: list[tuple[str, int]] = []
+
     def approval_facts(self, market_id: str, exact_debit_wei: int = 0) -> dict[str, object]:
-        assert (market_id, exact_debit_wei) == ("predict-market", 0)
+        self.approval_fact_calls.append((market_id, exact_debit_wei))
         return {
             "predict_account": CONFIG.predict.wallet_address if CONFIG.predict else "",
+            "gas_signer": CONFIG.signer_address,
             "available_usdt": "10",
             "allowance": "0",
             "scope_ready": True,
             "approval_scope": {"operation": "TRADE", "side": "BUY"},
+            "bnb_balance": "0.002",
+            "required_bnb": "0.001",
             "minimum_top_up_bnb": "0",
         }
 
@@ -160,7 +166,14 @@ def test_readiness_report_distinguishes_all_no_submit_facts(tmp_path: Path) -> N
     assert report.as_dict() == {
         "predict": {
             "market_book_rest_ws": {"status": "PASS", "detail": "Predict REST and WebSocket market/book ready"},
-            "account_jwt_balance_allowance": {"status": "PASS", "detail": "Predict JWT, balance, and allowance ready"},
+            "account_jwt_balance_allowance": {
+                "status": "PASS",
+                "detail": "Predict JWT, balance, allowance, and signer gas ready",
+                "gas_signer": CONFIG.signer_address,
+                "bnb_balance": "0.002",
+                "required_bnb": "0.001",
+                "minimum_top_up_bnb": "0",
+            },
             "signed_not_submitted_preflight": {"status": "PASS", "detail": "Predict order signed but not submitted"},
         },
         "polymarket": {
@@ -183,6 +196,8 @@ def test_readiness_report_distinguishes_all_no_submit_facts(tmp_path: Path) -> N
 def test_successful_empty_predict_market_scan_is_pass_without_signed_preflight(
     tmp_path: Path,
 ) -> None:
+    client = PredictClient()
+
     class EmptyPredictSource(PredictSource):
         async def list_open_markets(self) -> tuple[Market, ...]:
             return ()
@@ -190,6 +205,7 @@ def test_successful_empty_predict_market_scan_is_pass_without_signed_preflight(
     report = readiness_report(
         tmp_path,
         predict_source_factory=lambda _config, *, urlopen_fn: EmptyPredictSource(),
+        predict_client_factory=lambda _config, *, urlopen_fn: client,
     )
 
     assert report.status == "PASS"
@@ -197,6 +213,7 @@ def test_successful_empty_predict_market_scan_is_pass_without_signed_preflight(
     assert report.predict_preflight.status == "NOT_APPLICABLE"
     assert report.mutation_calls == 0
     assert report.live_notifications == 0
+    assert client.approval_fact_calls == [("", 0)]
 
 
 def test_predict_account_readiness_uses_exact_approval_facts_not_satisfied_flag(
@@ -207,16 +224,94 @@ def test_predict_account_readiness_uses_exact_approval_facts_not_satisfied_flag(
             del steps
             return (SimpleNamespace(satisfied=False),)
 
-    class ExactFactsPredictClient(PredictClient):
-        _builder = LegacyUnsatisfiedBuilder()
+    client = PredictClient()
+    client._builder = LegacyUnsatisfiedBuilder()  # type: ignore[method-assign]
 
     report = readiness_report(
         tmp_path,
-        predict_client_factory=lambda _config, *, urlopen_fn: ExactFactsPredictClient(),
+        predict_client_factory=lambda _config, *, urlopen_fn: client,
     )
 
     assert report.status == "PASS"
     assert report.predict_account.status == "PASS"
+    assert report.as_dict()["predict"]["account_jwt_balance_allowance"] == {
+        "status": "PASS",
+        "detail": "Predict JWT, balance, allowance, and signer gas ready",
+        "gas_signer": CONFIG.signer_address,
+        "bnb_balance": "0.002",
+        "required_bnb": "0.001",
+        "minimum_top_up_bnb": "0",
+    }
+    assert report.mutation_calls == 0
+    assert report.live_notifications == 0
+    assert client.approval_fact_calls == [("predict-market", 0)]
+
+
+@pytest.mark.parametrize("empty_scan", (False, True))
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"gas_signer": ""},
+        {"bnb_balance": "bad"},
+        {"required_bnb": None},
+        {"minimum_top_up_bnb": "bad"},
+    ),
+)
+def test_predict_account_readiness_fails_closed_on_missing_or_malformed_gas_facts(
+    tmp_path: Path, empty_scan: bool, overrides: dict[str, object]
+) -> None:
+    class GasFactsPredictClient(PredictClient):
+        def approval_facts(self, market_id: str, exact_debit_wei: int = 0) -> dict[str, object]:
+            facts = super().approval_facts(market_id, exact_debit_wei)
+            facts.update(overrides)
+            return facts
+
+    class EmptyPredictSource(PredictSource):
+        async def list_open_markets(self) -> tuple[Market, ...]:
+            return ()
+
+    report = readiness_report(
+        tmp_path,
+        predict_source_factory=(
+            (lambda _config, *, urlopen_fn: EmptyPredictSource())
+            if empty_scan
+            else (lambda _config, *, urlopen_fn: PredictSource())
+        ),
+        predict_client_factory=lambda _config, *, urlopen_fn: GasFactsPredictClient(),
+    )
+
+    assert report.status == "FAIL"
+    assert report.predict_account.status == "FAIL"
+    assert report.mutation_calls == 0
+    assert report.live_notifications == 0
+
+
+@pytest.mark.parametrize("empty_scan", (False, True))
+def test_predict_account_readiness_fails_closed_on_insufficient_signer_bnb(
+    tmp_path: Path, empty_scan: bool
+) -> None:
+    class LowGasPredictClient(PredictClient):
+        def approval_facts(self, market_id: str, exact_debit_wei: int = 0) -> dict[str, object]:
+            facts = super().approval_facts(market_id, exact_debit_wei)
+            facts["minimum_top_up_bnb"] = "0.001"
+            return facts
+
+    class EmptyPredictSource(PredictSource):
+        async def list_open_markets(self) -> tuple[Market, ...]:
+            return ()
+
+    report = readiness_report(
+        tmp_path,
+        predict_source_factory=(
+            (lambda _config, *, urlopen_fn: EmptyPredictSource())
+            if empty_scan
+            else (lambda _config, *, urlopen_fn: PredictSource())
+        ),
+        predict_client_factory=lambda _config, *, urlopen_fn: LowGasPredictClient(),
+    )
+
+    assert report.status == "FAIL"
+    assert report.predict_account.status == "FAIL"
     assert report.mutation_calls == 0
     assert report.live_notifications == 0
 
