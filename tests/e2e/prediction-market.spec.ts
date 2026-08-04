@@ -102,6 +102,61 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     }
   });
 
+  test('covers final allowance gas and scan fixture states on desktop and mobile', async ({ page }) => {
+    const cases: Array<[string, string[]]> = [
+      ['ready-zero-allowance', ['Predict Account', '授权 $0.00 USDT', '可以交易', 'Privy signer', 'BNB']],
+      ['signer-bnb-low', ['Privy signer', '只读', '当前 0.001 BNB', '需要 0.004 BNB', '最低保留 0.006 BNB', 'BNB top-up to 0xBnbSigner…BEEF']],
+      ['cross-signal-bnb-low', ['可下单明确信号', '只读', 'BNB top-up to 0xBnbSigner…BEEF']],
+      ['residual-allowance', ['熔断只读', '残余授权', '$2.40 USDT', '清理残余授权']],
+      ['cleanup-success', ['熔断只读', '清理残余授权']],
+      ['cleanup-failure', ['熔断只读', '清理残余授权']],
+      ['cross-stale-stage4', ['两所对应标的', '正在监视', 'Codex 认为可以', '有套利空间', '可下单明确信号', '保留时间 2026-08-03T15:39:00Z']],
+      ['cross-empty-scan', ['当前没有合格跨所市场', '扫描正常，没有失败']],
+      ['first-canary-cap5', ['首单验证', '单笔成本上限 $5.00']],
+      ['completed-canary-cap20', ['常规上限', '单笔成本上限 $20.00']],
+      ['post-approval-cleared', ['未下单 · 授权已清零']],
+      ['cross-grouped-history', ['授权', '0xapprove-fixture', '双腿订单', '0xorders-fixture', '对账', '0xreconcile-fixture', '授权清零', '0xcleanup-fixture']],
+    ];
+    for (const viewport of [{ width: 1440, height: 1100 }, { width: 375, height: 812 }]) {
+      await page.setViewportSize(viewport);
+      for (const [state, texts] of cases) {
+        await openPrediction(page, state);
+        if (state === 'cross-grouped-history') {
+          await page.getByRole('button', { name: '交易与合并', exact: true }).click();
+        }
+        for (const text of texts) await expect(page.locator('body')).toContainText(text);
+        await expect(page.locator('body')).not.toContainText('倒计时');
+        const smallButtons = await page.locator('button:visible').evaluateAll((buttons) =>
+          buttons.map((button) => (button as HTMLElement).getBoundingClientRect().height).filter((height) => height < 44),
+        );
+        expect(smallButtons).toEqual([]);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+      }
+    }
+  });
+
+  test('cleans residual Predict allowance only after a second confirmation', async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 812 });
+    await openPrediction(page, 'residual-allowance');
+    const cleanupRequests: string[] = [];
+    page.on('request', async (request) => {
+      if (request.url().includes('/prediction-arbitrage/predict-allowance/cleanup')) {
+        cleanupRequests.push(request.postData() || '');
+      }
+    });
+    const trigger = page.getByRole('button', { name: '清理残余授权' });
+    await trigger.click();
+    await expect(page.locator('.pm-modal')).toContainText('不转移 USDT');
+    await expect(page.locator('.pm-modal')).toContainText('$2.40 → $0.00');
+    await expect(page.locator('.pm-modal')).toContainText('0xcE23…f435');
+    await expect(page.locator('.pm-modal')).toContainText('0xSpender…C0DE');
+    expect(cleanupRequests).toEqual([]);
+    await page.getByRole('button', { name: /我知道/ }).click();
+    expect(cleanupRequests).toEqual([]);
+    await page.getByRole('button', { name: /二次确认/ }).click();
+    await expect.poll(() => cleanupRequests).toEqual(['{"confirm":true}']);
+  });
+
   test('keeps observe-only cross rows and history visible without an execution action', async ({ page }) => {
     await openPrediction(page, 'cross-observe-only');
     const observeOnly = page.locator('[data-cross-opportunity-id="cross-opportunity-observe-only-fixture"]');

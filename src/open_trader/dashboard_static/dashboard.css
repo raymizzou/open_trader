@@ -5618,8 +5618,10 @@ table {
 .pm-alert p { margin: 0; }
 .pm-alert.info { background: #eef6f8; border-color: #a8ccd7; color: #214f5c; }
 .pm-alert.success { background: #edf8f1; border-color: #add4bc; color: #245b39; }
+.pm-alert.warning { background: #fff8e8; border-color: #e4c98e; color: #6b4a11; }
 .pm-alert.danger { background: #fff2f0; border-color: #e7aaa4; color: #7a211a; }
 .pm-alert-body { min-width: 0; }
+.pm-copy-text { background: rgba(255,255,255,0.55); border: 1px solid var(--line); border-radius: 6px; display: block; margin-top: 8px; overflow-wrap: anywhere; padding: 8px; }
 .pm-progress { display: grid; gap: 8px; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 12px; }
 .pm-progress-step { background: rgba(255, 255, 255, 0.56); border: 1px solid currentColor; border-radius: 6px; min-height: 66px; opacity: 0.58; padding: 9px; }
 .pm-progress-step.done, .pm-progress-step.current { opacity: 1; }
@@ -5793,6 +5795,7 @@ table {
 .pm-order-leg span { color: var(--muted); display: block; font-size: 12px; margin-bottom: 5px; }
 .pm-order-leg strong { display: block; font-size: 17px; }
 .pm-order-leg small { color: var(--muted); display: block; margin-top: 5px; }
+.pm-order-leg a { color: inherit; overflow-wrap: anywhere; }
 .pm-order-summary { display: grid; gap: 8px; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 12px; }
 .pm-order-summary div { background: #f2eee7; border-radius: 7px; padding: 11px; }
 .pm-order-summary span { color: var(--muted); display: block; font-size: 11px; margin-bottom: 5px; }
@@ -5804,6 +5807,11 @@ table {
 .pm-check { align-items: center; border-bottom: 1px solid var(--line); display: flex; gap: 12px; justify-content: space-between; padding: 8px 0; }
 .pm-check:last-child { border-bottom: 0; }
 .pm-check span { color: var(--muted); }
+.pm-check strong { overflow-wrap: anywhere; text-align: right; }
+.pm-lifecycle { margin-top: 8px; }
+.pm-lifecycle summary { cursor: pointer; min-height: 44px; padding-top: 10px; }
+.pm-lifecycle div { border-top: 1px solid var(--line); display: grid; gap: 3px; padding: 6px 0; }
+.pm-lifecycle span, .pm-lifecycle small { color: var(--muted); }
 .pm-modal-actions { align-items: center; display: flex; gap: 10px; justify-content: flex-end; }
 .pm-modal-actions .pm-button { min-width: 150px; }
 @media (max-width: 1100px) {

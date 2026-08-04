@@ -71,8 +71,8 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         for event in events
     ]
     cross_legs = [
-        {"exchange": "predict.fun", "outcome": "YES", "token_id": "predict-yes-fixture"},
-        {"exchange": "polymarket", "outcome": "NO", "token_id": "poly-no-fixture"},
+        {"exchange": "predict.fun", "market_id": "predict-market-fixture", "condition_id": "predict-condition-fixture", "outcome": "YES", "token_id": "predict-yes-fixture", "official_url": "https://predict.fun/markets/predict-market-fixture"},
+        {"exchange": "polymarket", "market_id": "poly-market-fixture", "condition_id": "poly-condition-fixture", "outcome": "NO", "token_id": "poly-no-fixture", "official_url": "https://polymarket.com/event/poly-market-fixture"},
     ]
     cross_opportunity = {
         "opportunity_id": "cross-opportunity-observe-only-fixture",
@@ -108,6 +108,7 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
             {"exchange": "polymarket", "wallet": "0x7A4E…91C2", "asset": "pUSD", "available": "50.00"},
         ],
         "unsettled": {"current": "35.20", "after": "40.00", "limit": "100"},
+        "data_timestamps": {"predict.fun": "2026-08-03T15:40:00Z", "polymarket": "2026-08-03T15:40:01Z", "codex_reviewed_at": "2026-08-03T15:41:00Z"},
         "volume_24h": "320000",
         "actionable": True,
     }
@@ -162,11 +163,12 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "balances": {"p_usd": "50.00", "allowance": "50.00"},
         "venues": [
             {"venue": "polymarket", "rest": "ready", "ws": "ready", "wallet": "0x7A4E…91C2", "balance": {"asset": "pUSD", "value": "50.00"}, "mode": "可以交易", "last_success": "2026-08-02T01:00:00Z"},
-            {"venue": "predict.fun", "rest": "ready", "ws": "ready", "wallet": "0xcE23…f435", "balance": {"asset": "USDT", "value": "12.34"}, "mode": "可以交易", "last_success": "2026-08-02T00:59:58Z"},
+            {"venue": "predict.fun", "rest": "ready", "ws": "ready", "wallet": "0xcE23…f435", "balance": {"asset": "USDT", "value": "12.34"}, "allowance": {"asset": "USDT", "value": "20.00", "spender": "0xSpender…C0DE"}, "mode": "可以交易", "last_success": "2026-08-02T00:59:58Z"},
         ],
+        "privy_signer": {"address": "0xBnbSigner…BEEF", "mode": "可以交易", "bnb": {"current": "0.012", "required": "0.004", "minimum": "0.006"}, "copy_text": "BNB top-up to 0xBnbSigner…BEEF on BNB Smart Chain", "official_links": [{"label": "Predict.fun", "url": "https://predict.fun/"}, {"label": "BNB Chain", "url": "https://www.bnbchain.org/"}]},
         "cross_venue": {
             "mode": "manual_confirm" if scenario == "cross-manual-confirm" else "observe_only",
-            "funnel": {"matched_pairs": 12, "monitored_pairs": 8, "codex_approved_pairs": 5, "arbitrage_space_pairs": 2, "clear_signal_pairs": 1},
+            "funnel": {"matched_pairs": 12, "monitored_pairs": 8, "codex_approved_pairs": 5, "arbitrage_space_pairs": 2, "clear_signal_pairs": 1, "retained_at": "2026-08-03T15:39:00Z"},
             "unsettled": {"current": "35.20", "limit": "100"},
             "breaker": {"open": False, "scope": "cross_venue"},
         },
@@ -182,6 +184,48 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "breaker": {"open": scenario == "incident", "status": "locked" if scenario == "incident" else "ready"},
         "csrf_token": "fixture-csrf",
     }
+    if scenario == "ready-zero-allowance":
+        payload["venues"][1] = {**payload["venues"][1], "allowance": {"asset": "USDT", "value": "0", "spender": "0xSpender…C0DE"}, "mode": "可以交易"}
+    if scenario in {"signer-bnb-low", "cross-signal-bnb-low"}:
+        payload["privy_signer"] = {**payload["privy_signer"], "mode": "只读", "bnb": {"current": "0.001", "required": "0.004", "minimum": "0.006"}}
+        if scenario == "signer-bnb-low":
+            payload["opportunities"] = []
+            payload["events"] = []
+            payload["cross_venue"] = {**payload["cross_venue"], "funnel": {**payload["cross_venue"]["funnel"], "clear_signal_pairs": 0}}
+        else:
+            payload["venues"][1] = {**payload["venues"][1], "mode": "只读", "reason": "insufficient_signer_bnb"}
+    if scenario in {"residual-allowance", "cleanup-success", "cleanup-failure"}:
+        payload["venues"][1] = {**payload["venues"][1], "mode": "熔断只读", "allowance": {"asset": "USDT", "value": "2.40", "spender": "0xSpender…C0DE"}}
+        payload["predict_allowance_cleanup"] = {"owner": "0xcE23…f435", "spender": "0xSpender…C0DE", "before_allowance": "2.40", "after_allowance": "0", "gas_effect": "消耗 Privy signer BNB，不转移 USDT"}
+        payload["cross_venue"]["breaker"] = {"open": True, "scope": "predict_allowance", "reason": "residual_allowance"}
+    if scenario == "cross-stale-stage4":
+        stale = {**manual_cross_opportunity, "clear_signal": False, "funnel_stage": 4, "actionable": False, "eligibility_reason": "books_stale"}
+        payload["stale"] = True
+        payload["events"] = [{**stale, "opportunities": [stale]}]
+        payload["opportunities"] = [stale]
+        payload["cross_venue"] = {**payload["cross_venue"], "funnel": {"matched_pairs": 12, "monitored_pairs": 8, "codex_approved_pairs": 5, "arbitrage_space_pairs": 2, "clear_signal_pairs": 0, "retained_at": "2026-08-03T15:39:00Z"}}
+    if scenario == "cross-empty-scan":
+        payload["events"] = []
+        payload["opportunities"] = []
+        payload["signals_24h"] = 0
+        payload["cross_venue"] = {**payload["cross_venue"], "funnel": {"matched_pairs": 0, "monitored_pairs": 0, "codex_approved_pairs": 0, "arbitrage_space_pairs": 0, "clear_signal_pairs": 0}}
+    if scenario == "first-canary-cap5":
+        payload["policy_limits"] = {**payload["policy_limits"], "max_normal_cost": "5", "canary_status": "first_live_trade"}
+    if scenario == "completed-canary-cap20":
+        payload["policy_limits"] = {**payload["policy_limits"], "max_normal_cost": "20", "canary_status": "completed"}
+    if scenario == "post-approval-cleared":
+        payload["histories"] = {"signals": [{**_prediction_history("signals")[1], "status": "未下单 · 授权已清零", "actionable_now": False}]}
+    if scenario == "cross-grouped-history":
+        payload["histories"] = {"executions": [{
+            "completed_at": "今天 15:42:00", "event_title": "跨所比特币阈值", "market_type": "cross_venue_yes_no",
+            "legs": cross_opportunity["legs"], "state": "holding_to_resolution", "status": "待兑付", "quantity": "5", "actual_cost": "4.80",
+            "lifecycle": [
+                {"phase": "授权", "receipt": "0xapprove-fixture", "status": "成功"},
+                {"phase": "双腿订单", "receipt": "0xorders-fixture", "status": "全部成交"},
+                {"phase": "对账", "receipt": "0xreconcile-fixture", "status": "余额一致"},
+                {"phase": "授权清零", "receipt": "0xcleanup-fixture", "status": "完成"},
+            ],
+        }]}
     if scenario == "predict-pending":
         payload["venues"] = [
             payload["venues"][0],
@@ -342,6 +386,20 @@ def _prediction_history(kind: str) -> list[dict[str, object]]:
 
 def _prediction_history_for_scenario(kind: str, scenario: str) -> list[dict[str, object]]:
     items = _prediction_history(kind)
+    if scenario == "cross-grouped-history" and kind == "executions":
+        return [{
+            "completed_at": "今天 15:42:00", "event_title": "跨所比特币阈值", "market_type": "cross_venue_yes_no",
+            "legs": [{"exchange": "predict.fun", "outcome": "YES"}, {"exchange": "polymarket", "outcome": "NO"}],
+            "state": "holding_to_resolution", "status": "待兑付", "quantity": "5", "actual_cost": "4.80",
+            "lifecycle": [
+                {"phase": "授权", "receipt": "0xapprove-fixture", "status": "成功"},
+                {"phase": "双腿订单", "receipt": "0xorders-fixture", "status": "全部成交"},
+                {"phase": "对账", "receipt": "0xreconcile-fixture", "status": "余额一致"},
+                {"phase": "授权清零", "receipt": "0xcleanup-fixture", "status": "完成"},
+            ],
+        }]
+    if scenario == "post-approval-cleared" and kind == "signals":
+        return [{**items[1], "status": "未下单 · 授权已清零", "actionable_now": False}]
     if kind != "signals":
         return items
     if scenario == "cross-manual-confirm":
@@ -445,6 +503,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/prediction-arbitrage/preview",
             "/api/prediction-arbitrage/executions",
             "/api/prediction-arbitrage/circuit-breaker/reset",
+            "/api/prediction-arbitrage/predict-allowance/cleanup",
         }:
             self.send_response(HTTPStatus.NOT_FOUND)
             self.end_headers()
@@ -483,8 +542,8 @@ class Handler(BaseHTTPRequestHandler):
                     "direction": "PREDICT_YES_POLYMARKET_NO",
                     "net_quantity": "5",
                     "buy_legs": [
-                        {"exchange": "predict.fun", "market_id": "predict-market-fixture", "condition_id": "predict-condition-fixture", "outcome": "YES", "token_id": "predict-yes-fixture", "settlement_asset": "USDT", "requested_quantity": "5", "net_quantity": "5", "max_price": "0.470", "max_cost": "2.35", "maximum_fee": "0.02", "fee_asset": "USDT"},
-                        {"exchange": "polymarket", "market_id": "poly-market-fixture", "condition_id": "poly-condition-fixture", "outcome": "NO", "token_id": "poly-no-fixture", "settlement_asset": "pUSD", "requested_quantity": "5", "net_quantity": "5", "max_price": "0.490", "max_cost": "2.45", "maximum_fee": "0.00", "fee_asset": "pUSD"},
+                        {"exchange": "predict.fun", "market_id": "predict-market-fixture", "condition_id": "predict-condition-fixture", "outcome": "YES", "token_id": "predict-yes-fixture", "settlement_asset": "USDT", "requested_quantity": "5", "net_quantity": "5", "max_price": "0.470", "max_cost": "2.35", "maximum_fee": "0.02", "fee_asset": "USDT", "official_url": "https://predict.fun/markets/predict-market-fixture", "quote_at": "2026-08-03T15:40:00Z"},
+                        {"exchange": "polymarket", "market_id": "poly-market-fixture", "condition_id": "poly-condition-fixture", "outcome": "NO", "token_id": "poly-no-fixture", "settlement_asset": "pUSD", "requested_quantity": "5", "net_quantity": "5", "max_price": "0.490", "max_cost": "2.45", "maximum_fee": "0.00", "fee_asset": "pUSD", "official_url": "https://polymarket.com/event/poly-market-fixture", "quote_at": "2026-08-03T15:40:01Z"},
                     ],
                     "total_max_cost": "4.80",
                     "maximum_total_cost": "4.80",
@@ -492,10 +551,10 @@ class Handler(BaseHTTPRequestHandler):
                     "minimum_profit": "0.20",
                     "annualized_yield": "0.201",
                     "canonical_cutoff": "2099-12-31T23:59:00Z",
-                    "codex_approval": {"decision": "APPROVE", "summary": "两所规则确认同一截止时间，YES/NO 方向直接互补。", "direct_outcome_mapping": {"predict_yes": "YES", "predict_no": "NO", "polymarket_yes": "YES", "polymarket_no": "NO"}, "evidence": [{"exchange": "predict.fun", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2099"}, {"exchange": "polymarket", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2099"}]},
+                    "codex_approval": {"decision": "APPROVE", "summary": "两所规则确认同一截止时间，YES/NO 方向直接互补。", "reviewed_at": "2026-08-03T15:41:00Z", "direct_outcome_mapping": {"predict_yes": "YES", "predict_no": "NO", "polymarket_yes": "YES", "polymarket_no": "NO"}, "evidence": [{"exchange": "predict.fun", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2099"}, {"exchange": "polymarket", "field": "cutoff", "quote": "at 23:59 UTC on December 31, 2099"}]},
                     "balances": {"predict.fun": {"asset": "USDT", "wallet_address": "0xcE23…f435", "available_balance": "12.34", "allowance_ready": True}, "polymarket": {"asset": "pUSD", "wallet_address": "0x7A4E…91C2", "available_balance": "50.00", "allowance": "50.00"}},
                     "unsettled": {"current": "35.20", "after": "40.00", "limit": "100"},
-                    "policy_limits": {"max_normal_cost": "20", "max_emergency_loss": "2"},
+                    "policy_limits": {"max_normal_cost": "5" if type(self).prediction_scenario == "first-canary-cap5" else "20", "max_emergency_loss": "2", "max_cross_unsettled_principal": "100"},
                     "expires_at": "2026-08-03T12:00:00Z",
                 })
             else:
@@ -521,6 +580,16 @@ class Handler(BaseHTTPRequestHandler):
         elif path.endswith("/executions"):
             type(self).prediction_scenario = "success"
             self._send_json({"execution_id": "exec-fixture", "status": "executing"})
+        elif path.endswith("/predict-allowance/cleanup"):
+            if body != {"confirm": True}:
+                self.send_response(HTTPStatus.BAD_REQUEST)
+                self.end_headers()
+                return
+            if type(self).prediction_scenario == "cleanup-failure":
+                self._send_json({"state": "rejected", "reason": "gas_unavailable", "before_allowance": "2.40", "after_allowance": "2.40", "usdt_moved": False})
+            else:
+                type(self).prediction_scenario = "cleanup-success"
+                self._send_json({"state": "ready", "before_allowance": "2.40", "after_allowance": "0", "usdt_moved": False})
         else:
             if type(self).prediction_scenario == "reset-denied":
                 self._send_json({"state": "rejected", "reason": "incident_unresolved"})

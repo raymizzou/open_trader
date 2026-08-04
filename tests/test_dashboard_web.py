@@ -3881,6 +3881,59 @@ console.log(JSON.stringify({
     }
 
 
+def test_prediction_allowance_gas_cleanup_and_cross_order_facts_render() -> None:
+    output = run_dashboard_js(r'''
+const payload = {
+  status:"healthy", health:{status:"healthy",degraded_reasons:[]}, breaker:{open:false},
+  policy_limits:{max_wallet_balance:"65",max_normal_cost:"5",max_emergency_loss:"2",max_cross_unsettled_principal:"100",min_estimated_profit:"1"},
+  readiness:{status:"ready",geoblock:"allowed",relayer:"ready"},
+  venues:[
+    {venue:"predict.fun",rest:"ready",ws:"ready",wallet:"0xcE23…f435",balance:{asset:"USDT",value:"12.34"},allowance:{asset:"USDT",value:"0",spender:"0xSpender…C0DE"},mode:"可以交易"},
+    {venue:"polymarket",rest:"ready",ws:"ready",wallet:"0x7A4E…91C2",balance:{asset:"pUSD",value:"50.00"},mode:"可以交易"},
+  ],
+  privy_signer:{address:"0xBnbSigner…BEEF",mode:"只读",bnb:{current:"0.001",required:"0.004",minimum:"0.006"},copy_text:"BNB top-up to 0xBnbSigner…BEEF on BNB Smart Chain",official_links:[{label:"Predict.fun",url:"https://predict.fun/"}]},
+  predict_allowance_cleanup:{owner:"0xcE23…f435",spender:"0xSpender…C0DE",before_allowance:"2.40",after_allowance:"0",gas_effect:"消耗 Privy signer BNB，不转移 USDT"},
+  cross_venue:{breaker:{open:false},funnel:{matched_pairs:12,monitored_pairs:8,codex_approved_pairs:5,arbitrage_space_pairs:2,clear_signal_pairs:0,retained_at:"2026-08-03T15:39:00Z"}},
+};
+const preview = {
+  state:"previewed", preview_id:"cross-preview-real", market_type:"cross_venue_yes_no",
+  question:"Will Bitcoin close above $100,000 on December 31, 2099?", direction:"PREDICT_YES_POLYMARKET_NO",
+  buy_legs:[
+    {exchange:"predict.fun",market_id:"predict-market",condition_id:"predict-condition",outcome:"YES",token_id:"predict-yes",official_url:"https://predict.fun/markets/predict-market",settlement_asset:"USDT",fee_asset:"USDT",net_quantity:"5",max_price:"0.470",max_cost:"2.35",maximum_fee:"0.02",quote_at:"2026-08-03T15:40:00Z"},
+    {exchange:"polymarket",market_id:"poly-market",condition_id:"poly-condition",outcome:"NO",token_id:"poly-no",official_url:"https://polymarket.com/event/poly-market",settlement_asset:"pUSD",fee_asset:"pUSD",net_quantity:"5",max_price:"0.490",max_cost:"2.45",maximum_fee:"0.00",quote_at:"2026-08-03T15:40:01Z"},
+  ],
+  net_quantity:"5", total_max_cost:"4.80", minimum_payout:"5.00", minimum_profit:"0.20",
+  annualized_yield:"0.201", canonical_cutoff:"2099-12-31T23:59:00Z",
+  codex_approval:{decision:"APPROVE",summary:"server approval",reviewed_at:"2026-08-03T15:41:00Z",evidence:[
+    {exchange:"predict.fun",field:"cutoff",quote:"server predict cutoff"},
+    {exchange:"polymarket",field:"cutoff",quote:"server polymarket cutoff"},
+  ],direct_outcome_mapping:{predict_yes:"YES",predict_no:"NO",polymarket_yes:"YES",polymarket_no:"NO"}},
+  balances:{"predict.fun":{asset:"USDT",wallet_address:"0xcE23…f435",available_balance:"12.34",allowance_ready:true},polymarket:{asset:"pUSD",wallet_address:"0x7A4E…91C2",available_balance:"50.00",allowance:"50.00"}},
+  unsettled:{current:"35.20",after:"40.00",limit:"100"}, policy_limits:payload.policy_limits,
+};
+const readiness = predictionReadinessStrip(payload);
+const safeguards = predictionSafeguardsHtml(payload);
+const cleanup = predictionModalHtml("allowance_cleanup", payload.predict_allowance_cleanup);
+const order = predictionModalHtml("order", preview);
+console.log(JSON.stringify({readiness,safeguards,cleanup,order}));
+''')
+    rendered = json.loads(output)
+
+    for text in ("Predict Account", "USDT", "授权 $0.00 USDT", "Privy signer", "BNB", "0xBnbSigner…BEEF", "只读"):
+        assert text in rendered["readiness"] + rendered["safeguards"]
+    assert "转账" not in rendered["safeguards"]
+    for text in ("owner", "0xcE23…f435", "spender", "0xSpender…C0DE", "$2.40 → $0.00", "消耗 Privy signer BNB", "不转移 USDT", "二次确认"):
+        assert text in rendered["cleanup"]
+    for text in (
+        "predict-market", "predict-condition", "predict-yes", "https://predict.fun/markets/predict-market",
+        "poly-market", "poly-condition", "poly-no", "https://polymarket.com/event/poly-market",
+        "冻结数量", "最高价冻结", "$5.00", "2026-08-03T15:40:00Z", "Codex 2026-08-03T15:41:00Z",
+        "统一截止", "待结算占用", "$100.00", "不是原子交易",
+    ):
+        assert text in rendered["order"]
+    assert "倒计时" not in rendered["order"] + rendered["readiness"] + rendered["safeguards"]
+
+
 def test_prediction_cross_execution_mode_is_required_for_actions() -> None:
     output = run_dashboard_js(r'''
 const opportunity = {
@@ -6397,7 +6450,7 @@ def test_prediction_market_static_contract_is_present() -> None:
         assert copy in js
     for fabricated in (
         "$65.00", "$50.00 pUSD", "$49.40", "$18.80", "$20.00",
-        "+$1.20", "$0.60", "14:36:12", "1 秒前更新", "首单验证",
+        "+$1.20", "$0.60", "14:36:12", "1 秒前更新",
         "macOS 与飞书已发送",
     ):
         assert fabricated not in js
