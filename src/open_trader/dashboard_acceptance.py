@@ -23,6 +23,7 @@ from .dashboard import (
     _is_dashboard_holding,
     _project_trend_actions,
     _project_trend_money_fields,
+    _project_trend_strength_fields,
     _read_csv_rows,
     _valid_partial_trend_action,
 )
@@ -2545,6 +2546,11 @@ def _check_trend_artifact_projection(
         isinstance(item, Mapping) for item in holdings
     ), f"{broker} 冻结报告持仓动作无效"
     sells, buys, holds, reviews = _project_trend_actions(dict(payload), {})
+    frozen_signals = payload.get("signal_snapshots")
+    frozen_signals = frozen_signals if isinstance(frozen_signals, Mapping) else {}
+    buys = _project_trend_strength_fields(buys, frozen_signals.get("candidates"))
+    sells = _project_trend_strength_fields(sells, frozen_signals.get("holdings"))
+    holds = _project_trend_strength_fields(holds, frozen_signals.get("holdings"))
     if broker == "eastmoney":
         for item in buys:
             for key, label in (
