@@ -4438,12 +4438,15 @@ def _browser_check(
                     page.wait_for_timeout(ACCOUNT_POLL_PROOF_WAIT_MS)
                     assert page.evaluate(
                         """() => {
-                          const active = state.quoteIntervalId !== null;
+                          const active = state.quoteIntervalId !== null
+                            && state.accountIntervalId !== null;
                           clearInterval(state.quoteIntervalId);
+                          clearInterval(state.accountIntervalId);
                           state.quoteIntervalId = null;
+                          state.accountIntervalId = null;
                           return active;
                         }"""
-                    ), "Dashboard 未启动文件轮询"
+                    ), "Dashboard 未启动数据轮询"
                     errors.extend(
                         f"{name}：{message}"
                         for message in _browser_account_network_errors(

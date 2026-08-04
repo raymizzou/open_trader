@@ -5083,6 +5083,7 @@ def test_browser_check_treats_page_error_as_desktop_failure_and_runs_mobile(
             if expression == "() => state.dashboard":
                 return self.payload
             if "clearInterval(state.quoteIntervalId)" in expression:
+                assert "clearInterval(state.accountIntervalId)" in expression
                 polling_freezes.append(self.name)
                 return True
             if (
