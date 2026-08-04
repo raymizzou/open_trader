@@ -364,6 +364,7 @@ def _run_acceptance_main_with_reports(
     log_read_error: OSError | None = None,
     controller_errors: list[str] | None = None,
     public_calls: list[str] | None = None,
+    cutover_errors: dict[str, list[str]] | None = None,
 ) -> tuple[int, dict[str, object], list[Path | None]]:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
@@ -513,11 +514,36 @@ def _run_acceptance_main_with_reports(
         "cash_balances": [],
         "errors": [],
     }
-    snapshots = iter(((200, account_snapshot, '"account"'), (304, None, '"account"')))
+    snapshots = iter((
+        (200, account_snapshot, '"account"'),
+        (200, account_snapshot, '"account"'),
+        (304, None, '"account"'),
+    ))
     monkeypatch.setattr(
         dashboard_acceptance,
         "_fetch_account_snapshot",
         lambda url, **_kwargs: (record_public(url), next(snapshots))[1],
+    )
+    cutover_errors = cutover_errors or {}
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_legacy_cutover_errors",
+        lambda *_args: cutover_errors.get("legacy", []),
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_published_trend_account_input_errors",
+        lambda *_args: cutover_errors.get("trend", []),
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_account_statement_facts_errors",
+        lambda *_args: cutover_errors.get("facts", []),
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_disabled_workflow_errors",
+        lambda *_args: cutover_errors.get("disabled", []),
     )
     monkeypatch.setattr(
         dashboard_acceptance,
@@ -627,6 +653,30 @@ def test_acceptance_main_reports_distinct_dual_runtime_pids(
     assert result["legacy_pid"] == 456
 
 
+def test_acceptance_main_enforces_account_cutover_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    status, result, _ = _run_acceptance_main_with_reports(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        [reports, reports],
+        cutover_errors={
+            "legacy": ["legacy"],
+            "facts": ["facts"],
+            "disabled": ["disabled"],
+            "trend": ["trend"],
+        },
+    )
+
+    assert status == 1
+    assert {"legacy", "facts", "disabled", "trend"} <= set(result["errors"])
+
+
 def test_acceptance_rejects_missing_legacy_listener(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -731,7 +781,7 @@ def test_acceptance_main_rejects_same_gateway_and_legacy_pid(
     assert any("不同 PID" in error for error in result["errors"])
 
 
-def test_acceptance_business_and_browser_checks_stay_on_gateway(
+def test_acceptance_business_checks_use_gateway_and_account_api(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -750,7 +800,7 @@ def test_acceptance_business_and_browser_checks_stay_on_gateway(
 
     assert status == 0
     assert calls
-    assert set(calls) == {"http://127.0.0.1:8766"}
+    assert set(calls) == {"http://127.0.0.1:8766", "http://127.0.0.1:8768"}
 
 
 def test_acceptance_main_fails_when_reports_dir_changes_during_refresh(
@@ -6972,6 +7022,113 @@ def test_account_api_browser_does_not_reuse_earlier_response_for_same_etag_reque
     )
 
     assert errors == ["浏览器后续 Account 请求没有对应的 304 或有效 200 响应"]
+
+
+def test_acceptance_reads_snapshot_and_facts_with_production_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dashboard_acceptance.Request] = []
+
+    class Response:
+        status = 200
+        headers: dict[str, str] = {}
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def __enter__(self) -> "Response":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _size: int = -1) -> bytes:
+            return json.dumps(self._payload).encode("utf-8")
+
+    def open_request(request: dashboard_acceptance.Request, **_kwargs: object) -> Response:
+        requests.append(request)
+        if request.full_url.endswith("/snapshot"):
+            return Response({"accepted_statement_generation": {"tiger": "sha256:abc"}})
+        return Response({
+            "schema_version": "open_trader.account.statement_trade_facts.v1",
+            "broker": "tiger",
+            "statement_generation": "sha256:abc",
+            "facts": [],
+        })
+
+    monkeypatch.setattr(dashboard_acceptance, "urlopen", open_request)
+
+    dashboard_acceptance._fetch_account_snapshot("http://account.test")
+    dashboard_acceptance._fetch_account_statement_facts(
+        "http://account.test", "tiger", "sha256:" + "a" * 64
+    )
+
+    assert [request.full_url for request in requests] == [
+        "http://account.test/api/v1/account/snapshot",
+        "http://account.test/api/v1/account/statements/tiger/sha256:"
+        + "a" * 64 + "/trade-facts",
+    ]
+    assert all(
+        request.get_header("X-open-trader-account-route") == "production"
+        for request in requests
+    )
+
+
+def test_acceptance_requires_non_account_legacy_payload_and_quotes_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_quotes(request: dashboard_acceptance.Request, **_kwargs: object) -> object:
+        raise dashboard_acceptance.HTTPError(
+            request.full_url, 404, "Not Found", {}, None
+        )
+
+    monkeypatch.setattr(dashboard_acceptance, "urlopen", missing_quotes)
+
+    assert dashboard_acceptance._legacy_cutover_errors(
+        {
+            "trade_actions": [],
+            "holding_enrichment": [],
+            "backtest_universe": {"holdings": [], "watchlist": []},
+            "trend_reports": {},
+        },
+        "http://legacy.test",
+    ) == []
+
+
+def test_acceptance_requires_pinned_trend_account_input() -> None:
+    assert dashboard_acceptance._trend_account_input_errors({
+        "snapshot_generation": "sha256:" + "a" * 64,
+        "account_generation": "sha256:" + "b" * 64,
+        "status": "healthy",
+    }) == []
+    assert dashboard_acceptance._trend_account_input_errors({}) == [
+        "趋势报告缺少有效 account_input"
+    ]
+
+
+def test_acceptance_rejects_enabled_premarket_or_t_signal_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def run(command: list[str], **_kwargs: object) -> Result:
+        if command[:2] == ["launchctl", "list"]:
+            return Result(0, "-\t0\tcom.open-trader.premarket\n")
+        if command[:2] == ["ps", "ax"]:
+            return Result(0)
+        return Result(0)
+
+    monkeypatch.setattr(dashboard_acceptance.subprocess, "run", run)
+
+    errors = dashboard_acceptance._disabled_workflow_errors(tmp_path)
+
+    assert any("launchd" in error for error in errors)
+    assert any("run-premarket" in error for error in errors)
 
 
 def test_make_acceptance_allows_a_verified_shared_interpreter() -> None:

@@ -1,51 +1,38 @@
 # Account API Production Cutover
 
-This is the R3 (#21) operator procedure. It prepares a browser cutover from
-Legacy-owned Account reads to the read-only Account API while keeping the
-Account Sync Worker as the only writer. It is a runbook, not an acceptance
-claim: do not call the cutover accepted until the final `make acceptance`
-returns `PASS` from the candidate checkout.
+This is the #23 operator procedure. It moves active Account consumers to the
+read-only Account HTTP contract, leaves Legacy responsible only for non-Account
+module data, and disables the unused Premarket/T-signal entrypoints. It is not
+an acceptance claim: only the final `make acceptance` result from the committed
+candidate can be `PASS`.
 
-## Release identities
+## Candidate and preflight
 
-The immutable Account protected-file baseline is
-`c0129b6f0c74d00a92166e867402337514c80a34`. Record the candidate only after
-the cutover documentation and tests are committed. Use a detached checkout so
-the deployed Worker, Account API, and Dashboard all resolve the same SHA:
+Deploy one clean detached checkout. Account API and Account Sync Worker are a
+matched pair at that SHA; Gateway, Legacy Dashboard and active Trend controllers
+then use the same SHA. Do not combine #23 consumers with the older #22 Account
+release, and do not add a raw-read or dual-read fallback.
 
 ```bash
-BASELINE_SHA=c0129b6f0c74d00a92166e867402337514c80a34
-CANDIDATE_WORKTREE=/absolute/path/to/issue-21-account-api-cutover
+CANDIDATE_WORKTREE=/absolute/path/to/issue-23-account-consumers
 CUTOVER_SHA="$(git -C "$CANDIDATE_WORKTREE" rev-parse HEAD)"
 git -C "$CANDIDATE_WORKTREE" status --short
-git -C "$CANDIDATE_WORKTREE" diff --exit-code "$BASELINE_SHA".."$CUTOVER_SHA" -- \
-  src/open_trader/account_snapshot.py \
-  src/open_trader/account_api.py \
-  src/open_trader/account_sync_worker.py \
-  ops/launchd/com.open-trader.account-api.plist.template \
-  scripts/install_account_api_launchd.sh \
-  scripts/install_account_sync_launchd.sh
-git worktree add --detach /absolute/path/to/open-trader-r3 "$CUTOVER_SHA"
-export CUTOVER_ROOT=/absolute/path/to/open-trader-r3
+git worktree add --detach /absolute/path/to/open-trader-r4 "$CUTOVER_SHA"
+export CUTOVER_ROOT=/absolute/path/to/open-trader-r4
 export OPEN_TRADER_PYTHON="${OPEN_TRADER_PYTHON:-$(command -v python3)}"
 test -n "$OPEN_TRADER_PYTHON"
 test -x "$OPEN_TRADER_PYTHON"
 export PYTHONPATH="$CUTOVER_ROOT:$CUTOVER_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
-"$OPEN_TRADER_PYTHON" -c \
-  'import open_trader, pytest; import playwright.sync_api'
+"$OPEN_TRADER_PYTHON" -c 'import open_trader, pytest; import playwright.sync_api'
 ```
 
-The protected-file diff must be empty. A non-empty status or protected-file
-diff stops the cutover. Do not improvise a second writer or edit the deployed
-checkout. The verified `$OPEN_TRADER_PYTHON` is shared by the Worker, Account
-API, Dashboard acceptance, and `make acceptance`; do not assume a detached
-worktree has its own `.venv`.
+Stop if the candidate is dirty or the interpreter cannot import the candidate.
+Keep the previous accepted whole-release checkout for rollback.
 
-## Preflight and cutover
+## Deployment order
 
-The Dashboard installer defaults to stack mode in #21. **Do not run
-`scripts/install_dashboard_launchd.sh --mode single` during this procedure.**
-Single mode is the old Dashboard topology, not an Account API cutover path.
+Run dry runs first. Then apply the release in this exact order; a short,
+observable Account-unavailable interval during a restart is acceptable.
 
 ```bash
 cd "$CUTOVER_ROOT"
@@ -53,15 +40,39 @@ scripts/install_account_sync_launchd.sh --dry-run --repo-root "$CUTOVER_ROOT"
 scripts/install_account_api_launchd.sh --dry-run --mode production --repo-root "$CUTOVER_ROOT"
 scripts/install_dashboard_launchd.sh --dry-run --repo-root "$CUTOVER_ROOT"
 
-# The Worker installer stops the old writer and proves controller.lock is released
-# before starting the candidate Worker.
+# 1. Account writer and API — one matched release pair.
 scripts/install_account_sync_launchd.sh --repo-root "$CUTOVER_ROOT"
 scripts/install_account_api_launchd.sh --mode production --repo-root "$CUTOVER_ROOT"
+
+# 2. Verify the two Account production reads before starting consumers.
+curl -fsS -H 'X-Open-Trader-Account-Route: production' \
+  http://127.0.0.1:8768/api/v1/account/snapshot > /tmp/open-trader-r4-snapshot.json
+
+# Select one non-empty broker/generation from accepted_statement_generation in
+# the saved snapshot, then substitute it below.
+curl -fsS -H 'X-Open-Trader-Account-Route: production' \
+  'http://127.0.0.1:8768/api/v1/account/statements/BROKER/GENERATION/trade-facts'
+
+# 3. Gateway, Legacy Dashboard, then active Trend controllers at CUTOVER_SHA.
 scripts/install_dashboard_launchd.sh --repo-root "$CUTOVER_ROOT"
+
+# 4. Disabled paths must stay absent. Do not run a Premarket/T-signal dry run.
+launchctl list | rg 'com\.open-trader\.premarket(\.|$)' && exit 1 || true
+ps ax -o command= | rg 'run-premarket|run-daily-premarket|watch-t|daily_premarket|t_signal_runner' && exit 1 || true
+for command in run-premarket run-daily-premarket watch-t; do
+  PYTHONSAFEPATH=1 "$OPEN_TRADER_PYTHON" -m open_trader "$command" --help
+  test $? -eq 2
+done
 ```
 
-After the Worker reports a fresh candidate publication, verify the exact
-processes, publications, and route before browser acceptance:
+If an old Premarket label exists, unload only that exact label before proving
+absence; never unload an unrelated job. No Premarket/T-signal notification or
+dry-run is part of this cutover.
+
+## Runtime proof before the final gate
+
+Verify the candidate process identities and fresh logs. Every PID, working
+directory and Git SHA must resolve to `$CUTOVER_ROOT` and `$CUTOVER_SHA`.
 
 ```bash
 launchctl print gui/$(id -u)/com.open-trader.account-sync-controller
@@ -77,96 +88,63 @@ tail -n 100 logs/account_sync/launchd.out.log
 tail -n 100 logs/account_api/launchd.out.log
 tail -n 100 logs/frontend_gateway/launchd.out.log
 tail -n 100 logs/legacy_dashboard/launchd.out.log
-PYTHONPATH="$PYTHONPATH" "$OPEN_TRADER_PYTHON" -m open_trader account-api-parity --data-dir data
+PYTHONSAFEPATH=1 "$OPEN_TRADER_PYTHON" -m open_trader account-sync-status --json
 ```
 
-Confirm one listener per port; every runtime record has the detached `cwd`,
-clean source state, fresh PID/start time, and `$CUTOVER_SHA`. Account health
-must report `status: ok`, `mode: production`, and matching
-`api_git_sha`/`worker_git_sha`; Gateway health must report both
-`legacy_upstream_status: ok` and `account_upstream_status: ok`.
+Run one controller-safe CN/HK/US report or revision attempt with notifications
+disabled by its existing invocation, then inspect each new JSON artifact. Its
+`account_input` must contain the matching snapshot and account generations.
+Do not substitute a stale historical report for this proof.
 
-Verify the public production route and its strong ETag without bypassing the
-Gateway:
+The browser reaches both owners only through Gateway: `/api/dashboard` is
+non-Account module data, `/api/v1/account/snapshot` is Account data, and the
+browser must not request `/api/quotes`. Legacy `/api/quotes` must return 404.
+One fresh Account publication must update the browser's in-memory Account
+snapshot without refetching Legacy options.
 
-```bash
-PROBE_DIR="$(mktemp -d)"
-curl -fsS -D "$PROBE_DIR/headers" -o "$PROBE_DIR/snapshot.json" \
-  http://127.0.0.1:8766/api/v1/account/snapshot
-ETAG="$(awk 'BEGIN{IGNORECASE=1} /^ETag:/{gsub("\\r", ""); print $2}' "$PROBE_DIR/headers")"
-test -n "$ETAG"
-curl -sS -o /dev/null -D "$PROBE_DIR/conditional-headers" \
-  -H "If-None-Match: $ETAG" \
-  http://127.0.0.1:8766/api/v1/account/snapshot
-rg '^HTTP/.* (304|200)' "$PROBE_DIR/conditional-headers"
-```
+## Controlled Account-only fault
 
-If a publication advances between requests, a contract-valid `200` with a new
-ETag is valid; otherwise the conditional request must be `304`. Keep
-`$PROBE_DIR` until operator acceptance.
-
-The acceptance suite also exercises the Gateway with an existing upstream
-harness and asserts that the Account route overwrites any caller-supplied
-`X-Open-Trader-Account-Route` value with `production`; this is not inferred
-from the downstream response body.
-
-## Controlled Account-only fault and recovery
-
-Only after the normal preflight passes, prove that Account failure is isolated
-from Legacy-owned modules. Stop only the confirmed Account API label, verify
-the Gateway returns explicit Account unavailability, and leave the Worker and
-Legacy Dashboard running:
+After normal reads succeed, stop only the confirmed Account API label. Account
+consumers must fail closed; previously published Trend, Research and Prediction
+display data must remain readable. Do not stop the Worker or Legacy process.
 
 ```bash
 launchctl bootout gui/$(id -u)/com.open-trader.account-api
-FAULT_DIR="$(mktemp -d)"
-curl -sS -o "$FAULT_DIR/account.json" -w '%{http_code}\n' \
+curl -sS -o /tmp/open-trader-r4-account.json -w '%{http_code}\n' \
   http://127.0.0.1:8766/api/v1/account/snapshot
-rg '"code"[[:space:]]*:[[:space:]]*"account_module_unavailable"' "$FAULT_DIR/account.json"
-curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8766/api/dashboard
+rg '"code"[[:space:]]*:[[:space:]]*"account_module_unavailable"' \
+  /tmp/open-trader-r4-account.json
+curl -fsS http://127.0.0.1:8766/api/dashboard > /dev/null
+curl -fsS http://127.0.0.1:8766/api/trend-reports/tiger/history > /dev/null
+curl -fsS http://127.0.0.1:8766/api/prediction-arbitrage/state > /dev/null
+
 scripts/install_account_api_launchd.sh --mode production --repo-root "$CUTOVER_ROOT"
-curl -fsS http://127.0.0.1:8766/api/v1/account/snapshot
-PYTHONPATH="$PYTHONPATH" "$OPEN_TRADER_PYTHON" -m open_trader account-api-parity --data-dir data
+curl -fsS -H 'X-Open-Trader-Account-Route: production' \
+  http://127.0.0.1:8768/api/v1/account/snapshot > /dev/null
 ```
 
-The Account route must be `503 account_module_unavailable` while stopped;
-Legacy `/api/dashboard` stays independently available. Restart only the
-candidate Account API and repeat the health, listener, log, ETag, and parity
-checks. Do not fault the Worker as part of this browser-isolation proof.
+Confirm the Research workspace remains available from the existing Dashboard
+payload after the fault. Restore Account before the final gate, then repeat the
+health, listener and fresh-log checks.
 
-## Rollback and re-cutover
+## Final gate and rollback
 
-Rollback is the inverse release sequence: keep one Worker, stop the candidate
-API, replace the Worker only after its writer lock is released, then start the
-rollback API and stack from the prior accepted detached checkout. Do not run
-two Worker installers concurrently.
-
-```bash
-export ROLLBACK_ROOT=/absolute/path/to/prior-accepted-checkout
-launchctl bootout gui/$(id -u)/com.open-trader.account-api
-scripts/install_account_sync_launchd.sh --repo-root "$ROLLBACK_ROOT"
-scripts/install_account_api_launchd.sh --mode production --repo-root "$ROLLBACK_ROOT"
-scripts/install_dashboard_launchd.sh --repo-root "$ROLLBACK_ROOT"
-```
-
-Check `data/account_sync/controller.lock` is not held before and after each
-Worker replacement, then repeat the PID/cwd/SHA/listener/log, Gateway health,
-parity, and ETag checks above using the rollback SHA. Re-cut over by repeating
-the same ordered candidate commands after the rollback Worker lock is released.
-
-Do not delete plists, logs, detached worktrees, or `$PROBE_DIR` until the
-operator has accepted the final `make acceptance` result. Cleanup happens only
-after that acceptance record is retained.
-
-## Final acceptance gate
-
-After the controlled fault has recovered and the exact candidate SHA has been
-rechecked, run the final gate with the verified shared interpreter:
+After no source or data changes remain, run the gate once with the verified
+shared interpreter:
 
 ```bash
 PYTHON_BIN="$OPEN_TRADER_PYTHON" make acceptance
 ```
 
-Only a `PASS` result is acceptance. `FAIL` requires fixing the candidate and
-repeating the cutover checks; `BLOCKED` must be reported as an unavailable
-browser or external environment.
+Only `PASS` is acceptance. After `PASS`, redeploy the exact accepted SHA in the
+same dependency order and recheck fresh PID/cwd/SHA/log evidence plus HTTP 200
+at [http://127.0.0.1:8766/](http://127.0.0.1:8766/). Do not capture screenshots
+unless the operator asks.
+
+Rollback #23 as one whole release to the retained prior accepted checkout:
+stop the candidate Account API, replace the Worker only after its writer lock
+is released, start the rollback Account API, then restart Gateway/Legacy/Trend
+from that same rollback SHA. Never pair #23 consumers with a #22 Account API,
+and never restore Legacy Account fields or raw-file reads as an incident
+workaround. Repeat the production snapshot/facts, runtime identity, disabled
+path and isolation proofs on the rollback release.

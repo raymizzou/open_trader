@@ -9,11 +9,12 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import time
 from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from .a_share_trend import valid_frozen_report_contract
 from .account_api import check_account_api_parity
@@ -92,6 +93,12 @@ SIMULATE_POSITIONS_READY_EXPRESSION = """
 SIMULATE_POSITIONS_READY_TIMEOUT_MS = 30_000
 DASHBOARD_API_TIMEOUT_SECONDS = 30
 ACCOUNT_SNAPSHOT_PATH = "/api/v1/account/snapshot"
+ACCOUNT_ROUTE_HEADER = "X-Open-Trader-Account-Route"
+PRODUCTION_ROUTE_MARKER = "production"
+LEGACY_REMOVED_ACCOUNT_FIELDS = frozenset({
+    "account_sync", "broker_positions", "broker_summaries", "cash_details",
+    "cash_rows", "holdings", "positions", "quotes", "summary",
+})
 ACCOUNT_POLL_PROOF_WAIT_MS = 10_100
 WARM_LEDGER_TOKENS = {
     "--bg": "#F7F5F1",
@@ -960,6 +967,7 @@ def _fetch_payload(url: str) -> dict[str, Any]:
 
 
 def _fetch_quotes_payload(url: str) -> dict[str, Any]:
+    """Compatibility seam for historical acceptance unit fixtures; never a gate probe."""
     with urlopen(
         f"{url.rstrip('/')}/api/quotes", timeout=DASHBOARD_API_TIMEOUT_SECONDS
     ) as response:
@@ -971,7 +979,9 @@ def _fetch_quotes_payload(url: str) -> dict[str, Any]:
 def _fetch_account_snapshot(
     url: str, *, etag: str | None = None,
 ) -> tuple[int, dict[str, Any] | None, str | None]:
-    headers = {"If-None-Match": etag} if etag else {}
+    headers = {ACCOUNT_ROUTE_HEADER: PRODUCTION_ROUTE_MARKER}
+    if etag:
+        headers["If-None-Match"] = etag
     request = Request(f"{url.rstrip('/')}{ACCOUNT_SNAPSHOT_PATH}", headers=headers)
     try:
         with urlopen(request, timeout=DASHBOARD_API_TIMEOUT_SECONDS) as response:
@@ -985,6 +995,168 @@ def _fetch_account_snapshot(
         if error.code == 304:
             return 304, None, error.headers.get("ETag")
         raise
+
+
+def _fetch_account_statement_facts(
+    url: str, broker: str, generation: str,
+) -> dict[str, Any]:
+    path = "/api/v1/account/statements/{broker}/{generation}/trade-facts".format(
+        broker=quote(broker, safe=""), generation=quote(generation, safe=":"),
+    )
+    request = Request(
+        f"{url.rstrip('/')}{path}",
+        headers={ACCOUNT_ROUTE_HEADER: PRODUCTION_ROUTE_MARKER},
+    )
+    with urlopen(request, timeout=DASHBOARD_API_TIMEOUT_SECONDS) as response:
+        if response.status != 200:
+            raise RuntimeError(f"Account statement facts HTTP {response.status}")
+        payload = json.load(response)
+    if not isinstance(payload, dict):
+        raise RuntimeError("Account statement facts 不是对象")
+    return payload
+
+
+def _legacy_cutover_errors(payload: Mapping[str, Any], legacy_url: str) -> list[str]:
+    errors = [
+        f"Legacy Dashboard 仍包含 Account 字段：{field}"
+        for field in sorted(LEGACY_REMOVED_ACCOUNT_FIELDS & set(payload))
+    ]
+    request = Request(f"{legacy_url.rstrip('/')}/api/quotes")
+    try:
+        with urlopen(request, timeout=DASHBOARD_API_TIMEOUT_SECONDS) as response:
+            if response.status != 404:
+                errors.append(f"Legacy /api/quotes HTTP {response.status}，应为 404")
+    except HTTPError as error:
+        if error.code != 404:
+            errors.append(f"Legacy /api/quotes HTTP {error.code}，应为 404")
+    except OSError as error:
+        errors.append(f"Legacy /api/quotes 检查失败：{type(error).__name__}")
+    return errors
+
+
+def _trend_account_input_errors(value: object) -> list[str]:
+    if not (
+        isinstance(value, Mapping)
+        and set(value) == {"snapshot_generation", "account_generation", "status"}
+        and value.get("status") in {"healthy", "stale"}
+        and all(
+            isinstance(value.get(field), str)
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", value[field])
+            for field in ("snapshot_generation", "account_generation")
+        )
+    ):
+        return ["趋势报告缺少有效 account_input"]
+    return []
+
+
+def _published_trend_account_input_errors(
+    payload: Mapping[str, Any], reports_dir: Path,
+) -> list[str]:
+    reports = payload.get("trend_reports")
+    if not isinstance(reports, Mapping):
+        return ["Dashboard 缺少当前趋势报告"]
+    errors: list[str] = []
+    for broker in TREND_REPORT_BROKERS:
+        report = reports.get(broker)
+        report = report if isinstance(report, Mapping) else {}
+        audit = report.get("audit")
+        artifact = report.get("artifact") or (
+            audit.get("artifact") if isinstance(audit, Mapping) else None
+        )
+        if not isinstance(artifact, str) or Path(artifact).name != artifact:
+            errors.append(f"{broker} 当前趋势报告产物无效")
+            continue
+        try:
+            frozen = json.loads(
+                (reports_dir / TREND_REPORT_DIRECTORIES[broker] / artifact).read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            errors.append(f"{broker} 当前趋势报告无法读取：{type(exc).__name__}")
+            continue
+        for error in _trend_account_input_errors(
+            frozen.get("account_input") if isinstance(frozen, Mapping) else None
+        ):
+            errors.append(f"{broker} {error}")
+    return errors
+
+
+def _account_statement_facts_errors(
+    snapshot: Mapping[str, Any], account_url: str,
+) -> list[str]:
+    generations = snapshot.get("accepted_statement_generation")
+    if not isinstance(generations, Mapping):
+        return ["Account snapshot 缺少 accepted_statement_generation"]
+    broker, generation = next(
+        (
+            (broker, generation)
+            for broker, generation in generations.items()
+            if isinstance(broker, str) and isinstance(generation, str) and generation
+        ),
+        (None, None),
+    )
+    if broker is None or generation is None:
+        return ["Account snapshot 没有已接受的结单 generation"]
+    try:
+        facts = _fetch_account_statement_facts(account_url, broker, generation)
+    except (HTTPError, OSError, RuntimeError, UnicodeError, json.JSONDecodeError) as exc:
+        return [f"Account statement facts 检查失败：{type(exc).__name__}: {exc}"]
+    if not (
+        facts.get("schema_version") == "open_trader.account.statement_trade_facts.v1"
+        and facts.get("broker") == broker
+        and facts.get("statement_generation") == generation
+        and isinstance(facts.get("facts"), list)
+    ):
+        return ["Account statement facts 契约无效"]
+    return []
+
+
+def _disabled_workflow_errors(expected_root: Path) -> list[str]:
+    errors: list[str] = []
+    labels = (
+        "com.open-trader.premarket",
+        "com.open-trader.premarket.hk",
+        "com.open-trader.premarket.us",
+    )
+    try:
+        launchd = subprocess.run(
+            ["launchctl", "list"], capture_output=True, text=True, check=False,
+        )
+        if launchd.returncode != 0:
+            errors.append("无法读取 launchd labels")
+        else:
+            errors.extend(
+                f"已禁用 Premarket launchd label 仍存在：{label}"
+                for label in labels if label in launchd.stdout
+            )
+        processes = subprocess.run(
+            ["ps", "ax", "-o", "command="], capture_output=True, text=True,
+            check=False,
+        )
+        if processes.returncode != 0:
+            errors.append("无法读取 Premarket/T-signal 进程")
+        elif re.search(
+            r"(?:run-premarket|run-daily-premarket|watch-t|daily_premarket|t_signal_runner)",
+            processes.stdout,
+        ):
+            errors.append("已禁用 Premarket/T-signal 进程仍在运行")
+    except OSError as exc:
+        errors.append(f"已禁用工作流检查失败：{type(exc).__name__}")
+        return errors
+    environment = {**os.environ, "PYTHONSAFEPATH": "1", "PYTHONPATH": str(expected_root / "src")}
+    for command in ("run-premarket", "run-daily-premarket", "watch-t"):
+        result = subprocess.run(
+            [sys.executable, "-m", "open_trader", command, "--help"],
+            cwd=expected_root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 2:
+            errors.append(f"已禁用 CLI 仍可调用：{command}")
+    return errors
 
 
 def _account_snapshot_errors(
@@ -5244,12 +5416,20 @@ def main(argv: list[str] | None = None) -> int:
         ))
         first = _fetch_payload(args.url)
         first_reports_dir = _effective_reports_dir(first, process_cwd=legacy_cwd)
-        errors.extend(validate_dashboard_payload(
-            first, expected_cn=expected_cn,
-            expected_eastmoney_cny=args.expected_eastmoney_cny,
-            expected_rows=args.expected_rows,
-            expected_phillips_period=phillips_period,
-        ))
+        errors.extend(_legacy_cutover_errors(first, args.legacy_url))
+        errors.extend(_published_trend_account_input_errors(first, first_reports_dir))
+        account_snapshot_status, account_snapshot, _account_snapshot_etag = (
+            _fetch_account_snapshot(args.account_url)
+        )
+        if account_snapshot_status != 200 or account_snapshot is None:
+            errors.append(f"Account API snapshot HTTP {account_snapshot_status}")
+        else:
+            errors.extend(
+                _account_snapshot_errors(account_snapshot, expected_sha=expected_sha)
+            )
+            errors.extend(
+                _account_statement_facts_errors(account_snapshot, args.account_url)
+            )
         try:
             account_ids = _configured_simulate_account_ids(args.expected_root)
         except Exception as exc:
@@ -5310,12 +5490,6 @@ def main(argv: list[str] | None = None) -> int:
         reports_dir = _effective_reports_dir(second, process_cwd=legacy_cwd)
         if first_reports_dir != reports_dir:
             errors.append("账户刷新前后的 Dashboard reports_dir 不一致")
-        errors.extend(validate_dashboard_payload(
-            second, expected_cn=expected_cn,
-            expected_eastmoney_cny=args.expected_eastmoney_cny,
-            expected_rows=args.expected_rows,
-            expected_phillips_period=phillips_period,
-        ))
         errors.extend(_trend_controller_errors(
             second,
             expected_root=args.expected_root,
@@ -5333,6 +5507,7 @@ def main(argv: list[str] | None = None) -> int:
             errors.append("账户刷新后的 Dashboard 数据不稳定")
         if trend_advice_signature(first) != trend_advice_signature(second):
             errors.append("实盘刷新改写了冻结建议、Kelly 或模拟统计")
+        errors.extend(_disabled_workflow_errors(args.expected_root))
     except Exception as exc:
         errors.append(f"运行检查失败：{type(exc).__name__}: {exc}")
     browser_errors, blocker = _browser_check(

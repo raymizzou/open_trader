@@ -17,7 +17,7 @@ def test_dashboard_parser_defaults() -> None:
     assert args.command == "dashboard"
     assert args.host == "127.0.0.1"
     assert args.port == 8765
-    assert args.portfolio == Path("data/latest/portfolio.csv")
+    assert args.portfolio is None
     assert args.data_dir == Path("data")
     assert args.reports_dir == Path("reports")
     assert args.config == Path("config/daily_premarket.env")
