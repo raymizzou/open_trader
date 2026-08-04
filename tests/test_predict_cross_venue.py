@@ -1340,6 +1340,11 @@ def test_stale_funnel_retains_last_success_stages_and_disables_actions() -> None
             "arbitrage_space_pairs": 1,
             "clear_signal_pairs": 1,
         }
+        assert healthy["funnel_last_success_at"] == "2026-01-01T00:00:00+00:00"
+        now = datetime(2026, 1, 1, 0, 0, 3, tzinfo=UTC)
+        assert monitor.snapshot()["funnel_last_success_at"] == (
+            "2026-01-01T00:00:00+00:00"
+        )
 
         now = datetime(2026, 1, 1, 0, 0, 7, tzinfo=UTC)
         predict.health["ws"] = "stale"
@@ -1470,6 +1475,41 @@ def test_official_market_url_omits_missing_or_unsafe_slugs() -> None:
     )
 
     assert "market_url" not in opportunity["approved_candidates"]["predict.fun"]
+    assert "market_url" not in opportunity["approved_candidates"]["polymarket"]
+
+
+def test_official_market_url_ignores_generic_polymarket_slug() -> None:
+    base_pair = resolve_explicit_market_pairs(
+        (monitor_predict_market(external_ids=("poly-condition",)),),
+        gamma_lookup=lambda condition_ids, **kwargs: [
+            {
+                **polymarket_row("poly-condition"),
+                "slug": "generic-market-slug",
+            }
+        ],
+        clob_lookup=lambda condition_id: None,
+    ).pairs[0]
+    pair = ExplicitMarketPair(
+        pair_id="public-pair",
+        predict=replace(base_pair.predict, market_slug="btc-year-end"),
+        polymarket=base_pair.polymarket,
+    )
+    opportunity = PredictCrossVenueMonitor(
+        predict_source=FakeCrossVenuePredict(()),
+        polymarket_monitor=FakeCrossVenuePolymarket(),
+        validator=FakeCrossVenueValidator(),
+        gamma_lookup=monitor_gamma,
+        clob_lookup=lambda condition_id: None,
+        predict_quote_fn=predict_quote(),
+    )._opportunity_payload(
+        pair,
+        _build_stage_four_intent(pair),
+        FakeCrossVenueValidator().validate(pair),
+    )
+
+    assert opportunity["approved_candidates"]["predict.fun"]["market_url"] == (
+        "https://predict.fun/market/btc-year-end"
+    )
     assert "market_url" not in opportunity["approved_candidates"]["polymarket"]
 
 

@@ -659,7 +659,7 @@ def _polymarket_market(row: object, condition_id: str) -> VenueMarket | None:
     rules = fields[3]
     return VenueMarket(
         exchange="polymarket", market_id=fields[0], condition_id=condition_id,
-        event_slug=_text(_value(row, "eventSlug", "event_slug", "slug")),
+        event_slug=_text(_value(row, "eventSlug", "event_slug")),
         question=fields[2], rules=rules, resolution_source=fields[4],
         close_at=close_at, settlement_at=settlement_at, yes_token_id=fields[5],
         no_token_id=fields[6], settlement_asset=fields[7], minimum_order_size=minimum,
@@ -1095,13 +1095,17 @@ class PredictCrossVenueMonitor:
     def _snapshot_funnel(self) -> dict[str, int]:
         current = self._current_funnel()
         if self._status == "ready":
-            self._last_success_funnel = dict(current)
-            self._funnel_last_success_at = self._clock()
-            self._stale_at = None
             return current
         if self._last_success_funnel is None:
             return current
         return {**self._last_success_funnel, "clear_signal_pairs": 0}
+
+    def _record_successful_funnel(self) -> None:
+        if self._status != "ready":
+            return
+        self._last_success_funnel = self._current_funnel()
+        self._funnel_last_success_at = self._clock()
+        self._stale_at = None
 
     async def refresh_opportunity(
         self,
@@ -1279,6 +1283,7 @@ class PredictCrossVenueMonitor:
             if self._status == "ready" and not markets and not eligible
             else ""
         )
+        self._record_successful_funnel()
         await self._reconcile_holdings()
 
     async def _reconcile_holdings(self) -> None:
@@ -1402,6 +1407,7 @@ class PredictCrossVenueMonitor:
                         pair_id, completed
                     )
                 )
+            self._record_successful_funnel()
 
     async def _confirm_pair(self, pair: ExplicitMarketPair) -> None:
         tokens = self._polymarket_tokens(pair)
@@ -1437,6 +1443,7 @@ class PredictCrossVenueMonitor:
             opportunity = self._opportunity_payload(current, intent, validation)
             self._opportunities[(pair.pair_id, intent.direction)] = opportunity
             self._persist_observation(opportunity)
+        self._record_successful_funnel()
 
     @staticmethod
     def _approval_still_valid(
