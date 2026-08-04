@@ -52,8 +52,10 @@ OWNER_FINGERPRINTS = {
 }
 
 
-def _matches() -> list[tuple[str, int, str, str]]:
-    source_root = Path(__file__).parents[1] / "src" / "open_trader"
+def _matches(
+    source_root: Path | None = None,
+) -> list[tuple[str, int, str, str]]:
+    source_root = source_root or Path(__file__).parents[1] / "src" / "open_trader"
     matches: list[tuple[str, int, str, str]] = []
     for path in sorted(source_root.rglob("*.py")):
         relative_path = path.relative_to(source_root).as_posix()
@@ -73,9 +75,20 @@ def _matches() -> list[tuple[str, int, str, str]]:
     return matches
 
 
-def test_owner_exclusions_are_exact_relative_paths() -> None:
-    assert "account_api.py" in OWNER_MODULES
-    assert "nested/account_api.py" not in OWNER_MODULES
+def test_owner_exclusions_do_not_skip_nested_same_basename(tmp_path: Path) -> None:
+    source_root = tmp_path / "open_trader"
+    nested = source_root / "nested" / "account_api.py"
+    nested.parent.mkdir(parents=True)
+    nested.write_text('path = "data/latest/portfolio.csv"\n', encoding="utf-8")
+
+    assert _matches(source_root) == [
+        (
+            "nested/account_api.py",
+            1,
+            r"latest[\"' /]+portfolio\.csv",
+            'path = "data/latest/portfolio.csv"',
+        )
+    ]
 
 
 def _fingerprint(matches: list[tuple[str, int, str, str]]) -> str:
