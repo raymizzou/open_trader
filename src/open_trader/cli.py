@@ -27,6 +27,7 @@ from .a_share_trend import (
 from .backtest import run_backtest
 from .account_sync_worker import (
     AccountSyncWorkerConfig,
+    default_portfolio_path,
     run_account_sync_worker,
 )
 from .account_http import (
@@ -121,13 +122,11 @@ from .trend_api_stats import (
     TigerActualFillClient,
     sync_trend_api_stats,
 )
-from .trade_actions import generate_trade_actions
 from .tradingagents_summary import (
     LLMTradingAgentsSummaryExtractor,
     generate_tradingagents_summary,
 )
 from .trading_plan import (
-    TradingPlanRow,
     build_trading_plan,
     evaluate_plan_quote,
     load_trading_plan_rows,
@@ -331,34 +330,6 @@ def _kelly_sync_trd_markets(
     if not markets:
         raise ValueError("no Kelly experiment markets found for auto Futu sync")
     return sorted(markets)
-
-
-def _active_trade_action_plans_for_quotes(
-    plans: list[TradingPlanRow],
-    run_date: str | None,
-) -> list[TradingPlanRow]:
-    active_plans = [plan for plan in plans if plan.status == "active"]
-    if run_date is not None:
-        matching_plans = [
-            plan
-            for plan in active_plans
-            if not plan.run_date.strip() or plan.run_date == run_date
-        ]
-        if not matching_plans:
-            raise ValueError(f"no active trading plans match run_date {run_date}")
-        return matching_plans
-
-    dates = sorted({
-        plan.run_date.strip() for plan in active_plans if plan.run_date.strip()
-    })
-    if not dates:
-        raise ValueError("--date is required when trading plan has no active run_date rows")
-    effective_run_date = dates[-1]
-    return [
-        plan
-        for plan in active_plans
-        if not plan.run_date.strip() or plan.run_date == effective_run_date
-    ]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -713,9 +684,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     account_sync_worker.add_argument("--data-dir", type=Path, default=Path("data"))
     account_sync_worker.add_argument("--reports-dir", type=Path, default=Path("reports"))
-    account_sync_worker.add_argument(
-        "--portfolio", type=Path, default=Path("data/latest/portfolio.csv")
-    )
+    account_sync_worker.add_argument("--portfolio", type=Path)
     account_sync_worker.add_argument(
         "--tiger-config-dir", type=Path, default=Path("~/.tigeropen/")
     )
@@ -968,35 +937,6 @@ def build_parser() -> argparse.ArgumentParser:
     check_futu_plan_parser.add_argument("--host", default="127.0.0.1")
     check_futu_plan_parser.add_argument("--port", type=positive_int, default=11111)
 
-    trade_actions_parser = subparsers.add_parser(
-        "generate-trade-actions",
-        help="Generate trade action CSV and report from trading_plan.csv",
-    )
-    trade_actions_parser.add_argument(
-        "--plan",
-        type=Path,
-        default=Path("data/latest/trading_plan.csv"),
-    )
-    trade_actions_parser.add_argument(
-        "--portfolio",
-        type=Path,
-        default=Path("data/latest/portfolio.csv"),
-    )
-    trade_actions_parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    trade_actions_parser.add_argument("--reports-dir", type=Path, default=Path("reports"))
-    trade_actions_parser.add_argument(
-        "--date",
-        type=canonical_date,
-        help="Run date, YYYY-MM-DD. Required only when active plan rows do not contain run_date.",
-    )
-    trade_actions_parser.add_argument("--host", default="127.0.0.1")
-    trade_actions_parser.add_argument("--port", type=positive_int, default=11111)
-    trade_actions_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Write dated output and report but do not update latest trade actions",
-    )
-
     backtest_parser = subparsers.add_parser(
         "run-backtest",
         help="Backtest one active trading-plan rule against historical daily prices",
@@ -1088,7 +1028,6 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_parser.add_argument(
         "--portfolio",
         type=Path,
-        default=Path("data/latest/portfolio.csv"),
     )
     dashboard_parser.add_argument("--data-dir", type=Path, default=Path("data"))
     dashboard_parser.add_argument("--reports-dir", type=Path, default=Path("reports"))
@@ -1216,7 +1155,7 @@ def main(argv: list[str] | None = None) -> int:
             config = AccountSyncWorkerConfig(
                 data_dir=args.data_dir,
                 reports_dir=args.reports_dir,
-                portfolio_path=args.portfolio,
+                portfolio_path=args.portfolio or default_portfolio_path(args.data_dir),
                 futu_host=values.get("OPEN_TRADER_FUTU_HOST", "127.0.0.1"),
                 futu_port=positive_int(values.get("OPEN_TRADER_FUTU_PORT", "11111")),
                 tiger_config_dir=args.tiger_config_dir.expanduser(),
@@ -2338,50 +2277,6 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             if quote_client is not None:
                 quote_client.close()
-        return 0
-
-    if args.command == "generate-trade-actions":
-        quote_client = None
-        try:
-            plans = _active_trade_action_plans_for_quotes(
-                load_trading_plan_rows(args.plan),
-                args.date,
-            )
-            quote_client = FutuQuoteClient(host=args.host, port=args.port)
-            print(f"connected to Futu OpenD at {args.host}:{args.port}")
-            print(f"loaded {len(plans)} active trading plan(s)")
-            symbols = sorted({plan.futu_symbol for plan in plans})
-            try:
-                snapshots = quote_client.get_snapshots(symbols) if symbols else {}
-            except FutuQuoteError as exc:
-                print(f"warning: Futu quote snapshot failed: {exc}")
-                print(
-                    "continuing with missing quotes for "
-                    f"{len(plans)} active plan(s)"
-                )
-                snapshots = {}
-            result = generate_trade_actions(
-                plan_path=args.plan,
-                portfolio_path=args.portfolio,
-                data_dir=args.data_dir,
-                reports_dir=args.reports_dir,
-                snapshots=snapshots,
-                run_date=args.date,
-                update_latest=not args.dry_run,
-            )
-        except (FileNotFoundError, ValueError, FutuQuoteError) as exc:
-            parser.error(str(exc))
-        finally:
-            if quote_client is not None:
-                quote_client.close()
-        print(f"run_date: {result.run_date}")
-        print(f"actions: {result.action_count}")
-        print(f"ready: {result.ready_count}")
-        print(f"review: {result.review_count}")
-        print(f"watch: {result.watch_count}")
-        print(f"trade_actions_csv: {result.actions_path}")
-        print(f"report: {result.report_path}")
-        print(f"latest: {result.latest_path}")
         return 0
 
     if args.command == "run-backtest":

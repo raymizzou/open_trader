@@ -2012,7 +2012,8 @@ def serve_dashboard(
     _, actual_port = server.server_address
     try:
         print(f"dashboard_url: {resolved_public_url}", flush=True)
-        print(f"portfolio: {config.portfolio_path}")
+        if config.portfolio_path is not None:
+            print(f"portfolio: {config.portfolio_path}")
         print(f"futu: {config.futu_host}:{config.futu_port}")
         print(f"poll_seconds: {config.poll_seconds}")
         server.serve_forever()

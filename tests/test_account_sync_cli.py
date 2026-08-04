@@ -32,7 +32,7 @@ def test_parser_exposes_only_account_sync_commands() -> None:
     assert worker.config == Path("config/daily_premarket.env")
     assert worker.data_dir == Path("data")
     assert worker.reports_dir == Path("reports")
-    assert worker.portfolio == Path("data/latest/portfolio.csv")
+    assert worker.portfolio is None
     assert worker.tiger_config_dir == Path("~/.tigeropen/")
     assert worker.account_interval_seconds == 60.0
     assert worker.quote_interval_seconds == 5.0

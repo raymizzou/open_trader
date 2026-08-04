@@ -40,6 +40,10 @@ from .tiger_account import (
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
+def default_portfolio_path(data_dir: Path) -> Path:
+    return data_dir / "latest" / "portfolio.csv"
+
+
 @dataclass(frozen=True)
 class AccountSyncWorkerConfig:
     data_dir: Path

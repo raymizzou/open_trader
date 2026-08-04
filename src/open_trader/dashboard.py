@@ -164,7 +164,7 @@ TREND_MARKET_TIMEZONES = {
 
 @dataclass(frozen=True)
 class DashboardConfig:
-    portfolio_path: Path
+    portfolio_path: Path | None
     data_dir: Path
     reports_dir: Path
     poll_seconds: float
