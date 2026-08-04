@@ -593,12 +593,12 @@ def test_cross_venue_intent_uses_decimal_depth_fees_later_settlement_and_venue_i
     intent = intents[0]
     assert intent.direction == "PREDICT_YES_POLYMARKET_NO"
     assert intent.quantity == Decimal("10")
-    assert intent.total_max_cost == Decimal("9.22998")
+    assert intent.total_max_cost == Decimal("9.32998")
     assert intent.maximum_fee == Decimal("0.12998")
     assert intent.minimum_payout == Decimal("10")
-    assert intent.minimum_profit == Decimal("0.77002")
+    assert intent.minimum_profit == Decimal("0.67002")
     assert intent.resolution_at == datetime(2026, 1, 21, tzinfo=UTC)
-    assert intent.annualized_yield == Decimal("0.77002") / Decimal("9.22998") * Decimal("365") / Decimal("20")
+    assert intent.annualized_yield == Decimal("0.67002") / Decimal("9.32998") * Decimal("365") / Decimal("20")
     assert [(leg.exchange, leg.outcome, leg.max_price, leg.max_cost, leg.maximum_fee) for leg in intent.legs] == [
         ("predict.fun", "YES", Decimal("0.4"), Decimal("4.08"), Decimal("0.08")),
         ("polymarket", "NO", Decimal("0.51"), Decimal("5.14998"), Decimal("0.04998")),
@@ -795,8 +795,91 @@ def test_cross_venue_treats_usdt_and_pusd_as_one_to_one_without_fx() -> None:
     )[0]
 
     assert [leg.settlement_asset for leg in intent.legs] == ["USDT", "pUSD"]
-    assert intent.total_max_cost == Decimal("9.22998")
-    assert intent.calculable_gas == Decimal("0")
+    assert intent.total_max_cost == Decimal("9.32998")
+    assert intent.calculable_gas == Decimal("0.10")
+
+
+def test_cross_venue_gas_reserve_pushes_total_over_twenty_cap() -> None:
+    pair = replace(
+        cross_venue_pair(),
+        predict=replace(
+            cross_venue_pair().predict, fee_rate_bps=Decimal("250")
+        ),
+    )
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    quantity = Decimal("20")
+    predict = PredictBook(
+        market_id=pair.predict.market_id,
+        yes_asks=(BookLevel(Decimal("0.49"), quantity),),
+        no_asks=(BookLevel(Decimal("0.70"), quantity),),
+        source_timestamp=now,
+        received_at=now,
+    )
+    polymarket = {
+        pair.polymarket.yes_token_id: ThresholdOrderBook(
+            token_id=pair.polymarket.yes_token_id,
+            asks=(BookLevel(Decimal("0.80"), quantity),),
+            bids=(BookLevel(Decimal("0.79"), quantity),),
+            confirmed_at=now,
+        ),
+        pair.polymarket.no_token_id: ThresholdOrderBook(
+            token_id=pair.polymarket.no_token_id,
+            asks=(BookLevel(Decimal("0.49"), quantity),),
+            bids=(BookLevel(Decimal("0.48"), quantity),),
+            confirmed_at=now,
+        ),
+    }
+
+    def quote(market_id: str, token_id: str, requested_units: int) -> PredictBuyQuote:
+        requested = Decimal(requested_units) / Decimal(10**18)
+        return PredictBuyQuote(
+            market_id,
+            token_id,
+            490_000,
+            int(requested * Decimal("0.50225") * Decimal(10**6)),
+            requested_units,
+        )
+
+    assert predict_cross_venue._build_cross_venue_intents(
+        pair,
+        predict,
+        polymarket,
+        now=now,
+        require_annualized_gate=False,
+        predict_quote_fn=quote,
+        target_quantity=quantity,
+        max_total_cost=Decimal("20"),
+    ) == ()
+
+
+def test_cross_venue_gas_reserve_rejects_exact_zero_profit() -> None:
+    pair = replace(
+        cross_venue_pair(),
+        predict=replace(cross_venue_pair().predict, fee_rate_bps=Decimal("0")),
+        polymarket=replace(cross_venue_pair().polymarket, fee_rate_bps=Decimal("0")),
+    )
+    predict, polymarket = cross_venue_books()
+    predict = replace(
+        predict,
+        yes_asks=(BookLevel(Decimal("0.49"), Decimal("10")),),
+    )
+    polymarket[pair.polymarket.no_token_id] = replace(
+        polymarket[pair.polymarket.no_token_id],
+        asks=(BookLevel(Decimal("0.50"), Decimal("10")),),
+    )
+
+    def quote(market_id: str, token_id: str, requested_units: int) -> PredictBuyQuote:
+        return PredictBuyQuote(
+            market_id, token_id, 490_000, 4_900_000, requested_units
+        )
+
+    assert build_cross_venue_intents(
+        pair,
+        predict,
+        polymarket,
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        predict_quote_fn=quote,
+    ) == ()
 
 
 def test_cross_venue_rejects_fee_inclusive_zero_profit_quotes() -> None:
@@ -870,7 +953,7 @@ def test_cross_venue_intent_uses_shared_scalar_annualization_with_fee_inclusive_
 
     assert len(intents) == 1
     assert calls == [
-        (Decimal("0.77002"), Decimal("9.22998"), now, pair.canonical_cutoff)
+        (Decimal("0.67002"), Decimal("9.32998"), now, pair.canonical_cutoff)
     ]
 
 

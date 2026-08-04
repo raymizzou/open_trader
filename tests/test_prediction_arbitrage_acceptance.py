@@ -70,7 +70,10 @@ class PredictClient:
             "predict_account": CONFIG.predict.wallet_address if CONFIG.predict else "",
             "gas_signer": CONFIG.signer_address,
             "available_usdt": "10",
+            "available_usdt_raw": "10000000",
             "allowance": "0",
+            "allowance_raw": "0",
+            "allowance_breaker": False,
             "scope_ready": True,
             "approval_scope": {"operation": "TRADE", "side": "BUY"},
             "bnb_balance": "0.002",
@@ -88,7 +91,6 @@ class PredictClient:
             "wallet_address": CONFIG.predict.wallet_address if CONFIG.predict else "",
             **self._account_facts(),
             "gas_ready": True,
-            "allowance_breaker": False,
             "open_orders": (),
             "positions": (),
         }
@@ -369,6 +371,44 @@ def test_predict_account_readiness_fails_closed_on_insufficient_signer_bnb(
     assert report.live_notifications == 0
 
 
+@pytest.mark.parametrize("empty_scan", (False, True))
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"allowance": "0.000001"},
+        {"allowance_raw": "1"},
+        {"allowance_breaker": True},
+    ),
+)
+def test_predict_account_readiness_fails_on_any_residual_allowance_signal(
+    tmp_path: Path, empty_scan: bool, overrides: dict[str, object]
+) -> None:
+    class ResidualPredictClient(PredictClient):
+        def _account_facts(self) -> dict[str, object]:
+            facts = super()._account_facts()
+            facts.update(overrides)
+            return facts
+
+    class EmptyPredictSource(PredictSource):
+        async def list_open_markets(self) -> tuple[Market, ...]:
+            return ()
+
+    report = readiness_report(
+        tmp_path,
+        predict_source_factory=(
+            (lambda _config, *, urlopen_fn: EmptyPredictSource())
+            if empty_scan
+            else (lambda _config, *, urlopen_fn: PredictSource())
+        ),
+        predict_client_factory=lambda _config, *, urlopen_fn: ResidualPredictClient(),
+    )
+
+    assert report.status == "FAIL"
+    assert report.predict_account.status == "FAIL"
+    assert report.mutation_calls == 0
+    assert report.live_notifications == 0
+
+
 def test_missing_configuration_is_blocked_not_fixture_pass(tmp_path: Path) -> None:
     report = acceptance.run_live_readiness(tmp_path / "missing.json")
 
@@ -417,6 +457,100 @@ def test_read_only_transport_rejects_mutation_endpoint_and_counts_no_delivery(
 
     assert transport.mutation_calls == 1
     assert transport.live_notifications == 0
+
+
+@pytest.mark.parametrize(
+    ("target", "action"),
+    (
+        ("builder", "set_approval"),
+        ("builder", "transfer"),
+        ("builder", "redemption"),
+        ("client", "submit_order"),
+    ),
+)
+def test_predict_guard_blocks_client_and_nested_builder_mutations_without_real_call(
+    tmp_path: Path, target: str, action: str
+) -> None:
+    real_calls: list[str] = []
+
+    def mutate(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        real_calls.append(action)
+
+    builder = Builder()
+    setattr(builder, action, mutate)
+
+    class MutatingPredictClient(PredictClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self._builder = builder
+            if target == "client":
+                setattr(self, action, mutate)
+
+        def approval_facts(
+            self, market_id: str, exact_debit_wei: int = 0
+        ) -> dict[str, object]:
+            getattr(self._builder if target == "builder" else self, action)()
+            return super().approval_facts(market_id, exact_debit_wei)
+
+    client = MutatingPredictClient()
+    report = readiness_report(
+        tmp_path,
+        predict_client_factory=lambda _config, *, urlopen_fn: client,
+    )
+
+    assert report.status == "FAIL"
+    assert report.predict_account.status == "FAIL"
+    assert report.safety.status == "FAIL"
+    assert report.mutation_calls == 1
+    assert report.live_notifications == 0
+    assert real_calls == []
+    assert client._builder is builder
+    if target == "client":
+        assert client.__dict__[action] is mutate
+
+
+def test_predict_guard_preserves_builder_reads_and_signed_no_submit_construction(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    class SigningBuilder(Builder):
+        def balance_of(self, asset: str) -> Decimal:
+            calls.append("balance_of")
+            assert asset == "USDT"
+            return Decimal("10")
+
+        def build_order(self) -> dict[str, str]:
+            calls.append("build_order")
+            return {"signature": "local-only"}
+
+    class SigningPredictClient(PredictClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self._builder = SigningBuilder()
+
+        def approval_facts(
+            self, market_id: str, exact_debit_wei: int = 0
+        ) -> dict[str, object]:
+            assert self._builder.balance_of("USDT") == Decimal("10")
+            return super().approval_facts(market_id, exact_debit_wei)
+
+        def no_submit_buy_preflight(
+            self, market_id: str, token_id: str, quantity_wei: int
+        ) -> SimpleNamespace:
+            assert self._builder.build_order()["signature"] == "local-only"
+            return super().no_submit_buy_preflight(market_id, token_id, quantity_wei)
+
+    report = readiness_report(
+        tmp_path,
+        predict_client_factory=lambda _config, *, urlopen_fn: SigningPredictClient(),
+    )
+
+    assert report.status == "PASS"
+    assert report.mutation_calls == 0
+    assert report.live_notifications == 0
+    assert calls == ["balance_of", "build_order"]
 
 
 @pytest.mark.parametrize(

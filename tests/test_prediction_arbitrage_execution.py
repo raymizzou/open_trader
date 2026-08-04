@@ -1086,8 +1086,8 @@ def _cross_intent(*, predict_price: Decimal = Decimal("0.45")) -> CrossVenueInte
             CrossVenueLeg("predict.fun", "predict-market", "predict-condition", "YES", "predict-yes", "USDT", Decimal("5"), Decimal("5"), predict_price, Decimal("2.30"), Decimal("0.05"), "USDT", now, None, Decimal("1")),
             CrossVenueLeg("polymarket", "poly-market", "poly-condition", "NO", "poly-no", "pUSD", Decimal("5"), Decimal("5"), Decimal("0.47"), Decimal("2.40"), Decimal("0.05"), "pUSD", now, now + timedelta(days=30), Decimal("1")),
         ),
-        quantity=Decimal("5"), calculable_gas=Decimal("0"), total_max_cost=Decimal("4.70"),
-        maximum_fee=Decimal("0.10"), minimum_payout=Decimal("5"), minimum_profit=Decimal("0.30"),
+        quantity=Decimal("5"), calculable_gas=Decimal("0.10"), total_max_cost=Decimal("4.80"),
+        maximum_fee=Decimal("0.10"), minimum_payout=Decimal("5"), minimum_profit=Decimal("0.20"),
         annualized_yield=Decimal("0.16"), canonical_cutoff=now + timedelta(days=30),
         resolution_at=now + timedelta(days=30), actionable=True, quote_available=True,
     )
@@ -1254,6 +1254,7 @@ class CrossPredictTrading:
         self.gas_ready = True
         self.allowance_breaker = False
         self.allowance = "0"
+        self.allowance_raw = "0"
         self.use_legacy_allowance_ready = False
         self.allowance_ready = True
         self.account_available = True
@@ -1300,6 +1301,7 @@ class CrossPredictTrading:
         snapshot = {
             "wallet_address": "0xpredict",
             "available_usdt": str(self.balance),
+            "available_usdt_raw": str(int(self.balance * Decimal("1000000"))),
             "open_orders": (),
             "positions": self.positions,
             "checked_at": datetime.now(UTC),
@@ -1310,6 +1312,7 @@ class CrossPredictTrading:
         snapshot.update(
             {
                 "allowance": self.allowance,
+                "allowance_raw": self.allowance_raw,
                 "scope_ready": self.scope_ready,
                 "gas_ready": self.gas_ready,
                 "allowance_breaker": self.allowance_breaker,
@@ -1329,13 +1332,24 @@ class CrossPredictTrading:
         self.call_log.append("set_allowance")
         self.approval_calls.append((market_id, exact_debit_wei))
         if self.approval_results:
-            return self.approval_results.pop(0)
+            result = self.approval_results.pop(0)
+            if "allowance" in result:
+                self.allowance = str(result["allowance"])
+            if "allowance_raw" in result:
+                self.allowance_raw = str(result["allowance_raw"])
+            self.allowance_breaker = (
+                Decimal(self.allowance) != 0 or Decimal(self.allowance_raw) != 0
+            )
+            return result
         self.allowance = str(Decimal(exact_debit_wei) / Decimal("1000000"))
+        self.allowance_raw = str(exact_debit_wei)
+        self.allowance_breaker = exact_debit_wei != 0
         return {
             "status": "confirmed",
             "market_id": market_id,
             "exact_debit_wei": exact_debit_wei,
             "allowance": self.allowance,
+            "allowance_raw": self.allowance_raw,
             "transaction_hash": "0xapprove",
         }
 
@@ -1345,10 +1359,13 @@ class CrossPredictTrading:
         if self.clear_results:
             return self.clear_results.pop(0)
         self.allowance = "0"
+        self.allowance_raw = "0"
+        self.allowance_breaker = False
         return {
             "status": "confirmed",
             "market_id": market_id,
             "allowance": "0",
+            "allowance_raw": "0",
             "transaction_hash": "0xclear",
         }
 
@@ -1510,14 +1527,22 @@ def test_cross_exact_allowance_wraps_current_dual_rest_refresh_before_submit(
     refreshes = [index for index, item in enumerate(cross.call_log) if item == "refresh"]
     first_refresh = max(index for index in refreshes if index < set_allowance)
     second_refresh = min(index for index in refreshes if index > set_allowance)
+    predict_preflights = [
+        index for index, item in enumerate(cross.call_log) if item == "predict_preflight"
+    ]
+    poly_preflights = [
+        index for index, item in enumerate(cross.call_log) if item == "poly_preflight"
+    ]
     predict_submit = cross.call_log.index("predict_submit")
     poly_submit = cross.call_log.index("poly_submit")
     predict_reconcile = cross.call_log.index("predict_reconcile")
     poly_reconcile = cross.call_log.index("poly_reconcile")
     clear_allowance = cross.call_log.index("clear_allowance")
     assert first_refresh < set_allowance < second_refresh
-    assert second_refresh < predict_submit
-    assert second_refresh < poly_submit
+    assert predict_preflights[0] < poly_preflights[0] < set_allowance
+    assert second_refresh < predict_preflights[1] < poly_preflights[1]
+    assert poly_preflights[1] < predict_submit
+    assert poly_preflights[1] < poly_submit
     assert predict_submit < predict_reconcile < clear_allowance
     assert poly_submit < poly_reconcile < clear_allowance
     assert final["evidence"][-1]["predict_allowance"] == {
@@ -1526,6 +1551,51 @@ def test_cross_exact_allowance_wraps_current_dual_rest_refresh_before_submit(
         "zero_verified": True,
     }
     assert (trading.cross_submit_calls, predict.submit_calls) == (1, 1)
+
+
+@pytest.mark.parametrize("failed_venue", ("predict.fun", "polymarket"))
+def test_cross_refreshed_preflight_failure_clears_without_submit_or_retry(
+    tmp_path: Path, failed_venue: str,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    if failed_venue == "predict.fun":
+        original = predict.no_submit_cross_buy_preflight
+
+        def predict_preflight(order: dict[str, object]) -> PredictLegResult:
+            result = original(order)
+            return (
+                PredictLegResult(False, "rejected", error_code="rejected")
+                if predict.preflight_calls == 2
+                else result
+            )
+
+        predict.no_submit_cross_buy_preflight = predict_preflight  # type: ignore[method-assign]
+    else:
+        original = trading.no_submit_cross_leg_preflight
+
+        def polymarket_preflight(leg: CrossVenueLeg) -> dict[str, object]:
+            result = original(leg)
+            return {"result": "FAIL"} if trading.cross_preflight_calls == 2 else result
+
+        trading.no_submit_cross_leg_preflight = polymarket_preflight  # type: ignore[method-assign]
+
+    _accepted, final = _cross_execution(
+        service, idempotency_key=f"cross-refreshed-preflight-{failed_venue}"
+    )
+
+    assert final["state"] == "both_rejected"
+    assert (trading.cross_preflight_calls, predict.preflight_calls) == (2, 2)
+    assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
+    assert predict.clear_calls == ["predict-market"]
+    assert predict.allowance == "0"
+    assert store.cross_unsettled_principal() == Decimal("0")
+    evidence = final["evidence"][-1]
+    assert evidence["reason"] == "cross_preflight_failed"
+    assert evidence["submitted"] is False
+    assert evidence["status_text"] == "未下单 · 授权已清零"
+    assert evidence["predict_allowance"]["zero_verified"] is True
+    assert "predict_submit" not in cross.call_log
+    assert "poly_submit" not in cross.call_log
 
 
 def test_cross_exact_approval_failure_posts_neither_venue(
@@ -1560,7 +1630,8 @@ def test_cross_post_approval_refresh_breach_clears_allowance_without_submit(
         return replace(
             cross.intent,
             legs=(replace(predict_leg, max_cost=Decimal("2.31")), polymarket_leg),
-            total_max_cost=Decimal("4.71"),
+            total_max_cost=Decimal("4.81"),
+            minimum_profit=Decimal("0.19"),
         )
 
     cross.refresh_intent_resolver = resolver
@@ -1589,7 +1660,8 @@ def test_cross_post_approval_breach_cleanup_failure_persists_one_immediate_incid
         return replace(
             cross.intent,
             legs=(replace(predict_leg, max_cost=Decimal("2.31")), polymarket_leg),
-            total_max_cost=Decimal("4.71"),
+            total_max_cost=Decimal("4.81"),
+            minimum_profit=Decimal("0.19"),
         )
 
     cross.refresh_intent_resolver = resolver
@@ -1606,7 +1678,7 @@ def test_cross_post_approval_breach_cleanup_failure_persists_one_immediate_incid
     assert service._cross_breaker_open is True
     assert predict.clear_calls == ["predict-market"]
     assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
-    assert store.cross_unsettled_principal() == Decimal("4.70")
+    assert store.cross_unsettled_principal() == Decimal("4.80")
     incidents = store.histories("incidents")
     assert len(incidents) == 1
     assert incidents[0]["reason"] == "predict_allowance_cleanup_failed"
@@ -1635,10 +1707,35 @@ def test_cross_confirmed_approval_with_unverified_post_read_opens_incident_witho
     assert predict.approval_calls == [("predict-market", 2_300_000)]
     assert predict.clear_calls == []
     assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
-    assert store.cross_unsettled_principal() == Decimal("4.70")
+    assert store.cross_unsettled_principal() == Decimal("4.80")
     incidents = store.histories("incidents")
     assert len(incidents) == 1
     assert incidents[0]["reason"] == "predict_allowance_approval_unverified"
+
+
+def test_cross_exact_approval_rejects_mismatched_raw_post_read_without_submit(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.approval_results.append(
+        {
+            "status": "confirmed",
+            "market_id": "predict-market",
+            "allowance": "2.3",
+            "allowance_raw": "2299999",
+            "transaction_hash": "0xapprove",
+        }
+    )
+
+    _accepted, final = _cross_execution(
+        service, idempotency_key="cross-approval-raw-post-read-mismatch"
+    )
+
+    assert final["state"] == "directional_incident"
+    assert final["evidence"][-1]["reason"] == "predict_allowance_approval_unverified"
+    assert (trading.cross_submit_calls, predict.submit_calls) == (0, 0)
+    assert predict.clear_calls == []
+    assert store.cross_unsettled_principal() == Decimal("4.80")
 
 
 def test_cross_cleanup_failure_opens_breaker_and_persists_one_incident(
@@ -1702,7 +1799,26 @@ def test_cross_unknown_submit_keeps_allowance_and_breaker_fail_closed(
     assert final["evidence"][-1]["reason"] == "cross_reconciliation_unknown"
     assert predict.clear_calls == []
     assert service._cross_breaker_open is True
-    assert store.cross_unsettled_principal() == Decimal("4.70")
+    assert store.cross_unsettled_principal() == Decimal("4.80")
+
+
+def test_cross_predict_accepted_without_order_id_is_unknown_without_cleanup_or_remediation(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    predict.submit_results.append(PredictLegResult(True, "accepted", "", "none"))
+
+    _accepted, final = _cross_execution(
+        service, idempotency_key="cross-predict-empty-order-id"
+    )
+
+    assert final["state"] == "directional_incident"
+    assert final["evidence"][-1]["reason"] == "cross_reconciliation_unknown"
+    assert predict.allowance == "2.3"
+    assert predict.clear_calls == []
+    assert predict.cross_remediation_option_calls == []
+    assert trading.cross_remediation_option_calls == []
+    assert store.cross_unsettled_principal() == Decimal("4.80")
 
 
 def test_residual_predict_allowance_startup_locks_and_operator_cleanup_is_read_only(
@@ -1746,14 +1862,51 @@ def test_predict_allowance_cleanup_rejects_active_execution_without_mutation(
     tmp_path: Path,
 ) -> None:
     service, store, _trading, _cross, predict = _cross_service(tmp_path)
-    predict.allowance = "2.4"
     preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
     store.consume_preview_and_create_execution(str(preview["preview_id"]), "cleanup-active")
+    predict.allowance = "2.4"
 
     result = service.cleanup_predict_allowance(confirm=True)
 
     assert result == {"state": "locked", "reason": "active_execution"}
     assert predict.clear_calls == []
+
+
+def test_predict_allowance_cleanup_uses_residual_breaker_as_reason_to_clear(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "2.4"
+    predict.allowance_breaker = True
+
+    result = service.cleanup_predict_allowance(confirm=True)
+
+    assert result == {
+        "state": "ready",
+        "before_allowance": "2.4",
+        "after_allowance": "0",
+        "usdt_moved": False,
+    }
+    assert predict.clear_calls == ["predict-market"]
+
+
+def test_predict_allowance_cleanup_clears_raw_residual_with_zero_human_projection(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "0"
+    predict.allowance_raw = "1"
+    predict.allowance_breaker = True
+
+    result = service.cleanup_predict_allowance(confirm=True)
+
+    assert result == {
+        "state": "ready",
+        "before_allowance": "0",
+        "after_allowance": "0",
+        "usdt_moved": False,
+    }
+    assert predict.clear_calls == ["predict-market"]
 
 
 def test_predict_allowance_cleanup_rejects_insufficient_bnb_without_mutation(
@@ -1807,7 +1960,39 @@ def test_predict_allowance_cleanup_rejects_changed_identity_after_clear(
 def test_cross_canary_cap_stays_five_until_exact_zero_allowance_success_is_verified(
     tmp_path: Path,
 ) -> None:
-    service, _store, _trading, cross, predict = _cross_service(tmp_path)
+    service, _store, trading, cross, predict = _cross_service(tmp_path)
+    predict.reconcile_results.append(
+        {
+            "status": "verified",
+            "verified": True,
+            "filled_quantity": Decimal("5"),
+            "position_quantity": Decimal("5"),
+            "actual_fee": Decimal("0.05"),
+            "execution_proof": {
+                "verified": True,
+                "venue": "predict.fun",
+                "order_ids": ["predict-order"],
+                "trade_ids": ["predict-trade"],
+                "fee": Decimal("0.05"),
+            },
+        }
+    )
+    trading.reconcile_results.append(
+        {
+            "status": "verified",
+            "verified": True,
+            "filled_quantity": Decimal("5"),
+            "position_quantity": Decimal("5"),
+            "actual_fee": Decimal("0.05"),
+            "execution_proof": {
+                "verified": True,
+                "venue": "polymarket",
+                "order_ids": ["poly-order"],
+                "trade_ids": ["poly-trade"],
+                "fee": Decimal("0.05"),
+            },
+        }
+    )
 
     first = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
     _accepted, final = _cross_execution(service, idempotency_key="cross-canary-first")
@@ -1974,7 +2159,10 @@ def test_cross_canary_cap_stays_five_after_non_graduating_outcomes(
 
     assert first["policy_limits"]["max_normal_cost"] == "5"
     assert final["evidence"][-1].get("canary_verified") is not True
-    assert second["policy_limits"]["max_normal_cost"] == "5"
+    if name == "cleanup_failure":
+        assert second == {"state": "rejected", "reason": "residual_predict_allowance"}
+    else:
+        assert second["policy_limits"]["max_normal_cost"] == "5"
 
 
 def _post_approval_breach_resolver(cross: CrossVenueMonitor) -> object:
@@ -1989,7 +2177,8 @@ def _post_approval_breach_resolver(cross: CrossVenueMonitor) -> object:
         return replace(
             cross.intent,
             legs=(replace(predict_leg, max_cost=Decimal("2.31")), polymarket_leg),
-            total_max_cost=Decimal("4.71"),
+            total_max_cost=Decimal("4.81"),
+            minimum_profit=Decimal("0.19"),
         )
 
     return resolver
@@ -2015,7 +2204,8 @@ def test_cross_venue_submits_both_legs_concurrently_and_deduplicates_preview(
 
     assert {first["execution_id"], duplicate["execution_id"], different_key["execution_id"]} == {first["execution_id"]}
     assert (trading.cross_submit_calls, predict.submit_calls) == (1, 1)
-    assert predict.cross_entry_preflight_orders == predict.cross_entry_submit_orders
+    assert len(predict.cross_entry_preflight_orders) == 2
+    assert predict.cross_entry_preflight_orders[-1:] == predict.cross_entry_submit_orders
     assert predict.cross_entry_submit_orders[0]["execution_id"] == first["execution_id"]
     assert final["state"] == "holding_to_resolution"
 
@@ -2043,8 +2233,8 @@ def test_cross_venue_uses_one_fresh_bounded_completion_only_below_emergency_limi
     cross.intent = replace(
         cross.intent,
         legs=(replace(predict_leg, max_cost=Decimal("1.90")), polymarket_leg),
-        total_max_cost=Decimal("4.30"),
-        minimum_profit=Decimal("0.70"),
+        total_max_cost=Decimal("4.40"),
+        minimum_profit=Decimal("0.60"),
     )
     predict.submit_results.extend(
         (
@@ -2059,7 +2249,7 @@ def test_cross_venue_uses_one_fresh_bounded_completion_only_below_emergency_limi
 
     assert final["state"] == "holding_to_resolution"
     assert predict.submit_calls == 2
-    assert final["evidence"][-1]["remediation_worst_case_loss"] == "1.00"
+    assert final["evidence"][-1]["remediation_worst_case_loss"] == "1.10"
 
 
 def test_cross_venue_never_completes_an_opposite_partial_fill(
@@ -2095,8 +2285,8 @@ def test_cross_venue_never_completes_above_emergency_limit(
     cross.intent = replace(
         cross.intent,
         legs=(replace(predict_leg, max_cost=Decimal("2.01")), polymarket_leg),
-        total_max_cost=Decimal("4.41"),
-        minimum_profit=Decimal("0.59"),
+        total_max_cost=Decimal("4.51"),
+        minimum_profit=Decimal("0.49"),
     )
     predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected"))
     predict.reconcile_results.append(
@@ -2123,6 +2313,7 @@ def test_cross_holding_settlement_uses_post_fill_baseline_not_preorder_balance(
         ),
         quantity=Decimal("10"),
         minimum_payout=Decimal("10"),
+        minimum_profit=Decimal("5.20"),
     )
     predict.default_filled_quantity = Decimal("10")
     trading.balance = Decimal("100")
@@ -2166,6 +2357,7 @@ def test_cross_holding_settlement_requires_exact_redeemable_net_quantity(
         ),
         quantity=Decimal("10"),
         minimum_payout=Decimal("10"),
+        minimum_profit=Decimal("5.20"),
     )
     predict.default_filled_quantity = Decimal("10")
     trading.balance = predict.balance = Decimal("100")
@@ -2209,7 +2401,7 @@ def test_cross_remediation_prefers_fresh_cheaper_polymarket_unwind_once(
     assert [order["side"] for order in trading.cross_remediation_calls] == ["SELL"]
     assert predict.submit_calls == 1
     assert service._cross_breaker_open is True
-    assert store.cross_unsettled_principal() == Decimal("4.70")
+    assert store.cross_unsettled_principal() == Decimal("4.80")
 
 
 def test_cross_remediation_completes_from_fresh_bound_option_within_limit(
@@ -2252,8 +2444,8 @@ def test_cross_remediation_rejects_nonactionable_fresh_options_without_order(
     cross.intent = replace(
         cross.intent,
         legs=(replace(predict_leg, max_cost=Decimal("1.00")), polymarket_leg),
-        total_max_cost=Decimal("3.40"),
-        minimum_profit=Decimal("1.60"),
+        total_max_cost=Decimal("3.50"),
+        minimum_profit=Decimal("1.50"),
     )
     predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected"))
     if option_state == "stale":
@@ -2357,7 +2549,7 @@ def test_cross_holding_keeps_capacity_when_only_losing_venue_collateral_grows(
     assert pending == {"complete": 0, "pending": 0, "unknown": 1}
     assert execution["state"] == "holding_to_resolution"
     assert execution["evidence"][-1]["status_text"] == "待兑付"
-    assert store.cross_unsettled_principal() == Decimal("4.70")
+    assert store.cross_unsettled_principal() == Decimal("4.80")
 
 
 def test_cross_reservation_release_failure_becomes_an_incident(
@@ -2481,9 +2673,9 @@ def test_cross_preview_is_server_owned_without_expires_at_or_countdown(
     assert preview["signal_episode_id"] == "signal-episode-1"
     assert [leg["exchange"] for leg in preview["buy_legs"]] == ["predict.fun", "polymarket"]
     assert preview["net_quantity"] == "5"
-    assert preview["maximum_total_cost"] == "4.70"
+    assert preview["maximum_total_cost"] == "4.80"
     assert preview["minimum_payout"] == "5"
-    assert preview["minimum_profit"] == "0.30"
+    assert preview["minimum_profit"] == "0.20"
     assert preview["annualized_yield"] >= "0.15"
     assert preview["canonical_cutoff"].endswith("Z")
     assert preview["codex_approval"]["decision"] == "APPROVE"
@@ -2493,6 +2685,35 @@ def test_cross_preview_is_server_owned_without_expires_at_or_countdown(
     assert preview["policy_limits"]["max_normal_cost"] == "5"
     assert preview["policy_limits"]["max_emergency_loss"] == "2"
     assert "expires_at" not in preview
+
+
+def test_cross_venue_preview_requires_named_gas_inside_cost_and_profit(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, cross, _predict = _cross_service(tmp_path)
+    cross.intent = replace(
+        cross.intent,
+        calculable_gas=Decimal("0"),
+        total_max_cost=Decimal("4.70"),
+        minimum_profit=Decimal("0.30"),
+    )
+
+    assert service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO") == {
+        "state": "rejected",
+        "reason": "cross_venue_economics",
+    }
+
+    cross.intent = replace(
+        cross.intent,
+        calculable_gas=Decimal("0.10"),
+        total_max_cost=Decimal("4.80"),
+        minimum_profit=Decimal("0.20"),
+    )
+    preview = service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO")
+
+    assert preview["state"] == "previewed"
+    assert preview["maximum_total_cost"] == "4.80"
+    assert preview["minimum_profit"] == "0.20"
 
 
 def test_cross_venue_execution_mode_is_server_authority_for_preview_and_confirm(
@@ -2672,8 +2893,8 @@ def test_cross_preview_no_ttl_accepts_same_episode_better_prices_after_elapsed_w
             replace(predict_leg, max_price=Decimal("0.44"), max_cost=Decimal("2.25")),
             replace(polymarket_leg, max_price=Decimal("0.46"), max_cost=Decimal("2.35")),
         ),
-        total_max_cost=Decimal("4.60"),
-        minimum_profit=Decimal("0.40"),
+        total_max_cost=Decimal("4.70"),
+        minimum_profit=Decimal("0.30"),
         annualized_yield=Decimal("0.17"),
     )
 
@@ -2720,7 +2941,7 @@ def test_cross_venue_confirmation_retains_reservation_without_current_account_pr
     service._threads[str(accepted["execution_id"])].join(timeout=5)
 
     assert service.execution(str(accepted["execution_id"]))["state"] == "directional_incident"
-    assert store.cross_unsettled_principal() == Decimal("4.70")
+    assert store.cross_unsettled_principal() == Decimal("4.80")
     assert service._cross_breaker_open is True
 
 
@@ -2751,8 +2972,8 @@ def test_cross_venue_refresh_rejects_changed_ceilings_without_cached_snapshot(
     cross.intent = replace(
         cross.intent,
         legs=(changed_predict, cross.intent.legs[1]),
-        total_max_cost=Decimal("4.75"),
-        minimum_profit=Decimal("0.25"),
+        total_max_cost=Decimal("4.85"),
+        minimum_profit=Decimal("0.15"),
     )
 
     accepted = service.confirm(str(preview["preview_id"]), "cross-ceiling-change")
@@ -2792,8 +3013,8 @@ def test_cross_venue_refresh_rejects_changed_ceilings_without_cached_snapshot(
                     replace(intent.legs[0], max_cost=Decimal("2.31")),
                     intent.legs[1],
                 ),
-                total_max_cost=Decimal("4.71"),
-                minimum_profit=Decimal("0.29"),
+                total_max_cost=Decimal("4.81"),
+                minimum_profit=Decimal("0.19"),
             ),
         ),
         lambda opportunity, intent: (
@@ -2841,9 +3062,9 @@ def test_cross_preview_canary_quantity_requests_smallest_and_freezes_exact_quant
             ),
         ),
         quantity=Decimal("10"),
-        total_max_cost=Decimal("9.40"),
+        total_max_cost=Decimal("9.50"),
         minimum_payout=Decimal("10"),
-        minimum_profit=Decimal("0.60"),
+        minimum_profit=Decimal("0.50"),
         annualized_yield=Decimal("0.16"),
     )
     cross.intent = large

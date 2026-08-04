@@ -201,14 +201,12 @@ class PredictTradingClient:
     def submit_buy_once(self, market_id: str, token_id: str, quantity_wei: int) -> PredictLegResult:
         try:
             market = self._market(market_id)
-            response = self._json("/v1/orders", method="POST", data=self._order_body(self.quote_market_buy(market_id, token_id, quantity_wei), market), auth=True)
-            row = _data(response)
-            order_id = row.get("hash") or row.get("id")
-            return PredictLegResult(True, "accepted", str(order_id or ""))
-        except (HTTPError, URLError, OSError):
-            return PredictLegResult(False, "ambiguous", error_code="ambiguous")
+            body = self._order_body(
+                self.quote_market_buy(market_id, token_id, quantity_wei), market
+            )
         except Exception:
             return PredictLegResult(False, "rejected", error_code="rejected")
+        return self._post_order_once(body)
 
     def _cross_entry_bound(self, order: Mapping[str, object]) -> tuple[tuple[object, ...], str, str, int, int, Decimal, Decimal, Decimal, Decimal] | None:
         """Validate one persisted cross-leg bound without accepting replacement terms."""
@@ -251,7 +249,7 @@ class PredictTradingClient:
             or cost_units is None
             or net > requested
             or maximum_fee < 0
-            or calculable_gas < 0
+            or calculable_gas <= 0
         ):
             return None
         key = (
@@ -301,7 +299,7 @@ class PredictTradingClient:
                 or debit <= 0
                 or fee < 0
                 or fee > maximum_fee
-                or debit + calculable_gas > max_cost
+                or debit > max_cost
             ):
                 return PredictLegResult(False, "rejected", error_code="rejected")
             self._order_body(quote, market)
@@ -320,16 +318,10 @@ class PredictTradingClient:
         self._cross_entry_ready = None
         try:
             _key, quote, market = ready
-            response = self._json(
-                "/v1/orders", method="POST", data=self._order_body(quote, market), auth=True
-            )
-            row = _data(response)
-            order_id = row.get("hash") or row.get("id")
-            return PredictLegResult(True, "accepted", str(order_id or ""))
-        except (HTTPError, URLError, OSError):
-            return PredictLegResult(False, "ambiguous", error_code="ambiguous")
+            body = self._order_body(quote, market)
         except Exception:
             return PredictLegResult(False, "rejected", error_code="rejected")
+        return self._post_order_once(body)
 
     def cross_remediation_option(
         self,
@@ -425,16 +417,39 @@ class PredictTradingClient:
                 str(order["market_id"]), str(order["token_id"]), price_wei, debit, units
             )
             market = self._market(quote.market_id)
-            response = self._json(
-                "/v1/orders", method="POST", data=self._order_body(quote, market), auth=True
-            )
-            row = _data(response)
-            order_id = row.get("hash") or row.get("id")
-            return PredictLegResult(True, "accepted", str(order_id or ""))
-        except (HTTPError, URLError, OSError):
-            return PredictLegResult(False, "ambiguous", error_code="ambiguous")
+            body = self._order_body(quote, market)
         except Exception:
             return PredictLegResult(False, "rejected", error_code="rejected")
+        return self._post_order_once(body)
+
+    def _post_order_once(self, body: Mapping[str, object]) -> PredictLegResult:
+        try:
+            token = self._authenticate()
+            request = Request(
+                f"{PREDICT_REST_URL}/v1/orders",
+                data=json.dumps(body, separators=(",", ":")).encode(),
+                headers={
+                    "x-api-key": self._api_key,
+                    "User-Agent": "open-trader/0.1",
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+        except Exception:
+            return PredictLegResult(False, "rejected", error_code="rejected")
+        try:
+            with self._urlopen_fn(request, timeout=_TIMEOUT_SECONDS) as response:
+                raw = response.read()
+            payload = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            if not isinstance(payload, Mapping):
+                raise ValueError("invalid predict response")
+            order_id = _data(payload).get("hash") or _data(payload).get("id")
+            if not isinstance(order_id, str) or not order_id:
+                raise ValueError("invalid predict order response")
+            return PredictLegResult(True, "accepted", order_id)
+        except Exception:
+            return PredictLegResult(False, "ambiguous", error_code="ambiguous")
 
     def approval_facts(self, market_id: str, exact_debit_wei: int = 0) -> Mapping[str, object]:
         scope = self._approval_scope_for_market(market_id)
@@ -455,9 +470,13 @@ class PredictTradingClient:
         if allowance is None:
             return self._allowance_result(False, _receipt_error_code(result), facts)
         if allowance != amount:
-            facts["allowance"] = str(allowance)
+            facts["allowance"] = _usdt_string(allowance)
+            facts["allowance_raw"] = str(allowance)
+            facts["allowance_breaker"] = allowance > 0
             return self._allowance_result(False, "allowance_mismatch", facts, result)
-        facts["allowance"] = str(allowance)
+        facts["allowance"] = _usdt_string(allowance)
+        facts["allowance_raw"] = str(allowance)
+        facts["allowance_breaker"] = allowance > 0
         return self._allowance_result(True, "none", facts, result)
 
     def clear_buy_allowance(self, market_id: str) -> Mapping[str, object]:
@@ -472,9 +491,13 @@ class PredictTradingClient:
         if allowance is None:
             return self._allowance_result(False, _receipt_error_code(result), facts)
         if allowance != 0:
-            facts["allowance"] = str(allowance)
+            facts["allowance"] = _usdt_string(allowance)
+            facts["allowance_raw"] = str(allowance)
+            facts["allowance_breaker"] = allowance > 0
             return self._allowance_result(False, "allowance_mismatch", facts, result)
         facts["allowance"] = "0"
+        facts["allowance_raw"] = "0"
+        facts["allowance_breaker"] = False
         return self._allowance_result(True, "none", facts, result)
 
     def account_snapshot(self) -> Mapping[str, object]:
@@ -484,14 +507,16 @@ class PredictTradingClient:
         )
         open_orders = _data(self._json("/v1/orders", auth=True)).get("orders", ())
         positions = _data(self._json("/v1/positions", auth=True)).get("positions", ())
-        allowance = _non_negative_int(facts["allowance"], "allowance")
+        allowance = _non_negative_int(facts["allowance_raw"], "allowance")
         minimum_top_up = _number(facts["minimum_top_up_bnb"]) or Decimal("0")
         return {
             "wallet_address": self._config.wallet_address,
             "predict_account": facts["predict_account"],
             "gas_signer": facts["gas_signer"],
             "available_usdt": facts["available_usdt"],
+            "available_usdt_raw": facts["available_usdt_raw"],
             "allowance": facts["allowance"],
+            "allowance_raw": facts["allowance_raw"],
             "scope_ready": facts["scope_ready"],
             "gas_ready": minimum_top_up == 0,
             "approval_scope": facts["approval_scope"],
@@ -522,6 +547,13 @@ class PredictTradingClient:
             events = [row for row in activity if str(row.get("orderHash")) == order_hash]
             facts = [(_facts(match), _facts(event)) for match in matched for event in events]
             agreed = next((match for match, event in facts if match is not None and match == event), None)
+            trade_ids = list(
+                dict.fromkeys(
+                    match[0]
+                    for match, event in facts
+                    if match is not None and match == event
+                )
+            )
             position_quantity = sum(
                 (
                     _number(row.get("amount")) or Decimal("0")
@@ -552,6 +584,14 @@ class PredictTradingClient:
                     {
                         "filled_quantity": agreed[1],
                         "position_quantity": position_quantity,
+                        "actual_fee": agreed[2],
+                        "execution_proof": {
+                            "verified": True,
+                            "venue": "predict.fun",
+                            "order_ids": [order_hash],
+                            "trade_ids": trade_ids,
+                            "fee": agreed[2],
+                        },
                     }
                 )
                 try:
@@ -587,8 +627,8 @@ class PredictTradingClient:
     ) -> Mapping[str, object]:
         amount = _non_negative_int(exact_debit_wei, "approval")
         step = self._approval_step(scope)
-        allowance = self._raw_allowance(step)
-        available_usdt = _non_negative_int(
+        allowance_raw = self._raw_allowance(step)
+        available_usdt_raw = _non_negative_int(
             self._builder.balance_of("USDT", self._config.wallet_address),
             "allowance",
         )
@@ -600,8 +640,12 @@ class PredictTradingClient:
         return {
             "predict_account": self._config.wallet_address,
             "gas_signer": self._gas_signer,
-            "available_usdt": str(available_usdt),
-            "allowance": str(allowance),
+            "available_usdt": _usdt_string(available_usdt_raw),
+            "available_usdt_raw": str(available_usdt_raw),
+            "allowance": _usdt_string(allowance_raw),
+            "allowance_raw": str(allowance_raw),
+            "allowance_breaker": allowance_raw > 0,
+            "exact_debit_wei": amount,
             "approval_scope": {
                 "operation": str(scope.operation),
                 "side": "BUY",
@@ -725,6 +769,9 @@ class PredictTradingClient:
             "approval_step_id": facts.get("approval_step_id"),
             "approval_spender": facts.get("approval_spender"),
             "allowance": facts.get("allowance"),
+            "allowance_raw": facts.get("allowance_raw"),
+            "allowance_breaker": facts.get("allowance_breaker"),
+            "exact_debit_wei": facts.get("exact_debit_wei"),
             "checked_at": datetime.now(UTC),
         }
         tx_hash = _receipt_hash(receipt)
@@ -811,6 +858,10 @@ def _non_negative_int(value: object, code: str) -> int:
 
 def _bnb_wei_string(value: int) -> str:
     return _decimal_string(Decimal(value) / Decimal(10**18))
+
+
+def _usdt_string(value: int) -> str:
+    return _decimal_string(Decimal(value) / Decimal(10**6))
 
 
 def _decimal_string(value: Decimal) -> str:

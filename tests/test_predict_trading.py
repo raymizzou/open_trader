@@ -36,6 +36,11 @@ class FakeResponse:
         return None
 
 
+class RawResponse(FakeResponse):
+    def read(self) -> bytes:
+        return b"not-json"
+
+
 class FakeBuilder:
     last_order_input = None
 
@@ -291,7 +296,7 @@ def test_cross_entry_rejects_a_moved_quote_above_approved_ceiling_without_post()
         "max_price": Decimal("0.50"),
         "max_cost": Decimal("0.50"),
         "maximum_fee": Decimal("0.01"),
-        "calculable_gas": Decimal("0"),
+        "calculable_gas": Decimal("0.10"),
     }
 
     result = client.no_submit_cross_buy_preflight(order)
@@ -330,7 +335,7 @@ def test_cross_entry_posts_only_the_preflight_bound_order() -> None:
         "max_price": Decimal("1"),
         "max_cost": Decimal("1"),
         "maximum_fee": Decimal("0"),
-        "calculable_gas": Decimal("0"),
+        "calculable_gas": Decimal("0.10"),
     }
 
     assert client.no_submit_cross_buy_preflight(order).accepted is True
@@ -344,7 +349,7 @@ def test_cross_entry_posts_only_the_preflight_bound_order() -> None:
     ) == 1
 
 
-def test_cross_entry_rejects_quote_and_calculable_gas_over_approved_cost() -> None:
+def test_cross_entry_rejects_unknown_zero_gas_without_post() -> None:
     requests = []
     now_ms = int(datetime.now(UTC).timestamp() * 1000)
 
@@ -370,7 +375,7 @@ def test_cross_entry_rejects_quote_and_calculable_gas_over_approved_cost() -> No
         "max_price": Decimal("1"),
         "max_cost": Decimal("1"),
         "maximum_fee": Decimal("0"),
-        "calculable_gas": Decimal("0.01"),
+        "calculable_gas": Decimal("0"),
     }
 
     assert client.no_submit_cross_buy_preflight(order).accepted is False
@@ -393,8 +398,44 @@ def test_submit_posts_once_and_transport_error_is_ambiguous() -> None:
     assert sum(request.full_url.endswith("/v1/orders") for request in requests) == 1
     assert requests[-1].headers["Content-type"] == "application/json"
 
-    failure_client, _ = make_client(lambda *args, **kwargs: (_ for _ in ()).throw(URLError("offline")))
+    def fail_order_only(request, **kwargs):
+        if request.full_url.endswith("/v1/orders"):
+            raise URLError("offline")
+        return response_for(request)
+
+    failure_client, _ = make_client(fail_order_only)
     assert failure_client.submit_buy_once("896", "yes-token", 10**18).error_code == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    "order_response",
+    (RawResponse(None), FakeResponse([]), FakeResponse({"data": {}})),
+)
+def test_predict_post_response_failures_are_ambiguous_after_single_attempt(
+    order_response: FakeResponse,
+) -> None:
+    requests = []
+
+    def urlopen_fn(request, **kwargs):
+        requests.append(request)
+        if request.full_url.endswith("/v1/orders"):
+            return order_response
+        return response_for(request)
+
+    client, _ = make_client(urlopen_fn)
+
+    result = client.submit_buy_once("896", "yes-token", 10**18)
+
+    assert (result.accepted, result.status, result.order_id, result.error_code) == (
+        False,
+        "ambiguous",
+        "",
+        "ambiguous",
+    )
+    assert sum(
+        request.full_url.endswith("/v1/orders") and request.get_method() == "POST"
+        for request in requests
+    ) == 1
 
 
 def test_reconcile_returns_unknown_for_pending_order_with_preexisting_position() -> None:
@@ -445,6 +486,14 @@ def test_reconcile_verifies_only_full_order_match_activity_and_position_agreemen
         "status": "verified",
         "filled_quantity": Decimal("1"),
         "position_quantity": Decimal("1"),
+        "actual_fee": Decimal("2"),
+        "execution_proof": {
+            "verified": True,
+            "venue": "predict.fun",
+            "order_ids": ["order-hash"],
+            "trade_ids": ["tx"],
+            "fee": Decimal("2"),
+        },
         "minimum_order_size": Decimal("1"),
     }
 
@@ -515,6 +564,7 @@ def test_approval_facts_report_predict_account_owner_allowance_and_gas() -> None
     assert facts["predict_account"] == DEPOSIT
     assert facts["gas_signer"] == PRIVY_SIGNER
     assert facts["allowance"] == "0"
+    assert facts["allowance_breaker"] is False
     assert facts["approval_scope"] == {
         "operation": "TRADE",
         "side": "BUY",
@@ -530,6 +580,29 @@ def test_approval_facts_report_predict_account_owner_allowance_and_gas() -> None
     assert client._builder.balance_of_calls == [("USDT", DEPOSIT)]  # type: ignore[attr-defined]
     assert client._builder.transfer_calls == 0  # type: ignore[attr-defined]
     assert client._builder.order_submit_calls == 0  # type: ignore[attr-defined]
+
+
+def test_real_adapter_reports_human_usdt_and_raw_post_approval_units() -> None:
+    client, _ = make_client(response_for)
+    client._builder.allowance_value = 2_400_000  # type: ignore[attr-defined]
+
+    facts = client.approval_facts("896", exact_debit_wei=2_400_000)
+
+    assert facts["available_usdt"] == "5"
+    assert facts["available_usdt_raw"] == "5000000"
+    assert facts["allowance"] == "2.4"
+    assert facts["allowance_raw"] == "2400000"
+    assert facts["allowance_breaker"] is True
+    assert facts["exact_debit_wei"] == 2_400_000
+
+    client._builder.allowance_value = 0  # type: ignore[attr-defined]
+    client._builder.allowance_after_approve = 2_400_000  # type: ignore[attr-defined]
+    result = client.set_exact_buy_allowance("896", 2_400_000)
+
+    assert result["allowance"] == "2.4"
+    assert result["allowance_raw"] == "2400000"
+    assert result["allowance_breaker"] is True
+    assert result["exact_debit_wei"] == 2_400_000
 
 
 @pytest.mark.parametrize(
@@ -576,6 +649,7 @@ def test_account_snapshot_removes_allowance_ready_and_marks_residual_allowance_a
 
     assert "allowance_ready" not in clean
     assert clean["allowance"] == "0"
+    assert clean["allowance_raw"] == "0"
     assert clean["allowance_breaker"] is False
     assert clean["scope_ready"] is True
     assert clean["gas_ready"] is True
@@ -584,7 +658,8 @@ def test_account_snapshot_removes_allowance_ready_and_marks_residual_allowance_a
     residual = client.account_snapshot()
 
     assert residual["allowance_breaker"] is True
-    assert residual["allowance"] == "2400000"
+    assert residual["allowance"] == "2.4"
+    assert residual["allowance_raw"] == "2400000"
 
 
 def test_account_snapshot_marks_low_signer_bnb_read_only_without_breaker() -> None:
@@ -609,7 +684,9 @@ def test_set_exact_buy_allowance_uses_sdk_set_approval_and_proves_exact_post_rea
     step, approved, amount = client._builder.set_approval_calls[0]  # type: ignore[attr-defined]
     assert (step.id, approved, amount) == ("ERC20_ALLOWANCE:CTF_EXCHANGE", True, 2_400_000)
     assert result["success"] is True
-    assert result["allowance"] == "2400000"
+    assert result["allowance"] == "2.4"
+    assert result["allowance_raw"] == "2400000"
+    assert result["allowance_breaker"] is True
     assert "_approval_step" not in result
     assert not any(str(key).startswith("_") for key in result)
     assert client._builder.order_submit_calls == 0  # type: ignore[attr-defined]
@@ -627,6 +704,8 @@ def test_clear_buy_allowance_uses_sdk_revoke_and_proves_zero_post_read() -> None
     assert (step.id, approved, amount) == ("ERC20_ALLOWANCE:CTF_EXCHANGE", False, None)
     assert result["success"] is True
     assert result["allowance"] == "0"
+    assert result["allowance_raw"] == "0"
+    assert result["allowance_breaker"] is False
     assert "_approval_step" not in result
     assert not any(str(key).startswith("_") for key in result)
     assert client._builder.order_submit_calls == 0  # type: ignore[attr-defined]

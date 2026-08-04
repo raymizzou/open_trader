@@ -145,6 +145,10 @@ class _PolymarketMutationViolation(RuntimeError):
     """Internal marker for a guarded Polymarket mutation or notification."""
 
 
+class _PredictMutationViolation(RuntimeError):
+    """Internal marker for a guarded Predict mutation."""
+
+
 class _GuardedCallable:
     """Call an SDK method with a guarded proxy as its self object."""
 
@@ -391,6 +395,68 @@ class _GuardedPolymarketValue:
         return len(object.__getattribute__(self, "_value"))  # type: ignore[arg-type]
 
 
+class _PredictReadOnlyGuard(_PolymarketReadOnlyGuard):
+    """Use the SDK proxy machinery while reporting Predict mutations separately."""
+
+    _MUTATION_NAMES = _PolymarketReadOnlyGuard._MUTATION_NAMES | frozenset(
+        {"approval", "redemption", "submit_order", "submit_orders"}
+    )
+
+    def violation(self, name: str, *, kind: str | None = None) -> None:
+        del name, kind
+        self.mutation_calls += 1
+        raise _PredictMutationViolation("Predict mutation prohibited")
+
+
+@contextmanager
+def _guard_predict_client(
+    client: object, guard: _PredictReadOnlyGuard
+) -> Iterator[None]:
+    """Install a reversible guard around the Predict client and nested builder."""
+
+    try:
+        builder = getattr(client, "_builder")
+        setattr(client, "_builder", guard.wrap(builder))
+    except Exception:
+        raise RuntimeError("Predict read-only guard unavailable") from None
+
+    direct_replacements: list[tuple[str, bool, object]] = []
+    direct_names = set(guard._MUTATION_NAMES)
+    direct_names.update(name for name in dir(client) if guard._kind(name) == "mutation")
+    try:
+        for name in direct_names:
+            try:
+                previous = getattr(client, name)
+            except AttributeError:
+                had_previous = False
+                previous = None
+            else:
+                had_previous = True
+            setattr(
+                client,
+                name,
+                lambda *args, _name=name, **kwargs: guard.violation(_name),
+            )
+            direct_replacements.append((name, had_previous, previous))
+    except Exception:
+        for name, had_previous, previous in reversed(direct_replacements):
+            if had_previous:
+                setattr(client, name, previous)
+            else:
+                delattr(client, name)
+        setattr(client, "_builder", builder)
+        raise RuntimeError("Predict read-only guard unavailable") from None
+    try:
+        yield
+    finally:
+        for name, had_previous, previous in reversed(direct_replacements):
+            if had_previous:
+                setattr(client, name, previous)
+            else:
+                delattr(client, name)
+        setattr(client, "_builder", builder)
+
+
 @contextmanager
 def _guard_polymarket_client(
     client: object, guard: _PolymarketReadOnlyGuard
@@ -628,7 +694,9 @@ def _predict_account_check(client: object, market: object | None) -> ReadinessCh
         predict_account = facts["predict_account"]
         gas_signer = facts["gas_signer"]
         balance = _decimal_fact(facts, "available_usdt")
+        balance_raw = _decimal_fact(facts, "available_usdt_raw")
         allowance = _decimal_fact(facts, "allowance")
+        allowance_raw = _decimal_fact(facts, "allowance_raw")
         bnb_balance = _decimal_fact(facts, "bnb_balance")
         required_bnb = _decimal_fact(facts, "required_bnb")
         minimum_top_up_bnb = _decimal_fact(facts, "minimum_top_up_bnb")
@@ -642,6 +710,11 @@ def _predict_account_check(client: object, market: object | None) -> ReadinessCh
         or not isinstance(gas_signer, str)
         or not gas_signer
         or facts.get("scope_ready") is not True
+        or facts.get("allowance_breaker") is not False
+        or balance * Decimal("1000000") != balance_raw
+        or allowance != 0
+        or allowance_raw != 0
+        or allowance * Decimal("1000000") != allowance_raw
     ):
         return _failed("predict account read failed")
     wallet_address = facts.get("wallet_address")
@@ -782,6 +855,7 @@ def run_live_readiness(
         else:
             predict_market = _failed("Predict REST/WebSocket market/book read failed")
 
+    predict_guard = _PredictReadOnlyGuard()
     try:
         predict_client = predict_client_factory(config, urlopen_fn=transport)
     except KeychainError:
@@ -795,15 +869,28 @@ def run_live_readiness(
             else _failed("predict account read failed")
         )
     else:
-        predict_account = _predict_account_check(predict_client, market)
-    if market is _NO_PREDICT_MARKET:
-        predict_preflight = _not_applicable("Predict signed-order construction not applicable; no open V1 market")
-    elif market is None or predict_client is None:
+        try:
+            with _guard_predict_client(predict_client, predict_guard):
+                predict_account = _predict_account_check(predict_client, market)
+                if market is _NO_PREDICT_MARKET:
+                    predict_preflight = _not_applicable(
+                        "Predict signed-order construction not applicable; no open V1 market"
+                    )
+                elif market is None:
+                    predict_preflight = _blocked("Predict market/account readiness unavailable")
+                elif predict_account.status != _READY:
+                    predict_preflight = _blocked("Predict account readiness unavailable")
+                else:
+                    predict_preflight = _predict_preflight_check(predict_client, market)
+        except Exception as exc:
+            predict_account = (
+                _blocked("Predict account environment unavailable")
+                if _is_external_unavailable(exc)
+                else _failed("predict account read failed")
+            )
+            predict_preflight = _blocked("Predict account readiness unavailable")
+    if predict_client is None:
         predict_preflight = _blocked("Predict market/account readiness unavailable")
-    elif predict_account.status != _READY:
-        predict_preflight = _blocked("Predict account readiness unavailable")
-    else:
-        predict_preflight = _predict_preflight_check(predict_client, market)
 
     polymarket_guard = _PolymarketReadOnlyGuard()
     try:
@@ -819,8 +906,16 @@ def run_live_readiness(
             else _failed("Polymarket source/account/preflight read failed")
         )
 
-    mutation_calls = transport.mutation_calls + polymarket_guard.mutation_calls
-    live_notifications = transport.live_notifications + polymarket_guard.live_notifications
+    mutation_calls = (
+        transport.mutation_calls
+        + predict_guard.mutation_calls
+        + polymarket_guard.mutation_calls
+    )
+    live_notifications = (
+        transport.live_notifications
+        + predict_guard.live_notifications
+        + polymarket_guard.live_notifications
+    )
     safety = (
         _ready("zero mutation calls; zero live notifications")
         if mutation_calls == 0 and live_notifications == 0

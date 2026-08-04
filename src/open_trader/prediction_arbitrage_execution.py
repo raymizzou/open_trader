@@ -116,12 +116,25 @@ def _normalize_predict_account_snapshot(
     snapshot: Mapping[str, object],
 ) -> dict[str, object] | None:
     normalized = dict(snapshot)
-    required = ("wallet_address", "available_usdt", "open_orders", "positions", "checked_at")
+    required = (
+        "wallet_address",
+        "available_usdt",
+        "available_usdt_raw",
+        "open_orders",
+        "positions",
+        "checked_at",
+    )
     if not all(name in normalized for name in required):
         return None
     has_current = all(
         name in normalized
-        for name in ("allowance", "scope_ready", "gas_ready", "allowance_breaker")
+        for name in (
+            "allowance",
+            "allowance_raw",
+            "scope_ready",
+            "gas_ready",
+            "allowance_breaker",
+        )
     )
     if has_current:
         if (
@@ -129,6 +142,7 @@ def _normalize_predict_account_snapshot(
             or not isinstance(normalized.get("gas_ready"), bool)
             or not isinstance(normalized.get("allowance_breaker"), bool)
             or normalized.get("allowance") in (None, "")
+            or normalized.get("allowance_raw") in (None, "")
         ):
             return None
         return normalized
@@ -136,6 +150,7 @@ def _normalize_predict_account_snapshot(
         return None
     ready = normalized.get("allowance_ready") is True
     normalized["allowance"] = "0" if ready else ""
+    normalized["allowance_raw"] = "0" if ready else ""
     normalized["scope_ready"] = ready
     normalized["gas_ready"] = ready
     normalized["allowance_breaker"] = not ready
@@ -1075,7 +1090,12 @@ class PredictionExecutionService:
         active_id = str(active.get("execution_id", "")) if active else ""
         predict = self._fresh_predict_account_snapshot()
         residual_allowance = _decimal(predict.get("allowance")) if predict else None
-        if active is None and residual_allowance is not None and residual_allowance > 0:
+        residual_allowance_raw = _decimal(predict.get("allowance_raw")) if predict else None
+        if active is None and (
+            residual_allowance is not None
+            and residual_allowance_raw is not None
+            and (residual_allowance > 0 or residual_allowance_raw > 0)
+        ):
             self._cross_breaker_open = True
             evidence = {
                 "phase": "startup_residual_predict_allowance",
@@ -1351,13 +1371,13 @@ class PredictionExecutionService:
         if before is None:
             return {"state": "locked", "reason": "account_unavailable"}
         allowance = _decimal(before.get("allowance"))
-        if allowance is None:
+        allowance_raw = _decimal(before.get("allowance_raw"))
+        if allowance is None or allowance_raw is None:
             return {"state": "locked", "reason": "allowance_unavailable"}
-        if allowance == 0:
+        if allowance == 0 and allowance_raw == 0:
             return {"state": "locked", "reason": "allowance_already_zero"}
         if (
             before.get("gas_ready") is not True
-            or before.get("allowance_breaker") is True
             or (_decimal(before.get("minimum_top_up_bnb")) or Decimal("0")) > 0
         ):
             return {
@@ -1374,6 +1394,7 @@ class PredictionExecutionService:
             proof is None
             or after is None
             or _decimal(after.get("allowance")) != 0
+            or _decimal(after.get("allowance_raw")) != 0
             or self._predict_approval_identity(before) != self._predict_approval_identity(after)
         ):
             self._cross_breaker_open = True
@@ -1723,7 +1744,10 @@ class PredictionExecutionService:
         refreshed_account, volatile_reason = (
             (None, None)
             if reason is not None
-            else self._volatile_checks(refreshed_intent)
+            else self._volatile_checks(
+                refreshed_intent,
+                expected_predict_allowance_raw=exact_debit_wei,
+            )
         )
         if reason is not None or refreshed_account is None:
             cleanup = self._clear_predict_allowance_zero(predict_leg.market_id)
@@ -1744,6 +1768,7 @@ class PredictionExecutionService:
                 reason or volatile_reason or "readiness_unavailable",
                 intent,
                 status_text="未下单 · 授权已清零",
+                extra={"predict_allowance": cleanup},
             )
             return
         intent = refreshed_intent
@@ -1754,6 +1779,38 @@ class PredictionExecutionService:
             execution_id, intent, predict_leg
         )
         accounts = refreshed_account
+        try:
+            refreshed_predict_ready = _call(predict_preflight, predict_order)
+        except Exception:
+            refreshed_predict_ready = None
+        try:
+            refreshed_polymarket_ready = _call(polymarket_preflight, polymarket_leg)
+        except Exception:
+            refreshed_polymarket_ready = None
+        if not self._preflight_passed(
+            refreshed_predict_ready
+        ) or not self._preflight_passed(refreshed_polymarket_ready):
+            cleanup = self._clear_predict_allowance_zero(predict_leg.market_id)
+            if cleanup is None:
+                self._finish_cross_incident(
+                    execution_id,
+                    "predict_allowance_cleanup_failed",
+                    evidence={
+                        "market_id": predict_leg.market_id,
+                        "submitted": False,
+                        "status_text": "未下单 · 授权清零失败",
+                        "rejection_reason": "cross_preflight_failed",
+                    },
+                )
+                return
+            self._finish_cross_rejected(
+                execution_id,
+                "cross_preflight_failed",
+                intent,
+                status_text="未下单 · 授权已清零",
+                extra={"predict_allowance": cleanup},
+            )
+            return
         self._transition(
             execution_id,
             "submitting",
@@ -1961,8 +2018,17 @@ class PredictionExecutionService:
 
     @staticmethod
     def _cross_result_ambiguous(value: object) -> bool:
+        accepted = getattr(
+            value, "accepted", value.get("accepted") if isinstance(value, Mapping) else False
+        ) is True
+        order_id = getattr(
+            value, "order_id", value.get("order_id", "") if isinstance(value, Mapping) else ""
+        )
         return (
-            str(getattr(value, "status", "")).lower() in {"ambiguous", "pending", "processing"}
+            (accepted and not isinstance(order_id, str))
+            or (accepted and not order_id.strip())
+            or str(getattr(value, "status", "")).lower()
+            in {"ambiguous", "pending", "processing"}
             or str(getattr(value, "error_code", "")).lower() == "ambiguous"
             or (isinstance(value, Mapping) and (
                 str(value.get("status", "")).lower() in {"ambiguous", "pending", "processing"}
@@ -2053,7 +2119,11 @@ class PredictionExecutionService:
             return None, False
         snapshot = self._fresh_predict_account_snapshot()
         expected = Decimal(exact_debit_wei) / Decimal("1000000")
-        if snapshot is None or _decimal(snapshot.get("allowance")) != expected:
+        if (
+            snapshot is None
+            or _decimal(snapshot.get("allowance")) != expected
+            or _decimal(snapshot.get("allowance_raw")) != Decimal(exact_debit_wei)
+        ):
             return None, True
         return {
             "market_id": market_id,
@@ -2073,7 +2143,11 @@ class PredictionExecutionService:
         if not isinstance(result, Mapping) or str(result.get("status", "")).lower() != "confirmed":
             return None
         snapshot = self._fresh_predict_account_snapshot()
-        if snapshot is None or _decimal(snapshot.get("allowance")) != 0:
+        if (
+            snapshot is None
+            or _decimal(snapshot.get("allowance")) != 0
+            or _decimal(snapshot.get("allowance_raw")) != 0
+        ):
             return None
         return {"market_id": market_id, "after": "0", "zero_verified": True}
 
@@ -2337,6 +2411,14 @@ class PredictionExecutionService:
         )
         chosen = self._choose_cross_remediation_option(completion, unwind)
         if chosen is None:
+            cleanup = self._clear_predict_allowance_zero(predict_leg.market_id)
+            if cleanup is None:
+                self._finish_cross_incident(
+                    execution_id,
+                    "predict_allowance_cleanup_failed",
+                    evidence={"missing_venue": missing_venue},
+                )
+                return
             self._finish_cross_incident(
                 execution_id,
                 "cross_remediation_no_safe_option",
@@ -2345,6 +2427,7 @@ class PredictionExecutionService:
                     "completion": self._safe_mapping(completion or {}),
                     "unwind": self._safe_mapping(unwind or {}),
                     "reconciliation": reconciled,
+                    "predict_allowance": cleanup,
                 },
             )
             return
@@ -3154,10 +3237,16 @@ class PredictionExecutionService:
         return self._execution_for_idempotency(key)
 
     def _volatile_checks(
-        self, intent: ExecutionIntent
+        self,
+        intent: ExecutionIntent,
+        *,
+        expected_predict_allowance_raw: int = 0,
     ) -> tuple[dict[str, object] | None, str | None]:
         if isinstance(intent, CrossVenueIntent):
-            return self._cross_volatile_checks(intent)
+            return self._cross_volatile_checks(
+                intent,
+                expected_predict_allowance_raw=expected_predict_allowance_raw,
+            )
         if not self._notification_channels_ready():
             return None, "notification_config_unavailable"
         geoblock = getattr(self._trading, "geoblock_allowed", None)
@@ -3195,7 +3284,10 @@ class PredictionExecutionService:
         return account, None
 
     def _cross_volatile_checks(
-        self, intent: CrossVenueIntent
+        self,
+        intent: CrossVenueIntent,
+        *,
+        expected_predict_allowance_raw: int = 0,
     ) -> tuple[dict[str, object] | None, str | None]:
         if not self._notification_channels_ready():
             return None, "notification_config_unavailable"
@@ -3217,10 +3309,26 @@ class PredictionExecutionService:
         poly_balance = _decimal(polymarket.get("p_usd_balance"))
         poly_allowance = _decimal(polymarket.get("p_usd_allowance"))
         predict_balance = _decimal(predict.get("available_usdt"))
+        predict_allowance = _decimal(predict.get("allowance"))
+        predict_allowance_raw = _decimal(predict.get("allowance_raw"))
+        expected_predict_allowance = (
+            Decimal(expected_predict_allowance_raw) / Decimal("1000000")
+        )
         minimum_top_up = _decimal(predict.get("minimum_top_up_bnb")) or Decimal("0")
         if predict.get("gas_ready") is not True or minimum_top_up > 0:
             return None, "insufficient_bnb"
-        if predict.get("allowance_breaker") is True:
+        if (
+            predict.get("allowance_breaker")
+            != (expected_predict_allowance_raw > 0)
+            or (
+                predict_allowance is not None
+                and predict_allowance != expected_predict_allowance
+            )
+            or (
+                predict_allowance_raw is not None
+                and predict_allowance_raw != expected_predict_allowance_raw
+            )
+        ):
             return None, "residual_predict_allowance"
         if (
             not str(polymarket.get("wallet_address", "")).strip()
@@ -3228,6 +3336,8 @@ class PredictionExecutionService:
             or poly_balance is None
             or poly_allowance is None
             or predict_balance is None
+            or predict_allowance is None
+            or predict_allowance_raw is None
             or poly_balance < poly_leg.max_cost
             or poly_allowance < poly_leg.max_cost
             or predict_balance < predict_leg.max_cost
@@ -3240,6 +3350,7 @@ class PredictionExecutionService:
                 "asset": "USDT", "wallet_address": str(predict["wallet_address"]),
                 "available_balance": predict_balance,
                 "allowance": predict.get("allowance"),
+                "allowance_raw": predict.get("allowance_raw"),
                 "scope_ready": predict.get("scope_ready"),
                 "gas_ready": predict.get("gas_ready"),
                 "allowance_breaker": predict.get("allowance_breaker"),
@@ -4187,7 +4298,14 @@ class PredictionExecutionService:
             for leg in intent.legs
         ) or not all(value.is_finite() and value > 0 for value in (intent.total_max_cost, intent.maximum_fee, intent.minimum_payout)):
             return "invalid_intent"
-        if sum((leg.max_cost for leg in intent.legs), Decimal("0")) != intent.total_max_cost:
+        if not intent.calculable_gas.is_finite() or intent.calculable_gas <= 0:
+            return "cross_venue_economics"
+        if (
+            sum((leg.max_cost for leg in intent.legs), intent.calculable_gas)
+            != intent.total_max_cost
+            or not intent.minimum_profit.is_finite()
+            or intent.minimum_payout - intent.total_max_cost != intent.minimum_profit
+        ):
             return "cost_mismatch"
         if intent.total_max_cost > MAX_NORMAL_COST or intent.minimum_profit <= 0:
             return "cross_venue_economics"
