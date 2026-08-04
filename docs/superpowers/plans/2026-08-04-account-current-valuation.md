@@ -13,7 +13,11 @@
 - Start implementation from this branch, which is based on merged Issue #21 at `main@ff2b2f05`.
 - Preserve Account v1 price precedence: current accepted OpenD quote, then retained accepted quote; if neither exists for a required instrument, return `503`. Never promote a statement/account snapshot price to a current quote.
 - Preserve every existing flat v1 field's meaning. In particular, flat `market_value_usd` remains empty for non-USD positions.
-- The optional public compatibility object is exactly `current_valuation` with `price`, `price_kind`, `price_as_of`, `market_value_usd`, and `market_value_hkd`. A new Worker publication supplies all five fields for every in-scope position or supplies no new projection.
+- The optional public compatibility object is exactly `current_valuation` with `price`, `price_kind`, `price_as_of`, `market_value_usd`, and `market_value_hkd`. A new Worker publication supplies all five fields for every quoteable stock/ETF/fund/option/unknown US/HK/CN position or supplies no new projection. `cash` and `money_market_fund` positions remain unchanged.
+- Accepted Account positions are the only production quote-universe source. `DashboardQuoteService.refresh` has no no-argument or `portfolio.csv` fallback.
+- HK/CN quote time comes from OpenD `update_time`, normalized with the market timezone; use refresh time only when it is absent.
+- Runtime may serve retained quotes as `200 stale` without a new hard age cap, but release acceptance requires one fresh complete OpenD refresh from the candidate Worker.
+- A newly accepted position may create a brief fail-closed `503` until its first quote cycle; the browser must keep the previous snapshot and recover automatically.
 - Do not change Gateway routing, Dashboard layout, Account polling, Trend strategy/report/allocation/execution behavior, cash valuation, or rollback topology.
 - Do not add an abstraction layer. Reuse `FutuQuoteUniverse`, `DashboardQuoteService`, Account projection validation, existing `Decimal` money rounding, and the current browser row renderer.
 - Write each behavior test first, observe the named failure, implement only enough to pass, and commit at the end of each task.
@@ -34,8 +38,8 @@
 **Interfaces**
 
 - Consumes: normalized `account_sync_state.json` returned by `load_account_sync_state`.
-- Produces: the existing `FutuQuoteUniverse`; `DashboardQuoteService.refresh()` accepts that universe when called by Account Sync Worker.
-- Preserves: no-argument `DashboardQuoteService.refresh()` still loads `portfolio.csv` for existing direct callers; the CSV loader's statement-only exclusion remains unchanged.
+- Produces: the existing `FutuQuoteUniverse`; `DashboardQuoteService.refresh(universe)` requires it from Account Sync Worker.
+- Removes: the CSV quote-universe loader, statement-only CSV exclusion, and no-argument production fallback. `portfolio.csv` itself remains available to its other owners.
 
 **Files**
 
@@ -53,7 +57,9 @@
   - includes accepted Eastmoney CN and Phillips HK positions;
   - includes stock/ETF/fund/option/unknown positions with non-zero quantity;
   - excludes cash, money-market funds, zero quantity, unsupported markets, and invalid symbols with explicit skip reasons;
-  - returns duplicate Account rows and lets the existing quote service canonical-symbol map request one symbol once.
+  - returns duplicate Account rows and lets the existing quote service canonical-symbol map request one symbol once;
+  - requires an explicit universe at every quote refresh call;
+  - retains HK/CN OpenD `update_time` as an offset-aware market timestamp and falls back to `fetched_at` only when it is absent.
 
   Use the intended public helper directly:
 
@@ -86,11 +92,11 @@
     tests/test_account_sync_worker.py
   ```
 
-  Expected: failure because `build_account_quote_universe` does not exist and the Worker still derives requests from `portfolio.csv`.
+  Expected: failure because `build_account_quote_universe` does not exist, refresh still accepts no universe, and HK/CN quote rows discard OpenD `update_time`.
 
 - [ ] **Step 3: Implement the accepted-state builder by reusing the existing row rules**
 
-  Add one function in `futu_universe.py`; do not add a new model:
+  Replace the CSV loader with one Account-state function in `futu_universe.py`; retain the existing dataclasses and do not add a new model:
 
   ```python
   def build_account_quote_universe(
@@ -105,26 +111,30 @@
           positions = source.get("positions") if isinstance(source, Mapping) else None
           for row in positions if isinstance(positions, list) else ():
               row_number += 1
-              # Normalize the existing Account fields, call _skip_reason with
-              # brokers=set() so source kind cannot exclude a valid position,
-              # and append the existing item or skipped-row dataclass.
+              # Normalize Account fields, apply the existing market/asset/
+              # quantity/symbol checks, and append the existing item or
+              # skipped-row dataclass. Broker source kind is not an input.
       return FutuQuoteUniverse(items=items, skipped=skipped)
   ```
 
-  Keep `load_futu_quote_universe()` and its `statement_only_source` behavior untouched for non-Account callers.
+  Delete `load_futu_quote_universe`, the `csv` import, `STATEMENT_BROKERS`, the brokers parameter on `_skip_reason`, and their CSV-only tests after `rg` confirms there is no production caller. Replace quote-service test setup with a local `FutuQuoteUniverse` fixture helper rather than retaining production fallback code for tests.
 
-- [ ] **Step 4: Let the Worker inject the accepted-state universe**
+- [ ] **Step 4: Require the Worker-owned universe and preserve real quote time**
 
-  Change only the optional input at the shared service boundary:
+  Make the existing service boundary explicit:
 
   ```python
   def refresh(
-      self, universe: FutuQuoteUniverse | None = None,
+      self, universe: FutuQuoteUniverse,
   ) -> QuoteRefreshResult:
       fetched_at = _now_text()
-      if universe is None:
-          universe = load_futu_quote_universe(self.config.portfolio_path)
   ```
+
+  For non-US quote rows, normalize `snapshot.update_time` with
+  `ZoneInfo("Asia/Hong_Kong")` for HK and `ZoneInfo("Asia/Shanghai")` for CN.
+  Store it in the existing `price_time` field. Leave it empty when OpenD omits
+  the value so `_dashboard_position_row` uses `fetched_at` as the defined
+  fallback. Keep the existing US session/time selection unchanged.
 
   In `sync_quotes_once`, load state once before refreshing and reuse the same object for projection:
 
@@ -142,7 +152,7 @@
   )
   ```
 
-  Update Worker test doubles to accept the optional universe and assert that an accepted statement position is requested even when `portfolio.csv` omits it.
+  Update every quote-service test call to pass an explicit universe. Update Worker test doubles to require the universe and assert that accepted statement positions are requested without reading `portfolio.csv`.
 
 - [ ] **Step 5: Run focused tests and commit**
 
@@ -160,7 +170,7 @@
   git commit -m "fix: quote every accepted Account holding"
   ```
 
-  Expected: all three focused files pass; one canonical Futu symbol produces one OpenD request regardless of how many brokers hold it.
+  Expected: all three focused files pass; one canonical Futu symbol produces one OpenD request regardless of how many brokers hold it, no production refresh can fall back to CSV, and HK/CN quote times preserve OpenD provenance.
 
 ---
 
@@ -169,7 +179,7 @@
 **Interfaces**
 
 - Consumes: accepted Account positions, accepted quote rows, native-currency-to-HKD rates, and the accepted USD-to-HKD rate.
-- Produces: a complete `current_valuation` object on every non-cash US/HK/CN position in a newly built projection.
+- Produces: a complete `current_valuation` object on every quoteable US/HK/CN position in a newly built projection.
 - Preserves: flat fields, summaries, weights, P/L, cash rows, and the last accepted projection when any required quote or FX fact is missing.
 
 **Files**
@@ -210,6 +220,7 @@
   - zero, negative, or non-finite quote price;
   - missing native-to-HKD FX;
   - missing USD-to-HKD denominator;
+  - cash and money-market positions retain their old flat shape and do not gain `current_valuation`;
   - a complete old projection with no `current_valuation` still validates for independent rollback compatibility;
   - a partially present object never validates.
 
@@ -231,7 +242,7 @@
 
 - [ ] **Step 4: Generalize the existing FX lookup just enough for USD conversion**
 
-  Replace the value-bound lookup with one small currency lookup and keep the statement defaults:
+  Replace the value-bound lookup with one small currency lookup and keep the statement defaults, including the approved fixed `USD/HKD = 7.8` for Eastmoney and Phillips:
 
   ```python
   def _dashboard_fx_rate(
@@ -276,7 +287,7 @@
   }
   ```
 
-  Add the object only for non-cash US/HK/CN positions. Keep flat `market_value_hkd` exactly equal to the nested value and flat `market_value_usd` unchanged.
+  Add the object only for positions accepted by `build_account_quote_universe`; cash and money-market funds remain unchanged. Keep flat `market_value_hkd` exactly equal to the nested value and flat `market_value_usd` unchanged. USD and HKD outputs use the existing money rounding independently; do not add a round-trip equality check for USD-native rows.
 
   Change affected projection annotations from `dict[str, str]`/`Mapping[str, str]` to `dict[str, object]`/`Mapping[str, object]`; do not hide the nested object behind casts.
 
@@ -330,6 +341,7 @@
   - API parity compares the nested object and fails on a nested mismatch;
   - the existing `test_snapshot_rejects_incomplete_retained_quotes` still returns `503`;
   - an accepted Eastmoney or Phillips quote is now included in required quote coverage;
+  - cash and money-market positions neither require quotes nor expose the optional object;
   - a fully absent object remains readable as the accepted v1 compatibility shape.
 
 - [ ] **Step 2: Run the focused API tests and confirm the red state**
@@ -380,6 +392,7 @@
   - nested USD is the cross-currency display value while flat non-USD `market_value_usd` stays empty;
   - object absence is valid only for release compatibility;
   - feature-enabled publications are all-or-nothing;
+  - cash and money-market positions remain outside the object;
   - required missing quote still produces `503`.
 
 - [ ] **Step 6: Run API tests and commit**
@@ -473,7 +486,7 @@
 
 - Consumes: real and simulated position objects returned by their existing endpoints.
 - Produces: existing Dashboard table cells and DOM controller attributes populated from `current_valuation` when present.
-- Preserves: flat-field fallback only when the object is completely absent; no `/api/quotes` call, FX arithmetic, layout, interaction, or scroll/focus change.
+- Preserves: flat-field fallback only when the object is completely absent; the `实时价` column label; no per-row OpenD badge, `/api/quotes` call, FX arithmetic, layout, interaction, or scroll/focus change.
 
 **Files**
 
@@ -491,13 +504,16 @@
 
   Add one real row and one simulated row where nested values differ visibly from flat fixtures. Assert the DOM uses nested price, price kind/time, USD, and HKD. Add a second case with the object wholly absent and assert the existing flat display remains unchanged.
 
+  Add a polling regression where a valid Account snapshot is followed by the brief contract-shaped `503` caused by a newly accepted position, then a valid recovered snapshot. Assert the table keeps the previous rows during the failure and updates after recovery without losing scroll/focus state.
+
   Keep the existing fetch-spy assertion that the browser never calls `/api/quotes`.
 
 - [ ] **Step 2: Add failing acceptance tests for nested controller truth**
 
   Extend `_controller_position` fixtures so `_check_controller_owned_rows` expects nested values in the DOM. Add `_account_snapshot_errors` cases for:
 
-  - missing object on an in-scope real position;
+  - missing object on a quoteable real position;
+  - cash or money-market rows remaining valid without the object;
   - partial object;
   - blank, non-finite, or non-positive values;
   - nested price/kind/time/HKD not matching flat facts.
@@ -537,7 +553,9 @@
 
 - [ ] **Step 5: Project the same display fields in acceptance**
 
-  Add one Python helper mirroring the browser's pure field selection and call it before comparing `CONTROLLER_DOM_FIELDS`. In `_account_snapshot_errors`, require a complete object for every non-cash US/HK/CN accepted position in the final candidate and compare its price/kind/time/HKD with the flat fields.
+  Add one Python helper mirroring the browser's pure field selection and call it before comparing `CONTROLLER_DOM_FIELDS`. Add `price_as_of: data-price-as-of` to that mapping. In `_account_snapshot_errors`, wrap the public positions as `{"brokers": {"public": {"positions": positions}}}`, pass that to `build_account_quote_universe`, require a complete object for every resulting `(market, symbol)` identity, leave cash/money-market rows outside the rule, and compare nested price/kind/time/HKD with the flat fields.
+
+  Add one acceptance helper that reads a stable candidate Account/quotes pair, derives the same Account universe, and compares every quoteable API position with the matching accepted quote row. It must verify price and normalized `price_time or fetched_at`, canonical coverage, `quotes.status == "ok"`, `stale == false`, a last-success time newer than the candidate Worker start, and zero missing rows. This is the final provenance proof; do not issue a second price query that can race a moving market. Report unavailable OpenD/fresh refresh as the gate's external `BLOCKED` condition, while normal runtime still permits retained `200 stale` responses.
 
   In `_validate_simulated_positions`, require the complete object and compare `price` with the direct snapshot's selected accepted price plus `price_as_of` with response `synced_at`. Use existing `_position_decimal` for finite value checks.
 
@@ -576,12 +594,16 @@
   Add a 2026-08-04 operator-facing changelog entry covering:
 
   - Account-position-derived quote universe;
+  - removal of the production `portfolio.csv` quote fallback;
   - OpenD overrides for Eastmoney/Phillips quoteable holdings;
   - optional complete real/simulated current valuation;
+  - unchanged cash/money-market rows, fixed statement `USD/HKD = 7.8`, and independently rounded USD/HKD outputs;
+  - truthful HK/CN OpenD quote time with no UI label or `实时价` copy change;
   - preserved `503` behavior when neither current nor retained quote exists;
+  - accepted brief new-position `503` recovery and runtime stale behavior;
   - the focused/full/live/final verification commands; insert their exact results after Steps 2, 3, 5, and 6 and before the documentation commit.
 
-  Extend the cutover runbook with commands that prove every in-scope Account position has the five-field object and explicitly identify at least one Eastmoney CN and one Phillips HK row whose `price_kind` is an accepted OpenD session, not `statement`. Document the whole-stack and Account-only rollback behavior already approved in the design.
+  Extend the cutover runbook with commands that prove every quoteable Account position has the five-field object, matches the same fresh accepted quote publication, and uses a non-statement OpenD `price_kind`. Document the cash/money-market exclusion, brief new-position `503` recovery, runtime stale behavior, whole-stack rollback, and Account-only rollback.
 
 - [ ] **Step 2: Run all focused behavior suites**
 
@@ -642,17 +664,19 @@
   tail -n 100 "$CUTOVER_ROOT/logs/account_api/launchd.out.log"
   ```
 
-  Require fresh PID/start time, detached cwd, clean source, and `CANDIDATE_SHA` for Worker/API/Gateway/Legacy records. Require HTTP 200, Account parity, and fresh Worker/API logs.
+  Require fresh PID/start time, detached cwd, clean source, and `CANDIDATE_SHA` for Worker/API/Gateway/Legacy records. Require HTTP 200, Account parity, fresh Worker/API logs, and a candidate-Worker quote publication with `status == "ok"`, `stale == false`, zero missing rows, and `last_success_at` after Worker start.
 
   Inspect the real Gateway response and browser for:
 
-  - at least one Eastmoney CN statement position with non-statement OpenD `price_kind`, current price, USD value, and HKD value;
-  - at least one Phillips HK statement position with the same proof;
-  - all in-scope real positions with complete nested values;
+  - every quoteable Account position matching its canonical accepted OpenD quote price and normalized quote time;
+  - every quoteable Eastmoney and Phillips position using non-statement OpenD `price_kind`;
+  - all quoteable real positions with complete nested values, while cash/money-market rows retain their old shape;
   - one US, one HK, and one CN simulated endpoint with complete nested values;
   - no browser request to `/api/quotes`.
 
-  If a required live quote is genuinely unavailable and no retained accepted quote exists, stop with the contract-shaped `503`; do not substitute a statement price, fixture, or mock.
+  Current read-only preflight evidence on 2026-08-04 is 35 requested, 35 returned, and 35 valid OpenD prices. Repeat the candidate-owned proof rather than treating this planning probe as release evidence.
+
+  If a required live quote is genuinely unavailable and no retained accepted quote exists, stop with the contract-shaped `503`; do not substitute a statement price, fixture, or mock. If only retained stale quotes are available, normal runtime remains valid but release acceptance is `BLOCKED` until a fresh OpenD refresh succeeds.
 
 - [ ] **Step 6: Run `make acceptance` once as the final review gate**
 

@@ -1,6 +1,6 @@
 # Account Current Valuation Design
 
-**Status:** Approved design; Issue #21 merged and implementation is planned
+**Status:** Approved after grill; Issue #21 merged and implementation is planned
 **Date:** 2026-08-04
 
 ## Context
@@ -27,8 +27,8 @@ cutover checkpoints.
 
 - Use accepted OpenD quotes for every quoteable US, HK, and CN real position,
   regardless of whether its broker source is live or statement.
-- Publish complete USD and HKD display values for every non-cash US, HK, and CN
-  real position.
+- Publish complete USD and HKD display values for every quoteable US, HK, and
+  CN real position.
 - Publish the same complete display valuation shape for the three Trend
   simulated accounts.
 - Keep Account Sync Worker as the sole Account writer, Account API as the
@@ -49,6 +49,8 @@ cutover checkpoints.
 - No Dashboard layout, interaction, strategy, report, allocation, execution,
   refresh-cadence, or broker-adapter redesign.
 - No change to cash-balance valuation.
+- No new valuation object or USD display value for `cash` or
+  `money_market_fund` positions.
 
 ## Chosen Approach
 
@@ -93,10 +95,11 @@ do not calculate price, market value, or currency conversion.
 
 ## Quote Universe
 
-The Worker builds the quote universe from the current accepted Account
-positions rather than `data/latest/portfolio.csv`. Positions are deduplicated
-by canonical Futu symbol before an OpenD request and mapped back to every
-matching broker position afterward.
+The Worker builds the quote universe only from the current accepted Account
+positions. `data/latest/portfolio.csv` is not a production fallback and the
+quote service requires the Account-derived universe explicitly. Positions are
+deduplicated by canonical Futu symbol before an OpenD request and mapped back
+to every matching broker position afterward.
 
 A position is quoteable when all of these hold:
 
@@ -106,9 +109,9 @@ A position is quoteable when all of these hold:
 - market and symbol form a valid canonical Futu symbol.
 
 Broker source kind is not an exclusion. In particular, Eastmoney and Phillips
-positions are eligible. `cash` and `money_market_fund` remain outside the OpenD
-quote request; their accepted account or statement facts continue to supply
-their valuation.
+positions are eligible. `cash` and `money_market_fund` remain outside both the
+OpenD quote request and the new `current_valuation` object; their existing flat
+account or statement facts remain unchanged.
 
 Invalid or unsupported identities are explicit skipped rows in quote
 diagnostics. They are never synthesized or silently converted into a different
@@ -128,6 +131,11 @@ price, session kind, and quote time replace the position's displayed
 with the existing quantity and instrument-multiplier rules. Non-quoteable
 positions keep their truthful accepted `account_snapshot` or `statement` facts.
 
+For HK and CN, `price_as_of` uses OpenD's actual `update_time`, normalized to an
+offset-aware market timestamp. It uses the quote refresh time only when OpenD
+does not provide an update time. This prevents a closed-market price from being
+stamped as if it traded at the later polling time.
+
 Unknown, non-finite, zero, or negative quote prices do not overwrite an
 accepted value. Zero is never used to mean unavailable.
 
@@ -139,7 +147,7 @@ HKD values continue to be derived from those same selected position values.
 
 ## Additive Account v1 Field
 
-Each non-cash `US`, `HK`, or `CN` position may add this optional v1 object:
+Each quoteable `US`, `HK`, or `CN` position may add this optional v1 object:
 
 ```json
 {
@@ -181,7 +189,9 @@ No new generation is added.
 ## FX And Valuation Rules
 
 The Worker reuses its accepted currency-to-HKD rates and existing deterministic
-rounding. It does not add an FX provider.
+rounding. It does not add an FX provider. Eastmoney and Phillips currently
+publish no FX rows, so their existing deterministic statement fallback remains
+`USD/HKD = 7.8`; Futu and Tiger continue using their accepted account rates.
 
 For the selected native market value:
 
@@ -193,6 +203,11 @@ market_value_usd = market_value_hkd / usd_to_hkd
 `HKD` converts to HKD at `1`. The accepted USD-to-HKD rate is required even for
 a non-USD position because it is the denominator of the USD equivalent. Values
 are finite decimal strings rounded with the existing money rule.
+
+USD and HKD outputs are rounded independently under that rule. A USD-native
+position may therefore differ from a round-trip HKD-to-USD calculation by a
+small currency-unit rounding amount; no additional equality invariant is
+introduced.
 
 If the selected quote changes native market value, existing Account summaries,
 weights, and P/L use that same value. The nested HKD result must therefore equal
@@ -214,6 +229,12 @@ valuation while Account totals use another.
 - With a previous complete publication, Account API serves that publication as
   `200 stale` according to the existing contract. Without one, it returns the
   existing contract-shaped `503`; it does not emit a partially blank `200`.
+- Retained accepted quotes gain no new hard age limit in this follow-up. The
+  existing stale status and action-disable behavior remain authoritative.
+- When a newly accepted position appears before its first quote refresh, a
+  brief fail-closed `503` window is allowed. The browser retains its previous
+  snapshot and the next successful quote cycle restores the Account response;
+  this follow-up does not add cross-file transactional publication.
 - Error reasons contain stable machine codes and no upstream response, account
   identifier, credential, or absolute path.
 
@@ -252,6 +273,10 @@ Within a feature-enabled Account release, partial presence is rejected before
 publication, so a normal browser refresh cannot intermittently lose one of the
 two display currencies.
 
+The existing Account-table column remains labelled `实时价`. No per-row OpenD
+badge is added. Provenance is enforced by the Account contract, accepted quote
+publication, quote time, and release acceptance rather than extra UI copy.
+
 ## Release And Rollback Sequence
 
 1. Finish, accept, merge, and deploy Issue #21 without this behavior change.
@@ -275,6 +300,7 @@ restoring Legacy Account ownership.
 Focused automated checks must prove:
 
 - accepted statement-only CN/HK positions enter the OpenD quote universe;
+- production quote refresh has no `portfolio.csv` or no-argument fallback;
 - cash and money-market positions remain excluded from quote requests;
 - one instrument held at multiple brokers is requested once and applied to all
   matching positions;
@@ -282,7 +308,10 @@ Focused automated checks must prove:
   values, summaries, weights, and P/L consistently;
 - invalid/missing quotes retain an accepted quote or fail closed and never
   produce zero or partial valuation objects;
-- all real US/HK/CN non-cash positions publish complete USD and HKD equivalents;
+- all quoteable real US/HK/CN positions publish complete USD and HKD
+  equivalents, while cash and money-market positions remain unchanged;
+- HK/CN price time uses OpenD `update_time` and only falls back to refresh time
+  when the upstream value is absent;
 - existing flat v1 fields keep their types and semantics;
 - ETag and generation change when a visible current valuation changes;
 - simulated US/HK/CN positions publish the complete object, and missing FX
@@ -291,12 +320,16 @@ Focused automated checks must prove:
   Account state based on Legacy fields, and perform no `/api/quotes` request or
   client FX calculation.
 
-Direct verification must include real OpenD quotes for at least one accepted CN
-statement position and one accepted HK statement position, the corresponding
-Worker publication, Account API/Gateway response, and browser-rendered price,
-USD value, and HKD value. It must also check one US, one HK, and one CN
-simulated-position response.
+Direct verification must compare every quoteable Account position with the
+same stable accepted OpenD quote publication used by the Worker, then verify
+the corresponding Account API/Gateway response and browser-rendered price, USD
+value, and HKD value. It must also check one US, one HK, and one CN
+simulated-position response. The current pre-implementation probe returned
+valid OpenD prices for all 35 accepted quoteable positions.
 
 The final `make acceptance` result is the only Dashboard review-readiness gate.
 Only `PASS` permits deployment and operator review; `FAIL` is fixed and rerun,
-and `BLOCKED` is reported without substituting fixtures or screenshots.
+and `BLOCKED` is reported without substituting fixtures or screenshots. A
+release candidate may not pass this gate using only retained stale prices: the
+candidate Worker must complete a fresh OpenD refresh covering every quoteable
+position. OpenD unavailability at that gate is `BLOCKED`.
