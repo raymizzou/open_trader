@@ -2045,7 +2045,9 @@ def test_dashboard_projects_frozen_rotation_comparisons_and_signal_strengths(
     }
     payload["signal_snapshots"] = {
         "holdings": {"SELL": {"strength": "76", "global_strength": "61"}},
-        "candidates": {"BUY": {"strength": "88", "global_strength": "96"}},
+        "candidates": [
+            {"symbol": "BUY", "strength": "88", "global_strength": "96"},
+        ],
     }
     judgments = payload["strategy_judgments"]
     assert isinstance(judgments, dict)
