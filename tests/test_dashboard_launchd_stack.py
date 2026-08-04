@@ -253,7 +253,9 @@ def test_stack_dry_run_prints_two_valid_plists_without_side_effects(
     sections = _dry_run_sections(result.stdout)
     assert set(sections) == {GATEWAY_LABEL, LEGACY_LABEL}
     assert sections[GATEWAY_LABEL]["WorkingDirectory"] == str(ROOT)
-    assert str(runtime / "data") in sections[LEGACY_LABEL]["ProgramArguments"]
+    legacy_args = sections[LEGACY_LABEL]["ProgramArguments"]
+    assert str(runtime / "data") in legacy_args
+    assert str(runtime / "config/prediction_arbitrage.json") in legacy_args
     assert not list(agents.iterdir())
 
 
