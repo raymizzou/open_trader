@@ -3609,6 +3609,44 @@ def _plan_account_rotation_pairs(
     )
 
 
+def _terminal_rotation_symbol_pairs(
+    data_dir: Path, market: str, execution_date: str,
+) -> set[tuple[str, str]]:
+    """Return (sell, buy) pairs already finalized for this market/date."""
+    root = (
+        data_dir
+        / "trend_review"
+        / "ledgers"
+        / market.upper()
+        / "rotations"
+        / execution_date
+    )
+    terminal_statuses = {
+        "complete", "skipped", "failed", "partial", "incomplete", "missed",
+    }
+    pairs: set[tuple[str, str]] = set()
+    if not root.is_dir():
+        return pairs
+    for ledger in root.iterdir():
+        try:
+            payload = json.loads(
+                (ledger / "terminal.json").read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("kind") != "terminal"
+            or str(payload.get("status") or "").lower() not in terminal_statuses
+        ):
+            continue
+        sell = str(payload.get("sell_symbol") or "").strip().upper()
+        buy = str(payload.get("buy_symbol") or "").strip().upper()
+        if sell and buy:
+            pairs.add((sell, buy))
+    return pairs
+
+
 def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendReport:
     """Replace proposed pairs with the immutable reservations for this report date."""
     parameters = report.strategy_snapshot.get("parameters")
@@ -3730,6 +3768,24 @@ def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendRe
         )
         if real_broker
         else ()
+    )
+    # Regeneration must never re-freeze an already-executed rotation pair;
+    # otherwise the revision could be mistaken for new actionable work and
+    # duplicate orders once the ledger key changes with the report SHA.
+    executed_pairs = _terminal_rotation_symbol_pairs(
+        data_dir,
+        str(report.metadata.get("market") or "CN"),
+        report.execution_date,
+    )
+    simulate_pairs = tuple(
+        pair for pair in simulate_pairs
+        if (str(pair.sell_symbol).upper(), str(pair.buy_symbol).upper())
+        not in executed_pairs
+    )
+    real_pairs = tuple(
+        pair for pair in real_pairs
+        if (str(pair.sell_symbol).upper(), str(pair.buy_symbol).upper())
+        not in executed_pairs
     )
     return replace(
         report,

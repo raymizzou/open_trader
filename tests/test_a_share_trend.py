@@ -1286,6 +1286,86 @@ def test_real_rotation_sizing_uses_net_value_when_cash_is_negative() -> None:
     assert pair.estimated_shares > 0
 
 
+def test_freeze_report_rotation_pairs_skips_executed_terminal_pairs(
+    tmp_path: Path,
+) -> None:
+    held_symbols = tuple(f"10{index:04d}" for index in range(10))
+    simulated = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("50000"),
+        positions=tuple(
+            AccountPosition(symbol, symbol, "stock", Decimal("500"), Decimal("10"), Decimal("5000"))
+            for symbol in held_symbols
+        ),
+        exceptions=(),
+    )
+    allocation = allocation_for("CN", rank=2, entry_weight="0.04")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199),
+        allocation=allocation,
+    )
+
+    def freeze(data_dir: Path) -> TrendReport:
+        built = build_report(
+            as_of_date="2026-07-14",
+            execution_date="2026-07-15",
+            account=simulated,
+            candidates=[
+                candidate("200001", asset="ETF基金", strength="96", global_strength="90"),
+                candidate("200002", asset="ETF基金", strength="96", global_strength="40"),
+            ],
+            holding_snapshots={
+                symbol: holding(symbol, strength="10", global_strength="10")
+                for symbol in held_symbols
+            },
+            bars_by_symbol={symbol: bars() for symbol in held_symbols},
+            prior_state={
+                "positions": {
+                    symbol: {
+                        "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                        "tracking_active": False,
+                    }
+                    for symbol in held_symbols
+                }
+            },
+            strategy_snapshot=strategy,
+            drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+            allocation_reference=allocation,
+            metadata={"simulate_acc_id": 123456, "market": "CN"},
+        )
+        assert [(pair.sell_symbol, pair.buy_symbol) for pair in built.simulate_rotation_pairs] == [
+            ("100000", "200001"), ("100001", "200002"),
+        ]
+        return trend_module.freeze_report_rotation_pairs(built, data_dir)
+
+    executed_root = tmp_path / "trend_review/ledgers/CN/rotations/2026-07-15/executed"
+    executed_root.mkdir(parents=True)
+    (executed_root / "terminal.json").write_text(json.dumps({
+        "schema_version": "open_trader.trend_review.rotation.v1",
+        "kind": "terminal",
+        "status": "incomplete",
+        "reason": "execution_date_ended",
+        "market": "CN",
+        "execution_date": "2026-07-15",
+        "sell_symbol": "100000",
+        "buy_symbol": "200001",
+    }), encoding="utf-8")
+
+    frozen = freeze(tmp_path)
+    assert [(pair.sell_symbol, pair.buy_symbol) for pair in frozen.simulate_rotation_pairs] == [
+        ("100001", "200002"),
+    ]
+
+    control_root = tmp_path / "control"
+    control_root.mkdir()
+    control = freeze(control_root)
+    assert [(pair.sell_symbol, pair.buy_symbol) for pair in control.simulate_rotation_pairs] == [
+        ("100000", "200001"), ("100001", "200002"),
+    ]
+
+
 def report(*, candidates: tuple[CandidateInput, ...] = ()) -> TrendReport:
     return build_report(
         as_of_date="2026-07-14",
