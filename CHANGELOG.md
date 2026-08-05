@@ -6,6 +6,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-08-05
 
 - 修复资源排名轮换冻结契约把同资产大类（local 基准）轮换对的强度差按全局强度核对、导致 US 趋势报告生成失败的问题；local 基准现在与比较快照同口径按大类内强度差校验，global 基准行为不变。新增 local 基准轮换对冻结契约回归，相关趋势/控制器/复盘测试 877 个通过。
+- 修复 Trend allocation 守护进程在每日 16:20 等待窗口内每 5 秒新建一次 Futu 行情连接、OpenD 异常时线程持续泄漏直至进程卡死的问题；等待阶段不再访问 Futu，只在收盘窗口按需查询交易日历，并新增等待阶段零外部调用回归。
 
 ## 2026-08-04
 

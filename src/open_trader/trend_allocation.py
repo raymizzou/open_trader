@@ -321,6 +321,23 @@ def run_trend_allocation_controller(
                     return status
                 sleep_fn(60)
                 continue
+            if not once and now.time() < _ATTEMPT_AT:
+                reference = (
+                    {
+                        "daily_path": current["daily_path"],
+                        "sha256": current["sha256"],
+                    }
+                    if current is not None
+                    else None
+                )
+                status = _write_allocation_status(config, _allocation_status(
+                    config, now=now, phase="waiting", attempted_for=None,
+                    reference=reference, blocker=None,
+                    next_check_at=datetime.combine(now.date(), _ATTEMPT_AT, tzinfo=_SHANGHAI),
+                    process_version=process_version,
+                ))
+                sleep_fn(5)
+                continue
             quote = quote_factory(host=config.futu_host, port=config.futu_port)
             try:
                 days = sorted(quote.get_cn_trading_days(
@@ -338,15 +355,6 @@ def run_trend_allocation_controller(
                 {"daily_path": latest["daily_path"], "sha256": latest["sha256"]}
                 if latest else None
             )
-            if not once and now.time() < _ATTEMPT_AT:
-                status = _write_allocation_status(config, _allocation_status(
-                    config, now=now, phase="waiting", attempted_for=None,
-                    reference=reference, blocker=None,
-                    next_check_at=datetime.combine(now.date(), _ATTEMPT_AT, tzinfo=_SHANGHAI),
-                    process_version=process_version,
-                ))
-                sleep_fn(5)
-                continue
             if day not in days:
                 status = _write_allocation_status(config, _allocation_status(
                     config, now=now, phase="holiday", attempted_for=day,

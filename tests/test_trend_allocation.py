@@ -558,15 +558,11 @@ def test_holiday_waits_for_the_post_close_attempt_window(
         portfolio=tmp_path / "data/latest/portfolio.csv", trend_executor_host="executor",
     )
 
-    class Quote:
-        def get_cn_trading_days(self, **_kwargs: object) -> list[str]:
-            return []
-
-        def close(self) -> None:
-            pass
-
     class StopLoop(Exception):
         pass
+
+    def unexpected_external_call(**_kwargs: object) -> object:
+        raise AssertionError("waiting allocation fetched the calendar")
 
     monkeypatch.setattr(trend_allocation, "require_trend_executor", lambda *_args, **_kwargs: None)
     with pytest.raises(StopLoop):
@@ -574,7 +570,7 @@ def test_holiday_waits_for_the_post_close_attempt_window(
             config,
             now_fn=lambda: datetime.fromisoformat("2026-08-03T16:19:00+08:00"),
             sleep_fn=lambda _seconds: (_ for _ in ()).throw(StopLoop()),
-            quote_factory=lambda **_kwargs: Quote(),
+            quote_factory=unexpected_external_call,
         )
 
     status = json.loads(
