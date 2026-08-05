@@ -1122,6 +1122,16 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
             try:
                 sell_strength = Decimal(str(pair.get("sell_global_strength")))
                 buy_strength = Decimal(str(pair.get("buy_global_strength")))
+                sell_compared = (
+                    Decimal(str(pair.get("sell_compared_strength")))
+                    if pair.get("sell_compared_strength") is not None
+                    else None
+                )
+                buy_compared = (
+                    Decimal(str(pair.get("buy_compared_strength")))
+                    if pair.get("buy_compared_strength") is not None
+                    else None
+                )
                 gap = Decimal(str(pair.get("strength_gap")))
                 weight = Decimal(str(pair.get("target_weight")))
                 amount = Decimal(str(pair.get("target_amount")))
@@ -1130,13 +1140,28 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
                 lot_size = pair.get("lot_size")
             except (InvalidOperation, TypeError, ValueError):
                 return False
+            compared = (
+                (sell_compared, buy_compared)
+                if sell_compared is not None and buy_compared is not None
+                else None
+            )
             if (
                 not all(value.is_finite() for value in (
                     sell_strength, buy_strength, gap, weight, amount, atr,
                 ))
+                or (
+                    compared is not None
+                    and not all(
+                        value.is_finite() for value in compared
+                    )
+                )
                 or not Decimal("0") <= sell_strength <= Decimal("100")
                 or not Decimal("0") <= buy_strength <= Decimal("100")
-                or gap != buy_strength - sell_strength
+                or gap != (
+                    buy_compared - sell_compared
+                    if compared is not None
+                    else buy_strength - sell_strength
+                )
                 or gap < Decimal("20")
                 or not Decimal("0") < weight <= Decimal("1")
                 or amount <= 0

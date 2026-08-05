@@ -909,6 +909,83 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
     )
 
 
+def test_frozen_contract_accepts_local_basis_rotation_pair() -> None:
+    held_symbols = (
+        "AAAA", "AAAB", "AAAC", "AAAD", "AAAE",
+        "AAAF", "AAAG", "AAAH", "AAAI", "AAAJ",
+    )
+    simulated = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("0"),
+        positions=tuple(
+            AccountPosition(
+                symbol, symbol, "stock", Decimal("500"), Decimal("10"), Decimal("5000")
+            )
+            for symbol in held_symbols
+        ),
+        exceptions=(),
+    )
+    allocation = allocation_for("US", rank=1, entry_weight="0.06")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "US", "abc123", (622460, 705013),
+        allocation=allocation,
+        execution_date="2026-07-15",
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="US",
+        metadata={"market": "US"},
+        account=simulated,
+        candidates=[
+            candidate(
+                "BUYA", exchange="US", asset="美股",
+                strength="95", global_strength="85",
+            ),
+            candidate(
+                "BUYB", exchange="US", asset="美股",
+                strength="89", global_strength="40",
+            ),
+        ],
+        holding_snapshots={
+            symbol: holding(
+                symbol,
+                asset="美股",
+                strength=("70" if index == 0 else "90"),
+                global_strength=("90" if index == 0 else "20"),
+            )
+            for index, symbol in enumerate(held_symbols)
+        },
+        bars_by_symbol={symbol: bars() for symbol in held_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in held_symbols
+            }
+        },
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        allocation_reference=allocation,
+    )
+    payload = trend_module._report_payload(built)
+    pair = payload["strategy_judgments"]["simulate_rotation_pairs"][0]
+    comparison = payload["strategy_judgments"]["simulate_rotation_comparisons"][0]
+    assert comparison["strength_basis"] == "local"
+    assert comparison["strength_gap"] == "25"
+    assert pair["strength_gap"] == "25"
+    assert trend_module.valid_frozen_report_contract(payload)
+    global_gap = json.loads(json.dumps(payload))
+    global_gap["strategy_judgments"]["simulate_rotation_pairs"][0][
+        "strength_gap"
+    ] = "-5"
+    assert not trend_module.valid_frozen_report_contract(global_gap)
+
+
 def test_new_report_construction_and_serialization_require_account_input() -> None:
     with pytest.raises(
         ValueError,

@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-05
+
+- 修复资源排名轮换冻结契约把同资产大类（local 基准）轮换对的强度差按全局强度核对、导致 US 趋势报告生成失败的问题；local 基准现在与比较快照同口径按大类内强度差校验，global 基准行为不变。新增 local 基准轮换对冻结契约回归，相关趋势/控制器/复盘测试 877 个通过。
+
 ## 2026-08-04
 
 - #23 将生产 Account 消费者统一迁到带 `X-Open-Trader-Account-Route: production` 的 HTTP 快照和 accepted statement-facts 路由：Trend 每轮冻结一个 `account_input` generation，Legacy `/api/dashboard` 不再返回或读取 Account 字段且 `/api/quotes` 返回 404，浏览器以 exact `position_id`/`instrument_id` 合成持仓与 Backtest 选项。Premarket/T-signal CLI、launchd 路径和 watcher 已禁用；候选验收新增 Account/Legacy 独立请求、强制观察快照更新、三市场冻结 generation、受控 Account 故障时非 Account 模块可读及无通知路径，并从共享主仓库/运行根读取被 Git 忽略的预测市场凭据配置与验收 Python，受控 Account 停机后也以同一运行根和 Python 恢复，避免隔离 worktree 误报外部环境不可用、部署后指向缺失文件或门禁在测试前失败。部署先启动匹配的 Account Worker/API、验证两条生产路由，再同 SHA 重启 Gateway/Legacy/Trend；故障时整体回滚 #23，绝不将新消费者与 #22 Account 或 Legacy 原始读取混用。已完成专项验收回归与全量自动测试；最终状态仍以候选 SHA 的 `make acceptance` 与同 SHA 重部署证据为准。
