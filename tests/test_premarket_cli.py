@@ -691,3 +691,4 @@ def test_extract_tradingagents_summary_main_writes_summary_with_fake_extractor(
     assert "failed: 0" in output
     assert f"summary_json: {summary_path}" in output
     assert f"latest: {latest_path}" in output
+

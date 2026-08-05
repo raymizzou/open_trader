@@ -15,3 +15,5 @@ config/prediction_arbitrage.json
 node_modules/
 test-results/
 playwright-report/
+# Added by code-review-graph
+.code-review-graph/
