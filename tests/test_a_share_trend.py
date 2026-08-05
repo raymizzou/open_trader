@@ -818,10 +818,9 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
         ),),
     )
     comparison_markdown = render_markdown(comparison_only)
-    assert "未触发" in comparison_markdown
-    assert "门槛 20" in comparison_markdown
-    assert "还差 0.1" in comparison_markdown
-    assert "无。" not in comparison_markdown.split("## 模拟盘自动轮换", 1)[1].split("##", 1)[0]
+    assert "未触发" not in comparison_markdown
+    assert "还差 0.1" not in comparison_markdown
+    assert "无。" in comparison_markdown.split("## 模拟盘自动轮换", 1)[1].split("##", 1)[0]
     ordered_payload = json.loads(json.dumps(payload))
     ordered_payload["strategy_judgments"]["formal_actions"] = [
         {"action": "SELL_ALL", "symbol": "EXIT", "name": "Exit", "reason": "danger_signal"},

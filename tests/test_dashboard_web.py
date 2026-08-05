@@ -12946,7 +12946,7 @@ console.log("ok");
     assert "ok" in output
 
 
-def test_dashboard_renders_hybrid_rotation_basis_and_non_trigger_reasons() -> None:
+def test_dashboard_hides_unqualified_rotation_comparisons() -> None:
     output = run_dashboard_js(r'''
 const comparison = (overrides = {}) => ({
   pair_index: 0,
@@ -12974,8 +12974,11 @@ const report = {
   ],
 };
 const html = renderTrendReportWorkspace(report);
-for (const text of ["大类内强度", "全局强度", "比较口径", "未触发", "门槛 20", "还差 0.1", "买入手数缺失", "大类未提供或不属于当前市场", "目标金额 4,000", "预计数量 100 股"]) {
+for (const text of ["大类内强度", "全局强度", "比较口径", "目标金额 4,000", "预计数量 100 股"]) {
   if (!html.includes(text)) throw new Error("missing " + text + "\n" + html);
+}
+for (const text of ["未触发", "还差 0.1", "买入手数缺失", "大类未提供或不属于当前市场"]) {
+  if (html.includes(text)) throw new Error("unexpected " + text + "\n" + html);
 }
 console.log("ok");
 ''')

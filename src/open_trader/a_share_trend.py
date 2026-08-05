@@ -6252,6 +6252,7 @@ def _rotation_comparison_markdown_lines(
         for raw in (asdict(item) if isinstance(item, RotationPair) else item,)
         if isinstance(raw, Mapping) and isinstance(raw.get("pair_index"), int)
     }
+    rendered = False
     for item in comparisons:
         raw = asdict(item) if isinstance(item, RotationComparison) else item
         basis = {
@@ -6261,43 +6262,28 @@ def _rotation_comparison_markdown_lines(
         outcome = str(raw.get("outcome") or "data_unavailable")
         gap = raw.get("strength_gap")
         gap_text = "数据未提供" if gap is None else str(gap)
-        if outcome == "planned":
-            pair = pair_by_index.get(raw.get("pair_index"))
-            if pair is None:
-                lines.append(
-                    f"- 已进入轮换｜比较口径 {basis}｜买入 {raw.get('buy_symbol')} "
-                    f"{raw.get('buy_name')}｜卖出 {raw.get('sell_symbol')} {raw.get('sell_name')}"
-                    f"｜差值 {gap_text}｜门槛 20"
-                )
-                continue
+        if outcome != "planned":
+            continue
+        rendered = True
+        pair = pair_by_index.get(raw.get("pair_index"))
+        if pair is None:
             lines.append(
-                f"- 已进入轮换｜比较口径 {basis}｜全部卖出 {pair['sell_symbol']} "
-                f"{pair['sell_name']}，再买入 {pair['buy_symbol']} {pair['buy_name']}"
+                f"- 已进入轮换｜比较口径 {basis}｜买入 {raw.get('buy_symbol')} "
+                f"{raw.get('buy_name')}｜卖出 {raw.get('sell_symbol')} {raw.get('sell_name')}"
                 f"｜差值 {gap_text}｜门槛 20"
-                f"｜目标仓位 {_money(Decimal(str(pair['target_weight'])) * Decimal('100'))}%"
-                f"｜金额 {_money(Decimal(str(pair['target_amount'])))} {currency}"
-                f"｜约 {pair['estimated_shares']} 股｜MARKET 卖出全成后才买入"
-                f"｜目标交易日 {pair.get('execution_date') or '待定'}｜不得跨日"
             )
             continue
-        status = {
-            "gap_below_threshold": "未触发",
-            "sizing_blocked": "仓位规则阻止",
-            "data_unavailable": "数据不可用",
-        }.get(outcome, outcome)
-        reason = str(raw.get("reason") or "数据未提供")
-        threshold = raw.get("threshold") or Decimal("20")
-        remaining = ""
-        if outcome == "gap_below_threshold" and gap is not None:
-            try:
-                remaining = f"｜还差 {_money(Decimal(str(threshold)) - Decimal(str(gap)))}"
-            except (InvalidOperation, ValueError):
-                remaining = ""
         lines.append(
-            f"- {status}｜比较口径 {basis}｜卖出 {raw.get('sell_symbol')} "
-            f"{raw.get('sell_name')}｜买入 {raw.get('buy_symbol')} {raw.get('buy_name')}"
-            f"｜实际差值 {gap_text}｜门槛 {threshold}{remaining}｜原因 {reason}"
+            f"- 已进入轮换｜比较口径 {basis}｜全部卖出 {pair['sell_symbol']} "
+            f"{pair['sell_name']}，再买入 {pair['buy_symbol']} {pair['buy_name']}"
+            f"｜差值 {gap_text}｜门槛 20"
+            f"｜目标仓位 {_money(Decimal(str(pair['target_weight'])) * Decimal('100'))}%"
+            f"｜金额 {_money(Decimal(str(pair['target_amount'])))} {currency}"
+            f"｜约 {pair['estimated_shares']} 股｜MARKET 卖出全成后才买入"
+            f"｜目标交易日 {pair.get('execution_date') or '待定'}｜不得跨日"
         )
+    if not rendered:
+        lines.append("- 无。")
     return lines
 
 

@@ -5056,7 +5056,9 @@ function renderTrendRotations(report) {
   };
   const strength = (label, value) => `${label} ${formatDisplayNumber(value)}`;
   const group = (title, mode, comparisons, pairs) => {
-    const comparisonRows = cnTrendRows(comparisons);
+    const comparisonRows = cnTrendRows(comparisons).filter(
+      (comparison) => String(comparison.outcome || "") === "planned",
+    );
     const rows = comparisonRows.length
       ? comparisonRows.map((comparison) => {
         const pair = cnTrendRows(pairs).find((item) => item.pair_index === comparison.pair_index) || {};
