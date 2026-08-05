@@ -1198,6 +1198,94 @@ def test_real_rotation_plan_is_independent_of_simulate_account() -> None:
     ]
 
 
+def test_real_rotation_sizing_uses_net_value_when_cash_is_negative() -> None:
+    simulated_symbols = tuple(f"10{index:04d}" for index in range(10))
+    real_symbols = tuple(f"30{index:04d}" for index in range(10))
+    simulated = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("50000"),
+        positions=tuple(
+            AccountPosition(symbol, symbol, "stock", Decimal("500"), Decimal("10"), Decimal("5000"))
+            for symbol in simulated_symbols
+        ),
+        exceptions=(),
+    )
+    real = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "eastmoney"},
+        positions=tuple(
+            AccountPosition(symbol, symbol, "stock", Decimal("500"), Decimal("10"), Decimal("5000"))
+            for symbol in real_symbols
+        ),
+        holding_snapshots={
+            symbol: (
+                None
+                if symbol == real_symbols[-1]
+                else holding(symbol, strength="60", global_strength="60")
+            )
+            for symbol in real_symbols
+        },
+        bars_by_symbol={symbol: bars() for symbol in real_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in real_symbols
+            }
+        },
+        net_value=Decimal("50000"),
+        available_cash=Decimal("-5000"),
+        position_count=10,
+        instrument_ids_by_symbol={
+            symbol: f"ins_{symbol}" for symbol in real_symbols
+        },
+        blocked_instrument_ids={},
+    )
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199),
+        allocation=allocation_for("CN", rank=2, entry_weight="0.04"),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=simulated,
+        candidates=[
+            candidate(real_symbols[-1], asset="ETF基金", strength="96", global_strength="100"),
+            candidate("200001", asset="ETF基金", strength="96", global_strength="90"),
+            candidate("200002", asset="ETF基金", strength="96", global_strength="40"),
+        ],
+        holding_snapshots={
+            symbol: holding(symbol, strength="10", global_strength="10")
+            for symbol in simulated_symbols
+        },
+        bars_by_symbol={symbol: bars() for symbol in simulated_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in simulated_symbols
+            }
+        },
+        real_holdings=real,
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    assert [(pair.sell_symbol, pair.buy_symbol) for pair in built.real_rotation_pairs] == [
+        ("300000", "200001"),
+    ]
+    pair = built.real_rotation_pairs[0]
+    assert pair.target_amount == Decimal("2000")
+    assert pair.estimated_shares > 0
+
+
 def report(*, candidates: tuple[CandidateInput, ...] = ()) -> TrendReport:
     return build_report(
         as_of_date="2026-07-14",

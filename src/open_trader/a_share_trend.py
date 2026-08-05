@@ -2129,6 +2129,33 @@ def _ticker_labels(value: object) -> tuple[str, ...]:
     return tuple(part.strip() for part in value.split(";") if part.strip())
 
 
+def _snapshot_usd_per_hkd(
+    positions_value: Sequence[object],
+    broker: str,
+    account_currency: str,
+) -> Decimal | None:
+    if account_currency != "USD":
+        return None
+    for row in positions_value:
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("broker") or "").strip().lower() != broker:
+            continue
+        if str(row.get("currency") or "").strip().upper() != account_currency:
+            continue
+        valuation = row.get("current_valuation")
+        if not isinstance(valuation, Mapping):
+            continue
+        try:
+            usd = _decimal(valuation.get("market_value_usd"))
+            hkd = _decimal(valuation.get("market_value_hkd"))
+        except (ValueError, InvalidOperation):
+            continue
+        if usd > 0 and hkd > 0:
+            return usd / hkd
+    return None
+
+
 def load_real_holding_input(
     account_snapshot: Mapping[str, object],
     market: str,
@@ -2296,8 +2323,9 @@ def load_real_holding_input(
                 futu_symbol=futu_symbol,
             )
         )
-    cash_values: list[Decimal] = []
+    converted_cash: list[Decimal] = []
     cash_reason = ""
+    usd_per_hkd: Decimal | None = None
     for row in cash_value:
         assert isinstance(row, Mapping)
         if str(row.get("broker") or "").strip().lower() != broker:
@@ -2310,25 +2338,34 @@ def load_real_holding_input(
             cash_reason = "真实账户可用现金不可用"
             break
         currency = str(row.get("currency") or "").strip().upper()
-        if value is None or not value.is_finite() or value < 0:
+        if value is None or not value.is_finite():
             cash_reason = "真实账户可用现金不可用"
             break
         if currency == account_currency:
-            cash_values.append(value)
-        elif value != 0:
-            cash_reason = "真实账户存在未换算的多币种现金"
+            converted_cash.append(value)
+            continue
+        if usd_per_hkd is None:
+            usd_per_hkd = _snapshot_usd_per_hkd(
+                positions_value, broker, account_currency
+            )
+        if usd_per_hkd is None:
+            cash_reason = "真实账户现金汇率不可用"
             break
-    if cash_reason or len(cash_values) != 1:
+        converted_cash.append(value * usd_per_hkd)
+    if cash_reason:
         return RealHoldingInput(
             status="unavailable",
-            reason=cash_reason or f"真实账户缺少唯一 {account_currency} 可用现金",
+            reason=cash_reason,
             source=source,
             positions=(),
             holding_snapshots={},
             bars_by_symbol={},
             prior_state=None,
         )
-    available_cash = cash_values[0]
+    # Multi-currency and negative cash are expected for real accounts (IPO
+    # subscriptions and margin financing); only the converted net value gates
+    # rotation sizing.
+    available_cash = sum(converted_cash, Decimal("0")) if converted_cash else Decimal("0")
     return RealHoldingInput(
         status="available",
         reason="",
@@ -3441,6 +3478,7 @@ def _plan_account_rotation_pairs(
     critical_data_reason: str,
     require_mapping: bool,
     excluded_sell_symbols: Sequence[str] = (),
+    cash_unconstrained: bool = False,
 ) -> tuple[tuple[RotationPair, ...], tuple[RotationComparison, ...]]:
     """Pair first, then reuse ordinary entry sizing with each sell's proceeds."""
     positions_by_symbol = {item.symbol: item for item in account.positions}
@@ -3470,13 +3508,20 @@ def _plan_account_rotation_pairs(
     }
     selected_sell_symbols = set(forced_sell_symbols)
     sale_factor = max(Decimal("0"), Decimal("1") - normal_cost_rate)
-    remaining_cash = account.available_cash + sum(
-        (
-            item.market_value * sale_factor
-            for item in account.positions
-            if item.symbol in forced_sell_symbols
-        ),
-        Decimal("0"),
+    # ponytail: real accounts finance with margin (IPO subscriptions), so cash
+    # is not the buying constraint; size real rotation buys from net value.
+    remaining_cash = (
+        account.net_value
+        if cash_unconstrained
+        else account.available_cash
+        + sum(
+            (
+                item.market_value * sale_factor
+                for item in account.positions
+                if item.symbol in forced_sell_symbols
+            ),
+            Decimal("0"),
+        )
     )
     replacement_risk = Decimal("0")
     for pair in proposed:
@@ -3501,6 +3546,7 @@ def _plan_account_rotation_pairs(
             sell_symbols=candidate_sell_symbols,
             price_fx_to_account_currency=price_fx_to_account_currency,
             normal_cost_rate=normal_cost_rate,
+            cash_unconstrained=cash_unconstrained,
         )
         if existing_risk is not None:
             existing_risk += replacement_risk
@@ -4522,10 +4568,13 @@ def _post_sell_planned_risk(
     sell_symbols: set[str],
     price_fx_to_account_currency: Decimal,
     normal_cost_rate: Decimal,
+    cash_unconstrained: bool = False,
 ) -> tuple[Decimal | None, str]:
     if not account.net_value.is_finite() or account.net_value <= 0:
         return None, "模拟盘净值缺失，暂停新开仓"
-    if not account.available_cash.is_finite() or account.available_cash < 0:
+    if not account.available_cash.is_finite() or (
+        not cash_unconstrained and account.available_cash < 0
+    ):
         return None, "模拟盘现金缺失，暂停新开仓"
     if (
         not price_fx_to_account_currency.is_finite()
@@ -5286,6 +5335,7 @@ def build_report(
                 critical_data_reason=kelly_data_reason,
                 require_mapping=symbol_mapping_required,
                 excluded_sell_symbols=tuple(real_blocked_symbols),
+                cash_unconstrained=True,
             )
             real_rotation_pairs = tuple(
                 replace(

@@ -209,3 +209,66 @@ def test_real_input_never_scans_run_csvs(tmp_path: Path, monkeypatch: pytest.Mon
     )
 
     assert loaded.status == "available"
+
+
+def test_real_input_tolerates_multi_currency_and_negative_cash(
+    tmp_path: Path,
+) -> None:
+    snapshot = account_snapshot()
+    tiger_position = next(
+        row for row in snapshot["positions"]  # type: ignore[index]
+        if row["broker"] == "tiger"
+    )
+    tiger_position["current_valuation"] = {
+        "market_value_usd": "1234.5",
+        "market_value_hkd": "12345",
+    }
+    tiger_cash = next(
+        row for row in snapshot["cash_balances"]  # type: ignore[index]
+        if row["broker"] == "tiger"
+    )
+    tiger_cash.update(
+        currency="HKD",
+        cash_balance="1000",
+        available_balance="1000",
+        cash_balance_hkd="1000",
+        available_balance_hkd="1000",
+    )
+    snapshot["cash_balances"].append({  # type: ignore[union-attr]
+        "broker": "tiger",
+        "account_alias": "tiger_main",
+        "currency": "USD",
+        "cash_balance": "-200",
+        "available_balance": "-200",
+        "cash_balance_hkd": "-1560",
+        "available_balance_hkd": "-1560",
+    })
+
+    loaded = load_real_holding_input(
+        snapshot,
+        "US",
+        state_path=tmp_path / "real_protection_state.json",
+    )
+
+    assert loaded.status == "available"
+    assert [position.symbol for position in loaded.positions] == ["AAPL"]
+    assert loaded.available_cash == pytest.approx(-100)
+    assert loaded.net_value == pytest.approx(1134.5)
+
+
+def test_real_input_fails_closed_for_malformed_cash(tmp_path: Path) -> None:
+    snapshot = account_snapshot()
+    tiger_cash = next(
+        row for row in snapshot["cash_balances"]  # type: ignore[index]
+        if row["broker"] == "tiger"
+    )
+    tiger_cash["available_balance"] = "bad"
+
+    loaded = load_real_holding_input(
+        snapshot,
+        "US",
+        state_path=tmp_path / "real_protection_state.json",
+    )
+
+    assert loaded.status == "unavailable"
+    assert "可用现金" in loaded.reason
