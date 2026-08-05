@@ -7957,6 +7957,70 @@ def test_projection_prefers_v10_when_current_facts_are_mixed(
     assert projection["strategy_snapshot"]["strategy_version"] == "v10"
 
 
+def _allocation_ref(
+    market: str, *, score: str, rank: int, path: str,
+) -> dict[str, object]:
+    weights = {1: ("0.06", "0.60"), 2: ("0.04", "0.40"), 3: ("0.02", "0.20")}
+    entry_weight, nominal_weight = weights[rank]
+    return {
+        "daily_path": path,
+        "sha256": hashlib.sha256(path.encode()).hexdigest(),
+        "snapshot": {
+            "version": 1,
+            "allocation_date": "2026-08-03",
+            "generated_at": "2026-08-03T16:18:00+08:00",
+            "markets": {
+                market: {
+                    "rank": rank,
+                    "score": score,
+                    "score_source": "A股",
+                    "entry_weight": entry_weight,
+                    "nominal_weight": nominal_weight,
+                }
+            },
+        },
+    }
+
+
+def test_projection_tolerates_daily_allocation_identity_changes(
+    tmp_path: Path,
+) -> None:
+    snapshots = [
+        live_trend_strategy_snapshot(
+            "CN", "test-sha", (),
+            allocation=_allocation_ref(
+                "CN", score="90", rank=1,
+                path="data/trend_allocation/daily/2026-08-03.json",
+            ),
+        ),
+        live_trend_strategy_snapshot(
+            "CN", "test-sha", (),
+            allocation=_allocation_ref(
+                "CN", score="92.97", rank=3,
+                path="data/trend_allocation/daily/2026-08-05.json",
+            ),
+        ),
+    ]
+    write_projection_strategy_facts(tmp_path, "CN", snapshots)
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["strategy_snapshot"]["strategy_version"] == "v12"
+
+
+def test_projection_excludes_non_allocation_parameter_drift_fact(
+    tmp_path: Path,
+) -> None:
+    base = live_trend_strategy_snapshot("CN", "test-sha", ())
+    drifted = copy.deepcopy(base)
+    drifted["parameters"]["position_limit"] = 9
+    write_projection_strategy_facts(tmp_path, "CN", [base, drifted])
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["interval"]["end"] == "2026-07-16"
+
+
 @pytest.mark.parametrize(
     ("market", "strategy_versions"),
     [

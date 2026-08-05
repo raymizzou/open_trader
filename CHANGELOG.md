@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-06
+
+- 修复复盘投影把每日变化的资源分配字段（市场分数、快照路径/SHA、排名与目标仓位）算入策略身份、导致 CN/HK/US 控制器在同版本区间内出现新一天分配后持续阻塞的问题；身份计算现在与回撤身份同口径排除分配动态字段，非分配策略参数漂移仍失败关闭。新增分配变化容忍与非分配漂移排除回归，趋势复盘与控制器测试 439 个通过。
+
 ## 2026-08-05
 
 - 修复资源排名轮换冻结契约把同资产大类（local 基准）轮换对的强度差按全局强度核对、导致 US 趋势报告生成失败的问题；local 基准现在与比较快照同口径按大类内强度差校验，global 基准行为不变。新增 local 基准轮换对冻结契约回归，相关趋势/控制器/复盘测试 877 个通过。

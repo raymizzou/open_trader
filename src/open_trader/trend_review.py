@@ -16,6 +16,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 from .models import TradeFill
+from .strategy_drawdown import ALLOCATION_DYNAMIC_PARAMETER_NAMES
 from .trend_kelly import trend_kelly_identity_matches
 
 EVIDENCE_SCHEMA_VERSION = "open_trader.trend_review.evidence.v1"
@@ -6667,6 +6668,29 @@ def normalize_trend_strategy_snapshot(
 
 
 def _strategy_identity(snapshot: Mapping[str, object]) -> bytes:
+    parameters = snapshot.get("parameters")
+    identity_parameters = (
+        dict(parameters) if isinstance(parameters, Mapping) else parameters
+    )
+    if isinstance(identity_parameters, dict):
+        for name in ALLOCATION_DYNAMIC_PARAMETER_NAMES:
+            identity_parameters.pop(name, None)
+    rows = snapshot.get("parameter_rows")
+    identity_rows = (
+        [
+            row
+            for row in rows
+            if not (
+                isinstance(row, Mapping)
+                and (
+                    row.get("group") == "市场资源配置"
+                    or row.get("name") == "目标仓位"
+                )
+            )
+        ]
+        if isinstance(rows, list)
+        else rows
+    )
     return _canonical_json_bytes(
         {
             key: snapshot[key]
@@ -6676,9 +6700,11 @@ def _strategy_identity(snapshot: Mapping[str, object]) -> bytes:
                 "strategy_version",
                 "market",
                 "effective_from",
-                "parameters",
-                "parameter_rows",
             )
+        }
+        | {
+            "parameters": identity_parameters,
+            "parameter_rows": identity_rows,
         }
     )
 
