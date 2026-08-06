@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>跨所 YES/NO 漏斗 · 发现链路失败 Mock</title>
+  <link rel="stylesheet" href="../../../src/open_trader/dashboard_static/dashboard.css">
+  <style>
+    .mock-page { max-width: 960px; margin: 24px auto; padding: 0 16px 48px; }
+    .mock-caption { color: var(--muted); font-size: 12px; margin: 22px 0 8px; }
+    .mock-caption strong { color: var(--text); }
+  </style>
+</head>
+<body>
+  <div class="mock-page">
+    <p class="mock-caption"><strong>状态 A · 现状（ready）</strong>：扫描正常，只有保留时间。</p>
+    <section class="pm-panel pm-relation-funnel pm-cross-venue-funnel" aria-label="跨所 YES/NO 漏斗">
+      <header class="pm-funnel-header">
+        <div><h2>跨所 YES/NO 漏斗</h2><p>只展示明确映射的两所标的；确认前始终重新读取两所 REST 与账户事实。</p></div>
+      </header>
+      <div class="pm-funnel-lane">
+        <div class="pm-funnel-grid pm-cross-venue-funnel-grid">
+          <article class="pm-funnel-stage"><span>两所对应标的</span><strong>14</strong><small>明确映射的市场对</small></article>
+          <article class="pm-funnel-stage live"><span>正在监视</span><strong>8</strong><small>低频候选在 Codex queue 等待复核</small></article>
+          <article class="pm-funnel-stage"><span>Codex 认为可以</span><strong>1</strong><small>严格等价后进入实时 REST 准入</small></article>
+          <article class="pm-funnel-stage good"><span>有套利空间</span><strong>0</strong><small>实时盘口为正收益</small></article>
+          <article class="pm-funnel-stage good"><span>可下单明确信号</span><strong>0</strong><small>双 REST 与账户确认后才开放</small></article>
+        </div>
+      </div>
+      <div class="pm-funnel-meta"><span>保留时间 2026-08-06T23:28:00+08:00</span></div>
+    </section>
+
+    <p class="mock-caption"><strong>状态 B · 新增（degraded + discovery_error）</strong>：漏斗保留上次成功快照，明确写出失败原因；不再出现“扫描正常”的误导文案。</p>
+    <section class="pm-panel pm-relation-funnel pm-cross-venue-funnel" aria-label="跨所 YES/NO 漏斗">
+      <header class="pm-funnel-header">
+        <div><h2>跨所 YES/NO 漏斗</h2><p>只展示明确映射的两所标的；确认前始终重新读取两所 REST 与账户事实。</p></div>
+        <span class="pm-pill watch">降级</span>
+      </header>
+      <div class="pm-funnel-lane">
+        <div class="pm-funnel-grid pm-cross-venue-funnel-grid">
+          <article class="pm-funnel-stage"><span>两所对应标的</span><strong>14</strong><small>上次成功快照</small></article>
+          <article class="pm-funnel-stage live"><span>正在监视</span><strong>8</strong><small>上次成功快照</small></article>
+          <article class="pm-funnel-stage"><span>Codex 认为可以</span><strong>1</strong><small>上次成功快照</small></article>
+          <article class="pm-funnel-stage good"><span>有套利空间</span><strong>0</strong><small>上次成功快照</small></article>
+          <article class="pm-funnel-stage good"><span>可下单明确信号</span><strong>0</strong><small>上次成功快照</small></article>
+        </div>
+      </div>
+      <div class="pm-funnel-empty pm-funnel-warning" role="alert">
+        <strong>跨所发现链路失败</strong>
+        <p>gamma_lookup_failed: HTTPError 429 Too Many Requests · 降级于 2026-08-06T23:30:00+08:00 · 保留上次成功快照</p>
+      </div>
+      <div class="pm-funnel-meta"><span>保留时间 2026-08-06T23:28:00+08:00</span></div>
+    </section>
+  </div>
+</body>
+</html>

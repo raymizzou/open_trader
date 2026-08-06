@@ -30,6 +30,15 @@ from open_trader.predict_trading import PredictBuyQuote
 from open_trader.prediction_arbitrage import BookLevel, ThresholdOrderBook
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_arbitrage_execution import PredictionExecutionService
+from polymarket.models.gamma.market import (
+    FeeSchedule,
+    Market,
+    MarketOutcome,
+    MarketOutcomes,
+    MarketResolution,
+    MarketState,
+    MarketTrading,
+)
 
 
 @pytest.mark.parametrize(
@@ -87,38 +96,25 @@ def polymarket_row(condition_id: str) -> dict[str, object]:
     }
 
 
-def test_mapping_requests_every_external_id_checks_both_gamma_states_and_uses_exact_clob_fallback() -> None:
+def test_mapping_requests_every_external_id_checks_both_gamma_states() -> None:
     gamma_calls: list[tuple[tuple[str, ...], bool]] = []
-    clob_calls: list[str] = []
 
     def gamma(condition_ids: tuple[str, ...], *, closed: bool) -> list[object]:
         gamma_calls.append((condition_ids, closed))
         return [polymarket_row("poly-a")] if not closed else []
 
-    def clob(condition_id: str) -> object:
-        clob_calls.append(condition_id)
-        return polymarket_row(condition_id) if condition_id == "poly-b" else None
-
     result = resolve_explicit_market_pairs(
         (predict_market(external_ids=("poly-a", "", "poly-b")),),
         gamma_lookup=gamma,
-        clob_lookup=clob,
     )
 
     assert gamma_calls == [(("poly-a", "poly-b"), False), (("poly-a", "poly-b"), True)]
-    assert clob_calls == ["poly-b"]
-    assert [pair.polymarket.condition_id for pair in result.pairs] == ["poly-a", "poly-b"]
+    assert [pair.polymarket.condition_id for pair in result.pairs] == ["poly-a"]
     assert result.skipped_empty_mappings == 1
-    assert result.skipped_unresolved_mappings == 0
+    assert result.skipped_unresolved_mappings == 1
 
 
 def test_mapping_uses_only_external_polymarket_ids_and_counts_unresolved_values() -> None:
-    clob_calls: list[str] = []
-
-    def clob(condition_id: str) -> object:
-        clob_calls.append(condition_id)
-        return polymarket_row("poly-external") if condition_id == "poly-external" else None
-
     market = replace(
         predict_market(external_ids=("poly-external", "poly-missing", "")),
         condition_id="poly-native-but-not-external",
@@ -127,33 +123,103 @@ def test_mapping_uses_only_external_polymarket_ids_and_counts_unresolved_values(
     result = resolve_explicit_market_pairs(
         (market,),
         gamma_lookup=lambda *args, **kwargs: [polymarket_row("poly-native-but-not-external")],
-        clob_lookup=clob,
     )
 
-    assert [pair.polymarket.condition_id for pair in result.pairs] == ["poly-external"]
-    assert clob_calls == ["poly-external", "poly-missing"]
+    assert result.pairs == ()
     assert result.skipped_empty_mappings == 1
-    assert result.skipped_unresolved_mappings == 1
+    assert result.skipped_unresolved_mappings == 2
 
 
-def test_mapping_skips_polymarket_rows_without_actual_resolution_time() -> None:
+def test_mapping_falls_back_to_close_time_without_resolution_time() -> None:
     result = resolve_explicit_market_pairs(
         (predict_market(external_ids=("poly-no-resolution",)),),
         gamma_lookup=lambda *args, **kwargs: [
             {key: value for key, value in polymarket_row("poly-no-resolution").items() if key != "resolutionDate"}
         ],
-        clob_lookup=lambda condition_id: None,
     )
 
-    assert result.pairs == ()
-    assert result.skipped_unresolved_mappings == 1
+    assert len(result.pairs) == 1
+    assert result.skipped_unresolved_mappings == 0
+    pair = result.pairs[0]
+    assert pair.polymarket.settlement_at == pair.polymarket.close_at
+
+
+def sdk_market_row(condition_id: str) -> Market:
+    return Market.model_construct(
+        id="poly-sdk-market-1",
+        slug="will-the-public-test-event-resolve-yes",
+        condition_id=condition_id,
+        question="Will the public test event resolve Yes?",
+        description="This public test event resolves from the named source.",
+        state=MarketState(
+            active=True,
+            closed=False,
+            accepting_orders=True,
+            enable_order_book=True,
+            neg_risk=False,
+            end_date=datetime(2026, 12, 31, tzinfo=UTC),
+        ),
+        outcomes=MarketOutcomes(
+            yes=MarketOutcome(label="Yes", token_id="poly-sdk-yes"),
+            no=MarketOutcome(label="No", token_id="poly-sdk-no"),
+        ),
+        trading=MarketTrading(
+            minimum_order_size=Decimal("5"),
+            minimum_tick_size=Decimal("0.01"),
+            fees_enabled=True,
+            fee_schedule=FeeSchedule(
+                exponent=1,
+                rate=Decimal("0.02"),
+                taker_only=True,
+                rebate_rate=Decimal("0.2"),
+            ),
+        ),
+        resolution=MarketResolution(source="Public Test Oracle"),
+    )
+
+
+def test_gamma_sdk_market_shape_constructs_pair() -> None:
+    result = resolve_explicit_market_pairs(
+        (predict_market(external_ids=("poly-gamma",)),),
+        gamma_lookup=lambda *args, **kwargs: (
+            [sdk_market_row("poly-gamma")] if not kwargs.get("closed") else []
+        ),
+    )
+
+    assert result.skipped_unresolved_mappings == 0
+    assert len(result.pairs) == 1
+    gamma_market = result.pairs[0].polymarket
+    assert gamma_market.market_id == "poly-sdk-market-1"
+    assert gamma_market.yes_token_id == "poly-sdk-yes"
+    assert gamma_market.no_token_id == "poly-sdk-no"
+    assert gamma_market.fee_rate_bps == Decimal("200")
+    assert gamma_market.settlement_at == gamma_market.close_at
+
+
+def test_gamma_sdk_market_without_fee_schedule_defaults_to_zero() -> None:
+    row = sdk_market_row("poly-no-fee").model_copy(
+        update={
+            "trading": MarketTrading(
+            minimum_order_size=Decimal("5"),
+            minimum_tick_size=Decimal("0.01"),
+            fees_enabled=False,
+            fee_schedule=None,
+            )
+        }
+    )
+    result = resolve_explicit_market_pairs(
+        (predict_market(external_ids=("poly-no-fee",)),),
+        gamma_lookup=lambda *args, **kwargs: [row] if not kwargs.get("closed") else [],
+    )
+
+    assert result.skipped_unresolved_mappings == 0
+    assert result.pairs[0].polymarket.fee_rate_bps == Decimal("0")
 
 
 def test_mapping_counts_normalized_empty_external_id_tuples() -> None:
     result = resolve_explicit_market_pairs(
         (predict_market(external_ids=()),),
         gamma_lookup=lambda *args, **kwargs: pytest.fail("Gamma called"),
-        clob_lookup=lambda condition_id: pytest.fail("CLOB called"),
     )
 
     assert result.pairs == ()
@@ -173,7 +239,6 @@ def explicit_pair() -> ExplicitMarketPair:
     pair = resolve_explicit_market_pairs(
         (predict_market(external_ids=("poly-condition",)),),
         gamma_lookup=lambda *args, **kwargs: [polymarket_row("poly-condition")],
-        clob_lookup=lambda condition_id: None,
     ).pairs[0]
     cutoff = "at 23:59 UTC on December 31, 2026"
     return replace(
@@ -527,8 +592,7 @@ def test_equivalence_cache_and_hot_pool_invalidate_every_admission_input() -> No
     monitor = PredictCrossVenueMonitor(
         predict_source=FakeCrossVenuePredict(()), polymarket_monitor=FakeCrossVenuePolymarket(),
         validator=FakeCrossVenueValidator(), gamma_lookup=lambda *args, **kwargs: [],
-        clob_lookup=lambda condition_id: None,
-        predict_quote_fn=predict_quote(),
+                predict_quote_fn=predict_quote(),
     )
     monitor._set_approved({pair.pair_id: pair})
     for variant in variants:
@@ -1172,8 +1236,7 @@ def test_monitor_allows_task_six_to_defer_quote_wiring() -> None:
         polymarket_monitor=FakeCrossVenuePolymarket(),
         validator=FakeCrossVenueValidator(),
         gamma_lookup=lambda *args, **kwargs: [],
-        clob_lookup=lambda condition_id: None,
-    )
+            )
 
     assert monitor._predict_quote_fn is None
 
@@ -1271,8 +1334,7 @@ def test_monitor_does_not_admit_validation_without_exact_direct_mapping(mapping)
             polymarket_monitor=polymarket,
             validator=validator,
             gamma_lookup=monitor_gamma,
-            clob_lookup=lambda condition_id: None,
-            predict_quote_fn=predict_quote(),
+                        predict_quote_fn=predict_quote(),
         )
 
         await monitor.start()
@@ -1303,8 +1365,7 @@ def test_monitor_validates_before_subscription_and_confirms_both_rest_books_conc
             polymarket_monitor=polymarket,
             validator=validator,
             gamma_lookup=monitor_gamma,
-            clob_lookup=lambda condition_id: None,
-            predict_quote_fn=predict_quote(),
+                        predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
@@ -1384,8 +1445,7 @@ def test_monitor_explicit_manual_confirm_mode_is_emitted_by_real_monitor() -> No
             polymarket_monitor=polymarket,
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
-            clob_lookup=lambda condition_id: None,
-            predict_quote_fn=predict_quote(),
+                        predict_quote_fn=predict_quote(),
             execution_mode="manual_confirm",
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
@@ -1420,8 +1480,7 @@ def test_monitor_closes_and_rearms_episode_without_touching_same_venue_state() -
             polymarket_monitor=polymarket,
             validator=validator,
             gamma_lookup=monitor_gamma,
-            clob_lookup=lambda condition_id: None,
-            predict_quote_fn=predict_quote(),
+                        predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
@@ -1474,8 +1533,7 @@ def test_stale_funnel_retains_last_success_stages_and_disables_actions() -> None
             polymarket_monitor=polymarket,
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
-            clob_lookup=lambda condition_id: None,
-            predict_quote_fn=predict_quote(),
+                        predict_quote_fn=predict_quote(),
             clock=lambda: now,
         )
 
@@ -1529,8 +1587,7 @@ def test_complete_empty_scan_no_v1_market_is_ready_not_blocked() -> None:
             polymarket_monitor=FakeCrossVenuePolymarket(),
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
-            clob_lookup=lambda condition_id: None,
-            predict_quote_fn=predict_quote(),
+                        predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
@@ -1552,6 +1609,34 @@ def test_complete_empty_scan_no_v1_market_is_ready_not_blocked() -> None:
     asyncio.run(exercise())
 
 
+def test_monitor_discovery_api_rejection_is_degraded_not_silent_zero() -> None:
+    async def exercise() -> None:
+        monitor = PredictCrossVenueMonitor(
+            predict_source=FakeCrossVenuePredict(
+                (monitor_predict_market(external_ids=("poly-condition",)),)
+            ),
+            polymarket_monitor=FakeCrossVenuePolymarket(),
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("gamma rejected")
+            ),
+            predict_quote_fn=predict_quote(),
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+        await monitor.start()
+        await wait_until(lambda: monitor.snapshot()["status"] == "degraded")
+        snapshot = monitor.snapshot()
+
+        assert snapshot["status"] == "degraded"
+        assert snapshot["stale_at"] == "2026-01-01T00:00:00+00:00"
+        assert snapshot["funnel"]["matched_pairs"] == 0
+        assert "gamma rejected" in snapshot["discovery_error"]
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+
 def test_official_market_url_uses_only_validated_api_slugs() -> None:
     base_pair = resolve_explicit_market_pairs(
         (monitor_predict_market(external_ids=("poly-condition",)),),
@@ -1561,8 +1646,7 @@ def test_official_market_url_uses_only_validated_api_slugs() -> None:
                 "eventSlug": "btc-above-100k",
             }
         ],
-        clob_lookup=lambda condition_id: None,
-    ).pairs[0]
+            ).pairs[0]
     pair = ExplicitMarketPair(
         pair_id="public-pair",
         predict=replace(base_pair.predict, market_slug="btc-year-end"),
@@ -1573,8 +1657,7 @@ def test_official_market_url_uses_only_validated_api_slugs() -> None:
         polymarket_monitor=FakeCrossVenuePolymarket(),
         validator=FakeCrossVenueValidator(),
         gamma_lookup=monitor_gamma,
-        clob_lookup=lambda condition_id: None,
-        predict_quote_fn=predict_quote(),
+                predict_quote_fn=predict_quote(),
     )
     intent = _build_stage_four_intent(pair)
 
@@ -1604,8 +1687,7 @@ def test_official_market_url_omits_missing_or_unsafe_slugs() -> None:
                 "eventSlug": "https://evil.test/event",
             }
         ],
-        clob_lookup=lambda condition_id: None,
-    ).pairs[0]
+            ).pairs[0]
     pair = ExplicitMarketPair(
         pair_id="public-pair",
         predict=replace(base_pair.predict, market_slug="../unsafe"),
@@ -1616,8 +1698,7 @@ def test_official_market_url_omits_missing_or_unsafe_slugs() -> None:
         polymarket_monitor=FakeCrossVenuePolymarket(),
         validator=FakeCrossVenueValidator(),
         gamma_lookup=monitor_gamma,
-        clob_lookup=lambda condition_id: None,
-        predict_quote_fn=predict_quote(),
+                predict_quote_fn=predict_quote(),
     )
     opportunity = monitor._opportunity_payload(
         pair,
@@ -1638,8 +1719,7 @@ def test_official_market_url_ignores_generic_polymarket_slug() -> None:
                 "slug": "generic-market-slug",
             }
         ],
-        clob_lookup=lambda condition_id: None,
-    ).pairs[0]
+            ).pairs[0]
     pair = ExplicitMarketPair(
         pair_id="public-pair",
         predict=replace(base_pair.predict, market_slug="btc-year-end"),
@@ -1650,8 +1730,7 @@ def test_official_market_url_ignores_generic_polymarket_slug() -> None:
         polymarket_monitor=FakeCrossVenuePolymarket(),
         validator=FakeCrossVenueValidator(),
         gamma_lookup=monitor_gamma,
-        clob_lookup=lambda condition_id: None,
-        predict_quote_fn=predict_quote(),
+                predict_quote_fn=predict_quote(),
     )._opportunity_payload(
         pair,
         _build_stage_four_intent(pair),
@@ -1712,8 +1791,7 @@ def test_monitor_signal_episode_persists_refreshes_and_rotates_on_reopen(
             polymarket_monitor=polymarket,
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
-            clob_lookup=lambda condition_id: None,
-            predict_quote_fn=predict_quote(),
+                        predict_quote_fn=predict_quote(),
             store=store,
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
@@ -1779,8 +1857,7 @@ def test_monitor_notifies_only_first_cross_stage_5_per_dedupe_identity(
             polymarket_monitor=polymarket,
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
-            clob_lookup=lambda condition_id: None,
-            predict_quote_fn=predict_quote(),
+                        predict_quote_fn=predict_quote(),
             store=store,
             ready_observer=lambda opportunity_id, signal_id: notifications.append(
                 (opportunity_id, signal_id)
@@ -1886,8 +1963,7 @@ def test_monitor_candidate_identity_rotation_closes_old_episode_and_creates_new_
             polymarket_monitor=FakeCrossVenuePolymarket(),
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
-            clob_lookup=lambda condition_id: None,
-            store=store,
+                        store=store,
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
         base = {
@@ -1984,8 +2060,7 @@ def test_monitor_fingerprint_rotation_isolates_in_flight_notification_lease(
             polymarket_monitor=FakeCrossVenuePolymarket(),
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
-            clob_lookup=lambda condition_id: None,
-            store=store,
+                        store=store,
             ready_observer=observer,
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
@@ -2052,8 +2127,7 @@ def test_monitor_uses_existing_discovery_cycle_for_holding_reconciliation() -> N
             polymarket_monitor=FakeCrossVenuePolymarket(),
             validator=FakeCrossVenueValidator(),
             gamma_lookup=lambda *args, **kwargs: [],
-            clob_lookup=lambda condition_id: None,
-            holding_reconciler=lambda: calls.append("once"),
+                        holding_reconciler=lambda: calls.append("once"),
         )
 
         await monitor._discover()
@@ -2076,8 +2150,7 @@ def test_monitor_snapshot_closes_episode_when_books_age_without_another_update()
             polymarket_monitor=polymarket,
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
-            clob_lookup=lambda condition_id: None,
-            predict_quote_fn=predict_quote(),
+                        predict_quote_fn=predict_quote(),
             clock=lambda: now[0],
         )
 
@@ -2106,8 +2179,7 @@ def test_monitor_missing_api_key_is_pending_and_has_zero_cross_subscriptions() -
             polymarket_monitor=polymarket,
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
-            clob_lookup=lambda condition_id: None,
-            predict_quote_fn=predict_quote(),
+                        predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
@@ -2129,8 +2201,7 @@ def test_funnel_clear_signal_counts_only_actionable_opportunity_pairs() -> None:
         polymarket_monitor=FakeCrossVenuePolymarket(),
         validator=FakeCrossVenueValidator(),
         gamma_lookup=lambda *args, **kwargs: [],
-        clob_lookup=lambda condition_id: None,
-    )
+            )
     monitor._status = "ready"
     monitor._opportunities = {  # type: ignore[assignment]
         ("stage-4-pair", "PREDICT_YES_POLYMARKET_NO"): {
@@ -2176,8 +2247,7 @@ def test_monitor_uses_fixed_fifteen_minute_discovery_and_invalidates_changed_fin
             polymarket_monitor=polymarket,
             validator=validator,
             gamma_lookup=monitor_gamma,
-            clob_lookup=lambda condition_id: None,
-            predict_quote_fn=predict_quote(),
+                        predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
@@ -2241,8 +2311,7 @@ def test_monitor_discovery_evicts_before_one_re_admission_for_changed_inputs(
                 {**polymarket_row(condition_id), "endDate": "2026-01-20T00:00:00Z", "resolutionDate": "2026-01-21T00:00:00Z"}
                 for condition_id in ids
             ],
-            clob_lookup=lambda condition_id: None,
-            predict_quote_fn=predict_quote(),
+                        predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
@@ -2287,7 +2356,7 @@ def test_monitor_discovery_re_admits_once_when_prompt_version_changes(
         validator = BlockingValidator()
         monitor = PredictCrossVenueMonitor(
             predict_source=predict, polymarket_monitor=polymarket, validator=validator,
-            gamma_lookup=monitor_gamma, clob_lookup=lambda condition_id: None,
+            gamma_lookup=monitor_gamma,
             predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
@@ -2343,8 +2412,7 @@ def test_monitor_suspends_during_hidden_predict_reconnect_and_rearms_after_fresh
             polymarket_monitor=polymarket,
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
-            clob_lookup=lambda condition_id: None,
-            predict_quote_fn=predict_quote(),
+                        predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 
@@ -2396,8 +2464,7 @@ def test_monitor_slow_codex_validation_does_not_pause_hot_books(
             polymarket_monitor=polymarket,
             validator=validator,
             gamma_lookup=monitor_gamma,
-            clob_lookup=lambda condition_id: None,
-            predict_quote_fn=predict_quote(),
+                        predict_quote_fn=predict_quote(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 

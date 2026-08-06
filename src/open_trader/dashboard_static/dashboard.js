@@ -2507,17 +2507,25 @@ function predictionSafeguardsHtml(payload) {
 }
 
 function predictionCrossVenueFunnel(payload) {
-  const funnel = payload?.cross_venue?.funnel && typeof payload.cross_venue.funnel === "object"
-    ? payload.cross_venue.funnel
-    : {};
+  const crossVenue = payload?.cross_venue && typeof payload.cross_venue === "object" ? payload.cross_venue : {};
+  const funnel = crossVenue.funnel && typeof crossVenue.funnel === "object" ? crossVenue.funnel : {};
   const counts = ["matched_pairs", "monitored_pairs", "codex_approved_pairs", "arbitrage_space_pairs", "clear_signal_pairs"].map((key) => Number(funnel[key] || 0));
-  const empty = counts.every((count) => count === 0)
-    ? `<div class="pm-funnel-empty"><strong>当前没有合格跨所市场</strong><p>扫描正常，没有失败；出现 stage-5 明确信号前不会开放按钮。</p></div>`
+  const degraded = String(crossVenue.status || "").toLowerCase() !== "ready"
+    && typeof crossVenue.discovery_error === "string"
+    && crossVenue.discovery_error !== "";
+  const stageNote = degraded ? "上次成功快照" : "";
+  const warning = degraded
+    ? `<div class="pm-funnel-empty pm-funnel-warning" role="alert"><strong>跨所发现链路失败</strong><p>${escapeHtml(crossVenue.discovery_error)} · 降级于 ${escapeHtml(predictionValue(crossVenue.stale_at))} · 保留上次成功快照</p></div>`
     : "";
+  const empty = warning
+    || (counts.every((count) => count === 0)
+      ? `<div class="pm-funnel-empty"><strong>当前没有合格跨所市场</strong><p>扫描正常，没有失败；出现 stage-5 明确信号前不会开放按钮。</p></div>`
+      : "");
   const retained = funnel.retained_at
     ? `<div class="pm-funnel-meta"><span>保留时间 ${escapeHtml(predictionValue(funnel.retained_at))}</span></div>`
     : "";
-  return `<section class="pm-panel pm-relation-funnel pm-cross-venue-funnel" aria-label="跨所 YES/NO 漏斗"><header class="pm-funnel-header"><div><h2>跨所 YES/NO 漏斗</h2><p>只展示明确映射的两所标的；确认前始终重新读取两所 REST 与账户事实。</p></div></header><div class="pm-funnel-lane"><div class="pm-funnel-grid pm-cross-venue-funnel-grid">${predictionFunnelStage("两所对应标的", funnel.matched_pairs, "明确映射的市场对")}${predictionFunnelStage("正在监视", funnel.monitored_pairs, "低频候选在 Codex queue 等待复核", "live")}${predictionFunnelStage("Codex 认为可以", funnel.codex_approved_pairs, "严格等价后进入实时 REST 准入")}${predictionFunnelStage("有套利空间", funnel.arbitrage_space_pairs, "实时盘口为正收益", "good")}${predictionFunnelStage("可下单明确信号", funnel.clear_signal_pairs, "双 REST 与账户确认后才开放", "good")}</div></div>${retained}${empty}</section>`;
+  const statusPill = degraded ? `<span class="pm-pill watch">降级</span>` : "";
+  return `<section class="pm-panel pm-relation-funnel pm-cross-venue-funnel" aria-label="跨所 YES/NO 漏斗"><header class="pm-funnel-header"><div><h2>跨所 YES/NO 漏斗</h2><p>只展示明确映射的两所标的；确认前始终重新读取两所 REST 与账户事实。</p></div>${statusPill}</header><div class="pm-funnel-lane"><div class="pm-funnel-grid pm-cross-venue-funnel-grid">${predictionFunnelStage("两所对应标的", funnel.matched_pairs, stageNote || "明确映射的市场对")}${predictionFunnelStage("正在监视", funnel.monitored_pairs, stageNote || "低频候选在 Codex queue 等待复核", "live")}${predictionFunnelStage("Codex 认为可以", funnel.codex_approved_pairs, stageNote || "严格等价后进入实时 REST 准入")}${predictionFunnelStage("有套利空间", funnel.arbitrage_space_pairs, stageNote || "实时盘口为正收益", "good")}${predictionFunnelStage("可下单明确信号", funnel.clear_signal_pairs, stageNote || "双 REST 与账户确认后才开放", "good")}</div></div>${retained}${empty}</section>`;
 }
 
 function predictionExecutionProgress(execution) {
