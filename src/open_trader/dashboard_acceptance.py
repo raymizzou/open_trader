@@ -5605,6 +5605,13 @@ def main(argv: list[str] | None = None) -> int:
             errors.extend(_controlled_account_outage_errors(
                 args.url, args.expected_root,
             ))
+            try:
+                restored_pid, _restored_cwd = _listener(args.account_url)
+            except Exception:
+                restored_pid = None
+            if restored_pid is not None:
+                account_pid = restored_pid
+                account_started_at = _process_started_at(restored_pid)
         parity = check_account_api_parity(project_data_dir, base_url=args.account_url)
         if parity.status != "PASS":
             errors.append(f"Account API parity {parity.status}: {parity.reason}")
