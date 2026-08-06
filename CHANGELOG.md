@@ -5,6 +5,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-06
 
+- #24 把 Account API 与 Account Sync Worker 作为同一个 Account release 管理：新增
+  `scripts/install_account_release.sh` 按「停旧 writer → 等锁释放 → 启新 writer →
+  等新发布 → 启新 API → 同 SHA 交叉校验」顺序安装，并输出含 PID/cwd/SHA/启动时间/
+  heartbeat/generation/8768 监听与日志路径的证据 JSON；升级与回滚都只改 Account
+  双进程，Gateway/Legacy/Trend/Research/Prediction 进程与 PID 保持不变。新增
+  Account release 升级/回滚 runbook 与 2026-08-06 有界演练记录：候选
+  `40b3b83a` 升级、API 单独重启、Worker 停 20 秒故障、反向回滚到 `14526bc9`，
+  每次快照均 200 healthy 且 release SHA 匹配；最终状态仍以候选 SHA 的
+  `make acceptance` 与同 SHA 重部署证据为准。
 - 修复复盘投影把每日变化的资源分配字段（市场分数、快照路径/SHA、排名与目标仓位）算入策略身份、导致 CN/HK/US 控制器在同版本区间内出现新一天分配后持续阻塞的问题；身份计算现在与回撤身份同口径排除分配动态字段，非分配策略参数漂移仍失败关闭。新增分配变化容忍与非分配漂移排除回归，趋势复盘与控制器测试 439 个通过。
 - 真实持仓不再因多币种或负现金（打新/融资场景）被判不可用：现金按快照汇率折算合计、允许为负，资产净值作为真实轮换买入金额基准，模拟盘现金约束不变。新增多币种负现金放行、现金行损坏失败关闭与负现金轮换净值计价回归，相关趋势测试 892 个通过。
 - 重生成趋势报告时，已终态（已执行/结束）的轮换对不再重新冻结进新报告，避免修订版被误当作新可执行动作而重复下单；未执行轮换对保持原冻结语义。新增已终态轮换对跳过与未执行保留回归，相关趋势测试 893 个通过。
