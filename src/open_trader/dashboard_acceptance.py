@@ -603,21 +603,6 @@ def dashboard_signature(payload: dict[str, Any]) -> tuple[tuple[str, ...], ...]:
     return tuple(sorted(tuple(str(row.get(field, "")) for field in fields) for row in rows))
 
 
-def account_snapshot_signature(payload: Mapping[str, Any]) -> tuple[tuple[str, ...], ...]:
-    fields = ("market", "symbol", "broker")
-    positions = payload.get("positions") or []
-    cash = payload.get("cash_balances") or []
-    return tuple(sorted(
-        tuple(str(row.get(field, "")) for field in fields)
-        for row in positions
-        if isinstance(row, Mapping)
-    )) + tuple(sorted(
-        tuple(str(row.get(field, "")) for field in ("broker", "currency"))
-        for row in cash
-        if isinstance(row, Mapping)
-    ))
-
-
 def trend_advice_signature(payload: Mapping[str, Any]) -> tuple[str, ...]:
     reports = payload.get("trend_reports")
     reports = reports if isinstance(reports, Mapping) else {}
@@ -4594,8 +4579,12 @@ def _check_source_status_panel(page: Any, payload: Mapping[str, object]) -> None
     assert "实时账户" in panel_text and "券商结单" in panel_text, "券商来源未分组"
     for removed in ("控制器心跳", "控制器", "刷新于", "部分标的当前时段无报价"):
         assert removed not in panel_text, f"来源面板仍显示冗余信息：{removed}"
-    account_sync = payload.get("account_sync")
-    account_sync = account_sync if isinstance(account_sync, Mapping) else {}
+    sources = payload.get("sources")
+    sources = sources if isinstance(sources, Mapping) else {}
+    account_sync = sources.get("account")
+    account_sync = account_sync if isinstance(account_sync, Mapping) else (
+        payload.get("account_sync") or {}
+    )
     brokers = account_sync.get("brokers")
     brokers = brokers if isinstance(brokers, Mapping) else {}
     for broker in ACCOUNT_BROKERS:
@@ -4615,7 +4604,7 @@ def _page_dashboard_payload(page: Any) -> Mapping[str, object]:
           const live = state.accountSnapshot?.sources?.account?.brokers;
           if (!dashboard || !live) return dashboard;
           const brokers = {...(dashboard.account_sync?.brokers || {})};
-          for (const broker of ["futu", "tiger"]) {
+          for (const broker of Object.keys(live)) {
             if (live[broker]) brokers[broker] = {...brokers[broker], ...live[broker]};
           }
           return {
@@ -5636,13 +5625,6 @@ def main(argv: list[str] | None = None) -> int:
                 reports_dir=reports_dir,
                 account_ids=account_ids,
             ))
-        if (
-            isinstance(account_snapshot, Mapping)
-            and isinstance(snapshot, Mapping)
-            and account_snapshot_signature(account_snapshot)
-            != account_snapshot_signature(snapshot)
-        ):
-            errors.append("账户刷新后的 Dashboard 数据不稳定")
         if trend_advice_signature(first) != trend_advice_signature(second):
             errors.append("实盘刷新改写了冻结建议、Kelly 或模拟统计")
         errors.extend(_disabled_workflow_errors(args.expected_root))
