@@ -16,6 +16,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
   市场 14 个候选：matched_pairs 13、unresolved 1（该市场源数据无 end_date，
   按规则失败关闭）。相关自动测试 466 个通过，最终状态以候选 SHA 的
   `make acceptance` 为准。
+- #28 预测套利阈值信号（APR≥15% 且规则 approved）一旦 actionable 立即发飞书观察提醒，
+  不再等待 fresh no-submit 复核；构造后 30 秒内因 data_unavailable 关闭的信号仍会收到
+  提醒。同一信号只提醒一次，同一机会再次出现按新 episode 重新提醒；原 order-ready
+  通知（fresh preflight 通过后）保留。观察提醒标题为「观察提醒」，正文标注
+  「观察中 · 未下单」；order-ready 标题为「可下单提醒」并标注「待人工确认」，两者独立
+  去重互不覆盖。新增 6 个回归（store/execution/monitor/通知文案）；最终状态以候选
+  SHA 的 `make acceptance` 为准。
 
 ## 2026-08-06
 
