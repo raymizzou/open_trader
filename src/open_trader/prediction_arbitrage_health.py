@@ -136,8 +136,8 @@ def _dashboard_git_sha(repo_root: Path) -> str | None:
         text = log.read_text(errors="replace")
     except OSError:
         return None
-    match = re.search(r'"git_sha":\s*"([0-9a-f]{7,40})"', text)
-    return match.group(1) if match else None
+    matches = re.findall(r'"git_sha":\s*"([0-9a-f]{7,40})"', text)
+    return matches[-1] if matches else None
 
 
 def run_health_check(

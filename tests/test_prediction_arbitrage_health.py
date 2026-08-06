@@ -196,9 +196,11 @@ def test_dashboard_git_sha_reads_startup_log(tmp_path: Path) -> None:
     log.parent.mkdir(parents=True)
     log.write_text(
         'dashboard_runtime: {"pid": 44548, "git_sha": '
-        '"64809e3f45d8c8f1a53cf80d98c497027dc5d590", "source_state": "clean"}'
+        '"64809e3f45d8c8f1a53cf80d98c497027dc5d590", "source_state": "clean"}\n'
+        'dashboard_runtime: {"pid": 94923, "git_sha": '
+        '"ca308877fec207773786c16e98317fcec77aba70", "source_state": "clean"}'
     )
-    assert _dashboard_git_sha(tmp_path) == "64809e3f45d8c8f1a53cf80d98c497027dc5d590"
+    assert _dashboard_git_sha(tmp_path) == "ca308877fec207773786c16e98317fcec77aba70"
 
 
 def test_dashboard_git_sha_returns_none_without_log(tmp_path: Path) -> None:
