@@ -2349,6 +2349,67 @@ def test_transient_codex_failure_retries_once_at_the_retry_boundary(
     asyncio.run(tick())
 
 
+def test_llm_unavailable_notifies_failure_observer_once_and_resets_on_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.polymarket_monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "RELATION_VALIDATION_RETRY_SECONDS", 60)
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
+    now = [NOW]
+    validator = FakeRelationValidator("llm_unavailable")
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+        clock=lambda: now[0],
+    )
+    calls: list[dict[str, object]] = []
+    monitor.set_failure_observer(
+        lambda payload: calls.append(dict(payload)) or {"state": "sent"}
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+
+    async def scenario() -> None:
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is not None
+        await monitor._codex_task
+        await monitor._poll_relation_validation(client)
+        await asyncio.sleep(0.01)
+        monitor._reap_llm_failure_notification_task()
+        assert len(calls) == 1
+        assert calls[0]["component"] == "llm_validation"
+        assert calls[0]["reason_codes"] == ["CODEX_FAILED"]
+
+        relation_id = next(iter(monitor._active_relation_ids))
+        validator.status = "approved"
+        monitor._codex_statuses[relation_id] = "pending"
+        monitor._codex_retry_at.pop(relation_id, None)
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is not None
+        await monitor._codex_task
+        await monitor._poll_relation_validation(client)
+        assert validator.calls == 2
+
+        validator.status = "llm_unavailable"
+        validator.cached.pop(relation_id, None)
+        monitor._codex_validations.pop(relation_id, None)
+        monitor._codex_statuses[relation_id] = "pending"
+        monitor._codex_retry_at.pop(relation_id, None)
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is not None
+        await monitor._codex_task
+        await monitor._poll_relation_validation(client)
+        await asyncio.sleep(0.01)
+        monitor._reap_llm_failure_notification_task()
+        assert len(calls) == 2
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("terminal_status", ["approved", "llm_rejected"])
 def test_terminal_codex_cache_survives_pool_churn_and_restart(
     tmp_path: Path, terminal_status: str

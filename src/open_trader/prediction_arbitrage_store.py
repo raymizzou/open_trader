@@ -984,6 +984,10 @@ class PredictionArbitrageStore:
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{field} must be a non-negative integer")
             payload[field] = value
+        provider = usage.get("provider", "codex")
+        if not isinstance(provider, str) or not provider.strip():
+            raise ValueError("provider must be a non-empty string")
+        payload["provider"] = provider.strip()
         return payload
 
     def record_llm_call(
@@ -1002,15 +1006,21 @@ class PredictionArbitrageStore:
                 (_new_id(), status, _dump_payload(payload), _utc_now()),
             )
 
-    def record_llm_cache_hit(self) -> None:
+    def record_llm_cache_hit(self, *, provider: str = "codex") -> None:
+        if not isinstance(provider, str) or not provider.strip():
+            raise ValueError("provider must be a non-empty string")
         with self._transaction() as connection:
             connection.execute(
                 """
                 INSERT INTO llm_usage(
                     usage_id, kind, status, payload, created_at
-                ) VALUES (?, 'cache_hit', 'success', '{}', ?)
+                ) VALUES (?, 'cache_hit', 'success', ?, ?)
                 """,
-                (_new_id(), _utc_now()),
+                (
+                    _new_id(),
+                    _dump_payload({"provider": provider.strip()}),
+                    _utc_now(),
+                ),
             )
 
     def llm_usage_24h(self) -> dict[str, int]:
@@ -1047,6 +1057,45 @@ class PredictionArbitrageStore:
                 "output_tokens",
                 "reasoning_output_tokens",
             )
+        }
+
+    def llm_usage_24h_by_provider(self) -> dict[str, dict[str, int]]:
+        cutoff = _canonical_timestamp(
+            _parse_timestamp(_utc_now()) - timedelta(hours=24)
+        )
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    COALESCE(json_extract(payload, '$.provider'), 'codex') AS provider,
+                    COALESCE(SUM(CASE WHEN kind='call' THEN 1 ELSE 0 END), 0) AS calls,
+                    COALESCE(SUM(CASE WHEN kind='call' AND status='success' THEN 1 ELSE 0 END), 0) AS successes,
+                    COALESCE(SUM(CASE WHEN kind='call' AND status!='success' THEN 1 ELSE 0 END), 0) AS failures,
+                    COALESCE(SUM(CASE WHEN kind='cache_hit' THEN 1 ELSE 0 END), 0) AS cache_hits,
+                    COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.input_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS input_tokens,
+                    COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.cached_input_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS cached_input_tokens,
+                    COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.output_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS output_tokens,
+                    COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.reasoning_output_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS reasoning_output_tokens
+                FROM llm_usage
+                WHERE created_at >= ?
+                GROUP BY provider
+                ORDER BY provider
+                """,
+                (cutoff,),
+            ).fetchall()
+        fields = (
+            "calls",
+            "successes",
+            "failures",
+            "cache_hits",
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        )
+        return {
+            str(row["provider"]): {field: int(row[field]) for field in fields}
+            for row in rows
         }
 
     def create_preview(self, payload: Mapping[str, object], *, expires_at: str) -> str:

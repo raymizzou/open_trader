@@ -952,6 +952,31 @@ def test_notify_monitor_failure_sanitizes_error_and_reports_delivery_failure(
     assert "从未成功" in feishu.messages[-1][1]
 
 
+def test_notify_monitor_failure_llm_validation_uses_feishu_operator_copy(
+    tmp_path: Path,
+) -> None:
+    service, _trading, _store, _monitor, macos, feishu = (
+        standard_notification_fixture(tmp_path)
+    )
+
+    result = service.notify_monitor_failure(
+        {
+            "component": "llm_validation",
+            "reason_codes": ["CODEX_FAILED", "DEEPSEEK_FAILED"],
+            "summary": "Codex 与 DeepSeek 校验均不可用，当前不可下单。",
+        }
+    )
+
+    assert result == {"state": "sent"}
+    assert macos.calls == 0
+    assert feishu.calls == 1
+    title, message = feishu.messages[-1]
+    assert title == "预测市场 LLM 校验不可用"
+    assert "Codex 与 DeepSeek 校验均不可用" in message
+    assert "CODEX_FAILED · DEEPSEEK_FAILED" in message
+    assert "Dashboard：http://127.0.0.1:8766/" in message
+
+
 def test_notify_ready_opportunity_standard_sends_feishu_observation_without_preflight(
     tmp_path: Path,
 ) -> None:
