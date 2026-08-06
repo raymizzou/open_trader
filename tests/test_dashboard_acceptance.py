@@ -4526,6 +4526,45 @@ def test_first_in_scope_holding_returns_exact_market_and_symbol() -> None:
     ) == "US:MSFT::5"
 
 
+def test_dashboard_holding_key_prefers_stable_position_id() -> None:
+    payload = {
+        "positions": [
+            {
+                "market": "US",
+                "symbol": "AAPL",
+                "name": "苹果",
+                "position_id": "pos_abc",
+            },
+            {
+                "market": "CN",
+                "symbol": "000001",
+                "name": "平安银行",
+                "position_id": "pos_123",
+            },
+        ],
+    }
+
+    assert dashboard_acceptance._dashboard_holding_key(
+        payload, "CN", "000001"
+    ) == "pos_123"
+
+
+def test_dashboard_holding_key_falls_back_to_index_key_without_position_id() -> None:
+    payload = {
+        "positions": [
+            {
+                "market": "CN",
+                "symbol": "000001",
+                "name": "平安银行",
+            },
+        ],
+    }
+
+    assert dashboard_acceptance._dashboard_holding_key(
+        payload, "CN", "000001"
+    ) == "CN:000001:平安银行:0"
+
+
 def test_first_in_scope_holding_ignores_current_advice_availability() -> None:
     payload = valid_payload()
     payload["holdings"][-1]["agent_report"]["available"] = False  # type: ignore[index]

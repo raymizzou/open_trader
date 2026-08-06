@@ -2489,6 +2489,9 @@ def _dashboard_holding_key(
             and str(holding.get("market", "")) == market
             and str(holding.get("symbol", "")) == symbol
         ):
+            position_id = holding.get("position_id")
+            if isinstance(position_id, str) and position_id:
+                return position_id
             return ":".join((market, symbol, str(holding.get("name", "")), str(index)))
     raise AssertionError(f"{market}.{symbol} is missing from Dashboard payload")
 
@@ -4910,6 +4913,10 @@ def _browser_check(
                         )
                     )
                     page_payload = _page_dashboard_payload(page)
+                    holdings_payload = {
+                        **page_payload,
+                        "broker_positions": payload.get("positions") or [],
+                    }
                     _check_visual_contract(page)
                     _check_source_status_panel(page, page_payload)
                     if "看板数据加载失败" in page.locator("body").inner_text():
@@ -4925,7 +4932,7 @@ def _browser_check(
                     try:
                         _check_account_holdings(
                             page,
-                            payload,
+                            holdings_payload,
                             reports_dir=reports_dir,
                         )
                     except Exception as exc:
@@ -4933,7 +4940,7 @@ def _browser_check(
                     try:
                         _check_separated_trend_report_views(
                             page,
-                            payload,
+                            page_payload,
                         )
                     except Exception as exc:
                         errors.append(f"{name}：{type(exc).__name__}: {exc}")
@@ -4941,7 +4948,7 @@ def _browser_check(
                         try:
                             _check_trend_account_views(
                                 page,
-                                payload,
+                                page_payload,
                                 _refresh_simulate_payloads(url, simulate_payloads),
                                 history_expectations,
                             )
