@@ -236,6 +236,19 @@ for the exact cutover, rollback, fault-injection, and acceptance sequence; the
 [shadow runtime reference](docs/operations/account-api-shadow-runtime.md) remains
 available for R2 parity work.
 
+Account Sync Worker and Account API are one Account release and must run the
+same Git SHA. Install, upgrade, or roll back the pair as a unit (Worker first,
+then API, then same-SHA verification) with:
+
+```bash
+scripts/install_account_release.sh --dry-run
+scripts/install_account_release.sh --repo-root "$PWD" \
+  --evidence-out "$PWD/logs/account_release/install.json"
+```
+
+See the [Account release upgrade and rollback runbook](docs/operations/account-release-upgrade-rollback.md)
+for the fixed topology, diagnostics, drill order, and evidence checklist.
+
 The Dashboard has no account or quote write path and no manual refresh action.
 It only projects `data/latest/account_sync_state.json`,
 `data/latest/portfolio.csv`, `data/latest/quotes.json`, and
