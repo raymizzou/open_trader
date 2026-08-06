@@ -29,6 +29,25 @@ _TERMINAL_EXECUTION_STATES = (
     "merge_incident",
 )
 
+_NOTIFICATION_KINDS = {
+    "order_ready": {
+        "state": "notification_state",
+        "attempts": "notification_attempts",
+        "lease_id": "notification_lease_id",
+        "lease_expires_at": "notification_lease_expires_at",
+        "sent_at": "notification_sent_at",
+        "error_code": "notification_error_code",
+    },
+    "observation": {
+        "state": "observation_state",
+        "attempts": "observation_attempts",
+        "lease_id": "observation_lease_id",
+        "lease_expires_at": "observation_lease_expires_at",
+        "sent_at": "observation_sent_at",
+        "error_code": "observation_error_code",
+    },
+}
+
 # These are deliberately field-name based: the store is an audit ledger, not a
 # credential vault. Values belonging to these fields never cross the SQLite
 # boundary, even when a caller accidentally includes them in a larger payload.
@@ -710,12 +729,16 @@ class PredictionArbitrageStore:
         self,
         signal_id: str,
         *,
+        kind: str = "order_ready",
         max_attempts: int = 3,
         lease_seconds: float = 60.0,
         order_ready_at: str | None = None,
     ) -> dict[str, object]:
         """Atomically reserve one open signal notification attempt."""
 
+        fields = _NOTIFICATION_KINDS.get(kind)
+        if fields is None:
+            raise ValueError(f"unknown notification kind: {kind}")
         if isinstance(max_attempts, bool) or max_attempts < 1:
             raise ValueError("max_attempts must be positive")
         if isinstance(lease_seconds, bool) or lease_seconds < 0:
@@ -735,10 +758,10 @@ class PredictionArbitrageStore:
             payload = _load_payload(str(row["payload"]))
             if row["ended_at"] is not None or payload.get("ended_at") is not None:
                 return {"state": "closed", "signal_id": str(signal_id)}
-            state = str(payload.get("notification_state", "pending"))
+            state = str(payload.get(fields["state"], "pending"))
             if state == "sent":
                 return {"state": "sent", "signal_id": str(signal_id)}
-            current_lease = payload.get("notification_lease_expires_at")
+            current_lease = payload.get(fields["lease_expires_at"])
             lease_active = False
             if current_lease not in (None, ""):
                 try:
@@ -748,21 +771,21 @@ class PredictionArbitrageStore:
             if lease_active:
                 return {"state": "in_flight", "signal_id": str(signal_id)}
             try:
-                attempts = int(payload.get("notification_attempts", 0) or 0)
+                attempts = int(payload.get(fields["attempts"], 0) or 0)
             except (TypeError, ValueError):
                 attempts = 0
             if attempts >= max_attempts:
                 return {
                     "state": "exhausted",
                     "signal_id": str(signal_id),
-                    "notification_attempts": attempts,
+                    fields["attempts"]: attempts,
                 }
             payload.update(
                 {
-                    "notification_state": "pending",
-                    "notification_attempts": attempts + 1,
-                    "notification_lease_id": lease_id,
-                    "notification_lease_expires_at": lease_expires,
+                    fields["state"]: "pending",
+                    fields["attempts"]: attempts + 1,
+                    fields["lease_id"]: lease_id,
+                    fields["lease_expires_at"]: lease_expires,
                 }
             )
             if order_ready_at is not None:
@@ -775,7 +798,7 @@ class PredictionArbitrageStore:
                 "state": "reserved",
                 "signal_id": str(signal_id),
                 "lease_id": lease_id,
-                "notification_attempts": attempts + 1,
+                fields["attempts"]: attempts + 1,
                 "signal": {
                     **payload,
                     "signal_id": str(signal_id),
@@ -791,11 +814,15 @@ class PredictionArbitrageStore:
         signal_id: str,
         lease_id: str,
         *,
+        kind: str = "order_ready",
         success: bool,
         error_code: str = "delivery_failed",
     ) -> dict[str, object]:
         """Persist a reserved attempt's final pending/sent/failed state."""
 
+        fields = _NOTIFICATION_KINDS.get(kind)
+        if fields is None:
+            raise ValueError(f"unknown notification kind: {kind}")
         with self._transaction() as connection:
             row = connection.execute(
                 "SELECT * FROM signals WHERE signal_id=?", (str(signal_id),)
@@ -803,27 +830,27 @@ class PredictionArbitrageStore:
             if row is None:
                 return {"state": "missing", "signal_id": str(signal_id)}
             payload = _load_payload(str(row["payload"]))
-            if payload.get("notification_lease_id") != str(lease_id):
+            if payload.get(fields["lease_id"]) != str(lease_id):
                 return {"state": "stale", "signal_id": str(signal_id)}
-            if row["ended_at"] is not None:
+            if row["ended_at"] is not None and kind != "observation":
                 return {"state": "closed", "signal_id": str(signal_id)}
-            payload["notification_state"] = "sent" if success else "failed"
-            payload.pop("notification_lease_id", None)
-            payload.pop("notification_lease_expires_at", None)
+            payload[fields["state"]] = "sent" if success else "failed"
+            payload.pop(fields["lease_id"], None)
+            payload.pop(fields["lease_expires_at"], None)
             if success:
-                payload["notification_sent_at"] = _utc_now()
-                payload.pop("notification_error_code", None)
+                payload[fields["sent_at"]] = _utc_now()
+                payload.pop(fields["error_code"], None)
             else:
-                payload["notification_error_code"] = str(error_code)
+                payload[fields["error_code"]] = str(error_code)
             updated_at = _utc_now()
             connection.execute(
                 "UPDATE signals SET payload=?, updated_at=? WHERE signal_id=?",
                 (_dump_relation_payload(payload), updated_at, str(signal_id)),
             )
             return {
-                "state": payload["notification_state"],
+                "state": payload[fields["state"]],
                 "signal_id": str(signal_id),
-                "notification_attempts": payload.get("notification_attempts", 0),
+                fields["attempts"]: payload.get(fields["attempts"], 0),
             }
 
     def close_signal(

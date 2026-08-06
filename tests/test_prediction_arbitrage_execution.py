@@ -3486,6 +3486,42 @@ def test_ready_notification_sends_only_after_read_only_proof(tmp_path: Path) -> 
     assert feishu.calls == 1
 
 
+def test_notify_observation_sends_immediately_dedupes_and_survives_close(
+    tmp_path: Path,
+) -> None:
+    service, trading, store, monitor = threshold_execution_fixture(tmp_path)
+    macos, feishu = service.test_notifiers
+    signal_id = _notification_signal(store)
+    opportunity = monitor.opportunity("threshold-opp-1")
+    reserved = store.reserve_notification_attempt(
+        signal_id, kind="observation", lease_seconds=0
+    )
+    store.close_signal(
+        "relation-1",
+        ended_at=datetime.now(UTC).isoformat(),
+        reason="data_unavailable",
+    )
+
+    result = service.notify_observation(
+        opportunity, signal_id, str(reserved["lease_id"])
+    )
+
+    assert result == {"state": "sent", "signal_id": signal_id}
+    assert trading.threshold_preflight_calls == 0
+    assert trading.threshold_submit_calls == 0
+    assert macos.calls == 0
+    assert feishu.calls == 1
+    assert "【观察提醒】" in feishu.messages[-1][0]
+    current = store.signal(signal_id)
+    assert current is not None
+    assert current["observation_state"] == "sent"
+    assert current["notification_state"] == "pending"
+    assert service.notify_observation(
+        opportunity, signal_id, "stale-lease"
+    ) == {"state": "ignored", "reason": "already_sent"}
+    assert feishu.calls == 1
+
+
 def test_two_service_instances_reserve_one_notification_attempt(tmp_path: Path) -> None:
     service, _, store, _ = threshold_execution_fixture(tmp_path)
     signal_id = _notification_signal(store)

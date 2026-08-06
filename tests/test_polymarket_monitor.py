@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Mapping
 
 import pytest
 
@@ -1858,6 +1859,108 @@ def test_ready_observer_is_called_once_for_order_ready_episode(tmp_path: Path) -
     assert len(calls) == 1
     assert calls[0][0]
     assert calls[0][1]
+
+
+def test_observation_alert_delivered_after_actionable_signal_closes(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> tuple[list[str], dict[str, object]]:
+        setup_public([threshold_event()])
+        setup_threshold_books(low_ask="0.40", high_no_ask="0.48")
+        monitor = make_monitor(
+            tmp_path,
+            relation_discovery=discover_threshold_relations,
+            relation_validator=FakeRelationValidator(),
+        )
+        calls: list[str] = []
+
+        def observer(
+            opportunity: Mapping[str, object], signal_id: str, lease_id: str
+        ) -> dict[str, object]:
+            calls.append(signal_id)
+            monitor._store.complete_notification_attempt(
+                signal_id,
+                lease_id,
+                kind="observation",
+                success=True,
+            )
+            return {"state": "sent"}
+
+        monitor.set_observation_observer(observer)
+        client = FakePublicClient()
+        await monitor._run_full_relation_scan(client)
+        await monitor._refresh_readiness()
+        await monitor._refresh_relation_activity(client)
+        await monitor._drain_relation_validation(client)
+        await monitor._refresh_relation_opportunities(
+            client, set(monitor._active_relation_ids)
+        )
+        signal_id = str(monitor._store.open_signal_history()[0]["signal_id"])
+        market_id = str(monitor._store.signal(signal_id)["market_id"])
+        monitor._close_signal(market_id, "data_unavailable")
+        await asyncio.sleep(0.05)
+        monitor._reap_notification_task()
+        return calls, monitor._store.signal(signal_id)
+
+    calls, signal = asyncio.run(scenario())
+    assert calls == [str(signal["signal_id"])]
+    assert signal["observation_state"] == "sent"
+    assert signal["ended_reason"] == "data_unavailable"
+
+
+def test_observation_alert_then_order_ready_both_fire_once_per_episode(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> tuple[list[str], list[str]]:
+        setup_public([threshold_event()])
+        setup_threshold_books(low_ask="0.40", high_no_ask="0.48")
+        monitor = make_monitor(
+            tmp_path,
+            relation_discovery=discover_threshold_relations,
+            relation_validator=FakeRelationValidator(),
+        )
+        observations: list[str] = []
+        ready: list[str] = []
+
+        def observation_observer(
+            opportunity: Mapping[str, object], signal_id: str, lease_id: str
+        ) -> dict[str, object]:
+            observations.append(signal_id)
+            return {"state": "sent"}
+
+        def ready_observer(
+            opportunity_id: str, signal_id: str
+        ) -> dict[str, object]:
+            ready.append(signal_id)
+            monitor._store.update_signal(
+                signal_id,
+                {"notification_state": "sent", "notification_attempts": 1},
+            )
+            return {"state": "sent"}
+
+        monitor.set_observation_observer(observation_observer)
+        monitor.set_ready_observer(ready_observer)
+        client = FakePublicClient()
+        await monitor._run_full_relation_scan(client)
+        await monitor._refresh_readiness()
+        await monitor._refresh_relation_activity(client)
+        await monitor._drain_relation_validation(client)
+        await monitor._refresh_relation_opportunities(
+            client, set(monitor._active_relation_ids)
+        )
+        await asyncio.sleep(0.05)
+        monitor._reap_notification_task()
+        await monitor._refresh_relation_opportunities(
+            client, set(monitor._active_relation_ids)
+        )
+        await asyncio.sleep(0.01)
+        monitor._reap_notification_task()
+        return observations, ready
+
+    observations, ready = asyncio.run(scenario())
+    assert len(observations) == 1
+    assert len(ready) == 1
+    assert observations[0] == ready[0]
 
 
 def test_schedule_ready_notification_calls_standard_without_rule_or_codex(

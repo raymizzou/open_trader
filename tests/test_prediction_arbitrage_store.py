@@ -501,6 +501,33 @@ def test_notification_attempts_stop_at_three_and_close_blocks_reservation(
     assert db.reserve_notification_attempt(signal_id)["state"] == "closed"
 
 
+def test_observation_notification_is_independent_and_completes_after_close(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    signal_id = db.upsert_signal(signal_payload("relation-1", iso(datetime.now(UTC))))
+    reserved = db.reserve_notification_attempt(
+        signal_id, kind="observation", lease_seconds=0
+    )
+    assert reserved["state"] == "reserved"
+    db.close_signal(
+        "relation-1", ended_at=iso(datetime.now(UTC)), reason="data_unavailable"
+    )
+    completed = db.complete_notification_attempt(
+        signal_id,
+        str(reserved["lease_id"]),
+        kind="observation",
+        success=True,
+    )
+    assert completed["state"] == "sent"
+    signal = db.signal(signal_id)
+    assert signal is not None
+    assert signal["observation_state"] == "sent"
+    assert signal.get("notification_state", "pending") == "pending"
+    assert db.reserve_notification_attempt(signal_id, kind="observation")["state"] == "closed"
+    assert db.reserve_notification_attempt(signal_id)["state"] == "closed"
+
+
 def test_preview_expires_after_ten_seconds_and_is_idempotent(tmp_path: Path) -> None:
     db = store(tmp_path)
     now = datetime.now(UTC)

@@ -480,6 +480,45 @@ class PredictionExecutionService:
             return {"state": "ignored", "reason": "signal_closed"}
         return {"state": "failed", "reason": "notification_failed"}
 
+    def notify_observation(
+        self,
+        opportunity: Mapping[str, object],
+        signal_id: str,
+        lease_id: str,
+    ) -> dict[str, object]:
+        """Deliver the immediate observation alert reserved by the monitor."""
+
+        signal = self._store.signal(str(signal_id))
+        if signal is None:
+            return {"state": "ignored", "reason": "signal_unavailable"}
+        if signal.get("observation_state") == "sent":
+            return {"state": "ignored", "reason": "already_sent"}
+        attempts = _decimal(signal.get("observation_attempts")) or Decimal("0")
+        if attempts >= 3:
+            return {"state": "ignored", "reason": "notification_attempts_exhausted"}
+        try:
+            title, message = render_prediction_opportunity_notification(
+                opportunity,
+                signal,
+                dashboard_url=self._dashboard_url,
+                kind="observation",
+            )
+            feishu_success = self._deliver_feishu_notification(title, message)
+        except Exception:
+            feishu_success = False
+        completion = self._store.complete_notification_attempt(
+            str(signal_id),
+            str(lease_id),
+            kind="observation",
+            success=feishu_success,
+            error_code="delivery_failed",
+        )
+        if completion.get("state") == "sent":
+            return {"state": "sent", "signal_id": str(signal_id)}
+        if completion.get("state") == "closed":
+            return {"state": "ignored", "reason": "signal_closed"}
+        return {"state": "failed", "reason": "notification_failed"}
+
     def _notify_cross_venue_signal(
         self,
         opportunity_id: str,

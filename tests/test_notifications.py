@@ -128,7 +128,7 @@ def test_prediction_notification_contains_ready_order_facts_only() -> None:
         },
         dashboard_url="http://127.0.0.1:8766/",
     )
-    assert title == "【仅观察·未下单】Polymarket 正收益机会｜+$0.38"
+    assert title == "【可下单提醒】Polymarket 正收益机会｜+$0.38"
     for text in (
         "事件：2026 年美联储会降息多少次？",
         "买入「至少降息 2 次」YES：10.00 份 × $0.53 = $5.30",
@@ -142,7 +142,7 @@ def test_prediction_notification_contains_ready_order_facts_only() -> None:
         "信号→发送：1.2 秒",
         "盘口年龄：184 毫秒",
         "关系复核：通过",
-        "机会状态：观察中",
+        "机会状态：可下单 · 待人工确认",
         "机会编号：pm-01",
         "https://polymarket.com/event/fed-cuts-2026",
         "Dashboard：http://127.0.0.1:8766/",
@@ -257,6 +257,25 @@ def test_cross_venue_yes_no_signal_notification_has_actionable_deep_link() -> No
         "订单",
     ):
         assert forbidden not in message
+
+
+def test_prediction_observation_notification_distinguishes_observation_alert() -> None:
+    title, message = render_prediction_opportunity_notification(
+        {
+            "event_title": "2026 年美联储会降息多少次？",
+            "minimum_profit": "0.38",
+            "net_edge": "0.0395",
+            "rules_verified_at": "2026-07-31T10:46:54.700000+08:00",
+        },
+        {
+            "signal_id": "pm-01",
+            "first_positive_at": "2026-07-31T10:46:53.696000+08:00",
+        },
+        dashboard_url="http://127.0.0.1:8766/",
+        kind="observation",
+    )
+    assert title == "【观察提醒】Polymarket 正收益机会｜+$0.38"
+    assert "机会状态：观察中 · 未下单" in message
 
 
 def test_feishu_webhook_notifier_raises_on_api_error() -> None:

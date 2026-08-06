@@ -310,8 +310,9 @@ def render_prediction_opportunity_notification(
     signal: Mapping[str, object],
     *,
     dashboard_url: str,
+    kind: str = "order_ready",
 ) -> tuple[str, str]:
-    """Render facts from an order-ready observation without execution claims."""
+    """Render a threshold opportunity alert for observation or order-ready."""
 
     def text(name: str, default: str = "") -> str:
         value = opportunity.get(name, default)
@@ -374,7 +375,12 @@ def render_prediction_opportunity_notification(
     verified = opportunity.get("rules_verified_at") not in (None, "")
     event_slug = text("event_slug").strip()
     event_url = f"https://polymarket.com/event/{event_slug}" if event_slug else "https://polymarket.com/"
-    title = f"【仅观察·未下单】Polymarket 正收益机会｜{money(minimum_profit, signed=True)}"
+    is_observation = kind == "observation"
+    title = (
+        f"【观察提醒】Polymarket 正收益机会｜{money(minimum_profit, signed=True)}"
+        if is_observation
+        else f"【可下单提醒】Polymarket 正收益机会｜{money(minimum_profit, signed=True)}"
+    )
     message = "\n".join(
         (
             f"事件：{text('event_title', text('question'))}",
@@ -389,7 +395,7 @@ def render_prediction_opportunity_notification(
             f"信号→发送：{delay_text}",
             f"盘口年龄：{age.quantize(Decimal('1'), rounding=ROUND_HALF_UP):.0f} 毫秒",
             f"关系复核：{'通过' if verified else '未通过'}",
-            "机会状态：观察中",
+            "机会状态：观察中 · 未下单" if is_observation else "机会状态：可下单 · 待人工确认",
             f"机会编号：{signal.get('signal_id', '')}",
             event_url,
             f"Dashboard：{dashboard_url}",

@@ -2990,6 +2990,9 @@ def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_firs
         def set_ready_observer(self, _observer: object) -> None:
             pass
 
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
         def set_failure_observer(self, _observer: object) -> None:
             pass
 
@@ -3004,6 +3007,9 @@ def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_firs
             return {"status": "ready"}
 
         def notify_ready_opportunity(self, *_: object) -> dict[str, object]:
+            return {"status": "ignored"}
+
+        def notify_observation(self, *_: object) -> dict[str, object]:
             return {"status": "ignored"}
 
         def notify_monitor_failure(self, *_: object) -> dict[str, object]:
@@ -4419,6 +4425,9 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
         def set_ready_observer(self, observer: object) -> None:
             self.__class__.observer = observer
 
+        def set_observation_observer(self, observer: object) -> None:
+            self.__class__.observation_observer = observer
+
         def set_failure_observer(self, observer: object) -> None:
             self.__class__.failure_observer = observer
 
@@ -4430,6 +4439,11 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
 
         def notify_ready_opportunity(self, opportunity_id: str, signal_id: str) -> dict[str, object]:
             return {"state": "ignored", "opportunity_id": opportunity_id, "signal_id": signal_id}
+
+        def notify_observation(
+            self, opportunity: object, signal_id: str, lease_id: str
+        ) -> dict[str, object]:
+            return {"state": "ignored", "signal_id": signal_id, "lease_id": lease_id}
 
         def notify_monitor_failure(self, failure: object) -> dict[str, object]:
             return {"state": "sent", "failure": failure}

@@ -320,6 +320,12 @@ class PolymarketMonitor:
         self._relation_validator = relation_validator
         self._title_translator = title_translator
         self._ready_observer: Callable[[str, str], Mapping[str, object]] | None = None
+        self._observation_observer: (
+            Callable[
+                [Mapping[str, object], str, str], Mapping[str, object]
+            ]
+            | None
+        ) = None
         self._failure_observer: Callable[
             [Mapping[str, object]], Mapping[str, object] | object
         ] | None = None
@@ -436,6 +442,14 @@ class PolymarketMonitor:
         self, observer: Callable[[str, str], Mapping[str, object]]
     ) -> None:
         self._ready_observer = observer
+
+    def set_observation_observer(
+        self,
+        observer: Callable[
+            [Mapping[str, object], str, str], Mapping[str, object]
+        ],
+    ) -> None:
+        self._observation_observer = observer
 
     def set_cross_venue_tokens(self, token_ids: Sequence[str]) -> None:
         """Replace the externally requested token set and force a fresh subscription."""
@@ -3636,12 +3650,46 @@ class PolymarketMonitor:
                     "book_received_at_b": opportunity.get("book_received_at_b"),
                 }
             )
+            self._schedule_observation_notification(signal_id, opportunity)
             self._schedule_ready_notification(signal_id, opportunity)
             return signal_id
         except Exception as exc:
             self._store_failed = True
             self._record_error(exc, "store")
             return None
+
+    def _schedule_observation_notification(
+        self, signal_id: str | None, opportunity: Mapping[str, object]
+    ) -> None:
+        """Reserve and schedule the immediate threshold observation alert."""
+
+        observer = self._observation_observer
+        if observer is None or signal_id is None:
+            return
+        if opportunity.get("market_type") != "threshold_hedge":
+            return
+        if opportunity.get("actionable") is not True:
+            return
+        self._reap_notification_task()
+        task = self._notification_task
+        if task is not None and not task.done():
+            return
+        signal = self._store.signal(str(signal_id))
+        if signal is None or signal.get("observation_state") in {"sent", "suppressed"}:
+            return
+        attempts = _decimal(signal.get("observation_attempts")) or Decimal("0")
+        if attempts >= 3:
+            return
+        reservation = self._store.reserve_notification_attempt(
+            str(signal_id), kind="observation", max_attempts=3, lease_seconds=60.0
+        )
+        lease_id = reservation.get("lease_id")
+        if reservation.get("state") != "reserved" or not isinstance(lease_id, str):
+            return
+        self._notification_signal_id = str(signal_id)
+        self._notification_task = asyncio.create_task(
+            asyncio.to_thread(observer, dict(opportunity), str(signal_id), lease_id)
+        )
 
     def _schedule_ready_notification(
         self, signal_id: str | None, opportunity: Mapping[str, object]

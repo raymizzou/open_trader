@@ -2171,6 +2171,9 @@ def serve_dashboard(
             prediction_monitor.set_ready_observer(
                 prediction_execution.notify_ready_opportunity
             )
+            prediction_monitor.set_observation_observer(
+                prediction_execution.notify_observation
+            )
             prediction_monitor.set_failure_observer(
                 prediction_execution.notify_monitor_failure
             )
