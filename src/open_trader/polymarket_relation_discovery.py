@@ -15,7 +15,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable, Literal
 
-from .advice.change_classifier import OpenAIClassifierClient
+from .advice.change_classifier import DEEPSEEK_BASE_URL
 from .prediction_arbitrage import (
     MAX_EMERGENCY_LOSS,
     MAX_NORMAL_COST,
@@ -1273,13 +1273,35 @@ def _deepseek_completion(
     """Return (content, None) or (None, reason) for the DeepSeek fallback."""
 
     try:
-        return (
-            OpenAIClassifierClient(
-                model=model,
-                timeout_seconds=timeout_seconds,
-            ).classify(prompt, dict(payload)),
-            None,
+        from openai import OpenAI
+
+        reasoning_effort = (
+            os.environ.get("OPEN_TRADER_LLM_FALLBACK_REASONING_EFFORT", "max")
+            or "max"
         )
+        response = OpenAI(
+            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+            base_url=DEEPSEEK_BASE_URL,
+            timeout=timeout_seconds,
+        ).chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        dict(payload),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                },
+            ],
+            response_format={"type": "json_object"},
+            reasoning_effort=reasoning_effort,
+            timeout=timeout_seconds,
+        )
+        content = response.choices[0].message.content
+        return (content, None) if content else (None, "DEEPSEEK_FAILED")
     except Exception:
         return None, "DEEPSEEK_FAILED"
 
