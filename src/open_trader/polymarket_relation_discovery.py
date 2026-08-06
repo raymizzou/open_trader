@@ -15,10 +15,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable, Literal
 
-from .advice.change_classifier import (
-    DEFAULT_CLASSIFIER_MODEL,
-    OpenAIClassifierClient,
-)
+from .advice.change_classifier import OpenAIClassifierClient
 from .prediction_arbitrage import (
     MAX_EMERGENCY_LOSS,
     MAX_NORMAL_COST,
@@ -45,6 +42,7 @@ ValidationStatus = Literal[
 ValidationRelation = Literal["A_IMPLIES_B", "B_IMPLIES_A", "NONE"]
 
 CODEX_PROMPT_VERSION = "polymarket-threshold-relation-v1"
+DEEPSEEK_FALLBACK_MODEL = "deepseek-v4-flash"
 CODEX_RELATION_PROMPT = """You are a semantic auditor for pairs of binary Polymarket contracts.
 
 GOAL
@@ -1389,7 +1387,7 @@ class CodexRelationValidator:
         fallback_model = (
             fallback_model
             or os.environ.get("OPEN_TRADER_LLM_FALLBACK_MODEL")
-            or DEFAULT_CLASSIFIER_MODEL
+            or DEEPSEEK_FALLBACK_MODEL
         ).strip()
         if not fallback_model:
             raise ValueError("fallback model is required")
@@ -1639,7 +1637,12 @@ class CodexRelationValidator:
         cached = self.cached_validation(relation, model=self.fallback_model)
         if cached is not None:
             return cached
-        raw, reason = self.fallback(CODEX_RELATION_PROMPT, _codex_payload(relation))
+        fallback_prompt = (
+            f"{CODEX_RELATION_PROMPT}\n"
+            "OUTPUT JSON SCHEMA\n"
+            f"{_CODEX_SCHEMA.read_text(encoding='utf-8')}\n"
+        )
+        raw, reason = self.fallback(fallback_prompt, _codex_payload(relation))
         if raw is None:
             self.store.record_llm_call(
                 status="failed", usage={"provider": "deepseek"}

@@ -19,12 +19,12 @@ from pathlib import Path
 from typing import Literal
 
 from .polymarket_relation_discovery import (
+    DEEPSEEK_FALLBACK_MODEL,
     _deepseek_completion,
     _codex_events,
     _fee,
     simple_annualized_yield_from_values,
 )
-from .advice.change_classifier import DEFAULT_CLASSIFIER_MODEL
 from .polymarket_monitor import PolymarketMonitor
 from .predict_source import PredictBook, PredictMarket, PredictSource
 from .predict_trading import PREDICT_BASE_UNITS, PredictBuyQuote
@@ -956,7 +956,7 @@ class CodexCrossVenueEquivalenceValidator:
         fallback_model = (
             fallback_model
             or os.environ.get("OPEN_TRADER_LLM_FALLBACK_MODEL")
-            or DEFAULT_CLASSIFIER_MODEL
+            or DEEPSEEK_FALLBACK_MODEL
         ).strip()
         if not fallback_model:
             raise ValueError("fallback model is required")
@@ -1048,8 +1048,13 @@ class CodexCrossVenueEquivalenceValidator:
             return self._result(pair, "MARKET_INVALID")
         if cached := self._cached(pair, fallback_cache_key, model=self.fallback_model):
             return cached
+        fallback_prompt = (
+            f"{CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT}\n"
+            "OUTPUT JSON SCHEMA\n"
+            f"{_CODEX_SCHEMA.read_text(encoding='utf-8')}\n"
+        )
         raw, reason = self.fallback(
-            CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT,
+            fallback_prompt,
             {
                 "predict": _equivalence_market_payload(pair.predict),
                 "polymarket": _equivalence_market_payload(pair.polymarket),
