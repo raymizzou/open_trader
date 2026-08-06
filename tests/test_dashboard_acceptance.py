@@ -1060,6 +1060,105 @@ def test_acceptance_allows_dashboard_only_holding_projection_fields(
     )
 
 
+def test_acceptance_projects_automatic_rotation_execution_legs(
+    tmp_path: Path,
+) -> None:
+    reports = tmp_path / "reports"
+    artifact = reports / "trend_us_tiger" / "2026-07-15.json"
+    artifact.parent.mkdir(parents=True)
+    ledger = (
+        tmp_path
+        / "data"
+        / "trend_review"
+        / "ledgers"
+        / "US"
+        / "actions"
+        / "2026-07-15"
+        / "batch"
+    )
+    ledger.mkdir(parents=True)
+    (ledger / "sell.json").write_text(json.dumps({
+        "recorded_at": "2026-07-15T12:00:00+08:00",
+        "report_sha256": "sha-rotation",
+        "symbol": "PCAR", "side": "sell", "status": "filled",
+        "filled_qty": "716", "target_qty": "716", "avg_fill_price": "84.1",
+    }), encoding="utf-8")
+    (ledger / "buy.json").write_text(json.dumps({
+        "recorded_at": "2026-07-15T12:00:01+08:00",
+        "report_sha256": "sha-rotation",
+        "symbol": "CRNX", "side": "buy", "status": "filled",
+        "filled_qty": "300", "target_qty": "300", "avg_fill_price": "120.0",
+    }), encoding="utf-8")
+    artifact.write_text(json.dumps({
+        "execution_date": "2026-07-15",
+        "as_of_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "account": serialized_trend_account(fresh=True),
+        "metadata": {"market": "US", "broker": "tiger"},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [],
+            "top10_candidates": [],
+            "simulate_rotation_pairs": [{
+                "execution_mode": "automatic",
+                "sell_symbol": "PCAR",
+                "sell_name": "帕卡",
+                "sell_futu_symbol": "US.PCAR",
+                "buy_symbol": "CRNX",
+                "buy_name": "Crinetics",
+                "buy_futu_symbol": "US.CRNX",
+                "target_weight": "0.06",
+                "target_amount": "60219.14",
+                "estimated_shares": 716,
+            }],
+            "simulate_rotation_comparisons": [],
+            "real_rotation_comparisons": [],
+        },
+        "excluded": {},
+        "industry_concentration": [],
+        "data_sources": [],
+    }), encoding="utf-8")
+    projected = {
+        "available": True,
+        "broker": "tiger",
+        "market": "US",
+        "report_date": "2026-07-15",
+        "data_date": "2026-07-14",
+        "generated_at": "2026-07-15T11:30:36+08:00",
+        "report_sha256": "sha-rotation",
+        "sell_actions": [{
+            "symbol": "PCAR", "name": "帕卡", "futu_symbol": "US.PCAR",
+            "action": "全部卖出", "reason": "relative_rotation",
+            "target_weight": "0.06", "target_amount": "60219.14",
+            "estimated_shares": 716,
+            "execution": {"status": "filled"},
+        }],
+        "buy_actions": [{
+            "symbol": "CRNX", "name": "Crinetics", "futu_symbol": "US.CRNX",
+            "action": "正式买入", "reason": "relative_rotation",
+            "target_weight": "0.06", "target_amount": "60219.14",
+            "estimated_shares": 716,
+            "execution": {"status": "filled"},
+        }],
+        "hold_actions": [],
+        "review_actions": [],
+        "simulate_rotation_comparisons": [],
+        "real_rotation_comparisons": [],
+        "counts": {"sell": 1, "buy": 1, "hold": 0, "review": 0},
+        "audit": {
+            "artifact": "2026-07-15.json",
+            "candidates": [],
+            "excluded": {},
+            "industry_concentration": [],
+            "data_sources": [],
+        },
+    }
+
+    dashboard_acceptance._check_trend_artifact_projection(
+        reports, "tiger", projected, data_dir=tmp_path / "data"
+    )
+
+
 def test_acceptance_recognizes_only_strict_partial_sell_actions() -> None:
     partial = {
         "action": "SELL_PARTIAL",

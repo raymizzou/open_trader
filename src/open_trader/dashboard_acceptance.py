@@ -25,10 +25,12 @@ from .account_sync_state import (
 from .dashboard import (
     SHANGHAI,
     _is_dashboard_holding,
+    _project_rotation_execution_actions,
     _project_trend_actions,
     _project_trend_money_fields,
     _project_trend_strength_fields,
     _read_csv_rows,
+    _trend_action_executions,
     _valid_partial_trend_action,
 )
 from .daily_premarket import _optional_positive_tm_id, _read_env_file
@@ -2904,7 +2906,11 @@ def _valid_trend_account(value: object) -> bool:
 
 
 def _check_trend_artifact_projection(
-    reports_dir: Path, broker: str, report: Mapping[str, Any]
+    reports_dir: Path,
+    broker: str,
+    report: Mapping[str, Any],
+    *,
+    data_dir: Path | None = None,
 ) -> None:
     audit = report.get("audit")
     audit = audit if isinstance(audit, Mapping) else {}
@@ -2945,6 +2951,21 @@ def _check_trend_artifact_projection(
         isinstance(item, Mapping) for item in holdings
     ), f"{broker} 冻结报告持仓动作无效"
     sells, buys, holds, reviews = _project_trend_actions(dict(payload), {})
+    executions = _trend_action_executions(
+        data_dir or reports_dir.parent / "data",
+        market=str(report.get("market") or ""),
+        execution_date=str(report.get("report_date") or ""),
+        report_sha256=str(
+            (report.get("execution_batch") or {}).get("report_sha256")
+            or report.get("report_sha256")
+            or ""
+        ),
+    )
+    rotation_sells, rotation_buys = _project_rotation_execution_actions(
+        dict(payload), executions
+    )
+    sells = [*sells, *rotation_sells]
+    buys = [*buys, *rotation_buys]
     frozen_signals = payload.get("signal_snapshots")
     frozen_signals = frozen_signals if isinstance(frozen_signals, Mapping) else {}
     buys = _project_trend_strength_fields(buys, frozen_signals.get("candidates"))
@@ -2977,19 +2998,21 @@ def _check_trend_artifact_projection(
     expected_actions["hold_actions"] = _project_trend_strength_fields(
         expected_actions["hold_actions"], frozen_signals.get("holdings")
     )
-    assert all(
-        isinstance(projected := report.get(key), list)
-        and all(isinstance(item, Mapping) for item in projected)
-        and [
+    for key, value in expected_actions.items():
+        projected_rows = report.get(key)
+        normalized = lambda rows: [
             {
                 field: field_value
                 for field, field_value in item.items()
                 if field not in {"execution", "option_anomaly", "trend_report_state"}
             }
-            for item in projected
-        ] == value
-        for key, value in expected_actions.items()
-    ), f"{broker} 冻结报告动作与 API 投影不一致"
+            for item in rows
+        ]
+        assert (
+            isinstance(projected_rows, list)
+            and all(isinstance(item, Mapping) for item in projected_rows)
+            and normalized(projected_rows) == normalized(value)
+        ), f"{broker} 冻结报告动作与 API 投影不一致：{key}"
     for key in ("simulate_rotation_comparisons", "real_rotation_comparisons"):
         expected = judgments.get(key, [])
         assert isinstance(expected, list) and report.get(key, []) == expected, (
