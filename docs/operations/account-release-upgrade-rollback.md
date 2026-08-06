@@ -129,6 +129,13 @@ job is gone and its lock is free.
 - With Account unavailable, `/api/dashboard`, Trend history, and prediction
   state must stay readable on `8766`.
 
+## Acceptance gate
+
+`make acceptance` validates process identity, frozen-artifact contracts, and
+truthful display of whatever state exists. It never requires today's report,
+an allocation terminal state, or a controller first success; those are
+deterministic pytest concerns and daily operator monitoring, not gate inputs.
+
 ## Evidence checklist
 
 Each upgrade and rollback evidence JSON must record: API and Worker PID, cwd,

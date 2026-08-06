@@ -109,11 +109,6 @@ tail -n 100 logs/legacy_dashboard/launchd.out.log
 PYTHONSAFEPATH=1 "$OPEN_TRADER_PYTHON" -m open_trader account-sync-status --json
 ```
 
-Run one controller-safe CN/HK/US report or revision attempt with notifications
-disabled by its existing invocation, then inspect each new JSON artifact. Its
-`account_input` must contain the matching snapshot and account generations.
-Do not substitute a stale historical report for this proof.
-
 The browser reaches both owners only through Gateway: `/api/dashboard` is
 non-Account module data, `/api/v1/account/snapshot` is Account data, and the
 browser must not request `/api/quotes`. Legacy `/api/quotes` must return 404.

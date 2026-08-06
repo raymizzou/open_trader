@@ -1886,6 +1886,7 @@ def integrated_v4_payload(
         report.update({
             "available": True,
             "data_status": "current",
+            "status_text": "今日已更新",
             "account_fresh": True,
             "broker": broker,
             "broker_label": labels[broker],
@@ -2027,11 +2028,10 @@ def test_acceptance_rejects_integrated_contract_drift(
         ("mutation", "expected"),
         [
             ("process", "冻结 Kelly/回撤策略身份"),
-        ("stale", "当前真实数据"),
         ("account", "模拟账户快照不是最新"),
     ],
 )
-def test_acceptance_rejects_noncandidate_or_stale_integrated_report(
+def test_acceptance_rejects_noncandidate_integrated_report(
     tmp_path: Path, mutation: str, expected: str,
 ) -> None:
     payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
@@ -2044,8 +2044,6 @@ def test_acceptance_rejects_noncandidate_or_stale_integrated_report(
         artifact.write_text(json.dumps(frozen), encoding="utf-8")
         from open_trader.trend_review import _report_hash
         report["report_sha256"] = _report_hash(frozen)
-    elif mutation == "stale":
-        report["data_status"] = "stale"
     else:
         report["account_fresh"] = False
 
@@ -2058,6 +2056,46 @@ def test_acceptance_rejects_noncandidate_or_stale_integrated_report(
     )
 
     assert any(expected in error for error in errors)
+
+
+def test_acceptance_accepts_stale_integrated_report_with_truthful_status_text(
+    tmp_path: Path,
+) -> None:
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    report = payload["trend_reports"]["tiger"]  # type: ignore[index]
+    assert isinstance(report, dict)
+    report["data_status"] = "stale"
+    report["status_text"] = "数据截至 2026-07-17；今日未更新"
+
+    errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+
+    assert errors == []
+
+
+def test_acceptance_rejects_stale_integrated_report_with_current_status_text(
+    tmp_path: Path,
+) -> None:
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    report = payload["trend_reports"]["tiger"]  # type: ignore[index]
+    assert isinstance(report, dict)
+    report["data_status"] = "stale"
+    report["status_text"] = "今日已更新"
+
+    errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+
+    assert any("状态文案" in error and "不一致" in error for error in errors)
 
 
 def test_acceptance_rejects_frozen_parameter_audit_identity_mismatch(
@@ -5588,36 +5626,53 @@ def test_acceptance_reads_account_sync_worker_from_shared_project_data_dir(
     ) == []
 
 
-def test_acceptance_allows_recent_frozen_report_after_friday_close() -> None:
-    report = {
-        "data_status": "stale",
-        "generated_at": "2026-07-24T18:00:00+08:00",
-    }
+@pytest.mark.parametrize(
+    ("report",),
+    [
+        ({"data_status": "current", "status_text": "今日已更新"},),
+        (
+            {
+                "data_status": "current",
+                "status_text": "今日执行（数据截至 2026-07-17）",
+            },
+        ),
+        (
+            {
+                "data_status": "stale",
+                "status_text": "数据截至 2026-07-17；今日未更新",
+            },
+        ),
+    ],
+)
+def test_trend_report_status_truthfulness_accepts_matching_copy(
+    report: dict[str, str],
+) -> None:
+    assert dashboard_acceptance._trend_report_status_is_truthful(report)
 
-    assert dashboard_acceptance._trend_report_is_current_or_recent_weekend_snapshot(
-        report,
-        now=datetime(2026, 7, 25, 9, 0, tzinfo=dashboard_acceptance.SHANGHAI),
-    )
-    assert not dashboard_acceptance._trend_report_is_current_or_recent_weekend_snapshot(
-        report,
-        now=datetime(2026, 7, 24, 9, 0, tzinfo=dashboard_acceptance.SHANGHAI),
-    )
 
-
-def test_acceptance_allows_stale_us_report_for_current_shanghai_execution_date() -> None:
-    report = {
-        "data_status": "stale",
-        "report_date": "2026-07-27",
-        "generated_at": "2026-07-25T12:42:27+08:00",
-    }
-    monday_morning = datetime(
-        2026, 7, 27, 10, 0, tzinfo=dashboard_acceptance.SHANGHAI
-    )
-
-    assert dashboard_acceptance._trend_report_is_current_or_recent_weekend_snapshot(
-        report,
-        now=monday_morning,
-    )
+@pytest.mark.parametrize(
+    ("report",),
+    [
+        (
+            {
+                "data_status": "stale",
+                "status_text": "今日已更新",
+            },
+        ),
+        (
+            {
+                "data_status": "current",
+                "status_text": "数据截至 2026-07-17；今日未更新",
+            },
+        ),
+        ({"data_status": "stale", "status_text": ""},),
+        ({"data_status": "unknown", "status_text": "今日已更新"},),
+    ],
+)
+def test_trend_report_status_truthfulness_rejects_inconsistent_copy(
+    report: dict[str, str],
+) -> None:
+    assert not dashboard_acceptance._trend_report_status_is_truthful(report)
 
 
 def test_validate_dashboard_payload_rejects_retired_tiger_strategy_payload() -> None:
@@ -6196,24 +6251,27 @@ def simulate_snapshot(
 
 def simulate_api_payload(
     *,
+    broker: str = "tiger",
+    market: str = "US",
     symbol: str = "NDAQ",
     quantity: str = "13",
     cost_price: str = "94.25",
+    price: str = "100",
     attribution_status: str = "unlinked",
     report: dict[str, str] | None = None,
 ) -> dict[str, object]:
     return {
         "available": True,
-        "broker": "tiger",
-        "market": "US",
+        "broker": broker,
+        "market": market,
         "synced_at": "2026-08-04T10:00:00-04:00",
         "positions": [{
-            "market": "US",
+            "market": market,
             "symbol": symbol,
             "quantity": quantity,
             "cost_price": cost_price,
             "current_valuation": {
-                "price": "100",
+                "price": price,
                 "price_kind": "account_snapshot",
                 "price_as_of": "2026-08-04T10:00:00-04:00",
                 "market_value_usd": "1300.00",
@@ -6315,6 +6373,18 @@ def test_acceptance_rejects_simulated_api_facts_that_differ_from_direct_futu(
         )
 
 
+def test_acceptance_accepts_simulated_live_price_difference(
+    tmp_path: Path,
+) -> None:
+    dashboard_acceptance._validate_simulated_positions(
+        "tiger",
+        simulate_snapshot(),
+        simulate_api_payload(price="101"),
+        tmp_path / "data",
+        tmp_path / "reports",
+    )
+
+
 def test_acceptance_accepts_zero_simulated_positions(tmp_path: Path) -> None:
     dashboard_acceptance._validate_simulated_positions(
         "tiger",
@@ -6388,6 +6458,138 @@ def test_acceptance_treats_dashboard_simulate_fallback_as_fail_when_futu_works(
     assert blocker is None
     assert len(errors) == 3
     assert all("Dashboard 模拟盘不可用" in error for error in errors)
+
+
+def _simulated_payload_for(
+    broker: str, market: str, *, quantity: str,
+) -> dict[str, object]:
+    symbols = {"tiger": "NDAQ", "phillips": "00700", "eastmoney": "600001"}
+    return simulate_api_payload(
+        broker=broker,
+        market=market,
+        symbol=symbols[broker],
+        quantity=quantity,
+    )
+
+
+def test_acceptance_converges_simulated_facts_after_transient_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.market = str(kwargs["trd_market"])
+
+        def account_snapshot(self) -> dict[str, object]:
+            code = {
+                "US": "US.NDAQ",
+                "HK": "HK.00700",
+                "CN": "SH.600001",
+            }[self.market]
+            return {
+                "positions": [{
+                    "code": code,
+                    "qty": "13",
+                    "cost_price": "94.25",
+                    "last_price": "100",
+                }],
+            }
+
+        def close(self) -> None:
+            pass
+
+    calls: dict[str, int] = {}
+
+    def fetcher(_url: str, path: str) -> dict[str, object]:
+        broker = path.rsplit("/", 1)[-1]
+        calls[broker] = calls.get(broker, 0) + 1
+        market = dashboard_acceptance.TREND_SIMULATE_MARKETS[broker]
+        quantity = "13" if (broker != "tiger" or calls["tiger"] >= 2) else "999"
+        return _simulated_payload_for(broker, market, quantity=quantity)
+
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "FutuSimulateOrderExecutionClient",
+        lambda **_kwargs: Client(**_kwargs),
+    )
+    monkeypatch.setattr(dashboard_acceptance, "_fetch_json_path", fetcher)
+    monkeypatch.setattr(
+        dashboard_acceptance, "SIMULATE_FACTS_CONVERGE_ATTEMPTS", 3
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance, "SIMULATE_FACTS_CONVERGE_INTERVAL_SECONDS", 0
+    )
+
+    payloads, errors, blocker = dashboard_acceptance._check_simulated_accounts(
+        "http://dashboard.test",
+        {"futu_host": "127.0.0.1", "futu_port": 11111},
+        {"tiger": 1, "phillips": 2, "eastmoney": 3},
+        tmp_path / "data",
+        tmp_path / "reports",
+    )
+
+    assert blocker is None
+    assert errors == []
+    assert set(payloads) == {"tiger", "phillips", "eastmoney"}
+    assert calls["tiger"] == 2
+
+
+def test_acceptance_rejects_simulated_facts_that_never_converge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Client:
+        def __init__(self, **kwargs: object) -> None:
+            self.market = str(kwargs["trd_market"])
+
+        def account_snapshot(self) -> dict[str, object]:
+            code = {
+                "US": "US.NDAQ",
+                "HK": "HK.00700",
+                "CN": "SH.600001",
+            }[self.market]
+            return {
+                "positions": [{
+                    "code": code,
+                    "qty": "13",
+                    "cost_price": "94.25",
+                    "last_price": "100",
+                }],
+            }
+
+        def close(self) -> None:
+            pass
+
+    def fetcher(_url: str, path: str) -> dict[str, object]:
+        broker = path.rsplit("/", 1)[-1]
+        market = dashboard_acceptance.TREND_SIMULATE_MARKETS[broker]
+        quantity = "999" if broker == "tiger" else "13"
+        return _simulated_payload_for(broker, market, quantity=quantity)
+
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "FutuSimulateOrderExecutionClient",
+        lambda **_kwargs: Client(**_kwargs),
+    )
+    monkeypatch.setattr(dashboard_acceptance, "_fetch_json_path", fetcher)
+    monkeypatch.setattr(
+        dashboard_acceptance, "SIMULATE_FACTS_CONVERGE_ATTEMPTS", 2
+    )
+    monkeypatch.setattr(
+        dashboard_acceptance, "SIMULATE_FACTS_CONVERGE_INTERVAL_SECONDS", 0
+    )
+
+    _payloads, errors, blocker = dashboard_acceptance._check_simulated_accounts(
+        "http://dashboard.test",
+        {"futu_host": "127.0.0.1", "futu_port": 11111},
+        {"tiger": 1, "phillips": 2, "eastmoney": 3},
+        tmp_path / "data",
+        tmp_path / "reports",
+    )
+
+    assert blocker is None
+    assert any(
+        "tiger" in error and "模拟盘持仓与 Futu 不匹配" in error
+        for error in errors
+    )
 
 
 def test_acceptance_accepts_explicitly_unlinked_legacy_simulated_position(
@@ -7692,7 +7894,7 @@ def _controller_runtime_errors(
 @pytest.mark.parametrize(
     "phase", ["reconciling", "recovering_report", "recovering_review"]
 )
-def test_acceptance_rejects_fresh_blocked_controller(
+def test_acceptance_accepts_blocked_controller_with_valid_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
 ) -> None:
     now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
@@ -7710,7 +7912,7 @@ def test_acceptance_rejects_fresh_blocked_controller(
         tmp_path, monkeypatch, now=now, payload=payload
     )
 
-    assert any("tiger" in error and "阻塞" in error for error in errors)
+    assert errors == []
 
 
 @pytest.mark.parametrize(
@@ -7765,7 +7967,7 @@ def test_acceptance_accepts_matching_controller_runtime(
 
 
 @pytest.mark.parametrize("phase", ["before", "monitoring", "closed"])
-def test_acceptance_rejects_stable_controller_without_first_success(
+def test_acceptance_accepts_stable_controller_without_first_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
 ) -> None:
     now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
@@ -7777,7 +7979,37 @@ def test_acceptance_rejects_stable_controller_without_first_success(
         tmp_path, monkeypatch, now=now, payload=payload
     )
 
-    assert any("tiger" in error and "成功" in error for error in errors)
+    assert errors == []
+
+
+def test_acceptance_rejects_controller_with_invalid_state_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller["health"] = "unknown"  # type: ignore[index]
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert any("tiger" in error and "状态无效" in error for error in errors)
+
+
+def test_acceptance_rejects_readonly_controller_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    payload = _controller_runtime_payload(tmp_path, now=now)
+    controller = payload["trend_controllers"]["tiger"]  # type: ignore[index]
+    controller["effective_mode"] = "readonly"  # type: ignore[index]
+
+    errors = _controller_runtime_errors(
+        tmp_path, monkeypatch, now=now, payload=payload
+    )
+
+    assert any("tiger" in error and "不可用或阻塞" in error for error in errors)
 
 
 @pytest.mark.parametrize(

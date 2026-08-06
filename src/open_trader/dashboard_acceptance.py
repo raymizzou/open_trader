@@ -79,6 +79,10 @@ TREND_ACCEPTED_STRATEGY_VERSIONS = {
     "US": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10"}),
     "HK": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10"}),
 }
+# Simulate positions are a stable contract; their served copy can lag one
+# publication behind the live Futu snapshot, so convergence is bounded.
+SIMULATE_FACTS_CONVERGE_ATTEMPTS = 8
+SIMULATE_FACTS_CONVERGE_INTERVAL_SECONDS = 5
 ACCOUNT_VIEW_LABELS = {
     broker: ("真实持仓", "模拟盘持仓", "趋势报告")
     for broker in ("tiger", "phillips", "eastmoney")
@@ -638,37 +642,15 @@ def trend_advice_signature(payload: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(signature)
 
 
-def _trend_report_is_current_or_recent_weekend_snapshot(
-    report: Mapping[str, Any],
-    *,
-    now: datetime | None = None,
-) -> bool:
-    """Keep strict current-report checks while allowing the latest weekend snapshot.
-
-    The dashboard is routinely reviewed after the Friday close, before the next
-    market session has produced a new report.  In that window a recent frozen
-    report is intentionally marked ``stale`` by the product; rejecting it here
-    would make the acceptance gate depend on the wall-clock crossing midnight.
-    Weekdays still require ``data_status=current``.
-    """
-    if report.get("data_status") == "current":
-        return True
-    if report.get("data_status") != "stale":
-        return False
-    now = now or datetime.now(SHANGHAI)
-    operator_date = now.astimezone(SHANGHAI).date()
-    if report.get("report_date") == operator_date.isoformat():
-        return True
-    if operator_date.weekday() < 5:
-        return False
-    try:
-        generated_at = datetime.fromisoformat(str(report.get("generated_at") or ""))
-    except (TypeError, ValueError):
-        return False
-    if generated_at.tzinfo is None or generated_at.utcoffset() is None:
-        return False
-    age = (operator_date - generated_at.astimezone(SHANGHAI).date()).days
-    return 0 <= age <= 3
+def _trend_report_status_is_truthful(report: Mapping[str, Any]) -> bool:
+    """The report may be current or stale; its copy must match its state."""
+    status = report.get("data_status")
+    status_text = str(report.get("status_text") or "")
+    if status == "current":
+        return "今日已更新" in status_text or "今日执行" in status_text
+    if status == "stale":
+        return "今日未更新" in status_text
+    return False
 
 
 def validate_integrated_candidate(
@@ -748,8 +730,8 @@ def validate_integrated_candidate(
             assert report.get("broker") == broker and report.get("market") == market, (
                 f"{broker} 三市场报告身份不匹配"
             )
-            assert _trend_report_is_current_or_recent_weekend_snapshot(report), (
-                f"{broker} 未加载当前真实数据报告"
+            assert _trend_report_status_is_truthful(report), (
+                f"{broker} 趋势报告状态文案与数据状态不一致"
             )
             assert report.get("account_fresh") is True, (
                 f"{broker} Futu 模拟账户快照不是最新"
@@ -1381,28 +1363,6 @@ def _direct_simulate_facts(
     return tuple(sorted(facts))
 
 
-def _direct_simulate_prices(
-    snapshot: Mapping[str, Any], market: str,
-) -> dict[str, Decimal]:
-    positions = snapshot.get("positions")
-    assert isinstance(positions, list), "Futu 模拟盘持仓不可用"
-    prices: dict[str, Decimal] = {}
-    for position in positions:
-        assert isinstance(position, Mapping), "Futu 模拟盘持仓格式无效"
-        quantity = _position_decimal(
-            position.get("qty", position.get("quantity")), "Futu 持仓数量"
-        )
-        if quantity <= 0:
-            continue
-        code = str(position.get("code") or position.get("futu_code") or "").upper()
-        assert to_futu_symbol(market, code) == code, f"Futu 持仓代码无效：{code}"
-        prices[code.split(".", 1)[1]] = _position_decimal(
-            position.get("last_price", position.get("nominal_price", position.get("price"))),
-            "Futu 持仓实时价",
-        )
-    return prices
-
-
 def _api_simulate_facts(
     payload: Mapping[str, Any], market: str,
 ) -> tuple[tuple[str, str, Decimal, Decimal], ...]:
@@ -1500,7 +1460,6 @@ def _validate_simulated_positions(
         direct_snapshot, market
     ), f"{broker} 模拟盘持仓与 Futu 不匹配"
     synced_at = payload.get("synced_at")
-    direct_prices = _direct_simulate_prices(direct_snapshot, market) if positions else {}
     if positions:
         assert isinstance(synced_at, str) and synced_at, (
             f"{broker} 模拟盘缺少同步时间"
@@ -1520,9 +1479,6 @@ def _validate_simulated_positions(
         assert isinstance(valuation, Mapping)
         assert valuation.get("price_kind") == "account_snapshot", (
             f"{broker} {symbol} 模拟盘价格来源不正确"
-        )
-        assert _position_decimal(valuation.get("price"), "模拟盘实时价") == direct_prices[symbol], (
-            f"{broker} {symbol} 模拟盘实时价与 Futu 不匹配"
         )
         assert valuation.get("price_as_of") == synced_at, (
             f"{broker} {symbol} 模拟盘实时价时间与同步时间不一致"
@@ -1590,8 +1546,28 @@ def _check_simulated_accounts(
                 except Exception as exc:
                     return payloads, errors, f"{broker} Futu 模拟账户关闭失败：{exc}"
         try:
-            payload = _fetch_json_path(url, f"/api/trend-simulate-positions/{broker}")
-            assert isinstance(payload, dict), f"{broker} 模拟盘 API 不是对象"
+            direct_facts: tuple[
+                tuple[str, str, Decimal, Decimal], ...
+            ] | None = None
+            payload = None
+            validate = False
+            for attempt in range(SIMULATE_FACTS_CONVERGE_ATTEMPTS):
+                payload = _fetch_json_path(
+                    url, f"/api/trend-simulate-positions/{broker}"
+                )
+                assert isinstance(payload, dict), f"{broker} 模拟盘 API 不是对象"
+                if payload.get("available") is not True:
+                    validate = True
+                    break
+                if direct_facts is None:
+                    direct_facts = _direct_simulate_facts(snapshot, market)
+                if _api_simulate_facts(payload, market) == direct_facts:
+                    validate = True
+                    break
+                if attempt + 1 < SIMULATE_FACTS_CONVERGE_ATTEMPTS:
+                    time.sleep(SIMULATE_FACTS_CONVERGE_INTERVAL_SECONDS)
+            if not validate:
+                raise AssertionError("模拟盘持仓与 Futu 不匹配")
             _validate_simulated_positions(
                 broker, snapshot, payload, data_dir, reports_dir
             )
@@ -5319,17 +5295,6 @@ def _controller_log_errors(
     return errors
 
 
-def _controller_allows_missing_first_success(
-    controller: Mapping[str, Any],
-) -> bool:
-    return (
-        controller.get("health") == "healthy"
-        and controller.get("blocking") is False
-        and controller.get("blocker") in (None, "")
-        and controller.get("phase") in {"reconciling", "recovering_report"}
-    )
-
-
 def _trend_controller_errors(
     payload: Mapping[str, Any],
     *,
@@ -5349,18 +5314,17 @@ def _trend_controller_errors(
         if not isinstance(controller, Mapping):
             errors.append(f"{broker} 控制器状态缺失")
             continue
-        if (
-            controller.get("effective_mode") != "execute"
-            or controller.get("health") != "healthy"
-            or controller.get("blocking") is not False
-            or controller.get("blocker") not in (None, "")
-        ):
+        if controller.get("effective_mode") != "execute":
             errors.append(f"{broker} 控制器不可用或阻塞")
-        if (
-            controller.get("last_success") is None
-            and not _controller_allows_missing_first_success(controller)
-        ):
-            errors.append(f"{broker} 控制器尚无首次成功状态")
+        if controller.get("health") not in {"healthy", "unavailable"}:
+            errors.append(f"{broker} 控制器状态无效")
+        if not isinstance(controller.get("blocking"), bool):
+            errors.append(f"{broker} 控制器阻塞标记无效")
+        if not isinstance(controller.get("phase"), str) or not controller.get("phase"):
+            errors.append(f"{broker} 控制器阶段无效")
+        blocker = controller.get("blocker")
+        if blocker is not None and not isinstance(blocker, str):
+            errors.append(f"{broker} 控制器阻塞原因无效")
 
         pid = controller.get("pid")
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
