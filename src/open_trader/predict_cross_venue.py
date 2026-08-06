@@ -558,7 +558,6 @@ def resolve_explicit_market_pairs(
     predict_markets: Sequence[PredictMarket],
     *,
     gamma_lookup: Callable[..., Sequence[object]],
-    clob_lookup: Callable[[str], object],
 ) -> ExplicitPairResolution:
     """Resolve only Predict-supplied Polymarket condition IDs."""
     requested = tuple(
@@ -582,12 +581,6 @@ def resolve_explicit_market_pairs(
         for row in gamma_rows
         if (condition_id := _text(_value(row, "conditionId", "condition_id"))) in requested
     }
-    rows = dict(gamma_by_condition)
-    for condition_id in requested:
-        if condition_id not in rows:
-            row = clob_lookup(condition_id)
-            if _text(_value(row, "conditionId", "condition_id")) == condition_id:
-                rows[condition_id] = row
 
     pairs: list[ExplicitMarketPair] = []
     unresolved = 0
@@ -596,7 +589,9 @@ def resolve_explicit_market_pairs(
         for condition_id in predict_market.polymarket_condition_ids:
             if not condition_id:
                 continue
-            polymarket = _polymarket_market(rows.get(condition_id), condition_id)
+            polymarket = _polymarket_market(
+                gamma_by_condition.get(condition_id), condition_id
+            )
             if polymarket is None:
                 unresolved += 1
                 continue
@@ -635,43 +630,120 @@ def _predict_market(market: PredictMarket) -> VenueMarket:
 def _polymarket_market(row: object, condition_id: str) -> VenueMarket | None:
     if _text(_value(row, "conditionId", "condition_id")) != condition_id:
         return None
-    outcomes = _json_list(_value(row, "outcomes"))
-    token_ids = _json_list(_value(row, "clobTokenIds", "clob_token_ids"))
-    tokens = dict(zip((_text(item).upper() for item in outcomes), (_text(item) for item in token_ids)))
-    close_at = _datetime(_value(row, "endDate", "end_date", "close_at"))
+    tokens = _outcome_tokens(row)
+    if tokens is None:
+        return None
+    close_at = _datetime(
+        _value(row, "endDate", "end_date", "close_at")
+        or _nested(row, "state", "end_date", "endDate")
+    )
     settlement_at = _datetime(
         _value(row, "resolutionDate", "resolution_date", "settlement_at")
     )
+    if settlement_at is None:
+        settlement_at = close_at
+    minimum = _decimal(
+        _value(row, "orderMinSize", "order_min_size", "minimum_order_size")
+        or _nested(row, "trading", "minimum_order_size", "orderMinSize")
+    )
+    tick_size = _decimal(
+        _value(row, "orderPriceMinTickSize", "minimum_tick_size", "tick_size")
+        or _nested(row, "trading", "minimum_tick_size", "orderPriceMinTickSize")
+    )
     rate = _decimal(_value(row, "feeRateBps", "fee_rate_bps", "takerBaseFee", "taker_base_fee"))
     if rate is None:
-        schedule = _value(row, "feeSchedule", "fee_schedule")
+        schedule = _value(row, "feeSchedule", "fee_schedule") or _nested(
+            row, "trading", "fee_schedule", "feeSchedule"
+        )
         rate = _decimal(_value(schedule, "rate"))
         rate = rate * 10_000 if rate is not None and rate <= 1 else rate
-    fields = (
-        _text(_value(row, "id", "market_id")), condition_id,
-        _text(_value(row, "question")), _text(_value(row, "description", "rules")),
-        _text(_value(row, "resolutionSource", "resolution_source")),
-        tokens.get("YES", ""), tokens.get("NO", ""),
-        _text(_value(_value(row, "collateralToken", "collateral_token"), "symbol")) or "USDC",
+    fees_enabled = _value(row, "feesEnabled", "fees_enabled")
+    if fees_enabled is None:
+        fees_enabled = _nested(row, "trading", "fees_enabled", "feesEnabled")
+    if rate is None and fees_enabled is False:
+        rate = Decimal("0")
+    market_id = _text(_value(row, "id", "market_id"))
+    question = _text(_value(row, "question"))
+    rules = _text(_value(row, "description", "rules"))
+    resolution_source = _text(
+        _value(row, "resolutionSource", "resolution_source")
+        or _nested(row, "resolution", "source")
     )
-    minimum = _decimal(_value(row, "orderMinSize", "minimum_order_size"))
-    tick_size = _decimal(_value(row, "orderPriceMinTickSize", "minimum_tick_size", "tick_size"))
-    if not all(fields) or close_at is None or settlement_at is None or minimum is None or minimum <= 0 or tick_size is None or tick_size <= 0 or rate is None or rate < 0:
+    if (
+        not market_id
+        or not question
+        or not rules
+        or close_at is None
+        or minimum is None
+        or minimum <= 0
+        or tick_size is None
+        or tick_size <= 0
+        or rate is None
+        or rate < 0
+    ):
         return None
-    rules = fields[3]
     return VenueMarket(
-        exchange="polymarket", market_id=fields[0], condition_id=condition_id,
+        exchange="polymarket", market_id=market_id, condition_id=condition_id,
         event_slug=_text(_value(row, "eventSlug", "event_slug")),
-        question=fields[2], rules=rules, resolution_source=fields[4],
-        close_at=close_at, settlement_at=settlement_at, yes_token_id=fields[5],
-        no_token_id=fields[6], settlement_asset=fields[7], minimum_order_size=minimum,
-        tick_size=tick_size, fee_rate_bps=rate,
+        question=question, rules=rules, resolution_source=resolution_source,
+        close_at=close_at, settlement_at=settlement_at, yes_token_id=tokens["YES"],
+        no_token_id=tokens["NO"],
+        settlement_asset=(
+            _text(_value(_value(row, "collateralToken", "collateral_token"), "symbol"))
+            or "USDC"
+        ),
+        minimum_order_size=minimum, tick_size=tick_size, fee_rate_bps=rate,
         event_end_at=close_at,
-        resolution_provider=fields[4],
+        resolution_provider=resolution_source,
         rules_fingerprint=hashlib.sha256(
-            "\n".join((fields[2], rules, fields[4], close_at.isoformat(), settlement_at.isoformat())).encode()
+            "\n".join(
+                (
+                    question,
+                    rules,
+                    resolution_source,
+                    close_at.isoformat(),
+                    settlement_at.isoformat(),
+                )
+            ).encode()
         ).hexdigest(),
     )
+
+
+def _outcome_tokens(row: object) -> dict[str, str] | None:
+    """Map YES/NO to token ids for old dict and Gamma SDK market shapes."""
+    outcomes = _value(row, "outcomes")
+    tokens: dict[str, str] = {}
+    if isinstance(outcomes, Mapping):
+        for item in outcomes.values():
+            label = _text(_value(item, "label", "name")).casefold()
+            token = _text(
+                _value(item, "token_id", "tokenId", "asset_id", "assetId")
+            )
+            if label in {"yes", "no"} and token:
+                tokens[label] = token
+    else:
+        rows = _json_list(outcomes)
+        structured = [
+            (
+                _text(_value(row, "label", "name")).casefold(),
+                _text(_value(row, "token_id", "tokenId", "asset_id", "assetId")),
+            )
+            for row in rows
+        ]
+        if structured and all(label and token for label, token in structured):
+            labels, token_ids = zip(*structured, strict=True)
+            tokens = dict(zip(labels, token_ids, strict=True))
+        elif rows:
+            labels = [_text(item).casefold() for item in rows]
+            token_ids = [
+                _text(item)
+                for item in _json_list(_value(row, "clobTokenIds", "clob_token_ids"))
+            ]
+            if len(labels) == 2 and len(token_ids) == 2:
+                tokens = dict(zip(labels, token_ids, strict=True))
+    if set(tokens) != {"yes", "no"} or tokens["yes"] == tokens["no"]:
+        return None
+    return {"YES": tokens["yes"], "NO": tokens["no"]}
 
 
 def _pair_id(predict: VenueMarket, polymarket: VenueMarket) -> str:
@@ -695,6 +767,10 @@ def _value(value: object, *names: str) -> object:
         if candidate is not None:
             return candidate
     return None
+
+
+def _nested(value: object, container: str, *names: str) -> object:
+    return _value(_value(value, container), *names)
 
 
 def _text(value: object) -> str:
@@ -1112,7 +1188,6 @@ class PredictCrossVenueMonitor:
         polymarket_monitor: PolymarketMonitor,
         validator: CodexCrossVenueEquivalenceValidator,
         gamma_lookup: Callable[..., Sequence[object]],
-        clob_lookup: Callable[[str], object],
         predict_quote_fn: Callable[[str, str, int], PredictBuyQuote] | None = None,
         store: PredictionArbitrageStore | None = None,
         ready_observer: Callable[[str, str], object] | None = None,
@@ -1124,7 +1199,6 @@ class PredictCrossVenueMonitor:
         self._polymarket = polymarket_monitor
         self._validator = validator
         self._gamma_lookup = gamma_lookup
-        self._clob_lookup = clob_lookup
         self._predict_quote_fn = predict_quote_fn
         self._store = store
         self._ready_observer = ready_observer
@@ -1149,6 +1223,7 @@ class PredictCrossVenueMonitor:
         self._funnel_last_success_at: datetime | None = None
         self._stale_at: datetime | None = None
         self._empty_state = ""
+        self._discovery_error = ""
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -1173,6 +1248,7 @@ class PredictCrossVenueMonitor:
                 "funnel_last_success_at": _isoformat(self._funnel_last_success_at),
                 "stale_at": _isoformat(self._stale_at),
                 **({"empty_state": self._empty_state} if self._empty_state else {}),
+                **({"discovery_error": self._discovery_error} if self._discovery_error else {}),
                 "opportunities": list(self._opportunities.values()),
                 "events": [],
             }
@@ -1239,7 +1315,6 @@ class PredictCrossVenueMonitor:
                 resolve_explicit_market_pairs,
                 markets,
                 gamma_lookup=self._gamma_lookup,
-                clob_lookup=self._clob_lookup,
             )
         except Exception:
             return None
@@ -1307,6 +1382,7 @@ class PredictCrossVenueMonitor:
         except asyncio.CancelledError:
             raise
         except Exception:
+            self._discovery_error = "discovery_loop_failed"
             await self._suspend_hot(status="degraded")
         finally:
             if slow_task is not None and not slow_task.done():
@@ -1324,17 +1400,18 @@ class PredictCrossVenueMonitor:
                 resolve_explicit_market_pairs,
                 markets,
                 gamma_lookup=self._gamma_lookup,
-                clob_lookup=self._clob_lookup,
             )
-        except Exception:
+        except Exception as exc:
             if self._last_success_funnel is None:
                 self._matched_pairs = 0
                 self._monitored_pairs = 0
                 self._set_approved({})
             self._empty_state = ""
-            await self._suspend_hot(status=self._source_status())
+            self._discovery_error = f"{type(exc).__name__}: {exc}"
+            await self._suspend_hot(status="degraded")
             await self._reconcile_holdings()
             return
+        self._discovery_error = ""
         eligible = {
             pair.pair_id: pair for pair in resolution.pairs if _valid_market_pair(pair)
         }

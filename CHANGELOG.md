@@ -3,6 +3,20 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-07
+
+- #27 跨市场配对解析改为只读 Gamma 主查：Gamma SDK `Market` 对象（嵌套
+  `state.end_date`、`outcomes.yes/no.token_id`、`trading` 费率）与旧格式 dict
+  （`outcomes` + `clobTokenIds`）都能解析 YES/NO token 并构造配对，旧格式保持
+  兼容；移除 CLOB REST 兜底（`end_date_iso` 只是事件日期取 00:00，不是收盘时间，
+  无法提供可信 close）。无 resolution date 时 settlement 回退为 close_at，
+  fees disabled 且无费率表时按 0 处理、费率未知仍失败关闭。Gamma 发现失败时
+  跨所状态置为 degraded，快照带具体 `discovery_error`，看板跨所漏斗显示降级
+  pill、上次成功快照与失败原因，不再静默显示 0。真实验证 16 个 Predict 开放
+  市场 14 个候选：matched_pairs 13、unresolved 1（该市场源数据无 end_date，
+  按规则失败关闭）。相关自动测试 466 个通过，最终状态以候选 SHA 的
+  `make acceptance` 为准。
+
 ## 2026-08-06
 
 - #25 预测套利 LLM 校验降级（子任务 1/5）：Codex CLI 401/超时/输出无效时自动改用

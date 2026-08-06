@@ -16,7 +16,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, quote, unquote, urlparse
-from urllib.request import Request, urlopen
 
 from .backtest import run_backtest
 from .backtest_prices import DailyKlineProvider, normalize_backtest_symbol
@@ -2070,15 +2069,6 @@ def _cross_venue_gamma_lookup(
         client.close()
 
 
-def _cross_venue_clob_lookup(condition_id: str) -> object:
-    request = Request(
-        f"https://clob.polymarket.com/markets/{quote(condition_id, safe='')}",
-        headers={"User-Agent": "OpenTrader/1.0"},
-    )
-    with urlopen(request, timeout=10) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
 def _build_cross_venue_monitor(
     *,
     trading_config: object,
@@ -2099,7 +2089,6 @@ def _build_cross_venue_monitor(
             polymarket_monitor=prediction_monitor,
             validator=CodexCrossVenueEquivalenceValidator(store, model=codex_model),
             gamma_lookup=_cross_venue_gamma_lookup,
-            clob_lookup=_cross_venue_clob_lookup,
             predict_quote_fn=getattr(predict_trading, "quote_market_buy", None),
             store=store,
             ready_observer=execution.notify_ready_opportunity,
