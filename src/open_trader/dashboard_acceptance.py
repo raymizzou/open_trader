@@ -83,6 +83,10 @@ TREND_ACCEPTED_STRATEGY_VERSIONS = {
 # publication behind the live Futu snapshot, so convergence is bounded.
 SIMULATE_FACTS_CONVERGE_ATTEMPTS = 8
 SIMULATE_FACTS_CONVERGE_INTERVAL_SECONDS = 5
+# The Account snapshot may validly 503 during a publication refresh; the
+# acceptance retries bounded before treating it as a failure.
+ACCOUNT_SNAPSHOT_REFRESH_ATTEMPTS = 3
+ACCOUNT_SNAPSHOT_REFRESH_RETRY_SECONDS = 5
 ACCOUNT_VIEW_LABELS = {
     broker: ("真实持仓", "模拟盘持仓", "趋势报告")
     for broker in ("tiger", "phillips", "eastmoney")
@@ -200,7 +204,7 @@ REMOVED_TREND_EXECUTION_LABELS = (
 )
 REMOVED_TREND_REPORT_POSITION_LABELS = (
     "允许 · 建议", "计划止损风险", "正常成本", "决定性约束",
-    "待执行", "模拟盘执行状态", "实盘执行辅助",
+    "模拟盘执行状态", "实盘执行辅助",
 )
 
 
@@ -984,15 +988,20 @@ def _account_snapshot_refresh_errors(
     wait: Any = time.sleep,
 ) -> list[str]:
     wait(ACCOUNT_POLL_PROOF_WAIT_MS / 1000)
-    status, refreshed, etag = fetch(url)
-    if status != 200 or not isinstance(refreshed, Mapping):
-        return [f"Account 快照刷新后 HTTP {status}，应为 200"]
-    if (
-        refreshed.get("snapshot_generation") == previous.get("snapshot_generation")
-        and etag == previous_etag
-    ):
-        return ["Account 快照刷新后未发布新的 generation 或 ETag"]
-    return []
+    status = 0
+    for attempt in range(ACCOUNT_SNAPSHOT_REFRESH_ATTEMPTS):
+        status, refreshed, etag = fetch(url)
+        if status != 200 or not isinstance(refreshed, Mapping):
+            if attempt + 1 < ACCOUNT_SNAPSHOT_REFRESH_ATTEMPTS:
+                wait(ACCOUNT_SNAPSHOT_REFRESH_RETRY_SECONDS)
+            continue
+        if (
+            refreshed.get("snapshot_generation") == previous.get("snapshot_generation")
+            and etag == previous_etag
+        ):
+            return ["Account 快照刷新后未发布新的 generation 或 ETag"]
+        return []
+    return [f"Account 快照刷新后 HTTP {status}，应为 200"]
 
 
 def _fetch_status_payload(url: str, path: str) -> tuple[int, object]:
@@ -2741,41 +2750,51 @@ def _check_trend_rotation_visibility(
         return
     panel = report_root.locator(".trend-rotation-panel")
     assert panel.count() == 1, f"{broker} 缺少相对强度轮换面板"
-    for mode, key in (
-        ("automatic", "simulate_rotation_comparisons"),
-        ("manual", "real_rotation_comparisons"),
-    ):
-        comparisons = report.get(key)
-        comparisons = comparisons if isinstance(comparisons, list) else []
-        group = panel.locator(f'.trend-rotation-group[data-mode="{mode}"]')
+    for mode, (title, key, note) in {
+        "automatic": (
+            "模拟盘自动轮换",
+            "simulate_rotation_comparisons",
+            "只显示已触发（强度差 ≥ 20）的合格轮换；未达标项不显示。",
+        ),
+        "manual": (
+            "实盘手动轮换",
+            "real_rotation_comparisons",
+            "按实盘持仓独立生成；仅人工确认，不自动下单。",
+        ),
+    }.items():
+        group = panel.locator(f'.cn-trend-stage:has(h2:text-is("{title}"))')
         assert group.count() == 1, f"{broker} 缺少 {mode} 轮换组"
         text = group.inner_text()
+        assert note in text, f"{broker} 轮换组缺少说明"
+        comparisons = report.get(key)
+        comparisons = comparisons if isinstance(comparisons, list) else []
+        rendered_symbols: set[str] = set()
         for comparison in comparisons:
             assert isinstance(comparison, Mapping), f"{broker} 轮换比较格式无效"
+            outcome = str(comparison.get("outcome") or "")
+            if outcome != "planned":
+                for value in (
+                    comparison.get("sell_symbol"), comparison.get("buy_symbol"),
+                ):
+                    if value and str(value) not in rendered_symbols:
+                        assert str(value) not in text, (
+                            f"{broker} 未达标轮换仍被展示"
+                        )
+                continue
             for value in (
                 comparison.get("sell_symbol"), comparison.get("sell_name"),
                 comparison.get("buy_symbol"), comparison.get("buy_name"),
             ):
                 if value:
                     assert str(value) in text, f"{broker} 轮换比较缺少 {value}"
+                    rendered_symbols.add(str(value))
             basis = comparison.get("strength_basis")
             basis_label = {
                 "local": "大类内强度",
                 "global": "全局强度",
             }.get(str(basis), "数据不可用")
             assert basis_label in text, f"{broker} 轮换比较缺少比较口径"
-            assert f"强度差" in text, f"{broker} 轮换比较缺少强度差"
-            outcome = str(comparison.get("outcome") or "")
-            if outcome == "gap_below_threshold":
-                assert "未触发 · 门槛" in text and "还差" in text, (
-                    f"{broker} 轮换比较缺少门槛未触发原因"
-                )
-            elif outcome == "sizing_blocked":
-                assert "未执行" in text, f"{broker} 轮换比较缺少仓位阻断原因"
-            elif outcome == "data_unavailable":
-                assert "数据不可用" in text or "未触发" in text, (
-                    f"{broker} 轮换比较缺少数据不可用原因"
-                )
+            assert "强度差" in text, f"{broker} 轮换比较缺少强度差"
 
 
 def _display_number(value: Any) -> str:
@@ -4876,9 +4895,16 @@ def _browser_check(
                             request, request.url, None,
                         )),
                     )
-                    page.on("response", lambda response: browser_errors.append(
-                        f"HTTP {response.status} {response.url}"
-                    ) if response.status >= 400 else None)
+                    def record_http_error(response: Any) -> None:
+                        if response.status >= 400 and not (
+                            response.status == 503
+                            and urlsplit(response.url).path == ACCOUNT_SNAPSHOT_PATH
+                        ):
+                            browser_errors.append(
+                                f"HTTP {response.status} {response.url}"
+                            )
+
+                    page.on("response", record_http_error)
                     page.on(
                         "response",
                         lambda response: browser_responses.append(response),
@@ -5023,6 +5049,7 @@ def _browser_account_network_errors(
         if urlsplit(response_url).netloc == gateway.netloc
         and urlsplit(response_url).path == ACCOUNT_SNAPSHOT_PATH
     ]
+    recovered = False
     for request, _request_url, _request_etag in account_requests[1:]:
         matched_index = next(
             (
@@ -5037,19 +5064,25 @@ def _browser_account_network_errors(
             matched_index
         )
         if status == 304:
+            recovered = True
             continue
-        if status != 200:
+        if status == 200:
+            if expected_sha is not None:
+                errors = _account_snapshot_errors(payload, expected_sha=expected_sha)
+            else:
+                errors = [] if isinstance(payload, Mapping) and payload.get(
+                    "schema_version"
+                ) == 1 and payload.get("status") in {"healthy", "stale"} and isinstance(
+                    payload.get("stale"), bool
+                ) else ["浏览器后续 Account 200 响应契约无效"]
+            if errors:
+                return errors
+            recovered = True
+            continue
+        if status != 503:
             return ["浏览器后续 Account 请求响应状态无效"]
-        if expected_sha is not None:
-            errors = _account_snapshot_errors(payload, expected_sha=expected_sha)
-        else:
-            errors = [] if isinstance(payload, Mapping) and payload.get(
-                "schema_version"
-            ) == 1 and payload.get("status") in {"healthy", "stale"} and isinstance(
-                payload.get("stale"), bool
-            ) else ["浏览器后续 Account 200 响应契约无效"]
-        if errors:
-            return ["浏览器后续 Account 请求响应契约无效"]
+    if not recovered:
+        return ["浏览器后续 Account 请求没有对应的 304 或有效 200 响应"]
     return []
 
 

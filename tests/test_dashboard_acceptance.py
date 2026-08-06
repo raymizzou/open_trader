@@ -7181,6 +7181,68 @@ def test_account_api_browser_requests_prove_conditional_polling_through_gateway(
     ) == []
 
 
+def test_account_api_browser_requests_allow_transient_snapshot_503_then_recover() -> None:
+    gateway = "http://127.0.0.1:8766"
+    account = gateway + "/api/v1/account/snapshot"
+    dashboard_request = object()
+    initial_request = object()
+    first_poll_request = object()
+    second_poll_request = object()
+
+    assert dashboard_acceptance._browser_account_network_errors(
+        [
+            (dashboard_request, gateway + "/api/dashboard", None),
+            (initial_request, account, None),
+            (first_poll_request, account, '"account-v1"'),
+            (second_poll_request, account, '"account-v1"'),
+        ],
+        [
+            (
+                initial_request,
+                account,
+                200,
+                None,
+                {"schema_version": 1, "status": "healthy", "stale": False},
+            ),
+            (first_poll_request, account, 503, None, None),
+            (second_poll_request, account, 304, '"account-v1"', None),
+        ],
+        gateway,
+    ) == []
+
+
+def test_account_api_browser_requests_reject_persistent_snapshot_503() -> None:
+    gateway = "http://127.0.0.1:8766"
+    account = gateway + "/api/v1/account/snapshot"
+    dashboard_request = object()
+    initial_request = object()
+    first_poll_request = object()
+    second_poll_request = object()
+
+    errors = dashboard_acceptance._browser_account_network_errors(
+        [
+            (dashboard_request, gateway + "/api/dashboard", None),
+            (initial_request, account, None),
+            (first_poll_request, account, '"account-v1"'),
+            (second_poll_request, account, '"account-v1"'),
+        ],
+        [
+            (
+                initial_request,
+                account,
+                200,
+                None,
+                {"schema_version": 1, "status": "healthy", "stale": False},
+            ),
+            (first_poll_request, account, 503, None, None),
+            (second_poll_request, account, 503, None, None),
+        ],
+        gateway,
+    )
+
+    assert errors == ["浏览器后续 Account 请求没有对应的 304 或有效 200 响应"]
+
+
 def test_account_api_browser_requests_reject_legacy_quotes_after_cutover() -> None:
     gateway = "http://127.0.0.1:8766"
     account = gateway + "/api/v1/account/snapshot"
@@ -7492,6 +7554,58 @@ def test_account_snapshot_refresh_rejects_unchanged_publication() -> None:
         ),
         wait=lambda _seconds: None,
     ) == []
+
+
+def test_account_snapshot_refresh_retries_transient_503_then_new_publication() -> None:
+    snapshot = {
+        "snapshot_generation": "sha256:first",
+        "account_generation": "sha256:account",
+    }
+    calls = {"count": 0}
+
+    def fetch(_url: str) -> tuple[int, object, str | None]:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return 503, None, None
+        return (
+            200,
+            {**snapshot, "snapshot_generation": "sha256:second"},
+            '"account-second"',
+        )
+
+    errors = dashboard_acceptance._account_snapshot_refresh_errors(
+        "http://account.test",
+        snapshot,
+        '"account-first"',
+        fetch=fetch,
+        wait=lambda _seconds: None,
+    )
+
+    assert errors == []
+    assert calls["count"] == 2
+
+
+def test_account_snapshot_refresh_rejects_persistent_503() -> None:
+    snapshot = {
+        "snapshot_generation": "sha256:first",
+        "account_generation": "sha256:account",
+    }
+    calls = {"count": 0}
+
+    def fetch(_url: str) -> tuple[int, object, str | None]:
+        calls["count"] += 1
+        return 503, None, None
+
+    errors = dashboard_acceptance._account_snapshot_refresh_errors(
+        "http://account.test",
+        snapshot,
+        '"account-first"',
+        fetch=fetch,
+        wait=lambda _seconds: None,
+    )
+
+    assert "HTTP 503" in errors[0]
+    assert calls["count"] == dashboard_acceptance.ACCOUNT_SNAPSHOT_REFRESH_ATTEMPTS
 
 
 def test_make_acceptance_allows_a_verified_shared_interpreter() -> None:
