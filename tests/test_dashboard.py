@@ -653,6 +653,56 @@ def test_trend_report_projects_frozen_real_positions_separately_from_simulation(
     assert report["counts"] == {"sell": 0, "buy": 1, "hold": 1, "review": 0}
 
 
+def test_project_rotation_execution_actions_surfaces_executed_legs() -> None:
+    payload = {
+        "strategy_judgments": {
+            "simulate_rotation_pairs": [
+                {
+                    "pair_index": 0,
+                    "execution_mode": "automatic",
+                    "sell_symbol": "HIG",
+                    "sell_name": "哈特福德保险",
+                    "sell_futu_symbol": "US.HIG",
+                    "buy_symbol": "PYPL",
+                    "buy_name": "PayPal Holdings Inc",
+                    "buy_futu_symbol": "US.PYPL",
+                    "target_weight": "0.06",
+                    "target_amount": "60308.86",
+                    "estimated_shares": 1030,
+                },
+                {
+                    "pair_index": 1,
+                    "execution_mode": "manual",
+                    "sell_symbol": "WAB",
+                    "buy_symbol": "DDOG",
+                },
+            ],
+        },
+    }
+    executions = {
+        ("HIG", "sell"): {
+            "status": "filled",
+            "updated_at": "2026-08-05T10:13:36-04:00",
+        },
+        ("PYPL", "buy"): {
+            "status": "filled",
+            "updated_at": "2026-08-05T10:13:47-04:00",
+        },
+    }
+
+    sell_actions, buy_actions = (
+        dashboard_module._project_rotation_execution_actions(payload, executions)
+    )
+
+    assert [item["symbol"] for item in sell_actions] == ["HIG"]
+    assert [item["symbol"] for item in buy_actions] == ["PYPL"]
+    assert sell_actions[0]["action"] == "全部卖出"
+    assert sell_actions[0]["futu_symbol"] == "US.HIG"
+    assert sell_actions[0]["execution"]["status"] == "filled"
+    assert buy_actions[0]["target_amount"] == "60308.86"
+    assert buy_actions[0]["estimated_shares"] == 1030
+
+
 def test_trend_report_disables_mismatched_futu_derivatives(
     tmp_path: Path,
 ) -> None:

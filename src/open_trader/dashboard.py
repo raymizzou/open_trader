@@ -1151,6 +1151,44 @@ def _project_trend_real_actions(payload: dict[str, Any]) -> list[dict[str, Any]]
     )
 
 
+def _project_rotation_execution_actions(
+    payload: dict[str, Any],
+    executions: Mapping[tuple[str, str], dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Surface executed rotation legs as historical sell/buy actions."""
+    judgments = payload.get("strategy_judgments")
+    pairs = (
+        judgments.get("simulate_rotation_pairs")
+        if isinstance(judgments, dict)
+        else None
+    )
+    sell_actions: list[dict[str, Any]] = []
+    buy_actions: list[dict[str, Any]] = []
+    for pair in pairs or []:
+        if not isinstance(pair, Mapping) or pair.get("execution_mode") != "automatic":
+            continue
+        for side, symbol_key, name_key, futu_key, action, output in (
+            ("sell", "sell_symbol", "sell_name", "sell_futu_symbol", "全部卖出", sell_actions),
+            ("buy", "buy_symbol", "buy_name", "buy_futu_symbol", "正式买入", buy_actions),
+        ):
+            symbol = str(pair.get(symbol_key) or "").strip()
+            execution = executions.get((symbol, side))
+            if not symbol or execution is None:
+                continue
+            output.append({
+                "symbol": symbol,
+                "name": str(pair.get(name_key) or symbol).strip(),
+                "futu_symbol": str(pair.get(futu_key) or "").strip(),
+                "action": action,
+                "reason": "relative_rotation",
+                "target_weight": str(pair.get("target_weight") or ""),
+                "target_amount": str(pair.get("target_amount") or ""),
+                "estimated_shares": pair.get("estimated_shares"),
+                "execution": dict(execution),
+            })
+    return sell_actions, buy_actions
+
+
 def _valid_trend_collections(
     payload: dict[str, Any], judgments: dict[str, Any]
 ) -> bool:
@@ -2026,6 +2064,11 @@ def _project_broker_trend_report(
     sell_actions, buy_actions, hold_actions, review_actions = (
         _project_trend_actions(payload, executions)
     )
+    rotation_sell_actions, rotation_buy_actions = _project_rotation_execution_actions(
+        payload, executions
+    )
+    sell_actions = [*sell_actions, *rotation_sell_actions]
+    buy_actions = [*buy_actions, *rotation_buy_actions]
     real_position_actions = _project_trend_real_actions(payload)
     frozen_signals = payload.get("signal_snapshots")
     frozen_signals = frozen_signals if isinstance(frozen_signals, dict) else {}
