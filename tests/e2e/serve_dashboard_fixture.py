@@ -289,6 +289,7 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
                 {"market": "B", "field": "threshold", "quote": "above $90,000"},
             ],
             "llm_uncertainties": [],
+            "codex_model": "deepseek-v4-flash-max",
             "actionable": True,
         }
         rejected_threshold = {
@@ -329,6 +330,24 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
                 "cache_hits": 11,
                 "input_tokens": 41200,
                 "output_tokens": 8600,
+            },
+            "llm_usage_24h_by_provider": {
+                "codex": {
+                    "calls": 12,
+                    "successes": 12,
+                    "failures": 0,
+                    "cache_hits": 9,
+                    "input_tokens": 32100,
+                    "output_tokens": 6100,
+                },
+                "deepseek": {
+                    "calls": 6,
+                    "successes": 5,
+                    "failures": 1,
+                    "cache_hits": 2,
+                    "input_tokens": 9100,
+                    "output_tokens": 2500,
+                },
             },
             "annualized_distribution": {
                 "current": {"count": 2, "median": "0.185", "p90": "0.2155"},

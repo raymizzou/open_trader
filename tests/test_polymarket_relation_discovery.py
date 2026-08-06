@@ -927,6 +927,57 @@ def test_codex_reject_is_cached_with_operator_visible_reason(
     assert db.llm_usage_24h()["calls"] == 1
 
 
+def test_codex_failure_falls_back_to_deepseek_and_caches_by_fallback_model(
+    tmp_path: Path,
+) -> None:
+    relation = threshold_relation()
+    fallback_calls: list[tuple[str, dict[str, object]]] = []
+    runner_calls = 0
+    db = codex_store(tmp_path)
+
+    def runner(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal runner_calls
+        runner_calls += 1
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="401")
+
+    validator = CodexRelationValidator(
+        db,
+        model="gpt-test",
+        fallback_model="deepseek-v4-flash-max",
+        runner=runner,
+        fallback=lambda prompt, payload: (
+            (
+                fallback_calls.append((prompt, dict(payload)))
+                or json.dumps(codex_result()),
+                None,
+            )
+        ),
+    )
+
+    first = validator.validate(relation)
+
+    assert first.status == "approved"
+    assert first.model == "deepseek-v4-flash-max"
+    assert first.cached is False
+    assert len(fallback_calls) == 1
+    assert db.llm_usage_24h()["failures"] == 1
+    assert db.llm_usage_24h()["successes"] == 1
+    assert db.llm_usage_24h_by_provider()["deepseek"]["successes"] == 1
+    assert db.llm_usage_24h_by_provider()["codex"]["failures"] == 1
+
+    fallback_calls.clear()
+    second = validator.validate(relation)
+
+    assert second.status == "approved"
+    assert second.cached is True
+    assert second.model == "deepseek-v4-flash-max"
+    assert fallback_calls == []
+    assert runner_calls == 2
+    assert db.llm_usage_24h()["cache_hits"] == 1
+
+
 @pytest.mark.parametrize(
     ("response", "expected_reason"),
     [
@@ -976,14 +1027,15 @@ def test_codex_unavailable_results_are_not_cached(
         codex_store(tmp_path),
         model="gpt-test",
         runner=runner,
+        fallback=lambda prompt, payload: (None, "DEEPSEEK_FAILED"),
     )
     first = validator.validate(threshold_relation())
     second = validator.validate(threshold_relation())
 
     assert first.status == second.status == "llm_unavailable"
-    assert first.reason_codes == (expected_reason,)
+    assert first.reason_codes == (expected_reason, "DEEPSEEK_FAILED")
     assert calls == 2
-    assert validator.store.llm_usage_24h()["failures"] == 2
+    assert validator.store.llm_usage_24h()["failures"] == 4
     assert validator.store.llm_usage_24h()["cache_hits"] == 0
 
 

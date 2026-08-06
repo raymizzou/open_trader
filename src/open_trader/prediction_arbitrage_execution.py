@@ -651,6 +651,25 @@ class PredictionExecutionService:
     ) -> dict[str, object]:
         """Alert operators once when universe refresh retries are exhausted."""
 
+        if failure.get("component") == "llm_validation":
+            reason_codes = failure.get("reason_codes") or []
+            reason_text = " · ".join(
+                str(code) for code in reason_codes if str(code).strip()
+            ) or "未知原因"
+            summary = str(failure.get("summary") or "").strip()
+            message = "\n".join(
+                (
+                    summary
+                    or "Codex 与 DeepSeek 校验均不可用，当前无法校验新关系。",
+                    f"原因：{reason_text}",
+                    f"Dashboard：{self._dashboard_url}",
+                    "降级期间不自动下单；Codex 恢复后会重新校验。",
+                )
+            )
+            if self._deliver_feishu_notification("预测市场 LLM 校验不可用", message):
+                return {"state": "sent"}
+            return {"state": "failed", "reason": "notification_failed"}
+
         raw_error_type = str(failure.get("error_type") or "")
         error_type = (
             raw_error_type

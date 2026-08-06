@@ -391,6 +391,8 @@ class PolymarketMonitor:
         self._codex_validations: dict[str, object] = {}
         self._codex_statuses: dict[str, str] = {}
         self._codex_wait_started_at: dict[str, datetime] = {}
+        self._llm_failure_notified = False
+        self._llm_failure_notification_task: asyncio.Task[object] | None = None
         self._notification_task: asyncio.Task[object] | None = None
         self._notification_signal_id: str | None = None
         self._title_translation_queue: asyncio.Queue[str] | None = None
@@ -407,6 +409,7 @@ class PolymarketMonitor:
         self._subscription_dirty = False
         self._last_runtime_write: datetime | None = None
         self._llm_usage_cache: dict[str, int] | None = None
+        self._llm_usage_by_provider_cache: dict[str, object] | None = None
         self._llm_usage_cached_at: float | None = None
         self._annualized_distribution_cache: dict[str, dict[str, object]] | None = None
         self._signals_24h_cache = 0
@@ -423,6 +426,7 @@ class PolymarketMonitor:
             "malformed_markets": 0,
             "last_error": None,
             "universe_notification_error": None,
+            "llm_notification_error": None,
         }
         self._relation_scan_logs: deque[dict[str, object]] = deque(
             maxlen=RELATION_SCAN_LOG_LIMIT
@@ -569,6 +573,9 @@ class PolymarketMonitor:
                     "websocket": self._websocket_snapshot(now),
                     "scan_logs": copy.deepcopy(list(self._relation_scan_logs)),
                     "codex_usage_24h": copy.deepcopy(self._llm_usage_cache or {}),
+                    "llm_usage_24h_by_provider": copy.deepcopy(
+                        self._llm_usage_by_provider_cache or {}
+                    ),
                     "annualized_distribution": copy.deepcopy(
                         self._annualized_distribution_cache or {}
                     ),
@@ -845,6 +852,7 @@ class PolymarketMonitor:
             while not self._stop_event.is_set():
                 self._reap_notification_task()
                 self._reap_universe_failure_notification_task()
+                self._reap_llm_failure_notification_task()
                 self._maintain_open_signals()
                 await self._poll_relation_validation(client)
                 current = time.monotonic()
@@ -985,6 +993,32 @@ class PolymarketMonitor:
                 character if character.isalnum() or character in "_-" else "_"
                 for character in reason
             )[:80]
+
+    def _schedule_llm_failure_notification(self, validation: object) -> None:
+        observer = self._failure_observer
+        if observer is None or self._llm_failure_notified:
+            return
+        self._llm_failure_notified = True
+        payload = {
+            "component": "llm_validation",
+            "reason_codes": list(getattr(validation, "reason_codes", ())),
+            "summary": str(getattr(validation, "summary", "")),
+        }
+        self._llm_failure_notification_task = asyncio.create_task(
+            asyncio.to_thread(observer, payload)
+        )
+
+    def _reap_llm_failure_notification_task(self) -> None:
+        task = self._llm_failure_notification_task
+        if task is None or not task.done():
+            return
+        self._llm_failure_notification_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            self._diagnostics["llm_notification_error"] = type(exc).__name__
 
     async def _stream_next(self, handle: object) -> object:
         iterator = getattr(handle, "__anext__", None)
@@ -2661,7 +2695,9 @@ class PolymarketMonitor:
                     self._codex_retry_at[relation_id] = self._now() + timedelta(
                         seconds=RELATION_VALIDATION_RETRY_SECONDS
                     )
+                    self._schedule_llm_failure_notification(validation)
                 else:
+                    self._llm_failure_notified = False
                     self._codex_retry_at.pop(relation_id, None)
                 self._codex_wait_started_at.pop(relation_id, None)
                 self._rebuild_relation_subscriptions()
@@ -3800,6 +3836,7 @@ class PolymarketMonitor:
             return dict(self._llm_usage_cache)
         try:
             result = self._store.llm_usage_24h()
+            by_provider = self._store.llm_usage_24h_by_provider()
         except Exception:
             result = {
                 "calls": 0,
@@ -3811,7 +3848,9 @@ class PolymarketMonitor:
                 "output_tokens": 0,
                 "reasoning_output_tokens": 0,
             }
+            by_provider = {}
         self._llm_usage_cache = dict(result)
+        self._llm_usage_by_provider_cache = copy.deepcopy(by_provider)
         self._llm_usage_cached_at = now
         return result
 
@@ -3834,6 +3873,9 @@ class PolymarketMonitor:
             signals_24h = self._signals_24h_cache
         with self._lock:
             self._llm_usage_cache = dict(usage)
+            self._llm_usage_by_provider_cache = copy.deepcopy(
+                self._llm_usage_by_provider_cache or {}
+            )
             self._annualized_distribution_cache = copy.deepcopy(annualized)
             self._signals_24h_cache = signals_24h
 

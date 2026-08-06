@@ -5,6 +5,16 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-06
 
+- #25 预测套利 LLM 校验降级（子任务 1/5）：Codex CLI 401/超时/输出无效时自动改用
+  DeepSeek（默认 `deepseek-v4-flash` + `reasoning_effort=max`，模型可用
+  `OPEN_TRADER_LLM_FALLBACK_MODEL`、effort 可用
+  `OPEN_TRADER_LLM_FALLBACK_REASONING_EFFORT` 覆盖），阈值关系与跨市场等价两条校验链
+  都覆盖；降级 prompt 携带完整 JSON schema，DeepSeek 结果按模型单独缓存，Codex
+  恢复后重新走 Codex。24h LLM 统计按 Codex/DeepSeek 分开并在看板两处展示，候选卡片
+  标签按实际模型显示且 hover 可查看该模型评价；实时两层漏斗与关联合约扫描默认折叠
+  只显示状态。Codex 与 DeepSeek 双失败时立即发一次飞书（每个故障周期一次），降级
+  运行只进统计。相关自动测试 523 个通过，最终状态以候选 SHA 的 `make acceptance`
+  为准。
 - #24 把 Account API 与 Account Sync Worker 作为同一个 Account release 管理：新增
   `scripts/install_account_release.sh` 按「停旧 writer → 等锁释放 → 启新 writer →
   等新发布 → 启新 API → 同 SHA 交叉校验」顺序安装，并输出含 PID/cwd/SHA/启动时间/

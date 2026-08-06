@@ -1302,6 +1302,42 @@ def test_llm_usage_24h_counts_calls_failures_hits_and_tokens(
     }
 
 
+def test_llm_usage_24h_breaks_down_by_provider(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    db.record_llm_call(status="failed", usage={"provider": "codex"})
+    db.record_llm_call(
+        status="success",
+        usage={"provider": "deepseek", "input_tokens": 10},
+    )
+    db.record_llm_call(status="success", usage={})
+    db.record_llm_cache_hit()
+
+    assert db.llm_usage_24h_by_provider() == {
+        "codex": {
+            "calls": 2,
+            "successes": 1,
+            "failures": 1,
+            "cache_hits": 1,
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+        },
+        "deepseek": {
+            "calls": 1,
+            "successes": 1,
+            "failures": 0,
+            "cache_hits": 0,
+            "input_tokens": 10,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+        },
+    }
+    assert db.llm_usage_24h()["calls"] == 3
+    assert db.llm_usage_24h()["cache_hits"] == 1
+
+
 def test_llm_usage_window_includes_exact_boundary_and_excludes_older(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

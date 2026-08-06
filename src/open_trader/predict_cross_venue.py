@@ -7,6 +7,7 @@ import contextlib
 import copy
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -18,6 +19,8 @@ from pathlib import Path
 from typing import Literal
 
 from .polymarket_relation_discovery import (
+    DEEPSEEK_FALLBACK_MODEL,
+    _deepseek_completion,
     _codex_events,
     _fee,
     simple_annualized_yield_from_values,
@@ -940,6 +943,8 @@ class CodexCrossVenueEquivalenceValidator:
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         timeout_seconds: float = 45.0,
         prompt_version: str = CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION,
+        fallback_model: str | None = None,
+        fallback: Callable[[str, Mapping[str, object]], str] | None = None,
     ) -> None:
         if not model.strip():
             raise ValueError("Codex model is required")
@@ -948,13 +953,36 @@ class CodexCrossVenueEquivalenceValidator:
         self.runner = runner
         self.timeout_seconds = timeout_seconds
         self.prompt_version = prompt_version
+        fallback_model = (
+            fallback_model
+            or os.environ.get("OPEN_TRADER_LLM_FALLBACK_MODEL")
+            or DEEPSEEK_FALLBACK_MODEL
+        ).strip()
+        if not fallback_model:
+            raise ValueError("fallback model is required")
+        self.fallback_model = fallback_model
+        self.fallback = fallback or (
+            lambda prompt, payload: _deepseek_completion(
+                prompt,
+                payload,
+                model=self.fallback_model,
+                timeout_seconds=60.0,
+            )
+        )
 
     def _result(self, pair: ExplicitMarketPair, reason: str) -> CrossVenueValidation:
         return _cross_venue_validation(pair, False, reason, self.prompt_version)
 
-    def _cached(self, pair: ExplicitMarketPair, cache_key: str) -> CrossVenueValidation | None:
+    def _cached(
+        self,
+        pair: ExplicitMarketPair,
+        cache_key: str,
+        *,
+        model: str | None = None,
+    ) -> CrossVenueValidation | None:
+        model = model or self.model
         cached = self.store.load_llm_cache(cache_key)
-        if not isinstance(cached, Mapping) or cached.get("model") != self.model or cached.get("prompt_version") != self.prompt_version:
+        if not isinstance(cached, Mapping) or cached.get("model") != model or cached.get("prompt_version") != self.prompt_version:
             return None
         structured = cached.get("structured_result")
         if not _valid_equivalence_result(structured):
@@ -965,7 +993,9 @@ class CodexCrossVenueEquivalenceValidator:
         )
         if result.reason not in {"APPROVED", "LLM_REJECTED"}:
             return None
-        self.store.record_llm_cache_hit()
+        self.store.record_llm_cache_hit(
+            provider="deepseek" if model != self.model else "codex"
+        )
         return result
 
     def validate(self, pair: ExplicitMarketPair) -> CrossVenueValidation:
@@ -984,25 +1014,91 @@ class CodexCrossVenueEquivalenceValidator:
             with tempfile.TemporaryDirectory(prefix="open-trader-codex-") as working_dir:
                 completed = self.runner(command, input=prompt, text=True, capture_output=True, cwd=working_dir, timeout=self.timeout_seconds, check=False)
         except subprocess.TimeoutExpired:
-            self.store.record_llm_call(status="failed", usage={})
-            return self._result(pair, "CODEX_TIMEOUT")
+            self.store.record_llm_call(status="failed", usage={"provider": "codex"})
+            return self._fallback(pair, cache_key, "CODEX_TIMEOUT")
         except Exception:
-            self.store.record_llm_call(status="failed", usage={})
-            return self._result(pair, "CODEX_FAILED")
+            self.store.record_llm_call(status="failed", usage={"provider": "codex"})
+            return self._fallback(pair, cache_key, "CODEX_FAILED")
         structured, usage = _codex_events(completed.stdout or "")
         if completed.returncode != 0:
-            self.store.record_llm_call(status="failed", usage=usage)
-            return self._result(pair, "CODEX_FAILED")
+            self.store.record_llm_call(status="failed", usage={**usage, "provider": "codex"})
+            return self._fallback(pair, cache_key, "CODEX_FAILED")
         if not _valid_equivalence_result(structured):
-            self.store.record_llm_call(status="failed", usage=usage)
-            return self._result(pair, "CODEX_OUTPUT_INVALID")
+            self.store.record_llm_call(status="failed", usage={**usage, "provider": "codex"})
+            return self._fallback(pair, cache_key, "CODEX_OUTPUT_INVALID")
         assert isinstance(structured, Mapping)
-        self.store.record_llm_call(status="success", usage=usage)
+        self.store.record_llm_call(status="success", usage={**usage, "provider": "codex"})
         result = _equivalence_validation(
             pair, structured, prompt_version=self.prompt_version, cache_key=cache_key
         )
         if result.reason in {"APPROVED", "LLM_REJECTED"}:
             self.store.save_llm_cache(cache_key, {"model": self.model, "prompt_version": self.prompt_version, "structured_result": structured})
+        return result
+
+    def _fallback(
+        self,
+        pair: ExplicitMarketPair,
+        codex_cache_key: str,
+        codex_reason: str,
+    ) -> CrossVenueValidation:
+        fallback_cache_key = cross_exchange_equivalence_cache_key(
+            pair, model=self.fallback_model, prompt_version=self.prompt_version
+        )
+        if fallback_cache_key is None:
+            return self._result(pair, "MARKET_INVALID")
+        if cached := self._cached(pair, fallback_cache_key, model=self.fallback_model):
+            return cached
+        fallback_prompt = (
+            f"{CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT}\n"
+            "OUTPUT JSON SCHEMA\n"
+            f"{_CODEX_SCHEMA.read_text(encoding='utf-8')}\n"
+        )
+        raw, reason = self.fallback(
+            fallback_prompt,
+            {
+                "predict": _equivalence_market_payload(pair.predict),
+                "polymarket": _equivalence_market_payload(pair.polymarket),
+            },
+        )
+        if raw is None:
+            self.store.record_llm_call(status="failed", usage={"provider": "deepseek"})
+            return _cross_venue_validation(
+                pair,
+                False,
+                "DEEPSEEK_FAILED",
+                self.prompt_version,
+                summary=f"Codex({codex_reason}) 与 DeepSeek 校验均不可用，当前不可下单。",
+            )
+        try:
+            structured = json.loads(raw)
+        except json.JSONDecodeError:
+            structured = None
+        if not _valid_equivalence_result(structured):
+            self.store.record_llm_call(status="failed", usage={"provider": "deepseek"})
+            return _cross_venue_validation(
+                pair,
+                False,
+                "DEEPSEEK_OUTPUT_INVALID",
+                self.prompt_version,
+                summary=f"Codex({codex_reason}) 与 DeepSeek 校验均不可用，当前不可下单。",
+            )
+        assert isinstance(structured, Mapping)
+        self.store.record_llm_call(status="success", usage={"provider": "deepseek"})
+        result = _equivalence_validation(
+            pair,
+            structured,
+            prompt_version=self.prompt_version,
+            cache_key=fallback_cache_key,
+        )
+        if result.reason in {"APPROVED", "LLM_REJECTED"}:
+            self.store.save_llm_cache(
+                fallback_cache_key,
+                {
+                    "model": self.fallback_model,
+                    "prompt_version": self.prompt_version,
+                    "structured_result": structured,
+                },
+            )
         return result
 
 

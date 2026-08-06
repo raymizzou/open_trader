@@ -267,6 +267,70 @@ def test_equivalence_approval_uses_required_namespace_schema_and_cache(tmp_path:
     assert store.llm_usage_24h()["cache_hits"] == 1
 
 
+def test_cross_venue_codex_failure_falls_back_to_deepseek_and_caches(
+    tmp_path: Path,
+) -> None:
+    pair = explicit_pair()
+    fallback_calls: list[str] = []
+    runner_calls = 0
+    store = PredictionArbitrageStore(tmp_path / "data")
+
+    def runner(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal runner_calls
+        runner_calls += 1
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="401")
+
+    validator = CodexCrossVenueEquivalenceValidator(
+        store,
+        model="gpt-test",
+        fallback_model="deepseek-v4-flash-max",
+        runner=runner,
+        fallback=lambda prompt, payload: (
+            fallback_calls.append(prompt) or json.dumps(equivalence_result(pair)),
+            None,
+        ),
+    )
+
+    first = validator.validate(pair)
+
+    assert first.approved is True
+    assert len(fallback_calls) == 1
+    assert store.llm_usage_24h_by_provider()["deepseek"]["successes"] == 1
+    assert store.llm_usage_24h_by_provider()["codex"]["failures"] == 1
+
+    fallback_calls.clear()
+    second = validator.validate(pair)
+
+    assert second.approved is True
+    assert fallback_calls == []
+    assert runner_calls == 2
+    assert store.llm_usage_24h()["cache_hits"] == 1
+
+
+def test_cross_venue_double_failure_reports_deepseek_unavailable(
+    tmp_path: Path,
+) -> None:
+    pair = explicit_pair()
+    store = PredictionArbitrageStore(tmp_path / "data")
+    validator = CodexCrossVenueEquivalenceValidator(
+        store,
+        model="gpt-test",
+        fallback_model="deepseek-v4-flash-max",
+        runner=lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 1, stdout="", stderr="401"
+        ),
+        fallback=lambda prompt, payload: (None, "DEEPSEEK_FAILED"),
+    )
+
+    result = validator.validate(pair)
+
+    assert result.approved is False
+    assert result.reason == "DEEPSEEK_FAILED"
+    assert store.llm_usage_24h()["failures"] == 2
+
+
 def test_equivalence_approval_accepts_one_minute_raw_metadata_difference(tmp_path: Path) -> None:
     pair = explicit_pair()
     pair = replace(

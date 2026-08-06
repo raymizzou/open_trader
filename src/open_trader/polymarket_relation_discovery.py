@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -14,6 +15,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable, Literal
 
+from .advice.change_classifier import DEEPSEEK_BASE_URL
 from .prediction_arbitrage import (
     MAX_EMERGENCY_LOSS,
     MAX_NORMAL_COST,
@@ -40,6 +42,7 @@ ValidationStatus = Literal[
 ValidationRelation = Literal["A_IMPLIES_B", "B_IMPLIES_A", "NONE"]
 
 CODEX_PROMPT_VERSION = "polymarket-threshold-relation-v1"
+DEEPSEEK_FALLBACK_MODEL = "deepseek-v4-flash"
 CODEX_RELATION_PROMPT = """You are a semantic auditor for pairs of binary Polymarket contracts.
 
 GOAL
@@ -1260,6 +1263,49 @@ def _codex_events(
     )
 
 
+def _deepseek_completion(
+    prompt: str,
+    payload: Mapping[str, object],
+    *,
+    model: str,
+    timeout_seconds: float = 60.0,
+) -> tuple[str | None, str | None]:
+    """Return (content, None) or (None, reason) for the DeepSeek fallback."""
+
+    try:
+        from openai import OpenAI
+
+        reasoning_effort = (
+            os.environ.get("OPEN_TRADER_LLM_FALLBACK_REASONING_EFFORT", "max")
+            or "max"
+        )
+        response = OpenAI(
+            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+            base_url=DEEPSEEK_BASE_URL,
+            timeout=timeout_seconds,
+        ).chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        dict(payload),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                },
+            ],
+            response_format={"type": "json_object"},
+            reasoning_effort=reasoning_effort,
+            timeout=timeout_seconds,
+        )
+        content = response.choices[0].message.content
+        return (content, None) if content else (None, "DEEPSEEK_FAILED")
+    except Exception:
+        return None, "DEEPSEEK_FAILED"
+
+
 def _normalized_semantic(value: object) -> object:
     return _normalized(value) if isinstance(value, str) else value
 
@@ -1350,6 +1396,8 @@ class CodexRelationValidator:
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         timeout_seconds: float = 45.0,
         prompt_version: str = CODEX_PROMPT_VERSION,
+        fallback_model: str | None = None,
+        fallback: Callable[[str, Mapping[str, object]], str] | None = None,
     ) -> None:
         if not model.strip():
             raise ValueError("Codex model is required")
@@ -1358,6 +1406,22 @@ class CodexRelationValidator:
         self.runner = runner
         self.timeout_seconds = timeout_seconds
         self.prompt_version = prompt_version
+        fallback_model = (
+            fallback_model
+            or os.environ.get("OPEN_TRADER_LLM_FALLBACK_MODEL")
+            or DEEPSEEK_FALLBACK_MODEL
+        ).strip()
+        if not fallback_model:
+            raise ValueError("fallback model is required")
+        self.fallback_model = fallback_model
+        self.fallback = fallback or (
+            lambda prompt, payload: _deepseek_completion(
+                prompt,
+                payload,
+                model=self.fallback_model,
+                timeout_seconds=60.0,
+            )
+        )
 
     def _validation(
         self,
@@ -1368,6 +1432,8 @@ class CodexRelationValidator:
         status: ValidationStatus,
         reason: str | None = None,
         cached: bool = False,
+        model: str | None = None,
+        reasons: Sequence[str] | None = None,
     ) -> RelationValidation:
         decision = (
             structured.get("decision")
@@ -1384,7 +1450,9 @@ class CodexRelationValidator:
             if isinstance(structured, Mapping)
             else ()
         )
-        if reason is not None:
+        if reasons is not None:
+            reason_codes = tuple(str(item) for item in reasons)
+        elif reason is not None:
             reason_codes = (reason,)
         evidence = (
             tuple(structured.get("evidence", []))
@@ -1400,6 +1468,8 @@ class CodexRelationValidator:
             "CODEX_TIMEOUT": "Codex 语义校验超时，当前不可下单。",
             "CODEX_FAILED": "Codex 语义校验不可用，当前不可下单。",
             "CODEX_OUTPUT_INVALID": "Codex 返回的结构化结果无效，当前不可下单。",
+            "DEEPSEEK_FAILED": "Codex 与 DeepSeek 校验均不可用，当前不可下单。",
+            "DEEPSEEK_OUTPUT_INVALID": "Codex 与 DeepSeek 校验均不可用，当前不可下单。",
             "CONDITION_ID_MISMATCH": "Codex 返回的 condition ID 与候选合约不一致。",
             "INVALID_THRESHOLD": "Codex 返回的阈值不是有效十进制数。",
             "EVIDENCE_NOT_FOUND": "Codex 引用的规则证据无法在原文中核验。",
@@ -1427,7 +1497,7 @@ class CodexRelationValidator:
             reason_codes=reason_codes,
             evidence=evidence,
             uncertainties=uncertainties,
-            model=self.model,
+            model=model or self.model,
             prompt_version=self.prompt_version,
             cache_key=cache_key,
             cached=cached,
@@ -1441,6 +1511,7 @@ class CodexRelationValidator:
         structured: Mapping[str, object],
         *,
         cached: bool,
+        model: str | None = None,
     ) -> RelationValidation:
         status, reason = _deterministic_result(relation, structured)
         return self._validation(
@@ -1450,14 +1521,16 @@ class CodexRelationValidator:
             status=status,
             reason=reason,
             cached=cached,
+            model=model,
         )
 
     def cached_validation(
-        self, relation: ThresholdRelation
+        self, relation: ThresholdRelation, *, model: str | None = None
     ) -> RelationValidation | None:
+        model = model or self.model
         cache_key = codex_relation_cache_key(
             relation,
-            model=self.model,
+            model=model,
             prompt_version=self.prompt_version,
         )
         cached = self.store.load_llm_cache(cache_key)
@@ -1465,7 +1538,7 @@ class CodexRelationValidator:
             return None
         structured = cached.get("structured_result")
         if (
-            cached.get("model") != self.model
+            cached.get("model") != model
             or cached.get("prompt_version") != self.prompt_version
             or not _valid_structured_result(structured)
         ):
@@ -1476,10 +1549,13 @@ class CodexRelationValidator:
             cache_key,
             structured,
             cached=True,
+            model=model,
         )
         if validation.status not in {"approved", "llm_rejected"}:
             return None
-        self.store.record_llm_cache_hit()
+        self.store.record_llm_cache_hit(
+            provider="deepseek" if model != self.model else "codex"
+        )
         return validation
 
     def validate(self, relation: ThresholdRelation) -> RelationValidation:
@@ -1528,44 +1604,30 @@ class CodexRelationValidator:
                     check=False,
                 )
         except subprocess.TimeoutExpired:
-            self.store.record_llm_call(status="failed", usage={})
-            return self._validation(
-                relation=relation,
-                cache_key=cache_key,
-                structured=None,
-                status="llm_unavailable",
-                reason="CODEX_TIMEOUT",
+            self.store.record_llm_call(
+                status="failed", usage={"provider": "codex"}
             )
+            return self._fallback(relation, cache_key, "CODEX_TIMEOUT")
         except Exception:
-            self.store.record_llm_call(status="failed", usage={})
-            return self._validation(
-                relation=relation,
-                cache_key=cache_key,
-                structured=None,
-                status="llm_unavailable",
-                reason="CODEX_FAILED",
+            self.store.record_llm_call(
+                status="failed", usage={"provider": "codex"}
             )
+            return self._fallback(relation, cache_key, "CODEX_FAILED")
         structured, usage = _codex_events(completed.stdout or "")
         if completed.returncode != 0:
-            self.store.record_llm_call(status="failed", usage=usage)
-            return self._validation(
-                relation=relation,
-                cache_key=cache_key,
-                structured=None,
-                status="llm_unavailable",
-                reason="CODEX_FAILED",
+            self.store.record_llm_call(
+                status="failed", usage={**usage, "provider": "codex"}
             )
+            return self._fallback(relation, cache_key, "CODEX_FAILED")
         if not _valid_structured_result(structured):
-            self.store.record_llm_call(status="failed", usage=usage)
-            return self._validation(
-                relation=relation,
-                cache_key=cache_key,
-                structured=None,
-                status="llm_unavailable",
-                reason="CODEX_OUTPUT_INVALID",
+            self.store.record_llm_call(
+                status="failed", usage={**usage, "provider": "codex"}
             )
+            return self._fallback(relation, cache_key, "CODEX_OUTPUT_INVALID")
         assert isinstance(structured, Mapping)
-        self.store.record_llm_call(status="success", usage=usage)
+        self.store.record_llm_call(
+            status="success", usage={**usage, "provider": "codex"}
+        )
         validation = self._validated(
             relation,
             cache_key,
@@ -1577,6 +1639,76 @@ class CodexRelationValidator:
                 cache_key,
                 {
                     "model": self.model,
+                    "prompt_version": self.prompt_version,
+                    "structured_result": structured,
+                },
+            )
+        return validation
+
+    def _fallback(
+        self,
+        relation: ThresholdRelation,
+        codex_cache_key: str,
+        codex_reason: str,
+    ) -> RelationValidation:
+        fallback_cache_key = codex_relation_cache_key(
+            relation,
+            model=self.fallback_model,
+            prompt_version=self.prompt_version,
+        )
+        cached = self.cached_validation(relation, model=self.fallback_model)
+        if cached is not None:
+            return cached
+        fallback_prompt = (
+            f"{CODEX_RELATION_PROMPT}\n"
+            "OUTPUT JSON SCHEMA\n"
+            f"{_CODEX_SCHEMA.read_text(encoding='utf-8')}\n"
+        )
+        raw, reason = self.fallback(fallback_prompt, _codex_payload(relation))
+        if raw is None:
+            self.store.record_llm_call(
+                status="failed", usage={"provider": "deepseek"}
+            )
+            return self._validation(
+                relation=relation,
+                cache_key=codex_cache_key,
+                structured=None,
+                status="llm_unavailable",
+                reason="DEEPSEEK_FAILED",
+                reasons=(codex_reason, "DEEPSEEK_FAILED"),
+            )
+        try:
+            structured = json.loads(raw)
+        except json.JSONDecodeError:
+            structured = None
+        if not _valid_structured_result(structured):
+            self.store.record_llm_call(
+                status="failed", usage={"provider": "deepseek"}
+            )
+            return self._validation(
+                relation=relation,
+                cache_key=codex_cache_key,
+                structured=None,
+                status="llm_unavailable",
+                reason="DEEPSEEK_OUTPUT_INVALID",
+                reasons=(codex_reason, "DEEPSEEK_OUTPUT_INVALID"),
+            )
+        assert isinstance(structured, Mapping)
+        self.store.record_llm_call(
+            status="success", usage={"provider": "deepseek"}
+        )
+        validation = self._validated(
+            relation,
+            fallback_cache_key,
+            structured,
+            cached=False,
+            model=self.fallback_model,
+        )
+        if validation.status in {"approved", "llm_rejected"}:
+            self.store.save_llm_cache(
+                fallback_cache_key,
+                {
+                    "model": self.fallback_model,
                     "prompt_version": self.prompt_version,
                     "structured_result": structured,
                 },

@@ -5896,6 +5896,11 @@ table {
 .pm-funnel-stage strong { display: block; font-size: 20px; line-height: 1.15; margin: 4px 0 3px; overflow-wrap: anywhere; }
 .pm-funnel-meta { align-items: center; border-top: 1px solid var(--line); color: var(--muted); display: flex; flex-wrap: wrap; font-size: 11px; gap: 8px 14px; padding: 9px 14px; }
 .pm-funnel-meta details { color: var(--text); }
+.pm-collapse-summary { cursor: pointer; list-style: none; }
+.pm-collapse-summary::-webkit-details-marker { display: none; }
+.pm-funnel-chips-body { border-bottom: 1px solid var(--line); padding: 0 14px 10px; }
+.pm-usage-line strong { color: var(--text); }
+.pm-relation-discovery > summary { margin-bottom: 0; }
 .pm-funnel-rejections p { margin: 6px 0 0; }
 .pm-funnel-empty { border-top: 1px solid var(--line); padding: 12px 14px 14px; }
 .pm-funnel-empty strong { display: block; }
@@ -5935,6 +5940,12 @@ table {
 .pm-threshold-questions strong { line-height: 1.35; }
 .pm-threshold-llm { border: 1px solid var(--line); border-radius: 6px; display: grid; gap: 5px; padding: 10px; }
 .pm-threshold-llm p, .pm-threshold-llm small { color: var(--muted); margin: 0; }
+.pm-llm-line { align-items: center; display: flex; flex-wrap: wrap; gap: 6px; }
+.pm-model-tag { background: var(--surface); border: 1px solid var(--line); border-radius: 999px; color: var(--muted); cursor: help; font-size: 10px; font-weight: 800; line-height: 1; padding: 5px 7px; position: relative; }
+.pm-model-tip { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); color: var(--text); display: none; font-size: 12px; font-weight: 400; left: 0; line-height: 1.45; max-width: 280px; min-width: 240px; padding: 10px; position: absolute; text-align: left; top: calc(100% + 8px); z-index: 5; }
+.pm-model-tag:hover .pm-model-tip, .pm-model-tag:focus-visible .pm-model-tip { display: block; }
+.pm-model-tip p { color: var(--text); margin: 0 0 5px; }
+.pm-model-tip small { color: var(--muted); display: block; }
 .pm-participate { min-width: 190px; }
 .pm-empty { align-items: center; display: grid; justify-items: center; min-height: 210px; padding: 30px; text-align: center; }
 .pm-empty.compact { min-height: 150px; }
