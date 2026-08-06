@@ -1,0 +1,503 @@
+<!doctype html>
+<!-- PROTOTYPE — three broker trend-report layouts, switchable via ?variant=A|B|C. -->
+<html lang="zh-Hans">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Open Trader · 券商趋势报告 Mock</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f5f7fa;
+        --surface: #fff;
+        --surface-soft: #f8fafc;
+        --text: #101828;
+        --muted: #667085;
+        --line: #e4e7ec;
+        --accent: #2563eb;
+        --accent-soft: #eff6ff;
+        --danger: #b42318;
+        --danger-soft: #fff4f2;
+        --ok: #027a48;
+        --ok-soft: #ecfdf3;
+        --warning: #b54708;
+        --warning-soft: #fffaeb;
+        --shadow: 0 12px 32px rgba(16, 24, 40, .07);
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 14px;
+        font-variant-numeric: tabular-nums;
+        margin: 0;
+      }
+      button { font: inherit; }
+      button:focus-visible, summary:focus-visible {
+        outline: 3px solid rgba(37, 99, 235, .32);
+        outline-offset: 2px;
+      }
+      button, summary { cursor: pointer; }
+      .shell { margin: 0 auto; max-width: 1480px; min-height: 100vh; padding: 16px 16px 96px; }
+      .topbar, .account, .report-hero, .panel, .timeline-step, .rail, .audit-table-wrap {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        box-shadow: var(--shadow);
+      }
+      .topbar {
+        align-items: center;
+        display: flex;
+        gap: 16px;
+        justify-content: space-between;
+        margin-bottom: 12px;
+        min-height: 64px;
+        padding: 12px 16px;
+      }
+      .brand-row, .actions, .meta-row, .summary-row, .account-meta, .filter-row {
+        align-items: center;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .brand { font-size: 20px; font-weight: 800; letter-spacing: -.03em; }
+      .page-label, .muted { color: var(--muted); }
+      .primary, .secondary, .quiet, .switcher button {
+        align-items: center;
+        border-radius: 8px;
+        display: inline-flex;
+        justify-content: center;
+        min-height: 44px;
+        padding: 0 14px;
+      }
+      .primary { background: var(--accent); border: 1px solid var(--accent); color: #fff; font-weight: 700; }
+      .primary:hover { background: #1d4ed8; }
+      .secondary { background: var(--surface); border: 1px solid var(--line); color: var(--text); font-weight: 700; }
+      .secondary:hover, .quiet:hover { background: var(--surface-soft); border-color: #98a2b3; }
+      .quiet { background: transparent; border: 1px solid transparent; color: var(--muted); }
+      .primary svg, .secondary svg, .quiet svg { height: 17px; margin-right: 7px; width: 17px; }
+      .status, .count, .date-chip {
+        border-radius: 999px;
+        display: inline-flex;
+        font-size: 12px;
+        font-weight: 700;
+        padding: 5px 9px;
+      }
+      .status.ok { background: var(--ok-soft); color: var(--ok); }
+      .status.danger { background: var(--danger-soft); color: var(--danger); }
+      .status.warning { background: var(--warning-soft); color: var(--warning); }
+      .count, .date-chip { background: #f2f4f7; color: #344054; }
+      .date-chip strong { color: var(--text); margin-left: 4px; }
+      .account-grid { display: grid; gap: 12px; }
+      .account { overflow: hidden; }
+      .account-head {
+        align-items: center;
+        display: grid;
+        gap: 12px;
+        grid-template-columns: minmax(170px, 1fr) auto minmax(280px, 1.4fr) auto;
+        padding: 14px 16px;
+      }
+      .account-title h2 { font-size: 17px; margin: 0 0 4px; }
+      .account-title span { color: var(--muted); font-size: 12px; }
+      .account-value { font-size: 18px; }
+      .account-meta { color: var(--muted); font-size: 12px; }
+      .report-entry { align-items: flex-end; display: grid; gap: 6px; justify-items: end; }
+      .report-entry small { color: var(--muted); }
+      .holding-strip {
+        background: var(--surface-soft);
+        border-top: 1px solid var(--line);
+        display: grid;
+        gap: 0;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+      .holding-strip div { border-right: 1px solid var(--line); display: grid; gap: 3px; padding: 10px 16px; }
+      .holding-strip div:last-child { border-right: 0; }
+      .holding-strip span { color: var(--muted); font-size: 12px; }
+      .holding-strip strong { font-size: 13px; }
+
+      .report-shell { display: grid; gap: 12px; }
+      .report-hero { display: grid; gap: 14px; padding: 16px; }
+      .report-nav { align-items: flex-start; display: flex; gap: 14px; justify-content: space-between; }
+      .report-title h1 { font-size: 24px; letter-spacing: -.025em; margin: 5px 0; }
+      .report-title p { color: var(--muted); margin: 0; }
+      .summary-row { border-top: 1px solid var(--line); padding-top: 13px; }
+      .metric { display: grid; gap: 2px; min-width: 110px; padding-right: 20px; }
+      .metric span { color: var(--muted); font-size: 12px; }
+      .metric strong { font-size: 20px; }
+      .metric.danger strong { color: var(--danger); }
+      .metric.ok strong { color: var(--ok); }
+      .stale-note {
+        align-items: center;
+        background: var(--warning-soft);
+        border: 1px solid #fedf89;
+        border-radius: 8px;
+        color: #93370d;
+        display: flex;
+        gap: 8px;
+        padding: 10px 12px;
+      }
+      .stale-note svg { flex: 0 0 auto; height: 18px; width: 18px; }
+
+      .cockpit { display: grid; gap: 12px; grid-template-columns: 1.25fr 1fr; }
+      .panel { min-width: 0; padding: 16px; }
+      .panel h2, .panel h3 { margin: 0; }
+      .panel-head { align-items: center; display: flex; gap: 12px; justify-content: space-between; margin-bottom: 12px; }
+      .action-list { display: grid; gap: 8px; }
+      .action-row {
+        align-items: center;
+        background: var(--surface-soft);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        display: grid;
+        gap: 10px;
+        grid-template-columns: auto minmax(140px, 1fr) minmax(130px, 1.5fr) auto;
+        padding: 10px 12px;
+      }
+      .action-row.sell { background: var(--danger-soft); border-color: #fecdca; }
+      .action-row.hold { background: var(--ok-soft); border-color: #abefc6; }
+      .sequence {
+        align-items: center;
+        background: var(--text);
+        border-radius: 50%;
+        color: #fff;
+        display: inline-flex;
+        font-size: 12px;
+        font-weight: 800;
+        height: 28px;
+        justify-content: center;
+        width: 28px;
+      }
+      .symbol strong, .reason strong { display: block; }
+      .symbol span, .reason span { color: var(--muted); font-size: 12px; }
+      .price { font-weight: 800; white-space: nowrap; }
+      .side-stack { display: grid; gap: 12px; }
+      .empty-buy { background: var(--surface-soft); border: 1px dashed #98a2b3; border-radius: 8px; padding: 18px; text-align: center; }
+      details.panel { padding: 0; }
+      details.panel summary { align-items: center; display: flex; font-weight: 700; justify-content: space-between; min-height: 52px; padding: 0 16px; }
+      details.panel summary::marker { display: none; }
+      .detail-body { border-top: 1px solid var(--line); display: grid; gap: 10px; padding: 14px 16px; }
+      .candidate-grid { display: grid; gap: 8px; grid-template-columns: repeat(5, minmax(0, 1fr)); }
+      .candidate { background: var(--surface-soft); border: 1px solid var(--line); border-radius: 8px; display: grid; gap: 4px; padding: 10px; }
+      .candidate span { color: var(--muted); font-size: 12px; }
+
+      .timeline-layout { display: grid; gap: 12px; grid-template-columns: minmax(0, 1.6fr) minmax(280px, .7fr); }
+      .timeline { display: grid; gap: 10px; }
+      .timeline-step { display: grid; gap: 14px; grid-template-columns: 130px minmax(0, 1fr); padding: 16px; }
+      .timeline-time { color: var(--accent); font-size: 15px; font-weight: 800; }
+      .timeline-time span { color: var(--muted); display: block; font-size: 12px; font-weight: 500; margin-top: 4px; }
+      .timeline-body h2 { font-size: 17px; margin: 0 0 10px; }
+      .compact-list { display: grid; gap: 7px; }
+      .compact-line { align-items: center; border-top: 1px solid var(--line); display: grid; gap: 8px; grid-template-columns: minmax(150px, 1fr) minmax(160px, 1.4fr) auto; padding-top: 8px; }
+      .compact-line:first-child { border-top: 0; }
+      .rail { align-self: start; display: grid; gap: 14px; padding: 16px; position: sticky; top: 12px; }
+      .rail h2 { font-size: 17px; margin: 0; }
+      .checklist { display: grid; gap: 8px; }
+      .check { align-items: flex-start; display: flex; gap: 8px; }
+      .check svg { color: var(--ok); flex: 0 0 auto; height: 18px; width: 18px; }
+
+      .audit-toolbar { align-items: center; display: flex; gap: 12px; justify-content: space-between; }
+      .filter-button { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; min-height: 44px; padding: 0 14px; }
+      .filter-button.active { background: var(--text); border-color: var(--text); color: #fff; }
+      .audit-table-wrap { overflow: auto; }
+      .audit-table { border-collapse: collapse; min-width: 900px; width: 100%; }
+      .audit-table th, .audit-table td { border-bottom: 1px solid var(--line); padding: 12px 14px; text-align: left; vertical-align: top; }
+      .audit-table th { background: var(--surface-soft); color: var(--muted); font-size: 12px; position: sticky; top: 0; }
+      .audit-table tr:last-child td { border-bottom: 0; }
+      .audit-bottom { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
+
+      .switcher {
+        align-items: center;
+        background: #101828;
+        border: 1px solid #344054;
+        border-radius: 999px;
+        bottom: 18px;
+        box-shadow: 0 16px 40px rgba(16, 24, 40, .28);
+        color: #fff;
+        display: flex;
+        gap: 4px;
+        left: 50%;
+        padding: 5px;
+        position: fixed;
+        transform: translateX(-50%);
+        z-index: 100;
+      }
+      .switcher button { background: transparent; border: 0; color: #fff; min-width: 44px; padding: 0 10px; }
+      .switcher button:hover { background: #344054; }
+      .switcher-label { min-width: 230px; text-align: center; }
+      .prototype-note { color: #d0d5dd; display: block; font-size: 10px; margin-top: 2px; }
+      .hidden { display: none !important; }
+
+      @media (max-width: 900px) {
+        .account-head { grid-template-columns: 1fr auto; }
+        .account-meta { grid-column: 1 / -1; }
+        .report-entry { grid-column: 2; grid-row: 1 / span 2; }
+        .cockpit, .timeline-layout, .audit-bottom { grid-template-columns: 1fr; }
+        .rail { position: static; }
+        .candidate-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+      @media (max-width: 600px) {
+        body { font-size: 14px; }
+        .shell { padding: 8px 8px 96px; }
+        .topbar { align-items: flex-start; border-radius: 10px; flex-direction: column; }
+        .topbar .actions { width: 100%; }
+        .topbar .actions button { flex: 1; }
+        .account-head { align-items: start; grid-template-columns: 1fr; padding: 12px; }
+        .account-value { grid-row: 2; }
+        .account-meta { grid-column: 1; grid-row: 3; }
+        .report-entry { align-items: stretch; grid-column: 1; grid-row: 4; justify-items: stretch; }
+        .report-entry small { text-align: left; }
+        .report-entry button { width: 100%; }
+        .holding-strip { grid-template-columns: 1fr 1fr; }
+        .holding-strip div:nth-child(2) { border-right: 0; }
+        .holding-strip div:nth-child(-n + 2) { border-bottom: 1px solid var(--line); }
+        .report-nav { align-items: stretch; flex-direction: column-reverse; }
+        .report-nav .secondary { align-self: flex-start; }
+        .report-title h1 { font-size: 21px; }
+        .summary-row { align-items: stretch; display: grid; grid-template-columns: 1fr 1fr; }
+        .metric { padding: 8px 0; }
+        .action-row { align-items: start; grid-template-columns: auto minmax(0, 1fr) auto; }
+        .action-row .reason { grid-column: 2 / -1; }
+        .candidate-grid { grid-template-columns: 1fr; }
+        .timeline-step { grid-template-columns: 1fr; }
+        .compact-line { grid-template-columns: 1fr auto; }
+        .compact-line span:nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
+        .audit-toolbar { align-items: stretch; flex-direction: column; }
+        .filter-row { display: grid; grid-template-columns: 1fr 1fr; }
+        .switcher { bottom: 10px; width: calc(100% - 20px); }
+        .switcher-label { flex: 1; min-width: 0; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
+      }
+    </style>
+  </head>
+  <body>
+    <main id="app" class="shell"></main>
+    <nav class="switcher" aria-label="Mock 布局切换">
+      <button id="previous-variant" type="button" aria-label="上一个布局">←</button>
+      <div class="switcher-label"><strong id="variant-label"></strong><span class="prototype-note">PROTOTYPE · 左右方向键切换</span></div>
+      <button id="next-variant" type="button" aria-label="下一个布局">→</button>
+    </nav>
+    <script>
+      "use strict";
+
+      const variants = [
+        { key: "A", name: "行动驾驶舱" },
+        { key: "B", name: "盘中时间线" },
+        { key: "C", name: "审计工作台" },
+      ];
+      const brokers = [
+        { key: "futu", name: "富途证券", profile: "中短线 · 股票与期权", value: "HKD 1,280,340", positions: "8", cash: "HKD 312,800", updated: "2026-07-15 09:42" },
+        { key: "tiger", name: "老虎证券", profile: "长线 · SMA200 组合策略", value: "HKD 824,190", positions: "6", cash: "HKD 126,200", updated: "2026-07-15 09:41" },
+        { key: "phillips", name: "辉立证券", profile: "中线 · 中线策略", value: "HKD 469,720", positions: "4", cash: "HKD 82,300", updated: "2026-07-15 09:38" },
+        { key: "eastmoney", name: "东方财富", profile: "偏短线 · 趋势交易", value: "HKD 733,085", positions: "5", cash: "HKD 438,920", updated: "2026-07-15 09:44" },
+      ];
+      const sells = [
+        ["600025", "华能水电", "右侧趋势已结束", "9.32"],
+        ["601728", "中国电信", "右侧趋势已结束", "5.46"],
+        ["601398", "工商银行", "右侧趋势已结束", "7.18"],
+        ["601288", "农业银行", "右侧趋势已结束", "6.04"],
+      ];
+      const holds = [["600900", "长江电力", "趋势保持完好", "27.53"]];
+      const candidates = [
+        ["603065", "宿迁联盛", "100.0", "7 天"],
+        ["300534", "陇神戎发", "99.8", "1 天"],
+        ["603313", "梦百合", "99.8", "1 天"],
+        ["002821", "凯莱英", "99.6", "1 天"],
+        ["603233", "大参林", "99.6", "1 天"],
+      ];
+      const app = document.getElementById("app");
+
+      function icon(name) {
+        const paths = {
+          report: '<path d="M6 2.75h8l4 4v14.5H6z"/><path d="M14 2.75v4h4M9 11h6M9 15h6M9 19h4"/>',
+          back: '<path d="m15 18-6-6 6-6"/>',
+          alert: '<path d="M12 3 2.8 20h18.4z"/><path d="M12 9v5M12 17.2v.1"/>',
+          check: '<path d="m5 12 4 4L19 6"/>',
+        };
+        return `<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${paths[name]}</svg>`;
+      }
+
+      function params() { return new URLSearchParams(window.location.search); }
+      function currentVariant() {
+        const requested = String(params().get("variant") || "A").toUpperCase();
+        return variants.some(({key}) => key === requested) ? requested : "A";
+      }
+      function currentBroker() {
+        return brokers.find(({key}) => key === params().get("broker")) || brokers[3];
+      }
+      function setParams(patch, push = false) {
+        const next = params();
+        Object.entries(patch).forEach(([key, value]) => value ? next.set(key, value) : next.delete(key));
+        const url = `${window.location.pathname}?${next.toString()}`;
+        window.history[push ? "pushState" : "replaceState"]({}, "", url);
+        render();
+      }
+
+      function topbar(label = "持仓实时看板") {
+        return `<header class="topbar">
+          <div class="brand-row"><span class="brand">Open Trader</span><span class="page-label">${label}</span></div>
+          <div class="actions"><span class="status ok">行情已连接</span><button class="secondary" type="button">刷新账户与行情</button></div>
+        </header>`;
+      }
+
+      function home() {
+        return `${topbar()}
+          <section class="account-grid" aria-label="券商账户">
+            ${brokers.map((broker) => `<article class="account">
+              <header class="account-head">
+                <div class="account-title"><h2>${broker.name}</h2><span>${broker.profile}</span></div>
+                <strong class="account-value">${broker.value}</strong>
+                <div class="account-meta"><span>持仓 ${broker.positions}</span><span>现金 ${broker.cash}</span><span>账户更新 ${broker.updated}</span></div>
+                <div class="report-entry">
+                  <small>报告日期 <strong>2026-07-15</strong> · 数据截至 <strong>2026-07-14</strong></small>
+                  <button class="primary" type="button" data-open-report="${broker.key}">${icon("report")}当天趋势报告</button>
+                </div>
+              </header>
+              <div class="holding-strip">
+                <div><span>代表持仓</span><strong>${broker.key === "eastmoney" ? "600900 长江电力" : "持仓标的示例"}</strong></div>
+                <div><span>今日动作</span><strong>${broker.key === "eastmoney" ? "卖出 4 · 持有 1" : "查看报告"}</strong></div>
+                <div><span>组合状态</span><strong>纪律执行中</strong></div>
+                <div><span>报告生成</span><strong>${broker.updated}</strong></div>
+              </div>
+            </article>`).join("")}
+          </section>`;
+      }
+
+      function reportHero(broker) {
+        return `<header class="report-hero">
+          <div class="report-nav">
+            <div class="report-title">
+              <div class="meta-row"><span class="status ok">当天报告</span><span class="date-chip">报告日期 <strong>2026-07-15</strong></span><span class="date-chip">数据截至 <strong>2026-07-14</strong></span></div>
+              <h1>${broker.name} · 趋势操作报告</h1>
+              <p>生成于 2026-07-15 09:44 · 只读报告，不代表订单或成交事实</p>
+            </div>
+            <button class="secondary" type="button" data-back-home>${icon("back")}返回${broker.name}</button>
+          </div>
+          <div class="summary-row">
+            <div class="metric danger"><span>开盘前确认卖出</span><strong>4</strong></div>
+            <div class="metric"><span>允许买入</span><strong>0</strong></div>
+            <div class="metric ok"><span>继续持有</span><strong>1</strong></div>
+            <div class="metric"><span>人工复核</span><strong>0</strong></div>
+          </div>
+          <div class="stale-note">${icon("alert")}账户数据已过期：禁止正式买入；卖出和保护线仍需人工确认。</div>
+        </header>`;
+      }
+
+      function actionRows(items, type) {
+        return items.map((item, index) => `<div class="action-row ${type}">
+          <span class="sequence">${index + 1}</span>
+          <div class="symbol"><strong>${item[0]} · ${item[1]}</strong><span>${type === "sell" ? "全部卖出" : "继续持有"}</span></div>
+          <div class="reason"><strong>${item[2]}</strong><span>按趋势纪律生成</span></div>
+          <span class="price">保护线 ${item[3]}</span>
+        </div>`).join("");
+      }
+
+      function candidatePanel(open = false) {
+        return `<details class="panel" ${open ? "open" : ""}>
+          <summary><span>查看候选榜、排除项与数据来源</span><span class="count">审计详情</span></summary>
+          <div class="detail-body">
+            <div class="candidate-grid">${candidates.map((item, index) => `<div class="candidate"><strong>${index + 1}. ${item[0]}</strong><span>${item[1]}</span><span>强度 ${item[2]} · 右侧 ${item[3]}</span></div>`).join("")}</div>
+            <p class="muted">排除 13 项 · 趋势动物 44 条快照 · API 成本估算 1.144 · 数据来源：趋势动物、富途行情、账户快照</p>
+          </div>
+        </details>`;
+      }
+
+      function variantA() {
+        return `<section class="cockpit" aria-label="行动驾驶舱布局">
+          <section class="panel">
+            <div class="panel-head"><h2>开盘前：确认卖出</h2><span class="status danger">优先处理</span></div>
+            <div class="action-list">${actionRows(sells, "sell")}</div>
+          </section>
+          <div class="side-stack">
+            <section class="panel">
+              <div class="panel-head"><h2>09:30–10:00：考虑买入</h2><span class="count">0 项</span></div>
+              <div class="empty-buy"><strong>今天没有允许买入的标的</strong><p class="muted">账户数据过期，禁止正式买入。</p></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head"><h2>继续持有</h2><span class="status ok">1 项</span></div>
+              <div class="action-list">${actionRows(holds, "hold")}</div>
+            </section>
+          </div>
+        </section>${candidatePanel()}`;
+      }
+
+      function compactLines(items, action) {
+        return items.map((item) => `<div class="compact-line"><strong>${item[0]} ${item[1]}</strong><span>${item[2]}</span><span class="status ${action === "全部卖出" ? "danger" : "ok"}">${action} · ${item[3]}</span></div>`).join("");
+      }
+
+      function variantB() {
+        return `<section class="timeline-layout" aria-label="盘中时间线布局">
+          <div class="timeline">
+            <article class="timeline-step"><div class="timeline-time">开盘前<span>09:30 以前</span></div><div class="timeline-body"><h2>确认 4 笔全部卖出</h2><div class="compact-list">${compactLines(sells, "全部卖出")}</div></div></article>
+            <article class="timeline-step"><div class="timeline-time">开盘窗口<span>09:30–10:00</span></div><div class="timeline-body"><h2>不执行买入</h2><p class="muted">当前没有允许买入的标的；账户数据过期是硬性阻断条件。</p></div></article>
+            <article class="timeline-step"><div class="timeline-time">盘中持续<span>交易时段</span></div><div class="timeline-body"><h2>保留 1 笔持仓</h2><div class="compact-list">${compactLines(holds, "继续持有")}</div></div></article>
+            ${candidatePanel()}
+          </div>
+          <aside class="rail">
+            <h2>今日执行检查</h2>
+            <div class="checklist">
+              <div class="check">${icon("check")}<span>先复核账户是否已经刷新</span></div>
+              <div class="check">${icon("check")}<span>确认 4 笔卖出及活动保护线</span></div>
+              <div class="check">${icon("check")}<span>账户过期时不新增仓位</span></div>
+              <div class="check">${icon("check")}<span>保留长江电力并观察 27.53</span></div>
+            </div>
+            <span class="date-chip">数据截至 <strong>2026-07-14</strong></span>
+          </aside>
+        </section>`;
+      }
+
+      function auditRows() {
+        return [...sells.map((row) => [...row, "全部卖出", "danger"]), ...holds.map((row) => [...row, "继续持有", "ok"])]
+          .map((item) => `<tr data-action="${item[4]}"><td><strong>${item[0]}</strong><br><span class="muted">${item[1]}</span></td><td><span class="status ${item[5]}">${item[4]}</span></td><td>${item[2]}</td><td>${item[3]}</td><td>2026-07-14</td><td><button class="secondary" type="button">查看依据</button></td></tr>`).join("");
+      }
+
+      function variantC() {
+        return `<section aria-label="审计工作台布局">
+          <div class="audit-toolbar panel">
+            <div class="filter-row" role="group" aria-label="动作筛选"><button class="filter-button active" type="button">全部 5</button><button class="filter-button" type="button">卖出 4</button><button class="filter-button" type="button">买入 0</button><button class="filter-button" type="button">持有 1</button></div>
+            <span class="muted">按动作筛选并逐项复核</span>
+          </div>
+          <div class="audit-table-wrap"><table class="audit-table"><thead><tr><th>标的</th><th>动作</th><th>原因</th><th>活动保护线</th><th>数据日期</th><th>明细</th></tr></thead><tbody>${auditRows()}</tbody></table></div>
+          <div class="audit-bottom">
+            <section class="panel"><div class="panel-head"><h2>买入计划</h2><span class="count">0 项</span></div><p>账户数据过期，当前没有正式买入动作。</p></section>
+            ${candidatePanel(true)}
+          </div>
+        </section>`;
+      }
+
+      function report() {
+        const broker = currentBroker();
+        const content = currentVariant() === "B" ? variantB() : currentVariant() === "C" ? variantC() : variantA();
+        return `${topbar("券商趋势报告 Mock")}<div class="report-shell">${reportHero(broker)}${content}</div>`;
+      }
+
+      function render() {
+        const view = params().get("view") === "home" ? "home" : "report";
+        app.innerHTML = view === "report" ? report() : home();
+        const variant = variants.find(({key}) => key === currentVariant());
+        document.getElementById("variant-label").textContent = `${variant.key} — ${variant.name}`;
+        document.querySelectorAll("[data-open-report]").forEach((button) => button.addEventListener("click", () => setParams({view: "report", broker: button.dataset.openReport}, true)));
+        document.querySelectorAll("[data-back-home]").forEach((button) => button.addEventListener("click", () => setParams({view: "home", broker: ""})));
+      }
+
+      function cycle(direction) {
+        const index = variants.findIndex(({key}) => key === currentVariant());
+        const next = variants[(index + direction + variants.length) % variants.length];
+        setParams({variant: next.key});
+      }
+
+      document.getElementById("previous-variant").addEventListener("click", () => cycle(-1));
+      document.getElementById("next-variant").addEventListener("click", () => cycle(1));
+      document.addEventListener("keydown", (event) => {
+        if (["INPUT", "TEXTAREA"].includes(document.activeElement.tagName) || document.activeElement.isContentEditable) return;
+        if (event.key === "ArrowLeft") cycle(-1);
+        if (event.key === "ArrowRight") cycle(1);
+      });
+      window.addEventListener("popstate", render);
+      render();
+    </script>
+  </body>
+</html>
