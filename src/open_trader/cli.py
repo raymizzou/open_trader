@@ -1120,6 +1120,22 @@ def build_parser() -> argparse.ArgumentParser:
     prediction_status.add_argument("--url", default="http://127.0.0.1:8766")
     prediction_status.add_argument("--timeout", type=positive_float, default=5.0)
 
+    health_parser = prediction_commands.add_parser(
+        "health-check", help="Run or serve the prediction-arbitrage health check"
+    )
+    health_parser.add_argument("--url", default="http://127.0.0.1:8766")
+    health_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    health_parser.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    health_parser.add_argument("--repo", type=Path, default=Path.cwd())
+    health_parser.add_argument(
+        "--interval", type=positive_float, default=7200.0
+    )
+    health_parser.add_argument("--once", action="store_true")
+    health_parser.add_argument("--no-notify", action="store_true")
+    health_parser.add_argument("--json", action="store_true")
+
     return parser
 
 
@@ -1377,6 +1393,29 @@ def main(argv: list[str] | None = None) -> int:
             print(f"masked_wallet: {payload.get('masked_wallet') or readiness.get('masked_address') or 'unknown'}")
             print(f"result: {'PASS' if status not in {'unavailable', 'error'} else 'BLOCKED'}")
             return 0 if status not in {"unavailable", "error"} else 2
+
+        if args.prediction_command == "health-check":
+            from .prediction_arbitrage_health import main as health_main
+
+            health_argv = [
+                "--url",
+                args.url,
+                "--data-dir",
+                str(args.data_dir),
+                "--config",
+                str(args.config),
+                "--repo",
+                str(args.repo),
+                "--interval",
+                str(args.interval),
+            ]
+            if args.once:
+                health_argv.append("--once")
+            if args.no_notify:
+                health_argv.append("--no-notify")
+            if args.json:
+                health_argv.append("--json")
+            return health_main(health_argv)
 
     if args.command == "trend-allocation":
         try:

@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.open-trader.prediction-arbitrage-health</string>
+  <key>WorkingDirectory</key>
+  <string>OPEN_TRADER_REPO</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>OPEN_TRADER_REPO/src</string>
+  </dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>OPEN_TRADER_PYTHON</string>
+    <string>-m</string>
+    <string>open_trader</string>
+    <string>prediction-arb</string>
+    <string>health-check</string>
+    <string>--url</string>
+    <string>OPEN_TRADER_HEALTH_URL</string>
+    <string>--data-dir</string>
+    <string>OPEN_TRADER_DATA_DIR</string>
+    <string>--config</string>
+    <string>OPEN_TRADER_DAILY_CONFIG</string>
+    <string>--repo</string>
+    <string>OPEN_TRADER_REPO</string>
+    <string>--interval</string>
+    <string>OPEN_TRADER_HEALTH_INTERVAL</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>OPEN_TRADER_REPO/logs/prediction_arbitrage_health/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>OPEN_TRADER_REPO/logs/prediction_arbitrage_health/launchd.err.log</string>
+</dict>
+</plist>

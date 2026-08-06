@@ -5,6 +5,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-07
 
+- #29 新增独立 prediction-arbitrage 健康检查后端服务（launchd label
+  `com.open-trader.prediction-arbitrage-health`，RunAtLoad/KeepAlive，只装生产环境，
+  与其他 worktree 部署无关）：每 2 小时检查 8766 状态端点与 healthz、heartbeat≤60s、
+  universe≤300s、breaker、cross-venue、relation catalog、universe_retry_exhausted、
+  readiness（执行被挡即 FAIL）、LLM 近 2 小时成功率、dashboard PID/运行 SHA；结果
+  PASS/WARN/FAIL 每次发飞书（PASS 一行摘要，WARN/FAIL 逐项带值带原因）；飞书未配置
+  显示 WARN，发送失败记日志下轮重试；`prediction-arb health-check --once` 可手动单跑。
+  新增 24 个回归测试。
 - #27 跨市场配对解析改为只读 Gamma 主查：Gamma SDK `Market` 对象（嵌套
   `state.end_date`、`outcomes.yes/no.token_id`、`trading` 费率）与旧格式 dict
   （`outcomes` + `clobTokenIds`）都能解析 YES/NO token 并构造配对，旧格式保持
