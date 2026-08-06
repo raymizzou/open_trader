@@ -97,7 +97,7 @@ test.describe('YES/NO arbitrage signal workspace', () => {
       await page.getByRole('button', { name: /确认下单/ }).dblclick();
       await expect.poll(() => confirmRequests.length).toBe(1);
       expect(previewRequests).toEqual(['POST', 'POST']);
-      expect(await page.locator('.pm-venue-card').nth(1).evaluate((card) => getComputedStyle(card).borderRightWidth)).toBe('1px');
+      await expect(page.locator('.pm-venue-card').nth(1)).toHaveCSS('border-right-width', '1px');
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     }
   });
