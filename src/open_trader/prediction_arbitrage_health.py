@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -117,31 +118,7 @@ def _process_info(repo_root: Path) -> dict[str, object] | None:
             break
     if pid is None:
         return None
-    cwd = None
-    try:
-        cwd_output = subprocess.run(
-            ["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
-            check=False,
-            capture_output=True,
-            text=True,
-        ).stdout
-    except OSError:
-        cwd_output = ""
-    for line in cwd_output.splitlines():
-        if line.startswith("n"):
-            cwd = line[1:]
-            break
-    sha = None
-    if cwd:
-        sha = (
-            subprocess.run(
-                ["git", "-C", cwd, "rev-parse", "HEAD"],
-                check=False,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            or None
-        )
+    sha = _dashboard_git_sha(repo_root)
     expected_sha = subprocess.run(
         ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
         check=False,
@@ -149,6 +126,18 @@ def _process_info(repo_root: Path) -> dict[str, object] | None:
         text=True,
     ).stdout.strip()
     return {"pid": pid, "sha": sha, "expected_sha": expected_sha}
+
+
+def _dashboard_git_sha(repo_root: Path) -> str | None:
+    """Read the git SHA the dashboard process actually loaded from its startup log."""
+
+    log = Path(repo_root) / "logs" / "legacy_dashboard" / "launchd.out.log"
+    try:
+        text = log.read_text(errors="replace")
+    except OSError:
+        return None
+    match = re.search(r'"git_sha":\s*"([0-9a-f]{7,40})"', text)
+    return match.group(1) if match else None
 
 
 def run_health_check(

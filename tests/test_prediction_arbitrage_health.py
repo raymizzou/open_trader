@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from open_trader.prediction_arbitrage_health import (
+    _dashboard_git_sha,
     format_report,
     report_to_dict,
     run_health_check,
@@ -188,3 +189,17 @@ def test_send_report_returns_false_on_failure() -> None:
             raise RuntimeError("boom")
 
     assert send_report(BrokenNotifier(), run_check()) is False
+
+
+def test_dashboard_git_sha_reads_startup_log(tmp_path: Path) -> None:
+    log = tmp_path / "logs" / "legacy_dashboard" / "launchd.out.log"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        'dashboard_runtime: {"pid": 44548, "git_sha": '
+        '"64809e3f45d8c8f1a53cf80d98c497027dc5d590", "source_state": "clean"}'
+    )
+    assert _dashboard_git_sha(tmp_path) == "64809e3f45d8c8f1a53cf80d98c497027dc5d590"
+
+
+def test_dashboard_git_sha_returns_none_without_log(tmp_path: Path) -> None:
+    assert _dashboard_git_sha(tmp_path) is None
