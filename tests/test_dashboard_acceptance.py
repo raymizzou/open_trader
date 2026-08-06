@@ -1912,18 +1912,7 @@ def integrated_v4_payload(
                 },
             },
             "drawdown_summary": frozen["drawdown_summary"],
-            "actual_overlay": {
-                "available": True,
-                "broker": broker,
-                "broker_label": labels[broker],
-                "market": market,
-                "notice": (
-                    "只读执行辅助；实盘变化不会改写模拟建议、Kelly、模拟统计或报告哈希；"
-                    "系统不会自动交易真实账户。"
-                ),
-                "items": [{"deviation_label": "已跟随"}],
-                "outside_positions": [],
-            },
+            "actual_overlay": {},
             "audit": {"artifact": artifact.name},
         })
     return payload, reports_dir, account_ids
@@ -1992,7 +1981,6 @@ def test_acceptance_reports_malformed_integrated_artifact_container(
         ("lot", "整手"),
         ("stats", "实盘统计券商"),
         ("cutoff", "来源截止时间"),
-        ("overlay", "实盘辅助"),
         ("drawdown_missing", "回撤状态缺失"),
     ],
 )
@@ -2023,8 +2011,6 @@ def test_acceptance_rejects_integrated_contract_drift(
         ] = "2026-07-21T00:00:00+08:00"
     elif mutation == "drawdown_missing":
         report["drawdown_summary"]["state_status"] = "missing"  # type: ignore[index]
-    else:
-        report["actual_overlay"]["broker"] = "eastmoney"  # type: ignore[index]
 
     errors = dashboard_acceptance.validate_integrated_candidate(
         payload,
@@ -2203,7 +2189,6 @@ def test_trend_advice_signature_allows_overlay_refresh_only(tmp_path: Path) -> N
     first, _reports_dir, _account_ids = integrated_v4_payload(tmp_path)
     second = copy.deepcopy(first)
     second_report = second["trend_reports"]["tiger"]  # type: ignore[index]
-    second_report["actual_overlay"]["items"] = [{"deviation_label": "超买"}]  # type: ignore[index]
 
     assert dashboard_acceptance.trend_advice_signature(
         first

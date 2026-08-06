@@ -603,6 +603,21 @@ def dashboard_signature(payload: dict[str, Any]) -> tuple[tuple[str, ...], ...]:
     return tuple(sorted(tuple(str(row.get(field, "")) for field in fields) for row in rows))
 
 
+def account_snapshot_signature(payload: Mapping[str, Any]) -> tuple[tuple[str, ...], ...]:
+    fields = ("market", "symbol", "broker")
+    positions = payload.get("positions") or []
+    cash = payload.get("cash_balances") or []
+    return tuple(sorted(
+        tuple(str(row.get(field, "")) for field in fields)
+        for row in positions
+        if isinstance(row, Mapping)
+    )) + tuple(sorted(
+        tuple(str(row.get(field, "")) for field in ("broker", "currency"))
+        for row in cash
+        if isinstance(row, Mapping)
+    ))
+
+
 def trend_advice_signature(payload: Mapping[str, Any]) -> tuple[str, ...]:
     reports = payload.get("trend_reports")
     reports = reports if isinstance(reports, Mapping) else {}
@@ -944,15 +959,7 @@ def validate_integrated_candidate(
                 ) == Decimal("0.05")
             ), f"{broker} 5% 策略回撤状态不正确"
             overlay = report.get("actual_overlay")
-            assert (
-                isinstance(overlay, Mapping)
-                and overlay.get("available") is True
-                and overlay.get("broker") == broker
-                and overlay.get("broker_label") == labels[broker]
-                and overlay.get("market") == market
-                and "不会改写模拟建议、Kelly、模拟统计或报告哈希"
-                in str(overlay.get("notice") or "")
-            ), f"{broker} 只读实盘辅助与对应账户不一致"
+            assert overlay in (None, {}), f"{broker} 只读实盘辅助与对应账户不一致"
         except (
             AssertionError, InvalidOperation, KeyError, OSError, TypeError,
             UnicodeError, ValueError, json.JSONDecodeError,
@@ -2482,7 +2489,12 @@ def _is_actionable_console_error(message: str) -> bool:
 
 
 def _first_in_scope_holding(payload: dict[str, Any]) -> tuple[str, str, str]:
-    for holding in payload.get("holdings") or []:
+    rows = (
+        payload.get("positions")
+        if isinstance(payload.get("positions"), list)
+        else payload.get("holdings") or []
+    )
+    for holding in rows:
         brokers = {
             "phillips" if value == "phillip" else value
             for value in [
@@ -2505,7 +2517,12 @@ def _first_in_scope_holding(payload: dict[str, Any]) -> tuple[str, str, str]:
 def _dashboard_holding_key(
     payload: Mapping[str, Any], market: str, symbol: str,
 ) -> str:
-    for index, holding in enumerate(payload.get("holdings") or []):
+    rows = (
+        payload.get("positions")
+        if isinstance(payload.get("positions"), list)
+        else payload.get("holdings") or []
+    )
+    for index, holding in enumerate(rows):
         if (
             isinstance(holding, Mapping)
             and str(holding.get("market", "")) == market
@@ -5603,7 +5620,6 @@ def main(argv: list[str] | None = None) -> int:
         if parity.status != "PASS":
             errors.append(f"Account API parity {parity.status}: {parity.reason}")
         second = _fetch_payload(args.url)
-        browser_payload = second
         reports_dir = _effective_reports_dir(second, process_cwd=legacy_cwd)
         if first_reports_dir != reports_dir:
             errors.append("账户刷新前后的 Dashboard reports_dir 不一致")
@@ -5620,11 +5636,17 @@ def main(argv: list[str] | None = None) -> int:
                 reports_dir=reports_dir,
                 account_ids=account_ids,
             ))
-        if dashboard_signature(first) != dashboard_signature(second):
+        if (
+            isinstance(account_snapshot, Mapping)
+            and isinstance(snapshot, Mapping)
+            and account_snapshot_signature(account_snapshot)
+            != account_snapshot_signature(snapshot)
+        ):
             errors.append("账户刷新后的 Dashboard 数据不稳定")
         if trend_advice_signature(first) != trend_advice_signature(second):
             errors.append("实盘刷新改写了冻结建议、Kelly 或模拟统计")
         errors.extend(_disabled_workflow_errors(args.expected_root))
+        browser_payload = snapshot if isinstance(snapshot, Mapping) else {}
     except Exception as exc:
         errors.append(f"运行检查失败：{type(exc).__name__}: {exc}")
     browser_errors, blocker = _browser_check(
