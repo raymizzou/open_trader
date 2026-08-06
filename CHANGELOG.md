@@ -13,6 +13,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   PASS/WARN/FAIL 每次发飞书（PASS 一行摘要，WARN/FAIL 逐项带值带原因）；飞书未配置
   显示 WARN，发送失败记日志下轮重试；`prediction-arb health-check --once` 可手动单跑。
   新增 24 个回归测试。
+- #29 健康检查的运行 SHA 改为解析 legacy-dashboard 启动日志里最后一条
+  `dashboard_runtime.git_sha`（进程真正加载的版本），不再读进程 cwd 的 git HEAD，
+  避免 main pull 后把旧进程误报为最新；日志缺失时该检查 WARN。新增 2 个回归测试。
 - #27 跨市场配对解析改为只读 Gamma 主查：Gamma SDK `Market` 对象（嵌套
   `state.end_date`、`outcomes.yes/no.token_id`、`trading` 费率）与旧格式 dict
   （`outcomes` + `clobTokenIds`）都能解析 YES/NO token 并构造配对，旧格式保持
