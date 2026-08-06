@@ -4465,12 +4465,12 @@ function renderTrendBuyStage(report) {
     "日成交额（亿元）", "目标仓位（占净值）", "目标金额", "预计数量", "预计保护线",
   ];
   const optionMarket = ["US", "HK"].includes(String(report?.market || "").toUpperCase());
-  const row = (item, action, skipped = false) => {
+  const row = (item, action) => {
     const targetWeight = decimalAsPercent(item.target_weight, null);
-    const shares = skipped ? "0 股" : hasValue(item.estimated_shares)
+    const shares = hasValue(item.estimated_shares)
       ? `${formatDisplayNumber(item.estimated_shares)} 股` : null;
     return `<tr class="cn-trend-card">
-      ${!skipped && optionMarket ? renderTrendOptionIdentityCell(item) : renderTrendCell("标的", trendIdentity(item))}
+      ${optionMarket ? renderTrendOptionIdentityCell(item) : renderTrendCell("标的", trendIdentity(item))}
       ${renderTrendCell("动作", action)}
       ${renderTrendCell("筛选价（Trend Animals）", hasValue(item.filter_price) ? formatDisplayNumber(item.filter_price) : null)}
       ${renderTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : null)}
@@ -4490,11 +4490,31 @@ function renderTrendBuyStage(report) {
     </tr>`;
   };
   const rows = cnTrendRows(report.buy_actions).map((item) => row(item, "正式买入"));
-  rows.push(...cnTrendRows(report.risk_skips).map((item) => row(item, "跳过", true)));
-  return renderCnTrendTable(
-    `${formatPlain(report.buy_window)} · 正式买入计划`, "buy", headings, rows,
+  const simulateStage = renderCnTrendTable(
+    `${formatPlain(report.buy_window)} · 模拟盘正式买入计划`, "buy", headings, rows,
     "价格口径：筛选价（Trend Animals）｜执行参考价（各市场报告来源）",
   );
+  const realHeadings = ["卖出", "买入", "动作", "强度差", "目标仓位（占净值）", "目标金额", "预计数量", "目标交易日", "状态"];
+  const realRows = cnTrendRows(report.real_rotation_pairs).map((pair) => {
+    const executionStatus = [pair.execution_status, pair.status, pair.order_status].find(hasValue);
+    const status = executionStatus ?? "待人工确认";
+    return `<tr class="cn-trend-card">
+      ${renderTrendCell("卖出", trendIdentity({symbol: pair.sell_symbol, name: pair.sell_name}))}
+      ${renderTrendCell("买入", trendIdentity({symbol: pair.buy_symbol, name: pair.buy_name}))}
+      ${renderTrendCell("动作", "卖出后买入")}
+      ${renderTrendCell("强度差", hasValue(pair.strength_gap) ? formatDisplayNumber(pair.strength_gap) : null)}
+      ${renderTrendCell("目标仓位（占净值）", decimalAsPercent(pair.target_weight, null))}
+      ${renderTrendCell("目标金额", hasValue(pair.target_amount) ? formatDisplayNumber(pair.target_amount) : null)}
+      ${renderTrendCell("预计数量", hasValue(pair.estimated_shares) ? `${formatDisplayNumber(pair.estimated_shares)} 股` : null)}
+      ${renderTrendCell("目标交易日", pair.execution_date || report.report_date)}
+      ${renderTrendCell("状态", status)}
+    </tr>`;
+  });
+  const realStage = renderCnTrendTable(
+    "实盘买入计划 · 人工确认", "buy", realHeadings, realRows,
+    "按实盘持仓独立生成；仅人工确认，不自动下单。",
+  );
+  return simulateStage + realStage;
 }
 
 const TREND_DISCIPLINE_ROW_NAMES = {
@@ -5041,75 +5061,66 @@ function renderTrendAllocation(report) {
 
 function renderTrendRotations(report) {
   if (!report?.allocation) return "";
-  const outcomeLabel = (comparison) => {
-    const outcome = String(comparison?.outcome || "");
-    if (outcome === "planned") return "已触发";
-    if (outcome === "gap_below_threshold") {
-      const gap = numericValue(comparison?.strength_gap);
-      const threshold = numericValue(comparison?.threshold) ?? 20;
-      const remaining = gap === null ? "" : ` · 还差 ${formatDisplayNumber(threshold - gap)}`;
-      return `未触发 · 门槛 ${formatDisplayNumber(threshold)}${remaining}`;
-    }
-    if (outcome === "sizing_blocked") return `未执行 · ${formatPlain(comparison?.reason || "仓位/交易单位不满足")}`;
-    if (outcome === "data_unavailable") return `未触发 · ${formatPlain(comparison?.reason || "比较数据不可用")}`;
-    return formatPlain(outcome || "未触发");
-  };
-  const strength = (label, value) => `${label} ${formatDisplayNumber(value)}`;
-  const group = (title, mode, comparisons, pairs) => {
+  const group = (title, mode, comparisons, pairs, statusLabel) => {
     const comparisonRows = cnTrendRows(comparisons).filter(
       (comparison) => String(comparison.outcome || "") === "planned",
     );
-    const rows = comparisonRows.length
-      ? comparisonRows.map((comparison) => {
-        const pair = cnTrendRows(pairs).find((item) => item.pair_index === comparison.pair_index) || {};
-        const basisLabel = comparison.strength_basis === "local" ? "大类内强度" : comparison.strength_basis === "global" ? "全局强度" : "数据不可用";
-        const executionStatus = [pair.execution_status, pair.status, pair.order_status].find(hasValue);
-        const status = executionStatus ?? (mode === "automatic" ? "待执行" : "待人工执行");
-        return `<article class="trend-rotation-pair">
-        <div class="trend-rotation-route">
-          <div><span>1 · MARKET 卖出 · ${escapeHtml(formatPlain(comparison.sell_asset || "资产类型未提供"))}</span><strong>${escapeHtml(trendIdentity({symbol: comparison.sell_symbol, name: comparison.sell_name}) || "数据未提供")}</strong><small>${escapeHtml(strength("大类内强度", comparison.sell_local_strength))} · ${escapeHtml(strength("全局强度", comparison.sell_global_strength))}</small></div>
-          <div><span>2 · MARKET 买入 · ${escapeHtml(formatPlain(comparison.buy_asset || "资产类型未提供"))}</span><strong>${escapeHtml(trendIdentity({symbol: comparison.buy_symbol, name: comparison.buy_name}) || "数据未提供")}</strong><small>${escapeHtml(strength("大类内强度", comparison.buy_local_strength))} · ${escapeHtml(strength("全局强度", comparison.buy_global_strength))}</small></div>
-        </div>
-        <dl>
-          <div><dt>比较口径</dt><dd>${escapeHtml(basisLabel)}</dd></div>
-          <div><dt>强度差</dt><dd>${escapeHtml(formatDisplayNumber(comparison.strength_gap))}</dd></div>
-          <div><dt>判断</dt><dd>${escapeHtml(outcomeLabel(comparison))}</dd></div>
-          ${comparison.reason && comparison.outcome !== "gap_below_threshold" ? `<div><dt>原因</dt><dd>${escapeHtml(formatPlain(comparison.reason))}</dd></div>` : ""}
-          ${pair.target_weight !== undefined ? `<div><dt>目标仓位</dt><dd>${escapeHtml(decimalAsPercent(pair.target_weight, "-"))}</dd></div>` : ""}
-          ${pair.target_amount !== undefined ? `<div aria-label="目标金额 ${escapeHtml(formatDisplayNumber(pair.target_amount))}"><dt>目标金额</dt><dd>${escapeHtml(formatDisplayNumber(pair.target_amount))}</dd></div>` : ""}
-          ${pair.estimated_shares !== undefined ? `<div aria-label="预计数量 ${escapeHtml(formatDisplayNumber(pair.estimated_shares))} 股"><dt>预计数量</dt><dd>${escapeHtml(formatDisplayNumber(pair.estimated_shares))} 股</dd></div>` : ""}
-          <div><dt>执行状态</dt><dd>${escapeHtml(formatPlain(status))}</dd></div>
-        </dl>
-        <p>MARKET 卖出全成后才买入｜比较口径：${escapeHtml(basisLabel)}｜目标交易日 ${escapeHtml(formatPlain(pair.execution_date || report.report_date))}</p>
-      </article>`;
-      }).join("")
-      : cnTrendRows(pairs).map((pair) => {
-      const frozenStatus = [pair.execution_status, pair.status, pair.order_status].find(hasValue);
-      const status = frozenStatus ?? (mode === "automatic" ? "待执行" : "待人工执行");
-      return `<article class="trend-rotation-pair">
-      <div class="trend-rotation-route">
-        <div><span>1 · MARKET 卖出</span><strong>${escapeHtml(trendIdentity({symbol: pair.sell_symbol, name: pair.sell_name}) || "数据未提供")}</strong><small>全局强度 ${escapeHtml(formatDisplayNumber(pair.sell_global_strength))}</small></div>
-        <div><span>2 · MARKET 买入</span><strong>${escapeHtml(trendIdentity({symbol: pair.buy_symbol, name: pair.buy_name}) || "数据未提供")}</strong><small>全局强度 ${escapeHtml(formatDisplayNumber(pair.buy_global_strength))}</small></div>
-      </div>
-      <dl>
-        <div><dt>强度差</dt><dd>差值 ${escapeHtml(formatDisplayNumber(pair.strength_gap))}</dd></div>
-        <div><dt>目标仓位</dt><dd>${escapeHtml(decimalAsPercent(pair.target_weight, "-"))}</dd></div>
-        <div aria-label="目标金额 ${escapeHtml(formatDisplayNumber(pair.target_amount))}"><dt>目标金额</dt><dd>${escapeHtml(formatDisplayNumber(pair.target_amount))}</dd></div>
-        <div aria-label="预计数量 ${escapeHtml(formatDisplayNumber(pair.estimated_shares))} 股"><dt>预计数量</dt><dd>${escapeHtml(formatDisplayNumber(pair.estimated_shares))} 股</dd></div>
-        <div><dt>执行状态</dt><dd>${escapeHtml(formatPlain(status))}</dd></div>
-      </dl>
-      <p>MARKET 卖出全成后才买入｜目标交易日 ${escapeHtml(formatPlain(pair.execution_date))}｜不得跨日</p>
-    </article>`;
-    }).join("");
-    return `<section class="trend-rotation-group" data-mode="${mode}"><h3>${escapeHtml(title)}</h3>${rows || "<p>无</p>"}</section>`;
+    const headings = [
+      "卖出标的", "买入标的", "比较口径", "大类内强度", "全局强度", "强度差",
+      "判断", "目标仓位（占净值）", "目标金额", "预计数量", "目标交易日", statusLabel,
+    ];
+    const sourceRows = comparisonRows.length
+      ? comparisonRows.map((comparison) => ({
+          comparison,
+          pair: cnTrendRows(pairs).find((item) => item.pair_index === comparison.pair_index) || {},
+        }))
+      : cnTrendRows(pairs).map((pair) => ({pair}));
+    const rows = sourceRows.map(({comparison, pair}) => {
+      comparison = comparison || {
+        sell_symbol: pair.sell_symbol,
+        sell_name: pair.sell_name,
+        buy_symbol: pair.buy_symbol,
+        buy_name: pair.buy_name,
+        strength_basis: "global",
+        sell_local_strength: null,
+        buy_local_strength: null,
+        sell_global_strength: pair.sell_global_strength,
+        buy_global_strength: pair.buy_global_strength,
+        strength_gap: pair.strength_gap,
+      };
+      const basisLabel = comparison.strength_basis === "local" ? "大类内强度" : comparison.strength_basis === "global" ? "全局强度" : "数据未提供";
+      const executionStatus = [pair.execution_status, pair.status, pair.order_status].find(hasValue);
+      const status = executionStatus ?? (mode === "automatic" ? "待执行" : "待人工确认");
+      const route = (label, localValue, globalValue) => renderTrendCell(
+        label,
+        `${hasValue(localValue) ? formatDisplayNumber(localValue) : "数据未提供"} → ${hasValue(globalValue) ? formatDisplayNumber(globalValue) : "数据未提供"}`,
+      );
+      return `<tr class="cn-trend-card">
+        ${renderTrendCell("卖出标的", trendIdentity({symbol: comparison.sell_symbol, name: comparison.sell_name}))}
+        ${renderTrendCell("买入标的", trendIdentity({symbol: comparison.buy_symbol, name: comparison.buy_name}))}
+        ${renderTrendCell("比较口径", basisLabel)}
+        ${route("大类内强度", comparison.sell_local_strength, comparison.buy_local_strength)}
+        ${route("全局强度", comparison.sell_global_strength, comparison.buy_global_strength)}
+        ${renderTrendCell("强度差", hasValue(comparison.strength_gap) ? formatDisplayNumber(comparison.strength_gap) : null)}
+        ${renderTrendCell("判断", "已触发")}
+        ${renderTrendCell("目标仓位（占净值）", decimalAsPercent(pair.target_weight, null))}
+        ${renderTrendCell("目标金额", hasValue(pair.target_amount) ? formatDisplayNumber(pair.target_amount) : null)}
+        ${renderTrendCell("预计数量", hasValue(pair.estimated_shares) ? `${formatDisplayNumber(pair.estimated_shares)} 股` : null)}
+        ${renderTrendCell("目标交易日", pair.execution_date || report.report_date)}
+        ${renderTrendCell(statusLabel, status)}
+      </tr>`;
+    });
+    return renderCnTrendTable(
+      title, "buy", headings, rows,
+      mode === "automatic"
+        ? "只显示已触发（强度差 ≥ 20）的合格轮换；未达标项不显示。"
+        : "按实盘持仓独立生成；仅人工确认，不自动下单。",
+    );
   };
-  return `<section class="trend-rotation-panel" aria-label="相对强度轮换">
-    <h2>相对强度轮换</h2>
-    <div class="trend-rotation-groups">
-      ${group("模拟盘自动", "automatic", report.simulate_rotation_comparisons, report.simulate_rotation_pairs)}
-      ${group("实盘手动", "manual", report.real_rotation_comparisons, report.real_rotation_pairs)}
-    </div>
-  </section>`;
+  return `<section class="trend-rotation-panel" aria-label="相对强度轮换"><h2>相对强度轮换</h2>`
+    + group("模拟盘自动轮换", "automatic", report.simulate_rotation_comparisons, report.simulate_rotation_pairs, "执行状态")
+    + group("实盘手动轮换", "manual", report.real_rotation_comparisons, report.real_rotation_pairs, "状态")
+    + `</section>`;
 }
 
 function renderCnTrendReportWorkspace(report, embedded = false, historical = false, trailingContent = "") {

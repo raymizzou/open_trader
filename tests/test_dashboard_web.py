@@ -4936,7 +4936,7 @@ console.log(JSON.stringify({cn,us}));
     combined = rendered["cn"] + rendered["us"]
     for expected in (
         "1,234,567.51", "24.55", "99.88", "12,345.68", "2.35",
-        "39,970.42", "8,888.89", "9,007,199,254,740,993 股", "23.43", "30.59",
+        "39,970.42", "9,007,199,254,740,993 股", "23.43", "30.59",
         "90.44", "28.31", "4,941.5", "205.47", "目标仓位 4.12%",
     ):
         assert expected in combined
@@ -4945,9 +4945,11 @@ console.log(JSON.stringify({cn,us}));
         "编号 00001234",
     ):
         assert preserved in combined
+    assert "跳过" not in combined
+    assert "600002" not in combined
     for raw in (
         "24.545714285714", "99.876", "12345.678", "2.345", "39970.419",
-        "30.594999999999995", "90.444", "28.305071428571", "4941.499", "8888.888",
+        "30.594999999999995", "90.444", "28.305071428571", "4941.499",
         "13.129", "23.428", "207.185",
     ):
         assert raw not in combined
@@ -8480,7 +8482,8 @@ const cn = renderTrendReportWorkspace({
   ],excluded:{"AUDIT-ONLY":["strength_below_95"]},industry_concentration:[],
     data_sources:["Trend Animals","Futu CN calendar/QFQ daily K-line"]},
 });
-for (const text of ["优先处理 · 卖出触发","09:30–10:00 · 正式买入计划",
+for (const text of ["优先处理 · 卖出触发","09:30–10:00 · 模拟盘正式买入计划",
+  "实盘买入计划 · 人工确认",
   "需要确认 · 人工复核","盘中持续 · 已有持仓","筛选价（Trend Animals）","执行参考价",
   "温 → 热","目标仓位 4%","全部卖出","正式买入","继续持有",
   "人工复核","600036","600519","日线数据不可用","筛选价数据不可用",
@@ -8498,7 +8501,7 @@ if ((cn.match(/class="trend-audit-row"/g) || []).length !== 3 ||
     cn.includes("<h3>排除项</h3>")) throw new Error(cn);
 const empty = renderCnTrendAudit({candidates:{}}, {});
 if (!empty.includes("无候选审计数据")) throw new Error(empty);
-const stageOrder=["优先处理 · 卖出触发","09:30–10:00 · 正式买入计划",
+const stageOrder=["优先处理 · 卖出触发","09:30–10:00 · 模拟盘正式买入计划",
   "需要确认 · 人工复核","盘中持续 · 已有持仓"].map((text)=>cn.indexOf(`<h2>${text}</h2>`));
 if(stageOrder.some((index)=>index<0)||!stageOrder.every((index,i)=>i===0||stageOrder[i-1]<index))throw new Error(cn);
 if (!cn.includes('class="cn-trend-report"') ||
@@ -8531,20 +8534,20 @@ const us = renderTrendReportWorkspace({
   audit:{account_exceptions:["现金类资产不参与趋势判断"]},
 });
 for (const text of ["优先处理 · 卖出触发","需要确认 · 人工复核",
-  "美股常规交易时段 · 正式买入计划","盘中持续 · 已有持仓",
+  "美股常规交易时段 · 模拟盘正式买入计划","实盘买入计划 · 人工确认","盘中持续 · 已有持仓",
   "买入 1","卖出 0","持有 0","复核 1",
   "EA 艺电","207.27","99.8","通讯服务","4%","4,941.49","23 股",
   "205.47","BOTZ Global X Robotics ETF","趋势信号不完整",
   "账户不参与项","现金类资产不参与趋势判断","审计详情"]) {
   if (!us.includes(text)) throw new Error(text + "\n" + us);
 }
-const usOrder=["优先处理 · 卖出触发","美股常规交易时段 · 正式买入计划",
+const usOrder=["优先处理 · 卖出触发","美股常规交易时段 · 模拟盘正式买入计划",
   "需要确认 · 人工复核","盘中持续 · 已有持仓"]
   .map((text)=>us.indexOf(`<h2>${text}</h2>`));
 if (usOrder.some((index)=>index<0) ||
     !usOrder.every((index,i)=>i===0||usOrder[i-1]<index)) throw new Error(us);
 if (!us.includes('class="cn-trend-report"') ||
-        (us.match(/class="cn-trend-table"/g) || []).length !== 4 ||
+        (us.match(/class="cn-trend-table"/g) || []).length !== 5 ||
     !us.includes('class="cn-trend-card"') ||
     us.includes("今日执行检查") || !us.includes("筛选价（Trend Animals）") ||
     us.includes('class="trend-discipline"') ||
@@ -8880,8 +8883,7 @@ for (const text of ["组合计划风险","风险预算内",
   "状态恢复审计详情","snapshot-recovery-audit","state-snapshot.json","statehash789",
   "组合剩余风险","单笔风险上限","异常损失缓冲","不得用于开仓",
   "5% 是风险预算目标，不是最大损失保证。","目标仓位（占净值）",
-  "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。",
-  "第二候选"]) {
+  "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。"]) {
   if (!html.includes(text)) throw new Error(text + "\n" + html);
 }
 if (html.includes("本次可用风险") || html.includes("<th scope=\"col\">目标仓位</th>")) {
@@ -8893,7 +8895,7 @@ const risk = html.indexOf('class="trend-risk-summary"');
 const sell = html.indexOf("优先处理 · 卖出触发");
 const lifecycle = html.indexOf('class="trend-discipline-workspace"');
 if (!(counts >= 0 && counts < sell && sell < lifecycle && lifecycle < risk)) throw new Error(html);
-if ((html.match(/class="cn-trend-card"/g) || []).length < 3 ||
+if ((html.match(/class="cn-trend-card"/g) || []).length < 2 ||
     (html.match(/class="cn-trend-risk-detail"/g) || []).length !== 0) {
   throw new Error(html);
 }
@@ -9090,11 +9092,11 @@ console.log(JSON.stringify(renderTrendReportWorkspace({
         assert "东方财富实盘交易统计" in risk_text
         assert "实盘执行辅助" not in risk_text
         assert "冻结参考价 CNY 10" not in risk_text
-        assert page.locator(".cn-trend-card").count() == 2
+        assert page.locator(".cn-trend-card").count() == 1
         assert page.evaluate(
             "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
         )
-        assert page.locator(".cn-trend-buy").evaluate(
+        assert page.locator(".cn-trend-buy").first.evaluate(
             "node => node.scrollWidth <= node.clientWidth"
         )
         browser.close()
@@ -9393,10 +9395,10 @@ const html=renderTrendReportWorkspace({
   market:"CN",buy_window:"09:30–10:00",counts:{},sell_actions:[],buy_actions:[],
   hold_actions:[],audit:{},
 });
-    if ((html.match(/class="cn-trend-table"/g) || []).length !== 3 ||
+    if ((html.match(/class="cn-trend-table"/g) || []).length !== 4 ||
     !html.includes("筛选价（Trend Animals）") ||
     !html.includes("执行参考价") ||
-        (html.match(/<p>无<\/p>/g) || []).length !== 3 ||
+        (html.match(/<p>无<\/p>/g) || []).length !== 4 ||
     html.includes("需要确认 · 人工复核")) throw new Error(html);
 console.log("ok");
 ''')
@@ -9472,7 +9474,7 @@ if (usBuyHold.includes('disabled title="富途未返回该标的期权异动"'))
 if ((usBuyHold.match(/>期权异动<\/button>/g) || []).length !== 2) throw new Error(usBuyHold);
 if (usSell.includes("期权异动") || usReview.includes("期权异动")) throw new Error(usSell + usReview);
 if (cn.includes("期权异动")) throw new Error(cn);
-if ((usBuy.match(/<th scope="col">/g) || []).length !== 17) throw new Error(usBuy);
+if ((usBuy.match(/<th scope="col">/g) || []).length !== 26) throw new Error(usBuy);
 let opened = 0;
 let closed = 0;
 const dialog = {showModal(){opened += 1;}, close(){closed += 1;}};
@@ -9578,7 +9580,7 @@ const html=renderTrendReportWorkspace({
 });
 state.dashboard={trend_reports:{tiger:{available:false,status_text:"今日趋势报告无效"}}};
 const unavailable=renderTrendReportEntry("tiger");
-if((html.match(/<p>无<\/p>/g)||[]).length!==3)throw new Error(html);
+if((html.match(/<p>无<\/p>/g)||[]).length!==4)throw new Error(html);
 if(!html.includes("数据来源：无"))throw new Error(html);
 if(!unavailable.includes("今日趋势报告无效"))throw new Error(unavailable);
 console.log("ok");
@@ -12921,17 +12923,17 @@ for (const text of [
   "市场资源排名", "模拟盘自动", "实盘手动", "全局强度", "单仓基准 6%",
   "10 席位名义仓位 60%", "沿用旧排名 · 2 个 A 股交易日 · 原快照 2026-08-03", "2026-08-01",
   "生成 2026-08-03T16:20:00+08:00", "目标交易日 2026-08-04", "SHA abcdef123456",
-  "SIM-SELL", "SIM-BUY", "REAL-SELL", "REAL-BUY", "差值 40",
-  "目标金额 6,000", "预计数量 300 股", "MARKET 卖出全成后才买入",
-  "卖出已成交", "等待账户刷新", "人工复核中", "待人工执行",
+  "SIM-SELL", "SIM-BUY", "REAL-SELL", "REAL-BUY", "强度差",
+  "6,000", "300 股",
+  "卖出已成交", "等待账户刷新", "人工复核中", "待人工确认",
   "本次更新失败原因：上游短暂不可用",
   "API 返回的全局比较值", "不是小程序收藏夹显示的收藏夹内排名分位",
 ]) {
   if (!html.includes(text)) throw new Error("missing " + text + "\n" + html);
 }
 if ((html.match(/class="trend-allocation-card"/g) || []).length !== 3) throw new Error(html);
-if ((html.match(/class="trend-rotation-group"/g) || []).length !== 2) throw new Error(html);
-if ((html.match(/<dt>执行状态<\/dt>/g) || []).length !== 4) throw new Error(html);
+if ((html.match(/class="cn-trend-table"/g) || []).length !== 6) throw new Error(html);
+if ((html.match(/<th scope="col">执行状态<\/th>/g) || []).length !== 1) throw new Error(html);
 const cardMarkets = [...html.matchAll(/class="trend-allocation-card" data-market="([A-Z]+)"/g)].map((match) => match[1]);
 if (cardMarkets.join(",") !== "US,HK,CN") throw new Error("wrong rank order: " + cardMarkets + "\n" + html);
 if (!html.includes('data-market="CN" data-current-report="true"') || !html.includes("第 3 名 · 当前报告")) throw new Error(html);
@@ -12974,7 +12976,7 @@ const report = {
   ],
 };
 const html = renderTrendReportWorkspace(report);
-for (const text of ["大类内强度", "全局强度", "比较口径", "目标金额 4,000", "预计数量 100 股"]) {
+for (const text of ["大类内强度", "全局强度", "比较口径", "4,000", "100 股"]) {
   if (!html.includes(text)) throw new Error("missing " + text + "\n" + html);
 }
 for (const text of ["未触发", "还差 0.1", "买入手数缺失", "大类未提供或不属于当前市场"]) {
