@@ -37,7 +37,7 @@ done
 [[ "$WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]] || { usage; exit 2; }
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 RUNTIME_ROOT="${RUNTIME_ROOT:-$REPO_ROOT}"
-RUNTIME_ROOT="$(cd "$RUNTIME_ROOT" && pwd)"
+RUNTIME_ROOT="$(cd "$RUNTIME_ROOT" 2>/dev/null && pwd || printf '%s' "$RUNTIME_ROOT")"
 
 [[ -f "$REPO_ROOT/scripts/install_account_sync_launchd.sh" ]] || { echo "missing release scripts in $REPO_ROOT" >&2; exit 1; }
 EXPECTED_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"

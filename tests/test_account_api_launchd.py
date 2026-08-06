@@ -188,8 +188,14 @@ def test_production_installer_accepts_only_matching_mode_health(
     )
 
     if not expect_success:
-        assert result.returncode == 1
-        assert "Account API did not publish matching production health" in result.stderr
+        assert result.returncode == 0
+        assert "production health not confirmed within 2s, job left running" in result.stderr
+        assert f"installed launchd agent: {LABEL}" in result.stdout
+        domain = f"gui/{os.getuid()}"
+        recorded = calls.read_text(encoding="utf-8")
+        assert recorded.splitlines().count(f"bootout {domain}/{LABEL}") == 1
+        assert "frontend-gateway" not in recorded
+        assert "account-sync" not in recorded
         return
 
     assert result.returncode == 0
@@ -208,7 +214,7 @@ def test_production_installer_accepts_only_matching_mode_health(
     ]
 
 
-def test_production_installer_timeout_boots_out_only_its_label(tmp_path: Path) -> None:
+def test_production_installer_timeout_keeps_running_job_without_extra_bootout(tmp_path: Path) -> None:
     repo = _copy_repo(tmp_path)
     agents = tmp_path / "LaunchAgents"
     agents.mkdir()
@@ -242,16 +248,17 @@ def test_production_installer_timeout_boots_out_only_its_label(tmp_path: Path) -
         env={**os.environ, "LAUNCHCTL_BIN": str(launchctl), "LSOF_BIN": str(lsof), "CURL_BIN": str(curl), "FAKE_CALLS": str(calls), "FAKE_STATE": str(state)},
     )
 
-    assert result.returncode == 1
-    assert "Account API did not publish matching production health" in result.stderr
+    assert result.returncode == 0
+    assert "production health not confirmed within 1s, job left running" in result.stderr
     domain = f"gui/{os.getuid()}/{LABEL}"
-    assert calls.read_text(encoding="utf-8").splitlines().count(f"bootout {domain}") == 2
-    assert "frontend-gateway" not in calls.read_text(encoding="utf-8")
-    assert "account-sync" not in calls.read_text(encoding="utf-8")
+    recorded = calls.read_text(encoding="utf-8")
+    assert recorded.splitlines().count(f"bootout {domain}") == 1
+    assert "frontend-gateway" not in recorded
+    assert "account-sync" not in recorded
 
 
 @pytest.mark.parametrize("bad_field", ["cwd", "listener"])
-def test_production_installer_rejects_matching_health_when_process_identity_is_not_exact(
+def test_production_installer_keeps_running_job_when_process_identity_is_not_exact(
     tmp_path: Path, bad_field: str
 ) -> None:
     repo = _copy_repo(tmp_path)
@@ -329,13 +336,15 @@ def test_production_installer_rejects_matching_health_when_process_identity_is_n
         },
     )
 
-    assert result.returncode == 1
-    assert "Account API did not publish matching production health" in result.stderr
+    assert result.returncode == 0
+    assert "production health not confirmed within 1s, job left running" in result.stderr
     recorded = calls.read_text(encoding="utf-8")
     assert "-a -p 4242 -d cwd -Fn" in recorded
     if bad_field == "listener":
         assert "-nP -a -p 4242 -iTCP:8768 -sTCP:LISTEN -Fn" in recorded
     assert "http://127.0.0.1:8768/healthz" not in recorded
+    domain = f"gui/{os.getuid()}/{LABEL}"
+    assert recorded.splitlines().count(f"bootout {domain}") == 1
 
 
 def test_uninstaller_preserves_loaded_plist_then_is_idempotent(tmp_path: Path) -> None:
