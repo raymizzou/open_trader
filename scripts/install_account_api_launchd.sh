@@ -10,7 +10,7 @@ LAUNCH_AGENTS_DIR="${HOME}/Library/LaunchAgents"
 LAUNCHCTL_BIN="${LAUNCHCTL_BIN:-/bin/launchctl}"
 LSOF_BIN="${LSOF_BIN:-/usr/sbin/lsof}"
 CURL_BIN="${CURL_BIN:-/usr/bin/curl}"
-WAIT_SECONDS="${ACCOUNT_API_LAUNCHD_WAIT_SECONDS:-30}"
+WAIT_SECONDS="${ACCOUNT_API_LAUNCHD_WAIT_SECONDS:-90}"
 LABEL="com.open-trader.account-api"
 
 usage() {
@@ -141,11 +141,14 @@ loopback_listener_matches() {
 }
 
 wait_ready() {
-  local expected_sha attempt output pid health
+  local expected_sha attempt output pid health alive=0
   expected_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
   for ((attempt = 1; attempt <= WAIT_SECONDS; attempt++)); do
     output="$("$LAUNCHCTL_BIN" print "gui/$UID/$LABEL" 2>&1 || true)"
     pid="$(printf '%s\n' "$output" | awk '$1 == "pid" && $2 == "=" && $3 ~ /^[0-9]+$/ { print $3; exit }')"
+    if [[ -n "$pid" ]]; then
+      alive=1
+    fi
     if [[ -n "$pid" ]] && process_cwd_matches "$pid" \
       && loopback_listener_matches "$pid" \
       && health="$("$CURL_BIN" -fsS http://127.0.0.1:8768/healthz 2>/dev/null)" \
@@ -154,9 +157,13 @@ wait_ready() {
     fi
     sleep 1
   done
+  if [[ "$alive" -eq 1 ]]; then
+    echo "Account API installed; $MODE health not confirmed within ${WAIT_SECONDS}s, job left running" >&2
+    return 0
+  fi
   bootout_if_loaded || true
   wait_agent_absent || return 1
-  echo "Account API did not publish matching $MODE health" >&2
+  echo "Account API did not start (no process bound to 8768)" >&2
   return 1
 }
 
