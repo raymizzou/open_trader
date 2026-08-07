@@ -1022,7 +1022,13 @@ class CodexCrossVenueEquivalenceValidator:
         timeout_seconds: float = 45.0,
         prompt_version: str = CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION,
         fallback_model: str | None = None,
-        fallback: Callable[[str, Mapping[str, object]], str] | None = None,
+        fallback: (
+            Callable[
+                [str, Mapping[str, object]],
+                tuple[str | None, str | None],
+            ]
+            | None
+        ) = None,
     ) -> None:
         if not model.strip():
             raise ValueError("Codex model is required")
@@ -1139,7 +1145,7 @@ class CodexCrossVenueEquivalenceValidator:
             "OUTPUT JSON SCHEMA\n"
             f"{_CODEX_SCHEMA.read_text(encoding='utf-8')}\n"
         )
-        raw, reason = self.fallback(
+        raw, fallback_reason = self.fallback(
             fallback_prompt,
             {
                 "predict": _equivalence_market_payload(pair.predict),
@@ -1147,13 +1153,17 @@ class CodexCrossVenueEquivalenceValidator:
             },
         )
         if raw is None:
+            deepseek_reason = fallback_reason or "DEEPSEEK_FAILED"
             self.store.record_llm_call(status="failed", usage={"provider": "deepseek"})
             return _cross_venue_validation(
                 pair,
                 False,
-                "DEEPSEEK_FAILED",
+                deepseek_reason,
                 self.prompt_version,
-                summary=f"Codex({codex_reason}) 与 DeepSeek 校验均不可用，当前不可下单。",
+                summary=(
+                    f"Codex({codex_reason}) 与 DeepSeek 校验均不可用"
+                    f"（{deepseek_reason}），当前不可下单。"
+                ),
             )
         try:
             structured = json.loads(raw)

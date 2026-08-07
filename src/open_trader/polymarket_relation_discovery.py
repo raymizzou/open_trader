@@ -1275,6 +1275,9 @@ def _deepseek_completion(
 ) -> tuple[str | None, str | None]:
     """Return (content, None) or (None, reason) for the DeepSeek fallback."""
 
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    if not api_key:
+        return None, "DEEPSEEK_KEY_MISSING"
     try:
         from openai import OpenAI
 
@@ -1283,7 +1286,7 @@ def _deepseek_completion(
             or "max"
         )
         response = OpenAI(
-            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+            api_key=api_key,
             base_url=DEEPSEEK_BASE_URL,
             timeout=timeout_seconds,
         ).chat.completions.create(
@@ -1304,9 +1307,24 @@ def _deepseek_completion(
             timeout=timeout_seconds,
         )
         content = response.choices[0].message.content
-        return (content, None) if content else (None, "DEEPSEEK_FAILED")
-    except Exception:
-        return None, "DEEPSEEK_FAILED"
+        return (content, None) if content else (None, "DEEPSEEK_EMPTY_CONTENT")
+    except Exception as exc:
+        return None, _deepseek_failure_reason(exc)
+
+
+def _deepseek_failure_reason(exc: BaseException) -> str:
+    status = getattr(exc, "status_code", None)
+    if status in (401, 403):
+        return "DEEPSEEK_AUTH_FAILED"
+    if status == 429:
+        return "DEEPSEEK_RATE_LIMITED"
+    if status is not None:
+        return "DEEPSEEK_HTTP_ERROR"
+    if isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.lower():
+        return "DEEPSEEK_TIMEOUT"
+    if "connection" in type(exc).__name__.lower():
+        return "DEEPSEEK_CONNECTION_FAILED"
+    return "DEEPSEEK_FAILED"
 
 
 class _CodexCircuitBreaker:
@@ -1426,7 +1444,13 @@ class CodexRelationValidator:
         timeout_seconds: float = 45.0,
         prompt_version: str = CODEX_PROMPT_VERSION,
         fallback_model: str | None = None,
-        fallback: Callable[[str, Mapping[str, object]], str] | None = None,
+        fallback: (
+            Callable[
+                [str, Mapping[str, object]],
+                tuple[str | None, str | None],
+            ]
+            | None
+        ) = None,
     ) -> None:
         if not model.strip():
             raise ValueError("Codex model is required")
@@ -1501,6 +1525,13 @@ class CodexRelationValidator:
             "CODEX_CIRCUIT_OPEN": "Codex 连续失败已临时熔断，当前使用 DeepSeek 校验。",
             "DEEPSEEK_FAILED": "Codex 与 DeepSeek 校验均不可用，当前不可下单。",
             "DEEPSEEK_OUTPUT_INVALID": "Codex 与 DeepSeek 校验均不可用，当前不可下单。",
+            "DEEPSEEK_KEY_MISSING": "DeepSeek API Key 未配置，当前不可下单。",
+            "DEEPSEEK_EMPTY_CONTENT": "DeepSeek 返回空内容，当前不可下单。",
+            "DEEPSEEK_TIMEOUT": "DeepSeek 校验超时，当前不可下单。",
+            "DEEPSEEK_CONNECTION_FAILED": "DeepSeek 网络连接失败，当前不可下单。",
+            "DEEPSEEK_AUTH_FAILED": "DeepSeek 认证失败，当前不可下单。",
+            "DEEPSEEK_RATE_LIMITED": "DeepSeek 限流，当前不可下单。",
+            "DEEPSEEK_HTTP_ERROR": "DeepSeek API 请求失败，当前不可下单。",
             "CONDITION_ID_MISMATCH": "Codex 返回的 condition ID 与候选合约不一致。",
             "INVALID_THRESHOLD": "Codex 返回的阈值不是有效十进制数。",
             "EVIDENCE_NOT_FOUND": "Codex 引用的规则证据无法在原文中核验。",
@@ -1702,8 +1733,11 @@ class CodexRelationValidator:
             "OUTPUT JSON SCHEMA\n"
             f"{_CODEX_SCHEMA.read_text(encoding='utf-8')}\n"
         )
-        raw, reason = self.fallback(fallback_prompt, _codex_payload(relation))
+        raw, fallback_reason = self.fallback(
+            fallback_prompt, _codex_payload(relation)
+        )
         if raw is None:
+            deepseek_reason = fallback_reason or "DEEPSEEK_FAILED"
             self.store.record_llm_call(
                 status="failed", usage={"provider": "deepseek"}
             )
@@ -1712,8 +1746,8 @@ class CodexRelationValidator:
                 cache_key=codex_cache_key,
                 structured=None,
                 status="llm_unavailable",
-                reason="DEEPSEEK_FAILED",
-                reasons=(codex_reason, "DEEPSEEK_FAILED"),
+                reason=deepseek_reason,
+                reasons=(codex_reason, deepseek_reason),
             )
         try:
             structured = json.loads(raw)

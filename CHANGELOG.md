@@ -10,6 +10,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   恢复即优先。已验：两条 validator 相关测试 147 通过；真实链路 Codex 401 →
   DeepSeek APPROVE → 确定性校验 fail-closed 通过；线上重启后以 dashboard_runtime
   SHA 为准。
+- #26 修复：fallback 回调类型标注修正为 `tuple[str|None, str|None]`；DeepSeek 失败
+  原因细分（缺 key/空内容/超时/连接/认证/限流/HTTP），具体原因码透传到校验结果，
+  不再一律显示 `DEEPSEEK_FAILED`。已验：两条 validator 测试 150 通过。
 - 规范：`docs/superpowers/specs/` 与 `docs/superpowers/plans/` 不再纳入 git 跟踪
   （加入 `.gitignore`；已跟踪的 140 个 spec、159 个 plan 文件改为 untrack，文件保留
   在本地，历史提交不受影响）。

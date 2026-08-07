@@ -22,6 +22,7 @@ from polymarket.models.gamma.market import (
 
 from open_trader.polymarket_relation_discovery import (
     CODEX_PROMPT_VERSION,
+    _deepseek_completion,
     CodexRelationValidator,
     RelationActivityAssessment,
     ThresholdRelation,
@@ -1006,6 +1007,37 @@ def test_codex_circuit_breaker_skips_codex_after_repeated_failures(
 
     assert validator.validate(relation).status == "approved"
     assert runner_calls == 3  # circuit open: Codex skipped, DeepSeek cache hit
+
+
+def test_deepseek_completion_missing_key_reports_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "")
+
+    content, reason = _deepseek_completion(
+        "prompt", {}, model="deepseek-v4-flash"
+    )
+
+    assert content is None
+    assert reason == "DEEPSEEK_KEY_MISSING"
+
+
+def test_deepseek_failure_reason_propagates_to_validation(tmp_path: Path) -> None:
+    db = codex_store(tmp_path)
+    validator = CodexRelationValidator(
+        db,
+        model="gpt-test",
+        fallback_model="deepseek-v4-flash-max",
+        runner=lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 1, stdout="", stderr="401"
+        ),
+        fallback=lambda prompt, payload: (None, "DEEPSEEK_KEY_MISSING"),
+    )
+
+    result = validator.validate(threshold_relation())
+
+    assert result.status == "llm_unavailable"
+    assert result.reason_codes == ("CODEX_FAILED", "DEEPSEEK_KEY_MISSING")
 
 
 @pytest.mark.parametrize(
