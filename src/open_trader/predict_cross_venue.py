@@ -183,6 +183,31 @@ class ExplicitMarketPair:
     canonical_cutoff: datetime | None = None
 
 
+_MANUAL_ELIGIBLE_REJECT_REASONS = frozenset({
+    "LLM_REJECTED",
+    "IDENTITY_MISMATCH",
+    "FINGERPRINT_MISMATCH",
+    "OUTCOME_MAPPING_MISMATCH",
+    "CUTOFF_INVALID",
+    "COMPOUND_CONTRACT",
+    "DIVERGENT_STATE_POSSIBLE",
+    "EVIDENCE_NOT_FOUND",
+    "MISSING_EVIDENCE",
+    "CUTOFF_EVIDENCE_MISMATCH",
+    "UNRESOLVED_UNCERTAINTY",
+})
+
+
+def normalize_question(text: str) -> str:
+    return " ".join(str(text or "").split())
+
+
+def text_identical_pair(pair: ExplicitMarketPair) -> bool:
+    return normalize_question(pair.predict.question) == normalize_question(
+        pair.polymarket.question
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ExplicitPairResolution:
     pairs: tuple[ExplicitMarketPair, ...]

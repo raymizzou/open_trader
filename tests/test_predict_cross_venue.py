@@ -21,6 +21,7 @@ from open_trader.predict_cross_venue import (
     CrossVenueValidation,
     ExplicitMarketPair,
     PredictCrossVenueMonitor,
+    VenueMarket,
     build_cross_venue_intents,
     resolve_explicit_market_pairs,
     validate_cross_execution_mode,
@@ -1359,6 +1360,71 @@ def test_cross_venue_opportunity_exposes_depth_fields() -> None:
         await monitor.stop()
 
     asyncio.run(exercise())
+
+
+def _venue_market(exchange: str, market_id: str, *, question: str) -> VenueMarket:
+    if exchange == "predict.fun":
+        return VenueMarket(
+            exchange=exchange, market_id=market_id, condition_id=f"c-{market_id}",
+            question=question, rules="same rules",
+            yes_token_id=f"yes-{market_id}", no_token_id=f"no-{market_id}",
+            settlement_asset="USDT", minimum_order_size=Decimal("5"),
+            tick_size=Decimal("0.01"), fee_rate_bps=Decimal("0"),
+            category_slug="test", resolution_provider="provider",
+            event_start_at=datetime(2026, 1, 1, tzinfo=UTC),
+            event_end_at=datetime(2027, 1, 1, tzinfo=UTC),
+        )
+    return VenueMarket(
+        exchange=exchange, market_id=market_id, condition_id=f"c-{market_id}",
+        question=question, rules="same rules",
+        yes_token_id=f"yes-{market_id}", no_token_id=f"no-{market_id}",
+        settlement_asset="USDC", minimum_order_size=Decimal("5"),
+        tick_size=Decimal("0.01"), fee_rate_bps=Decimal("0"),
+        event_slug="event", resolution_source="source",
+        close_at=datetime(2027, 1, 1, tzinfo=UTC),
+        settlement_at=datetime(2027, 1, 2, tzinfo=UTC),
+    )
+
+
+def test_normalize_question_collapses_whitespace_only() -> None:
+    assert (
+        predict_cross_venue.normalize_question("  Metamask FDV  above $700M? ")
+        == "Metamask FDV above $700M?"
+    )
+    assert predict_cross_venue.normalize_question(
+        "Metamask FDV above $700M?"
+    ) != predict_cross_venue.normalize_question("metamask fdv above $700m?")
+
+
+def test_text_identical_pair_compares_normalized_questions() -> None:
+    pair = ExplicitMarketPair(
+        pair_id="p1",
+        predict=_venue_market(
+            "predict.fun", "1", question="  Metamask FDV above $700M?  "
+        ),
+        polymarket=_venue_market(
+            "polymarket", "2", question="Metamask FDV above $700M?"
+        ),
+    )
+    assert predict_cross_venue.text_identical_pair(pair) is True
+    different = ExplicitMarketPair(
+        pair_id="p2",
+        predict=_venue_market(
+            "predict.fun", "1", question="Metamask FDV above $700M?"
+        ),
+        polymarket=_venue_market(
+            "polymarket", "2", question="Metamask FDV above $500M?"
+        ),
+    )
+    assert predict_cross_venue.text_identical_pair(different) is False
+
+
+def test_manual_reject_whitelist_excludes_audit_failures() -> None:
+    reasons = predict_cross_venue._MANUAL_ELIGIBLE_REJECT_REASONS
+    assert "LLM_REJECTED" in reasons
+    assert "UNRESOLVED_UNCERTAINTY" in reasons
+    assert "DEEPSEEK_FAILED" not in reasons
+    assert "CODEX_TIMEOUT" not in reasons
 
 
 class FakeCrossVenuePredict:
