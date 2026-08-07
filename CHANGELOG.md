@@ -14,6 +14,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   关系对 submitted 后 5 分钟冷静期、每日 5 单或 $25（只统计 submitted）、余额 <$10 停；
   失败只记录不重试。成功吃单与结算（实际 vs 预计利润）发飞书，auto 模式不再发 order-ready；
   健康检查新增 auto_eat 模式/单数/拒绝/已实现盈亏统计。默认保持 observe_only。
+- #33 修复：结算通知改为读取执行 payload 的 auto_eat 标记，消除“执行线程先完成、
+  尝试记录后落库”导致的偶发漏发；结算测试轮询改用独立 30 秒预算。
 - #29 新增独立 prediction-arbitrage 健康检查后端服务（launchd label
   `com.open-trader.prediction-arbitrage-health`，RunAtLoad/KeepAlive，只装生产环境，
   与其他 worktree 部署无关）：每 2 小时检查 8766 状态端点与 healthz、heartbeat≤60s、

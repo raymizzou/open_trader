@@ -718,16 +718,13 @@ class PredictionArbitrageStore:
             ).fetchone()
         return None if row is None else str(row["created_at"])
 
-    def auto_eat_attempt_for_execution(self, execution_id: str) -> dict[str, object] | None:
+    def execution_payload(self, execution_id: str) -> dict[str, object] | None:
         with self._read_connection() as connection:
             row = connection.execute(
-                """
-                SELECT * FROM auto_eat_attempts
-                WHERE execution_id=? AND decision='submitted' LIMIT 1
-                """,
+                "SELECT payload FROM executions WHERE execution_id=?",
                 (str(execution_id),),
             ).fetchone()
-        return None if row is None else {key: row[key] for key in row.keys()}
+        return None if row is None else _load_payload(str(row["payload"]))
 
     def auto_eat_stats(self, *, now: datetime | None = None) -> dict[str, object]:
         current = now or _parse_timestamp(_utc_now())

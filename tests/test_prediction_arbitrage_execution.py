@@ -3549,6 +3549,7 @@ def test_threshold_settlement_notifies_only_auto_eat_executions(
     assert trading.threshold_submit_calls == 1
     _macos, feishu = service.test_notifiers  # type: ignore[attr-defined]
     feishu_messages = feishu.messages
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline and not any(
         "结算" in title for title, _ in feishu_messages
     ):

@@ -597,7 +597,8 @@ class PredictionExecutionService:
         quantity: Decimal,
         proof: Mapping[str, object],
     ) -> None:
-        if self._store.auto_eat_attempt_for_execution(execution_id) is None:
+        payload = self._store.execution_payload(execution_id)
+        if not isinstance(payload, Mapping) or payload.get("auto_eat") is not True:
             return
         expected = intent.minimum_profit
         actual = quantity - (
