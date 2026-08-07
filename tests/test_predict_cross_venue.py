@@ -1293,6 +1293,40 @@ def test_monitor_allows_task_six_to_defer_quote_wiring() -> None:
     assert monitor._predict_quote_fn is None
 
 
+def test_cross_venue_opportunity_exposes_depth_fields() -> None:
+    async def exercise() -> None:
+        predict = FakeCrossVenuePredict(
+            (monitor_predict_market(external_ids=("poly-condition",)),)
+        )
+        polymarket = FakeCrossVenuePolymarket()
+        polymarket.release.set()
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=monitor_gamma,
+            predict_quote_fn=predict_quote(),
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+        await monitor.start()
+        await wait_until(lambda: bool(predict.subscriptions))
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
+
+        payload = next(iter(monitor.snapshot()["opportunities"]))
+        assert payload["depth_status"] == "pass"
+        assert payload["max_executable_quantity"] >= payload["policy_quantity"]
+        assert payload["max_executable_cost"] >= payload["policy_cost"]
+        assert payload["policy_quantity"] == payload["quantity"]
+        assert payload["policy_cost"] == payload["total_max_cost"]
+
+        await predict.queue.put(None)
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+
 class FakeCrossVenuePredict:
     def __init__(self, markets: tuple[PredictMarket, ...]) -> None:
         self.markets = markets

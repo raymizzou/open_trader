@@ -24,6 +24,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
   健康检查新增 auto_eat 模式/单数/拒绝/已实现盈亏统计。默认保持 observe_only。
 - #33 修复：结算通知改为读取执行 payload 的 auto_eat 标记，消除“执行线程先完成、
   尝试记录后落库”导致的偶发漏发；结算测试轮询改用独立 30 秒预算。
+- #32 套利筛选取向改为“年化 >15% 硬门槛 + 短结算优先 + 盘口深度充足”：低于 15% 的
+  信号不再出现在看板 state/历史列表（`annualized_distribution`、`signals_24h` 统计保留）；
+  达标候选中按 可参与 → 年化降序 → 结算期升序 → 绝对利润 → 成交量排序；机会行新增
+  “理论可执行深度”（全簿扫价、含手续费后净边际仍为正的最大数量/成本）与“当前 $20
+  政策下单量”双值；LLM 对冲候选区改为紧凑表格（标的/年化/结算期/理论深度/政策下单量/
+  状态/操作），并移除左侧“可观察标的”面板。验证：627 个相关单测通过；全量 5010 通过
+  （7 个失败为 worktree 缺少 `data/trend_review` 运行数据的环境性失败，main 上通过）；
+  最终状态以候选 SHA 的 `make acceptance` 为准。
 - #29 新增独立 prediction-arbitrage 健康检查后端服务（launchd label
   `com.open-trader.prediction-arbitrage-health`，RunAtLoad/KeepAlive，只装生产环境，
   与其他 worktree 部署无关）：每 2 小时检查 8766 状态端点与 healthz、heartbeat≤60s、

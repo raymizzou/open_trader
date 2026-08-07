@@ -29,8 +29,10 @@ from open_trader.polymarket_relation_discovery import (
     ThresholdMarket,
     ThresholdRelation,
     build_threshold_hedge_intent,
+    positive_edge_depth,
     simple_annualized_yield,
     simple_annualized_yield_from_values,
+    _fee,
 )
 
 
@@ -564,3 +566,81 @@ def test_simple_annualized_yield_from_values_uses_profit_capital_and_days() -> N
     )
 
     assert annualized == Decimal("0.73")
+
+
+def test_positive_edge_depth_returns_largest_common_positive_edge() -> None:
+    segments_a = [
+        (Decimal("0.98"), Decimal("0"), Decimal("100")),
+        (Decimal("0.99"), Decimal("100"), Decimal("500")),
+    ]
+    segments_b = [
+        (Decimal("0.005"), Decimal("0"), Decimal("1000")),
+    ]
+    depth = positive_edge_depth(
+        segments_a,
+        segments_b,
+        tick_size_a=Decimal("0.01"),
+        tick_size_b=Decimal("0.005"),
+        fee_rate_a=Decimal("0.002"),
+        fee_rate_b=Decimal("0.002"),
+        minimum_order_size=Decimal("1"),
+    )
+    assert depth is not None
+    assert depth.quantity == Decimal("500")
+    expected_cost = (
+        Decimal("500") * Decimal("0.99")
+        + Decimal("500") * Decimal("0.005")
+        + _fee(Decimal("500"), Decimal("0.002"), Decimal("0.99"))
+        + _fee(Decimal("500"), Decimal("0.002"), Decimal("0.005"))
+    )
+    assert depth.cost == expected_cost
+
+
+def test_positive_edge_depth_returns_none_when_edge_turns_negative() -> None:
+    segments_a = [(Decimal("0.999"), Decimal("0"), Decimal("1000"))]
+    segments_b = [(Decimal("0.001"), Decimal("0"), Decimal("1000"))]
+    assert (
+        positive_edge_depth(
+            segments_a,
+            segments_b,
+            tick_size_a=Decimal("0.001"),
+            tick_size_b=Decimal("0.001"),
+            fee_rate_a=Decimal("0.01"),
+            fee_rate_b=Decimal("0.01"),
+            minimum_order_size=Decimal("1"),
+        )
+        is None
+    )
+
+
+def test_positive_edge_depth_includes_extra_cost_for_cross_venue_gas() -> None:
+    segments_a = [(Decimal("0.98"), Decimal("0"), Decimal("100"))]
+    segments_b = [(Decimal("0.01"), Decimal("0"), Decimal("100"))]
+    depth = positive_edge_depth(
+        segments_a,
+        segments_b,
+        tick_size_a=Decimal("0.01"),
+        tick_size_b=Decimal("0.01"),
+        fee_rate_a=Decimal("0"),
+        fee_rate_b=Decimal("0"),
+        minimum_order_size=Decimal("1"),
+        extra_cost=Decimal("1.50"),
+    )
+    assert depth is None
+
+
+def test_positive_edge_depth_respects_minimum_order_size() -> None:
+    segments_a = [(Decimal("0.98"), Decimal("0"), Decimal("100"))]
+    segments_b = [(Decimal("0.01"), Decimal("0"), Decimal("100"))]
+    assert (
+        positive_edge_depth(
+            segments_a,
+            segments_b,
+            tick_size_a=Decimal("0.01"),
+            tick_size_b=Decimal("0.01"),
+            fee_rate_a=Decimal("0"),
+            fee_rate_b=Decimal("0"),
+            minimum_order_size=Decimal("200"),
+        )
+        is None
+    )

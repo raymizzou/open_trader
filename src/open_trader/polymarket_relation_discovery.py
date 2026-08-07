@@ -1823,6 +1823,58 @@ def _fee(quantity: Decimal, rate: Decimal, price: Decimal) -> Decimal:
     return quantity * rate * price * (Decimal("1") - price)
 
 
+@dataclass(frozen=True, slots=True)
+class PositiveEdgeDepth:
+    quantity: Decimal
+    cost: Decimal
+
+
+def positive_edge_depth(
+    segments_a: list[tuple[Decimal, Decimal, Decimal]],
+    segments_b: list[tuple[Decimal, Decimal, Decimal]],
+    *,
+    tick_size_a: Decimal,
+    tick_size_b: Decimal,
+    fee_rate_a: Decimal,
+    fee_rate_b: Decimal,
+    minimum_order_size: Decimal,
+    extra_cost: Decimal = Decimal("0"),
+) -> PositiveEdgeDepth | None:
+    if not all(
+        isinstance(value, Decimal) and value.is_finite() and value > 0
+        for value in (tick_size_a, tick_size_b, minimum_order_size)
+    ):
+        return None
+    if not all(
+        isinstance(value, Decimal) and value.is_finite() and value >= 0
+        for value in (fee_rate_a, fee_rate_b, extra_cost)
+    ):
+        return None
+    depths_a = [total for _, _, total in segments_a]
+    depths_b = [total for _, _, total in segments_b]
+    if not depths_a or not depths_b:
+        return None
+    candidates = sorted(
+        {min(left, right) for left in depths_a for right in depths_b},
+        reverse=True,
+    )
+    for quantity in candidates:
+        if quantity < minimum_order_size or quantity <= 0:
+            continue
+        price_a = _worst_price(segments_a, quantity)
+        price_b = _worst_price(segments_b, quantity)
+        if price_a is None or price_b is None:
+            continue
+        cost_a = quantity * price_a
+        cost_b = quantity * price_b
+        fee_a = _fee(quantity, fee_rate_a, price_a)
+        fee_b = _fee(quantity, fee_rate_b, price_b)
+        total_cost = cost_a + cost_b + fee_a + fee_b + extra_cost
+        if quantity - total_cost > 0:
+            return PositiveEdgeDepth(quantity=quantity, cost=total_cost)
+    return None
+
+
 def _sell_proceeds(
     bids: tuple[BookLevel, ...],
     *,

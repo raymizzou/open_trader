@@ -8,7 +8,7 @@ import os
 import secrets
 import subprocess
 import threading
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -56,6 +56,7 @@ from .prediction_arbitrage import (
     MAX_WALLET_BALANCE,
     MIN_ESTIMATED_PROFIT,
     MIN_NET_EDGE,
+    MIN_THRESHOLD_ANNUALIZED_YIELD,
 )
 from .prediction_arbitrage_execution import PredictionExecutionService
 from .prediction_arbitrage_store import PredictionArbitrageStore
@@ -198,7 +199,86 @@ def _prediction_decimal_sort(value: object) -> Decimal:
     return parsed if parsed.is_finite() else Decimal("-Infinity")
 
 
-def _prediction_sort_key(item: Mapping[str, object]) -> tuple[bool, Decimal, Decimal, str]:
+def _prediction_displayable(row: Mapping[str, object]) -> bool:
+    reason = str(row.get("eligibility_reason") or "").strip()
+    if reason in {"annualized_yield_below_minimum", "annualized_yield_unavailable"}:
+        return False
+    annualized = row.get("annualized_yield")
+    if annualized not in (None, ""):
+        try:
+            value = Decimal(str(annualized))
+        except Exception:
+            value = None
+        if (
+            value is not None
+            and value.is_finite()
+            and value < MIN_THRESHOLD_ANNUALIZED_YIELD
+        ):
+            return False
+    return True
+
+
+def _prediction_annualized(item: Mapping[str, object]) -> Decimal:
+    value = item.get("annualized_yield")
+    if value not in (None, ""):
+        try:
+            parsed = Decimal(str(value))
+        except Exception:
+            parsed = None
+        if parsed is not None and parsed.is_finite():
+            return parsed
+    opportunities = item.get("opportunities")
+    if isinstance(opportunities, (list, tuple)):
+        values = [
+            _prediction_annualized(row)
+            for row in opportunities
+            if isinstance(row, Mapping)
+        ]
+        if values:
+            return max(values)
+    return Decimal("-Infinity")
+
+
+def _prediction_remaining_days(item: Mapping[str, object]) -> Decimal:
+    value = item.get("remaining_days")
+    if value not in (None, ""):
+        try:
+            parsed = Decimal(str(value))
+        except Exception:
+            parsed = None
+        if parsed is not None and parsed.is_finite():
+            return parsed
+    cutoff = item.get("resolution_at") or item.get("canonical_cutoff")
+    if isinstance(cutoff, str):
+        try:
+            end = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+            days = Decimal(
+                str(
+                    (
+                        end.astimezone(UTC)
+                        - datetime.now(UTC).astimezone(UTC)
+                    ).total_seconds()
+                )
+            ) / Decimal("86400")
+            if days.is_finite():
+                return days
+        except Exception:
+            pass
+    opportunities = item.get("opportunities")
+    if isinstance(opportunities, (list, tuple)):
+        days = [
+            _prediction_remaining_days(row)
+            for row in opportunities
+            if isinstance(row, Mapping)
+        ]
+        if days:
+            return min(days)
+    return Decimal("Infinity")
+
+
+def _prediction_sort_key(
+    item: Mapping[str, object],
+) -> tuple[bool, Decimal, Decimal, Decimal, Decimal, str]:
     opportunities = item.get("opportunities")
     actionable = bool(item.get("actionable"))
     nested_profits: list[Decimal] = []
@@ -220,6 +300,8 @@ def _prediction_sort_key(item: Mapping[str, object]) -> tuple[bool, Decimal, Dec
         volume = max(nested_volumes)
     return (
         not actionable,
+        -_prediction_annualized(item),
+        _prediction_remaining_days(item),
         -_prediction_decimal_sort(profit),
         -_prediction_decimal_sort(volume),
         str(item.get("event_id") or ""),
@@ -937,6 +1019,24 @@ def _prediction_state_payload(
         _prediction_attach_cached_title(store, _prediction_opportunity_aliases(row))
         for row in cross_venue["opportunities"]
     )
+    opportunity_rows = [
+        row for row in opportunity_rows if _prediction_displayable(row)
+    ]
+    for event in event_rows:
+        markets = event.get("markets")
+        if isinstance(markets, (list, tuple)):
+            event["markets"] = [
+                market
+                for market in markets
+                if isinstance(market, Mapping) and _prediction_displayable(market)
+            ]
+    event_rows = [
+        event
+        for event in event_rows
+        if event.get("actionable") is True
+        or "markets" not in event
+        or event.get("markets")
+    ]
     event_rows = sorted(
         (row for row in event_rows if isinstance(row, Mapping)), key=_prediction_sort_key
     )
@@ -1118,6 +1218,11 @@ def _prediction_history_payload(
         for row in rows
     ]
     if kind == "signals":
+        safe_rows = [
+            row
+            for row in safe_rows
+            if not isinstance(row, Mapping) or _prediction_displayable(row)
+        ]
         try:
             state = _prediction_state_payload(
                 store=store,

@@ -3202,13 +3202,53 @@ function predictionYesNoWorkspace(payload, expandedEventKeys) {
   return `${predictionCrossVenueFunnel(viewPayload)}<aside class="pm-policy"><strong>V1 仅对普通二元、免手续费市场开放实盘</strong><p>收费市场和 Negative Risk 市场仍监控，但不会出现“参与”按钮。</p></aside><div class="pm-layout"><section class="pm-panel"><header class="pm-panel-heading"><div><h2>当前监控范围</h2><p>可参与优先；同组按利润，再按 24h 成交量。</p></div><span class="pm-pill">显示 ${displayedEvents} / ${escapeHtml(predictionValue(eventTotal))}</span></header><div class="pm-event-list">${predictionEventRows(viewPayload, expandedEventKeys)}</div></section><div class="pm-stack">${predictionHistoryPanel(viewPayload)}</div></div>`;
 }
 
+function predictionCandidateTable(opportunities) {
+  const rows = (Array.isArray(opportunities) ? opportunities : []).map((raw) => {
+    const opportunity = predictionOpportunityDisplay(raw);
+    const actionable = opportunity.actionable === true;
+    const cross = predictionIsCrossVenue(opportunity);
+    const combinedQuestions = opportunity.question_a && opportunity.question_b
+      ? `${opportunity.question_a} / ${opportunity.question_b}`
+      : "";
+    const title = predictionValue(
+      opportunity.title_zh || opportunity.title || opportunity.question || combinedQuestions,
+      "数据未返回"
+    );
+    const sub = cross ? "Predict × Polymarket" : "Polymarket 阈值对冲";
+    const annualized = predictionAnnualizedPercent(opportunity.annualized_yield, 2);
+    const remaining = Number(opportunity.remaining_days);
+    const settlement = Number.isFinite(remaining) && remaining > 0
+      ? `${Number.isInteger(remaining) ? remaining : remaining.toFixed(1)} 天`
+      : "不可计算";
+    const resolution = predictionHktTimestamp(
+      opportunity.resolution_at ?? opportunity.canonical_cutoff,
+      "—"
+    );
+    const depthOk = String(opportunity.depth_status || "") === "pass";
+    const depth = depthOk
+      ? `${escapeHtml(predictionValue(opportunity.max_executable_quantity, "-"))} 份 / ${escapeHtml(predictionMoney(opportunity.max_executable_cost))}`
+      : `<span class="pm-tone-danger">深度不足</span>`;
+    const policy = depthOk
+      ? `${escapeHtml(predictionValue(opportunity.policy_quantity, "-"))} 份 / ${escapeHtml(predictionMoney(opportunity.policy_cost))}`
+      : "—";
+    const status = actionable
+      ? `<span class="pm-pill action">可参与</span>`
+      : `<span class="pm-pill watch">仅观察</span><small>${escapeHtml(predictionReasonLabel(opportunity.eligibility_reason || "opportunity_unavailable"))}</small>${Array.isArray(opportunity.llm_reason_codes) && opportunity.llm_reason_codes[0] ? `<small>${escapeHtml(String(opportunity.llm_reason_codes[0]))}</small>` : ""}`;
+    const action = actionable
+      ? `<button class="pm-button primary pm-participate" type="button" data-action="participate" data-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id || opportunity.id, ""))}">确认</button>`
+      : "—";
+    return `<tr data-relation-key="${escapeHtml(predictionValue(opportunity.relation_id || opportunity.opportunity_id || opportunity.id, ""))}"><td><strong>${escapeHtml(title)}</strong><span class="sub">${escapeHtml(sub)}</span></td><td class="num"><strong>${escapeHtml(annualized)}</strong></td><td class="num"><strong>${escapeHtml(settlement)}</strong><span class="sub">${escapeHtml(resolution)}</span></td><td class="num">${depth}</td><td class="num">${escapeHtml(policy)}</td><td>${status}</td><td>${action}</td></tr>`;
+  }).join("");
+  return `<div class="pm-table-wrap"><table class="pm-table pm-candidate-table"><thead><tr><th>标的</th><th class="num">年化</th><th class="num">结算期</th><th class="num">理论深度</th><th class="num">政策下单量</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
 function predictionLlmHedgeWorkspace(payload, expandedRelationKeys) {
   const opportunities = predictionOpportunities(payload)
     .filter((item) => String(item.market_type || "") === "threshold_hedge");
   const candidates = opportunities.length
-    ? opportunities.map((item) => predictionThresholdCandidateHtml(item, payload, expandedRelationKeys)).join("")
+    ? predictionCandidateTable(opportunities)
     : `<div class="pm-empty"><strong>当前没有正收益候选</strong><p>关联合约扫描仍在运行；出现候选后会在这里展示校验状态和年化计算。</p></div>`;
-  return `${predictionRelationFunnel(payload)}<aside class="pm-policy"><strong>所有正收益候选都会展示</strong><p>Codex 结论和程序复核全部通过后才出现人工确认入口；两腿属于不同 condition，不会 merge。</p></aside><div class="pm-llm-layout"><aside>${predictionRelationDiscoveryPanel(payload)}</aside><section class="pm-panel"><header class="pm-panel-heading"><div><h2>候选标的</h2><p>点击年化查看当前计算、历史参考、校验链和 LLM 理由；默认全部折叠。</p></div><span class="pm-pill">显示 ${opportunities.length}</span></header><div class="pm-threshold-candidates">${candidates}</div></section></div>`;
+  return `${predictionRelationFunnel(payload)}<aside class="pm-policy"><strong>所有正收益候选都会展示</strong><p>低于 15% 年化的信号不展示；Codex 结论和程序复核全部通过后才出现人工确认入口；两腿属于不同 condition，不会 merge。</p></aside><section class="pm-panel"><header class="pm-panel-heading"><div><h2>候选标的</h2><p>按可参与 → 年化 → 结算期 → 利润排序；点击确认前会重新检查价格。</p></div><span class="pm-pill">显示 ${opportunities.length}</span></header>${candidates}</section>`;
 }
 
 function predictionModeBar(payload) {
