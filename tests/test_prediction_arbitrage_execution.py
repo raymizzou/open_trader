@@ -3535,6 +3535,32 @@ def test_auto_eat_threshold_rejects_when_daily_cost_cap_reached(
     assert store.auto_eat_stats()["rejected_by_reason"] == {"daily_cost_cap": 1}
 
 
+def test_threshold_settlement_notifies_only_auto_eat_executions(
+    tmp_path: Path,
+) -> None:
+    service, trading, store, _ = threshold_execution_fixture(tmp_path)
+    store.set_validation_mode("auto")
+    signal_id = _notification_signal(store)
+    service.auto_eat_threshold("threshold-opp-1", signal_id)
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and trading.threshold_submit_calls == 0:
+        time.sleep(0.05)
+    assert trading.threshold_submit_calls == 1
+    _macos, feishu = service.test_notifiers  # type: ignore[attr-defined]
+    feishu_messages = feishu.messages
+    while time.monotonic() < deadline and not any(
+        "结算" in title for title, _ in feishu_messages
+    ):
+        time.sleep(0.05)
+    assert any("验证单" in title for title, _ in feishu_messages)
+    assert any(
+        "结算" in title and "预计利润" in message
+        for title, message in feishu_messages
+    )
+    assert store.auto_eat_stats()["realized_pnl"] > 0
+
+
 def test_notify_observation_sends_immediately_dedupes_and_survives_close(
     tmp_path: Path,
 ) -> None:

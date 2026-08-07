@@ -718,6 +718,17 @@ class PredictionArbitrageStore:
             ).fetchone()
         return None if row is None else str(row["created_at"])
 
+    def auto_eat_attempt_for_execution(self, execution_id: str) -> dict[str, object] | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM auto_eat_attempts
+                WHERE execution_id=? AND decision='submitted' LIMIT 1
+                """,
+                (str(execution_id),),
+            ).fetchone()
+        return None if row is None else {key: row[key] for key in row.keys()}
+
     def auto_eat_stats(self, *, now: datetime | None = None) -> dict[str, object]:
         current = now or _parse_timestamp(_utc_now())
         day_start = (
@@ -747,12 +758,13 @@ class PredictionArbitrageStore:
             realized = connection.execute(
                 """
                 SELECT coalesce(sum(
-                    CASE WHEN state = 'holding_to_resolution'
-                          AND json_extract(payload, '$.auto_eat') = json('true')
-                         THEN COALESCE(json_extract(payload, '$.minimum_profit'), 0)
-                         ELSE 0 END
+                    CAST(json_extract(e.payload, '$.minimum_profit') AS REAL)
                 ), 0)
-                FROM executions WHERE created_at >= ?
+                FROM auto_eat_attempts a
+                JOIN executions e ON e.execution_id = a.execution_id
+                WHERE a.decision = 'submitted'
+                  AND e.state = 'holding_to_resolution'
+                  AND e.created_at >= ?
                 """,
                 (day_start,),
             ).fetchone()

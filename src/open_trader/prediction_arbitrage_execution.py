@@ -590,6 +590,32 @@ class PredictionExecutionService:
         except Exception:
             return
 
+    def _notify_threshold_settlement(
+        self,
+        execution_id: str,
+        intent: ThresholdHedgeIntent,
+        quantity: Decimal,
+        proof: Mapping[str, object],
+    ) -> None:
+        if self._store.auto_eat_attempt_for_execution(execution_id) is None:
+            return
+        expected = intent.minimum_profit
+        actual = quantity - (
+            intent.total_max_cost / intent.quantity * quantity
+        )
+        try:
+            title = "预测套利验证单结算"
+            message = (
+                f"关系 {intent.relation_id}\n"
+                f"成交数量 {quantity}\n"
+                f"预计利润 ${expected:.4f}\n"
+                f"实际锁定利润 ${actual:.4f}\n"
+                f"证明已验证: {proof.get('verified') is True}"
+            )
+            self._deliver_feishu_notification(title, message)
+        except Exception:
+            return
+
     def notify_observation(
         self,
         opportunity: Mapping[str, object],
@@ -3032,6 +3058,9 @@ class PredictionExecutionService:
                 "quantity": quantity_a,
                 "execution_proof": proof,
             },
+        )
+        self._notify_threshold_settlement(
+            execution_id, intent, quantity_a, proof
         )
 
     def _threshold_reconcile_until(
