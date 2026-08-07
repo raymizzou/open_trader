@@ -205,3 +205,19 @@ def test_dashboard_git_sha_reads_startup_log(tmp_path: Path) -> None:
 
 def test_dashboard_git_sha_returns_none_without_log(tmp_path: Path) -> None:
     assert _dashboard_git_sha(tmp_path) is None
+
+
+def test_health_check_reports_auto_eat_stats() -> None:
+    report = run_check(payload=base_state(auto_eat_stats={
+        "mode": "auto",
+        "today_attempts": 3,
+        "today_submitted": 0,
+        "today_cost": 0.0,
+        "realized_pnl": 0.0,
+        "rejected_by_reason": {"cooldown": 3},
+    }))
+
+    checks = {check.name: check for check in report.checks}
+    assert checks["auto_eat"].status == "WARN"
+    assert "submitted=0" in checks["auto_eat"].value
+    assert report.summary["validation_mode"] == "auto"

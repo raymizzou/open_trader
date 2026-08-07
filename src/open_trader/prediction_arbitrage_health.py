@@ -241,6 +241,26 @@ def run_health_check(
         reason = str(readiness.get("reason") or readiness.get("status") or "unavailable")
         add("readiness", "FAIL", value=reason, reason="execution readiness blocked")
 
+    auto_eat = _mapping(payload.get("auto_eat_stats"))
+    mode = str(auto_eat.get("mode") or "observe_only")
+    submitted = int(auto_eat.get("today_submitted") or 0)
+    attempts = int(auto_eat.get("today_attempts") or 0)
+    rejected = max(attempts - submitted, 0)
+    realized = float(auto_eat.get("realized_pnl") or 0.0)
+    if mode == "auto" and attempts > 0 and submitted == 0:
+        add(
+            "auto_eat",
+            "WARN",
+            value=f"mode={mode} submitted={submitted} rejected={rejected} realized={realized:.4f}",
+            reason="auto mode active but every attempt rejected",
+        )
+    else:
+        add(
+            "auto_eat",
+            "PASS",
+            value=f"mode={mode} submitted={submitted} rejected={rejected} realized={realized:.4f}",
+        )
+
     try:
         llm_total, llm_success = llm_stats(data_dir)
     except Exception as exc:
@@ -291,6 +311,10 @@ def run_health_check(
             "cross_venue": cross_status,
             "pid": pid,
             "sha": sha,
+            "validation_mode": mode,
+            "auto_eat_submitted": submitted,
+            "auto_eat_rejected": rejected,
+            "auto_eat_realized_pnl": realized,
         },
     )
 
