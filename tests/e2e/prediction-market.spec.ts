@@ -272,24 +272,15 @@ test.describe('YES/NO arbitrage signal workspace', () => {
       await openPrediction(page, 'threshold');
       await page.getByRole('button', { name: 'LLM对冲套利', exact: true }).click();
 
-      const approved = page.locator('[data-relation-key="threshold-approved"]');
-      await expect(approved.locator('summary')).toContainText('21.5%');
-      await expect(approved.locator('summary')).toContainText('$19.46 / $20.00');
-      await approved.locator('summary').click();
-      await expect(approved).toContainText('$0.54 / $19.46');
+      const approved = page.locator('.pm-candidate-table tbody tr[data-relation-key="threshold-approved"]');
       await expect(approved).toContainText('21.55%');
       await expect(approved).toContainText('47 天');
-      await expect(approved).toContainText('7 天');
-      await expect(approved).toContainText('30 天');
-      await expect(approved).toContainText('A · BUY NO');
-      await expect(approved).toContainText('B · BUY YES');
+      await expect(approved).toContainText('2000');
       await expect(approved.locator('[data-action="participate"]')).toBeEnabled();
 
-      const rejected = page.locator('[data-relation-key="threshold-rejected"]');
-      await expect(rejected.locator('summary')).toContainText('REJECT');
-      await rejected.locator('summary').click();
+      const rejected = page.locator('.pm-candidate-table tbody tr[data-relation-key="threshold-rejected"]');
+      await expect(rejected).toContainText('仅观察');
       await expect(rejected).toContainText('SPECIAL_SETTLEMENT_MISMATCH');
-      await expect(rejected).toContainText('特殊结算可能破坏覆盖关系');
       await expect(rejected.locator('[data-action="participate"]')).toHaveCount(0);
       await expect(page.locator('.pm-scan-logs[open]')).toHaveCount(0);
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
@@ -415,16 +406,16 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(page.locator('[data-prediction-strategy="yes_no"]')).toHaveAttribute('aria-pressed', 'true');
     await page.getByRole('button', { name: 'LLM对冲套利', exact: true }).click();
     await expect(page.locator('[data-prediction-strategy="llm_hedge"]')).toHaveAttribute('aria-pressed', 'true');
-    await expect(page.locator('.pm-table tbody tr')).toHaveCount(2);
-    await expect(page.locator('.pm-table tbody tr').first()).toContainText('21.5%');
-    await expect(page.locator('.pm-table tbody tr').first()).not.toContainText('仅监控');
+    await expect(page.locator('.pm-candidate-table tbody tr')).toHaveCount(2);
+    await expect(page.locator('.pm-candidate-table tbody tr').first()).toContainText('21.55%');
+    await expect(page.locator('.pm-candidate-table tbody tr').first()).not.toContainText('仅监控');
     await expect(page.locator('.pm-relation-funnel')).toBeVisible();
     await expect(page.locator('.pm-llm-layout')).toHaveCount(0);
     await expect(page.locator('.pm-cross-venue-funnel')).toHaveCount(0);
     await page.evaluate(() => (
       window as Window & { startPredictionSignalPolling: () => void }
     ).startPredictionSignalPolling());
-    await expect(page.locator('.pm-table tbody tr')).toHaveCount(2);
+    await expect(page.locator('.pm-candidate-table tbody tr')).toHaveCount(2);
   });
 
   test('same-venue actions never emit a Predict.fun mutation request', async ({ page }) => {

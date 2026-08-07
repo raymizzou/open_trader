@@ -3207,8 +3207,11 @@ function predictionCandidateTable(opportunities) {
     const opportunity = predictionOpportunityDisplay(raw);
     const actionable = opportunity.actionable === true;
     const cross = predictionIsCrossVenue(opportunity);
+    const combinedQuestions = opportunity.question_a && opportunity.question_b
+      ? `${opportunity.question_a} / ${opportunity.question_b}`
+      : "";
     const title = predictionValue(
-      opportunity.title_zh || opportunity.title || opportunity.question,
+      opportunity.title_zh || opportunity.title || opportunity.question || combinedQuestions,
       "数据未返回"
     );
     const sub = cross ? "Predict × Polymarket" : "Polymarket 阈值对冲";
@@ -3230,13 +3233,13 @@ function predictionCandidateTable(opportunities) {
       : "—";
     const status = actionable
       ? `<span class="pm-pill action">可参与</span>`
-      : `<span class="pm-pill watch">仅观察</span><small>${escapeHtml(predictionReasonLabel(opportunity.eligibility_reason || "opportunity_unavailable"))}</small>`;
+      : `<span class="pm-pill watch">仅观察</span><small>${escapeHtml(predictionReasonLabel(opportunity.eligibility_reason || "opportunity_unavailable"))}</small>${Array.isArray(opportunity.llm_reason_codes) && opportunity.llm_reason_codes[0] ? `<small>${escapeHtml(String(opportunity.llm_reason_codes[0]))}</small>` : ""}`;
     const action = actionable
       ? `<button class="pm-button primary pm-participate" type="button" data-action="participate" data-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id || opportunity.id, ""))}">确认</button>`
       : "—";
-    return `<tr><td><strong>${escapeHtml(title)}</strong><span class="sub">${escapeHtml(sub)}</span></td><td class="num"><strong>${escapeHtml(annualized)}</strong></td><td class="num"><strong>${escapeHtml(settlement)}</strong><span class="sub">${escapeHtml(resolution)}</span></td><td class="num">${depth}</td><td class="num">${escapeHtml(policy)}</td><td>${status}</td><td>${action}</td></tr>`;
+    return `<tr data-relation-key="${escapeHtml(predictionValue(opportunity.relation_id || opportunity.opportunity_id || opportunity.id, ""))}"><td><strong>${escapeHtml(title)}</strong><span class="sub">${escapeHtml(sub)}</span></td><td class="num"><strong>${escapeHtml(annualized)}</strong></td><td class="num"><strong>${escapeHtml(settlement)}</strong><span class="sub">${escapeHtml(resolution)}</span></td><td class="num">${depth}</td><td class="num">${escapeHtml(policy)}</td><td>${status}</td><td>${action}</td></tr>`;
   }).join("");
-  return `<div class="pm-table-wrap"><table class="pm-table"><thead><tr><th>标的</th><th class="num">年化</th><th class="num">结算期</th><th class="num">理论深度</th><th class="num">政策下单量</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  return `<div class="pm-table-wrap"><table class="pm-table pm-candidate-table"><thead><tr><th>标的</th><th class="num">年化</th><th class="num">结算期</th><th class="num">理论深度</th><th class="num">政策下单量</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function predictionLlmHedgeWorkspace(payload, expandedRelationKeys) {
