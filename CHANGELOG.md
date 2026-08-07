@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-07
 
+- #26 修复：Codex 连续 3 次失败后熔断 5 分钟，期间阈值关系与跨市场等价校验直接走
+  DeepSeek，不再每轮先等 Codex 子进程失败（约 30-45 秒）；冷却后自动复探 Codex，
+  恢复即优先。已验：两条 validator 相关测试 147 通过；真实链路 Codex 401 →
+  DeepSeek APPROVE → 确定性校验 fail-closed 通过；线上重启后以 dashboard_runtime
+  SHA 为准。
 - 规范：`docs/superpowers/specs/` 与 `docs/superpowers/plans/` 不再纳入 git 跟踪
   （加入 `.gitignore`；已跟踪的 140 个 spec、159 个 plan 文件改为 untrack，文件保留
   在本地，历史提交不受影响）。

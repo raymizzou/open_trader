@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Literal
 
 from .polymarket_relation_discovery import (
+    _CodexCircuitBreaker,
     DEEPSEEK_FALLBACK_MODEL,
     _deepseek_completion,
     _codex_events,
@@ -1045,6 +1047,7 @@ class CodexCrossVenueEquivalenceValidator:
                 timeout_seconds=60.0,
             )
         )
+        self._breaker = _CodexCircuitBreaker()
 
     def _result(self, pair: ExplicitMarketPair, reason: str) -> CrossVenueValidation:
         return _cross_venue_validation(pair, False, reason, self.prompt_version)
@@ -1080,6 +1083,8 @@ class CodexCrossVenueEquivalenceValidator:
             return self._result(pair, "MARKET_INVALID")
         if cached := self._cached(pair, cache_key):
             return cached
+        if self._breaker.disabled(time.monotonic()):
+            return self._fallback(pair, cache_key, "CODEX_CIRCUIT_OPEN")
         command = [
             "codex", "exec", "--model", self.model, "--ephemeral", "--sandbox", "read-only",
             "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules", "--disable", "hooks",
@@ -1090,19 +1095,24 @@ class CodexCrossVenueEquivalenceValidator:
             with tempfile.TemporaryDirectory(prefix="open-trader-codex-") as working_dir:
                 completed = self.runner(command, input=prompt, text=True, capture_output=True, cwd=working_dir, timeout=self.timeout_seconds, check=False)
         except subprocess.TimeoutExpired:
+            self._breaker.record_failure(time.monotonic())
             self.store.record_llm_call(status="failed", usage={"provider": "codex"})
             return self._fallback(pair, cache_key, "CODEX_TIMEOUT")
         except Exception:
+            self._breaker.record_failure(time.monotonic())
             self.store.record_llm_call(status="failed", usage={"provider": "codex"})
             return self._fallback(pair, cache_key, "CODEX_FAILED")
         structured, usage = _codex_events(completed.stdout or "")
         if completed.returncode != 0:
+            self._breaker.record_failure(time.monotonic())
             self.store.record_llm_call(status="failed", usage={**usage, "provider": "codex"})
             return self._fallback(pair, cache_key, "CODEX_FAILED")
         if not _valid_equivalence_result(structured):
+            self._breaker.record_failure(time.monotonic())
             self.store.record_llm_call(status="failed", usage={**usage, "provider": "codex"})
             return self._fallback(pair, cache_key, "CODEX_OUTPUT_INVALID")
         assert isinstance(structured, Mapping)
+        self._breaker.record_success()
         self.store.record_llm_call(status="success", usage={**usage, "provider": "codex"})
         result = _equivalence_validation(
             pair, structured, prompt_version=self.prompt_version, cache_key=cache_key

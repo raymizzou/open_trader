@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -43,6 +44,8 @@ ValidationRelation = Literal["A_IMPLIES_B", "B_IMPLIES_A", "NONE"]
 
 CODEX_PROMPT_VERSION = "polymarket-threshold-relation-v1"
 DEEPSEEK_FALLBACK_MODEL = "deepseek-v4-flash"
+CODEX_CIRCUIT_FAILURES = 3
+CODEX_CIRCUIT_COOLDOWN_SECONDS = 300.0
 CODEX_RELATION_PROMPT = """You are a semantic auditor for pairs of binary Polymarket contracts.
 
 GOAL
@@ -1306,6 +1309,32 @@ def _deepseek_completion(
         return None, "DEEPSEEK_FAILED"
 
 
+class _CodexCircuitBreaker:
+    """Skip Codex after repeated failures; probe again after a cooldown."""
+
+    def __init__(self) -> None:
+        self._failures = 0
+        self._disabled_until: float | None = None
+
+    def disabled(self, now: float) -> bool:
+        if self._disabled_until is None:
+            return False
+        if now >= self._disabled_until:
+            self._disabled_until = None
+            self._failures = 0
+            return False
+        return True
+
+    def record_failure(self, now: float) -> None:
+        self._failures += 1
+        if self._failures >= CODEX_CIRCUIT_FAILURES:
+            self._disabled_until = now + CODEX_CIRCUIT_COOLDOWN_SECONDS
+
+    def record_success(self) -> None:
+        self._failures = 0
+        self._disabled_until = None
+
+
 def _normalized_semantic(value: object) -> object:
     return _normalized(value) if isinstance(value, str) else value
 
@@ -1422,6 +1451,7 @@ class CodexRelationValidator:
                 timeout_seconds=60.0,
             )
         )
+        self._breaker = _CodexCircuitBreaker()
 
     def _validation(
         self,
@@ -1468,6 +1498,7 @@ class CodexRelationValidator:
             "CODEX_TIMEOUT": "Codex 语义校验超时，当前不可下单。",
             "CODEX_FAILED": "Codex 语义校验不可用，当前不可下单。",
             "CODEX_OUTPUT_INVALID": "Codex 返回的结构化结果无效，当前不可下单。",
+            "CODEX_CIRCUIT_OPEN": "Codex 连续失败已临时熔断，当前使用 DeepSeek 校验。",
             "DEEPSEEK_FAILED": "Codex 与 DeepSeek 校验均不可用，当前不可下单。",
             "DEEPSEEK_OUTPUT_INVALID": "Codex 与 DeepSeek 校验均不可用，当前不可下单。",
             "CONDITION_ID_MISMATCH": "Codex 返回的 condition ID 与候选合约不一致。",
@@ -1567,6 +1598,8 @@ class CodexRelationValidator:
             model=self.model,
             prompt_version=self.prompt_version,
         )
+        if self._breaker.disabled(time.monotonic()):
+            return self._fallback(relation, cache_key, "CODEX_CIRCUIT_OPEN")
 
         command = [
             "codex",
@@ -1604,27 +1637,32 @@ class CodexRelationValidator:
                     check=False,
                 )
         except subprocess.TimeoutExpired:
+            self._breaker.record_failure(time.monotonic())
             self.store.record_llm_call(
                 status="failed", usage={"provider": "codex"}
             )
             return self._fallback(relation, cache_key, "CODEX_TIMEOUT")
         except Exception:
+            self._breaker.record_failure(time.monotonic())
             self.store.record_llm_call(
                 status="failed", usage={"provider": "codex"}
             )
             return self._fallback(relation, cache_key, "CODEX_FAILED")
         structured, usage = _codex_events(completed.stdout or "")
         if completed.returncode != 0:
+            self._breaker.record_failure(time.monotonic())
             self.store.record_llm_call(
                 status="failed", usage={**usage, "provider": "codex"}
             )
             return self._fallback(relation, cache_key, "CODEX_FAILED")
         if not _valid_structured_result(structured):
+            self._breaker.record_failure(time.monotonic())
             self.store.record_llm_call(
                 status="failed", usage={**usage, "provider": "codex"}
             )
             return self._fallback(relation, cache_key, "CODEX_OUTPUT_INVALID")
         assert isinstance(structured, Mapping)
+        self._breaker.record_success()
         self.store.record_llm_call(
             status="success", usage={**usage, "provider": "codex"}
         )
