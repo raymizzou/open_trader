@@ -7,6 +7,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - #26 LLM 校验 prompt 统一：Codex 与 DeepSeek 两条路径使用同一固定 prompt（内嵌输出
   JSON Schema），只严格解析返回；prompt 版本提升使旧缓存失效。新增 2 个回归测试。
+- #26 加固：DeepSeek 返回空内容时立即重试一次，仍为空才 `DEEPSEEK_EMPTY_CONTENT`
+  fail-closed。新增 2 个回归测试。
 - #26 修复：Codex 连续 3 次失败后熔断 5 分钟，期间阈值关系与跨市场等价校验直接走
   DeepSeek，不再每轮先等 Codex 子进程失败（约 30-45 秒）；冷却后自动复探 Codex，
   恢复即优先。已验：两条 validator 相关测试 147 通过；真实链路 Codex 401 →

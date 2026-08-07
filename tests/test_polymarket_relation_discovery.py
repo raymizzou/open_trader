@@ -1053,6 +1053,87 @@ def test_deepseek_completion_missing_key_reports_reason(
     assert reason == "DEEPSEEK_KEY_MISSING"
 
 
+def test_deepseek_completion_retries_once_on_empty_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+    from types import SimpleNamespace
+
+    calls = {"n": 0}
+
+    class FakeOpenAI:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        @property
+        def chat(self) -> "FakeOpenAI":
+            return self
+
+        @property
+        def completions(self) -> "FakeOpenAI":
+            return self
+
+        def create(self, **kwargs: object) -> SimpleNamespace:
+            calls["n"] += 1
+            content = None if calls["n"] == 1 else '{"ok": true}'
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(message=SimpleNamespace(content=content))
+                ]
+            )
+
+    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+
+    content, reason = _deepseek_completion(
+        "prompt", {}, model="deepseek-v4-flash"
+    )
+
+    assert content == '{"ok": true}'
+    assert reason is None
+    assert calls["n"] == 2
+
+
+def test_deepseek_completion_reports_empty_after_single_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+    from types import SimpleNamespace
+
+    calls = {"n": 0}
+
+    class FakeOpenAI:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        @property
+        def chat(self) -> "FakeOpenAI":
+            return self
+
+        @property
+        def completions(self) -> "FakeOpenAI":
+            return self
+
+        def create(self, **kwargs: object) -> SimpleNamespace:
+            calls["n"] += 1
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(message=SimpleNamespace(content=None))
+                ]
+            )
+
+    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+
+    content, reason = _deepseek_completion(
+        "prompt", {}, model="deepseek-v4-flash"
+    )
+
+    assert content is None
+    assert reason == "DEEPSEEK_EMPTY_CONTENT"
+    assert calls["n"] == 2
+
+
 def test_deepseek_failure_reason_propagates_to_validation(tmp_path: Path) -> None:
     db = codex_store(tmp_path)
     validator = CodexRelationValidator(

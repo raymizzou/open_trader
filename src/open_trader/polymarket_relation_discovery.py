@@ -1295,28 +1295,37 @@ def _deepseek_completion(
             os.environ.get("OPEN_TRADER_LLM_FALLBACK_REASONING_EFFORT", "max")
             or "max"
         )
-        response = OpenAI(
+        client = OpenAI(
             api_key=api_key,
             base_url=DEEPSEEK_BASE_URL,
             timeout=timeout_seconds,
-        ).chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": prompt},
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        dict(payload),
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                },
-            ],
-            response_format={"type": "json_object"},
-            reasoning_effort=reasoning_effort,
-            timeout=timeout_seconds,
         )
+
+        def create() -> object:
+            return client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            dict(payload),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    },
+                ],
+                response_format={"type": "json_object"},
+                reasoning_effort=reasoning_effort,
+                timeout=timeout_seconds,
+            )
+
+        response = create()
         content = response.choices[0].message.content
+        if not content:
+            # One immediate retry: transient empty responses are common.
+            response = create()
+            content = response.choices[0].message.content
         return (content, None) if content else (None, "DEEPSEEK_EMPTY_CONTENT")
     except Exception as exc:
         return None, _deepseek_failure_reason(exc)
