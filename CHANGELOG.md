@@ -3,6 +3,17 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-08
+
+- 跨所 YES/NO 文字一致人工批准：标题（question）规范化后一字不差的候选自动实时监控；
+  年化 ≥15% 后显示“待人工批准”，由你在确认弹窗人工下单，永不自动执行（auto-eat 拦截）；
+  严格等价配对保持自动路径语义。漏斗改为单行递减（正在监视 → 正收益 → 年化达标 → 已提交），
+  准入来源（Codex 认为可以 / 文字一致）放底部图例；列表只展示可下单候选两类（人工 / 自动），
+  人工类确认弹窗固定展示“结算规则可能不一致”警告与最坏损失，审核失败不进可下单列表。
+  验证：监控/执行/通知/dashboard 单测与 e2e 全绿（Python 5047 通过，6 个 trend_review
+  为 worktree 缺 `data/trend_review` 的环境性失败，补数据后 289/289 通过；prediction-market
+  e2e 36/36 通过）。
+
 ## 2026-08-07
 
 - #26 LLM 校验 prompt 统一：Codex 与 DeepSeek 两条路径使用同一固定 prompt（内嵌输出
