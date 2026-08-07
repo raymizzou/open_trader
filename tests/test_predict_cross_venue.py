@@ -407,6 +407,25 @@ def test_cross_venue_circuit_breaker_skips_codex_after_repeated_failures(
     assert runner_calls == 3  # circuit open: Codex skipped, DeepSeek cache hit
 
 
+def test_cross_venue_deepseek_failure_reason_propagates(tmp_path: Path) -> None:
+    pair = explicit_pair()
+    store = PredictionArbitrageStore(tmp_path / "data")
+    validator = CodexCrossVenueEquivalenceValidator(
+        store,
+        model="gpt-test",
+        fallback_model="deepseek-v4-flash-max",
+        runner=lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 1, stdout="", stderr="401"
+        ),
+        fallback=lambda prompt, payload: (None, "DEEPSEEK_AUTH_FAILED"),
+    )
+
+    result = validator.validate(pair)
+
+    assert result.approved is False
+    assert result.reason == "DEEPSEEK_AUTH_FAILED"
+
+
 def test_cross_venue_double_failure_reports_deepseek_unavailable(
     tmp_path: Path,
 ) -> None:
