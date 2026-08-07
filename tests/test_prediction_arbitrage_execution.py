@@ -778,6 +778,7 @@ def _notification_signal(store: PredictionArbitrageStore) -> str:
         {
             "market_id": "relation-1",
             "event_id": "event-threshold",
+            "market_type": "threshold_hedge",
             "question": "Fed cuts",
             "started_at": datetime.now(UTC).isoformat(),
             "first_positive_at": datetime.now(UTC).isoformat(),
@@ -3486,6 +3487,80 @@ def test_ready_notification_sends_only_after_read_only_proof(tmp_path: Path) -> 
     assert feishu.calls == 1
 
 
+def test_auto_eat_threshold_ignored_outside_auto_mode(tmp_path: Path) -> None:
+    service, trading, store, _ = threshold_execution_fixture(tmp_path)
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+
+    assert result == {"state": "ignored", "reason": "mode_not_auto"}
+    assert trading.threshold_submit_calls == 0
+    assert store.auto_eat_stats()["today_attempts"] == 0
+
+
+def test_auto_eat_threshold_submits_once_in_auto_mode(tmp_path: Path) -> None:
+    service, trading, store, _ = threshold_execution_fixture(tmp_path)
+    store.set_validation_mode("auto")
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+
+    assert result["state"] == "validating" or result.get("execution_id")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and trading.threshold_submit_calls == 0:
+        time.sleep(0.05)
+    assert trading.threshold_submit_calls == 1
+    assert store.auto_eat_stats()["today_submitted"] == 1
+    assert len(store.histories("executions")) == 1
+    assert service.notify_ready_opportunity(
+        "threshold-opp-1", signal_id
+    ) == {"state": "ignored", "reason": "mode_auto"}
+
+
+def test_auto_eat_threshold_rejects_when_daily_cost_cap_reached(
+    tmp_path: Path,
+) -> None:
+    service, trading, store, _ = threshold_execution_fixture(tmp_path)
+    store.set_validation_mode("auto")
+    store.record_auto_eat_attempt(
+        signal_id="other", market_id="other", decision="submitted",
+        total_cost=Decimal("25.00"),
+    )
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+
+    assert result == {"state": "rejected", "reason": "daily_cost_cap"}
+    assert trading.threshold_submit_calls == 0
+    assert store.auto_eat_stats()["rejected_by_reason"] == {"daily_cost_cap": 1}
+
+
+def test_threshold_settlement_notifies_only_auto_eat_executions(
+    tmp_path: Path,
+) -> None:
+    service, trading, store, _ = threshold_execution_fixture(tmp_path)
+    store.set_validation_mode("auto")
+    signal_id = _notification_signal(store)
+    service.auto_eat_threshold("threshold-opp-1", signal_id)
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and trading.threshold_submit_calls == 0:
+        time.sleep(0.05)
+    assert trading.threshold_submit_calls == 1
+    _macos, feishu = service.test_notifiers  # type: ignore[attr-defined]
+    feishu_messages = feishu.messages
+    while time.monotonic() < deadline and not any(
+        "结算" in title for title, _ in feishu_messages
+    ):
+        time.sleep(0.05)
+    assert any("验证单" in title for title, _ in feishu_messages)
+    assert any(
+        "结算" in title and "预计利润" in message
+        for title, message in feishu_messages
+    )
+    assert store.auto_eat_stats()["realized_pnl"] > 0
+
+
 def test_notify_observation_sends_immediately_dedupes_and_survives_close(
     tmp_path: Path,
 ) -> None:
@@ -3953,7 +4028,9 @@ def test_preview_returns_busy_when_execution_is_active(tmp_path: Path) -> None:
 
 def test_browser_economics_are_not_service_inputs(tmp_path: Path) -> None:
     service, _, _, _ = execution_fixture(tmp_path)
-    assert set(inspect.signature(service.preview).parameters) == {"opportunity_id"}
+    assert set(inspect.signature(service.preview).parameters) == {
+        "opportunity_id", "auto_eat",
+    }
     assert set(inspect.signature(service.confirm).parameters) == {"preview_id", "idempotency_key"}
 
 

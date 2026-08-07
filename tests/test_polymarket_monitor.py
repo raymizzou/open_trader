@@ -421,6 +421,70 @@ def make_monitor(
     )
 
 
+def test_auto_eat_observer_runs_once_for_actionable_threshold(
+    tmp_path: Path,
+) -> None:
+    monitor = make_monitor(tmp_path)
+    calls: list[tuple[str, str]] = []
+    monitor.set_auto_eat_observer(
+        lambda opportunity_id, signal_id: calls.append((opportunity_id, signal_id))
+    )
+    signal_id = monitor._store.upsert_signal(
+        {
+            "market_id": "threshold:abc",
+            "event_id": "e1",
+            "question": "Q",
+            "started_at": NOW.isoformat(),
+            "first_positive_at": NOW.isoformat(),
+            "net_edge": Decimal("0.1"),
+            "estimated_profit": Decimal("1"),
+            "profit": Decimal("1"),
+            "market_type": "threshold_hedge",
+            "annualized_yield": Decimal("0.20"),
+            "eligibility_reason": "actionable",
+            "llm_status": "approved",
+            "rules_verified_at": NOW.isoformat(),
+        }
+    )
+    opportunity = {
+        "market_type": "threshold_hedge",
+        "actionable": True,
+        "market_id": "threshold:abc",
+        "event_id": "e1",
+        "question": "Q",
+        "opportunity_id": "threshold:abc",
+        "rules_verified_at": NOW.isoformat(),
+        "relation_validation": {"status": "approved"},
+    }
+
+    async def run() -> None:
+        monitor._schedule_auto_eat(signal_id, opportunity)
+        await monitor._auto_eat_task
+
+    asyncio.run(run())
+
+    assert calls == [("threshold:abc", signal_id)]
+
+
+def test_auto_eat_observer_skips_non_actionable(tmp_path: Path) -> None:
+    monitor = make_monitor(tmp_path)
+    calls: list[tuple[str, str]] = []
+    monitor.set_auto_eat_observer(
+        lambda opportunity_id, signal_id: calls.append((opportunity_id, signal_id))
+    )
+    monitor._schedule_auto_eat("s1", {
+        "market_type": "threshold_hedge",
+        "actionable": False,
+        "market_id": "threshold:abc",
+        "event_id": "e1",
+        "question": "Q",
+        "opportunity_id": "threshold:abc",
+        "rules_verified_at": NOW.isoformat(),
+        "relation_validation": {"status": "approved"},
+    })
+    assert calls == []
+
+
 def test_snapshot_uses_metrics_refreshed_outside_monitor_lock(tmp_path: Path) -> None:
     monitor = make_monitor(tmp_path)
     monotonic = [0.0]

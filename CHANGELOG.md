@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-07
 
+- #33 验证期自动吃单：看板新增三档模式（观察/手动/auto，sqlite 持久化，切换即时生效，
+  切回观察或手动即暂停所有自动下单）。auto 模式对 Polymarket 同市场阈值对冲自动真实吃
+  小单：年化 >15%、按最差价格扣最大手续费后净边际 >0 为硬门槛；每 signal 最多一次、
+  关系对 submitted 后 5 分钟冷静期、每日 5 单或 $25（只统计 submitted）、余额 <$10 停；
+  失败只记录不重试。成功吃单与结算（实际 vs 预计利润）发飞书，auto 模式不再发 order-ready；
+  健康检查新增 auto_eat 模式/单数/拒绝/已实现盈亏统计。默认保持 observe_only。
 - #29 新增独立 prediction-arbitrage 健康检查后端服务（launchd label
   `com.open-trader.prediction-arbitrage-health`，RunAtLoad/KeepAlive，只装生产环境，
   与其他 worktree 部署无关）：每 2 小时检查 8766 状态端点与 healthz、heartbeat≤60s、

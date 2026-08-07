@@ -320,6 +320,8 @@ class PolymarketMonitor:
         self._relation_validator = relation_validator
         self._title_translator = title_translator
         self._ready_observer: Callable[[str, str], Mapping[str, object]] | None = None
+        self._auto_eat_observer: Callable[[str, str], object] | None = None
+        self._auto_eat_task: asyncio.Task[object] | None = None
         self._observation_observer: (
             Callable[
                 [Mapping[str, object], str, str], Mapping[str, object]
@@ -450,6 +452,21 @@ class PolymarketMonitor:
         ],
     ) -> None:
         self._observation_observer = observer
+
+    def set_auto_eat_observer(
+        self, observer: Callable[[str, str], object]
+    ) -> None:
+        self._auto_eat_observer = observer
+
+    def _reap_auto_eat_task(self) -> None:
+        task = self._auto_eat_task
+        if task is None or not task.done():
+            return
+        try:
+            task.result()
+        except Exception:
+            pass
+        self._auto_eat_task = None
 
     def set_cross_venue_tokens(self, token_ids: Sequence[str]) -> None:
         """Replace the externally requested token set and force a fresh subscription."""
@@ -3652,6 +3669,7 @@ class PolymarketMonitor:
             )
             self._schedule_observation_notification(signal_id, opportunity)
             self._schedule_ready_notification(signal_id, opportunity)
+            self._schedule_auto_eat(signal_id, opportunity)
             return signal_id
         except Exception as exc:
             self._store_failed = True
@@ -3689,6 +3707,40 @@ class PolymarketMonitor:
         self._notification_signal_id = str(signal_id)
         self._notification_task = asyncio.create_task(
             asyncio.to_thread(observer, dict(opportunity), str(signal_id), lease_id)
+        )
+
+    def _schedule_auto_eat(
+        self, signal_id: str | None, opportunity: Mapping[str, object]
+    ) -> None:
+        observer = self._auto_eat_observer
+        if observer is None or signal_id is None:
+            return
+        if opportunity.get("market_type") != "threshold_hedge":
+            return
+        if opportunity.get("actionable") is not True:
+            return
+        if opportunity.get("rules_verified_at") in (None, ""):
+            return
+        validation = opportunity.get("relation_validation")
+        codex_status = (
+            validation.get("status")
+            if isinstance(validation, Mapping)
+            else opportunity.get("llm_status")
+        )
+        if str(codex_status).strip().lower() != "approved":
+            return
+        self._reap_auto_eat_task()
+        task = self._auto_eat_task
+        if task is not None and not task.done():
+            return
+        signal = self._store.signal(str(signal_id))
+        if signal is None or signal.get("ended_at") is not None:
+            return
+        opportunity_id = str(opportunity.get("opportunity_id") or "")
+        if not opportunity_id:
+            return
+        self._auto_eat_task = asyncio.create_task(
+            asyncio.to_thread(observer, opportunity_id, str(signal_id))
         )
 
     def _schedule_ready_notification(

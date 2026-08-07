@@ -5754,6 +5754,10 @@ table {
 .pm-brand strong { font-size: 20px; letter-spacing: -0.03em; }
 .pm-brand span { color: var(--muted); font-weight: 700; }
 .pm-nav { display: flex; flex-wrap: wrap; gap: 8px; }
+.pm-mode-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 0; }
+.pm-mode-button { border: 1px solid var(--border, #555); background: transparent; color: inherit; border-radius: 6px; padding: 4px 12px; cursor: pointer; }
+.pm-mode-button.active { background: var(--accent, #2f81f7); color: #fff; }
+.pm-mode-stats { color: var(--muted); font-size: 12px; }
 .pm-nav button,
 .pm-button {
   background: var(--surface);

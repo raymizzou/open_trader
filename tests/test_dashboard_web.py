@@ -14416,3 +14416,19 @@ def test_prediction_history_fails_closed_for_unusable_live_truth(
     )["items"][0]
     assert item["actionable_now"] is False
     assert item["live_profit"] is None
+
+
+def test_prediction_state_payload_includes_validation_mode_and_stats(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard_web import _prediction_state_payload
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    store.set_validation_mode("manual")
+    payload = _prediction_state_payload(
+        store=store, monitor=None, execution=None, csrf_token="csrf"
+    )
+
+    assert payload["validation_mode"] == "manual"
+    assert payload["auto_eat_stats"]["today_submitted"] == 0

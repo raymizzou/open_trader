@@ -1047,6 +1047,21 @@ def _prediction_state_payload(
         cross_venue_monitor=cross_venue_monitor,
         cross_venue=cross_venue,
     )
+    validation_mode = "observe_only"
+    auto_eat_stats: dict[str, object] = {}
+    if store is not None:
+        get_mode = getattr(store, "get_validation_mode", None)
+        if callable(get_mode):
+            try:
+                validation_mode = get_mode()
+            except Exception:
+                validation_mode = "observe_only"
+        get_stats = getattr(store, "auto_eat_stats", None)
+        if callable(get_stats):
+            try:
+                auto_eat_stats = get_stats()
+            except Exception:
+                auto_eat_stats = {}
     return {
         "status": status,
         "health": health,
@@ -1071,6 +1086,8 @@ def _prediction_state_payload(
         "market_count": market_count,
         "token_count": token_count,
         "signals_24h": signals_24h,
+        "validation_mode": validation_mode,
+        "auto_eat_stats": auto_eat_stats,
         "current_execution": current_execution,
         "breaker": {
             "open": breaker_open,
@@ -1639,6 +1656,7 @@ def create_dashboard_server(
                 if path in {
                     "/api/prediction-arbitrage/preview",
                     "/api/prediction-arbitrage/executions",
+                    "/api/prediction-arbitrage/mode",
                     "/api/prediction-arbitrage/circuit-breaker/reset",
                     "/api/prediction-arbitrage/predict-allowance/cleanup",
                 }:
@@ -1655,6 +1673,10 @@ def create_dashboard_server(
                         preview_id = self._required_prediction_string(payload, "preview_id")
                         idempotency_key = self._required_prediction_string(payload, "idempotency_key")
                         result = prediction_execution_service.confirm(preview_id, idempotency_key)
+                    elif path.endswith("/mode"):
+                        self._require_prediction_schema(payload, {"mode"})
+                        mode = self._required_prediction_string(payload, "mode")
+                        result = prediction_execution_service.set_validation_mode(mode)
                     elif path.endswith("/circuit-breaker/reset"):
                         self._require_prediction_schema(payload, {"incident_id"})
                         incident_id = self._required_prediction_string(payload, "incident_id")

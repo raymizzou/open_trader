@@ -3211,6 +3211,20 @@ function predictionLlmHedgeWorkspace(payload, expandedRelationKeys) {
   return `${predictionRelationFunnel(payload)}<aside class="pm-policy"><strong>所有正收益候选都会展示</strong><p>Codex 结论和程序复核全部通过后才出现人工确认入口；两腿属于不同 condition，不会 merge。</p></aside><div class="pm-llm-layout"><aside>${predictionRelationDiscoveryPanel(payload)}</aside><section class="pm-panel"><header class="pm-panel-heading"><div><h2>候选标的</h2><p>点击年化查看当前计算、历史参考、校验链和 LLM 理由；默认全部折叠。</p></div><span class="pm-pill">显示 ${opportunities.length}</span></header><div class="pm-threshold-candidates">${candidates}</div></section></div>`;
 }
 
+function predictionModeBar(payload) {
+  const mode = payload.validation_mode || "observe_only";
+  const stats = payload.auto_eat_stats || {};
+  const modes = [
+    ["observe_only", "观察"],
+    ["manual", "手动"],
+    ["auto", "auto"],
+  ];
+  const buttons = modes.map(([value, label]) =>
+    `<button type="button" class="pm-mode-button${mode === value ? " active" : ""}" data-action="set-mode" data-mode="${value}">${label}</button>`
+  ).join("");
+  return `<div class="pm-mode-bar" aria-label="验证期吃单模式">${buttons}<span class="pm-mode-stats">今日 ${stats.today_submitted || 0} 单 / $${Number(stats.today_cost || 0).toFixed(2)}</span></div>`;
+}
+
 function renderPredictionMarket() {
   const root = elements["prediction-market-root"];
   if (!root) return;
@@ -3228,7 +3242,7 @@ function renderPredictionMarket() {
   const workspace = strategy === "llm_hedge"
     ? predictionLlmHedgeWorkspace(viewPayload, expandedRelationKeys)
     : predictionYesNoWorkspace(viewPayload, expandedEventKeys);
-  root.innerHTML = `${predictionPageHeader(viewPayload)}${predictionReadinessStrip(viewPayload, strategy)}${predictionSafeguardsHtml(viewPayload)}${predictionStrategyTabs(strategy)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload, strategy)}${workspace}`;
+  root.innerHTML = `${predictionPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionReadinessStrip(viewPayload, strategy)}${predictionSafeguardsHtml(viewPayload)}${predictionStrategyTabs(strategy)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload, strategy)}${workspace}`;
 }
 
 function startPredictionPolling() {
@@ -3616,6 +3630,18 @@ async function handlePredictionMarketClick(event) {
   const cleanup = event.target.closest("[data-action='open-allowance-cleanup']");
   if (cleanup) {
     openPredictionModal("allowance_cleanup", cleanup, state.predictionMarket.payload?.predict_allowance_cleanup || {});
+    return;
+  }
+  const modeButton = event.target.closest("[data-action='set-mode']");
+  if (modeButton) {
+    const mode = String(modeButton.dataset.mode || "");
+    if (!["observe_only", "manual", "auto"].includes(mode)) return;
+    try {
+      await predictionPost("/api/prediction-arbitrage/mode", {mode});
+    } catch (error) {
+      state.predictionMarket.error = error instanceof Error ? error.message : String(error);
+    }
+    await fetchPredictionState();
     return;
   }
   const participate = event.target.closest("[data-action='participate']");

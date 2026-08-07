@@ -220,6 +220,8 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "relation_state",
         "relation_scan_runs",
         "cross_execution_reservations",
+        "validation_mode",
+        "auto_eat_attempts",
     }
     assert "signals_market_started_at" in indexes
     assert "signals_started_at" in indexes
