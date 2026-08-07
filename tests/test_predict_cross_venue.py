@@ -1520,6 +1520,40 @@ def test_monitor_manual_set_subscribes_and_exposes_funnel_fields() -> None:
     asyncio.run(exercise())
 
 
+def test_monitor_manual_stage5_notifies_manual_only_signal(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        predict = FakeCrossVenuePredict(
+            (monitor_predict_market(external_ids=("poly-condition",)),)
+        )
+        polymarket = FakeCrossVenuePolymarket()
+        polymarket.release.set()
+        store = PredictionArbitrageStore(tmp_path / "data")
+        notifications: list[tuple[str, str]] = []
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=ManualRejectValidator(),
+            gamma_lookup=monitor_gamma,
+            predict_quote_fn=predict_quote(),
+            store=store,
+            ready_observer=lambda opportunity_id, signal_id: notifications.append(
+                (opportunity_id, signal_id)
+            ),
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        await monitor.start()
+        await wait_until(lambda: bool(predict.subscriptions))
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: len(notifications) >= 1)
+        assert notifications[0][0].startswith("cross:")
+        await predict.queue.put(None)
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+
 class FakeCrossVenuePredict:
     def __init__(self, markets: tuple[PredictMarket, ...]) -> None:
         self.markets = markets

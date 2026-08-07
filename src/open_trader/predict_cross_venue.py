@@ -2121,6 +2121,20 @@ class PredictCrossVenueMonitor:
             asyncio.create_task(
                 asyncio.to_thread(self._ready_observer, opportunity_id, signal_id)
             )
+        if (
+            self._ready_observer is not None
+            and notification_identity is not None
+            and opportunity.get("funnel_stage") == 5
+            and opportunity.get("actionable") is True
+            and opportunity.get("manual_only") is True
+            and not (
+                same_notification_identity
+                and previous.get("actionable") is True
+            )
+        ):
+            asyncio.create_task(
+                asyncio.to_thread(self._ready_observer, opportunity_id, signal_id)
+            )
 
     def _close_opportunity(self, key: tuple[str, Direction]) -> None:
         opportunity = self._opportunities.pop(key, None)

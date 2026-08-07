@@ -463,8 +463,13 @@ def render_yes_no_signal_notification(
                     f"{quantity(leg.get('quantity'))} 份，最大成本 "
                     f"{money(leg.get('max_cost'))}（{str(leg.get('settlement_asset', '')).upper()}）"
                 )
+        manual_only = signal.get("manual_only") is True
         return (
-            f"【跨交易所 YES/NO 可执行信号】{money(profit, signed=True)}",
+            (
+                f"【跨交易所 YES/NO 可执行信号】{money(profit, signed=True)}"
+                if not manual_only
+                else f"【规则模糊 · 需人工批准】{money(profit, signed=True)}"
+            ),
             "\n".join(
                 (
                     *lines,
@@ -473,6 +478,14 @@ def render_yes_no_signal_notification(
                     f"理论年化收益：{annualized.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}%",
                     f"统一截止时间：{timestamp(signal.get('canonical_cutoff'))}",
                     f"发现时间（HKT）：{discovered}",
+                    *(
+                        (
+                            "结算规则可能不一致：两所对规则有独立解释权，文字一致不保证同向结算。",
+                            "需人工批准后才能下单（不会自动执行）。",
+                        )
+                        if manual_only
+                        else ()
+                    ),
                     f"Dashboard：/?prediction_signal={signal.get('signal_id', '')}",
                 )
             ),
