@@ -16,3 +16,5 @@ node_modules/
 test-results/
 playwright-report/
 output/
+# Design specs stay local; never committed.
+docs/superpowers/specs/

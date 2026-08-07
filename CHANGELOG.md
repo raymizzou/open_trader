@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-07
 
+- 规范：`docs/superpowers/specs/` 不再纳入 git 跟踪（加入 `.gitignore`；已跟踪的
+  140 个 spec 文件改为 untrack，文件保留在本地，历史提交不受影响）。
 - #33 验证期自动吃单：看板新增三档模式（观察/手动/auto，sqlite 持久化，切换即时生效，
   切回观察或手动即暂停所有自动下单）。auto 模式对 Polymarket 同市场阈值对冲自动真实吃
   小单：年化 >15%、按最差价格扣最大手续费后净边际 >0 为硬门槛；每 signal 最多一次、
