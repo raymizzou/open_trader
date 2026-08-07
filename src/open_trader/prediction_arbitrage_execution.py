@@ -53,6 +53,7 @@ from .predict_cross_venue import (
 from .predict_trading import PREDICT_BASE_UNITS
 from .prediction_arbitrage_store import PredictionArbitrageStore
 from .prediction_title_translation import cached_prediction_title_zh
+from .validation_eat_policy import should_eat as _validation_should_eat
 
 
 PREVIEW_TTL = timedelta(seconds=10)
@@ -271,7 +272,7 @@ class PredictionExecutionService:
                     return True
         return False
 
-    def preview(self, opportunity_id: str) -> dict[str, object]:
+    def preview(self, opportunity_id: str, *, auto_eat: bool = False) -> dict[str, object]:
         """Freshly validate one server-issued opportunity and persist a preview."""
 
         cross_preview = str(opportunity_id).startswith("cross:")
@@ -298,6 +299,8 @@ class PredictionExecutionService:
         payload = self._preview_payload(
             opportunity, intent, account=account, expires_at=expires_at
         )
+        if auto_eat:
+            payload["auto_eat"] = True
         preview_id = self._store.create_preview(
             payload, expires_at=_timestamp(expires_at)
         )
@@ -375,6 +378,11 @@ class PredictionExecutionService:
         signal = self._store.signal(str(signal_id))
         if signal is None:
             return {"state": "ignored", "reason": "signal_unavailable"}
+        if (
+            signal.get("market_type") == "threshold_hedge"
+            and self._store.get_validation_mode() == "auto"
+        ):
+            return {"state": "ignored", "reason": "mode_auto"}
         if signal.get("market_type") == "cross_venue_yes_no":
             return self._notify_cross_venue_signal(
                 str(opportunity_id), str(signal_id), signal
@@ -479,6 +487,108 @@ class PredictionExecutionService:
         if completion.get("state") == "closed":
             return {"state": "ignored", "reason": "signal_closed"}
         return {"state": "failed", "reason": "notification_failed"}
+
+    def set_validation_mode(self, mode: str) -> dict[str, object]:
+        try:
+            value = self._store.set_validation_mode(mode)
+        except ValueError as exc:
+            return {"state": "rejected", "reason": str(exc)}
+        return {"state": "ok", "mode": value}
+
+    def auto_eat_threshold(
+        self, opportunity_id: str, signal_id: str
+    ) -> dict[str, object]:
+        signal = self._store.signal(str(signal_id))
+        if signal is None:
+            return {"state": "ignored", "reason": "signal_unavailable"}
+        if self._store.get_validation_mode() != "auto":
+            return {"state": "ignored", "reason": "mode_not_auto"}
+        market_id = str(signal.get("market_id") or "")
+        prepared = self._prepare_opportunity(str(opportunity_id))
+        if isinstance(prepared, dict):
+            reason = str(prepared.get("reason") or "not_ready")
+            if reason != "circuit_breaker_open":
+                self._store.record_auto_eat_attempt(
+                    signal_id=str(signal_id), market_id=market_id,
+                    decision="rejected", reason=reason,
+                )
+            return prepared
+        opportunity, intent, account = prepared
+        if not isinstance(intent, ThresholdHedgeIntent):
+            self._store.record_auto_eat_attempt(
+                signal_id=str(signal_id), market_id=market_id,
+                decision="rejected", reason="unsupported_intent",
+            )
+            return {"state": "rejected", "reason": "unsupported_intent"}
+        annualized = _decimal(opportunity.get("annualized_yield"))
+        if annualized is None or annualized <= MIN_THRESHOLD_ANNUALIZED_YIELD:
+            self._store.record_auto_eat_attempt(
+                signal_id=str(signal_id), market_id=market_id,
+                decision="rejected", reason="annualized_below_minimum",
+            )
+            return {"state": "rejected", "reason": "annualized_below_minimum"}
+        if intent.minimum_profit <= 0 or intent.net_edge <= 0:
+            self._store.record_auto_eat_attempt(
+                signal_id=str(signal_id), market_id=market_id,
+                decision="rejected", reason="threshold_economics",
+            )
+            return {"state": "rejected", "reason": "threshold_economics"}
+        balance = _decimal(account.get("p_usd_balance")) or Decimal("0")
+        allowed, reason = _validation_should_eat(
+            store=self._store, signal=signal, intent=intent,
+            balance=balance, now=datetime.now(UTC),
+        )
+        if not allowed:
+            self._store.record_auto_eat_attempt(
+                signal_id=str(signal_id), market_id=market_id,
+                decision="rejected", reason=reason,
+            )
+            return {"state": "rejected", "reason": reason}
+        preview_result = self.preview(str(opportunity_id), auto_eat=True)
+        if not isinstance(preview_result, Mapping) or preview_result.get("state") != "previewed":
+            reason = str(preview_result.get("reason") or "preview_failed")
+            self._store.record_auto_eat_attempt(
+                signal_id=str(signal_id), market_id=market_id,
+                decision="rejected", reason=reason,
+            )
+            return preview_result
+        preview_id = str(preview_result["preview_id"])
+        confirm_result = self.confirm(preview_id, str(signal_id))
+        execution_id = str(confirm_result.get("execution_id") or "")
+        confirm_state = str(confirm_result.get("state") or "")
+        if execution_id or confirm_state in {
+            "validating", "submitting", "reconciling", "holding_to_resolution",
+        }:
+            self._store.record_auto_eat_attempt(
+                signal_id=str(signal_id), market_id=market_id,
+                decision="submitted", preview_id=preview_id,
+                execution_id=execution_id, total_cost=intent.total_max_cost,
+            )
+            self._notify_auto_eat_success(opportunity, intent, preview_result)
+            return confirm_result
+        reason = str(confirm_result.get("reason") or "confirm_failed")
+        self._store.record_auto_eat_attempt(
+            signal_id=str(signal_id), market_id=market_id,
+            decision="rejected", reason=reason, preview_id=preview_id,
+        )
+        return confirm_result
+
+    def _notify_auto_eat_success(
+        self,
+        opportunity: Mapping[str, object],
+        intent: ThresholdHedgeIntent,
+        preview_result: Mapping[str, object],
+    ) -> None:
+        try:
+            title = "预测套利验证单已吃"
+            message = (
+                f"{opportunity.get('question') or opportunity.get('question_a') or ''}\n"
+                f"数量 {intent.quantity} · 成本 ${intent.total_max_cost:.4f} · "
+                f"预计利润 ${intent.minimum_profit:.4f}"
+            )
+            self._deliver_feishu_notification(title, message)
+        except Exception:
+            return
 
     def notify_observation(
         self,
