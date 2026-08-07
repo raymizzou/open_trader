@@ -8,7 +8,7 @@ import os
 import secrets
 import subprocess
 import threading
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -56,6 +56,7 @@ from .prediction_arbitrage import (
     MAX_WALLET_BALANCE,
     MIN_ESTIMATED_PROFIT,
     MIN_NET_EDGE,
+    MIN_THRESHOLD_ANNUALIZED_YIELD,
 )
 from .prediction_arbitrage_execution import PredictionExecutionService
 from .prediction_arbitrage_store import PredictionArbitrageStore
@@ -196,6 +197,25 @@ def _prediction_decimal_sort(value: object) -> Decimal:
     except Exception:
         return Decimal("-Infinity")
     return parsed if parsed.is_finite() else Decimal("-Infinity")
+
+
+def _prediction_displayable(row: Mapping[str, object]) -> bool:
+    reason = str(row.get("eligibility_reason") or "").strip()
+    if reason in {"annualized_yield_below_minimum", "annualized_yield_unavailable"}:
+        return False
+    annualized = row.get("annualized_yield")
+    if annualized not in (None, ""):
+        try:
+            value = Decimal(str(annualized))
+        except Exception:
+            value = None
+        if (
+            value is not None
+            and value.is_finite()
+            and value < MIN_THRESHOLD_ANNUALIZED_YIELD
+        ):
+            return False
+    return True
 
 
 def _prediction_sort_key(item: Mapping[str, object]) -> tuple[bool, Decimal, Decimal, str]:
@@ -937,6 +957,24 @@ def _prediction_state_payload(
         _prediction_attach_cached_title(store, _prediction_opportunity_aliases(row))
         for row in cross_venue["opportunities"]
     )
+    opportunity_rows = [
+        row for row in opportunity_rows if _prediction_displayable(row)
+    ]
+    for event in event_rows:
+        markets = event.get("markets")
+        if isinstance(markets, (list, tuple)):
+            event["markets"] = [
+                market
+                for market in markets
+                if isinstance(market, Mapping) and _prediction_displayable(market)
+            ]
+    event_rows = [
+        event
+        for event in event_rows
+        if event.get("actionable") is True
+        or "markets" not in event
+        or event.get("markets")
+    ]
     event_rows = sorted(
         (row for row in event_rows if isinstance(row, Mapping)), key=_prediction_sort_key
     )
@@ -1101,6 +1139,11 @@ def _prediction_history_payload(
         for row in rows
     ]
     if kind == "signals":
+        safe_rows = [
+            row
+            for row in safe_rows
+            if not isinstance(row, Mapping) or _prediction_displayable(row)
+        ]
         try:
             state = _prediction_state_payload(
                 store=store,

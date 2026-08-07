@@ -3314,7 +3314,7 @@ def test_prediction_arbitrage_projects_threshold_relation_validation_without_sec
                     "total_max_cost": "2.12",
                     "minimum_payout": "10",
                     "minimum_profit": "7.88",
-                    "annualized_yield": "0.1234",
+                    "annualized_yield": "0.20",
                     "resolution_at": "2026-12-31T17:00:00Z",
                     "remaining_days": "155.5",
                     "confirmed_at": "2026-07-29T00:00:00Z",
@@ -14416,3 +14416,154 @@ def test_prediction_history_fails_closed_for_unusable_live_truth(
     )["items"][0]
     assert item["actionable_now"] is False
     assert item["live_profit"] is None
+
+
+def test_state_payload_hides_below_threshold_opportunities_and_markets() -> None:
+    from open_trader.dashboard_web import _prediction_state_payload
+
+    class FakeStore:
+        def active_execution(self) -> None:
+            return None
+
+        def unacknowledged_incident(self) -> None:
+            return None
+
+        def cross_unsettled_principal(self) -> Decimal:
+            return Decimal("0")
+
+        def load_runtime(self) -> dict[str, object]:
+            return {}
+
+        def signal_history(self, _window: str) -> list[dict[str, object]]:
+            return []
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "health": {"status": "healthy", "degraded_reasons": []},
+                "readiness": {
+                    "status": "ready",
+                    "geoblock": "allowed",
+                    "relayer": "ready",
+                },
+                "events": [
+                    {
+                        "event_id": "ev-mixed",
+                        "title": "Mixed event",
+                        "actionable": False,
+                        "volume_24h": "10",
+                        "markets": [
+                            {
+                                "event_id": "ev-mixed",
+                                "market_id": "m-below",
+                                "question": "below",
+                                "eligibility_reason": "annualized_yield_below_minimum",
+                                "annualized_yield": "0.05",
+                                "actionable": False,
+                            },
+                            {
+                                "event_id": "ev-mixed",
+                                "market_id": "m-above",
+                                "question": "above",
+                                "eligibility_reason": "actionable",
+                                "annualized_yield": "0.20",
+                                "actionable": True,
+                            },
+                        ],
+                    }
+                ],
+                "opportunities": [
+                    {
+                        "opportunity_id": "below",
+                        "market_type": "threshold_hedge",
+                        "annualized_yield": "0.05",
+                        "eligibility_reason": "annualized_yield_below_minimum",
+                        "actionable": False,
+                        "event_id": "ev-below",
+                        "quantity": "20",
+                        "total_max_cost": "19.9",
+                    },
+                    {
+                        "opportunity_id": "above",
+                        "market_type": "threshold_hedge",
+                        "annualized_yield": "0.20",
+                        "eligibility_reason": "actionable",
+                        "actionable": True,
+                        "event_id": "ev-above",
+                        "remaining_days": "3",
+                        "quantity": "20",
+                        "total_max_cost": "19.9",
+                    },
+                ],
+            }
+
+    class FakeExecution:
+        _breaker_open = False
+        _cross_breaker_open = False
+
+    state = _prediction_state_payload(
+        store=FakeStore(),
+        monitor=FakeMonitor(),
+        execution=FakeExecution(),
+        csrf_token="",
+    )
+    assert [row["opportunity_id"] for row in state["opportunities"]] == ["above"]
+    assert [market["market_id"] for market in state["events"][0]["markets"]] == [
+        "m-above"
+    ]
+
+
+def test_signal_history_hides_below_threshold_rows() -> None:
+    from open_trader.dashboard_web import _prediction_history_payload
+
+    rows = [
+        {
+            "signal_id": "below",
+            "market_type": "threshold_hedge",
+            "annualized_yield": "0.007",
+            "eligibility_reason": "annualized_yield_below_minimum",
+            "started_at": "2026-08-06T00:00:00Z",
+            "occurred_at": "2026-08-06T00:00:00Z",
+        },
+        {
+            "signal_id": "above",
+            "market_type": "threshold_hedge",
+            "annualized_yield": "0.20",
+            "eligibility_reason": "actionable",
+            "started_at": "2026-08-06T00:01:00Z",
+            "occurred_at": "2026-08-06T00:01:00Z",
+            "opportunity_id": "above",
+        },
+    ]
+
+    class FakeStore:
+        def histories(self, kind: str) -> list[dict[str, object]]:
+            assert kind == "signals"
+            return rows
+
+        def active_execution(self) -> None:
+            return None
+
+        def unacknowledged_incident(self) -> None:
+            return None
+
+        def signal_history(self, _window: str) -> list[dict[str, object]]:
+            return rows
+
+        def load_runtime(self) -> dict[str, object]:
+            return {}
+
+        def load_llm_cache(self, _key: str) -> dict[str, object] | None:
+            return None
+
+        def record_llm_cache_hit(self) -> None:
+            return None
+
+    payload = _prediction_history_payload(
+        FakeStore(),
+        kind="signals",
+        limit=10,
+        offset=0,
+    )
+    assert [row["signal_id"] for row in payload["items"]] == ["above"]
