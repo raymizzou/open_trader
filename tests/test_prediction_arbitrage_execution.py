@@ -2971,6 +2971,36 @@ def test_cross_venue_execution_mode_is_server_authority_for_preview_and_confirm(
     assert predict.submit_calls == 0
 
 
+def test_manual_only_cross_venue_rejected_by_auto_eat_but_valid_for_confirm(
+    tmp_path: Path,
+) -> None:
+    service, _store, _trading, cross, _predict = _cross_service(tmp_path)
+    cross.intent = replace(cross.intent, manual_only=True)
+    cross.overrides["manual_only"] = True
+    cross.overrides["manual_reason"] = "UNRESOLVED_UNCERTAINTY"
+    opportunity_id = "cross:public-pair:PREDICT_YES_POLYMARKET_NO"
+
+    auto = service.preview(opportunity_id, auto_eat=True)
+    assert auto == {"state": "rejected", "reason": "manual_only_requires_approval"}
+
+    preview = service.preview(opportunity_id)
+    assert preview["state"] == "previewed"
+
+    opportunity = cross._opportunity(cross.intent)
+    assert service._validate_cross_venue_opportunity(opportunity, cross.intent) is None
+
+    strict = CrossVenueMonitor(_cross_intent())
+    strict.overrides["codex_approval"] = {
+        "decision": "REJECT",
+        "cache_key": "",
+        "direct_outcome_mapping": {},
+        "evidence": [],
+    }
+    assert service._validate_cross_venue_opportunity(
+        strict._opportunity(strict.intent), strict.intent
+    ) == "codex_not_approved"
+
+
 @pytest.mark.parametrize(
     "cutoff",
     [

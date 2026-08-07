@@ -1888,6 +1888,7 @@ class PredictCrossVenueMonitor:
             ),
             "actionable": intent.actionable,
             "quote_available": intent.quote_available,
+            "manual_only": intent.manual_only,
         }
 
     def _confirmation_done(
