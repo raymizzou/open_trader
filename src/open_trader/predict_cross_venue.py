@@ -58,7 +58,7 @@ def validate_cross_execution_mode(value: object) -> str:
 
 
 CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION = (
-    "cross-exchange-yes-no-equivalence-v3"
+    "cross-exchange-yes-no-equivalence-v4"
 )
 CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT = """You are a semantic auditor for one explicit Predict.fun and Polymarket binary-market pair.
 
@@ -87,8 +87,12 @@ def _cross_equivalence_prompt() -> str:
 
     return (
         f"{CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT}\n"
-        "OUTPUT JSON SCHEMA (return exactly this shape)\n"
+        "OUTPUT JSON SCHEMA (contract reference only; do NOT echo it)\n"
         f"{_CODEX_SCHEMA.read_text(encoding='utf-8')}\n"
+        "OUTPUT RULE\n"
+        "Return ONLY the data object that satisfies the schema above. "
+        "Never include schema meta keys in the output: no \"$schema\", \"type\", "
+        "\"required\", \"properties\", \"additionalProperties\", \"$defs\".\n"
     )
 _RESULT_FIELDS = {
     "schema_version", "decision", "summary", "predict", "polymarket",

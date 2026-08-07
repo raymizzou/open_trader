@@ -775,7 +775,7 @@ def test_codex_fingerprint_uses_only_versioned_semantic_payload() -> None:
         codex_relation_cache_key(
             relation,
             model="gpt-test",
-            prompt_version="polymarket-threshold-relation-v3",
+            prompt_version="polymarket-threshold-relation-v4",
         )
         != expected
     )
@@ -845,6 +845,7 @@ def test_codex_prompt_embeds_fixed_output_schema(tmp_path: Path) -> None:
     prompt = captured[0]
     schema_text = _CODEX_SCHEMA.read_text(encoding="utf-8")
     assert "OUTPUT JSON SCHEMA" in prompt
+    assert "Never include schema meta keys" in prompt
     assert schema_text in prompt
     assert "INPUT JSON" in prompt
 

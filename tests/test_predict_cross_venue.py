@@ -316,7 +316,7 @@ def test_equivalence_approval_uses_required_namespace_schema_and_cache(tmp_path:
     second = validator.validate(pair)
 
     assert first.approved is True
-    assert first.prompt_version == "cross-exchange-yes-no-equivalence-v3"
+    assert first.prompt_version == "cross-exchange-yes-no-equivalence-v4"
     assert first.canonical_cutoff == datetime(2026, 12, 31, 23, 59, tzinfo=UTC)
     assert first.direct_outcome_mapping == {
         "predict_yes": "YES", "predict_no": "NO",
@@ -327,7 +327,7 @@ def test_equivalence_approval_uses_required_namespace_schema_and_cache(tmp_path:
     )
     assert second.approved is True
     assert len(calls) == 1
-    assert CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION == "cross-exchange-yes-no-equivalence-v3"
+    assert CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION == "cross-exchange-yes-no-equivalence-v4"
     assert Path(calls[0][calls[0].index("--output-schema") + 1]).name == "cross_exchange_yes_no_equivalence.json"
     assert store.llm_usage_24h()["cache_hits"] == 1
 
@@ -361,6 +361,7 @@ def test_cross_venue_codex_prompt_embeds_fixed_output_schema(
     prompt = captured[0]
     schema_text = predict_cross_venue._CODEX_SCHEMA.read_text(encoding="utf-8")
     assert "OUTPUT JSON SCHEMA" in prompt
+    assert "Never include schema meta keys" in prompt
     assert schema_text in prompt
     assert "INPUT JSON" in prompt
 

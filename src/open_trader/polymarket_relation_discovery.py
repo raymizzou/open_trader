@@ -42,7 +42,7 @@ ValidationStatus = Literal[
 ]
 ValidationRelation = Literal["A_IMPLIES_B", "B_IMPLIES_A", "NONE"]
 
-CODEX_PROMPT_VERSION = "polymarket-threshold-relation-v2"
+CODEX_PROMPT_VERSION = "polymarket-threshold-relation-v3"
 DEEPSEEK_FALLBACK_MODEL = "deepseek-v4-flash"
 CODEX_CIRCUIT_FAILURES = 3
 CODEX_CIRCUIT_COOLDOWN_SECONDS = 300.0
@@ -125,8 +125,12 @@ def _codex_relation_prompt() -> str:
 
     return (
         f"{CODEX_RELATION_PROMPT}\n"
-        "OUTPUT JSON SCHEMA (return exactly this shape)\n"
+        "OUTPUT JSON SCHEMA (contract reference only; do NOT echo it)\n"
         f"{_CODEX_SCHEMA.read_text(encoding='utf-8')}\n"
+        "OUTPUT RULE\n"
+        "Return ONLY the data object that satisfies the schema above. "
+        "Never include schema meta keys in the output: no \"$schema\", \"type\", "
+        "\"required\", \"properties\", \"additionalProperties\", \"$defs\".\n"
     )
 _TOP_LEVEL_RESULT_FIELDS = {
     "schema_version",
