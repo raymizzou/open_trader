@@ -14567,3 +14567,76 @@ def test_signal_history_hides_below_threshold_rows() -> None:
         offset=0,
     )
     assert [row["signal_id"] for row in payload["items"]] == ["above"]
+
+
+def test_prediction_sort_key_orders_actionable_then_annualized_then_settlement() -> None:
+    from open_trader.dashboard_web import _prediction_sort_key
+
+    rows = [
+        {
+            "event_id": "low-annualized-short",
+            "actionable": True,
+            "annualized_yield": "0.16",
+            "remaining_days": "1",
+            "profit": "1.00",
+            "volume_24h": "1",
+        },
+        {
+            "event_id": "high-annualized-long",
+            "actionable": True,
+            "annualized_yield": "0.80",
+            "remaining_days": "40",
+            "profit": "1.00",
+            "volume_24h": "1",
+        },
+        {
+            "event_id": "high-annualized-short",
+            "actionable": True,
+            "annualized_yield": "0.80",
+            "remaining_days": "3",
+            "profit": "0.50",
+            "volume_24h": "1",
+        },
+        {
+            "event_id": "inactive",
+            "actionable": False,
+            "annualized_yield": "1.00",
+            "remaining_days": "1",
+            "profit": "1.00",
+            "volume_24h": "1",
+        },
+    ]
+    ordered = sorted(rows, key=_prediction_sort_key)
+    assert [row["event_id"] for row in ordered] == [
+        "high-annualized-short",
+        "high-annualized-long",
+        "low-annualized-short",
+        "inactive",
+    ]
+
+
+def test_prediction_sort_key_falls_back_to_cross_venue_cutoff() -> None:
+    from datetime import timedelta
+
+    from open_trader.dashboard_web import _prediction_sort_key
+
+    base = datetime.now(timezone.utc)
+    short_cross = {
+        "event_id": "cross-short",
+        "actionable": True,
+        "market_type": "cross_venue_yes_no",
+        "annualized_yield": "0.50",
+        "canonical_cutoff": (base + timedelta(days=1)).isoformat(),
+        "profit": "1.00",
+        "volume_24h": "1",
+    }
+    long_cross = {
+        "event_id": "cross-long",
+        "actionable": True,
+        "market_type": "cross_venue_yes_no",
+        "annualized_yield": "0.50",
+        "canonical_cutoff": (base + timedelta(days=40)).isoformat(),
+        "profit": "1.00",
+        "volume_24h": "1",
+    }
+    assert _prediction_sort_key(short_cross) < _prediction_sort_key(long_cross)

@@ -218,7 +218,67 @@ def _prediction_displayable(row: Mapping[str, object]) -> bool:
     return True
 
 
-def _prediction_sort_key(item: Mapping[str, object]) -> tuple[bool, Decimal, Decimal, str]:
+def _prediction_annualized(item: Mapping[str, object]) -> Decimal:
+    value = item.get("annualized_yield")
+    if value not in (None, ""):
+        try:
+            parsed = Decimal(str(value))
+        except Exception:
+            parsed = None
+        if parsed is not None and parsed.is_finite():
+            return parsed
+    opportunities = item.get("opportunities")
+    if isinstance(opportunities, (list, tuple)):
+        values = [
+            _prediction_annualized(row)
+            for row in opportunities
+            if isinstance(row, Mapping)
+        ]
+        if values:
+            return max(values)
+    return Decimal("-Infinity")
+
+
+def _prediction_remaining_days(item: Mapping[str, object]) -> Decimal:
+    value = item.get("remaining_days")
+    if value not in (None, ""):
+        try:
+            parsed = Decimal(str(value))
+        except Exception:
+            parsed = None
+        if parsed is not None and parsed.is_finite():
+            return parsed
+    cutoff = item.get("resolution_at") or item.get("canonical_cutoff")
+    if isinstance(cutoff, str):
+        try:
+            end = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+            days = Decimal(
+                str(
+                    (
+                        end.astimezone(UTC)
+                        - datetime.now(UTC).astimezone(UTC)
+                    ).total_seconds()
+                )
+            ) / Decimal("86400")
+            if days.is_finite():
+                return days
+        except Exception:
+            pass
+    opportunities = item.get("opportunities")
+    if isinstance(opportunities, (list, tuple)):
+        days = [
+            _prediction_remaining_days(row)
+            for row in opportunities
+            if isinstance(row, Mapping)
+        ]
+        if days:
+            return min(days)
+    return Decimal("Infinity")
+
+
+def _prediction_sort_key(
+    item: Mapping[str, object],
+) -> tuple[bool, Decimal, Decimal, Decimal, Decimal, str]:
     opportunities = item.get("opportunities")
     actionable = bool(item.get("actionable"))
     nested_profits: list[Decimal] = []
@@ -240,6 +300,8 @@ def _prediction_sort_key(item: Mapping[str, object]) -> tuple[bool, Decimal, Dec
         volume = max(nested_volumes)
     return (
         not actionable,
+        -_prediction_annualized(item),
+        _prediction_remaining_days(item),
         -_prediction_decimal_sort(profit),
         -_prediction_decimal_sort(volume),
         str(item.get("event_id") or ""),
