@@ -14640,3 +14640,38 @@ def test_prediction_sort_key_falls_back_to_cross_venue_cutoff() -> None:
         "volume_24h": "1",
     }
     assert _prediction_sort_key(short_cross) < _prediction_sort_key(long_cross)
+
+
+def test_prediction_workspace_renders_candidate_table_and_no_observation_aside() -> None:
+    output = run_dashboard_js(r'''
+state.predictionMarket.payload = {
+  status: "healthy",
+  health: {status: "healthy", degraded_reasons: []},
+  readiness: {status: "ready", geoblock: "allowed", relayer: "ready"},
+  policy_limits: {max_wallet_balance: "65", max_normal_cost: "20", max_emergency_loss: "2", min_estimated_profit: "1"},
+  breaker: {open: false},
+  events: [],
+  opportunities: [{
+    opportunity_id: "threshold-1", market_type: "threshold_hedge",
+    question: "A / B", question_a: "A", question_b: "B",
+    relation: "B_IMPLIES_A", condition_id_a: "a", condition_id_b: "b",
+    token_id_a: "ta", token_id_b: "tb",
+    annualized_yield: "0.20", remaining_days: "3", resolution_at: "2026-08-10T00:00:00Z",
+    max_executable_quantity: "2000", max_executable_cost: "1998.00",
+    policy_quantity: "20", policy_cost: "19.90",
+    depth_status: "pass", actionable: true,
+    quantity: "20", total_max_cost: "19.90", minimum_payout: "20",
+    profit: "0.10", llm_status: "approved", volume_24h: "29379",
+  }],
+};
+const html = predictionLlmHedgeWorkspace(state.predictionMarket.payload, new Set());
+console.log(JSON.stringify(html));
+''')
+    rendered = json.loads(output)
+    for label in ("候选标的", "年化", "结算期", "理论深度", "政策下单量", "状态", "操作"):
+        assert label in rendered
+    assert "3 天" in rendered
+    assert "2000" in rendered
+    assert "19.90" in rendered
+    assert "可观察标的" not in rendered
+    assert "pm-llm-layout" not in rendered

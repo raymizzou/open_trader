@@ -5958,6 +5958,9 @@ table {
 .pm-table th, .pm-table td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: left; vertical-align: top; }
 .pm-table th { color: var(--muted); font-size: 11px; letter-spacing: 0.03em; text-transform: uppercase; }
 .pm-table tr:last-child td { border-bottom: 0; }
+.pm-table-wrap { overflow-x: auto; }
+.pm-table .num { font-variant-numeric: tabular-nums; text-align: right; }
+.pm-table .sub { color: var(--muted); display: block; font-size: 11px; margin-top: 3px; }
 .pm-signal-table { min-width: 0; table-layout: fixed; }
 .pm-signal-table th:nth-child(1), .pm-signal-table td:nth-child(1) { width: 132px; }
 .pm-signal-table th:nth-child(2), .pm-signal-table td:nth-child(2) { width: 35%; }
