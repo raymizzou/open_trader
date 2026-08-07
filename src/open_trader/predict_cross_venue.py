@@ -20,9 +20,11 @@ from typing import Literal
 
 from .polymarket_relation_discovery import (
     DEEPSEEK_FALLBACK_MODEL,
+    PositiveEdgeDepth,
     _deepseek_completion,
     _codex_events,
     _fee,
+    positive_edge_depth,
     simple_annualized_yield_from_values,
 )
 from .polymarket_monitor import PolymarketMonitor
@@ -226,6 +228,7 @@ class CrossVenueIntent:
     resolution_at: datetime | None
     actionable: bool
     quote_available: bool
+    depth_probe: PositiveEdgeDepth | None = None
 
 
 def build_cross_venue_intents(
@@ -298,6 +301,16 @@ def _build_cross_venue_intents(
             polymarket_segments, pair.polymarket.tick_size
         )
         minimum = max(pair.predict.minimum_order_size, pair.polymarket.minimum_order_size)
+        depth_probe = positive_edge_depth(
+            predict_side,
+            polymarket_segments,
+            tick_size_a=pair.predict.tick_size,
+            tick_size_b=pair.polymarket.tick_size,
+            fee_rate_a=pair.predict.fee_rate_bps / Decimal("10000"),
+            fee_rate_b=pair.polymarket.fee_rate_bps / Decimal("10000"),
+            minimum_order_size=minimum,
+            extra_cost=CROSS_VENUE_GAS_RESERVE,
+        )
         observation: CrossVenueIntent | None = None
         requested_quantities = (
             (target_quantity,)
@@ -416,6 +429,7 @@ def _build_cross_venue_intents(
                 minimum_profit=minimum_profit, annualized_yield=annualized,
                 canonical_cutoff=canonical_cutoff, resolution_at=canonical_cutoff,
                 actionable=actionable, quote_available=quote_available,
+                depth_probe=depth_probe,
             )
             if total_max_cost > MAX_NORMAL_COST:
                 observation = observation or intent
@@ -1666,6 +1680,21 @@ class PredictCrossVenueMonitor:
             "quantity": intent.quantity,
             "calculable_gas": intent.calculable_gas,
             "total_max_cost": intent.total_max_cost,
+            "depth_status": (
+                "pass" if intent.depth_probe is not None else "insufficient"
+            ),
+            "max_executable_quantity": (
+                intent.depth_probe.quantity
+                if intent.depth_probe is not None
+                else Decimal("0")
+            ),
+            "max_executable_cost": (
+                intent.depth_probe.cost
+                if intent.depth_probe is not None
+                else Decimal("0")
+            ),
+            "policy_quantity": intent.quantity,
+            "policy_cost": intent.total_max_cost,
             "maximum_fee": intent.maximum_fee,
             "minimum_payout": intent.minimum_payout,
             "minimum_profit": intent.minimum_profit,
