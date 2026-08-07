@@ -57,11 +57,12 @@ test.describe('YES/NO arbitrage signal workspace', () => {
 
       const funnel = page.locator('.pm-cross-venue-funnel');
       await expect(funnel.locator('.pm-funnel-stage > span')).toHaveText([
-        '两所对应标的', '正在监视', 'Codex 认为可以', '有套利空间', '可下单明确信号',
+        '正在监视', '正收益', '年化达标', '已提交',
       ]);
-      await expect(funnel).toContainText('低频候选');
-      await expect(funnel).toContainText('Codex queue');
-      await expect(funnel).toContainText('实时 REST 准入');
+      await expect(funnel).toContainText('Codex 认为可以');
+      await expect(funnel).toContainText('文字一致');
+      await expect(page.locator('.pm-manual-card')).toContainText('人工下单');
+      await expect(page.locator('.pm-manual-card')).toContainText('结算规则可能不一致');
 
       const actionableCross = page.locator('[data-cross-opportunity-id="cross-opportunity-actionable-fixture"]');
       await expect(actionableCross).toContainText('Predict.fun · BUY YES');
@@ -106,11 +107,11 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     const cases: Array<[string, string[]]> = [
       ['ready-zero-allowance', ['Predict Account', '授权 $0.00 USDT', '可以交易', 'Privy signer', 'BNB']],
       ['signer-bnb-low', ['Privy signer', '只读', '当前 0.001 BNB', '需要 0.004 BNB', '最低保留 0.006 BNB', 'BNB top-up to 0xBnbSigner…BEEF']],
-      ['cross-signal-bnb-low', ['可下单明确信号', '只读', 'BNB top-up to 0xBnbSigner…BEEF']],
+      ['cross-signal-bnb-low', ['年化达标', '只读', 'BNB top-up to 0xBnbSigner…BEEF']],
       ['residual-allowance', ['熔断只读', '残余授权', '$2.40 USDT', '清理残余授权']],
       ['cleanup-success', ['熔断只读', '清理残余授权']],
       ['cleanup-failure', ['熔断只读', '清理残余授权']],
-      ['cross-stale-stage4', ['两所对应标的', '正在监视', 'Codex 认为可以', '有套利空间', '可下单明确信号', '保留时间 2026-08-03T15:39:00Z']],
+      ['cross-stale-stage4', ['正在监视', '正收益', '年化达标', '已提交', '保留时间 2026-08-03T15:39:00Z']],
       ['cross-empty-scan', ['当前没有合格跨所市场', '扫描正常，没有失败']],
       ['first-canary-cap5', ['首单验证', '单笔成本上限 $5.00']],
       ['completed-canary-cap20', ['常规上限', '单笔成本上限 $20.00']],
@@ -163,7 +164,7 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(observeOnly).toContainText('仅观察');
     await expect(observeOnly).toContainText('只观察模式');
     await expect(observeOnly.locator('[data-action="participate"]')).toHaveCount(0);
-    await expect(page.locator('.pm-cross-venue-funnel')).toContainText('可下单明确信号');
+    await expect(page.locator('.pm-cross-venue-funnel')).toContainText('年化达标');
 
     const history = page.locator('[data-prediction-history-panel]');
     const observeSignal = history.locator('tbody tr').filter({ hasText: '跨所只观察信号' });

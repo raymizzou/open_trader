@@ -134,6 +134,8 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "opportunity_id": "cross-opportunity-actionable-fixture",
         "event_id": "cross-event-actionable-fixture",
         "execution_mode": "manual_confirm",
+        "manual_only": True,
+        "manual_reason": "UNRESOLVED_UNCERTAINTY",
     }
     if scenario == "quiet":
         opportunity = {**opportunity, "actionable": False}
@@ -168,7 +170,7 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "privy_signer": {"address": "0xBnbSigner…BEEF", "mode": "可以交易", "bnb": {"current": "0.012", "required": "0.004", "minimum": "0.006"}, "copy_text": "BNB top-up to 0xBnbSigner…BEEF on BNB Smart Chain", "official_links": [{"label": "Predict.fun", "url": "https://predict.fun/"}, {"label": "BNB Chain", "url": "https://www.bnbchain.org/"}]},
         "cross_venue": {
             "mode": "manual_confirm" if scenario == "cross-manual-confirm" else "observe_only",
-            "funnel": {"matched_pairs": 12, "monitored_pairs": 8, "codex_approved_pairs": 5, "arbitrage_space_pairs": 2, "clear_signal_pairs": 1, "retained_at": "2026-08-03T15:39:00Z"},
+            "funnel": {"matched_pairs": 12, "monitored_pairs": 8, "codex_approved_pairs": 5, "arbitrage_space_pairs": 2, "clear_signal_pairs": 1, "manual_eligible_pairs": 3, "manual_pending_pairs": 1, "retained_at": "2026-08-03T15:39:00Z"},
             "unsettled": {"current": "35.20", "limit": "100"},
             "breaker": {"open": False, "scope": "cross_venue"},
         },
@@ -203,12 +205,12 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         payload["stale"] = True
         payload["events"] = [{**stale, "opportunities": [stale]}]
         payload["opportunities"] = [stale]
-        payload["cross_venue"] = {**payload["cross_venue"], "funnel": {"matched_pairs": 12, "monitored_pairs": 8, "codex_approved_pairs": 5, "arbitrage_space_pairs": 2, "clear_signal_pairs": 0, "retained_at": "2026-08-03T15:39:00Z"}}
+        payload["cross_venue"] = {**payload["cross_venue"], "funnel": {"matched_pairs": 12, "monitored_pairs": 8, "codex_approved_pairs": 5, "arbitrage_space_pairs": 2, "clear_signal_pairs": 0, "manual_eligible_pairs": 3, "manual_pending_pairs": 0, "retained_at": "2026-08-03T15:39:00Z"}}
     if scenario == "cross-empty-scan":
         payload["events"] = []
         payload["opportunities"] = []
         payload["signals_24h"] = 0
-        payload["cross_venue"] = {**payload["cross_venue"], "funnel": {"matched_pairs": 0, "monitored_pairs": 0, "codex_approved_pairs": 0, "arbitrage_space_pairs": 0, "clear_signal_pairs": 0}}
+        payload["cross_venue"] = {**payload["cross_venue"], "funnel": {"matched_pairs": 0, "monitored_pairs": 0, "codex_approved_pairs": 0, "arbitrage_space_pairs": 0, "clear_signal_pairs": 0, "manual_eligible_pairs": 0, "manual_pending_pairs": 0}}
     if scenario == "first-canary-cap5":
         payload["policy_limits"] = {**payload["policy_limits"], "max_normal_cost": "5", "canary_status": "first_live_trade"}
     if scenario == "completed-canary-cap20":
