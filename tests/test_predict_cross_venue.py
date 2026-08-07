@@ -1472,6 +1472,54 @@ def test_cross_intent_manual_only_flag_and_payload() -> None:
     assert normal and all(intent.manual_only is False for intent in normal)
 
 
+class ManualRejectValidator(FakeCrossVenueValidator):
+    def validate(self, pair: ExplicitMarketPair) -> CrossVenueValidation:
+        result = super().validate(pair)
+        return CrossVenueValidation(
+            approved=False,
+            reason="UNRESOLVED_UNCERTAINTY",
+            prompt_version=result.prompt_version,
+            predict_fingerprint=result.predict_fingerprint,
+            polymarket_fingerprint=result.polymarket_fingerprint,
+            predict_event_start_at=result.predict_event_start_at,
+            predict_event_end_at=result.predict_event_end_at,
+            polymarket_close_at=result.polymarket_close_at,
+            polymarket_settlement_at=result.polymarket_settlement_at,
+            summary="Resolution source is not uniquely defined.",
+        )
+
+
+def test_monitor_manual_set_subscribes_and_exposes_funnel_fields() -> None:
+    async def exercise() -> None:
+        predict = FakeCrossVenuePredict(
+            (monitor_predict_market(external_ids=("poly-condition",)),)
+        )
+        polymarket = FakeCrossVenuePolymarket()
+        polymarket.release.set()
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=ManualRejectValidator(),
+            gamma_lookup=monitor_gamma,
+            predict_quote_fn=predict_quote(),
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        await monitor.start()
+        await wait_until(lambda: bool(predict.subscriptions))
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
+        snapshot = monitor.snapshot()
+        assert snapshot["funnel"]["manual_eligible_pairs"] == 1
+        assert snapshot["funnel"]["manual_pending_pairs"] == 1
+        opportunity = next(iter(snapshot["opportunities"]))
+        assert opportunity["manual_only"] is True
+        assert opportunity["manual_reason"] == "UNRESOLVED_UNCERTAINTY"
+        await predict.queue.put(None)
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+
 class FakeCrossVenuePredict:
     def __init__(self, markets: tuple[PredictMarket, ...]) -> None:
         self.markets = markets
@@ -1602,8 +1650,15 @@ def test_monitor_validates_before_subscription_and_confirms_both_rest_books_conc
 
         await monitor.start()
         await wait_until(lambda: bool(predict.subscriptions))
-        assert predict.subscriptions == [("predict-market-1",)]
-        assert polymarket.token_sets[-1] == ("poly-no-1", "poly-yes-1")
+        assert predict.subscriptions == [
+            ("predict-market-1", "predict-market-rejected")
+        ]
+        assert polymarket.token_sets[-1] == (
+            "poly-no-1",
+            "poly-no-rejected",
+            "poly-yes-1",
+            "poly-yes-rejected",
+        )
         assert len(validator.calls) == 2
 
         await predict.queue.put(monitor_predict_book())
@@ -1624,6 +1679,8 @@ def test_monitor_validates_before_subscription_and_confirms_both_rest_books_conc
             "codex_approved_pairs": 1,
             "arbitrage_space_pairs": 1,
             "clear_signal_pairs": 1,
+            "manual_eligible_pairs": 1,
+            "manual_pending_pairs": 0,
         }
         assert {row["direction"] for row in snapshot["opportunities"]} == {
             "PREDICT_YES_POLYMARKET_NO",
@@ -1779,6 +1836,8 @@ def test_stale_funnel_retains_last_success_stages_and_disables_actions() -> None
             "codex_approved_pairs": 1,
             "arbitrage_space_pairs": 1,
             "clear_signal_pairs": 1,
+            "manual_eligible_pairs": 1,
+            "manual_pending_pairs": 0,
         }
         assert healthy["funnel_last_success_at"] == "2026-01-01T00:00:00+00:00"
         now = datetime(2026, 1, 1, 0, 0, 3, tzinfo=UTC)
@@ -1799,6 +1858,8 @@ def test_stale_funnel_retains_last_success_stages_and_disables_actions() -> None
             "codex_approved_pairs": 1,
             "arbitrage_space_pairs": 1,
             "clear_signal_pairs": 0,
+            "manual_eligible_pairs": 1,
+            "manual_pending_pairs": 0,
         }
         assert stale["funnel_last_success_at"] == "2026-01-01T00:00:00+00:00"
         assert stale["stale_at"] == "2026-01-01T00:00:07+00:00"
@@ -1832,6 +1893,8 @@ def test_complete_empty_scan_no_v1_market_is_ready_not_blocked() -> None:
             "codex_approved_pairs": 0,
             "arbitrage_space_pairs": 0,
             "clear_signal_pairs": 0,
+            "manual_eligible_pairs": 0,
+            "manual_pending_pairs": 0,
         }
         assert snapshot["empty_state"] == "complete_scan_no_v1_market"
         assert snapshot.get("blocker") in (None, "")
