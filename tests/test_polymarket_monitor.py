@@ -2780,6 +2780,7 @@ def test_nonpositive_threshold_economics_enters_codex_but_stays_invisible(
         relation_validator=validator,
     )
 
+    monitor.refresh_once()
     asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
     monitor.refresh_once()
 
@@ -3747,3 +3748,31 @@ def test_universe_failure_observer_is_scheduled_once_on_attempt_five(
         }
     ]
     assert monitor._universe_failure_notification_task is None
+
+
+def test_threshold_row_exposes_theoretical_and_policy_depth(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books()
+    validator = FakeRelationValidator()
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+    )
+
+    monitor.refresh_once()
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    monitor.refresh_once()
+
+    row = next(
+        row
+        for row in monitor.snapshot()["opportunities"]
+        if row.get("market_type") == "threshold_hedge"
+    )
+    assert row["depth_status"] == "pass"
+    assert row["max_executable_quantity"] >= row["policy_quantity"]
+    assert row["max_executable_cost"] >= row["policy_cost"]
+    assert row["policy_quantity"] == row["quantity"]
+    assert row["policy_cost"] == row["total_max_cost"]

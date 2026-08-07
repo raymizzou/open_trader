@@ -27,10 +27,12 @@ from .prediction_arbitrage import (
     MarketFacts,
     build_pair_intent,
     monitored_event_sort_key,
+    _book_segments,
 )
 from .prediction_arbitrage_store import PredictionArbitrageStore
 from .prediction_title_translation import cached_prediction_title_zh
 from .polymarket_relation_discovery import (
+    PositiveEdgeDepth,
     RelationValidation,
     ThresholdHedgeIntent,
     ThresholdOrderBook,
@@ -38,9 +40,11 @@ from .polymarket_relation_discovery import (
     ThresholdRelationDiscoveryResult,
     assess_threshold_relation_activity,
     build_threshold_hedge_intent,
+    positive_edge_depth,
     simple_annualized_yield,
     threshold_relation_from_payload,
     threshold_relation_payload,
+    _fee_rate,
 )
 
 
@@ -2600,11 +2604,32 @@ class PolymarketMonitor:
                 eligibility_reason = "annualized_yield_below_minimum"
             actionable = status == "approved" and eligibility_reason == "actionable"
             intent = safe_intent
+            probe = positive_edge_depth(
+                _book_segments(
+                    self._relation_books[relation.buy_leg_a.token_id].asks,
+                    relation.market_a.tick_size,
+                )
+                or [],
+                _book_segments(
+                    self._relation_books[relation.buy_leg_b.token_id].asks,
+                    relation.market_b.tick_size,
+                )
+                or [],
+                tick_size_a=relation.market_a.tick_size,
+                tick_size_b=relation.market_b.tick_size,
+                fee_rate_a=_fee_rate(relation.market_a) or Decimal("0"),
+                fee_rate_b=_fee_rate(relation.market_b) or Decimal("0"),
+                minimum_order_size=max(
+                    relation.market_a.minimum_order_size,
+                    relation.market_b.minimum_order_size,
+                ),
+            )
             row = self._relation_row(
                 relation,
                 candidate,
                 intent,
                 validation,
+                probe=probe,
                 volume=self._relation_volumes.get(relation.relation_id, Decimal("0")),
                 confirmed_at=confirmed_at,
                 confirmed_age=confirmed_age,
@@ -2852,6 +2877,7 @@ class PolymarketMonitor:
         intent: ThresholdHedgeIntent | None,
         validation: object,
         *,
+        probe: PositiveEdgeDepth | None,
         volume: Decimal,
         confirmed_at: datetime,
         confirmed_age: float,
@@ -2923,6 +2949,19 @@ class PolymarketMonitor:
                 "max_cost": legs[1].max_cost,
             },
             "planned_amount": selected.total_max_cost,
+            "depth_status": "pass" if probe is not None else "insufficient",
+            "max_executable_quantity": (
+                probe.quantity if probe is not None else Decimal("0")
+            ),
+            "max_executable_cost": (
+                probe.cost if probe is not None else Decimal("0")
+            ),
+            "policy_quantity": (
+                intent.quantity if intent is not None else Decimal("0")
+            ),
+            "policy_cost": (
+                intent.total_max_cost if intent is not None else Decimal("0")
+            ),
             "volume_24h": volume,
             "confirmed_at": confirmed_at,
             "confirmed_age_seconds": confirmed_age,
