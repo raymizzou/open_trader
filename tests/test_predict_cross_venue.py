@@ -374,6 +374,39 @@ def test_cross_venue_codex_failure_falls_back_to_deepseek_and_caches(
     assert store.llm_usage_24h()["cache_hits"] == 1
 
 
+def test_cross_venue_circuit_breaker_skips_codex_after_repeated_failures(
+    tmp_path: Path,
+) -> None:
+    pair = explicit_pair()
+    runner_calls = 0
+    store = PredictionArbitrageStore(tmp_path / "data")
+
+    def runner(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal runner_calls
+        runner_calls += 1
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="401")
+
+    validator = CodexCrossVenueEquivalenceValidator(
+        store,
+        model="gpt-test",
+        fallback_model="deepseek-v4-flash-max",
+        runner=runner,
+        fallback=lambda prompt, payload: (
+            json.dumps(equivalence_result(pair)),
+            None,
+        ),
+    )
+
+    for _ in range(3):
+        assert validator.validate(pair).approved is True
+    assert runner_calls == 3
+
+    assert validator.validate(pair).approved is True
+    assert runner_calls == 3  # circuit open: Codex skipped, DeepSeek cache hit
+
+
 def test_cross_venue_double_failure_reports_deepseek_unavailable(
     tmp_path: Path,
 ) -> None:

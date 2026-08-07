@@ -978,6 +978,36 @@ def test_codex_failure_falls_back_to_deepseek_and_caches_by_fallback_model(
     assert db.llm_usage_24h()["cache_hits"] == 1
 
 
+def test_codex_circuit_breaker_skips_codex_after_repeated_failures(
+    tmp_path: Path,
+) -> None:
+    relation = threshold_relation()
+    runner_calls = 0
+    db = codex_store(tmp_path)
+
+    def runner(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal runner_calls
+        runner_calls += 1
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="401")
+
+    validator = CodexRelationValidator(
+        db,
+        model="gpt-test",
+        fallback_model="deepseek-v4-flash-max",
+        runner=runner,
+        fallback=lambda prompt, payload: (json.dumps(codex_result()), None),
+    )
+
+    for _ in range(3):
+        assert validator.validate(relation).status == "approved"
+    assert runner_calls == 3
+
+    assert validator.validate(relation).status == "approved"
+    assert runner_calls == 3  # circuit open: Codex skipped, DeepSeek cache hit
+
+
 @pytest.mark.parametrize(
     ("response", "expected_reason"),
     [
