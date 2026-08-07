@@ -18,3 +18,4 @@ playwright-report/
 output/
 # Design specs stay local; never committed.
 docs/superpowers/specs/
+docs/superpowers/plans/
