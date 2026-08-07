@@ -22,6 +22,7 @@ from polymarket.models.gamma.market import (
 
 from open_trader.polymarket_relation_discovery import (
     CODEX_PROMPT_VERSION,
+    _CODEX_SCHEMA,
     _deepseek_completion,
     CodexRelationValidator,
     RelationActivityAssessment,
@@ -774,7 +775,7 @@ def test_codex_fingerprint_uses_only_versioned_semantic_payload() -> None:
         codex_relation_cache_key(
             relation,
             model="gpt-test",
-            prompt_version="polymarket-threshold-relation-v2",
+            prompt_version="polymarket-threshold-relation-v3",
         )
         != expected
     )
@@ -816,6 +817,36 @@ def test_cached_validation_never_invokes_runner(tmp_path: Path) -> None:
     assert cached is not None
     assert cached.status == "approved"
     assert cached.cached is True
+
+
+def test_codex_prompt_embeds_fixed_output_schema(tmp_path: Path) -> None:
+    relation = threshold_relation()
+    captured: list[str] = []
+
+    def runner(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        captured.append(str(kwargs.get("input") or ""))
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=codex_jsonl(codex_result()),
+            stderr="",
+        )
+
+    validator = CodexRelationValidator(
+        codex_store(tmp_path), model="gpt-test", runner=runner
+    )
+
+    result = validator.validate(relation)
+
+    assert result.status == "approved"
+    assert captured
+    prompt = captured[0]
+    schema_text = _CODEX_SCHEMA.read_text(encoding="utf-8")
+    assert "OUTPUT JSON SCHEMA" in prompt
+    assert schema_text in prompt
+    assert "INPUT JSON" in prompt
 
 
 def test_codex_approve_uses_isolated_structured_command_and_records_usage(

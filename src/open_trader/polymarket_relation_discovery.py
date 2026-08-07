@@ -42,7 +42,7 @@ ValidationStatus = Literal[
 ]
 ValidationRelation = Literal["A_IMPLIES_B", "B_IMPLIES_A", "NONE"]
 
-CODEX_PROMPT_VERSION = "polymarket-threshold-relation-v1"
+CODEX_PROMPT_VERSION = "polymarket-threshold-relation-v2"
 DEEPSEEK_FALLBACK_MODEL = "deepseek-v4-flash"
 CODEX_CIRCUIT_FAILURES = 3
 CODEX_CIRCUIT_COOLDOWN_SECONDS = 300.0
@@ -118,6 +118,16 @@ INVARIANTS
 _CODEX_SCHEMA = (
     Path(__file__).with_name("schemas") / "polymarket_threshold_relation.json"
 )
+
+
+def _codex_relation_prompt() -> str:
+    """Fixed relation-audit prompt with the exact output JSON schema embedded."""
+
+    return (
+        f"{CODEX_RELATION_PROMPT}\n"
+        "OUTPUT JSON SCHEMA (return exactly this shape)\n"
+        f"{_CODEX_SCHEMA.read_text(encoding='utf-8')}\n"
+    )
 _TOP_LEVEL_RESULT_FIELDS = {
     "schema_version",
     "decision",
@@ -1651,7 +1661,7 @@ class CodexRelationValidator:
             "-",
         ]
         prompt = (
-            f"{CODEX_RELATION_PROMPT}\n"
+            f"{_codex_relation_prompt()}\n"
             f"INPUT JSON\n{_canonical_json(_codex_payload(relation))}\n"
         )
         try:
@@ -1729,9 +1739,7 @@ class CodexRelationValidator:
         if cached is not None:
             return cached
         fallback_prompt = (
-            f"{CODEX_RELATION_PROMPT}\n"
-            "OUTPUT JSON SCHEMA\n"
-            f"{_CODEX_SCHEMA.read_text(encoding='utf-8')}\n"
+            f"{_codex_relation_prompt()}\n"
         )
         raw, fallback_reason = self.fallback(
             fallback_prompt, _codex_payload(relation)
