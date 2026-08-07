@@ -2367,6 +2367,8 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
                     "codex_approved_pairs": 5,
                     "arbitrage_space_pairs": 2,
                     "clear_signal_pairs": 1,
+                    "manual_eligible_pairs": 13,
+                    "manual_pending_pairs": 1,
                 },
                 "events": [
                     {
@@ -2469,6 +2471,8 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
         "codex_approved_pairs": 5,
         "arbitrage_space_pairs": 2,
         "clear_signal_pairs": 1,
+        "manual_eligible_pairs": 13,
+        "manual_pending_pairs": 1,
     }
     assert state["cross_venue"]["unsettled"] == {"current": "35.20", "limit": "100"}
     assert state["cross_venue"]["breaker"] == {"open": False, "scope": "cross_venue"}
