@@ -21,6 +21,7 @@ from open_trader.predict_cross_venue import (
     CrossVenueValidation,
     ExplicitMarketPair,
     PredictCrossVenueMonitor,
+    VenueMarket,
     build_cross_venue_intents,
     resolve_explicit_market_pairs,
     validate_cross_execution_mode,
@@ -1361,6 +1362,198 @@ def test_cross_venue_opportunity_exposes_depth_fields() -> None:
     asyncio.run(exercise())
 
 
+def _venue_market(
+    exchange: str,
+    market_id: str,
+    *,
+    question: str,
+    yes_token_id: str | None = None,
+    no_token_id: str | None = None,
+) -> VenueMarket:
+    if exchange == "predict.fun":
+        return VenueMarket(
+            exchange=exchange, market_id=market_id, condition_id=f"c-{market_id}",
+            question=question, rules="same rules",
+            yes_token_id=yes_token_id or f"yes-{market_id}",
+            no_token_id=no_token_id or f"no-{market_id}",
+            settlement_asset="USDT", minimum_order_size=Decimal("5"),
+            tick_size=Decimal("0.01"), fee_rate_bps=Decimal("0"),
+            category_slug="test", resolution_provider="provider",
+            event_start_at=datetime(2026, 1, 1, tzinfo=UTC),
+            event_end_at=datetime(2027, 1, 1, tzinfo=UTC),
+        )
+    return VenueMarket(
+        exchange=exchange, market_id=market_id, condition_id=f"c-{market_id}",
+        question=question, rules="same rules",
+        yes_token_id=yes_token_id or f"yes-{market_id}",
+        no_token_id=no_token_id or f"no-{market_id}",
+        settlement_asset="USDC", minimum_order_size=Decimal("5"),
+        tick_size=Decimal("0.01"), fee_rate_bps=Decimal("0"),
+        event_slug="event", resolution_source="source",
+        close_at=datetime(2027, 1, 1, tzinfo=UTC),
+        settlement_at=datetime(2027, 1, 2, tzinfo=UTC),
+    )
+
+
+def test_normalize_question_collapses_whitespace_only() -> None:
+    assert (
+        predict_cross_venue.normalize_question("  Metamask FDV  above $700M? ")
+        == "Metamask FDV above $700M?"
+    )
+    assert predict_cross_venue.normalize_question(
+        "Metamask FDV above $700M?"
+    ) != predict_cross_venue.normalize_question("metamask fdv above $700m?")
+
+
+def test_text_identical_pair_compares_normalized_questions() -> None:
+    pair = ExplicitMarketPair(
+        pair_id="p1",
+        predict=_venue_market(
+            "predict.fun", "1", question="  Metamask FDV above $700M?  "
+        ),
+        polymarket=_venue_market(
+            "polymarket", "2", question="Metamask FDV above $700M?"
+        ),
+    )
+    assert predict_cross_venue.text_identical_pair(pair) is True
+    different = ExplicitMarketPair(
+        pair_id="p2",
+        predict=_venue_market(
+            "predict.fun", "1", question="Metamask FDV above $700M?"
+        ),
+        polymarket=_venue_market(
+            "polymarket", "2", question="Metamask FDV above $500M?"
+        ),
+    )
+    assert predict_cross_venue.text_identical_pair(different) is False
+
+
+def test_manual_reject_whitelist_excludes_audit_failures() -> None:
+    reasons = predict_cross_venue._MANUAL_ELIGIBLE_REJECT_REASONS
+    assert "LLM_REJECTED" in reasons
+    assert "UNRESOLVED_UNCERTAINTY" in reasons
+    assert "DEEPSEEK_FAILED" not in reasons
+    assert "CODEX_TIMEOUT" not in reasons
+
+
+def _manual_pair() -> ExplicitMarketPair:
+    return ExplicitMarketPair(
+        pair_id="manual-1",
+        predict=_venue_market(
+            "predict.fun", "predict-market-1", question="Metamask FDV above $700M?",
+            yes_token_id="predict-yes-1", no_token_id="predict-no-1",
+        ),
+        polymarket=_venue_market(
+            "polymarket", "poly-market-1", question="Metamask FDV above $700M?",
+            yes_token_id="poly-yes-1", no_token_id="poly-no-1",
+        ),
+    )
+
+
+def test_cross_intent_manual_only_flag_and_payload() -> None:
+    intents = predict_cross_venue._build_cross_venue_intents(
+        _manual_pair(),
+        monitor_predict_book(),
+        monitor_polymarket_books(),
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        require_annualized_gate=False,
+        predict_quote_fn=None,
+        manual_only=True,
+    )
+    assert intents and all(intent.manual_only for intent in intents)
+    normal = predict_cross_venue._build_cross_venue_intents(
+        _manual_pair(),
+        monitor_predict_book(),
+        monitor_polymarket_books(),
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        require_annualized_gate=False,
+        predict_quote_fn=None,
+    )
+    assert normal and all(intent.manual_only is False for intent in normal)
+
+
+class ManualRejectValidator(FakeCrossVenueValidator):
+    def validate(self, pair: ExplicitMarketPair) -> CrossVenueValidation:
+        result = super().validate(pair)
+        return CrossVenueValidation(
+            approved=False,
+            reason="UNRESOLVED_UNCERTAINTY",
+            prompt_version=result.prompt_version,
+            predict_fingerprint=result.predict_fingerprint,
+            polymarket_fingerprint=result.polymarket_fingerprint,
+            predict_event_start_at=result.predict_event_start_at,
+            predict_event_end_at=result.predict_event_end_at,
+            polymarket_close_at=result.polymarket_close_at,
+            polymarket_settlement_at=result.polymarket_settlement_at,
+            summary="Resolution source is not uniquely defined.",
+        )
+
+
+def test_monitor_manual_set_subscribes_and_exposes_funnel_fields() -> None:
+    async def exercise() -> None:
+        predict = FakeCrossVenuePredict(
+            (monitor_predict_market(external_ids=("poly-condition",)),)
+        )
+        polymarket = FakeCrossVenuePolymarket()
+        polymarket.release.set()
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=ManualRejectValidator(),
+            gamma_lookup=monitor_gamma,
+            predict_quote_fn=predict_quote(),
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        await monitor.start()
+        await wait_until(lambda: bool(predict.subscriptions))
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: bool(monitor.snapshot()["opportunities"]))
+        snapshot = monitor.snapshot()
+        assert snapshot["funnel"]["manual_eligible_pairs"] == 1
+        assert snapshot["funnel"]["manual_pending_pairs"] == 1
+        opportunity = next(iter(snapshot["opportunities"]))
+        assert opportunity["manual_only"] is True
+        assert opportunity["manual_reason"] == "UNRESOLVED_UNCERTAINTY"
+        await predict.queue.put(None)
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+
+def test_monitor_manual_stage5_notifies_manual_only_signal(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        predict = FakeCrossVenuePredict(
+            (monitor_predict_market(external_ids=("poly-condition",)),)
+        )
+        polymarket = FakeCrossVenuePolymarket()
+        polymarket.release.set()
+        store = PredictionArbitrageStore(tmp_path / "data")
+        notifications: list[tuple[str, str]] = []
+        monitor = PredictCrossVenueMonitor(
+            predict_source=predict,
+            polymarket_monitor=polymarket,
+            validator=ManualRejectValidator(),
+            gamma_lookup=monitor_gamma,
+            predict_quote_fn=predict_quote(),
+            store=store,
+            ready_observer=lambda opportunity_id, signal_id: notifications.append(
+                (opportunity_id, signal_id)
+            ),
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        await monitor.start()
+        await wait_until(lambda: bool(predict.subscriptions))
+        await predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: len(notifications) >= 1)
+        assert notifications[0][0].startswith("cross:")
+        await predict.queue.put(None)
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+
 class FakeCrossVenuePredict:
     def __init__(self, markets: tuple[PredictMarket, ...]) -> None:
         self.markets = markets
@@ -1491,8 +1684,15 @@ def test_monitor_validates_before_subscription_and_confirms_both_rest_books_conc
 
         await monitor.start()
         await wait_until(lambda: bool(predict.subscriptions))
-        assert predict.subscriptions == [("predict-market-1",)]
-        assert polymarket.token_sets[-1] == ("poly-no-1", "poly-yes-1")
+        assert predict.subscriptions == [
+            ("predict-market-1", "predict-market-rejected")
+        ]
+        assert polymarket.token_sets[-1] == (
+            "poly-no-1",
+            "poly-no-rejected",
+            "poly-yes-1",
+            "poly-yes-rejected",
+        )
         assert len(validator.calls) == 2
 
         await predict.queue.put(monitor_predict_book())
@@ -1513,6 +1713,8 @@ def test_monitor_validates_before_subscription_and_confirms_both_rest_books_conc
             "codex_approved_pairs": 1,
             "arbitrage_space_pairs": 1,
             "clear_signal_pairs": 1,
+            "manual_eligible_pairs": 1,
+            "manual_pending_pairs": 0,
         }
         assert {row["direction"] for row in snapshot["opportunities"]} == {
             "PREDICT_YES_POLYMARKET_NO",
@@ -1668,6 +1870,8 @@ def test_stale_funnel_retains_last_success_stages_and_disables_actions() -> None
             "codex_approved_pairs": 1,
             "arbitrage_space_pairs": 1,
             "clear_signal_pairs": 1,
+            "manual_eligible_pairs": 1,
+            "manual_pending_pairs": 0,
         }
         assert healthy["funnel_last_success_at"] == "2026-01-01T00:00:00+00:00"
         now = datetime(2026, 1, 1, 0, 0, 3, tzinfo=UTC)
@@ -1688,6 +1892,8 @@ def test_stale_funnel_retains_last_success_stages_and_disables_actions() -> None
             "codex_approved_pairs": 1,
             "arbitrage_space_pairs": 1,
             "clear_signal_pairs": 0,
+            "manual_eligible_pairs": 1,
+            "manual_pending_pairs": 0,
         }
         assert stale["funnel_last_success_at"] == "2026-01-01T00:00:00+00:00"
         assert stale["stale_at"] == "2026-01-01T00:00:07+00:00"
@@ -1721,6 +1927,8 @@ def test_complete_empty_scan_no_v1_market_is_ready_not_blocked() -> None:
             "codex_approved_pairs": 0,
             "arbitrage_space_pairs": 0,
             "clear_signal_pairs": 0,
+            "manual_eligible_pairs": 0,
+            "manual_pending_pairs": 0,
         }
         assert snapshot["empty_state"] == "complete_scan_no_v1_market"
         assert snapshot.get("blocker") in (None, "")

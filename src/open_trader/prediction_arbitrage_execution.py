@@ -293,6 +293,12 @@ class PredictionExecutionService:
         if isinstance(prepared, dict):
             return prepared
         opportunity, intent, account = prepared
+        if (
+            auto_eat
+            and isinstance(intent, CrossVenueIntent)
+            and intent.manual_only
+        ):
+            return {"state": "rejected", "reason": "manual_only_requires_approval"}
 
         now = _utc_now()
         expires_at = now + PREVIEW_TTL
@@ -4464,6 +4470,14 @@ class PredictionExecutionService:
     ) -> str | None:
         if opportunity.get("execution_mode") != "manual_confirm":
             return "cross_execution_mode"
+        manual_only = opportunity.get("manual_only") is True
+        if manual_only and (
+            intent.manual_only is not True
+            or not str(opportunity.get("manual_reason", "")).strip()
+        ):
+            return "manual_only_unavailable"
+        if not manual_only and intent.manual_only is True:
+            return "manual_only_mismatch"
         if (
             opportunity.get("market_type") != "cross_venue_yes_no"
             or opportunity.get("funnel_stage") != 5
@@ -4511,16 +4525,17 @@ class PredictionExecutionService:
             return "canonical_cutoff_invalid"
         if cutoff is None or not canonical_cutoff_is_future(cutoff):
             return "canonical_cutoff_invalid"
-        approval = opportunity.get("codex_approval")
         fingerprints = opportunity.get("rules_fingerprints")
-        if not isinstance(approval, Mapping) or approval.get("decision") != "APPROVE" or not str(approval.get("cache_key", "")).strip():
-            return "codex_not_approved"
-        direct = approval.get("direct_outcome_mapping")
-        evidence = approval.get("evidence")
-        if direct != {"predict_yes": "YES", "predict_no": "NO", "polymarket_yes": "YES", "polymarket_no": "NO"} or not isinstance(evidence, (list, tuple)) or not evidence:
-            return "codex_evidence_unavailable"
         if not isinstance(fingerprints, Mapping) or not all(str(fingerprints.get(exchange, "")).strip() for exchange in ("predict.fun", "polymarket")):
             return "rules_fingerprint_unavailable"
+        if not manual_only:
+            approval = opportunity.get("codex_approval")
+            if not isinstance(approval, Mapping) or approval.get("decision") != "APPROVE" or not str(approval.get("cache_key", "")).strip():
+                return "codex_not_approved"
+            direct = approval.get("direct_outcome_mapping")
+            evidence = approval.get("evidence")
+            if direct != {"predict_yes": "YES", "predict_no": "NO", "polymarket_yes": "YES", "polymarket_no": "NO"} or not isinstance(evidence, (list, tuple)) or not evidence:
+                return "codex_evidence_unavailable"
         if not self._cross_venue_identity_matches(
             opportunity, intent, fingerprints
         ):
@@ -4798,7 +4813,7 @@ class PredictionExecutionService:
             if not isinstance(value.get("pair_id"), str) or not isinstance(value.get("direction"), str) or value.get("actionable") is not True or value.get("quote_available") is not True:
                 return None
             try:
-                return CrossVenueIntent(pair_id=value["pair_id"], direction=value["direction"], legs=legs, annualized_yield=annualized, canonical_cutoff=cutoff, resolution_at=resolution, actionable=True, quote_available=True, **raw)  # type: ignore[arg-type]
+                return CrossVenueIntent(pair_id=value["pair_id"], direction=value["direction"], legs=legs, annualized_yield=annualized, canonical_cutoff=cutoff, resolution_at=resolution, actionable=True, quote_available=True, manual_only=value.get("manual_only") is True, **raw)  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 return None
         if value.get("intent_type") == "threshold_hedge" or {

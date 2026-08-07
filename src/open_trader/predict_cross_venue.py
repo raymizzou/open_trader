@@ -183,6 +183,31 @@ class ExplicitMarketPair:
     canonical_cutoff: datetime | None = None
 
 
+_MANUAL_ELIGIBLE_REJECT_REASONS = frozenset({
+    "LLM_REJECTED",
+    "IDENTITY_MISMATCH",
+    "FINGERPRINT_MISMATCH",
+    "OUTCOME_MAPPING_MISMATCH",
+    "CUTOFF_INVALID",
+    "COMPOUND_CONTRACT",
+    "DIVERGENT_STATE_POSSIBLE",
+    "EVIDENCE_NOT_FOUND",
+    "MISSING_EVIDENCE",
+    "CUTOFF_EVIDENCE_MISMATCH",
+    "UNRESOLVED_UNCERTAINTY",
+})
+
+
+def normalize_question(text: str) -> str:
+    return " ".join(str(text or "").split())
+
+
+def text_identical_pair(pair: ExplicitMarketPair) -> bool:
+    return normalize_question(pair.predict.question) == normalize_question(
+        pair.polymarket.question
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ExplicitPairResolution:
     pairs: tuple[ExplicitMarketPair, ...]
@@ -245,6 +270,7 @@ class CrossVenueIntent:
     actionable: bool
     quote_available: bool
     depth_probe: PositiveEdgeDepth | None = None
+    manual_only: bool = False
 
 
 def build_cross_venue_intents(
@@ -284,6 +310,7 @@ def _build_cross_venue_intents(
     target_quantity: Decimal | None = None,
     max_total_cost: Decimal | None = None,
     prefer_smallest: bool = False,
+    manual_only: bool = False,
 ) -> tuple[CrossVenueIntent, ...]:
 
     now = _fresh_datetime(now)
@@ -293,6 +320,8 @@ def _build_cross_venue_intents(
     if predict_segments is None or not isinstance(polymarket_books, Mapping):
         return ()
     canonical_cutoff = _fresh_datetime(pair.canonical_cutoff)
+    if canonical_cutoff is None and manual_only:
+        canonical_cutoff = _fresh_datetime(pair.polymarket.settlement_at)
     intents: list[CrossVenueIntent] = []
     for direction, predict_outcome, polymarket_outcome in (
         ("PREDICT_YES_POLYMARKET_NO", "YES", "NO"),
@@ -445,7 +474,7 @@ def _build_cross_venue_intents(
                 minimum_profit=minimum_profit, annualized_yield=annualized,
                 canonical_cutoff=canonical_cutoff, resolution_at=canonical_cutoff,
                 actionable=actionable, quote_available=quote_available,
-                depth_probe=depth_probe,
+                depth_probe=depth_probe, manual_only=manual_only,
             )
             if total_max_cost > MAX_NORMAL_COST:
                 observation = observation or intent
@@ -1257,6 +1286,8 @@ class PredictCrossVenueMonitor:
         self._approved: dict[str, ExplicitMarketPair] = {}
         self._validations: dict[str, CrossVenueValidation] = {}
         self._approved_prompt_version = ""
+        self._manual: dict[str, ExplicitMarketPair] = {}
+        self._manual_validations: dict[str, CrossVenueValidation] = {}
         self._predict_books: dict[str, PredictBook] = {}
         self._opportunities: dict[tuple[str, Direction], dict[str, object]] = {}
         self._signal_episodes: dict[str, str] = {}
@@ -1311,6 +1342,13 @@ class PredictCrossVenueMonitor:
                 for (pair_id, _), opportunity in self._opportunities.items()
                 if opportunity.get("actionable") is True
             }),
+            "manual_eligible_pairs": len(self._manual),
+            "manual_pending_pairs": len({
+                pair_id
+                for (pair_id, _), opportunity in self._opportunities.items()
+                if opportunity.get("manual_only") is True
+                and opportunity.get("actionable") is True
+            }),
         }
 
     def _snapshot_funnel(self) -> dict[str, int]:
@@ -1319,7 +1357,11 @@ class PredictCrossVenueMonitor:
             return current
         if self._last_success_funnel is None:
             return current
-        return {**self._last_success_funnel, "clear_signal_pairs": 0}
+        return {
+            **self._last_success_funnel,
+            "clear_signal_pairs": 0,
+            "manual_pending_pairs": 0,
+        }
 
     def _record_successful_funnel(self) -> None:
         if self._status != "ready":
@@ -1495,9 +1537,26 @@ class PredictCrossVenueMonitor:
                 approved[pair_id] = replace(
                     pair, canonical_cutoff=validation.canonical_cutoff
                 )
-                validations[pair_id] = validation
+            validations[pair_id] = validation
         self._set_approved(
             approved, prompt_version=prompt_version, validations=validations
+        )
+        manual = {
+            pair_id: pair
+            for pair_id, pair in eligible.items()
+            if (
+                pair_id not in approved
+                and pair_id in validations
+                and not validations[pair_id].approved
+                and validations[pair_id].reason in _MANUAL_ELIGIBLE_REJECT_REASONS
+                and text_identical_pair(pair)
+            )
+        }
+        self._set_manual(
+            manual,
+            validations={
+                pair_id: validations[pair_id] for pair_id in manual
+            },
         )
         self._status = self._source_status()
         self._empty_state = (
@@ -1518,7 +1577,7 @@ class PredictCrossVenueMonitor:
 
     async def _hot_while(self, slow_task: asyncio.Task[None]) -> None:
         market_ids = sorted(
-            {pair.predict.market_id for pair in self._approved.values()}
+            {pair.predict.market_id for pair in self._monitored().values()}
         )
         restart = asyncio.create_task(self._hot_restart.wait())
         if not market_ids:
@@ -1592,7 +1651,7 @@ class PredictCrossVenueMonitor:
                     await close()
 
     def _process_local_book(self, market_id: str) -> None:
-        for pair in tuple(self._approved.values()):
+        for pair_id, pair in tuple(self._monitored().items()):
             if pair.predict.market_id != market_id:
                 continue
             tokens = self._polymarket_tokens(pair)
@@ -1603,6 +1662,7 @@ class PredictCrossVenueMonitor:
                 now=self._clock(),
                 require_annualized_gate=False,
                 predict_quote_fn=None,
+                manual_only=pair_id in self._manual,
             )
             local_directions = {intent.direction for intent in local}
             self._prune_pair_directions(pair.pair_id, local_directions)
@@ -1637,7 +1697,7 @@ class PredictCrossVenueMonitor:
             self._predict.get_order_book(pair.predict.market_id),
             self._polymarket._confirm_cross_venue_books(tokens),
         )
-        current = self._approved.get(pair.pair_id)
+        current = self._monitored().get(pair.pair_id)
         if (
             current is None
             or not self._same_fingerprints(pair, current)
@@ -1652,6 +1712,7 @@ class PredictCrossVenueMonitor:
             now=self._clock(),
             require_annualized_gate=False,
             predict_quote_fn=self._predict_quote_fn,
+            manual_only=pair.pair_id in self._manual,
         )
         if not intents:
             self._close_pair(pair.pair_id)
@@ -1661,7 +1722,12 @@ class PredictCrossVenueMonitor:
             if key[0] == pair.pair_id and key[1] not in confirmed_directions:
                 self._close_opportunity(key)
         for intent in intents:
-            validation = self._validations.get(pair.pair_id)
+            manual_only = pair.pair_id in self._manual
+            validation = (
+                self._manual_validations
+                if manual_only
+                else self._validations
+            ).get(pair.pair_id)
             opportunity = self._opportunity_payload(current, intent, validation)
             self._opportunities[(pair.pair_id, intent.direction)] = opportunity
             self._persist_observation(opportunity)
@@ -1733,6 +1799,12 @@ class PredictCrossVenueMonitor:
             "annualized_yield": intent.annualized_yield,
             "canonical_cutoff": intent.canonical_cutoff,
             "resolution_at": intent.resolution_at,
+            "manual_only": intent.manual_only,
+            "manual_reason": (
+                validation.reason
+                if intent.manual_only and validation is not None
+                else ""
+            ),
             "codex_approval": {
                 "decision": "APPROVE" if validation and validation.approved else "REJECT",
                 "cache_key": validation.cache_key if validation else "",
@@ -1802,12 +1874,21 @@ class PredictCrossVenueMonitor:
                 if intent.annualized_yield is not None
                 else None
             ),
-            "canonical_cutoff": intent.canonical_cutoff.astimezone(UTC).isoformat().replace(
-                "+00:00", "Z"
+            "canonical_cutoff": (
+                intent.canonical_cutoff.astimezone(UTC).isoformat().replace(
+                    "+00:00", "Z"
+                )
+                if intent.canonical_cutoff is not None
+                else None
             ),
-            "resolution_at": intent.resolution_at.isoformat(),
+            "resolution_at": (
+                intent.resolution_at.isoformat()
+                if intent.resolution_at is not None
+                else None
+            ),
             "actionable": intent.actionable,
             "quote_available": intent.quote_available,
+            "manual_only": intent.manual_only,
         }
 
     def _confirmation_done(
@@ -1841,7 +1922,7 @@ class PredictCrossVenueMonitor:
             self._status = status
             return
         for pair_id in {key[0] for key in self._opportunities}:
-            pair = self._approved.get(pair_id)
+            pair = self._monitored().get(pair_id)
             predict_book = (
                 self._predict_books.get(pair.predict.market_id) if pair else None
             )
@@ -1857,6 +1938,7 @@ class PredictCrossVenueMonitor:
                     now=self._clock(),
                     require_annualized_gate=False,
                     predict_quote_fn=None,
+                    manual_only=pair_id in self._manual,
                 )
             )
             self._prune_pair_directions(
@@ -1889,7 +1971,7 @@ class PredictCrossVenueMonitor:
             set(self._arbitrage_pairs)
             | {key[0] for key in self._opportunities}
             | set(self._confirmation_tasks)
-        ) - set(self._approved):
+        ) - set(self._approved) - set(self._manual):
             self._close_pair(pair_id)
             task = self._confirmation_tasks.pop(pair_id, None)
             if task is not None:
@@ -1913,12 +1995,34 @@ class PredictCrossVenueMonitor:
         if changed:
             self._hot_restart.set()
 
+    def _monitored(self) -> dict[str, ExplicitMarketPair]:
+        return {**self._approved, **self._manual}
+
+    def _set_manual(
+        self,
+        manual: Mapping[str, ExplicitMarketPair],
+        *,
+        validations: Mapping[str, CrossVenueValidation] | None = None,
+    ) -> None:
+        replacement = dict(manual)
+        changed = replacement != self._manual
+        self._manual = replacement
+        self._manual_validations = {
+            pair_id: validation
+            for pair_id, validation in (validations or {}).items()
+            if pair_id in replacement
+        }
+        self._drop_unapproved_state()
+        self._publish_subscriptions()
+        if changed:
+            self._hot_restart.set()
+
     def _publish_subscriptions(self) -> None:
         self._polymarket.set_cross_venue_tokens(
             sorted(
                 {
                     token
-                    for pair in self._approved.values()
+                    for pair in self._monitored().values()
                     for token in self._polymarket_tokens(pair)
                 }
             )
@@ -2009,6 +2113,20 @@ class PredictCrossVenueMonitor:
             and opportunity.get("actionable") is True
             and isinstance(approval, Mapping)
             and approval.get("decision") == "APPROVE"
+            and not (
+                same_notification_identity
+                and previous.get("actionable") is True
+            )
+        ):
+            asyncio.create_task(
+                asyncio.to_thread(self._ready_observer, opportunity_id, signal_id)
+            )
+        if (
+            self._ready_observer is not None
+            and notification_identity is not None
+            and opportunity.get("funnel_stage") == 5
+            and opportunity.get("actionable") is True
+            and opportunity.get("manual_only") is True
             and not (
                 same_notification_identity
                 and previous.get("actionable") is True

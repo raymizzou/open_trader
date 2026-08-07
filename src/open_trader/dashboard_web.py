@@ -665,6 +665,8 @@ _CROSS_VENUE_FUNNEL_FIELDS = (
     "codex_approved_pairs",
     "arbitrage_space_pairs",
     "clear_signal_pairs",
+    "manual_eligible_pairs",
+    "manual_pending_pairs",
 )
 
 

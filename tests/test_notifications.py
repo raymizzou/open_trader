@@ -259,6 +259,42 @@ def test_cross_venue_yes_no_signal_notification_has_actionable_deep_link() -> No
         assert forbidden not in message
 
 
+def test_manual_cross_signal_notification_labels_manual_approval() -> None:
+    title, message = render_yes_no_signal_notification(
+        {
+            "market_type": "cross_venue_yes_no",
+            "manual_only": True,
+            "signal_id": "manual-signal-1",
+            "first_positive_at": "2026-08-07T17:04:29+08:00",
+            "total_max_cost": "18.88",
+            "minimum_profit": "1.12",
+            "annualized_yield": "0.224",
+            "canonical_cutoff": "2026-08-10T12:34:56.789000Z",
+            "legs": [
+                {
+                    "exchange": "predict.fun",
+                    "outcome": "YES",
+                    "quantity": "20",
+                    "max_cost": "17.24",
+                    "settlement_asset": "USDT",
+                },
+                {
+                    "exchange": "polymarket",
+                    "outcome": "NO",
+                    "quantity": "20",
+                    "max_cost": "1.52",
+                    "settlement_asset": "USDC",
+                },
+            ],
+        }
+    )
+
+    assert title == "【规则模糊 · 需人工批准】+$1.12"
+    assert "可下单" not in title
+    assert "结算规则可能不一致" in message
+    assert "需人工批准" in message
+
+
 def test_prediction_observation_notification_distinguishes_observation_alert() -> None:
     title, message = render_prediction_opportunity_notification(
         {

@@ -6074,3 +6074,6 @@ table {
 @media (max-width: 390px) {
   .pm-progress, .pm-opportunity-metrics { grid-template-columns: 1fr; }
 }
+.pm-manual-card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; display: grid; gap: 8px; padding: 12px; }
+.pm-manual-card-head { align-items: start; display: flex; gap: 10px; justify-content: space-between; }
+.pm-manual-title { font-weight: 800; overflow-wrap: anywhere; }
