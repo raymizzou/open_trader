@@ -7,10 +7,11 @@ import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterator, Literal, Mapping
+from zoneinfo import ZoneInfo
 
 from open_trader.prediction_arbitrage import MAX_CROSS_UNSETTLED_PRINCIPAL
 
@@ -425,6 +426,33 @@ class PredictionArbitrageStore:
 
             CREATE INDEX IF NOT EXISTS llm_usage_created_at
             ON llm_usage(created_at);
+
+            CREATE TABLE IF NOT EXISTS validation_mode (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                mode TEXT NOT NULL CHECK (mode IN ('observe_only', 'manual', 'auto')),
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS auto_eat_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                signal_id TEXT NOT NULL,
+                market_id TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                preview_id TEXT,
+                execution_id TEXT,
+                total_cost TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS auto_eat_attempts_created_at
+            ON auto_eat_attempts(created_at);
+
+            CREATE INDEX IF NOT EXISTS auto_eat_attempts_signal
+            ON auto_eat_attempts(signal_id, decision);
+
+            CREATE INDEX IF NOT EXISTS auto_eat_attempts_market
+            ON auto_eat_attempts(market_id, created_at DESC);
             """
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -615,6 +643,127 @@ class PredictionArbitrageStore:
                 "SELECT payload FROM runtime WHERE singleton=1"
             ).fetchone()
         return None if row is None else _load_payload(str(row["payload"]))
+
+    VALIDATION_MODES = frozenset({"observe_only", "manual", "auto"})
+
+    def get_validation_mode(self) -> str:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT mode FROM validation_mode WHERE singleton=1"
+            ).fetchone()
+        if row is None or str(row["mode"]) not in self.VALIDATION_MODES:
+            return "observe_only"
+        return str(row["mode"])
+
+    def set_validation_mode(self, mode: str) -> str:
+        if mode not in self.VALIDATION_MODES:
+            raise ValueError(f"invalid validation mode: {mode}")
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO validation_mode(singleton, mode, updated_at)
+                VALUES (1, ?, ?)
+                ON CONFLICT(singleton) DO UPDATE SET mode=excluded.mode, updated_at=excluded.updated_at
+                """,
+                (mode, _utc_now()),
+            )
+        return mode
+
+    def record_auto_eat_attempt(
+        self,
+        *,
+        signal_id: str,
+        market_id: str,
+        decision: str,
+        reason: str = "",
+        preview_id: str = "",
+        execution_id: str = "",
+        total_cost: Decimal | None = None,
+    ) -> str:
+        attempt_id = _new_id()
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO auto_eat_attempts(
+                    attempt_id, signal_id, market_id, decision, reason,
+                    preview_id, execution_id, total_cost, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id, str(signal_id), str(market_id), str(decision), str(reason),
+                    str(preview_id), str(execution_id),
+                    _decimal_string(total_cost) if total_cost is not None else None,
+                    _utc_now(),
+                ),
+            )
+        return attempt_id
+
+    def auto_eat_attempt_exists(self, signal_id: str, decision: str) -> bool:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM auto_eat_attempts WHERE signal_id=? AND decision=? LIMIT 1",
+                (str(signal_id), str(decision)),
+            ).fetchone()
+        return row is not None
+
+    def last_submitted_auto_eat(self, market_id: str) -> str | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT created_at FROM auto_eat_attempts
+                WHERE market_id=? AND decision='submitted'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (str(market_id),),
+            ).fetchone()
+        return None if row is None else str(row["created_at"])
+
+    def auto_eat_stats(self, *, now: datetime | None = None) -> dict[str, object]:
+        current = now or _parse_timestamp(_utc_now())
+        day_start = (
+            current.astimezone(ZoneInfo("Asia/Shanghai"))
+            .replace(hour=0, minute=0, second=0, microsecond=0)
+            .astimezone(UTC)
+            .isoformat(timespec="seconds")
+        )
+        with self._read_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT count(*),
+                       coalesce(sum(CASE WHEN decision='submitted' THEN 1 ELSE 0 END), 0),
+                       coalesce(sum(CASE WHEN decision='submitted' AND total_cost IS NOT NULL
+                                         THEN CAST(total_cost AS REAL) ELSE 0 END), 0)
+                FROM auto_eat_attempts WHERE created_at >= ?
+                """,
+                (day_start,),
+            ).fetchone()
+            rejected = connection.execute(
+                """
+                SELECT reason, count(*) FROM auto_eat_attempts
+                WHERE decision='rejected' AND created_at >= ? GROUP BY reason
+                """,
+                (day_start,),
+            ).fetchall()
+            realized = connection.execute(
+                """
+                SELECT coalesce(sum(
+                    CASE WHEN state = 'holding_to_resolution'
+                          AND json_extract(payload, '$.auto_eat') = json('true')
+                         THEN COALESCE(json_extract(payload, '$.minimum_profit'), 0)
+                         ELSE 0 END
+                ), 0)
+                FROM executions WHERE created_at >= ?
+                """,
+                (day_start,),
+            ).fetchone()
+        return {
+            "mode": self.get_validation_mode(),
+            "today_attempts": int(row[0]),
+            "today_submitted": int(row[1]),
+            "today_cost": float(row[2] or 0.0),
+            "realized_pnl": float(realized[0] or 0.0),
+            "rejected_by_reason": {str(item[0]): int(item[1]) for item in rejected},
+        }
 
     @staticmethod
     def _signal_time(payload: Mapping[str, object]) -> str:
