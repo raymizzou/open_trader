@@ -1362,12 +1362,20 @@ def test_cross_venue_opportunity_exposes_depth_fields() -> None:
     asyncio.run(exercise())
 
 
-def _venue_market(exchange: str, market_id: str, *, question: str) -> VenueMarket:
+def _venue_market(
+    exchange: str,
+    market_id: str,
+    *,
+    question: str,
+    yes_token_id: str | None = None,
+    no_token_id: str | None = None,
+) -> VenueMarket:
     if exchange == "predict.fun":
         return VenueMarket(
             exchange=exchange, market_id=market_id, condition_id=f"c-{market_id}",
             question=question, rules="same rules",
-            yes_token_id=f"yes-{market_id}", no_token_id=f"no-{market_id}",
+            yes_token_id=yes_token_id or f"yes-{market_id}",
+            no_token_id=no_token_id or f"no-{market_id}",
             settlement_asset="USDT", minimum_order_size=Decimal("5"),
             tick_size=Decimal("0.01"), fee_rate_bps=Decimal("0"),
             category_slug="test", resolution_provider="provider",
@@ -1377,7 +1385,8 @@ def _venue_market(exchange: str, market_id: str, *, question: str) -> VenueMarke
     return VenueMarket(
         exchange=exchange, market_id=market_id, condition_id=f"c-{market_id}",
         question=question, rules="same rules",
-        yes_token_id=f"yes-{market_id}", no_token_id=f"no-{market_id}",
+        yes_token_id=yes_token_id or f"yes-{market_id}",
+        no_token_id=no_token_id or f"no-{market_id}",
         settlement_asset="USDC", minimum_order_size=Decimal("5"),
         tick_size=Decimal("0.01"), fee_rate_bps=Decimal("0"),
         event_slug="event", resolution_source="source",
@@ -1425,6 +1434,42 @@ def test_manual_reject_whitelist_excludes_audit_failures() -> None:
     assert "UNRESOLVED_UNCERTAINTY" in reasons
     assert "DEEPSEEK_FAILED" not in reasons
     assert "CODEX_TIMEOUT" not in reasons
+
+
+def _manual_pair() -> ExplicitMarketPair:
+    return ExplicitMarketPair(
+        pair_id="manual-1",
+        predict=_venue_market(
+            "predict.fun", "predict-market-1", question="Metamask FDV above $700M?",
+            yes_token_id="predict-yes-1", no_token_id="predict-no-1",
+        ),
+        polymarket=_venue_market(
+            "polymarket", "poly-market-1", question="Metamask FDV above $700M?",
+            yes_token_id="poly-yes-1", no_token_id="poly-no-1",
+        ),
+    )
+
+
+def test_cross_intent_manual_only_flag_and_payload() -> None:
+    intents = predict_cross_venue._build_cross_venue_intents(
+        _manual_pair(),
+        monitor_predict_book(),
+        monitor_polymarket_books(),
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        require_annualized_gate=False,
+        predict_quote_fn=None,
+        manual_only=True,
+    )
+    assert intents and all(intent.manual_only for intent in intents)
+    normal = predict_cross_venue._build_cross_venue_intents(
+        _manual_pair(),
+        monitor_predict_book(),
+        monitor_polymarket_books(),
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        require_annualized_gate=False,
+        predict_quote_fn=None,
+    )
+    assert normal and all(intent.manual_only is False for intent in normal)
 
 
 class FakeCrossVenuePredict:

@@ -270,6 +270,7 @@ class CrossVenueIntent:
     actionable: bool
     quote_available: bool
     depth_probe: PositiveEdgeDepth | None = None
+    manual_only: bool = False
 
 
 def build_cross_venue_intents(
@@ -309,6 +310,7 @@ def _build_cross_venue_intents(
     target_quantity: Decimal | None = None,
     max_total_cost: Decimal | None = None,
     prefer_smallest: bool = False,
+    manual_only: bool = False,
 ) -> tuple[CrossVenueIntent, ...]:
 
     now = _fresh_datetime(now)
@@ -470,7 +472,7 @@ def _build_cross_venue_intents(
                 minimum_profit=minimum_profit, annualized_yield=annualized,
                 canonical_cutoff=canonical_cutoff, resolution_at=canonical_cutoff,
                 actionable=actionable, quote_available=quote_available,
-                depth_probe=depth_probe,
+                depth_probe=depth_probe, manual_only=manual_only,
             )
             if total_max_cost > MAX_NORMAL_COST:
                 observation = observation or intent
@@ -1758,6 +1760,12 @@ class PredictCrossVenueMonitor:
             "annualized_yield": intent.annualized_yield,
             "canonical_cutoff": intent.canonical_cutoff,
             "resolution_at": intent.resolution_at,
+            "manual_only": intent.manual_only,
+            "manual_reason": (
+                validation.reason
+                if intent.manual_only and validation is not None
+                else ""
+            ),
             "codex_approval": {
                 "decision": "APPROVE" if validation and validation.approved else "REJECT",
                 "cache_key": validation.cache_key if validation else "",
