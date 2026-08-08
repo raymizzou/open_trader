@@ -272,7 +272,13 @@ class PredictionExecutionService:
                     return True
         return False
 
-    def preview(self, opportunity_id: str, *, auto_eat: bool = False) -> dict[str, object]:
+    def preview(
+        self,
+        opportunity_id: str,
+        *,
+        auto_eat: bool = False,
+        auto_submit: bool = False,
+    ) -> dict[str, object]:
         """Freshly validate one server-issued opportunity and persist a preview."""
 
         cross_preview = str(opportunity_id).startswith("cross:")
@@ -289,15 +295,23 @@ class PredictionExecutionService:
             cross_prefer_smallest=cross_preview,
             cross_canary_fingerprint=cross_fingerprint,
             cross_canary_cap=cross_cap if cross_preview else None,
+            cross_auto_submit=auto_submit,
         )
         if isinstance(prepared, dict):
             return prepared
         opportunity, intent, account = prepared
         if (
-            auto_eat
+            cross_preview
             and isinstance(intent, CrossVenueIntent)
-            and intent.manual_only
+            and intent.total_max_cost > cross_cap
         ):
+            return {
+                "state": "rejected",
+                "reason": "cross_venue_minimum_exceeds_canary",
+                "current": format(intent.total_max_cost, "f"),
+                "limit": format(cross_cap, "f"),
+            }
+        if (auto_eat or auto_submit) and isinstance(intent, CrossVenueIntent) and intent.manual_only:
             return {"state": "rejected", "reason": "manual_only_requires_approval"}
 
         now = _utc_now()
@@ -307,6 +321,8 @@ class PredictionExecutionService:
         )
         if auto_eat:
             payload["auto_eat"] = True
+        if auto_submit:
+            payload["auto_submit"] = True
         preview_id = self._store.create_preview(
             payload, expires_at=_timestamp(expires_at)
         )
@@ -331,6 +347,7 @@ class PredictionExecutionService:
         cross_prefer_smallest: bool = False,
         cross_canary_fingerprint: str | None = None,
         cross_canary_cap: Decimal | None = None,
+        cross_auto_submit: bool = False,
     ) -> tuple[dict[str, object], ExecutionIntent, dict[str, object]] | dict[str, object]:
         """Run the shared read-only admission checks used by preview and notify."""
 
@@ -363,7 +380,9 @@ class PredictionExecutionService:
         intent = self._intent_from_opportunity(opportunity)
         if opportunity is None or intent is None:
             return {"state": "rejected", "reason": "opportunity_unavailable"}
-        reason = self._validate_opportunity(opportunity, intent)
+        reason = self._validate_opportunity(
+            opportunity, intent, auto_submit=cross_auto_submit
+        )
         if reason is not None:
             return {"state": "rejected", "reason": reason}
         account, reason = self._volatile_checks(intent)
@@ -390,6 +409,10 @@ class PredictionExecutionService:
         ):
             return {"state": "ignored", "reason": "mode_auto"}
         if signal.get("market_type") == "cross_venue_yes_no":
+            if self._configured_cross_execution_mode() == "auto_submit":
+                return self.auto_submit_cross_venue(
+                    str(opportunity_id), str(signal_id)
+                )
             return self._notify_cross_venue_signal(
                 str(opportunity_id), str(signal_id), signal
             )
@@ -695,6 +718,212 @@ class PredictionExecutionService:
         return self._notify_yes_no_signal(
             signal_id, signal, rendered_signal={**opportunity, "signal_id": signal_id}
         )
+
+    _CROSS_AUTO_REASONS: dict[str, tuple[str, str, bool]] = {
+        "cross_auto_paused": ("自动下单已暂停", "系统", True),
+        "cross_auto_daily_principal_cap": ("当日自动本金已达到上限", "跨市场", False),
+        "cross_pair_unsettled": ("同一市场对仍有未结算仓位", "跨市场", True),
+        "active_execution": ("已有执行正在进行", "系统", False),
+        "execution_lock": ("已有执行正在进行", "系统", False),
+        "books_stale": ("盘口数据已过期", "行情", False),
+        "insufficient_bnb": ("BNB Gas 不足", "Predict.fun", True),
+        "account_insufficient": ("账户可用余额不足", "账户", True),
+        "notification_config_unavailable": ("飞书通知配置不可用", "通知", True),
+        "manual_only_requires_approval": ("该机会需要人工审查，自动模式不执行", "规则", True),
+        "cross_venue_minimum_exceeds_canary": ("场所最小可执行金额高于当前试探额度", "跨市场", True),
+    }
+
+    def auto_submit_cross_venue(
+        self, opportunity_id: str, signal_id: str
+    ) -> dict[str, object]:
+        """Claim one stage-5 episode, then reuse the normal submit state machine."""
+
+        if not self._store.claim_cross_auto_attempt(signal_id, opportunity_id):
+            return {"state": "ignored", "reason": "signal_already_attempted"}
+        if not self._store.cross_auto_state().get("armed"):
+            return self._finish_cross_auto_rejection(
+                signal_id, opportunity_id, {"reason": "cross_auto_paused"}
+            )
+        if not self._notification_channels_ready():
+            return self._finish_cross_auto_rejection(
+                signal_id,
+                opportunity_id,
+                {"reason": "notification_config_unavailable"},
+            )
+        preview = self.preview(opportunity_id, auto_submit=True)
+        if preview.get("state") != "previewed":
+            return self._finish_cross_auto_rejection(signal_id, opportunity_id, preview)
+        result = self.confirm(str(preview["preview_id"]), signal_id)
+        if result.get("execution_id"):
+            return self._record_cross_auto_result(signal_id, preview, result)
+        return self._finish_cross_auto_rejection(signal_id, opportunity_id, result)
+
+    def _cross_auto_facts(
+        self,
+        reason: str,
+        *,
+        signal_id: str,
+        opportunity_id: str,
+    ) -> dict[str, object]:
+        reason_zh, venue, required = self._CROSS_AUTO_REASONS.get(
+            reason, ("自动下单条件不满足", "系统", False)
+        )
+        current: object = None
+        limit: object = None
+        if reason == "cross_auto_paused":
+            current, limit = "paused", "armed"
+        elif reason == "cross_auto_daily_principal_cap":
+            current, limit = (
+                format(self._store.cross_auto_daily_principal(), "f"),
+                "100",
+            )
+        elif reason == "cross_pair_unsettled":
+            current, limit = "1", "1"
+        elif reason in {"active_execution", "execution_lock"}:
+            current, limit = "1", "1"
+        elif reason == "books_stale":
+            current, limit = ">10s", "10s"
+        elif reason == "insufficient_bnb":
+            account = self._fresh_predict_account_snapshot() or {}
+            current = _safe_decimal(account.get("bnb_balance"))
+            limit = _safe_decimal(account.get("required_bnb"))
+        elif reason == "account_insufficient":
+            account = self._fresh_predict_account_snapshot() or {}
+            current = _safe_decimal(account.get("available_usdt"))
+            limit = "required"
+        elif reason == "notification_config_unavailable":
+            current, limit = "unavailable", "ready"
+        return {
+            "reason_code": reason,
+            "reason_zh": reason_zh,
+            "current": current,
+            "limit": limit,
+            "venue": venue,
+            "operator_action_required": required,
+            "signal_id": signal_id,
+            "opportunity_id": opportunity_id,
+        }
+
+    def _finish_cross_auto_rejection(
+        self,
+        signal_id: str,
+        opportunity_id: str,
+        result: Mapping[str, object],
+    ) -> dict[str, object]:
+        reason = str(result.get("reason", "opportunity_unavailable"))
+        if reason == "execution_lock":
+            reason = "active_execution"
+        facts = self._cross_auto_facts(
+            reason, signal_id=signal_id, opportunity_id=opportunity_id
+        )
+        if result.get("current") is not None:
+            facts["current"] = result["current"]
+        if result.get("limit") is not None:
+            facts["limit"] = result["limit"]
+        try:
+            self._store.finish_cross_auto_attempt(
+                signal_id,
+                decision="rejected",
+                reason=reason,
+                reason_zh=str(facts["reason_zh"]),
+                current=facts["current"],
+                limit=facts["limit"],
+                venue=str(facts["venue"]),
+                operator_action_required=bool(facts["operator_action_required"]),
+            )
+        except KeyError:
+            return {"state": "ignored", "reason": "signal_already_attempted"}
+        if facts["operator_action_required"]:
+            self._notify_cross_auto_rejection_once(signal_id, facts)
+        return {"state": "rejected", "reason": reason, "facts": facts}
+
+    def _record_cross_auto_result(
+        self,
+        signal_id: str,
+        preview: Mapping[str, object],
+        result: Mapping[str, object],
+    ) -> dict[str, object]:
+        try:
+            self._store.finish_cross_auto_attempt(
+                signal_id,
+                decision="submitted",
+                reason="submitted",
+                reason_zh="已提交双边订单，等待对账",
+                venue="跨市场",
+                preview_id=str(preview.get("preview_id", "")),
+                execution_id=str(result.get("execution_id", "")),
+                total_cost=preview.get("total_max_cost"),
+            )
+        except KeyError:
+            return {"state": "ignored", "reason": "signal_already_attempted"}
+        return dict(result)
+
+    def _notify_cross_auto_rejection_once(
+        self, signal_id: str, facts: Mapping[str, object]
+    ) -> None:
+        reservation = self._store.reserve_notification_attempt(
+            signal_id, max_attempts=1, lease_seconds=60.0
+        )
+        if reservation.get("state") != "reserved" or not isinstance(
+            reservation.get("lease_id"), str
+        ):
+            return
+        message = "\n".join(
+            (
+                f"原因：{facts['reason_zh']}（{facts['reason_code']}）",
+                f"场所：{facts['venue']}",
+                f"当前/限制：{facts['current']} / {facts['limit']}",
+                f"机会编号：{facts['signal_id']}",
+                f"Dashboard：{self._dashboard_url}",
+            )
+        )
+        try:
+            sent = self._deliver_feishu_notification("自动下单已拒绝", message)
+        except Exception:
+            sent = False
+        self._store.complete_notification_attempt(
+            signal_id,
+            str(reservation["lease_id"]),
+            success=sent,
+            error_code="delivery_failed",
+        )
+
+    def _configured_cross_execution_mode(self) -> str:
+        configured = "observe_only"
+        source = self._cross_venue_monitor
+        snapshot = getattr(source, "snapshot", None)
+        try:
+            value = _call(snapshot) if callable(snapshot) else None
+        except Exception:
+            value = None
+        opportunities = value.get("opportunities") if isinstance(value, Mapping) else None
+        if isinstance(opportunities, (list, tuple)):
+            for opportunity in opportunities:
+                if isinstance(opportunity, Mapping):
+                    configured = str(opportunity.get("execution_mode", configured))
+                    break
+        return configured
+
+    def cross_auto_status(self) -> dict[str, object]:
+        configured = self._configured_cross_execution_mode()
+        state = self._store.cross_auto_state()
+        armed = state.get("armed") is True
+        latest = self._store.cross_auto_attempts(limit=1)
+        return {
+            "configured_mode": configured,
+            "effective_mode": configured if configured == "auto_submit" and armed else "observe_only",
+            "armed": armed,
+            "pause_reason": "" if armed else str(state.get("reason", "not_armed")),
+            "notification_ready": self._notification_channels_ready(),
+            "daily_principal": {
+                "current": format(self._store.cross_auto_daily_principal(), "f"),
+                "limit": "100",
+            },
+            "latest_attempt": latest[0] if latest else None,
+        }
+
+    def pause_cross_auto(self, reason: str = "operator_paused") -> dict[str, object]:
+        return self._store.pause_cross_auto(reason)
 
     def _notify_cross_gas_blocked_signal(
         self, signal_id: str, signal: Mapping[str, object]
@@ -1674,7 +1903,11 @@ class PredictionExecutionService:
                     execution_id, "opportunity_changed", persisted_intent
                 )
                 return
-            reason = self._validate_opportunity(opportunity, current_intent)
+            reason = self._validate_opportunity(
+                opportunity,
+                current_intent,
+                auto_submit=row.get("auto_submit") is True,
+            )
             account, volatile_reason = self._volatile_checks(current_intent)
             if reason is not None or account is None:
                 if cross_execution:
@@ -1941,7 +2174,11 @@ class PredictionExecutionService:
             if refreshed is None
             or not isinstance(refreshed_intent, CrossVenueIntent)
             or not self._cross_preview_matches(preview_payload, refreshed, refreshed_intent)
-            else self._validate_opportunity(refreshed, refreshed_intent)
+            else self._validate_opportunity(
+                refreshed,
+                refreshed_intent,
+                auto_submit=preview_payload.get("auto_submit") is True,
+            )
         )
         refreshed_account, volatile_reason = (
             (None, None)
@@ -2506,6 +2743,7 @@ class PredictionExecutionService:
                 evidence["canary_verified"] = True
                 evidence["canary_fingerprint"] = fingerprint
         self._transition(execution_id, "holding_to_resolution", evidence)
+        self._notify_cross_auto_success(execution_id, evidence)
 
     @staticmethod
     def _cross_canary_reconciliation_verified(
@@ -2952,6 +3190,49 @@ class PredictionExecutionService:
             "directional_incident",
             {**details, "breaker": "open", **({"incident_id": incident_id} if incident_id else {})},
         )
+
+    def _is_cross_auto_execution(self, execution_id: str) -> bool:
+        try:
+            row = self.execution(execution_id)
+        except KeyError:
+            return False
+        return (
+            row.get("market_type") == "cross_venue_yes_no"
+            and row.get("auto_submit") is True
+        )
+
+    @staticmethod
+    def _feishu_delivery_failed(attempts: object) -> bool:
+        if not isinstance(attempts, (list, tuple)):
+            return False
+        return any(
+            isinstance(attempt, Mapping)
+            and attempt.get("channel") in {"feishu", "feishu_app"}
+            and attempt.get("success") is not True
+            for attempt in attempts
+        )
+
+    def _notify_cross_auto_success(
+        self, execution_id: str, evidence: Mapping[str, object]
+    ) -> None:
+        if not self._is_cross_auto_execution(execution_id):
+            return
+        positions = evidence.get("positions")
+        message = "\n".join(
+            (
+                "双边订单已成交并完成 REST 对账。",
+                f"执行编号：{execution_id}",
+                f"持仓：{positions}",
+                "Predict 授权已清零。",
+                f"Dashboard：{self._dashboard_url}",
+            )
+        )
+        try:
+            sent = self._deliver_feishu_notification("自动下单已完成", message)
+        except Exception:
+            sent = False
+        if not sent:
+            self._store.pause_cross_auto("notification_delivery_failed")
 
     def _run_threshold_execution(
         self,
@@ -4401,10 +4682,16 @@ class PredictionExecutionService:
         return False
 
     def _validate_opportunity(
-        self, opportunity: Mapping[str, object], intent: ExecutionIntent
+        self,
+        opportunity: Mapping[str, object],
+        intent: ExecutionIntent,
+        *,
+        auto_submit: bool = False,
     ) -> str | None:
         if isinstance(intent, CrossVenueIntent):
-            return self._validate_cross_venue_opportunity(opportunity, intent)
+            return self._validate_cross_venue_opportunity(
+                opportunity, intent, auto_submit=auto_submit
+            )
         if opportunity.get("actionable") is not True:
             return str(opportunity.get("eligibility_reason", "opportunity_not_actionable"))
         if "confirmed_age_seconds" not in opportunity or "confirmed_at" not in opportunity:
@@ -4466,9 +4753,19 @@ class PredictionExecutionService:
         return None
 
     def _validate_cross_venue_opportunity(
-        self, opportunity: Mapping[str, object], intent: CrossVenueIntent
+        self,
+        opportunity: Mapping[str, object],
+        intent: CrossVenueIntent,
+        *,
+        auto_submit: bool = False,
     ) -> str | None:
-        if opportunity.get("execution_mode") != "manual_confirm":
+        mode = opportunity.get("execution_mode")
+        if auto_submit:
+            if opportunity.get("manual_only") is True:
+                return "manual_only_requires_approval"
+            if mode != "auto_submit":
+                return "cross_execution_mode"
+        elif mode != "manual_confirm":
             return "cross_execution_mode"
         manual_only = opportunity.get("manual_only") is True
         if manual_only and (
@@ -5286,7 +5583,7 @@ class PredictionExecutionService:
         return (
             isinstance(old_approval, Mapping)
             and isinstance(new_approval, Mapping)
-            and old_approval.get("cache_key") == new_approval.get("cache_key")
+            and self._safe_mapping(old_approval) == self._safe_mapping(new_approval)
             and preview.get("rules_fingerprints") == opportunity.get("rules_fingerprints")
             and preview.get("approved_candidates")
             == opportunity.get("approved_candidates")
@@ -5339,6 +5636,10 @@ class PredictionExecutionService:
     ) -> str | None:
         self._breaker_open = True
         attempts = self._notify_incident(reason) if notify else []
+        if self._is_cross_auto_execution(execution_id) and self._feishu_delivery_failed(
+            attempts
+        ):
+            self._store.pause_cross_auto("notification_delivery_failed")
         payload = {
             "reason": reason,
             "breaker": "open",

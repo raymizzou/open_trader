@@ -3001,6 +3001,166 @@ def test_manual_only_cross_venue_rejected_by_auto_eat_but_valid_for_confirm(
     ) == "codex_not_approved"
 
 
+def test_auto_submit_cross_venue_runs_once_without_pretrade_notification(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    macos, feishu = service._notifier._notifiers  # type: ignore[attr-defined]
+    cross.overrides["execution_mode"] = "auto_submit"
+    assert store.arm_cross_auto()["armed"] is True
+    signal_id = _cross_venue_notification_signal(store)
+    store.update_signal(signal_id, {"execution_mode": "auto_submit"})
+
+    accepted = service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    )
+    final = wait_until_terminal(service, str(accepted["execution_id"]))
+
+    assert final["state"] == "holding_to_resolution"
+    assert (predict.submit_calls, trading.cross_submit_calls) == (1, 1)
+    assert macos.calls == 0
+    assert feishu.calls == 1
+    assert store.cross_auto_attempts()[0]["decision"] == "submitted"
+    assert service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    ) == {"state": "ignored", "reason": "signal_already_attempted"}
+    assert (predict.submit_calls, trading.cross_submit_calls) == (1, 1)
+
+
+def test_auto_submit_preview_requires_automatic_authority(tmp_path: Path) -> None:
+    service, _store, _trading, cross, _predict = _cross_service(tmp_path)
+    cross.overrides["execution_mode"] = "auto_submit"
+
+    assert service.preview("cross:public-pair:PREDICT_YES_POLYMARKET_NO") == {
+        "state": "rejected",
+        "reason": "cross_execution_mode",
+    }
+    assert service.preview(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", auto_submit=True
+    )["auto_submit"] is True
+
+
+def test_auto_submit_rejection_records_safe_reason_without_orders(tmp_path: Path) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    cross.overrides["execution_mode"] = "auto_submit"
+    signal_id = _cross_venue_notification_signal(store)
+    store.update_signal(signal_id, {"execution_mode": "auto_submit"})
+
+    result = service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    )
+
+    assert result["state"] == "rejected"
+    assert result["reason"] == "cross_auto_paused"
+    attempt = store.cross_auto_attempts()[0]
+    assert attempt["reason_code"] == "cross_auto_paused"
+    assert attempt["reason_zh"]
+    assert attempt["operator_action_required"] is True
+    assert (predict.submit_calls, trading.cross_submit_calls) == (0, 0)
+    assert service.cross_auto_status()["armed"] is False
+
+
+def test_auto_submit_terminal_feishu_failure_pauses_future_entries(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, cross, _predict = _cross_service(tmp_path)
+    _macos, feishu = service._notifier._notifiers  # type: ignore[attr-defined]
+    cross.overrides["execution_mode"] = "auto_submit"
+    assert store.arm_cross_auto()["armed"] is True
+    signal_id = _cross_venue_notification_signal(store)
+    store.update_signal(signal_id, {"execution_mode": "auto_submit"})
+    feishu.fail = True
+
+    accepted = service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    )
+    final = wait_until_terminal(service, str(accepted["execution_id"]))
+
+    assert final["state"] == "holding_to_resolution"
+    assert store.cross_auto_state()["reason"] == "notification_delivery_failed"
+
+
+def test_auto_submit_incident_feishu_failure_pauses_future_entries(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, cross, predict = _cross_service(tmp_path)
+    _macos, feishu = service._notifier._notifiers  # type: ignore[attr-defined]
+    cross.overrides["execution_mode"] = "auto_submit"
+    predict.submit_results.append(PredictLegResult(False, "rejected", "", "rejected"))
+    predict.reconcile_results.append(
+        {"status": "absent", "conclusively_absent": True, "position_quantity": Decimal("0")}
+    )
+    assert store.arm_cross_auto()["armed"] is True
+    signal_id = _cross_venue_notification_signal(store)
+    feishu.fail = True
+
+    accepted = service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    )
+    final = wait_until_terminal(service, str(accepted["execution_id"]))
+
+    assert final["state"] == "directional_incident"
+    assert store.cross_auto_state()["reason"] == "notification_delivery_failed"
+
+
+def test_auto_submit_rejects_venue_minimum_above_canary_limit(tmp_path: Path) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    cross.overrides["execution_mode"] = "auto_submit"
+    cross.intent = replace(
+        cross.intent,
+        legs=(
+            replace(cross.intent.legs[0], max_cost=Decimal("2.60")),
+            replace(cross.intent.legs[1], max_cost=Decimal("2.50")),
+        ),
+        total_max_cost=Decimal("5.20"),
+        minimum_payout=Decimal("6"),
+        minimum_profit=Decimal("0.80"),
+    )
+    assert store.arm_cross_auto()["armed"] is True
+    signal_id = _cross_venue_notification_signal(store)
+
+    result = service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    )
+
+    assert result["reason"] == "cross_venue_minimum_exceeds_canary"
+    assert result["facts"]["current"] == "5.20"
+    assert result["facts"]["limit"] == "5"
+    assert (predict.submit_calls, trading.cross_submit_calls) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "cross_auto_paused",
+        "cross_auto_daily_principal_cap",
+        "cross_pair_unsettled",
+        "active_execution",
+        "books_stale",
+        "insufficient_bnb",
+        "account_insufficient",
+        "notification_config_unavailable",
+        "manual_only_requires_approval",
+    ),
+)
+def test_auto_submit_rejection_codes_have_safe_operator_facts(
+    tmp_path: Path, reason: str
+) -> None:
+    service, _store, _trading, _cross, _predict = _cross_service(tmp_path)
+
+    facts = service._cross_auto_facts(
+        reason, signal_id="signal-1", opportunity_id="cross:pair:direction"
+    )
+
+    assert facts["reason_code"] == reason
+    assert isinstance(facts["reason_zh"], str) and facts["reason_zh"]
+    assert facts["venue"]
+    assert set(facts) == {
+        "reason_code", "reason_zh", "current", "limit", "venue",
+        "operator_action_required", "signal_id", "opportunity_id",
+    }
+
+
 @pytest.mark.parametrize(
     "cutoff",
     [
@@ -4060,7 +4220,7 @@ def test_preview_returns_busy_when_execution_is_active(tmp_path: Path) -> None:
 def test_browser_economics_are_not_service_inputs(tmp_path: Path) -> None:
     service, _, _, _ = execution_fixture(tmp_path)
     assert set(inspect.signature(service.preview).parameters) == {
-        "opportunity_id", "auto_eat",
+        "opportunity_id", "auto_eat", "auto_submit",
     }
     assert set(inspect.signature(service.confirm).parameters) == {"preview_id", "idempotency_key"}
 
