@@ -6,7 +6,7 @@ import re
 import subprocess
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -3897,16 +3897,119 @@ def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendRe
         if (str(pair.sell_symbol).upper(), str(pair.buy_symbol).upper())
         not in executed_pairs
     )
+    effective_pair_keys = {
+        (str(pair.sell_symbol).upper(), str(pair.buy_symbol).upper())
+        for pair in (*simulate_pairs, *real_pairs)
+    }
+    removed_pairs: dict[str, RotationPair] = {}
+    for pair in (*report.simulate_rotation_pairs, *report.real_rotation_pairs):
+        pair_key = (str(pair.sell_symbol).upper(), str(pair.buy_symbol).upper())
+        if pair_key not in effective_pair_keys:
+            removed_pairs.setdefault(pair.buy_symbol, pair)
+
+    if removed_pairs and _uses_individual_global_ranking(
+        str(report.metadata.get("market") or "CN"),
+        str(report.strategy_snapshot.get("strategy_version") or ""),
+    ):
+        candidate_signals = report.signal_snapshots.get("candidates")
+        signals_by_symbol = {
+            str(signal.get("symbol") or ""): signal
+            for signal in candidate_signals
+            if isinstance(signal, Mapping) and signal.get("symbol")
+        } if isinstance(candidate_signals, Sequence) else {}
+        rank_by_symbol = {
+            symbol: int(signal["rank"])
+            for symbol, signal in signals_by_symbol.items()
+            if isinstance(signal.get("rank"), int)
+        }
+        rank_by_symbol.update(
+            {
+                item.symbol: rank
+                for rank, item in enumerate(report.candidates, 1)
+                if item.symbol not in rank_by_symbol
+            }
+        )
+
+        def terminal_skip_row(pair: RotationPair) -> dict[str, object]:
+            signal = signals_by_symbol.get(pair.buy_symbol)
+            if signal is not None:
+                row = {
+                    item_field.name: signal.get(item_field.name)
+                    for item_field in fields(CandidateInput)
+                }
+                row["pools"] = tuple(signal.get("pools") or ())
+                row["labels"] = tuple(signal.get("labels") or ())
+            else:
+                row = {item_field.name: None for item_field in fields(CandidateInput)}
+                row.update(
+                    {
+                        "symbol": pair.buy_symbol,
+                        "name": pair.buy_name,
+                        "asset": pair.buy_asset,
+                        "exchange": str(report.metadata.get("market") or ""),
+                        "as_of_date": report.as_of_date,
+                        "strength": pair.buy_local_strength,
+                        "global_strength": pair.buy_global_strength,
+                    }
+                )
+            row.update(
+                {
+                    "symbol": pair.buy_symbol,
+                    "name": row.get("name") or pair.buy_name,
+                    "asset": row.get("asset") or pair.buy_asset,
+                    "strength": (
+                        row.get("strength")
+                        if row.get("strength") is not None
+                        else pair.buy_local_strength
+                    ),
+                    "global_strength": (
+                        row.get("global_strength")
+                        if row.get("global_strength") is not None
+                        else pair.buy_global_strength
+                    ),
+                    "futu_symbol": pair.buy_futu_symbol,
+                    "target_weight": pair.target_weight,
+                    "target_amount": pair.target_amount,
+                    "estimated_shares": 0,
+                    "reason": "轮换已终态，本次不再重复买入",
+                    "decisive_constraint": "轮换终态",
+                }
+            )
+            return row
+
+        risk_skips = list(report.risk_skips)
+        present_symbols = {
+            str(item.get("symbol") or "") for item in risk_skips
+        }
+        for symbol, pair in sorted(
+            removed_pairs.items(),
+            key=lambda item: rank_by_symbol.get(item[0], 10**9),
+        ):
+            if symbol in present_symbols:
+                continue
+            row = terminal_skip_row(pair)
+            target_rank = rank_by_symbol.get(symbol, 10**9)
+            insert_at = len(risk_skips)
+            for index, item in enumerate(risk_skips):
+                if rank_by_symbol.get(str(item.get("symbol") or ""), 10**9) > target_rank:
+                    insert_at = index
+                    break
+            risk_skips.insert(insert_at, row)
+            present_symbols.add(symbol)
+        report = replace(report, risk_skips=tuple(risk_skips))
+
+    simulate_comparisons = frozen_comparisons(
+        report.simulate_rotation_comparisons, simulate_pairs
+    )
+    real_comparisons = frozen_comparisons(
+        report.real_rotation_comparisons, real_pairs
+    )
     return replace(
         report,
         simulate_rotation_pairs=simulate_pairs,
         real_rotation_pairs=real_pairs,
-        simulate_rotation_comparisons=frozen_comparisons(
-            report.simulate_rotation_comparisons, simulate_pairs
-        ),
-        real_rotation_comparisons=frozen_comparisons(
-            report.real_rotation_comparisons, real_pairs
-        ),
+        simulate_rotation_comparisons=simulate_comparisons,
+        real_rotation_comparisons=real_comparisons,
         metadata={
             **report.metadata,
             "rotation_allocation_sha256": allocation_sha256,
@@ -6749,36 +6852,44 @@ def render_markdown(report: TrendReport) -> str:
                 )
             )
 
-    if report.buy_actions:
+    omit_empty_buy_section = _uses_individual_global_ranking(
+        market, strategy_version
+    )
+    if report.buy_actions or not omit_empty_buy_section:
         buy_window = "09:30–10:00" if market == "CN" else "下个常规交易时段"
         lines.extend(["", f"## {buy_window}：按顺序考虑买入", ""])
-        for index, item in enumerate(report.buy_actions, 1):
+        if report.buy_actions:
+            for index, item in enumerate(report.buy_actions, 1):
+                if market == "CN":
+                    lines.append(
+                        f"- {index}. {item.symbol} {item.name}｜"
+                        f"筛选价 {_money(item.filter_price)} 元（Trend Animals）｜"  # type: ignore[arg-type]
+                        f"执行参考价 {_money(item.close)} 元（富途前复权日线）｜"
+                        f"温度 {item.temperature_prev or '未知'}→{item.temperature_curr or '未知'}｜"
+                        f"节气 {item.phase or '未知'}｜强度 {item.strength}｜"
+                        f"行业温度 {item.industry_temperature or '未知'}｜"
+                        f"市值 {item.market_cap} 亿元｜成交额 {item.amount} 亿元｜"
+                        f"目标仓位 {_money(item.target_weight * Decimal('100'))}%｜"
+                        f"金额上限 {_money(item.target_amount)} 元｜约 {item.estimated_shares} 股｜"
+                        f"预计保护线 {_money(item.estimated_initial_line)}"
+                    )
+                else:
+                    lines.append(
+                        f"- {index}. {item.symbol} {item.name}｜约 {item.estimated_shares} 股｜"
+                        f"金额上限 {_money(item.target_amount)} {currency}｜"
+                        f"预计保护线 {_money(item.estimated_initial_line)}"
+                    )
             if market == "CN":
-                lines.append(
-                    f"- {index}. {item.symbol} {item.name}｜"
-                    f"筛选价 {_money(item.filter_price)} 元（Trend Animals）｜"  # type: ignore[arg-type]
-                    f"执行参考价 {_money(item.close)} 元（富途前复权日线）｜"
-                    f"温度 {item.temperature_prev or '未知'}→{item.temperature_curr or '未知'}｜"
-                    f"节气 {item.phase or '未知'}｜强度 {item.strength}｜"
-                    f"行业温度 {item.industry_temperature or '未知'}｜"
-                    f"市值 {item.market_cap} 亿元｜成交额 {item.amount} 亿元｜"
-                    f"目标仓位 {_money(item.target_weight * Decimal('100'))}%｜"
-                    f"金额上限 {_money(item.target_amount)} 元｜约 {item.estimated_shares} 股｜"
-                    f"预计保护线 {_money(item.estimated_initial_line)}"
-                )
+                quantity_rule = "按富途数据日前复权日线收盘价向下取整为 100 股整数倍"
+            elif market == "HK":
+                quantity_rule = "按富途 lot size 向下取整为整手"
             else:
-                lines.append(
-                    f"- {index}. {item.symbol} {item.name}｜约 {item.estimated_shares} 股｜"
-                    f"金额上限 {_money(item.target_amount)} {currency}｜"
-                    f"预计保护线 {_money(item.estimated_initial_line)}"
-                )
-        if market == "CN":
-            quantity_rule = "按富途数据日前复权日线收盘价向下取整为 100 股整数倍"
-        elif market == "HK":
-            quantity_rule = "按富途 lot size 向下取整为整手"
+                quantity_rule = "按富途实时价格向下取整为整股，不使用碎股"
+            lines.append(f"- 实际股数{quantity_rule}，不得超过金额上限。")
         else:
-            quantity_rule = "按富途实时价格向下取整为整股，不使用碎股"
-        lines.append(f"- 实际股数{quantity_rule}，不得超过金额上限。")
+            lines.append("- 无允许买入标的。")
+        if not sells and not report.buy_actions:
+            lines.extend(["", NO_ACTION_TEXT])
 
     lines.extend(["", "## 继续持有与人工复核", ""])
     for item in [*holds, *reviews, *others]:

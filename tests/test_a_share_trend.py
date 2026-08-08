@@ -1611,6 +1611,9 @@ def test_freeze_report_rotation_pairs_skips_executed_terminal_pairs(
     assert [(pair.sell_symbol, pair.buy_symbol) for pair in frozen.simulate_rotation_pairs] == [
         ("100001", "200002"),
     ]
+    assert next(
+        item for item in frozen.risk_skips if item["symbol"] == "200001"
+    )["reason"] == "轮换已终态，本次不再重复买入"
 
     control_root = tmp_path / "control"
     control_root.mkdir()
@@ -2840,10 +2843,11 @@ def test_build_report_rejects_any_injected_snapshot_parameter_drift(
 
 
 def test_build_report_upgrades_exact_repository_legacy_snapshot() -> None:
-    legacy_path = Path("data/trend_review/daily/CN/2026-07-16.json")
-    if not legacy_path.is_file():
-        pytest.skip("ignored legacy Trend report fixture is unavailable")
-    legacy = json.loads(legacy_path.read_text(encoding="utf-8"))["strategy_snapshot"]
+    legacy = json.loads(
+        Path("data/trend_review/daily/CN/2026-07-16.json").read_text(
+            encoding="utf-8"
+        )
+    )["strategy_snapshot"]
     pools = tuple(legacy["parameters"]["candidate_pool_ids"])
 
     built = build_report(
@@ -6762,10 +6766,33 @@ def test_report_freezes_and_renders_aggregate_right_side_structure() -> None:
 
 
 def test_no_action_report_omits_empty_normal_buy_section() -> None:
-    markdown = render_markdown(report())
+    allocation = allocation_for("CN", rank=2, entry_weight="0.04")
+    current = replace(
+        report(),
+        metadata={"market": "CN"},
+        strategy_snapshot=trend_module.live_trend_strategy_snapshot(
+            "CN", "abc123", (622466, 697199), allocation=allocation,
+        ),
+    )
+    markdown = render_markdown(current)
 
     assert "## 09:30–10:00：按顺序考虑买入" not in markdown
     assert "现金也是有效仓位，本日无需交易。" not in markdown
+
+
+def test_legacy_markdown_keeps_empty_normal_buy_section() -> None:
+    legacy = replace(
+        report(),
+        metadata={"market": "CN"},
+        strategy_snapshot=trend_module.live_trend_strategy_snapshot(
+            "CN", "abc123", (), strategy_version="v10",
+        ),
+    )
+    markdown = render_markdown(legacy)
+
+    assert "## 09:30–10:00：按顺序考虑买入" in markdown
+    assert "- 无允许买入标的。" in markdown
+    assert "现金也是有效仓位，本日无需交易。" in markdown
 
 
 def test_formal_buy_text_includes_window_estimates_target_and_line() -> None:
