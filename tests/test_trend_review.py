@@ -30,6 +30,14 @@ from open_trader.strategy_drawdown import (
     automatic_bootstrap_strategy_drawdown,
     observe_strategy_equity,
 )
+from open_trader.trend_api_stats import (
+    build_trend_api_stats_payload,
+    write_trend_api_stats,
+)
+from open_trader.trend_kelly import (
+    calculate_trend_kelly,
+    trend_kelly_rounds_from_payload,
+)
 from open_trader.models import Market, TradeFill
 from open_trader.trend_industry_context import IndustryContext
 
@@ -8018,7 +8026,7 @@ def test_projection_excludes_non_allocation_parameter_drift_fact(
 
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
-    assert projection["interval"]["end"] == "2026-07-16"
+    assert projection["metric_cutoffs"]["discipline"] == "2026-07-16"
 
 
 @pytest.mark.parametrize(
@@ -8993,16 +9001,11 @@ def write_review_history(
         )
 
 
-@pytest.mark.parametrize(
-    ("discipline_count", "actual_count", "discipline_ready", "actual_ready"),
-    [(29, 30, False, True), (30, 29, True, False), (31, 31, True, True)],
-)
-def test_projection_unlocks_series_independently_and_never_batches(
+@pytest.mark.parametrize(("discipline_count", "actual_count"), [(29, 30), (30, 29), (31, 31)])
+def test_projection_metrics_do_not_depend_on_legacy_round_counts(
     tmp_path: Path,
     discipline_count: int,
     actual_count: int,
-    discipline_ready: bool,
-    actual_ready: bool,
 ) -> None:
     write_separate_review_facts(
         tmp_path,
@@ -9013,16 +9016,23 @@ def test_projection_unlocks_series_independently_and_never_batches(
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
     assert projection["sample_counts"] == {
-        "discipline": discipline_count,
-        "actual": actual_count,
+        "discipline": None,
+        "actual": None,
         "required": 30,
     }
-    assert (
-        projection["metrics"]["calmar"]["discipline"]["value"] is not None
-    ) is discipline_ready
-    assert (
-        projection["metrics"]["calmar"]["actual"]["value"] is not None
-    ) is actual_ready
+    assert projection["sample_details"] == {
+        "discipline": None,
+        "actual": None,
+    }
+    assert projection["sample_cutoffs"] == {
+        "discipline": None,
+        "actual": None,
+    }
+    assert projection["metrics"]["calmar"]["discipline"]["value"] is not None
+    assert projection["metrics"]["calmar"]["actual"] == {
+        "value": None,
+        "reason": "实际执行日终净值缺失",
+    }
     assert "batch" not in projection
     assert "batch_path" not in projection
     assert not (tmp_path / "trend_review/batches").exists()
@@ -9034,25 +9044,25 @@ def test_projection_unlocks_series_independently_and_never_batches(
         "sharpe",
     }
     assert all(
-        set(values) == {"discipline", "actual", "benchmark"}
+        set(values) == {
+            "discipline",
+            "actual",
+            "discipline_benchmark",
+            "actual_benchmark",
+        }
         for values in projection["metrics"].values()
     )
-    assert projection["metrics"]["market_excess_return"]["benchmark"] == {
+    assert projection["metrics"]["market_excess_return"]["discipline_benchmark"] == {
         "value": "0",
         "reason": None,
     }
-    for series, ready in (
-        ("discipline", discipline_ready),
-        ("actual", actual_ready),
-    ):
-        if ready:
-            assert Decimal(
-                projection["metrics"]["market_excess_return"][series]["value"]
-            ) == Decimal(
-                projection["metrics"]["period_net_return"][series]["value"]
-            ) - Decimal(
-                projection["metrics"]["period_net_return"]["benchmark"]["value"]
-            )
+    assert Decimal(
+        projection["metrics"]["market_excess_return"]["discipline"]["value"]
+    ) == Decimal(
+        projection["metrics"]["period_net_return"]["discipline"]["value"]
+    ) - Decimal(
+        projection["metrics"]["period_net_return"]["discipline_benchmark"]["value"]
+    )
 
 
 def test_actual_cycles_close_partials_opening_positions_rebuys_and_dedupe() -> None:
@@ -9199,7 +9209,9 @@ def test_completed_cycles_rejects_conflicting_payloads_for_one_identity(
         trend_review._completed_cycles([sell, buy] if reverse else [buy, sell])
 
 
-def test_legacy_single_date_completeness_never_fabricates_samples(tmp_path: Path) -> None:
+def test_legacy_fill_completeness_does_not_fabricate_statistics_availability(
+    tmp_path: Path,
+) -> None:
     write_review_history(
         tmp_path,
         completed_trades=30,
@@ -9216,8 +9228,8 @@ def test_legacy_single_date_completeness_never_fabricates_samples(tmp_path: Path
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
     assert projection["sample_counts"] == {
-        "discipline": 0,
-        "actual": 0,
+        "discipline": None,
+        "actual": None,
         "required": 30,
     }
 
@@ -9334,11 +9346,11 @@ def test_projection_ignores_exit_for_position_held_before_tracking(
 
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
-    assert projection["sample_counts"]["discipline"] == 30
+    assert projection["sample_counts"]["discipline"] is None
     assert "batch_path" not in projection
 
 
-def test_projection_counts_partial_exit_once_and_keeps_entry_version(
+def test_projection_count_does_not_use_legacy_partial_exit(
     tmp_path: Path,
 ) -> None:
     write_review_history(tmp_path, completed_trades=29, days=40)
@@ -9363,12 +9375,12 @@ def test_projection_counts_partial_exit_once_and_keeps_entry_version(
 
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
-    assert projection["sample_counts"]["discipline"] == 29
-    assert projection["common_cutoff"] == "2026-08-14"
+    assert projection["sample_counts"]["discipline"] is None
+    assert projection["metric_cutoffs"]["discipline"] == "2026-08-14"
     assert "batch_path" not in projection
 
 
-def test_common_cutoff_respects_equity_continuity_and_fill_completeness(
+def test_cn_actual_metric_remains_unavailable_when_equity_has_a_gap(
     tmp_path: Path,
 ) -> None:
     write_separate_review_facts(tmp_path, discipline_count=0, actual_count=0)
@@ -9380,14 +9392,15 @@ def test_common_cutoff_respects_equity_continuity_and_fill_completeness(
 
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
-    assert projection["common_cutoff"] == "2026-07-17"
+    assert projection["common_cutoff"] is None
     assert projection["interval"] == {
         "start": "2026-07-16",
-        "end": "2026-07-17",
+        "end": None,
     }
+    assert projection["metric_cutoffs"]["actual"] is None
 
 
-def test_common_cutoff_stops_before_gap_between_fill_coverage_intervals(
+def test_cn_statement_fill_coverage_does_not_create_actual_metric_cutoff(
     tmp_path: Path,
 ) -> None:
     write_separate_review_facts(tmp_path, discipline_count=0, actual_count=0)
@@ -9405,7 +9418,8 @@ def test_common_cutoff_stops_before_gap_between_fill_coverage_intervals(
 
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
-    assert projection["common_cutoff"] == "2026-07-16"
+    assert projection["common_cutoff"] is None
+    assert projection["metric_cutoffs"]["actual"] is None
 
 
 def test_legacy_complete_through_without_start_only_covers_that_date(
@@ -9519,6 +9533,568 @@ def test_metric_formulas_reject_non_finite_values(value: Decimal) -> None:
         )
 
 
+def test_review_keeps_simulation_count_when_actual_equity_is_missing(
+    tmp_path: Path,
+) -> None:
+    write_review_history(
+        tmp_path,
+        completed_trades=0,
+        days=40,
+        with_actual_fill_coverage=False,
+    )
+    for path in (tmp_path / "trend_review/daily/CN").glob("*.json"):
+        fact = json.loads(path.read_text(encoding="utf-8"))
+        fact.pop("actual_equity", None)
+        path.write_text(json.dumps(fact), encoding="utf-8")
+    fills: list[dict[str, object]] = []
+    for index in range(4):
+        symbol = f"SIM{index}"
+        common = {
+            "source": "simulation",
+            "source_id": "simulation:futu:101",
+            "broker": "futu",
+            "account_id": "101",
+            "market": "CN",
+            "symbol": symbol,
+            "currency": "CNY",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v3",
+            "strategy_version": "v3",
+            "attribution_status": "attributed",
+            "exclusion_reason": "",
+            "costs_complete": False,
+            "normal_cost_rate": "0.001",
+            "normal_cost_model": "estimated complete round-trip normal costs",
+            "report_sha256": "a" * 64,
+        }
+        fills.extend([
+            {
+                **common,
+                "fill_id": f"{symbol}-buy",
+                "order_id": f"{symbol}-buy",
+                "side": "buy",
+                "quantity": "1",
+                "price": "10",
+                "fee": "0",
+                "filled_at": f"2026-07-{16 + index * 2:02d}T10:00:00+08:00",
+            },
+            {
+                **common,
+                "fill_id": f"{symbol}-sell",
+                "order_id": f"{symbol}-sell",
+                "side": "sell",
+                "quantity": "1",
+                "price": "11",
+                "fee": "0",
+                "filled_at": f"2026-07-{17 + index * 2:02d}T10:00:00+08:00",
+            },
+        ])
+    actual_common = {
+        "source": "actual",
+        "source_id": "actual:eastmoney:eastmoney_main",
+        "broker": "eastmoney",
+        "account_id": "eastmoney_main",
+        "market": "CN",
+        "symbol": "ACTUAL",
+        "currency": "CNY",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v3",
+        "strategy_version": "v3",
+        "attribution_status": "attributed",
+        "exclusion_reason": "",
+        "costs_complete": True,
+        "statement_period": "2026-07",
+        "execution_granularity": "statement_trade_date",
+        "timestamp_semantics": "market_close_ordering_sentinel",
+    }
+    fills.extend([
+        {
+            **actual_common,
+            "fill_id": "actual-buy",
+            "order_id": "actual-buy",
+            "side": "buy",
+            "quantity": "1",
+            "price": "10",
+            "fee": "0.1",
+            "filled_at": "2026-07-16T15:00:00+08:00",
+            "statement_sequence": 1,
+        },
+        {
+            **actual_common,
+            "fill_id": "actual-sell",
+            "order_id": "actual-sell",
+            "side": "sell",
+            "quantity": "1",
+            "price": "12",
+            "fee": "0.1",
+            "filled_at": "2026-07-17T15:00:00+08:00",
+            "statement_sequence": 2,
+        },
+    ])
+    stats = build_trend_api_stats_payload(
+        fills,
+        strategy_versions=[{
+            "market": "CN",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v3",
+            "strategy_version": "v3",
+        }],
+        generated_at="2026-08-24T18:00:00+08:00",
+        statistics_cutoff_at="2026-08-24T15:00:00+08:00",
+    )
+    stats["sources"] = [
+        {
+            "source": "simulation",
+            "source_id": "simulation:futu:101",
+            "broker": "futu",
+            "account_id": "101",
+            "market": "CN",
+            "orders_seen": 8,
+            "fill_count": 8,
+            "statistics_cutoff_at": "2026-08-24T15:00:00+08:00",
+            "status": "available",
+        },
+        {
+            "source": "actual",
+            "source_id": "actual:eastmoney:eastmoney_main",
+            "broker": "eastmoney",
+            "account_id": "eastmoney_main",
+            "market": "CN",
+            "orders_seen": 2,
+            "fill_count": 2,
+            "statistics_cutoff_at": "2026-07-31T15:00:00+08:00",
+            "status": "available",
+        },
+    ]
+    write_trend_api_stats(tmp_path, stats)
+
+    result = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert result["sample_counts"] == {
+        "discipline": 4,
+        "actual": 1,
+        "required": 30,
+    }
+    assert result["sample_details"]["discipline"]["eligible_sample_count"] == 4
+    assert result["metrics"]["period_net_return"]["discipline"]["value"] is not None
+    assert result["metrics"]["period_net_return"]["actual"]["value"] is None
+    assert result["metrics"]["period_net_return"]["actual"]["reason"] == (
+        "实际执行日终净值缺失"
+    )
+
+
+def projection_stats_fill(
+    label: str,
+    *,
+    source: str,
+    broker: str,
+    account_id: str,
+    market: str,
+    strategy_version: str,
+    side: str,
+    filled_at: str,
+    attribution_status: str = "attributed",
+    exclusion_reason: str = "",
+    statement_sequence: int | None = None,
+) -> dict[str, object]:
+    fill = {
+        "fill_id": f"{label}-{side}",
+        "order_id": f"{label}-{side}",
+        "source": source,
+        "source_id": f"{source}:{broker}:{account_id}",
+        "broker": broker,
+        "account_id": account_id,
+        "market": market,
+        "symbol": label,
+        "currency": {"CN": "CNY", "HK": "HKD", "US": "USD"}[market],
+        "side": side,
+        "quantity": "1",
+        "price": "10" if side == "buy" else "11",
+        "fee": "0" if source == "simulation" else "0.1",
+        "filled_at": filled_at,
+        "strategy_id": (
+            f"trend_animals_warm_to_hot/{market}/{strategy_version}"
+            if attribution_status == "attributed"
+            else ""
+        ),
+        "strategy_version": (
+            strategy_version if attribution_status == "attributed" else ""
+        ),
+        "attribution_status": attribution_status,
+        "exclusion_reason": exclusion_reason,
+        "costs_complete": source == "actual",
+    }
+    if source == "simulation":
+        fill.update({
+            "normal_cost_rate": "0.001",
+            "normal_cost_model": "estimated complete round-trip normal costs",
+            "report_sha256": "a" * 64,
+        })
+    if broker in {"eastmoney", "phillips"}:
+        fill.update({
+            "statement_period": "2026-07",
+            "execution_granularity": "statement_trade_date",
+            "timestamp_semantics": "market_close_ordering_sentinel",
+            "statement_sequence": statement_sequence,
+        })
+    return fill
+
+
+def write_projection_metric_history(
+    root: Path,
+    market: str,
+    *,
+    discipline_days: int,
+    actual_days: int,
+    benchmark_days: int,
+) -> None:
+    start = date.fromisoformat(trend_review.TREND_V1_EFFECTIVE_FROM[market])
+    snapshot = strategy_snapshot(market)
+    benchmark_source, benchmark_symbol = {
+        "CN": ("CSI_ALL_SHARE_PRICE", "SH.000985"),
+        "HK": ("HSCI_PRICE", "HK.800701"),
+        "US": ("SPY_QFQ", "US.SPY"),
+    }[market]
+    for index in range(benchmark_days):
+        trading_date = (start + timedelta(days=index)).isoformat()
+        if index < discipline_days:
+            trend_review.freeze_discipline_fact(
+                root,
+                market,
+                trading_date,
+                str(100000 + index * 100),
+                [],
+                snapshot,
+            )
+        if index < actual_days:
+            trend_review.freeze_actual_equity_fact(
+                root,
+                market,
+                trading_date,
+                str(100000 + index * 80),
+                [],
+                snapshot,
+            )
+        trend_review.freeze_benchmark_fact(
+            root,
+            market,
+            trading_date,
+            {
+                "date": trading_date,
+                "close": str(1000 + index),
+                "source_id": benchmark_source,
+                "futu_symbol": benchmark_symbol,
+            },
+        )
+    if market == "US" and actual_days:
+        trend_review.freeze_actual_fill_batch(
+            root,
+            {"broker": "tiger"},
+            [],
+            (start + timedelta(days=actual_days - 1)).isoformat(),
+            coverage_start=start.isoformat(),
+        )
+    rates = root / "rates/DGS3MO.csv"
+    rates.parent.mkdir(parents=True, exist_ok=True)
+    rates.write_text("DATE,DGS3MO\n2026-07-15,4.0\n", encoding="utf-8")
+
+
+def write_projection_stats(
+    root: Path,
+    fills: list[dict[str, object]],
+    *,
+    market: str,
+    strategy_version: str = "v3",
+    simulation_cutoff: str | None = None,
+    actual_cutoff: str | None = None,
+) -> dict[str, object]:
+    artifact_cutoff = "2026-08-24T16:00:00+08:00"
+    payload = build_trend_api_stats_payload(
+        fills,
+        strategy_versions=[{
+            "market": market,
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/{strategy_version}",
+            "strategy_version": strategy_version,
+        }],
+        generated_at="2026-08-24T18:00:00+08:00",
+        statistics_cutoff_at=artifact_cutoff,
+    )
+    sources = []
+    for source, cutoff in (
+        ("simulation", simulation_cutoff),
+        ("actual", actual_cutoff),
+    ):
+        if cutoff is None:
+            continue
+        broker = "futu" if source == "simulation" else {
+            "CN": "eastmoney",
+            "HK": "phillips",
+            "US": "tiger",
+        }[market]
+        account_id = "101" if source == "simulation" else {
+            "CN": "eastmoney_main",
+            "HK": "phillips_main",
+            "US": "tiger_main",
+        }[market]
+        source_fills = [fill for fill in fills if fill["source"] == source]
+        sources.append({
+            "source": source,
+            "source_id": f"{source}:{broker}:{account_id}",
+            "broker": broker,
+            "account_id": account_id,
+            "market": market,
+            "orders_seen": len(source_fills),
+            "fill_count": len(source_fills),
+            "statistics_cutoff_at": cutoff,
+            "status": "available",
+        })
+    payload["sources"] = sources
+    write_trend_api_stats(root, payload)
+    return payload
+
+
+def test_projection_discipline_sample_count_matches_kelly_qualified_pool(
+    tmp_path: Path,
+) -> None:
+    write_projection_metric_history(
+        tmp_path, "US", discipline_days=4, actual_days=0, benchmark_days=4
+    )
+    fills = [
+        projection_stats_fill(
+            label,
+            source="simulation",
+            broker="futu",
+            account_id="101",
+            market="US",
+            strategy_version="v3",
+            side=side,
+            filled_at=filled_at,
+        )
+        for label, side, filled_at in (
+            ("ONE", "buy", "2026-07-17T10:00:00-04:00"),
+            ("ONE", "sell", "2026-07-18T10:00:00-04:00"),
+            ("TWO", "buy", "2026-07-19T10:00:00-04:00"),
+            ("TWO", "sell", "2026-07-20T10:00:00-04:00"),
+        )
+    ]
+    payload = write_projection_stats(
+        tmp_path,
+        fills,
+        market="US",
+        simulation_cutoff="2026-08-24T16:00:00+08:00",
+    )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "US")
+    kelly = calculate_trend_kelly(
+        trend_kelly_rounds_from_payload(payload),
+        market="US",
+        strategy_id="trend_animals_warm_to_hot/US/v3",
+        opening_strategy_version="v3",
+    )
+
+    assert projection["sample_counts"]["discipline"] == kelly.eligible_sample_count
+
+
+def test_projection_actual_zero_sample_count_is_available_with_exclusions(
+    tmp_path: Path,
+) -> None:
+    write_projection_metric_history(
+        tmp_path, "CN", discipline_days=2, actual_days=2, benchmark_days=2
+    )
+    fills = [
+        projection_stats_fill(
+            "MANUAL",
+            source="actual",
+            broker="eastmoney",
+            account_id="eastmoney_main",
+            market="CN",
+            strategy_version="v3",
+            side=side,
+            filled_at=f"2026-07-{16 + index:02d}T15:00:00+08:00",
+            attribution_status="outside_strategy",
+            exclusion_reason="no_matching_opening_strategy_action",
+            statement_sequence=index + 1,
+        )
+        for index, side in enumerate(("buy", "sell"))
+    ]
+    write_projection_stats(
+        tmp_path,
+        fills,
+        market="CN",
+        actual_cutoff="2026-08-24T16:00:00+08:00",
+    )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["sample_counts"]["actual"] == 0
+    assert projection["sample_details"]["actual"]["available"] is True
+    assert projection["sample_details"]["actual"]["excluded_candidate_count"] == 1
+    assert projection["sample_details"]["actual"]["exclusion_reasons"] == [{
+        "reason": "no_matching_opening_strategy_action",
+        "count": 1,
+    }]
+
+
+def test_projection_sample_conservation_is_visible(tmp_path: Path) -> None:
+    write_projection_metric_history(
+        tmp_path, "US", discipline_days=3, actual_days=0, benchmark_days=3
+    )
+    fills = [
+        projection_stats_fill(
+            label,
+            source="simulation",
+            broker="futu",
+            account_id="101",
+            market="US",
+            strategy_version="v3",
+            side=side,
+            filled_at=filled_at,
+        )
+        for label, side, filled_at in (
+            ("CLOSED", "buy", "2026-07-17T10:00:00-04:00"),
+            ("CLOSED", "sell", "2026-07-18T10:00:00-04:00"),
+            ("OPEN", "buy", "2026-07-19T10:00:00-04:00"),
+        )
+    ]
+    write_projection_stats(
+        tmp_path,
+        fills,
+        market="US",
+        simulation_cutoff="2026-08-24T16:00:00+08:00",
+    )
+
+    detail = trend_review.build_trend_review_projection(tmp_path, "US")[
+        "sample_details"
+    ]["discipline"]
+
+    assert detail["discovered_candidate_count"] == (
+        detail["eligible_sample_count"]
+        + detail["excluded_candidate_count"]
+        + detail["incomplete_open_candidate_count"]
+    )
+
+
+def test_projection_metric_cutoffs_are_source_specific(tmp_path: Path) -> None:
+    write_projection_metric_history(
+        tmp_path, "US", discipline_days=4, actual_days=2, benchmark_days=4
+    )
+    write_projection_stats(
+        tmp_path,
+        [],
+        market="US",
+        simulation_cutoff="2026-08-24T16:00:00+08:00",
+        actual_cutoff="2026-08-23T16:00:00+08:00",
+    )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "US")
+
+    assert projection["metric_cutoffs"] == {
+        "discipline": "2026-07-20",
+        "actual": "2026-07-18",
+    }
+    assert projection["sample_cutoffs"] == {
+        "discipline": "2026-08-24T16:00:00+08:00",
+        "actual": "2026-08-23T16:00:00+08:00",
+    }
+    assert set(projection["metrics"]["period_net_return"]) == {
+        "discipline",
+        "actual",
+        "discipline_benchmark",
+        "actual_benchmark",
+    }
+    assert (
+        projection["metrics"]["period_net_return"]["discipline_benchmark"]
+        != projection["metrics"]["period_net_return"]["actual_benchmark"]
+    )
+
+
+def test_projection_metric_cutoff_stops_before_missing_equity_value(
+    tmp_path: Path,
+) -> None:
+    write_review_history(tmp_path, completed_trades=0, days=3)
+    path = tmp_path / "trend_review/daily/CN/2026-07-17.json"
+    fact = json.loads(path.read_text(encoding="utf-8"))
+    fact.pop("discipline_equity_after_fees")
+    path.write_text(json.dumps(fact), encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["metric_cutoffs"]["discipline"] == "2026-07-16"
+    assert projection["metrics"]["period_net_return"]["discipline"] == {
+        "value": "0",
+        "reason": None,
+    }
+
+
+def test_missing_common_metric_cutoff_preserves_discipline_metrics(
+    tmp_path: Path,
+) -> None:
+    write_projection_metric_history(
+        tmp_path, "US", discipline_days=3, actual_days=0, benchmark_days=3
+    )
+    write_projection_stats(
+        tmp_path,
+        [],
+        market="US",
+        simulation_cutoff="2026-08-24T16:00:00+08:00",
+        actual_cutoff="2026-08-24T16:00:00+08:00",
+    )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "US")
+
+    assert projection["common_cutoff"] is None
+    assert projection["metrics"]["period_net_return"]["discipline"]["value"] is not None
+    assert projection["metrics"]["period_net_return"]["actual"]["value"] is None
+
+
+@pytest.mark.parametrize(
+    ("market", "broker", "account_id", "hour"),
+    [
+        ("CN", "eastmoney", "eastmoney_main", 15),
+        ("HK", "phillips", "phillips_main", 16),
+    ],
+)
+def test_cn_hk_actual_metric_cutoff_unavailable_with_statement_rounds(
+    tmp_path: Path,
+    market: str,
+    broker: str,
+    account_id: str,
+    hour: int,
+) -> None:
+    write_projection_metric_history(
+        tmp_path, market, discipline_days=2, actual_days=2, benchmark_days=2
+    )
+    start = date.fromisoformat(trend_review.TREND_V1_EFFECTIVE_FROM[market])
+    fills = [
+        projection_stats_fill(
+            "ROUND",
+            source="actual",
+            broker=broker,
+            account_id=account_id,
+            market=market,
+            strategy_version="v3",
+            side=side,
+            filled_at=(
+                f"{(start + timedelta(days=index)).isoformat()}T{hour:02d}:00:00+08:00"
+            ),
+            statement_sequence=index + 1,
+        )
+        for index, side in enumerate(("buy", "sell"))
+    ]
+    write_projection_stats(
+        tmp_path,
+        fills,
+        market=market,
+        actual_cutoff="2026-08-24T16:00:00+08:00",
+    )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, market)
+
+    assert projection["sample_counts"]["actual"] == 1
+    assert projection["metric_cutoffs"]["actual"] is None
+    assert projection["metrics"]["period_net_return"]["actual"] == {
+        "value": None,
+        "reason": "实际执行日终净值缺失",
+    }
+
+
 def test_projection_does_not_mix_strategy_versions(tmp_path: Path) -> None:
     write_separate_review_facts(tmp_path, discipline_count=31, actual_count=31)
     path = tmp_path / "trend_review/facts/discipline/CN/2026-08-15.json"
@@ -9530,7 +10106,8 @@ def test_projection_does_not_mix_strategy_versions(tmp_path: Path) -> None:
 
     assert projection["strategy_snapshot"]["strategy_version"] == "v3"
     assert projection["strategy_snapshot"]["effective_from"] == "2026-07-20"
-    assert projection["sample_counts"]["discipline"] == 30
+    assert projection["sample_counts"]["discipline"] is None
+    assert projection["metric_cutoffs"]["discipline"] == "2026-08-14"
 
 
 @pytest.mark.parametrize("stream", ["discipline", "actual_equity"])
@@ -9550,8 +10127,8 @@ def test_projection_excludes_v1_facts_with_wrong_strategy_id(
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
     assert projection["sample_counts"] == {
-        "discipline": 30,
-        "actual": 30,
+        "discipline": None,
+        "actual": None,
         "required": 30,
     }
 
@@ -9626,8 +10203,8 @@ def test_projection_shows_current_strategy_before_first_effective_sample(
 
     assert projection["common_cutoff"] is None
     assert projection["sample_counts"] == {
-        "discipline": 0,
-        "actual": 0,
+        "discipline": None,
+        "actual": None,
         "required": 30,
     }
     assert projection["strategy_snapshot"] == trend_strategy_snapshot(
@@ -9651,7 +10228,7 @@ def test_close_report_rejects_wrong_strategy_market_or_effective_date(
         )
 
 
-def test_projection_snapshot_ignores_facts_after_common_cutoff(
+def test_projection_snapshot_uses_latest_fact_without_common_cutoff_gating(
     tmp_path: Path,
 ) -> None:
     write_separate_review_facts(
@@ -9671,15 +10248,17 @@ def test_projection_snapshot_ignores_facts_after_common_cutoff(
 
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
-    assert projection["common_cutoff"] == "2026-07-17"
-    assert projection["strategy_snapshot"]["process_version"] == "test-sha"
+    assert projection["common_cutoff"] is None
+    assert projection["strategy_snapshot"]["process_version"] == "future-sha"
     assert projection["strategy_snapshot"] == trend_strategy_snapshot(
-        "CN", "test-sha", ()
+        "CN", "future-sha", ()
     )
     assert projection["strategy_snapshot"]["strategy_version"] == "v3"
 
 
-def test_late_opening_fact_never_backfills_an_earlier_sell(tmp_path: Path) -> None:
+def test_projection_does_not_rebuild_actual_samples_from_legacy_fills(
+    tmp_path: Path,
+) -> None:
     write_review_history(tmp_path, completed_trades=0, days=2)
     snapshot = strategy_snapshot()
     trend_review.freeze_actual_equity_fact(
@@ -9698,5 +10277,6 @@ def test_late_opening_fact_never_backfills_an_earlier_sell(tmp_path: Path) -> No
         coverage_start="2026-07-16",
     )
 
-    with pytest.raises(ValueError, match="sell fill exceeds actual position"):
-        trend_review.build_trend_review_projection(tmp_path, "CN")
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["sample_counts"]["actual"] is None
