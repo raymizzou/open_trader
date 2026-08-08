@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta, timezone
@@ -20,6 +21,7 @@ StoreHistoryKind = Literal["signals", "executions", "incidents"]
 SignalHistoryWindow = Literal["24h", "7d", "30d", "all"]
 
 _BUSY_TIMEOUT_MS = 5_000
+_LLM_USAGE_RETENTION = timedelta(days=7)
 _PREVIEW_TTL = timedelta(seconds=10)
 _TERMINAL_EXECUTION_STATES = (
     "both_rejected",
@@ -268,6 +270,9 @@ class PredictionArbitrageStore:
         with self._read_connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             self._create_schema(connection)
+        self._cache_hits: dict[str, int] = {}
+        self._cache_hits_lock = threading.Lock()
+        self.prune_llm_usage()
 
     def _connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -1194,18 +1199,23 @@ class PredictionArbitrageStore:
     def record_llm_cache_hit(self, *, provider: str = "codex") -> None:
         if not isinstance(provider, str) or not provider.strip():
             raise ValueError("provider must be a non-empty string")
-        with self._transaction() as connection:
+        with self._cache_hits_lock:
+            self._cache_hits[provider.strip()] = (
+                self._cache_hits.get(provider.strip(), 0) + 1
+            )
+
+    def _cache_hit_snapshot(self) -> tuple[int, dict[str, int]]:
+        with self._cache_hits_lock:
+            return sum(self._cache_hits.values()), dict(self._cache_hits)
+
+    def prune_llm_usage(
+        self, *, retention: timedelta = _LLM_USAGE_RETENTION
+    ) -> None:
+        cutoff = _canonical_timestamp(_parse_timestamp(_utc_now()) - retention)
+        with self._read_connection() as connection:
             connection.execute(
-                """
-                INSERT INTO llm_usage(
-                    usage_id, kind, status, payload, created_at
-                ) VALUES (?, 'cache_hit', 'success', ?, ?)
-                """,
-                (
-                    _new_id(),
-                    _dump_payload({"provider": provider.strip()}),
-                    _utc_now(),
-                ),
+                "DELETE FROM llm_usage WHERE kind='cache_hit' OR created_at < ?",
+                (cutoff,),
             )
 
     def llm_usage_24h(self) -> dict[str, int]:
@@ -1230,7 +1240,7 @@ class PredictionArbitrageStore:
                 (cutoff,),
             ).fetchone()
         assert row is not None
-        return {
+        result = {
             field: int(row[field])
             for field in (
                 "calls",
@@ -1243,6 +1253,9 @@ class PredictionArbitrageStore:
                 "reasoning_output_tokens",
             )
         }
+        cache_hits, _ = self._cache_hit_snapshot()
+        result["cache_hits"] = cache_hits
+        return result
 
     def llm_usage_24h_by_provider(self) -> dict[str, dict[str, int]]:
         cutoff = _canonical_timestamp(
@@ -1278,10 +1291,15 @@ class PredictionArbitrageStore:
             "output_tokens",
             "reasoning_output_tokens",
         )
-        return {
+        result = {
             str(row["provider"]): {field: int(row[field]) for field in fields}
             for row in rows
         }
+        _, memory_hits = self._cache_hit_snapshot()
+        for provider, count in memory_hits.items():
+            counts = result.setdefault(provider, {field: 0 for field in fields})
+            counts["cache_hits"] = count
+        return result
 
     def create_preview(self, payload: Mapping[str, object], *, expires_at: str) -> str:
         encoded = _dump_execution_payload(payload)

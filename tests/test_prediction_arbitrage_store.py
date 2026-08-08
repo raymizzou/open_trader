@@ -1401,6 +1401,55 @@ def test_llm_usage_rejects_unknown_status(
         store(tmp_path).record_llm_call(status=status, usage={})
 
 
+def test_llm_usage_cache_hits_are_memory_only(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    db.record_llm_cache_hit()
+    db.record_llm_cache_hit(provider="deepseek")
+    with db._read_connection() as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM llm_usage WHERE kind='cache_hit'"
+        ).fetchone()
+    assert int(row[0]) == 0
+    assert db.llm_usage_24h()["cache_hits"] == 2
+    by_provider = db.llm_usage_24h_by_provider()
+    assert by_provider["codex"]["cache_hits"] == 1
+    assert by_provider["deepseek"]["cache_hits"] == 1
+
+
+def test_llm_usage_prune_keeps_recent_calls_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        "open_trader.prediction_arbitrage_store._utc_now", lambda: iso(now)
+    )
+    db = store(tmp_path)
+    db.record_llm_call(status="success", usage={})
+    with db._transaction() as connection:
+        connection.execute(
+            "INSERT INTO llm_usage(usage_id, kind, status, payload, created_at) "
+            "VALUES (?, 'call', 'success', ?, ?)",
+            ("old-call", "{}", iso(now - timedelta(days=8))),
+        )
+        connection.execute(
+            "INSERT INTO llm_usage(usage_id, kind, status, payload, created_at) "
+            "VALUES (?, 'cache_hit', 'success', ?, ?)",
+            ("legacy-hit", '{"provider": "codex"}', iso(now - timedelta(hours=1))),
+        )
+    db.prune_llm_usage()
+    with db._read_connection() as connection:
+        rows = connection.execute(
+            "SELECT usage_id, kind FROM llm_usage ORDER BY usage_id"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "call"
+    assert rows[0]["usage_id"] != "old-call"
+    # Startup also prunes, and the memory counter starts fresh on a new instance.
+    db2 = store(tmp_path)
+    assert db2.llm_usage_24h()["calls"] == 1
+    assert db2.llm_usage_24h()["cache_hits"] == 0
+
+
 def test_histories_are_newest_first_for_all_kinds(tmp_path: Path) -> None:
     db = store(tmp_path)
     now = datetime.now(UTC)
