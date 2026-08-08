@@ -1247,7 +1247,6 @@ def _attempt_market_report(
                         "staged_snapshot_requests": [
                             dict(trace) for trace in staged.request_trace
                         ],
-                        "industry_fields": list(A_SHARE_INDUSTRY_FIELDS),
                     }
                     if staged is not None
                     else {

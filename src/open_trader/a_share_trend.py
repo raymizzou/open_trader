@@ -8838,9 +8838,11 @@ def _attempt_report(
                         ],
                     }
                     if staged is not None
-                    else {"snapshot_fields": list(fields)}
+                    else {
+                        "snapshot_fields": list(fields),
+                        "industry_fields": list(A_SHARE_INDUSTRY_FIELDS),
+                    }
                 ),
-                "industry_fields": list(A_SHARE_INDUSTRY_FIELDS),
                 **(
                     {
                         "industry_member_fields": list(INDUSTRY_MEMBER_FIELDS),
