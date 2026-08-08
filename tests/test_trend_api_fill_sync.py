@@ -19,7 +19,10 @@ from open_trader.trend_api_stats import (
     _tiger_transaction_record,
     build_trend_api_stats_payload,
     load_trend_api_stats,
+    run_trend_statistics_cycle,
     sync_trend_api_stats,
+    trend_statistics_cutoff_at,
+    trend_statistics_cycle_path,
     write_trend_api_stats,
 )
 from open_trader.trend_review import _report_hash, _write_action_event
@@ -727,3 +730,91 @@ def test_sync_uses_frozen_attribution_merges_idempotently_and_writes_canonical_a
     assert any(source["broker"] == "eastmoney" for source in payload["sources"])
     assert load_trend_api_stats(tmp_path / "data") == payload
     assert (tmp_path / "data/latest/trend_api_stats.json").is_file()
+
+
+class RecordingCycleClient:
+    def __init__(self, *, account_id: str = "101", fail_once: bool = False) -> None:
+        self.account_id = account_id
+        self.fail_once = fail_once
+        self.calls: list[dict[str, object]] = []
+
+    def fetch_fills(
+        self,
+        *,
+        start: str,
+        end: str,
+        attributions_by_order: dict[str, dict[str, object]],
+    ) -> dict[str, object]:
+        self.calls.append({
+            "start": start,
+            "end": end,
+            "attributions_by_order": dict(attributions_by_order),
+        })
+        if self.fail_once:
+            self.fail_once = False
+            raise RuntimeError("broker unavailable")
+        return {"account_id": self.account_id, "orders_seen": 0, "fills": []}
+
+
+def cycle_kwargs(
+    tmp_path: Path,
+    *,
+    market: str,
+    futu_client: RecordingCycleClient,
+    tiger_client: RecordingCycleClient | None = None,
+) -> dict[str, object]:
+    return {
+        "data_dir": tmp_path / "data",
+        "reports_dir": tmp_path / "reports",
+        "market": market,
+        "as_of_date": "2026-08-08",
+        "generated_at": "2026-08-09T08:00:00+08:00",
+        "process_git_sha": "abc1234",
+        "futu_client": futu_client,
+        "tiger_client": tiger_client,
+    }
+
+
+def test_completed_cycle_is_not_recomputed_without_explicit_force(tmp_path: Path) -> None:
+    client = RecordingCycleClient()
+    kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=client)
+
+    first = run_trend_statistics_cycle(**kwargs)
+    repeated = run_trend_statistics_cycle(**(kwargs | {"process_git_sha": "def5678"}))
+
+    assert first["status"] == "completed"
+    assert repeated["status"] == "already_completed"
+    assert len(client.calls) == 1
+    assert trend_statistics_cycle_path(
+        tmp_path / "data", "CN", "2026-08-08"
+    ).is_file()
+    assert not (tmp_path / "data/trend_api_stats/missed").exists()
+
+
+def test_force_requires_actor_and_reason(tmp_path: Path) -> None:
+    kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=RecordingCycleClient())
+    run_trend_statistics_cycle(**kwargs)
+
+    with pytest.raises(ValueError, match="force requires actor and reason"):
+        run_trend_statistics_cycle(**kwargs, force=True)
+
+
+def test_failed_cycle_retries_and_downtime_uses_one_range_request(tmp_path: Path) -> None:
+    client = RecordingCycleClient(fail_once=True)
+    kwargs = cycle_kwargs(
+        tmp_path,
+        market="US",
+        futu_client=client,
+        tiger_client=RecordingCycleClient(account_id="U1"),
+    )
+
+    assert run_trend_statistics_cycle(**kwargs)["status"] == "failed"
+    assert run_trend_statistics_cycle(**kwargs)["status"] == "completed"
+    assert len(client.calls) == 2
+    assert client.calls[-1]["end"] == kwargs["as_of_date"]
+
+
+def test_cycle_cutoffs_are_market_local_closes() -> None:
+    assert trend_statistics_cutoff_at("CN", "2026-08-08") == "2026-08-08T15:00:00+08:00"
+    assert trend_statistics_cutoff_at("HK", "2026-08-08") == "2026-08-08T16:00:00+08:00"
+    assert trend_statistics_cutoff_at("US", "2026-08-08") == "2026-08-08T16:00:00-04:00"

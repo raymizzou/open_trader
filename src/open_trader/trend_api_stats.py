@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from .kelly_order_execution import (
     FutuSimulateOrderExecutionClient,
 )
+from .daily_premarket import RunLock
 from .kelly_trade_samples import _write_json_atomic
 from .tiger_account import TigerAccountClient, TigerAccountError
 from .trend_kelly import trend_kelly_identity_matches
@@ -21,6 +22,7 @@ from .trend_simulate_positions import _action_events
 
 
 TREND_API_STATS_SCHEMA_VERSION = "open_trader.trend_api_stats.v1"
+STATISTICS_CYCLE_SCHEMA = "open_trader.trend_api_stats.cycle.v1"
 _CALCULATION_CONTEXT = Context(prec=28)
 _MARKET_TIMEZONES = {
     "CN": ZoneInfo("Asia/Shanghai"),
@@ -461,7 +463,7 @@ def sync_trend_api_stats(
     data_dir: Any,
     reports_dir: Any,
     futu_clients: Mapping[str, object],
-    tiger_client: object,
+    tiger_client: object | None = None,
     start: str,
     end: str,
     generated_at: str,
@@ -497,54 +499,229 @@ def sync_trend_api_stats(
             "statistics_cutoff_at": statistics_cutoff_at,
             "status": "available",
         })
-    tiger_result = tiger_client.fetch_fills(
-        start=start,
-        end=end,
-        attributions_by_order={},
+    if tiger_client is not None:
+        tiger_result = tiger_client.fetch_fills(
+            start=start,
+            end=end,
+            attributions_by_order={},
+        )
+        tiger_fills = _attribute_actual_fills(_result_fills(tiger_result), facts)
+        fetched_fills.extend(tiger_fills)
+        tiger_account = str(
+            tiger_result.get("account_id")
+            or (tiger_fills[0].get("account_id") if tiger_fills else "")
+        )
+        tiger_source_id = str(
+            tiger_result.get("source_id") or f"actual:tiger:{tiger_account}"
+        )
+        sources.append({
+            "source": "actual",
+            "source_id": tiger_source_id,
+            "broker": "tiger",
+            "account_id": tiger_account,
+            "market": "US",
+            "orders_seen": int(tiger_result.get("orders_seen", 0)),
+            "fill_count": len(tiger_fills),
+            "statistics_cutoff_at": statistics_cutoff_at,
+            "status": "available",
+        })
+    with RunLock(data_dir / "trend_statement_consumption/.stats.lock", wait=True):
+        path = data_dir / "latest" / "trend_api_stats.json"
+        existing_fills: list[Mapping[str, object]] = []
+        existing_sources: list[Mapping[str, object]] = []
+        if path.exists():
+            existing = load_trend_api_stats(data_dir)
+            existing_fills = list(existing["fills"])
+            existing_sources = list(existing["sources"])
+        strategy_versions = sorted({
+            (str(fact["market"]), str(fact["strategy_id"]), str(fact["strategy_version"]))
+            for fact in facts
+        })
+        payload = build_trend_api_stats_payload(
+            _merge_synced_fills(existing_fills, fetched_fills),
+            strategy_versions=[
+                {"market": market, "strategy_id": strategy_id, "strategy_version": version}
+                for market, strategy_id, version in strategy_versions
+            ],
+            generated_at=generated_at,
+            statistics_cutoff_at=statistics_cutoff_at,
+        )
+        payload["sources"] = _merge_source_audits(existing_sources, sources)
+        write_trend_api_stats(data_dir, payload)
+        published, _ = read_trend_api_stats_snapshot(data_dir)
+        if published != payload:
+            raise ValueError("trend_api_stats readback mismatch")
+        return payload
+
+
+def trend_statistics_cycle_path(
+    data_dir: Path, market: str, as_of_date: str
+) -> Path:
+    normalized_market, normalized_date = _cycle_market_date(market, as_of_date)
+    return _path(data_dir) / "trend_api_stats" / "daily" / normalized_market / f"{normalized_date}.json"
+
+
+def trend_statistics_cutoff_at(market: str, as_of_date: str) -> str:
+    normalized_market, normalized_date = _cycle_market_date(market, as_of_date)
+    close = time(15 if normalized_market == "CN" else 16)
+    return datetime.combine(
+        date.fromisoformat(normalized_date), close, _MARKET_TIMEZONES[normalized_market]
+    ).isoformat()
+
+
+def run_trend_statistics_cycle(
+    *,
+    data_dir: Path,
+    reports_dir: Path,
+    market: str,
+    as_of_date: str,
+    generated_at: str,
+    process_git_sha: str,
+    futu_client: object,
+    tiger_client: object | None = None,
+    force: bool = False,
+    actor: str = "",
+    reason: str = "",
+) -> dict[str, object]:
+    normalized_market, normalized_date = _cycle_market_date(market, as_of_date)
+    state_path = trend_statistics_cycle_path(data_dir, normalized_market, normalized_date)
+    previous = _read_optional_json(state_path)
+    if previous.get("status") == "completed" and not force:
+        return {**previous, "status": "already_completed"}
+    if force and (not actor.strip() or not reason.strip()):
+        raise ValueError("force requires actor and reason")
+    cutoff = trend_statistics_cutoff_at(normalized_market, normalized_date)
+    start, end = _statistics_fetch_range(
+        _path(data_dir), _path(reports_dir), normalized_market, normalized_date
     )
-    tiger_fills = _attribute_actual_fills(_result_fills(tiger_result), facts)
-    fetched_fills.extend(tiger_fills)
-    tiger_account = str(
-        tiger_result.get("account_id")
-        or (tiger_fills[0].get("account_id") if tiger_fills else "")
+    try:
+        if normalized_market == "US" and tiger_client is None:
+            raise ValueError("US statistics cycle requires Tiger actual client")
+        payload = sync_trend_api_stats(
+            data_dir=data_dir,
+            reports_dir=reports_dir,
+            futu_clients={normalized_market: futu_client},
+            tiger_client=tiger_client if normalized_market == "US" else None,
+            start=start,
+            end=end,
+            generated_at=generated_at,
+            statistics_cutoff_at=cutoff,
+        )
+        published, artifact_sha256 = read_trend_api_stats_snapshot(data_dir)
+        if published != payload:
+            raise ValueError("trend_api_stats readback mismatch")
+    except Exception as exc:
+        return _write_failed_cycle_state(
+            state_path, previous, exc, generated_at, process_git_sha
+        )
+    return _write_completed_cycle_state(
+        state_path, previous, cutoff, artifact_sha256, generated_at, process_git_sha,
+        actor if force else "", reason if force else "",
     )
-    tiger_source_id = str(
-        tiger_result.get("source_id") or f"actual:tiger:{tiger_account}"
-    )
-    sources.append({
-        "source": "actual",
-        "source_id": tiger_source_id,
-        "broker": "tiger",
-        "account_id": tiger_account,
-        "market": "US",
-        "orders_seen": int(tiger_result.get("orders_seen", 0)),
-        "fill_count": len(tiger_fills),
-        "statistics_cutoff_at": statistics_cutoff_at,
-        "status": "available",
-    })
-    path = data_dir / "latest" / "trend_api_stats.json"
-    existing_fills: list[Mapping[str, object]] = []
-    existing_sources: list[Mapping[str, object]] = []
-    if path.exists():
-        existing = load_trend_api_stats(data_dir)
-        existing_fills = list(existing["fills"])
-        existing_sources = list(existing["sources"])
-    strategy_versions = sorted({
-        (str(fact["market"]), str(fact["strategy_id"]), str(fact["strategy_version"]))
-        for fact in facts
-    })
-    payload = build_trend_api_stats_payload(
-        _merge_synced_fills(existing_fills, fetched_fills),
-        strategy_versions=[
-            {"market": market, "strategy_id": strategy_id, "strategy_version": version}
-            for market, strategy_id, version in strategy_versions
-        ],
-        generated_at=generated_at,
-        statistics_cutoff_at=statistics_cutoff_at,
-    )
-    payload["sources"] = _merge_source_audits(existing_sources, sources)
-    write_trend_api_stats(data_dir, payload)
-    return payload
+
+
+def _cycle_market_date(market: str, as_of_date: str) -> tuple[str, str]:
+    normalized_market = str(market).strip().upper()
+    if normalized_market not in _MARKET_TIMEZONES:
+        raise ValueError(f"unsupported statistics market: {market}")
+    try:
+        normalized_date = date.fromisoformat(str(as_of_date)).isoformat()
+    except ValueError:
+        raise ValueError("statistics as_of_date is invalid") from None
+    return normalized_market, normalized_date
+
+
+def _read_optional_json(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _statistics_fetch_range(
+    data_dir: Path, reports_dir: Path, market: str, as_of_date: str
+) -> tuple[str, str]:
+    normalized_market, normalized_date = _cycle_market_date(market, as_of_date)
+    starts = [normalized_date]
+    try:
+        existing = read_trend_api_stats_snapshot(data_dir)[0]
+    except ValueError:
+        existing = None
+    if existing is not None:
+        for source in existing["sources"]:
+            if source["market"] != normalized_market:
+                continue
+            if source["source"] == "simulation" or (
+                normalized_market == "US" and source["broker"] == "tiger"
+            ):
+                starts.append(
+                    _aware_timestamp(
+                        source["statistics_cutoff_at"], "source statistics_cutoff_at"
+                    ).astimezone(_MARKET_TIMEZONES[normalized_market]).date().isoformat()
+                )
+    else:
+        starts.extend(
+            str(fact["execution_date"])
+            for fact in _load_frozen_strategy_facts(reports_dir)
+            if fact["market"] == normalized_market
+        )
+    return min(starts), normalized_date
+
+
+def _cycle_state_identity(path: Path) -> tuple[str, str]:
+    return path.parent.name, path.stem
+
+
+def _write_failed_cycle_state(
+    path: Path,
+    previous: Mapping[str, object],
+    error: Exception,
+    attempted_at: str,
+    process_git_sha: str,
+) -> dict[str, object]:
+    market, as_of_date = _cycle_state_identity(path)
+    state = {
+        "schema_version": STATISTICS_CYCLE_SCHEMA,
+        "status": "failed",
+        "market": market,
+        "as_of_date": as_of_date,
+        "attempt_count": int(previous.get("attempt_count", 0)) + 1,
+        "attempted_at": attempted_at,
+        "process_git_sha": process_git_sha,
+        "reason": str(error),
+    }
+    _write_json_atomic(path, state)
+    return state
+
+
+def _write_completed_cycle_state(
+    path: Path,
+    previous: Mapping[str, object],
+    cutoff: str,
+    artifact_sha256: str,
+    completed_at: str,
+    process_git_sha: str,
+    actor: str,
+    reason: str,
+) -> dict[str, object]:
+    market, as_of_date = _cycle_state_identity(path)
+    state: dict[str, object] = {
+        "schema_version": STATISTICS_CYCLE_SCHEMA,
+        "status": "completed",
+        "market": market,
+        "as_of_date": as_of_date,
+        "attempt_count": int(previous.get("attempt_count", 0)) + 1,
+        "completed_at": completed_at,
+        "process_git_sha": process_git_sha,
+        "statistics_cutoff_at": cutoff,
+        "artifact_sha256": artifact_sha256,
+    }
+    if actor:
+        state["actor"] = actor.strip()
+        state["reason"] = reason.strip()
+    _write_json_atomic(path, state)
+    return state
 
 
 def build_statement_actual_stats_payload(

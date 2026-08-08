@@ -120,7 +120,7 @@ from .technical_facts import LLMTechnicalFactsExtractor, generate_technical_fact
 from .trend_api_stats import (
     FutuSimulateFillClient,
     TigerActualFillClient,
-    sync_trend_api_stats,
+    run_trend_statistics_cycle,
 )
 from .tradingagents_summary import (
     LLMTradingAgentsSummaryExtractor,
@@ -460,8 +460,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
     sync_stats_parser = trend_review_commands.add_parser("sync-stats")
-    sync_stats_parser.add_argument("--start", type=canonical_date, required=True)
-    sync_stats_parser.add_argument("--end", type=canonical_date, required=True)
+    sync_stats_parser.add_argument("--market", choices=("CN", "HK", "US"), required=True)
+    sync_stats_parser.add_argument("--as-of-date", type=canonical_date, required=True)
+    sync_stats_parser.add_argument("--force", action="store_true")
+    sync_stats_parser.add_argument("--actor", default="")
+    sync_stats_parser.add_argument("--reason", default="")
     sync_stats_parser.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
@@ -1704,33 +1707,35 @@ def main(argv: list[str] | None = None) -> int:
             if args.trend_review_command == "replay":
                 result = run_trend_review_replay(config, args.evidence)
             else:
-                futu_clients = {}
-                for market in ("CN", "HK", "US"):
-                    client = FutuSimulateFillClient(
-                        host=config.futu_host,
-                        port=config.futu_port,
-                        simulate_acc_id=require_trend_review_config(config, market),
-                        trd_market=market,
-                    )
-                    futu_clients[market] = client
-                    stats_clients.append(client)
-                tiger_config = load_tiger_account_config(
-                    config_dir=args.tiger_config_dir,
-                    account=args.tiger_account,
-                    sandbox=False,
+                futu_client = FutuSimulateFillClient(
+                    host=config.futu_host,
+                    port=config.futu_port,
+                    simulate_acc_id=require_trend_review_config(config, args.market),
+                    trd_market=args.market,
                 )
-                tiger_client = TigerActualFillClient(config=tiger_config)
-                stats_clients.append(tiger_client)
+                stats_clients.append(futu_client)
+                tiger_client = None
+                if args.market == "US":
+                    tiger_config = load_tiger_account_config(
+                        config_dir=args.tiger_config_dir,
+                        account=args.tiger_account,
+                        sandbox=False,
+                    )
+                    tiger_client = TigerActualFillClient(config=tiger_config)
+                    stats_clients.append(tiger_client)
                 timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-                result = sync_trend_api_stats(
+                result = run_trend_statistics_cycle(
                     data_dir=config.data_dir,
                     reports_dir=config.reports_dir,
-                    futu_clients=futu_clients,
-                    tiger_client=tiger_client,
-                    start=args.start,
-                    end=args.end,
+                    market=args.market,
+                    as_of_date=args.as_of_date,
                     generated_at=timestamp,
-                    statistics_cutoff_at=timestamp,
+                    process_git_sha=_process_version(config.repo),
+                    futu_client=futu_client,
+                    tiger_client=tiger_client,
+                    force=args.force,
+                    actor=args.actor,
+                    reason=args.reason,
                 )
         except (FileNotFoundError, ValueError, RuntimeError, FutuQuoteError) as exc:
             print(str(exc), file=sys.stderr)
@@ -1739,11 +1744,10 @@ def main(argv: list[str] | None = None) -> int:
             for client in stats_clients:
                 client.close()
         if args.trend_review_command == "sync-stats":
-            print(f"fills: {len(result['fills'])}")
-            print(f"rounds: {len(result['rounds'])}")
-            print(f"stats: {len(result['stats'])}")
+            print(f"status: {result['status']}")
+            print(f"statistics_cutoff_at: {result.get('statistics_cutoff_at', '')}")
             print(f"latest: {config.data_dir / 'latest' / 'trend_api_stats.json'}")
-            return 0
+            return 1 if result["status"] == "failed" else 0
         print(json.dumps(result, ensure_ascii=False))
         return 0
 
