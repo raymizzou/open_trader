@@ -6546,6 +6546,9 @@ def test_controller_close_capture_rebuilds_failed_shared_account_on_retry(
         lambda *_args, **_kwargs: protection_success(),
     )
     monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    monkeypatch.setattr(
+        controller, "_run_cycle_statistics", lambda *_args: {"status": "completed"}
+    )
     monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
     monkeypatch.setattr(controller, "benchmark_fact", lambda *_args: {})
     monkeypatch.setattr(controller, "capture_trend_review_close", capture)
