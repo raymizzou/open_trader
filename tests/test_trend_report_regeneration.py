@@ -34,6 +34,7 @@ def _config(tmp_path: Path) -> SimpleNamespace:
         data_dir=tmp_path / "data",
         run_date="2026-08-07",
         timezone="Asia/Shanghai",
+        allocation_reference={"fake": True},
     )
 
 

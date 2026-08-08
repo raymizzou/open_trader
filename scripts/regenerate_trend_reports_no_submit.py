@@ -17,7 +17,7 @@ import re
 import shutil
 import tempfile
 from collections.abc import Mapping
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -54,6 +54,42 @@ def _run_date(config: object) -> str:
         return value
     timezone = ZoneInfo(str(getattr(config, "timezone", "Asia/Shanghai")))
     return datetime.now(timezone).date().isoformat()
+
+
+def _allocation_reference(config: object, run_date: str) -> Mapping[str, object]:
+    configured = getattr(config, "allocation_reference", None)
+    if configured is not None:
+        if not isinstance(configured, Mapping):
+            raise ValueError("configured allocation reference is invalid")
+        return configured
+
+    # The allocation controller owns the decision.  Read its immutable
+    # terminal reference; do not create or update an allocation here.
+    from open_trader.futu_quote import FutuQuoteClient
+    from open_trader.trend_allocation import allocation_reference_for_report
+
+    quote = FutuQuoteClient(
+        host=str(config.futu_host), port=int(config.futu_port)
+    )
+    try:
+        day = date.fromisoformat(run_date)
+        trading_days = quote.get_trading_days(
+            market="CN",
+            start=(day - timedelta(days=35)).isoformat(),
+            end=(day + timedelta(days=1)).isoformat(),
+        )
+        reference = allocation_reference_for_report(
+            config,
+            allocation_date=run_date,
+            a_trading_days=trading_days,
+        )
+    finally:
+        close = getattr(quote, "close", None)
+        if callable(close):
+            close()
+    if not isinstance(reference, Mapping):
+        raise RuntimeError("allocation reference is unavailable")
+    return reference
 
 
 def _copy_reports(source_root: Path, stage_root: Path) -> None:
@@ -294,6 +330,7 @@ def stage_and_publish(config: DailyPremarketConfig, *, publish: bool = False) ->
     """
     reports_root = Path(config.reports_dir)
     run_date = _run_date(config)
+    allocation_reference = _allocation_reference(config, run_date)
     with tempfile.TemporaryDirectory(prefix="trend-report-stage-") as temporary:
         stage_root = Path(temporary) / "reports"
         _copy_reports(reports_root, stage_root)
@@ -314,6 +351,7 @@ def stage_and_publish(config: DailyPremarketConfig, *, publish: bool = False) ->
                     run_date=run_date,
                     revision=True,
                     notifier=notifier,
+                    allocation_reference=allocation_reference,
                 )
             else:
                 result = run_market_trend_report(
@@ -322,6 +360,7 @@ def stage_and_publish(config: DailyPremarketConfig, *, publish: bool = False) ->
                     run_date=run_date,
                     revision=True,
                     notifier=notifier,
+                    allocation_reference=allocation_reference,
                 )
             artifacts[market] = _validate_artifact(
                 market=market,
