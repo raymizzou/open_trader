@@ -8303,6 +8303,14 @@ def rebuild_trend_report_from_evidence(
         raise TrendReplayIncompleteError(
             "invalid original input: account_input"
         )
+    metadata_input = inputs["metadata"]
+    if not isinstance(metadata_input, Mapping):
+        raise TrendReplayIncompleteError("invalid original input: metadata")
+    critical_data_reason = metadata_input.get("industry_data_reason", "")
+    if not isinstance(critical_data_reason, str):
+        raise TrendReplayIncompleteError(
+            "invalid original input: metadata.industry_data_reason"
+        )
     report = build_report(
         as_of_date=str(inputs["as_of_date"]),
         execution_date=str(inputs["execution_date"]),
@@ -8322,7 +8330,7 @@ def rebuild_trend_report_from_evidence(
         actual_api_cost=decimal_or_none(inputs.get("actual_api_cost")),
         generated_at=str(inputs.get("generated_at") or "") or None,
         metadata={
-            **dict(inputs["metadata"]),
+            **dict(metadata_input),
             "process_version": process_version,
         },
         market=str(inputs["market"]),
@@ -8341,6 +8349,7 @@ def rebuild_trend_report_from_evidence(
         strategy_snapshot=replay_snapshot,
         kelly_rounds=kelly_rounds,
         kelly_data_reason=kelly_data_reason,
+        critical_data_reason=critical_data_reason,
         drawdown_summary=(
             inputs["drawdown_summary"]
             if strategy_version in {

@@ -219,6 +219,15 @@ class TrendKellyRound:
 
 
 @dataclass(frozen=True)
+class TrendKellyEvidence:
+    rounds: tuple[TrendKellyRound, ...]
+    status: str
+    artifact_sha256: str | None
+    statistics_cutoff_at: str | None
+    reason: str
+
+
+@dataclass(frozen=True)
 class TrendKellyState:
     phase: str
     eligible_sample_count: int
@@ -257,6 +266,23 @@ def load_trend_kelly_rounds(data_dir: Path) -> tuple[TrendKellyRound, ...]:
             f"trend_api_stats.json validation failed: {exc}"
         ) from None
     return trend_kelly_rounds_from_payload(payload)
+
+
+def load_trend_kelly_evidence(data_dir: Path) -> TrendKellyEvidence:
+    from .trend_api_stats import read_trend_api_stats_snapshot
+
+    try:
+        payload, digest = read_trend_api_stats_snapshot(data_dir)
+        rounds = trend_kelly_rounds_from_payload(payload)
+    except (OSError, ValueError) as exc:
+        return TrendKellyEvidence((), "unavailable", None, None, str(exc))
+    return TrendKellyEvidence(
+        rounds,
+        "available",
+        digest,
+        str(payload["statistics_cutoff_at"]),
+        "",
+    )
 
 
 def trend_kelly_rounds_from_payload(payload: object) -> tuple[TrendKellyRound, ...]:

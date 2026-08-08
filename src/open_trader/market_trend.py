@@ -66,7 +66,7 @@ from .daily_premarket import (
     send_notification_with_results,
 )
 from .kelly_order_execution import FutuSimulateOrderExecutionClient
-from .trend_kelly import load_trend_kelly_rounds
+from .trend_kelly import load_trend_kelly_evidence
 from .notifications import Notifier, NullNotifier
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_symbols import from_trend_animals_symbol, to_futu_symbol
@@ -940,12 +940,13 @@ def _attempt_market_report(
             and industry_field_prices_complete
         )
         watch_events = load_watch_events(paths.events)
-        try:
-            kelly_rounds = load_trend_kelly_rounds(config.data_dir)
-            kelly_data_reason = ""
-        except ValueError as exc:
-            kelly_rounds = ()
-            kelly_data_reason = f"Kelly 模拟闭环统计不可用，暂停新开仓：{exc}"
+        kelly_evidence = load_trend_kelly_evidence(config.data_dir)
+        kelly_rounds = kelly_evidence.rounds
+        kelly_data_reason = (
+            ""
+            if kelly_evidence.status == "available"
+            else f"Kelly 模拟闭环统计不可用，使用固定风险仓位：{kelly_evidence.reason}"
+        )
         generated_at = datetime.now(SHANGHAI).isoformat(timespec="seconds")
         drawdown_summary = observe_strategy_equity(
             config.data_dir,
@@ -1024,6 +1025,11 @@ def _attempt_market_report(
                 "run_date": run_date,
                 "process_version": process_version,
                 "paid_response_cache": cache_metadata,
+                "trend_statistics": {
+                    "status": kelly_evidence.status,
+                    "artifact_sha256": kelly_evidence.artifact_sha256,
+                    "statistics_cutoff_at": kelly_evidence.statistics_cutoff_at,
+                },
                 **(
                     {"symbol_mapping_schema": TREND_SYMBOL_MAPPING_SCHEMA}
                     if _supports_symbol_mapping_contract(api)
@@ -1044,7 +1050,8 @@ def _attempt_market_report(
                 ),
             },
             kelly_rounds=kelly_rounds,
-            kelly_data_reason=kelly_data_reason or industry_data_reason,
+            kelly_data_reason=kelly_data_reason,
+            critical_data_reason=industry_data_reason,
             real_holdings=real_holdings,
             allocation_reference=allocation_reference,
             account_input=_account_input(account_snapshot),
@@ -1100,7 +1107,7 @@ def _attempt_market_report(
             previous_attention_rows=previous_attention_rows,
             option_attention_broker_label=option_attention_broker_label,
             kelly_rounds=kelly_rounds,
-            kelly_data_reason=kelly_data_reason or industry_data_reason,
+            kelly_data_reason=kelly_data_reason,
             real_holdings_input=real_holdings,
         )
         report = replace(

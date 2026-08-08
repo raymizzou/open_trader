@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal
 
 import pytest
@@ -16,6 +17,7 @@ from open_trader.trend_kelly import (
     TREND_KELLY_SAMPLE_IDENTITIES,
     TrendKellyRound,
     calculate_trend_kelly,
+    load_trend_kelly_evidence,
     load_trend_kelly_rounds,
     maximize_average_log_growth,
     trend_kelly_identity_matches,
@@ -570,6 +572,34 @@ def test_stats_loader_treats_missing_artifact_as_cold_start(tmp_path) -> None:
     assert load_trend_kelly_rounds(tmp_path / "data") == ()
 
 
+def test_evidence_loader_marks_missing_and_corrupt_artifacts_unavailable(
+    tmp_path,
+) -> None:
+    data_dir = tmp_path / "data"
+
+    missing = load_trend_kelly_evidence(data_dir)
+
+    assert missing.rounds == ()
+    assert missing.status == "unavailable"
+    assert missing.artifact_sha256 is None
+    assert missing.statistics_cutoff_at is None
+    assert "missing" in missing.reason
+    with pytest.raises(FrozenInstanceError):
+        missing.status = "available"
+
+    path = data_dir / "latest/trend_api_stats.json"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"schema_version":"broken","rounds":[]}', encoding="utf-8")
+
+    corrupt = load_trend_kelly_evidence(data_dir)
+
+    assert corrupt.status == "unavailable"
+    assert corrupt.rounds == ()
+    assert corrupt.artifact_sha256 is None
+    assert corrupt.statistics_cutoff_at is None
+    assert "schema_version" in corrupt.reason
+
+
 def test_stats_loader_accepts_derived_rounds_and_rejects_tampering(tmp_path) -> None:
     data_dir = tmp_path / "data"
     common = {
@@ -622,8 +652,14 @@ def test_stats_loader_accepts_derived_rounds_and_rejects_tampering(tmp_path) -> 
     )
     path = write_trend_api_stats(data_dir, payload)
 
+    evidence = load_trend_kelly_evidence(data_dir)
     rounds = load_trend_kelly_rounds(data_dir)
 
+    assert evidence.status == "available"
+    assert evidence.rounds == rounds
+    assert evidence.artifact_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert evidence.statistics_cutoff_at == "2026-06-01T23:59:59+00:00"
+    assert evidence.reason == ""
     assert len(rounds) == 1
     assert rounds[0].net_return == Decimal("0.1")
 
