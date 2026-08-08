@@ -2187,6 +2187,9 @@ def test_prediction_arbitrage_state_history_and_strict_mutation_schema(tmp_path:
         def unacknowledged_incident(self) -> None:
             return None
 
+        def signal_history(self, _window: str) -> list[dict[str, object]]:
+            return self.histories("signals")
+
         def histories(self, kind: str) -> list[dict[str, object]]:
             return [{"kind": kind, "id": "one"}, {"kind": kind, "id": "two"}]
 
@@ -2307,6 +2310,9 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
 
         def unacknowledged_incident(self) -> None:
             return None
+
+        def signal_history(self, _window: str) -> list[dict[str, object]]:
+            return self.histories("signals")
 
         def cross_unsettled_principal(self) -> Decimal:
             return Decimal("35.20")
@@ -3153,7 +3159,7 @@ def test_prediction_arbitrage_projects_live_monitor_and_store_rows_for_ui() -> N
             return None
 
         def signal_history(self, _window: str) -> list[dict[str, object]]:
-            return [{"signal_id": "s-1"}, {"signal_id": "s-2"}]
+            return self.histories("signals") + [{"signal_id": "s-2"}]
 
         def load_runtime(self) -> dict[str, object]:
             return {"prediction_arbitrage": "ready", "first_live_order": "validated"}
@@ -4780,6 +4786,9 @@ def test_prediction_arbitrage_json_redacts_nested_secret_keys(tmp_path: Path) ->
 
         def unacknowledged_incident(self) -> None:
             return None
+
+        def signal_history(self, _window: str) -> list[dict[str, object]]:
+            return self.histories("signals")
 
         def histories(self, _kind: str) -> list[dict[str, object]]:
             return [{"api_key": "SECRET", "nested": {"access_token": "SECRET"}}]
@@ -6701,6 +6710,8 @@ def test_prediction_market_static_contract_is_present() -> None:
     assert "signalPollId" in js
     assert "signalRequestInFlight" in js
     assert "signalPollEpoch" in js
+    assert "loadPredictionHistory(\"signals\", {panelOnly: true});\n  }, 5000);" in js
+    assert "cache(本次运行)" in js
     assert "predictionTradingAvailable(currentState)" in js
     assert "row.live_profit ?? row.estimated_profit ?? row.profit" not in js
     for copy in ("免手续费", "可能只成交一腿", "24h 成交量"):
@@ -14305,6 +14316,89 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
     )["items"][0]
     assert refreshed["live_profit"] == "0.51"
     assert refreshed["initial_profit"] == "0.38"
+
+
+def test_prediction_history_title_lookup_is_memoized_per_request() -> None:
+    from open_trader.dashboard_web import _prediction_history_payload
+    from open_trader.prediction_title_translation import prediction_title_cache_key
+
+    title = "Will the event happen?"
+    rows = [
+        {
+            "signal_id": f"s-{i}",
+            "market_id": f"m-{i}",
+            "question": title,
+            "started_at": f"2026-08-01T10:0{i}:00Z",
+            "ended_at": None,
+            "initial_profit": "0.31",
+            "notification_state": "pending",
+        }
+        for i in range(3)
+    ]
+    lookups = 0
+
+    class FakeStore:
+        def histories(self, kind: str) -> list[dict[str, object]]:
+            assert kind == "signals"
+            return rows
+
+        def active_execution(self) -> None:
+            return None
+
+        def unacknowledged_incident(self) -> None:
+            return None
+
+        def signal_history(self, _window: str) -> list[dict[str, object]]:
+            return rows
+
+        def load_runtime(self) -> dict[str, object]:
+            return {}
+
+        def load_llm_cache(self, cache_key: str) -> dict[str, object] | None:
+            nonlocal lookups
+            lookups += 1
+            if cache_key == prediction_title_cache_key(title):
+                return {"title_zh": "这件事会发生吗？"}
+            return None
+
+    payload = _prediction_history_payload(
+        FakeStore(), kind="signals", limit=10, offset=0
+    )
+    assert lookups == 1
+    assert payload["items"][0]["event_title_zh"] == "这件事会发生吗？"
+    assert payload["items"][1]["event_title_zh"] == "这件事会发生吗？"
+
+
+def test_prediction_history_signals_use_thirty_day_window() -> None:
+    from open_trader.dashboard_web import _prediction_history_payload
+
+    class FakeStore:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def signal_history(self, window: str) -> list[dict[str, object]]:
+            self.calls.append(("signal_history", window))
+            return []
+
+        def histories(self, kind: str) -> list[dict[str, object]]:
+            self.calls.append(("histories", kind))
+            return []
+
+        def active_execution(self) -> None:
+            return None
+
+        def unacknowledged_incident(self) -> None:
+            return None
+
+        def load_runtime(self) -> dict[str, object]:
+            return {}
+
+    fake = FakeStore()
+    _prediction_history_payload(fake, kind="signals", limit=10, offset=0)
+    assert ("signal_history", "30d") in fake.calls
+
+    _prediction_history_payload(fake, kind="executions", limit=10, offset=0)
+    assert ("histories", "executions") in fake.calls
 
 
 @pytest.mark.parametrize(
