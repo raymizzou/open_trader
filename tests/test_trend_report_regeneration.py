@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,11 +31,14 @@ MARKETS = {
 
 def _config(tmp_path: Path) -> SimpleNamespace:
     return SimpleNamespace(
+        repo=tmp_path / "old-checkout",
         reports_dir=tmp_path / "reports",
         data_dir=tmp_path / "data",
         run_date="2026-08-07",
         timezone="Asia/Shanghai",
-        allocation_reference={"fake": True},
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        allocation_reference={"snapshot": {"allocation_date": "2026-08-07"}},
     )
 
 
@@ -67,7 +71,12 @@ def _fake_generator(calls: list[dict[str, object]], market: str):
         assert isinstance(notifier, NullNotifier)
         root = config.reports_dir / directory
         root.mkdir(parents=True, exist_ok=True)
-        stem = f"{run_date}-r1"
+        report_date = (
+            (date.fromisoformat(run_date) - timedelta(days=1)).isoformat()
+            if market == "US"
+            else run_date
+        )
+        stem = f"{report_date}-r1"
         json_path = root / f"{stem}.json"
         markdown_path = root / f"{stem}.md"
         payload = {
@@ -113,8 +122,66 @@ def test_stage_calls_all_markets_with_revision_and_does_not_publish(
     assert [call["market"] for call in calls] == ["CN", "HK", "US"]
     assert all(call["revision"] is True for call in calls)
     assert all(isinstance(call["notifier"], NullNotifier) for call in calls)
+    assert all(call["config"].repo == SCRIPT_PATH.parents[1] for call in calls)
     assert {path: path.read_bytes() for path in previous} == previous
     assert not list(config.reports_dir.rglob("*-r*.json"))
+
+
+def test_stage_uses_latest_allocation_date_for_each_market_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.futu_quote as futu_quote
+    import open_trader.trend_allocation as trend_allocation
+
+    config = _config(tmp_path)
+    config.run_date = "2026-08-09"
+    del config.allocation_reference
+    _seed_previous_reports(config)
+    calls: list[dict[str, object]] = []
+    reference = {"snapshot": {"allocation_date": "2026-08-07"}}
+
+    class Quote:
+        def __init__(self, **_kwargs):
+            pass
+
+        def get_trading_days(self, **_kwargs):
+            return ["2026-08-07"]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(futu_quote, "FutuQuoteClient", Quote)
+    monkeypatch.setattr(
+        trend_allocation,
+        "load_allocation_reference",
+        lambda *_args, **_kwargs: reference,
+    )
+    monkeypatch.setattr(
+        trend_allocation,
+        "allocation_reference_for_report",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("revision publisher must not require the current cycle")
+        ),
+    )
+    monkeypatch.setattr(
+        publisher,
+        "run_a_share_trend_report",
+        _fake_generator(calls, "CN"),
+    )
+    monkeypatch.setattr(
+        publisher,
+        "run_market_trend_report",
+        lambda **kwargs: _fake_generator(calls, kwargs["market"])(**kwargs),
+    )
+
+    manifest = publisher.stage_and_publish(config, publish=False)
+
+    assert manifest["run_date"] == "2026-08-07"
+    assert [(call["market"], call["run_date"]) for call in calls] == [
+        ("CN", "2026-08-07"),
+        ("HK", "2026-08-07"),
+        ("US", "2026-08-08"),
+    ]
 
 
 def test_market_failure_blocks_every_publication(

@@ -25,7 +25,8 @@ from zoneinfo import ZoneInfo
 
 # Run against this checkout even when the shared virtualenv has another
 # worktree installed in editable mode.
-_SRC = str(Path(__file__).resolve().parents[1] / "src")
+_CHECKOUT_ROOT = Path(__file__).resolve().parents[1]
+_SRC = str(_CHECKOUT_ROOT / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
@@ -68,12 +69,13 @@ def _allocation_reference(config: object, run_date: str) -> Mapping[str, object]
     if configured is not None:
         if not isinstance(configured, Mapping):
             raise ValueError("configured allocation reference is invalid")
+        _allocation_date(configured)
         return configured
 
     # The allocation controller owns the decision.  Read its immutable
     # terminal reference; do not create or update an allocation here.
     from open_trader.futu_quote import FutuQuoteClient
-    from open_trader.trend_allocation import allocation_reference_for_report
+    from open_trader.trend_allocation import load_allocation_reference
 
     quote = FutuQuoteClient(
         host=str(config.futu_host), port=int(config.futu_port)
@@ -85,10 +87,11 @@ def _allocation_reference(config: object, run_date: str) -> Mapping[str, object]
             start=(day - timedelta(days=35)).isoformat(),
             end=(day + timedelta(days=1)).isoformat(),
         )
-        reference = allocation_reference_for_report(
-            config,
+        reference = load_allocation_reference(
+            config.data_dir,
             allocation_date=run_date,
             a_trading_days=trading_days,
+            status_failure_reason=None,
         )
     finally:
         close = getattr(quote, "close", None)
@@ -96,7 +99,28 @@ def _allocation_reference(config: object, run_date: str) -> Mapping[str, object]
             close()
     if not isinstance(reference, Mapping):
         raise RuntimeError("allocation reference is unavailable")
+    if reference.get("stale_a_trading_days") not in (None, 0):
+        raise RuntimeError("latest allocation reference is stale")
+    allocation_date = _allocation_date(reference)
+    if allocation_date != run_date:
+        reference = load_allocation_reference(
+            config.data_dir,
+            allocation_date=allocation_date,
+            a_trading_days=trading_days,
+            status_failure_reason=None,
+        )
+        if not isinstance(reference, Mapping):
+            raise RuntimeError("allocation reference is unavailable")
     return reference
+
+
+def _allocation_date(reference: Mapping[str, object]) -> str:
+    snapshot = reference.get("snapshot")
+    value = snapshot.get("allocation_date") if isinstance(snapshot, Mapping) else None
+    if not isinstance(value, str):
+        raise ValueError("allocation reference has no date")
+    date.fromisoformat(value)
+    return value
 
 
 def _copy_reports(source_root: Path, stage_root: Path) -> None:
@@ -112,8 +136,11 @@ def _copy_reports(source_root: Path, stage_root: Path) -> None:
 
 def _with_reports_dir(config: object, reports_dir: Path) -> object:
     if dataclasses.is_dataclass(config):
-        return dataclasses.replace(config, reports_dir=reports_dir)
+        return dataclasses.replace(
+            config, repo=_CHECKOUT_ROOT, reports_dir=reports_dir
+        )
     copied = copy.copy(config)
+    setattr(copied, "repo", _CHECKOUT_ROOT)
     setattr(copied, "reports_dir", reports_dir)
     return copied
 
@@ -344,7 +371,13 @@ def stage_and_publish(config: DailyPremarketConfig, *, publish: bool = False) ->
         staged_config = _with_reports_dir(config, stage_root)
         artifacts: dict[str, dict[str, object]] = {}
 
+        allocation_date = _allocation_date(allocation_reference)
         for market in ("CN", "HK", "US"):
+            market_run_date = (
+                (date.fromisoformat(allocation_date) + timedelta(days=1)).isoformat()
+                if market == "US"
+                else allocation_date
+            )
             directory = stage_root / REPORT_DIRECTORIES[market]
             before = {
                 path: path.read_bytes()
@@ -355,7 +388,7 @@ def stage_and_publish(config: DailyPremarketConfig, *, publish: bool = False) ->
             if market == "CN":
                 result = run_a_share_trend_report(
                     config=staged_config,
-                    run_date=run_date,
+                    run_date=market_run_date,
                     revision=True,
                     notifier=notifier,
                     allocation_reference=allocation_reference,
@@ -364,7 +397,7 @@ def stage_and_publish(config: DailyPremarketConfig, *, publish: bool = False) ->
                 result = run_market_trend_report(
                     config=staged_config,
                     market=market,
-                    run_date=run_date,
+                    run_date=market_run_date,
                     revision=True,
                     notifier=notifier,
                     allocation_reference=allocation_reference,
@@ -378,7 +411,7 @@ def stage_and_publish(config: DailyPremarketConfig, *, publish: bool = False) ->
 
         manifest: dict[str, object] = {
             "status": "PASS",
-            "run_date": run_date,
+            "run_date": allocation_date,
             "published": False,
             "submitted_orders": 0,
             "markets": {
