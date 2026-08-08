@@ -7,6 +7,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+import open_trader.cli as cli
+from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install_dashboard_launchd.sh"
@@ -216,3 +221,149 @@ def test_prediction_status_command_is_registered() -> None:
     assert 'add_parser("status"' in source
     assert "event_count" in source
     assert "masked_wallet" in source
+
+
+class _JsonResponse:
+    status = 200
+
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = payload
+
+    def __enter__(self) -> "_JsonResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        import json
+
+        return json.dumps(self._payload).encode("utf-8")
+
+
+def _arm_ready_state() -> dict[str, object]:
+    return {
+        "status": "healthy",
+        "cross_venue": {"status": "ready", "breaker": {"open": False}},
+        "venues": [
+            {"venue": "polymarket", "rest": "ready", "ws": "ready"},
+            {"venue": "predict.fun", "rest": "ready", "ws": "ready"},
+        ],
+        "breaker": {"open": False},
+        "current_execution": None,
+        "cross_auto": {
+            "configured_mode": "auto_submit",
+            "notification_ready": True,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    (
+        (("health_status", "bad"), "healthz_unavailable"),
+        (("sha", "other-sha"), "git_sha_mismatch"),
+        (("dirty", "dirty"), "source_dirty"),
+        (("cross", "degraded"), "cross_venue_not_ready"),
+        (("poly_rest", "stale"), "polymarket_rest_not_ready"),
+        (("poly_ws", "stale"), "polymarket_ws_not_ready"),
+        (("predict_rest", "stale"), "predict_fun_rest_not_ready"),
+        (("predict_ws", "stale"), "predict_fun_ws_not_ready"),
+        (("breaker", True), "breaker_open"),
+        (("active", {"state": "running"}), "active_execution"),
+        (("mode", "manual_confirm"), "configured_mode_not_auto_submit"),
+        (("notification", False), "notification_config_unavailable"),
+    ),
+)
+def test_cross_auto_arm_fails_closed_for_remote_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    change: tuple[str, object],
+    reason: str,
+) -> None:
+    state = _arm_ready_state()
+    health: dict[str, object] = {"git_sha": "accepted-sha", "source_state": "clean"}
+    field, value = change
+    if field == "health_status":
+        health["status"] = value
+    elif field == "sha":
+        health["git_sha"] = value
+    elif field == "dirty":
+        health["source_state"] = value
+    elif field == "cross":
+        state["cross_venue"] = {"status": value, "breaker": {"open": False}}
+    elif field == "poly_rest":
+        state["venues"][0]["rest"] = value  # type: ignore[index]
+    elif field == "poly_ws":
+        state["venues"][0]["ws"] = value  # type: ignore[index]
+    elif field == "predict_rest":
+        state["venues"][1]["rest"] = value  # type: ignore[index]
+    elif field == "predict_ws":
+        state["venues"][1]["ws"] = value  # type: ignore[index]
+    elif field == "breaker":
+        state["breaker"] = {"open": value}
+    elif field == "active":
+        state["current_execution"] = value
+    elif field == "mode":
+        state["cross_auto"]["configured_mode"] = value  # type: ignore[index]
+    elif field == "notification":
+        state["cross_auto"]["notification_ready"] = value  # type: ignore[index]
+
+    def fetch(url: str, timeout: float) -> _JsonResponse:
+        assert timeout == 10
+        if url.endswith("/healthz"):
+            response = _JsonResponse(health)
+            response.status = int(health.get("status", 200))
+            return response
+        return _JsonResponse(state)
+
+    monkeypatch.setattr(cli, "urlopen", fetch)
+    assert cli.main(
+        [
+            "prediction-arb", "cross-auto", "arm", "--data-dir", str(tmp_path),
+            "--url", "http://127.0.0.1:8766", "--expected-sha", "accepted-sha",
+        ]
+    ) == 2
+    assert f"reason: {reason}" in capsys.readouterr().out
+    assert PredictionArbitrageStore(tmp_path).cross_auto_state()["armed"] is False
+
+
+def test_cross_auto_arm_requires_complete_remote_readiness_and_status_is_local(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state = _arm_ready_state()
+    health = {"git_sha": "accepted-sha", "source_state": "clean"}
+    monkeypatch.setattr(
+        cli,
+        "urlopen",
+        lambda url, timeout: _JsonResponse(health if url.endswith("/healthz") else state),
+    )
+    args = [
+        "prediction-arb", "cross-auto", "arm", "--data-dir", str(tmp_path),
+        "--url", "http://127.0.0.1:8766", "--expected-sha", "accepted-sha",
+    ]
+    assert cli.main(args) == 0
+    assert "result: PASS" in capsys.readouterr().out
+    assert PredictionArbitrageStore(tmp_path).cross_auto_state()["armed"] is True
+    assert cli.main(["prediction-arb", "cross-auto", "status", "--data-dir", str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    assert "armed: True" in output
+    assert "result: PASS" in output
+
+
+def test_cross_auto_arm_never_contacts_a_non_loopback_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli, "urlopen", lambda *args, **kwargs: pytest.fail("must not fetch"))
+    assert cli.main(
+        [
+            "prediction-arb", "cross-auto", "arm", "--data-dir", str(tmp_path),
+            "--url", "http://example.com", "--expected-sha", "accepted-sha",
+        ]
+    ) == 2
+    assert "reason: url_not_loopback" in capsys.readouterr().out

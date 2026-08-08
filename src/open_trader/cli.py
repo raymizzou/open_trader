@@ -114,6 +114,7 @@ from .polymarket_trading import (
     store_predict_api_key,
 )
 from .polymarket_monitor import monitor_once_diagnostic
+from .prediction_arbitrage_store import PredictionArbitrageStore
 from .report_translation import DeepSeekReportTranslator, translate_agent_report_files
 from .tiger_account import load_tiger_account_config
 from .technical_facts import LLMTechnicalFactsExtractor, generate_technical_facts
@@ -1120,6 +1121,21 @@ def build_parser() -> argparse.ArgumentParser:
     prediction_status.add_argument("--url", default="http://127.0.0.1:8766")
     prediction_status.add_argument("--timeout", type=positive_float, default=5.0)
 
+    cross_auto_parser = prediction_commands.add_parser(
+        "cross-auto", help="Inspect or locally arm cross-venue automatic execution"
+    )
+    cross_auto_commands = cross_auto_parser.add_subparsers(
+        dest="cross_auto_command", required=True
+    )
+    cross_auto_status = cross_auto_commands.add_parser("status", help="Show local arm state")
+    cross_auto_status.add_argument("--data-dir", type=Path, default=Path("data"))
+    cross_auto_arm = cross_auto_commands.add_parser(
+        "arm", help="Arm only after local Dashboard readiness checks"
+    )
+    cross_auto_arm.add_argument("--data-dir", type=Path, default=Path("data"))
+    cross_auto_arm.add_argument("--url", required=True)
+    cross_auto_arm.add_argument("--expected-sha", required=True)
+
     health_parser = prediction_commands.add_parser(
         "health-check", help="Run or serve the prediction-arbitrage health check"
     )
@@ -1204,6 +1220,102 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "prediction-arb":
+        if args.prediction_command == "cross-auto":
+            store = PredictionArbitrageStore(args.data_dir.expanduser())
+            if args.cross_auto_command == "status":
+                state = store.cross_auto_state()
+                latest = store.cross_auto_attempts(limit=1)
+                print(f"armed: {state.get('armed') is True}")
+                print(f"pause_reason: {state.get('reason', 'not_armed')}")
+                print(f"daily_principal: {format(store.cross_auto_daily_principal(), 'f')}/100")
+                if latest:
+                    print(f"latest_attempt: {latest[0].get('decision', 'unknown')}")
+                    print(f"latest_reason: {latest[0].get('reason_code', '')}")
+                print("result: PASS")
+                return 0
+
+            parsed_url = urlparse(args.url)
+            host = parsed_url.hostname or ""
+            try:
+                loopback_url = parsed_url.scheme == "http" and ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                loopback_url = host == "localhost"
+            if not loopback_url:
+                print(f"armed: {store.cross_auto_state().get('armed') is True}")
+                print("reason: url_not_loopback")
+                print("result: BLOCKED")
+                return 2
+
+            def fetch_json(path: str) -> dict[str, object] | None:
+                try:
+                    with urlopen(args.url.rstrip("/") + path, timeout=10) as response:
+                        if getattr(response, "status", 200) != 200:
+                            return None
+                        payload = json.loads(response.read().decode("utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    return None
+                return payload if isinstance(payload, dict) else None
+
+            health = fetch_json("/healthz")
+            reason = ""
+            if health is None:
+                reason = "healthz_unavailable"
+            elif health.get("git_sha") != args.expected_sha:
+                reason = "git_sha_mismatch"
+            elif health.get("source_state") != "clean":
+                reason = "source_dirty"
+            state = fetch_json("/api/prediction-arbitrage/state") if not reason else None
+            if not reason and state is None:
+                reason = "prediction_state_unavailable"
+            if not reason:
+                assert state is not None
+                cross = state.get("cross_venue")
+                cross = cross if isinstance(cross, dict) else {}
+                if cross.get("status") != "ready":
+                    reason = "cross_venue_not_ready"
+                elif isinstance(cross.get("breaker"), dict) and cross["breaker"].get("open"):
+                    reason = "cross_breaker_open"
+                venues = state.get("venues")
+                venue_rows = venues if isinstance(venues, list) else []
+                for venue_name, reason_prefix in (
+                    ("polymarket", "polymarket"),
+                    ("predict.fun", "predict_fun"),
+                ):
+                    venue = next(
+                        (
+                            row
+                            for row in venue_rows
+                            if isinstance(row, dict) and row.get("venue") == venue_name
+                        ),
+                        {},
+                    )
+                    if not reason and venue.get("rest") != "ready":
+                        reason = f"{reason_prefix}_rest_not_ready"
+                    if not reason and venue.get("ws") != "ready":
+                        reason = f"{reason_prefix}_ws_not_ready"
+                breaker = state.get("breaker")
+                if not reason and isinstance(breaker, dict) and breaker.get("open"):
+                    reason = "breaker_open"
+                active = state.get("current_execution")
+                if not reason and isinstance(active, dict) and active:
+                    reason = "active_execution"
+                cross_auto = state.get("cross_auto")
+                cross_auto = cross_auto if isinstance(cross_auto, dict) else {}
+                if not reason and cross_auto.get("configured_mode") != "auto_submit":
+                    reason = "configured_mode_not_auto_submit"
+                if not reason and cross_auto.get("notification_ready") is not True:
+                    reason = "notification_config_unavailable"
+            if reason:
+                print(f"armed: {store.cross_auto_state().get('armed') is True}")
+                print(f"reason: {reason}")
+                print("result: BLOCKED")
+                return 2
+            armed = store.arm_cross_auto()
+            print(f"armed: {armed.get('armed') is True}")
+            print(f"git_sha: {args.expected_sha}")
+            print("result: PASS")
+            return 0
+
         if args.prediction_command == "predict" and args.predict_command == "setup":
             config_path = args.config.expanduser()
             try:

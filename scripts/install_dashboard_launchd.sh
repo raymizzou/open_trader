@@ -3,6 +3,7 @@ set -euo pipefail
 
 DRY_RUN=0
 MODE="stack"
+CROSS_EXECUTION_MODE="observe_only"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_ROOT=""
 PYTHON_BIN="${OPEN_TRADER_PYTHON:-$REPO_ROOT/.venv/bin/python}"
@@ -14,13 +15,14 @@ CURL_BIN="${CURL_BIN:-$(command -v curl || true)}"
 WAIT_SECONDS="${DASHBOARD_LAUNCHD_WAIT_SECONDS:-30}"
 
 usage() {
-  echo "usage: $0 [--dry-run] [--mode stack|single] [--repo-root PATH] [--runtime-root PATH] [--python PATH] [--launch-agents-dir PATH] [--wait-seconds N]" >&2
+  echo "usage: $0 [--dry-run] [--mode stack|single] [--cross-execution-mode observe_only|manual_confirm|auto_submit] [--repo-root PATH] [--runtime-root PATH] [--python PATH] [--launch-agents-dir PATH] [--wait-seconds N]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
     --mode) [[ $# -ge 2 ]] || { usage; exit 2; }; MODE="$2"; shift 2 ;;
+    --cross-execution-mode) [[ $# -ge 2 ]] || { usage; exit 2; }; CROSS_EXECUTION_MODE="$2"; shift 2 ;;
     --repo-root) [[ $# -ge 2 ]] || { usage; exit 2; }; REPO_ROOT="$2"; shift 2 ;;
     --runtime-root) [[ $# -ge 2 ]] || { usage; exit 2; }; RUNTIME_ROOT="$2"; shift 2 ;;
     --python) [[ $# -ge 2 ]] || { usage; exit 2; }; PYTHON_BIN="$2"; shift 2 ;;
@@ -31,6 +33,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$MODE" == "stack" || "$MODE" == "single" ]] || { usage; exit 2; }
+[[ "$CROSS_EXECUTION_MODE" == "observe_only" || "$CROSS_EXECUTION_MODE" == "manual_confirm" || "$CROSS_EXECUTION_MODE" == "auto_submit" ]] || { usage; exit 2; }
 
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 RUNTIME_ROOT="${RUNTIME_ROOT:-$REPO_ROOT}"
@@ -68,7 +71,7 @@ sed_escape() {
 }
 
 render_template() {
-  local template="$1" repo python data reports portfolio daily_config prediction
+  local template="$1" repo python data reports portfolio daily_config prediction cross_execution_mode
   repo="$(sed_escape "$REPO_ROOT")"
   python="$(sed_escape "$PYTHON_BIN")"
   data="$(sed_escape "$DATA_DIR")"
@@ -76,6 +79,7 @@ render_template() {
   portfolio="$(sed_escape "$PORTFOLIO")"
   daily_config="$(sed_escape "$DAILY_CONFIG")"
   prediction="$(sed_escape "$PREDICTION_CONFIG")"
+  cross_execution_mode="$(sed_escape "$CROSS_EXECUTION_MODE")"
   sed \
     -e "s|OPEN_TRADER_PYTHON|$python|g" \
     -e "s|OPEN_TRADER_PORTFOLIO|$portfolio|g" \
@@ -83,6 +87,7 @@ render_template() {
     -e "s|OPEN_TRADER_REPORTS_DIR|$reports|g" \
     -e "s|OPEN_TRADER_DAILY_CONFIG|$daily_config|g" \
     -e "s|OPEN_TRADER_PREDICTION_CONFIG|$prediction|g" \
+    -e "s|CROSS_EXECUTION_MODE_VALUE|$cross_execution_mode|g" \
     -e "s|OPEN_TRADER_REPO|$repo|g" \
     "$template"
 }
