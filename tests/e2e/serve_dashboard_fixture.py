@@ -223,8 +223,9 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
     if scenario in {
         "cross-auto-armed", "cross-auto-paused", "cross-auto-daily-cap",
         "cross-auto-same-pair", "cross-auto-notification-blocked", "cross-auto-manual-only",
+        "cross-auto-paused-manual-only",
     }:
-        paused = scenario in {"cross-auto-paused", "cross-auto-notification-blocked"}
+        paused = scenario in {"cross-auto-paused", "cross-auto-notification-blocked", "cross-auto-paused-manual-only"}
         reason = {
             "cross-auto-paused": ("operator_paused", "操作员已暂停自动下单", "-", "-", "both", True),
             "cross-auto-daily-cap": ("cross_auto_daily_principal_cap", "自动新本金已达当日上限", "100", "100", "both", False),
@@ -239,7 +240,7 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
             "execution_mode": "auto_submit",
             "manual_only": False,
         }
-        if scenario == "cross-auto-manual-only":
+        if scenario in {"cross-auto-manual-only", "cross-auto-paused-manual-only"}:
             payload["opportunities"] = [manual_cross_opportunity]
         else:
             payload["opportunities"] = [auto_opportunity]

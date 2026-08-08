@@ -2528,7 +2528,7 @@ function predictionCrossVenueFunnel(payload) {
 function predictionCrossVenueCandidates(payload) {
   const crossVenue = payload?.cross_venue && typeof payload.cross_venue === "object" ? payload.cross_venue : {};
   const crossAuto = payload?.cross_auto && typeof payload.cross_auto === "object" ? payload.cross_auto : {};
-  const automaticMode = crossAuto.effective_mode === "auto_submit";
+  const automaticMode = crossAuto.configured_mode === "auto_submit";
   const opportunities = Array.isArray(crossVenue.opportunities)
     ? crossVenue.opportunities
     : (Array.isArray(payload?.opportunities) ? payload.opportunities : []);

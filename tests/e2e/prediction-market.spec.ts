@@ -180,6 +180,10 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(root).toContainText('需人工审查，自动模式不执行');
     await expect(root.locator('[data-action="participate"]')).toHaveCount(0);
 
+    await openPrediction(page, 'cross-auto-paused-manual-only');
+    await expect(root).toContainText('需人工审查，自动模式不执行');
+    await expect(root.locator('[data-action="participate"]')).toHaveCount(0);
+
     for (const [scenario, code, zh, current, limit, venue, action] of [
       ['cross-auto-paused', 'operator_paused', '操作员已暂停自动下单', '-', '-', 'both', '需要操作员处理'],
       ['cross-auto-daily-cap', 'cross_auto_daily_principal_cap', '自动新本金已达当日上限', '100', '100', 'both', '无需操作员处理'],
