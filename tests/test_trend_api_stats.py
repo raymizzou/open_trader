@@ -7,6 +7,7 @@ import hashlib
 import pytest
 
 from open_trader.trend_api_stats import (
+    build_statement_actual_stats_payload,
     build_trend_api_stats_payload,
     eligible_simulation_rounds,
     load_trend_api_stats,
@@ -113,6 +114,105 @@ def _cn_closed_pair(
                 "statement_sequence": 1,
             })
     return pair
+
+
+def _phillips_closed_pair(label: str, version: str) -> list[dict[str, object]]:
+    return [{
+        **item,
+        "source_id": "actual:phillips:phillips_main",
+        "broker": "phillips",
+        "account_id": "phillips_main",
+        "market": "HK",
+        "currency": "HKD",
+        "strategy_id": f"trend_animals_warm_to_hot/HK/{version}",
+        "filled_at": item["filled_at"].replace("15:00:00", "16:00:00"),
+    } for item in _cn_closed_pair(label, version, source="actual")]
+
+
+def test_eastmoney_rebuild_changes_only_cn_actual_statement_period(
+    tmp_path: Path,
+) -> None:
+    simulated = _cn_closed_pair("simulated", "v8", source="simulation")
+    eastmoney = _cn_closed_pair("eastmoney", "v8", source="actual")
+    phillips = _phillips_closed_pair("phillips", "v8")
+    for item in [*eastmoney, *phillips]:
+        item["statement_period"] = "2026-07"
+    before = build_trend_api_stats_payload(
+        [*simulated, *eastmoney, *phillips],
+        strategy_versions=[
+            {"market": "CN", "strategy_id": "trend_animals_warm_to_hot/CN/v8", "strategy_version": "v8"},
+            {"market": "HK", "strategy_id": "trend_animals_warm_to_hot/HK/v8", "strategy_version": "v8"},
+        ],
+        generated_at="2026-08-08T18:00:00+08:00",
+        statistics_cutoff_at="2026-08-08T16:00:00+08:00",
+    )
+    write_trend_api_stats(tmp_path / "data", before)
+    replacement = _cn_closed_pair("eastmoney-replacement", "v8", source="actual")
+    for item in replacement:
+        item["statement_period"] = "2026-07"
+
+    payload = build_statement_actual_stats_payload(
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        broker="eastmoney",
+        statement_period="2026-07",
+        fills=replacement,
+        generated_at="2026-08-08T18:00:00+08:00",
+        statistics_cutoff_at="2026-07-31T15:00:00+08:00",
+    )
+
+    assert [item for item in payload["fills"] if item["broker"] == "phillips"] == [
+        item for item in before["fills"] if item["broker"] == "phillips"
+    ]
+    assert [item for item in payload["fills"] if item["broker"] == "futu"] == [
+        item for item in before["fills"] if item["broker"] == "futu"
+    ]
+    assert [item["fill_id"] for item in payload["fills"] if item["broker"] == "eastmoney"] == [
+        item["fill_id"] for item in replacement
+    ]
+
+
+def test_phillips_rebuild_changes_only_hk_actual_statement_period(
+    tmp_path: Path,
+) -> None:
+    simulated = _cn_closed_pair("simulated", "v8", source="simulation")
+    eastmoney = _cn_closed_pair("eastmoney", "v8", source="actual")
+    phillips = _phillips_closed_pair("phillips", "v8")
+    for item in [*eastmoney, *phillips]:
+        item["statement_period"] = "2026-07"
+    before = build_trend_api_stats_payload(
+        [*simulated, *eastmoney, *phillips],
+        strategy_versions=[
+            {"market": "CN", "strategy_id": "trend_animals_warm_to_hot/CN/v8", "strategy_version": "v8"},
+            {"market": "HK", "strategy_id": "trend_animals_warm_to_hot/HK/v8", "strategy_version": "v8"},
+        ],
+        generated_at="2026-08-08T18:00:00+08:00",
+        statistics_cutoff_at="2026-08-08T16:00:00+08:00",
+    )
+    write_trend_api_stats(tmp_path / "data", before)
+    replacement = _phillips_closed_pair("phillips-replacement", "v8")
+    for item in replacement:
+        item["statement_period"] = "2026-07"
+
+    payload = build_statement_actual_stats_payload(
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        broker="phillips",
+        statement_period="2026-07",
+        fills=replacement,
+        generated_at="2026-08-08T18:00:00+08:00",
+        statistics_cutoff_at="2026-07-31T16:00:00+08:00",
+    )
+
+    assert [item for item in payload["fills"] if item["broker"] == "eastmoney"] == [
+        item for item in before["fills"] if item["broker"] == "eastmoney"
+    ]
+    assert [item for item in payload["fills"] if item["broker"] == "futu"] == [
+        item for item in before["fills"] if item["broker"] == "futu"
+    ]
+    assert [item["fill_id"] for item in payload["fills"] if item["broker"] == "phillips"] == [
+        item["fill_id"] for item in replacement
+    ]
 
 
 @pytest.mark.parametrize(

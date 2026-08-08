@@ -798,7 +798,9 @@ def build_statement_actual_stats_payload(
     ]
     combined = [*retained, *incoming]
     facts = _load_frozen_strategy_facts(reports_dir)
-    combined = _reattribute_statement_fills(combined, facts)
+    combined = _reattribute_statement_fills(
+        combined, facts, broker=normalized_broker,
+    )
 
     cutoff_values = [statistics_cutoff_at]
     if existing is not None:
@@ -855,13 +857,14 @@ def build_statement_actual_stats_payload(
 def _reattribute_statement_fills(
     fills: Sequence[Mapping[str, object]],
     facts: Sequence[Mapping[str, object]],
+    *,
+    broker: str,
 ) -> list[dict[str, object]]:
-    statement_brokers = set(_STATEMENT_ACCOUNTS)
     other: list[dict[str, object]] = []
     statement: list[dict[str, object]] = []
     for raw in fills:
         fill = dict(raw)
-        if fill.get("broker") not in statement_brokers:
+        if fill.get("broker") != broker:
             other.append(fill)
             continue
         fill.update(
