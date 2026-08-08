@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -184,7 +185,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] > 0
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         names = {
             row[1]
             for row in connection.execute("PRAGMA table_list")
@@ -222,6 +223,8 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "cross_execution_reservations",
         "validation_mode",
         "auto_eat_attempts",
+        "cross_auto_state",
+        "cross_auto_attempts",
     }
     assert "signals_market_started_at" in indexes
     assert "signals_started_at" in indexes
@@ -229,6 +232,91 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
     assert any("signals_market_started_at" in row[3] for row in query_plan)
     assert any("signals_started_at" in row[3] for row in history_query_plan)
     assert any("signals_open_started_at" in row[3] for row in open_query_plan)
+
+
+def test_cross_auto_pause_is_durable_and_runtime_writes_do_not_clear_it(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+
+    assert db.cross_auto_state() == {
+        "armed": False,
+        "reason": "not_armed",
+        "updated_at": None,
+    }
+    assert db.arm_cross_auto()["armed"] is True
+    db.write_runtime({"heartbeat": "ok"})
+    paused = db.pause_cross_auto("operator_paused")
+
+    assert paused["armed"] is False
+    assert paused["reason"] == "operator_paused"
+    restored = PredictionArbitrageStore(tmp_path / "data")
+    assert restored.cross_auto_state() == paused
+
+
+def test_cross_auto_attempt_claim_is_one_shot_across_store_instances(tmp_path: Path) -> None:
+    setup = store(tmp_path)
+    stores = [
+        PredictionArbitrageStore(tmp_path / "data"),
+        PredictionArbitrageStore(tmp_path / "data"),
+    ]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda db: db.claim_cross_auto_attempt("signal-1", "opportunity-1"),
+                stores,
+            )
+        )
+
+    assert sorted(results) == [False, True]
+    assert len(setup.cross_auto_attempts()) == 1
+
+
+def test_cross_auto_attempt_finishes_once_with_safe_rejection_facts(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    assert db.claim_cross_auto_attempt("signal-1", "opportunity-1") is True
+
+    finished = db.finish_cross_auto_attempt(
+        "signal-1",
+        decision="rejected",
+        reason="cross_auto_paused",
+        reason_zh="自动下单已暂停",
+        current=Decimal("1"),
+        limit=Decimal("0"),
+        venue="cross_venue",
+        operator_action_required=True,
+        preview_id="preview-1",
+        execution_id="execution-1",
+        total_cost=Decimal("5"),
+    )
+
+    assert finished["reason_code"] == "cross_auto_paused"
+    assert finished["current"] == "1"
+    assert finished["total_cost"] == "5"
+    with pytest.raises(KeyError, match="signal-1"):
+        db.finish_cross_auto_attempt(
+            "signal-1",
+            decision="rejected",
+            reason="cross_auto_paused",
+            reason_zh="自动下单已暂停",
+        )
+    with sqlite3.connect(db.path) as connection:
+        payload = json.loads(
+            connection.execute(
+                "SELECT payload FROM cross_auto_attempts WHERE signal_id='signal-1'"
+            ).fetchone()[0]
+        )
+    assert set(payload) == {
+        "reason_code",
+        "reason_zh",
+        "current",
+        "limit",
+        "venue",
+        "operator_action_required",
+        "signal_id",
+        "opportunity_id",
+    }
 
 
 def test_store_sets_wal_once_instead_of_on_every_read(
@@ -788,6 +876,165 @@ def test_cross_principal_cap_is_atomic_across_store_instances(tmp_path: Path) ->
         assert connection.execute(
             "SELECT COUNT(*) FROM cross_execution_reservations"
         ).fetchone()[0] == 2
+
+
+def test_auto_cross_preview_requires_durable_arm_before_consuming(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    payload = cross_preview_payload(total_max_cost=Decimal("5"))
+    payload["auto_submit"] = True
+    preview_id = db.create_preview(
+        payload, expires_at=iso(datetime.now(UTC) + timedelta(seconds=10))
+    )
+
+    with pytest.raises(ValueError, match="cross_auto_paused"):
+        db.consume_preview_and_create_execution(preview_id, "auto-unarmed")
+
+    db.arm_cross_auto()
+    assert db.consume_preview_and_create_execution(preview_id, "auto-armed")["state"] == "validating"
+
+
+def test_auto_cross_daily_and_pair_gates_preserve_originating_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from open_trader import prediction_arbitrage_store
+
+    db = store(tmp_path)
+    db.arm_cross_auto()
+    shanghai_noon = datetime(2026, 8, 8, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
+    monkeypatch.setattr(prediction_arbitrage_store, "_utc_now", lambda: iso(shanghai_noon))
+
+    first_payload = cross_preview_payload(
+        market_id="daily-first", total_max_cost=Decimal("100")
+    )
+    first_payload["auto_submit"] = True
+    first_preview = db.create_preview(first_payload, expires_at=iso(shanghai_noon))
+    first = db.consume_preview_and_create_execution(first_preview, "daily-first")
+    db.transition_execution(
+        str(first["execution_id"]), state="holding_to_resolution", evidence={"held": True}
+    )
+    assert db.cross_auto_daily_principal(now=shanghai_noon) == Decimal("100")
+
+    next_payload = cross_preview_payload(
+        market_id="daily-next", total_max_cost=Decimal("1")
+    )
+    next_payload["auto_submit"] = True
+    next_preview = db.create_preview(next_payload, expires_at=iso(shanghai_noon))
+    with pytest.raises(ValueError, match="cross_auto_daily_principal_cap"):
+        db.consume_preview_and_create_execution(next_preview, "daily-next")
+
+    assert db.cross_auto_daily_principal(
+        now=datetime(2026, 8, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    ) == Decimal("0")
+
+    pair_payload = cross_preview_payload(
+        market_id="pair-1", total_max_cost=Decimal("1")
+    )
+    pair_payload["auto_submit"] = True
+    pair_preview = db.create_preview(pair_payload, expires_at=iso(shanghai_noon))
+    with pytest.raises(ValueError, match="cross_auto_daily_principal_cap"):
+        db.consume_preview_and_create_execution(pair_preview, "pair-daily-blocked")
+
+
+def test_auto_cross_pair_gate_and_no_submit_releases_daily_charge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from open_trader import prediction_arbitrage_store
+
+    db = store(tmp_path)
+    db.arm_cross_auto()
+    shanghai_noon = datetime(2026, 8, 8, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
+    monkeypatch.setattr(prediction_arbitrage_store, "_utc_now", lambda: iso(shanghai_noon))
+
+    payload = cross_preview_payload(market_id="pair-1", total_max_cost=Decimal("5"))
+    payload["auto_submit"] = True
+    first_preview = db.create_preview(payload, expires_at=iso(shanghai_noon))
+    first = db.consume_preview_and_create_execution(first_preview, "pair-first")
+    db.transition_execution(
+        str(first["execution_id"]), state="holding_to_resolution", evidence={"held": True}
+    )
+
+    opposite = cross_preview_payload(market_id="pair-1", total_max_cost=Decimal("5"))
+    opposite["auto_submit"] = True
+    opposite["execution_id"] = "execution:pair-1-opposite"
+    opposite["opportunity_id"] = "cross:pair-1:PREDICT_NO_POLYMARKET_YES"
+    opposite["direction"] = "PREDICT_NO_POLYMARKET_YES"
+    opposite["intent"]["direction"] = "PREDICT_NO_POLYMARKET_YES"
+    opposite["intent"]["legs"][0]["outcome"] = "NO"
+    opposite["intent"]["legs"][1]["outcome"] = "YES"
+    opposite_preview = db.create_preview(opposite, expires_at=iso(shanghai_noon))
+    with pytest.raises(ValueError, match="cross_pair_unsettled"):
+        db.consume_preview_and_create_execution(opposite_preview, "pair-opposite")
+
+    no_submit_payload = cross_preview_payload(
+        market_id="no-submit", total_max_cost=Decimal("5")
+    )
+    no_submit_payload["auto_submit"] = True
+    no_submit_preview = db.create_preview(no_submit_payload, expires_at=iso(shanghai_noon))
+    no_submit = db.consume_preview_and_create_execution(no_submit_preview, "no-submit")
+    db.transition_execution(
+        str(no_submit["execution_id"]),
+        state="both_rejected",
+        evidence={
+            "submitted": False,
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+        },
+    )
+    db.release_cross_reservation(str(no_submit["execution_id"]), reason="no_submit")
+    assert db.cross_auto_daily_principal(now=shanghai_noon) == Decimal("5")
+
+    rejected_payload = cross_preview_payload(
+        market_id="both-rejected", total_max_cost=Decimal("5")
+    )
+    rejected_payload["auto_submit"] = True
+    rejected_preview = db.create_preview(rejected_payload, expires_at=iso(shanghai_noon))
+    rejected = db.consume_preview_and_create_execution(rejected_preview, "both-rejected")
+    db.transition_execution(
+        str(rejected["execution_id"]),
+        state="both_rejected",
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "no_position_observed": True,
+        },
+    )
+    db.release_cross_reservation(str(rejected["execution_id"]), reason="both_rejected")
+    assert db.cross_auto_daily_principal(now=shanghai_noon) == Decimal("10")
+
+    redeemed_payload = cross_preview_payload(
+        market_id="redeemed", total_max_cost=Decimal("5")
+    )
+    redeemed_payload["auto_submit"] = True
+    redeemed_preview = db.create_preview(redeemed_payload, expires_at=iso(shanghai_noon))
+    redeemed = db.consume_preview_and_create_execution(redeemed_preview, "redeemed")
+    db.transition_execution(
+        str(redeemed["execution_id"]),
+        state="holding_to_resolution",
+        evidence={
+            "phase": "holding_to_resolution",
+            "positions": {"predict.fun": "5", "polymarket": "5"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+        },
+    )
+    db.transition_execution(
+        str(redeemed["execution_id"]),
+        state="complete",
+        evidence={
+            "positions": {"predict.fun": "0", "polymarket": "0"},
+            "settlement_baseline": {"predict.fun": "90", "polymarket": "90"},
+            "redemption": {
+                "observed": True,
+                "winner": {
+                    "venue": "predict.fun",
+                    "condition_id": "predict-condition",
+                    "outcome": "YES",
+                    "token_id": "predict-yes",
+                    "quantity": "5",
+                },
+                "redeemed_collateral": {"predict.fun": "5"},
+            },
+        },
+    )
+    db.release_cross_reservation(str(redeemed["execution_id"]), reason="redeemed")
+    assert db.cross_auto_daily_principal(now=shanghai_noon) == Decimal("15")
 
 
 def test_cross_reservation_remains_until_an_allowed_final_release(tmp_path: Path) -> None:

@@ -23,6 +23,8 @@ SignalHistoryWindow = Literal["24h", "7d", "30d", "all"]
 _BUSY_TIMEOUT_MS = 5_000
 _LLM_USAGE_RETENTION = timedelta(days=7)
 _PREVIEW_TTL = timedelta(seconds=10)
+_CROSS_AUTO_DAILY_PRINCIPAL_CAP = Decimal("100")
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 _TERMINAL_EXECUTION_STATES = (
     "both_rejected",
     "complete",
@@ -458,6 +460,29 @@ class PredictionArbitrageStore:
 
             CREATE INDEX IF NOT EXISTS auto_eat_attempts_market
             ON auto_eat_attempts(market_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS cross_auto_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                armed INTEGER NOT NULL CHECK (armed IN (0, 1)),
+                reason TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cross_auto_attempts (
+                signal_id TEXT PRIMARY KEY,
+                opportunity_id TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                preview_id TEXT NOT NULL,
+                execution_id TEXT NOT NULL,
+                total_cost TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS cross_auto_attempts_created_at
+            ON cross_auto_attempts(created_at DESC, signal_id DESC);
             """
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -469,6 +494,9 @@ class PredictionArbitrageStore:
             version = 2
         if version < 3:
             connection.execute("PRAGMA user_version=3")
+            version = 3
+        if version < 4:
+            connection.execute("PRAGMA user_version=4")
 
     @staticmethod
     def _execution_fields(row: sqlite3.Row) -> dict[str, object]:
@@ -648,6 +676,193 @@ class PredictionArbitrageStore:
                 "SELECT payload FROM runtime WHERE singleton=1"
             ).fetchone()
         return None if row is None else _load_payload(str(row["payload"]))
+
+    @staticmethod
+    def _cross_auto_state_from_connection(
+        connection: sqlite3.Connection,
+    ) -> dict[str, object]:
+        row = connection.execute(
+            "SELECT armed, reason, updated_at FROM cross_auto_state WHERE singleton=1"
+        ).fetchone()
+        if row is None:
+            return {"armed": False, "reason": "not_armed", "updated_at": None}
+        return {
+            "armed": bool(row["armed"]),
+            "reason": str(row["reason"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def cross_auto_state(self) -> dict[str, object]:
+        with self._read_connection() as connection:
+            return self._cross_auto_state_from_connection(connection)
+
+    def _set_cross_auto_state(self, *, armed: bool, reason: str) -> dict[str, object]:
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("cross auto state reason is required")
+        updated_at = _utc_now()
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO cross_auto_state(singleton, armed, reason, updated_at)
+                VALUES (1, ?, ?, ?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    armed=excluded.armed,
+                    reason=excluded.reason,
+                    updated_at=excluded.updated_at
+                """,
+                (int(armed), reason, updated_at),
+            )
+            return self._cross_auto_state_from_connection(connection)
+
+    def pause_cross_auto(self, reason: str) -> dict[str, object]:
+        return self._set_cross_auto_state(armed=False, reason=reason)
+
+    def arm_cross_auto(self) -> dict[str, object]:
+        return self._set_cross_auto_state(armed=True, reason="armed")
+
+    @staticmethod
+    def _cross_auto_attempt_payload(
+        *,
+        reason: str,
+        reason_zh: str,
+        current: object,
+        limit: object,
+        venue: str,
+        operator_action_required: bool,
+        signal_id: str,
+        opportunity_id: str,
+    ) -> str:
+        return _dump_payload(
+            {
+                "reason_code": reason,
+                "reason_zh": reason_zh,
+                "current": current,
+                "limit": limit,
+                "venue": venue,
+                "operator_action_required": operator_action_required,
+                "signal_id": signal_id,
+                "opportunity_id": opportunity_id,
+            }
+        )
+
+    def claim_cross_auto_attempt(self, signal_id: str, opportunity_id: str) -> bool:
+        signal = str(signal_id).strip()
+        opportunity = str(opportunity_id).strip()
+        if not signal or not opportunity:
+            raise ValueError("signal_id and opportunity_id are required")
+        now = _utc_now()
+        payload = self._cross_auto_attempt_payload(
+            reason="claimed",
+            reason_zh="",
+            current=None,
+            limit=None,
+            venue="",
+            operator_action_required=False,
+            signal_id=signal,
+            opportunity_id=opportunity,
+        )
+        with self._transaction() as connection:
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO cross_auto_attempts(
+                        signal_id, opportunity_id, decision, reason, payload,
+                        preview_id, execution_id, total_cost, created_at, updated_at
+                    ) VALUES (?, ?, 'claimed', 'claimed', ?, '', '', NULL, ?, ?)
+                    """,
+                    (signal, opportunity, payload, now, now),
+                )
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def finish_cross_auto_attempt(
+        self,
+        signal_id: str,
+        *,
+        decision: str,
+        reason: str,
+        reason_zh: str,
+        current: object = None,
+        limit: object = None,
+        venue: str = "",
+        operator_action_required: bool = False,
+        preview_id: str = "",
+        execution_id: str = "",
+        total_cost: object = None,
+    ) -> dict[str, object]:
+        signal = str(signal_id).strip()
+        if not signal or not str(decision).strip() or not str(reason).strip():
+            raise ValueError("signal_id, decision, and reason are required")
+        if not isinstance(reason_zh, str) or not isinstance(venue, str):
+            raise ValueError("reason_zh and venue must be strings")
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT opportunity_id FROM cross_auto_attempts WHERE signal_id=? AND decision='claimed'",
+                (signal,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(signal)
+            opportunity = str(row["opportunity_id"])
+            payload = self._cross_auto_attempt_payload(
+                reason=str(reason),
+                reason_zh=reason_zh,
+                current=current,
+                limit=limit,
+                venue=venue,
+                operator_action_required=bool(operator_action_required),
+                signal_id=signal,
+                opportunity_id=opportunity,
+            )
+            connection.execute(
+                """
+                UPDATE cross_auto_attempts
+                SET decision=?, reason=?, payload=?, preview_id=?, execution_id=?, total_cost=?, updated_at=?
+                WHERE signal_id=? AND decision='claimed'
+                """,
+                (
+                    str(decision),
+                    str(reason),
+                    payload,
+                    str(preview_id),
+                    str(execution_id),
+                    None if total_cost is None else format(Decimal(str(total_cost)), "f"),
+                    now,
+                    signal,
+                ),
+            )
+        return self.cross_auto_attempts(limit=1, signal_id=signal)[0]
+
+    def cross_auto_attempts(
+        self, limit: int = 100, *, signal_id: str | None = None
+    ) -> list[dict[str, object]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        if limit == 0:
+            return []
+        query = "SELECT * FROM cross_auto_attempts"
+        parameters: tuple[object, ...] = ()
+        if signal_id is not None:
+            query += " WHERE signal_id=?"
+            parameters = (str(signal_id),)
+        query += " ORDER BY created_at DESC, signal_id DESC LIMIT ?"
+        parameters += (limit,)
+        with self._read_connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [
+            {
+                **_load_payload(str(row["payload"])),
+                "decision": str(row["decision"]),
+                "reason": str(row["reason"]),
+                "preview_id": str(row["preview_id"]),
+                "execution_id": str(row["execution_id"]),
+                "total_cost": row["total_cost"],
+                "created_at": str(row["created_at"]),
+                "updated_at": str(row["updated_at"]),
+            }
+            for row in rows
+        ]
 
     VALIDATION_MODES = frozenset({"observe_only", "manual", "auto"})
 
@@ -1327,6 +1542,54 @@ class PredictionArbitrageStore:
         return sum((Decimal(str(row["amount"])) for row in rows), Decimal("0"))
 
     @staticmethod
+    def _cross_auto_daily_principal_for(
+        connection: sqlite3.Connection, now: object
+    ) -> Decimal:
+        day = _parse_timestamp(now).astimezone(_SHANGHAI).date()
+        rows = connection.execute(
+            """
+            SELECT reservation.amount, reservation.created_at
+            FROM cross_execution_reservations AS reservation
+            JOIN executions AS execution ON execution.execution_id=reservation.execution_id
+            WHERE json_extract(execution.payload, '$.auto_submit') = 1
+              AND NOT (reservation.state='released' AND reservation.release_reason='no_submit')
+            """
+        ).fetchall()
+        return sum(
+            (
+                Decimal(str(row["amount"]))
+                for row in rows
+                if _parse_timestamp(row["created_at"]).astimezone(_SHANGHAI).date() == day
+            ),
+            Decimal("0"),
+        )
+
+    def cross_auto_daily_principal(self, now: object = None) -> Decimal:
+        with self._read_connection() as connection:
+            return self._cross_auto_daily_principal_for(
+                connection, _utc_now() if now is None else now
+            )
+
+    @staticmethod
+    def _cross_pair_unsettled(
+        connection: sqlite3.Connection, pair_id: object
+    ) -> bool:
+        return (
+            connection.execute(
+                """
+                SELECT 1
+                FROM cross_execution_reservations AS reservation
+                JOIN executions AS execution ON execution.execution_id=reservation.execution_id
+                WHERE reservation.state='reserved'
+                  AND json_extract(execution.payload, '$.pair_id') = ?
+                LIMIT 1
+                """,
+                (str(pair_id),),
+            ).fetchone()
+            is not None
+        )
+
+    @staticmethod
     def _cross_reservation_amount(payload: Mapping[str, object]) -> Decimal:
         value = payload.get("total_max_cost")
         if isinstance(value, bool):
@@ -1776,6 +2039,16 @@ class PredictionArbitrageStore:
                         raise ValueError("preview_expired")
                     raise ValueError("cross_preview_invalid")
                 cross_amount = self._cross_reservation_amount(preview_payload)
+                if preview_payload.get("auto_submit") is True:
+                    if not self._cross_auto_state_from_connection(connection)["armed"]:
+                        raise ValueError("cross_auto_paused")
+                    if (
+                        self._cross_auto_daily_principal_for(connection, now) + cross_amount
+                        > _CROSS_AUTO_DAILY_PRINCIPAL_CAP
+                    ):
+                        raise ValueError("cross_auto_daily_principal_cap")
+                    if self._cross_pair_unsettled(connection, preview_payload["pair_id"]):
+                        raise ValueError("cross_pair_unsettled")
                 if (
                     self._reserved_cross_principal(connection) + cross_amount
                     > MAX_CROSS_UNSETTLED_PRINCIPAL
