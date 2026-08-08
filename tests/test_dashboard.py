@@ -1637,6 +1637,22 @@ def test_dashboard_current_trend_uses_candidate_snapshot_and_fails_closed(
     }]
     payload["signal_snapshots"] = {"candidates": candidates}
     assert dashboard_module._valid_trend_collections(payload, judgments)
+    candidates[0]["excluded_reasons"] = ["contradictory"]
+    assert not dashboard_module._valid_trend_collections(payload, judgments)
+    candidates[0]["excluded_reasons"] = []
+    candidates[0]["rank"] = None
+    assert not dashboard_module._valid_trend_collections(payload, judgments)
+    candidates[0].update({"eligible": False, "rank": 1, "excluded_reasons": ["not eligible"]})
+    assert not dashboard_module._valid_trend_collections(payload, judgments)
+    candidates[0].update({"eligible": False, "rank": None, "excluded_reasons": []})
+    assert not dashboard_module._valid_trend_collections(payload, judgments)
+    candidates[0].update({
+        "eligible": True,
+        "rank": 2,
+        "excluded_reasons": [],
+        "global_strength": None,
+    })
+    assert dashboard_module._valid_trend_collections(payload, judgments)
 
     report = dashboard_module._project_broker_trend_report(
         selected=(
@@ -1716,6 +1732,24 @@ def test_dashboard_current_trend_risk_audit_requires_final_plan_rows() -> None:
         "kelly_last_closed_at": "",
         "kelly_source": "合格的富途模拟闭环；实盘结果不参与计算",
     })
+    judgments["risk_skips"].extend([
+        {
+            "symbol": "ROTATION",
+            "target_weight": "0.06",
+            "target_amount": "6000",
+            "estimated_shares": 0,
+            "reason": "relative_rotation",
+            "decisive_constraint": "轮换终态",
+        },
+        {
+            "symbol": "MAPPING",
+            "target_weight": "0.06",
+            "target_amount": None,
+            "estimated_shares": 0,
+            "reason": "symbol_mapping_unavailable",
+            "decisive_constraint": "趋势代码映射",
+        },
+    ])
     judgments["risk_skips"].append({
         "symbol": "PLAN-SKIP",
         "target_weight": None,
@@ -1725,6 +1759,13 @@ def test_dashboard_current_trend_risk_audit_requires_final_plan_rows() -> None:
         "decisive_constraint": "买入计划",
     })
     assert dashboard_module._valid_trend_risk_summary(payload)
+
+    judgments["risk_skips"][3]["estimated_shares"] = 1
+    assert not dashboard_module._valid_trend_risk_summary(payload)
+    judgments["risk_skips"][3]["estimated_shares"] = 0
+    judgments["risk_skips"][1]["target_weight"] = "NaN"
+    assert not dashboard_module._valid_trend_risk_summary(payload)
+    judgments["risk_skips"][1]["target_weight"] = "0.06"
 
     judgments.pop("risk_skips")
     assert not dashboard_module._valid_trend_risk_summary(payload)
@@ -1751,6 +1792,14 @@ def test_dashboard_current_trend_risk_audit_requires_final_plan_rows() -> None:
 
 def test_dashboard_individual_global_context_mode_requires_current_only_facts() -> None:
     payload = _dashboard_frozen_report_payload()
+    snapshot = payload["strategy_snapshot"]
+    metadata = payload["metadata"]
+    assert isinstance(snapshot, dict) and isinstance(metadata, dict)
+    snapshot.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v13",
+        "strategy_version": "v13",
+    })
+    metadata["market"] = "CN"
     status = payload["industry_context_status"]
     assert isinstance(status, dict)
     status.update({
@@ -1766,6 +1815,17 @@ def test_dashboard_individual_global_context_mode_requires_current_only_facts() 
     status["history_complete"] = False
     status["fallback_reason"] = "missing current context"
     assert not dashboard_module._valid_frozen_trend_facts(payload)
+
+    legacy = _dashboard_frozen_report_payload()
+    legacy_status = legacy["industry_context_status"]
+    assert isinstance(legacy_status, dict)
+    legacy_status.update({
+        "ordering_mode": "individual_global",
+        "current_complete": True,
+        "history_complete": False,
+        "fallback_reason": None,
+    })
+    assert not dashboard_module._valid_frozen_trend_facts(legacy)
 
 
 def test_dashboard_rejects_malformed_signal_candidate_audit_when_present(

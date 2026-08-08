@@ -1493,20 +1493,27 @@ def _is_current_final_plan_payload(payload: Mapping[str, object]) -> bool:
 def _valid_current_candidate_signal(value: object) -> bool:
     if not isinstance(value, dict):
         return False
+    eligible = value.get("eligible")
+    excluded_reasons = value.get("excluded_reasons")
     if (
         not isinstance(value.get("symbol"), str)
         or not value["symbol"].strip()
         or not isinstance(value.get("name"), str)
         or not value["name"].strip()
-        or type(value.get("eligible")) is not bool
-        or not isinstance(value.get("excluded_reasons"), list)
-        or not all(isinstance(reason, str) and reason.strip() for reason in value["excluded_reasons"])
+        or type(eligible) is not bool
+        or not isinstance(excluded_reasons, list)
+        or not all(isinstance(reason, str) and reason.strip() for reason in excluded_reasons)
     ):
         return False
     rank = value.get("rank")
-    return rank is None or (
-        isinstance(rank, int) and not isinstance(rank, bool) and rank >= 1
-    )
+    if eligible:
+        return (
+            isinstance(rank, int)
+            and not isinstance(rank, bool)
+            and rank >= 1
+            and not excluded_reasons
+        )
+    return rank is None and bool(excluded_reasons)
 
 
 def _valid_frozen_trend_facts(payload: dict[str, Any]) -> bool:
@@ -1617,6 +1624,9 @@ def _valid_frozen_trend_facts(payload: dict[str, Any]) -> bool:
     if fallback_reason is not None and (
         not isinstance(fallback_reason, str) or not fallback_reason.strip()
     ):
+        return False
+    current_final_plan = _is_current_final_plan_payload(payload)
+    if (mode == "individual_global") != current_final_plan:
         return False
     if mode == "context_with_history" and (
         not status["current_complete"] or not status["history_complete"]
@@ -1900,7 +1910,6 @@ def _valid_current_trend_risk_contract(
         parameters, summary, expected_nav=expected_nav
     ):
         return False
-    ordinary_skips: list[dict[str, Any]] = []
     for item in risk_skips:
         if not isinstance(item, dict):
             return False
@@ -1918,15 +1927,14 @@ def _valid_current_trend_risk_contract(
         target_weight = item.get("target_weight")
         target_amount = item.get("target_amount")
         if target_weight is None:
-            if target_amount is not None:
+            if target_amount is not None or shares != 0:
                 return False
             continue
         if _dashboard_risk_decimal(target_weight) is None:
             return False
         if target_amount is not None and _dashboard_risk_decimal(target_amount) is None:
             return False
-        ordinary_skips.append(item)
-    risk_judgments = {**judgments, "risk_skips": ordinary_skips}
+    risk_judgments = {**judgments, "risk_skips": []}
     if not _valid_v2_risk_items(
         payload,
         risk_judgments,
