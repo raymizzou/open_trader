@@ -182,6 +182,19 @@ def _close_completed(
     return True
 
 
+def _trend_review_projection_current(
+    config: DailyPremarketConfig, market: str
+) -> bool:
+    try:
+        projection = _read_json(
+            config.data_dir / "latest" / f"trend_review_{market.lower()}.json",
+            "trend review projection",
+        )
+    except ValueError:
+        return False
+    return projection.get("schema_version") == "open_trader.trend_review.projection.v3"
+
+
 def _complete_close(
     config: DailyPremarketConfig,
     market: str,
@@ -3608,11 +3621,17 @@ def run_trend_market_controller(
                     or now.astimezone(TIMEZONES[market]).date()
                     > date.fromisoformat(cycle.as_of_date)
                 )
+                close_completed = close_due and _close_completed(
+                    config, market, cycle.as_of_date
+                )
                 if (
                     close_due
                     and not operation_delayed
                     and not review_delayed
-                    and not _close_completed(config, market, cycle.as_of_date)
+                    and (
+                        not close_completed
+                        or not _trend_review_projection_current(config, market)
+                    )
                     and _load_report_for_as_of(
                         config, market, cycle.as_of_date
                     ) is not None
@@ -3626,7 +3645,8 @@ def run_trend_market_controller(
                             account_client=account_client,
                             account_client_factory=shared_account,
                         )
-                        _complete_close(config, market, cycle.as_of_date, now)
+                        if not close_completed:
+                            _complete_close(config, market, cycle.as_of_date, now)
                     except FutuOrderExecutionError:
                         reset_account()
                         raise

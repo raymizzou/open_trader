@@ -2067,6 +2067,27 @@ def test_acceptance_validates_integrated_templates_and_three_market_reports(
     ) == []
 
 
+def test_acceptance_allows_unavailable_trade_stats_after_retryable_cycle_failure(
+    tmp_path: Path,
+) -> None:
+    payload, reports_dir, account_ids = integrated_v4_payload(tmp_path)
+    for broker in ("tiger", "phillips", "eastmoney"):
+        report = payload["trend_reports"][broker]  # type: ignore[index]
+        report["risk_summary"]["trade_stats"] = {  # type: ignore[index]
+            "available": False,
+            "status_text": "交易统计暂不可用",
+        }
+        payload["trend_reviews"][broker]["statistics_status"] = "failed"  # type: ignore[index]
+
+    assert dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    ) == []
+
+
 def test_acceptance_validates_current_live_strategy_versions(
     tmp_path: Path,
 ) -> None:
@@ -2462,6 +2483,56 @@ def test_acceptance_checks_integrated_risk_copy_and_text_status() -> None:
     )
     assert ".trend-risk-summary .trend-drawdown-bootstrap-audit summary" in clicked
     assert ".trend-risk-summary .trend-drawdown-recovery-audit summary" in clicked
+
+
+def test_acceptance_checks_truthful_unavailable_trade_stats_copy() -> None:
+    report = {
+        "risk_summary": {
+            "status": "active",
+            "status_label": "风险预算内",
+            "trade_stats": {
+                "available": False,
+                "status_text": "交易统计暂不可用",
+            },
+        },
+        "drawdown_summary": {"status_label": "纪律内"},
+    }
+    text = " ".join((
+        "组合计划风险 风险预算内 组合剩余风险 单笔风险上限 异常损失缓冲 不得用于开仓",
+        "Kelly 阶段 当前 Kelly 上限 交易统计暂不可用",
+        "策略累计回撤 纪律内",
+        "5% 是风险预算目标，不是最大损失保证。",
+    ))
+
+    class Locator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+
+        def count(self) -> int:
+            return int(self.selector not in {
+                ".trend-simulation-overlay", ".trend-actual-overlay",
+            })
+
+        def get_attribute(self, name: str) -> str | None:
+            return None if name == "open" else "active"
+
+        def locator(self, selector: str) -> "Locator":
+            return Locator(f"{self.selector} {selector}")
+
+        def click(self) -> None:
+            pass
+
+        def inner_text(self) -> str:
+            return text
+
+        def all_inner_texts(self) -> list[str]:
+            return []
+
+    class Root:
+        def locator(self, selector: str) -> Locator:
+            return Locator(selector)
+
+    dashboard_acceptance._check_integrated_trend_ui(Root(), report, "tiger")
 
 
 def test_acceptance_checks_displayed_current_lifecycle_cards_and_industry_context() -> None:

@@ -2171,6 +2171,12 @@ def patch_cycle(monkeypatch: pytest.MonkeyPatch, cycle: ControllerCycle) -> None
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{}", encoding="utf-8")
+        projection = config.data_dir / f"latest/trend_review_{market.lower()}.json"
+        projection.parent.mkdir(parents=True, exist_ok=True)
+        projection.write_text(
+            json.dumps({"schema_version": "open_trader.trend_review.projection.v3"}),
+            encoding="utf-8",
+        )
 
     monkeypatch.setattr(controller, "_capture_close", capture)
     monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
@@ -3290,11 +3296,21 @@ def test_close_review_recovery_completes_once_after_backoff(
         }
 
     projections: list[str] = []
+
+    def build_projection(data_dir: Path, market: str) -> None:
+        path = data_dir / "latest" / f"trend_review_{market.lower()}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"schema_version": "open_trader.trend_review.projection.v3"}),
+            encoding="utf-8",
+        )
+        projections.append(market)
+
     monkeypatch.setattr(controller, "benchmark_fact", benchmark)
     monkeypatch.setattr(
         controller,
         "build_trend_review_projection",
-        lambda _data_dir, market: projections.append(market),
+        build_projection,
     )
     monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
 
@@ -4450,6 +4466,12 @@ def test_close_capture_is_recovered_once_after_session_close(
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{}", encoding="utf-8")
+        projection = config.data_dir / f"latest/trend_review_{market.lower()}.json"
+        projection.parent.mkdir(parents=True, exist_ok=True)
+        projection.write_text(
+            json.dumps({"schema_version": "open_trader.trend_review.projection.v3"}),
+            encoding="utf-8",
+        )
 
     monkeypatch.setattr(controller, "_capture_close", capture)
 
@@ -4457,6 +4479,39 @@ def test_close_capture_is_recovered_once_after_session_close(
     run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
 
     assert calls == 1
+
+
+def test_closed_restart_rebuilds_legacy_trend_review_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    closed = replace(active_cn_cycle(), session="closed", market_open=False)
+    patch_cycle(monkeypatch, closed)
+    write_report(config)
+    fact = controller._close_path(config, "CN", closed.as_of_date)
+    fact.parent.mkdir(parents=True)
+    fact.write_text("{}", encoding="utf-8")
+    controller._complete_close(config, "CN", closed.as_of_date, NOW)
+    projection = config.data_dir / "latest/trend_review_cn.json"
+    projection.parent.mkdir(parents=True)
+    projection.write_text(
+        json.dumps({"schema_version": "open_trader.trend_review.projection.v2"}),
+        encoding="utf-8",
+    )
+
+    def rebuild(*_args: object, **_kwargs: object) -> None:
+        projection.write_text(
+            json.dumps({"schema_version": "open_trader.trend_review.projection.v3"}),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(controller, "_capture_close", rebuild)
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert json.loads(projection.read_text(encoding="utf-8"))["schema_version"] == (
+        "open_trader.trend_review.projection.v3"
+    )
 
 
 def test_stable_closed_restart_records_successful_reconciliation(
@@ -4489,6 +4544,12 @@ def test_stable_closed_restart_records_successful_reconciliation(
         controller, "_load_cycle_report", lambda *_args: (report_path, report)
     )
     monkeypatch.setattr(controller, "_close_completed", lambda *_args: True)
+    projection = config.data_dir / "latest/trend_review_cn.json"
+    projection.parent.mkdir(parents=True, exist_ok=True)
+    projection.write_text(
+        json.dumps({"schema_version": "open_trader.trend_review.projection.v3"}),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(controller, "_execute_locked_report", pytest.fail)
 
     result = run_trend_market_controller(

@@ -842,17 +842,26 @@ def validate_integrated_candidate(
             assert projected_summary == frozen_summary, (
                 f"{broker} 冻结风险摘要被实盘数据改写"
             )
-            assert (
-                isinstance(stats, Mapping)
-                and stats.get("available") is True
-                and isinstance(stats.get("simulation"), Mapping)
-                and isinstance(stats.get("actual"), Mapping)
-                and stats.get("actual_broker") == broker
-                and stats.get("actual_broker_label") == labels[broker]
-            ), f"{broker} 实盘统计券商或来源截止时间不正确"
-            assert stats.get("statistics_cutoff_at") == source_cutoffs.get(broker), (
-                f"{broker} 实盘统计来源截止时间与源数据不一致"
-            )
+            assert isinstance(stats, Mapping), f"{broker} 交易统计状态缺失"
+            if stats.get("available") is True:
+                assert (
+                    isinstance(stats.get("simulation"), Mapping)
+                    and isinstance(stats.get("actual"), Mapping)
+                    and stats.get("actual_broker") == broker
+                    and stats.get("actual_broker_label") == labels[broker]
+                ), f"{broker} 实盘统计券商或来源截止时间不正确"
+                assert stats.get("statistics_cutoff_at") == source_cutoffs.get(broker), (
+                    f"{broker} 实盘统计来源截止时间与源数据不一致"
+                )
+            else:
+                reviews = payload.get("trend_reviews")
+                review = reviews.get(broker) if isinstance(reviews, Mapping) else None
+                assert (
+                    stats.get("available") is False
+                    and stats.get("status_text") == "交易统计暂不可用"
+                    and isinstance(review, Mapping)
+                    and review.get("statistics_status") == "failed"
+                ), f"{broker} 交易统计不可用状态不真实"
             assert (
                 summary.get("kelly_phase") in {
                     "cold_start", "active_all_samples", "active_rolling_200",
@@ -2700,13 +2709,18 @@ def _check_integrated_trend_ui(
     for stage_text in report_root.locator(".trend-stage:visible").all_inner_texts():
         _check_visible_decimal_precision(stage_text, f"{broker} 趋势报告")
     stats = summary.get("trade_stats")
-    actual_label = (
-        stats.get("actual_broker_label") if isinstance(stats, Mapping) else ""
+    trade_stats_required = (
+        (
+            "富途模拟盘交易统计",
+            f"{_plain(stats.get('actual_broker_label'))}实盘交易统计",
+        )
+        if isinstance(stats, Mapping) and stats.get("available") is not False
+        else (_plain(stats.get("status_text")) if isinstance(stats, Mapping) else "",)
     )
     required = (
         "组合计划风险", "组合剩余风险", "单笔风险上限", "异常损失缓冲",
         "不得用于开仓", "Kelly 阶段", "当前 Kelly 上限",
-        "富途模拟盘交易统计", f"{_plain(actual_label)}实盘交易统计",
+        *trade_stats_required,
         "策略累计回撤", _plain(summary.get("status_label")),
         _plain(drawdown.get("status_label")),
         "5% 是风险预算目标，不是最大损失保证。",
