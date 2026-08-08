@@ -5,6 +5,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-08
 
+- 跨所 YES/NO 新增持久化 `auto_submit`：仅新进入 stage-5、Codex 已核准且非
+  `manual_only` 的机会可并发提交双腿；首笔 5 USDT，完成双腿成交、REST 对账和
+  Predict 授权归零后，同一指纹才升至 20 USDT。补救最多 2 USDT、未结算最多
+  100 USDT、每日新增本金最多 100 USDT；同一信号不重试、不排队，同一 canonical
+  pair 同时只允许一笔。所有拒绝在看板/API/历史显示稳定原因码、中文说明、当前值/
+  上限、场所、时间及是否需人工操作；紧急暂停为单向持久化，重新 arm 只可通过本机
+  CLI。飞书终态/事故通知失败不会中断当前对账，但会暂停后续自动入场；通知就绪是 arm
+  的前置条件。验证：最终以完整聚焦套件、prediction-market e2e 与 `make acceptance`
+  的结果为准。
 - 预测市场 YES/NO 页移除「当前监控范围」事件列表，主内容只保留「套利信号」（仍含
   交易与合并/事故 tab），24h 成交量移入套利信号表格新列（数据来自既有 signals 表，
   无后端改动）；跨所 YES/NO 漏斗与「可下单候选」保留，且候选列表只展示
