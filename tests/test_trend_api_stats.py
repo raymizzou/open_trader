@@ -9,8 +9,10 @@ from open_trader.trend_api_stats import (
     build_trend_api_stats_payload,
     eligible_simulation_rounds,
     load_trend_api_stats,
+    trend_statistics_disposition,
     strategy_payoff_ratio,
 )
+from open_trader.trend_kelly import calculate_trend_kelly, trend_kelly_rounds_from_payload
 
 
 def fill(
@@ -882,3 +884,66 @@ def test_artifact_load_reports_missing_and_unreadable_files_as_validation_errors
 
     with pytest.raises(ValueError, match="invalid JSON"):
         load_trend_api_stats(tmp_path)
+
+
+def test_statistics_disposition_conserves_every_candidate() -> None:
+    actual = {
+        "source": "actual", "broker": "tiger", "account_id": "U1",
+        "strategy_id": "trend_animals_warm_to_hot/US/v8",
+        "strategy_version": "v8",
+    }
+    payload = build_trend_api_stats_payload(
+        [
+            fill("eligible-buy", side="buy", quantity="1", price="10", fee="0.1", filled_at="2026-08-04T10:00:00-04:00", **actual),
+            fill("eligible-sell", side="sell", quantity="1", price="12", fee="0.1", filled_at="2026-08-05T10:00:00-04:00", **actual),
+            fill("manual-buy", side="buy", quantity="1", price="10", fee="0.1", filled_at="2026-08-06T10:00:00-04:00", source="actual", broker="tiger", account_id="U1", strategy_id="", strategy_version="", attribution_status="outside_strategy", exclusion_reason="no_matching_opening_strategy_action"),
+            fill("manual-sell", side="sell", quantity="1", price="11", fee="0.1", filled_at="2026-08-07T10:00:00-04:00", source="actual", broker="tiger", account_id="U1", strategy_id="", strategy_version="", attribution_status="outside_strategy", exclusion_reason="no_matching_opening_strategy_action"),
+            fill("still-open", side="buy", quantity="1", price="9", fee="0.1", filled_at="2026-08-08T10:00:00-04:00", **actual),
+        ],
+        strategy_versions=[{"market": "US", "strategy_id": "trend_animals_warm_to_hot/US/v8", "strategy_version": "v8"}],
+        generated_at="2026-08-08T17:00:00-04:00",
+        statistics_cutoff_at="2026-08-08T16:00:00-04:00",
+    )
+    payload["sources"] = [{
+        "source": "actual", "source_id": "actual:tiger:U1", "broker": "tiger",
+        "account_id": "U1", "market": "US", "orders_seen": 5, "fill_count": 5,
+        "statistics_cutoff_at": "2026-08-08T16:00:00-04:00", "status": "available",
+    }]
+
+    result = trend_statistics_disposition(payload, market="US", strategy_id="trend_animals_warm_to_hot/US/v8", opening_strategy_version="v8", source="actual")
+
+    assert result["eligible_sample_count"] == 1
+    assert result["excluded_candidate_count"] == 1
+    assert result["incomplete_open_candidate_count"] == 1
+    assert result["discovered_candidate_count"] == 3
+    assert result["discovered_candidate_count"] == result["eligible_sample_count"] + result["excluded_candidate_count"] + result["incomplete_open_candidate_count"]
+    assert result["exclusion_reasons"] == [{"reason": "no_matching_opening_strategy_action", "count": 1}]
+
+
+def test_simulation_disposition_count_equals_calculate_trend_kelly_eligible_count() -> None:
+    def pair(label: str, version: str, buy_at: str, sell_at: str) -> list[dict[str, object]]:
+        entries = [
+            fill(f"{label}-buy", side="buy", quantity="1", price="10", fee="0", filled_at=buy_at, strategy_id=f"trend_animals_warm_to_hot/US/{version}", strategy_version=version),
+            fill(f"{label}-sell", side="sell", quantity="1", price="11", fee="0", filled_at=sell_at, strategy_id=f"trend_animals_warm_to_hot/US/{version}", strategy_version=version),
+        ]
+        for entry in entries:
+            entry["symbol"] = label
+        return entries
+
+    payload = build_trend_api_stats_payload(
+        [*pair("V4", "v4", "2026-08-04T10:00:00-04:00", "2026-08-05T10:00:00-04:00"), *pair("V8", "v8", "2026-08-06T10:00:00-04:00", "2026-08-07T10:00:00-04:00")],
+        strategy_versions=[{"market": "US", "strategy_id": "trend_animals_warm_to_hot/US/v8", "strategy_version": "v8"}],
+        generated_at="2026-08-08T17:00:00-04:00",
+        statistics_cutoff_at="2026-08-08T16:00:00-04:00",
+    )
+    payload["sources"] = [{
+        "source": "simulation", "source_id": "simulation:futu:101", "broker": "futu",
+        "account_id": "101", "market": "US", "orders_seen": 4, "fill_count": 4,
+        "statistics_cutoff_at": "2026-08-08T16:00:00-04:00", "status": "available",
+    }]
+
+    disposition = trend_statistics_disposition(payload, market="US", strategy_id="trend_animals_warm_to_hot/US/v8", opening_strategy_version="v8", source="simulation")
+
+    assert disposition["eligible_sample_count"] == calculate_trend_kelly(
+        trend_kelly_rounds_from_payload(payload), market="US", strategy_id="trend_animals_warm_to_hot/US/v8", opening_strategy_version="v8",
+    ).eligible_sample_count

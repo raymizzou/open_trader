@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Context, Decimal, InvalidOperation, localcontext
 from pathlib import Path
@@ -787,16 +787,21 @@ def write_trend_api_stats(data_dir: Any, payload: object) -> Any:
 
 
 def load_trend_api_stats(data_dir: Any) -> dict[str, object]:
+    return read_trend_api_stats_snapshot(data_dir)[0]
+
+
+def read_trend_api_stats_snapshot(data_dir: Any) -> tuple[dict[str, object], str]:
     path = _path(data_dir) / "latest" / "trend_api_stats.json"
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_bytes()
+        payload = json.loads(raw)
     except FileNotFoundError:
         raise ValueError("trend_api_stats.json is missing") from None
     except (OSError, UnicodeError):
         raise ValueError("trend_api_stats.json is unreadable") from None
     except json.JSONDecodeError:
         raise ValueError("trend_api_stats.json is invalid JSON") from None
-    return _validated_payload(payload)
+    return _validated_payload(payload), hashlib.sha256(raw).hexdigest()
 
 
 def _load_frozen_strategy_facts(reports_dir: Any) -> list[dict[str, object]]:
@@ -1389,6 +1394,118 @@ def _strategy_stats(
             "statistics_cutoff_at": statistics_cutoff_at,
         })
     return stats
+
+
+def trend_statistics_disposition(
+    payload: object,
+    *,
+    market: str,
+    strategy_id: str,
+    opening_strategy_version: str,
+    source: str,
+) -> dict[str, object]:
+    validated = _validated_payload(payload)
+    target = (
+        _required_text(market, "market").upper(),
+        _required_text(strategy_id, "strategy_id"),
+        _required_text(opening_strategy_version, "opening_strategy_version"),
+    )
+    source = _required_text(source, "source")
+    cutoff = _source_cutoff(validated, target[0], source)
+    if not cutoff:
+        return {
+            "available": False,
+            "eligible_sample_count": 0,
+            "discovered_candidate_count": 0,
+            "excluded_candidate_count": 0,
+            "incomplete_open_candidate_count": 0,
+            "exclusion_reasons": [],
+            "statistics_cutoff_at": "",
+            "reason": "matching_source_audit_absent",
+        }
+    closed = [
+        item for item in validated["rounds"]
+        if item["market"] == target[0] and item["source"] == source
+    ]
+    incomplete = _incomplete_open_candidates(
+        validated["fills"], market=target[0], source=source
+    )
+    eligible, excluded = _partition_round_dispositions(closed, target=target)
+    reasons = Counter(str(item["reason"]) for item in excluded)
+    return {
+        "available": True,
+        "eligible_sample_count": len(eligible),
+        "discovered_candidate_count": len(eligible) + len(excluded) + len(incomplete),
+        "excluded_candidate_count": len(excluded),
+        "incomplete_open_candidate_count": len(incomplete),
+        "exclusion_reasons": [
+            {"reason": reason, "count": count}
+            for reason, count in sorted(reasons.items())
+        ],
+        "statistics_cutoff_at": cutoff,
+        "reason": "",
+    }
+
+
+def _incomplete_open_candidates(
+    fills: Sequence[dict[str, object]], *, market: str, source: str,
+) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, str, str], list[dict[str, object]]] = defaultdict(list)
+    for fill in fills:
+        if fill["market"] == market and fill["source"] == source:
+            grouped[(str(fill["source_id"]), market, str(fill["symbol"]))].append(fill)
+    candidates = []
+    for group in grouped.values():
+        position = Decimal("0")
+        opening: dict[str, object] | None = None
+        for fill in group:
+            quantity = _required_decimal(fill["quantity"], "fill quantity")
+            if fill["side"] == "buy":
+                opening = opening or fill
+                position += quantity
+            elif position:
+                position -= quantity
+                if position == 0:
+                    opening = None
+        if position and opening is not None:
+            candidates.append(opening)
+    return candidates
+
+
+def _partition_round_dispositions(
+    rounds: Sequence[dict[str, object]], *, target: tuple[str, str, str],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    eligible = []
+    excluded = []
+    for round_ in rounds:
+        identity = (
+            str(round_["market"]),
+            str(round_["strategy_id"]),
+            str(round_["opening_strategy_version"]),
+        )
+        reason = str(round_.get("exclusion_reason") or "")
+        if not trend_kelly_identity_matches(identity, target):
+            reason = reason or "strategy_identity_not_eligible"
+        elif round_["attribution_status"] != "attributed":
+            reason = reason or "round_not_attributed"
+        elif round_["costs_complete"] is not True:
+            reason = "costs_incomplete"
+        elif round_["net_return"] is None:
+            reason = "net_return_unavailable"
+        if reason:
+            excluded.append({"round": round_, "reason": reason})
+        else:
+            eligible.append(round_)
+    return eligible, excluded
+
+
+def _source_cutoff(payload: Mapping[str, object], market: str, source: str) -> str:
+    cutoffs = [
+        str(item["statistics_cutoff_at"])
+        for item in payload["sources"]
+        if item["market"] == market and item["source"] == source
+    ]
+    return min(cutoffs, key=lambda value: _aware_timestamp(value, "source cutoff")) if cutoffs else ""
 
 
 def _required_decimal(value: object, field: str) -> Decimal:
