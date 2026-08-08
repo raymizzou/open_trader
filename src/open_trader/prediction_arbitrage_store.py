@@ -2039,6 +2039,8 @@ class PredictionArbitrageStore:
                         raise ValueError("preview_expired")
                     raise ValueError("cross_preview_invalid")
                 cross_amount = self._cross_reservation_amount(preview_payload)
+                if self._cross_pair_unsettled(connection, preview_payload["pair_id"]):
+                    raise ValueError("cross_pair_unsettled")
                 if preview_payload.get("auto_submit") is True:
                     if not self._cross_auto_state_from_connection(connection)["armed"]:
                         raise ValueError("cross_auto_paused")
@@ -2047,8 +2049,6 @@ class PredictionArbitrageStore:
                         > _CROSS_AUTO_DAILY_PRINCIPAL_CAP
                     ):
                         raise ValueError("cross_auto_daily_principal_cap")
-                    if self._cross_pair_unsettled(connection, preview_payload["pair_id"]):
-                        raise ValueError("cross_pair_unsettled")
                 if (
                     self._reserved_cross_principal(connection) + cross_amount
                     > MAX_CROSS_UNSETTLED_PRINCIPAL

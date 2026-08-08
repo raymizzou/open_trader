@@ -1037,6 +1037,41 @@ def test_auto_cross_pair_gate_and_no_submit_releases_daily_charge(
     assert db.cross_auto_daily_principal(now=shanghai_noon) == Decimal("15")
 
 
+@pytest.mark.parametrize("existing_auto_submit", (False, True))
+def test_cross_pair_gate_rejects_manual_preview_while_pair_is_unsettled(
+    tmp_path: Path, existing_auto_submit: bool
+) -> None:
+    db = store(tmp_path)
+    if existing_auto_submit:
+        db.arm_cross_auto()
+    first_payload = cross_preview_payload(market_id="manual-pair", total_max_cost=Decimal("5"))
+    if existing_auto_submit:
+        first_payload["auto_submit"] = True
+    first_preview = db.create_preview(
+        first_payload, expires_at=iso(datetime.now(UTC) + timedelta(seconds=10))
+    )
+    first = db.consume_preview_and_create_execution(first_preview, "manual-pair-first")
+    db.transition_execution(
+        str(first["execution_id"]), state="holding_to_resolution", evidence={"held": True}
+    )
+
+    manual_payload = cross_preview_payload(
+        market_id="manual-pair", total_max_cost=Decimal("5")
+    )
+    manual_payload["execution_id"] = "execution:manual-pair-opposite"
+    manual_payload["opportunity_id"] = "cross:manual-pair:PREDICT_NO_POLYMARKET_YES"
+    manual_payload["direction"] = "PREDICT_NO_POLYMARKET_YES"
+    manual_payload["intent"]["direction"] = "PREDICT_NO_POLYMARKET_YES"
+    manual_payload["intent"]["legs"][0]["outcome"] = "NO"
+    manual_payload["intent"]["legs"][1]["outcome"] = "YES"
+    manual_preview = db.create_preview(
+        manual_payload, expires_at=iso(datetime.now(UTC) + timedelta(seconds=10))
+    )
+
+    with pytest.raises(ValueError, match="cross_pair_unsettled"):
+        db.consume_preview_and_create_execution(manual_preview, "manual-pair-opposite")
+
+
 def test_cross_reservation_remains_until_an_allowed_final_release(tmp_path: Path) -> None:
     db = store(tmp_path)
     preview_id = db.create_preview(
