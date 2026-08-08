@@ -332,11 +332,12 @@ class PredictSource:
         previous = self._versions[source].get(market.market_id)
         timestamp_ms = payload.get("updateTimestampMs")
         sequence = payload.get("version") if source == "ws" else timestamp_ms
-        if (
-            type(sequence) is not int
-            or previous is not None
-            and (sequence < previous or source == "ws" and sequence == previous)
-        ):
+        if type(sequence) is not int:
+            self._mark_stale(source)
+            return None
+        if previous is not None and source == "ws" and sequence <= previous:
+            return None
+        if previous is not None and sequence < previous:
             self._mark_stale(source)
             return None
         timestamp = _timestamp(timestamp_ms)

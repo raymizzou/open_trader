@@ -653,6 +653,44 @@ def test_websocket_drops_duplicate_and_rollback_versions() -> None:
     assert source.snapshot()["ws"] == "ready"
 
 
+def test_websocket_duplicate_and_rollback_keep_accepted_book_healthy() -> None:
+    class BlockingWebSocket(FakeWebSocket):
+        async def recv(self) -> str:
+            if self.messages:
+                return await super().recv()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    source, _ = source_with_responses(
+        [{"success": True, "data": market()}],
+        connector=lambda *args, **kwargs: BlockingWebSocket(
+            [
+                book_message(2, 1788048000000),
+                book_message(2, 1788048001000),
+                book_message(1, 1788048002000),
+            ]
+        ),
+    )
+
+    async def consume_duplicates() -> None:
+        stream = source.stream_books(("123",))
+        pending = None
+        try:
+            await anext(stream)
+            pending = asyncio.create_task(anext(stream))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert source.snapshot()["ws"] == "ready"
+        finally:
+            if pending is not None:
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            await stream.aclose()
+
+    asyncio.run(consume_duplicates())
+
+
 def test_non_finite_book_prices_are_dropped_without_raising() -> None:
     source, _ = source_with_responses(
         [

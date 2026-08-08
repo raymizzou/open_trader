@@ -5,6 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-08
 
+- 修复 Predict WebSocket 初始盘口后的重复/回滚版本把整条来源误标为 stale：这些旧帧现在
+  只被忽略，已接受盘口与 ready 健康态继续保留；真正畸形的盘口仍 fail-closed。验证：
+  Predict source、跨所监控与只读验收聚焦测试 234 通过，真实 11-market WS 持续探针保持
+  ready 且零提交。
 - 跨所 YES/NO 新增持久化 `auto_submit`：仅新进入 stage-5、Codex 已核准且非
   `manual_only` 的机会可并发提交双腿；首笔 5 USDT，完成双腿成交、REST 对账和
   Predict 授权归零后，同一指纹才升至 20 USDT。补救最多 2 USDT、未结算最多
