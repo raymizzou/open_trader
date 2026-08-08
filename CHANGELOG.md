@@ -910,3 +910,4 @@ operator-facing: what changed, which workflow is affected, and what was verified
   of explanatory filler or raw English TradingAgents prose.
 - Documented local dashboard deployment on port `8766` and added structured API
   checks for `SOXX` decision facts.
+- 2026-08-08: Trend statistics forced refreshes now retain an fsynced append-only audit trail with fail-closed history validation, preserving one-attempt evidence across retries.
