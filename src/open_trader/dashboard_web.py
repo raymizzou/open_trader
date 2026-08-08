@@ -1225,7 +1225,12 @@ def _prediction_history_payload(
 ) -> dict[str, object]:
     if kind not in PREDICTION_HISTORY_KINDS:
         raise ValueError("kind must be signals, executions, or incidents")
-    rows = store.histories(kind) if store is not None else []
+    if store is None:
+        rows = []
+    elif kind == "signals":
+        rows = store.signal_history("30d")
+    else:
+        rows = store.histories(kind)
     title_cache: dict[str, object] = {}
     safe_rows = [
         _prediction_attach_cached_title(

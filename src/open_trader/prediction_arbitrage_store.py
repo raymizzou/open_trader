@@ -1058,23 +1058,26 @@ class PredictionArbitrageStore:
         if window not in {"24h", "7d", "30d", "all"}:
             raise ValueError("window must be 24h, 7d, 30d, or all")
         with self._read_connection() as connection:
-            rows = connection.execute(
-                "SELECT * FROM signals ORDER BY started_at DESC, signal_id DESC"
-            ).fetchall()
-        cutoff: datetime | None = None
-        if window != "all":
-            deltas = {
-                "24h": timedelta(hours=24),
-                "7d": timedelta(days=7),
-                "30d": timedelta(days=30),
-            }
-            delta = deltas[window]
-            cutoff = _parse_timestamp(_utc_now()) - delta
+            if window == "all":
+                rows = connection.execute(
+                    "SELECT * FROM signals ORDER BY started_at DESC, signal_id DESC"
+                ).fetchall()
+            else:
+                deltas = {
+                    "24h": timedelta(hours=24),
+                    "7d": timedelta(days=7),
+                    "30d": timedelta(days=30),
+                }
+                cutoff = _canonical_timestamp(
+                    _parse_timestamp(_utc_now()) - deltas[window]
+                )
+                rows = connection.execute(
+                    "SELECT * FROM signals WHERE started_at >= ? "
+                    "ORDER BY started_at DESC, signal_id DESC",
+                    (cutoff,),
+                ).fetchall()
         result = []
         for row in rows:
-            started = _parse_timestamp(row["started_at"])
-            if cutoff is not None and started < cutoff:
-                continue
             result.append(
                 _row_payload(
                     row,
