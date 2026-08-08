@@ -10,8 +10,10 @@ from open_trader.trend_api_stats import (
     build_trend_api_stats_payload,
     write_trend_api_stats,
 )
+from open_trader.a_share_trend import live_trend_strategy_snapshot
 from open_trader.trend_kelly import (
     TREND_API_STATS_SCHEMA_VERSION,
+    TREND_KELLY_SAMPLE_IDENTITIES,
     TrendKellyRound,
     calculate_trend_kelly,
     load_trend_kelly_rounds,
@@ -263,6 +265,28 @@ def test_cn_v8_kelly_inherits_only_v4_v7_v8() -> None:
 
     assert state.eligible_sample_count == 3
     assert state.selected_round_ids == ("round-001", "round-002", "round-003")
+
+
+@pytest.mark.parametrize(
+    ("market", "pools"),
+    [("US", (622460,)), ("HK", (622494,))],
+)
+def test_live_snapshot_kelly_inheritance_matches_runtime_selector(
+    market: str, pools: tuple[int, ...],
+) -> None:
+    snapshot = live_trend_strategy_snapshot(market, "abc123", pools)
+    target = (market, snapshot["strategy_id"], snapshot["strategy_version"])
+    declared = {
+        (
+            item["market"],
+            item["strategy_id"],
+            item["opening_strategy_version"],
+        )
+        for item in snapshot["parameters"]["kelly_sample_inherits"]
+    }
+
+    assert declared == TREND_KELLY_SAMPLE_IDENTITIES[target]
+    assert all(trend_kelly_identity_matches(item, target) for item in declared)
 
 
 @pytest.mark.parametrize(
