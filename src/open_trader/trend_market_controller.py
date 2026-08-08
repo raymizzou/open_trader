@@ -723,6 +723,13 @@ def _run_cycle_statistics(
     now: datetime,
     process_version: str,
 ) -> dict[str, object]:
+    state_path = trend_statistics_cycle_path(
+        config.data_dir, cycle.market, cycle.as_of_date
+    )
+    state = _read_optional_json(state_path)
+    if state.get("status") == "completed":
+        return {**state, "status": "already_completed"}
+
     futu = FutuSimulateFillClient(
         host=config.futu_host,
         port=config.futu_port,

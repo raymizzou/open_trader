@@ -2330,10 +2330,23 @@ def test_statistics_wrapper_delegates_malformed_marker_to_cycle_api(
         "require_trend_review_config",
         lambda _config, _market: "CN-account",
     )
+
+    def recover_marker(**_kwargs: object) -> dict[str, object]:
+        state_path.write_text(
+            json.dumps({
+                "schema_version": "open_trader.trend_api_stats.cycle.v1",
+                "status": "completed",
+                "market": "CN",
+                "as_of_date": cycle.as_of_date,
+            }),
+            encoding="utf-8",
+        )
+        return {"status": "completed"}
+
     monkeypatch.setattr(
         controller,
         "run_trend_statistics_cycle",
-        lambda **_kwargs: {"status": "completed"},
+        recover_marker,
         raising=False,
     )
 
@@ -2354,6 +2367,44 @@ def test_statistics_wrapper_delegates_malformed_marker_to_cycle_api(
     assert json.loads(state_path.read_text(encoding="utf-8"))["reason"] == (
         "cycle failed"
     )
+
+
+def test_completed_statistics_cycle_opens_no_broker_clients_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    state_path = (
+        config.data_dir
+        / "trend_api_stats/daily/CN"
+        / f"{cycle.as_of_date}.json"
+    )
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_api_stats.cycle.v1",
+            "status": "completed",
+            "market": cycle.market,
+            "as_of_date": cycle.as_of_date,
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        controller,
+        "FutuSimulateFillClient",
+        lambda **_kwargs: pytest.fail("completed cycle reopened Futu"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "TigerActualFillClient",
+        lambda **_kwargs: pytest.fail("completed CN cycle opened Tiger"),
+        raising=False,
+    )
+
+    result = controller._run_cycle_statistics(config, cycle, NOW, "test-sha")
+
+    assert result["status"] == "already_completed"
 
 
 def test_statistics_wrapper_selects_futu_for_market_and_tiger_only_for_us(
