@@ -25,7 +25,7 @@ from open_trader.strategy_drawdown import (
 )
 
 
-@pytest.mark.parametrize("market,version", [("CN", "v11"), ("HK", "v9"), ("US", "v9")])
+@pytest.mark.parametrize("market,version", [("CN", "v12"), ("HK", "v10"), ("US", "v10")])
 def test_legacy_allocation_compatibility_event_remains_readable(
     market: str, version: str,
 ) -> None:
@@ -166,9 +166,9 @@ def test_parameter_hash_is_canonical() -> None:
 @pytest.mark.parametrize(
     ("market", "version", "predecessor"),
     [
-        ("CN", "v12", "v11"),
-        ("HK", "v10", "v9"),
-        ("US", "v10", "v9"),
+        ("CN", "v13", "v12"),
+        ("HK", "v11", "v10"),
+        ("US", "v11", "v10"),
     ],
 )
 def test_daily_allocation_changes_keep_one_drawdown_identity(

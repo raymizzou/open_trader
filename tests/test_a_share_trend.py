@@ -1512,9 +1512,9 @@ def active_drawdown_for(
 @pytest.mark.parametrize(
     ("market", "version", "rank", "weight"),
     [
-        ("CN", "v12", 1, "0.06"),
-        ("HK", "v10", 2, "0.04"),
-        ("US", "v10", 3, "0.02"),
+        ("CN", "v13", 1, "0.06"),
+        ("HK", "v11", 2, "0.04"),
+        ("US", "v11", 3, "0.02"),
     ],
 )
 def test_current_allocation_versions_freeze_rank_weight(
@@ -1532,6 +1532,32 @@ def test_current_allocation_versions_freeze_rank_weight(
     assert snapshot["parameters"]["target_weight"] == weight
     assert snapshot["parameters"]["allocation_snapshot_sha256"] == "b" * 64
     assert trend_review.normalize_trend_strategy_snapshot(snapshot, market) == snapshot
+
+
+@pytest.mark.parametrize(
+    ("market", "rank", "weight"),
+    [("CN", 1, "0.06"), ("HK", 2, "0.04"), ("US", 3, "0.02")],
+)
+def test_current_allocation_versions_publish_only_individual_rank_keys(
+    market: str, rank: int, weight: str,
+) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        market,
+        "abc123",
+        (1, 2),
+        allocation=allocation_for(market, rank=rank, entry_weight=weight),
+    )
+
+    rows = [
+        row["name"]
+        for row in snapshot["parameter_rows"]
+        if row["group"] == "候选排序"
+    ]
+
+    assert rows == [
+        "排序顺序", "候选数量", "个股全局强度", "行业温度",
+        "个股右侧天数", "个股成交额", "股票代码",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -2496,6 +2522,35 @@ def test_candidates_filter_then_sort_deterministically() -> None:
     assert decisions.excluded["600006"] == ["danger_signal"]
 
 
+def test_new_versions_rank_mixed_assets_by_global_strength() -> None:
+    rows = [
+        candidate(
+            "ETF", asset="ETF基金", global_strength="97", strength="95",
+            industry_temperature="温",
+        ),
+        candidate(
+            "STOCK", asset="A股", global_strength="98", strength="96",
+            industry_temperature="温", name="股票",
+        ),
+        candidate(
+            "TIE-HOT", global_strength="96", industry_temperature="热",
+            days=4, amount="2",
+        ),
+        candidate(
+            "TIE-WARM", global_strength="96", industry_temperature="温",
+            days=1, amount="9",
+        ),
+    ]
+
+    decision = build_candidate_list(
+        rows, held_symbols=set(), market="CN", strategy_version="v13"
+    )
+
+    assert [item.symbol for item in decision.eligible] == [
+        "STOCK", "ETF", "TIE-HOT", "TIE-WARM",
+    ]
+
+
 def _industry_context(
     industry_tm_id: int,
     *,
@@ -2560,6 +2615,26 @@ def test_candidate_industry_context_ordering_uses_report_wide_context_keys() -> 
         "600002",
         "600001",
     ]
+
+
+def test_cn_v12_keeps_industry_first_order() -> None:
+    rows = [
+        candidate("600001", global_strength="99", strength="99", industry_tm_id=1),
+        candidate("600002", global_strength="98", strength="98", industry_tm_id=2),
+    ]
+
+    decision = build_candidate_list(
+        rows,
+        held_symbols=set(),
+        market="CN",
+        strategy_version="v12",
+        industry_contexts={
+            1: _industry_context(1, temperature="温", strength="80"),
+            2: _industry_context(2, temperature="热", strength="90"),
+        },
+    )
+
+    assert [item.symbol for item in decision.eligible] == ["600002", "600001"]
 
 
 def test_candidate_context_missing_prior_uses_current_only_for_every_candidate() -> None:

@@ -294,11 +294,11 @@ def test_live_snapshot_kelly_inheritance_matches_runtime_selector(
 @pytest.mark.parametrize(
     ("market", "target_version", "inherited_versions"),
     [
-        ("CN", "v11", ("v4", "v7", "v8", "v9", "v10", "v11")),
+        ("CN", "v13", ("v4", "v7", "v8", "v9", "v10", "v11")),
         ("US", "v7", ("v4", "v5", "v6", "v7")),
         ("HK", "v7", ("v4", "v5", "v6", "v7")),
-        ("US", "v9", ("v4", "v5", "v6", "v7", "v8", "v9")),
-        ("HK", "v9", ("v4", "v5", "v6", "v7", "v8", "v9")),
+        ("US", "v11", ("v4", "v5", "v6", "v7", "v8", "v9")),
+        ("HK", "v11", ("v4", "v5", "v6", "v7", "v8", "v9")),
     ],
 )
 def test_current_strategy_versions_use_exact_inherited_kelly_samples(
@@ -319,7 +319,7 @@ def test_current_strategy_versions_use_exact_inherited_kelly_samples(
             version,
         )
         assert trend_kelly_identity_matches(sample, target) is (
-            version in inherited_versions
+            version in {*inherited_versions, target_version}
         )
         if version != target_version and version_number < int(target_version[1:]):
             assert not trend_kelly_identity_matches(target, sample)

@@ -81,7 +81,7 @@ PROTECTION_STATE_ROOTS = {
 TREND_STRATEGY_VERSIONS = frozenset(
     {
         "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12",
+        "v11", "v12", "v13",
     }
 )
 
@@ -4976,7 +4976,7 @@ def _remaining_buy_quantity(
         if isinstance(strategy_snapshot, Mapping)
         else ""
     )
-    if version in {"v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"}:
+    if version in {"v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"}:
         risk_summary = report.get("risk_summary")
         if not isinstance(risk_summary, Mapping):
             raise ValueError("trend review risk summary is unavailable")
@@ -6589,9 +6589,9 @@ def normalize_trend_strategy_snapshot(
         version = str(snapshot.get("strategy_version") or "")
         allocation = None
         if (market, version) in {
-            ("CN", "v11"), ("CN", "v12"),
-            ("HK", "v9"), ("HK", "v10"),
-            ("US", "v9"), ("US", "v10"),
+            ("CN", "v11"), ("CN", "v12"), ("CN", "v13"),
+            ("HK", "v9"), ("HK", "v10"), ("HK", "v11"),
+            ("US", "v9"), ("US", "v10"), ("US", "v11"),
         }:
             allocation = {
                 "daily_path": parameters.get("allocation_snapshot_path"),
@@ -6609,7 +6609,7 @@ def normalize_trend_strategy_snapshot(
                 },
             }
         if version in {
-            "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
+            "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
         }:
             expected_snapshot = live_trend_strategy_snapshot(
                 market,
@@ -7590,7 +7590,7 @@ def build_trend_review_projection(
         fact
         for fact in effective_facts
         if fact_identity(fact)[2] in {
-            "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
+            "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
         }
     ]
     target_candidates = live_facts or effective_facts
@@ -7923,15 +7923,15 @@ def rebuild_trend_report_from_evidence(
         "price_fx_to_account_currency",
     }
     if strategy_version in {
-        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
+        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
     }:
         required.add("normal_cost_rate")
     if strategy_version in {
-        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
+        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
     }:
         required.update({"kelly_rounds", "kelly_data_reason"})
     if strategy_version in {
-        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
+        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
     }:
         required.add("drawdown_summary")
     missing = sorted(required - inputs.keys())
@@ -8310,7 +8310,7 @@ def rebuild_trend_report_from_evidence(
         )
     normal_cost_rate = decimal_or_none(inputs.get("normal_cost_rate"))
     if strategy_version in {
-        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
+        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
     } and (
         normal_cost_rate is None
         or not normal_cost_rate.is_finite()
@@ -8439,7 +8439,7 @@ def rebuild_trend_report_from_evidence(
         drawdown_summary=(
             inputs["drawdown_summary"]
             if strategy_version in {
-                "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
+                "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
             }
             and isinstance(inputs.get("drawdown_summary"), Mapping)
             else None

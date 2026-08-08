@@ -297,7 +297,7 @@ def test_cn_historical_and_current_snapshots_normalize_without_cross_version_rew
     assert old["parameters"]["max_filter_price"] == "200"
     assert "kelly_sample_inherits" not in historic_v6["parameters"]
     assert current["strategy_version"] == "v10"
-    assert "v10" in trend_review.TREND_STRATEGY_VERSIONS
+    assert "v13" in trend_review.TREND_STRATEGY_VERSIONS
     assert "max_filter_price" not in current["parameters"]
     assert current["parameters"]["kelly_sample_inherits"][0][
         "opening_strategy_version"
@@ -8013,7 +8013,7 @@ def test_projection_tolerates_daily_allocation_identity_changes(
 
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
-    assert projection["strategy_snapshot"]["strategy_version"] == "v12"
+    assert projection["strategy_snapshot"]["strategy_version"] == "v13"
 
 
 def test_projection_excludes_non_allocation_parameter_drift_fact(
