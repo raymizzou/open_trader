@@ -950,3 +950,52 @@ def test_cycle_hashes_current_locked_snapshot_without_comparing_stale_sync_resul
         (tmp_path / "data/latest/trend_api_stats.json").read_bytes()
     ).hexdigest()
     assert result["artifact_sha256"] == expected_sha
+
+
+def test_market_cutoff_filters_late_fill_until_later_cycle(tmp_path: Path) -> None:
+    us_kwargs = cycle_kwargs(
+        tmp_path,
+        market="US",
+        futu_client=RecordingCycleClient(account_id="us-sim"),
+        tiger_client=RecordingCycleClient(account_id="U1"),
+    )
+    assert run_trend_statistics_cycle(**us_kwargs)["status"] == "completed"
+
+    late_fill = normalized_fill(
+        "late-cn", "late-cn-order", source="simulation", side="buy",
+        filled_at="2026-08-08T16:00:00+08:00", price="10",
+    ) | {
+        "source_id": "simulation:futu:cn-sim",
+        "account_id": "cn-sim",
+        "market": "CN",
+        "currency": "CNY",
+    }
+
+    class LateFillClient(RecordingCycleClient):
+        def fetch_fills(self, **kwargs: object) -> dict[str, object]:
+            self.calls.append({
+                "start": kwargs["start"],
+                "end": kwargs["end"],
+                "attributions_by_order": dict(kwargs["attributions_by_order"]),
+            })
+            return {
+                "account_id": self.account_id,
+                "orders_seen": 1,
+                "fills": [late_fill],
+            }
+
+    client = LateFillClient(account_id="cn-sim")
+    first = run_trend_statistics_cycle(
+        **cycle_kwargs(tmp_path, market="CN", futu_client=client)
+    )
+    assert first["status"] == "completed"
+    assert all(fill["fill_id"] != "late-cn" for fill in load_trend_api_stats(tmp_path / "data")["fills"])
+
+    second_kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=client) | {
+        "as_of_date": "2026-08-09",
+        "generated_at": "2026-08-09T16:00:00+08:00",
+    }
+    second = run_trend_statistics_cycle(**second_kwargs)
+    assert second["status"] == "completed"
+    assert any(fill["fill_id"] == "late-cn" for fill in load_trend_api_stats(tmp_path / "data")["fills"])
+    assert len(client.calls) == 2

@@ -473,6 +473,9 @@ def sync_trend_api_stats(
     reports_dir = _path(reports_dir)
     facts = _load_frozen_strategy_facts(reports_dir)
     futu_attributions = _futu_order_attributions(data_dir, facts)
+    source_cutoff = _aware_timestamp(
+        statistics_cutoff_at, "statistics_cutoff_at"
+    )
     fetched_fills: list[Mapping[str, object]] = []
     sources: list[dict[str, object]] = []
     for market, client in sorted(futu_clients.items()):
@@ -481,7 +484,10 @@ def sync_trend_api_stats(
             end=end,
             attributions_by_order=futu_attributions.get(market.upper(), {}),
         )
-        fills = _result_fills(result)
+        fills = [
+            fill for fill in _result_fills(result)
+            if _aware_timestamp(fill["filled_at"], "fill filled_at") <= source_cutoff
+        ]
         fetched_fills.extend(fills)
         account_id = str(
             result.get("account_id")
@@ -505,7 +511,10 @@ def sync_trend_api_stats(
             end=end,
             attributions_by_order={},
         )
-        tiger_fills = _attribute_actual_fills(_result_fills(tiger_result), facts)
+        tiger_fills = [
+            fill for fill in _attribute_actual_fills(_result_fills(tiger_result), facts)
+            if _aware_timestamp(fill["filled_at"], "fill filled_at") <= source_cutoff
+        ]
         fetched_fills.extend(tiger_fills)
         tiger_account = str(
             tiger_result.get("account_id")
@@ -1217,6 +1226,20 @@ def _validated_payload(payload: object) -> dict[str, object]:
         raise ValueError("rounds are not derived from fills")
     if payload["stats"] != rebuilt["stats"]:
         raise ValueError("stats are not derived from rounds")
+    source_cutoffs = {
+        (str(source["source_id"]), str(source["market"])): _aware_timestamp(
+            source["statistics_cutoff_at"], "source statistics_cutoff_at"
+        )
+        for source in payload["sources"]
+    }
+    for fill in rebuilt["fills"]:
+        source_cutoff = source_cutoffs.get(
+            (str(fill["source_id"]), str(fill["market"]))
+        )
+        if source_cutoff is not None and _aware_timestamp(
+            fill["filled_at"], "fill filled_at"
+        ) > source_cutoff:
+            raise ValueError("fill filled_at exceeds source statistics_cutoff_at")
     return payload
 
 
