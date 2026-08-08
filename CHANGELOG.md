@@ -3,6 +3,15 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-09
+
+- 三市场趋势报告降低候选筛选成本：A 股升级为 v13，港股/美股升级为 v11；候选按个股
+  全局强度排序，行业只取温度和方向，不再请求合格行业成分及成员快照。纪律、持仓、退出、
+  风险、仓位和轮换门槛保持原规则；审计区只解释“已通过纪律但未进入最终买入计划”的原因，
+  未通过纪律的候选统一折叠在末尾，空的普通买入区不再展示。新增三市场一次性校验后才发布的
+  无下单修订脚本；冻结请求账本估算为 CN 0.276、HK 0.205、US 0.205，US 保持低于
+  2.852 上限。相关 Python/Dashboard 测试 1573 通过。
+
 ## 2026-08-08
 
 - Dashboard 验收不再把账户快照刷新期间允许的短暂 503 控制台提示重复判错；其他接口的
