@@ -198,6 +198,12 @@ TREND_REASON_LABELS = {
     "unsupported_exchange": "不属于沪深市场",
     "atr_unavailable": "缺少 ATR 数据",
     "data_date_mismatch": "数据日期不一致",
+    "strategy_identity_not_eligible": "策略身份不匹配",
+    "round_not_attributed": "无法归属策略",
+    "costs_incomplete": "成本不完整",
+    "net_return_unavailable": "净收益不可用",
+    "no_matching_opening_strategy_action": "无匹配开仓策略动作",
+    "scaled_entry_attribution_conflict": "加仓归属冲突",
 }
 REMOVED_TREND_EXECUTION_LABELS = (
     "待执行", "已提交", "部分成交", "全部成交", "失败", "受阻",
@@ -4367,7 +4373,11 @@ def _check_trend_review(
 
     def sample_text(key: str, label: str) -> str:
         count = sample_counts.get(key)
-        assert isinstance(count, int), f"{broker} 趋势复盘 {label}样本数无效"
+        if count is None:
+            return f"{label} 数据不可用"
+        assert isinstance(count, int) and not isinstance(count, bool), (
+            f"{broker} 趋势复盘 {label}样本数无效"
+        )
         return (
             f"{label} {count} 笔"
             if count >= required_count
@@ -4394,14 +4404,54 @@ def _check_trend_review(
         "返回持仓看板",
         sample_text("discipline", "纪律模拟"),
         sample_text("actual", "实际执行"),
-        f"共同截止日 {_plain(cutoff) if cutoff is not None else '暂无'}",
     ]
+    if cutoff is not None:
+        header_items.append(f"共同截止日 {_plain(cutoff)}")
+    statistics_status = review.get("statistics_status")
+    if statistics_status == "failed":
+        header_items.append("统计刷新失败；报告继续使用上一个有效快照")
+    elif statistics_status == "stale":
+        header_items.append("统计快照已过期；报告继续使用上一个有效快照")
+    elif statistics_status == "unavailable":
+        header_items.append("统计刷新状态不可用")
+    statistics_items: list[str] = []
+    details = review.get("sample_details")
+    sample_cutoffs = review.get("sample_cutoffs")
+    metric_cutoffs = review.get("metric_cutoffs")
+    assert isinstance(details, Mapping), f"{broker} 趋势复盘样本明细无效"
+    assert isinstance(sample_cutoffs, Mapping), f"{broker} 趋势复盘样本截止无效"
+    assert isinstance(metric_cutoffs, Mapping), f"{broker} 趋势复盘指标截止无效"
+    for series, _label, _title in TREND_REVIEW_COMPARISONS:
+        detail = details.get(series)
+        if isinstance(detail, Mapping) and detail.get("available") is True:
+            statistics_items.extend((
+                f"统计截至 {_plain(sample_cutoffs.get(series))}",
+                "发现 "
+                f"{detail.get('discovered_candidate_count')} · 排除 "
+                f"{detail.get('excluded_candidate_count')} · 未闭环 "
+                f"{detail.get('incomplete_open_candidate_count')}",
+            ))
+            metric_cutoff = metric_cutoffs.get(series)
+            if metric_cutoff is not None:
+                statistics_items.append(f"指标截至 {_plain(metric_cutoff)}")
+            reasons = detail.get("exclusion_reasons")
+            if isinstance(reasons, list) and reasons:
+                statistics_items.append(
+                    "排除原因 " + "、".join(
+                        f"{TREND_REASON_LABELS.get(str(item.get('reason')), '其他原因')} "
+                        f"{item.get('count')}"
+                        for item in reasons if isinstance(item, Mapping)
+                    )
+                )
+        else:
+            statistics_items.append("统计来源不可用")
     for required in (
         f"{market_label}趋势复盘",
         _plain(review.get("broker_label")),
         _plain(snapshot.get("strategy_name")),
         _trend_review_strategy_version(snapshot.get("strategy_version")),
         *header_items,
+        *statistics_items,
         *(title for _series, _label, title in TREND_REVIEW_COMPARISONS),
         "同期市场",
     ):
@@ -4458,21 +4508,29 @@ def _check_trend_review(
         benchmark_values.append(panel.locator(
             '.trend-review-series[data-series="benchmark"] strong'
         ).all_inner_texts())
-    assert benchmark_values[0] == benchmark_values[1], (
-        f"{broker} 两个比较 panel 的市场基准显示值不一致"
-    )
     metrics_payload = review.get("metrics")
     assert isinstance(metrics_payload, Mapping), f"{broker} 趋势复盘指标数据无效"
-    expected_benchmark = [
-        _trend_review_display(
-            metrics_payload[key]["benchmark"],
-            percent=percent,
+    metric_reasons = {
+        str(cell.get("reason"))
+        for values in metrics_payload.values()
+        if isinstance(values, Mapping)
+        for cell in values.values()
+        if isinstance(cell, Mapping) and cell.get("value") is None
+        and cell.get("reason")
+    }
+    for reason in metric_reasons:
+        assert reason in text, f"{broker} 趋势复盘缺少指标不可用原因 {reason}"
+    for index, (series, _label, _title) in enumerate(TREND_REVIEW_COMPARISONS):
+        expected_benchmark = [
+            _trend_review_display(
+                metrics_payload[key][f"{series}_benchmark"],
+                percent=percent,
+            )
+            for key, _label, percent in TREND_REVIEW_METRIC_SPECS
+        ]
+        assert benchmark_values[index] == expected_benchmark, (
+            f"{broker} {series} 市场基准未使用对应 API cell"
         )
-        for key, _label, percent in TREND_REVIEW_METRIC_SPECS
-    ]
-    assert benchmark_values[0] == expected_benchmark, (
-        f"{broker} 比较 panel 的市场基准未使用同一 API cell"
-    )
     metric_values = workspace.locator(
         ".trend-review-series strong"
     ).all_inner_texts()
@@ -4488,6 +4546,14 @@ def _check_trend_review(
         "Backtest", "Sharpe", "Calmar", "Alpha", "Beta", "Sortino",
     ):
         assert forbidden not in text, f"{broker} 趋势复盘包含未要求内容 {forbidden}"
+    controls = page.locator(
+        "#trend-report-workspace:visible button, "
+        "#trend-report-workspace:visible input, "
+        "#trend-report-workspace:visible select, "
+        "#trend-report-workspace:visible textarea, "
+        "#trend-report-workspace:visible summary"
+    )
+    assert controls.count() == 1, f"{broker} 趋势复盘新增了交互控件"
     _check_trend_review_visual_contract(page, broker)
     _check_trend_review_geometry(page, broker)
     width = (getattr(page, "viewport_size", None) or {}).get("width", 0)

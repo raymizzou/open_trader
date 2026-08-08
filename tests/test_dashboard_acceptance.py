@@ -1590,8 +1590,38 @@ def trend_reviews() -> dict[str, dict[str, object]]:
             "broker_label": broker_label,
             "market": market,
             "market_label": market_label,
-            "sample_counts": {"discipline": 31, "actual": 29, "required": 30},
-            "common_cutoff": "2026-07-17",
+            "sample_counts": {"discipline": 4, "actual": None, "required": 30},
+            "sample_details": {
+                "discipline": {
+                    "available": True,
+                    "eligible_sample_count": 4,
+                    "discovered_candidate_count": 9,
+                    "excluded_candidate_count": 4,
+                    "incomplete_open_candidate_count": 1,
+                    "exclusion_reasons": [{"reason": "costs_incomplete", "count": 4}],
+                    "statistics_cutoff_at": "2026-08-08T15:00:00+08:00",
+                    "reason": "",
+                },
+                "actual": {
+                    "available": False,
+                    "eligible_sample_count": 0,
+                    "discovered_candidate_count": 0,
+                    "excluded_candidate_count": 0,
+                    "incomplete_open_candidate_count": 0,
+                    "exclusion_reasons": [],
+                    "statistics_cutoff_at": "",
+                    "reason": "matching_source_audit_absent",
+                },
+            },
+            "sample_cutoffs": {
+                "discipline": "2026-08-08T15:00:00+08:00",
+                "actual": None,
+            },
+            "metric_cutoffs": {"discipline": "2026-08-08", "actual": None},
+            "common_cutoff": None,
+            "statistics_status": "failed",
+            "statistics_reason": "broker unavailable",
+            "statistics_as_of_date": "2026-08-08",
             "strategy_snapshot": {
                 "strategy_id": f"trend/{market}/v1",
                 "strategy_name": f"{market_label}短线右侧趋势",
@@ -1609,12 +1639,17 @@ def trend_reviews() -> dict[str, dict[str, object]]:
                     for series, value in (
                         ("discipline", "12.6"),
                         ("actual", "9.4"),
-                        ("benchmark", "7.8"),
+                        ("discipline_benchmark", "7.8"),
+                        ("actual_benchmark", "6.8"),
                     )
                 }
                 for key, _label, _percent
                 in dashboard_acceptance.TREND_REVIEW_METRIC_SPECS
             },
+        }
+        reviews[broker]["metrics"]["sharpe"]["actual"] = {  # type: ignore[index]
+            "value": None,
+            "reason": "实际执行日终净值缺失",
         }
     return reviews
 
@@ -2614,6 +2649,29 @@ def test_acceptance_rejects_trend_review_benchmark_drift() -> None:
         )
 
 
+def test_acceptance_rejects_extra_trend_review_controls() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.review_control_count = 2
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="交互控件"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_checks_stale_trend_statistics_status() -> None:
+    payload = valid_payload()
+    payload["trend_reviews"]["tiger"]["statistics_status"] = "stale"  # type: ignore[index]
+    page = tabbed_account_page(payload)
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    dashboard_acceptance._check_trend_review(
+        page, section, "tiger", payload["trend_reviews"]["tiger"]
+    )
+
+
 def test_acceptance_rejects_trend_review_panel_style_drift() -> None:
     payload = valid_payload()
     page = tabbed_account_page(payload)
@@ -2867,17 +2925,26 @@ def trend_workspace_text(
     )
 
 
-def trend_review_workspace_text(broker: str) -> str:
-    review = trend_reviews()[broker]
+def trend_review_workspace_text(
+    broker: str, review: Mapping[str, object] | None = None,
+) -> str:
+    review = review or trend_reviews()[broker]
     snapshot = review["strategy_snapshot"]
+    status_text = (
+        "统计快照已过期；报告继续使用上一个有效快照"
+        if review.get("statistics_status") == "stale"
+        else "统计刷新失败；报告继续使用上一个有效快照"
+    )
     return (
         f"{review['broker_label']}｜{review['market_label']} "
         f"{review['market_label']}趋势复盘 {snapshot['strategy_name']}｜第 1 版 "
-        "返回持仓看板 纪律模拟 31 笔 实际执行 29 / 30，数据不足 "
-        "共同截止日 2026-07-17 "
+        "返回持仓看板 纪律模拟 4 / 30，数据不足 实际执行 数据不可用 "
+        f"{status_text} "
+        "统计截至 2026-08-08T15:00:00+08:00 指标截至 2026-08-08 "
+        "发现 9 · 排除 4 · 未闭环 1 排除原因 成本不完整 4 统计来源不可用 "
         "纪律模拟与市场 期间净收益率 相对市场超额收益 最大回撤 卡玛比率 夏普比率 "
         "实际执行与市场 期间净收益率 相对市场超额收益 最大回撤 卡玛比率 夏普比率 "
-        "纪律模拟 实际执行 同期市场"
+        "纪律模拟 实际执行 同期市场 实际执行日终净值缺失"
     )
 
 
@@ -3360,6 +3427,14 @@ class TabbedAccountLocator:
             return int(self.page.trend_broker is not None)
         if self.selector == "#trend-report-workspace:visible [data-close-trend-report]":
             return int(self.page.trend_broker is not None)
+        if self.selector == (
+            "#trend-report-workspace:visible button, "
+            "#trend-report-workspace:visible input, "
+            "#trend-report-workspace:visible select, "
+            "#trend-report-workspace:visible textarea, "
+            "#trend-report-workspace:visible summary"
+        ):
+            return self.page.review_control_count
         if self.selector == "#trend-report-workspace:visible .trend-review-header-side":
             return int(self.page.trend_kind == "review")
         if self.selector == "#trend-report-workspace:visible .trend-review-header-side > *":
@@ -3622,7 +3697,7 @@ class TabbedAccountLocator:
         ):
             if self.page.trend_kind == "review":
                 broker = str(self.page.trend_broker)
-                return trend_review_workspace_text(broker)
+                return trend_review_workspace_text(broker, self.page.reviews[broker])
             broker = str(self.page.trend_broker)
             return self.page.workspace_texts[broker]
         if self.selector == "#trend-report-workspace:visible .trend-controller-status":
@@ -3779,9 +3854,15 @@ class TabbedAccountLocator:
                 f"{snapshot['strategy_name']}｜第 1 版",
             ]
         if self.selector == "#trend-report-workspace:visible .trend-review-header-side > *":
+            status = self.page.reviews[broker].get("statistics_status")
             return [
-                "返回持仓看板", "纪律模拟 31 笔",
-                "实际执行 29 / 30，数据不足", "共同截止日 2026-07-17",
+                "返回持仓看板", "纪律模拟 4 / 30，数据不足",
+                "实际执行 数据不可用",
+                (
+                    "统计快照已过期；报告继续使用上一个有效快照"
+                    if status == "stale"
+                    else "统计刷新失败；报告继续使用上一个有效快照"
+                ),
             ]
         if self.selector == "#trend-report-workspace:visible .trend-review-comparison figcaption":
             return ["纪律模拟与市场", "实际执行与市场"]
@@ -3980,9 +4061,10 @@ class TabbedAccountPage:
         self.review_style_checks: list[str | None] = []
         self.review_geometry_checks: list[str | None] = []
         self.review_benchmark_checks: list[str] = []
+        self.review_control_count = 1
         self.review_benchmark_values = {
             "discipline": ["7.8%", "7.8%", "7.8%", "7.8", "7.8"],
-            "actual": ["7.8%", "7.8%", "7.8%", "7.8", "7.8"],
+            "actual": ["6.8%", "6.8%", "6.8%", "6.8", "6.8"],
         }
         self.review_panel_radius = "8px"
         self.review_label_border_width = "0px"

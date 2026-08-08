@@ -3848,6 +3848,12 @@ const TREND_REASON_LABELS = {
   unsupported_exchange: "不属于沪深市场",
   atr_unavailable: "缺少 ATR 数据",
   data_date_mismatch: "数据日期不一致",
+  strategy_identity_not_eligible: "策略身份不匹配",
+  round_not_attributed: "无法归属策略",
+  costs_incomplete: "成本不完整",
+  net_return_unavailable: "净收益不可用",
+  no_matching_opening_strategy_action: "无匹配开仓策略动作",
+  scaled_entry_attribution_conflict: "加仓归属冲突",
 };
 
 const CURRENT_TREND_EXIT_DISCIPLINES = new Set(["CN:v9", "US:v6", "HK:v6"]);
@@ -3926,9 +3932,9 @@ function renderTrendReviewMetric(review, metric, seriesDefinitions) {
     const width = value === null || maximum === 0 ? 0 : Math.round(Math.abs(value) / maximum * 50);
     const direction = value !== null && value < 0 ? " negative" : " positive";
     const unavailable = value === null ? " unavailable" : "";
-    return `<div class="trend-review-series${unavailable}" data-series="${series.key}">
+    return `<div class="trend-review-series${unavailable}" data-series="${series.dataKey || series.key}">
       <span>${escapeHtml(series.label)}</span>
-      <span class="trend-review-track" aria-hidden="true"><i class="trend-review-bar ${series.key}${direction}" style="--trend-review-width:${width}%"></i></span>
+      <span class="trend-review-track" aria-hidden="true"><i class="trend-review-bar ${series.dataKey || series.key}${direction}" style="--trend-review-width:${width}%"></i></span>
       <strong>${escapeHtml(formatTrendReviewValue(cell, metric.percent))}</strong>
     </div>`;
   }).join("");
@@ -3936,17 +3942,32 @@ function renderTrendReviewMetric(review, metric, seriesDefinitions) {
 }
 
 function renderTrendReviewComparison(review, comparison) {
+  const detail = review.sample_details?.[comparison.key];
+  const sampleCutoff = review.sample_cutoffs?.[comparison.key];
+  const metricCutoff = review.metric_cutoffs?.[comparison.key];
+  const disposition = detail?.available === true
+    ? `<span>发现 ${detail.discovered_candidate_count} · 排除 ${detail.excluded_candidate_count} · 未闭环 ${detail.incomplete_open_candidate_count}</span>`
+    : "<span>统计来源不可用</span>";
+  const exclusions = Array.isArray(detail?.exclusion_reasons) && detail.exclusion_reasons.length
+    ? `<span>排除原因 ${detail.exclusion_reasons.map((item) => `${TREND_REASON_LABELS[item.reason] || "其他原因"} ${item.count}`).join("、")}</span>`
+    : "";
   const seriesDefinitions = [
     {key:comparison.key, label:comparison.label},
-    {key:"benchmark", label:"同期市场"},
+    {key:`${comparison.key}_benchmark`, dataKey:"benchmark", label:"同期市场"},
   ];
   return `<figure class="trend-review-comparison" data-series="${comparison.key}"><figcaption>${escapeHtml(comparison.title)}</figcaption>
+    <div class="trend-entry-details trend-review-comparison-meta">
+      ${sampleCutoff ? `<span>统计截至 ${escapeHtml(formatPlain(sampleCutoff))}</span>` : ""}
+      ${metricCutoff ? `<span>指标截至 ${escapeHtml(formatPlain(metricCutoff))}</span>` : ""}
+      ${disposition}${exclusions}
+    </div>
     ${TREND_REVIEW_METRICS.map((metric) => renderTrendReviewMetric(review, metric, seriesDefinitions)).join("")}
   </figure>`;
 }
 
 function formatTrendReviewSampleCount(review, key, label) {
-  const count = Number.isInteger(review.sample_counts?.[key]) ? review.sample_counts[key] : 0;
+  const count = review.sample_counts?.[key];
+  if (!Number.isInteger(count)) return `${label} 数据不可用`;
   const required = Number.isInteger(review.sample_counts?.required) ? review.sample_counts.required : 30;
   return count >= required ? `${label} ${count} 笔` : `${label} ${count} / ${required}，数据不足`;
 }
@@ -3960,6 +3981,13 @@ function formatTrendReviewStrategyVersion(value) {
 function renderTrendReviewWorkspace(review, embedded = false) {
   const snapshot = review.strategy_snapshot || {};
   const root = embedded ? "div" : "main";
+  const statisticsStatus = review.statistics_status === "failed"
+    ? "<span>统计刷新失败；报告继续使用上一个有效快照</span>"
+    : review.statistics_status === "stale"
+      ? "<span>统计快照已过期；报告继续使用上一个有效快照</span>"
+    : review.statistics_status === "unavailable"
+      ? "<span>统计刷新状态不可用</span>"
+      : "";
   return `<${root} class="trend-review">
     <header class="trend-review-header">
       <div><p>${escapeHtml(`${formatPlain(review.broker_label)}｜${formatPlain(review.market_label)}`)}</p>
@@ -3969,7 +3997,8 @@ function renderTrendReviewWorkspace(review, embedded = false) {
         ${embedded ? "" : '<button type="button" data-close-trend-report>返回持仓看板</button>'}
         <span>${escapeHtml(formatTrendReviewSampleCount(review,"discipline","纪律模拟"))}</span>
         <span>${escapeHtml(formatTrendReviewSampleCount(review,"actual","实际执行"))}</span>
-        <span>共同截止日 ${escapeHtml(review.common_cutoff ? formatPlain(review.common_cutoff) : "暂无")}</span>
+        ${review.common_cutoff ? `<span>共同截止日 ${escapeHtml(formatPlain(review.common_cutoff))}</span>` : ""}
+        ${statisticsStatus}
       </div>
     </header>
     <div class="trend-review-comparisons">

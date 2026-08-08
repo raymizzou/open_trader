@@ -944,6 +944,172 @@ def trend_review_projection_v2(market: str, broker: str) -> dict[str, object]:
     return payload
 
 
+def trend_review_projection_v3(market: str, broker: str) -> dict[str, object]:
+    payload = trend_review_projection_v2(market, broker)
+    payload["schema_version"] = "open_trader.trend_review.projection.v3"
+    payload["sample_details"] = {
+        key: {
+            "available": True,
+            "eligible_sample_count": payload["sample_counts"][key],  # type: ignore[index]
+            "discovered_candidate_count": payload["sample_counts"][key],  # type: ignore[index]
+            "excluded_candidate_count": 0,
+            "incomplete_open_candidate_count": 0,
+            "exclusion_reasons": [],
+            "statistics_cutoff_at": "2026-07-17T16:00:00+08:00",
+            "reason": "",
+        }
+        for key in ("discipline", "actual")
+    }
+    payload["sample_cutoffs"] = {
+        "discipline": "2026-07-17T16:00:00+08:00",
+        "actual": "2026-07-17T16:00:00+08:00",
+    }
+    payload["metric_cutoffs"] = {
+        "discipline": "2026-07-17",
+        "actual": "2026-07-17",
+    }
+    for values in payload["metrics"].values():  # type: ignore[union-attr]
+        benchmark = values.pop("benchmark")
+        values["discipline_benchmark"] = dict(benchmark)
+        values["actual_benchmark"] = dict(benchmark)
+    return payload
+
+
+def test_dashboard_keeps_report_available_when_statistics_cycle_failed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "data/latest/trend_review_cn.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(trend_review_projection_v3("CN", "eastmoney")),
+        encoding="utf-8",
+    )
+    state_path = tmp_path / "data/trend_api_stats/daily/CN/2026-08-08.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({
+        "schema_version": "open_trader.trend_api_stats.cycle.v1",
+        "market": "CN",
+        "as_of_date": "2026-08-08",
+        "status": "failed",
+        "attempted_at": "2026-08-08T16:05:00+08:00",
+        "reason": "broker unavailable",
+        "process_git_sha": "abc1234",
+        "failure_notified_at": "2026-08-08T16:05:01+08:00",
+        "recovery_notified_at": None,
+    }), encoding="utf-8")
+
+    review = dashboard_module._load_trend_reviews(tmp_path / "data")["eastmoney"]
+
+    assert review["available"] is True
+    assert review["statistics_status"] == "failed"
+    assert review["statistics_reason"] == "broker unavailable"
+    assert review["sample_counts"]["discipline"] == 31
+
+
+def test_dashboard_overlays_latest_statistics_without_writing_files(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    path = data_dir / "latest/trend_review_cn.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(trend_review_projection_v3("CN", "eastmoney")),
+        encoding="utf-8",
+    )
+    stats = build_trend_api_stats_payload(
+        [],
+        strategy_versions=[{
+            "market": "CN",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v1",
+            "strategy_version": "v1",
+        }],
+        generated_at="2026-08-08T16:05:00+08:00",
+        statistics_cutoff_at="2026-08-08T15:00:00+08:00",
+    )
+    stats["sources"] = [{
+        "source": "simulation",
+        "source_id": "simulation:futu:101",
+        "broker": "futu",
+        "account_id": "101",
+        "market": "CN",
+        "orders_seen": 0,
+        "fill_count": 0,
+        "statistics_cutoff_at": "2026-08-08T15:00:00+08:00",
+        "status": "available",
+    }]
+    write_trend_api_stats(data_dir, stats)
+    before = {item: item.read_bytes() for item in data_dir.rglob("*") if item.is_file()}
+
+    review = dashboard_module._load_trend_reviews(data_dir)["eastmoney"]
+
+    assert review["sample_counts"]["discipline"] == 0
+    assert review["sample_counts"]["actual"] is None
+    assert review["sample_details"]["discipline"]["statistics_cutoff_at"] == (
+        "2026-08-08T15:00:00+08:00"
+    )
+    assert review["sample_details"]["actual"]["available"] is False
+    assert {item: item.read_bytes() for item in data_dir.rglob("*") if item.is_file()} == before
+
+
+def test_dashboard_does_not_fall_back_to_older_statistics_cycle_state(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    path = data_dir / "latest/trend_review_cn.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(trend_review_projection_v3("CN", "eastmoney")),
+        encoding="utf-8",
+    )
+    cycle_dir = data_dir / "trend_api_stats/daily/CN"
+    cycle_dir.mkdir(parents=True)
+    (cycle_dir / "2026-08-07.json").write_text(json.dumps({
+        "schema_version": "open_trader.trend_api_stats.cycle.v1",
+        "market": "CN",
+        "as_of_date": "2026-08-07",
+        "status": "completed",
+        "completed_at": "2026-08-07T16:05:00+08:00",
+        "process_git_sha": "abc1234",
+        "statistics_cutoff_at": "2026-08-07T15:00:00+08:00",
+        "artifact_sha256": "a" * 64,
+    }), encoding="utf-8")
+    (cycle_dir / "2026-08-08.json").write_text("{", encoding="utf-8")
+
+    review = dashboard_module._load_trend_reviews(data_dir)["eastmoney"]
+
+    assert review["statistics_status"] == "unavailable"
+    assert review["statistics_as_of_date"] is None
+
+
+def test_dashboard_marks_completed_cycle_stale_when_accepted_artifact_is_missing(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    path = data_dir / "latest/trend_review_cn.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(trend_review_projection_v3("CN", "eastmoney")),
+        encoding="utf-8",
+    )
+    cycle_path = data_dir / "trend_api_stats/daily/CN/2026-08-08.json"
+    cycle_path.parent.mkdir(parents=True)
+    cycle_path.write_text(json.dumps({
+        "schema_version": "open_trader.trend_api_stats.cycle.v1",
+        "market": "CN",
+        "as_of_date": "2026-08-08",
+        "status": "completed",
+        "completed_at": "2026-08-08T16:05:00+08:00",
+        "process_git_sha": "abc1234",
+        "statistics_cutoff_at": "2026-08-08T15:00:00+08:00",
+        "artifact_sha256": "a" * 64,
+    }), encoding="utf-8")
+
+    review = dashboard_module._load_trend_reviews(data_dir)["eastmoney"]
+
+    assert review["statistics_status"] == "stale"
+    assert review["statistics_as_of_date"] == "2026-08-08"
+
+
 def test_dashboard_loads_only_strict_market_matched_trend_reviews(
     tmp_path: Path,
 ) -> None:
@@ -953,7 +1119,7 @@ def test_dashboard_loads_only_strict_market_matched_trend_reviews(
     latest.mkdir(parents=True, exist_ok=True)
     for market, broker in (("CN", "eastmoney"), ("US", "tiger"), ("HK", "phillips")):
         (latest / f"trend_review_{market.lower()}.json").write_text(
-            json.dumps(trend_review_projection(market, broker)), encoding="utf-8"
+            json.dumps(trend_review_projection_v3(market, broker)), encoding="utf-8"
         )
 
     reviews = load_dashboard_state(config).to_dict()["trend_reviews"]
@@ -981,9 +1147,10 @@ def test_dashboard_loads_only_strict_market_matched_trend_reviews(
 
 
 def test_dashboard_keeps_null_common_cutoff_available(tmp_path: Path) -> None:
-    payload = trend_review_projection("US", "tiger")
+    payload = trend_review_projection_v3("US", "tiger")
     payload["common_cutoff"] = None
     payload["interval"] = {"start": "2026-07-17", "end": None}
+    payload["metric_cutoffs"]["actual"] = None  # type: ignore[index]
     path = tmp_path / "data/latest/trend_review_us.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -1007,7 +1174,7 @@ def test_dashboard_keeps_null_common_cutoff_available(tmp_path: Path) -> None:
 def test_dashboard_rejects_incomplete_snapshot_without_common_cutoff(
     tmp_path: Path, snapshot: dict[str, object]
 ) -> None:
-    payload = trend_review_projection("US", "tiger")
+    payload = trend_review_projection_v3("US", "tiger")
     payload["common_cutoff"] = None
     payload["interval"] = {"start": "2026-07-17", "end": None}
     payload["strategy_snapshot"] = snapshot
@@ -1020,11 +1187,11 @@ def test_dashboard_rejects_incomplete_snapshot_without_common_cutoff(
     assert review["available"] is False
 
 
-def test_dashboard_accepts_strict_v2_trend_review_projection(tmp_path: Path) -> None:
+def test_dashboard_accepts_strict_v3_trend_review_projection(tmp_path: Path) -> None:
     path = tmp_path / "data/latest/trend_review_us.json"
     path.parent.mkdir(parents=True)
     path.write_text(
-        json.dumps(trend_review_projection_v2("US", "tiger")), encoding="utf-8"
+        json.dumps(trend_review_projection_v3("US", "tiger")), encoding="utf-8"
     )
 
     review = dashboard_module._load_trend_reviews(tmp_path / "data")["tiger"]
@@ -1036,7 +1203,7 @@ def test_dashboard_accepts_strict_v2_trend_review_projection(tmp_path: Path) -> 
 def test_dashboard_accepts_current_snapshot_after_historical_interval_start(
     tmp_path: Path,
 ) -> None:
-    payload = trend_review_projection_v2("US", "tiger")
+    payload = trend_review_projection_v3("US", "tiger")
     snapshot = payload["strategy_snapshot"]
     assert isinstance(snapshot, dict)
     snapshot.update(
@@ -1103,12 +1270,16 @@ def test_dashboard_accepts_current_snapshot_after_historical_interval_start(
             lambda payload: payload["interval"].update(source="internal"),
             "tiger",
         ),
+        (
+            lambda payload: payload["metric_cutoffs"].update(actual=None),
+            "tiger",
+        ),
     ],
 )
 def test_dashboard_rejects_invalid_trend_review_projection(
     tmp_path: Path, mutation: object, broker: str
 ) -> None:
-    payload = trend_review_projection("US", "tiger")
+    payload = trend_review_projection_v3("US", "tiger")
     mutation(payload)  # type: ignore[operator]
     path = tmp_path / "data/latest/trend_review_us.json"
     path.parent.mkdir(parents=True)

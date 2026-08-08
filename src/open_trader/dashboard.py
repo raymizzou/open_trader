@@ -85,7 +85,11 @@ from .trend_review import (
 )
 from .trend_market_controller import _valid_status
 from .strategy_drawdown import valid_drawdown_decision
-from .trend_api_stats import load_trend_api_stats
+from .trend_api_stats import (
+    load_trend_api_stats,
+    read_trend_api_stats_snapshot,
+    trend_statistics_disposition,
+)
 from .tradingagents_summary import (
     index_tradingagents_summary_by_market_symbol,
     load_tradingagents_summary_cache,
@@ -152,7 +156,12 @@ TREND_REVIEW_METRICS = {
     "calmar",
     "sharpe",
 }
-TREND_REVIEW_SERIES = {"discipline", "actual", "benchmark"}
+TREND_REVIEW_SERIES = {
+    "discipline",
+    "actual",
+    "discipline_benchmark",
+    "actual_benchmark",
+}
 ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TREND_MARKET_TIMEZONES = {
@@ -474,6 +483,63 @@ def _valid_iso_date(value: object) -> bool:
     return True
 
 
+def _valid_aware_datetime(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def _valid_trend_review_sample_detail(value: object) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, dict) or set(value) != {
+        "available",
+        "eligible_sample_count",
+        "discovered_candidate_count",
+        "excluded_candidate_count",
+        "incomplete_open_candidate_count",
+        "exclusion_reasons",
+        "statistics_cutoff_at",
+        "reason",
+    }:
+        return False
+    counts = [
+        value[key]
+        for key in (
+            "eligible_sample_count",
+            "discovered_candidate_count",
+            "excluded_candidate_count",
+            "incomplete_open_candidate_count",
+        )
+    ]
+    reasons = value["exclusion_reasons"]
+    if (
+        not isinstance(value["available"], bool)
+        or any(type(count) is not int or count < 0 for count in counts)
+        or counts[1] != counts[0] + counts[2] + counts[3]
+        or not isinstance(reasons, list)
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"reason", "count"}
+            or not isinstance(item["reason"], str)
+            or not item["reason"].strip()
+            or type(item["count"]) is not int
+            or item["count"] < 1
+            for item in reasons
+        )
+        or not isinstance(value["statistics_cutoff_at"], str)
+        or not isinstance(value["reason"], str)
+    ):
+        return False
+    if value["available"]:
+        return _valid_aware_datetime(value["statistics_cutoff_at"]) and not value["reason"]
+    return not value["statistics_cutoff_at"] and bool(value["reason"].strip())
+
+
 def _valid_trend_review_projection(
     payload: object, *, broker: str, market: str
 ) -> bool:
@@ -485,11 +551,11 @@ def _valid_trend_review_projection(
     interval = payload.get("interval")
     metrics = payload.get("metrics")
     schema_version = payload.get("schema_version")
+    sample_details = payload.get("sample_details")
+    sample_cutoffs = payload.get("sample_cutoffs")
+    metric_cutoffs = payload.get("metric_cutoffs")
     if (
-        schema_version not in {
-            "open_trader.trend_review.projection.v1",
-            "open_trader.trend_review.projection.v2",
-        }
+        schema_version != "open_trader.trend_review.projection.v3"
         or payload.get("available") is not True
         or payload.get("broker") != broker
         or payload.get("market") != market
@@ -497,7 +563,8 @@ def _valid_trend_review_projection(
         or not isinstance(sample_counts, dict)
         or set(sample_counts) != {"discipline", "actual", "required"}
         or any(
-            type(sample_counts[key]) is not int or sample_counts[key] < 0
+            sample_counts[key] is not None
+            and (type(sample_counts[key]) is not int or sample_counts[key] < 0)
             for key in ("discipline", "actual")
         )
         or type(sample_counts["required"]) is not int
@@ -515,34 +582,46 @@ def _valid_trend_review_projection(
         )
         or not isinstance(metrics, dict)
         or set(metrics) != TREND_REVIEW_METRICS
+        or not isinstance(sample_details, dict)
+        or set(sample_details) != {"discipline", "actual"}
+        or not all(
+            _valid_trend_review_sample_detail(sample_details[key])
+            for key in ("discipline", "actual")
+        )
+        or not isinstance(sample_cutoffs, dict)
+        or set(sample_cutoffs) != {"discipline", "actual"}
+        or not isinstance(metric_cutoffs, dict)
+        or set(metric_cutoffs) != {"discipline", "actual"}
     ):
         return False
-    if schema_version == "open_trader.trend_review.projection.v2":
-        sample_counts = payload.get("sample_counts")
-        common_cutoff = payload.get("common_cutoff")
-        interval = payload.get("interval")
+    for key in ("discipline", "actual"):
+        detail = sample_details[key]
+        expected_count = (
+            detail["eligible_sample_count"]
+            if isinstance(detail, dict) and detail["available"] is True
+            else None
+        )
+        expected_cutoff = (
+            detail["statistics_cutoff_at"]
+            if isinstance(detail, dict) and detail["available"] is True
+            else None
+        )
         if (
-            not isinstance(sample_counts, dict)
-            or set(sample_counts) != {"discipline", "actual", "required"}
-            or any(
-                type(sample_counts[key]) is not int or sample_counts[key] < 0
-                for key in ("discipline", "actual")
-            )
-            or type(sample_counts["required"]) is not int
-            or sample_counts["required"] != 30
-            or not isinstance(interval, dict)
-            or set(interval) != {"start", "end"}
-            or not _valid_iso_date(interval["start"])
-            or interval["end"] != common_cutoff
+            sample_counts[key] != expected_count
+            or sample_cutoffs[key] != expected_cutoff
             or (
-                common_cutoff is not None
-                and (
-                    not _valid_iso_date(common_cutoff)
-                    or common_cutoff < interval["start"]
-                )
+                metric_cutoffs[key] is not None
+                and not _valid_iso_date(metric_cutoffs[key])
             )
         ):
             return False
+    expected_common_cutoff = (
+        min(metric_cutoffs.values())
+        if all(metric_cutoffs.values())
+        else None
+    )
+    if common_cutoff != expected_common_cutoff:
+        return False
     for key in (
         "strategy_id",
         "strategy_name",
@@ -581,6 +660,68 @@ def _valid_trend_review_projection(
     )
 
 
+def _latest_trend_statistics_cycle(data_dir: Path, market: str) -> dict[str, Any]:
+    root = data_dir / "trend_api_stats" / "daily" / market
+    paths = sorted(root.glob("*.json"), reverse=True)
+    if not paths:
+        return {}
+    path = paths[0]
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version")
+        != "open_trader.trend_api_stats.cycle.v1"
+        or payload.get("market") != market
+        or payload.get("as_of_date") != path.stem
+        or payload.get("status") not in {"completed", "failed"}
+        or not _valid_iso_date(payload.get("as_of_date"))
+        or not isinstance(payload.get("process_git_sha"), str)
+        or not payload["process_git_sha"].strip()
+    ):
+        return {}
+    if payload["status"] == "failed":
+        if (
+            not _valid_aware_datetime(payload.get("attempted_at"))
+            or not isinstance(payload.get("reason"), str)
+            or not payload["reason"].strip()
+        ):
+            return {}
+    elif (
+        not _valid_aware_datetime(payload.get("completed_at"))
+        or not _valid_aware_datetime(payload.get("statistics_cutoff_at"))
+        or not isinstance(payload.get("artifact_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", payload["artifact_sha256"]) is None
+    ):
+        return {}
+    return payload
+
+
+def _overlay_trend_statistics(
+    data_dir: Path, payload: Mapping[str, Any], market: str
+) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    details = dict(payload["sample_details"])
+    artifact_available = False
+    try:
+        statistics, _digest = read_trend_api_stats_snapshot(data_dir)
+    except ValueError:
+        pass
+    else:
+        artifact_available = True
+        snapshot = payload["strategy_snapshot"]
+        for key, source in (("discipline", "simulation"), ("actual", "actual")):
+            details[key] = trend_statistics_disposition(
+                statistics,
+                market=market,
+                strategy_id=snapshot["strategy_id"],
+                opening_strategy_version=snapshot["strategy_version"],
+                source=source,
+            )
+    return details, _latest_trend_statistics_cycle(data_dir, market), artifact_available
+
+
 def _load_trend_reviews(data_dir: Path) -> dict[str, dict[str, Any]]:
     reviews: dict[str, dict[str, Any]] = {}
     for broker, (market, market_label, broker_label) in TREND_REVIEW_SOURCES.items():
@@ -599,6 +740,19 @@ def _load_trend_reviews(data_dir: Path) -> dict[str, dict[str, Any]]:
         if not _valid_trend_review_projection(payload, broker=broker, market=market):
             reviews[broker] = {**unavailable, "status_text": "复盘数据无效"}
             continue
+        sample_details, cycle, artifact_available = _overlay_trend_statistics(
+            data_dir, payload, market
+        )
+        sample_counts = {
+            key: (
+                detail["eligible_sample_count"]
+                if isinstance(detail := sample_details[key], dict)
+                and detail["available"] is True
+                else None
+            )
+            for key in ("discipline", "actual")
+        }
+        sample_counts["required"] = payload["sample_counts"]["required"]
         reviews[broker] = {
             "available": True,
             "broker": broker,
@@ -606,10 +760,28 @@ def _load_trend_reviews(data_dir: Path) -> dict[str, dict[str, Any]]:
             "market": market,
             "market_label": market_label,
             "strategy_snapshot": payload["strategy_snapshot"],
-            "sample_counts": payload["sample_counts"],
+            "sample_counts": sample_counts,
+            "sample_details": sample_details,
+            "sample_cutoffs": {
+                key: (
+                    detail["statistics_cutoff_at"]
+                    if isinstance(detail := sample_details[key], dict)
+                    and detail["available"] is True
+                    else None
+                )
+                for key in ("discipline", "actual")
+            },
+            "metric_cutoffs": payload["metric_cutoffs"],
             "common_cutoff": payload["common_cutoff"],
             "interval": payload["interval"],
             "metrics": payload["metrics"],
+            "statistics_status": (
+                "stale"
+                if cycle.get("status") == "completed" and not artifact_available
+                else cycle.get("status", "unavailable")
+            ),
+            "statistics_reason": cycle.get("reason", ""),
+            "statistics_as_of_date": cycle.get("as_of_date"),
         }
     return reviews
 
