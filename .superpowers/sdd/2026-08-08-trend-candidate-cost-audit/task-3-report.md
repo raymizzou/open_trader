@@ -108,3 +108,21 @@ passed. `ruff` remains unavailable in the shared virtualenv.
 
 The previous concern about missing HK/US ledger fixtures is resolved by the
 new parameterized allocation-backed test.
+
+### Evidence-ledger follow-up
+
+The staged current-version evidence query now carries the industry-temperature
+fields only inside the exact staged trace; the standalone `industry_fields`
+metadata remains on legacy evidence only. This keeps the request ledger
+unambiguous without changing legacy replay semantics.
+
+```text
+/Users/ray/projects/open_trader/.venv/bin/python -m pytest -q \
+  tests/test_a_share_trend.py::test_current_cn_runner_ledger_excludes_real_only_candidates \
+  tests/test_market_trend.py::test_allocation_market_runner_ledger_excludes_real_only_candidates \
+  tests/test_market_trend.py::test_corrupt_statistics_do_not_weaken_current_market_industry_gate
+6 passed in 0.54s
+
+git diff --check
+exit 0
+```
