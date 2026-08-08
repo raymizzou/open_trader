@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -805,6 +806,50 @@ def cycle_kwargs(
     }
 
 
+def force_audit_path(tmp_path: Path) -> Path:
+    return trend_statistics_cycle_path(
+        tmp_path / "data", "CN", "2026-08-08"
+    ).with_suffix(".force_attempts.jsonl")
+
+
+def force_audit_event(
+    attempt_id: int,
+    status: str,
+    *,
+    timestamp: str = "2026-08-09T08:00:00+08:00",
+) -> dict[str, object]:
+    event: dict[str, object] = {
+        "schema_version": "open_trader.trend_api_stats.force_attempt.v1",
+        "attempt_id": attempt_id,
+        "market": "CN",
+        "as_of_date": "2026-08-08",
+        "actor": "ray",
+        "reason": "repair stale facts",
+        "process_git_sha": "face001",
+        "timestamp": timestamp,
+        "status": status,
+    }
+    if status == "failed":
+        event["error"] = "broker unavailable"
+    return event
+
+
+def assert_force_audit_rejected(
+    tmp_path: Path, events: list[object], *, final_newline: bool = True
+) -> None:
+    path = force_audit_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    body = "\n".join(json.dumps(event) for event in events)
+    path.write_text(body + ("\n" if final_newline else ""), encoding="utf-8")
+    with pytest.raises(ValueError, match="force attempt audit"):
+        run_trend_statistics_cycle(
+            **cycle_kwargs(tmp_path, market="CN", futu_client=RecordingCycleClient()),
+            force=True,
+            actor="ray",
+            reason="another repair",
+        )
+
+
 def test_completed_cycle_is_not_recomputed_without_explicit_force(tmp_path: Path) -> None:
     client = RecordingCycleClient()
     kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=client)
@@ -857,6 +902,136 @@ def test_force_requires_actor_and_reason(tmp_path: Path) -> None:
         run_trend_statistics_cycle(**kwargs, force=True)
 
 
+def test_force_rejects_unterminated_audit_line(tmp_path: Path) -> None:
+    assert_force_audit_rejected(
+        tmp_path,
+        [
+            force_audit_event(1, "started"),
+            force_audit_event(
+                1, "completed", timestamp="2026-08-09T08:01:00+08:00"
+            ),
+        ],
+        final_newline=False,
+    )
+
+
+def test_force_rejects_non_utf8_audit(tmp_path: Path) -> None:
+    path = force_audit_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xff\n")
+    with pytest.raises(ValueError, match="force attempt audit"):
+        run_trend_statistics_cycle(
+            **cycle_kwargs(tmp_path, market="CN", futu_client=RecordingCycleClient()),
+            force=True,
+            actor="ray",
+            reason="another repair",
+        )
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        [
+            force_audit_event(1, "queued"),
+            force_audit_event(1, "completed", timestamp="2026-08-09T08:01:00+08:00"),
+        ],
+        [
+            force_audit_event(1, "started"),
+            force_audit_event(1, "completed", timestamp="2026-08-09T08:01:00+08:00"),
+            force_audit_event(1, "started", timestamp="2026-08-09T08:02:00+08:00"),
+            force_audit_event(1, "completed", timestamp="2026-08-09T08:03:00+08:00"),
+        ],
+        [
+            force_audit_event(2, "started"),
+            force_audit_event(2, "completed", timestamp="2026-08-09T08:01:00+08:00"),
+            force_audit_event(1, "started", timestamp="2026-08-09T08:02:00+08:00"),
+            force_audit_event(1, "completed", timestamp="2026-08-09T08:03:00+08:00"),
+        ],
+        [
+            force_audit_event(1, "started"),
+            force_audit_event(1, "completed", timestamp="2026-08-09T08:01:00+08:00")
+            | {"actor": "operator"},
+        ],
+        [force_audit_event(1, "started")],
+    ],
+    ids=[
+        "invalid_status",
+        "duplicate_id",
+        "out_of_order",
+        "identity_changed",
+        "incomplete",
+    ],
+)
+def test_force_rejects_invalid_audit_grouping(
+    tmp_path: Path, events: list[dict[str, object]]
+) -> None:
+    assert_force_audit_rejected(tmp_path, events)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema_version", "open_trader.trend_api_stats.force_attempt.v0"),
+        ("market", "XX"),
+        ("as_of_date", "2026-8-8"),
+        ("actor", " ray"),
+        ("reason", ""),
+        ("process_git_sha", "not-a-sha"),
+        ("timestamp", "2026-08-09T08:00:00"),
+        ("actor", None),
+    ],
+    ids=[
+        "schema",
+        "market",
+        "date",
+        "actor",
+        "reason",
+        "process_sha",
+        "timestamp",
+        "missing_field",
+    ],
+)
+def test_force_rejects_invalid_audit_event_fields(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    started = force_audit_event(1, "started")
+    if value is None:
+        started.pop(field)
+    else:
+        started[field] = value
+    events = [
+        started,
+        force_audit_event(1, "completed", timestamp="2026-08-09T08:01:00+08:00"),
+    ]
+    assert_force_audit_rejected(tmp_path, events)
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        [
+            [],
+            force_audit_event(1, "completed", timestamp="2026-08-09T08:01:00+08:00"),
+        ],
+        [
+            force_audit_event(1, "started"),
+            {
+                key: value
+                for key, value in force_audit_event(
+                    1, "failed", timestamp="2026-08-09T08:01:00+08:00"
+                ).items()
+                if key != "error"
+            },
+        ],
+    ],
+    ids=["non_object", "failed_without_error"],
+)
+def test_force_rejects_invalid_audit_event_shape(
+    tmp_path: Path, events: list[object]
+) -> None:
+    assert_force_audit_rejected(tmp_path, events)
+
+
 def test_failed_forced_refresh_preserves_completed_marker_and_audit(tmp_path: Path) -> None:
     client = RecordingCycleClient()
     kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=client)
@@ -864,7 +1039,7 @@ def test_failed_forced_refresh_preserves_completed_marker_and_audit(tmp_path: Pa
     client.fail_once = True
 
     forced = run_trend_statistics_cycle(
-        **(kwargs | {"process_git_sha": "forced123"}),
+        **(kwargs | {"process_git_sha": "fade123"}),
         force=True,
         actor="ray",
         reason="repair stale facts",
@@ -881,7 +1056,7 @@ def test_failed_forced_refresh_preserves_completed_marker_and_audit(tmp_path: Pa
     assert state["last_forced_failure_at"] == kwargs["generated_at"]
     assert state["last_forced_failure_actor"] == "ray"
     assert state["last_forced_failure_reason"] == "repair stale facts"
-    assert state["last_forced_failure_process_git_sha"] == "forced123"
+    assert state["last_forced_failure_process_git_sha"] == "fade123"
     assert state["last_forced_failure_error"] == "broker unavailable"
     assert repeated["status"] == "already_completed"
     assert len(client.calls) == 2
@@ -893,8 +1068,9 @@ def test_two_forced_refresh_attempts_have_distinct_durable_audit_ids(tmp_path: P
     assert run_trend_statistics_cycle(**kwargs)["status"] == "completed"
     client.fail_once = True
 
+    before_first_terminal = datetime.now(UTC)
     first = run_trend_statistics_cycle(
-        **(kwargs | {"process_git_sha": "force001"}),
+        **(kwargs | {"process_git_sha": "face001"}),
         force=True,
         actor="ray",
         reason="first repair",
@@ -902,16 +1078,14 @@ def test_two_forced_refresh_attempts_have_distinct_durable_audit_ids(tmp_path: P
     second = run_trend_statistics_cycle(
         **(kwargs | {
             "generated_at": "2026-08-09T08:05:00+08:00",
-            "process_git_sha": "force002",
+            "process_git_sha": "face002",
         }),
         force=True,
         actor="operator",
         reason="second repair",
     )
 
-    audit_path = trend_statistics_cycle_path(
-        tmp_path / "data", "CN", "2026-08-08"
-    ).with_suffix(".force_attempts.jsonl")
+    audit_path = force_audit_path(tmp_path)
     events = [json.loads(line) for line in audit_path.read_text().splitlines()]
     assert first["status"] == "failed"
     assert second["status"] == "completed"
@@ -926,9 +1100,12 @@ def test_two_forced_refresh_attempts_have_distinct_durable_audit_ids(tmp_path: P
         ("operator", "second repair"),
     ]
     assert [event["process_git_sha"] for event in events[::2]] == [
-        "force001",
-        "force002",
+        "face001",
+        "face002",
     ]
+    first_terminal = datetime.fromisoformat(events[1]["timestamp"])
+    assert before_first_terminal <= first_terminal <= datetime.now(UTC)
+    assert events[1]["timestamp"] != events[0]["timestamp"]
 
 
 def test_ordinary_retry_completion_preserves_forced_failure_audit(tmp_path: Path) -> None:

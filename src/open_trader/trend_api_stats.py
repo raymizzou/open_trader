@@ -24,6 +24,7 @@ from .trend_simulate_positions import _action_events
 
 TREND_API_STATS_SCHEMA_VERSION = "open_trader.trend_api_stats.v1"
 STATISTICS_CYCLE_SCHEMA = "open_trader.trend_api_stats.cycle.v1"
+STATISTICS_FORCE_ATTEMPT_SCHEMA = "open_trader.trend_api_stats.force_attempt.v1"
 _CALCULATION_CONTEXT = Context(prec=28)
 _MARKET_TIMEZONES = {
     "CN": ZoneInfo("Asia/Shanghai"),
@@ -643,6 +644,7 @@ def run_trend_statistics_cycle(
         force_attempt = None
         if force:
             force_attempt = {
+                "schema_version": STATISTICS_FORCE_ATTEMPT_SCHEMA,
                 "attempt_id": _next_force_attempt_id(force_audit_path),
                 "market": normalized_market,
                 "as_of_date": normalized_date,
@@ -673,6 +675,7 @@ def run_trend_statistics_cycle(
             ):
                 _, artifact_sha256 = read_trend_api_stats_snapshot(data_dir)
         except Exception as exc:
+            force_error = str(exc).strip() or type(exc).__name__
             result = _write_failed_cycle_state(
                 state_path, previous, exc, generated_at, process_git_sha,
                 actor if force else "", reason if force else "",
@@ -680,7 +683,11 @@ def run_trend_statistics_cycle(
             if force_attempt is not None:
                 _append_force_attempt(
                     force_audit_path,
-                    force_attempt | {"status": "failed", "error": str(exc)},
+                    force_attempt | {
+                        "status": "failed",
+                        "timestamp": datetime.now(UTC).isoformat(),
+                        "error": force_error,
+                    },
                 )
             return result
         result = _write_completed_cycle_state(
@@ -689,7 +696,11 @@ def run_trend_statistics_cycle(
         )
         if force_attempt is not None:
             _append_force_attempt(
-                force_audit_path, force_attempt | {"status": "completed"}
+                force_audit_path,
+                force_attempt | {
+                    "status": "completed",
+                    "timestamp": datetime.now(UTC).isoformat(),
+                },
             )
         return result
 
@@ -714,32 +725,104 @@ def _read_optional_json(path: Path) -> dict[str, object]:
 
 
 def _next_force_attempt_id(path: Path) -> int:
-    latest = 0
     if not path.exists():
         return 1
-    for line_number, line in enumerate(
-        path.read_text(encoding="utf-8").splitlines(), start=1
-    ):
-        if not line.strip():
-            continue
+    raw = path.read_bytes()
+    if not raw:
+        return 1
+    if not raw.endswith(b"\n"):
+        raise ValueError("force attempt audit has an unterminated line")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("force attempt audit is not valid UTF-8") from exc
+    events: list[dict[str, object]] = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
         try:
             event = json.loads(line)
-            attempt_id = event["attempt_id"]
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        except json.JSONDecodeError as exc:
             raise ValueError(
                 f"force attempt audit line {line_number} is invalid"
             ) from exc
+        events.append(_validated_force_attempt_event(event, line_number))
+    if len(events) % 2:
+        raise ValueError("force attempt audit has an incomplete attempt")
+    latest = 0
+    identity_fields = (
+        "attempt_id",
+        "market",
+        "as_of_date",
+        "actor",
+        "reason",
+        "process_git_sha",
+    )
+    for index in range(0, len(events), 2):
+        started, terminal = events[index:index + 2]
+        attempt_id = int(started["attempt_id"])
         if (
-            not isinstance(attempt_id, int)
-            or isinstance(attempt_id, bool)
-            or attempt_id < 1
+            started["status"] != "started"
+            or terminal["status"] not in {"failed", "completed"}
+            or attempt_id <= latest
+            or any(started[field] != terminal[field] for field in identity_fields)
+            or started["timestamp"] == terminal["timestamp"]
         ):
-            raise ValueError(f"force attempt audit line {line_number} is invalid")
-        latest = max(latest, attempt_id)
+            raise ValueError("force attempt audit grouping is invalid")
+        latest = attempt_id
     return latest + 1
 
 
+def _validated_force_attempt_event(
+    event: object, line_number: int
+) -> dict[str, object]:
+    if not isinstance(event, dict):
+        raise ValueError(f"force attempt audit line {line_number} is invalid")
+    status = event.get("status")
+    fields = {
+        "schema_version",
+        "attempt_id",
+        "market",
+        "as_of_date",
+        "actor",
+        "reason",
+        "process_git_sha",
+        "timestamp",
+        "status",
+    } | ({"error"} if status == "failed" else set())
+    attempt_id = event.get("attempt_id")
+    market = event.get("market")
+    as_of_date = event.get("as_of_date")
+    valid = (
+        set(event) == fields
+        and event.get("schema_version") == STATISTICS_FORCE_ATTEMPT_SCHEMA
+        and isinstance(attempt_id, int)
+        and not isinstance(attempt_id, bool)
+        and attempt_id > 0
+        and isinstance(market, str)
+        and market in _MARKET_TIMEZONES
+        and isinstance(as_of_date, str)
+        and _valid_force_audit_text(event.get("actor"))
+        and _valid_force_audit_text(event.get("reason"))
+        and isinstance(event.get("process_git_sha"), str)
+        and re.fullmatch(r"[0-9a-f]{7,64}", str(event["process_git_sha"])) is not None
+        and status in {"started", "failed", "completed"}
+        and (status != "failed" or _valid_force_audit_text(event.get("error")))
+    )
+    try:
+        valid = valid and _cycle_market_date(market, as_of_date) == (market, as_of_date)
+        _aware_timestamp(event.get("timestamp"), "force attempt timestamp")
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError(f"force attempt audit line {line_number} is invalid")
+    return event
+
+
+def _valid_force_audit_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value) and value == value.strip()
+
+
 def _append_force_attempt(path: Path, event: Mapping[str, object]) -> None:
+    _validated_force_attempt_event(dict(event), 0)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(
