@@ -8,6 +8,8 @@
 
 **Tech Stack:** Python 3.12, `Decimal`, dataclasses, pytest, existing Trend Animals/Futu clients, existing vanilla JavaScript Dashboard renderer, stdlib temporary-file and immutable-write primitives.
 
+**2026-08-09 operator update:** Historical 20-day replay is not required. Validate the deterministic CN/HK/US contracts and regenerate only the latest immutable reports.
+
 ## Global Constraints
 
 - Apply the same behavior to CN, HK, and US; failure in any market blocks activation of all three.
@@ -40,14 +42,12 @@
 - `src/open_trader/trend_review.py`: recognize and rebuild the new versions while retaining old-version normalization.
 - `src/open_trader/dashboard.py`: project all-market candidate signals and final `risk_skips` without recomputing strategy decisions.
 - `src/open_trader/dashboard_static/dashboard.js`: omit the empty normal BUY stage, render the final-plan audit, and reduce industry columns.
-- `scripts/validate_trend_candidate_replay.py`: read-only 20-day-per-market offline comparison using frozen evidence.
 - `scripts/regenerate_trend_reports_no_submit.py`: stage, validate, and publish the three latest immutable revisions without entering controller/order code.
 - `tests/test_a_share_trend.py`: version, rank, fetch-waterfall, final audit, Markdown, and CN integration coverage.
 - `tests/test_market_trend.py`: HK/US staged-request and cost coverage.
 - `tests/test_trend_review.py`: new/old version normalization and replay coverage.
 - `tests/test_strategy_drawdown.py`, `tests/test_trend_kelly.py`: predecessor, allocation identity, and inherited-sample coverage.
 - `tests/test_dashboard.py`, `tests/test_dashboard_web.py`: projection and browser-rendered report contract.
-- `tests/test_trend_candidate_replay.py`: comparator behavior without depending on local untracked evidence.
 - `tests/test_trend_report_regeneration.py`: staging, all-market gate, immutable publication, and no-submit proof.
 - `CHANGELOG.md`: dated cost/ranking/audit/release entry before merge.
 
@@ -535,76 +535,6 @@ git commit -m "feat: show final trend candidate audit"
 
 ---
 
-### Task 6: Prove 20 recent offline days per market
-
-**Files:**
-- Create: `scripts/validate_trend_candidate_replay.py`
-- Create: `tests/test_trend_candidate_replay.py`
-
-**Interfaces:**
-- Produces: a read-only CLI that accepts `--data-dir`, `--days 20`, and emits one JSON summary.
-- Consumes: frozen `data/trend_review/evidence/{CN,HK,US}`, `rebuild_trend_report_from_evidence`, and the new explicit strategy versions.
-
-- [ ] **Step 1: Write failing comparator tests**
-
-Unit-test the allowlist with synthetic old/new reports. It must reject a changed discipline-qualified set, holding decision, protection line, exit, risk formula/limit, or rotation threshold/basis. It may accept candidate order, normal-BUY priority, final audit, strategy identity, cost, generation time, and hashes.
-
-```python
-assert compare_reports(old, new).errors == ()
-assert compare_reports(old, new | {"protection_state": changed}).errors == (
-    "protection_state changed",
-)
-```
-
-- [ ] **Step 2: Run comparator tests and confirm failure**
-
-Run:
-
-```bash
-.venv/bin/python -m pytest -q tests/test_trend_candidate_replay.py tests/test_trend_review.py -k 'replay or v13 or v11'
-```
-
-Expected: FAIL because the comparator and new-version rebuild recognition do not exist.
-
-- [ ] **Step 3: Implement the read-only replay validator**
-
-Use only stdlib file reads plus existing pure rebuild functions. Select the latest complete evidence per `(market, report_id)`, then the latest 20 report IDs for each market. Rebuild the frozen predecessor and a copy whose strategy snapshot is the explicit v13/v11 version with the same allocation reference; update only drawdown identity fields to the new version so the comparison tests strategy logic rather than missing-state bootstrap. Do not instantiate `TrendAnimalsClient`, `FutuQuoteClient`, a notifier, or any broker client.
-
-Emit and fail on this contract:
-
-```json
-{
-  "status": "PASS",
-  "days_per_market": {"CN": 20, "HK": 20, "US": 20},
-  "paid_api_calls": 0,
-  "errors": []
-}
-```
-
-Use the v13/v11 recognition added in Task 1; do not add an online replay path.
-
-- [ ] **Step 4: Run unit tests and the real 60-artifact replay**
-
-Run:
-
-```bash
-.venv/bin/python -m pytest -q tests/test_trend_candidate_replay.py tests/test_trend_review.py
-.venv/bin/python scripts/validate_trend_candidate_replay.py \
-  --data-dir /Users/ray/projects/open_trader/data --days 20
-```
-
-Expected: tests PASS and JSON `status` is `PASS`, each market count is 20, and `paid_api_calls` is 0.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add scripts/validate_trend_candidate_replay.py \
-  tests/test_trend_candidate_replay.py
-git commit -m "test: replay trend cost change across markets"
-```
-
----
-
 ### Task 7: Add a no-submit three-market revision publisher
 
 **Files:**
@@ -685,25 +615,18 @@ Run:
   tests/test_trend_industry_context.py tests/test_trend_review.py \
   tests/test_strategy_drawdown.py tests/test_trend_kelly.py \
   tests/test_dashboard.py tests/test_dashboard_web.py \
-  tests/test_trend_candidate_replay.py tests/test_trend_report_regeneration.py
+  tests/test_trend_report_regeneration.py
 ```
 
 Expected: PASS with the exact count recorded in the operator log.
 
-- [ ] **Step 2: Run the real offline replay and record the frozen cost ledgers**
+- [ ] **Step 2: Record the deterministic three-market cost ledgers**
 
-Run:
-
-```bash
-.venv/bin/python scripts/validate_trend_candidate_replay.py \
-  --data-dir /Users/ray/projects/open_trader/data --days 20
-```
-
-Inspect CN/HK/US request traces, estimated cost, actual debit completeness, and confirm US `<= 2.852`, no eligible-industry components, no member fields, and no earlier-stage failures in later paid requests.
+Inspect the focused CN/HK/US request-ledger tests, estimated cost, actual debit completeness, and confirm US `<= 2.852`, no eligible-industry components, no member fields, and no earlier-stage failures in later paid requests.
 
 - [ ] **Step 3: Update and commit the changelog before merge**
 
-Add a dated entry containing the three new versions, unchanged discipline/risk boundary, exact frozen CN/HK/US cost results, new audit behavior, offline 60-artifact result, and no-submit revision procedure.
+Add a dated entry containing the three new versions, unchanged discipline/risk boundary, exact frozen CN/HK/US cost results, new audit behavior, and no-submit revision procedure.
 
 ```bash
 git add CHANGELOG.md
@@ -759,4 +682,4 @@ Inspect PID, cwd, Git SHA, fresh log timestamps, controller SHA/phase, all three
 
 - [ ] **Step 8: Fast-forward local main and hand off the review URL**
 
-Confirm the worktree is clean and `CHANGELOG.md` is already committed. Fast-forward local `main` to the accepted SHA without including unrelated root changes. The runtime SHA must remain identical to the accepted/merged SHA. Provide `http://127.0.0.1:8766/` and the exact focused-test count, 60-artifact replay result, acceptance `PASS`, report filenames/hashes, costs, PID/cwd/SHA/log evidence, and confirmation that no order was submitted.
+Confirm the worktree is clean and `CHANGELOG.md` is already committed. Fast-forward local `main` to the accepted SHA without including unrelated root changes. The runtime SHA must remain identical to the accepted/merged SHA. Provide `http://127.0.0.1:8766/` and the exact focused-test count, acceptance `PASS`, report filenames/hashes, costs, PID/cwd/SHA/log evidence, and confirmation that no order was submitted.
