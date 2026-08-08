@@ -67,6 +67,7 @@ from .trend_api_stats import (
     STATISTICS_CYCLE_SCHEMA,
     FutuSimulateFillClient,
     TigerActualFillClient,
+    _read_optional_json,
     run_trend_statistics_cycle,
     trend_statistics_cycle_path,
 )
@@ -722,14 +723,6 @@ def _run_cycle_statistics(
     now: datetime,
     process_version: str,
 ) -> dict[str, object]:
-    state_path = trend_statistics_cycle_path(
-        config.data_dir, cycle.market, cycle.as_of_date
-    )
-    if state_path.exists():
-        state = _read_json(state_path, "trend statistics cycle")
-        if state.get("status") == "completed":
-            return {**state, "status": "already_completed"}
-
     futu = FutuSimulateFillClient(
         host=config.futu_host,
         port=config.futu_port,
@@ -757,9 +750,11 @@ def _run_cycle_statistics(
             tiger_client=tiger,
         )
     finally:
-        futu.close()
-        if tiger is not None:
-            tiger.close()
+        try:
+            futu.close()
+        finally:
+            if tiger is not None:
+                tiger.close()
 
 
 def _allocation_reference_for_cycle(
@@ -1296,9 +1291,7 @@ def _record_statistics_exception(
 ) -> dict[str, object]:
     path = trend_statistics_cycle_path(config.data_dir, cycle.market, cycle.as_of_date)
     with RunLock(path.with_suffix(".lock"), wait=True):
-        previous = (
-            _read_json(path, "trend statistics cycle") if path.exists() else {}
-        )
+        previous = _read_optional_json(path)
         if previous.get("status") == "completed":
             return {**previous, "status": "already_completed"}
         state = {
@@ -1379,13 +1372,12 @@ def _notify_statistics_result(
 
 def _record_statement_statistics_diagnostic(
     config: DailyPremarketConfig,
+    market: str,
     broker: str,
     result: Mapping[str, object],
     now: datetime,
 ) -> None:
-    if result.get("status") in {"consumed", "already_consumed"}:
-        return
-    path = config.data_dir / "trend_statement_consumption" / f"{broker}.json"
+    path = _controller_root(config, market) / "statement_statistics" / f"{broker}.json"
     diagnostic = dict(result)
     diagnostic.setdefault(
         "schema_version", "open_trader.trend.statement_consumption.v1"
@@ -3153,7 +3145,11 @@ def run_trend_market_controller(
                     }
                 with suppress(Exception):
                     _record_statement_statistics_diagnostic(
-                        config, statement_broker, statement_statistics, now
+                        config,
+                        market,
+                        statement_broker,
+                        statement_statistics,
+                        now,
                     )
             local = now.astimezone(TIMEZONES[market])
             local_session = (
@@ -3243,54 +3239,6 @@ def run_trend_market_controller(
                 statistics_status = None
                 statistics_failures = 0
                 statistics_retry_after = None
-            if (
-                not revision
-                and statistics_status not in {"completed", "already_completed"}
-                and (
-                    statistics_retry_after is None
-                    or now >= statistics_retry_after
-                )
-            ):
-                try:
-                    statistics_result = _run_cycle_statistics(
-                        config, cycle, now, process_version
-                    )
-                except Exception as exc:
-                    try:
-                        statistics_result = _record_statistics_exception(
-                            config, cycle, now, process_version, exc
-                        )
-                    except Exception:
-                        statistics_result = {
-                            "status": "failed",
-                            "reason": str(exc),
-                        }
-                statistics_status = str(statistics_result.get("status") or "")
-                if statistics_status not in {
-                    "failed",
-                    "completed",
-                    "already_completed",
-                }:
-                    statistics_result = {
-                        "status": "failed",
-                        "reason": (
-                            "statistics refresh returned invalid status: "
-                            f"{statistics_status or '<empty>'}"
-                        ),
-                    }
-                    statistics_status = "failed"
-                with suppress(Exception):
-                    _notify_statistics_result(
-                        config, cycle, statistics_result, now
-                    )
-                if statistics_status == "failed":
-                    statistics_failures += 1
-                    statistics_retry_after = _retry_at(
-                        now, statistics_failures
-                    )
-                else:
-                    statistics_failures = 0
-                    statistics_retry_after = None
             phase = "monitoring" if cycle.market_open else cycle.session
             blocker = protection_error
             if blocker is not None:
@@ -3334,6 +3282,60 @@ def run_trend_market_controller(
                     if latest is not None
                     else None
                 )
+                natural_statistics_due = (
+                    not revision
+                    and report_target is None
+                    and future is None
+                    and work_cycle == cycle
+                    and not revision_pending
+                    and recovery_revision is None
+                    and statistics_status not in {"completed", "already_completed"}
+                    and (
+                        statistics_retry_after is None
+                        or now >= statistics_retry_after
+                    )
+                )
+                if natural_statistics_due:
+                    try:
+                        statistics_result = _run_cycle_statistics(
+                            config, cycle, now, process_version
+                        )
+                    except Exception as exc:
+                        try:
+                            statistics_result = _record_statistics_exception(
+                                config, cycle, now, process_version, exc
+                            )
+                        except Exception:
+                            statistics_result = {
+                                "status": "failed",
+                                "reason": str(exc),
+                            }
+                    statistics_status = str(statistics_result.get("status") or "")
+                    if statistics_status not in {
+                        "failed",
+                        "completed",
+                        "already_completed",
+                    }:
+                        statistics_result = {
+                            "status": "failed",
+                            "reason": (
+                                "statistics refresh returned invalid status: "
+                                f"{statistics_status or '<empty>'}"
+                            ),
+                        }
+                        statistics_status = "failed"
+                    with suppress(Exception):
+                        _notify_statistics_result(
+                            config, cycle, statistics_result, now
+                        )
+                    if statistics_status == "failed":
+                        statistics_failures += 1
+                        statistics_retry_after = _retry_at(
+                            now, statistics_failures
+                        )
+                    else:
+                        statistics_failures = 0
+                        statistics_retry_after = None
                 if (
                     revision_pending
                     and latest is not None
