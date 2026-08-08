@@ -902,6 +902,38 @@ def test_failed_cycle_retries_and_downtime_uses_one_range_request(tmp_path: Path
     assert client.calls[-1]["end"] == kwargs["as_of_date"]
 
 
+def test_failed_cycle_repairs_stale_derived_stats_from_valid_fills(tmp_path: Path) -> None:
+    artifact = build_trend_api_stats_payload(
+        [],
+        strategy_versions=[{
+            "market": "CN",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v1",
+            "strategy_version": "v1",
+        }],
+        generated_at="2026-08-08T16:00:00+08:00",
+        statistics_cutoff_at="2026-08-08T15:00:00+08:00",
+    )
+    artifact["stats"][0]["eligible_sample_count"] = 99
+    artifact_path = tmp_path / "data/latest/trend_api_stats.json"
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    with pytest.raises(ValueError, match="stats are not derived from rounds"):
+        load_trend_api_stats(tmp_path / "data")
+
+    result = run_trend_statistics_cycle(
+        **cycle_kwargs(
+            tmp_path,
+            market="CN",
+            futu_client=RecordingCycleClient(account_id="cn-sim"),
+        )
+    )
+
+    assert result["status"] == "completed"
+    repaired = load_trend_api_stats(tmp_path / "data")
+    assert repaired["stats"] == []
+    assert repaired["sources"][0]["source_id"] == "simulation:futu:cn-sim"
+
+
 def test_cycle_cutoffs_are_market_local_closes() -> None:
     assert trend_statistics_cutoff_at("CN", "2026-08-08") == "2026-08-08T15:00:00+08:00"
     assert trend_statistics_cutoff_at("HK", "2026-08-08") == "2026-08-08T16:00:00+08:00"

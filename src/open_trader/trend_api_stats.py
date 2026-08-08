@@ -540,7 +540,7 @@ def sync_trend_api_stats(
         existing_sources: list[Mapping[str, object]] = []
         artifact_cutoff = statistics_cutoff_at
         if path.exists():
-            existing = load_trend_api_stats(data_dir)
+            existing = _load_trend_api_stats_for_refresh(data_dir)
             existing_fills = list(existing["fills"])
             existing_sources = list(existing["sources"])
             artifact_cutoff = max(
@@ -566,6 +566,38 @@ def sync_trend_api_stats(
         if published != payload:
             raise ValueError("trend_api_stats readback mismatch")
         return payload
+
+
+def _load_trend_api_stats_for_refresh(data_dir: Path) -> dict[str, object]:
+    try:
+        return load_trend_api_stats(data_dir)
+    except ValueError as exc:
+        if str(exc) != "stats are not derived from rounds":
+            raise
+    path = _path(data_dir) / "latest" / "trend_api_stats.json"
+    payload = _read_optional_json(path)
+    strategy_versions = sorted({
+        (
+            _required_text(stat.get("market"), "stats market"),
+            _required_text(stat.get("strategy_id"), "stats strategy_id"),
+            _required_text(stat.get("opening_strategy_version"), "stats opening version"),
+        )
+        for stat in payload.get("stats", [])
+        if isinstance(stat, Mapping)
+    })
+    rebuilt = build_trend_api_stats_payload(
+        payload.get("fills", []),
+        strategy_versions=[
+            {"market": market, "strategy_id": strategy_id, "strategy_version": version}
+            for market, strategy_id, version in strategy_versions
+        ],
+        generated_at=_required_text(payload.get("generated_at"), "generated_at"),
+        statistics_cutoff_at=_required_text(
+            payload.get("statistics_cutoff_at"), "statistics_cutoff_at"
+        ),
+    )
+    payload["stats"] = rebuilt["stats"]
+    return _validated_payload(payload)
 
 
 def trend_statistics_cycle_path(
