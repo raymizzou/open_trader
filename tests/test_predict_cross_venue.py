@@ -2175,82 +2175,106 @@ def test_monitor_signal_episode_persists_refreshes_and_rotates_on_reopen(
 def test_monitor_stage_five_observer_dedupes_restart_and_rearms_after_stale_recovery(
     tmp_path: Path,
 ) -> None:
+    class ReconnectingPredict(FakeCrossVenuePredict):
+        def __init__(self) -> None:
+            super().__init__(
+                (monitor_predict_market(external_ids=("poly-condition",)),)
+            )
+            self.disconnect = asyncio.Event()
+            self.disconnected = asyncio.Event()
+            self.reconnect = asyncio.Event()
+
+        async def stream_books(self, market_ids):
+            subscription = tuple(sorted(market_ids))
+            self.subscriptions.append(subscription)
+            self.active_subscriptions.add(subscription)
+            try:
+                yield monitor_predict_book()
+                await self.disconnect.wait()
+                self.health["ws"] = "stale"
+                self.ws_generation += 1
+                self.disconnected.set()
+                await self.reconnect.wait()
+                self.health["ws"] = "ready"
+                yield monitor_predict_book()
+                while True:
+                    book = await self.queue.get()
+                    if book is None:
+                        return
+                    yield book
+            finally:
+                self.active_subscriptions.discard(subscription)
+
     async def exercise() -> None:
         store = PredictionArbitrageStore(tmp_path / "data")
-        notifications: list[tuple[str, str]] = []
-        monitor = PredictCrossVenueMonitor(
-            predict_source=FakeCrossVenuePredict(()),
-            polymarket_monitor=FakeCrossVenuePolymarket(),
+        polymarket = FakeCrossVenuePolymarket()
+        polymarket.release.set()
+        polymarket.books = {"poly-no-1": monitor_polymarket_books()["poly-no-1"]}
+        first_monitor_notifications: list[tuple[str, str]] = []
+        first_predict = ReconnectingPredict()
+        first_monitor = PredictCrossVenueMonitor(
+            predict_source=first_predict,
+            polymarket_monitor=polymarket,
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
+            predict_quote_fn=predict_quote(),
             store=store,
-            ready_observer=lambda opportunity_id, signal_id: notifications.append(
+            ready_observer=lambda opportunity_id, signal_id: first_monitor_notifications.append(
                 (opportunity_id, signal_id)
             ),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
-        opportunity_id = "cross:public-pair:PREDICT_YES_POLYMARKET_NO"
-        stage_five = {
-            "opportunity_id": opportunity_id,
-            "pair_id": "public-pair",
-            "direction": "PREDICT_YES_POLYMARKET_NO",
-            "market_type": "cross_venue_yes_no",
-            "execution_mode": "observe_only",
-            "funnel_stage": 5,
-            "actionable": True,
-            "clear_signal": True,
-            "total_max_cost": Decimal("8.128"),
-            "minimum_profit": Decimal("1.872"),
-            "rules_fingerprints": {
-                "predict.fun": "predict-fingerprint-1",
-                "polymarket": "poly-fingerprint-1",
-            },
-            "approved_candidates": {
-                "predict.fun": {
-                    "market_id": "predict-market-1",
-                    "condition_id": "predict-condition-1",
-                    "yes_token_id": "predict-yes-1",
-                    "no_token_id": "predict-no-1",
-                },
-                "polymarket": {
-                    "market_id": "poly-market-1",
-                    "condition_id": "poly-condition-1",
-                    "yes_token_id": "poly-yes-1",
-                    "no_token_id": "poly-no-1",
-                },
-            },
-            "codex_approval": {"decision": "APPROVE", "cache_key": "approval-1"},
-        }
-        monitor._persist_observation(stage_five)
-        await wait_until(lambda: len(notifications) == 1)
-        original_signal_id = notifications[0][1]
+        await first_monitor.start()
+        await wait_until(lambda: bool(first_monitor.snapshot()["opportunities"]))
+        first = next(iter(first_monitor.snapshot()["opportunities"]))
+        opportunity_id = str(first["opportunity_id"])
+        original_signal_id = str(first["signal_episode_id"])
+        await wait_until(lambda: len(first_monitor_notifications) == 1)
+        await first_monitor.stop()
 
         restarted_notifications: list[tuple[str, str]] = []
+        restarted_predict = ReconnectingPredict()
         restarted = PredictCrossVenueMonitor(
-            predict_source=FakeCrossVenuePredict(()),
-            polymarket_monitor=FakeCrossVenuePolymarket(),
+            predict_source=restarted_predict,
+            polymarket_monitor=polymarket,
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
+            predict_quote_fn=predict_quote(),
             store=store,
-            ready_observer=lambda opportunity_id, signal_id:
-            restarted_notifications.append((opportunity_id, signal_id)),
+            ready_observer=lambda opportunity_id, signal_id: restarted_notifications.append(
+                (opportunity_id, signal_id)
+            ),
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
-        restarted._persist_observation(stage_five)
+        await restarted.start()
+        await wait_until(lambda: bool(restarted.snapshot()["opportunities"]))
+        assert restarted_notifications == []
+        assert restarted.snapshot()["opportunities"][0]["signal_episode_id"] == original_signal_id
+
+        restarted_predict.disconnect.set()
+        await restarted_predict.disconnected.wait()
+        await wait_until(lambda: polymarket.token_sets[-1] == ())
+        assert restarted.snapshot()["opportunities"] == []
+        assert store.open_signal_history()[0]["signal_id"] == original_signal_id
+
+        restarted_predict.reconnect.set()
+        await wait_until(lambda: polymarket.token_sets[-1] == ("poly-no-1", "poly-yes-1"))
+        await wait_until(lambda: bool(restarted.snapshot()["opportunities"]))
         await asyncio.sleep(0)
         assert restarted_notifications == []
 
-        restarted._opportunities[(
-            "public-pair", "PREDICT_YES_POLYMARKET_NO"
-        )] = dict(stage_five)
-        await restarted._suspend_hot(status="degraded")
-        restarted._status = "ready"
-        restarted._persist_observation(stage_five)
+        polymarket.books = {}
+        await restarted_predict.queue.put(monitor_predict_book())
+        await wait_until(lambda: restarted.snapshot()["opportunities"] == [])
+
+        polymarket.books = {"poly-no-1": monitor_polymarket_books()["poly-no-1"]}
+        await restarted_predict.queue.put(monitor_predict_book())
         await wait_until(lambda: len(restarted_notifications) == 1)
-        assert restarted_notifications == [
-            (opportunity_id, store.open_signal_history()[0]["signal_id"])
-        ]
-        assert restarted_notifications[0][1] != original_signal_id
+        new_signal_id = restarted_notifications[0][1]
+        assert restarted_notifications[0][0] == opportunity_id
+        assert new_signal_id != original_signal_id
+        await restarted_predict.queue.put(None)
+        await restarted.stop()
 
     asyncio.run(exercise())
 

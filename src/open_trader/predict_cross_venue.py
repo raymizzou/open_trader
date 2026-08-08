@@ -1900,7 +1900,7 @@ class PredictCrossVenueMonitor:
             self._close_pair(pair_id)
 
     async def _suspend_hot(self, *, status: str) -> None:
-        tasks = self._clear_hot_state()
+        tasks = self._clear_hot_state(preserve_signal_episodes=True)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._status = status
@@ -1915,10 +1915,10 @@ class PredictCrossVenueMonitor:
                 self._predict_generation is not None
                 and generation != self._predict_generation
             ):
-                self._clear_hot_state()
+                self._clear_hot_state(preserve_signal_episodes=True)
             self._predict_generation = generation
         if status != "ready":
-            self._clear_hot_state()
+            self._clear_hot_state(preserve_signal_episodes=True)
             self._status = status
             return
         for pair_id in {key[0] for key in self._opportunities}:
@@ -1954,7 +1954,9 @@ class PredictCrossVenueMonitor:
             if key[0] == pair_id and key[1] not in live_directions:
                 self._close_opportunity(key)
 
-    def _clear_hot_state(self) -> tuple[asyncio.Task[None], ...]:
+    def _clear_hot_state(
+        self, *, preserve_signal_episodes: bool = False
+    ) -> tuple[asyncio.Task[None], ...]:
         tasks = tuple(self._confirmation_tasks.values())
         self._confirmation_tasks.clear()
         for task in tasks:
@@ -1962,7 +1964,10 @@ class PredictCrossVenueMonitor:
         self._predict_books.clear()
         self._arbitrage_pairs.clear()
         for key in tuple(self._opportunities):
-            self._close_opportunity(key)
+            if preserve_signal_episodes:
+                self._opportunities.pop(key, None)
+            else:
+                self._close_opportunity(key)
         self._polymarket.set_cross_venue_tokens(())
         return tasks
 
