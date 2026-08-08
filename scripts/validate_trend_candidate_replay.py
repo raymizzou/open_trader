@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
 import re
 import sys
@@ -32,14 +31,6 @@ from open_trader.trend_review import rebuild_trend_report_from_evidence
 
 MARKETS = ("CN", "HK", "US")
 TARGET_VERSIONS = {"CN": "v13", "HK": "v11", "US": "v11"}
-TARGET_RANKS = {"CN": 3, "HK": 2, "US": 1}
-TARGET_ENTRY_WEIGHTS = {1: "0.06", 2: "0.04", 3: "0.02"}
-TARGET_NOMINAL_WEIGHTS = {1: "0.60", 2: "0.40", 3: "0.20"}
-ROOT_ASSETS = {
-    "CN": ("A股", "ETF基金"),
-    "HK": ("港股", "香港ETF"),
-    "US": ("美股", "美国ETF"),
-}
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -76,7 +67,9 @@ def _canonical_bytes(value: object) -> bytes:
 def _rows(value: object) -> list[dict[str, object]] | None:
     if not isinstance(value, list):
         return None
-    return [dict(item) for item in value if isinstance(item, dict)]
+    if any(not isinstance(item, dict) for item in value):
+        return None
+    return [dict(item) for item in value]
 
 
 def _symbol(row: dict[str, object]) -> str:
@@ -104,8 +97,11 @@ def _qualified_symbols(report: object) -> tuple[str, ...] | None:
             or row.get("discipline_passed") is True
             or row.get("discipline_status") in {"qualified", "passed"}
         )
-        if qualified and _symbol(row):
-            result.add(_symbol(row))
+        if qualified:
+            symbol = _symbol(row)
+            if not symbol:
+                return None
+            result.add(symbol)
     return tuple(sorted(result))
 
 
@@ -118,9 +114,8 @@ def _judgments(report: object) -> dict[str, object]:
 
 def _holding_rows(report: object) -> list[dict[str, object]] | None:
     judgments = _judgments(report)
-    rows = _rows(judgments.get("holding_decisions"))
-    if rows is not None:
-        return rows
+    if "holding_decisions" in judgments:
+        return _rows(judgments["holding_decisions"])
     if isinstance(report, dict):
         rows = _rows(report.get("holdings"))
         if rows is not None:
@@ -132,8 +127,10 @@ def _holding_rows(report: object) -> list[dict[str, object]] | None:
 
 
 def _real_holding_rows(report: object) -> list[dict[str, object]] | None:
-    rows = _rows(_judgments(report).get("real_holding_decisions"))
-    return rows
+    judgments = _judgments(report)
+    if "real_holding_decisions" not in judgments:
+        return None
+    return _rows(judgments["real_holding_decisions"])
 
 
 def _sorted_rows(rows: list[dict[str, object]] | None) -> tuple[object, ...] | None:
@@ -149,6 +146,8 @@ def _exit_rows(report: object) -> tuple[object, ...] | None:
     judgments = _judgments(report)
     rows = _rows(judgments.get("formal_actions"))
     real_rows = _real_holding_rows(report)
+    if "formal_actions" in judgments and rows is None:
+        return None
     if rows is None and real_rows is None:
         return None
     rows = (rows or []) + (real_rows or [])
@@ -200,6 +199,10 @@ def _risk_contract(report: object) -> dict[str, object] | None:
                     for token in ("formula", "risk_limit", "risk_buffer")
                 ):
                     result[key_text] = _canonical(value)
+    if not {"portfolio_risk_limit", "single_entry_risk_limit"} <= result.keys():
+        return None
+    if any(isinstance(value, (dict, list, tuple)) for value in result.values()):
+        return None
     return result
 
 
@@ -208,10 +211,14 @@ def _rotation_contract(report: object) -> dict[str, object] | None:
         return None
     result: dict[str, object] = {}
     judgments = _judgments(report)
+    saw_rotation_fact = False
     for key, value in judgments.items():
         if "rotation" not in str(key).lower():
             continue
+        saw_rotation_fact = True
         rows = _rows(value)
+        if rows is None and not isinstance(value, dict):
+            return None
         if rows is not None:
             selected: list[dict[str, object]] = []
             for row in rows:
@@ -249,14 +256,20 @@ def _rotation_contract(report: object) -> dict[str, object] | None:
                 result[str(key)] = selected
     for key in ("rotation_threshold", "rotation_basis", "strength_basis"):
         if key in report:
+            saw_rotation_fact = True
+            if isinstance(report[key], (dict, list, tuple)):
+                return None
             result[key] = _canonical(report[key])
     snapshot = report.get("strategy_snapshot")
     if isinstance(snapshot, dict) and isinstance(snapshot.get("parameters"), dict):
         parameters = snapshot["parameters"]
         for key in ("rotation_threshold", "rotation_basis", "strength_basis"):
             if key in parameters:
+                saw_rotation_fact = True
+                if isinstance(parameters[key], (dict, list, tuple)):
+                    return None
                 result[f"parameters.{key}"] = _canonical(parameters[key])
-    return result
+    return result if saw_rotation_fact else None
 
 
 def compare_reports(old: dict[str, object], new: dict[str, object]) -> ReplayComparison:
@@ -282,7 +295,9 @@ def compare_reports(old: dict[str, object], new: dict[str, object]) -> ReplayCom
         errors.append("holding_decisions changed")
     old_real_holdings = _sorted_rows(_real_holding_rows(old))
     new_real_holdings = _sorted_rows(_real_holding_rows(new))
-    if old_real_holdings is not None or new_real_holdings is not None:
+    old_real_present = "real_holding_decisions" in _judgments(old)
+    new_real_present = "real_holding_decisions" in _judgments(new)
+    if old_real_present or new_real_present:
         if old_real_holdings is None or new_real_holdings is None:
             errors.append("holding_decisions unavailable")
         elif old_real_holdings != new_real_holdings:
@@ -325,6 +340,68 @@ def _load_json(path: Path) -> dict[str, object] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _complete_evidence(payload: dict[str, object], market: str) -> bool:
+    if payload.get("schema_version") != "open_trader.trend_review.evidence.v1":
+        return False
+    if payload.get("market") != market:
+        return False
+    report_id = payload.get("report_id")
+    snapshot = payload.get("strategy_snapshot")
+    inputs = payload.get("rebuild_inputs")
+    if (
+        not isinstance(report_id, str)
+        or not _DATE_RE.fullmatch(report_id)
+        or not isinstance(snapshot, dict)
+        or not isinstance(snapshot.get("parameters"), dict)
+        or not isinstance(inputs, dict)
+    ):
+        return False
+    pool_ids = snapshot["parameters"].get("candidate_pool_ids")
+    required = {
+        "generated_at",
+        "as_of_date",
+        "execution_date",
+        "account",
+        "candidates",
+        "holding_snapshots",
+        "bars_by_symbol",
+        "prior_state",
+        "watch_events",
+        "market",
+        "candidate_pool_ids",
+        "metadata",
+        "price_fx_to_account_currency",
+    }
+    if not required <= inputs.keys() or inputs.get("market") != market:
+        return False
+    if not isinstance(pool_ids, list) or any(
+        isinstance(item, bool) or not isinstance(item, int) for item in pool_ids
+    ):
+        return False
+    candidates = inputs["candidates"]
+    if not isinstance(candidates, list):
+        return False
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            return False
+        symbol = candidate.get("symbol")
+        as_of_date = candidate.get("as_of_date")
+        if (
+            not isinstance(symbol, str)
+            or not symbol.strip()
+            or not isinstance(as_of_date, str)
+            or not _DATE_RE.fullmatch(as_of_date)
+        ):
+            return False
+    return (
+        isinstance(inputs["account"], dict)
+        and isinstance(inputs["holding_snapshots"], dict)
+        and isinstance(inputs["bars_by_symbol"], dict)
+        and isinstance(inputs["watch_events"], list)
+        and isinstance(inputs["metadata"], dict)
+    )
+
+
 def _selected_evidence(
     data_dir: Path, market: str, days: int
 ) -> list[tuple[str, Path, dict[str, object]]]:
@@ -332,14 +409,21 @@ def _selected_evidence(
     root = data_dir / "trend_review" / "evidence" / market
     for path in sorted(root.glob("*.json")):
         payload = _load_json(path)
-        if payload is None or payload.get("market") != market:
+        if payload is None or not _complete_evidence(payload, market):
+            continue
+        # Structural fields alone are not sufficient evidence: an artifact is
+        # replayable only when the existing pure rebuild accepts its complete
+        # input contract.  Keep this check read-only and fail closed for a
+        # malformed/stale revision rather than selecting it and failing later.
+        try:
+            rebuild_trend_report_from_evidence(payload)
+        except Exception:
             continue
         report_id = payload.get("report_id")
         if not isinstance(report_id, str) or not _DATE_RE.fullmatch(report_id):
             continue
-        inputs = payload.get("rebuild_inputs")
-        if not isinstance(inputs, dict):
-            continue
+        inputs = payload["rebuild_inputs"]
+        assert isinstance(inputs, dict)
         generated_at = inputs.get("generated_at")
         timestamp = generated_at if isinstance(generated_at, str) else ""
         grouped.setdefault(report_id, []).append((timestamp, path, payload))
@@ -350,58 +434,6 @@ def _selected_evidence(
         )
         selected.append((report_id, path, payload))
     return selected
-
-
-def _synthetic_allocation(market: str, report_id: str) -> dict[str, object]:
-    """Build a valid allocation fact when an old report predates allocation."""
-    strengths = {"CN": "70", "HK": "80", "US": "90"}
-    roots: dict[str, object] = {}
-    markets: dict[str, object] = {}
-    tm_id = 900001
-    for item_market, assets in ROOT_ASSETS.items():
-        score = Decimal(str(strengths[item_market]))
-        roots[item_market] = {
-            "stock": {
-                "asset": assets[0],
-                "tm_id": tm_id,
-                "as_of_date": report_id,
-                "global_strength": str(score),
-            },
-            "etf": {
-                "asset": assets[1],
-                "tm_id": tm_id + 1,
-                "as_of_date": report_id,
-                "global_strength": str(score - 1),
-            },
-        }
-        rank = TARGET_RANKS[item_market]
-        markets[item_market] = {
-            "rank": rank,
-            "score": str(score),
-            "score_source": assets[0],
-            "entry_weight": TARGET_ENTRY_WEIGHTS[rank],
-            "nominal_weight": TARGET_NOMINAL_WEIGHTS[rank],
-        }
-        tm_id += 2
-    snapshot = {
-        "version": 1,
-        "allocation_date": report_id,
-        "generated_at": f"{report_id}T16:20:00+08:00",
-        "generator_version": "trend-allocation-v1",
-        "git_sha": "0" * 40,
-        "roots": roots,
-        "markets": markets,
-    }
-    body = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
-    return {
-        "daily_path": f"data/trend_allocation/daily/{report_id}-r1.json",
-        "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
-        "snapshot": snapshot,
-        "reused": False,
-        "stale_a_trading_days": 0,
-        "failure_reason": "",
-        "_daily_json": body,
-    }
 
 
 def _allocation_for(
@@ -426,27 +458,7 @@ def _allocation_for(
                     return raw, {"reference": dict(reference), "daily_json": daily_json}
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 pass
-    daily_root = data_dir / "trend_allocation" / "daily"
-    for path in sorted(daily_root.glob("*.json"), reverse=True):
-        try:
-            body = path.read_text(encoding="utf-8")
-            snapshot = json.loads(body)
-            raw = {
-                "daily_path": f"data/trend_allocation/daily/{path.name}",
-                "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
-                "snapshot": snapshot,
-                "reused": False,
-                "stale_a_trading_days": 0,
-                "failure_reason": "",
-            }
-            reference = freeze_allocation_reference(raw)
-            return raw, {"reference": reference, "daily_json": body}
-        except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
-            continue
-    raw = _synthetic_allocation(market, report_id)
-    body = str(raw.pop("_daily_json"))
-    reference = freeze_allocation_reference(raw)
-    return raw, {"reference": reference, "daily_json": body}
+    raise ValueError("missing frozen allocation provenance")
 
 
 def _target_snapshot(
