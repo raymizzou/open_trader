@@ -1601,6 +1601,173 @@ def test_dashboard_projects_complete_candidate_audit_for_every_market(
         ]
 
 
+@pytest.mark.parametrize(
+    ("market", "version", "broker"),
+    [("CN", "v13", "eastmoney"), ("HK", "v11", "phillips"), ("US", "v11", "tiger")],
+)
+def test_dashboard_current_trend_uses_candidate_snapshot_and_fails_closed(
+    tmp_path: Path,
+    market: str,
+    version: str,
+    broker: str,
+) -> None:
+    config = dashboard_config(tmp_path)
+    payload = _valid_v2_dashboard_trend_payload()
+    snapshot = payload["strategy_snapshot"]
+    metadata = payload["metadata"]
+    judgments = payload["strategy_judgments"]
+    assert isinstance(snapshot, dict) and isinstance(metadata, dict)
+    assert isinstance(judgments, dict)
+    snapshot.update({
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+        "strategy_version": version,
+    })
+    metadata.update({"market": market, "broker": broker})
+    judgments["top10_candidates"] = [{"symbol": "TOP10-FALLBACK"}]
+
+    payload["signal_snapshots"] = {}
+    assert not dashboard_module._valid_trend_collections(payload, judgments)
+
+    candidates = [{
+        "symbol": "CURRENT",
+        "name": "Current candidate",
+        "eligible": True,
+        "excluded_reasons": [],
+        "rank": 1,
+    }]
+    payload["signal_snapshots"] = {"candidates": candidates}
+    assert dashboard_module._valid_trend_collections(payload, judgments)
+
+    report = dashboard_module._project_broker_trend_report(
+        selected=(
+            config.reports_dir / f"{market}.json",
+            payload,
+            date(2026, 7, 15),
+            date(2026, 7, 14),
+            date(2026, 7, 15),
+            datetime.fromisoformat("2026-07-15T20:00:00+08:00"),
+        ),
+        data_dir=config.data_dir,
+        reports_dir=config.reports_dir,
+        broker=broker,
+        market=market,
+        market_label=market,
+        broker_label=broker,
+        buy_window="常规交易时段",
+        report_date="2026-07-15",
+    )
+    assert [item["symbol"] for item in report["audit"]["candidates"]] == ["CURRENT"]
+
+    payload["signal_snapshots"] = {}
+    report_without_snapshot = dashboard_module._project_broker_trend_report(
+        selected=(
+            config.reports_dir / f"{market}.json",
+            payload,
+            date(2026, 7, 15),
+            date(2026, 7, 14),
+            date(2026, 7, 15),
+            datetime.fromisoformat("2026-07-15T20:00:00+08:00"),
+        ),
+        data_dir=config.data_dir,
+        reports_dir=config.reports_dir,
+        broker=broker,
+        market=market,
+        market_label=market,
+        broker_label=broker,
+        buy_window="常规交易时段",
+        report_date="2026-07-15",
+    )
+    assert report_without_snapshot["audit"]["candidates"] == []
+
+
+def test_dashboard_current_trend_risk_audit_requires_final_plan_rows() -> None:
+    payload = _valid_v4_dashboard_trend_payload()
+    snapshot = payload["strategy_snapshot"]
+    metadata = payload["metadata"]
+    judgments = payload["strategy_judgments"]
+    assert isinstance(snapshot, dict) and isinstance(metadata, dict)
+    assert isinstance(judgments, dict)
+    snapshot.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v13",
+        "strategy_version": "v13",
+    })
+    metadata.update({"market": "CN", "broker": "eastmoney"})
+    drawdown = payload["drawdown_summary"]
+    assert isinstance(drawdown, dict)
+    drawdown.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v13",
+        "strategy_version": "v13",
+        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v13|v13",
+    })
+    bootstrap = drawdown["bootstrap_event"]
+    assert isinstance(bootstrap, dict)
+    bootstrap.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v13",
+        "strategy_version": "v13",
+    })
+    summary = payload["risk_summary"]
+    assert isinstance(summary, dict)
+    summary.update({
+        "kelly_phase": "cold_start",
+        "kelly_eligible_sample_count": 0,
+        "kelly_selected_sample_count": 0,
+        "kelly_cap": None,
+        "kelly_reason": "Kelly 冷启动：0/30 个合格模拟闭环；继续使用固定风险仓位",
+        "kelly_last_closed_at": "",
+        "kelly_source": "合格的富途模拟闭环；实盘结果不参与计算",
+    })
+    judgments["risk_skips"].append({
+        "symbol": "PLAN-SKIP",
+        "target_weight": None,
+        "target_amount": None,
+        "estimated_shares": 0,
+        "reason": "未纳入最终买入计划",
+        "decisive_constraint": "买入计划",
+    })
+    assert dashboard_module._valid_trend_risk_summary(payload)
+
+    judgments.pop("risk_skips")
+    assert not dashboard_module._valid_trend_risk_summary(payload)
+    judgments["risk_skips"] = [{
+        "symbol": "",
+        "target_weight": None,
+        "target_amount": None,
+        "estimated_shares": 0,
+        "reason": "未纳入最终买入计划",
+        "decisive_constraint": "买入计划",
+    }]
+    assert not dashboard_module._valid_trend_risk_summary(payload)
+    judgments["risk_skips"] = [{
+        "symbol": "PLAN-SKIP",
+        "target_weight": None,
+        "target_amount": None,
+        "estimated_shares": 0,
+        "reason": "未纳入最终买入计划",
+        "decisive_constraint": "买入计划",
+    }]
+    payload.pop("risk_summary")
+    assert not dashboard_module._valid_trend_risk_summary(payload)
+
+
+def test_dashboard_individual_global_context_mode_requires_current_only_facts() -> None:
+    payload = _dashboard_frozen_report_payload()
+    status = payload["industry_context_status"]
+    assert isinstance(status, dict)
+    status.update({
+        "ordering_mode": "individual_global",
+        "current_complete": True,
+        "history_complete": False,
+        "fallback_reason": None,
+    })
+    assert dashboard_module._valid_frozen_trend_facts(payload)
+
+    status["history_complete"] = True
+    assert not dashboard_module._valid_frozen_trend_facts(payload)
+    status["history_complete"] = False
+    status["fallback_reason"] = "missing current context"
+    assert not dashboard_module._valid_frozen_trend_facts(payload)
+
+
 def test_dashboard_rejects_malformed_signal_candidate_audit_when_present(
     tmp_path: Path,
 ) -> None:
@@ -2218,6 +2385,22 @@ def test_dashboard_projects_only_valid_frozen_allocation_contract(
             "snapshot": snapshot,
         },
     )
+    payload["drawdown_summary"] = copy.deepcopy(
+        _valid_v4_dashboard_trend_payload()["drawdown_summary"]
+    )
+    drawdown = payload["drawdown_summary"]
+    assert isinstance(drawdown, dict)
+    drawdown.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v13",
+        "strategy_version": "v13",
+        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v13|v13",
+    })
+    bootstrap = drawdown["bootstrap_event"]
+    assert isinstance(bootstrap, dict)
+    bootstrap.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v13",
+        "strategy_version": "v13",
+    })
     judgments = payload["strategy_judgments"]
     assert isinstance(judgments, dict)
     judgments["simulate_rotation_pairs"] = []

@@ -111,6 +111,11 @@ TREND_REPORT_SOURCES = {
     "phillips": ("HK", "港股", "辉立", "trend_hk_phillips", "09:30–10:00"),
     "eastmoney": ("CN", "A股", "东方财富", "trend_a_share", "09:30–10:00"),
 }
+CURRENT_FINAL_PLAN_TREND_VERSIONS = frozenset({
+    ("CN", "v13"),
+    ("HK", "v11"),
+    ("US", "v11"),
+})
 TREND_ACTUAL_BROKERS = {
     market: broker for broker, (market, *_rest) in TREND_REPORT_SOURCES.items()
 }
@@ -1431,7 +1436,13 @@ def _valid_trend_collections(
     ):
         return False
     snapshots = payload.get("signal_snapshots")
-    if snapshots is not None and (
+    if _is_current_final_plan_payload(payload):
+        candidates = snapshots.get("candidates") if isinstance(snapshots, dict) else None
+        if not isinstance(candidates, list) or not all(
+            _valid_current_candidate_signal(item) for item in candidates
+        ):
+            return False
+    elif snapshots is not None and (
         not isinstance(snapshots, dict)
         or "candidates" in snapshots
         and (
@@ -1463,6 +1474,38 @@ def _valid_trend_collections(
             payload.get("data_sources", []),
             payload.get("api_facts", []),
         )
+    )
+
+
+def _is_current_final_plan_payload(payload: Mapping[str, object]) -> bool:
+    snapshot = payload.get("strategy_snapshot")
+    metadata = payload.get("metadata")
+    market = str(
+        (snapshot.get("market") if isinstance(snapshot, Mapping) else None)
+        or (metadata.get("market") if isinstance(metadata, Mapping) else "")
+    ).upper()
+    version = str(
+        snapshot.get("strategy_version") if isinstance(snapshot, Mapping) else ""
+    )
+    return (market, version) in CURRENT_FINAL_PLAN_TREND_VERSIONS
+
+
+def _valid_current_candidate_signal(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if (
+        not isinstance(value.get("symbol"), str)
+        or not value["symbol"].strip()
+        or not isinstance(value.get("name"), str)
+        or not value["name"].strip()
+        or type(value.get("eligible")) is not bool
+        or not isinstance(value.get("excluded_reasons"), list)
+        or not all(isinstance(reason, str) and reason.strip() for reason in value["excluded_reasons"])
+    ):
+        return False
+    rank = value.get("rank")
+    return rank is None or (
+        isinstance(rank, int) and not isinstance(rank, bool) and rank >= 1
     )
 
 
@@ -1561,6 +1604,7 @@ def _valid_frozen_trend_facts(payload: dict[str, Any]) -> bool:
     if mode not in {
         "context_with_history",
         "context_current_only",
+        "individual_global",
         "legacy_invalid_current",
         "legacy_no_eligible_candidates",
     }:
@@ -1580,6 +1624,12 @@ def _valid_frozen_trend_facts(payload: dict[str, Any]) -> bool:
         return False
     if mode == "context_current_only" and (
         not status["current_complete"] or status["history_complete"]
+    ):
+        return False
+    if mode == "individual_global" and (
+        not status["current_complete"]
+        or status["history_complete"]
+        or fallback_reason is not None
     ):
         return False
     if mode == "legacy_invalid_current" and status["current_complete"]:
@@ -1751,6 +1801,8 @@ def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
     )
     summary = payload.get("risk_summary")
     if summary is None:
+        if _is_current_final_plan_payload(payload):
+            return False
         return strategy_version not in {
             "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10"
         }
@@ -1758,6 +1810,17 @@ def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
         isinstance(value, (dict, list)) for value in summary.values()
     ):
         return False
+    if _is_current_final_plan_payload(payload):
+        judgments = payload.get("strategy_judgments")
+        parameters = snapshot.get("parameters") if isinstance(snapshot, dict) else None
+        account = payload.get("account")
+        expected_nav = account.get("net_value") if isinstance(account, dict) else None
+        return _valid_current_trend_risk_contract(
+            payload,
+            judgments,
+            parameters=parameters,
+            expected_nav=expected_nav,
+        )
     if strategy_version not in {
         "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10"
     }:
@@ -1810,6 +1873,86 @@ def _valid_trend_risk_summary(payload: dict[str, Any]) -> bool:
                 isinstance(action, dict) and action.get("action") == "BUY"
                 for action in formal_actions
             )
+        )
+    )
+
+
+def _valid_current_trend_risk_contract(
+    payload: dict[str, Any],
+    judgments: object,
+    *,
+    parameters: object,
+    expected_nav: object,
+) -> bool:
+    if not isinstance(judgments, dict):
+        return False
+    if any(
+        not isinstance(judgments.get(key), list)
+        or not all(isinstance(item, dict) for item in judgments[key])
+        for key in ("formal_actions", "holding_decisions")
+    ):
+        return False
+    risk_skips = judgments.get("risk_skips")
+    if not isinstance(risk_skips, list):
+        return False
+    summary = payload.get("risk_summary")
+    if not isinstance(summary, dict) or not valid_v4_risk_contract(
+        parameters, summary, expected_nav=expected_nav
+    ):
+        return False
+    ordinary_skips: list[dict[str, Any]] = []
+    for item in risk_skips:
+        if not isinstance(item, dict):
+            return False
+        symbol = item.get("symbol")
+        reason = item.get("reason")
+        constraint = item.get("decisive_constraint")
+        shares = item.get("estimated_shares")
+        if (
+            not isinstance(symbol, str) or not symbol.strip()
+            or not isinstance(reason, str) or not reason.strip()
+            or not isinstance(constraint, str) or not constraint.strip()
+            or isinstance(shares, bool) or not isinstance(shares, int) or shares < 0
+        ):
+            return False
+        target_weight = item.get("target_weight")
+        target_amount = item.get("target_amount")
+        if target_weight is None:
+            if target_amount is not None:
+                return False
+            continue
+        if _dashboard_risk_decimal(target_weight) is None:
+            return False
+        if target_amount is not None and _dashboard_risk_decimal(target_amount) is None:
+            return False
+        ordinary_skips.append(item)
+    risk_judgments = {**judgments, "risk_skips": ordinary_skips}
+    if not _valid_v2_risk_items(
+        payload,
+        risk_judgments,
+        summary,
+        strategy_version="v10",
+    ):
+        return False
+    snapshot = payload.get("strategy_snapshot")
+    metadata = payload.get("metadata")
+    drawdown = payload.get("drawdown_summary")
+    formal_actions = judgments.get("formal_actions")
+    market = metadata.get("market") if isinstance(metadata, dict) else ""
+    strategy_id = snapshot.get("strategy_id") if isinstance(snapshot, dict) else ""
+    return valid_drawdown_decision(
+        drawdown,
+        expected_market=str(market),
+        expected_strategy_id=str(strategy_id),
+        expected_strategy_version=str(snapshot.get("strategy_version") or "") if isinstance(snapshot, dict) else "",
+        expected_equity=expected_nav,
+        expected_entry_date=str(payload.get("execution_date") or ""),
+    ) and (
+        drawdown.get("entry_allowed") is True
+        or isinstance(formal_actions, list)
+        and not any(
+            isinstance(action, dict) and action.get("action") == "BUY"
+            for action in formal_actions
         )
     )
 
@@ -2322,7 +2465,13 @@ def _project_broker_trend_report(
     directory = reports_dir.name
     signal_snapshots = payload.get("signal_snapshots", {})
     audit_candidates = payload["strategy_judgments"]["top10_candidates"]
-    if isinstance(signal_snapshots, dict):
+    if _is_current_final_plan_payload(payload):
+        audit_candidates = (
+            signal_snapshots.get("candidates", [])
+            if isinstance(signal_snapshots, dict)
+            else []
+        )
+    elif isinstance(signal_snapshots, dict):
         audit_candidates = signal_snapshots.get("candidates", audit_candidates)
     updated_today = freshness_date.isoformat() == report_date
     execution_today = execution_date.isoformat() == report_date

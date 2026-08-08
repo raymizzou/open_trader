@@ -4586,6 +4586,19 @@ function renderTrendSellOrHoldStage(title, items, kind, report) {
   return renderCnTrendTable(title, kind, headings, rows);
 }
 
+function isTrendRotationBuyAction(item) {
+  return [item?.reason, item?.action].some((value) =>
+    String(value || "").trim().toLowerCase() === "relative_rotation"
+  );
+}
+
+function trendFinalPlanBuyActions(report) {
+  const rows = cnTrendRows(report?.buy_actions);
+  return usesFinalPlanTrendAudit(report)
+    ? rows.filter((item) => !isTrendRotationBuyAction(item))
+    : rows;
+}
+
 function renderTrendBuyStage(report) {
   const headings = [
     "标的", "动作", "筛选价（Trend Animals）", "执行参考价",
@@ -4617,7 +4630,7 @@ function renderTrendBuyStage(report) {
       ${renderTrendCell("预计保护线", hasValue(item.estimated_initial_line) ? formatDisplayNumber(item.estimated_initial_line) : null)}
     </tr>`;
   };
-  const rows = cnTrendRows(report.buy_actions).map((item) => row(item, "正式买入"));
+  const rows = trendFinalPlanBuyActions(report).map((item) => row(item, "正式买入"));
   const simulateStage = renderCnTrendTable(
     `${formatPlain(report.buy_window)} · 模拟盘正式买入计划`, "buy", headings, rows,
     "价格口径：筛选价（Trend Animals）｜执行参考价（各市场报告来源）",
@@ -5076,16 +5089,25 @@ function cnTrendAuditTableTemperature(item) {
 function renderFinalPlanTrendAudit(report) {
   const audit = report?.audit && typeof report.audit === "object" && !Array.isArray(report.audit)
     ? report.audit : {};
+  const market = String(report?.market || "").trim().toUpperCase();
+  const auditKey = (item, symbol = item?.symbol, futuSymbol = item?.futu_symbol) =>
+    normalizeActionKey("", futuSymbol)
+      || normalizeActionKey("", symbol)
+      || normalizeActionKey(market, symbol);
   const plannedSymbols = new Set([
     ...cnTrendRows(report?.buy_actions),
-    ...cnTrendRows(report?.simulate_rotation_pairs).map((item) => ({symbol:item.buy_symbol})),
-    ...cnTrendRows(report?.real_rotation_pairs).map((item) => ({symbol:item.buy_symbol})),
-  ].map((item) => formatPlain(item.symbol)).filter(Boolean));
+    ...cnTrendRows(report?.simulate_rotation_pairs).map((item) => ({
+      symbol: item.buy_symbol, futu_symbol: item.buy_futu_symbol,
+    })),
+    ...cnTrendRows(report?.real_rotation_pairs).map((item) => ({
+      symbol: item.buy_symbol, futu_symbol: item.buy_futu_symbol,
+    })),
+  ].map((item) => auditKey(item)).filter(Boolean));
   const finalSkips = cnTrendRows(report?.risk_skips).filter(
-    (item) => !plannedSymbols.has(formatPlain(item.symbol)),
+    (item) => !plannedSymbols.has(auditKey(item)),
   );
   const disciplineFailures = cnTrendRows(audit.candidates).filter(
-    (item) => item.eligible === false,
+    (item) => item.eligible === false && !plannedSymbols.has(auditKey(item)),
   );
   const finalRows = finalSkips.map((item) => `<tr class="trend-audit-row">
     <td data-label="标的"><strong>${escapeHtml(cnTrendIdentity(item))}</strong></td>
@@ -5097,7 +5119,7 @@ function renderFinalPlanTrendAudit(report) {
   </tr>`).join("") || '<tr class="trend-audit-empty"><td colspan="2">无</td></tr>';
   return `<details class="trend-audit"><summary>候选审计 · 为什么没有进入买入计划</summary>
     <section><h3>通过纪律，但未纳入最终计划</h3><table class="trend-audit-table"><thead><tr><th scope="col">标的</th><th scope="col">最终原因</th></tr></thead><tbody>${finalRows}</tbody></table></section>
-    <section><h3>最后 · 没有通过纪律 ${disciplineFailures.length}</h3><table class="trend-audit-table"><thead><tr><th scope="col">标的</th><th scope="col">纪律结果</th></tr></thead><tbody>${failureRows}</tbody></table></section>
+    <section><details class="trend-audit-discipline"><summary>最后 · 没有通过纪律 ${disciplineFailures.length}</summary><table class="trend-audit-table"><thead><tr><th scope="col">标的</th><th scope="col">纪律结果</th></tr></thead><tbody>${failureRows}</tbody></table></details></section>
   </details>`;
 }
 
@@ -5300,7 +5322,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const isCn = String(report.market || "").toUpperCase() === "CN";
   const finalPlanAudit = usesFinalPlanTrendAudit(report);
   const sellOrHold = renderTrendSellOrHoldStage;
-  const buyStage = finalPlanAudit && !cnTrendRows(report.buy_actions).length
+  const buyStage = finalPlanAudit && !trendFinalPlanBuyActions(report).length
     ? "" : renderTrendBuyStage(report);
   const root = embedded ? "div" : "main";
   const identity = report.artifact && report.report_sha256 && report.strategy_version

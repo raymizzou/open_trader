@@ -8904,6 +8904,26 @@ const normalBuy = renderTrendReportWorkspace({
 for (const text of ["模拟盘正式买入计划", 'data-label="标的"', 'aria-label="目标仓位 6%"']) {
   if (!normalBuy.includes(text)) throw new Error(text + "\n" + normalBuy);
 }
+const rotationOnly = renderTrendReportWorkspace({
+  ...base("US"),
+  simulate_rotation_pairs:[], simulate_rotation_comparisons:[],
+  real_rotation_pairs:[], real_rotation_comparisons:[],
+  buy_actions:[{symbol:" us.aapl ",name:"轮换买入",action:"relative_rotation"}],
+  risk_skips:[
+    {symbol:"aapl",name:"轮换买入",reason:"已进入轮换"},
+    {symbol:"BLOCK",name:"计划外跳过",reason:"组合席位已满"},
+  ],
+  audit:{candidates:[
+    {symbol:"US.AAPL",name:"轮换买入",eligible:false,excluded_reasons:["already_held"]},
+    {symbol:"MSFT",name:"纪律失败",eligible:false,excluded_reasons:["strength_below_95"]},
+  ]},
+});
+if (rotationOnly.includes("模拟盘正式买入计划")) throw new Error("rotation BUY duplicated");
+const rotationAudit = rotationOnly.slice(rotationOnly.indexOf('<details class="trend-audit"'));
+if (rotationAudit.includes("AAPL") || !rotationAudit.includes("BLOCK") || !rotationAudit.includes("MSFT")) {
+  throw new Error("planned symbols were not normalized out of audit\n" + rotationAudit);
+}
+if ((rotationAudit.match(/<details/g) || []).length < 2) throw new Error("discipline group is not collapsible");
 console.log("ok");
 ''')
 
