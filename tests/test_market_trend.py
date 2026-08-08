@@ -2209,11 +2209,15 @@ def test_allocation_market_runner_ledger_excludes_real_only_candidates(
     ).encode()
     allocation_path.write_bytes(allocation_body)
     allocation["sha256"] = hashlib.sha256(allocation_body).hexdigest()
-    as_of_date = "2026-08-07" if market == "HK" else "2026-08-06"
-    execution_date = "2026-08-08" if market == "HK" else "2026-08-07"
+    # Freeze the signal/data date across both markets.  The US resolver uses
+    # the following run date to roll back to the prior trading day (8/7).
+    as_of_date = "2026-08-07"
+    execution_date = "2026-08-08"
+    run_date = "2026-08-07" if market == "HK" else "2026-08-08"
     pool_id = 622494 if market == "HK" else 622460
     complete_snapshot_ids: list[int] = []
-    staged_snapshot_requests: list[tuple[list[int], tuple[str, ...]]] = []
+    snapshot_request_ledger: list[tuple[tuple[str, ...], tuple[int, ...]]] = []
+    api_expected_dates: list[str] = []
     eligible_industry_component_calls: list[int] = []
     industry_member_snapshot_calls: list[list[int]] = []
     industry_state_snapshot_calls: list[list[int]] = []
@@ -2270,6 +2274,7 @@ def test_allocation_market_runner_ledger_excludes_real_only_candidates(
         def get_components(
             self, *, tm_id: int, expected_date: str,
         ) -> list[dict[str, object]]:
+            api_expected_dates.append(expected_date)
             if tm_id != pool_id:
                 eligible_industry_component_calls.append(tm_id)
             return [
@@ -2292,6 +2297,7 @@ def test_allocation_market_runner_ledger_excludes_real_only_candidates(
             self, symbol: str, *, market: str, expected_date: str,
         ) -> int:
             assert market == self_market
+            api_expected_dates.append(expected_date)
             return 3
 
         def get_snapshot_billing(self) -> list[dict[str, object]]:
@@ -2299,7 +2305,13 @@ def test_allocation_market_runner_ledger_excludes_real_only_candidates(
             return [
                 {
                     "field": field,
-                    "priceCost": "0.071" if field == "tickerName" else "0",
+                    "priceCost": (
+                        "0.045"
+                        if field == "tickerName"
+                        else "0.001"
+                        if field in UNIFIED_TREND_FIELDS
+                        else "0.002"
+                    ),
                 }
                 for field in fields
             ]
@@ -2307,14 +2319,14 @@ def test_allocation_market_runner_ledger_excludes_real_only_candidates(
         def get_snapshots(
             self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str,
         ) -> list[dict[str, object]]:
+            api_expected_dates.append(expected_date)
             if fields == INDUSTRY_MEMBER_FIELDS:
                 industry_member_snapshot_calls.append(list(tm_ids))
             if fields == INDUSTRY_STATE_FIELDS:
                 industry_state_snapshot_calls.append(list(tm_ids))
             if fields == UNIFIED_TREND_FIELDS:
                 complete_snapshot_ids.extend(tm_ids)
-            else:
-                staged_snapshot_requests.append((list(tm_ids), fields))
+            snapshot_request_ledger.append((tuple(fields), tuple(tm_ids)))
             if fields == A_SHARE_INDUSTRY_FIELDS:
                 return [
                     {
@@ -2391,7 +2403,7 @@ def test_allocation_market_runner_ledger_excludes_real_only_candidates(
     result = run_market_trend_report(
         config=cfg,
         market=market,
-        run_date="2026-08-07",
+        run_date=run_date,
         allocation_reference=allocation,
         notifier=NullNotifier(),
         api_factory=lambda **kwargs: api,
@@ -2405,11 +2417,40 @@ def test_allocation_market_runner_ledger_excludes_real_only_candidates(
 
     assert sorted(complete_snapshot_ids) == [3]
     assert len(complete_snapshot_ids) == len(set(complete_snapshot_ids))
-    assert [item["tm_ids"] for item in trace] == [
-        [1, 2], [1, 2], [1], [1], [1], [700001], [1],
-    ]
+    assert api_expected_dates and set(api_expected_dates) == {as_of_date}
+    expected_unified_fields = (
+        "tmId", "tickerName", "tickerSymbol", "asset", "asOfDate",
+        "tradableFlag", "industryTmId", "industryName", "priceIndex",
+        "marketCap", "amount1d", "isTrendRightSide", "trendTemperatureCurr",
+        "trendTemperaturePrev", "daysSinceTrendEntry", "gainSinceTrendEntry",
+        "trendPhasePrev", "trendPhaseCurr", "trendStrengthLocalCurr",
+        "trendStrengthLocalChange", "trendStrengthGlobalCurr",
+        "trendStrengthLocalPrevWeek", "trendStrengthLocalPrevMonth",
+        "stopwinFlagByDangerSignal", "stopwinFlagByBoilingTemperature",
+        "stopwinFlagByPopChampagne", "tickerLabels",
+    )
+    expected_ledger = (
+        (expected_unified_fields, (3,)),
+        (("tmId", "tickerName", "tickerSymbol", "asset", "asOfDate"), (1, 2)),
+        (("tmId", "asOfDate", "trendStrengthLocalCurr"), (1, 2)),
+        (("tmId", "asOfDate", "marketCap"), (1,)),
+        (("tmId", "asOfDate", "trendTemperaturePrev", "trendTemperatureCurr"), (1,)),
+        (("tmId", "asOfDate", "tradableFlag", "industryTmId", "industryName",
+          "amount1d", "isTrendRightSide", "daysSinceTrendEntry", "trendPhaseCurr",
+          "stopwinFlagByDangerSignal"), (1,)),
+        (("tmId", "asOfDate", "trendTemperatureCurr"), (700001,)),
+        (("priceIndex", "gainSinceTrendEntry", "trendPhasePrev",
+          "trendStrengthLocalChange", "trendStrengthGlobalCurr",
+          "trendStrengthLocalPrevWeek", "trendStrengthLocalPrevMonth",
+          "stopwinFlagByBoilingTemperature", "stopwinFlagByPopChampagne",
+          "tickerLabels"), (1,)),
+    )
+    assert tuple(snapshot_request_ledger) == expected_ledger
+    assert tuple(
+        (tuple(item["fields"]), tuple(item["tm_ids"])) for item in trace
+    ) == expected_ledger[1:]
     assert all(item["tm_ids"] == sorted(set(item["tm_ids"])) for item in trace)
-    assert all(3 not in item["tm_ids"] for item in trace)
+    assert all(3 not in ids for _, ids in expected_ledger[1:])
     assert eligible_industry_component_calls == []
     assert industry_member_snapshot_calls == []
     assert industry_state_snapshot_calls == []
@@ -2419,15 +2460,11 @@ def test_allocation_market_runner_ledger_excludes_real_only_candidates(
         for fact in payload["api_facts"]
     ) == 1
 
-    billing = {
-        row["field"]: Decimal(str(row["priceCost"]))
+    assert all(
+        Decimal(str(row["priceCost"])) > 0
         for row in api.get_snapshot_billing()
-    }
-    expected_cost = Decimal("0.071") * len(complete_snapshot_ids)
-    expected_cost += sum(
-        sum(billing[field] for field in item["fields"]) * len(item["tm_ids"])
-        for item in trace
     )
-    assert payload["estimated_api_cost"] == format(expected_cost, "f")
+    expected_cost = Decimal("0.205")
+    assert Decimal(payload["estimated_api_cost"]) == expected_cost
     if market == "US":
         assert Decimal(payload["estimated_api_cost"]) <= Decimal("2.852")

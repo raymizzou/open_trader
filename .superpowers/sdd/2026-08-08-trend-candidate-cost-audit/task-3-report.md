@@ -33,6 +33,51 @@ git diff --check
 exit 0
 ```
 
+## Fix round 2 (independent request-ledger proof)
+
+- Declared the expected ordered field tuples and `tmId` tuples directly in
+  each CN/HK/US runner fixture. Assertions now cover every complete holding
+  request and every staged identity, strength, cap, temperature, discipline,
+  industry-temperature, and expansion request without deriving expectations
+  from the emitted trace.
+- Changed all fixtures to positive frozen billing prices. The independent
+  expected estimates are CN `0.276`, HK `0.205`, and US `0.205`; the US
+  assertion explicitly checks the non-zero estimate is `<= Decimal("2.852")`.
+- The US fixture invokes `run_date="2026-08-08"`, whose market-date resolver
+  yields the frozen signal/as-of date `2026-08-07`; HK keeps its as-of rule.
+  Every date-bearing API request recorded by the HK/US fake is asserted to
+  use the frozen as-of date.
+- Complete snapshots remain exactly simulated plus real-only holdings, with
+  no real-only `tmId` in staged requests and no eligible-industry component,
+  member, or state breadth calls.
+
+### Fix-round-2 verification
+
+```text
+PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest -q \
+ tests/test_a_share_trend.py::test_current_cn_runner_ledger_excludes_real_only_candidates \
+  tests/test_market_trend.py::test_allocation_market_runner_ledger_excludes_real_only_candidates
+...                                                                      [100%]
+3 passed in 0.70s
+
+PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest -q \
+  tests/test_a_share_trend.py tests/test_market_trend.py tests/test_trend_industry_context.py \
+  -k 'not build_report_upgrades_exact_repository_legacy_snapshot'
+554 passed, 1 deselected in 2.30s
+
+PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest -q \
+  tests/test_a_share_trend.py -k 'runner or paid_scope or cost' \
+  tests/test_market_trend.py -k 'report or snapshot or cost'
+1 failed, 162 passed, 363 deselected in 1.53s
+```
+
+The combined broad selection still has only the known missing ignored fixture
+failure (`data/trend_review/daily/CN/2026-07-16.json` in
+`test_build_report_upgrades_exact_repository_legacy_snapshot`); all changed
+runner fixtures pass. `git diff --check` and the previously recorded
+three-module `compileall` check remain clean. `ruff` is not installed in the
+shared virtualenv.
+
 The unfiltered three-file pytest invocation had one unrelated failure before
 the exclusion: `test_build_report_upgrades_exact_repository_legacy_snapshot`
 expects the ignored local artifact
@@ -41,11 +86,9 @@ clean worktree. It did not execute the changed runner code.
 
 ## Concerns for review
 
-- The current-version runner ledger regression test is direct for CN. The
-  shared HK/US runner follows the same gated branch and all 44 existing market
-  tests pass, but there is not yet a separate allocation-backed HK/US request
-  ledger fixture in this task. Add one in review if three-market ledger proof
-  must be test-local rather than supplied by the final offline/live gate.
+- Historical concern (resolved in fix round 1): the parameterized
+  allocation-backed HK/US request-ledger fixture now covers both market
+  branches alongside the CN fixture.
 - `ruff` is not installed in the shared virtualenv (`No module named ruff`).
 
 ## Fix round 1 (review findings)
