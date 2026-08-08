@@ -2540,6 +2540,12 @@ def test_dashboard_projects_only_valid_frozen_allocation_contract(
         "strategy_id": "trend_animals_warm_to_hot/CN/v13",
         "strategy_version": "v13",
     })
+    payload["industry_context_status"] = {
+        "ordering_mode": "individual_global",
+        "current_complete": True,
+        "history_complete": False,
+        "fallback_reason": None,
+    }
     judgments = payload["strategy_judgments"]
     assert isinstance(judgments, dict)
     judgments["simulate_rotation_pairs"] = []
