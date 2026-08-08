@@ -602,7 +602,7 @@ def run_trend_statistics_cycle(
         )
         if normalized_market == "US" and tiger_client is None:
             raise ValueError("US statistics cycle requires Tiger actual client")
-        payload = sync_trend_api_stats(
+        sync_trend_api_stats(
             data_dir=data_dir,
             reports_dir=reports_dir,
             futu_clients={normalized_market: futu_client},
@@ -612,9 +612,10 @@ def run_trend_statistics_cycle(
             generated_at=generated_at,
             statistics_cutoff_at=cutoff,
         )
-        published, artifact_sha256 = read_trend_api_stats_snapshot(data_dir)
-        if published != payload:
-            raise ValueError("trend_api_stats readback mismatch")
+        with RunLock(
+            _path(data_dir) / "trend_statement_consumption/.stats.lock", wait=True
+        ):
+            _, artifact_sha256 = read_trend_api_stats_snapshot(data_dir)
     except Exception as exc:
         return _write_failed_cycle_state(
             state_path, previous, exc, generated_at, process_git_sha

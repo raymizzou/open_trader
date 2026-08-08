@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import open_trader.trend_api_stats as trend_api_stats_module
 
 from open_trader.tiger_account import TigerAccountConfig, TigerAccountError
 from open_trader.trend_api_stats import (
@@ -909,3 +910,43 @@ def test_partial_actual_artifact_catches_up_missing_simulation_from_reports(
     assert len(client.calls) == 1
     assert client.calls[0]["start"] == "2026-01-01"
     assert client.calls[0]["end"] == "2026-08-08"
+
+
+def test_cycle_hashes_current_locked_snapshot_without_comparing_stale_sync_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = build_trend_api_stats_payload(
+        [],
+        strategy_versions=[],
+        generated_at="2026-08-09T08:00:00+08:00",
+        statistics_cutoff_at="2026-08-08T15:00:00+08:00",
+    )
+    artifact["sources"] = [{
+        "source": "simulation",
+        "source_id": "simulation:futu:cn-sim",
+        "broker": "futu",
+        "account_id": "cn-sim",
+        "market": "CN",
+        "orders_seen": 0,
+        "fill_count": 0,
+        "statistics_cutoff_at": "2026-08-08T15:00:00+08:00",
+        "status": "available",
+    }]
+    write_trend_api_stats(tmp_path / "data", artifact)
+    monkeypatch.setattr(
+        trend_api_stats_module,
+        "sync_trend_api_stats",
+        lambda **_: {"stale": "concurrent writer result"},
+    )
+
+    result = run_trend_statistics_cycle(
+        **cycle_kwargs(
+            tmp_path, market="CN", futu_client=RecordingCycleClient(account_id="cn-sim")
+        )
+    )
+
+    assert result["status"] == "completed"
+    expected_sha = hashlib.sha256(
+        (tmp_path / "data/latest/trend_api_stats.json").read_bytes()
+    ).hexdigest()
+    assert result["artifact_sha256"] == expected_sha
