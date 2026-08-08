@@ -818,3 +818,94 @@ def test_cycle_cutoffs_are_market_local_closes() -> None:
     assert trend_statistics_cutoff_at("CN", "2026-08-08") == "2026-08-08T15:00:00+08:00"
     assert trend_statistics_cutoff_at("HK", "2026-08-08") == "2026-08-08T16:00:00+08:00"
     assert trend_statistics_cutoff_at("US", "2026-08-08") == "2026-08-08T16:00:00-04:00"
+
+
+def test_market_cycle_publications_are_order_independent(tmp_path: Path) -> None:
+    us_kwargs = cycle_kwargs(
+        tmp_path,
+        market="US",
+        futu_client=RecordingCycleClient(account_id="us-sim"),
+        tiger_client=RecordingCycleClient(account_id="U1"),
+    )
+    assert run_trend_statistics_cycle(**us_kwargs)["status"] == "completed"
+
+    cn_kwargs = cycle_kwargs(
+        tmp_path,
+        market="CN",
+        futu_client=RecordingCycleClient(account_id="cn-sim"),
+    )
+    cn_result = run_trend_statistics_cycle(**cn_kwargs)
+
+    assert cn_result["status"] == "completed"
+    assert cn_result["statistics_cutoff_at"] == "2026-08-08T15:00:00+08:00"
+    artifact = load_trend_api_stats(tmp_path / "data")
+    assert artifact["statistics_cutoff_at"] == "2026-08-08T16:00:00-04:00"
+    assert {source["market"] for source in artifact["sources"]} == {"CN", "US"}
+
+
+def test_range_validation_failure_persists_retryable_cycle_state(tmp_path: Path) -> None:
+    report_path = tmp_path / "reports/trend_a_share/2026-08-08.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text("not json", encoding="utf-8")
+    kwargs = cycle_kwargs(
+        tmp_path,
+        market="CN",
+        futu_client=RecordingCycleClient(account_id="cn-sim"),
+    )
+
+    result = run_trend_statistics_cycle(**kwargs)
+
+    assert result["status"] == "failed"
+    state = json.loads(
+        trend_statistics_cycle_path(tmp_path / "data", "CN", "2026-08-08").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert state["status"] == "failed"
+    assert "frozen trend report is unreadable" in state["reason"]
+
+
+def test_partial_actual_artifact_catches_up_missing_simulation_from_reports(
+    tmp_path: Path,
+) -> None:
+    report = {
+        "execution_date": "2026-01-01",
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_snapshot": {
+            "strategy_id": "trend_animals_warm_to_hot/CN/v1",
+            "strategy_version": "v1",
+            "parameters": {},
+        },
+        "strategy_judgments": {"formal_actions": []},
+    }
+    report_path = tmp_path / "reports/trend_a_share/2026-01-01.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    artifact = build_trend_api_stats_payload(
+        [],
+        strategy_versions=[],
+        generated_at="2026-07-01T16:00:00+08:00",
+        statistics_cutoff_at="2026-07-01T15:00:00+08:00",
+    )
+    artifact["sources"] = [{
+        "source": "actual",
+        "source_id": "actual:eastmoney:eastmoney_main",
+        "broker": "eastmoney",
+        "account_id": "eastmoney_main",
+        "market": "CN",
+        "orders_seen": 0,
+        "fill_count": 0,
+        "statistics_cutoff_at": "2026-07-01T15:00:00+08:00",
+        "status": "available",
+    }]
+    write_trend_api_stats(tmp_path / "data", artifact)
+    client = RecordingCycleClient(account_id="cn-sim")
+
+    result = run_trend_statistics_cycle(
+        **cycle_kwargs(tmp_path, market="CN", futu_client=client)
+    )
+
+    assert result["status"] == "completed"
+    assert len(client.calls) == 1
+    assert client.calls[0]["start"] == "2026-01-01"
+    assert client.calls[0]["end"] == "2026-08-08"

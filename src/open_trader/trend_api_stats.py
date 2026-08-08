@@ -529,10 +529,15 @@ def sync_trend_api_stats(
         path = data_dir / "latest" / "trend_api_stats.json"
         existing_fills: list[Mapping[str, object]] = []
         existing_sources: list[Mapping[str, object]] = []
+        artifact_cutoff = statistics_cutoff_at
         if path.exists():
             existing = load_trend_api_stats(data_dir)
             existing_fills = list(existing["fills"])
             existing_sources = list(existing["sources"])
+            artifact_cutoff = max(
+                (str(existing["statistics_cutoff_at"]), statistics_cutoff_at),
+                key=lambda value: _aware_timestamp(value, "statistics_cutoff_at"),
+            )
         strategy_versions = sorted({
             (str(fact["market"]), str(fact["strategy_id"]), str(fact["strategy_version"]))
             for fact in facts
@@ -544,7 +549,7 @@ def sync_trend_api_stats(
                 for market, strategy_id, version in strategy_versions
             ],
             generated_at=generated_at,
-            statistics_cutoff_at=statistics_cutoff_at,
+            statistics_cutoff_at=artifact_cutoff,
         )
         payload["sources"] = _merge_source_audits(existing_sources, sources)
         write_trend_api_stats(data_dir, payload)
@@ -591,10 +596,10 @@ def run_trend_statistics_cycle(
     if force and (not actor.strip() or not reason.strip()):
         raise ValueError("force requires actor and reason")
     cutoff = trend_statistics_cutoff_at(normalized_market, normalized_date)
-    start, end = _statistics_fetch_range(
-        _path(data_dir), _path(reports_dir), normalized_market, normalized_date
-    )
     try:
+        start, end = _statistics_fetch_range(
+            _path(data_dir), _path(reports_dir), normalized_market, normalized_date
+        )
         if normalized_market == "US" and tiger_client is None:
             raise ValueError("US statistics cycle requires Tiger actual client")
         payload = sync_trend_api_stats(
@@ -649,17 +654,31 @@ def _statistics_fetch_range(
     except ValueError:
         existing = None
     if existing is not None:
+        has_simulation = False
+        has_tiger_actual = normalized_market != "US"
         for source in existing["sources"]:
             if source["market"] != normalized_market:
                 continue
-            if source["source"] == "simulation" or (
-                normalized_market == "US" and source["broker"] == "tiger"
-            ):
+            if source["source"] == "simulation":
+                has_simulation = True
                 starts.append(
                     _aware_timestamp(
                         source["statistics_cutoff_at"], "source statistics_cutoff_at"
                     ).astimezone(_MARKET_TIMEZONES[normalized_market]).date().isoformat()
                 )
+            elif normalized_market == "US" and source["broker"] == "tiger":
+                has_tiger_actual = True
+                starts.append(
+                    _aware_timestamp(
+                        source["statistics_cutoff_at"], "source statistics_cutoff_at"
+                    ).astimezone(_MARKET_TIMEZONES[normalized_market]).date().isoformat()
+                )
+        if not has_simulation or not has_tiger_actual:
+            starts.extend(
+                str(fact["execution_date"])
+                for fact in _load_frozen_strategy_facts(reports_dir)
+                if fact["market"] == normalized_market
+            )
     else:
         starts.extend(
             str(fact["execution_date"])
