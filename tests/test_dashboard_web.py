@@ -6710,6 +6710,8 @@ def test_prediction_market_static_contract_is_present() -> None:
     assert "signalPollId" in js
     assert "signalRequestInFlight" in js
     assert "signalPollEpoch" in js
+    assert "loadPredictionHistory(\"signals\", {panelOnly: true});\n  }, 5000);" in js
+    assert "cache(本次运行)" in js
     assert "predictionTradingAvailable(currentState)" in js
     assert "row.live_profit ?? row.estimated_profit ?? row.profit" not in js
     for copy in ("免手续费", "可能只成交一腿", "24h 成交量"):
