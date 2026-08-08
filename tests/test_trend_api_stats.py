@@ -9,6 +9,7 @@ from open_trader.trend_api_stats import (
     build_trend_api_stats_payload,
     eligible_simulation_rounds,
     load_trend_api_stats,
+    read_trend_api_stats_snapshot,
     trend_statistics_disposition,
     strategy_payoff_ratio,
 )
@@ -884,6 +885,16 @@ def test_artifact_load_reports_missing_and_unreadable_files_as_validation_errors
 
     with pytest.raises(ValueError, match="invalid JSON"):
         load_trend_api_stats(tmp_path)
+
+
+def test_artifact_loaders_reject_utf8_bom_as_invalid_json(tmp_path) -> None:
+    path = tmp_path / "latest/trend_api_stats.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xef\xbb\xbf{}")
+
+    for loader in (load_trend_api_stats, read_trend_api_stats_snapshot):
+        with pytest.raises(ValueError, match="trend_api_stats.json is invalid JSON"):
+            loader(tmp_path)
 
 
 def test_statistics_disposition_conserves_every_candidate() -> None:

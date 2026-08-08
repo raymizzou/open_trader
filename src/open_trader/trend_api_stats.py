@@ -794,7 +794,7 @@ def read_trend_api_stats_snapshot(data_dir: Any) -> tuple[dict[str, object], str
     path = _path(data_dir) / "latest" / "trend_api_stats.json"
     try:
         raw = path.read_bytes()
-        payload = json.loads(raw)
+        payload = json.loads(raw.decode("utf-8"))
     except FileNotFoundError:
         raise ValueError("trend_api_stats.json is missing") from None
     except (OSError, UnicodeError):
