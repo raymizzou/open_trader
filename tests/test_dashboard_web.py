@@ -14307,6 +14307,57 @@ def test_prediction_history_projects_live_yes_no_actionability_and_cached_title(
     assert refreshed["initial_profit"] == "0.38"
 
 
+def test_prediction_history_title_lookup_is_memoized_per_request() -> None:
+    from open_trader.dashboard_web import _prediction_history_payload
+    from open_trader.prediction_title_translation import prediction_title_cache_key
+
+    title = "Will the event happen?"
+    rows = [
+        {
+            "signal_id": f"s-{i}",
+            "market_id": f"m-{i}",
+            "question": title,
+            "started_at": f"2026-08-01T10:0{i}:00Z",
+            "ended_at": None,
+            "initial_profit": "0.31",
+            "notification_state": "pending",
+        }
+        for i in range(3)
+    ]
+    lookups = 0
+
+    class FakeStore:
+        def histories(self, kind: str) -> list[dict[str, object]]:
+            assert kind == "signals"
+            return rows
+
+        def active_execution(self) -> None:
+            return None
+
+        def unacknowledged_incident(self) -> None:
+            return None
+
+        def signal_history(self, _window: str) -> list[dict[str, object]]:
+            return rows
+
+        def load_runtime(self) -> dict[str, object]:
+            return {}
+
+        def load_llm_cache(self, cache_key: str) -> dict[str, object] | None:
+            nonlocal lookups
+            lookups += 1
+            if cache_key == prediction_title_cache_key(title):
+                return {"title_zh": "这件事会发生吗？"}
+            return None
+
+    payload = _prediction_history_payload(
+        FakeStore(), kind="signals", limit=10, offset=0
+    )
+    assert lookups == 1
+    assert payload["items"][0]["event_title_zh"] == "这件事会发生吗？"
+    assert payload["items"][1]["event_title_zh"] == "这件事会发生吗？"
+
+
 @pytest.mark.parametrize(
     "state_overrides",
     [

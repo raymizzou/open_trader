@@ -375,7 +375,9 @@ def _prediction_event_aliases(value: object) -> object:
 
 
 def _prediction_attach_cached_title(
-    store: PredictionArbitrageStore | None, value: object
+    store: PredictionArbitrageStore | None,
+    value: object,
+    title_cache: dict[str, object] | None = None,
 ) -> object:
     if store is None or not isinstance(value, Mapping):
         return value
@@ -384,14 +386,25 @@ def _prediction_attach_cached_title(
         result, "event_title", "title", "question", "market_title"
     )
     if title is not None:
-        translated = cached_prediction_title_zh(store, str(title), record_hit=False)
+        key = str(title)
+        translated = None
+        if title_cache is not None:
+            translated = title_cache.get(key)
+            if key not in title_cache:
+                translated = cached_prediction_title_zh(
+                    store, key, record_hit=False
+                )
+                title_cache[key] = translated
+        else:
+            translated = cached_prediction_title_zh(store, key, record_hit=False)
         if translated is not None:
             result["event_title_zh"] = translated
             result.setdefault("title_zh", translated)
     markets = result.get("markets")
     if isinstance(markets, (list, tuple)):
         result["markets"] = [
-            _prediction_attach_cached_title(store, item) for item in markets
+            _prediction_attach_cached_title(store, item, title_cache)
+            for item in markets
         ]
     return result
 
@@ -1213,9 +1226,12 @@ def _prediction_history_payload(
     if kind not in PREDICTION_HISTORY_KINDS:
         raise ValueError("kind must be signals, executions, or incidents")
     rows = store.histories(kind) if store is not None else []
+    title_cache: dict[str, object] = {}
     safe_rows = [
         _prediction_attach_cached_title(
-            store, _prediction_history_aliases(kind, _prediction_safe_value(row))
+            store,
+            _prediction_history_aliases(kind, _prediction_safe_value(row)),
+            title_cache,
         )
         for row in rows
     ]
