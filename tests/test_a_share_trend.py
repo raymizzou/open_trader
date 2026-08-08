@@ -989,6 +989,235 @@ def test_frozen_contract_accepts_local_basis_rotation_pair() -> None:
     assert not trend_module.valid_frozen_report_contract(global_gap)
 
 
+def _frozen_us_2026_08_07_final_plan_audit(
+    extra_candidates: tuple[CandidateInput, ...] = (),
+) -> TrendReport:
+    as_of_date = "2026-08-07"
+    execution_date = "2026-08-10"
+    held_symbols = tuple(f"HOLD{index}" for index in range(10))
+    allocation = allocation_for("US", rank=1, entry_weight="0.06")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "US",
+        "abc123",
+        (622460, 705013),
+        allocation=allocation,
+        execution_date=execution_date,
+    )
+    ranked = (
+        ("GRMN", "100", "100", "美股"),
+        ("WTW", "90", "99", "美股"),
+        ("ABNB", "80", "96", "美国ETF"),
+        ("REGN", "70", "96", "美国ETF"),
+        ("TEAM", "60", "96", "美国ETF"),
+        ("CRWD", "50", "96", "美国ETF"),
+        ("HPQ", "40", "96", "美国ETF"),
+        ("PATH", "30", "96", "美国ETF"),
+        ("SWK", "20", "96", "美国ETF"),
+        ("WSM", "10", "96", "美国ETF"),
+    )
+    return build_report(
+        as_of_date=as_of_date,
+        execution_date=execution_date,
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        account=AccountSnapshot(
+            source_date=as_of_date,
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("0"),
+            positions=tuple(
+                AccountPosition(
+                    symbol,
+                    symbol,
+                    "stock",
+                    Decimal("500"),
+                    Decimal("10"),
+                    Decimal("10000"),
+                )
+                for symbol in held_symbols
+            ),
+            exceptions=(),
+            position_count=10,
+        ),
+        candidates=[
+            replace(
+                candidate(
+                    symbol,
+                    exchange="US",
+                    asset=asset,
+                    strength=strength,
+                    global_strength=global_strength,
+                ),
+                as_of_date=as_of_date,
+            )
+            for symbol, global_strength, strength, asset in ranked
+        ] + list(extra_candidates),
+        holding_snapshots={
+            symbol: replace(
+                holding(
+                    symbol,
+                    asset="美股",
+                    strength=("10" if index == 0 else "86.7" if index == 1 else "99"),
+                    global_strength=("10" if index == 0 else "95" if index == 1 else "99"),
+                ),
+                as_of_date=as_of_date,
+                exchange="US",
+            )
+            for index, symbol in enumerate(held_symbols)
+        },
+        bars_by_symbol={
+            symbol: bars(end_date=as_of_date) for symbol in held_symbols
+        },
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10",
+                    "active_line": "10",
+                    "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in held_symbols
+            }
+        },
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        allocation_reference=allocation,
+    )
+
+
+def test_frozen_2026_08_07_final_plan_audit_omits_rotation_buy_and_explains_skips() -> None:
+    built = _frozen_us_2026_08_07_final_plan_audit()
+
+    assert [item.symbol for item in built.candidates] == [
+        "GRMN", "WTW", "ABNB", "REGN", "TEAM", "CRWD", "HPQ", "PATH", "SWK", "WSM",
+    ]
+    assert "GRMN" not in {item["symbol"] for item in built.risk_skips}
+    assert next(item for item in built.risk_skips if item["symbol"] == "WTW")["reason"] == (
+        "10 个持仓席位已满；强度差 12.3 小于门槛 20"
+    )
+    assert next(item for item in built.risk_skips if item["symbol"] == "ABNB")["reason"] == (
+        "10 个持仓席位已满；未进入 2 个轮换比较席位"
+    )
+    markdown = render_markdown(built)
+    assert "## 下个常规交易时段：按顺序考虑买入" not in markdown
+    assert "现金也是有效仓位，本日无需交易。" not in markdown
+
+
+def test_final_plan_audit_keeps_ranked_candidate_below_display_top10() -> None:
+    lower = replace(
+        candidate(
+            "LOWER",
+            exchange="US",
+            asset="美国ETF",
+            strength="96",
+            global_strength="1",
+        ),
+        as_of_date="2026-08-07",
+    )
+    built = _frozen_us_2026_08_07_final_plan_audit((lower,))
+
+    assert len(built.candidates) == 10
+    assert next(item for item in built.risk_skips if item["symbol"] == "LOWER")[
+        "reason"
+    ] == "10 个持仓席位已满；未进入 2 个轮换比较席位"
+
+
+def test_final_plan_audit_missing_global_precedes_normal_plan_eligibility() -> None:
+    as_of_date = "2026-08-07"
+    allocation = allocation_for("US", rank=1, entry_weight="0.06")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "US",
+        "abc123",
+        (622460, 705013),
+        allocation=allocation,
+        execution_date="2026-08-10",
+    )
+    built = build_report(
+        as_of_date=as_of_date,
+        execution_date="2026-08-10",
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        account=AccountSnapshot(
+            source_date=as_of_date,
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=[
+            replace(
+                candidate(
+                    "BUY",
+                    exchange="US",
+                    asset="美股",
+                    global_strength="90",
+                ),
+                as_of_date=as_of_date,
+            ),
+            replace(
+                candidate(
+                    "MISSING",
+                    exchange="US",
+                    asset="美股",
+                    global_strength=None,
+                ),
+                as_of_date=as_of_date,
+            ),
+        ],
+        holding_snapshots={},
+        bars_by_symbol={},
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        allocation_reference=allocation,
+    )
+
+    assert [item.symbol for item in built.buy_actions] == ["BUY"]
+    assert [item["symbol"] for item in built.risk_skips] == ["MISSING"]
+    assert built.risk_skips[0]["reason"] == "全局强度缺失，无法排序"
+
+
+def test_final_plan_audit_markdown_lists_qualified_skips_before_generic_discipline_failures() -> None:
+    failing = replace(candidate("FAIL", strength="94"), as_of_date="2026-08-07")
+    built = _frozen_us_2026_08_07_final_plan_audit((
+        replace(
+            failing,
+            exchange="US",
+            asset="美股",
+        ),
+    ))
+
+    markdown = render_markdown(built)
+
+    assert "- WTW 股票WTW｜10 个持仓席位已满；强度差 12.3 小于门槛 20" in markdown
+    assert "- FAIL 股票FAIL｜没有通过纪律" in markdown
+    assert "趋势强度低于 95" not in markdown
+    assert markdown.index("- WTW") < markdown.index("- FAIL")
+
+
+def test_final_plan_audit_markdown_reduces_new_industry_context_to_temperature_and_direction() -> None:
+    allocation = allocation_for("US", rank=1, entry_weight="0.06")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "US", "abc123", (622460, 705013), allocation=allocation,
+    )
+    built = replace(
+        report(),
+        metadata={"market": "US", "broker": "tiger"},
+        strategy_snapshot=strategy,
+        industry_contexts=(replace(
+            _industry_context(700001),
+            industry="软件",
+            temperature="热",
+            temperature_direction="rising",
+        ),),
+    )
+
+    markdown = render_markdown(built)
+
+    assert "软件｜温度 热｜方向 上升" in markdown
+    assert "右侧个数占比" not in markdown
+
+
 def test_new_report_construction_and_serialization_require_account_input() -> None:
     with pytest.raises(
         ValueError,
@@ -1038,7 +1267,7 @@ def test_rotation_ignores_display_only_kelly_unavailability() -> None:
             ),
             exceptions=(),
         ),
-        candidates=[candidate("200001", strength="100")],
+        candidates=[candidate("200001", strength="100", global_strength="100")],
         holding_snapshots={
             symbol: holding(symbol, strength="10")
             for symbol in held_symbols
@@ -1066,7 +1295,7 @@ def test_rotation_ignores_display_only_kelly_unavailability() -> None:
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
         account=built.account,
-        candidates=[candidate("200001", strength="100")],
+        candidates=[candidate("200001", strength="100", global_strength="100")],
         holding_snapshots={
             symbol: holding(symbol, strength="10")
             for symbol in held_symbols
@@ -1622,8 +1851,8 @@ def test_allocation_cn_v11_applies_rank_weight_only_to_new_hot_and_boiling_buys(
         execution_date="2026-07-15",
         account=current_account,
         candidates=(
-            candidate("600001", temperature_curr="热"),
-            candidate("600002", temperature_curr="沸"),
+            candidate("600001", temperature_curr="热", global_strength="100"),
+            candidate("600002", temperature_curr="沸", global_strength="90"),
         ),
         holding_snapshots={},
         bars_by_symbol={},
@@ -2611,11 +2840,10 @@ def test_build_report_rejects_any_injected_snapshot_parameter_drift(
 
 
 def test_build_report_upgrades_exact_repository_legacy_snapshot() -> None:
-    legacy = json.loads(
-        Path("data/trend_review/daily/CN/2026-07-16.json").read_text(
-            encoding="utf-8"
-        )
-    )["strategy_snapshot"]
+    legacy_path = Path("data/trend_review/daily/CN/2026-07-16.json")
+    if not legacy_path.is_file():
+        pytest.skip("ignored legacy Trend report fixture is unavailable")
+    legacy = json.loads(legacy_path.read_text(encoding="utf-8"))["strategy_snapshot"]
     pools = tuple(legacy["parameters"]["candidate_pool_ids"])
 
     built = build_report(
@@ -6533,8 +6761,11 @@ def test_report_freezes_and_renders_aggregate_right_side_structure() -> None:
     assert "不是账户仓位或上涨概率" in markdown
 
 
-def test_no_action_report_uses_exact_cash_sentence() -> None:
-    assert "现金也是有效仓位，本日无需交易。" in render_markdown(report())
+def test_no_action_report_omits_empty_normal_buy_section() -> None:
+    markdown = render_markdown(report())
+
+    assert "## 09:30–10:00：按顺序考虑买入" not in markdown
+    assert "现金也是有效仓位，本日无需交易。" not in markdown
 
 
 def test_formal_buy_text_includes_window_estimates_target_and_line() -> None:

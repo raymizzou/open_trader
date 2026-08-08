@@ -4319,6 +4319,85 @@ def _risk_skip(
     }
 
 
+def _final_plan_risk_skips(
+    ranked: Sequence[CandidateInput],
+    ordinary_skips: Sequence[Mapping[str, object]],
+    buy_actions: Sequence[BuyAction],
+    simulate_pairs: Sequence[RotationPair],
+    simulate_comparisons: Sequence[RotationComparison],
+    real_pairs: Sequence[RotationPair],
+    real_comparisons: Sequence[RotationComparison],
+    market: str,
+    strategy_version: str,
+) -> list[dict[str, object]]:
+    """Turn ordinary entry skips into the decisive outcome after rotations."""
+    if not _uses_individual_global_ranking(market, strategy_version):
+        return [dict(item) for item in ordinary_skips]
+
+    ordinary_by_symbol = {
+        str(item.get("symbol") or ""): item for item in ordinary_skips
+    }
+    planned_symbols = {
+        item.symbol for item in buy_actions
+    } | {
+        item.buy_symbol for item in (*simulate_pairs, *real_pairs)
+    }
+    comparisons = (*simulate_comparisons, *real_comparisons)
+    comparison_by_symbol: dict[str, RotationComparison] = {}
+    for comparison in comparisons:
+        if (
+            comparison.buy_symbol not in comparison_by_symbol
+            and comparison.outcome != "planned"
+        ):
+            comparison_by_symbol[comparison.buy_symbol] = comparison
+
+    skips: list[dict[str, object]] = []
+    for item in ranked:
+        if item.global_strength is None or not item.global_strength.is_finite():
+            skips.append(
+                _risk_skip(
+                    item,
+                    weight=None,
+                    target_amount=None,
+                    reason="全局强度缺失，无法排序",
+                    decisive_constraint="全局强度",
+                )
+            )
+            continue
+        if item.symbol in planned_symbols:
+            continue
+        ordinary = ordinary_by_symbol.get(item.symbol)
+        skip = (
+            dict(ordinary)
+            if ordinary is not None
+            else _risk_skip(
+                item,
+                weight=None,
+                target_amount=None,
+                reason="未纳入买入计划",
+                decisive_constraint="买入计划",
+            )
+        )
+        comparison = comparison_by_symbol.get(item.symbol)
+        if comparison is not None and comparison.reason:
+            reason = str(skip.get("reason") or "")
+            if comparison.reason not in reason:
+                skip["reason"] = (
+                    f"{reason}；{comparison.reason}"
+                    if reason
+                    else comparison.reason
+                )
+        elif comparisons:
+            reason = str(skip.get("reason") or "")
+            slot_reason = "未进入 2 个轮换比较席位"
+            if slot_reason not in reason:
+                skip["reason"] = (
+                    f"{reason}；{slot_reason}" if reason else slot_reason
+                )
+        skips.append(skip)
+    return skips
+
+
 def _risk_summary(
     *,
     net_value: Decimal,
@@ -5264,6 +5343,15 @@ def build_report(
             }
         )
     displayed_candidates = candidate_decision.eligible[:CANDIDATE_LIMIT]
+    plan_eligible = (
+        tuple(
+            item
+            for item in candidate_decision.eligible
+            if item.global_strength is not None and item.global_strength.is_finite()
+        )
+        if _uses_individual_global_ranking(market, snapshot_version)
+        else candidate_decision.eligible
+    )
     simulated_evaluation = _evaluate_holding_positions(
         positions=account.positions,
         holding_snapshots=holding_snapshots,
@@ -5330,7 +5418,7 @@ def build_report(
     )
     if snapshot_version == "v1":
         buy_actions = _estimate_buy_actions_v1(
-            ranked=candidate_decision.eligible,
+            ranked=plan_eligible,
             net_value=account.net_value,
             available_cash=post_sell_cash,
             current_position_count=post_sell_position_count,
@@ -5353,7 +5441,7 @@ def build_report(
             critical_data_reason or inferred_critical_data_reason
         )
         buy_actions, risk_skips, risk_summary = _plan_buy_actions(
-            ranked=candidate_decision.eligible,
+            ranked=plan_eligible,
             net_value=account.net_value,
             available_cash=post_sell_cash,
             current_position_count=post_sell_position_count,
@@ -5398,7 +5486,7 @@ def build_report(
                     reason=pause_reason,
                     decisive_constraint="策略累计回撤",
                 )
-                for item in candidate_decision.eligible
+                for item in plan_eligible
             ]
             buy_actions = []
             if risk_summary.get("status") == "active":
@@ -5497,7 +5585,7 @@ def build_report(
             account=account,
             holdings=holdings,
             holding_snapshots=holding_snapshots,
-            candidates=candidate_decision.eligible,
+            candidates=plan_eligible,
             entry_weight=position_weight,
             forced_sell_symbols=sell_symbols,
             market=market,
@@ -5549,7 +5637,7 @@ def build_report(
                 account=real_account,
                 holdings=real_decisions,
                 holding_snapshots=real_holdings.holding_snapshots,
-                candidates=candidate_decision.eligible,
+                candidates=plan_eligible,
                 entry_weight=position_weight,
                 forced_sell_symbols=real_sell_symbols,
                 market=market,
@@ -5571,6 +5659,19 @@ def build_report(
                 )
                 for pair in real_rotation_pairs
             )
+
+    if _uses_individual_global_ranking(market, snapshot_version):
+        risk_skips = _final_plan_risk_skips(
+            candidate_decision.eligible,
+            risk_skips,
+            buy_actions,
+            simulate_rotation_pairs,
+            simulate_rotation_comparisons,
+            real_rotation_pairs,
+            real_rotation_comparisons,
+            market,
+            snapshot_version,
+        )
 
     industry_concentration = tuple(
         (
@@ -6648,9 +6749,9 @@ def render_markdown(report: TrendReport) -> str:
                 )
             )
 
-    buy_window = "09:30–10:00" if market == "CN" else "下个常规交易时段"
-    lines.extend(["", f"## {buy_window}：按顺序考虑买入", ""])
     if report.buy_actions:
+        buy_window = "09:30–10:00" if market == "CN" else "下个常规交易时段"
+        lines.extend(["", f"## {buy_window}：按顺序考虑买入", ""])
         for index, item in enumerate(report.buy_actions, 1):
             if market == "CN":
                 lines.append(
@@ -6678,10 +6779,6 @@ def render_markdown(report: TrendReport) -> str:
         else:
             quantity_rule = "按富途实时价格向下取整为整股，不使用碎股"
         lines.append(f"- 实际股数{quantity_rule}，不得超过金额上限。")
-    else:
-        lines.append("- 无允许买入标的。")
-    if not sells and not report.buy_actions:
-        lines.extend(["", NO_ACTION_TEXT])
 
     lines.extend(["", "## 继续持有与人工复核", ""])
     for item in [*holds, *reviews, *others]:
@@ -6743,28 +6840,72 @@ def render_markdown(report: TrendReport) -> str:
     lines.extend(["", "### 行业上下文", ""])
     if report.industry_contexts:
         for context in report.industry_contexts:
-            explanation = _industry_structure_explanation(context)
-            line = (
-                f"- {context.industry or '未知行业'}｜"
-                "右侧个数占比 "
-                f"{_industry_ratio_transition(context.aggregate_right_count_ratio, context.prior_aggregate_right_count_ratio)}｜"
-                "右侧市值占比 "
-                f"{_industry_ratio_transition(context.aggregate_right_market_cap_ratio, context.prior_aggregate_right_market_cap_ratio)}"
-            )
-            if explanation:
-                line += f"｜{explanation}"
+            if _uses_individual_global_ranking(market, strategy_version):
+                direction = {
+                    "rising": "上升",
+                    "unchanged": "持平",
+                    "falling": "下降",
+                }.get(context.temperature_direction or "", "未知")
+                line = (
+                    f"- {context.industry or '未知行业'}｜"
+                    f"温度 {context.temperature or '未知'}｜方向 {direction}"
+                )
+            else:
+                explanation = _industry_structure_explanation(context)
+                line = (
+                    f"- {context.industry or '未知行业'}｜"
+                    "右侧个数占比 "
+                    f"{_industry_ratio_transition(context.aggregate_right_count_ratio, context.prior_aggregate_right_count_ratio)}｜"
+                    "右侧市值占比 "
+                    f"{_industry_ratio_transition(context.aggregate_right_market_cap_ratio, context.prior_aggregate_right_market_cap_ratio)}"
+                )
+                if explanation:
+                    line += f"｜{explanation}"
             lines.append(line)
     else:
         lines.append("- 无可用行业上下文。")
 
     lines.extend(["", "### 排除项", ""])
-    for symbol, reasons in report.excluded.items():
-        lines.append(f"- {symbol}｜{'、'.join(_reason_label(reason) for reason in reasons)}")
+    final_plan_audit = _uses_individual_global_ranking(market, strategy_version)
+    if final_plan_audit:
+        for item in report.risk_skips:
+            symbol = str(item.get("symbol") or "未知代码")
+            name = str(item.get("name") or "").strip()
+            reason = str(item.get("reason") or "未纳入买入计划")
+            lines.append(f"- {symbol}{f' {name}' if name else ''}｜{reason}")
+        excluded_signals = report.signal_snapshots.get("excluded")
+        for symbol in report.excluded:
+            signals = (
+                excluded_signals.get(symbol, [])
+                if isinstance(excluded_signals, Mapping)
+                else []
+            )
+            name = next(
+                (
+                    str(signal.get("name") or "").strip()
+                    for signal in signals
+                    if isinstance(signal, Mapping)
+                    and str(signal.get("name") or "").strip()
+                ),
+                "",
+            )
+            lines.append(
+                f"- {symbol}{f' {name}' if name else ''}｜没有通过纪律"
+            )
+    else:
+        for symbol, reasons in report.excluded.items():
+            lines.append(
+                f"- {symbol}｜{'、'.join(_reason_label(reason) for reason in reasons)}"
+            )
     lines.extend(
         f"- 账户例外｜{_account_exception_label(item)}"
         for item in report.account.exceptions
     )
-    if not report.excluded and not report.account.exceptions:
+    if (
+        not report.excluded
+        and not report.account.exceptions
+        and (not final_plan_audit or not report.risk_skips)
+    ):
         lines.append("- 无。")
 
     lines.extend(["", "### 数据与成本", ""])
