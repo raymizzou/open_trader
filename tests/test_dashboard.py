@@ -1006,6 +1006,44 @@ def test_dashboard_keeps_report_available_when_statistics_cycle_failed(
     assert review["sample_counts"]["discipline"] == 31
 
 
+def test_dashboard_projects_failed_forced_refresh_over_preserved_completed_state(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    path = data_dir / "latest/trend_review_cn.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(trend_review_projection_v3("CN", "eastmoney")),
+        encoding="utf-8",
+    )
+    state_path = data_dir / "trend_api_stats/daily/CN/2026-08-08.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({
+        "schema_version": "open_trader.trend_api_stats.cycle.v1",
+        "status": "completed",
+        "market": "CN",
+        "as_of_date": "2026-08-08",
+        "attempt_count": 2,
+        "completed_at": "2026-08-08T16:05:00+08:00",
+        "process_git_sha": "accepted123",
+        "statistics_cutoff_at": "2026-08-08T15:00:00+08:00",
+        "artifact_sha256": "a" * 64,
+        "last_forced_failure_status": "failed",
+        "last_forced_failure_at": "2026-08-08T17:05:00+08:00",
+        "last_forced_failure_actor": "ray",
+        "last_forced_failure_reason": "repair stale facts",
+        "last_forced_failure_process_git_sha": "forced123",
+        "last_forced_failure_error": "broker unavailable",
+    }), encoding="utf-8")
+
+    review = dashboard_module._load_trend_reviews(data_dir)["eastmoney"]
+
+    assert review["available"] is True
+    assert review["statistics_status"] == "failed"
+    assert review["statistics_reason"] == "broker unavailable"
+    assert review["statistics_as_of_date"] == "2026-08-08"
+
+
 def test_dashboard_overlays_latest_statistics_without_writing_files(
     tmp_path: Path,
 ) -> None:

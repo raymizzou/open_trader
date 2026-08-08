@@ -696,6 +696,27 @@ def _latest_trend_statistics_cycle(data_dir: Path, market: str) -> dict[str, Any
         or re.fullmatch(r"[0-9a-f]{64}", payload["artifact_sha256"]) is None
     ):
         return {}
+    if payload["status"] == "completed" and payload.get("last_forced_failure_status") == "failed":
+        forced_at = payload.get("last_forced_failure_at")
+        forced_sha = payload.get("last_forced_failure_process_git_sha")
+        forced_reason = payload.get("last_forced_failure_error") or payload.get(
+            "last_forced_failure_reason"
+        )
+        if (
+            not _valid_aware_datetime(forced_at)
+            or not isinstance(forced_sha, str)
+            or not forced_sha.strip()
+            or not isinstance(forced_reason, str)
+            or not forced_reason.strip()
+        ):
+            return {}
+        return {
+            **payload,
+            "status": "failed",
+            "attempted_at": forced_at,
+            "process_git_sha": forced_sha,
+            "reason": forced_reason,
+        }
     return payload
 
 
