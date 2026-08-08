@@ -168,9 +168,12 @@ def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
     assert "--wait-seconds" not in makefile
 
 
-def test_browser_ignores_chrome_unattributed_404_but_not_app_errors() -> None:
+def test_browser_ignores_unattributed_http_errors_checked_by_response_handler() -> None:
     assert not _is_actionable_console_error(
         "Failed to load resource: the server responded with a status of 404 (Not Found)"
+    )
+    assert not _is_actionable_console_error(
+        "Failed to load resource: the server responded with a status of 503 (Service Unavailable)"
     )
     assert _is_actionable_console_error("Uncaught TypeError: failed")
 

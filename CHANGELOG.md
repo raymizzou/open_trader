@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-08
 
+- Dashboard 验收不再把账户快照刷新期间允许的短暂 503 控制台提示重复判错；其他接口的
+  HTTP 错误仍由带 URL 的响应检查拦截。验证：Dashboard acceptance 单测 349 通过。
 - 修复 Predict WebSocket 初始盘口后的重复/回滚版本把整条来源误标为 stale：这些旧帧现在
   只被忽略，已接受盘口与 ready 健康态继续保留；真正畸形的盘口仍 fail-closed。验证：
   Predict source、跨所监控与只读验收聚焦测试 235 通过，真实 11-market WS 持续探针保持

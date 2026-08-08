@@ -2467,11 +2467,11 @@ def _runtime_evidence(
 
 
 def _is_actionable_console_error(message: str) -> bool:
-    # Chrome can emit an unattributed favicon 404 without exposing a response.
-    # HTTP failures for actual page resources and APIs are checked separately.
+    # Chrome duplicates HTTP failures without the URL; the response handler
+    # reports actionable URLs and tolerates the Account snapshot refresh 503.
     return not (
         message.startswith("Failed to load resource:")
-        and "status of 404" in message
+        and ("status of 404" in message or "status of 503" in message)
     )
 
 
