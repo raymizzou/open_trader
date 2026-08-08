@@ -887,6 +887,77 @@ def test_failed_forced_refresh_preserves_completed_marker_and_audit(tmp_path: Pa
     assert len(client.calls) == 2
 
 
+def test_two_forced_refresh_attempts_have_distinct_durable_audit_ids(tmp_path: Path) -> None:
+    client = RecordingCycleClient()
+    kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=client)
+    assert run_trend_statistics_cycle(**kwargs)["status"] == "completed"
+    client.fail_once = True
+
+    first = run_trend_statistics_cycle(
+        **(kwargs | {"process_git_sha": "force001"}),
+        force=True,
+        actor="ray",
+        reason="first repair",
+    )
+    second = run_trend_statistics_cycle(
+        **(kwargs | {
+            "generated_at": "2026-08-09T08:05:00+08:00",
+            "process_git_sha": "force002",
+        }),
+        force=True,
+        actor="operator",
+        reason="second repair",
+    )
+
+    audit_path = trend_statistics_cycle_path(
+        tmp_path / "data", "CN", "2026-08-08"
+    ).with_suffix(".force_attempts.jsonl")
+    events = [json.loads(line) for line in audit_path.read_text().splitlines()]
+    assert first["status"] == "failed"
+    assert second["status"] == "completed"
+    assert [(event["attempt_id"], event["status"]) for event in events] == [
+        (1, "started"),
+        (1, "failed"),
+        (2, "started"),
+        (2, "completed"),
+    ]
+    assert [(event["actor"], event["reason"]) for event in events[::2]] == [
+        ("ray", "first repair"),
+        ("operator", "second repair"),
+    ]
+    assert [event["process_git_sha"] for event in events[::2]] == [
+        "force001",
+        "force002",
+    ]
+
+
+def test_ordinary_retry_completion_preserves_forced_failure_audit(tmp_path: Path) -> None:
+    client = RecordingCycleClient(fail_once=True)
+    kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=client)
+
+    forced = run_trend_statistics_cycle(
+        **kwargs,
+        force=True,
+        actor="ray",
+        reason="repair missing cycle",
+    )
+    audit_path = trend_statistics_cycle_path(
+        tmp_path / "data", "CN", "2026-08-08"
+    ).with_suffix(".force_attempts.jsonl")
+    force_events = audit_path.read_text(encoding="utf-8")
+    completed = run_trend_statistics_cycle(**kwargs)
+
+    events = [json.loads(line) for line in force_events.splitlines()]
+    assert forced["status"] == "failed"
+    assert completed["status"] == "completed"
+    assert audit_path.read_text(encoding="utf-8") == force_events
+    assert [(event["attempt_id"], event["status"]) for event in events] == [
+        (1, "started"),
+        (1, "failed"),
+    ]
+    assert events[-1]["error"] == "broker unavailable"
+
+
 def test_failed_cycle_retries_and_downtime_uses_one_range_request(tmp_path: Path) -> None:
     client = RecordingCycleClient(fail_once=True)
     kwargs = cycle_kwargs(

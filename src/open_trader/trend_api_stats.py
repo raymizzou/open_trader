@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections import Counter, defaultdict
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Context, Decimal, InvalidOperation, localcontext
@@ -638,6 +639,19 @@ def run_trend_statistics_cycle(
         previous = _read_optional_json(state_path)
         if previous.get("status") == "completed" and not force:
             return {**previous, "status": "already_completed"}
+        force_audit_path = state_path.with_suffix(".force_attempts.jsonl")
+        force_attempt = None
+        if force:
+            force_attempt = {
+                "attempt_id": _next_force_attempt_id(force_audit_path),
+                "market": normalized_market,
+                "as_of_date": normalized_date,
+                "actor": actor.strip(),
+                "reason": reason.strip(),
+                "process_git_sha": process_git_sha,
+                "timestamp": generated_at,
+            }
+            _append_force_attempt(force_audit_path, force_attempt | {"status": "started"})
         try:
             start, end = _statistics_fetch_range(
                 _path(data_dir), _path(reports_dir), normalized_market, normalized_date
@@ -659,14 +673,25 @@ def run_trend_statistics_cycle(
             ):
                 _, artifact_sha256 = read_trend_api_stats_snapshot(data_dir)
         except Exception as exc:
-            return _write_failed_cycle_state(
+            result = _write_failed_cycle_state(
                 state_path, previous, exc, generated_at, process_git_sha,
                 actor if force else "", reason if force else "",
             )
-        return _write_completed_cycle_state(
+            if force_attempt is not None:
+                _append_force_attempt(
+                    force_audit_path,
+                    force_attempt | {"status": "failed", "error": str(exc)},
+                )
+            return result
+        result = _write_completed_cycle_state(
             state_path, previous, cutoff, artifact_sha256, generated_at, process_git_sha,
             actor if force else "", reason if force else "",
         )
+        if force_attempt is not None:
+            _append_force_attempt(
+                force_audit_path, force_attempt | {"status": "completed"}
+            )
+        return result
 
 
 def _cycle_market_date(market: str, as_of_date: str) -> tuple[str, str]:
@@ -686,6 +711,48 @@ def _read_optional_json(path: Path) -> dict[str, object]:
     except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _next_force_attempt_id(path: Path) -> int:
+    latest = 0
+    if not path.exists():
+        return 1
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+            attempt_id = event["attempt_id"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ValueError(
+                f"force attempt audit line {line_number} is invalid"
+            ) from exc
+        if (
+            not isinstance(attempt_id, int)
+            or isinstance(attempt_id, bool)
+            or attempt_id < 1
+        ):
+            raise ValueError(f"force attempt audit line {line_number} is invalid")
+        latest = max(latest, attempt_id)
+    return latest + 1
+
+
+def _append_force_attempt(path: Path, event: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                event,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _statistics_fetch_range(
