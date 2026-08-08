@@ -2208,6 +2208,173 @@ def test_industry_temperature_loader_preserves_all_known_cold_states() -> None:
     assert temperatures == {700001: "冻", 700002: "寒"}
 
 
+def test_staged_candidate_fetch_requests_only_gate_survivors() -> None:
+    expected_date = "2026-07-14"
+    calls: list[tuple[tuple[str, ...], list[int]]] = []
+
+    class Api:
+        def get_snapshots(
+            self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str
+        ) -> list[dict[str, object]]:
+            calls.append((fields, tm_ids))
+            assert fields != UNIFIED_TREND_FIELDS
+            rows: list[dict[str, object]] = []
+            for tm_id in tm_ids:
+                row: dict[str, object] = {
+                    "tmId": tm_id,
+                    "asOfDate": expected_date,
+                    "tickerName": f"股票{tm_id}",
+                    "tickerSymbol": f"{tm_id:06d}.SH",
+                    "asset": "基金" if tm_id == 1 else "A股",
+                    "trendStrengthLocalCurr": "96" if tm_id != 2 else "94",
+                    "marketCap": "100" if tm_id != 3 else "99",
+                    "trendTemperaturePrev": "温" if tm_id != 4 else "平",
+                    "trendTemperatureCurr": "热",
+                    "tradableFlag": tm_id != 5,
+                    "industryTmId": 700001 if tm_id == 6 else 700002,
+                    "industryName": "行业一" if tm_id == 6 else "行业二",
+                    "amount1d": "2",
+                    "isTrendRightSide": True,
+                    "daysSinceTrendEntry": 3,
+                    "trendPhaseCurr": "立夏",
+                    "stopwinFlagByDangerSignal": False,
+                    "priceIndex": "10",
+                    "trendStrengthGlobalCurr": "99",
+                    "gainSinceTrendEntry": "1",
+                    "trendPhasePrev": "谷雨",
+                    "trendStrengthLocalChange": "1",
+                    "trendStrengthLocalPrevWeek": "95",
+                    "trendStrengthLocalPrevMonth": "94",
+                    "stopwinFlagByBoilingTemperature": False,
+                    "stopwinFlagByPopChampagne": False,
+                    "tickerLabels": ["测试"],
+                }
+                if fields == trend_module.A_SHARE_INDUSTRY_FIELDS:
+                    row["trendTemperatureCurr"] = "热"
+                rows.append({
+                    "tmId": row["tmId"],
+                    "asOfDate": row["asOfDate"],
+                    **{field: row[field] for field in fields},
+                })
+            return rows
+
+    result = trend_module.fetch_staged_candidates(
+        Api(),
+        candidate_ids={1, 2, 3, 4, 5, 6, 7},
+        component_pools={tm_id: {"池"} for tm_id in range(1, 8)},
+        held_symbols=set(),
+        holding_snapshots={},
+        expected_date=expected_date,
+        market="CN",
+        strategy_version="v13",
+        cny_per_local_currency=Decimal("1"),
+        billing={field: {"priceCost": "0.001"} for field in UNIFIED_TREND_FIELDS},
+        resolve_bars=lambda _row: bars(end_date=expected_date),
+    )
+
+    assert calls == [
+        (trend_module.IDENTITY_FIELDS, [1, 2, 3, 4, 5, 6, 7]),
+        (trend_module.LOCAL_STRENGTH_FIELDS, [2, 3, 4, 5, 6, 7]),
+        (trend_module.MARKET_CAP_FIELDS, [3, 4, 5, 6, 7]),
+        (trend_module.TEMPERATURE_FIELDS, [4, 5, 6, 7]),
+        (trend_module.DISCIPLINE_FIELDS, [5, 6, 7]),
+        (trend_module.A_SHARE_INDUSTRY_FIELDS, [700001, 700002]),
+        (trend_module.CANDIDATE_EXPANSION_FIELDS, [6, 7]),
+    ]
+    assert [item.tm_id for item in result.candidates] == [1, 2, 3, 4, 5, 6, 7]
+    assert [row["tmId"] for row in result.industry_rows] == [700001, 700002]
+    assert result.estimate_complete is True
+
+
+@pytest.mark.parametrize("malformed", ["duplicate", "missing", "extra", "stale"])
+@pytest.mark.parametrize("stage", range(7))
+def test_malformed_stage_closes_staged_candidate_fetch(
+    stage: int, malformed: str,
+) -> None:
+    expected_date = "2026-07-14"
+    stage_fields = (
+        trend_module.IDENTITY_FIELDS,
+        trend_module.LOCAL_STRENGTH_FIELDS,
+        trend_module.MARKET_CAP_FIELDS,
+        trend_module.TEMPERATURE_FIELDS,
+        trend_module.DISCIPLINE_FIELDS,
+        trend_module.A_SHARE_INDUSTRY_FIELDS,
+        trend_module.CANDIDATE_EXPANSION_FIELDS,
+    )
+    calls: list[tuple[tuple[str, ...], list[int]]] = []
+
+    class Api:
+        def get_snapshots(
+            self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str
+        ) -> list[dict[str, object]]:
+            calls.append((fields, tm_ids))
+            base = {
+                "tmId": tm_ids[0],
+                "asOfDate": expected_date,
+                "tickerName": "股票1",
+                "tickerSymbol": "000001.SH",
+                "asset": "A股",
+                "trendStrengthLocalCurr": "96",
+                "marketCap": "100",
+                "trendTemperaturePrev": "温",
+                "trendTemperatureCurr": "热",
+                "tradableFlag": True,
+                "industryTmId": 700001,
+                "industryName": "行业一",
+                "amount1d": "2",
+                "isTrendRightSide": True,
+                "daysSinceTrendEntry": 3,
+                "trendPhaseCurr": "立夏",
+                "stopwinFlagByDangerSignal": False,
+                "priceIndex": "10",
+                "trendStrengthGlobalCurr": "99",
+                "gainSinceTrendEntry": "1",
+                "trendPhasePrev": "谷雨",
+                "trendStrengthLocalChange": "1",
+                "trendStrengthLocalPrevWeek": "95",
+                "trendStrengthLocalPrevMonth": "94",
+                "stopwinFlagByBoilingTemperature": False,
+                "stopwinFlagByPopChampagne": False,
+                "tickerLabels": ["测试"],
+            }
+            rows = [{
+                "tmId": base["tmId"],
+                "asOfDate": base["asOfDate"],
+                **{field: base[field] for field in fields},
+            }]
+            if fields != stage_fields[stage]:
+                return rows
+            if malformed == "duplicate":
+                return rows * 2
+            if malformed == "missing":
+                return []
+            if malformed == "extra":
+                extra = dict(rows[0])
+                extra["tmId"] = 999999
+                return [*rows, extra]
+            stale = dict(rows[0])
+            stale["asOfDate"] = "2026-07-13"
+            return [stale]
+
+    with pytest.raises(TrendAnimalsError, match="stage returned"):
+        trend_module.fetch_staged_candidates(
+            Api(),
+            candidate_ids={1},
+            component_pools={1: {"池"}},
+            held_symbols=set(),
+            holding_snapshots={},
+            expected_date=expected_date,
+            market="CN",
+            strategy_version="v13",
+            cny_per_local_currency=Decimal("1"),
+            billing={field: {"priceCost": "0.001"} for field in UNIFIED_TREND_FIELDS},
+            resolve_bars=lambda _row: bars(end_date=expected_date),
+        )
+
+    assert [fields for fields, _ids in calls] == list(stage_fields[: stage + 1])
+    assert all(fields != UNIFIED_TREND_FIELDS for fields, _ids in calls)
+
+
 @pytest.mark.parametrize(
     ("market", "asset", "pool_id"),
     [("US", "美股", 622460), ("HK", "港股", 622494)],

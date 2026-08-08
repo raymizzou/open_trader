@@ -94,6 +94,24 @@ UNIFIED_TREND_FIELDS = (
     "stopwinFlagByDangerSignal", "stopwinFlagByBoilingTemperature",
     "stopwinFlagByPopChampagne", "tickerLabels",
 )
+IDENTITY_FIELDS = ("tmId", "tickerName", "tickerSymbol", "asset", "asOfDate")
+LOCAL_STRENGTH_FIELDS = ("tmId", "asOfDate", "trendStrengthLocalCurr")
+MARKET_CAP_FIELDS = ("tmId", "asOfDate", "marketCap")
+TEMPERATURE_FIELDS = (
+    "tmId", "asOfDate", "trendTemperaturePrev", "trendTemperatureCurr",
+)
+DISCIPLINE_FIELDS = (
+    "tmId", "asOfDate", "tradableFlag", "industryTmId", "industryName",
+    "amount1d", "isTrendRightSide", "daysSinceTrendEntry",
+    "trendPhaseCurr", "stopwinFlagByDangerSignal",
+)
+CANDIDATE_EXPANSION_FIELDS = tuple(
+    field for field in UNIFIED_TREND_FIELDS
+    if field not in set(
+        IDENTITY_FIELDS + LOCAL_STRENGTH_FIELDS + MARKET_CAP_FIELDS
+        + TEMPERATURE_FIELDS + DISCIPLINE_FIELDS
+    )
+)
 UNIFIED_TREND_UNIT_COST = Decimal("0.071")
 CANDIDATE_FIELDS = UNIFIED_TREND_FIELDS
 HOLDING_FIELDS = UNIFIED_TREND_FIELDS
@@ -1872,6 +1890,17 @@ class CandidateDecision:
     excluded: dict[str, list[str]]
     ordering_mode: str = "legacy_no_eligible_candidates"
     industry_context_status: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class StagedCandidateFetch:
+    candidates: tuple[CandidateInput, ...]
+    industry_contexts: tuple[IndustryContext, ...]
+    industry_context_status: dict[str, object]
+    industry_rows: tuple[Mapping[str, object], ...]
+    request_trace: tuple[dict[str, object], ...]
+    estimated_cost: Decimal
+    estimate_complete: bool
 
 
 @dataclass(frozen=True)
@@ -7957,6 +7986,195 @@ def load_industry_temperatures(
         )
         for row in rows
     }
+
+
+_CANDIDATE_REASON_STAGE = {
+    "a_share_only": 0,
+    "name_missing": 0,
+    "asset_missing": 0,
+    "already_held": 0,
+    "excluded_security": 0,
+    "unsupported_exchange": 0,
+    "data_date_mismatch": 0,
+    "strength_missing": 1,
+    "strength_below_95": 1,
+    "strength_not_above_90": 1,
+    "market_cap_missing": 2,
+    "market_cap_below_100": 2,
+    "market_cap_below_100_cny": 2,
+    "temperature_missing": 3,
+    "temperature_transition_not_entry": 3,
+    "industry_id_missing": 4,
+    "amount_missing": 4,
+    "amount_below_2": 4,
+    "amount_below_2_cny": 4,
+    "amount_below_1": 4,
+    "right_side_days_missing": 4,
+    "right_side_days_not_below_10": 4,
+    "phase_missing": 4,
+    "phase_after_summer_solstice": 4,
+    "right_side_not_true": 4,
+    "not_tradable": 4,
+    "danger_signal": 4,
+    "danger_unknown": 4,
+    "atr_unavailable": 4,
+    "industry_temperature_missing": 5,
+    "industry_temperature_not_hot": 5,
+}
+
+
+def _merge_exact_snapshot_stage(
+    rows_by_id: dict[int, dict[str, object]],
+    requested_ids: Sequence[int],
+    rows: Sequence[Mapping[str, object]],
+    expected_date: str,
+) -> None:
+    returned = [_row_tm_id(row) for row in rows]
+    if (
+        returned != list(dict.fromkeys(returned))
+        or sorted(returned) != sorted(requested_ids)
+    ):
+        raise TrendAnimalsError("getTickerSnapshot stage returned mismatched tmIds")
+    if any(row.get("asOfDate") != expected_date for row in rows):
+        raise TrendAnimalsError("getTickerSnapshot stage returned a stale data date")
+    for row in rows:
+        rows_by_id.setdefault(_row_tm_id(row), {}).update(row)
+
+
+def _holding_industry_ids(holding_snapshots: object) -> set[int]:
+    result: set[int] = set()
+    if isinstance(holding_snapshots, Mapping):
+        values = holding_snapshots.values()
+    elif isinstance(holding_snapshots, Sequence) and not isinstance(
+        holding_snapshots, (str, bytes)
+    ):
+        values = holding_snapshots
+    else:
+        return result
+    for holding in values:
+        value = (
+            holding.get("industryTmId", holding.get("industry_tm_id"))
+            if isinstance(holding, Mapping)
+            else getattr(holding, "industry_tm_id", None)
+        )
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            result.add(value)
+    return result
+
+
+def fetch_staged_candidates(
+    api: object,
+    *,
+    candidate_ids: set[int],
+    component_pools: Mapping[int, Sequence[str] | set[str]],
+    held_symbols: set[str],
+    holding_snapshots: object,
+    expected_date: str,
+    market: str,
+    strategy_version: str,
+    cny_per_local_currency: Decimal,
+    billing: Mapping[str, Mapping[str, object]],
+    resolve_bars: Callable[[Mapping[str, object]], Sequence[DailyKlineBar] | None],
+) -> StagedCandidateFetch:
+    """Fetch only the next discipline fields for candidates still in contention."""
+    rows_by_id: dict[int, dict[str, object]] = {}
+    candidates: dict[int, CandidateInput] = {}
+    active_ids = sorted(candidate_ids)
+    request_trace: list[dict[str, object]] = []
+    estimated_cost = Decimal("0")
+    estimate_complete = True
+    bars_by_id: dict[int, Sequence[DailyKlineBar] | None] = {}
+
+    def fetch_stage(fields: tuple[str, ...], tm_ids: Sequence[int]) -> list[Mapping[str, object]]:
+        nonlocal estimated_cost, estimate_complete
+        rows = (
+            api.get_snapshots(
+                tm_ids=list(tm_ids), fields=fields, expected_date=expected_date,
+            )
+            if tm_ids else []
+        )
+        _merge_exact_snapshot_stage(rows_by_id, tm_ids, rows, expected_date)
+        request_trace.append({"fields": list(fields), "tm_ids": list(tm_ids)})
+        for field in fields:
+            price = billing.get(field)
+            if price is None:
+                estimate_complete = False
+                continue
+            estimated_cost += _billing_price(price) * len(tm_ids)
+        return rows
+
+    def stage_candidates(stage: int, tm_ids: Sequence[int], *, temperatures: Mapping[int, str | None] = {}) -> list[int]:
+        survivors: list[int] = []
+        for tm_id in tm_ids:
+            row = rows_by_id[tm_id]
+            candidate = evaluate_candidate(
+                row,
+                bars_by_id.get(tm_id),
+                pools=component_pools.get(tm_id, ()),
+                market=market,
+                industry_temperature=temperatures.get(_optional_int(row.get("industryTmId"))),
+            )
+            candidates[tm_id] = candidate
+            reasons = _candidate_reasons(
+                candidate,
+                held_symbols,
+                expected_date,
+                market=market,
+                strategy_version=strategy_version,
+                cny_per_local_currency=cny_per_local_currency,
+            )
+            if not any(_CANDIDATE_REASON_STAGE.get(reason, stage) <= stage for reason in reasons):
+                survivors.append(tm_id)
+        return survivors
+
+    stages = (
+        IDENTITY_FIELDS,
+        LOCAL_STRENGTH_FIELDS,
+        MARKET_CAP_FIELDS,
+        TEMPERATURE_FIELDS,
+        DISCIPLINE_FIELDS,
+    )
+    for stage, fields in enumerate(stages):
+        fetch_stage(fields, active_ids)
+        if stage == 4:
+            for tm_id in active_ids:
+                bars_by_id[tm_id] = resolve_bars(rows_by_id[tm_id])
+        active_ids = stage_candidates(stage, active_ids)
+
+    industry_ids = sorted(
+        {
+            *_holding_industry_ids(holding_snapshots),
+            *(
+                industry_id
+                for tm_id in active_ids
+                if (industry_id := _optional_int(rows_by_id[tm_id].get("industryTmId")))
+                is not None
+            ),
+        }
+    )
+    industry_rows = fetch_stage(A_SHARE_INDUSTRY_FIELDS, industry_ids)
+    industry_temperatures = {
+        _row_tm_id(row): (
+            str(row["trendTemperatureCurr"])
+            if row.get("trendTemperatureCurr") in INDUSTRY_KNOWN_TEMPERATURES
+            else None
+        )
+        for row in industry_rows
+    }
+    active_ids = stage_candidates(5, active_ids, temperatures=industry_temperatures)
+
+    fetch_stage(CANDIDATE_EXPANSION_FIELDS, active_ids)
+    stage_candidates(6, active_ids, temperatures=industry_temperatures)
+
+    return StagedCandidateFetch(
+        candidates=tuple(candidates[tm_id] for tm_id in sorted(candidate_ids)),
+        industry_contexts=(),
+        industry_context_status={},
+        industry_rows=tuple(industry_rows),
+        request_trace=tuple(request_trace),
+        estimated_cost=estimated_cost,
+        estimate_complete=estimate_complete,
+    )
 
 
 def _attempt_report(
