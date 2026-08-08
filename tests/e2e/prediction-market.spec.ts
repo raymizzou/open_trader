@@ -167,6 +167,36 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(observeSignal.locator('[data-action="participate"]')).toHaveCount(0);
   });
 
+  test('shows cross auto safety facts and only the one-way emergency pause', async ({ page }) => {
+    await openPrediction(page, 'cross-auto-armed');
+    const root = page.locator('#prediction-market-root');
+    for (const text of ['自动下单', '已启用', '$5.00 / $100.00', '紧急暂停自动下单']) {
+      await expect(root).toContainText(text);
+    }
+    await expect(root.locator('[data-action="participate"]')).toHaveCount(0);
+    await expect(root.getByRole('button', { name: '重新开启自动下单' })).toHaveCount(0);
+
+    await openPrediction(page, 'cross-auto-manual-only');
+    await expect(root).toContainText('需人工审查，自动模式不执行');
+    await expect(root.locator('[data-action="participate"]')).toHaveCount(0);
+
+    for (const [scenario, code, zh, current, limit, venue, action] of [
+      ['cross-auto-paused', 'operator_paused', '操作员已暂停自动下单', '-', '-', 'both', '需要操作员处理'],
+      ['cross-auto-daily-cap', 'cross_auto_daily_principal_cap', '自动新本金已达当日上限', '100', '100', 'both', '无需操作员处理'],
+      ['cross-auto-same-pair', 'cross_pair_unsettled', '同一标的仍有未结算执行', '1', '1', 'both', '无需操作员处理'],
+      ['cross-auto-notification-blocked', 'notification_config_unavailable', '通知通道不可用，已暂停自动下单', '0', '1', 'feishu', '需要操作员处理'],
+    ]) {
+      await openPrediction(page, scenario);
+      for (const text of [code, zh, `当前 ${current}`, `上限 ${limit}`, `场所 ${venue}`, '2026-08-08', action]) {
+        await expect(root).toContainText(text);
+      }
+      await expect(root.locator('[data-action="participate"]')).toHaveCount(0);
+      await expect(root.getByRole('button', { name: '紧急暂停自动下单' })).toHaveCount(
+        scenario === 'cross-auto-daily-cap' || scenario === 'cross-auto-same-pair' ? 1 : 0,
+      );
+    }
+  });
+
   test('keeps invalid-cutoff cross candidates out of the orderable list', async ({ page }) => {
     let cutoff = '2099-12-31';
     await page.route('**/api/prediction-arbitrage/state*', async (route) => {

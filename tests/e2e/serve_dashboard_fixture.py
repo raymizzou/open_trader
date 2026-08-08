@@ -174,6 +174,15 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
             "unsettled": {"current": "35.20", "limit": "100"},
             "breaker": {"open": False, "scope": "cross_venue"},
         },
+        "cross_auto": {
+            "configured_mode": "observe_only",
+            "effective_mode": "observe_only",
+            "armed": False,
+            "pause_reason": "not_armed",
+            "notification_ready": True,
+            "daily_principal": {"current": "0", "limit": "100"},
+            "latest_attempt": None,
+        },
         "policy_limits": {"max_wallet_balance": "65", "max_normal_cost": "20", "max_emergency_loss": "2", "max_cross_unsettled_principal": "100", "min_estimated_profit": "1"},
         "heartbeat_at": "2026-08-01T02:00:00Z",
         "event_count": 20,
@@ -211,6 +220,42 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         payload["opportunities"] = []
         payload["signals_24h"] = 0
         payload["cross_venue"] = {**payload["cross_venue"], "funnel": {"matched_pairs": 0, "monitored_pairs": 0, "codex_approved_pairs": 0, "arbitrage_space_pairs": 0, "clear_signal_pairs": 0, "manual_eligible_pairs": 0, "manual_pending_pairs": 0}}
+    if scenario in {
+        "cross-auto-armed", "cross-auto-paused", "cross-auto-daily-cap",
+        "cross-auto-same-pair", "cross-auto-notification-blocked", "cross-auto-manual-only",
+    }:
+        paused = scenario in {"cross-auto-paused", "cross-auto-notification-blocked"}
+        reason = {
+            "cross-auto-paused": ("operator_paused", "操作员已暂停自动下单", "-", "-", "both", True),
+            "cross-auto-daily-cap": ("cross_auto_daily_principal_cap", "自动新本金已达当日上限", "100", "100", "both", False),
+            "cross-auto-same-pair": ("cross_pair_unsettled", "同一标的仍有未结算执行", "1", "1", "both", False),
+            "cross-auto-notification-blocked": ("notification_config_unavailable", "通知通道不可用，已暂停自动下单", "0", "1", "feishu", True),
+        }.get(scenario)
+        payload["cross_venue"] = {**payload["cross_venue"], "mode": "auto_submit"}
+        auto_opportunity = {
+            **cross_opportunity,
+            "opportunity_id": "cross-opportunity-auto-fixture",
+            "event_id": "cross-event-auto-fixture",
+            "execution_mode": "auto_submit",
+            "manual_only": False,
+        }
+        if scenario == "cross-auto-manual-only":
+            payload["opportunities"] = [manual_cross_opportunity]
+        else:
+            payload["opportunities"] = [auto_opportunity]
+        payload["cross_auto"] = {
+            "configured_mode": "auto_submit",
+            "effective_mode": "observe_only" if paused else "auto_submit",
+            "armed": not paused,
+            "pause_reason": "notification_delivery_failed" if scenario == "cross-auto-notification-blocked" else "operator_paused" if scenario == "cross-auto-paused" else "",
+            "notification_ready": scenario != "cross-auto-notification-blocked",
+            "daily_principal": {"current": "100" if scenario == "cross-auto-daily-cap" else "5", "limit": "100"},
+            "latest_attempt": None if reason is None else {
+                "reason_code": reason[0], "reason_zh": reason[1], "current": reason[2],
+                "limit": reason[3], "venue": reason[4], "occurred_at": "2026-08-08T01:00:00Z",
+                "operator_action_required": reason[5],
+            },
+        }
     if scenario == "first-canary-cap5":
         payload["policy_limits"] = {**payload["policy_limits"], "max_normal_cost": "5", "canary_status": "first_live_trade"}
     if scenario == "completed-canary-cap20":
@@ -530,6 +575,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/prediction-arbitrage/executions",
             "/api/prediction-arbitrage/circuit-breaker/reset",
             "/api/prediction-arbitrage/predict-allowance/cleanup",
+            "/api/prediction-arbitrage/cross-auto/pause",
         }:
             self.send_response(HTTPStatus.NOT_FOUND)
             self.end_headers()
@@ -616,6 +662,13 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 type(self).prediction_scenario = "cleanup-success"
                 self._send_json({"state": "ready", "before_allowance": "2.40", "after_allowance": "0", "usdt_moved": False})
+        elif path.endswith("/cross-auto/pause"):
+            if body != {"confirm": True}:
+                self.send_response(HTTPStatus.BAD_REQUEST)
+                self.end_headers()
+                return
+            type(self).prediction_scenario = "cross-auto-paused"
+            self._send_json({"armed": False, "reason": "operator_paused"})
         else:
             if type(self).prediction_scenario == "reset-denied":
                 self._send_json({"state": "rejected", "reason": "incident_unresolved"})

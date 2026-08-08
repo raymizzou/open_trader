@@ -2527,24 +2527,29 @@ function predictionCrossVenueFunnel(payload) {
 
 function predictionCrossVenueCandidates(payload) {
   const crossVenue = payload?.cross_venue && typeof payload.cross_venue === "object" ? payload.cross_venue : {};
+  const crossAuto = payload?.cross_auto && typeof payload.cross_auto === "object" ? payload.cross_auto : {};
+  const automaticMode = crossAuto.effective_mode === "auto_submit";
   const opportunities = Array.isArray(crossVenue.opportunities)
     ? crossVenue.opportunities
     : (Array.isArray(payload?.opportunities) ? payload.opportunities : []);
-  const orderable = opportunities.filter((item) => (
+  const candidates = opportunities.filter((item) => (
     item && typeof item === "object"
     && item.actionable === true
-    && predictionCrossExecutionMode(item) === "manual_confirm"
     && predictionOpportunityIsComplete(item)
   ));
-  const manual = orderable.filter((item) => item.manual_only === true);
-  const auto = orderable.filter((item) => item.manual_only !== true);
+  const manual = candidates.filter((item) => (
+    predictionCrossExecutionMode(item) === "manual_confirm" && item.manual_only === true
+  ));
+  const auto = candidates.filter((item) => predictionCrossExecutionMode(item) === "auto_submit");
   const card = (item, manualOnly) => {
     const approval = item.codex_approval && typeof item.codex_approval === "object" ? item.codex_approval : {};
     const reason = manualOnly
       ? `<div class="pm-alert warning"><div class="pm-alert-body"><strong>结算规则可能不一致</strong><p>${escapeHtml(predictionValue(item.manual_reason || approval.summary, "结构化理由未返回"))}</p></div></div>`
       : "";
     const action = manualOnly
-      ? `<button class="pm-button primary pm-participate" type="button" data-action="participate" data-opportunity-id="${escapeHtml(predictionValue(item.opportunity_id, ""))}">人工下单</button>`
+      ? automaticMode
+        ? `<span class="pm-relation-summary">需人工审查，自动模式不执行</span>`
+        : `<button class="pm-button primary pm-participate" type="button" data-action="participate" data-opportunity-id="${escapeHtml(predictionValue(item.opportunity_id, ""))}">人工下单</button>`
       : `<span class="pm-relation-summary">系统判定文字与规则等价 · 无需批准，条件满足后自动执行</span>`;
     return `<article class="pm-manual-card"><div class="pm-manual-card-head"><div><div class="pm-manual-title">${escapeHtml(predictionValue(item.title || item.question, "数据未返回"))}</div><div class="pm-relation-summary"><span>Predict.fun × Polymarket</span><span>数据时间 ${escapeHtml(predictionValue(item.confirmed_at, "-"))}</span></div></div><span class="pm-pill ${manualOnly ? "watch" : "pm-tone-ok"}">${manualOnly ? "人工下单" : "自动下单"}</span></div><div class="pm-relation-summary"><span>年化 <strong>${escapeHtml(predictionAnnualizedPercent(item.annualized_yield, 2))}</strong></span><span>最小利润 <strong>${escapeHtml(predictionSignedMoney(item.profit))}</strong></span><span>总成本 <strong>${escapeHtml(predictionMoney(item.total_max_cost))}</strong></span><span>最坏损失 <strong>${escapeHtml(predictionMoney(item.total_max_cost))}</strong></span></div>${reason}<div style="display:flex;justify-content:flex-end">${action}</div></article>`;
   };
@@ -3057,6 +3062,7 @@ function predictionHistoryContent(payload, kind) {
     };
     const operation = (row) => {
       const currentState = state.predictionMarket.payload || payload;
+      const automaticCrossMode = currentState?.cross_auto?.configured_mode === "auto_submit";
       const healthy = !String(state.predictionMarket.signalError || "").trim()
         && predictionTradingAvailable(currentState);
       const liveCrossOpportunity = cross(row) && Array.isArray(currentState?.opportunities)
@@ -3071,7 +3077,7 @@ function predictionHistoryContent(payload, kind) {
           : {...row, execution_mode: undefined}
         : row;
       const crossModeAllowsAction = !cross(row) || predictionCrossExecutionMode(effectiveCrossRow) === "manual_confirm";
-      const actionable = row.actionable_now === true && !closed(row) && predictionHasValue(row.opportunity_id) && healthy && crossModeAllowsAction;
+      const actionable = !automaticCrossMode && row.actionable_now === true && !closed(row) && predictionHasValue(row.opportunity_id) && healthy && crossModeAllowsAction;
       const button = `<button class="pm-button primary pm-signal-action" type="button" data-action="participate" data-opportunity-id="${escapeHtml(String(row.opportunity_id))}">重新检查</button>`;
       if (cross(row)) {
         if (String(row.status || "").includes("授权已清零")) {
@@ -3231,7 +3237,23 @@ function predictionModeBar(payload) {
   const buttons = modes.map(([value, label]) =>
     `<button type="button" class="pm-mode-button${mode === value ? " active" : ""}" data-action="set-mode" data-mode="${value}">${label}</button>`
   ).join("");
-  return `<div class="pm-mode-bar" aria-label="验证期吃单模式">${buttons}<span class="pm-mode-stats">今日 ${stats.today_submitted || 0} 单 / $${Number(stats.today_cost || 0).toFixed(2)}</span></div>`;
+  const crossAuto = predictionCrossAutoStatus(payload);
+  return `<div class="pm-mode-bar" aria-label="验证期吃单模式">${buttons}<span class="pm-mode-stats">今日 ${stats.today_submitted || 0} 单 / $${Number(stats.today_cost || 0).toFixed(2)}</span>${crossAuto}</div>`;
+}
+
+function predictionCrossAutoStatus(payload) {
+  const auto = payload?.cross_auto && typeof payload.cross_auto === "object" ? payload.cross_auto : {};
+  if (auto.configured_mode !== "auto_submit") return "";
+  const daily = auto.daily_principal && typeof auto.daily_principal === "object" ? auto.daily_principal : {};
+  const attempt = auto.latest_attempt && typeof auto.latest_attempt === "object" ? auto.latest_attempt : null;
+  const active = auto.armed === true && auto.effective_mode === "auto_submit";
+  const rejection = attempt
+    ? `<span class="pm-mode-stats">拒绝 ${escapeHtml(predictionValue(attempt.reason_code))} · ${escapeHtml(predictionValue(attempt.reason_zh))} · 当前 ${escapeHtml(predictionValue(attempt.current))} · 上限 ${escapeHtml(predictionValue(attempt.limit))} · 场所 ${escapeHtml(predictionValue(attempt.venue))} · ${escapeHtml(predictionHktTimestamp(attempt.occurred_at))} · ${attempt.operator_action_required === true ? "需要操作员处理" : "无需操作员处理"}</span>`
+    : "";
+  const pause = active
+    ? `<button class="pm-button danger" type="button" data-action="pause-cross-auto">紧急暂停自动下单</button>`
+    : "";
+  return `<span class="pm-mode-stats" data-cross-auto-status>跨所自动下单 · ${active ? "已启用" : "已暂停"} · 当日新本金 ${escapeHtml(predictionMoney(daily.current))} / ${escapeHtml(predictionMoney(daily.limit))}${auto.pause_reason ? ` · ${escapeHtml(predictionValue(auto.pause_reason))}` : ""}</span>${rejection}${pause}`;
 }
 
 function renderPredictionMarket() {
@@ -3642,6 +3664,17 @@ async function handlePredictionMarketClick(event) {
   const cleanup = event.target.closest("[data-action='open-allowance-cleanup']");
   if (cleanup) {
     openPredictionModal("allowance_cleanup", cleanup, state.predictionMarket.payload?.predict_allowance_cleanup || {});
+    return;
+  }
+  const pauseCrossAuto = event.target.closest("[data-action='pause-cross-auto']");
+  if (pauseCrossAuto) {
+    pauseCrossAuto.disabled = true;
+    try {
+      await predictionPost("/api/prediction-arbitrage/cross-auto/pause", {confirm: true});
+    } catch (error) {
+      state.predictionMarket.error = error instanceof Error ? error.message : String(error);
+    }
+    await fetchPredictionState();
     return;
   }
   const modeButton = event.target.closest("[data-action='set-mode']");

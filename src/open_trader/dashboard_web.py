@@ -1164,6 +1164,15 @@ def _prediction_state_payload(
     )
     validation_mode = "observe_only"
     auto_eat_stats: dict[str, object] = {}
+    cross_auto: dict[str, object] = {
+        "configured_mode": "observe_only",
+        "effective_mode": "observe_only",
+        "armed": False,
+        "pause_reason": "not_armed",
+        "notification_ready": False,
+        "daily_principal": {"current": "0", "limit": "100"},
+        "latest_attempt": None,
+    }
     if store is not None:
         get_mode = getattr(store, "get_validation_mode", None)
         if callable(get_mode):
@@ -1177,6 +1186,14 @@ def _prediction_state_payload(
                 auto_eat_stats = get_stats()
             except Exception:
                 auto_eat_stats = {}
+    get_cross_auto_status = getattr(execution, "cross_auto_status", None)
+    if callable(get_cross_auto_status):
+        try:
+            status_value = _prediction_safe_value(get_cross_auto_status())
+            if isinstance(status_value, Mapping):
+                cross_auto = dict(status_value)
+        except Exception:
+            pass
     return {
         "status": status,
         "health": health,
@@ -1203,6 +1220,7 @@ def _prediction_state_payload(
         "signals_24h": signals_24h,
         "validation_mode": validation_mode,
         "auto_eat_stats": auto_eat_stats,
+        "cross_auto": cross_auto,
         "current_execution": current_execution,
         "breaker": {
             "open": breaker_open,
@@ -1787,6 +1805,7 @@ def create_dashboard_server(
                     "/api/prediction-arbitrage/mode",
                     "/api/prediction-arbitrage/circuit-breaker/reset",
                     "/api/prediction-arbitrage/predict-allowance/cleanup",
+                    "/api/prediction-arbitrage/cross-auto/pause",
                 }:
                     self._require_prediction_mutation()
                     payload = self._read_json_body()
@@ -1809,6 +1828,14 @@ def create_dashboard_server(
                         self._require_prediction_schema(payload, {"incident_id"})
                         incident_id = self._required_prediction_string(payload, "incident_id")
                         result = prediction_execution_service.reset_breaker(incident_id)
+                    elif path.endswith("/cross-auto/pause"):
+                        self._require_prediction_schema(payload, {"confirm"})
+                        if payload.get("confirm") is not True:
+                            raise ValueError("confirm must be true")
+                        pause_cross_auto = getattr(prediction_execution_service, "pause_cross_auto", None)
+                        if not callable(pause_cross_auto):
+                            raise RuntimeError("cross auto pause is unavailable")
+                        result = pause_cross_auto()
                     else:
                         self._require_prediction_schema(payload, {"confirm"})
                         if payload.get("confirm") is not True:

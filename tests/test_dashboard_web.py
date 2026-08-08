@@ -2177,6 +2177,142 @@ def test_prediction_arbitrage_mutation_rejects_before_reading_body(tmp_path: Pat
         thread.join(timeout=5)
 
 
+def test_prediction_cross_auto_state_is_safe_and_pause_is_confirmed_only(tmp_path: Path) -> None:
+    """Removing the protected pause route must leave auto mode visibly safe."""
+    from open_trader.dashboard_web import create_dashboard_server
+
+    class FakeStore:
+        def active_execution(self) -> None:
+            return None
+
+        def unacknowledged_incident(self) -> None:
+            return None
+
+        def signal_history(self, _window: str) -> list[object]:
+            return []
+
+    class FakeMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "health": {"status": "healthy", "degraded_reasons": []},
+                "readiness": {"status": "ready"},
+            }
+
+    class FakeExecution:
+        _breaker_open = False
+        _cross_breaker_open = False
+
+        def __init__(self) -> None:
+            self.pause_calls: list[str] = []
+
+        def cross_auto_status(self) -> dict[str, object]:
+            return {
+                "configured_mode": "auto_submit",
+                "effective_mode": "auto_submit",
+                "armed": True,
+                "pause_reason": "",
+                "notification_ready": True,
+                "daily_principal": {"current": "5", "limit": "100"},
+                "latest_attempt": {
+                    "reason_code": "cross_auto_daily_principal_cap",
+                    "reason_zh": "自动新本金已达当日上限",
+                    "current": "100",
+                    "limit": "100",
+                    "venue": "both",
+                    "occurred_at": "2026-08-08T01:00:00Z",
+                    "operator_action_required": False,
+                    "api_token": "must-not-leak",
+                },
+            }
+
+        def pause_cross_auto(self, reason: str = "operator_paused") -> dict[str, object]:
+            self.pause_calls.append(reason)
+            return {"armed": False, "reason": reason, "updated_at": "2026-08-08T01:01:00Z"}
+
+    execution = FakeExecution()
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        prediction_store=FakeStore(),
+        prediction_monitor=FakeMonitor(),
+        prediction_execution_service=execution,
+        prediction_session_token="session-token",
+        prediction_csrf_token="csrf-token",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        with urllib.request.urlopen(f"{base}/api/prediction-arbitrage/state", timeout=5) as response:
+            state = json.loads(response.read().decode("utf-8"))
+        assert state["cross_auto"] == {
+            "configured_mode": "auto_submit",
+            "effective_mode": "auto_submit",
+            "armed": True,
+            "pause_reason": "",
+            "notification_ready": True,
+            "daily_principal": {"current": "5", "limit": "100"},
+            "latest_attempt": {
+                "reason_code": "cross_auto_daily_principal_cap",
+                "reason_zh": "自动新本金已达当日上限",
+                "current": "100",
+                "limit": "100",
+                "venue": "both",
+                "occurred_at": "2026-08-08T01:00:00Z",
+                "operator_action_required": False,
+            },
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "Cookie": "ot_prediction_session=session-token",
+            "Origin": base,
+            "X-CSRF-Token": "csrf-token",
+        }
+        denied = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/cross-auto/pause",
+            data=b'{"confirm":true}',
+            headers={key: value for key, value in headers.items() if key != "X-CSRF-Token"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(denied, timeout=5)
+        assert error.value.code == 403
+        assert execution.pause_calls == []
+
+        unconfirmed = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/cross-auto/pause",
+            data=b'{"confirm":false}', headers=headers, method="POST"
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(unconfirmed, timeout=5)
+        assert error.value.code == 400
+        assert execution.pause_calls == []
+
+        confirmed = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/cross-auto/pause",
+            data=b'{"confirm":true}', headers=headers, method="POST"
+        )
+        with urllib.request.urlopen(confirmed, timeout=5) as response:
+            assert json.loads(response.read().decode("utf-8"))["reason"] == "operator_paused"
+        assert execution.pause_calls == ["operator_paused"]
+
+        arm = urllib.request.Request(
+            f"{base}/api/prediction-arbitrage/cross-auto/arm",
+            data=b'{"confirm":true}', headers=headers, method="POST"
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(arm, timeout=5)
+        assert error.value.code == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_prediction_arbitrage_state_history_and_strict_mutation_schema(tmp_path: Path) -> None:
     from open_trader.dashboard_web import create_dashboard_server
 
