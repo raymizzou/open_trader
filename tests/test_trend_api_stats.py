@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from decimal import Decimal, getcontext
+import hashlib
 
 import pytest
 
@@ -12,6 +13,7 @@ from open_trader.trend_api_stats import (
     read_trend_api_stats_snapshot,
     trend_statistics_disposition,
     strategy_payoff_ratio,
+    write_trend_api_stats,
 )
 from open_trader.trend_kelly import calculate_trend_kelly, trend_kelly_rounds_from_payload
 
@@ -895,6 +897,22 @@ def test_artifact_loaders_reject_utf8_bom_as_invalid_json(tmp_path) -> None:
     for loader in (load_trend_api_stats, read_trend_api_stats_snapshot):
         with pytest.raises(ValueError, match="trend_api_stats.json is invalid JSON"):
             loader(tmp_path)
+
+
+def test_snapshot_loader_returns_hash_of_exact_bytes(tmp_path) -> None:
+    payload = build_trend_api_stats_payload(
+        [],
+        strategy_versions=[],
+        generated_at="2026-08-08T17:00:00-04:00",
+        statistics_cutoff_at="2026-08-08T16:00:00-04:00",
+    )
+    path = write_trend_api_stats(tmp_path, payload)
+    raw = path.read_bytes()
+
+    loaded, digest = read_trend_api_stats_snapshot(tmp_path)
+
+    assert loaded == payload
+    assert digest == hashlib.sha256(raw).hexdigest()
 
 
 def test_statistics_disposition_conserves_every_candidate() -> None:

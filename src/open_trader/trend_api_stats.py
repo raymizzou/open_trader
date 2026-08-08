@@ -1362,21 +1362,13 @@ def _strategy_stats(
     stats = []
     for source, market, strategy_id, version in sorted(identities):
         target_identity = (market, strategy_id, version)
-        eligible = [
+        source_rounds = [
             round_ for round_ in rounds
-            if round_["source"] == source
-            and trend_kelly_identity_matches(
-                (
-                    str(round_["market"]),
-                    str(round_["strategy_id"]),
-                    str(round_["opening_strategy_version"]),
-                ),
-                target_identity,
-            )
-            and round_["attribution_status"] == "attributed"
-            and round_["costs_complete"] is True
-            and round_["net_return"] is not None
+            if round_["source"] == source and round_["market"] == market
         ]
+        eligible, _ = _partition_round_dispositions(
+            source_rounds, target=target_identity
+        )
         wins = sum(round_["result"] == "win" for round_ in eligible)
         payoff_ratio, payoff_status = strategy_payoff_ratio(
             [round_["net_return"] for round_ in eligible if round_["result"] == "win"],
