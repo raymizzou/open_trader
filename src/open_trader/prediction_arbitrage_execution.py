@@ -49,6 +49,7 @@ from .predict_cross_venue import (
     canonical_cutoff_is_future,
     cross_venue_notification_dedupe_identity,
     parse_canonical_cutoff,
+    validate_cross_execution_mode,
 )
 from .predict_trading import PREDICT_BASE_UNITS
 from .prediction_arbitrage_store import PredictionArbitrageStore
@@ -754,7 +755,9 @@ class PredictionExecutionService:
         if preview.get("state") != "previewed":
             return self._finish_cross_auto_rejection(signal_id, opportunity_id, preview)
         result = self.confirm(str(preview["preview_id"]), signal_id)
-        if result.get("execution_id"):
+        if result.get("state") not in {
+            "busy", "locked", "rejected", "failed", "ignored"
+        }:
             return self._record_cross_auto_result(signal_id, preview, result)
         return self._finish_cross_auto_rejection(signal_id, opportunity_id, result)
 
@@ -889,20 +892,17 @@ class PredictionExecutionService:
         )
 
     def _configured_cross_execution_mode(self) -> str:
-        configured = "observe_only"
         source = self._cross_venue_monitor
         snapshot = getattr(source, "snapshot", None)
         try:
             value = _call(snapshot) if callable(snapshot) else None
         except Exception:
             value = None
-        opportunities = value.get("opportunities") if isinstance(value, Mapping) else None
-        if isinstance(opportunities, (list, tuple)):
-            for opportunity in opportunities:
-                if isinstance(opportunity, Mapping):
-                    configured = str(opportunity.get("execution_mode", configured))
-                    break
-        return configured
+        if not isinstance(value, Mapping):
+            return "observe_only"
+        # The monitor's root mode remains authoritative when books are empty
+        # or stale and therefore contain no opportunity rows.
+        return validate_cross_execution_mode(value.get("mode"))
 
     def cross_auto_status(self) -> dict[str, object]:
         configured = self._configured_cross_execution_mode()
@@ -2743,7 +2743,10 @@ class PredictionExecutionService:
                 evidence["canary_verified"] = True
                 evidence["canary_fingerprint"] = fingerprint
         self._transition(execution_id, "holding_to_resolution", evidence)
-        self._notify_cross_auto_success(execution_id, evidence)
+        if evidence.get("hedged") is False:
+            self._notify_cross_auto_residual(execution_id, evidence)
+        else:
+            self._notify_cross_auto_success(execution_id, evidence)
 
     @staticmethod
     def _cross_canary_reconciliation_verified(
@@ -3229,6 +3232,28 @@ class PredictionExecutionService:
         )
         try:
             sent = self._deliver_feishu_notification("自动下单已完成", message)
+        except Exception:
+            sent = False
+        if not sent:
+            self._store.pause_cross_auto("notification_delivery_failed")
+
+    def _notify_cross_auto_residual(
+        self, execution_id: str, evidence: Mapping[str, object]
+    ) -> None:
+        if not self._is_cross_auto_execution(execution_id):
+            return
+        message = "\n".join(
+            (
+                "自动下单完成对账，但保留在安全残差状态。",
+                f"执行编号：{execution_id}",
+                f"未对冲数量：{evidence.get('unhedged_units')}",
+                f"最坏损失：{evidence.get('worst_case_loss')}",
+                "Predict 授权已清零；未标记为成功套利。",
+                f"Dashboard：{self._dashboard_url}",
+            )
+        )
+        try:
+            sent = self._deliver_feishu_notification("自动下单残差事件", message)
         except Exception:
             sent = False
         if not sent:

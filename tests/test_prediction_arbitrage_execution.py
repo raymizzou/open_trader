@@ -1213,7 +1213,12 @@ class CrossVenueMonitor:
         return value if value["opportunity_id"] == opportunity_id else None
 
     def snapshot(self) -> dict[str, object]:
-        return {"opportunities": [self._opportunity(self.intent)]}
+        opportunity = self._opportunity(self.intent)
+        return {
+            "mode": opportunity["execution_mode"],
+            "status": "ready",
+            "opportunities": [opportunity],
+        }
 
 
 class CrossPolymarketTrading(FakeTrading):
@@ -3025,6 +3030,88 @@ def test_auto_submit_cross_venue_runs_once_without_pretrade_notification(
         "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
     ) == {"state": "ignored", "reason": "signal_already_attempted"}
     assert (predict.submit_calls, trading.cross_submit_calls) == (1, 1)
+
+
+def test_auto_submit_busy_signal_is_rejected_without_queue_or_submitted_record(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    cross.overrides["execution_mode"] = "auto_submit"
+    assert store.arm_cross_auto()["armed"] is True
+    first_signal = _cross_venue_notification_signal(store)
+    store.update_signal(first_signal, {"execution_mode": "auto_submit"})
+    second_payload = dict(store.signal(first_signal) or {})
+    second_payload.update({"market_id": "public-pair-2", "execution_mode": "auto_submit"})
+    second_signal = store.upsert_signal(second_payload)
+    predict.block_submit = True
+
+    first = service.auto_submit_cross_venue(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", first_signal
+    )
+    assert first.get("execution_id")
+    assert predict.submit_started.wait(timeout=2)
+
+    second = service.auto_submit_cross_venue(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", second_signal
+    )
+    assert second["state"] == "rejected"
+    assert second["reason"] == "active_execution"
+    attempts = {row["signal_id"]: row for row in store.cross_auto_attempts(limit=10)}
+    assert attempts[second_signal]["decision"] == "rejected"
+    assert attempts[second_signal]["reason_code"] == "active_execution"
+    assert trading.cross_submit_calls <= 1
+    assert predict.submit_calls == 1
+
+    predict.submit_release.set()
+    final = wait_until_terminal(service, str(first["execution_id"]))
+    assert final["state"] == "holding_to_resolution"
+
+
+def test_cross_auto_status_uses_root_mode_when_books_are_empty_and_degraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, store, _trading, cross, _predict = _cross_service(tmp_path)
+    assert store.arm_cross_auto()["armed"] is True
+    monkeypatch.setattr(
+        cross,
+        "snapshot",
+        lambda: {"mode": "auto_submit", "status": "degraded", "opportunities": []},
+    )
+
+    status = service.cross_auto_status()
+
+    assert status["configured_mode"] == "auto_submit"
+    assert status["effective_mode"] == "auto_submit"
+    assert status["armed"] is True
+
+
+def test_auto_submit_safe_dust_emits_residual_event_without_success(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, cross, predict = _cross_service(tmp_path)
+    _macos, feishu = service._notifier._notifiers  # type: ignore[attr-defined]
+    cross.overrides["execution_mode"] = "auto_submit"
+    predict.reconcile_results.append(
+        {
+            "status": "verified",
+            "verified": True,
+            "filled_quantity": Decimal("5"),
+            "position_quantity": Decimal("4.9"),
+            "execution_proof": {"verified": True},
+        }
+    )
+    assert store.arm_cross_auto()["armed"] is True
+    signal_id = _cross_venue_notification_signal(store)
+
+    accepted = service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    )
+    final = wait_until_terminal(service, str(accepted["execution_id"]))
+
+    assert final["state"] == "holding_to_resolution"
+    titles = [title for title, _message in feishu.messages]
+    assert "自动下单残差事件" in titles
+    assert "自动下单已完成" not in titles
 
 
 def test_auto_submit_preview_requires_automatic_authority(tmp_path: Path) -> None:
