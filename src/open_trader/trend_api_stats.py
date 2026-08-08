@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Context, Decimal, InvalidOperation, localcontext
 from pathlib import Path
@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from .kelly_order_execution import (
     FutuSimulateOrderExecutionClient,
 )
+from .daily_premarket import RunLock
 from .kelly_trade_samples import _write_json_atomic
 from .tiger_account import TigerAccountClient, TigerAccountError
 from .trend_kelly import trend_kelly_identity_matches
@@ -21,6 +22,7 @@ from .trend_simulate_positions import _action_events
 
 
 TREND_API_STATS_SCHEMA_VERSION = "open_trader.trend_api_stats.v1"
+STATISTICS_CYCLE_SCHEMA = "open_trader.trend_api_stats.cycle.v1"
 _CALCULATION_CONTEXT = Context(prec=28)
 _MARKET_TIMEZONES = {
     "CN": ZoneInfo("Asia/Shanghai"),
@@ -461,7 +463,7 @@ def sync_trend_api_stats(
     data_dir: Any,
     reports_dir: Any,
     futu_clients: Mapping[str, object],
-    tiger_client: object,
+    tiger_client: object | None = None,
     start: str,
     end: str,
     generated_at: str,
@@ -471,6 +473,9 @@ def sync_trend_api_stats(
     reports_dir = _path(reports_dir)
     facts = _load_frozen_strategy_facts(reports_dir)
     futu_attributions = _futu_order_attributions(data_dir, facts)
+    source_cutoff = _aware_timestamp(
+        statistics_cutoff_at, "statistics_cutoff_at"
+    )
     fetched_fills: list[Mapping[str, object]] = []
     sources: list[dict[str, object]] = []
     for market, client in sorted(futu_clients.items()):
@@ -479,7 +484,10 @@ def sync_trend_api_stats(
             end=end,
             attributions_by_order=futu_attributions.get(market.upper(), {}),
         )
-        fills = _result_fills(result)
+        fills = [
+            fill for fill in _result_fills(result)
+            if _aware_timestamp(fill["filled_at"], "fill filled_at") <= source_cutoff
+        ]
         fetched_fills.extend(fills)
         account_id = str(
             result.get("account_id")
@@ -497,54 +505,268 @@ def sync_trend_api_stats(
             "statistics_cutoff_at": statistics_cutoff_at,
             "status": "available",
         })
-    tiger_result = tiger_client.fetch_fills(
-        start=start,
-        end=end,
-        attributions_by_order={},
-    )
-    tiger_fills = _attribute_actual_fills(_result_fills(tiger_result), facts)
-    fetched_fills.extend(tiger_fills)
-    tiger_account = str(
-        tiger_result.get("account_id")
-        or (tiger_fills[0].get("account_id") if tiger_fills else "")
-    )
-    tiger_source_id = str(
-        tiger_result.get("source_id") or f"actual:tiger:{tiger_account}"
-    )
-    sources.append({
-        "source": "actual",
-        "source_id": tiger_source_id,
-        "broker": "tiger",
-        "account_id": tiger_account,
-        "market": "US",
-        "orders_seen": int(tiger_result.get("orders_seen", 0)),
-        "fill_count": len(tiger_fills),
-        "statistics_cutoff_at": statistics_cutoff_at,
-        "status": "available",
-    })
-    path = data_dir / "latest" / "trend_api_stats.json"
-    existing_fills: list[Mapping[str, object]] = []
-    existing_sources: list[Mapping[str, object]] = []
-    if path.exists():
-        existing = load_trend_api_stats(data_dir)
-        existing_fills = list(existing["fills"])
-        existing_sources = list(existing["sources"])
-    strategy_versions = sorted({
-        (str(fact["market"]), str(fact["strategy_id"]), str(fact["strategy_version"]))
-        for fact in facts
-    })
-    payload = build_trend_api_stats_payload(
-        _merge_synced_fills(existing_fills, fetched_fills),
-        strategy_versions=[
-            {"market": market, "strategy_id": strategy_id, "strategy_version": version}
-            for market, strategy_id, version in strategy_versions
-        ],
-        generated_at=generated_at,
-        statistics_cutoff_at=statistics_cutoff_at,
-    )
-    payload["sources"] = _merge_source_audits(existing_sources, sources)
-    write_trend_api_stats(data_dir, payload)
-    return payload
+    if tiger_client is not None:
+        tiger_result = tiger_client.fetch_fills(
+            start=start,
+            end=end,
+            attributions_by_order={},
+        )
+        tiger_fills = [
+            fill for fill in _attribute_actual_fills(_result_fills(tiger_result), facts)
+            if _aware_timestamp(fill["filled_at"], "fill filled_at") <= source_cutoff
+        ]
+        fetched_fills.extend(tiger_fills)
+        tiger_account = str(
+            tiger_result.get("account_id")
+            or (tiger_fills[0].get("account_id") if tiger_fills else "")
+        )
+        tiger_source_id = str(
+            tiger_result.get("source_id") or f"actual:tiger:{tiger_account}"
+        )
+        sources.append({
+            "source": "actual",
+            "source_id": tiger_source_id,
+            "broker": "tiger",
+            "account_id": tiger_account,
+            "market": "US",
+            "orders_seen": int(tiger_result.get("orders_seen", 0)),
+            "fill_count": len(tiger_fills),
+            "statistics_cutoff_at": statistics_cutoff_at,
+            "status": "available",
+        })
+    with RunLock(data_dir / "trend_statement_consumption/.stats.lock", wait=True):
+        path = data_dir / "latest" / "trend_api_stats.json"
+        existing_fills: list[Mapping[str, object]] = []
+        existing_sources: list[Mapping[str, object]] = []
+        artifact_cutoff = statistics_cutoff_at
+        if path.exists():
+            existing = load_trend_api_stats(data_dir)
+            existing_fills = list(existing["fills"])
+            existing_sources = list(existing["sources"])
+            artifact_cutoff = max(
+                (str(existing["statistics_cutoff_at"]), statistics_cutoff_at),
+                key=lambda value: _aware_timestamp(value, "statistics_cutoff_at"),
+            )
+        strategy_versions = sorted({
+            (str(fact["market"]), str(fact["strategy_id"]), str(fact["strategy_version"]))
+            for fact in facts
+        })
+        payload = build_trend_api_stats_payload(
+            _merge_synced_fills(existing_fills, fetched_fills),
+            strategy_versions=[
+                {"market": market, "strategy_id": strategy_id, "strategy_version": version}
+                for market, strategy_id, version in strategy_versions
+            ],
+            generated_at=generated_at,
+            statistics_cutoff_at=artifact_cutoff,
+        )
+        payload["sources"] = _merge_source_audits(existing_sources, sources)
+        write_trend_api_stats(data_dir, payload)
+        published, _ = read_trend_api_stats_snapshot(data_dir)
+        if published != payload:
+            raise ValueError("trend_api_stats readback mismatch")
+        return payload
+
+
+def trend_statistics_cycle_path(
+    data_dir: Path, market: str, as_of_date: str
+) -> Path:
+    normalized_market, normalized_date = _cycle_market_date(market, as_of_date)
+    return _path(data_dir) / "trend_api_stats" / "daily" / normalized_market / f"{normalized_date}.json"
+
+
+def trend_statistics_cutoff_at(market: str, as_of_date: str) -> str:
+    normalized_market, normalized_date = _cycle_market_date(market, as_of_date)
+    close = time(15 if normalized_market == "CN" else 16)
+    return datetime.combine(
+        date.fromisoformat(normalized_date), close, _MARKET_TIMEZONES[normalized_market]
+    ).isoformat()
+
+
+def run_trend_statistics_cycle(
+    *,
+    data_dir: Path,
+    reports_dir: Path,
+    market: str,
+    as_of_date: str,
+    generated_at: str,
+    process_git_sha: str,
+    futu_client: object,
+    tiger_client: object | None = None,
+    force: bool = False,
+    actor: str = "",
+    reason: str = "",
+) -> dict[str, object]:
+    normalized_market, normalized_date = _cycle_market_date(market, as_of_date)
+    state_path = trend_statistics_cycle_path(data_dir, normalized_market, normalized_date)
+    if force and (not actor.strip() or not reason.strip()):
+        raise ValueError("force requires actor and reason")
+    cutoff = trend_statistics_cutoff_at(normalized_market, normalized_date)
+    with RunLock(state_path.with_suffix(".lock"), wait=True):
+        previous = _read_optional_json(state_path)
+        if previous.get("status") == "completed" and not force:
+            return {**previous, "status": "already_completed"}
+        try:
+            start, end = _statistics_fetch_range(
+                _path(data_dir), _path(reports_dir), normalized_market, normalized_date
+            )
+            if normalized_market == "US" and tiger_client is None:
+                raise ValueError("US statistics cycle requires Tiger actual client")
+            sync_trend_api_stats(
+                data_dir=data_dir,
+                reports_dir=reports_dir,
+                futu_clients={normalized_market: futu_client},
+                tiger_client=tiger_client if normalized_market == "US" else None,
+                start=start,
+                end=end,
+                generated_at=generated_at,
+                statistics_cutoff_at=cutoff,
+            )
+            with RunLock(
+                _path(data_dir) / "trend_statement_consumption/.stats.lock", wait=True
+            ):
+                _, artifact_sha256 = read_trend_api_stats_snapshot(data_dir)
+        except Exception as exc:
+            return _write_failed_cycle_state(
+                state_path, previous, exc, generated_at, process_git_sha,
+                actor if force else "", reason if force else "",
+            )
+        return _write_completed_cycle_state(
+            state_path, previous, cutoff, artifact_sha256, generated_at, process_git_sha,
+            actor if force else "", reason if force else "",
+        )
+
+
+def _cycle_market_date(market: str, as_of_date: str) -> tuple[str, str]:
+    normalized_market = str(market).strip().upper()
+    if normalized_market not in _MARKET_TIMEZONES:
+        raise ValueError(f"unsupported statistics market: {market}")
+    try:
+        normalized_date = date.fromisoformat(str(as_of_date)).isoformat()
+    except ValueError:
+        raise ValueError("statistics as_of_date is invalid") from None
+    return normalized_market, normalized_date
+
+
+def _read_optional_json(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _statistics_fetch_range(
+    data_dir: Path, reports_dir: Path, market: str, as_of_date: str
+) -> tuple[str, str]:
+    normalized_market, normalized_date = _cycle_market_date(market, as_of_date)
+    starts = [normalized_date]
+    try:
+        existing = read_trend_api_stats_snapshot(data_dir)[0]
+    except ValueError:
+        existing = None
+    if existing is not None:
+        has_simulation = False
+        has_tiger_actual = normalized_market != "US"
+        for source in existing["sources"]:
+            if source["market"] != normalized_market:
+                continue
+            if source["source"] == "simulation":
+                has_simulation = True
+                starts.append(
+                    _aware_timestamp(
+                        source["statistics_cutoff_at"], "source statistics_cutoff_at"
+                    ).astimezone(_MARKET_TIMEZONES[normalized_market]).date().isoformat()
+                )
+            elif normalized_market == "US" and source["broker"] == "tiger":
+                has_tiger_actual = True
+                starts.append(
+                    _aware_timestamp(
+                        source["statistics_cutoff_at"], "source statistics_cutoff_at"
+                    ).astimezone(_MARKET_TIMEZONES[normalized_market]).date().isoformat()
+                )
+        if not has_simulation or not has_tiger_actual:
+            starts.extend(
+                str(fact["execution_date"])
+                for fact in _load_frozen_strategy_facts(reports_dir)
+                if fact["market"] == normalized_market
+            )
+    else:
+        starts.extend(
+            str(fact["execution_date"])
+            for fact in _load_frozen_strategy_facts(reports_dir)
+            if fact["market"] == normalized_market
+        )
+    return min(starts), normalized_date
+
+
+def _cycle_state_identity(path: Path) -> tuple[str, str]:
+    return path.parent.name, path.stem
+
+
+def _write_failed_cycle_state(
+    path: Path,
+    previous: Mapping[str, object],
+    error: Exception,
+    attempted_at: str,
+    process_git_sha: str,
+    forced_actor: str = "",
+    forced_reason: str = "",
+) -> dict[str, object]:
+    if previous.get("status") == "completed" and forced_actor:
+        state = dict(previous)
+        state.update({
+            "last_forced_failure_status": "failed",
+            "last_forced_failure_at": attempted_at,
+            "last_forced_failure_actor": forced_actor.strip(),
+            "last_forced_failure_reason": forced_reason.strip(),
+            "last_forced_failure_process_git_sha": process_git_sha,
+            "last_forced_failure_error": str(error),
+        })
+        _write_json_atomic(path, state)
+        return {**state, "status": "failed"}
+    market, as_of_date = _cycle_state_identity(path)
+    state = {
+        "schema_version": STATISTICS_CYCLE_SCHEMA,
+        "status": "failed",
+        "market": market,
+        "as_of_date": as_of_date,
+        "attempt_count": int(previous.get("attempt_count", 0)) + 1,
+        "attempted_at": attempted_at,
+        "process_git_sha": process_git_sha,
+        "reason": str(error),
+    }
+    _write_json_atomic(path, state)
+    return state
+
+
+def _write_completed_cycle_state(
+    path: Path,
+    previous: Mapping[str, object],
+    cutoff: str,
+    artifact_sha256: str,
+    completed_at: str,
+    process_git_sha: str,
+    actor: str,
+    reason: str,
+) -> dict[str, object]:
+    market, as_of_date = _cycle_state_identity(path)
+    state: dict[str, object] = {
+        "schema_version": STATISTICS_CYCLE_SCHEMA,
+        "status": "completed",
+        "market": market,
+        "as_of_date": as_of_date,
+        "attempt_count": int(previous.get("attempt_count", 0)) + 1,
+        "completed_at": completed_at,
+        "process_git_sha": process_git_sha,
+        "statistics_cutoff_at": cutoff,
+        "artifact_sha256": artifact_sha256,
+    }
+    if actor:
+        state["actor"] = actor.strip()
+        state["reason"] = reason.strip()
+    _write_json_atomic(path, state)
+    return state
 
 
 def build_statement_actual_stats_payload(
@@ -592,7 +814,9 @@ def build_statement_actual_stats_payload(
     ]
     combined = [*retained, *incoming]
     facts = _load_frozen_strategy_facts(reports_dir)
-    combined = _reattribute_statement_fills(combined, facts)
+    combined = _reattribute_statement_fills(
+        combined, facts, broker=normalized_broker,
+    )
 
     cutoff_values = [statistics_cutoff_at]
     if existing is not None:
@@ -649,13 +873,14 @@ def build_statement_actual_stats_payload(
 def _reattribute_statement_fills(
     fills: Sequence[Mapping[str, object]],
     facts: Sequence[Mapping[str, object]],
+    *,
+    broker: str,
 ) -> list[dict[str, object]]:
-    statement_brokers = set(_STATEMENT_ACCOUNTS)
     other: list[dict[str, object]] = []
     statement: list[dict[str, object]] = []
     for raw in fills:
         fill = dict(raw)
-        if fill.get("broker") not in statement_brokers:
+        if fill.get("broker") != broker:
             other.append(fill)
             continue
         fill.update(
@@ -787,16 +1012,21 @@ def write_trend_api_stats(data_dir: Any, payload: object) -> Any:
 
 
 def load_trend_api_stats(data_dir: Any) -> dict[str, object]:
+    return read_trend_api_stats_snapshot(data_dir)[0]
+
+
+def read_trend_api_stats_snapshot(data_dir: Any) -> tuple[dict[str, object], str]:
     path = _path(data_dir) / "latest" / "trend_api_stats.json"
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
     except FileNotFoundError:
         raise ValueError("trend_api_stats.json is missing") from None
     except (OSError, UnicodeError):
         raise ValueError("trend_api_stats.json is unreadable") from None
     except json.JSONDecodeError:
         raise ValueError("trend_api_stats.json is invalid JSON") from None
-    return _validated_payload(payload)
+    return _validated_payload(payload), hashlib.sha256(raw).hexdigest()
 
 
 def _load_frozen_strategy_facts(reports_dir: Any) -> list[dict[str, object]]:
@@ -1015,6 +1245,20 @@ def _validated_payload(payload: object) -> dict[str, object]:
         raise ValueError("rounds are not derived from fills")
     if payload["stats"] != rebuilt["stats"]:
         raise ValueError("stats are not derived from rounds")
+    source_cutoffs = {
+        (str(source["source_id"]), str(source["market"])): _aware_timestamp(
+            source["statistics_cutoff_at"], "source statistics_cutoff_at"
+        )
+        for source in payload["sources"]
+    }
+    for fill in rebuilt["fills"]:
+        source_cutoff = source_cutoffs.get(
+            (str(fill["source_id"]), str(fill["market"]))
+        )
+        if source_cutoff is not None and _aware_timestamp(
+            fill["filled_at"], "fill filled_at"
+        ) > source_cutoff:
+            raise ValueError("fill filled_at exceeds source statistics_cutoff_at")
     return payload
 
 
@@ -1357,21 +1601,13 @@ def _strategy_stats(
     stats = []
     for source, market, strategy_id, version in sorted(identities):
         target_identity = (market, strategy_id, version)
-        eligible = [
+        source_rounds = [
             round_ for round_ in rounds
-            if round_["source"] == source
-            and trend_kelly_identity_matches(
-                (
-                    str(round_["market"]),
-                    str(round_["strategy_id"]),
-                    str(round_["opening_strategy_version"]),
-                ),
-                target_identity,
-            )
-            and round_["attribution_status"] == "attributed"
-            and round_["costs_complete"] is True
-            and round_["net_return"] is not None
+            if round_["source"] == source and round_["market"] == market
         ]
+        eligible, _ = _partition_round_dispositions(
+            source_rounds, target=target_identity
+        )
         wins = sum(round_["result"] == "win" for round_ in eligible)
         payoff_ratio, payoff_status = strategy_payoff_ratio(
             [round_["net_return"] for round_ in eligible if round_["result"] == "win"],
@@ -1389,6 +1625,118 @@ def _strategy_stats(
             "statistics_cutoff_at": statistics_cutoff_at,
         })
     return stats
+
+
+def trend_statistics_disposition(
+    payload: object,
+    *,
+    market: str,
+    strategy_id: str,
+    opening_strategy_version: str,
+    source: str,
+) -> dict[str, object]:
+    validated = _validated_payload(payload)
+    target = (
+        _required_text(market, "market").upper(),
+        _required_text(strategy_id, "strategy_id"),
+        _required_text(opening_strategy_version, "opening_strategy_version"),
+    )
+    source = _required_text(source, "source")
+    cutoff = _source_cutoff(validated, target[0], source)
+    if not cutoff:
+        return {
+            "available": False,
+            "eligible_sample_count": 0,
+            "discovered_candidate_count": 0,
+            "excluded_candidate_count": 0,
+            "incomplete_open_candidate_count": 0,
+            "exclusion_reasons": [],
+            "statistics_cutoff_at": "",
+            "reason": "matching_source_audit_absent",
+        }
+    closed = [
+        item for item in validated["rounds"]
+        if item["market"] == target[0] and item["source"] == source
+    ]
+    incomplete = _incomplete_open_candidates(
+        validated["fills"], market=target[0], source=source
+    )
+    eligible, excluded = _partition_round_dispositions(closed, target=target)
+    reasons = Counter(str(item["reason"]) for item in excluded)
+    return {
+        "available": True,
+        "eligible_sample_count": len(eligible),
+        "discovered_candidate_count": len(eligible) + len(excluded) + len(incomplete),
+        "excluded_candidate_count": len(excluded),
+        "incomplete_open_candidate_count": len(incomplete),
+        "exclusion_reasons": [
+            {"reason": reason, "count": count}
+            for reason, count in sorted(reasons.items())
+        ],
+        "statistics_cutoff_at": cutoff,
+        "reason": "",
+    }
+
+
+def _incomplete_open_candidates(
+    fills: Sequence[dict[str, object]], *, market: str, source: str,
+) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, str, str], list[dict[str, object]]] = defaultdict(list)
+    for fill in fills:
+        if fill["market"] == market and fill["source"] == source:
+            grouped[(str(fill["source_id"]), market, str(fill["symbol"]))].append(fill)
+    candidates = []
+    for group in grouped.values():
+        position = Decimal("0")
+        opening: dict[str, object] | None = None
+        for fill in group:
+            quantity = _required_decimal(fill["quantity"], "fill quantity")
+            if fill["side"] == "buy":
+                opening = opening or fill
+                position += quantity
+            elif position:
+                position -= quantity
+                if position == 0:
+                    opening = None
+        if position and opening is not None:
+            candidates.append(opening)
+    return candidates
+
+
+def _partition_round_dispositions(
+    rounds: Sequence[dict[str, object]], *, target: tuple[str, str, str],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    eligible = []
+    excluded = []
+    for round_ in rounds:
+        identity = (
+            str(round_["market"]),
+            str(round_["strategy_id"]),
+            str(round_["opening_strategy_version"]),
+        )
+        reason = str(round_.get("exclusion_reason") or "")
+        if not trend_kelly_identity_matches(identity, target):
+            reason = reason or "strategy_identity_not_eligible"
+        elif round_["attribution_status"] != "attributed":
+            reason = reason or "round_not_attributed"
+        elif round_["costs_complete"] is not True:
+            reason = "costs_incomplete"
+        elif round_["net_return"] is None:
+            reason = "net_return_unavailable"
+        if reason:
+            excluded.append({"round": round_, "reason": reason})
+        else:
+            eligible.append(round_)
+    return eligible, excluded
+
+
+def _source_cutoff(payload: Mapping[str, object], market: str, source: str) -> str:
+    cutoffs = [
+        str(item["statistics_cutoff_at"])
+        for item in payload["sources"]
+        if item["market"] == market and item["source"] == source
+    ]
+    return min(cutoffs, key=lambda value: _aware_timestamp(value, "source cutoff")) if cutoffs else ""
 
 
 def _required_decimal(value: object, field: str) -> Decimal:

@@ -7162,22 +7162,34 @@ def _completed_cycles(
     return completed
 
 
+def _series_cutoff(
+    effective_from: str,
+    series_dates: set[str],
+    benchmark_dates: set[str],
+) -> str | None:
+    if effective_from not in series_dates or effective_from not in benchmark_dates:
+        return None
+    cutoff: str | None = None
+    for trading_date in sorted(
+        day for day in benchmark_dates if day >= effective_from
+    ):
+        if trading_date not in series_dates:
+            break
+        cutoff = trading_date
+    return cutoff
+
+
 def _common_cutoff(
     effective_from: str,
     discipline_dates: set[str],
     actual_dates: set[str],
     benchmark_dates: set[str],
 ) -> str | None:
-    if effective_from not in benchmark_dates:
-        return None
-    cutoff: str | None = None
-    for trading_date in sorted(
-        day for day in benchmark_dates if day >= effective_from
-    ):
-        if trading_date not in discipline_dates or trading_date not in actual_dates:
-            break
-        cutoff = trading_date
-    return cutoff
+    return _series_cutoff(
+        effective_from,
+        discipline_dates & actual_dates,
+        benchmark_dates,
+    )
 
 
 def _completed_trades(facts: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -7621,39 +7633,11 @@ def build_trend_review_projection(
         )
     if any(len(snapshots) > 1 for snapshots in identity_snapshots.values()):
         raise ValueError("strategy snapshot identity changed within version interval")
-    fills, actual_fill_coverage = _load_actual_fills(data_dir, market)
-    equity_cutoff = _common_cutoff(
-        effective_from,
-        {str(fact["date"]) for fact in discipline_facts},
-        {str(fact["date"]) for fact in actual_facts},
-        set(benchmark_by_date),
-    )
-    common_cutoff = None
-    if equity_cutoff is not None:
-        for trading_date in sorted(
-            day
-            for day in benchmark_by_date
-            if effective_from <= day <= equity_cutoff
-        ):
-            if not any(
-                start <= trading_date <= end
-                for start, end in actual_fill_coverage
-            ):
-                break
-            common_cutoff = trading_date
-    interval_discipline = [
-        fact
-        for fact in discipline_facts
-        if common_cutoff is not None
-        and effective_from <= str(fact["date"]) <= common_cutoff
-    ]
-
     snapshot_facts = sorted(
         (
             fact
             for fact in (*discipline_facts, *actual_facts)
             if effective_from <= str(fact["date"])
-            and (common_cutoff is None or str(fact["date"]) <= common_cutoff)
         ),
         key=lambda fact: str(fact["date"]),
     )
@@ -7676,77 +7660,143 @@ def build_trend_review_projection(
             {},
         )
     )
-    discipline_cycles = _completed_trades(interval_discipline)
-    interval_actual = {
-        str(fact["date"]): fact
-        for fact in actual_facts
-        if common_cutoff is not None
-        and effective_from <= str(fact["date"]) <= common_cutoff
-    }
-    interval_fills = [
-        fill
-        for fill in fills
-        if common_cutoff is not None
-        and effective_from <= str(fill["executed_at"])[:10] <= common_cutoff
-        and str(fill["executed_at"])[:10] in interval_actual
-    ]
-    opening_fact = interval_actual.get(effective_from)
-    if opening_fact is not None and opening_fact.get("new_fact") is not True:
-        opening_fact = None
-    opening_positions = (
-        [
-            {**position, "opened_at": position.get("opened_at", opening_fact["date"])}
-            for position in opening_fact.get("opening_positions", [])
-            if isinstance(position, Mapping)
-        ]
-        if opening_fact is not None
-        else []
-    )
-    if not isinstance(opening_positions, list):
-        raise ValueError("actual opening positions must be a list")
-    actual_cycles = _completed_cycles(interval_fills, opening_positions)
+
+    discipline_disposition: dict[str, object] | None = None
+    actual_disposition: dict[str, object] | None = None
+    if target_identity is not None:
+        try:
+            # Local import avoids the existing trend_api_stats -> trend_review cycle.
+            from .trend_api_stats import (
+                read_trend_api_stats_snapshot,
+                trend_statistics_disposition,
+            )
+
+            stats_payload, _ = read_trend_api_stats_snapshot(data_dir)
+        except ValueError:
+            pass
+        else:
+            disposition_args = {
+                "market": market,
+                "strategy_id": target_identity[1],
+                "opening_strategy_version": target_identity[2],
+            }
+            discipline_disposition = trend_statistics_disposition(
+                stats_payload, source="simulation", **disposition_args
+            )
+            actual_disposition = trend_statistics_disposition(
+                stats_payload, source="actual", **disposition_args
+            )
 
     rates_path = data_dir / "rates" / "DGS3MO.csv"
     rates = _load_dgs3mo_csv(rates_path)
-    curve_dates = [
+    benchmark_dates = set(benchmark_by_date)
+    discipline_metric_cutoff = _series_cutoff(
+        effective_from,
+        {
+            str(fact["date"])
+            for fact in discipline_facts
+            if "discipline_equity_after_fees" in fact
+        },
+        benchmark_dates,
+    )
+    actual_metric_cutoff = None
+    if market == "US":
+        _, actual_fill_coverage = _load_actual_fills(data_dir, market)
+        equity_cutoff = _series_cutoff(
+            effective_from,
+            {
+                str(fact["date"])
+                for fact in actual_facts
+                if "actual_equity" in fact
+            },
+            benchmark_dates,
+        )
+        if equity_cutoff is not None:
+            for trading_date in sorted(
+                day
+                for day in benchmark_by_date
+                if effective_from <= day <= equity_cutoff
+            ):
+                if not any(
+                    start <= trading_date <= end
+                    for start, end in actual_fill_coverage
+                ):
+                    break
+                actual_metric_cutoff = trading_date
+    common_cutoff = _common_cutoff(
+        effective_from,
+        {
+            day for day in benchmark_dates
+            if discipline_metric_cutoff is not None
+            and effective_from <= day <= discipline_metric_cutoff
+        },
+        {
+            day for day in benchmark_dates
+            if actual_metric_cutoff is not None
+            and effective_from <= day <= actual_metric_cutoff
+        },
+        benchmark_dates,
+    )
+
+    discipline_curve_dates = [
         trading_date
         for trading_date in sorted(benchmark_by_date)
-        if common_cutoff is not None
-        and effective_from <= trading_date <= common_cutoff
+        if discipline_metric_cutoff is not None
+        and effective_from <= trading_date <= discipline_metric_cutoff
     ]
     discipline_curve = _normalized_curve(
-        [discipline_by_date[trading_date] for trading_date in curve_dates],
+        [discipline_by_date[trading_date] for trading_date in discipline_curve_dates],
         "discipline_equity_after_fees",
-    ) if curve_dates else None
+    ) if discipline_curve_dates else None
+    actual_curve_dates = [
+        trading_date
+        for trading_date in sorted(benchmark_by_date)
+        if actual_metric_cutoff is not None
+        and effective_from <= trading_date <= actual_metric_cutoff
+    ]
     actual_curve = _normalized_curve(
-        [actual_by_date[trading_date] for trading_date in curve_dates],
+        [actual_by_date[trading_date] for trading_date in actual_curve_dates],
         "actual_equity",
-    ) if curve_dates else None
-    benchmark_curve = _normalized_curve(
+    ) if actual_curve_dates else None
+    discipline_benchmark_curve = _normalized_curve(
         [
             {
                 "date": trading_date,
                 "benchmark_equity": benchmark_by_date[trading_date]["close"],
             }
-            for trading_date in curve_dates
+            for trading_date in discipline_curve_dates
         ],
         "benchmark_equity",
-    ) if curve_dates else None
+    ) if discipline_curve_dates else None
+    actual_benchmark_curve = _normalized_curve(
+        [
+            {
+                "date": trading_date,
+                "benchmark_equity": benchmark_by_date[trading_date]["close"],
+            }
+            for trading_date in actual_curve_dates
+        ],
+        "benchmark_equity",
+    ) if actual_curve_dates else None
     discipline_metrics = _curve_metrics(
         discipline_curve, rates, missing_reason="纪律模拟日终净值缺失"
     )
     actual_metrics = _curve_metrics(
         actual_curve, rates, missing_reason="实际执行日终净值缺失"
     )
-    benchmark_metrics = _curve_metrics(
-        benchmark_curve, rates, missing_reason="市场基准缺失"
+    discipline_benchmark_metrics = _curve_metrics(
+        discipline_benchmark_curve, rates, missing_reason="市场基准缺失"
+    )
+    actual_benchmark_metrics = _curve_metrics(
+        actual_benchmark_curve, rates, missing_reason="市场基准缺失"
     )
 
     def values(metric_name: str) -> dict[str, dict[str, object]]:
         return {
             "discipline": discipline_metrics[metric_name],
             "actual": actual_metrics[metric_name],
-            "benchmark": benchmark_metrics[metric_name],
+            "discipline_benchmark": discipline_benchmark_metrics[metric_name],
+            "actual_benchmark": actual_benchmark_metrics[metric_name],
         }
 
     def excess(
@@ -7768,37 +7818,73 @@ def build_trend_review_projection(
         "market_excess_return": {
             "discipline": excess(
                 discipline_metrics["total_return_pct"],
-                benchmark_metrics["total_return_pct"],
+                discipline_benchmark_metrics["total_return_pct"],
             ),
             "actual": excess(
                 actual_metrics["total_return_pct"],
-                benchmark_metrics["total_return_pct"],
+                actual_benchmark_metrics["total_return_pct"],
             ),
-            "benchmark": _metric("0") if benchmark_curve else _metric(None, "市场基准缺失"),
+            "discipline_benchmark": (
+                _metric("0")
+                if discipline_benchmark_curve
+                else _metric(None, "市场基准缺失")
+            ),
+            "actual_benchmark": (
+                _metric("0")
+                if actual_benchmark_curve
+                else _metric(None, "市场基准缺失")
+            ),
         },
         "max_drawdown": values("max_drawdown_pct"),
         "calmar": values("calmar_ratio"),
         "sharpe": values("sharpe_ratio"),
     }
-    sample_counts = {
-        "discipline": len(discipline_cycles),
-        "actual": len(actual_cycles),
+    sample_counts: dict[str, int | None] = {
+        "discipline": (
+            int(discipline_disposition["eligible_sample_count"])
+            if discipline_disposition is not None
+            and discipline_disposition["available"] is True
+            else None
+        ),
+        "actual": (
+            int(actual_disposition["eligible_sample_count"])
+            if actual_disposition is not None
+            and actual_disposition["available"] is True
+            else None
+        ),
         "required": 30,
     }
-    for series in ("discipline", "actual"):
-        count = sample_counts[series]
-        if count < 30:
-            for metric in metrics.values():
-                metric[series] = _metric(None, f"{count} / 30，数据不足")
 
     projection = {
-        "schema_version": "open_trader.trend_review.projection.v2",
+        "schema_version": "open_trader.trend_review.projection.v3",
         "available": True,
         "market": market,
         "market_label": {"CN": "A 股", "US": "美股", "HK": "港股"}[market],
         "broker": {"CN": "eastmoney", "US": "tiger", "HK": "phillips"}[market],
         "strategy_snapshot": snapshot,
         "sample_counts": sample_counts,
+        "sample_details": {
+            "discipline": discipline_disposition,
+            "actual": actual_disposition,
+        },
+        "sample_cutoffs": {
+            "discipline": (
+                discipline_disposition["statistics_cutoff_at"]
+                if discipline_disposition is not None
+                and discipline_disposition["statistics_cutoff_at"]
+                else None
+            ),
+            "actual": (
+                actual_disposition["statistics_cutoff_at"]
+                if actual_disposition is not None
+                and actual_disposition["statistics_cutoff_at"]
+                else None
+            ),
+        },
+        "metric_cutoffs": {
+            "discipline": discipline_metric_cutoff,
+            "actual": actual_metric_cutoff,
+        },
         "common_cutoff": common_cutoff,
         "interval": {"start": effective_from, "end": common_cutoff},
         "metrics": metrics,
@@ -8303,6 +8389,14 @@ def rebuild_trend_report_from_evidence(
         raise TrendReplayIncompleteError(
             "invalid original input: account_input"
         )
+    metadata_input = inputs["metadata"]
+    if not isinstance(metadata_input, Mapping):
+        raise TrendReplayIncompleteError("invalid original input: metadata")
+    critical_data_reason = metadata_input.get("industry_data_reason", "")
+    if not isinstance(critical_data_reason, str):
+        raise TrendReplayIncompleteError(
+            "invalid original input: metadata.industry_data_reason"
+        )
     report = build_report(
         as_of_date=str(inputs["as_of_date"]),
         execution_date=str(inputs["execution_date"]),
@@ -8322,7 +8416,7 @@ def rebuild_trend_report_from_evidence(
         actual_api_cost=decimal_or_none(inputs.get("actual_api_cost")),
         generated_at=str(inputs.get("generated_at") or "") or None,
         metadata={
-            **dict(inputs["metadata"]),
+            **dict(metadata_input),
             "process_version": process_version,
         },
         market=str(inputs["market"]),
@@ -8341,6 +8435,7 @@ def rebuild_trend_report_from_evidence(
         strategy_snapshot=replay_snapshot,
         kelly_rounds=kelly_rounds,
         kelly_data_reason=kelly_data_reason,
+        critical_data_reason=critical_data_reason,
         drawdown_summary=(
             inputs["drawdown_summary"]
             if strategy_version in {

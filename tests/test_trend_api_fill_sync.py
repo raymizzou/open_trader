@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import open_trader.trend_api_stats as trend_api_stats_module
 
 from open_trader.tiger_account import TigerAccountConfig, TigerAccountError
 from open_trader.trend_api_stats import (
@@ -19,7 +22,10 @@ from open_trader.trend_api_stats import (
     _tiger_transaction_record,
     build_trend_api_stats_payload,
     load_trend_api_stats,
+    run_trend_statistics_cycle,
     sync_trend_api_stats,
+    trend_statistics_cutoff_at,
+    trend_statistics_cycle_path,
     write_trend_api_stats,
 )
 from open_trader.trend_review import _report_hash, _write_action_event
@@ -727,3 +733,356 @@ def test_sync_uses_frozen_attribution_merges_idempotently_and_writes_canonical_a
     assert any(source["broker"] == "eastmoney" for source in payload["sources"])
     assert load_trend_api_stats(tmp_path / "data") == payload
     assert (tmp_path / "data/latest/trend_api_stats.json").is_file()
+
+
+class RecordingCycleClient:
+    def __init__(self, *, account_id: str = "101", fail_once: bool = False) -> None:
+        self.account_id = account_id
+        self.fail_once = fail_once
+        self.calls: list[dict[str, object]] = []
+
+    def fetch_fills(
+        self,
+        *,
+        start: str,
+        end: str,
+        attributions_by_order: dict[str, dict[str, object]],
+    ) -> dict[str, object]:
+        self.calls.append({
+            "start": start,
+            "end": end,
+            "attributions_by_order": dict(attributions_by_order),
+        })
+        if self.fail_once:
+            self.fail_once = False
+            raise RuntimeError("broker unavailable")
+        return {"account_id": self.account_id, "orders_seen": 0, "fills": []}
+
+
+class BlockingCycleClient(RecordingCycleClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_fetch_started = threading.Event()
+        self.second_fetch_started = threading.Event()
+        self.release_first_fetch = threading.Event()
+
+    def fetch_fills(
+        self,
+        *,
+        start: str,
+        end: str,
+        attributions_by_order: dict[str, dict[str, object]],
+    ) -> dict[str, object]:
+        result = super().fetch_fills(
+            start=start,
+            end=end,
+            attributions_by_order=attributions_by_order,
+        )
+        if len(self.calls) == 1:
+            self.first_fetch_started.set()
+            assert self.release_first_fetch.wait(timeout=5)
+        else:
+            self.second_fetch_started.set()
+        return result
+
+
+def cycle_kwargs(
+    tmp_path: Path,
+    *,
+    market: str,
+    futu_client: RecordingCycleClient,
+    tiger_client: RecordingCycleClient | None = None,
+) -> dict[str, object]:
+    return {
+        "data_dir": tmp_path / "data",
+        "reports_dir": tmp_path / "reports",
+        "market": market,
+        "as_of_date": "2026-08-08",
+        "generated_at": "2026-08-09T08:00:00+08:00",
+        "process_git_sha": "abc1234",
+        "futu_client": futu_client,
+        "tiger_client": tiger_client,
+    }
+
+
+def test_completed_cycle_is_not_recomputed_without_explicit_force(tmp_path: Path) -> None:
+    client = RecordingCycleClient()
+    kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=client)
+
+    first = run_trend_statistics_cycle(**kwargs)
+    repeated = run_trend_statistics_cycle(**(kwargs | {"process_git_sha": "def5678"}))
+
+    assert first["status"] == "completed"
+    assert repeated["status"] == "already_completed"
+    assert len(client.calls) == 1
+    assert trend_statistics_cycle_path(
+        tmp_path / "data", "CN", "2026-08-08"
+    ).is_file()
+    assert not (tmp_path / "data/trend_api_stats/missed").exists()
+
+
+def test_concurrent_same_cycle_fetches_and_publishes_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = BlockingCycleClient()
+    kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=client)
+    statistics_path = tmp_path / "data/latest/trend_api_stats.json"
+    published_paths: list[Path] = []
+    write_lock = threading.Lock()
+    write_json = trend_api_stats_module._write_json_atomic
+
+    def record_write(path: Path, payload: object) -> None:
+        if path == statistics_path:
+            with write_lock:
+                published_paths.append(path)
+        write_json(path, payload)
+
+    monkeypatch.setattr(trend_api_stats_module, "_write_json_atomic", record_write)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(run_trend_statistics_cycle, **kwargs)
+        assert client.first_fetch_started.wait(timeout=5)
+        second = pool.submit(run_trend_statistics_cycle, **kwargs)
+        assert not client.second_fetch_started.wait(timeout=0.2)
+        client.release_first_fetch.set()
+        results = [first.result(timeout=5), second.result(timeout=5)]
+
+    assert sorted(result["status"] for result in results) == ["already_completed", "completed"]
+    assert len(client.calls) == 1
+    assert published_paths == [statistics_path]
+
+
+def test_force_requires_actor_and_reason(tmp_path: Path) -> None:
+    kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=RecordingCycleClient())
+    run_trend_statistics_cycle(**kwargs)
+
+    with pytest.raises(ValueError, match="force requires actor and reason"):
+        run_trend_statistics_cycle(**kwargs, force=True)
+
+
+def test_failed_forced_refresh_preserves_completed_marker_and_audit(tmp_path: Path) -> None:
+    client = RecordingCycleClient()
+    kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=client)
+    assert run_trend_statistics_cycle(**kwargs)["status"] == "completed"
+    client.fail_once = True
+
+    forced = run_trend_statistics_cycle(
+        **(kwargs | {"process_git_sha": "forced123"}),
+        force=True,
+        actor="ray",
+        reason="repair stale facts",
+    )
+
+    state = json.loads(
+        trend_statistics_cycle_path(tmp_path / "data", "CN", "2026-08-08").read_text(
+            encoding="utf-8"
+        )
+    )
+    repeated = run_trend_statistics_cycle(**kwargs)
+    assert forced["status"] == "failed"
+    assert state["status"] == "completed"
+    assert state["last_forced_failure_at"] == kwargs["generated_at"]
+    assert state["last_forced_failure_actor"] == "ray"
+    assert state["last_forced_failure_reason"] == "repair stale facts"
+    assert state["last_forced_failure_process_git_sha"] == "forced123"
+    assert state["last_forced_failure_error"] == "broker unavailable"
+    assert repeated["status"] == "already_completed"
+    assert len(client.calls) == 2
+
+
+def test_failed_cycle_retries_and_downtime_uses_one_range_request(tmp_path: Path) -> None:
+    client = RecordingCycleClient(fail_once=True)
+    kwargs = cycle_kwargs(
+        tmp_path,
+        market="US",
+        futu_client=client,
+        tiger_client=RecordingCycleClient(account_id="U1"),
+    )
+
+    assert run_trend_statistics_cycle(**kwargs)["status"] == "failed"
+    assert run_trend_statistics_cycle(**kwargs)["status"] == "completed"
+    assert len(client.calls) == 2
+    assert client.calls[-1]["end"] == kwargs["as_of_date"]
+
+
+def test_cycle_cutoffs_are_market_local_closes() -> None:
+    assert trend_statistics_cutoff_at("CN", "2026-08-08") == "2026-08-08T15:00:00+08:00"
+    assert trend_statistics_cutoff_at("HK", "2026-08-08") == "2026-08-08T16:00:00+08:00"
+    assert trend_statistics_cutoff_at("US", "2026-08-08") == "2026-08-08T16:00:00-04:00"
+
+
+def test_market_cycle_publications_are_order_independent(tmp_path: Path) -> None:
+    us_kwargs = cycle_kwargs(
+        tmp_path,
+        market="US",
+        futu_client=RecordingCycleClient(account_id="us-sim"),
+        tiger_client=RecordingCycleClient(account_id="U1"),
+    )
+    assert run_trend_statistics_cycle(**us_kwargs)["status"] == "completed"
+
+    cn_kwargs = cycle_kwargs(
+        tmp_path,
+        market="CN",
+        futu_client=RecordingCycleClient(account_id="cn-sim"),
+    )
+    cn_result = run_trend_statistics_cycle(**cn_kwargs)
+
+    assert cn_result["status"] == "completed"
+    assert cn_result["statistics_cutoff_at"] == "2026-08-08T15:00:00+08:00"
+    artifact = load_trend_api_stats(tmp_path / "data")
+    assert artifact["statistics_cutoff_at"] == "2026-08-08T16:00:00-04:00"
+    assert {source["market"] for source in artifact["sources"]} == {"CN", "US"}
+
+
+def test_range_validation_failure_persists_retryable_cycle_state(tmp_path: Path) -> None:
+    report_path = tmp_path / "reports/trend_a_share/2026-08-08.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text("not json", encoding="utf-8")
+    kwargs = cycle_kwargs(
+        tmp_path,
+        market="CN",
+        futu_client=RecordingCycleClient(account_id="cn-sim"),
+    )
+
+    result = run_trend_statistics_cycle(**kwargs)
+
+    assert result["status"] == "failed"
+    state = json.loads(
+        trend_statistics_cycle_path(tmp_path / "data", "CN", "2026-08-08").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert state["status"] == "failed"
+    assert "frozen trend report is unreadable" in state["reason"]
+
+
+def test_partial_actual_artifact_catches_up_missing_simulation_from_reports(
+    tmp_path: Path,
+) -> None:
+    report = {
+        "execution_date": "2026-01-01",
+        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "strategy_snapshot": {
+            "strategy_id": "trend_animals_warm_to_hot/CN/v1",
+            "strategy_version": "v1",
+            "parameters": {},
+        },
+        "strategy_judgments": {"formal_actions": []},
+    }
+    report_path = tmp_path / "reports/trend_a_share/2026-01-01.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    artifact = build_trend_api_stats_payload(
+        [],
+        strategy_versions=[],
+        generated_at="2026-07-01T16:00:00+08:00",
+        statistics_cutoff_at="2026-07-01T15:00:00+08:00",
+    )
+    artifact["sources"] = [{
+        "source": "actual",
+        "source_id": "actual:eastmoney:eastmoney_main",
+        "broker": "eastmoney",
+        "account_id": "eastmoney_main",
+        "market": "CN",
+        "orders_seen": 0,
+        "fill_count": 0,
+        "statistics_cutoff_at": "2026-07-01T15:00:00+08:00",
+        "status": "available",
+    }]
+    write_trend_api_stats(tmp_path / "data", artifact)
+    client = RecordingCycleClient(account_id="cn-sim")
+
+    result = run_trend_statistics_cycle(
+        **cycle_kwargs(tmp_path, market="CN", futu_client=client)
+    )
+
+    assert result["status"] == "completed"
+    assert len(client.calls) == 1
+    assert client.calls[0]["start"] == "2026-01-01"
+    assert client.calls[0]["end"] == "2026-08-08"
+
+
+def test_cycle_hashes_current_locked_snapshot_without_comparing_stale_sync_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = build_trend_api_stats_payload(
+        [],
+        strategy_versions=[],
+        generated_at="2026-08-09T08:00:00+08:00",
+        statistics_cutoff_at="2026-08-08T15:00:00+08:00",
+    )
+    artifact["sources"] = [{
+        "source": "simulation",
+        "source_id": "simulation:futu:cn-sim",
+        "broker": "futu",
+        "account_id": "cn-sim",
+        "market": "CN",
+        "orders_seen": 0,
+        "fill_count": 0,
+        "statistics_cutoff_at": "2026-08-08T15:00:00+08:00",
+        "status": "available",
+    }]
+    write_trend_api_stats(tmp_path / "data", artifact)
+    monkeypatch.setattr(
+        trend_api_stats_module,
+        "sync_trend_api_stats",
+        lambda **_: {"stale": "concurrent writer result"},
+    )
+
+    result = run_trend_statistics_cycle(
+        **cycle_kwargs(
+            tmp_path, market="CN", futu_client=RecordingCycleClient(account_id="cn-sim")
+        )
+    )
+
+    assert result["status"] == "completed"
+    expected_sha = hashlib.sha256(
+        (tmp_path / "data/latest/trend_api_stats.json").read_bytes()
+    ).hexdigest()
+    assert result["artifact_sha256"] == expected_sha
+
+
+def test_market_cutoff_filters_late_fill_until_later_cycle(tmp_path: Path) -> None:
+    us_kwargs = cycle_kwargs(
+        tmp_path,
+        market="US",
+        futu_client=RecordingCycleClient(account_id="us-sim"),
+        tiger_client=RecordingCycleClient(account_id="U1"),
+    )
+    assert run_trend_statistics_cycle(**us_kwargs)["status"] == "completed"
+
+    late_fill = normalized_fill(
+        "late-cn", "late-cn-order", source="simulation", side="buy",
+        filled_at="2026-08-08T16:00:00+08:00", price="10",
+    ) | {
+        "source_id": "simulation:futu:cn-sim",
+        "account_id": "cn-sim",
+        "market": "CN",
+        "currency": "CNY",
+    }
+
+    class LateFillClient(RecordingCycleClient):
+        def fetch_fills(self, **kwargs: object) -> dict[str, object]:
+            self.calls.append({
+                "start": kwargs["start"],
+                "end": kwargs["end"],
+                "attributions_by_order": dict(kwargs["attributions_by_order"]),
+            })
+            return {
+                "account_id": self.account_id,
+                "orders_seen": 1,
+                "fills": [late_fill],
+            }
+
+    client = LateFillClient(account_id="cn-sim")
+    first = run_trend_statistics_cycle(
+        **cycle_kwargs(tmp_path, market="CN", futu_client=client)
+    )
+    assert first["status"] == "completed"
+    assert all(fill["fill_id"] != "late-cn" for fill in load_trend_api_stats(tmp_path / "data")["fills"])
+
+    second_kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=client) | {
+        "as_of_date": "2026-08-09",
+        "generated_at": "2026-08-09T16:00:00+08:00",
+    }
+    second = run_trend_statistics_cycle(**second_kwargs)
+    assert second["status"] == "completed"
+    assert any(fill["fill_id"] == "late-cn" for fill in load_trend_api_stats(tmp_path / "data")["fills"])
+    assert len(client.calls) == 2

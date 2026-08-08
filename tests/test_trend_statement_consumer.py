@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from open_trader.trend_api_stats import build_trend_api_stats_payload, write_trend_api_stats
+
 
 GENERATION_A = "sha256:" + "a" * 64
 GENERATION_B = "sha256:" + "b" * 64
@@ -320,9 +322,66 @@ def test_trend_failed_facts_processing_keeps_snapshot_identity(
 
     assert result["status"] == "failed"
     assert result["reason"] == "statement_facts_processing_failed"
-    assert result["snapshot_generation"] == SNAPSHOT_GENERATION
     assert result["account_generation"] == ACCOUNT_GENERATION
     assert result["statement_generation"] == GENERATION_A
+
+
+def test_trend_failed_statistics_keeps_prior_artifact_and_retries_accepted_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.trend_statement_consumer as consumer
+
+    write_trend_api_stats(
+        tmp_path / "data",
+        build_trend_api_stats_payload(
+            [],
+            strategy_versions=[],
+            generated_at="2026-08-04T12:00:00+08:00",
+            statistics_cutoff_at="2026-08-04T11:00:00+08:00",
+        ),
+    )
+    artifact_path = tmp_path / "data/latest/trend_api_stats.json"
+    before = artifact_path.read_bytes()
+    monkeypatch.setattr(
+        consumer,
+        "fetch_account_snapshot",
+        lambda *_args: _snapshot(GENERATION_A),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        consumer,
+        "fetch_statement_trade_facts",
+        lambda *_args: _facts(GENERATION_A),
+        raising=False,
+    )
+    real_build = consumer.build_statement_actual_stats_payload
+    attempts = 0
+
+    def fail_once(**kwargs: object) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ValueError("statistics validation failed")
+        return real_build(**kwargs)
+
+    monkeypatch.setattr(
+        consumer, "build_statement_actual_stats_payload", fail_once, raising=False
+    )
+
+    failed = _consume(tmp_path)
+
+    assert failed == {
+        "schema_version": "open_trader.trend.statement_consumption.v1",
+        "status": "failed",
+        "broker": "phillips",
+        "statement_generation": GENERATION_A,
+        "account_generation": ACCOUNT_GENERATION,
+        "attempted_at": "2026-08-04T12:00:00+08:00",
+        "reason": "statement_facts_processing_failed",
+    }
+    assert artifact_path.read_bytes() == before
+    assert _consume(tmp_path)["status"] == "consumed"
+    assert attempts == 2
 
 
 def test_trend_already_consumed_preserves_http_snapshot_identity(

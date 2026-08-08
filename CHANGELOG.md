@@ -18,6 +18,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   CLI。飞书终态/事故通知失败不会中断当前对账，但会暂停后续自动入场；通知就绪是 arm
   的前置条件。验证：最终以完整聚焦套件、prediction-market e2e 与 `make acceptance`
   的结果为准。
+- Trend statistics now refresh once per natural market cycle inside the existing market controllers; reports remain independent and use the last accepted statistics snapshot on failure.
+- CN/HK accepted statements update only their own actual statistics, Kelly remains simulation-only, and Dashboard exposes independent counts, cutoffs, exclusions, and refresh status.
 - 预测市场 YES/NO 页移除「当前监控范围」事件列表，主内容只保留「套利信号」（仍含
   交易与合并/事故 tab），24h 成交量移入套利信号表格新列（数据来自既有 signals 表，
   无后端改动）；跨所 YES/NO 漏斗与「可下单候选」保留，且候选列表只展示

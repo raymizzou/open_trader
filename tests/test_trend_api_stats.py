@@ -2,15 +2,21 @@ from __future__ import annotations
 
 from copy import deepcopy
 from decimal import Decimal, getcontext
+import hashlib
 
 import pytest
 
 from open_trader.trend_api_stats import (
+    build_statement_actual_stats_payload,
     build_trend_api_stats_payload,
     eligible_simulation_rounds,
     load_trend_api_stats,
+    read_trend_api_stats_snapshot,
+    trend_statistics_disposition,
     strategy_payoff_ratio,
+    write_trend_api_stats,
 )
+from open_trader.trend_kelly import calculate_trend_kelly, trend_kelly_rounds_from_payload
 
 
 def fill(
@@ -108,6 +114,105 @@ def _cn_closed_pair(
                 "statement_sequence": 1,
             })
     return pair
+
+
+def _phillips_closed_pair(label: str, version: str) -> list[dict[str, object]]:
+    return [{
+        **item,
+        "source_id": "actual:phillips:phillips_main",
+        "broker": "phillips",
+        "account_id": "phillips_main",
+        "market": "HK",
+        "currency": "HKD",
+        "strategy_id": f"trend_animals_warm_to_hot/HK/{version}",
+        "filled_at": item["filled_at"].replace("15:00:00", "16:00:00"),
+    } for item in _cn_closed_pair(label, version, source="actual")]
+
+
+def test_eastmoney_rebuild_changes_only_cn_actual_statement_period(
+    tmp_path: Path,
+) -> None:
+    simulated = _cn_closed_pair("simulated", "v8", source="simulation")
+    eastmoney = _cn_closed_pair("eastmoney", "v8", source="actual")
+    phillips = _phillips_closed_pair("phillips", "v8")
+    for item in [*eastmoney, *phillips]:
+        item["statement_period"] = "2026-07"
+    before = build_trend_api_stats_payload(
+        [*simulated, *eastmoney, *phillips],
+        strategy_versions=[
+            {"market": "CN", "strategy_id": "trend_animals_warm_to_hot/CN/v8", "strategy_version": "v8"},
+            {"market": "HK", "strategy_id": "trend_animals_warm_to_hot/HK/v8", "strategy_version": "v8"},
+        ],
+        generated_at="2026-08-08T18:00:00+08:00",
+        statistics_cutoff_at="2026-08-08T16:00:00+08:00",
+    )
+    write_trend_api_stats(tmp_path / "data", before)
+    replacement = _cn_closed_pair("eastmoney-replacement", "v8", source="actual")
+    for item in replacement:
+        item["statement_period"] = "2026-07"
+
+    payload = build_statement_actual_stats_payload(
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        broker="eastmoney",
+        statement_period="2026-07",
+        fills=replacement,
+        generated_at="2026-08-08T18:00:00+08:00",
+        statistics_cutoff_at="2026-07-31T15:00:00+08:00",
+    )
+
+    assert [item for item in payload["fills"] if item["broker"] == "phillips"] == [
+        item for item in before["fills"] if item["broker"] == "phillips"
+    ]
+    assert [item for item in payload["fills"] if item["broker"] == "futu"] == [
+        item for item in before["fills"] if item["broker"] == "futu"
+    ]
+    assert [item["fill_id"] for item in payload["fills"] if item["broker"] == "eastmoney"] == [
+        item["fill_id"] for item in replacement
+    ]
+
+
+def test_phillips_rebuild_changes_only_hk_actual_statement_period(
+    tmp_path: Path,
+) -> None:
+    simulated = _cn_closed_pair("simulated", "v8", source="simulation")
+    eastmoney = _cn_closed_pair("eastmoney", "v8", source="actual")
+    phillips = _phillips_closed_pair("phillips", "v8")
+    for item in [*eastmoney, *phillips]:
+        item["statement_period"] = "2026-07"
+    before = build_trend_api_stats_payload(
+        [*simulated, *eastmoney, *phillips],
+        strategy_versions=[
+            {"market": "CN", "strategy_id": "trend_animals_warm_to_hot/CN/v8", "strategy_version": "v8"},
+            {"market": "HK", "strategy_id": "trend_animals_warm_to_hot/HK/v8", "strategy_version": "v8"},
+        ],
+        generated_at="2026-08-08T18:00:00+08:00",
+        statistics_cutoff_at="2026-08-08T16:00:00+08:00",
+    )
+    write_trend_api_stats(tmp_path / "data", before)
+    replacement = _phillips_closed_pair("phillips-replacement", "v8")
+    for item in replacement:
+        item["statement_period"] = "2026-07"
+
+    payload = build_statement_actual_stats_payload(
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        broker="phillips",
+        statement_period="2026-07",
+        fills=replacement,
+        generated_at="2026-08-08T18:00:00+08:00",
+        statistics_cutoff_at="2026-07-31T16:00:00+08:00",
+    )
+
+    assert [item for item in payload["fills"] if item["broker"] == "eastmoney"] == [
+        item for item in before["fills"] if item["broker"] == "eastmoney"
+    ]
+    assert [item for item in payload["fills"] if item["broker"] == "futu"] == [
+        item for item in before["fills"] if item["broker"] == "futu"
+    ]
+    assert [item["fill_id"] for item in payload["fills"] if item["broker"] == "phillips"] == [
+        item["fill_id"] for item in replacement
+    ]
 
 
 @pytest.mark.parametrize(
@@ -882,3 +987,92 @@ def test_artifact_load_reports_missing_and_unreadable_files_as_validation_errors
 
     with pytest.raises(ValueError, match="invalid JSON"):
         load_trend_api_stats(tmp_path)
+
+
+def test_artifact_loaders_reject_utf8_bom_as_invalid_json(tmp_path) -> None:
+    path = tmp_path / "latest/trend_api_stats.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xef\xbb\xbf{}")
+
+    for loader in (load_trend_api_stats, read_trend_api_stats_snapshot):
+        with pytest.raises(ValueError, match="trend_api_stats.json is invalid JSON"):
+            loader(tmp_path)
+
+
+def test_snapshot_loader_returns_hash_of_exact_bytes(tmp_path) -> None:
+    payload = build_trend_api_stats_payload(
+        [],
+        strategy_versions=[],
+        generated_at="2026-08-08T17:00:00-04:00",
+        statistics_cutoff_at="2026-08-08T16:00:00-04:00",
+    )
+    path = write_trend_api_stats(tmp_path, payload)
+    raw = path.read_bytes()
+
+    loaded, digest = read_trend_api_stats_snapshot(tmp_path)
+
+    assert loaded == payload
+    assert digest == hashlib.sha256(raw).hexdigest()
+
+
+def test_statistics_disposition_conserves_every_candidate() -> None:
+    actual = {
+        "source": "actual", "broker": "tiger", "account_id": "U1",
+        "strategy_id": "trend_animals_warm_to_hot/US/v8",
+        "strategy_version": "v8",
+    }
+    payload = build_trend_api_stats_payload(
+        [
+            fill("eligible-buy", side="buy", quantity="1", price="10", fee="0.1", filled_at="2026-08-04T10:00:00-04:00", **actual),
+            fill("eligible-sell", side="sell", quantity="1", price="12", fee="0.1", filled_at="2026-08-05T10:00:00-04:00", **actual),
+            fill("manual-buy", side="buy", quantity="1", price="10", fee="0.1", filled_at="2026-08-06T10:00:00-04:00", source="actual", broker="tiger", account_id="U1", strategy_id="", strategy_version="", attribution_status="outside_strategy", exclusion_reason="no_matching_opening_strategy_action"),
+            fill("manual-sell", side="sell", quantity="1", price="11", fee="0.1", filled_at="2026-08-07T10:00:00-04:00", source="actual", broker="tiger", account_id="U1", strategy_id="", strategy_version="", attribution_status="outside_strategy", exclusion_reason="no_matching_opening_strategy_action"),
+            fill("still-open", side="buy", quantity="1", price="9", fee="0.1", filled_at="2026-08-08T10:00:00-04:00", **actual),
+        ],
+        strategy_versions=[{"market": "US", "strategy_id": "trend_animals_warm_to_hot/US/v8", "strategy_version": "v8"}],
+        generated_at="2026-08-08T17:00:00-04:00",
+        statistics_cutoff_at="2026-08-08T16:00:00-04:00",
+    )
+    payload["sources"] = [{
+        "source": "actual", "source_id": "actual:tiger:U1", "broker": "tiger",
+        "account_id": "U1", "market": "US", "orders_seen": 5, "fill_count": 5,
+        "statistics_cutoff_at": "2026-08-08T16:00:00-04:00", "status": "available",
+    }]
+
+    result = trend_statistics_disposition(payload, market="US", strategy_id="trend_animals_warm_to_hot/US/v8", opening_strategy_version="v8", source="actual")
+
+    assert result["eligible_sample_count"] == 1
+    assert result["excluded_candidate_count"] == 1
+    assert result["incomplete_open_candidate_count"] == 1
+    assert result["discovered_candidate_count"] == 3
+    assert result["discovered_candidate_count"] == result["eligible_sample_count"] + result["excluded_candidate_count"] + result["incomplete_open_candidate_count"]
+    assert result["exclusion_reasons"] == [{"reason": "no_matching_opening_strategy_action", "count": 1}]
+
+
+def test_simulation_disposition_count_equals_calculate_trend_kelly_eligible_count() -> None:
+    def pair(label: str, version: str, buy_at: str, sell_at: str) -> list[dict[str, object]]:
+        entries = [
+            fill(f"{label}-buy", side="buy", quantity="1", price="10", fee="0", filled_at=buy_at, strategy_id=f"trend_animals_warm_to_hot/US/{version}", strategy_version=version),
+            fill(f"{label}-sell", side="sell", quantity="1", price="11", fee="0", filled_at=sell_at, strategy_id=f"trend_animals_warm_to_hot/US/{version}", strategy_version=version),
+        ]
+        for entry in entries:
+            entry["symbol"] = label
+        return entries
+
+    payload = build_trend_api_stats_payload(
+        [*pair("V4", "v4", "2026-08-04T10:00:00-04:00", "2026-08-05T10:00:00-04:00"), *pair("V8", "v8", "2026-08-06T10:00:00-04:00", "2026-08-07T10:00:00-04:00")],
+        strategy_versions=[{"market": "US", "strategy_id": "trend_animals_warm_to_hot/US/v8", "strategy_version": "v8"}],
+        generated_at="2026-08-08T17:00:00-04:00",
+        statistics_cutoff_at="2026-08-08T16:00:00-04:00",
+    )
+    payload["sources"] = [{
+        "source": "simulation", "source_id": "simulation:futu:101", "broker": "futu",
+        "account_id": "101", "market": "US", "orders_seen": 4, "fill_count": 4,
+        "statistics_cutoff_at": "2026-08-08T16:00:00-04:00", "status": "available",
+    }]
+
+    disposition = trend_statistics_disposition(payload, market="US", strategy_id="trend_animals_warm_to_hot/US/v8", opening_strategy_version="v8", source="simulation")
+
+    assert disposition["eligible_sample_count"] == calculate_trend_kelly(
+        trend_kelly_rounds_from_payload(payload), market="US", strategy_id="trend_animals_warm_to_hot/US/v8", opening_strategy_version="v8",
+    ).eligible_sample_count

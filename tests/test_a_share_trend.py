@@ -56,6 +56,10 @@ from open_trader.trend_animals import (
     TrendAnimalsNoCurrentRowsError,
 )
 from open_trader.trend_kelly import TrendKellyRound
+from open_trader.trend_api_stats import (
+    build_trend_api_stats_payload,
+    write_trend_api_stats,
+)
 from open_trader.strategy_drawdown import automatic_bootstrap_strategy_drawdown
 from open_trader.trend_industry_context import IndustryContext
 from open_trader.trend_industry_context import _context_to_mapping
@@ -1013,7 +1017,7 @@ def test_new_report_construction_and_serialization_require_account_input() -> No
         trend_module._report_payload(replace(report(), account_input={}))
 
 
-def test_rotation_keeps_the_ordinary_risk_data_gate() -> None:
+def test_rotation_ignores_display_only_kelly_unavailability() -> None:
     held_symbols = tuple(f"10{index:04d}" for index in range(10))
     strategy = trend_module.live_trend_strategy_snapshot(
         "CN", "abc123", (622466, 697199),
@@ -1034,9 +1038,9 @@ def test_rotation_keeps_the_ordinary_risk_data_gate() -> None:
             ),
             exceptions=(),
         ),
-        candidates=[candidate("200001", global_strength="90")],
+        candidates=[candidate("200001", strength="100")],
         holding_snapshots={
-            symbol: holding(symbol, global_strength="10")
+            symbol: holding(symbol, strength="10")
             for symbol in held_symbols
         },
         bars_by_symbol={symbol: bars() for symbol in held_symbols},
@@ -1054,8 +1058,30 @@ def test_rotation_keeps_the_ordinary_risk_data_gate() -> None:
         drawdown_summary=active_drawdown_for(strategy, equity="100000"),
     )
 
-    assert built.risk_summary["status"] == "paused"
-    assert built.simulate_rotation_pairs == ()
+    assert built.risk_summary["status"] == "active"
+    assert len(built.simulate_rotation_pairs) == 1
+    assert built.simulate_rotation_comparisons[0].outcome == "planned"
+
+    blocked = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=built.account,
+        candidates=[candidate("200001", strength="100")],
+        holding_snapshots={
+            symbol: holding(symbol, strength="10")
+            for symbol in held_symbols
+        },
+        bars_by_symbol={symbol: bars() for symbol in held_symbols},
+        prior_state=built.protection_state,
+        kelly_data_reason="frozen Kelly inputs unavailable",
+        critical_data_reason="independent risk inputs unavailable",
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    assert blocked.risk_summary["status"] == "paused"
+    assert blocked.simulate_rotation_pairs == ()
+    assert blocked.simulate_rotation_comparisons[0].outcome == "sizing_blocked"
 
 
 def test_cold_start_without_allocation_never_plans_rotation() -> None:
@@ -3669,7 +3695,7 @@ def test_v3_payload_rejects_kelly_cap_action_mismatch() -> None:
         trend_module._report_payload(replace(built, risk_summary=summary))
 
 
-def test_v3_corrupt_stats_reason_pauses_entries_visibly() -> None:
+def test_v3_corrupt_stats_use_fixed_risk_and_remain_visible() -> None:
     built = build_report(
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
@@ -3692,11 +3718,13 @@ def test_v3_corrupt_stats_reason_pauses_entries_visibly() -> None:
         ),
     )
 
-    assert built.buy_actions == ()
-    assert built.risk_summary["status"] == "paused"
+    assert len(built.buy_actions) == 1
+    assert built.buy_actions[0].target_weight == Decimal("0.04")
+    assert built.risk_summary["status"] == "active"
+    assert built.risk_summary["pause_reason"] == ""
     assert built.risk_summary["kelly_phase"] == "unavailable"
     assert built.risk_summary["kelly_cap"] is None
-    assert built.risk_summary["kelly_reason"] == built.risk_summary["pause_reason"]
+    assert "trend_api_stats.json schema_version" in built.risk_summary["kelly_reason"]
     assert "trend_api_stats.json schema_version" in render_markdown(built)
 
 
@@ -7129,7 +7157,7 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     assert "忽略旧成分 1 条：NUVL（2026-07-14）" in payload["api_facts"]
     assert payload["metadata"]["run_date"] == "2026-07-14"
     assert payload["strategy_snapshot"]["strategy_version"] == "v8"
-    assert payload["risk_summary"]["kelly_phase"] == "cold_start"
+    assert payload["risk_summary"]["kelly_phase"] == "unavailable"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
     assert payload["risk_summary"]["kelly_cap"] is None
     audit = payload["signal_snapshots"]["candidates"]
@@ -7712,13 +7740,14 @@ def test_frozen_2026_07_31_paid_scope_ledger() -> None:
     )
 
 
-def test_report_runner_turns_corrupt_kelly_stats_into_visible_entry_pause(
+def test_corrupt_statistics_keeps_report_active_with_fixed_risk(
     tmp_path: Path,
 ) -> None:
     cfg = trend_config(tmp_path)
     stats = cfg.data_dir / "latest/trend_api_stats.json"
     stats.parent.mkdir(parents=True, exist_ok=True)
     stats.write_text('{"schema_version":"broken","rounds":[]}', encoding="utf-8")
+    unlock_live_drawdown(cfg.data_dir, strategy_version="v10")
 
     result = run_a_share_trend_report(
         config=cfg,
@@ -7730,11 +7759,88 @@ def test_report_runner_turns_corrupt_kelly_stats_into_visible_entry_pause(
 
     assert result.json_path is not None
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
-    assert payload["strategy_judgments"]["formal_actions"] == []
     assert payload["risk_summary"]["kelly_phase"] == "unavailable"
-    assert payload["risk_summary"]["status"] == "paused"
-    assert "trend_api_stats.json" in payload["risk_summary"]["pause_reason"]
-    assert "schema_version" in payload["risk_summary"]["pause_reason"]
+    assert payload["risk_summary"]["status"] == "active"
+    assert payload["risk_summary"]["pause_reason"] == ""
+    assert payload["metadata"]["trend_statistics"] == {
+        "status": "unavailable",
+        "artifact_sha256": None,
+        "statistics_cutoff_at": None,
+        "eligible_sample_count": 0,
+        "selected_sample_count": 0,
+    }
+
+
+def test_report_freezes_statistics_artifact_and_sample_counts(tmp_path: Path) -> None:
+    cfg = trend_config(tmp_path)
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199), execution_date="2026-07-15"
+    )
+    common = {
+        "source": "simulation",
+        "source_id": "simulation:futu:101",
+        "broker": "futu",
+        "account_id": "101",
+        "market": "CN",
+        "symbol": "600001",
+        "currency": "CNY",
+        "quantity": "100",
+        "fee": "0",
+        "costs_complete": True,
+        "strategy_id": strategy["strategy_id"],
+        "strategy_version": strategy["strategy_version"],
+        "normal_cost_rate": "0.001",
+        "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+        "report_sha256": "a" * 64,
+        "attribution_status": "attributed",
+        "exclusion_reason": "",
+    }
+    stats_payload = build_trend_api_stats_payload(
+        [
+            {
+                **common,
+                "fill_id": "buy-1",
+                "order_id": "buy-order-1",
+                "side": "buy",
+                "price": "10",
+                "filled_at": "2026-07-13T10:00:00+08:00",
+            },
+            {
+                **common,
+                "fill_id": "sell-1",
+                "order_id": "sell-order-1",
+                "side": "sell",
+                "price": "11.011",
+                "filled_at": "2026-07-13T14:00:00+08:00",
+            },
+        ],
+        strategy_versions=[{
+            "market": "CN",
+            "strategy_id": strategy["strategy_id"],
+            "strategy_version": strategy["strategy_version"],
+        }],
+        generated_at="2026-07-14T15:01:00+08:00",
+        statistics_cutoff_at="2026-07-14T15:00:00+08:00",
+    )
+    stats_path = write_trend_api_stats(cfg.data_dir, stats_payload)
+    unlock_live_drawdown(cfg.data_dir, strategy_version="v10")
+
+    result = run_a_share_trend_report(
+        config=cfg,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert payload["metadata"]["trend_statistics"] == {
+        "status": "available",
+        "artifact_sha256": hashlib.sha256(stats_path.read_bytes()).hexdigest(),
+        "statistics_cutoff_at": "2026-07-14T15:00:00+08:00",
+        "eligible_sample_count": 1,
+        "selected_sample_count": 1,
+    }
 
 
 def test_missing_industry_row_excludes_only_affected_candidate(

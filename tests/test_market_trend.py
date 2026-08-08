@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -1044,9 +1045,16 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
         for snapshot in holding_context_snapshots
     )
     assert payload["strategy_snapshot"]["strategy_version"] == "v4"
-    assert payload["risk_summary"]["kelly_phase"] == "cold_start"
+    assert payload["risk_summary"]["kelly_phase"] == "unavailable"
     assert payload["risk_summary"]["kelly_eligible_sample_count"] == 0
     assert payload["risk_summary"]["kelly_cap"] is None
+    assert payload["metadata"]["trend_statistics"] == {
+        "status": "unavailable",
+        "artifact_sha256": None,
+        "statistics_cutoff_at": None,
+        "eligible_sample_count": 0,
+        "selected_sample_count": 0,
+    }
     assert payload["estimated_api_cost"] == "0.150"
     assert payload["industry_contexts"][0]["aggregate_right_count_ratio"] == "0.191"
     assert payload["industry_contexts"][0]["aggregate_right_market_cap_ratio"] == "0.650"
@@ -1099,7 +1107,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
         ),
     ],
 )
-def test_current_market_report_fail_closes_below_warm_industry_data_from_buy_views(
+def test_corrupt_statistics_do_not_weaken_current_market_industry_gate(
     tmp_path: Path,
     market: str,
     run_date: str,
@@ -1111,6 +1119,11 @@ def test_current_market_report_fail_closes_below_warm_industry_data_from_buy_vie
     expected_reason: str,
 ) -> None:
     cfg = config(tmp_path)
+    stats_path = cfg.data_dir / "latest/trend_api_stats.json"
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    stats_path.write_text(
+        '{"schema_version":"broken","rounds":[]}', encoding="utf-8"
+    )
     unlock_live_drawdown(cfg.data_dir, market, version="v8")
     industry_calls: list[dict[str, object]] = []
     mapping_calls: list[dict[str, object]] = []
@@ -1244,6 +1257,17 @@ def test_current_market_report_fail_closes_below_warm_industry_data_from_buy_vie
     }
     judgments = payload["strategy_judgments"]
     assert payload["strategy_snapshot"]["strategy_version"] == "v8"
+    assert payload["risk_summary"]["kelly_phase"] == "unavailable"
+    assert payload["metadata"]["trend_statistics"]["status"] == "unavailable"
+    assert (payload["risk_summary"]["status"] == "paused") is industry_error
+    evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
+    replayed = trend_review.rebuild_trend_report_from_evidence(
+        json.loads(evidence_path.read_text(encoding="utf-8"))
+    )
+    assert replayed["risk_summary"] == payload["risk_summary"]
+    assert replayed["metadata"]["trend_statistics"] == (
+        payload["metadata"]["trend_statistics"]
+    )
     assert payload["excluded"][symbol] == [expected_reason]
     assert judgments["formal_actions"] == []
     assert judgments["risk_skips"] == []
@@ -1439,7 +1463,7 @@ def test_account_snapshot_does_not_change_us_simulation_report(
         generated_at="2026-07-15T00:00:00+00:00",
         statistics_cutoff_at="2026-07-14T23:59:59+00:00",
     )
-    write_trend_api_stats(cfg.data_dir, stats_payload)
+    stats_path = write_trend_api_stats(cfg.data_dir, stats_payload)
     unlock_live_drawdown(cfg.data_dir, "US")
     write_protection_state(
         market_paths(cfg.data_dir, cfg.reports_dir, "US").state,
@@ -1636,6 +1660,13 @@ def test_account_snapshot_does_not_change_us_simulation_report(
     assert payload["risk_summary"]["pause_reason"] == (
         "Kelly 上限为 0，仅暂停未来新开仓"
     )
+    assert payload["metadata"]["trend_statistics"] == {
+        "status": "available",
+        "artifact_sha256": hashlib.sha256(stats_path.read_bytes()).hexdigest(),
+        "statistics_cutoff_at": "2026-07-14T23:59:59+00:00",
+        "eligible_sample_count": 30,
+        "selected_sample_count": 30,
+    }
     assert payload["strategy_judgments"]["holding_decisions"][0]["action"] == "HOLD"
     evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
@@ -1648,6 +1679,9 @@ def test_account_snapshot_does_not_change_us_simulation_report(
         "strategy_snapshot",
     ):
         assert replayed[key] == payload[key]
+    assert replayed["metadata"]["trend_statistics"] == (
+        payload["metadata"]["trend_statistics"]
+    )
     assert replayed["strategy_judgments"] == payload["strategy_judgments"]
     tampered_evidence = json.loads(json.dumps(evidence))
     tampered_evidence["rebuild_inputs"]["kelly_rounds"][-1][

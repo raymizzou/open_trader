@@ -8495,6 +8495,11 @@ def test_dashboard_trend_review_is_compact_exact_and_account_scoped() -> None:
 const review=(broker,brokerLabel,market,marketLabel)=>({
   available:true,broker,broker_label:brokerLabel,market,market_label:marketLabel,
   sample_counts:{discipline:31,actual:29,required:30},common_cutoff:"2026-07-17",
+  sample_details:{
+    discipline:{available:true,eligible_sample_count:31,discovered_candidate_count:31,excluded_candidate_count:0,incomplete_open_candidate_count:0,exclusion_reasons:[],statistics_cutoff_at:"2026-07-17T16:00:00+08:00",reason:""},
+    actual:{available:true,eligible_sample_count:29,discovered_candidate_count:29,excluded_candidate_count:0,incomplete_open_candidate_count:0,exclusion_reasons:[],statistics_cutoff_at:"2026-07-17T16:00:00+08:00",reason:""},
+  },sample_cutoffs:{discipline:"2026-07-17T16:00:00+08:00",actual:"2026-07-17T16:00:00+08:00"},
+  metric_cutoffs:{discipline:"2026-07-17",actual:"2026-07-17"},statistics_status:"completed",
   strategy_snapshot:{strategy_id:`trend/${market}/v1`,strategy_name:`${marketLabel}短线右侧趋势`,
     strategy_version:"v1",process_version:"abc1234",parameters:{position_limit:10},
     parameter_rows:[
@@ -8502,11 +8507,11 @@ const review=(broker,brokerLabel,market,marketLabel)=>({
       {group:"退出保护",name:"初始保护线",value:"成交均价减 2.0 倍 ATR14"},
     ]},
   metrics:{
-    period_net_return:{discipline:{value:"12.6",reason:null},actual:{value:"9.4",reason:null},benchmark:{value:"7.8",reason:null}},
-    market_excess_return:{discipline:{value:"4.8",reason:null},actual:{value:"1.6",reason:null},benchmark:{value:"0",reason:null}},
-    max_drawdown:{discipline:{value:"-8.9",reason:null},actual:{value:"-10.2",reason:null},benchmark:{value:"-12.2",reason:null}},
-    calmar:{discipline:{value:"1.42",reason:null},actual:{value:"0.92",reason:null},benchmark:{value:"0.64",reason:null}},
-    sharpe:{discipline:{value:"1.07",reason:null},actual:{value:null,reason:"实际执行日终净值缺失"},benchmark:{value:"0.58",reason:null}},
+    period_net_return:{discipline:{value:"12.6",reason:null},actual:{value:"9.4",reason:null},discipline_benchmark:{value:"7.8",reason:null},actual_benchmark:{value:"7.8",reason:null}},
+    market_excess_return:{discipline:{value:"4.8",reason:null},actual:{value:"1.6",reason:null},discipline_benchmark:{value:"0",reason:null},actual_benchmark:{value:"0",reason:null}},
+    max_drawdown:{discipline:{value:"-8.9",reason:null},actual:{value:"-10.2",reason:null},discipline_benchmark:{value:"-12.2",reason:null},actual_benchmark:{value:"-12.2",reason:null}},
+    calmar:{discipline:{value:"1.42",reason:null},actual:{value:"0.92",reason:null},discipline_benchmark:{value:"0.64",reason:null},actual_benchmark:{value:"0.64",reason:null}},
+    sharpe:{discipline:{value:"1.07",reason:null},actual:{value:null,reason:"实际执行日终净值缺失"},discipline_benchmark:{value:"0.58",reason:null},actual_benchmark:{value:"0.58",reason:null}},
   },
 });
 state.dashboard={trend_reports:{
@@ -8559,7 +8564,7 @@ for (const panel of panels) {
   if ((panel.match(/>同期市场</g)||[]).length!==5) throw new Error(panel);
 }
 const noCutoff=renderTrendReviewWorkspace({...state.dashboard.trend_reviews.eastmoney,common_cutoff:null});
-if (!noCutoff.includes("共同截止日 暂无")) throw new Error(noCutoff);
+if (noCutoff.includes("共同截止日")) throw new Error(noCutoff);
 for (const forbidden of ["复盘结论","运行状态","创建回测","导出参数","缺陷入口","Connected","Backtest","Sharpe","Calmar","Alpha","Beta","Sortino","胜率","盈亏比"]) {
   if (html.includes(forbidden)) throw new Error(forbidden+"\n"+html);
 }
@@ -8569,6 +8574,54 @@ console.log("ok");
     assert "ok" in output
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
     assert ".trend-review-parameter" not in css
+
+
+def test_dashboard_trend_review_renders_independent_statistics_status() -> None:
+    output = run_dashboard_js(r'''
+const detail=(eligible,discovered,excluded,open,cutoff,reasons=[])=>({
+  available:true,eligible_sample_count:eligible,discovered_candidate_count:discovered,
+  excluded_candidate_count:excluded,incomplete_open_candidate_count:open,
+  exclusion_reasons:reasons,statistics_cutoff_at:cutoff,reason:"",
+});
+const review={
+  available:true,broker:"eastmoney",broker_label:"东方财富",market:"CN",market_label:"A股",
+  statistics_status:"failed",statistics_reason:"broker unavailable",statistics_as_of_date:"2026-08-08",
+  sample_counts:{discipline:4,actual:null,required:30},
+  sample_details:{
+    discipline:detail(4,9,4,1,"2026-08-08T15:00:00+08:00",[{reason:"costs_incomplete",count:4}]),
+    actual:{available:false,eligible_sample_count:0,discovered_candidate_count:0,
+      excluded_candidate_count:0,incomplete_open_candidate_count:0,exclusion_reasons:[],
+      statistics_cutoff_at:"",reason:"matching_source_audit_absent"},
+  },
+  sample_cutoffs:{discipline:"2026-08-08T15:00:00+08:00",actual:null},
+  metric_cutoffs:{discipline:"2026-08-08",actual:null},common_cutoff:null,
+  strategy_snapshot:{strategy_id:"trend/CN/v1",strategy_name:"A股短线右侧趋势",
+    strategy_version:"v1",process_version:"abc1234",parameters:{},parameter_rows:[{group:"仓位",name:"上限",value:"10"}]},
+  metrics:Object.fromEntries(TREND_REVIEW_METRICS.map(({key})=>[key,{
+    discipline:{value:"12.6",reason:null},actual:{value:null,reason:"实际执行日终净值缺失"},
+    discipline_benchmark:{value:"7.8",reason:null},actual_benchmark:{value:"3.1",reason:null},
+  }])),
+};
+const html=renderTrendReviewWorkspace(review);
+for (const text of [
+  "纪律模拟 4 / 30，数据不足","实际执行 数据不可用","发现 9 · 排除 4 · 未闭环 1",
+  "统计截至 2026-08-08T15:00:00+08:00","指标截至 2026-08-08",
+  "排除原因 成本不完整 4","统计来源不可用","实际执行日终净值缺失",
+  "统计刷新失败；报告继续使用上一个有效快照",
+]) if (!html.includes(text)) throw new Error(text+"\n"+html);
+if (html.includes("共同截止日")) throw new Error(html);
+const panels=html.match(/<figure class="trend-review-comparison"[\s\S]*?<\/figure>/g)||[];
+if (panels.length!==2) throw new Error(html);
+if (!panels[0].includes("7.8%") || panels[0].includes("3.1%")) throw new Error(panels[0]);
+if (!panels[1].includes("3.1%") || panels[1].includes("7.8%")) throw new Error(panels[1]);
+if ((html.match(/data-close-trend-report/g)||[]).length!==1) throw new Error(html);
+if (html.match(/<button/g).length!==1) throw new Error(html);
+const stale=renderTrendReviewWorkspace({...review,statistics_status:"stale"});
+if (!stale.includes("统计快照已过期；报告继续使用上一个有效快照")) throw new Error(stale);
+console.log("ok");
+''')
+
+    assert "ok" in output
 
 
 def test_dashboard_renders_action_first_trend_report_for_every_market() -> None:

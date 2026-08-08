@@ -44,7 +44,7 @@ from .trend_kelly import (
     TrendKellyRound,
     TrendKellyState,
     calculate_trend_kelly,
-    load_trend_kelly_rounds,
+    load_trend_kelly_evidence,
 )
 from .trend_industry_context import (
     IndustryContext,
@@ -444,7 +444,6 @@ def valid_v3_risk_contract(
             and selected == 0
             and cap_raw is None
             and bool(reason)
-            and summary.get("status") == "paused"
             and not last_closed_at
         )
     if cap is None or cap > Decimal("0.25"):
@@ -4948,6 +4947,7 @@ def build_report(
     strategy_snapshot: Mapping[str, object] | None = None,
     kelly_rounds: Sequence[TrendKellyRound] = (),
     kelly_data_reason: str = "",
+    critical_data_reason: str = "",
     drawdown_summary: Mapping[str, object] | None = None,
     industry_contexts: Sequence[IndustryContext] = (),
     industry_context_status: Mapping[str, object] | None = None,
@@ -5174,14 +5174,16 @@ def build_report(
         risk_skips: list[dict[str, object]] = []
         risk_summary: dict[str, object] = {}
     else:
-        existing_planned_risk, critical_data_reason = _post_sell_planned_risk(
+        existing_planned_risk, inferred_critical_data_reason = _post_sell_planned_risk(
             account=account,
             holdings=holdings,
             sell_symbols=sell_symbols,
             price_fx_to_account_currency=price_fx_to_account_currency,
             normal_cost_rate=normal_cost_rate,
         )
-        critical_data_reason = critical_data_reason or kelly_data_reason
+        critical_data_reason = (
+            critical_data_reason or inferred_critical_data_reason
+        )
         buy_actions, risk_skips, risk_summary = _plan_buy_actions(
             ranked=candidate_decision.eligible,
             net_value=account.net_value,
@@ -5336,7 +5338,7 @@ def build_report(
             normal_cost_rate=normal_cost_rate,
             cn_target_weights=cn_target_weights,
             kelly_state=kelly_state,
-            critical_data_reason=kelly_data_reason,
+            critical_data_reason=critical_data_reason,
             require_mapping=symbol_mapping_required,
             excluded_sell_symbols=(),
         )
@@ -5388,7 +5390,7 @@ def build_report(
                 normal_cost_rate=normal_cost_rate,
                 cn_target_weights=cn_target_weights,
                 kelly_state=kelly_state,
-                critical_data_reason=kelly_data_reason,
+                critical_data_reason=critical_data_reason,
                 require_mapping=symbol_mapping_required,
                 excluded_sell_symbols=tuple(real_blocked_symbols),
                 cash_unconstrained=True,
@@ -5506,6 +5508,18 @@ def build_report(
             **dict(metadata or {}),
             "position_weight": str(position_weight),
             "position_weight_source": position_weight_source,
+            **(
+                {
+                    "trend_statistics": {
+                        **dict((metadata or {})["trend_statistics"]),
+                        "eligible_sample_count": kelly_state.eligible_sample_count,
+                        "selected_sample_count": kelly_state.selected_sample_count,
+                    }
+                }
+                if kelly_state is not None
+                and isinstance((metadata or {}).get("trend_statistics"), Mapping)
+                else {}
+            ),
         },
         strategy_snapshot=resolved_strategy_snapshot,
         industry_contexts=frozen_industry_contexts,
@@ -6803,7 +6817,9 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         expected_weight = Decimal(str(nominal_weight))
         if version in {
             "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
-        } and report.risk_summary.get("kelly_phase") != "cold_start":
+        } and report.risk_summary.get("kelly_phase") not in {
+            "cold_start", "unavailable",
+        }:
             cap = _nonnegative_risk_decimal(report.risk_summary.get("kelly_cap"))
             if cap is None:
                 raise ValueError("strategy snapshot does not match report actions")
@@ -8178,12 +8194,13 @@ def _attempt_report(
         watch_events = load_watch_events(
             config.data_dir / "trend_a_share/watch_events.jsonl"
         )
-        try:
-            kelly_rounds = load_trend_kelly_rounds(config.data_dir)
-            kelly_data_reason = ""
-        except ValueError as exc:
-            kelly_rounds = ()
-            kelly_data_reason = f"Kelly 模拟闭环统计不可用，暂停新开仓：{exc}"
+        kelly_evidence = load_trend_kelly_evidence(config.data_dir)
+        kelly_rounds = kelly_evidence.rounds
+        kelly_data_reason = (
+            ""
+            if kelly_evidence.status == "available"
+            else f"Kelly 模拟闭环统计不可用，使用固定风险仓位：{kelly_evidence.reason}"
+        )
         generated_at = datetime.now(SHANGHAI).isoformat(timespec="seconds")
         drawdown_summary = observe_strategy_equity(
             config.data_dir,
@@ -8245,6 +8262,11 @@ def _attempt_report(
                 "simulate_acc_id": simulate_acc_id,
                 "run_date": run_date,
                 "paid_response_cache": cache_metadata,
+                "trend_statistics": {
+                    "status": kelly_evidence.status,
+                    "artifact_sha256": kelly_evidence.artifact_sha256,
+                    "statistics_cutoff_at": kelly_evidence.statistics_cutoff_at,
+                },
                 **(
                     {"symbol_mapping_schema": TREND_SYMBOL_MAPPING_SCHEMA}
                     if _supports_symbol_mapping_contract(api)

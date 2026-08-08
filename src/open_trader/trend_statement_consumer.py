@@ -158,7 +158,6 @@ def _consume_facts_payload(
             "schema_version": CONSUMPTION_SCHEMA,
             "status": "failed",
             "broker": broker,
-            "snapshot_generation": snapshot_generation,
             "statement_generation": statement_generation,
             "account_generation": account_generation,
             "attempted_at": consumed_at,

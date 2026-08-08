@@ -2174,6 +2174,666 @@ def patch_cycle(monkeypatch: pytest.MonkeyPatch, cycle: ControllerCycle) -> None
 
     monkeypatch.setattr(controller, "_capture_close", capture)
     monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda *_args: {"status": "completed"},
+    )
+
+
+def test_controller_attempts_statistics_then_always_generates_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    calls: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda *_args: calls.append("statistics") or {"status": "completed"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "consume_accepted_statement_facts",
+        lambda **_kwargs: {"status": "waiting_for_promotion"},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda *_args: calls.append("report") or write_report(config),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert calls[:2] == ["statistics", "report"]
+
+
+def test_statistics_failure_does_not_become_report_or_controller_blocker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    generated: list[str] = []
+    attempted: list[str] = []
+
+    def fail_statistics(*_args: object) -> dict[str, object]:
+        attempted.append("statistics")
+        raise RuntimeError("broker unavailable")
+
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        fail_statistics,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "consume_accepted_statement_facts",
+        lambda **_kwargs: {"status": "blocked"},
+    )
+
+    def generate(*_args: object) -> None:
+        generated.append("report")
+        write_report(config)
+
+    monkeypatch.setattr(controller, "_generate_report", generate)
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+
+    result = run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert attempted == ["statistics"]
+    assert generated == ["report"]
+    assert result["blocker"] != "broker unavailable"
+    assert result["phase"] != "blocked"
+    state = json.loads(
+        (
+            config.data_dir
+            / "trend_api_stats/daily/CN/2026-07-17.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert state["status"] == "failed"
+    assert state["reason"] == "broker unavailable"
+
+
+def test_statement_consumer_exception_does_not_stop_report_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda *_args: {"status": "completed"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "consume_accepted_statement_facts",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("consumer crashed")),
+    )
+    generated: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda *_args: generated.append("report") or write_report(config),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+
+    result = run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert generated == ["report"]
+    assert result["phase"] == "monitoring"
+    statement_state = json.loads(
+        (
+            config.data_dir
+            / "trend_controller/CN/statement_statistics/eastmoney.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert statement_state["status"] == "failed"
+    assert statement_state["reason"] == "consumer crashed"
+
+
+def test_statistics_wrapper_delegates_malformed_marker_to_cycle_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    state_path = (
+        config.data_dir
+        / "trend_api_stats/daily/CN"
+        / f"{cycle.as_of_date}.json"
+    )
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text("{malformed", encoding="utf-8")
+    opened: list[str] = []
+
+    class Client:
+        def close(self) -> None:
+            opened.append("closed")
+
+    monkeypatch.setattr(
+        controller,
+        "FutuSimulateFillClient",
+        lambda **_kwargs: Client(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "TigerActualFillClient",
+        lambda **_kwargs: pytest.fail("CN cycle opened Tiger"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "require_trend_review_config",
+        lambda _config, _market: "CN-account",
+    )
+
+    def recover_marker(**_kwargs: object) -> dict[str, object]:
+        state_path.write_text(
+            json.dumps({
+                "schema_version": "open_trader.trend_api_stats.cycle.v1",
+                "status": "completed",
+                "market": "CN",
+                "as_of_date": cycle.as_of_date,
+            }),
+            encoding="utf-8",
+        )
+        return {"status": "completed"}
+
+    monkeypatch.setattr(
+        controller,
+        "run_trend_statistics_cycle",
+        recover_marker,
+        raising=False,
+    )
+
+    result = controller._run_cycle_statistics(config, cycle, NOW, "test-sha")
+
+    assert result["status"] == "completed"
+    assert opened == ["closed"]
+
+    state_path.write_text("{still malformed", encoding="utf-8")
+    failed = controller._record_statistics_exception(
+        config,
+        cycle,
+        NOW,
+        "test-sha",
+        RuntimeError("cycle failed"),
+    )
+    assert failed["status"] == "failed"
+    assert json.loads(state_path.read_text(encoding="utf-8"))["reason"] == (
+        "cycle failed"
+    )
+
+
+def test_completed_statistics_cycle_opens_no_broker_clients_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    state_path = (
+        config.data_dir
+        / "trend_api_stats/daily/CN"
+        / f"{cycle.as_of_date}.json"
+    )
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_api_stats.cycle.v1",
+            "status": "completed",
+            "market": cycle.market,
+            "as_of_date": cycle.as_of_date,
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        controller,
+        "FutuSimulateFillClient",
+        lambda **_kwargs: pytest.fail("completed cycle reopened Futu"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "TigerActualFillClient",
+        lambda **_kwargs: pytest.fail("completed CN cycle opened Tiger"),
+        raising=False,
+    )
+
+    result = controller._run_cycle_statistics(config, cycle, NOW, "test-sha")
+
+    assert result["status"] == "already_completed"
+
+
+def test_statistics_wrapper_selects_futu_for_market_and_tiger_only_for_us(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    opened: list[tuple[str, str]] = []
+    closed: list[tuple[str, str]] = []
+
+    class Client:
+        def __init__(self, source: str, market: str) -> None:
+            self.source = source
+            self.market = market
+
+        def close(self) -> None:
+            closed.append((self.source, self.market))
+
+    def futu_client(**kwargs: object) -> Client:
+        market = str(kwargs["trd_market"])
+        opened.append(("futu", market))
+        return Client("futu", market)
+
+    def tiger_client(*, config: object) -> Client:
+        del config
+        opened.append(("tiger", "US"))
+        return Client("tiger", "US")
+
+    monkeypatch.setattr(
+        controller, "FutuSimulateFillClient", futu_client, raising=False
+    )
+    monkeypatch.setattr(
+        controller, "TigerActualFillClient", tiger_client, raising=False
+    )
+    monkeypatch.setattr(
+        controller,
+        "load_tiger_account_config",
+        lambda **kwargs: kwargs,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "require_trend_review_config",
+        lambda _config, market: f"{market}-account",
+    )
+    received: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        controller,
+        "run_trend_statistics_cycle",
+        lambda **kwargs: received.append(kwargs) or {"status": "completed"},
+        raising=False,
+    )
+    us_cycle = replace(active_cn_cycle(), market="US")
+
+    controller._run_cycle_statistics(config, active_cn_cycle(), NOW, "test-sha")
+    controller._run_cycle_statistics(config, us_cycle, NOW, "test-sha")
+
+    assert opened == [("futu", "CN"), ("futu", "US"), ("tiger", "US")]
+    assert closed == opened
+    assert received[0]["tiger_client"] is None
+    assert received[1]["tiger_client"].source == "tiger"
+
+
+def test_statistics_wrapper_closes_tiger_when_futu_close_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    closed: list[str] = []
+
+    class Futu:
+        def close(self) -> None:
+            closed.append("futu")
+            raise RuntimeError("futu close failed")
+
+    class Tiger:
+        def close(self) -> None:
+            closed.append("tiger")
+
+    monkeypatch.setattr(
+        controller,
+        "FutuSimulateFillClient",
+        lambda **_kwargs: Futu(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "TigerActualFillClient",
+        lambda **_kwargs: Tiger(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "load_tiger_account_config",
+        lambda **kwargs: kwargs,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "require_trend_review_config",
+        lambda _config, _market: "US-account",
+    )
+    monkeypatch.setattr(
+        controller,
+        "run_trend_statistics_cycle",
+        lambda **_kwargs: {"status": "completed"},
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="futu close failed"):
+        controller._run_cycle_statistics(
+            config, replace(active_cn_cycle(), market="US"), NOW, "test-sha"
+        )
+
+    assert closed == ["futu", "tiger"]
+
+
+def test_statistics_failure_and_recovery_notify_once_per_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    notify_once = controller._notify_once
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(controller, "_notify_once", notify_once)
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    monkeypatch.setattr(
+        controller,
+        "consume_accepted_statement_facts",
+        lambda **_kwargs: {"status": "waiting_for_promotion"},
+    )
+    write_report(config)
+    statuses = iter(("failed", "failed", "completed"))
+
+    def run_statistics(
+        _config: DailyPremarketConfig,
+        cycle: ControllerCycle,
+        now: datetime,
+        _process_version: str,
+    ) -> dict[str, object]:
+        status = next(statuses)
+        state = {
+            "schema_version": "open_trader.trend_api_stats.cycle.v1",
+            "status": status,
+            "market": cycle.market,
+            "as_of_date": cycle.as_of_date,
+            "attempt_count": 1,
+        }
+        if status == "failed":
+            state.update({
+                "attempted_at": now.isoformat(timespec="seconds"),
+                "reason": "broker unavailable",
+            })
+        path = (
+            config.data_dir
+            / "trend_api_stats/daily/CN"
+            / f"{cycle.as_of_date}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state), encoding="utf-8")
+        return state
+
+    monkeypatch.setattr(controller, "_run_cycle_statistics", run_statistics)
+    sent = _record_controller_notification_attempts(monkeypatch)
+
+    for _ in range(3):
+        result = run_trend_market_controller(
+            config, "CN", once=True, now_fn=lambda: NOW
+        )
+        assert result["phase"] == "monitoring"
+        assert result["blocker"] is None
+
+    states = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in config.data_dir.glob(
+            "trend_controller/CN/notifications/2026-07-17/*.json"
+        )
+    ]
+    assert {state["action"] for state in states} == {
+        "statistics_failed",
+        "statistics_recovered",
+    }
+    assert len(sent) == 4
+    feishu_messages = [message for _, message, channels in sent if "feishu" in channels]
+    assert len(feishu_messages) == 2
+    assert all(
+        "报告与执行继续使用最后一次已接受的统计快照" in message
+        for message in feishu_messages
+    )
+    cycle_state = json.loads(
+        (
+            config.data_dir
+            / "trend_api_stats/daily/CN/2026-07-17.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert cycle_state["failure_notified_at"] == NOW.isoformat(timespec="seconds")
+    assert cycle_state["recovery_notified_at"] == NOW.isoformat(timespec="seconds")
+
+
+def test_report_retry_keeps_statistics_bound_to_natural_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    patch_cycle(monkeypatch, cycle)
+    monkeypatch.setattr(
+        controller,
+        "consume_accepted_statement_facts",
+        lambda **_kwargs: {"status": "waiting_for_promotion"},
+    )
+    statistics_cycles: list[ControllerCycle] = []
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda _config, selected, *_args: statistics_cycles.append(selected)
+        or {"status": "completed"},
+        raising=False,
+    )
+    report_attempts = 0
+
+    def generate(*_args: object) -> None:
+        nonlocal report_attempts
+        report_attempts += 1
+        if report_attempts == 1:
+            raise RuntimeError("report unavailable")
+        write_report(config)
+
+    monkeypatch.setattr(controller, "_generate_report", generate)
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    current = NOW
+
+    class StopController(Exception):
+        pass
+
+    def now_fn() -> datetime:
+        return current
+
+    def advance(_seconds: float) -> None:
+        nonlocal current
+        current += timedelta(seconds=11)
+        if report_attempts == 2:
+            raise StopController
+
+    with pytest.raises(StopController):
+        run_trend_market_controller(
+            config, "CN", now_fn=now_fn, sleep_fn=advance
+        )
+
+    assert report_attempts == 2
+    assert statistics_cycles == [cycle]
+
+
+def test_historical_work_cycle_does_not_attempt_statistics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    current = replace(
+        active_cn_cycle(),
+        as_of_date="2026-07-20",
+        execution_date="2026-07-21",
+        report_run_date="2026-07-20",
+    )
+    historical = active_cn_cycle()
+    patch_cycle(monkeypatch, current)
+    monkeypatch.setattr(
+        controller,
+        "_derive_cycle",
+        lambda *_args, **_kwargs: current,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_cycle_to_reconcile",
+        lambda *_args, **_kwargs: historical,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda *_args: pytest.fail("historical work cycle attempted statistics"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_load_cycle_report",
+        lambda *_args: write_report(config),
+    )
+    monkeypatch.setattr(
+        controller,
+        "consume_accepted_statement_facts",
+        lambda **_kwargs: {"status": "waiting_for_promotion"},
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW
+    )
+
+    assert result["phase"] == "monitoring"
+
+
+def test_failed_statistics_due_does_not_run_during_report_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    patch_cycle(monkeypatch, cycle)
+    monkeypatch.setattr(
+        controller,
+        "consume_accepted_statement_facts",
+        lambda **_kwargs: {"status": "waiting_for_promotion"},
+    )
+    statistics_calls: list[ControllerCycle] = []
+
+    def fail_statistics(
+        _config: DailyPremarketConfig,
+        selected: ControllerCycle,
+        *_args: object,
+    ) -> dict[str, object]:
+        statistics_calls.append(selected)
+        return {"status": "failed", "reason": "statistics unavailable"}
+
+    monkeypatch.setattr(controller, "_run_cycle_statistics", fail_statistics)
+    report_attempts = 0
+
+    def generate(*_args: object) -> None:
+        nonlocal report_attempts
+        report_attempts += 1
+        if report_attempts == 1:
+            raise RuntimeError("report unavailable")
+        write_report(config)
+
+    monkeypatch.setattr(controller, "_generate_report", generate)
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    current = NOW
+
+    class StopController(Exception):
+        pass
+
+    def now_fn() -> datetime:
+        return current
+
+    def advance(_seconds: float) -> None:
+        nonlocal current
+        current += timedelta(seconds=11)
+        if report_attempts == 2:
+            raise StopController
+
+    with pytest.raises(StopController):
+        run_trend_market_controller(
+            config, "CN", now_fn=now_fn, sleep_fn=advance
+        )
+
+    assert report_attempts == 2
+    assert statistics_calls == [cycle]
+
+
+def test_statement_already_consumed_is_diagnostic_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller,
+        "consume_accepted_statement_facts",
+        lambda **_kwargs: {
+            "status": "already_consumed",
+            "broker": "eastmoney",
+            "statement_generation": "statement-1",
+            "snapshot_generation": "snapshot-2",
+            "account_generation": "account-1",
+        },
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    write_report(config)
+    checkpoint = (
+        config.data_dir / "trend_statement_consumption/eastmoney.json"
+    )
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    original = {
+        "schema_version": "open_trader.trend.statement_consumption.v1",
+        "status": "consumed",
+        "broker": "eastmoney",
+        "statement_generation": "statement-1",
+        "account_generation": "account-1",
+    }
+    checkpoint.write_text(json.dumps(original), encoding="utf-8")
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert json.loads(checkpoint.read_text(encoding="utf-8")) == original
+    diagnostic = json.loads(
+        (
+            config.data_dir
+            / "trend_controller/CN/statement_statistics/eastmoney.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert diagnostic["status"] == "already_consumed"
+    assert diagnostic["snapshot_generation"] == "snapshot-2"
+
+
+def test_revision_request_does_not_attempt_natural_cycle_statistics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda *_args: pytest.fail("revision attempted natural statistics"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_request_revision",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        controller,
+        "consume_accepted_statement_facts",
+        lambda **_kwargs: {"status": "waiting_for_promotion"},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda *_args: write_report(config),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+
+    result = run_trend_market_controller(
+        config, "CN", revision=True, once=True, now_fn=lambda: NOW
+    )
+
+    assert result["phase"] == "monitoring"
 
 
 def test_start_after_original_trigger_generates_report_and_executes_inside_window(
