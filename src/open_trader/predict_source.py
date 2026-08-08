@@ -335,11 +335,6 @@ class PredictSource:
         if type(sequence) is not int:
             self._mark_stale(source)
             return None
-        if previous is not None and source == "ws" and sequence <= previous:
-            return None
-        if previous is not None and sequence < previous:
-            self._mark_stale(source)
-            return None
         timestamp = _timestamp(timestamp_ms)
         asks = _levels(payload.get("asks"), market.tick_size, ascending=True)
         bids = _levels(payload.get("bids"), market.tick_size, ascending=False)
@@ -353,6 +348,11 @@ class PredictSource:
             for level in reversed(bids)
         )
         if any(level.price < 0 or level.price > 1 for level in no_asks):
+            self._mark_stale(source)
+            return None
+        if previous is not None and source == "ws" and sequence <= previous:
+            return None
+        if previous is not None and sequence < previous:
             self._mark_stale(source)
             return None
         book = PredictBook(

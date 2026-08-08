@@ -524,6 +524,14 @@ class FakeWebSocket:
         return str(message)
 
 
+class BlockingFakeWebSocket(FakeWebSocket):
+    async def recv(self) -> str:
+        if self.messages:
+            return await super().recv()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
 def book_message(version: int, timestamp: int, *, asks: object = None) -> str:
     return json.dumps(
         {
@@ -654,16 +662,9 @@ def test_websocket_drops_duplicate_and_rollback_versions() -> None:
 
 
 def test_websocket_duplicate_and_rollback_keep_accepted_book_healthy() -> None:
-    class BlockingWebSocket(FakeWebSocket):
-        async def recv(self) -> str:
-            if self.messages:
-                return await super().recv()
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable")
-
     source, _ = source_with_responses(
         [{"success": True, "data": market()}],
-        connector=lambda *args, **kwargs: BlockingWebSocket(
+        connector=lambda *args, **kwargs: BlockingFakeWebSocket(
             [
                 book_message(2, 1788048000000),
                 book_message(2, 1788048001000),
@@ -681,6 +682,8 @@ def test_websocket_duplicate_and_rollback_keep_accepted_book_healthy() -> None:
             await asyncio.sleep(0)
             await asyncio.sleep(0)
             assert source.snapshot()["ws"] == "ready"
+            assert source.snapshot()["ws_reason"] is None
+            assert source.snapshot()["ws_generation"] == 0
         finally:
             if pending is not None:
                 pending.cancel()
@@ -689,6 +692,35 @@ def test_websocket_duplicate_and_rollback_keep_accepted_book_healthy() -> None:
             await stream.aclose()
 
     asyncio.run(consume_duplicates())
+
+
+def test_websocket_malformed_rollback_is_still_fail_closed() -> None:
+    source, _ = source_with_responses(
+        [{"success": True, "data": market()}],
+        connector=lambda *args, **kwargs: BlockingFakeWebSocket(
+            [
+                book_message(2, 1788048000000),
+                book_message(1, 1788048001000, asks=[]),
+            ]
+        ),
+    )
+
+    async def consume_malformed_rollback() -> None:
+        stream = source.stream_books(("123",))
+        pending = None
+        try:
+            await anext(stream)
+            pending = asyncio.create_task(anext(stream))
+            await asyncio.sleep(0)
+            assert source.snapshot()["ws"] == "stale"
+        finally:
+            if pending is not None:
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            await stream.aclose()
+
+    asyncio.run(consume_malformed_rollback())
 
 
 def test_non_finite_book_prices_are_dropped_without_raising() -> None:
