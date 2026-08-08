@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -757,6 +759,33 @@ class RecordingCycleClient:
         return {"account_id": self.account_id, "orders_seen": 0, "fills": []}
 
 
+class BlockingCycleClient(RecordingCycleClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_fetch_started = threading.Event()
+        self.second_fetch_started = threading.Event()
+        self.release_first_fetch = threading.Event()
+
+    def fetch_fills(
+        self,
+        *,
+        start: str,
+        end: str,
+        attributions_by_order: dict[str, dict[str, object]],
+    ) -> dict[str, object]:
+        result = super().fetch_fills(
+            start=start,
+            end=end,
+            attributions_by_order=attributions_by_order,
+        )
+        if len(self.calls) == 1:
+            self.first_fetch_started.set()
+            assert self.release_first_fetch.wait(timeout=5)
+        else:
+            self.second_fetch_started.set()
+        return result
+
+
 def cycle_kwargs(
     tmp_path: Path,
     *,
@@ -792,12 +821,70 @@ def test_completed_cycle_is_not_recomputed_without_explicit_force(tmp_path: Path
     assert not (tmp_path / "data/trend_api_stats/missed").exists()
 
 
+def test_concurrent_same_cycle_fetches_and_publishes_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = BlockingCycleClient()
+    kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=client)
+    statistics_path = tmp_path / "data/latest/trend_api_stats.json"
+    published_paths: list[Path] = []
+    write_lock = threading.Lock()
+    write_json = trend_api_stats_module._write_json_atomic
+
+    def record_write(path: Path, payload: object) -> None:
+        if path == statistics_path:
+            with write_lock:
+                published_paths.append(path)
+        write_json(path, payload)
+
+    monkeypatch.setattr(trend_api_stats_module, "_write_json_atomic", record_write)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(run_trend_statistics_cycle, **kwargs)
+        assert client.first_fetch_started.wait(timeout=5)
+        second = pool.submit(run_trend_statistics_cycle, **kwargs)
+        assert not client.second_fetch_started.wait(timeout=0.2)
+        client.release_first_fetch.set()
+        results = [first.result(timeout=5), second.result(timeout=5)]
+
+    assert sorted(result["status"] for result in results) == ["already_completed", "completed"]
+    assert len(client.calls) == 1
+    assert published_paths == [statistics_path]
+
+
 def test_force_requires_actor_and_reason(tmp_path: Path) -> None:
     kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=RecordingCycleClient())
     run_trend_statistics_cycle(**kwargs)
 
     with pytest.raises(ValueError, match="force requires actor and reason"):
         run_trend_statistics_cycle(**kwargs, force=True)
+
+
+def test_failed_forced_refresh_preserves_completed_marker_and_audit(tmp_path: Path) -> None:
+    client = RecordingCycleClient()
+    kwargs = cycle_kwargs(tmp_path, market="CN", futu_client=client)
+    assert run_trend_statistics_cycle(**kwargs)["status"] == "completed"
+    client.fail_once = True
+
+    forced = run_trend_statistics_cycle(
+        **(kwargs | {"process_git_sha": "forced123"}),
+        force=True,
+        actor="ray",
+        reason="repair stale facts",
+    )
+
+    state = json.loads(
+        trend_statistics_cycle_path(tmp_path / "data", "CN", "2026-08-08").read_text(
+            encoding="utf-8"
+        )
+    )
+    repeated = run_trend_statistics_cycle(**kwargs)
+    assert forced["status"] == "failed"
+    assert state["status"] == "completed"
+    assert state["last_forced_failure_at"] == kwargs["generated_at"]
+    assert state["last_forced_failure_actor"] == "ray"
+    assert state["last_forced_failure_reason"] == "repair stale facts"
+    assert state["last_forced_failure_process_git_sha"] == "forced123"
+    assert state["last_forced_failure_error"] == "broker unavailable"
+    assert repeated["status"] == "already_completed"
+    assert len(client.calls) == 2
 
 
 def test_failed_cycle_retries_and_downtime_uses_one_range_request(tmp_path: Path) -> None:

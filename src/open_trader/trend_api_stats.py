@@ -599,40 +599,42 @@ def run_trend_statistics_cycle(
 ) -> dict[str, object]:
     normalized_market, normalized_date = _cycle_market_date(market, as_of_date)
     state_path = trend_statistics_cycle_path(data_dir, normalized_market, normalized_date)
-    previous = _read_optional_json(state_path)
-    if previous.get("status") == "completed" and not force:
-        return {**previous, "status": "already_completed"}
     if force and (not actor.strip() or not reason.strip()):
         raise ValueError("force requires actor and reason")
     cutoff = trend_statistics_cutoff_at(normalized_market, normalized_date)
-    try:
-        start, end = _statistics_fetch_range(
-            _path(data_dir), _path(reports_dir), normalized_market, normalized_date
+    with RunLock(state_path.with_suffix(".lock"), wait=True):
+        previous = _read_optional_json(state_path)
+        if previous.get("status") == "completed" and not force:
+            return {**previous, "status": "already_completed"}
+        try:
+            start, end = _statistics_fetch_range(
+                _path(data_dir), _path(reports_dir), normalized_market, normalized_date
+            )
+            if normalized_market == "US" and tiger_client is None:
+                raise ValueError("US statistics cycle requires Tiger actual client")
+            sync_trend_api_stats(
+                data_dir=data_dir,
+                reports_dir=reports_dir,
+                futu_clients={normalized_market: futu_client},
+                tiger_client=tiger_client if normalized_market == "US" else None,
+                start=start,
+                end=end,
+                generated_at=generated_at,
+                statistics_cutoff_at=cutoff,
+            )
+            with RunLock(
+                _path(data_dir) / "trend_statement_consumption/.stats.lock", wait=True
+            ):
+                _, artifact_sha256 = read_trend_api_stats_snapshot(data_dir)
+        except Exception as exc:
+            return _write_failed_cycle_state(
+                state_path, previous, exc, generated_at, process_git_sha,
+                actor if force else "", reason if force else "",
+            )
+        return _write_completed_cycle_state(
+            state_path, previous, cutoff, artifact_sha256, generated_at, process_git_sha,
+            actor if force else "", reason if force else "",
         )
-        if normalized_market == "US" and tiger_client is None:
-            raise ValueError("US statistics cycle requires Tiger actual client")
-        sync_trend_api_stats(
-            data_dir=data_dir,
-            reports_dir=reports_dir,
-            futu_clients={normalized_market: futu_client},
-            tiger_client=tiger_client if normalized_market == "US" else None,
-            start=start,
-            end=end,
-            generated_at=generated_at,
-            statistics_cutoff_at=cutoff,
-        )
-        with RunLock(
-            _path(data_dir) / "trend_statement_consumption/.stats.lock", wait=True
-        ):
-            _, artifact_sha256 = read_trend_api_stats_snapshot(data_dir)
-    except Exception as exc:
-        return _write_failed_cycle_state(
-            state_path, previous, exc, generated_at, process_git_sha
-        )
-    return _write_completed_cycle_state(
-        state_path, previous, cutoff, artifact_sha256, generated_at, process_git_sha,
-        actor if force else "", reason if force else "",
-    )
 
 
 def _cycle_market_date(market: str, as_of_date: str) -> tuple[str, str]:
@@ -708,7 +710,21 @@ def _write_failed_cycle_state(
     error: Exception,
     attempted_at: str,
     process_git_sha: str,
+    forced_actor: str = "",
+    forced_reason: str = "",
 ) -> dict[str, object]:
+    if previous.get("status") == "completed" and forced_actor:
+        state = dict(previous)
+        state.update({
+            "last_forced_failure_status": "failed",
+            "last_forced_failure_at": attempted_at,
+            "last_forced_failure_actor": forced_actor.strip(),
+            "last_forced_failure_reason": forced_reason.strip(),
+            "last_forced_failure_process_git_sha": process_git_sha,
+            "last_forced_failure_error": str(error),
+        })
+        _write_json_atomic(path, state)
+        return {**state, "status": "failed"}
     market, as_of_date = _cycle_state_identity(path)
     state = {
         "schema_version": STATISTICS_CYCLE_SCHEMA,
