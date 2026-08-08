@@ -242,6 +242,7 @@ KNOWN_TEMPERATURE_ORDER = {
 }
 TEMPERATURE_DIRECTION_ORDER = {"rising": 0, "unchanged": 1, "falling": 2}
 INDUSTRY_ORDERING_MODES = {
+    "individual_global",
     "context_with_history",
     "context_current_only",
     "legacy_invalid_current",
@@ -3319,15 +3320,25 @@ def build_candidate_list(
             excluded[symbol] = reasons
         else:
             eligible.append(min(items, key=_candidate_sort_key))
+    if _uses_individual_global_ranking(market, strategy_version):
+        eligible.sort(key=_candidate_global_sort_key)
+        return CandidateDecision(
+            tuple(eligible),
+            excluded,
+            ordering_mode="individual_global",
+            industry_context_status={
+                "ordering_mode": "individual_global",
+                "current_complete": True,
+                "history_complete": False,
+                "fallback_reason": None,
+            },
+        )
     ordering_mode, context_status, contexts = _industry_context_state(
         eligible, industry_contexts, expected_date=expected_date
     )
-    if _uses_individual_global_ranking(market, strategy_version):
-        eligible.sort(key=_candidate_global_sort_key)
-    else:
-        eligible = _sort_candidates_for_mode(
-            eligible, mode=ordering_mode, contexts=contexts
-        )
+    eligible = _sort_candidates_for_mode(
+        eligible, mode=ordering_mode, contexts=contexts
+    )
     return CandidateDecision(
         tuple(eligible),
         excluded,
@@ -3915,6 +3926,7 @@ def collect_industry_contexts(
     history_root: Path,
     strategy_version: str | None = None,
     cny_per_local_currency: Decimal | None = None,
+    industry_rows: Sequence[Mapping[str, object]] | None = None,
 ) -> tuple[tuple[IndustryContext, ...], dict[str, object], dict[str, object]]:
     """Collect candidate context first, then append isolated holding context."""
     candidate_decision = build_candidate_list(
@@ -3969,6 +3981,62 @@ def collect_industry_contexts(
         if industry_id not in eligible_industry_ids
     ]
     context_industry_ids = [*eligible_industry_ids, *holding_only_ids]
+    if _uses_individual_global_ranking(market, strategy_version):
+        industry_by_id: dict[int, Mapping[str, object]] = {}
+        for row in industry_rows or ():
+            industry_id = _row_tm_id(row)
+            if industry_id in industry_by_id:
+                raise TrendAnimalsError("industry temperature snapshot returned duplicate tmIds")
+            industry_by_id[industry_id] = row
+        warm_to_hot_counts: defaultdict[int, int] = defaultdict(int)
+        for item in candidates:
+            if (
+                item.industry_tm_id is not None
+                and item.temperature_prev == "温"
+                and item.temperature_curr in HOT_TEMPERATURES
+            ):
+                warm_to_hot_counts[item.industry_tm_id] += 1
+        contexts = tuple(
+            calculate_industry_context(
+                industry_tm_id=industry_id,
+                industry=industry_names.get(industry_id, ""),
+                expected_date=expected_date,
+                component_tm_ids=(),
+                member_rows=(),
+                industry_row=industry_by_id.get(industry_id),
+                warm_to_hot_count=warm_to_hot_counts[industry_id],
+                member_breadth_collected=False,
+                require_strength=False,
+            )
+            for industry_id in context_industry_ids
+        )
+        prior = load_latest_prior_context(
+            history_root,
+            market=market,
+            before_date=expected_date,
+        )
+        contexts = attach_prior_context(contexts, prior)
+        facts = {
+            "eligible_industry_ids": tuple(eligible_industry_ids),
+            "holding_industry_ids": tuple(holding_industry_ids),
+            "context_industry_ids": tuple(context_industry_ids),
+            "holding_errors": {},
+            "component_requests": 0,
+            "component_rows": 0,
+            "component_rows_by_industry": {},
+            "member_ids": (),
+            "member_rows": 0,
+            "member_response": [],
+            "member_fields": (),
+            "state_ids": (),
+            "state_rows": 0,
+            "state_response": [],
+            "state_fields": (),
+        }
+        return tuple(sorted(contexts, key=lambda item: item.industry_tm_id)), {
+            **candidate_decision.industry_context_status,
+            "industry_temperature_ids": tuple(sorted(industry_by_id)),
+        }, facts
     component_ids_by_industry: dict[int, set[int]] = {}
     component_rows_by_industry: dict[int, list[Mapping[str, object]]] = {}
     component_rows_count = 0
@@ -8103,7 +8171,13 @@ def fetch_staged_candidates(
             estimated_cost += _billing_price(price) * len(tm_ids)
         return rows
 
-    def stage_candidates(stage: int, tm_ids: Sequence[int], *, temperatures: Mapping[int, str | None] = {}) -> list[int]:
+    def stage_candidates(
+        stage: int,
+        tm_ids: Sequence[int],
+        *,
+        temperatures: Mapping[int, str | None] | None = None,
+    ) -> list[int]:
+        temperatures = temperatures or {}
         survivors: list[int] = []
         for tm_id in tm_ids:
             row = rows_by_id[tm_id]
@@ -8226,6 +8300,9 @@ def _attempt_report(
             allocation=allocation_reference,
         )
         strategy_version = str(strategy_snapshot["strategy_version"])
+        individual_global_ranking = _uses_individual_global_ranking(
+            "CN", strategy_version
+        )
         component_rows = []
         component_pools: defaultdict[int, set[str]] = defaultdict(set)
         for tm_id in candidate_pool_ids:
@@ -8265,7 +8342,12 @@ def _attempt_report(
             except TrendAnimalsError:
                 continue
 
-        requested_ids = sorted(candidate_ids | set(holding_ids.values()))
+        holding_snapshot_ids = sorted(set(holding_ids.values()))
+        requested_ids = (
+            holding_snapshot_ids
+            if individual_global_ranking
+            else sorted(candidate_ids | set(holding_ids.values()))
+        )
         fields = UNIFIED_TREND_FIELDS
         billing_rows = api.get_snapshot_billing()
         billing = {_billing_field(row): row for row in billing_rows}
@@ -8293,66 +8375,71 @@ def _attempt_report(
             raise TrendAnimalsError("getTickerSnapshot returned mismatched tmIds")
         if any(row.get("asOfDate") != run_date for row in snapshot_rows):
             raise TrendAnimalsError("getTickerSnapshot returned a stale data date")
-        industry_ids = sorted(
-            {
-                value
-                for row in snapshot_rows
-                if isinstance((value := row.get("industryTmId")), int)
-                and not isinstance(value, bool)
-                and value > 0
-            }
-        )
-        industry_rows, industry_temperatures = load_industry_temperatures(
-            api,
-            tm_ids=industry_ids,
-            expected_date=run_date,
-        )
-        candidates: list[CandidateInput] = []
         holding_snapshots: dict[str, HoldingSnapshot | None] = {
             position.symbol: None for position in account.positions
         }
         rows_by_tm_id = {_row_tm_id(row): row for row in snapshot_rows}
         kline_start = (run_day - timedelta(days=90)).isoformat()
         bars_by_symbol: dict[str, Sequence[DailyKlineBar] | None] = {}
-        for tm_id in sorted(candidate_ids):
-            row = rows_by_tm_id.get(tm_id)
-            if row is None:
-                continue
-            mapping_verified = False
-            futu_symbol: str | None = None
-            try:
-                symbol, exchange = _symbol_parts(row.get("tickerSymbol"))
-                futu_symbol = f"{exchange}.{symbol}"
-                daily_bars = quote.get_daily_kline(
-                    futu_symbol, start=kline_start, end=run_date
-                )
-                try:
-                    mapping_verified = _remember_verified_symbol_row(
-                        api,
-                        market="CN",
-                        expected_futu_symbol=futu_symbol,
-                        expected_tm_id=tm_id,
-                        row=row,
-                    )
-                except TrendAnimalsError:
-                    mapping_verified = False
-            except FutuQuoteError as exc:
-                if _is_systemic_futu_error(exc):
-                    raise
-                daily_bars = None
-            except ValueError:
-                daily_bars = None
-            candidates.append(
-                evaluate_candidate(
-                    row,
-                    daily_bars,
-                    pools=component_pools[tm_id],
-                    industry_temperature=industry_temperatures.get(
-                        _optional_int(row.get("industryTmId"))
-                    ),
-                    futu_symbol=futu_symbol if mapping_verified else None,
-                )
+        industry_rows: list[Mapping[str, object]] = []
+        industry_temperatures: dict[int, str | None] = {}
+        candidates: Sequence[CandidateInput] = ()
+        if not individual_global_ranking:
+            industry_ids = sorted(
+                {
+                    value
+                    for row in snapshot_rows
+                    if isinstance((value := row.get("industryTmId")), int)
+                    and not isinstance(value, bool)
+                    and value > 0
+                }
             )
+            industry_rows, industry_temperatures = load_industry_temperatures(
+                api,
+                tm_ids=industry_ids,
+                expected_date=run_date,
+            )
+            legacy_candidates: list[CandidateInput] = []
+            for tm_id in sorted(candidate_ids):
+                row = rows_by_tm_id.get(tm_id)
+                if row is None:
+                    continue
+                mapping_verified = False
+                futu_symbol: str | None = None
+                try:
+                    symbol, exchange = _symbol_parts(row.get("tickerSymbol"))
+                    futu_symbol = f"{exchange}.{symbol}"
+                    daily_bars = quote.get_daily_kline(
+                        futu_symbol, start=kline_start, end=run_date
+                    )
+                    try:
+                        mapping_verified = _remember_verified_symbol_row(
+                            api,
+                            market="CN",
+                            expected_futu_symbol=futu_symbol,
+                            expected_tm_id=tm_id,
+                            row=row,
+                        )
+                    except TrendAnimalsError:
+                        mapping_verified = False
+                except FutuQuoteError as exc:
+                    if _is_systemic_futu_error(exc):
+                        raise
+                    daily_bars = None
+                except ValueError:
+                    daily_bars = None
+                legacy_candidates.append(
+                    evaluate_candidate(
+                        row,
+                        daily_bars,
+                        pools=component_pools[tm_id],
+                        industry_temperature=industry_temperatures.get(
+                            _optional_int(row.get("industryTmId"))
+                        ),
+                        futu_symbol=futu_symbol if mapping_verified else None,
+                    )
+                )
+            candidates = tuple(legacy_candidates)
         for position in account.positions:
             try:
                 bars_by_symbol[position.symbol] = quote.get_daily_kline(
@@ -8385,8 +8472,10 @@ def _attempt_report(
                     )
                     holding_snapshots[symbol] = _holding_snapshot(
                         row,
-                        industry_temperature=industry_temperatures.get(
-                            _optional_int(row.get("industryTmId"))
+                        industry_temperature=(
+                            industry_temperatures.get(_optional_int(row.get("industryTmId")))
+                            if not individual_global_ranking
+                            else None
                         ),
                         bars=tuple(daily_bars or ()),
                     )
@@ -8408,10 +8497,112 @@ def _attempt_report(
             )
         )
 
-        candidate_pool_rows = [
-            rows_by_tm_id[tm_id] for tm_id in sorted(candidate_ids)
-            if tm_id in rows_by_tm_id
-        ]
+        staged: StagedCandidateFetch | None = None
+        candidate_pool_rows: Sequence[Mapping[str, object]] = ()
+        if individual_global_ranking:
+            verified_candidate_symbols: dict[int, str] = {}
+
+            def resolve_candidate_bars(
+                row: Mapping[str, object],
+            ) -> Sequence[DailyKlineBar] | None:
+                tm_id = _row_tm_id(row)
+                try:
+                    symbol, exchange = _symbol_parts(row.get("tickerSymbol"))
+                    futu_symbol = f"{exchange}.{symbol}"
+                    daily_bars = quote.get_daily_kline(
+                        futu_symbol, start=kline_start, end=run_date
+                    )
+                    try:
+                        if _remember_verified_symbol_row(
+                            api,
+                            market="CN",
+                            expected_futu_symbol=futu_symbol,
+                            expected_tm_id=tm_id,
+                            row=row,
+                        ):
+                            verified_candidate_symbols[tm_id] = futu_symbol
+                    except TrendAnimalsError:
+                        pass
+                    return daily_bars
+                except FutuQuoteError as exc:
+                    if _is_systemic_futu_error(exc):
+                        raise
+                except ValueError:
+                    pass
+                return None
+
+            staged = fetch_staged_candidates(
+                api,
+                candidate_ids=candidate_ids - set(holding_ids.values()),
+                component_pools=component_pools,
+                held_symbols={position.symbol for position in account.positions},
+                holding_snapshots=(
+                    *holding_snapshots.values(),
+                    *(
+                        real_holdings.holding_snapshots.values()
+                        if real_holdings.status == "available"
+                        else ()
+                    ),
+                ),
+                expected_date=run_date,
+                market="CN",
+                strategy_version=strategy_version,
+                cny_per_local_currency=Decimal("1"),
+                billing=billing,
+                resolve_bars=resolve_candidate_bars,
+            )
+            industry_rows = list(staged.industry_rows)
+            industry_temperatures = {
+                _row_tm_id(row): (
+                    str(row["trendTemperatureCurr"])
+                    if row.get("trendTemperatureCurr") in INDUSTRY_KNOWN_TEMPERATURES
+                    else None
+                )
+                for row in industry_rows
+            }
+            holding_snapshots = {
+                symbol: (
+                    replace(
+                        snapshot,
+                        industry_temperature=industry_temperatures.get(
+                            snapshot.industry_tm_id
+                        ),
+                    )
+                    if snapshot is not None
+                    else None
+                )
+                for symbol, snapshot in holding_snapshots.items()
+            }
+            if real_holdings.status == "available":
+                real_holdings = replace(
+                    real_holdings,
+                    holding_snapshots={
+                        symbol: (
+                            replace(
+                                snapshot,
+                                industry_temperature=industry_temperatures.get(
+                                    snapshot.industry_tm_id
+                                ),
+                            )
+                            if snapshot is not None
+                            else None
+                        )
+                        for symbol, snapshot in real_holdings.holding_snapshots.items()
+                    },
+                )
+            candidates = tuple(
+                replace(
+                    item,
+                    futu_symbol=verified_candidate_symbols.get(item.tm_id),
+                )
+                for item in staged.candidates
+            )
+        else:
+            candidate_pool_rows = tuple(
+                rows_by_tm_id[tm_id]
+                for tm_id in sorted(candidate_ids)
+                if tm_id in rows_by_tm_id
+            )
         industry_contexts, industry_context_status, industry_facts = (
             collect_industry_contexts(
                 api=api,
@@ -8430,28 +8621,36 @@ def _attempt_report(
                 market="CN",
                 history_root=config.data_dir / "trend_industry_context",
                 strategy_version=strategy_version,
+                industry_rows=(industry_rows if individual_global_ranking else None),
             )
         )
         balance_after = _balance(api.get_account_balance())
 
-        estimated_cost = (
-            unified_unit_cost * (len(requested_ids) + real_only_count)
-            + sum(
-                (_billing_price(billing[field]) for field in A_SHARE_INDUSTRY_FIELDS),
-                Decimal("0"),
+        if individual_global_ranking:
+            assert staged is not None
+            estimated_cost = (
+                unified_unit_cost * (len(holding_snapshot_ids) + real_only_count)
+                + staged.estimated_cost
             )
-            * len(industry_ids)
-            + sum(
-                (_billing_price(billing[field]) for field in INDUSTRY_MEMBER_FIELDS if field in billing),
-                Decimal("0"),
+        else:
+            estimated_cost = (
+                unified_unit_cost * (len(requested_ids) + real_only_count)
+                + sum(
+                    (_billing_price(billing[field]) for field in A_SHARE_INDUSTRY_FIELDS),
+                    Decimal("0"),
+                )
+                * len(industry_rows)
+                + sum(
+                    (_billing_price(billing[field]) for field in INDUSTRY_MEMBER_FIELDS if field in billing),
+                    Decimal("0"),
+                )
+                * len(industry_facts["member_ids"])
+                + sum(
+                    (_billing_price(billing[field]) for field in INDUSTRY_STATE_FIELDS if field in billing),
+                    Decimal("0"),
+                )
+                * len(industry_facts["state_ids"])
             )
-            * len(industry_facts["member_ids"])
-            + sum(
-                (_billing_price(billing[field]) for field in INDUSTRY_STATE_FIELDS if field in billing),
-                Decimal("0"),
-            )
-            * len(industry_facts["state_ids"])
-        )
         balance_delta = balance_before - balance_after
         actual_cost = balance_delta if balance_delta >= 0 else None
         cache_events = tuple(getattr(api, "paid_cache_events", ()))
@@ -8472,9 +8671,39 @@ def _attempt_report(
             for field in (*INDUSTRY_MEMBER_FIELDS, *INDUSTRY_STATE_FIELDS)
         )
         estimate_complete = (
-            len(component_events) == expected_component_requests
+            (staged.estimate_complete if staged is not None else industry_field_prices_complete)
+            and len(component_events) == expected_component_requests
             and all(event.get("cache") == "hit" for event in component_events)
-            and industry_field_prices_complete
+        )
+        staged_api_facts = tuple(
+            "getTickerSnapshot staged "
+            f"fields={','.join(str(field) for field in trace['fields'])} "
+            f"ids={len(trace['tm_ids'])} cache=client-managed"
+            for trace in (staged.request_trace if staged is not None else ())
+        )
+        snapshot_api_facts = (
+            (
+                f"getTickerSnapshot holdings fields={','.join(fields)} rows={len(snapshot_rows)} cache=client-managed",
+                f"getTickerSnapshot industries fields={','.join(A_SHARE_INDUSTRY_FIELDS)} rows={len(industry_rows)} cache=client-managed",
+                *staged_api_facts,
+            )
+            if individual_global_ranking
+            else (
+                f"getTickerSnapshot fields={','.join(fields)} rows={len(snapshot_rows)} cache=client-managed",
+                f"getTickerSnapshot industries fields={','.join(A_SHARE_INDUSTRY_FIELDS)} rows={len(industry_rows)} cache=client-managed",
+            )
+        )
+        legacy_industry_api_facts = (
+            (
+                f"getComponentTicker eligible_industries={industry_facts['component_requests']} "
+                f"rows={industry_facts['component_rows']} cache=client-managed",
+                f"getTickerSnapshot fields={','.join(INDUSTRY_MEMBER_FIELDS)} "
+                f"ids={len(industry_facts['member_ids'])} rows={industry_facts['member_rows']} cache=client-managed",
+                f"getTickerSnapshot fields={','.join(INDUSTRY_STATE_FIELDS)} "
+                f"ids={len(industry_facts['state_ids'])} rows={industry_facts['state_rows']} cache=client-managed",
+            )
+            if not individual_global_ranking
+            else ()
         )
         prior_state = rebuild_overheat_trim_projection(
             config.data_dir,
@@ -8514,11 +8743,8 @@ def _attempt_report(
                 f"getUpdateStatus rows={len(update_rows)}",
                 f"getFavoritesTicker securities={len(favorite_ids)}",
                 *_component_api_facts(api, len(component_rows)),
-                f"getTickerSnapshot fields={','.join(fields)} rows={len(snapshot_rows)} cache=client-managed",
-                f"getTickerSnapshot industries fields={','.join(A_SHARE_INDUSTRY_FIELDS)} rows={len(industry_rows)} cache=client-managed",
-                f"getComponentTicker eligible_industries={industry_facts['component_requests']} rows={industry_facts['component_rows']} cache=client-managed",
-                f"getTickerSnapshot fields={','.join(INDUSTRY_MEMBER_FIELDS)} ids={len(industry_facts['member_ids'])} rows={industry_facts['member_rows']} cache=client-managed",
-                f"getTickerSnapshot fields={','.join(INDUSTRY_STATE_FIELDS)} ids={len(industry_facts['state_ids'])} rows={industry_facts['state_rows']} cache=client-managed",
+                *snapshot_api_facts,
+                *legacy_industry_api_facts,
             ),
             data_sources=(
                 "Trend Animals",
@@ -8589,10 +8815,25 @@ def _attempt_report(
             query={
                 "component_pool_ids": list(candidate_pool_ids),
                 "favorite_ids": sorted(favorite_ids),
-                "snapshot_fields": list(fields),
+                **(
+                    {
+                        "holding_snapshot_fields": list(fields),
+                        "staged_snapshot_requests": [
+                            dict(trace) for trace in staged.request_trace
+                        ],
+                    }
+                    if staged is not None
+                    else {"snapshot_fields": list(fields)}
+                ),
                 "industry_fields": list(A_SHARE_INDUSTRY_FIELDS),
-                "industry_member_fields": list(INDUSTRY_MEMBER_FIELDS),
-                "industry_state_fields": list(INDUSTRY_STATE_FIELDS),
+                **(
+                    {
+                        "industry_member_fields": list(INDUSTRY_MEMBER_FIELDS),
+                        "industry_state_fields": list(INDUSTRY_STATE_FIELDS),
+                    }
+                    if not _uses_individual_global_ranking("CN", strategy_version)
+                    else {}
+                ),
             },
             responses={
                 "update_status": update_rows,
@@ -8601,13 +8842,24 @@ def _attempt_report(
                 "snapshots": snapshot_rows,
                 "real_snapshots": list(real_snapshot_rows.values()),
                 "industries": industry_rows,
-                "industry_components": [
-                    row
-                    for rows in industry_facts["component_rows_by_industry"].values()
-                    for row in rows
-                ],
-                "industry_members": industry_facts["member_response"],
-                "industry_states": industry_facts["state_response"],
+                **(
+                    {"staged_candidates": candidates}
+                    if staged is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "industry_components": [
+                            row
+                            for rows in industry_facts["component_rows_by_industry"].values()
+                            for row in rows
+                        ],
+                        "industry_members": industry_facts["member_response"],
+                        "industry_states": industry_facts["state_response"],
+                    }
+                    if not individual_global_ranking
+                    else {}
+                ),
             },
             candidate_pool_ids=candidate_pool_ids,
             lot_sizes={},

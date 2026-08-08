@@ -7418,6 +7418,38 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     assert evidence["rebuild_inputs"]["candidates"]
 
 
+def test_current_cn_runner_skips_candidate_industry_breadth(tmp_path: Path) -> None:
+    config = trend_config(tmp_path)
+    allocation = allocation_for("CN", rank=2, entry_weight="0.04")
+    allocation_path = config.data_dir / "trend_allocation/daily/2026-08-03.json"
+    allocation_path.parent.mkdir(parents=True, exist_ok=True)
+    allocation_path.write_text("{}", encoding="utf-8")
+    allocation["sha256"] = hashlib.sha256(allocation_path.read_bytes()).hexdigest()
+    api = ReadyApi([])
+
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        allocation_reference=allocation,
+        api_factory=lambda **kwargs: api,
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert payload["strategy_snapshot"]["strategy_version"] == "v13"
+    assert payload["industry_context_status"]["ordering_mode"] == "individual_global"
+    assert [
+        fields for _, fields in api.snapshot_requests
+        if fields in {
+            trend_module.INDUSTRY_MEMBER_FIELDS,
+            trend_module.INDUSTRY_STATE_FIELDS,
+        }
+    ] == []
+    assert all(fields != UNIFIED_TREND_FIELDS for _, fields in api.snapshot_requests)
+    assert payload["estimated_api_cost"] == "0.142"
+
+
 def test_a_share_report_pins_one_account_snapshot_through_internal_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7592,6 +7624,48 @@ def test_collect_industry_contexts_queries_only_eligible_industries_and_unions_m
             ),
         ),
     ]
+
+
+def test_collect_industry_contexts_individual_global_skips_breadth_requests(
+    tmp_path: Path,
+) -> None:
+    class Api:
+        def get_components(self, **_kwargs: object) -> list[dict[str, object]]:
+            pytest.fail("individual-global context must not request industry components")
+
+        def get_snapshots(self, **_kwargs: object) -> list[dict[str, object]]:
+            pytest.fail("individual-global context must not request member/state breadth")
+
+    contexts, status, facts = trend_module.collect_industry_contexts(
+        api=Api(),
+        candidates=(candidate("600001", global_strength="99"),),
+        candidate_rows=(),
+        held_symbols=set(),
+        holding_snapshots=(holding("600010", industry="银行", industry_tm_id=339103),),
+        expected_date="2026-07-14",
+        market="CN",
+        strategy_version="v13",
+        history_root=tmp_path / "trend_industry_context",
+        industry_rows=(
+            {
+                "tmId": 700001,
+                "asOfDate": "2026-07-14",
+                "trendTemperatureCurr": "热",
+            },
+            {
+                "tmId": 339103,
+                "asOfDate": "2026-07-14",
+                "trendTemperatureCurr": "温",
+            },
+        ),
+    )
+
+    assert status["ordering_mode"] == "individual_global"
+    assert [item.industry_tm_id for item in contexts] == [339103, 700001]
+    assert all(item.valid and item.strength is None for item in contexts)
+    assert facts["component_requests"] == 0
+    assert facts["member_ids"] == ()
+    assert facts["state_ids"] == ()
 
 
 def test_collect_industry_contexts_marks_stale_only_components_invalid(

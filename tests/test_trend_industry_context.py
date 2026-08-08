@@ -99,6 +99,25 @@ def test_calculation_extracts_optional_aggregate_ratios_without_affecting_validi
     assert context.aggregate_right_market_cap_ratio == Decimal("0.650")
 
 
+def test_temperature_only_context_does_not_require_strength_or_member_breadth() -> None:
+    context = calculate_industry_context(
+        industry_tm_id=700001,
+        industry="工业",
+        expected_date="2026-07-24",
+        component_tm_ids=(),
+        member_rows=(),
+        industry_row=_industry(strength=None),
+        warm_to_hot_count=0,
+        member_breadth_collected=False,
+        require_strength=False,
+    )
+
+    assert context.valid
+    assert context.strength is None
+    assert context.component_count == 0
+    assert context.right_share is None
+
+
 def test_invalid_aggregate_ratios_become_unavailable_without_invalidating_context() -> None:
     context = calculate_industry_context(
         industry_tm_id=700001,

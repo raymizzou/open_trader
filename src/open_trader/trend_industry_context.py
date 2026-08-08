@@ -54,6 +54,7 @@ def calculate_industry_context(
     industry_row: Mapping[str, object] | None,
     warm_to_hot_count: int,
     member_breadth_collected: bool = True,
+    require_strength: bool = True,
 ) -> IndustryContext:
     normalized_warm_to_hot_count = _nonnegative_int(warm_to_hot_count)
     component_ids = {
@@ -144,7 +145,7 @@ def calculate_industry_context(
         invalid_reasons.append("warm_to_hot_count_invalid")
     if temperature is None:
         invalid_reasons.append("industry_temperature_invalid")
-    if strength is None:
+    if require_strength and strength is None:
         invalid_reasons.append("industry_strength_invalid")
 
     return IndustryContext(
