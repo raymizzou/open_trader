@@ -47,8 +47,11 @@ from polymarket.models.gamma.market import (
     [
         ("observe_only", "observe_only"),
         ("manual_confirm", "manual_confirm"),
+        ("auto_submit", "auto_submit"),
         (" manual_confirm ", "observe_only"),
+        (" auto_submit ", "observe_only"),
         ("MANUAL_CONFIRM", "observe_only"),
+        ("AUTO_SUBMIT", "observe_only"),
         (None, "observe_only"),
     ],
 )
@@ -2165,6 +2168,89 @@ def test_monitor_signal_episode_persists_refreshes_and_rotates_on_reopen(
         assert refreshed_reopened is not None
         assert refreshed_reopened["signal_episode_id"] == reopened["signal_episode_id"]
         await monitor.stop()
+
+    asyncio.run(exercise())
+
+
+def test_monitor_stage_five_observer_dedupes_restart_and_rearms_after_stale_recovery(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        store = PredictionArbitrageStore(tmp_path / "data")
+        notifications: list[tuple[str, str]] = []
+        monitor = PredictCrossVenueMonitor(
+            predict_source=FakeCrossVenuePredict(()),
+            polymarket_monitor=FakeCrossVenuePolymarket(),
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=monitor_gamma,
+            store=store,
+            ready_observer=lambda opportunity_id, signal_id: notifications.append(
+                (opportunity_id, signal_id)
+            ),
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        opportunity_id = "cross:public-pair:PREDICT_YES_POLYMARKET_NO"
+        stage_five = {
+            "opportunity_id": opportunity_id,
+            "pair_id": "public-pair",
+            "direction": "PREDICT_YES_POLYMARKET_NO",
+            "market_type": "cross_venue_yes_no",
+            "execution_mode": "observe_only",
+            "funnel_stage": 5,
+            "actionable": True,
+            "clear_signal": True,
+            "total_max_cost": Decimal("8.128"),
+            "minimum_profit": Decimal("1.872"),
+            "rules_fingerprints": {
+                "predict.fun": "predict-fingerprint-1",
+                "polymarket": "poly-fingerprint-1",
+            },
+            "approved_candidates": {
+                "predict.fun": {
+                    "market_id": "predict-market-1",
+                    "condition_id": "predict-condition-1",
+                    "yes_token_id": "predict-yes-1",
+                    "no_token_id": "predict-no-1",
+                },
+                "polymarket": {
+                    "market_id": "poly-market-1",
+                    "condition_id": "poly-condition-1",
+                    "yes_token_id": "poly-yes-1",
+                    "no_token_id": "poly-no-1",
+                },
+            },
+            "codex_approval": {"decision": "APPROVE", "cache_key": "approval-1"},
+        }
+        monitor._persist_observation(stage_five)
+        await wait_until(lambda: len(notifications) == 1)
+        original_signal_id = notifications[0][1]
+
+        restarted_notifications: list[tuple[str, str]] = []
+        restarted = PredictCrossVenueMonitor(
+            predict_source=FakeCrossVenuePredict(()),
+            polymarket_monitor=FakeCrossVenuePolymarket(),
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=monitor_gamma,
+            store=store,
+            ready_observer=lambda opportunity_id, signal_id:
+            restarted_notifications.append((opportunity_id, signal_id)),
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        restarted._persist_observation(stage_five)
+        await asyncio.sleep(0)
+        assert restarted_notifications == []
+
+        restarted._opportunities[(
+            "public-pair", "PREDICT_YES_POLYMARKET_NO"
+        )] = dict(stage_five)
+        await restarted._suspend_hot(status="degraded")
+        restarted._status = "ready"
+        restarted._persist_observation(stage_five)
+        await wait_until(lambda: len(restarted_notifications) == 1)
+        assert restarted_notifications == [
+            (opportunity_id, store.open_signal_history()[0]["signal_id"])
+        ]
+        assert restarted_notifications[0][1] != original_signal_id
 
     asyncio.run(exercise())
 

@@ -44,7 +44,7 @@ from .prediction_arbitrage_store import PredictionArbitrageStore
 
 
 Direction = Literal["PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"]
-CROSS_EXECUTION_MODES = frozenset({"observe_only", "manual_confirm"})
+CROSS_EXECUTION_MODES = frozenset({"observe_only", "manual_confirm", "auto_submit"})
 CROSS_VENUE_GAS_RESERVE = Decimal("0.10")
 _CANONICAL_CUTOFF_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$"
