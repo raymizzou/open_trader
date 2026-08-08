@@ -1653,6 +1653,23 @@ def test_dashboard_current_trend_uses_candidate_snapshot_and_fails_closed(
         "global_strength": None,
     })
     assert dashboard_module._valid_trend_collections(payload, judgments)
+    candidates[0].update({
+        "eligible": False,
+        "rank": None,
+        "excluded_reasons": ["name_missing"],
+    })
+    candidates[0].pop("name")
+    assert dashboard_module._valid_trend_collections(payload, judgments)
+    candidates[0]["name"] = ""
+    assert dashboard_module._valid_trend_collections(payload, judgments)
+    candidates[0]["excluded_reasons"] = ["strength_below_95"]
+    assert not dashboard_module._valid_trend_collections(payload, judgments)
+    candidates[0].update({
+        "eligible": True,
+        "rank": 2,
+        "excluded_reasons": [],
+    })
+    candidates[0]["name"] = "Current candidate"
 
     report = dashboard_module._project_broker_trend_report(
         selected=(
@@ -1763,9 +1780,48 @@ def test_dashboard_current_trend_risk_audit_requires_final_plan_rows() -> None:
     judgments["risk_skips"][3]["estimated_shares"] = 1
     assert not dashboard_module._valid_trend_risk_summary(payload)
     judgments["risk_skips"][3]["estimated_shares"] = 0
+    judgments["risk_skips"][3]["target_amount"] = "1"
+    assert not dashboard_module._valid_trend_risk_summary(payload)
+    judgments["risk_skips"][3]["target_amount"] = None
+    judgments["risk_skips"][1]["estimated_shares"] = 1
+    assert not dashboard_module._valid_trend_risk_summary(payload)
+    judgments["risk_skips"][1]["estimated_shares"] = 0
     judgments["risk_skips"][1]["target_weight"] = "NaN"
     assert not dashboard_module._valid_trend_risk_summary(payload)
     judgments["risk_skips"][1]["target_weight"] = "0.06"
+    judgments["risk_skips"][1]["target_weight"] = "0"
+    assert not dashboard_module._valid_trend_risk_summary(payload)
+    judgments["risk_skips"][1]["target_weight"] = "1.1"
+    assert not dashboard_module._valid_trend_risk_summary(payload)
+    judgments["risk_skips"][1]["target_weight"] = "0.06"
+
+    pause_reason = "Kelly 上限为 0，仅暂停未来新开仓"
+    judgments["formal_actions"] = []
+    judgments["risk_skips"] = [{
+        "symbol": "KELLY-PAUSE",
+        "target_weight": "0",
+        "target_amount": "0",
+        "estimated_shares": 0,
+        "reason": pause_reason,
+        "decisive_constraint": "Kelly 上限",
+    }]
+    summary.update({
+        "status": "paused",
+        "status_label": "暂停新开仓",
+        "pause_reason": pause_reason,
+        "new_planned_risk": "0",
+        "portfolio_planned_risk": "0",
+        "portfolio_planned_risk_pct": "0",
+        "portfolio_remaining_risk": "4000",
+        "portfolio_remaining_risk_pct": "0.04",
+        "kelly_phase": "active_all_samples",
+        "kelly_eligible_sample_count": 30,
+        "kelly_selected_sample_count": 30,
+        "kelly_cap": "0.000000",
+        "kelly_reason": pause_reason,
+        "kelly_last_closed_at": "2026-07-14T16:00:00+00:00",
+    })
+    assert dashboard_module._valid_trend_risk_summary(payload)
 
     judgments.pop("risk_skips")
     assert not dashboard_module._valid_trend_risk_summary(payload)
@@ -1816,6 +1872,21 @@ def test_dashboard_individual_global_context_mode_requires_current_only_facts() 
     status["fallback_reason"] = "missing current context"
     assert not dashboard_module._valid_frozen_trend_facts(payload)
 
+    current_without_facts = copy.deepcopy(payload)
+    current_without_facts.pop("api_cost", None)
+    current_without_facts.pop("industry_context_status", None)
+    current_without_facts.pop("industry_contexts", None)
+    assert not dashboard_module._valid_frozen_trend_facts(current_without_facts)
+    current_legacy_cost = copy.deepcopy(current_without_facts)
+    api_cost = current_legacy_cost["api_cost"] = {
+        "actual": "0.479",
+        "estimated": "0.479",
+        "estimate_complete": False,
+        "unit": "Trend Animals 余额单位",
+    }
+    assert isinstance(api_cost, dict)
+    assert not dashboard_module._valid_frozen_trend_facts(current_legacy_cost)
+
     legacy = _dashboard_frozen_report_payload()
     legacy_status = legacy["industry_context_status"]
     assert isinstance(legacy_status, dict)
@@ -1826,6 +1897,11 @@ def test_dashboard_individual_global_context_mode_requires_current_only_facts() 
         "fallback_reason": None,
     })
     assert not dashboard_module._valid_frozen_trend_facts(legacy)
+    legacy_without_facts = _dashboard_frozen_report_payload()
+    legacy_without_facts.pop("api_cost", None)
+    legacy_without_facts.pop("industry_context_status", None)
+    legacy_without_facts.pop("industry_contexts", None)
+    assert dashboard_module._valid_frozen_trend_facts(legacy_without_facts)
 
 
 def test_dashboard_rejects_malformed_signal_candidate_audit_when_present(

@@ -1495,17 +1495,26 @@ def _valid_current_candidate_signal(value: object) -> bool:
         return False
     eligible = value.get("eligible")
     excluded_reasons = value.get("excluded_reasons")
+    name = value.get("name")
     if (
         not isinstance(value.get("symbol"), str)
         or not value["symbol"].strip()
-        or not isinstance(value.get("name"), str)
-        or not value["name"].strip()
         or type(eligible) is not bool
         or not isinstance(excluded_reasons, list)
         or not all(isinstance(reason, str) and reason.strip() for reason in excluded_reasons)
     ):
         return False
     rank = value.get("rank")
+    name_missing = name is None or isinstance(name, str) and not name.strip()
+    if name_missing:
+        if not (
+            eligible is False
+            and rank is None
+            and "name_missing" in excluded_reasons
+        ):
+            return False
+    elif not isinstance(name, str):
+        return False
     if eligible:
         return (
             isinstance(rank, int)
@@ -1519,6 +1528,10 @@ def _valid_current_candidate_signal(value: object) -> bool:
 def _valid_frozen_trend_facts(payload: dict[str, Any]) -> bool:
     fact_keys = {"api_cost", "industry_context_status", "industry_contexts"}
     if not fact_keys.intersection(payload):
+        status = payload.get("industry_context_status")
+        mode = status.get("ordering_mode") if isinstance(status, dict) else None
+        if _is_current_final_plan_payload(payload) or mode == "individual_global":
+            return False
         return True
     api_cost = payload.get("api_cost")
     status = payload.get("industry_context_status")
@@ -1586,7 +1599,7 @@ def _valid_frozen_trend_facts(payload: dict[str, Any]) -> bool:
         "industry_context_status",
         "industry_contexts",
     }.intersection(payload):
-        return True
+        return not _is_current_final_plan_payload(payload)
     snapshot = payload.get("strategy_snapshot")
     if not isinstance(snapshot, dict):
         return False
@@ -1921,7 +1934,7 @@ def _valid_current_trend_risk_contract(
             not isinstance(symbol, str) or not symbol.strip()
             or not isinstance(reason, str) or not reason.strip()
             or not isinstance(constraint, str) or not constraint.strip()
-            or isinstance(shares, bool) or not isinstance(shares, int) or shares < 0
+            or isinstance(shares, bool) or not isinstance(shares, int) or shares != 0
         ):
             return False
         target_weight = item.get("target_weight")
@@ -1930,9 +1943,25 @@ def _valid_current_trend_risk_contract(
             if target_amount is not None or shares != 0:
                 return False
             continue
-        if _dashboard_risk_decimal(target_weight) is None:
+        parsed_weight = _dashboard_risk_decimal(target_weight)
+        parsed_amount = _dashboard_risk_decimal(target_amount)
+        zero_kelly_skip = (
+            parsed_weight == 0
+            and parsed_amount == 0
+            and summary.get("status") == "paused"
+            and summary.get("kelly_cap") in {"0", "0.000000", 0}
+            and summary.get("pause_reason") == "Kelly 上限为 0，仅暂停未来新开仓"
+            and item.get("reason") == summary.get("pause_reason")
+            and constraint == "Kelly 上限"
+        )
+        if (
+            parsed_weight is None
+            or parsed_weight < 0
+            or parsed_weight > 1
+            or parsed_weight == 0 and not zero_kelly_skip
+        ):
             return False
-        if target_amount is not None and _dashboard_risk_decimal(target_amount) is None:
+        if target_amount is not None and parsed_amount is None:
             return False
     risk_judgments = {**judgments, "risk_skips": []}
     if not _valid_v2_risk_items(
