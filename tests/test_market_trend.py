@@ -145,6 +145,52 @@ def allocation_for(market: str, *, rank: int, entry_weight: str) -> dict[str, ob
     }
 
 
+def allocation_reference_for_runner() -> dict[str, object]:
+    assets = {
+        "CN": ("A股", "ETF基金"),
+        "HK": ("港股", "香港ETF"),
+        "US": ("美股", "美国ETF"),
+    }
+    ranks = {"CN": 3, "HK": 2, "US": 1}
+    strengths = {1: ("90", "80"), 2: ("70", "60"), 3: ("50", "40")}
+    roots = {
+        market: {
+            role: {
+                "asset": asset,
+                "tm_id": (index + 1) * 10 + role_index,
+                "as_of_date": "2026-08-03",
+                "global_strength": strengths[ranks[market]][role_index],
+            }
+            for role_index, (role, asset) in enumerate(
+                zip(("stock", "etf"), assets[market])
+            )
+        }
+        for index, market in enumerate(("CN", "HK", "US"))
+    }
+    return {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": "b" * 64,
+        "snapshot": {
+            "version": 1,
+            "allocation_date": "2026-08-03",
+            "generated_at": "2026-08-03T16:18:00+08:00",
+            "generator_version": "trend-allocation-v1",
+            "git_sha": "a" * 40,
+            "roots": roots,
+            "markets": {
+                market: {
+                    "rank": ranks[market],
+                    "score": strengths[ranks[market]][0],
+                    "score_source": assets[market][0],
+                    "entry_weight": {1: "0.06", 2: "0.04", 3: "0.02"}[ranks[market]],
+                    "nominal_weight": {1: "0.60", 2: "0.40", 3: "0.20"}[ranks[market]],
+                }
+                for market in ("CN", "HK", "US")
+            },
+        },
+    }
+
+
 class DefaultSimAccountClient:
     def __init__(self, **kwargs: object) -> None:
         self.acc_id = int(kwargs["simulate_acc_id"])
@@ -1167,7 +1213,13 @@ def test_corrupt_statistics_do_not_weaken_current_market_industry_gate(
             return [
                 {
                     "field": field,
-                    "priceCost": "0.071" if field == "tickerName" else "0",
+                    "priceCost": (
+                        "0.061"
+                        if field == "tickerName"
+                        else "0.01"
+                        if field == "trendTemperatureCurr"
+                        else "0"
+                    ),
                 }
                 for field in fields
             ]
@@ -1257,6 +1309,7 @@ def test_corrupt_statistics_do_not_weaken_current_market_industry_gate(
     }
     judgments = payload["strategy_judgments"]
     assert payload["strategy_snapshot"]["strategy_version"] == "v8"
+    assert payload["estimated_api_cost"] == "0.081"
     assert payload["risk_summary"]["kelly_phase"] == "unavailable"
     assert payload["metadata"]["trend_statistics"]["status"] == "unavailable"
     assert (payload["risk_summary"]["status"] == "paused") is industry_error
@@ -1273,6 +1326,7 @@ def test_corrupt_statistics_do_not_weaken_current_market_industry_gate(
     assert judgments["risk_skips"] == []
     assert judgments["top10_candidates"] == []
     assert len(industry_calls) == 1
+    assert industry_calls[0]["tm_ids"] == [700001]
     assert bool(payload["metadata"]["industry_data_reason"]) is industry_error
     assert len(mapping_calls) == 1
     assert mapping_calls[0]["market"] == market
@@ -2134,3 +2188,246 @@ def test_previous_attention_rows_reject_malformed_tiger_baseline(
     assert market_trend._previous_attention_rows(
         paths, current_as_of_date="2026-07-16", market="US"
     ) == []
+
+
+@pytest.mark.parametrize("market", ["HK", "US"])
+def test_allocation_market_runner_ledger_excludes_real_only_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, market: str,
+) -> None:
+    cfg = config(tmp_path)
+    allocation = allocation_reference_for_runner()
+    allocation_path = cfg.data_dir / "trend_allocation/daily/2026-08-03.json"
+    allocation_path.parent.mkdir(parents=True, exist_ok=True)
+    allocation_body = (
+        json.dumps(
+            allocation["snapshot"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    allocation_path.write_bytes(allocation_body)
+    allocation["sha256"] = hashlib.sha256(allocation_body).hexdigest()
+    as_of_date = "2026-08-07" if market == "HK" else "2026-08-06"
+    execution_date = "2026-08-08" if market == "HK" else "2026-08-07"
+    pool_id = 622494 if market == "HK" else 622460
+    complete_snapshot_ids: list[int] = []
+    staged_snapshot_requests: list[tuple[list[int], tuple[str, ...]]] = []
+    eligible_industry_component_calls: list[int] = []
+    industry_member_snapshot_calls: list[list[int]] = []
+    industry_state_snapshot_calls: list[list[int]] = []
+
+    def ledger_row(tm_id: int, expected_date: str) -> dict[str, object]:
+        if market == "HK":
+            codes = {1: "2800", 2: "2801", 3: "2802"}
+            assets = "港股"
+            ticker_symbol = f"{codes[tm_id]}.HK"
+        else:
+            codes = {1: "QQQ", 2: "VIXY", 3: "SPY"}
+            assets = "美股"
+            ticker_symbol = f"{codes[tm_id]}.US"
+        return {
+            "tmId": tm_id,
+            "tickerName": f"标的{codes[tm_id]}",
+            "tickerSymbol": ticker_symbol,
+            "asset": assets,
+            "asOfDate": expected_date,
+            "tradableFlag": True,
+            "industryTmId": 700001,
+            "industryName": "行业ETF",
+            "priceIndex": "10",
+            "marketCap": "200",
+            "amount1d": "3",
+            "isTrendRightSide": True,
+            "trendTemperatureCurr": "热",
+            "trendTemperaturePrev": "温",
+            "daysSinceTrendEntry": 3,
+            "gainSinceEntry": "0.1",
+            "trendPhasePrev": "谷雨",
+            "trendPhaseCurr": "立夏",
+            "trendStrengthLocalCurr": {1: "98", 2: "94", 3: "97"}[tm_id],
+            "trendStrengthLocalChange": "1",
+            "trendStrengthGlobalCurr": {1: "98", 2: "94", 3: "97"}[tm_id],
+            "trendStrengthLocalPrevWeek": "96",
+            "trendStrengthLocalPrevMonth": "95",
+            "stopwinFlagByDangerSignal": False,
+            "stopwinFlagByBoilingTemperature": False,
+            "stopwinFlagByPopChampagne": False,
+            "tickerLabels": "成交主力",
+        }
+
+    class LedgerApi:
+        paid_cache_events: tuple[dict[str, object], ...] = ()
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            assets = ("港股", "香港ETF") if market == "HK" else ("美股", "美国ETF")
+            return [{"asset": asset, "asOfDate": as_of_date} for asset in assets]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str,
+        ) -> list[dict[str, object]]:
+            if tm_id != pool_id:
+                eligible_industry_component_calls.append(tm_id)
+            return [
+                {
+                    "tmId": candidate_id,
+                    "tickerSymbol": (
+                        f"{2800 + candidate_id - 1:04d}.HK"
+                        if market == "HK"
+                        else {1: "QQQ.US", 2: "VIXY.US", 3: "SPY.US"}[candidate_id]
+                    ),
+                    "asOfDate": expected_date,
+                }
+                for candidate_id in (1, 2, 3)
+            ]
+
+        def get_favorites_tickers(self) -> list[dict[str, object]]:
+            return []
+
+        def search_exact_symbol(
+            self, symbol: str, *, market: str, expected_date: str,
+        ) -> int:
+            assert market == self_market
+            return 3
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            fields = tuple(dict.fromkeys((*UNIFIED_TREND_FIELDS, *INDUSTRY_STATE_FIELDS)))
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in fields
+            ]
+
+        def get_snapshots(
+            self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str,
+        ) -> list[dict[str, object]]:
+            if fields == INDUSTRY_MEMBER_FIELDS:
+                industry_member_snapshot_calls.append(list(tm_ids))
+            if fields == INDUSTRY_STATE_FIELDS:
+                industry_state_snapshot_calls.append(list(tm_ids))
+            if fields == UNIFIED_TREND_FIELDS:
+                complete_snapshot_ids.extend(tm_ids)
+            else:
+                staged_snapshot_requests.append((list(tm_ids), fields))
+            if fields == A_SHARE_INDUSTRY_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": expected_date,
+                        "trendTemperatureCurr": "热",
+                    }
+                    for tm_id in tm_ids
+                ]
+            return [ledger_row(tm_id, expected_date) for tm_id in tm_ids]
+
+        def remember_symbol_row(self, **kwargs: object) -> None:
+            return None
+
+        def symbol_mapping(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    self_market = market
+    broker = "phillips" if market == "HK" else "tiger"
+    currency = "HKD" if market == "HK" else "USD"
+    real_symbol = "02802" if market == "HK" else "SPY"
+    real_snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)
+    real_snapshot["positions"] = [{
+        "instrument_id": f"{broker}:{market}:{real_symbol}",
+        "broker": broker,
+        "market": market,
+        "asset_class": "etf",
+        "symbol": real_symbol,
+        "name": f"真实{real_symbol}",
+        "currency": currency,
+        "quantity": "10",
+        "cost_price": "10",
+        "market_value": "100",
+    }]
+    real_snapshot["cash_balances"] = [{
+        "broker": broker,
+        "account_alias": f"{broker}_main",
+        "currency": currency,
+        "cash_balance": "100",
+        "available_balance": "100",
+    }]
+    monkeypatch.setattr(market_trend, "fetch_account_snapshot", lambda: real_snapshot)
+
+    class Quote:
+        def __init__(self, **kwargs: object) -> None:
+            return None
+
+        def get_trading_days(self, *, market: str, start: str, end: str) -> list[str]:
+            return [as_of_date, execution_date]
+
+        def get_daily_kline(
+            self, symbol: str, *, start: str, end: str,
+        ) -> list[object]:
+            end_day = datetime.fromisoformat(as_of_date)
+            return [
+                DailyKlineBar(
+                    date=(end_day - timedelta(days=14 - index)).date().isoformat(),
+                    open=10,
+                    high=10.2,
+                    low=9.8,
+                    close=10,
+                    volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def get_lot_sizes(self, symbols: list[str]) -> dict[str, int]:
+            return {symbol: 100 for symbol in symbols}
+
+        def close(self) -> None:
+            return None
+
+    api = LedgerApi()
+    result = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date="2026-08-07",
+        allocation_reference=allocation,
+        notifier=NullNotifier(),
+        api_factory=lambda **kwargs: api,
+        quote_factory=Quote,
+    )
+    assert result.json_path is not None
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    trace = evidence["query"]["staged_snapshot_requests"]
+
+    assert sorted(complete_snapshot_ids) == [3]
+    assert len(complete_snapshot_ids) == len(set(complete_snapshot_ids))
+    assert [item["tm_ids"] for item in trace] == [
+        [1, 2], [1, 2], [1], [1], [1], [700001], [1],
+    ]
+    assert all(item["tm_ids"] == sorted(set(item["tm_ids"])) for item in trace)
+    assert all(3 not in item["tm_ids"] for item in trace)
+    assert eligible_industry_component_calls == []
+    assert industry_member_snapshot_calls == []
+    assert industry_state_snapshot_calls == []
+    assert payload["industry_context_status"]["ordering_mode"] == "individual_global"
+    assert sum(
+        "fields=tmId,asOfDate,trendTemperatureCurr" in fact
+        for fact in payload["api_facts"]
+    ) == 1
+
+    billing = {
+        row["field"]: Decimal(str(row["priceCost"]))
+        for row in api.get_snapshot_billing()
+    }
+    expected_cost = Decimal("0.071") * len(complete_snapshot_ids)
+    expected_cost += sum(
+        sum(billing[field] for field in item["fields"]) * len(item["tm_ids"])
+        for item in trace
+    )
+    assert payload["estimated_api_cost"] == format(expected_cost, "f")
+    if market == "US":
+        assert Decimal(payload["estimated_api_cost"]) <= Decimal("2.852")

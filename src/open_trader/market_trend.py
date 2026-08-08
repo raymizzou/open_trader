@@ -771,6 +771,8 @@ def _attempt_market_report(
                 )
             except TrendAnimalsError as exc:
                 industry_data_reason = f"行业温度数据不可用，暂停新开仓：{exc}"
+        else:
+            industry_ids = []
         if not individual_global_ranking:
             legacy_candidates = []
             for tm_id in sorted(candidate_ids):
@@ -873,6 +875,17 @@ def _attempt_market_report(
                 existing_bars_by_symbol=bars_by_symbol,
             )
         )
+        real_only_holding_ids = set(real_snapshot_rows)
+        staged_candidate_ids = (
+            candidate_ids
+            - set(holding_ids.values())
+            - real_only_holding_ids
+        )
+        staged_held_symbols = {position.symbol for position in account.positions}
+        if real_holdings.status == "available":
+            staged_held_symbols.update(
+                position.symbol for position in real_holdings.positions
+            )
 
         staged = None
         candidate_pool_rows: Sequence[Mapping[str, object]] = ()
@@ -911,9 +924,9 @@ def _attempt_market_report(
 
             staged = fetch_staged_candidates(
                 api,
-                candidate_ids=candidate_ids - set(holding_ids.values()),
+                candidate_ids=staged_candidate_ids,
                 component_pools=component_pools,
-                held_symbols={position.symbol for position in account.positions},
+                held_symbols=staged_held_symbols,
                 holding_snapshots=(
                     *holding_snapshots.values(),
                     *(
@@ -986,7 +999,11 @@ def _attempt_market_report(
                 api=api,
                 candidates=candidates,
                 candidate_rows=candidate_pool_rows,
-                held_symbols={position.symbol for position in account.positions},
+                held_symbols=(
+                    staged_held_symbols
+                    if individual_global_ranking
+                    else {position.symbol for position in account.positions}
+                ),
                 holding_snapshots=(
                     *holding_snapshots.values(),
                     *(
@@ -1028,7 +1045,7 @@ def _attempt_market_report(
                     (_billing_price(billing[field]) for field in A_SHARE_INDUSTRY_FIELDS),
                     Decimal("0"),
                 )
-                * len(industry_rows)
+                * len(industry_ids)
                 + sum(
                     (_billing_price(billing[field]) for field in INDUSTRY_MEMBER_FIELDS if field in billing),
                     Decimal("0"),
@@ -1068,7 +1085,8 @@ def _attempt_market_report(
         staged_api_facts = tuple(
             "getTickerSnapshot staged "
             f"fields={','.join(str(field) for field in trace['fields'])} "
-            f"ids={len(trace['tm_ids'])} cache=client-managed"
+            f"ids={','.join(str(tm_id) for tm_id in trace['tm_ids'])} "
+            "cache=client-managed"
             for trace in (staged.request_trace if staged is not None else ())
         )
         legacy_industry_api_facts = (
@@ -1086,7 +1104,6 @@ def _attempt_market_report(
         snapshot_api_facts = (
             (
                 f"getTickerSnapshot holdings fields={','.join(UNIFIED_TREND_FIELDS)} rows={len(snapshot_rows)} cache=client-managed",
-                f"getTickerSnapshot industries fields={','.join(A_SHARE_INDUSTRY_FIELDS)} rows={len(industry_rows)} cache=client-managed",
                 *staged_api_facts,
             )
             if individual_global_ranking

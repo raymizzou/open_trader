@@ -7450,6 +7450,189 @@ def test_current_cn_runner_skips_candidate_industry_breadth(tmp_path: Path) -> N
     assert payload["estimated_api_cost"] == "0.142"
 
 
+def test_current_cn_runner_ledger_excludes_real_only_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = trend_config(tmp_path)
+    allocation = allocation_for("CN", rank=2, entry_weight="0.04")
+    allocation_path = config.data_dir / "trend_allocation/daily/2026-08-03.json"
+    allocation_path.parent.mkdir(parents=True, exist_ok=True)
+    allocation_path.write_text("{}", encoding="utf-8")
+    allocation["sha256"] = hashlib.sha256(allocation_path.read_bytes()).hexdigest()
+
+    complete_snapshot_ids: list[int] = []
+    staged_snapshot_requests: list[tuple[list[int], tuple[str, ...]]] = []
+    industry_component_calls: list[int] = []
+    industry_member_snapshot_calls: list[list[int]] = []
+    industry_state_snapshot_calls: list[list[int]] = []
+
+    def ledger_row(tm_id: int, expected_date: str) -> dict[str, object]:
+        symbols = {1: "600001", 2: "600002", 3: "600003", 10: "600010"}
+        strengths = {1: "98", 2: "94", 3: "97", 10: "70"}
+        symbol = symbols[tm_id]
+        return {
+            "tmId": tm_id,
+            "tickerName": f"股票{symbol}",
+            "tickerSymbol": f"{symbol}.SH",
+            "asset": "A股",
+            "asOfDate": expected_date,
+            "tradableFlag": True,
+            "industryTmId": 700001,
+            "industryName": "电力",
+            "priceIndex": "10",
+            "marketCap": "100",
+            "amount1d": "2",
+            "isTrendRightSide": True,
+            "trendTemperatureCurr": "热",
+            "trendTemperaturePrev": "温",
+            "daysSinceTrendEntry": 3,
+            "gainSinceEntry": "0.1",
+            "trendPhasePrev": "谷雨",
+            "trendPhaseCurr": "立夏",
+            "trendStrengthLocalCurr": strengths[tm_id],
+            "trendStrengthLocalChange": "1",
+            "trendStrengthGlobalCurr": strengths[tm_id],
+            "trendStrengthLocalPrevWeek": strengths[tm_id],
+            "trendStrengthLocalPrevMonth": strengths[tm_id],
+            "stopwinFlagByDangerSignal": False,
+            "stopwinFlagByBoilingTemperature": False,
+            "stopwinFlagByPopChampagne": False,
+            "tickerLabels": "成交主力",
+        }
+
+    class LedgerApi:
+        paid_cache_events: tuple[dict[str, object], ...] = ()
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": "A股", "asOfDate": "2026-07-14"},
+                {"asset": "ETF基金", "asOfDate": "2026-07-14"},
+            ]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str,
+        ) -> list[dict[str, object]]:
+            if tm_id not in {622466, 697199}:
+                industry_component_calls.append(tm_id)
+            return [
+                {
+                    "tmId": candidate_id,
+                    "tickerSymbol": f"{candidate_id + 600000:06d}.SH",
+                    "asOfDate": expected_date,
+                }
+                for candidate_id in (1, 2, 3)
+            ]
+
+        def get_favorites_tickers(self) -> list[dict[str, object]]:
+            return []
+
+        def search_exact_symbol(
+            self, symbol: str, *, market: str, expected_date: str,
+        ) -> int:
+            return {"600010": 10, "600003": 3}[symbol]
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            fields = tuple(dict.fromkeys((*UNIFIED_TREND_FIELDS, *trend_module.INDUSTRY_STATE_FIELDS)))
+            return [
+                {
+                    "columnName": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in fields
+            ]
+
+        def get_snapshots(
+            self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str,
+        ) -> list[dict[str, object]]:
+            if fields == trend_module.INDUSTRY_MEMBER_FIELDS:
+                industry_member_snapshot_calls.append(list(tm_ids))
+            if fields == trend_module.INDUSTRY_STATE_FIELDS:
+                industry_state_snapshot_calls.append(list(tm_ids))
+            if fields == UNIFIED_TREND_FIELDS:
+                complete_snapshot_ids.extend(tm_ids)
+            else:
+                staged_snapshot_requests.append((list(tm_ids), fields))
+            if fields == trend_module.A_SHARE_INDUSTRY_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": expected_date,
+                        "trendTemperatureCurr": "热",
+                    }
+                    for tm_id in tm_ids
+                ]
+            return [ledger_row(tm_id, expected_date) for tm_id in tm_ids]
+
+        def remember_symbol_row(self, **kwargs: object) -> None:
+            return None
+
+        def symbol_mapping(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    real_snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)
+    real_snapshot["positions"] = [{
+        "instrument_id": "eastmoney:CN:600003",
+        "broker": "eastmoney",
+        "market": "CN",
+        "asset_class": "stock",
+        "symbol": "600003",
+        "name": "股票600003",
+        "currency": "CNY",
+        "quantity": "10",
+        "cost_price": "10",
+        "market_value": "100",
+    }]
+    real_snapshot["cash_balances"] = [{
+        "broker": "eastmoney",
+        "account_alias": "eastmoney_main",
+        "currency": "CNY",
+        "cash_balance": "100",
+        "available_balance": "100",
+    }]
+    monkeypatch.setattr(trend_module, "fetch_account_snapshot", lambda: real_snapshot)
+
+    api = LedgerApi()
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        allocation_reference=allocation,
+        api_factory=lambda **kwargs: api,
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        account_factory=simulation_account_with_positions("SH.600010"),
+        notifier=RecordingFeishu(),
+    )
+    assert result.json_path is not None
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    evidence_path = config.data_dir / payload["replay_evidence"]["path"]
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+
+    assert sorted(complete_snapshot_ids) == [3, 10]
+    assert len(complete_snapshot_ids) == len(set(complete_snapshot_ids))
+    trace = evidence["query"]["staged_snapshot_requests"]
+    assert [item["tm_ids"] for item in trace] == [
+        [1, 2], [1, 2], [1], [1], [1], [700001], [1],
+    ]
+    assert all(3 not in item["tm_ids"] for item in trace)
+    assert industry_component_calls == []
+    assert industry_member_snapshot_calls == []
+    assert industry_state_snapshot_calls == []
+    assert payload["industry_context_status"]["ordering_mode"] == "individual_global"
+
+    billing = {
+        row["columnName"]: Decimal(str(row["priceCost"]))
+        for row in api.get_snapshot_billing()
+    }
+    expected_cost = Decimal("0.071") * len(complete_snapshot_ids)
+    expected_cost += sum(
+        sum(billing[field] for field in item["fields"]) * len(item["tm_ids"])
+        for item in trace
+    )
+    assert payload["estimated_api_cost"] == format(expected_cost, "f")
+
+
 def test_a_share_report_pins_one_account_snapshot_through_internal_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
