@@ -50,6 +50,23 @@ def test_dashboard_acceptance_allows_current_market_versions() -> None:
         assert version in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS[market]
 
 
+@pytest.mark.parametrize(
+    ("market", "version"),
+    [("CN", "v13"), ("HK", "v11"), ("US", "v11")],
+)
+def test_protection_reason_label_accepts_current_rank_versions(
+    market: str, version: str,
+) -> None:
+    assert dashboard_acceptance._trend_action_reason_label(
+        {
+            "reason": "protection_line_already_triggered",
+            "initial_line": "10",
+            "active_line": "10",
+        },
+        {"market": market, "strategy_version": version},
+    ) == "2×ATR14 硬止损"
+
+
 def test_prediction_acceptance_registry_is_exact_and_ordered() -> None:
     assert len(SCENARIO_IDS) == 63
     assert len(set(SCENARIO_IDS)) == 63

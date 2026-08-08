@@ -77,9 +77,9 @@ TREND_SIMULATE_MARKETS = {
     broker: market for broker, (market, _currency) in TREND_SIMULATE_BROKERS.items()
 }
 TREND_ACCEPTED_STRATEGY_VERSIONS = {
-    "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10", "v11", "v12"}),
-    "US": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10"}),
-    "HK": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10"}),
+    "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"}),
+    "US": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11"}),
+    "HK": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11"}),
 }
 # Simulate positions are a stable contract; their served copy can lag one
 # publication behind the live Futu snapshot, so convergence is bounded.
@@ -3079,12 +3079,15 @@ def _trend_action_reason_label(
         ("CN", "v9"),
         ("CN", "v10"),
         ("CN", "v12"),
+        ("CN", "v13"),
         ("US", "v6"),
         ("US", "v7"),
         ("US", "v10"),
+        ("US", "v11"),
         ("HK", "v6"),
         ("HK", "v7"),
         ("HK", "v10"),
+        ("HK", "v11"),
     }:
         try:
             initial = Decimal(str(item.get("initial_line")))
