@@ -3897,17 +3897,22 @@ def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendRe
         if (str(pair.sell_symbol).upper(), str(pair.buy_symbol).upper())
         not in executed_pairs
     )
-    effective_pair_keys = {
-        (str(pair.sell_symbol).upper(), str(pair.buy_symbol).upper())
-        for pair in (*simulate_pairs, *real_pairs)
+    effective_buy_symbols = {
+        str(pair.buy_symbol).upper() for pair in (*simulate_pairs, *real_pairs)
     }
-    removed_pairs: dict[str, RotationPair] = {}
+    removed_pairs: dict[str, tuple[RotationPair, str]] = {}
     for pair in (*report.simulate_rotation_pairs, *report.real_rotation_pairs):
         pair_key = (str(pair.sell_symbol).upper(), str(pair.buy_symbol).upper())
-        if pair_key not in effective_pair_keys:
-            removed_pairs.setdefault(pair.buy_symbol, pair)
+        buy_symbol = str(pair.buy_symbol).upper()
+        if buy_symbol not in effective_buy_symbols:
+            reason = (
+                "轮换已终态，本次不再重复买入"
+                if pair_key in executed_pairs
+                else "轮换预留已复用，本次不再重复买入"
+            )
+            removed_pairs.setdefault(pair.buy_symbol, (pair, reason))
 
-    if removed_pairs and _uses_individual_global_ranking(
+    if _uses_individual_global_ranking(
         str(report.metadata.get("market") or "CN"),
         str(report.strategy_snapshot.get("strategy_version") or ""),
     ):
@@ -3930,7 +3935,9 @@ def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendRe
             }
         )
 
-        def terminal_skip_row(pair: RotationPair) -> dict[str, object]:
+        def terminal_skip_row(
+            pair: RotationPair, reason: str,
+        ) -> dict[str, object]:
             signal = signals_by_symbol.get(pair.buy_symbol)
             if signal is not None:
                 row = {
@@ -3971,23 +3978,28 @@ def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendRe
                     "target_weight": pair.target_weight,
                     "target_amount": pair.target_amount,
                     "estimated_shares": 0,
-                    "reason": "轮换已终态，本次不再重复买入",
+                    "reason": reason,
                     "decisive_constraint": "轮换终态",
                 }
             )
             return row
 
-        risk_skips = list(report.risk_skips)
+        risk_skips = [
+            item
+            for item in report.risk_skips
+            if str(item.get("symbol") or "").upper() not in effective_buy_symbols
+        ]
         present_symbols = {
-            str(item.get("symbol") or "") for item in risk_skips
+            str(item.get("symbol") or "").upper() for item in risk_skips
         }
         for symbol, pair in sorted(
             removed_pairs.items(),
             key=lambda item: rank_by_symbol.get(item[0], 10**9),
         ):
-            if symbol in present_symbols:
+            if symbol.upper() in present_symbols:
                 continue
-            row = terminal_skip_row(pair)
+            pair, reason = pair
+            row = terminal_skip_row(pair, reason)
             target_rank = rank_by_symbol.get(symbol, 10**9)
             insert_at = len(risk_skips)
             for index, item in enumerate(risk_skips):
@@ -3995,7 +4007,7 @@ def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendRe
                     insert_at = index
                     break
             risk_skips.insert(insert_at, row)
-            present_symbols.add(symbol)
+            present_symbols.add(symbol.upper())
         report = replace(report, risk_skips=tuple(risk_skips))
 
     simulate_comparisons = frozen_comparisons(

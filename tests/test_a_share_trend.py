@@ -1623,6 +1623,97 @@ def test_freeze_report_rotation_pairs_skips_executed_terminal_pairs(
     ]
 
 
+def test_freeze_report_rotation_pairs_reconciles_reused_reservation_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    held_symbols = tuple(f"10{index:04d}" for index in range(10))
+    simulated = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("50000"),
+        positions=tuple(
+            AccountPosition(
+                symbol, symbol, "stock", Decimal("500"), Decimal("10"), Decimal("5000")
+            )
+            for symbol in held_symbols
+        ),
+        exceptions=(),
+    )
+    allocation = allocation_for("CN", rank=2, entry_weight="0.04")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199), allocation=allocation,
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=simulated,
+        candidates=[candidate("200001", asset="ETF基金", strength="96", global_strength="90")],
+        holding_snapshots={
+            symbol: holding(symbol, strength="10", global_strength="10")
+            for symbol in held_symbols
+        },
+        bars_by_symbol={symbol: bars() for symbol in held_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in held_symbols
+            }
+        },
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        allocation_reference=allocation,
+        metadata={"simulate_acc_id": 123456, "market": "CN"},
+    )
+    assert [(pair.sell_symbol, pair.buy_symbol) for pair in built.simulate_rotation_pairs] == [
+        ("100000", "200001"),
+    ]
+    stale_skip = trend_module._risk_skip(
+        candidate("200002", asset="ETF基金", strength="96", global_strength="40"),
+        weight=Decimal("0.04"),
+        target_amount=Decimal("4000"),
+        reason="旧审计行",
+        decisive_constraint="买入计划",
+    )
+    built = replace(built, risk_skips=(stale_skip,))
+
+    def reused_reservation(
+        data_dir: Path,
+        *,
+        market: str,
+        account_key: str,
+        execution_date: str,
+        pairs: tuple[dict[str, object], ...],
+        allocation_sha256: str,
+        reserved_at: str,
+    ) -> tuple[dict[str, object], ...]:
+        assert len(pairs) == 1
+        reused = dict(pairs[0])
+        reused.update(
+            buy_symbol="200002",
+            buy_name="股票200002",
+            buy_futu_symbol="SH.200002",
+            buy_global_strength=Decimal("40"),
+            buy_local_strength=Decimal("96"),
+            buy_compared_strength=Decimal("96"),
+            strength_gap=Decimal("86"),
+        )
+        return (reused,)
+
+    monkeypatch.setattr(trend_module, "reserve_rotation_pairs", reused_reservation)
+    frozen = trend_module.freeze_report_rotation_pairs(built, tmp_path)
+
+    assert [pair.buy_symbol for pair in frozen.simulate_rotation_pairs] == ["200002"]
+    assert "200002" not in {item["symbol"] for item in frozen.risk_skips}
+    assert next(
+        item for item in frozen.risk_skips if item["symbol"] == "200001"
+    )["reason"] == "轮换预留已复用，本次不再重复买入"
+
+
 def report(*, candidates: tuple[CandidateInput, ...] = ()) -> TrendReport:
     return build_report(
         as_of_date="2026-07-14",
