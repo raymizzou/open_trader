@@ -1923,6 +1923,24 @@ def _valid_current_trend_risk_contract(
         parameters, summary, expected_nav=expected_nav
     ):
         return False
+    if not isinstance(parameters, Mapping):
+        return False
+    raw_target_weight = parameters.get("target_weight")
+    if isinstance(raw_target_weight, Mapping):
+        target_weights = [
+            parsed
+            for value in raw_target_weight.values()
+            if (parsed := _dashboard_risk_decimal(value)) is not None
+        ]
+        target_weight_cap = max(target_weights, default=None)
+    else:
+        target_weight_cap = _dashboard_risk_decimal(raw_target_weight)
+    if (
+        target_weight_cap is None
+        or target_weight_cap <= 0
+        or target_weight_cap > 1
+    ):
+        return False
     for item in risk_skips:
         if not isinstance(item, dict):
             return False
@@ -1958,6 +1976,7 @@ def _valid_current_trend_risk_contract(
             parsed_weight is None
             or parsed_weight < 0
             or parsed_weight > 1
+            or parsed_weight > target_weight_cap
             or parsed_weight == 0 and not zero_kelly_skip
         ):
             return False

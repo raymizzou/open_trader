@@ -1724,6 +1724,9 @@ def test_dashboard_current_trend_risk_audit_requires_final_plan_rows() -> None:
         "strategy_id": "trend_animals_warm_to_hot/CN/v13",
         "strategy_version": "v13",
     })
+    parameters = snapshot["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["target_weight"] = {"热": "0.04", "沸": "0.04"}
     metadata.update({"market": "CN", "broker": "eastmoney"})
     drawdown = payload["drawdown_summary"]
     assert isinstance(drawdown, dict)
@@ -1752,15 +1755,15 @@ def test_dashboard_current_trend_risk_audit_requires_final_plan_rows() -> None:
     judgments["risk_skips"].extend([
         {
             "symbol": "ROTATION",
-            "target_weight": "0.06",
-            "target_amount": "6000",
+            "target_weight": "0.04",
+            "target_amount": "4000",
             "estimated_shares": 0,
             "reason": "relative_rotation",
             "decisive_constraint": "轮换终态",
         },
         {
             "symbol": "MAPPING",
-            "target_weight": "0.06",
+            "target_weight": "0.04",
             "target_amount": None,
             "estimated_shares": 0,
             "reason": "symbol_mapping_unavailable",
@@ -1788,12 +1791,12 @@ def test_dashboard_current_trend_risk_audit_requires_final_plan_rows() -> None:
     judgments["risk_skips"][1]["estimated_shares"] = 0
     judgments["risk_skips"][1]["target_weight"] = "NaN"
     assert not dashboard_module._valid_trend_risk_summary(payload)
-    judgments["risk_skips"][1]["target_weight"] = "0.06"
+    judgments["risk_skips"][1]["target_weight"] = "0.04"
     judgments["risk_skips"][1]["target_weight"] = "0"
     assert not dashboard_module._valid_trend_risk_summary(payload)
-    judgments["risk_skips"][1]["target_weight"] = "1.1"
+    judgments["risk_skips"][1]["target_weight"] = "0.9"
     assert not dashboard_module._valid_trend_risk_summary(payload)
-    judgments["risk_skips"][1]["target_weight"] = "0.06"
+    judgments["risk_skips"][1]["target_weight"] = "0.04"
 
     pause_reason = "Kelly 上限为 0，仅暂停未来新开仓"
     judgments["formal_actions"] = []
