@@ -4101,6 +4101,13 @@ function cnTrendRows(items) {
     : [];
 }
 
+function usesFinalPlanTrendAudit(report) {
+  const market = String(report?.market || "").toUpperCase();
+  const version = String(report?.strategy_version || "");
+  return (market === "CN" && version === "v13")
+    || (["HK", "US"].includes(market) && version === "v11");
+}
+
 function renderCnTrendCell(label, value, ariaLabel = "", missingLabel = "—") {
   const display = hasValue(value) ? formatPlain(value) : missingLabel;
   return `<td data-label="${escapeHtml(label)}"${ariaLabel ? ` aria-label="${escapeHtml(ariaLabel)}"` : ""}>${escapeHtml(display)}</td>`;
@@ -4615,6 +4622,7 @@ function renderTrendBuyStage(report) {
     `${formatPlain(report.buy_window)} · 模拟盘正式买入计划`, "buy", headings, rows,
     "价格口径：筛选价（Trend Animals）｜执行参考价（各市场报告来源）",
   );
+  if (usesFinalPlanTrendAudit(report)) return simulateStage;
   const realHeadings = ["卖出", "买入", "动作", "强度差", "目标仓位（占净值）", "目标金额", "预计数量", "目标交易日", "状态"];
   const realRows = cnTrendRows(report.real_rotation_pairs).map((pair) => {
     const executionStatus = [pair.execution_status, pair.status, pair.order_status].find(hasValue);
@@ -4886,6 +4894,20 @@ function renderTrendIndustryContext(report) {
     : [];
   const status = report?.industry_context_status && typeof report.industry_context_status === "object"
     ? report.industry_context_status : {};
+  if (usesFinalPlanTrendAudit(report)) {
+    const rows = contexts.map((context) => `<tr class="trend-industry-context-row${context.valid === false ? " invalid" : ""}">
+      <th scope="row" data-label="行业"><strong>${escapeHtml(formatPlain(context.industry || "行业"))}</strong></th>
+      <td data-label="当前温度">${escapeHtml(hasValue(context.temperature) ? formatPlain(context.temperature) : "数据未提供")}</td>
+      <td data-label="温度方向">${escapeHtml(hasValue(context.temperature_direction) ? trendIndustryDirection(context.temperature_direction) : "数据未提供")}</td>
+    </tr>`).join("");
+    return `<section class="trend-industry-context" aria-label="行业上下文">
+      <header><h2>行业上下文</h2><span>${escapeHtml(status.current_complete === false ? "当前数据不完整" : `${contexts.length} 个行业`)}</span></header>
+      ${trendIndustryContextFallback(status, contexts)}
+      ${rows
+        ? `<div class="trend-industry-context-table-wrap"><table class="trend-industry-context-table"><thead><tr><th scope="col">行业</th><th scope="col">当前温度</th><th scope="col">温度方向</th></tr></thead><tbody>${rows}</tbody></table></div>`
+        : "<p>行业上下文数据未提供</p>"}
+    </section>`;
+  }
   const rows = contexts.map((context) => {
     const countValue = trendIndustryTransition(
       context.aggregate_right_count_ratio,
@@ -5049,6 +5071,34 @@ function cnTrendAuditReason(reason, item, parameters, report) {
 
 function cnTrendAuditTableTemperature(item) {
   return cnTrendAuditValue(item.temperature_prev) + " → " + cnTrendAuditValue(item.temperature_curr);
+}
+
+function renderFinalPlanTrendAudit(report) {
+  const audit = report?.audit && typeof report.audit === "object" && !Array.isArray(report.audit)
+    ? report.audit : {};
+  const plannedSymbols = new Set([
+    ...cnTrendRows(report?.buy_actions),
+    ...cnTrendRows(report?.simulate_rotation_pairs).map((item) => ({symbol:item.buy_symbol})),
+    ...cnTrendRows(report?.real_rotation_pairs).map((item) => ({symbol:item.buy_symbol})),
+  ].map((item) => formatPlain(item.symbol)).filter(Boolean));
+  const finalSkips = cnTrendRows(report?.risk_skips).filter(
+    (item) => !plannedSymbols.has(formatPlain(item.symbol)),
+  );
+  const disciplineFailures = cnTrendRows(audit.candidates).filter(
+    (item) => item.eligible === false,
+  );
+  const finalRows = finalSkips.map((item) => `<tr class="trend-audit-row">
+    <td data-label="标的"><strong>${escapeHtml(cnTrendIdentity(item))}</strong></td>
+    <td data-label="最终原因">${escapeHtml(formatPlain(item.reason || "未纳入买入计划"))}</td>
+  </tr>`).join("") || '<tr class="trend-audit-empty"><td colspan="2">无</td></tr>';
+  const failureRows = disciplineFailures.map((item) => `<tr class="trend-audit-row">
+    <td data-label="标的"><strong>${escapeHtml(cnTrendIdentity(item))}</strong></td>
+    <td data-label="纪律结果">没有通过纪律</td>
+  </tr>`).join("") || '<tr class="trend-audit-empty"><td colspan="2">无</td></tr>';
+  return `<details class="trend-audit"><summary>候选审计 · 为什么没有进入买入计划</summary>
+    <section><h3>通过纪律，但未纳入最终计划</h3><table class="trend-audit-table"><thead><tr><th scope="col">标的</th><th scope="col">最终原因</th></tr></thead><tbody>${finalRows}</tbody></table></section>
+    <section><h3>最后 · 没有通过纪律 ${disciplineFailures.length}</h3><table class="trend-audit-table"><thead><tr><th scope="col">标的</th><th scope="col">纪律结果</th></tr></thead><tbody>${failureRows}</tbody></table></section>
+  </details>`;
 }
 
 function renderCnTrendAudit(audit, report = {}) {
@@ -5248,8 +5298,10 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const counts = report.counts || {};
   const audit = report.audit || {};
   const isCn = String(report.market || "").toUpperCase() === "CN";
+  const finalPlanAudit = usesFinalPlanTrendAudit(report);
   const sellOrHold = renderTrendSellOrHoldStage;
-  const buyStage = renderTrendBuyStage(report);
+  const buyStage = finalPlanAudit && !cnTrendRows(report.buy_actions).length
+    ? "" : renderTrendBuyStage(report);
   const root = embedded ? "div" : "main";
   const identity = report.artifact && report.report_sha256 && report.strategy_version
     ? ` data-report-artifact="${escapeHtml(formatPlain(report.artifact))}" data-report-sha256="${escapeHtml(formatPlain(report.report_sha256))}" data-strategy-version="${escapeHtml(formatPlain(report.strategy_version))}"`
@@ -5311,7 +5363,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
     ${disciplineCards}
     ${riskSummary}
     ${renderTrendControllerStatus(report.broker)}
-    ${isCn ? renderCnTrendAudit(audit, report) : renderTrendAudit(audit)}
+    ${finalPlanAudit ? renderFinalPlanTrendAudit(report) : isCn ? renderCnTrendAudit(audit, report) : renderTrendAudit(audit)}
     ${trailingContent}
   </${root}>`;
 }

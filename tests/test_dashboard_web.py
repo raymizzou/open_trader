@@ -8848,6 +8848,68 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_renders_final_plan_audit_for_current_three_market_versions() -> None:
+    output = run_dashboard_js(r'''
+const version = (market) => market === "CN" ? "v13" : "v11";
+const base = (market) => ({
+  available:true, market, strategy_version:version(market),
+  broker:market === "CN" ? "eastmoney" : market === "US" ? "tiger" : "phillips",
+  broker_label:market === "CN" ? "东方财富" : market === "US" ? "老虎" : "辉立",
+  market_label:market === "CN" ? "A股" : market === "US" ? "美股" : "港股",
+  report_date:"2026-08-10", data_date:"2026-08-07", generated_at:"now",
+  account_status:"已更新", buy_window:"常规交易时段", counts:{},
+  sell_actions:[], buy_actions:[], hold_actions:[], review_actions:[],
+  allocation:{roots:{},markets:{}},
+  simulate_rotation_pairs:[{pair_index:0,sell_symbol:"WAB",sell_name:"西屋制动",
+    buy_symbol:"GRMN",buy_name:"佳明",target_weight:"0.06",target_amount:"6000",
+    estimated_shares:168,execution_date:"2026-08-10"}],
+  simulate_rotation_comparisons:[{pair_index:0,outcome:"planned",sell_symbol:"WAB",
+    sell_name:"西屋制动",buy_symbol:"GRMN",buy_name:"佳明",strength_basis:"global",
+    sell_global_strength:"70",buy_global_strength:"95",strength_gap:"25"}],
+  real_rotation_pairs:[], real_rotation_comparisons:[],
+  risk_skips:[
+    {symbol:"WTW",name:"Willis Towers",reason:"10 个持仓席位已满；强度差 12.3 小于门槛 20"},
+    {symbol:"PATH",name:"UiPath",reason:"全局强度缺失，无法排序"},
+  ],
+  audit:{candidates:[
+    {symbol:"GRMN",name:"佳明",eligible:true,rank:1},
+    {symbol:"WTW",name:"Willis Towers",eligible:true,rank:2},
+    {symbol:"PATH",name:"UiPath",eligible:true,rank:null},
+    {symbol:"FAIL-1",name:"纪律失败一",eligible:false,excluded_reasons:["strength_below_95"]},
+    {symbol:"FAIL-2",name:"纪律失败二",eligible:false,excluded_reasons:["danger_signal"]},
+  ]},
+  industry_contexts:[{industry:"软件",temperature:"热",temperature_direction:"rising"}],
+});
+for (const market of ["CN", "US", "HK"]) {
+  const html = renderTrendReportWorkspace(base(market));
+  for (const text of [
+    "候选审计 · 为什么没有进入买入计划",
+    "通过纪律，但未纳入最终计划",
+    "全局强度缺失，无法排序",
+    "最后 · 没有通过纪律 2",
+  ]) if (!html.includes(text)) throw new Error(`${market}: ${text}\n${html}`);
+  for (const text of [
+    "无允许买入标的", "模拟盘正式买入计划",
+    "行业趋势强度", "温转热数量", "右侧个数占比", "右侧市值占比",
+  ]) if (html.includes(text)) throw new Error(`${market}: unexpected ${text}\n${html}`);
+  const audit = html.slice(html.indexOf('<details class="trend-audit"'));
+  if (audit.includes("GRMN") || audit.indexOf("WTW") >= audit.indexOf("FAIL-1")
+      || audit.indexOf("PATH") >= audit.indexOf("FAIL-1")) throw new Error(`${market}: audit order\n${audit}`);
+}
+const normalBuy = renderTrendReportWorkspace({
+  ...base("CN"), allocation:null, simulate_rotation_pairs:[],
+  simulate_rotation_comparisons:[],
+  buy_actions:[{symbol:"BUY",name:"正常买入",target_weight:"0.06",target_amount:"6000",estimated_shares:100}],
+});
+for (const text of ["模拟盘正式买入计划", 'data-label="标的"', 'aria-label="目标仓位 6%"']) {
+  if (!normalBuy.includes(text)) throw new Error(text + "\n" + normalBuy);
+}
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_compact_report_layout_contract_for_all_markets() -> None:
     output = run_dashboard_js(r'''
 const base = (market) => ({

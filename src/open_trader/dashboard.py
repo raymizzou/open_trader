@@ -2322,7 +2322,7 @@ def _project_broker_trend_report(
     directory = reports_dir.name
     signal_snapshots = payload.get("signal_snapshots", {})
     audit_candidates = payload["strategy_judgments"]["top10_candidates"]
-    if market == "CN" and isinstance(signal_snapshots, dict):
+    if isinstance(signal_snapshots, dict):
         audit_candidates = signal_snapshots.get("candidates", audit_candidates)
     updated_today = freshness_date.isoformat() == report_date
     execution_today = execution_date.isoformat() == report_date

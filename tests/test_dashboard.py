@@ -1554,7 +1554,7 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     assert reports["eastmoney"]["audit"]["data_sources"] == ["Trend Animals"]
 
 
-def test_dashboard_projects_complete_cn_candidate_audit_only_for_eastmoney(
+def test_dashboard_projects_complete_candidate_audit_for_every_market(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
@@ -1595,10 +1595,10 @@ def test_dashboard_projects_complete_cn_candidate_audit_only_for_eastmoney(
         config.data_dir, config.reports_dir, today=date(2026, 7, 15)
     )
 
-    assert [item["symbol"] for item in reports["eastmoney"]["audit"]["candidates"]] == [
-        "688046", "600000",
-    ]
-    assert reports["tiger"]["audit"]["candidates"] == top_ten
+    for broker in ("eastmoney", "tiger"):
+        assert [item["symbol"] for item in reports[broker]["audit"]["candidates"]] == [
+            "688046", "600000",
+        ]
 
 
 def test_dashboard_rejects_malformed_signal_candidate_audit_when_present(
@@ -2236,7 +2236,7 @@ def test_dashboard_projects_only_valid_frozen_allocation_contract(
     )["eastmoney"]
     assert projected["allocation"] == payload["allocation"]
     assert projected["simulate_rotation_pairs"] == []
-    assert projected["current_strategy_version"] == "v12"
+    assert projected["current_strategy_version"] == "v13"
     assert next(
         row["value"]
         for row in projected["current_strategy_parameter_rows"]
