@@ -3926,47 +3926,6 @@ console.log(JSON.stringify({
     }
 
 
-def test_prediction_market_incomplete_event_is_not_labeled_actionable() -> None:
-    output = run_dashboard_js(r'''
-const opportunity = {
-  opportunity_id:"opp-incomplete",
-  event_id:"event-incomplete",
-  title:"数据不完整的真实市场",
-  market_type:"standard_binary",
-  fee_status:"fee_free",
-  yes_price:"0.45",
-  quantity:"20",
-  max_cost:"18.80",
-  actionable:true,
-};
-console.log(predictionEventRows({
-  status:"healthy",
-  health:{status:"healthy",degraded_reasons:[]},
-  breaker:{open:false},
-  opportunities:[opportunity],
-    events:[{
-      event_id:"event-incomplete",
-      title:"数据不完整的真实事件",
-      actionable:true,
-      status:"可参与",
-      opportunities:[opportunity],
-      details:[
-        ["当前执行条件","20 组 · 最多 $18.80 · 可参与"],
-        ["不可参与市场","已订阅 · Negative Risk 暂不可参与"],
-      ],
-    }],
-  }));
-''')
-
-    assert "数据不完整的真实事件" in output
-    assert "数据不完整" in output
-    assert "当前执行条件" in output
-    assert "可参与</div>" not in output
-    assert "· 可参与</span>" not in output
-    assert "已订阅 · Negative Risk 暂不可参与" in output
-    assert "暂不暂不可参与" not in output
-
-
 def test_prediction_market_alerts_never_invent_execution_or_incident_facts() -> None:
     output = run_dashboard_js(r'''
 console.log(JSON.stringify({
@@ -6704,8 +6663,9 @@ def test_prediction_market_static_contract_is_present() -> None:
     assert "pm-controller" not in html
     assert "原型场景控制器" not in html
     assert "底部场景" not in html
-    for label in ("实盘就绪状态", "当前监控范围", "套利信号", "交易与合并", "事故", "出现时间（HKT）", "资金占用", "净回报", "重新检查", "Watcher 数据时间", "信号刷新时间"):
+    for label in ("实盘就绪状态", "套利信号", "交易与合并", "事故", "出现时间（HKT）", "24h 成交量", "资金占用", "净回报", "重新检查", "Watcher 数据时间", "信号刷新时间"):
         assert label in js
+    assert "当前监控范围" not in js
     assert "data-prediction-history-panel" in js
     assert "signalPollId" in js
     assert "signalRequestInFlight" in js
@@ -6754,28 +6714,29 @@ const payload = {
   opportunities: [],
   histories: {signals: [{
     occurred_at: "2026-08-01T01:59:00Z", event_title: englishPair, event_title_zh: chinesePair,
-    market_type: "threshold_hedge", duration: "12s", initial_profit: "0.30", minimum_profit: "0.81",
+    market_type: "threshold_hedge", duration: "12s", volume_24h: "9700000", initial_profit: "0.30", minimum_profit: "0.81",
     total_max_cost: "152.60", maximum_fee: "0.12", remaining_days: "152.6", resolution_at: "2026-12-31T00:00:00Z",
     annualized_yield: "0.0053", eligibility_reason: "annualized_yield_below_minimum", actionable_now: false,
     opportunity_id: "threshold-1", notification_state: "sent",
   }]},
 };
 state.predictionMarket.payload = payload;
-const open = predictionYesNoWorkspace(payload, new Set());
+const open = predictionYesNoWorkspace(payload);
 state.predictionMarket.signalError = "history 503";
-const failed = predictionYesNoWorkspace(payload, new Set());
+const failed = predictionYesNoWorkspace(payload);
 state.predictionMarket.signalError = "";
 state.predictionMarket.payload = {...payload, stale: true};
-    const stale = predictionYesNoWorkspace(payload, new Set());
+    const stale = predictionYesNoWorkspace(payload);
 console.log(JSON.stringify({open, failed, stale}));
 ''')
     rendered = json.loads(output)
     for html in (rendered["open"], rendered["failed"]):
-        for label in ("套利信号", "出现时间（HKT）", "标的", "资金占用", "净回报", "操作"):
+        for label in ("套利信号", "出现时间（HKT）", "标的", "24h 成交量", "资金占用", "净回报", "操作"):
             assert label in html
         for obsolete in ("当前机会", "历史记录", "信号历史", "峰值利润", "最终利润", "窗口结束", "预计", "未下单，当前可能已失效"):
             assert obsolete not in html
     assert rendered["open"].index(english_pair) < rendered["open"].index(chinese_pair)
+    assert "$9.7M" in rendered["open"]
     assert "152.6 天" in rendered["open"]
     assert "年化 0.53%" in rendered["open"]
     assert "含模型手续费" in rendered["open"]

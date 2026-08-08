@@ -2530,7 +2530,12 @@ function predictionCrossVenueCandidates(payload) {
   const opportunities = Array.isArray(crossVenue.opportunities)
     ? crossVenue.opportunities
     : (Array.isArray(payload?.opportunities) ? payload.opportunities : []);
-  const orderable = opportunities.filter((item) => item && typeof item === "object" && item.actionable === true);
+  const orderable = opportunities.filter((item) => (
+    item && typeof item === "object"
+    && item.actionable === true
+    && predictionCrossExecutionMode(item) === "manual_confirm"
+    && predictionOpportunityIsComplete(item)
+  ));
   const manual = orderable.filter((item) => item.manual_only === true);
   const auto = orderable.filter((item) => item.manual_only !== true);
   const card = (item, manualOnly) => {
@@ -2732,58 +2737,6 @@ function predictionCrossVenueCandidateHtml(value, payload) {
     return `<article class="pm-order-leg"><span>第 ${index + 1} 腿 · ${escapeHtml(predictionVenueLegLabels([leg]).replace(" · ", " · BUY "))} · FOK</span><strong>冻结数量 ${escapeHtml(predictionValue(leg.net_quantity ?? opportunity.net_quantity, "-"))} 份 · 最高价冻结 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(leg.max_cost))} · ${escapeHtml(predictionValue(leg.settlement_asset, "资产未返回"))}</small>${ids ? `<small>Native IDs ${escapeHtml(ids)}</small>` : ""}${link ? `<small>${link}</small>` : ""}</article>`;
   }).join("");
   return `<article class="pm-opportunity pm-cross-candidate ${actionable ? "" : "disabled"}" data-cross-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id, ""))}"><div class="pm-opportunity-title"><div><h3 class="pm-event-title"><span class="pm-title-zh">${escapeHtml(predictionValue(titleZh, "数据未返回"))}</span>${titleEn}</h3><p>Predict.fun × Polymarket · 跨所 YES/NO · ${escapeHtml(predictionValue(opportunity.canonical_cutoff ?? opportunity.resolution_at, "截止时间未返回"))}</p></div><span class="pm-pill ${actionable ? "action" : "watch"}">${status}</span></div><div class="pm-order-legs">${legRows || "<div class=\"pm-empty compact\">两条跨所腿数据未返回</div>"}</div><dl class="pm-cross-metrics"><div><dt>净可兑付份额</dt><dd>${escapeHtml(predictionValue(opportunity.net_quantity, "-"))}</dd></div><div><dt>含费最大成本</dt><dd>${escapeHtml(predictionMoney(opportunity.max_cost))}</dd></div><div><dt>最低赔付</dt><dd>${escapeHtml(predictionMoney(opportunity.minimum_payout))}</dd></div><div><dt>最低净利润</dt><dd class="pm-positive">${escapeHtml(predictionSignedMoney(opportunity.profit))}</dd></div><div><dt>简单年化</dt><dd>${escapeHtml(predictionAnnualizedPercent(opportunity.annualized_yield, 2))}</dd></div></dl><div class="pm-opportunity-action"><p>${escapeHtml(reason)}</p>${actionable ? `<button class="pm-button primary pm-participate" type="button" data-action="participate" data-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id, ""))}">查看并确认跨所订单</button>` : ""}</div></article>`;
-}
-
-function predictionEventRows(payload, expandedEventKeys = new Set()) {
-  const events = predictionEvents(payload);
-  const globalOpportunities = predictionOpportunities(payload);
-  if (!events.length) return `<div class="pm-empty compact"><strong>暂无监控事件</strong><p>Watcher 正常运行后，事件会按 24h 成交量显示。</p></div>`;
-  return events.map((event, index) => {
-    if (predictionIsCrossVenue(event)) {
-      const candidate = Array.isArray(event.opportunities) ? event.opportunities[0] : event;
-      return predictionCrossVenueCandidateHtml(candidate || event, payload);
-    }
-    const nested = Array.isArray(event.opportunities) ? event.opportunities.map(predictionOpportunityDisplay) : [];
-    const opportunity = nested[0] || event;
-    const matching = globalOpportunities.filter((item) => (
-      predictionHasValue(event.event_id)
-      && String(item.event_id || "") === String(event.event_id)
-    ));
-    const candidates = matching.length ? matching : nested;
-    const claimedActionable = event.actionable === true || candidates.some((item) => item?.actionable === true);
-    const completeActionable = candidates.some(
-      (item) => item?.actionable === true && predictionOpportunityIsComplete(item)
-    );
-    const incomplete = claimedActionable && !completeActionable;
-    const actionable = completeActionable && predictionTradingAvailable(payload);
-    const title = event.title || event.event_title || opportunity.event_title || opportunity.title || "数据未返回";
-    const titleZh = String(event.title_zh || event.event_title_zh || "").trim();
-    const titleMarkup = titleZh
-      ? `<span class="pm-title-zh">${escapeHtml(titleZh)}</span><span class="pm-title-en">${escapeHtml(title)}</span>`
-      : `<span class="pm-title-en">${escapeHtml(title)}</span>`;
-    const volume = event.volume_24h ?? opportunity.volume_24h;
-    const legs = predictionVenueLegLabels(event.legs || opportunity.legs);
-    const rawDetails = Array.isArray(event.details) ? event.details : nested.length ? nested.map((item) => [item.title || item.market_title || "市场", item.actionable ? "可参与" : predictionReasonLabel(item.reason || item.eligibility_reason || item.status)]) : [[event.market_title || "市场", event.actionable ? "可参与" : predictionReasonLabel(event.reason || event.eligibility_reason || event.status)]];
-    const unavailableLabel = incomplete ? "数据不完整" : "暂不可参与";
-    const details = rawDetails.map(([label, value]) => [
-      label,
-      !actionable
-        ? predictionReplacePositiveActionLabel(value, unavailableLabel)
-        : value,
-    ]);
-    const rawStatus = predictionValue(event.status, actionable ? "可参与" : "");
-    const displayStatus = !actionable
-      ? predictionReplacePositiveActionLabel(rawStatus, unavailableLabel)
-      : rawStatus;
-    const eventKey = predictionValue(
-      event.event_id ?? event.id ?? event.slug ?? event.question ?? event.title ?? event.event_title,
-      String(index)
-    );
-    const stateMarkup = displayStatus
-      ? `<div class="pm-event-state ${actionable ? "" : "watch"}">${escapeHtml(displayStatus)}</div>`
-      : "";
-    return `<details class="pm-event" data-event-key="${escapeHtml(eventKey)}"${expandedEventKeys.has(eventKey) ? " open" : ""}><summary><div><div class="pm-event-title">${titleMarkup}</div><div class="pm-event-meta">${escapeHtml(predictionValue(event.market_count ?? event.markets, "-"))} · ${escapeHtml(event.profit_label || (actionable ? "净利润" : "毛利润上限"))} ${escapeHtml(predictionMoney(event.profit ?? opportunity.profit ?? opportunity.minimum_profit))} · 排名 #${index + 1}${legs ? ` · ${escapeHtml(legs)}` : ""}</div></div><div class="pm-volume"><span>24h 成交量</span>${escapeHtml(predictionVolume(volume, "-"))}</div>${stateMarkup}</summary><div class="pm-market-list">${details.map(([label, value]) => `<div class="pm-market-line"><span>${escapeHtml(predictionValue(label))}</span><span>${escapeHtml(predictionValue(value))}</span></div>`).join("")}</div></details>`;
-  }).join("");
 }
 
 function predictionConditionLabel(value) {
@@ -3136,7 +3089,7 @@ function predictionHistoryContent(payload, kind) {
       const notice = notificationLabel(row.notification_state);
       return `${escapeHtml(notice)}${actionable ? button : ""}`;
     };
-    return `<table class="pm-table pm-signal-table"><thead><tr><th>出现时间（HKT）</th><th>标的</th><th>资金占用</th><th>净回报</th><th>操作</th></tr></thead><tbody>${displayRows.map((row) => `<tr class="${row.actionable_now === true && !closed(row) ? "pm-signal-live" : ""}"><td data-label="出现时间（HKT）">${escapeHtml(predictionHktTimestamp(row.occurred_at))}<small class="pm-relative-age">${escapeHtml(predictionRelativeAge(row.occurred_at))}</small></td><td data-label="标的" class="pm-title-cell">${title(row)}</td><td data-label="资金占用">${capitalUsage(row)}</td><td data-label="净回报">${netReturn(row)}</td><td data-label="操作" class="pm-signal-operation">${operation(row)}</td></tr>`).join("")}</tbody></table>`;
+    return `<table class="pm-table pm-signal-table"><thead><tr><th>出现时间（HKT）</th><th>标的</th><th>24h 成交量</th><th>资金占用</th><th>净回报</th><th>操作</th></tr></thead><tbody>${displayRows.map((row) => `<tr class="${row.actionable_now === true && !closed(row) ? "pm-signal-live" : ""}"><td data-label="出现时间（HKT）">${escapeHtml(predictionHktTimestamp(row.occurred_at))}<small class="pm-relative-age">${escapeHtml(predictionRelativeAge(row.occurred_at))}</small></td><td data-label="标的" class="pm-title-cell">${title(row)}</td><td data-label="24h 成交量">${escapeHtml(predictionVolume(row.volume_24h, "-"))}</td><td data-label="资金占用">${capitalUsage(row)}</td><td data-label="净回报">${netReturn(row)}</td><td data-label="操作" class="pm-signal-operation">${operation(row)}</td></tr>`).join("")}</tbody></table>`;
   }
   if (kind === "executions") {
     return `<table class="pm-table"><thead><tr><th>完成时间</th><th>市场</th><th>数量</th><th>实际成本</th><th>合并收回</th><th>已实现</th></tr></thead><tbody>${displayRows.map((row) => { const quantity = predictionValue(row.quantity); const quantityLabel = quantity === "-" || quantity.includes("组") ? quantity : `${quantity} 组`; const holding = row.state === "holding_to_resolution"; const legs = predictionVenueLegLabels(row.legs); const state = predictionValue(row.status ?? row.state, "-"); const lifecycle = Array.isArray(row.lifecycle) ? `<details class="pm-lifecycle"><summary>生命周期回执</summary>${row.lifecycle.map((item) => `<div><span>${escapeHtml(predictionValue(item.phase, "阶段"))}</span><strong>${escapeHtml(predictionValue(item.receipt, "-"))}</strong><small>${escapeHtml(predictionValue(item.status, "-"))}</small></div>`).join("")}</details>` : ""; return `<tr><td data-label="完成时间">${escapeHtml(predictionValue(row.completed_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}${legs ? `<small class="pm-signal-legs">${escapeHtml(legs)}</small>` : ""}<small>状态 ${escapeHtml(state)}</small>${lifecycle}</td><td data-label="数量">${escapeHtml(quantityLabel)}</td><td data-label="实际成本">${escapeHtml(predictionMoney(row.actual_cost))}</td><td data-label="合并收回">${holding ? "待兑付（不 merge）" : escapeHtml(predictionMoney(row.merge_value))}</td><td data-label="已实现" class="pm-positive"><strong>${holding ? "待兑付" : escapeHtml(predictionSignedMoney(row.realized_profit))}</strong></td></tr>`; }).join("")}</tbody></table>`;
@@ -3211,13 +3164,11 @@ function predictionHistoryPanel(payload) {
   return `<section class="pm-panel" data-prediction-history-panel><header class="pm-panel-heading"><div><h2>${title}</h2><p>${description}</p>${signalError}</div><div class="pm-panel-heading-actions">${signalClock}<div class="pm-history-tabs" aria-label="套利历史类型"><button class="pm-history-tab" type="button" data-history="signals" aria-pressed="${kind === "signals"}">套利信号</button><button class="pm-history-tab" type="button" data-history="executions" aria-pressed="${kind === "executions"}">交易与合并</button><button class="pm-history-tab" type="button" data-history="incidents" aria-pressed="${kind === "incidents"}">事故</button></div></div></header>${predictionHistoryContent(payload, kind)}</section>`;
 }
 
-function predictionYesNoWorkspace(payload, expandedEventKeys) {
+function predictionYesNoWorkspace(payload) {
   const opportunities = (Array.isArray(payload?.opportunities) ? payload.opportunities : [])
     .filter((item) => String(item?.market_type || "") !== "threshold_hedge");
   const viewPayload = {...payload, opportunities};
-  const displayedEvents = predictionEvents(viewPayload).length;
-  const eventTotal = predictionHasValue(viewPayload.event_count) ? viewPayload.event_count : "-";
-  return `${predictionCrossVenueFunnel(viewPayload)}${predictionCrossVenueCandidates(viewPayload)}<aside class="pm-policy"><strong>V1 仅对普通二元、免手续费市场开放实盘</strong><p>收费市场和 Negative Risk 市场仍监控，但不会出现“参与”按钮。</p></aside><div class="pm-layout"><section class="pm-panel"><header class="pm-panel-heading"><div><h2>当前监控范围</h2><p>可参与优先；同组按利润，再按 24h 成交量。</p></div><span class="pm-pill">显示 ${displayedEvents} / ${escapeHtml(predictionValue(eventTotal))}</span></header><div class="pm-event-list">${predictionEventRows(viewPayload, expandedEventKeys)}</div></section><div class="pm-stack">${predictionHistoryPanel(viewPayload)}</div></div>`;
+  return `${predictionCrossVenueFunnel(viewPayload)}${predictionCrossVenueCandidates(viewPayload)}<aside class="pm-policy"><strong>V1 仅对普通二元、免手续费市场开放实盘</strong><p>收费市场和 Negative Risk 市场仍监控，但不会出现“参与”按钮。</p></aside>${predictionHistoryPanel(viewPayload)}`;
 }
 
 function predictionCandidateTable(opportunities) {
@@ -3286,10 +3237,6 @@ function predictionModeBar(payload) {
 function renderPredictionMarket() {
   const root = elements["prediction-market-root"];
   if (!root) return;
-  const expandedEventKeys = new Set(
-    Array.from(root.querySelectorAll(".pm-event[open][data-event-key]"))
-      .map((event) => event.dataset.eventKey)
-  );
   const expandedRelationKeys = new Set(
     Array.from(root.querySelectorAll(".pm-threshold-candidate[open][data-relation-key]"))
       .map((candidate) => candidate.dataset.relationKey)
@@ -3299,7 +3246,7 @@ function renderPredictionMarket() {
   const strategy = state.predictionMarket.strategy === "llm_hedge" ? "llm_hedge" : "yes_no";
   const workspace = strategy === "llm_hedge"
     ? predictionLlmHedgeWorkspace(viewPayload, expandedRelationKeys)
-    : predictionYesNoWorkspace(viewPayload, expandedEventKeys);
+    : predictionYesNoWorkspace(viewPayload);
   root.innerHTML = `${predictionPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionReadinessStrip(viewPayload, strategy)}${predictionSafeguardsHtml(viewPayload)}${predictionStrategyTabs(strategy)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload, strategy)}${workspace}`;
 }
 

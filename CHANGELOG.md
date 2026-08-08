@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-08
 
+- 预测市场 YES/NO 页移除「当前监控范围」事件列表，主内容只保留「套利信号」（仍含
+  交易与合并/事故 tab），24h 成交量移入套利信号表格新列（数据来自既有 signals 表，
+  无后端改动）；跨所 YES/NO 漏斗与「可下单候选」保留，且候选列表只展示
+  `manual_confirm` 且数据完整的候选，observe_only 与截止时间无效的候选回到漏斗计数。
+  验证：dashboard 单测 374 通过，prediction-market e2e 34/34 通过，最终以
+  `make acceptance` 为准。
 - 预测市场存储瘦身与历史接口稳定性：LLM 缓存命中不再逐次落库（改为进程内计数，
   重启归零），真实调用仅保留最近 7 天（启动时清理，软上限）；一次性清理约 700 万行
   死数据并收缩 SQLite（约 1.3GB → 小）。套利信号历史面板只显示最近 30 天（SQL 层
