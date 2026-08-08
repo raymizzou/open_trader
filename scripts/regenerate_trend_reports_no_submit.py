@@ -15,12 +15,19 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+# Run against this checkout even when the shared virtualenv has another
+# worktree installed in editable mode.
+_SRC = str(Path(__file__).resolve().parents[1] / "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
 from open_trader.a_share_trend import (
     run_a_share_trend_report,
