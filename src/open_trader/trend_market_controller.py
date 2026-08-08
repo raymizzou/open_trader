@@ -62,6 +62,14 @@ from .opend_incident import (
     record_opend_failure,
     record_opend_health,
 )
+from .tiger_account import load_tiger_account_config
+from .trend_api_stats import (
+    STATISTICS_CYCLE_SCHEMA,
+    FutuSimulateFillClient,
+    TigerActualFillClient,
+    run_trend_statistics_cycle,
+    trend_statistics_cycle_path,
+)
 from .trend_review import (
     _canonical_json_bytes,
     _report_hash,
@@ -708,6 +716,52 @@ def _generate_report(
         raise RuntimeError(f"{market} trend report generation returned {result.status}")
 
 
+def _run_cycle_statistics(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+    now: datetime,
+    process_version: str,
+) -> dict[str, object]:
+    state_path = trend_statistics_cycle_path(
+        config.data_dir, cycle.market, cycle.as_of_date
+    )
+    if state_path.exists():
+        state = _read_json(state_path, "trend statistics cycle")
+        if state.get("status") == "completed":
+            return {**state, "status": "already_completed"}
+
+    futu = FutuSimulateFillClient(
+        host=config.futu_host,
+        port=config.futu_port,
+        simulate_acc_id=require_trend_review_config(config, cycle.market),
+        trd_market=cycle.market,
+    )
+    tiger = None
+    try:
+        if cycle.market == "US":
+            tiger = TigerActualFillClient(
+                config=load_tiger_account_config(
+                    config_dir=Path("~/.tigeropen/"),
+                    account=None,
+                    sandbox=False,
+                )
+            )
+        return run_trend_statistics_cycle(
+            data_dir=config.data_dir,
+            reports_dir=config.reports_dir,
+            market=cycle.market,
+            as_of_date=cycle.as_of_date,
+            generated_at=now.isoformat(timespec="seconds"),
+            process_git_sha=process_version,
+            futu_client=futu,
+            tiger_client=tiger,
+        )
+    finally:
+        futu.close()
+        if tiger is not None:
+            tiger.close()
+
+
 def _allocation_reference_for_cycle(
     config: DailyPremarketConfig,
     *,
@@ -1182,6 +1236,165 @@ def _write_notification_state(path: Path, state: Mapping[str, object]) -> None:
             temp.unlink(missing_ok=True)
 
 
+def _statistics_notification_path(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+    action: str,
+) -> Path:
+    identity = "|".join(
+        (cycle.market, cycle.as_of_date, action, "statistics_cycle")
+    )
+    return (
+        _controller_root(config, cycle.market)
+        / "notifications"
+        / cycle.as_of_date
+        / f"{hashlib.sha256(identity.encode('utf-8')).hexdigest()}.json"
+    )
+
+
+def _statistics_notification_time(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+    action: str,
+) -> str | None:
+    path = _statistics_notification_path(config, cycle, action)
+    if not path.exists():
+        return None
+    occurred_at = _read_json(path, "trend statistics notification").get(
+        "occurred_at"
+    )
+    return str(occurred_at or "") or None
+
+
+def _update_statistics_cycle_state(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+    updates: Mapping[str, object],
+) -> dict[str, object]:
+    path = trend_statistics_cycle_path(config.data_dir, cycle.market, cycle.as_of_date)
+    with RunLock(path.with_suffix(".lock"), wait=True):
+        state = (
+            _read_json(path, "trend statistics cycle")
+            if path.exists()
+            else {
+                "schema_version": STATISTICS_CYCLE_SCHEMA,
+                "market": cycle.market,
+                "as_of_date": cycle.as_of_date,
+            }
+        )
+        state.update(updates)
+        _write_notification_state(path, state)
+        return state
+
+
+def _record_statistics_exception(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+    now: datetime,
+    process_version: str,
+    error: BaseException,
+) -> dict[str, object]:
+    path = trend_statistics_cycle_path(config.data_dir, cycle.market, cycle.as_of_date)
+    with RunLock(path.with_suffix(".lock"), wait=True):
+        previous = (
+            _read_json(path, "trend statistics cycle") if path.exists() else {}
+        )
+        if previous.get("status") == "completed":
+            return {**previous, "status": "already_completed"}
+        state = {
+            "schema_version": STATISTICS_CYCLE_SCHEMA,
+            "status": "failed",
+            "market": cycle.market,
+            "as_of_date": cycle.as_of_date,
+            "attempt_count": int(previous.get("attempt_count", 0)) + 1,
+            "attempted_at": now.isoformat(timespec="seconds"),
+            "process_git_sha": process_version,
+            "reason": str(error),
+        }
+        for field in ("failure_notified_at", "recovery_notified_at"):
+            if field in previous:
+                state[field] = previous[field]
+        _write_notification_state(path, state)
+        return state
+
+
+def _notify_statistics_result(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+    result: Mapping[str, object],
+    now: datetime,
+) -> dict[str, object]:
+    status = str(result.get("status") or "")
+    failure_at = _statistics_notification_time(
+        config, cycle, "statistics_failed"
+    )
+    recovery_at = _statistics_notification_time(
+        config, cycle, "statistics_recovered"
+    )
+    occurred_at = now.isoformat(timespec="seconds")
+    if status == "failed" and failure_at is None:
+        _notify_once(
+            f"{cycle.market} 趋势统计刷新失败",
+            str(result.get("reason") or "statistics refresh failed"),
+            (
+                config,
+                cycle.market,
+                cycle.as_of_date,
+                "statistics_failed",
+                "statistics_cycle",
+                occurred_at,
+            ),
+        )
+        failure_at = _statistics_notification_time(
+            config, cycle, "statistics_failed"
+        ) or occurred_at
+    elif status in {"completed", "already_completed"} and failure_at is not None:
+        if recovery_at is None:
+            _notify_once(
+                f"{cycle.market} 趋势统计刷新已恢复",
+                "statistics refresh recovered",
+                (
+                    config,
+                    cycle.market,
+                    cycle.as_of_date,
+                    "statistics_recovered",
+                    "statistics_cycle",
+                    occurred_at,
+                ),
+            )
+            recovery_at = _statistics_notification_time(
+                config, cycle, "statistics_recovered"
+            ) or occurred_at
+
+    updates: dict[str, object] = {}
+    if failure_at is not None:
+        updates["failure_notified_at"] = failure_at
+        updates["recovery_notified_at"] = recovery_at
+    return (
+        _update_statistics_cycle_state(config, cycle, updates)
+        if updates
+        else dict(result)
+    )
+
+
+def _record_statement_statistics_diagnostic(
+    config: DailyPremarketConfig,
+    broker: str,
+    result: Mapping[str, object],
+    now: datetime,
+) -> None:
+    if result.get("status") in {"consumed", "already_consumed"}:
+        return
+    path = config.data_dir / "trend_statement_consumption" / f"{broker}.json"
+    diagnostic = dict(result)
+    diagnostic.setdefault(
+        "schema_version", "open_trader.trend.statement_consumption.v1"
+    )
+    diagnostic.setdefault("broker", broker)
+    diagnostic.setdefault("attempted_at", now.isoformat(timespec="seconds"))
+    _write_notification_state(path, diagnostic)
+
+
 def _notification_retry_lock(path: Path) -> RunLock:
     return RunLock(path.with_suffix(".lock"))
 
@@ -1196,6 +1409,23 @@ def _controller_feishu_payload(
 ) -> tuple[str, str]:
     broker = BROKER_LABELS[market]
     market_label = MARKET_LABELS[market]
+    if action in {"statistics_failed", "statistics_recovered"}:
+        recovered = action == "statistics_recovered"
+        return render_attention(
+            broker,
+            f"{market_label}趋势统计{'已恢复' if recovered else '待恢复'}",
+            execution_date,
+            happened=(
+                "趋势统计刷新已恢复" if recovered else "趋势统计刷新失败"
+            ),
+            impact="报告与执行继续使用最后一次已接受的统计快照",
+            action=(
+                "无需补跑报告"
+                if recovered
+                else "检查统计周期状态并等待自动重试"
+            ),
+            detail=brief_zh_detail(message),
+        )
     if action == "revision_after_batch_lock":
         return render_attention(
             broker,
@@ -2786,6 +3016,10 @@ def run_trend_market_controller(
     cycle_failures = 0
     cycle_retry_after: datetime | None = None
     cycle_blocker: str | None = None
+    statistics_identity: tuple[str, str] | None = None
+    statistics_status: str | None = None
+    statistics_failures = 0
+    statistics_retry_after: datetime | None = None
     last_success: object = None
     completed_execution_dates: set[str] = set()
     quote_client: object | None = None
@@ -2905,12 +3139,22 @@ def run_trend_market_controller(
                 "HK": "phillips",
             }.get(market)
             if statement_broker is not None:
-                consume_accepted_statement_facts(
-                    data_dir=config.data_dir,
-                    reports_dir=config.reports_dir,
-                    broker=statement_broker,
-                    generated_at=now.isoformat(timespec="seconds"),
-                )
+                try:
+                    statement_statistics = consume_accepted_statement_facts(
+                        data_dir=config.data_dir,
+                        reports_dir=config.reports_dir,
+                        broker=statement_broker,
+                        generated_at=now.isoformat(timespec="seconds"),
+                    )
+                except Exception as exc:
+                    statement_statistics = {
+                        "status": "failed",
+                        "reason": str(exc),
+                    }
+                with suppress(Exception):
+                    _record_statement_statistics_diagnostic(
+                        config, statement_broker, statement_statistics, now
+                    )
             local = now.astimezone(TIMEZONES[market])
             local_session = (
                 cn_session(local)
@@ -2993,6 +3237,60 @@ def run_trend_market_controller(
             cycle_failures = 0
             cycle_retry_after = None
             cycle_blocker = None
+            current_statistics_identity = (cycle.market, cycle.as_of_date)
+            if statistics_identity != current_statistics_identity:
+                statistics_identity = current_statistics_identity
+                statistics_status = None
+                statistics_failures = 0
+                statistics_retry_after = None
+            if (
+                not revision
+                and statistics_status not in {"completed", "already_completed"}
+                and (
+                    statistics_retry_after is None
+                    or now >= statistics_retry_after
+                )
+            ):
+                try:
+                    statistics_result = _run_cycle_statistics(
+                        config, cycle, now, process_version
+                    )
+                except Exception as exc:
+                    try:
+                        statistics_result = _record_statistics_exception(
+                            config, cycle, now, process_version, exc
+                        )
+                    except Exception:
+                        statistics_result = {
+                            "status": "failed",
+                            "reason": str(exc),
+                        }
+                statistics_status = str(statistics_result.get("status") or "")
+                if statistics_status not in {
+                    "failed",
+                    "completed",
+                    "already_completed",
+                }:
+                    statistics_result = {
+                        "status": "failed",
+                        "reason": (
+                            "statistics refresh returned invalid status: "
+                            f"{statistics_status or '<empty>'}"
+                        ),
+                    }
+                    statistics_status = "failed"
+                with suppress(Exception):
+                    _notify_statistics_result(
+                        config, cycle, statistics_result, now
+                    )
+                if statistics_status == "failed":
+                    statistics_failures += 1
+                    statistics_retry_after = _retry_at(
+                        now, statistics_failures
+                    )
+                else:
+                    statistics_failures = 0
+                    statistics_retry_after = None
             phase = "monitoring" if cycle.market_open else cycle.session
             blocker = protection_error
             if blocker is not None:
@@ -3405,6 +3703,11 @@ def run_trend_market_controller(
                 or review_retry_after
                 or cycle.next_check_at
             )
+            if (
+                statistics_retry_after is not None
+                and statistics_retry_after < next_check
+            ):
+                next_check = statistics_retry_after
             status_now = max(now, last_reconciliation_heartbeat or now)
             status_payload = _record_status(
                 config,
