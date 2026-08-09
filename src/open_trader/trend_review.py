@@ -7541,12 +7541,16 @@ def _series_cutoff(
 
 
 def _equity_cutoff(
-    effective_from: str, fact_dates: set[str], equity_dates: set[str]
+    effective_from: str,
+    fact_dates: set[str],
+    equity_dates: set[str],
+    expected_dates: set[str] | None = None,
 ) -> str | None:
-    if effective_from not in fact_dates or effective_from not in equity_dates:
+    expected = fact_dates if expected_dates is None else expected_dates
+    if effective_from not in expected or effective_from not in equity_dates:
         return None
     cutoff: str | None = None
-    for trading_date in sorted(day for day in fact_dates if day >= effective_from):
+    for trading_date in sorted(day for day in expected if day >= effective_from):
         if trading_date not in equity_dates:
             break
         cutoff = trading_date
@@ -7903,6 +7907,7 @@ def build_trend_review_projection(
             fact.get("benchmark"), market=market, trading_date=str(fact["date"])
         )
         benchmark_by_date[str(fact["date"])] = dict(benchmark)
+    benchmark_reference_dates = set(benchmark_by_date)
     long_term_snapshot: dict[str, object] | None = None
     try:
         long_term_snapshot = read_long_term_benchmark_snapshot(data_dir, market)
@@ -8092,6 +8097,7 @@ def build_trend_review_projection(
         effective_from,
         set(discipline_by_date),
         discipline_dates,
+        benchmark_reference_dates or set(discipline_by_date),
     )
     actual_metric_cutoff = None
     if market == "US":
@@ -8105,6 +8111,7 @@ def build_trend_review_projection(
             effective_from,
             set(actual_by_date),
             actual_dates,
+            benchmark_reference_dates or set(actual_by_date),
         )
         if equity_cutoff is not None:
             for trading_date in sorted(

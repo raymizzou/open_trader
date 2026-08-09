@@ -10719,6 +10719,19 @@ def test_projection_metric_cutoff_stops_before_missing_equity_value(
     }
 
 
+def test_projection_metric_cutoff_stops_before_missing_middle_equity_fact(
+    tmp_path: Path,
+) -> None:
+    write_projection_metric_history(
+        tmp_path, "CN", discipline_days=3, actual_days=0, benchmark_days=3
+    )
+    (tmp_path / "trend_review/facts/discipline/CN/2026-07-17.json").unlink()
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["metric_cutoffs"]["discipline"] == "2026-07-16"
+
+
 def test_missing_common_metric_cutoff_preserves_discipline_metrics(
     tmp_path: Path,
 ) -> None:
