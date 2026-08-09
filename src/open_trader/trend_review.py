@@ -258,142 +258,28 @@ def _validated_benchmark_closes(bars: Sequence[object]) -> list[tuple[date, Deci
     return closes
 
 
-def _valid_long_term_benchmark_cycle_marker(
-    payload: object, market: str, month: str
+def _completed_cycle_matches_latest_snapshot(
+    cycle_path: Path,
+    snapshot_path: Path,
+    *,
+    market: str,
+    month: str,
 ) -> bool:
     try:
-        if not isinstance(payload, Mapping):
+        cycle = json.loads(cycle_path.read_text(encoding="utf-8"))
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        if not isinstance(cycle, Mapping) or not isinstance(snapshot, Mapping):
             return False
-        identity = BENCHMARK_IDENTITIES[market]
         if (
-            payload.get("schema_version")
+            cycle.get("schema_version")
             != "open_trader.trend_review.long_term_benchmark.v1"
-            or payload.get("market") != market
-            or payload.get("month") != month
-            or payload.get("benchmark") != identity
-            or not str(payload.get("process_git_sha") or "").strip()
+            or cycle.get("market") != market
+            or cycle.get("month") != month
         ):
             return False
-        completed_at = datetime.fromisoformat(str(payload.get("completed_at")))
-        if completed_at.tzinfo is None or completed_at.utcoffset() is None:
-            return False
-        refresh = payload.get("refresh")
-        if not isinstance(refresh, Mapping) or set(refresh) != {"force", "actor", "reason"}:
-            return False
-        if refresh.get("force") is True:
-            if not str(refresh.get("actor") or "").strip() or not str(
-                refresh.get("reason") or ""
-            ).strip():
-                return False
-        elif refresh != {"force": False, "actor": None, "reason": None}:
-            return False
-        closes = _validated_benchmark_closes(payload.get("daily_closes", []))
-        cutoff = date.fromisoformat(str(payload.get("cutoff")))
-        if (
-            closes[-1][0] != cutoff
-            or closes[0][0] > _years_before(cutoff, 5)
-        ):
-            return False
-        windows = payload.get("windows")
-        if not isinstance(windows, Mapping) or set(windows) != {"1Y", "5Y"}:
-            return False
-        for label, years in (("1Y", 1), ("5Y", 5)):
-            window = windows[label]
-            if not isinstance(window, Mapping) or set(window) != {
-                "start",
-                "cutoff",
-                "observation_count",
-                "daily_returns",
-                "metrics",
-            }:
-                return False
-            start = _years_before(cutoff, years)
-            before_start = [
-                (trading_date, close)
-                for trading_date, close in closes
-                if trading_date < start
-            ]
-            expected_window = (
-                ([before_start[-1]] if before_start else [])
-                + [
-                    (trading_date, close)
-                    for trading_date, close in closes
-                    if trading_date >= start
-                ]
-            )
-            if (
-                len(expected_window) < 2
-                or expected_window[0][0] > start
-                or not any(
-                    trading_date >= start for trading_date, _ in expected_window
-                )
-            ):
-                return False
-            observation_count = window.get("observation_count")
-            if (
-                type(observation_count) is not int
-                or observation_count != len(expected_window)
-                or window.get("start") != start.isoformat()
-                or window.get("cutoff") != cutoff.isoformat()
-                or not isinstance(window.get("daily_returns"), list)
-                or len(window["daily_returns"]) != len(expected_window) - 1
-            ):
-                return False
-            expected_pairs = zip(expected_window, expected_window[1:])
-            for row, (previous, current) in zip(
-                window["daily_returns"], expected_pairs
-            ):
-                if not isinstance(row, Mapping) or set(row) != {
-                    "date",
-                    "return",
-                    "risk_free_return",
-                    "excess_return",
-                }:
-                    return False
-                if row["date"] != current[0].isoformat():
-                    return False
-                try:
-                    daily_return = Decimal(str(row["return"]))
-                    risk_free_return = Decimal(str(row["risk_free_return"]))
-                    excess_return = Decimal(str(row["excess_return"]))
-                except (InvalidOperation, TypeError, ValueError):
-                    return False
-                if not all(
-                    value.is_finite()
-                    for value in (daily_return, risk_free_return, excess_return)
-                ):
-                    return False
-                try:
-                    expected_daily_return = current[1] / previous[1] - Decimal("1")
-                    expected_excess_return = daily_return - risk_free_return
-                except ArithmeticError:
-                    return False
-                if (
-                    daily_return != expected_daily_return
-                    or excess_return != expected_excess_return
-                ):
-                    return False
-            metrics = window.get("metrics")
-            if not isinstance(metrics, Mapping) or set(metrics) != {
-                "total_return_pct",
-                "max_drawdown_pct",
-                "calmar_ratio",
-                "sharpe_ratio",
-                "annualized_return_pct",
-            }:
-                return False
-            for value in metrics.values():
-                if value is None:
-                    continue
-                try:
-                    metric = Decimal(str(value))
-                except (InvalidOperation, TypeError, ValueError):
-                    return False
-                if not metric.is_finite():
-                    return False
-    except (ArithmeticError, KeyError, TypeError, ValueError):
+        return _canonical_json_bytes(cycle) == _canonical_json_bytes(snapshot)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
         return False
-    return True
 
 
 def _benchmark_window(
@@ -562,12 +448,9 @@ def _refresh_long_term_benchmark_locked(
     snapshot_path = long_term_benchmark_snapshot_path(data_dir, market)
     existing_cycle_is_valid = False
     if force and cycle_path.exists():
-        try:
-            existing_cycle_is_valid = _valid_long_term_benchmark_cycle_marker(
-                json.loads(cycle_path.read_text(encoding="utf-8")), market, month
-            )
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            existing_cycle_is_valid = False
+        existing_cycle_is_valid = _completed_cycle_matches_latest_snapshot(
+            cycle_path, snapshot_path, market=market, month=month
+        )
     if cycle_path.exists() and not force:
         try:
             rates = _load_dgs3mo_csv(data_dir / "rates" / "DGS3MO.csv")
