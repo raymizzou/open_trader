@@ -1829,6 +1829,10 @@ def _trend_ratio_transition(current: Any, prior: Any) -> str:
 def _trend_context_display_value(key: str, value: Any) -> str:
     if key in {"strength", "warm_to_hot_count"}:
         return _display_number(value)
+    if key == "temperature_direction":
+        return {"rising": "上升", "falling": "下降", "unchanged": "持平"}.get(
+            str(value), str(value)
+        )
     return str(value)
 
 

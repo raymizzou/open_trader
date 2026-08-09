@@ -2584,7 +2584,7 @@ def test_acceptance_checks_truthful_unavailable_trade_stats_copy() -> None:
             "individual_global",
             {
                 "industry": "科技", "temperature": "热",
-                "temperature_direction": "上升", "strength": "246802.22",
+                "temperature_direction": "unchanged", "strength": "246802.22",
                 "warm_to_hot_count": 2468013579,
                 "aggregate_right_count_ratio": None,
                 "aggregate_right_market_cap_ratio": None,
@@ -2592,7 +2592,7 @@ def test_acceptance_checks_truthful_unavailable_trade_stats_copy() -> None:
                 "prior_aggregate_right_market_cap_ratio": None,
                 "valid": True,
             },
-            "科技 当前温度 热 温度方向 上升",
+            "科技 当前温度 热 温度方向 持平",
         ),
     ],
 )
