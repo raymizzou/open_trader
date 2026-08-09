@@ -933,7 +933,35 @@ class PredictionExecutionService:
         if not isinstance(current, Mapping) or current.get("status") != "ready":
             return False
         readiness = current.get("readiness")
-        return not isinstance(readiness, Mapping) or readiness.get("status") == "ready"
+        if isinstance(readiness, Mapping) and readiness.get("status") != "ready":
+            return False
+
+        primary_snapshot = getattr(self._monitor, "snapshot", None)
+        try:
+            primary = _call(primary_snapshot) if callable(primary_snapshot) else None
+        except Exception:
+            return False
+        if not isinstance(primary, Mapping):
+            return False
+        primary_status = str(primary.get("status", "")).casefold()
+        if primary_status not in {"healthy", "ready"}:
+            return False
+        primary_readiness = primary.get("readiness")
+        if not isinstance(primary_readiness, Mapping):
+            return False
+        accepted = (True, "ready", "allowed", "pass", "confirmed")
+        for key in ("wallet", "wallet_ready", "geoblock", "relayer", "relayer_readiness"):
+            if key in primary_readiness and primary_readiness[key] not in accepted:
+                return False
+        if "geoblock" not in primary_readiness:
+            return False
+        if "relayer" not in primary_readiness and "relayer_readiness" not in primary_readiness:
+            return False
+        if str(primary_readiness.get("status", "ready")).casefold() in {
+            "unavailable", "blocked", "fail", "failed"
+        }:
+            return False
+        return "balance" in primary_readiness or "p_usd_balance" in primary_readiness
 
     def cross_auto_status(self) -> dict[str, object]:
         try:

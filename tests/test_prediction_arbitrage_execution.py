@@ -3130,6 +3130,57 @@ def test_cross_auto_status_fails_closed_when_current_readiness_is_unavailable(
     assert service.cross_auto_status()["effective_mode"] == "observe_only"
 
 
+def test_cross_auto_status_fails_closed_when_primary_monitor_readiness_is_degraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, store, _trading, cross, _predict = _cross_service(tmp_path)
+    store.arm_cross_auto()
+    monkeypatch.setattr(
+        cross,
+        "snapshot",
+        lambda: {"status": "ready", "opportunities": []},
+    )
+
+    class DegradedPrimaryMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "degraded",
+                "readiness": {"status": "unavailable"},
+            }
+
+    service._monitor = DegradedPrimaryMonitor()
+
+    assert service.cross_auto_status()["effective_mode"] == "observe_only"
+
+
+def test_cross_auto_status_keeps_armed_auto_when_primary_monitor_is_healthy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, store, _trading, cross, _predict = _cross_service(tmp_path)
+    store.arm_cross_auto()
+    monkeypatch.setattr(
+        cross,
+        "snapshot",
+        lambda: {"status": "ready", "opportunities": []},
+    )
+
+    class HealthyPrimaryMonitor:
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "readiness": {
+                    "wallet": "ready",
+                    "geoblock": "allowed",
+                    "relayer": "ready",
+                    "balance": "20",
+                },
+            }
+
+    service._monitor = HealthyPrimaryMonitor()
+
+    assert service.cross_auto_status()["effective_mode"] == "auto_submit"
+
+
 def test_execution_mode_comes_from_store_when_monitor_snapshot_disagrees(
     tmp_path: Path,
 ) -> None:
