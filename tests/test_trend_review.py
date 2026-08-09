@@ -7195,6 +7195,39 @@ def test_long_term_benchmark_validator_requires_true_annual_coverage(
         trend_review.read_long_term_benchmark_snapshot(tmp_path, "US")
 
 
+def test_long_term_benchmark_uses_last_close_before_weekend_anniversary(
+    tmp_path: Path,
+) -> None:
+    rates = tmp_path / "rates/DGS3MO.csv"
+    rates.parent.mkdir(parents=True, exist_ok=True)
+    rates.write_text("DATE,DGS3MO\n2021-08-01,4.0\n", encoding="utf-8")
+
+    class CalendarBoundaryQuote:
+        def get_daily_kline(
+            self, _symbol: str, *, start: str, end: str
+        ) -> list[object]:
+            return [
+                SimpleNamespace(date="2021-08-06", close="100"),
+                SimpleNamespace(date="2021-08-09", close="102"),
+                SimpleNamespace(date="2025-08-08", close="110"),
+                SimpleNamespace(date="2026-08-08", close="120"),
+            ]
+
+    result = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        CalendarBoundaryQuote(),
+        now=datetime(2026, 8, 9, 12, tzinfo=UTC),
+        process_git_sha="calendar-boundary",
+    )
+
+    assert result["status"] == "completed"
+    snapshot = trend_review.read_long_term_benchmark_snapshot(tmp_path, "US")
+    assert snapshot["windows"]["5Y"]["start"] == "2021-08-08"
+    assert snapshot["windows"]["5Y"]["observation_count"] == 4
+    assert snapshot["daily_closes"][0] == {"date": "2021-08-06", "close": "100"}
+
+
 def test_long_term_benchmark_cycle_month_is_bound_to_path(
     tmp_path: Path,
 ) -> None:
