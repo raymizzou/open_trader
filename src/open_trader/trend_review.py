@@ -425,13 +425,15 @@ def _refresh_long_term_benchmark_locked(
     existing_cycle_is_valid = False
     if force and cycle_path.exists():
         try:
-            existing_cycle_is_valid = _validate_long_term_benchmark_snapshot(
-                json.loads(cycle_path.read_text(encoding="utf-8")),
-                market,
-                rates=_load_dgs3mo_csv(data_dir / "rates" / "DGS3MO.csv"),
-                expected_month=month,
-            ) is not None
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            existing = json.loads(cycle_path.read_text(encoding="utf-8"))
+            existing_cycle_is_valid = (
+                isinstance(existing, Mapping)
+                and existing.get("schema_version")
+                == "open_trader.trend_review.long_term_benchmark.v1"
+                and existing.get("market") == market
+                and existing.get("month") == month
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError):
             existing_cycle_is_valid = False
     if cycle_path.exists() and not force:
         try:
@@ -455,21 +457,21 @@ def _refresh_long_term_benchmark_locked(
                 and previous.get("market") == market
                 and previous.get("month") == month
             )
-            try:
-                _record_long_term_benchmark_failure(
-                    data_dir,
-                    market,
-                    month,
-                    now=now,
-                    process_git_sha=process_git_sha,
-                    force=False,
-                    actor="",
-                    reason="",
-                    error=exc,
-                )
-            except Exception:
-                pass
             if not retryable_failure:
+                try:
+                    _record_long_term_benchmark_failure(
+                        data_dir,
+                        market,
+                        month,
+                        now=now,
+                        process_git_sha=process_git_sha,
+                        force=False,
+                        actor="",
+                        reason="",
+                        error=exc,
+                    )
+                except Exception:
+                    pass
                 return {
                     "status": "failed",
                     "market": market,

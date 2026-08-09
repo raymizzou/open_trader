@@ -7433,6 +7433,41 @@ def test_long_term_benchmark_recovers_malformed_cycle_marker(
     ] == "recovered-sha"
 
 
+def test_long_term_benchmark_quote_failure_records_one_attempt_per_call(
+    tmp_path: Path,
+) -> None:
+    write_rates(tmp_path)
+    first = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        ExplodingQuote(),
+        now=datetime(2026, 8, 9, 12, tzinfo=UTC),
+        process_git_sha="first",
+    )
+    first_state = json.loads(
+        trend_review.long_term_benchmark_cycle_path(
+            tmp_path, "US", "2026-08"
+        ).read_text(encoding="utf-8")
+    )
+    second = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        ExplodingQuote(),
+        now=datetime(2026, 8, 9, 12, tzinfo=UTC),
+        process_git_sha="second",
+    )
+    second_state = json.loads(
+        trend_review.long_term_benchmark_cycle_path(
+            tmp_path, "US", "2026-08"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert first["status"] == "failed"
+    assert second["status"] == "failed"
+    assert first_state["attempt_count"] == 1
+    assert second_state["attempt_count"] == 2
+
+
 def test_long_term_benchmark_force_requires_audited_reason_and_preserves_success(
     tmp_path: Path,
 ) -> None:
@@ -7467,6 +7502,12 @@ def test_long_term_benchmark_force_requires_audited_reason_and_preserves_success
     cycle_path = trend_review.long_term_benchmark_cycle_path(tmp_path, "US", "2026-08")
     body = snapshot_path.read_bytes()
     cycle = cycle_path.read_bytes()
+    snapshot_refresh = trend_review.read_long_term_benchmark_snapshot(
+        tmp_path, "US"
+    )["refresh"]
+    (tmp_path / "rates" / "DGS3MO.csv").write_text(
+        "DATE,DGS3MO\nnot-a-date,not-a-rate\n", encoding="utf-8"
+    )
     failed = trend_review.refresh_long_term_benchmark(
         tmp_path,
         "US",
@@ -7479,7 +7520,7 @@ def test_long_term_benchmark_force_requires_audited_reason_and_preserves_success
     )
 
     assert forced["status"] == "completed"
-    assert trend_review.read_long_term_benchmark_snapshot(tmp_path, "US")["refresh"] == {
+    assert snapshot_refresh == {
         "force": True,
         "actor": "operator",
         "reason": "reconcile provider data",
