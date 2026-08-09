@@ -735,8 +735,16 @@ class PredictionArbitrageStore:
         }
 
     def cross_auto_state(self) -> dict[str, object]:
-        with self._read_connection() as connection:
-            return self._cross_auto_state_from_connection(connection)
+        try:
+            with self._read_connection() as connection:
+                return self._cross_auto_state_from_connection(connection)
+        except Exception:
+            return {
+                "configured_mode": "observe_only",
+                "armed": False,
+                "reason": "not_armed",
+                "updated_at": None,
+            }
 
     def _set_cross_auto_state(
         self,
@@ -801,6 +809,7 @@ class PredictionArbitrageStore:
         limit: object,
         venue: str,
         operator_action_required: bool,
+        operator_action: str,
         signal_id: str,
         opportunity_id: str,
     ) -> str:
@@ -812,6 +821,7 @@ class PredictionArbitrageStore:
                 "limit": limit,
                 "venue": venue,
                 "operator_action_required": operator_action_required,
+                "operator_action": operator_action,
                 "signal_id": signal_id,
                 "opportunity_id": opportunity_id,
             }
@@ -834,6 +844,7 @@ class PredictionArbitrageStore:
             limit=None,
             venue="",
             operator_action_required=False,
+            operator_action="",
             signal_id=signal,
             opportunity_id=opportunity,
         )
@@ -850,10 +861,13 @@ class PredictionArbitrageStore:
         except sqlite3.IntegrityError:
             return {"state": "signal_already_attempted"}
         state = self._cross_auto_state_from_connection(connection)
-        if (
-            state["configured_mode"] != "auto_submit"
-            or state["armed"] is not True
-        ):
+        if state["configured_mode"] != "auto_submit":
+            return {
+                "state": "rejected",
+                "reason": "configured_mode_not_auto_submit",
+                "current": str(state["configured_mode"]),
+            }
+        if state["armed"] is not True:
             return {"state": "rejected", "reason": "cross_auto_paused"}
         return {"state": "claimed"}
 
@@ -884,6 +898,7 @@ class PredictionArbitrageStore:
         limit: object = None,
         venue: str = "",
         operator_action_required: bool = False,
+        operator_action: str = "",
         preview_id: str = "",
         execution_id: str = "",
         total_cost: object = None,
@@ -891,8 +906,10 @@ class PredictionArbitrageStore:
         signal = str(signal_id).strip()
         if not signal or not str(decision).strip() or not str(reason).strip():
             raise ValueError("signal_id, decision, and reason are required")
-        if not isinstance(reason_zh, str) or not isinstance(venue, str):
-            raise ValueError("reason_zh and venue must be strings")
+        if not all(
+            isinstance(value, str) for value in (reason_zh, venue, operator_action)
+        ):
+            raise ValueError("reason_zh, venue, and operator_action must be strings")
         now = _utc_now()
         with self._transaction() as connection:
             row = connection.execute(
@@ -909,6 +926,7 @@ class PredictionArbitrageStore:
                 limit=limit,
                 venue=venue,
                 operator_action_required=bool(operator_action_required),
+                operator_action=operator_action,
                 signal_id=signal,
                 opportunity_id=opportunity,
             )

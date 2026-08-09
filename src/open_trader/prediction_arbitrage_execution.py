@@ -720,18 +720,29 @@ class PredictionExecutionService:
             signal_id, signal, rendered_signal={**opportunity, "signal_id": signal_id}
         )
 
-    _CROSS_AUTO_REASONS: dict[str, tuple[str, str, bool]] = {
-        "cross_auto_paused": ("自动下单已暂停", "系统", True),
-        "cross_auto_daily_principal_cap": ("当日自动本金已达到上限", "跨市场", False),
-        "cross_pair_unsettled": ("同一市场对仍有未结算仓位", "跨市场", True),
-        "active_execution": ("已有执行正在进行", "系统", False),
-        "execution_lock": ("已有执行正在进行", "系统", False),
-        "books_stale": ("盘口数据已过期", "行情", False),
-        "insufficient_bnb": ("BNB Gas 不足", "Predict.fun", True),
-        "account_insufficient": ("账户可用余额不足", "账户", True),
-        "notification_config_unavailable": ("飞书通知配置不可用", "通知", True),
-        "manual_only_requires_approval": ("该机会需要人工审查，自动模式不执行", "规则", True),
-        "cross_venue_minimum_exceeds_canary": ("场所最小可执行金额高于当前试探额度", "跨市场", True),
+    _CROSS_AUTO_REASONS: dict[str, tuple[str, str, bool, str]] = {
+        "configured_mode_not_auto_submit": (
+            "当前配置模式不是自动下单",
+            "系统",
+            True,
+            "prediction-arb cross-auto mode auto_submit --data-dir {data_dir}",
+        ),
+        "cross_auto_paused": (
+            "自动下单已暂停",
+            "系统",
+            True,
+            "prediction-arb cross-auto arm --data-dir {data_dir} --url LOOPBACK --expected-sha SHA",
+        ),
+        "cross_auto_daily_principal_cap": ("当日自动本金已达到上限", "跨市场", False, ""),
+        "cross_pair_unsettled": ("同一市场对仍有未结算仓位", "跨市场", True, ""),
+        "active_execution": ("已有执行正在进行", "系统", False, ""),
+        "execution_lock": ("已有执行正在进行", "系统", False, ""),
+        "books_stale": ("盘口数据已过期", "行情", False, ""),
+        "insufficient_bnb": ("BNB Gas 不足", "Predict.fun", True, ""),
+        "account_insufficient": ("账户可用余额不足", "账户", True, ""),
+        "notification_config_unavailable": ("飞书通知配置不可用", "通知", True, ""),
+        "manual_only_requires_approval": ("该机会需要人工审查，自动模式不执行", "规则", True, ""),
+        "cross_venue_minimum_exceeds_canary": ("场所最小可执行金额高于当前试探额度", "跨市场", True, ""),
     }
 
     def auto_submit_cross_venue(
@@ -775,13 +786,16 @@ class PredictionExecutionService:
         signal_id: str,
         opportunity_id: str,
     ) -> dict[str, object]:
-        reason_zh, venue, required = self._CROSS_AUTO_REASONS.get(
-            reason, ("自动下单条件不满足", "系统", False)
+        reason_zh, venue, required, action = self._CROSS_AUTO_REASONS.get(
+            reason, ("自动下单条件不满足", "系统", False, "")
         )
         current: object = None
         limit: object = None
         if reason == "cross_auto_paused":
             current, limit = "paused", "armed"
+        elif reason == "configured_mode_not_auto_submit":
+            current = self._configured_cross_execution_mode()
+            limit = "auto_submit"
         elif reason == "cross_auto_daily_principal_cap":
             current, limit = (
                 format(self._store.cross_auto_daily_principal(), "f"),
@@ -810,6 +824,7 @@ class PredictionExecutionService:
             "limit": limit,
             "venue": venue,
             "operator_action_required": required,
+            "operator_action": action.format(data_dir=self._store.data_dir),
             "signal_id": signal_id,
             "opportunity_id": opportunity_id,
         }
@@ -840,6 +855,7 @@ class PredictionExecutionService:
                 limit=facts["limit"],
                 venue=str(facts["venue"]),
                 operator_action_required=bool(facts["operator_action_required"]),
+                operator_action=str(facts["operator_action"]),
             )
         except KeyError:
             return {"state": "ignored", "reason": "signal_already_attempted"}
@@ -878,15 +894,17 @@ class PredictionExecutionService:
             reservation.get("lease_id"), str
         ):
             return
-        message = "\n".join(
-            (
-                f"原因：{facts['reason_zh']}（{facts['reason_code']}）",
-                f"场所：{facts['venue']}",
-                f"当前/限制：{facts['current']} / {facts['limit']}",
-                f"机会编号：{facts['signal_id']}",
-                f"Dashboard：{self._dashboard_url}",
-            )
+        lines = [
+            f"原因：{facts['reason_zh']}（{facts['reason_code']}）",
+            f"场所：{facts['venue']}",
+            f"当前/限制：{facts['current']} / {facts['limit']}",
+        ]
+        if facts.get("operator_action"):
+            lines.append(f"操作：{facts['operator_action']}")
+        lines.extend(
+            (f"机会编号：{facts['signal_id']}", f"Dashboard：{self._dashboard_url}")
         )
+        message = "\n".join(lines)
         try:
             sent = self._deliver_feishu_notification("自动下单已拒绝", message)
         except Exception:
@@ -906,20 +924,40 @@ class PredictionExecutionService:
         except Exception:
             return "observe_only"
 
+    def _cross_auto_monitor_ready(self) -> bool:
+        snapshot = getattr(self._cross_venue_monitor, "snapshot", None)
+        try:
+            current = _call(snapshot) if callable(snapshot) else None
+        except Exception:
+            return False
+        if not isinstance(current, Mapping) or current.get("status") != "ready":
+            return False
+        readiness = current.get("readiness")
+        return not isinstance(readiness, Mapping) or readiness.get("status") == "ready"
+
     def cross_auto_status(self) -> dict[str, object]:
-        configured = self._configured_cross_execution_mode()
         try:
             state = self._store.cross_auto_state()
         except Exception:
-            state = {"armed": False, "reason": "not_armed"}
+            state = {
+                "configured_mode": "observe_only",
+                "armed": False,
+                "reason": "not_armed",
+            }
+        configured = validate_cross_execution_mode(state.get("configured_mode"))
         armed = state.get("armed") is True
+        notification_ready = self._notification_channels_ready()
+        ready = self._cross_auto_monitor_ready() and notification_ready
         latest = self._store.cross_auto_attempts(limit=1)
+        effective = configured
+        if configured == "auto_submit" and not (armed and ready):
+            effective = "observe_only"
         return {
             "configured_mode": configured,
-            "effective_mode": configured if configured == "auto_submit" and armed else "observe_only",
+            "effective_mode": effective,
             "armed": armed,
             "pause_reason": "" if armed else str(state.get("reason", "not_armed")),
-            "notification_ready": self._notification_channels_ready(),
+            "notification_ready": notification_ready,
             "daily_principal": {
                 "current": format(self._store.cross_auto_daily_principal(), "f"),
                 "limit": "100",

@@ -291,6 +291,22 @@ def test_cross_auto_mode_command_changes_only_local_state(
     assert "configured_mode: auto_submit" in capsys.readouterr().out
 
 
+def test_cross_auto_status_keeps_manual_confirm_effective(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    PredictionArbitrageStore(tmp_path).set_cross_auto_mode(
+        "manual_confirm", "operator_configured"
+    )
+
+    assert cli.main(
+        ["prediction-arb", "cross-auto", "status", "--data-dir", str(tmp_path)]
+    ) == 0
+
+    output = capsys.readouterr().out
+    assert "configured_mode: manual_confirm" in output
+    assert "effective_mode: manual_confirm" in output
+
+
 @pytest.mark.parametrize(
     ("change", "reason"),
     (

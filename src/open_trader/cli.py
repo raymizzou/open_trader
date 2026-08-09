@@ -1239,7 +1239,9 @@ def main(argv: list[str] | None = None) -> int:
                 configured_mode = str(state.get("configured_mode", "observe_only"))
                 armed = state.get("armed") is True
                 effective_mode = (
-                    configured_mode if configured_mode == "auto_submit" and armed else "observe_only"
+                    "observe_only"
+                    if configured_mode == "auto_submit" and not armed
+                    else configured_mode
                 )
                 print(f"configured_mode: {configured_mode}")
                 print(f"effective_mode: {effective_mode}")

@@ -3067,7 +3067,7 @@ def test_auto_submit_busy_signal_is_rejected_without_queue_or_submitted_record(
     assert final["state"] == "holding_to_resolution"
 
 
-def test_cross_auto_status_uses_root_mode_when_books_are_empty_and_degraded(
+def test_cross_auto_status_pauses_armed_auto_when_monitor_is_degraded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service, store, _trading, cross, _predict = _cross_service(tmp_path)
@@ -3081,8 +3081,53 @@ def test_cross_auto_status_uses_root_mode_when_books_are_empty_and_degraded(
     status = service.cross_auto_status()
 
     assert status["configured_mode"] == "auto_submit"
-    assert status["effective_mode"] == "auto_submit"
+    assert status["effective_mode"] == "observe_only"
     assert status["armed"] is True
+
+
+def test_cross_auto_status_keeps_manual_confirm_effective_when_unready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, store, _trading, cross, _predict = _cross_service(tmp_path)
+    store.set_cross_auto_mode("manual_confirm", "operator_configured")
+    monkeypatch.setattr(
+        cross,
+        "snapshot",
+        lambda: {
+            "status": "degraded",
+            "readiness": {"status": "unavailable"},
+            "opportunities": [],
+        },
+    )
+    service._notifier = FakeNotifier()
+
+    status = service.cross_auto_status()
+
+    assert status["configured_mode"] == "manual_confirm"
+    assert status["effective_mode"] == "manual_confirm"
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "notification_ready"),
+    (
+        ({"status": "degraded", "opportunities": []}, True),
+        ({"status": "ready", "readiness": {"status": "unavailable"}}, True),
+        ({"status": "ready", "readiness": {"status": "ready"}}, False),
+    ),
+)
+def test_cross_auto_status_fails_closed_when_current_readiness_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot: dict[str, object],
+    notification_ready: bool,
+) -> None:
+    service, store, _trading, cross, _predict = _cross_service(tmp_path)
+    store.arm_cross_auto()
+    monkeypatch.setattr(cross, "snapshot", lambda: snapshot)
+    if not notification_ready:
+        service._notifier = FakeNotifier()
+
+    assert service.cross_auto_status()["effective_mode"] == "observe_only"
 
 
 def test_execution_mode_comes_from_store_when_monitor_snapshot_disagrees(
@@ -3110,7 +3155,31 @@ def test_pause_before_claim_records_cross_auto_paused_without_order(
 
     assert result["reason"] == "cross_auto_paused"
     assert result["facts"]["current"] == "paused"
+    assert "cross-auto arm" in result["facts"]["operator_action"]
     assert store.cross_auto_attempts()[0]["reason_code"] == "cross_auto_paused"
+    assert (predict.submit_calls, trading.cross_submit_calls) == (0, 0)
+
+
+@pytest.mark.parametrize("configured_mode", ("manual_confirm", "observe_only"))
+def test_nonautomatic_mode_claim_records_complete_configuration_rejection(
+    tmp_path: Path, configured_mode: str
+) -> None:
+    service, store, trading, _cross, predict = _cross_service(tmp_path)
+    store.set_cross_auto_mode(configured_mode, "operator_configured")
+    signal_id = _cross_venue_notification_signal(store)
+
+    result = service.auto_submit_cross_venue(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    )
+
+    assert result["reason"] == "configured_mode_not_auto_submit"
+    assert result["facts"]["current"] == configured_mode
+    assert "cross-auto mode auto_submit" in result["facts"]["operator_action"]
+    attempt = store.cross_auto_attempts()[0]
+    assert attempt["decision"] == "rejected"
+    assert attempt["reason_code"] == "configured_mode_not_auto_submit"
+    assert attempt["current"] == configured_mode
+    assert attempt["operator_action"] == result["facts"]["operator_action"]
     assert (predict.submit_calls, trading.cross_submit_calls) == (0, 0)
 
 
@@ -3193,7 +3262,10 @@ def test_auto_submit_rejection_records_safe_reason_without_orders(tmp_path: Path
     assert attempt["reason_zh"]
     assert attempt["operator_action_required"] is True
     assert (predict.submit_calls, trading.cross_submit_calls) == (0, 0)
-    assert service.cross_auto_status()["armed"] is False
+    status = service.cross_auto_status()
+    assert status["configured_mode"] == "auto_submit"
+    assert status["effective_mode"] == "observe_only"
+    assert status["armed"] is False
 
 
 def test_auto_submit_terminal_feishu_failure_pauses_future_entries(
@@ -3277,6 +3349,7 @@ def test_auto_submit_rejects_venue_minimum_above_canary_limit(tmp_path: Path) ->
         "account_insufficient",
         "notification_config_unavailable",
         "manual_only_requires_approval",
+        "configured_mode_not_auto_submit",
     ),
 )
 def test_auto_submit_rejection_codes_have_safe_operator_facts(
@@ -3293,7 +3366,7 @@ def test_auto_submit_rejection_codes_have_safe_operator_facts(
     assert facts["venue"]
     assert set(facts) == {
         "reason_code", "reason_zh", "current", "limit", "venue",
-        "operator_action_required", "signal_id", "opportunity_id",
+        "operator_action_required", "operator_action", "signal_id", "opportunity_id",
     }
 
 

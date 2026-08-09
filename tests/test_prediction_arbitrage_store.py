@@ -264,6 +264,30 @@ def test_cross_auto_state_defaults_fail_closed_with_configured_mode(tmp_path: Pa
     }
 
 
+@pytest.mark.parametrize(
+    "read_error",
+    (sqlite3.DatabaseError("database disk image is malformed"), OSError("unreadable")),
+)
+def test_cross_auto_state_fails_closed_when_database_read_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    read_error: Exception,
+) -> None:
+    db = store(tmp_path)
+
+    def fail_read() -> object:
+        raise read_error
+
+    monkeypatch.setattr(db, "_read_connection", fail_read)
+
+    assert db.cross_auto_state() == {
+        "configured_mode": "observe_only",
+        "armed": False,
+        "reason": "not_armed",
+        "updated_at": None,
+    }
+
+
 def test_cross_auto_mode_and_pause_survive_new_store_instance(tmp_path: Path) -> None:
     db = store(tmp_path)
 
@@ -354,6 +378,26 @@ def test_cross_auto_attempt_claim_is_one_shot_across_store_instances(tmp_path: P
     assert len(setup.cross_auto_attempts()) == 1
 
 
+@pytest.mark.parametrize("configured_mode", ("manual_confirm", "observe_only"))
+def test_cross_auto_claim_distinguishes_nonautomatic_mode_from_paused_auto(
+    tmp_path: Path, configured_mode: str
+) -> None:
+    db = store(tmp_path)
+    db.set_cross_auto_mode(configured_mode, "operator_configured")
+
+    assert db.claim_cross_auto_attempt("signal-mode", "opportunity-mode") == {
+        "state": "rejected",
+        "reason": "configured_mode_not_auto_submit",
+        "current": configured_mode,
+    }
+
+    db.set_cross_auto_mode("auto_submit", "operator_configured")
+    assert db.claim_cross_auto_attempt("signal-paused", "opportunity-paused") == {
+        "state": "rejected",
+        "reason": "cross_auto_paused",
+    }
+
+
 def test_cross_auto_attempt_finishes_once_with_safe_rejection_facts(tmp_path: Path) -> None:
     db = store(tmp_path)
     db.arm_cross_auto()
@@ -370,6 +414,7 @@ def test_cross_auto_attempt_finishes_once_with_safe_rejection_facts(tmp_path: Pa
         limit=Decimal("0"),
         venue="cross_venue",
         operator_action_required=True,
+        operator_action="prediction-arb cross-auto arm --data-dir /tmp/data",
         preview_id="preview-1",
         execution_id="execution-1",
         total_cost=Decimal("5"),
@@ -398,6 +443,7 @@ def test_cross_auto_attempt_finishes_once_with_safe_rejection_facts(tmp_path: Pa
         "limit",
         "venue",
         "operator_action_required",
+        "operator_action",
         "signal_id",
         "opportunity_id",
     }
@@ -972,9 +1018,15 @@ def test_auto_cross_preview_requires_durable_arm_before_consuming(tmp_path: Path
 
     assert db.consume_preview_and_create_execution(preview_id, "auto-unarmed") == {
         "state": "rejected",
-        "reason": "cross_auto_paused",
+        "reason": "configured_mode_not_auto_submit",
+        "current": "observe_only",
     }
 
+    db.set_cross_auto_mode("auto_submit", "operator_configured")
+    assert db.consume_preview_and_create_execution(preview_id, "auto-paused") == {
+        "state": "rejected",
+        "reason": "cross_auto_paused",
+    }
     db.arm_cross_auto()
     assert db.consume_preview_and_create_execution(preview_id, "auto-armed")["state"] == "validating"
 

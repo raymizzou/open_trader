@@ -176,6 +176,11 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(root.locator('[data-action="participate"]')).toHaveCount(0);
     await expect(root.getByRole('button', { name: '重新开启自动下单' })).toHaveCount(0);
 
+    await openPrediction(page, 'cross-auto-submitted');
+    await expect(root).toContainText('已提交双边订单');
+    await expect(root).toContainText('2026-08-08');
+    await expect(root).not.toContainText('拒绝 submitted');
+
     await openPrediction(page, 'cross-auto-manual-only');
     await expect(root).toContainText('需人工审查，自动模式不执行');
     await expect(root.locator('[data-action="participate"]')).toHaveCount(0);

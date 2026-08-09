@@ -223,7 +223,7 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
     if scenario in {
         "cross-auto-armed", "cross-auto-paused", "cross-auto-daily-cap",
         "cross-auto-same-pair", "cross-auto-notification-blocked", "cross-auto-manual-only",
-        "cross-auto-paused-manual-only",
+        "cross-auto-paused-manual-only", "cross-auto-submitted",
     }:
         paused = scenario in {"cross-auto-paused", "cross-auto-notification-blocked", "cross-auto-paused-manual-only"}
         reason = {
@@ -251,11 +251,25 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
             "pause_reason": "notification_delivery_failed" if scenario == "cross-auto-notification-blocked" else "operator_paused" if scenario in {"cross-auto-paused", "cross-auto-paused-manual-only"} else "",
             "notification_ready": scenario != "cross-auto-notification-blocked",
             "daily_principal": {"current": "100" if scenario == "cross-auto-daily-cap" else "5", "limit": "100"},
-            "latest_attempt": None if reason is None else {
-                "reason_code": reason[0], "reason_zh": reason[1], "current": reason[2],
-                "limit": reason[3], "venue": reason[4], "occurred_at": "2026-08-08T01:00:00Z",
-                "operator_action_required": reason[5],
-            },
+            "latest_attempt": (
+                {
+                    "decision": "submitted", "reason_code": "submitted",
+                    "reason_zh": "已提交双边订单，等待对账", "current": None,
+                    "limit": None, "venue": "跨市场",
+                    "created_at": "2026-08-08T01:00:00Z",
+                    "updated_at": "2026-08-08T01:01:00Z",
+                    "operator_action_required": False,
+                }
+                if scenario == "cross-auto-submitted"
+                else None if reason is None else {
+                    "decision": "rejected", "reason_code": reason[0],
+                    "reason_zh": reason[1], "current": reason[2],
+                    "limit": reason[3], "venue": reason[4],
+                    "created_at": "2026-08-08T01:00:00Z",
+                    "updated_at": "2026-08-08T01:02:00Z",
+                    "operator_action_required": reason[5],
+                }
+            ),
         }
     if scenario == "first-canary-cap5":
         payload["policy_limits"] = {**payload["policy_limits"], "max_normal_cost": "5", "canary_status": "first_live_trade"}

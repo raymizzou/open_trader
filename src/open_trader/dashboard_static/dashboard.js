@@ -3253,13 +3253,16 @@ function predictionCrossAutoStatus(payload) {
   const pauseReason = !active && auto.pause_reason
     ? ` · ${escapeHtml(predictionReasonLabel(auto.pause_reason))} · 需要操作员处理`
     : "";
-  const rejection = attempt
-    ? `<span class="pm-mode-stats">拒绝 ${escapeHtml(predictionValue(attempt.reason_code))} · ${escapeHtml(predictionValue(attempt.reason_zh))} · 当前 ${escapeHtml(predictionValue(attempt.current))} · 上限 ${escapeHtml(predictionValue(attempt.limit))} · 场所 ${escapeHtml(predictionValue(attempt.venue))} · ${escapeHtml(predictionHktTimestamp(attempt.occurred_at))} · ${attempt.operator_action_required === true ? "需要操作员处理" : "无需操作员处理"}</span>`
-    : "";
+  const attemptedAt = attempt?.updated_at || attempt?.created_at;
+  const attemptStatus = attempt?.decision === "rejected"
+    ? `<span class="pm-mode-stats">拒绝 ${escapeHtml(predictionValue(attempt.reason_code))} · ${escapeHtml(predictionValue(attempt.reason_zh))} · 当前 ${escapeHtml(predictionValue(attempt.current))} · 上限 ${escapeHtml(predictionValue(attempt.limit))} · 场所 ${escapeHtml(predictionValue(attempt.venue))} · ${escapeHtml(predictionHktTimestamp(attemptedAt))} · ${attempt.operator_action_required === true ? "需要操作员处理" : "无需操作员处理"}${attempt.operator_action ? ` · 操作 ${escapeHtml(predictionValue(attempt.operator_action))}` : ""}</span>`
+    : attempt?.decision === "submitted"
+      ? `<span class="pm-mode-stats">已提交双边订单 · ${escapeHtml(predictionValue(attempt.reason_zh))} · ${escapeHtml(predictionHktTimestamp(attemptedAt))}</span>`
+      : "";
   const pause = active
     ? `<button class="pm-button danger" type="button" data-action="pause-cross-auto">紧急暂停自动下单</button>`
     : "";
-  return `<span class="pm-mode-stats" data-cross-auto-status>跨所自动下单 · ${active ? "已启用" : "已暂停"} · 当日新本金 ${escapeHtml(predictionMoney(daily.current))} / ${escapeHtml(predictionMoney(daily.limit))}${pauseReason}</span>${rejection}${pause}`;
+  return `<span class="pm-mode-stats" data-cross-auto-status>跨所自动下单 · ${active ? "已启用" : "已暂停"} · 当日新本金 ${escapeHtml(predictionMoney(daily.current))} / ${escapeHtml(predictionMoney(daily.limit))}${pauseReason}</span>${attemptStatus}${pause}`;
 }
 
 function renderPredictionMarket() {

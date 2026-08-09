@@ -2205,6 +2205,18 @@ def test_prediction_cross_auto_state_is_safe_and_pause_is_confirmed_only(tmp_pat
 
         def __init__(self) -> None:
             self.pause_calls: list[str] = []
+            self.latest_attempt: dict[str, object] = {
+                "decision": "rejected",
+                "reason_code": "cross_auto_daily_principal_cap",
+                "reason_zh": "自动新本金已达当日上限",
+                "current": "100",
+                "limit": "100",
+                "venue": "both",
+                "created_at": "2026-08-08T01:00:00Z",
+                "updated_at": "2026-08-08T01:01:00Z",
+                "operator_action_required": False,
+                "api_token": "must-not-leak",
+            }
 
         def cross_auto_status(self) -> dict[str, object]:
             return {
@@ -2214,16 +2226,7 @@ def test_prediction_cross_auto_state_is_safe_and_pause_is_confirmed_only(tmp_pat
                 "pause_reason": "operator_paused",
                 "notification_ready": True,
                 "daily_principal": {"current": "5", "limit": "100"},
-                "latest_attempt": {
-                    "reason_code": "cross_auto_daily_principal_cap",
-                    "reason_zh": "自动新本金已达当日上限",
-                    "current": "100",
-                    "limit": "100",
-                    "venue": "both",
-                    "occurred_at": "2026-08-08T01:00:00Z",
-                    "operator_action_required": False,
-                    "api_token": "must-not-leak",
-                },
+                "latest_attempt": self.latest_attempt,
             }
 
         def pause_cross_auto(self, reason: str = "operator_paused") -> dict[str, object]:
@@ -2256,14 +2259,38 @@ def test_prediction_cross_auto_state_is_safe_and_pause_is_confirmed_only(tmp_pat
             "notification_ready": True,
             "daily_principal": {"current": "5", "limit": "100"},
             "latest_attempt": {
+                "decision": "rejected",
                 "reason_code": "cross_auto_daily_principal_cap",
                 "reason_zh": "自动新本金已达当日上限",
                 "current": "100",
                 "limit": "100",
                 "venue": "both",
-                "occurred_at": "2026-08-08T01:00:00Z",
+                "created_at": "2026-08-08T01:00:00Z",
+                "updated_at": "2026-08-08T01:01:00Z",
                 "operator_action_required": False,
             },
+        }
+
+        execution.latest_attempt = {
+            "decision": "submitted",
+            "reason_code": "submitted",
+            "reason_zh": "已提交双边订单，等待对账",
+            "venue": "跨市场",
+            "created_at": "2026-08-08T02:00:00Z",
+            "updated_at": "2026-08-08T02:01:00Z",
+            "operator_action_required": False,
+            "api_secret": "must-not-leak",
+        }
+        with urllib.request.urlopen(f"{base}/api/prediction-arbitrage/state", timeout=5) as response:
+            submitted = json.loads(response.read().decode("utf-8"))["cross_auto"]["latest_attempt"]
+        assert submitted == {
+            "decision": "submitted",
+            "reason_code": "submitted",
+            "reason_zh": "已提交双边订单，等待对账",
+            "venue": "跨市场",
+            "created_at": "2026-08-08T02:00:00Z",
+            "updated_at": "2026-08-08T02:01:00Z",
+            "operator_action_required": False,
         }
 
         headers = {
