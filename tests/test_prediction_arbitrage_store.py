@@ -277,6 +277,26 @@ def test_cross_auto_mode_and_pause_survive_new_store_instance(tmp_path: Path) ->
     assert store(tmp_path).cross_auto_state() == paused
 
 
+@pytest.mark.parametrize("configured_mode", ("observe_only", "manual_confirm"))
+def test_cross_auto_state_fails_closed_for_armed_nonautomatic_modes(
+    tmp_path: Path, configured_mode: str
+) -> None:
+    db = store(tmp_path)
+    db.set_cross_auto_mode(configured_mode, "operator_configured")
+    with sqlite3.connect(db.path) as connection:
+        connection.execute(
+            "UPDATE cross_auto_state SET configured_mode=?, armed=1",
+            (configured_mode,),
+        )
+
+    assert db.cross_auto_state() == {
+        "configured_mode": "observe_only",
+        "armed": False,
+        "reason": "not_armed",
+        "updated_at": None,
+    }
+
+
 def test_old_armed_row_migrates_to_observe_only_and_unarmed(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     database_dir = data_dir / "prediction_arbitrage"

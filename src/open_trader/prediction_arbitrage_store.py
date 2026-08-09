@@ -715,6 +715,7 @@ class PredictionArbitrageStore:
             row is None
             or row["configured_mode"] not in _CROSS_AUTO_MODES
             or row["armed"] not in (0, 1)
+            or (row["armed"] == 1 and row["configured_mode"] != "auto_submit")
             or not isinstance(row["reason"], str)
             or not row["reason"].strip()
             or not isinstance(row["updated_at"], str)
