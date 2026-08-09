@@ -8026,7 +8026,7 @@ def test_projection_excludes_non_allocation_parameter_drift_fact(
 
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
-    assert projection["metric_cutoffs"]["discipline"] == "2026-07-16"
+    assert projection["metric_cutoffs"]["discipline"] == "2026-07-17"
 
 
 @pytest.mark.parametrize(
@@ -9376,7 +9376,7 @@ def test_projection_count_does_not_use_legacy_partial_exit(
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
     assert projection["sample_counts"]["discipline"] is None
-    assert projection["metric_cutoffs"]["discipline"] == "2026-08-14"
+    assert projection["metric_cutoffs"]["discipline"] == "2026-08-24"
     assert "batch_path" not in projection
 
 
@@ -10030,6 +10030,32 @@ def test_projection_daily_metrics_ignore_kelly_identity_boundary(
     )
 
 
+def test_projection_actual_metrics_ignore_kelly_identity_boundary(
+    tmp_path: Path,
+) -> None:
+    write_projection_metric_history(
+        tmp_path, "US", discipline_days=0, actual_days=3, benchmark_days=3
+    )
+    path = tmp_path / "trend_review/facts/actual_equity/US/2026-07-18.json"
+    fact = json.loads(path.read_text(encoding="utf-8"))
+    fact["strategy_snapshot"] = live_trend_strategy_snapshot(
+        "US", "test-sha", (), strategy_version="v4"
+    )
+    path.write_text(json.dumps(fact), encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "US")
+
+    assert projection["sample_counts"]["actual"] is None
+    assert projection["metric_cutoffs"]["actual"] == "2026-07-19"
+    assert Decimal(
+        projection["metrics"]["period_net_return"]["actual"]["value"]
+    ) == Decimal("0.16")
+    assert (
+        projection["metrics"]["period_net_return"]["actual_benchmark"]["value"]
+        is not None
+    )
+
+
 def test_projection_metric_cutoff_stops_before_missing_equity_value(
     tmp_path: Path,
 ) -> None:
@@ -10132,7 +10158,7 @@ def test_projection_does_not_mix_strategy_versions(tmp_path: Path) -> None:
     assert projection["strategy_snapshot"]["strategy_version"] == "v3"
     assert projection["strategy_snapshot"]["effective_from"] == "2026-07-20"
     assert projection["sample_counts"]["discipline"] is None
-    assert projection["metric_cutoffs"]["discipline"] == "2026-08-14"
+    assert projection["metric_cutoffs"]["discipline"] == "2026-08-24"
 
 
 @pytest.mark.parametrize("stream", ["discipline", "actual_equity"])
