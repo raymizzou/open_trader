@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-09
 
+- 修复趋势复盘把 Kelly 策略版本边界误用于连续日终净值的问题：未满 30 笔仍显示已有模拟盘与同期市场绩效，30 笔门槛只控制 Kelly 启用；实盘缺少日终净值时继续明确不可用。
 - 跨所自动下单改由 SQLite `configured_mode` 与 `armed` 持久状态唯一授权：模式/arm 仅可由本机 CLI 修改，迁移或损坏状态一律 fail-closed 为 observe-only，安装器已拒绝退役的 `--cross-execution-mode` 覆盖项。验证范围包括存储/监控/看板/安装器回归、完整 pytest、干跑不改状态及最终 Dashboard acceptance；部署不会自动 arm。
 - 三市场趋势报告降低候选筛选成本：A 股升级为 v13，港股/美股升级为 v11；候选按个股
   全局强度排序，行业只取温度和方向，不再请求合格行业成分及成员快照。纪律、持仓、退出、
