@@ -7693,8 +7693,8 @@ def build_trend_review_projection(
     discipline_metric_cutoff = _series_cutoff(
         effective_from,
         {
-            str(fact["date"])
-            for fact in discipline_facts
+            trading_date
+            for trading_date, fact in discipline_by_date.items()
             if "discipline_equity_after_fees" in fact
         },
         benchmark_dates,
@@ -7705,8 +7705,8 @@ def build_trend_review_projection(
         equity_cutoff = _series_cutoff(
             effective_from,
             {
-                str(fact["date"])
-                for fact in actual_facts
+                trading_date
+                for trading_date, fact in actual_by_date.items()
                 if "actual_equity" in fact
             },
             benchmark_dates,

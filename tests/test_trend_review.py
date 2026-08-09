@@ -10005,6 +10005,31 @@ def test_projection_metric_cutoffs_are_source_specific(tmp_path: Path) -> None:
     )
 
 
+def test_projection_daily_metrics_ignore_kelly_identity_boundary(
+    tmp_path: Path,
+) -> None:
+    write_review_history(tmp_path, completed_trades=0, days=3)
+    path = tmp_path / "trend_review/daily/CN/2026-07-18.json"
+    fact = json.loads(path.read_text(encoding="utf-8"))
+    fact["strategy_snapshot"] = live_trend_strategy_snapshot(
+        "CN", "test-sha", (), strategy_version="v4"
+    )
+    path.write_text(json.dumps(fact), encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["sample_counts"]["discipline"] is None
+    assert projection["metric_cutoffs"]["discipline"] == "2026-07-18"
+    assert Decimal(
+        projection["metrics"]["period_net_return"]["discipline"]["value"]
+    ) == Decimal("0.2")
+    assert (
+        projection["metrics"]["period_net_return"]
+        ["discipline_benchmark"]["value"]
+        is not None
+    )
+
+
 def test_projection_metric_cutoff_stops_before_missing_equity_value(
     tmp_path: Path,
 ) -> None:
