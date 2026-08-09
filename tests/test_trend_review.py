@@ -7480,7 +7480,7 @@ def test_projection_keeps_newer_current_benchmark_facts_alongside_snapshot(
     projection = trend_review.build_trend_review_projection(tmp_path, "US")
 
     assert projection["schema_version"] == "open_trader.trend_review.projection.v4"
-    assert projection["metrics"]["period_net_return"]["discipline_benchmark"]["value"] == "10.0"
+    assert projection["metrics"]["period_net_return"]["same_period_benchmark"]["value"] == "10.0"
 
 
 @pytest.mark.parametrize(
@@ -7528,9 +7528,9 @@ def test_legacy_benchmark_facts_are_readable_but_cannot_drive_new_metrics(
     projection = trend_review.build_trend_review_projection(tmp_path, market)
 
     assert projection["schema_version"] == "open_trader.trend_review.projection.v4"
-    assert projection["metrics"]["period_net_return"]["discipline_benchmark"] == {
+    assert projection["metrics"]["period_net_return"]["same_period_benchmark"] == {
         "value": None,
-        "reason": "市场基准缺失",
+        "reason": "长期市场基准缺失",
     }
 
 
@@ -9497,7 +9497,10 @@ def test_projection_metrics_do_not_depend_on_legacy_round_counts(
         "discipline": None,
         "actual": None,
     }
-    assert projection["metrics"]["calmar"]["discipline"]["value"] is not None
+    assert projection["metrics"]["calmar"]["discipline"] == {
+        "value": None,
+        "reason": "观察期不足",
+    }
     assert projection["metrics"]["calmar"]["actual"] == {
         "value": None,
         "reason": "实际执行日终净值缺失",
@@ -9516,22 +9519,20 @@ def test_projection_metrics_do_not_depend_on_legacy_round_counts(
         set(values) == {
             "discipline",
             "actual",
-            "discipline_benchmark",
-            "actual_benchmark",
+            "same_period_benchmark",
+            "market_1y",
+            "market_5y",
         }
         for values in projection["metrics"].values()
     )
-    assert projection["metrics"]["market_excess_return"]["discipline_benchmark"] == {
-        "value": "0",
-        "reason": None,
+    assert projection["metrics"]["market_excess_return"]["same_period_benchmark"] == {
+        "value": None,
+        "reason": "基准自身",
     }
-    assert Decimal(
-        projection["metrics"]["market_excess_return"]["discipline"]["value"]
-    ) == Decimal(
-        projection["metrics"]["period_net_return"]["discipline"]["value"]
-    ) - Decimal(
-        projection["metrics"]["period_net_return"]["discipline_benchmark"]["value"]
-    )
+    assert projection["metrics"]["market_excess_return"]["discipline"] == {
+        "value": None,
+        "reason": "长期市场基准缺失",
+    }
 
 
 def test_actual_cycles_close_partials_opening_positions_rebuys_and_dedupe() -> None:
@@ -10265,6 +10266,119 @@ def write_projection_metric_history(
     rates.write_text("DATE,DGS3MO\n2026-07-15,4.0\n", encoding="utf-8")
 
 
+@pytest.mark.parametrize(
+    ("market", "symbol"),
+    [("CN", "SH.000905"), ("HK", "HK.800000"), ("US", "US.SPY")],
+)
+def test_projection_v4_uses_one_benchmark_identity_for_all_windows(
+    tmp_path: Path, market: str, symbol: str
+) -> None:
+    write_projection_metric_history(
+        tmp_path, market, discipline_days=4, actual_days=0, benchmark_days=4
+    )
+    write_rates(tmp_path)
+    trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        market,
+        FiveYearQuote(symbol=symbol),
+        now=datetime(2026, 8, 9, tzinfo=UTC),
+        process_git_sha="abc123",
+    )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, market)
+
+    assert projection["schema_version"] == "open_trader.trend_review.projection.v4"
+    assert projection["benchmark_context"]["futu_symbol"] == symbol
+    assert set(projection["metrics"]["period_net_return"]) == {
+        "discipline",
+        "actual",
+        "same_period_benchmark",
+        "market_1y",
+        "market_5y",
+    }
+    assert projection["metrics"]["market_excess_return"]["market_1y"] == {
+        "value": None,
+        "reason": "基准自身",
+    }
+    snapshot = trend_review.read_long_term_benchmark_snapshot(tmp_path, market)
+    assert projection["benchmark_context"]["windows"]["5Y"]["return_basis"] == "CAGR"
+    assert projection["metrics"]["period_net_return"]["market_5y"]["value"] == (
+        snapshot["windows"]["5Y"]["metrics"]["annualized_return_pct"]
+    )
+
+
+def test_projection_does_not_annualize_ratios_before_one_full_year(
+    tmp_path: Path,
+) -> None:
+    write_projection_metric_history(
+        tmp_path, "US", discipline_days=21, actual_days=0, benchmark_days=21
+    )
+    write_rates(tmp_path)
+    trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        FiveYearQuote(),
+        now=datetime(2026, 8, 9, tzinfo=UTC),
+        process_git_sha="abc123",
+    )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "US")
+
+    for metric in ("calmar", "sharpe"):
+        assert projection["metrics"][metric]["discipline"] == {
+            "value": None,
+            "reason": "观察期不足",
+        }
+        assert projection["metrics"][metric]["same_period_benchmark"] == {
+            "value": None,
+            "reason": "观察期不足",
+        }
+
+
+def test_projection_keeps_simulation_metrics_when_long_term_benchmark_is_missing(
+    tmp_path: Path,
+) -> None:
+    write_projection_metric_history(
+        tmp_path, "CN", discipline_days=4, actual_days=0, benchmark_days=4
+    )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["metrics"]["period_net_return"]["discipline"]["value"] is not None
+    assert projection["metrics"]["period_net_return"]["same_period_benchmark"] == {
+        "value": None,
+        "reason": "长期市场基准缺失",
+    }
+
+
+def test_projection_rejects_corrupt_long_term_benchmark_without_losing_simulation(
+    tmp_path: Path,
+) -> None:
+    write_projection_metric_history(
+        tmp_path, "CN", discipline_days=4, actual_days=0, benchmark_days=4
+    )
+    write_rates(tmp_path)
+    trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "CN",
+        FiveYearQuote(symbol="SH.000905"),
+        now=datetime(2026, 8, 9, tzinfo=UTC),
+        process_git_sha="abc123",
+    )
+    path = trend_review.long_term_benchmark_snapshot_path(tmp_path, "CN")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["benchmark"]["futu_symbol"] = "SH.000300"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["metrics"]["period_net_return"]["discipline"]["value"] is not None
+    assert projection["benchmark_refresh"] == {
+        "status": "unavailable",
+        "reason": "长期市场基准缺失",
+    }
+
+
 def write_projection_stats(
     root: Path,
     fills: list[dict[str, object]],
@@ -10465,13 +10579,14 @@ def test_projection_metric_cutoffs_are_source_specific(tmp_path: Path) -> None:
     assert set(projection["metrics"]["period_net_return"]) == {
         "discipline",
         "actual",
-        "discipline_benchmark",
-        "actual_benchmark",
+        "same_period_benchmark",
+        "market_1y",
+        "market_5y",
     }
-    assert (
-        projection["metrics"]["period_net_return"]["discipline_benchmark"]
-        != projection["metrics"]["period_net_return"]["actual_benchmark"]
-    )
+    assert projection["metrics"]["period_net_return"]["same_period_benchmark"] == {
+        "value": None,
+        "reason": "长期市场基准缺失",
+    }
 
 
 def test_projection_daily_metrics_ignore_kelly_identity_boundary(
@@ -10494,8 +10609,10 @@ def test_projection_daily_metrics_ignore_kelly_identity_boundary(
     ) == Decimal("0.2")
     assert (
         projection["metrics"]["period_net_return"]
-        ["discipline_benchmark"]["value"]
-        is not None
+        ["same_period_benchmark"] == {
+            "value": None,
+            "reason": "长期市场基准缺失",
+        }
     )
 
 
@@ -10520,8 +10637,10 @@ def test_projection_actual_metrics_ignore_kelly_identity_boundary(
         projection["metrics"]["period_net_return"]["actual"]["value"]
     ) == Decimal("0.16")
     assert (
-        projection["metrics"]["period_net_return"]["actual_benchmark"]["value"]
-        is not None
+        projection["metrics"]["market_excess_return"]["actual"] == {
+            "value": None,
+            "reason": "长期市场基准缺失",
+        }
     )
 
 

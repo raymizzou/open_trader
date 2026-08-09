@@ -7810,15 +7810,18 @@ def _curve_metrics(
             )
         }
     values = _portfolio_metrics(curve, rates, Decimal("100"))
+    dates = [date.fromisoformat(row["date"]) for row in curve]
+    ratio_reason = "最大回撤为零或样本不足"
+    sharpe_reason = "收益波动为零或样本不足"
+    if (dates[-1] - dates[0]).days < 365:
+        values["calmar_ratio"] = None
+        values["sharpe_ratio"] = None
+        ratio_reason = sharpe_reason = "观察期不足"
     return {
         "total_return_pct": _metric(values["total_return_pct"]),
         "max_drawdown_pct": _metric(values["max_drawdown_pct"]),
-        "calmar_ratio": _metric(
-            values["calmar_ratio"], "最大回撤为零或样本不足"
-        ),
-        "sharpe_ratio": _metric(
-            values["sharpe_ratio"], "收益波动为零或样本不足"
-        ),
+        "calmar_ratio": _metric(values["calmar_ratio"], ratio_reason),
+        "sharpe_ratio": _metric(values["sharpe_ratio"], sharpe_reason),
     }
 
 
@@ -7894,10 +7897,12 @@ def build_trend_review_projection(
             fact.get("benchmark"), market=market, trading_date=str(fact["date"])
         )
         benchmark_by_date[str(fact["date"])] = dict(benchmark)
+    current_benchmark_dates = set(benchmark_by_date)
+    long_term_snapshot: dict[str, object] | None = None
     try:
         long_term_snapshot = read_long_term_benchmark_snapshot(data_dir, market)
     except ValueError:
-        pass
+        benchmark_by_date = {}
     else:
         closes = long_term_snapshot["daily_closes"]
         assert isinstance(closes, list)
@@ -8073,31 +8078,33 @@ def build_trend_review_projection(
     rates_path = data_dir / "rates" / "DGS3MO.csv"
     rates = _load_dgs3mo_csv(rates_path)
     benchmark_dates = set(benchmark_by_date)
+    discipline_dates = {
+        trading_date
+        for trading_date, fact in discipline_by_date.items()
+        if "discipline_equity_after_fees" in fact
+    }
     discipline_metric_cutoff = _series_cutoff(
         effective_from,
-        {
-            trading_date
-            for trading_date, fact in discipline_by_date.items()
-            if "discipline_equity_after_fees" in fact
-        },
-        benchmark_dates,
+        discipline_dates,
+        benchmark_dates if long_term_snapshot is not None else current_benchmark_dates,
     )
     actual_metric_cutoff = None
     if market == "US":
         _, actual_fill_coverage = _load_actual_fills(data_dir, market)
+        actual_dates = {
+            trading_date
+            for trading_date, fact in actual_by_date.items()
+            if "actual_equity" in fact
+        }
         equity_cutoff = _series_cutoff(
             effective_from,
-            {
-                trading_date
-                for trading_date, fact in actual_by_date.items()
-                if "actual_equity" in fact
-            },
-            benchmark_dates,
+            actual_dates,
+            benchmark_dates if long_term_snapshot is not None else current_benchmark_dates,
         )
         if equity_cutoff is not None:
             for trading_date in sorted(
                 day
-                for day in benchmark_by_date
+                for day in actual_dates
                 if effective_from <= day <= equity_cutoff
             ):
                 if not any(
@@ -8106,24 +8113,15 @@ def build_trend_review_projection(
                 ):
                     break
                 actual_metric_cutoff = trading_date
-    common_cutoff = _common_cutoff(
-        effective_from,
-        {
-            day for day in benchmark_dates
-            if discipline_metric_cutoff is not None
-            and effective_from <= day <= discipline_metric_cutoff
-        },
-        {
-            day for day in benchmark_dates
-            if actual_metric_cutoff is not None
-            and effective_from <= day <= actual_metric_cutoff
-        },
-        benchmark_dates,
+    common_cutoff = (
+        min(discipline_metric_cutoff, actual_metric_cutoff)
+        if discipline_metric_cutoff is not None and actual_metric_cutoff is not None
+        else None
     )
 
     discipline_curve_dates = [
         trading_date
-        for trading_date in sorted(benchmark_by_date)
+        for trading_date in sorted(discipline_by_date)
         if discipline_metric_cutoff is not None
         and effective_from <= trading_date <= discipline_metric_cutoff
     ]
@@ -8133,7 +8131,7 @@ def build_trend_review_projection(
     ) if discipline_curve_dates else None
     actual_curve_dates = [
         trading_date
-        for trading_date in sorted(benchmark_by_date)
+        for trading_date in sorted(actual_by_date)
         if actual_metric_cutoff is not None
         and effective_from <= trading_date <= actual_metric_cutoff
     ]
@@ -8148,9 +8146,12 @@ def build_trend_review_projection(
                 "benchmark_equity": benchmark_by_date[trading_date]["close"],
             }
             for trading_date in discipline_curve_dates
+            if trading_date in benchmark_by_date
         ],
         "benchmark_equity",
-    ) if discipline_curve_dates else None
+    ) if discipline_curve_dates and all(
+        trading_date in benchmark_by_date for trading_date in discipline_curve_dates
+    ) else None
     actual_benchmark_curve = _normalized_curve(
         [
             {
@@ -8158,9 +8159,12 @@ def build_trend_review_projection(
                 "benchmark_equity": benchmark_by_date[trading_date]["close"],
             }
             for trading_date in actual_curve_dates
+            if trading_date in benchmark_by_date
         ],
         "benchmark_equity",
-    ) if actual_curve_dates else None
+    ) if actual_curve_dates and all(
+        trading_date in benchmark_by_date for trading_date in actual_curve_dates
+    ) else None
     discipline_metrics = _curve_metrics(
         discipline_curve, rates, missing_reason="纪律模拟日终净值缺失"
     )
@@ -8168,18 +8172,46 @@ def build_trend_review_projection(
         actual_curve, rates, missing_reason="实际执行日终净值缺失"
     )
     discipline_benchmark_metrics = _curve_metrics(
-        discipline_benchmark_curve, rates, missing_reason="市场基准缺失"
+        discipline_benchmark_curve, rates, missing_reason="长期市场基准缺失"
     )
     actual_benchmark_metrics = _curve_metrics(
-        actual_benchmark_curve, rates, missing_reason="市场基准缺失"
+        actual_benchmark_curve, rates, missing_reason="长期市场基准缺失"
     )
+
+    def market_metrics(label: str) -> dict[str, dict[str, object]]:
+        if long_term_snapshot is None:
+            return _curve_metrics(None, rates, missing_reason="长期市场基准缺失")
+        windows = long_term_snapshot["windows"]
+        assert isinstance(windows, Mapping)
+        window = windows[label]
+        assert isinstance(window, Mapping)
+        source = window["metrics"]
+        assert isinstance(source, Mapping)
+        return {
+            "total_return_pct": _metric(
+                source[
+                    "annualized_return_pct" if label == "5Y" else "total_return_pct"
+                ]
+            ),
+            "max_drawdown_pct": _metric(source["max_drawdown_pct"]),
+            "calmar_ratio": _metric(
+                source["calmar_ratio"], "最大回撤为零或样本不足"
+            ),
+            "sharpe_ratio": _metric(
+                source["sharpe_ratio"], "收益波动为零或样本不足"
+            ),
+        }
+
+    market_1y_metrics = market_metrics("1Y")
+    market_5y_metrics = market_metrics("5Y")
 
     def values(metric_name: str) -> dict[str, dict[str, object]]:
         return {
             "discipline": discipline_metrics[metric_name],
             "actual": actual_metrics[metric_name],
-            "discipline_benchmark": discipline_benchmark_metrics[metric_name],
-            "actual_benchmark": actual_benchmark_metrics[metric_name],
+            "same_period_benchmark": discipline_benchmark_metrics[metric_name],
+            "market_1y": market_1y_metrics[metric_name],
+            "market_5y": market_5y_metrics[metric_name],
         }
 
     def excess(
@@ -8207,16 +8239,9 @@ def build_trend_review_projection(
                 actual_metrics["total_return_pct"],
                 actual_benchmark_metrics["total_return_pct"],
             ),
-            "discipline_benchmark": (
-                _metric("0")
-                if discipline_benchmark_curve
-                else _metric(None, "市场基准缺失")
-            ),
-            "actual_benchmark": (
-                _metric("0")
-                if actual_benchmark_curve
-                else _metric(None, "市场基准缺失")
-            ),
+            "same_period_benchmark": _metric(None, "基准自身"),
+            "market_1y": _metric(None, "基准自身"),
+            "market_5y": _metric(None, "基准自身"),
         },
         "max_drawdown": values("max_drawdown_pct"),
         "calmar": values("calmar_ratio"),
@@ -8237,6 +8262,41 @@ def build_trend_review_projection(
         ),
         "required": 30,
     }
+
+    identity = BENCHMARK_IDENTITIES[market]
+    if long_term_snapshot is None:
+        benchmark_context = {
+            **identity,
+            "same_period_dates": [],
+            "windows": {"1Y": None, "5Y": None},
+        }
+        benchmark_refresh = {"status": "unavailable", "reason": "长期市场基准缺失"}
+    else:
+        windows = long_term_snapshot["windows"]
+        assert isinstance(windows, Mapping)
+        benchmark_context = {
+            **identity,
+            "same_period_dates": (
+                discipline_curve_dates if discipline_benchmark_curve is not None else []
+            ),
+            "windows": {
+                label: {
+                    "start": windows[label]["start"],
+                    "cutoff": windows[label]["cutoff"],
+                    "observation_count": windows[label]["observation_count"],
+                    "return_basis": "CAGR" if label == "5Y" else "period_return",
+                }
+                for label in ("1Y", "5Y")
+            },
+        }
+        benchmark_refresh = {
+            "status": "available",
+            "month": long_term_snapshot["month"],
+            "completed_at": long_term_snapshot["completed_at"],
+            "process_git_sha": long_term_snapshot["process_git_sha"],
+            "cutoff": long_term_snapshot["cutoff"],
+            "refresh": long_term_snapshot["refresh"],
+        }
 
     projection = {
         "schema_version": "open_trader.trend_review.projection.v4",
@@ -8271,6 +8331,8 @@ def build_trend_review_projection(
         "common_cutoff": common_cutoff,
         "interval": {"start": effective_from, "end": common_cutoff},
         "metrics": metrics,
+        "benchmark_context": benchmark_context,
+        "benchmark_refresh": benchmark_refresh,
     }
     _write_json_atomic(
         data_dir / "latest" / f"trend_review_{market.lower()}.json",

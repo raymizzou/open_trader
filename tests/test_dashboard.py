@@ -946,7 +946,9 @@ def trend_review_projection_v2(market: str, broker: str) -> dict[str, object]:
 
 def trend_review_projection_v3(market: str, broker: str) -> dict[str, object]:
     payload = trend_review_projection_v2(market, broker)
-    payload["schema_version"] = "open_trader.trend_review.projection.v3"
+    for key in ("batch", "batch_path", "source_path", "source_artifacts"):
+        payload.pop(key)
+    payload["schema_version"] = "open_trader.trend_review.projection.v4"
     payload["sample_details"] = {
         key: {
             "available": True,
@@ -970,8 +972,45 @@ def trend_review_projection_v3(market: str, broker: str) -> dict[str, object]:
     }
     for values in payload["metrics"].values():  # type: ignore[union-attr]
         benchmark = values.pop("benchmark")
-        values["discipline_benchmark"] = dict(benchmark)
-        values["actual_benchmark"] = dict(benchmark)
+        values["same_period_benchmark"] = dict(benchmark)
+        values["market_1y"] = dict(benchmark)
+        values["market_5y"] = dict(benchmark)
+    for series in ("same_period_benchmark", "market_1y", "market_5y"):
+        payload["metrics"]["market_excess_return"][series] = {  # type: ignore[index]
+            "value": None,
+            "reason": "基准自身",
+        }
+    identity = {
+        "CN": {"name": "中证 500", "source_id": "CSI_500_PRICE", "futu_symbol": "SH.000905"},
+        "HK": {"name": "恒生指数", "source_id": "HSI_PRICE", "futu_symbol": "HK.800000"},
+        "US": {"name": "S&P 500 ETF", "source_id": "SPY_QFQ", "futu_symbol": "US.SPY"},
+    }[market]
+    payload["benchmark_context"] = {
+        **identity,
+        "same_period_dates": ["2026-07-16", "2026-07-17"],
+        "windows": {
+            "1Y": {
+                "start": "2025-07-17",
+                "cutoff": "2026-07-17",
+                "observation_count": 252,
+                "return_basis": "period_return",
+            },
+            "5Y": {
+                "start": "2021-07-17",
+                "cutoff": "2026-07-17",
+                "observation_count": 1256,
+                "return_basis": "CAGR",
+            },
+        },
+    }
+    payload["benchmark_refresh"] = {
+        "status": "available",
+        "month": "2026-07",
+        "completed_at": "2026-07-17T16:00:00+08:00",
+        "process_git_sha": "abc1234",
+        "cutoff": "2026-07-17",
+        "refresh": {"force": False, "actor": None, "reason": None},
+    }
     return payload
 
 
@@ -1225,7 +1264,7 @@ def test_dashboard_rejects_incomplete_snapshot_without_common_cutoff(
     assert review["available"] is False
 
 
-def test_dashboard_accepts_strict_v3_trend_review_projection(tmp_path: Path) -> None:
+def test_dashboard_accepts_strict_v4_trend_review_projection(tmp_path: Path) -> None:
     path = tmp_path / "data/latest/trend_review_us.json"
     path.parent.mkdir(parents=True)
     path.write_text(
@@ -1312,6 +1351,31 @@ def test_dashboard_accepts_current_snapshot_after_historical_interval_start(
             lambda payload: payload["metric_cutoffs"].update(actual=None),
             "tiger",
         ),
+        (
+            lambda payload: payload["benchmark_context"].update(futu_symbol="US.QQQ"),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["benchmark_context"]["same_period_dates"].append("2026-02-30"),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["benchmark_context"]["windows"]["5Y"].update(return_basis="period_return"),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["benchmark_refresh"].update(status="stale"),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["benchmark_refresh"]["refresh"].update(actor="operator"),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["benchmark_refresh"].update(extra="control"),
+            "tiger",
+        ),
+        (lambda payload: payload.update(extra="control"), "tiger"),
     ],
 )
 def test_dashboard_rejects_invalid_trend_review_projection(

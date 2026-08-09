@@ -78,6 +78,7 @@ from .technical_facts import (
     technical_facts_latest_path,
 )
 from .trend_review import (
+    BENCHMARK_IDENTITIES,
     _report_hash,
     _rotation_pair_key,
     _validate_execution_batch,
@@ -164,8 +165,9 @@ TREND_REVIEW_METRICS = {
 TREND_REVIEW_SERIES = {
     "discipline",
     "actual",
-    "discipline_benchmark",
-    "actual_benchmark",
+    "same_period_benchmark",
+    "market_1y",
+    "market_5y",
 }
 ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -545,6 +547,77 @@ def _valid_trend_review_sample_detail(value: object) -> bool:
     return not value["statistics_cutoff_at"] and bool(value["reason"].strip())
 
 
+def _valid_trend_review_benchmark_metadata(
+    context: object, refresh: object, market: str
+) -> bool:
+    if not isinstance(context, dict) or set(context) != {
+        "name", "source_id", "futu_symbol", "same_period_dates", "windows"
+    } or {
+        key: context[key] for key in ("name", "source_id", "futu_symbol")
+    } != BENCHMARK_IDENTITIES[market]:
+        return False
+    dates = context["same_period_dates"]
+    windows = context["windows"]
+    if (
+        not isinstance(dates, list)
+        or any(not _valid_iso_date(item) for item in dates)
+        or dates != sorted(set(dates))
+        or not isinstance(windows, dict)
+        or set(windows) != {"1Y", "5Y"}
+        or not isinstance(refresh, dict)
+        or not isinstance(refresh.get("status"), str)
+    ):
+        return False
+    if refresh["status"] == "unavailable":
+        return (
+            set(refresh) == {"status", "reason"}
+            and isinstance(refresh["reason"], str)
+            and bool(refresh["reason"].strip())
+            and not dates
+            and windows == {"1Y": None, "5Y": None}
+        )
+    if refresh["status"] != "available" or set(refresh) != {
+        "status", "month", "completed_at", "process_git_sha", "cutoff", "refresh"
+    }:
+        return False
+    try:
+        month = datetime.strptime(str(refresh["month"]), "%Y-%m")
+    except ValueError:
+        return False
+    if (
+        month.strftime("%Y-%m") != refresh["month"]
+        or not _valid_aware_datetime(refresh["completed_at"])
+        or not isinstance(refresh["process_git_sha"], str)
+        or not refresh["process_git_sha"].strip()
+        or not _valid_iso_date(refresh["cutoff"])
+        or not isinstance(refresh["refresh"], dict)
+        or set(refresh["refresh"]) != {"force", "actor", "reason"}
+    ):
+        return False
+    controls = refresh["refresh"]
+    if controls["force"] is True:
+        if not all(
+            isinstance(controls[key], str) and controls[key].strip()
+            for key in ("actor", "reason")
+        ):
+            return False
+    elif controls["force"] is not False or controls["actor"] is not None or controls["reason"] is not None:
+        return False
+    for label, basis in (("1Y", "period_return"), ("5Y", "CAGR")):
+        window = windows[label]
+        if (
+            not isinstance(window, dict)
+            or set(window) != {"start", "cutoff", "observation_count", "return_basis"}
+            or not _valid_iso_date(window["start"])
+            or window["cutoff"] != refresh["cutoff"]
+            or type(window["observation_count"]) is not int
+            or window["observation_count"] < 2
+            or window["return_basis"] != basis
+        ):
+            return False
+    return True
+
+
 def _valid_trend_review_projection(
     payload: object, *, broker: str, market: str
 ) -> bool:
@@ -559,8 +632,16 @@ def _valid_trend_review_projection(
     sample_details = payload.get("sample_details")
     sample_cutoffs = payload.get("sample_cutoffs")
     metric_cutoffs = payload.get("metric_cutoffs")
+    benchmark_context = payload.get("benchmark_context")
+    benchmark_refresh = payload.get("benchmark_refresh")
     if (
-        schema_version != "open_trader.trend_review.projection.v3"
+        set(payload) != {
+            "schema_version", "available", "market", "market_label", "broker",
+            "strategy_snapshot", "sample_counts", "sample_details", "sample_cutoffs",
+            "metric_cutoffs", "common_cutoff", "interval", "metrics",
+            "benchmark_context", "benchmark_refresh",
+        }
+        or schema_version != "open_trader.trend_review.projection.v4"
         or payload.get("available") is not True
         or payload.get("broker") != broker
         or payload.get("market") != market
@@ -597,6 +678,9 @@ def _valid_trend_review_projection(
         or set(sample_cutoffs) != {"discipline", "actual"}
         or not isinstance(metric_cutoffs, dict)
         or set(metric_cutoffs) != {"discipline", "actual"}
+        or not _valid_trend_review_benchmark_metadata(
+            benchmark_context, benchmark_refresh, market
+        )
     ):
         return False
     for key in ("discipline", "actual"):
