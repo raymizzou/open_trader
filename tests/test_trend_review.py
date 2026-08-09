@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import time
 from dataclasses import asdict, replace
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
@@ -7154,6 +7155,132 @@ def test_long_term_benchmark_calculates_qfq_metrics_and_excess_returns(
     }
 
 
+def test_long_term_benchmark_validator_recomputes_tampered_metrics(
+    tmp_path: Path,
+) -> None:
+    write_rates(tmp_path)
+    trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        FiveYearQuote(),
+        now=datetime(2026, 8, 9, 12, tzinfo=UTC),
+        process_git_sha="abc123",
+    )
+    path = trend_review.long_term_benchmark_snapshot_path(tmp_path, "US")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["windows"]["5Y"]["metrics"]["calmar_ratio"] = "999999"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="metrics"):
+        trend_review.read_long_term_benchmark_snapshot(tmp_path, "US")
+
+
+def test_long_term_benchmark_validator_requires_true_annual_coverage(
+    tmp_path: Path,
+) -> None:
+    write_rates(tmp_path)
+    trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        FiveYearQuote(),
+        now=datetime(2026, 8, 9, 12, tzinfo=UTC),
+        process_git_sha="abc123",
+    )
+    path = trend_review.long_term_benchmark_snapshot_path(tmp_path, "US")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["daily_closes"] = [payload["daily_closes"][-1]]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="window is invalid"):
+        trend_review.read_long_term_benchmark_snapshot(tmp_path, "US")
+
+
+def test_long_term_benchmark_cycle_month_is_bound_to_path(
+    tmp_path: Path,
+) -> None:
+    write_rates(tmp_path)
+    trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        FiveYearQuote(),
+        now=datetime(2026, 8, 9, 12, tzinfo=UTC),
+        process_git_sha="abc123",
+    )
+    cycle_path = trend_review.long_term_benchmark_cycle_path(tmp_path, "US", "2026-08")
+    cycle = json.loads(cycle_path.read_text(encoding="utf-8"))
+    cycle["month"] = "2026-09"
+    cycle_path.write_text(json.dumps(cycle), encoding="utf-8")
+
+    result = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        ExplodingQuote(),
+        now=datetime(2026, 8, 20, 12, tzinfo=UTC),
+        process_git_sha="second",
+    )
+
+    assert result["status"] == "failed"
+    assert "month" in result["error"]
+
+
+def test_long_term_benchmark_cycle_uses_market_local_month(tmp_path: Path) -> None:
+    write_rates(tmp_path)
+
+    result = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        FiveYearQuote(),
+        now=datetime(2026, 9, 1, 1, tzinfo=UTC),
+        process_git_sha="local-month",
+    )
+
+    assert result["status"] == "completed"
+    assert result["month"] == "2026-08"
+    assert trend_review.long_term_benchmark_cycle_path(
+        tmp_path, "US", "2026-08"
+    ).exists()
+
+
+def test_long_term_benchmark_refresh_serializes_same_market_calls(
+    tmp_path: Path,
+) -> None:
+    write_rates(tmp_path)
+    state_lock = Lock()
+    active = 0
+    maximum_active = 0
+
+    class SlowQuote(FiveYearQuote):
+        def get_daily_kline(self, symbol: str, *, start: str, end: str) -> list[object]:
+            nonlocal active, maximum_active
+            with state_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            time.sleep(0.05)
+            with state_lock:
+                active -= 1
+            return super().get_daily_kline(symbol, start=start, end=end)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda sha: trend_review.refresh_long_term_benchmark(
+                    tmp_path,
+                    "US",
+                    SlowQuote(),
+                    now=datetime(2026, 8, 9, 12, tzinfo=UTC),
+                    process_git_sha=sha,
+                ),
+                ("first", "second"),
+            )
+        )
+
+    assert sorted(result["status"] for result in results) == [
+        "already_completed",
+        "completed",
+    ]
+    assert maximum_active == 1
+
+
 def test_long_term_benchmark_refresh_is_monthly_and_failure_preserves_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -7181,7 +7308,7 @@ def test_long_term_benchmark_refresh_is_monthly_and_failure_preserves_snapshot(
         tmp_path,
         "US",
         ExplodingQuote(),
-        now=datetime(2026, 9, 1, tzinfo=UTC),
+        now=datetime(2026, 9, 1, 12, tzinfo=UTC),
         process_git_sha="third",
     )
 

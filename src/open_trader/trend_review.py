@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import uuid
 from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass, replace
@@ -198,8 +199,8 @@ def _benchmark_window(
 ) -> dict[str, object]:
     start = _years_before(cutoff, years)
     window = [(trading_date, close) for trading_date, close in closes if trading_date >= start]
-    if not window:
-        raise ValueError(f"benchmark {years}Y window is empty")
+    if len(window) < 2 or window[0][0] > start:
+        raise ValueError(f"benchmark {years}Y window must cover full period")
     curve = [
         {"date": trading_date.isoformat(), "equity": format(close, "f")}
         for trading_date, close in window
@@ -238,7 +239,11 @@ def _benchmark_window(
 
 
 def _validate_long_term_benchmark_snapshot(
-    payload: object, market: str
+    payload: object,
+    market: str,
+    *,
+    rates: Mapping[date, Decimal],
+    expected_month: str | None = None,
 ) -> dict[str, object]:
     if not isinstance(payload, Mapping):
         raise ValueError("long-term benchmark snapshot must be an object")
@@ -261,6 +266,15 @@ def _validate_long_term_benchmark_snapshot(
     parsed = _validated_benchmark_closes(closes)
     if payload.get("cutoff") != parsed[-1][0].isoformat():
         raise ValueError("long-term benchmark snapshot cutoff is invalid")
+    month = payload.get("month")
+    try:
+        parsed_month = datetime.strptime(str(month), "%Y-%m")
+    except ValueError as exc:
+        raise ValueError("long-term benchmark snapshot month is invalid") from exc
+    if parsed_month.strftime("%Y-%m") != month:
+        raise ValueError("long-term benchmark snapshot month is invalid")
+    if expected_month is not None and month != expected_month:
+        raise ValueError("long-term benchmark snapshot month does not match cycle")
     completed_at = payload.get("completed_at")
     try:
         completed_at_value = datetime.fromisoformat(str(completed_at))
@@ -289,45 +303,14 @@ def _validate_long_term_benchmark_snapshot(
         window = windows[label]
         if not isinstance(window, Mapping):
             raise ValueError("long-term benchmark snapshot window is invalid")
-        window_start = _years_before(parsed[-1][0], years)
-        window_closes = [item for item in parsed if item[0] >= window_start]
-        if (
-            window.get("start") != window_start.isoformat()
-            or window.get("cutoff") != parsed[-1][0].isoformat()
-            or window.get("observation_count") != len(window_closes)
-            or not window_closes
-        ):
-            raise ValueError("long-term benchmark snapshot window is invalid")
-        daily_returns = window.get("daily_returns")
-        metrics = window.get("metrics")
-        if (
-            not isinstance(daily_returns, list)
-            or len(daily_returns) != len(window_closes) - 1
-            or not isinstance(metrics, Mapping)
-            or set(metrics)
-            != {
-                "total_return_pct",
-                "max_drawdown_pct",
-                "sharpe_ratio",
-                "calmar_ratio",
-                "annualized_return_pct",
-            }
-        ):
-            raise ValueError("long-term benchmark snapshot metrics are invalid")
-        for key, value in metrics.items():
-            if key in {"sharpe_ratio", "calmar_ratio"} and value is None:
-                continue
-            _required_decimal(value, f"benchmark {label} {key}")
-        for expected, daily_return in zip(window_closes[1:], daily_returns):
-            if (
-                not isinstance(daily_return, Mapping)
-                or daily_return.get("date") != expected[0].isoformat()
-                or set(daily_return)
-                != {"date", "return", "risk_free_return", "excess_return"}
-            ):
-                raise ValueError("long-term benchmark snapshot returns are invalid")
-            for key in ("return", "risk_free_return", "excess_return"):
-                _required_decimal(daily_return.get(key), f"benchmark {label} {key}")
+        try:
+            expected_window = _benchmark_window(
+                parsed, rates, years=years, cutoff=parsed[-1][0]
+            )
+        except ValueError as exc:
+            raise ValueError(f"long-term benchmark {label} window is invalid") from exc
+        if dict(window) != expected_window:
+            raise ValueError("long-term benchmark metrics are invalid")
     return dict(payload)
 
 
@@ -337,10 +320,11 @@ def read_long_term_benchmark_snapshot(data_dir: Path, market: str) -> dict[str, 
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read long-term benchmark snapshot: {path}") from exc
-    return _validate_long_term_benchmark_snapshot(payload, market)
+    rates = _load_dgs3mo_csv(data_dir / "rates" / "DGS3MO.csv")
+    return _validate_long_term_benchmark_snapshot(payload, market, rates=rates)
 
 
-def refresh_long_term_benchmark(
+def _refresh_long_term_benchmark_locked(
     data_dir: Path,
     market: str,
     quote: object,
@@ -356,13 +340,18 @@ def refresh_long_term_benchmark(
         raise ValueError("benchmark refresh now must be timezone-aware")
     if force and (not actor.strip() or not reason.strip()):
         raise ValueError("forced benchmark refresh requires actor and reason")
-    month = now.strftime("%Y-%m")
+    market_now = now.astimezone(MARKET_TIMEZONES[market])
+    month = market_now.strftime("%Y-%m")
     cycle_path = long_term_benchmark_cycle_path(data_dir, market, month)
     snapshot_path = long_term_benchmark_snapshot_path(data_dir, market)
     if cycle_path.exists() and not force:
         try:
+            rates = _load_dgs3mo_csv(data_dir / "rates" / "DGS3MO.csv")
             payload = _validate_long_term_benchmark_snapshot(
-                json.loads(cycle_path.read_text(encoding="utf-8")), market
+                json.loads(cycle_path.read_text(encoding="utf-8")),
+                market,
+                rates=rates,
+                expected_month=month,
             )
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
             return {"status": "failed", "market": market, "month": month, "error": str(exc)}
@@ -380,7 +369,7 @@ def refresh_long_term_benchmark(
             "cutoff": payload["cutoff"],
         }
     try:
-        as_of = now.date()
+        as_of = market_now.date()
         bars = quote.get_daily_kline(
             BENCHMARK_FUTU_SYMBOLS[market],
             start=(_years_before(as_of, 5) - timedelta(days=7)).isoformat(),
@@ -418,12 +407,44 @@ def refresh_long_term_benchmark(
                 "5Y": _benchmark_window(closes, rates, years=5, cutoff=cutoff),
             },
         }
-        _validate_long_term_benchmark_snapshot(payload, market)
+        _validate_long_term_benchmark_snapshot(payload, market, rates=rates)
     except Exception as exc:
         return {"status": "failed", "market": market, "month": month, "error": str(exc)}
     _write_json_atomic(snapshot_path, payload)
     _write_json_atomic(cycle_path, payload)
     return {"status": "completed", "market": market, "month": month, "cutoff": payload["cutoff"]}
+
+
+def refresh_long_term_benchmark(
+    data_dir: Path,
+    market: str,
+    quote: object,
+    *,
+    now: datetime,
+    process_git_sha: str,
+    force: bool = False,
+    actor: str = "",
+    reason: str = "",
+) -> dict[str, object]:
+    market = _market(market)
+    lock_root = data_dir / "trend_review" / "long_term_benchmarks" / market
+    lock_root.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(lock_root / ".refresh.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return _refresh_long_term_benchmark_locked(
+            data_dir,
+            market,
+            quote,
+            now=now,
+            process_git_sha=process_git_sha,
+            force=force,
+            actor=actor,
+            reason=reason,
+        )
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 def _json_value(value: object) -> object:
@@ -7793,7 +7814,7 @@ def _curve_metrics(
 
 def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         temp.write_bytes(_canonical_json_bytes(payload))
         os.replace(temp, path)
