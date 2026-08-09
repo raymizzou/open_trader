@@ -1133,6 +1133,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cross_auto_status = cross_auto_commands.add_parser("status", help="Show local arm state")
     cross_auto_status.add_argument("--data-dir", type=Path, default=Path("data"))
+    cross_auto_mode = cross_auto_commands.add_parser(
+        "mode", help="Set the durable cross-venue execution mode locally"
+    )
+    cross_auto_mode.add_argument(
+        "mode", choices=("observe_only", "manual_confirm", "auto_submit")
+    )
+    cross_auto_mode.add_argument("--data-dir", type=Path, default=Path("data"))
     cross_auto_arm = cross_auto_commands.add_parser(
         "arm", help="Arm only after local Dashboard readiness checks"
     )
@@ -1229,12 +1236,26 @@ def main(argv: list[str] | None = None) -> int:
             if args.cross_auto_command == "status":
                 state = store.cross_auto_state()
                 latest = store.cross_auto_attempts(limit=1)
-                print(f"armed: {state.get('armed') is True}")
+                configured_mode = str(state.get("configured_mode", "observe_only"))
+                armed = state.get("armed") is True
+                effective_mode = (
+                    configured_mode if configured_mode == "auto_submit" and armed else "observe_only"
+                )
+                print(f"configured_mode: {configured_mode}")
+                print(f"effective_mode: {effective_mode}")
+                print(f"armed: {armed}")
                 print(f"pause_reason: {state.get('reason', 'not_armed')}")
                 print(f"daily_principal: {format(store.cross_auto_daily_principal(), 'f')}/100")
                 if latest:
                     print(f"latest_attempt: {latest[0].get('decision', 'unknown')}")
                     print(f"latest_reason: {latest[0].get('reason_code', '')}")
+                print("result: PASS")
+                return 0
+
+            if args.cross_auto_command == "mode":
+                state = store.set_cross_auto_mode(args.mode, "operator_configured")
+                print(f"configured_mode: {state['configured_mode']}")
+                print(f"armed: {state['armed'] is True}")
                 print("result: PASS")
                 return 0
 

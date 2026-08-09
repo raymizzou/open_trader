@@ -258,6 +258,39 @@ def _arm_ready_state() -> dict[str, object]:
     }
 
 
+def test_cross_auto_mode_command_changes_only_local_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(
+        [
+            "prediction-arb",
+            "cross-auto",
+            "mode",
+            "auto_submit",
+            "--data-dir",
+            str(tmp_path),
+        ]
+    ) == 0
+
+    store = PredictionArbitrageStore(tmp_path)
+    state = store.cross_auto_state()
+    assert state["configured_mode"] == "auto_submit"
+    assert state["armed"] is False
+    assert store.arm_cross_auto()["armed"] is True
+    assert cli.main(
+        [
+            "prediction-arb",
+            "cross-auto",
+            "mode",
+            "auto_submit",
+            "--data-dir",
+            str(tmp_path),
+        ]
+    ) == 0
+    assert store.cross_auto_state()["armed"] is False
+    assert "configured_mode: auto_submit" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     ("change", "reason"),
     (
@@ -350,6 +383,8 @@ def test_cross_auto_arm_requires_complete_remote_readiness_and_status_is_local(
     assert PredictionArbitrageStore(tmp_path).cross_auto_state()["armed"] is True
     assert cli.main(["prediction-arb", "cross-auto", "status", "--data-dir", str(tmp_path)]) == 0
     output = capsys.readouterr().out
+    assert "configured_mode: auto_submit" in output
+    assert "effective_mode: auto_submit" in output
     assert "armed: True" in output
     assert "result: PASS" in output
 

@@ -259,99 +259,44 @@ def test_stack_dry_run_prints_two_valid_plists_without_side_effects(
     assert not list(agents.iterdir())
 
 
-@pytest.mark.parametrize("mode", ("single", "stack"))
-def test_cross_execution_mode_is_only_rendered_into_dashboard_owner(
-    tmp_path: Path, mode: str
+def test_retired_installer_mode_option_fails_without_launchctl_or_database_write(
+    tmp_path: Path,
 ) -> None:
-    agents = tmp_path / "LaunchAgents"
-    agents.mkdir()
-    runtime = tmp_path / "runtime"
-    runtime.mkdir()
+    forbidden = tmp_path / "forbidden"
+    _write_executable(forbidden, "#!/bin/sh\nexit 99\n")
     result = subprocess.run(
         [
             str(INSTALLER),
             "--dry-run",
             "--mode",
-            mode,
+            "single",
             "--repo-root",
             str(ROOT),
             "--runtime-root",
-            str(runtime),
-            "--launch-agents-dir",
-            str(agents),
-            "--python",
-            sys.executable,
+            str(tmp_path),
             "--cross-execution-mode",
             "auto_submit",
         ],
         cwd=ROOT,
+        env={
+            **os.environ,
+            "LAUNCHCTL_BIN": str(forbidden),
+            "LSOF_BIN": str(forbidden),
+            "CURL_BIN": str(forbidden),
+        },
         capture_output=True,
         text=True,
-        check=True,
     )
-    payloads = (
-        {SINGLE_LABEL: plistlib.loads(result.stdout.encode("utf-8"))}
-        if mode == "single"
-        else _dry_run_sections(result.stdout)
-    )
-    owners = {SINGLE_LABEL, LEGACY_LABEL}
-    for label, payload in payloads.items():
-        environment = payload["EnvironmentVariables"]
-        if label in owners:
-            assert environment["OPEN_TRADER_CROSS_EXECUTION_MODE"] == "auto_submit"
-        else:
-            assert "OPEN_TRADER_CROSS_EXECUTION_MODE" not in environment
+    assert result.returncode == 2
+    assert "cross-auto mode" in result.stderr
+    assert result.stdout == ""
 
 
-def test_cross_execution_mode_defaults_to_observe_only_and_rejects_non_exact_values(
-    tmp_path: Path,
-) -> None:
-    agents = tmp_path / "LaunchAgents"
-    agents.mkdir()
-    runtime = tmp_path / "runtime"
-    runtime.mkdir()
-    common = [
-        str(INSTALLER),
-        "--dry-run",
-        "--mode",
-        "single",
-        "--repo-root",
-        str(ROOT),
-        "--runtime-root",
-        str(runtime),
-        "--launch-agents-dir",
-        str(agents),
-        "--python",
-        sys.executable,
-    ]
-    default = subprocess.run(common, cwd=ROOT, capture_output=True, text=True, check=True)
-    assert (
-        plistlib.loads(default.stdout.encode("utf-8"))["EnvironmentVariables"]
-        ["OPEN_TRADER_CROSS_EXECUTION_MODE"]
-        == "observe_only"
-    )
-    for value in (" auto_submit", "auto_submit ", "AUTO_SUBMIT", "invalid"):
-        result = subprocess.run(
-            [*common, "--cross-execution-mode", value],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
+def test_dashboard_plists_have_no_cross_execution_environment_variable() -> None:
+    for template in (SINGLE_TEMPLATE, LEGACY_TEMPLATE):
+        assert "OPEN_TRADER_CROSS_EXECUTION_MODE" not in template.read_text(
+            encoding="utf-8"
         )
-        assert result.returncode == 2
-        assert result.stdout == ""
-
-    calls = tmp_path / "launchctl-calls"
-    launchctl = tmp_path / "launchctl"
-    _write_executable(launchctl, '#!/bin/sh\nprintf x >> "$FAKE_CALLS"\n')
-    rejected = subprocess.run(
-        [*common[:1], *common[2:-2], "--cross-execution-mode", " AUTO_SUBMIT"],
-        cwd=ROOT,
-        env={**os.environ, "FAKE_CALLS": str(calls), "LAUNCHCTL_BIN": str(launchctl)},
-        capture_output=True,
-        text=True,
-    )
-    assert rejected.returncode == 2
-    assert not calls.exists()
 
 
 def test_stack_cutover_verifies_legacy_before_stopping_single_and_starting_gateway(
