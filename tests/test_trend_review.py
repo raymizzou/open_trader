@@ -7542,6 +7542,43 @@ def test_long_term_benchmark_force_requires_audited_reason_and_preserves_success
     assert attempt["process_git_sha"] == "second"
 
 
+def test_force_failure_replaces_truncated_cycle_marker(
+    tmp_path: Path,
+) -> None:
+    write_rates(tmp_path)
+    trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        FiveYearQuote(),
+        now=datetime(2026, 8, 9, tzinfo=UTC),
+        process_git_sha="valid",
+    )
+    snapshot_path = trend_review.long_term_benchmark_snapshot_path(tmp_path, "US")
+    snapshot_body = snapshot_path.read_bytes()
+    cycle_path = trend_review.long_term_benchmark_cycle_path(tmp_path, "US", "2026-08")
+    cycle = json.loads(cycle_path.read_text(encoding="utf-8"))
+    cycle["daily_closes"] = cycle["daily_closes"][-1:]
+    cycle_path.write_text(json.dumps(cycle), encoding="utf-8")
+
+    result = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        ExplodingQuote(),
+        now=datetime(2026, 8, 20, tzinfo=UTC),
+        process_git_sha="failed",
+        force=True,
+        actor="operator",
+        reason="repair truncated cycle",
+    )
+
+    replaced = json.loads(cycle_path.read_text(encoding="utf-8"))
+    assert result["status"] == "failed"
+    assert replaced["schema_version"] == (
+        "open_trader.trend_review.long_term_benchmark.attempt.v1"
+    )
+    assert snapshot_path.read_bytes() == snapshot_body
+
+
 def test_long_term_benchmark_rejects_unordered_or_short_history(tmp_path: Path) -> None:
     write_rates(tmp_path)
 

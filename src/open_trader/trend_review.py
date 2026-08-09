@@ -258,6 +258,65 @@ def _validated_benchmark_closes(bars: Sequence[object]) -> list[tuple[date, Deci
     return closes
 
 
+def _valid_long_term_benchmark_cycle_marker(
+    payload: object, market: str, month: str
+) -> bool:
+    try:
+        if not isinstance(payload, Mapping):
+            return False
+        identity = BENCHMARK_IDENTITIES[market]
+        if (
+            payload.get("schema_version")
+            != "open_trader.trend_review.long_term_benchmark.v1"
+            or payload.get("market") != market
+            or payload.get("month") != month
+            or payload.get("benchmark") != identity
+            or not str(payload.get("process_git_sha") or "").strip()
+        ):
+            return False
+        completed_at = datetime.fromisoformat(str(payload.get("completed_at")))
+        if completed_at.tzinfo is None or completed_at.utcoffset() is None:
+            return False
+        refresh = payload.get("refresh")
+        if not isinstance(refresh, Mapping) or set(refresh) != {"force", "actor", "reason"}:
+            return False
+        if refresh.get("force") is True:
+            if not str(refresh.get("actor") or "").strip() or not str(
+                refresh.get("reason") or ""
+            ).strip():
+                return False
+        elif refresh != {"force": False, "actor": None, "reason": None}:
+            return False
+        closes = _validated_benchmark_closes(payload.get("daily_closes", []))
+        cutoff = date.fromisoformat(str(payload.get("cutoff")))
+        if (
+            closes[-1][0] != cutoff
+            or closes[0][0] > _years_before(cutoff, 5)
+        ):
+            return False
+        windows = payload.get("windows")
+        if not isinstance(windows, Mapping) or set(windows) != {"1Y", "5Y"}:
+            return False
+        for label, years in (("1Y", 1), ("5Y", 5)):
+            window = windows[label]
+            if not isinstance(window, Mapping):
+                return False
+            observation_count = int(window.get("observation_count"))
+            if (
+                window.get("start") != _years_before(cutoff, years).isoformat()
+                or window.get("cutoff") != cutoff.isoformat()
+                or observation_count < 2
+                or not isinstance(window.get("daily_returns"), list)
+                or len(window["daily_returns"]) != observation_count - 1
+                or not isinstance(window.get("metrics"), Mapping)
+                or not window["metrics"]
+            ):
+                return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
 def _benchmark_window(
     closes: Sequence[tuple[date, Decimal]],
     rates: Mapping[date, Decimal],
@@ -425,13 +484,8 @@ def _refresh_long_term_benchmark_locked(
     existing_cycle_is_valid = False
     if force and cycle_path.exists():
         try:
-            existing = json.loads(cycle_path.read_text(encoding="utf-8"))
-            existing_cycle_is_valid = (
-                isinstance(existing, Mapping)
-                and existing.get("schema_version")
-                == "open_trader.trend_review.long_term_benchmark.v1"
-                and existing.get("market") == market
-                and existing.get("month") == month
+            existing_cycle_is_valid = _valid_long_term_benchmark_cycle_marker(
+                json.loads(cycle_path.read_text(encoding="utf-8")), market, month
             )
         except (OSError, UnicodeError, json.JSONDecodeError):
             existing_cycle_is_valid = False
