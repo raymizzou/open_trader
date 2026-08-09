@@ -24,6 +24,7 @@ _BUSY_TIMEOUT_MS = 5_000
 _LLM_USAGE_RETENTION = timedelta(days=7)
 _PREVIEW_TTL = timedelta(seconds=10)
 _CROSS_AUTO_DAILY_PRINCIPAL_CAP = Decimal("100")
+_CROSS_AUTO_MODES = frozenset({"observe_only", "manual_confirm", "auto_submit"})
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _TERMINAL_EXECUTION_STATES = (
     "both_rejected",
@@ -463,6 +464,8 @@ class PredictionArbitrageStore:
 
             CREATE TABLE IF NOT EXISTS cross_auto_state (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                configured_mode TEXT NOT NULL DEFAULT 'observe_only'
+                    CHECK (configured_mode IN ('observe_only', 'manual_confirm', 'auto_submit')),
                 armed INTEGER NOT NULL CHECK (armed IN (0, 1)),
                 reason TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -497,6 +500,27 @@ class PredictionArbitrageStore:
             version = 3
         if version < 4:
             connection.execute("PRAGMA user_version=4")
+            version = 4
+        if version < 5:
+            columns = {
+                str(column[1])
+                for column in connection.execute("PRAGMA table_info(cross_auto_state)")
+            }
+            if "configured_mode" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE cross_auto_state ADD COLUMN configured_mode
+                    TEXT NOT NULL DEFAULT 'observe_only'
+                    CHECK (configured_mode IN ('observe_only', 'manual_confirm', 'auto_submit'))
+                    """
+                )
+            connection.execute(
+                """
+                UPDATE cross_auto_state
+                SET configured_mode='observe_only', armed=0, reason='migration_fail_closed'
+                """
+            )
+            connection.execute("PRAGMA user_version=5")
 
     @staticmethod
     def _execution_fields(row: sqlite3.Row) -> dict[str, object]:
@@ -682,11 +706,28 @@ class PredictionArbitrageStore:
         connection: sqlite3.Connection,
     ) -> dict[str, object]:
         row = connection.execute(
-            "SELECT armed, reason, updated_at FROM cross_auto_state WHERE singleton=1"
+            """
+            SELECT configured_mode, armed, reason, updated_at
+            FROM cross_auto_state WHERE singleton=1
+            """
         ).fetchone()
-        if row is None:
-            return {"armed": False, "reason": "not_armed", "updated_at": None}
+        if (
+            row is None
+            or row["configured_mode"] not in _CROSS_AUTO_MODES
+            or row["armed"] not in (0, 1)
+            or not isinstance(row["reason"], str)
+            or not row["reason"].strip()
+            or not isinstance(row["updated_at"], str)
+            or not row["updated_at"].strip()
+        ):
+            return {
+                "configured_mode": "observe_only",
+                "armed": False,
+                "reason": "not_armed",
+                "updated_at": None,
+            }
         return {
+            "configured_mode": str(row["configured_mode"]),
             "armed": bool(row["armed"]),
             "reason": str(row["reason"]),
             "updated_at": str(row["updated_at"]),
@@ -696,29 +737,59 @@ class PredictionArbitrageStore:
         with self._read_connection() as connection:
             return self._cross_auto_state_from_connection(connection)
 
-    def _set_cross_auto_state(self, *, armed: bool, reason: str) -> dict[str, object]:
+    def _set_cross_auto_state(
+        self,
+        *,
+        armed: bool,
+        reason: str,
+        configured_mode: str | None = None,
+    ) -> dict[str, object]:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("cross auto state reason is required")
+        if configured_mode is not None and configured_mode not in _CROSS_AUTO_MODES:
+            raise ValueError("invalid cross auto mode")
         updated_at = _utc_now()
         with self._transaction() as connection:
+            current = self._cross_auto_state_from_connection(connection)
             connection.execute(
                 """
-                INSERT INTO cross_auto_state(singleton, armed, reason, updated_at)
-                VALUES (1, ?, ?, ?)
+                INSERT INTO cross_auto_state(singleton, configured_mode, armed, reason, updated_at)
+                VALUES (1, ?, ?, ?, ?)
                 ON CONFLICT(singleton) DO UPDATE SET
+                    configured_mode=excluded.configured_mode,
                     armed=excluded.armed,
                     reason=excluded.reason,
                     updated_at=excluded.updated_at
                 """,
-                (int(armed), reason, updated_at),
+                (
+                    current["configured_mode"]
+                    if configured_mode is None
+                    else configured_mode,
+                    int(armed),
+                    reason,
+                    updated_at,
+                ),
             )
             return self._cross_auto_state_from_connection(connection)
+
+    def set_cross_auto_mode(self, mode: str, reason: str) -> dict[str, object]:
+        if not isinstance(mode, str) or mode not in _CROSS_AUTO_MODES:
+            raise ValueError("invalid cross auto mode")
+        return self._set_cross_auto_state(
+            configured_mode=mode,
+            armed=False,
+            reason=reason,
+        )
 
     def pause_cross_auto(self, reason: str) -> dict[str, object]:
         return self._set_cross_auto_state(armed=False, reason=reason)
 
     def arm_cross_auto(self) -> dict[str, object]:
-        return self._set_cross_auto_state(armed=True, reason="armed")
+        return self._set_cross_auto_state(
+            configured_mode="auto_submit",
+            armed=True,
+            reason="armed",
+        )
 
     @staticmethod
     def _cross_auto_attempt_payload(

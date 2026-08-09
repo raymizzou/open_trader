@@ -185,7 +185,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] > 0
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         names = {
             row[1]
             for row in connection.execute("PRAGMA table_list")
@@ -240,6 +240,7 @@ def test_cross_auto_pause_is_durable_and_runtime_writes_do_not_clear_it(
     db = store(tmp_path)
 
     assert db.cross_auto_state() == {
+        "configured_mode": "observe_only",
         "armed": False,
         "reason": "not_armed",
         "updated_at": None,
@@ -252,6 +253,62 @@ def test_cross_auto_pause_is_durable_and_runtime_writes_do_not_clear_it(
     assert paused["reason"] == "operator_paused"
     restored = PredictionArbitrageStore(tmp_path / "data")
     assert restored.cross_auto_state() == paused
+
+
+def test_cross_auto_state_defaults_fail_closed_with_configured_mode(tmp_path: Path) -> None:
+    assert store(tmp_path).cross_auto_state() == {
+        "configured_mode": "observe_only",
+        "armed": False,
+        "reason": "not_armed",
+        "updated_at": None,
+    }
+
+
+def test_cross_auto_mode_and_pause_survive_new_store_instance(tmp_path: Path) -> None:
+    db = store(tmp_path)
+
+    assert db.set_cross_auto_mode("auto_submit", "operator_configured")["armed"] is False
+    armed = db.arm_cross_auto()
+    assert armed["configured_mode"] == "auto_submit"
+    assert armed["armed"] is True
+    paused = db.pause_cross_auto("operator_paused")
+    assert paused["configured_mode"] == "auto_submit"
+    assert paused["armed"] is False
+    assert store(tmp_path).cross_auto_state() == paused
+
+
+def test_old_armed_row_migrates_to_observe_only_and_unarmed(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    database_dir = data_dir / "prediction_arbitrage"
+    database_dir.mkdir(parents=True)
+    connection = sqlite3.connect(database_dir / "prediction_arbitrage.sqlite3")
+    connection.executescript(
+        """
+        PRAGMA user_version=4;
+        CREATE TABLE cross_auto_state(
+            singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+            armed INTEGER NOT NULL CHECK (armed IN (0,1)),
+            reason TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO cross_auto_state VALUES (1, 1, 'armed', '2026-08-09T00:00:00Z');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = PredictionArbitrageStore(data_dir).cross_auto_state()
+    assert migrated["configured_mode"] == "observe_only"
+    assert migrated["armed"] is False
+
+
+def test_explicit_nonautomatic_mode_disarms(tmp_path: Path) -> None:
+    db = store(tmp_path)
+
+    db.arm_cross_auto()
+    state = db.set_cross_auto_mode("manual_confirm", "operator_manual")
+    assert state["configured_mode"] == "manual_confirm"
+    assert state["armed"] is False
 
 
 def test_cross_auto_attempt_claim_is_one_shot_across_store_instances(tmp_path: Path) -> None:
