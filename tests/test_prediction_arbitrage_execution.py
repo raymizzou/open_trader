@@ -3075,7 +3075,7 @@ def test_cross_auto_status_uses_root_mode_when_books_are_empty_and_degraded(
     monkeypatch.setattr(
         cross,
         "snapshot",
-        lambda: {"mode": "auto_submit", "status": "degraded", "opportunities": []},
+        lambda: {"mode": "observe_only", "status": "degraded", "opportunities": []},
     )
 
     status = service.cross_auto_status()
@@ -3083,6 +3083,54 @@ def test_cross_auto_status_uses_root_mode_when_books_are_empty_and_degraded(
     assert status["configured_mode"] == "auto_submit"
     assert status["effective_mode"] == "auto_submit"
     assert status["armed"] is True
+
+
+def test_execution_mode_comes_from_store_when_monitor_snapshot_disagrees(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, cross, _predict = _cross_service(tmp_path)
+    store.set_cross_auto_mode("auto_submit", "operator_configured")
+    cross.overrides["execution_mode"] = "observe_only"
+
+    assert service._configured_cross_execution_mode() == "auto_submit"
+
+
+def test_pause_before_claim_records_cross_auto_paused_without_order(
+    tmp_path: Path,
+) -> None:
+    service, store, trading, cross, predict = _cross_service(tmp_path)
+    store.set_cross_auto_mode("auto_submit", "operator_configured")
+    store.pause_cross_auto("operator_paused")
+    cross.overrides["execution_mode"] = "auto_submit"
+    signal_id = _cross_venue_notification_signal(store)
+
+    result = service.notify_ready_opportunity(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    )
+
+    assert result["reason"] == "cross_auto_paused"
+    assert result["facts"]["current"] == "paused"
+    assert store.cross_auto_attempts()[0]["reason_code"] == "cross_auto_paused"
+    assert (predict.submit_calls, trading.cross_submit_calls) == (0, 0)
+
+
+def test_pause_after_submission_started_does_not_interrupt_reconciliation(
+    tmp_path: Path,
+) -> None:
+    service, store, _trading, cross, predict = _cross_service(tmp_path)
+    store.arm_cross_auto()
+    cross.overrides["execution_mode"] = "auto_submit"
+    signal_id = _cross_venue_notification_signal(store)
+
+    accepted = service.auto_submit_cross_venue(
+        "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
+    )
+    assert accepted.get("execution_id")
+    store.pause_cross_auto("operator_paused")
+
+    final = wait_until_terminal(service, str(accepted["execution_id"]))
+    assert final["state"] == "holding_to_resolution"
+    assert predict.submit_calls == 1
 
 
 def test_auto_submit_safe_dust_emits_residual_event_without_success(
@@ -3130,6 +3178,7 @@ def test_auto_submit_preview_requires_automatic_authority(tmp_path: Path) -> Non
 def test_auto_submit_rejection_records_safe_reason_without_orders(tmp_path: Path) -> None:
     service, store, trading, cross, predict = _cross_service(tmp_path)
     cross.overrides["execution_mode"] = "auto_submit"
+    store.set_cross_auto_mode("auto_submit", "operator_configured")
     signal_id = _cross_venue_notification_signal(store)
     store.update_signal(signal_id, {"execution_mode": "auto_submit"})
 

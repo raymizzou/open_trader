@@ -333,6 +333,7 @@ def test_explicit_nonautomatic_mode_disarms(tmp_path: Path) -> None:
 
 def test_cross_auto_attempt_claim_is_one_shot_across_store_instances(tmp_path: Path) -> None:
     setup = store(tmp_path)
+    setup.arm_cross_auto()
     stores = [
         PredictionArbitrageStore(tmp_path / "data"),
         PredictionArbitrageStore(tmp_path / "data"),
@@ -346,13 +347,19 @@ def test_cross_auto_attempt_claim_is_one_shot_across_store_instances(tmp_path: P
             )
         )
 
-    assert sorted(results) == [False, True]
+    assert sorted(result["state"] for result in results) == [
+        "claimed",
+        "signal_already_attempted",
+    ]
     assert len(setup.cross_auto_attempts()) == 1
 
 
 def test_cross_auto_attempt_finishes_once_with_safe_rejection_facts(tmp_path: Path) -> None:
     db = store(tmp_path)
-    assert db.claim_cross_auto_attempt("signal-1", "opportunity-1") is True
+    db.arm_cross_auto()
+    assert db.claim_cross_auto_attempt("signal-1", "opportunity-1") == {
+        "state": "claimed"
+    }
 
     finished = db.finish_cross_auto_attempt(
         "signal-1",
@@ -963,8 +970,10 @@ def test_auto_cross_preview_requires_durable_arm_before_consuming(tmp_path: Path
         payload, expires_at=iso(datetime.now(UTC) + timedelta(seconds=10))
     )
 
-    with pytest.raises(ValueError, match="cross_auto_paused"):
-        db.consume_preview_and_create_execution(preview_id, "auto-unarmed")
+    assert db.consume_preview_and_create_execution(preview_id, "auto-unarmed") == {
+        "state": "rejected",
+        "reason": "cross_auto_paused",
+    }
 
     db.arm_cross_auto()
     assert db.consume_preview_and_create_execution(preview_id, "auto-armed")["state"] == "validating"
@@ -996,8 +1005,10 @@ def test_auto_cross_daily_and_pair_gates_preserve_originating_day(
     )
     next_payload["auto_submit"] = True
     next_preview = db.create_preview(next_payload, expires_at=iso(shanghai_noon))
-    with pytest.raises(ValueError, match="cross_auto_daily_principal_cap"):
-        db.consume_preview_and_create_execution(next_preview, "daily-next")
+    assert db.consume_preview_and_create_execution(next_preview, "daily-next") == {
+        "state": "rejected",
+        "reason": "cross_auto_daily_principal_cap",
+    }
 
     assert db.cross_auto_daily_principal(
         now=datetime(2026, 8, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -1008,8 +1019,10 @@ def test_auto_cross_daily_and_pair_gates_preserve_originating_day(
     )
     pair_payload["auto_submit"] = True
     pair_preview = db.create_preview(pair_payload, expires_at=iso(shanghai_noon))
-    with pytest.raises(ValueError, match="cross_auto_daily_principal_cap"):
-        db.consume_preview_and_create_execution(pair_preview, "pair-daily-blocked")
+    assert db.consume_preview_and_create_execution(pair_preview, "pair-daily-blocked") == {
+        "state": "rejected",
+        "reason": "cross_auto_daily_principal_cap",
+    }
 
 
 def test_auto_cross_pair_gate_and_no_submit_releases_daily_charge(
@@ -1039,8 +1052,10 @@ def test_auto_cross_pair_gate_and_no_submit_releases_daily_charge(
     opposite["intent"]["legs"][0]["outcome"] = "NO"
     opposite["intent"]["legs"][1]["outcome"] = "YES"
     opposite_preview = db.create_preview(opposite, expires_at=iso(shanghai_noon))
-    with pytest.raises(ValueError, match="cross_pair_unsettled"):
-        db.consume_preview_and_create_execution(opposite_preview, "pair-opposite")
+    assert db.consume_preview_and_create_execution(opposite_preview, "pair-opposite") == {
+        "state": "rejected",
+        "reason": "cross_pair_unsettled",
+    }
 
     no_submit_payload = cross_preview_payload(
         market_id="no-submit", total_max_cost=Decimal("5")

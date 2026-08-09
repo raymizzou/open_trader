@@ -1331,6 +1331,21 @@ def test_monitor_allows_task_six_to_defer_quote_wiring() -> None:
     assert monitor._predict_quote_fn is None
 
 
+def test_monitor_snapshot_uses_durable_configured_mode(tmp_path: Path) -> None:
+    store = PredictionArbitrageStore(tmp_path / "data")
+    store.set_cross_auto_mode("manual_confirm", "operator_configured")
+    monitor = PredictCrossVenueMonitor(
+        predict_source=FakeCrossVenuePredict(()),
+        polymarket_monitor=FakeCrossVenuePolymarket(),
+        validator=FakeCrossVenueValidator(),
+        gamma_lookup=lambda *args, **kwargs: [],
+        store=store,
+    )
+
+    assert monitor.snapshot()["configured_mode"] == "manual_confirm"
+    assert monitor.snapshot()["mode"] == "manual_confirm"
+
+
 def test_cross_venue_opportunity_exposes_depth_fields() -> None:
     async def exercise() -> None:
         predict = FakeCrossVenuePredict(
@@ -1758,20 +1773,24 @@ def test_monitor_validates_before_subscription_and_confirms_both_rest_books_conc
     asyncio.run(exercise())
 
 
-def test_monitor_explicit_manual_confirm_mode_is_emitted_by_real_monitor() -> None:
+def test_monitor_explicit_manual_confirm_mode_is_emitted_by_real_monitor(
+    tmp_path: Path,
+) -> None:
     async def exercise() -> None:
         predict = FakeCrossVenuePredict(
             (monitor_predict_market(external_ids=("poly-condition",)),)
         )
         polymarket = FakeCrossVenuePolymarket()
         polymarket.release.set()
+        store = PredictionArbitrageStore(tmp_path / "data")
+        store.set_cross_auto_mode("manual_confirm", "operator_configured")
         monitor = PredictCrossVenueMonitor(
             predict_source=predict,
             polymarket_monitor=polymarket,
             validator=FakeCrossVenueValidator(),
             gamma_lookup=monitor_gamma,
                         predict_quote_fn=predict_quote(),
-            execution_mode="manual_confirm",
+            store=store,
             clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
         )
 

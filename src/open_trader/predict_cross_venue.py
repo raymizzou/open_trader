@@ -1267,7 +1267,6 @@ class PredictCrossVenueMonitor:
         store: PredictionArbitrageStore | None = None,
         ready_observer: Callable[[str, str], object] | None = None,
         holding_reconciler: Callable[[], object] | None = None,
-        execution_mode: str = "observe_only",
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._predict = predict_source
@@ -1278,7 +1277,6 @@ class PredictCrossVenueMonitor:
         self._store = store
         self._ready_observer = ready_observer
         self._holding_reconciler = holding_reconciler
-        self._execution_mode = validate_cross_execution_mode(execution_mode)
         self._clock = clock
         self._task: asyncio.Task[None] | None = None
         self._hot_restart = asyncio.Event()
@@ -1317,10 +1315,12 @@ class PredictCrossVenueMonitor:
 
     def snapshot(self) -> dict[str, object]:
         funnel = self._snapshot_funnel()
+        configured_mode = self._configured_execution_mode()
         return copy.deepcopy(
             {
                 "status": self._status,
-                "mode": self._execution_mode,
+                "mode": configured_mode,
+                "configured_mode": configured_mode,
                 "funnel": funnel,
                 "funnel_last_success_at": _isoformat(self._funnel_last_success_at),
                 "stale_at": _isoformat(self._stale_at),
@@ -1330,6 +1330,16 @@ class PredictCrossVenueMonitor:
                 "events": [],
             }
         )
+
+    def _configured_execution_mode(self) -> str:
+        if self._store is None:
+            return "observe_only"
+        try:
+            return validate_cross_execution_mode(
+                self._store.cross_auto_state().get("configured_mode")
+            )
+        except Exception:
+            return "observe_only"
 
     def _current_funnel(self) -> dict[str, int]:
         return {
@@ -1766,7 +1776,7 @@ class PredictCrossVenueMonitor:
             "polymarket_question": pair.polymarket.question,
             "direction": intent.direction,
             "market_type": "cross_venue_yes_no",
-            "execution_mode": self._execution_mode,
+            "execution_mode": self._configured_execution_mode(),
             "actionable": intent.actionable,
             "clear_signal": intent.actionable,
             "funnel_stage": 5 if intent.actionable else 4,

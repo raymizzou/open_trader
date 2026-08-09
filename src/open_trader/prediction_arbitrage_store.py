@@ -817,12 +817,16 @@ class PredictionArbitrageStore:
             }
         )
 
-    def claim_cross_auto_attempt(self, signal_id: str, opportunity_id: str) -> bool:
-        signal = str(signal_id).strip()
-        opportunity = str(opportunity_id).strip()
-        if not signal or not opportunity:
-            raise ValueError("signal_id and opportunity_id are required")
-        now = _utc_now()
+    def _claim_cross_auto_attempt(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        signal: str,
+        opportunity: str,
+        now: str,
+    ) -> dict[str, str]:
+        """Insert the one-shot attempt and gate it on durable authority."""
+
         payload = self._cross_auto_attempt_payload(
             reason="claimed",
             reason_zh="",
@@ -833,20 +837,41 @@ class PredictionArbitrageStore:
             signal_id=signal,
             opportunity_id=opportunity,
         )
+        try:
+            connection.execute(
+                """
+                INSERT INTO cross_auto_attempts(
+                    signal_id, opportunity_id, decision, reason, payload,
+                    preview_id, execution_id, total_cost, created_at, updated_at
+                ) VALUES (?, ?, 'claimed', 'claimed', ?, '', '', NULL, ?, ?)
+                """,
+                (signal, opportunity, payload, now, now),
+            )
+        except sqlite3.IntegrityError:
+            return {"state": "signal_already_attempted"}
+        state = self._cross_auto_state_from_connection(connection)
+        if (
+            state["configured_mode"] != "auto_submit"
+            or state["armed"] is not True
+        ):
+            return {"state": "rejected", "reason": "cross_auto_paused"}
+        return {"state": "claimed"}
+
+    def claim_cross_auto_attempt(
+        self, signal_id: str, opportunity_id: str
+    ) -> dict[str, str]:
+        signal = str(signal_id).strip()
+        opportunity = str(opportunity_id).strip()
+        if not signal or not opportunity:
+            raise ValueError("signal_id and opportunity_id are required")
+        now = _utc_now()
         with self._transaction() as connection:
-            try:
-                connection.execute(
-                    """
-                    INSERT INTO cross_auto_attempts(
-                        signal_id, opportunity_id, decision, reason, payload,
-                        preview_id, execution_id, total_cost, created_at, updated_at
-                    ) VALUES (?, ?, 'claimed', 'claimed', ?, '', '', NULL, ?, ?)
-                    """,
-                    (signal, opportunity, payload, now, now),
-                )
-            except sqlite3.IntegrityError:
-                return False
-        return True
+            return self._claim_cross_auto_attempt(
+                connection,
+                signal=signal,
+                opportunity=opportunity,
+                now=now,
+            )
 
     def finish_cross_auto_attempt(
         self,
@@ -2105,26 +2130,43 @@ class PredictionArbitrageStore:
             payload = str(preview["payload"])
             preview_payload = _load_payload(payload)
             cross_amount: Decimal | None = None
+            auto_claim: dict[str, str] | None = None
             if preview_payload.get("market_type") == "cross_venue_yes_no":
                 if not self._valid_cross_preview_payload(preview_payload):
                     if now >= _parse_timestamp(preview["expires_at"]):
                         raise ValueError("preview_expired")
                     raise ValueError("cross_preview_invalid")
                 cross_amount = self._cross_reservation_amount(preview_payload)
+                if preview_payload.get("auto_submit") is True:
+                    auto_claim = self._claim_cross_auto_attempt(
+                        connection,
+                        signal=key,
+                        opportunity=str(preview_payload["opportunity_id"]),
+                        now=_canonical_timestamp(now),
+                    )
+                    if auto_claim["state"] != "claimed":
+                        return auto_claim
                 if self._cross_pair_unsettled(connection, preview_payload["pair_id"]):
+                    if auto_claim is not None:
+                        return {"state": "rejected", "reason": "cross_pair_unsettled"}
                     raise ValueError("cross_pair_unsettled")
                 if preview_payload.get("auto_submit") is True:
-                    if not self._cross_auto_state_from_connection(connection)["armed"]:
-                        raise ValueError("cross_auto_paused")
                     if (
                         self._cross_auto_daily_principal_for(connection, now) + cross_amount
                         > _CROSS_AUTO_DAILY_PRINCIPAL_CAP
                     ):
+                        if auto_claim is not None:
+                            return {
+                                "state": "rejected",
+                                "reason": "cross_auto_daily_principal_cap",
+                            }
                         raise ValueError("cross_auto_daily_principal_cap")
                 if (
                     self._reserved_cross_principal(connection) + cross_amount
                     > MAX_CROSS_UNSETTLED_PRINCIPAL
                 ):
+                    if auto_claim is not None:
+                        return {"state": "rejected", "reason": "cross_unsettled_cap"}
                     raise ValueError("cross_unsettled_cap")
             elif now >= _parse_timestamp(preview["expires_at"]):
                 raise ValueError("preview_expired")

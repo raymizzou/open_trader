@@ -739,26 +739,33 @@ class PredictionExecutionService:
     ) -> dict[str, object]:
         """Claim one stage-5 episode, then reuse the normal submit state machine."""
 
-        if not self._store.claim_cross_auto_attempt(signal_id, opportunity_id):
-            return {"state": "ignored", "reason": "signal_already_attempted"}
-        if not self._store.cross_auto_state().get("armed"):
-            return self._finish_cross_auto_rejection(
-                signal_id, opportunity_id, {"reason": "cross_auto_paused"}
-            )
         if not self._notification_channels_ready():
-            return self._finish_cross_auto_rejection(
-                signal_id,
-                opportunity_id,
-                {"reason": "notification_config_unavailable"},
+            return self._claim_and_finish_cross_auto_rejection(
+                signal_id, opportunity_id, {"reason": "notification_config_unavailable"}
             )
         preview = self.preview(opportunity_id, auto_submit=True)
         if preview.get("state") != "previewed":
-            return self._finish_cross_auto_rejection(signal_id, opportunity_id, preview)
+            return self._claim_and_finish_cross_auto_rejection(
+                signal_id, opportunity_id, preview
+            )
         result = self.confirm(str(preview["preview_id"]), signal_id)
         if result.get("state") not in {
             "busy", "locked", "rejected", "failed", "ignored"
         }:
             return self._record_cross_auto_result(signal_id, preview, result)
+        return self._finish_cross_auto_rejection(signal_id, opportunity_id, result)
+
+    def _claim_and_finish_cross_auto_rejection(
+        self,
+        signal_id: str,
+        opportunity_id: str,
+        result: Mapping[str, object],
+    ) -> dict[str, object]:
+        claim = self._store.claim_cross_auto_attempt(signal_id, opportunity_id)
+        if claim["state"] == "signal_already_attempted":
+            return {"state": "ignored", "reason": "signal_already_attempted"}
+        if claim["state"] == "rejected":
+            result = claim
         return self._finish_cross_auto_rejection(signal_id, opportunity_id, result)
 
     def _cross_auto_facts(
@@ -892,21 +899,19 @@ class PredictionExecutionService:
         )
 
     def _configured_cross_execution_mode(self) -> str:
-        source = self._cross_venue_monitor
-        snapshot = getattr(source, "snapshot", None)
         try:
-            value = _call(snapshot) if callable(snapshot) else None
+            return validate_cross_execution_mode(
+                self._store.cross_auto_state().get("configured_mode")
+            )
         except Exception:
-            value = None
-        if not isinstance(value, Mapping):
             return "observe_only"
-        # The monitor's root mode remains authoritative when books are empty
-        # or stale and therefore contain no opportunity rows.
-        return validate_cross_execution_mode(value.get("mode"))
 
     def cross_auto_status(self) -> dict[str, object]:
         configured = self._configured_cross_execution_mode()
-        state = self._store.cross_auto_state()
+        try:
+            state = self._store.cross_auto_state()
+        except Exception:
+            state = {"armed": False, "reason": "not_armed"}
         armed = state.get("armed") is True
         latest = self._store.cross_auto_attempts(limit=1)
         return {
@@ -1222,6 +1227,9 @@ class PredictionExecutionService:
                     "reason": "active_execution",
                     **({"execution_id": active["execution_id"]} if active else {}),
                 }
+            if execution.get("state") in {"rejected", "ignored"}:
+                self._release_global_lock(lock)
+                return execution
             execution_id = str(execution["execution_id"])
             # A store implementation may return an idempotency hit instead of
             # raising.  Never start a second worker for that durable row.
