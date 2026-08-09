@@ -299,20 +299,99 @@ def _valid_long_term_benchmark_cycle_marker(
             return False
         for label, years in (("1Y", 1), ("5Y", 5)):
             window = windows[label]
-            if not isinstance(window, Mapping):
+            if not isinstance(window, Mapping) or set(window) != {
+                "start",
+                "cutoff",
+                "observation_count",
+                "daily_returns",
+                "metrics",
+            }:
                 return False
-            observation_count = int(window.get("observation_count"))
+            start = _years_before(cutoff, years)
+            before_start = [
+                (trading_date, close)
+                for trading_date, close in closes
+                if trading_date < start
+            ]
+            expected_window = (
+                ([before_start[-1]] if before_start else [])
+                + [
+                    (trading_date, close)
+                    for trading_date, close in closes
+                    if trading_date >= start
+                ]
+            )
             if (
-                window.get("start") != _years_before(cutoff, years).isoformat()
-                or window.get("cutoff") != cutoff.isoformat()
-                or observation_count < 2
-                or not isinstance(window.get("daily_returns"), list)
-                or len(window["daily_returns"]) != observation_count - 1
-                or not isinstance(window.get("metrics"), Mapping)
-                or not window["metrics"]
+                len(expected_window) < 2
+                or expected_window[0][0] > start
+                or not any(
+                    trading_date >= start for trading_date, _ in expected_window
+                )
             ):
                 return False
-    except (KeyError, TypeError, ValueError):
+            observation_count = window.get("observation_count")
+            if (
+                type(observation_count) is not int
+                or observation_count != len(expected_window)
+                or window.get("start") != start.isoformat()
+                or window.get("cutoff") != cutoff.isoformat()
+                or not isinstance(window.get("daily_returns"), list)
+                or len(window["daily_returns"]) != len(expected_window) - 1
+            ):
+                return False
+            expected_pairs = zip(expected_window, expected_window[1:])
+            for row, (previous, current) in zip(
+                window["daily_returns"], expected_pairs
+            ):
+                if not isinstance(row, Mapping) or set(row) != {
+                    "date",
+                    "return",
+                    "risk_free_return",
+                    "excess_return",
+                }:
+                    return False
+                if row["date"] != current[0].isoformat():
+                    return False
+                try:
+                    daily_return = Decimal(str(row["return"]))
+                    risk_free_return = Decimal(str(row["risk_free_return"]))
+                    excess_return = Decimal(str(row["excess_return"]))
+                except (InvalidOperation, TypeError, ValueError):
+                    return False
+                if not all(
+                    value.is_finite()
+                    for value in (daily_return, risk_free_return, excess_return)
+                ):
+                    return False
+                try:
+                    expected_daily_return = current[1] / previous[1] - Decimal("1")
+                    expected_excess_return = daily_return - risk_free_return
+                except ArithmeticError:
+                    return False
+                if (
+                    daily_return != expected_daily_return
+                    or excess_return != expected_excess_return
+                ):
+                    return False
+            metrics = window.get("metrics")
+            if not isinstance(metrics, Mapping) or set(metrics) != {
+                "total_return_pct",
+                "max_drawdown_pct",
+                "calmar_ratio",
+                "sharpe_ratio",
+                "annualized_return_pct",
+            }:
+                return False
+            for value in metrics.values():
+                if value is None:
+                    continue
+                try:
+                    metric = Decimal(str(value))
+                except (InvalidOperation, TypeError, ValueError):
+                    return False
+                if not metric.is_finite():
+                    return False
+    except (ArithmeticError, KeyError, TypeError, ValueError):
         return False
     return True
 
