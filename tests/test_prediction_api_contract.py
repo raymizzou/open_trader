@@ -9,7 +9,6 @@ import urllib.error
 import urllib.request
 
 from open_trader.dashboard_web import create_dashboard_server
-from open_trader.prediction_api_contract import PREDICTION_API_CONTRACT_V1
 from tests.test_dashboard import dashboard_config
 
 
@@ -55,26 +54,47 @@ class _Execution:
     _cross_breaker_open = False
 
     def preview(self, opportunity_id: str) -> dict[str, object]:
-        return {"operation": "preview", "opportunity_id": opportunity_id}
+        return {
+            "state": "previewed",
+            "id": "preview-1",
+            "preview_id": "preview-1",
+            "opportunity_id": opportunity_id,
+        }
 
     def confirm(self, preview_id: str, idempotency_key: str) -> dict[str, object]:
         return {
-            "operation": "execution",
+            "state": "validating",
+            "execution_id": "execution-1",
             "preview_id": preview_id,
             "idempotency_key": idempotency_key,
         }
 
     def set_validation_mode(self, mode: str) -> dict[str, object]:
-        return {"operation": "mode", "mode": mode}
+        return {"state": "ok", "mode": mode}
 
     def reset_breaker(self, incident_id: str) -> dict[str, object]:
-        return {"operation": "breaker_reset", "incident_id": incident_id}
+        return {
+            "state": "ready",
+            "reason": "reset_confirmed",
+            "incident_id": incident_id,
+        }
 
     def cleanup_predict_allowance(self, *, confirm: bool) -> dict[str, object]:
-        return {"operation": "allowance_cleanup", "confirmed": confirm}
+        assert confirm is True
+        return {
+            "state": "ready",
+            "before_allowance": "1",
+            "after_allowance": "0",
+            "usdt_moved": False,
+        }
 
     def pause_cross_auto(self) -> dict[str, object]:
-        return {"operation": "cross_auto_pause"}
+        return {
+            "configured_mode": "manual_confirm",
+            "armed": False,
+            "reason": "operator_paused",
+            "updated_at": "2026-08-10T00:00:00Z",
+        }
 
     def cross_auto_status(self) -> dict[str, object]:
         return {
@@ -130,62 +150,6 @@ def _post(base: str, path: str, payload: dict[str, object]) -> urllib.request.Re
     )
 
 
-def test_prediction_platform_contract_v1_is_explicit() -> None:
-    assert PREDICTION_API_CONTRACT_V1 == {
-        "version": 1,
-        "legacy_baseline": {
-            "owner": "legacy_dashboard",
-            "routes": {
-                "/api/prediction-arbitrage/state": {"method": "GET", "success_status": 200},
-                "/api/prediction-arbitrage/history": {"method": "GET", "success_status": 200},
-                "/api/prediction-arbitrage/preview": {"method": "POST", "fields": ("opportunity_id",), "success_status": 200},
-                "/api/prediction-arbitrage/executions": {"method": "POST", "fields": ("preview_id", "idempotency_key"), "success_status": 200},
-                "/api/prediction-arbitrage/mode": {"method": "POST", "fields": ("mode",), "success_status": 200},
-                "/api/prediction-arbitrage/circuit-breaker/reset": {"method": "POST", "fields": ("incident_id",), "success_status": 200},
-                "/api/prediction-arbitrage/predict-allowance/cleanup": {"method": "POST", "fields": ("confirm",), "success_status": 200},
-                "/api/prediction-arbitrage/cross-auto/pause": {"method": "POST", "fields": ("confirm",), "success_status": 200},
-            },
-            "history_kinds": ("signals", "executions", "incidents"),
-            "validation_modes": ("observe_only", "manual", "auto"),
-            "cross_auto_modes": ("observe_only", "manual_confirm", "auto_submit"),
-            "unavailable_state_status": 200,
-        },
-        "product": {
-            "strategy_type_cardinality": "exactly_one",
-            "strategy_types": ("YES_NO", "LLM_RELATION", "N_LEG"),
-            "strategy_mode_scope": "per_strategy_type",
-            "strategy_modes": {
-                "OBSERVE_MANUAL": {"manual_submit": True, "automatic_submit": False},
-                "AUTO": {"manual_submit": True, "automatic_submit": True},
-            },
-            "shared_safety_standard": True,
-            "submit_requires": (
-                "approved_relation",
-                "current_proof",
-                "fresh_quotes",
-                "positive_guaranteed_profit",
-                "depth",
-                "balance",
-                "risk_limits",
-                "global_breaker_closed",
-            ),
-            "n_leg_initial_mode": "OBSERVE_MANUAL",
-            "global_breaker": {
-                "blocks": ("manual_submit", "automatic_submit", "automatic_repair"),
-                "allows": ("market_data", "discovery", "proof", "display", "history"),
-            },
-        },
-        "prediction_service_target": {
-            "owner": "prediction_service",
-            "liveness": {"endpoint": "/healthz", "status": 200, "implies_order_ready": False},
-            "not_ready": {"state_status": 503, "mutation_status": 503},
-            "source_degraded": {"state_status": 200, "affected_source_order_ready": False},
-            "history_when_ledger_readable": {"status": 200},
-            "unknown_or_stale": {"proof_status": "UNKNOWN", "order_ready": False},
-        },
-    }
-
-
 def test_legacy_prediction_http_surface_matches_contract_v1(tmp_path: Path) -> None:
     with _dashboard_server(tmp_path, available=True) as base:
         status, headers, state = _json_response(base + "/api/prediction-arbitrage/state")
@@ -195,8 +159,9 @@ def test_legacy_prediction_http_surface_matches_contract_v1(tmp_path: Path) -> N
         assert "HttpOnly" in headers["Set-Cookie"]
         assert state["csrf_token"] == "csrf-token"
         assert {
-            "status", "health", "readiness", "stale", "opportunities", "validation_mode",
-            "cross_auto", "current_execution", "breaker",
+            "status", "health", "readiness", "stale", "events", "opportunities",
+            "venues", "cross_venue", "relation_discovery", "validation_mode", "cross_auto",
+            "current_execution", "breaker",
         } <= set(state)
 
         status, _headers, history = _json_response(
@@ -209,17 +174,65 @@ def test_legacy_prediction_http_surface_matches_contract_v1(tmp_path: Path) -> N
         }
 
         cases = (
-            ("/api/prediction-arbitrage/preview", {"opportunity_id": "opp-1"}, "preview"),
-            ("/api/prediction-arbitrage/executions", {"preview_id": "preview-1", "idempotency_key": "key-1"}, "execution"),
-            ("/api/prediction-arbitrage/mode", {"mode": "manual"}, "mode"),
-            ("/api/prediction-arbitrage/circuit-breaker/reset", {"incident_id": "incident-1"}, "breaker_reset"),
-            ("/api/prediction-arbitrage/predict-allowance/cleanup", {"confirm": True}, "allowance_cleanup"),
-            ("/api/prediction-arbitrage/cross-auto/pause", {"confirm": True}, "cross_auto_pause"),
+            (
+                "/api/prediction-arbitrage/preview",
+                {"opportunity_id": "opp-1"},
+                {
+                    "state": "previewed",
+                    "id": "preview-1",
+                    "preview_id": "preview-1",
+                    "opportunity_id": "opp-1",
+                },
+            ),
+            (
+                "/api/prediction-arbitrage/executions",
+                {"preview_id": "preview-1", "idempotency_key": "key-1"},
+                {
+                    "state": "validating",
+                    "execution_id": "execution-1",
+                    "preview_id": "preview-1",
+                    "idempotency_key": "key-1",
+                },
+            ),
+            (
+                "/api/prediction-arbitrage/mode",
+                {"mode": "manual"},
+                {"state": "ok", "mode": "manual"},
+            ),
+            (
+                "/api/prediction-arbitrage/circuit-breaker/reset",
+                {"incident_id": "incident-1"},
+                {
+                    "state": "ready",
+                    "reason": "reset_confirmed",
+                    "incident_id": "incident-1",
+                },
+            ),
+            (
+                "/api/prediction-arbitrage/predict-allowance/cleanup",
+                {"confirm": True},
+                {
+                    "state": "ready",
+                    "before_allowance": "1",
+                    "after_allowance": "0",
+                    "usdt_moved": False,
+                },
+            ),
+            (
+                "/api/prediction-arbitrage/cross-auto/pause",
+                {"confirm": True},
+                {
+                    "configured_mode": "manual_confirm",
+                    "armed": False,
+                    "reason": "operator_paused",
+                    "updated_at": "2026-08-10T00:00:00Z",
+                },
+            ),
         )
-        for path, payload, operation in cases:
+        for path, payload, expected in cases:
             status, _headers, body = _json_response(_post(base, path, payload))
             assert status == 200, path
-            assert body["operation"] == operation, path
+            assert body == expected, path
 
         unauthorized = _post(base, "/api/prediction-arbitrage/preview", {"opportunity_id": "opp-1"})
         del unauthorized.headers["X-csrf-token"]
@@ -246,9 +259,22 @@ def test_legacy_prediction_http_surface_matches_contract_v1(tmp_path: Path) -> N
 def test_legacy_unavailable_state_is_the_documented_migration_gap(tmp_path: Path) -> None:
     with _dashboard_server(tmp_path, available=False) as base:
         status, _headers, state = _json_response(base + "/api/prediction-arbitrage/state")
+        try:
+            urllib.request.urlopen(
+                _post(base, "/api/prediction-arbitrage/preview", {"opportunity_id": "opp-1"}),
+                timeout=5,
+            )
+        except urllib.error.HTTPError as error:
+            mutation_status = error.code
+            mutation_error = json.loads(error.read().decode("utf-8"))
+        else:
+            raise AssertionError("unavailable execution service must fail")
 
     assert status == 200
     assert state["status"] == "unavailable"
     assert state["readiness"]["status"] == "unavailable"
     assert state["stale"] is True
     assert state["breaker"]["open"] is True
+    assert mutation_status == 500
+    assert mutation_error["status"] == "error"
+    assert mutation_error["error_type"] == "RuntimeError"

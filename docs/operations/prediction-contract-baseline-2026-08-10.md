@@ -3,13 +3,13 @@
 ## 范围
 
 这是 #39 的只读基线：冻结现有外部路径、关键字段、控制语义和真实运行归属，供后续
-8769 Prediction Service 迁移做 parity 对照。本票不切路由、不重启进程、不修改 SQLite、
-模式、熔断器或订单行为。
+8769 Prediction Service 迁移做 parity 对照。本票不切路由、不改变进程拓扑或 owner，
+不修改 SQLite、模式、熔断器或订单行为；最终验证只按发布门槛重启原 Dashboard stack。
 
-可执行契约位于 `open_trader.prediction_api_contract.PREDICTION_API_CONTRACT_V1`；
-`tests/test_prediction_api_contract.py` 用真实 `create_dashboard_server` HTTP 请求锁定路径、
-成功状态、关键响应字段、会话/CSRF、严格请求字段、400/403，以及 Legacy unavailable
-state 的现有 200 行为。
+可执行契约是 `tests/test_prediction_api_contract.py`：它用真实 `create_dashboard_server`
+HTTP 请求锁定路径、成功响应及关键字段、会话/CSRF、严格请求字段、400/403，以及 Legacy
+unavailable state 的现有 GET 200 / mutation 500 行为。目标服务语义只在本文件和已批准设计
+中定义；等 8769 真正消费共享契约时再提取生产 manifest，避免当前出现无人使用的第二真相源。
 
 ## 外部 API 基线
 
@@ -89,7 +89,7 @@ funnel 为 matched 13 / monitored 13；relation discovery 单源为 degraded。�
 | #29 | Issue OPEN | PR #35–#37 已进 main；健康进程 PID 91498 运行中 | 最新周期为 WARN；Issue 仍等待运营闭环 |
 | #30 | Issue OPEN | 当前 acceptance registry 没有 live matched/unresolved 配对检查 | 未实现；原 blocker #27 的代码已合并，但 tracker 依赖未更新 |
 | #31 | Issue CLOSED | 无独立实现 | 已由 #32 与 #33 取代 |
-| #32 | Issue OPEN | `36cfaeef` 已进 main 与生产 | `feat/issue-32-short-settlement-depth-screening@314fdfde` 已是 main 祖先；Issue 未关闭 |
+| #32 | Issue OPEN | `36cfaeef` 已进 main 与生产 | feature branch `314fdfde` 已是 main 祖先；docs/prototype branch `docs/issue-32-short-settlement-depth-screening@7f8065e9` 尚有 5 个提交未进 main；Issue 未关闭 |
 | #33 | Issue OPEN | `86b7cbc4` 已进 main 与生产；运行时为 auto | 无已知未合并实现；Issue 未关闭 |
 | #34 | Issue OPEN | `f4983487` 的 signal-count cache 已进 main 与生产，但原线程/FD 故障未证明消失 | `fix/prediction-state-timeout@f4983487` 已是 main 祖先；按 Issue 评论 blocked by #41 |
 | #35 | PR MERGED | #29 健康服务，`f4bb7122` merge | 不是 Issue |
