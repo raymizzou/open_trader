@@ -7400,6 +7400,39 @@ def test_long_term_benchmark_retries_a_failed_controller_attempt(
     ] == "recovered-sha"
 
 
+def test_long_term_benchmark_recovers_malformed_cycle_marker(
+    tmp_path: Path,
+) -> None:
+    write_rates(tmp_path)
+    path = trend_review.long_term_benchmark_cycle_path(tmp_path, "US", "2026-08")
+    path.parent.mkdir(parents=True)
+    path.write_text("{malformed", encoding="utf-8")
+
+    failed = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        ExplodingQuote(),
+        now=datetime(2026, 8, 9, 12, tzinfo=UTC),
+        process_git_sha="failed-sha",
+    )
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert failed["status"] == "failed"
+    assert state["status"] == "failed"
+
+    recovered = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        FiveYearQuote(),
+        now=datetime(2026, 8, 9, 12, tzinfo=UTC),
+        process_git_sha="recovered-sha",
+    )
+
+    assert recovered["status"] == "completed"
+    assert trend_review.read_long_term_benchmark_snapshot(tmp_path, "US")[
+        "process_git_sha"
+    ] == "recovered-sha"
+
+
 def test_long_term_benchmark_force_requires_audited_reason_and_preserves_success(
     tmp_path: Path,
 ) -> None:

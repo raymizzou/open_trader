@@ -175,6 +175,7 @@ def _record_long_term_benchmark_failure(
     actor: str,
     reason: str,
     error: BaseException,
+    preserve_existing_cycle: bool = False,
 ) -> None:
     cycle_path = long_term_benchmark_cycle_path(data_dir, market, month)
     try:
@@ -183,7 +184,8 @@ def _record_long_term_benchmark_failure(
         existing = None
     target = (
         _long_term_benchmark_attempt_path(data_dir, market, month)
-        if isinstance(existing, Mapping)
+        if preserve_existing_cycle
+        and isinstance(existing, Mapping)
         and existing.get("schema_version")
         == "open_trader.trend_review.long_term_benchmark.v1"
         and existing.get("status") is None
@@ -420,6 +422,17 @@ def _refresh_long_term_benchmark_locked(
     month = market_now.strftime("%Y-%m")
     cycle_path = long_term_benchmark_cycle_path(data_dir, market, month)
     snapshot_path = long_term_benchmark_snapshot_path(data_dir, market)
+    existing_cycle_is_valid = False
+    if force and cycle_path.exists():
+        try:
+            existing_cycle_is_valid = _validate_long_term_benchmark_snapshot(
+                json.loads(cycle_path.read_text(encoding="utf-8")),
+                market,
+                rates=_load_dgs3mo_csv(data_dir / "rates" / "DGS3MO.csv"),
+                expected_month=month,
+            ) is not None
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            existing_cycle_is_valid = False
     if cycle_path.exists() and not force:
         try:
             rates = _load_dgs3mo_csv(data_dir / "rates" / "DGS3MO.csv")
@@ -433,17 +446,38 @@ def _refresh_long_term_benchmark_locked(
             try:
                 previous = json.loads(cycle_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError):
-                return {"status": "failed", "market": market, "month": month, "error": str(exc)}
-            if not (
+                previous = None
+            retryable_failure = (
                 isinstance(previous, Mapping)
                 and previous.get("schema_version")
                 == "open_trader.trend_review.long_term_benchmark.attempt.v1"
                 and previous.get("status") == "failed"
                 and previous.get("market") == market
                 and previous.get("month") == month
-            ):
-                return {"status": "failed", "market": market, "month": month, "error": str(exc)}
+            )
+            try:
+                _record_long_term_benchmark_failure(
+                    data_dir,
+                    market,
+                    month,
+                    now=now,
+                    process_git_sha=process_git_sha,
+                    force=False,
+                    actor="",
+                    reason="",
+                    error=exc,
+                )
+            except Exception:
+                pass
+            if not retryable_failure:
+                return {
+                    "status": "failed",
+                    "market": market,
+                    "month": month,
+                    "error": str(exc),
+                }
         else:
+            existing_cycle_is_valid = True
             try:
                 current_snapshot = read_long_term_benchmark_snapshot(data_dir, market)
             except ValueError:
@@ -508,6 +542,7 @@ def _refresh_long_term_benchmark_locked(
             actor=actor,
             reason=reason,
             error=exc,
+            preserve_existing_cycle=existing_cycle_is_valid,
         )
         return {"status": "failed", "market": market, "month": month, "error": str(exc)}
     _write_json_atomic(snapshot_path, payload)
