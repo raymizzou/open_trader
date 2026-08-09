@@ -8127,8 +8127,16 @@ def build_trend_review_projection(
         "open_trader.trend_review.benchmark.v1",
     ):
         benchmark = _validate_benchmark(
-            fact.get("benchmark"), market=market, trading_date=str(fact["date"])
+            fact.get("benchmark"),
+            market=market,
+            trading_date=str(fact["date"]),
+            allow_legacy=True,
         )
+        if (
+            benchmark.get("source_id") != BENCHMARK_SOURCE_IDS[market]
+            or benchmark.get("futu_symbol") != BENCHMARK_FUTU_SYMBOLS[market]
+        ):
+            continue
         benchmark_by_date[str(fact["date"])] = dict(benchmark)
     benchmark_reference_dates = set(benchmark_by_date)
     long_term_snapshot: dict[str, object] | None = None

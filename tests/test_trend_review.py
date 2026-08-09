@@ -10639,6 +10639,56 @@ def test_projection_ignores_legacy_daily_benchmark_close_with_approved_snapshot(
     assert projection["metrics"]["period_net_return"]["same_period_benchmark"]["value"] == "0.100"
 
 
+@pytest.mark.parametrize(
+    ("market", "symbol", "legacy_identity"),
+    [
+        ("CN", "SH.000905", ("CSI_ALL_SHARE_PRICE", "SH.000985")),
+        ("HK", "HK.800000", ("HSCI_PRICE", "HK.800701")),
+    ],
+)
+def test_projection_ignores_legacy_separate_benchmark_fact_with_approved_snapshot(
+    tmp_path: Path,
+    market: str,
+    symbol: str,
+    legacy_identity: tuple[str, str],
+) -> None:
+    write_projection_metric_history(
+        tmp_path, market, discipline_days=2, actual_days=0, benchmark_days=2
+    )
+    legacy_date = (
+        date.fromisoformat(trend_review.TREND_V1_EFFECTIVE_FROM[market])
+        + timedelta(days=2)
+    ).isoformat()
+    legacy_path = tmp_path / f"trend_review/facts/benchmark/{market}/{legacy_date}.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_review.benchmark.v1",
+            "market": market,
+            "date": legacy_date,
+            "benchmark": {
+                "date": legacy_date,
+                "close": "10.0",
+                "source_id": legacy_identity[0],
+                "futu_symbol": legacy_identity[1],
+            },
+        }),
+        encoding="utf-8",
+    )
+    write_rates(tmp_path)
+    trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        market,
+        FiveYearQuote(symbol=symbol),
+        now=datetime(2026, 8, 9, tzinfo=UTC),
+        process_git_sha="abc123",
+    )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, market)
+
+    assert projection["metrics"]["period_net_return"]["same_period_benchmark"]["value"] == "0.100"
+
+
 def test_projection_does_not_annualize_ratios_before_one_full_year(
     tmp_path: Path,
 ) -> None:
