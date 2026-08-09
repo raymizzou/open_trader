@@ -3,6 +3,15 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-10
+
+- 趋势复盘改为单一共享标尺，同时展示纪律模拟、实际执行、同期市场、市场 1 年与市场
+  5 年；A 股固定对比中证 500（`SH.000905`）、港股固定对比恒生指数
+  （`HK.800000`）、美股固定对比 SPY（`US.SPY`）。长期基准由现有三市场 Controller
+  每月独立刷新一次，报告、交易统计和基准任一失败均不阻断另外两项；不足一年的 Calmar
+  与 Sharpe 明确显示“观察期不足”，5 年收益按 CAGR 展示。真实 OpenD 刷新已验证三市场
+  2026-08 快照、月内重复调用不改哈希，以及 v4 投影的批准身份和 1 年/5 年数值。
+
 ## 2026-08-09
 
 - 修复趋势复盘把 Kelly 策略版本边界误用于连续日终净值的问题：未满 30 笔仍显示已有模拟盘与同期市场绩效，30 笔门槛只控制 Kelly 启用；实盘缺少日终净值时继续明确不可用。
