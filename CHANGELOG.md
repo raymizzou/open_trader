@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-10
 
+- #39 冻结 Prediction API 与生产基线：新增可执行 v1 契约和真实 HTTP golden tests，
+  覆盖 state/history、6 条 mutation、关键字段、会话/CSRF、严格输入与 400/403；明确
+  `YES_NO`、`LLM_RELATION`、`N_LEG` 的独立模式、共享安全标准、全局熔断，以及目标
+  Prediction Service 的 liveness/readiness、单源降级和 503 语义。记录 #27–#38 在
+  main、分支和生产运行时的事实；本票不改路由、进程、SQLite、模式或订单行为。
+
 - 修复三市场 Controller 仍把 v3 趋势复盘投影当作当前版本、导致 v4 投影被重复捕获或旧文件不升级的问题；现与 Dashboard 和投影生成器统一要求 v4，控制器重启后会沿既有收盘恢复流程重建旧投影。验证：控制器回归通过。
 
 - 趋势复盘改为单一共享标尺，同时展示纪律模拟、实际执行、同期市场、市场 1 年与市场
