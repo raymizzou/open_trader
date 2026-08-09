@@ -167,7 +167,7 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(observeSignal.locator('[data-action="participate"]')).toHaveCount(0);
   });
 
-  test('shows cross auto safety facts and only the one-way emergency pause', async ({ page }) => {
+  test('shows cross-auto safety facts and only the one-way emergency pause', async ({ page }) => {
     await openPrediction(page, 'cross-auto-armed');
     const root = page.locator('#prediction-market-root');
     for (const text of ['自动下单', '已启用', '$5.00 / $100.00', '紧急暂停自动下单']) {
@@ -181,7 +181,9 @@ test.describe('YES/NO arbitrage signal workspace', () => {
     await expect(root.locator('[data-action="participate"]')).toHaveCount(0);
 
     await openPrediction(page, 'cross-auto-paused-manual-only');
-    await expect(root).toContainText('需人工审查，自动模式不执行');
+    for (const text of ['已暂停', '操作员已暂停自动下单', '需要操作员处理', '需人工审查，自动模式不执行']) {
+      await expect(root).toContainText(text);
+    }
     await expect(root.locator('[data-action="participate"]')).toHaveCount(0);
 
     for (const [scenario, code, zh, current, limit, venue, action] of [

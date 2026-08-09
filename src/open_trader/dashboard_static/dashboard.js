@@ -2074,6 +2074,9 @@ function predictionReasonLabel(value) {
     opportunity_unavailable: "机会已变化或已失效",
     annualized_yield_below_minimum: "年化低于 15% 入场门槛",
     annualized_yield_unavailable: "年化无法计算，禁止入场",
+    operator_paused: "操作员已暂停自动下单",
+    notification_delivery_failed: "通知发送失败，已暂停自动下单",
+    not_armed: "自动下单未启用",
   };
   return labels[raw] || raw.replaceAll("_", " ");
 }
@@ -3247,13 +3250,16 @@ function predictionCrossAutoStatus(payload) {
   const daily = auto.daily_principal && typeof auto.daily_principal === "object" ? auto.daily_principal : {};
   const attempt = auto.latest_attempt && typeof auto.latest_attempt === "object" ? auto.latest_attempt : null;
   const active = auto.armed === true && auto.effective_mode === "auto_submit";
+  const pauseReason = !active && auto.pause_reason
+    ? ` · ${escapeHtml(predictionReasonLabel(auto.pause_reason))} · 需要操作员处理`
+    : "";
   const rejection = attempt
     ? `<span class="pm-mode-stats">拒绝 ${escapeHtml(predictionValue(attempt.reason_code))} · ${escapeHtml(predictionValue(attempt.reason_zh))} · 当前 ${escapeHtml(predictionValue(attempt.current))} · 上限 ${escapeHtml(predictionValue(attempt.limit))} · 场所 ${escapeHtml(predictionValue(attempt.venue))} · ${escapeHtml(predictionHktTimestamp(attempt.occurred_at))} · ${attempt.operator_action_required === true ? "需要操作员处理" : "无需操作员处理"}</span>`
     : "";
   const pause = active
     ? `<button class="pm-button danger" type="button" data-action="pause-cross-auto">紧急暂停自动下单</button>`
     : "";
-  return `<span class="pm-mode-stats" data-cross-auto-status>跨所自动下单 · ${active ? "已启用" : "已暂停"} · 当日新本金 ${escapeHtml(predictionMoney(daily.current))} / ${escapeHtml(predictionMoney(daily.limit))}${auto.pause_reason ? ` · ${escapeHtml(predictionValue(auto.pause_reason))}` : ""}</span>${rejection}${pause}`;
+  return `<span class="pm-mode-stats" data-cross-auto-status>跨所自动下单 · ${active ? "已启用" : "已暂停"} · 当日新本金 ${escapeHtml(predictionMoney(daily.current))} / ${escapeHtml(predictionMoney(daily.limit))}${pauseReason}</span>${rejection}${pause}`;
 }
 
 function renderPredictionMarket() {

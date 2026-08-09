@@ -248,7 +248,7 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
             "configured_mode": "auto_submit",
             "effective_mode": "observe_only" if paused else "auto_submit",
             "armed": not paused,
-            "pause_reason": "notification_delivery_failed" if scenario == "cross-auto-notification-blocked" else "operator_paused" if scenario == "cross-auto-paused" else "",
+            "pause_reason": "notification_delivery_failed" if scenario == "cross-auto-notification-blocked" else "operator_paused" if scenario in {"cross-auto-paused", "cross-auto-paused-manual-only"} else "",
             "notification_ready": scenario != "cross-auto-notification-blocked",
             "daily_principal": {"current": "100" if scenario == "cross-auto-daily-cap" else "5", "limit": "100"},
             "latest_attempt": None if reason is None else {

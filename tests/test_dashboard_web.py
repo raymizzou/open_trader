@@ -2209,9 +2209,9 @@ def test_prediction_cross_auto_state_is_safe_and_pause_is_confirmed_only(tmp_pat
         def cross_auto_status(self) -> dict[str, object]:
             return {
                 "configured_mode": "auto_submit",
-                "effective_mode": "auto_submit",
-                "armed": True,
-                "pause_reason": "",
+                "effective_mode": "observe_only",
+                "armed": False,
+                "pause_reason": "operator_paused",
                 "notification_ready": True,
                 "daily_principal": {"current": "5", "limit": "100"},
                 "latest_attempt": {
@@ -2250,9 +2250,9 @@ def test_prediction_cross_auto_state_is_safe_and_pause_is_confirmed_only(tmp_pat
             state = json.loads(response.read().decode("utf-8"))
         assert state["cross_auto"] == {
             "configured_mode": "auto_submit",
-            "effective_mode": "auto_submit",
-            "armed": True,
-            "pause_reason": "",
+            "effective_mode": "observe_only",
+            "armed": False,
+            "pause_reason": "operator_paused",
             "notification_ready": True,
             "daily_principal": {"current": "5", "limit": "100"},
             "latest_attempt": {
