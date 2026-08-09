@@ -137,3 +137,72 @@ def test_trend_review_sync_stats_us_initializes_one_futu_and_one_tiger(
     assert result == 0
     assert created == ["US", "tiger"]
     assert cycle_calls[0]["tiger_client"] is not None
+
+
+def test_refresh_benchmark_parser_exposes_force_audit_inputs() -> None:
+    args = build_parser().parse_args([
+        "trend-review", "refresh-benchmark", "--market", "HK",
+        "--force", "--actor", "ray", "--reason", "repair snapshot",
+        "--config", "config/daily.env",
+    ])
+
+    assert args.trend_review_command == "refresh-benchmark"
+    assert args.market == "HK"
+    assert args.force is True
+    assert args.actor == "ray"
+    assert args.reason == "repair snapshot"
+    assert args.config == Path("config/daily.env")
+
+
+def test_refresh_benchmark_force_requires_actor_and_reason(capsys) -> None:
+    result = cli_module.main([
+        "trend-review", "refresh-benchmark", "--market", "HK", "--force",
+    ])
+
+    assert result == 1
+    assert "--force requires --actor and --reason" in capsys.readouterr().err
+
+
+def test_refresh_benchmark_uses_domain_api_and_closes_quote_client(
+    monkeypatch, tmp_path: Path, capsys,
+) -> None:
+    config = SimpleNamespace(
+        data_dir=tmp_path / "data", repo=tmp_path,
+        futu_host="127.0.0.1", futu_port=11111,
+    )
+    calls: list[dict[str, object]] = []
+    created: list[bool] = []
+
+    class FakeQuote:
+        def close(self) -> None:
+            raise AssertionError("completed benchmark refresh opened a quote client")
+
+    monkeypatch.setattr(cli_module, "load_env_config", lambda *_args, **_kwargs: config)
+    monkeypatch.setattr(
+        cli_module,
+        "FutuQuoteClient",
+        lambda **_kwargs: created.append(True) or FakeQuote(),
+    )
+    monkeypatch.setattr(cli_module, "_process_version", lambda _repo: "test-sha")
+    monkeypatch.setattr(
+        cli_module,
+        "refresh_long_term_benchmark",
+        lambda **kwargs: calls.append(kwargs) or {
+            "status": "already_completed", "market": "HK", "month": "2026-07",
+        },
+        raising=False,
+    )
+
+    result = cli_module.main([
+        "trend-review", "refresh-benchmark", "--market", "HK",
+    ])
+
+    assert result == 0
+    assert created == []
+    assert calls[0]["data_dir"] == config.data_dir
+    assert calls[0]["market"] == "HK"
+    assert calls[0]["process_git_sha"] == "test-sha"
+    assert calls[0]["force"] is False
+    assert calls[0]["actor"] == ""
+    assert calls[0]["reason"] == ""
+    assert '"status": "already_completed"' in capsys.readouterr().out

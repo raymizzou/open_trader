@@ -7366,6 +7366,38 @@ def test_long_term_benchmark_refresh_is_monthly_and_failure_preserves_snapshot(
     assert failed["status"] == "failed"
     assert snapshot_path.read_bytes() == body
     assert cycle_path.read_bytes() == cycle
+def test_long_term_benchmark_retries_a_failed_controller_attempt(
+    tmp_path: Path,
+) -> None:
+    write_rates(tmp_path)
+    path = trend_review.long_term_benchmark_cycle_path(tmp_path, "US", "2026-08")
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_review.long_term_benchmark.attempt.v1",
+            "status": "failed",
+            "market": "US",
+            "month": "2026-08",
+            "attempt_count": 1,
+            "attempted_at": "2026-08-09T12:00:00+00:00",
+            "process_git_sha": "failed-sha",
+            "reason": "quote failed",
+        }),
+        encoding="utf-8",
+    )
+
+    result = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        FiveYearQuote(),
+        now=datetime(2026, 8, 9, 12, tzinfo=UTC),
+        process_git_sha="recovered-sha",
+    )
+
+    assert result["status"] == "completed"
+    assert trend_review.read_long_term_benchmark_snapshot(tmp_path, "US")[
+        "process_git_sha"
+    ] == "recovered-sha"
 
 
 def test_long_term_benchmark_force_requires_audited_reason_and_preserves_success(
@@ -7422,6 +7454,18 @@ def test_long_term_benchmark_force_requires_audited_reason_and_preserves_success
     assert failed["status"] == "failed"
     assert snapshot_path.read_bytes() == body
     assert cycle_path.read_bytes() == cycle
+    attempt = json.loads(
+        trend_review._long_term_benchmark_attempt_path(
+            tmp_path, "US", "2026-08"
+        ).read_text(encoding="utf-8")
+    )
+    assert attempt["refresh"] == {
+        "force": True,
+        "actor": "operator",
+        "reason": "reconcile provider data",
+    }
+    assert attempt["attempted_at"] == "2026-08-20T00:00:00+00:00"
+    assert attempt["process_git_sha"] == "second"
 
 
 def test_long_term_benchmark_rejects_unordered_or_short_history(tmp_path: Path) -> None:
@@ -7447,6 +7491,13 @@ def test_long_term_benchmark_rejects_unordered_or_short_history(tmp_path: Path) 
     assert result["status"] == "failed"
     assert "strictly increasing" in result["error"]
     assert not trend_review.long_term_benchmark_snapshot_path(tmp_path, "US").exists()
+    state = json.loads(
+        trend_review.long_term_benchmark_cycle_path(
+            tmp_path, "US", "2026-08"
+        ).read_text(encoding="utf-8")
+    )
+    assert state["status"] == "failed"
+    assert state["process_git_sha"] == "invalid"
 
 
 def test_projection_keeps_newer_current_benchmark_facts_alongside_snapshot(

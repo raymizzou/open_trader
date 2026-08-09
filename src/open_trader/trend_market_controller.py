@@ -81,11 +81,13 @@ from .trend_review import (
     execute_relative_rotations,
     execute_trend_review_open,
     execute_trend_review_stop,
+    long_term_benchmark_cycle_path,
     load_trend_action_audit,
     lock_trend_execution_batch,
     overheat_trim_progress,
     _preflight_open_actions,
     record_trend_review_missed_buys,
+    refresh_long_term_benchmark,
     relative_rotations_completed,
     trend_action_futu_symbol,
 )
@@ -775,6 +777,49 @@ def _run_cycle_statistics(
         finally:
             if tiger is not None:
                 tiger.close()
+
+
+def _run_cycle_long_term_benchmark(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+    now: datetime,
+    process_version: str,
+    quote_client: object,
+) -> dict[str, object]:
+    return refresh_long_term_benchmark(
+        config.data_dir,
+        cycle.market,
+        quote_client,
+        now=now,
+        process_git_sha=process_version,
+    )
+
+
+def _record_long_term_benchmark_exception(
+    config: DailyPremarketConfig,
+    cycle: ControllerCycle,
+    now: datetime,
+    process_version: str,
+    error: BaseException,
+) -> dict[str, object]:
+    month = now.astimezone(TIMEZONES[cycle.market]).strftime("%Y-%m")
+    path = long_term_benchmark_cycle_path(config.data_dir, cycle.market, month)
+    with RunLock(path.with_suffix(".lock"), wait=True):
+        previous = _read_optional_json(path)
+        if previous.get("status") == "completed":
+            return {**previous, "status": "already_completed"}
+        state = {
+            "schema_version": "open_trader.trend_review.long_term_benchmark.attempt.v1",
+            "status": "failed",
+            "market": cycle.market,
+            "month": month,
+            "attempt_count": int(previous.get("attempt_count", 0)) + 1,
+            "attempted_at": now.isoformat(timespec="seconds"),
+            "process_git_sha": process_version,
+            "reason": str(error),
+        }
+        _write_notification_state(path, state)
+        return state
 
 
 def _allocation_reference_for_cycle(
@@ -3032,6 +3077,10 @@ def run_trend_market_controller(
     statistics_status: str | None = None
     statistics_failures = 0
     statistics_retry_after: datetime | None = None
+    benchmark_identity: tuple[str, str] | None = None
+    benchmark_status: str | None = None
+    benchmark_failures = 0
+    benchmark_retry_after: datetime | None = None
     last_success: object = None
     completed_execution_dates: set[str] = set()
     quote_client: object | None = None
@@ -3259,6 +3308,15 @@ def run_trend_market_controller(
                 statistics_status = None
                 statistics_failures = 0
                 statistics_retry_after = None
+            current_benchmark_identity = (
+                cycle.market,
+                now.astimezone(TIMEZONES[cycle.market]).strftime("%Y-%m"),
+            )
+            if benchmark_identity != current_benchmark_identity:
+                benchmark_identity = current_benchmark_identity
+                benchmark_status = None
+                benchmark_failures = 0
+                benchmark_retry_after = None
             phase = "monitoring" if cycle.market_open else cycle.session
             blocker = protection_error
             if blocker is not None:
@@ -3356,6 +3414,38 @@ def run_trend_market_controller(
                     else:
                         statistics_failures = 0
                         statistics_retry_after = None
+                natural_benchmark_due = (
+                    not revision
+                    and report_target is None
+                    and future is None
+                    and work_cycle == cycle
+                    and not revision_pending
+                    and recovery_revision is None
+                    and benchmark_status not in {"completed", "already_completed"}
+                    and (
+                        benchmark_retry_after is None
+                        or now >= benchmark_retry_after
+                    )
+                )
+                if natural_benchmark_due:
+                    try:
+                        benchmark_result = _run_cycle_long_term_benchmark(
+                            config, cycle, now, process_version, shared_quote()
+                        )
+                    except Exception as exc:
+                        try:
+                            benchmark_result = _record_long_term_benchmark_exception(
+                                config, cycle, now, process_version, exc
+                            )
+                        except Exception:
+                            benchmark_result = {"status": "failed", "reason": str(exc)}
+                    benchmark_status = str(benchmark_result.get("status") or "")
+                    if benchmark_status == "failed":
+                        benchmark_failures += 1
+                        benchmark_retry_after = _retry_at(now, benchmark_failures)
+                    else:
+                        benchmark_failures = 0
+                        benchmark_retry_after = None
                 if (
                     revision_pending
                     and latest is not None

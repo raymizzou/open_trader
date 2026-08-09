@@ -19,6 +19,7 @@ import pytest
 
 from open_trader import a_share_trend as a_share_trend
 from open_trader import trend_market_controller as controller
+from open_trader import trend_review
 from open_trader.account_http import AccountHttpError
 from open_trader.daily_premarket import DailyPremarketConfig, RunLock
 from open_trader.futu_symbols import to_futu_symbol
@@ -2185,6 +2186,12 @@ def patch_cycle(monkeypatch: pytest.MonkeyPatch, cycle: ControllerCycle) -> None
         "_run_cycle_statistics",
         lambda *_args: {"status": "completed"},
     )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_long_term_benchmark",
+        lambda *_args: {"status": "completed"},
+        raising=False,
+    )
 
 
 def test_controller_attempts_statistics_then_always_generates_report(
@@ -2261,6 +2268,182 @@ def test_statistics_failure_does_not_become_report_or_controller_blocker(
     )
     assert state["status"] == "failed"
     assert state["reason"] == "broker unavailable"
+
+
+def test_controller_report_statistics_and_benchmark_fail_independently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    calls: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda *_args: calls.append("statistics") or {"status": "completed"},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_long_term_benchmark",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("quote failed")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda *_args: calls.append("report") or write_report(config),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert calls == ["statistics", "report"]
+    state = json.loads(
+        trend_review.long_term_benchmark_cycle_path(
+            config.data_dir, "CN", "2026-07"
+        ).read_text(encoding="utf-8")
+    )
+    assert state["status"] == "failed"
+    assert state["reason"] == "quote failed"
+
+
+def test_controller_benchmark_completes_when_statistics_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    calls: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda *_args: calls.append("statistics") or {"status": "failed"},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_long_term_benchmark",
+        lambda *_args: calls.append("benchmark") or {"status": "completed"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda *_args: calls.append("report") or write_report(config),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert calls == ["statistics", "benchmark", "report"]
+
+
+def test_controller_benchmark_completes_when_report_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    calls: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda *_args: calls.append("statistics") or {"status": "completed"},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_long_term_benchmark",
+        lambda *_args: calls.append("benchmark") or {"status": "completed"},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda *_args: calls.append("report")
+        or (_ for _ in ()).throw(RuntimeError("report failed")),
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert calls == ["statistics", "benchmark", "report"]
+
+
+def test_failed_benchmark_result_uses_controller_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    patch_cycle(monkeypatch, cycle)
+    benchmark_cycles: list[ControllerCycle] = []
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_long_term_benchmark",
+        lambda _config, selected, *_args: benchmark_cycles.append(selected)
+        or {"status": "failed", "error": "quote failed"},
+    )
+    monkeypatch.setattr(
+        controller, "_generate_report", lambda *_args: write_report(config)
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+    current = NOW
+
+    class StopController(Exception):
+        pass
+
+    def advance(_seconds: float) -> None:
+        nonlocal current
+        current += timedelta(seconds=5)
+        if current >= NOW + timedelta(seconds=10):
+            raise StopController
+
+    with pytest.raises(StopController):
+        run_trend_market_controller(
+            config, "CN", now_fn=lambda: current, sleep_fn=advance
+        )
+
+    assert benchmark_cycles == [cycle]
+
+
+def test_revision_request_skips_statistics_and_benchmark_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda *_args: pytest.fail("revision attempted natural statistics"),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_long_term_benchmark",
+        lambda *_args: pytest.fail("revision attempted benchmark refresh"),
+        raising=False,
+    )
+    monkeypatch.setattr(controller, "_request_revision", lambda *_args: None)
+    monkeypatch.setattr(
+        controller, "_generate_report", lambda *_args: write_report(config)
+    )
+    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
+
+    run_trend_market_controller(
+        config, "CN", revision=True, once=True, now_fn=lambda: NOW
+    )
+
+
+def test_benchmark_failure_record_recovers_malformed_cycle_state(
+    tmp_path: Path,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    path = trend_review.long_term_benchmark_cycle_path(
+        config.data_dir, cycle.market, "2026-07"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_text("{malformed", encoding="utf-8")
+
+    state = controller._record_long_term_benchmark_exception(
+        config, cycle, NOW, "test-sha", RuntimeError("quote failed")
+    )
+
+    assert state["status"] == "failed"
+    assert json.loads(path.read_text(encoding="utf-8"))["reason"] == "quote failed"
 
 
 def test_statement_consumer_exception_does_not_stop_report_generation(
@@ -3291,8 +3474,8 @@ def test_close_review_recovery_completes_once_after_backoff(
         return {
             "date": trading_date,
             "close": "5833.72",
-            "source_id": "CSI_ALL_SHARE_PRICE",
-            "futu_symbol": "SH.000985",
+            "source_id": "CSI_500_PRICE",
+            "futu_symbol": "SH.000905",
         }
 
     projections: list[str] = []

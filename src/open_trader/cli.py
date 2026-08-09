@@ -134,6 +134,7 @@ from .trading_plan import (
 )
 from .watchlist import build_watchlist
 from .trend_review import (
+    refresh_long_term_benchmark,
     rebuild_trend_report_from_evidence,
     replay_trend_evidence,
     resolve_trend_action,
@@ -165,6 +166,22 @@ def _drawdown_unlock_now(timezone: str) -> datetime:
 
 def _drawdown_preflight_now() -> datetime:
     return datetime.now().astimezone()
+
+
+class _LazyFutuQuote:
+    def __init__(self, host: str, port: int) -> None:
+        self.host = host
+        self.port = port
+        self.client: FutuQuoteClient | None = None
+
+    def get_daily_kline(self, *args: object, **kwargs: object) -> object:
+        if self.client is None:
+            self.client = FutuQuoteClient(host=self.host, port=self.port)
+        return self.client.get_daily_kline(*args, **kwargs)
+
+    def close(self) -> None:
+        if self.client is not None:
+            self.client.close()
 
 
 def run_trend_review_replay(
@@ -474,6 +491,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--tiger-config-dir", type=Path, default=Path("~/.tigeropen/")
     )
     sync_stats_parser.add_argument("--tiger-account")
+    refresh_benchmark_parser = trend_review_commands.add_parser("refresh-benchmark")
+    refresh_benchmark_parser.add_argument(
+        "--market", choices=("CN", "HK", "US"), required=True
+    )
+    refresh_benchmark_parser.add_argument("--force", action="store_true")
+    refresh_benchmark_parser.add_argument("--actor", default="")
+    refresh_benchmark_parser.add_argument("--reason", default="")
+    refresh_benchmark_parser.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
 
     test_notification_parser = subparsers.add_parser(
         "test-notification",
@@ -1848,6 +1875,32 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "trend-review":
+        if args.trend_review_command == "refresh-benchmark":
+            if args.force and (not args.actor.strip() or not args.reason.strip()):
+                print("--force requires --actor and --reason", file=sys.stderr)
+                return 1
+            quote_client = None
+            try:
+                config = load_env_config(args.config, dry_run=False)
+                quote_client = _LazyFutuQuote(config.futu_host, config.futu_port)
+                result = refresh_long_term_benchmark(
+                    data_dir=config.data_dir,
+                    market=args.market,
+                    quote=quote_client,
+                    now=datetime.now().astimezone(),
+                    process_git_sha=_process_version(config.repo),
+                    force=args.force,
+                    actor=args.actor,
+                    reason=args.reason,
+                )
+            except (FileNotFoundError, ValueError, RuntimeError, FutuQuoteError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            finally:
+                if quote_client is not None:
+                    quote_client.close()
+            print(json.dumps(result, ensure_ascii=False))
+            return 1 if result["status"] == "failed" else 0
         stats_clients: list[object] = []
         try:
             config = load_env_config(args.config, dry_run=False)

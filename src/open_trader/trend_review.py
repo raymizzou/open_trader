@@ -155,6 +155,72 @@ def long_term_benchmark_cycle_path(data_dir: Path, market: str, month: str) -> P
     )
 
 
+def _long_term_benchmark_attempt_path(data_dir: Path, market: str, month: str) -> Path:
+    return (
+        long_term_benchmark_cycle_path(data_dir, market, month)
+        .parent.parent
+        / "attempts"
+        / f"{month}.json"
+    )
+
+
+def _record_long_term_benchmark_failure(
+    data_dir: Path,
+    market: str,
+    month: str,
+    *,
+    now: datetime,
+    process_git_sha: str,
+    force: bool,
+    actor: str,
+    reason: str,
+    error: BaseException,
+) -> None:
+    cycle_path = long_term_benchmark_cycle_path(data_dir, market, month)
+    try:
+        existing = json.loads(cycle_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        existing = None
+    target = (
+        _long_term_benchmark_attempt_path(data_dir, market, month)
+        if isinstance(existing, Mapping)
+        and existing.get("schema_version")
+        == "open_trader.trend_review.long_term_benchmark.v1"
+        and existing.get("status") is None
+        else cycle_path
+    )
+    try:
+        previous = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        previous = {}
+    try:
+        attempt_count = int(
+            previous.get("attempt_count", 0)
+            if isinstance(previous, Mapping)
+            else 0
+        )
+    except (TypeError, ValueError):
+        attempt_count = 0
+    _write_json_atomic(
+        target,
+        {
+            "schema_version": "open_trader.trend_review.long_term_benchmark.attempt.v1",
+            "status": "failed",
+            "market": market,
+            "month": month,
+            "attempt_count": attempt_count + 1,
+            "attempted_at": now.isoformat(timespec="seconds"),
+            "process_git_sha": process_git_sha,
+            "reason": str(error),
+            "refresh": {
+                "force": force,
+                "actor": actor.strip() if force else None,
+                "reason": reason.strip() if force else None,
+            },
+        },
+    )
+
+
 def _years_before(value: date, years: int) -> date:
     try:
         return value.replace(year=value.year - years)
@@ -364,20 +430,33 @@ def _refresh_long_term_benchmark_locked(
                 expected_month=month,
             )
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
-            return {"status": "failed", "market": market, "month": month, "error": str(exc)}
-        try:
-            current_snapshot = read_long_term_benchmark_snapshot(data_dir, market)
-        except ValueError:
-            _write_json_atomic(snapshot_path, payload)
+            try:
+                previous = json.loads(cycle_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return {"status": "failed", "market": market, "month": month, "error": str(exc)}
+            if not (
+                isinstance(previous, Mapping)
+                and previous.get("schema_version")
+                == "open_trader.trend_review.long_term_benchmark.attempt.v1"
+                and previous.get("status") == "failed"
+                and previous.get("market") == market
+                and previous.get("month") == month
+            ):
+                return {"status": "failed", "market": market, "month": month, "error": str(exc)}
         else:
-            if _canonical_json_bytes(current_snapshot) != _canonical_json_bytes(payload):
+            try:
+                current_snapshot = read_long_term_benchmark_snapshot(data_dir, market)
+            except ValueError:
                 _write_json_atomic(snapshot_path, payload)
-        return {
-            "status": "already_completed",
-            "market": market,
-            "month": month,
-            "cutoff": payload["cutoff"],
-        }
+            else:
+                if _canonical_json_bytes(current_snapshot) != _canonical_json_bytes(payload):
+                    _write_json_atomic(snapshot_path, payload)
+            return {
+                "status": "already_completed",
+                "market": market,
+                "month": month,
+                "cutoff": payload["cutoff"],
+            }
     try:
         as_of = market_now.date()
         bars = quote.get_daily_kline(
@@ -419,6 +498,17 @@ def _refresh_long_term_benchmark_locked(
         }
         _validate_long_term_benchmark_snapshot(payload, market, rates=rates)
     except Exception as exc:
+        _record_long_term_benchmark_failure(
+            data_dir,
+            market,
+            month,
+            now=now,
+            process_git_sha=process_git_sha,
+            force=force,
+            actor=actor,
+            reason=reason,
+            error=exc,
+        )
         return {"status": "failed", "market": market, "month": month, "error": str(exc)}
     _write_json_atomic(snapshot_path, payload)
     _write_json_atomic(cycle_path, payload)
