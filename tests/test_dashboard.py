@@ -1364,6 +1364,10 @@ def test_dashboard_accepts_current_snapshot_after_historical_interval_start(
             "tiger",
         ),
         (
+            lambda payload: payload["benchmark_context"]["windows"]["1Y"].update(start="2027-01-01"),
+            "tiger",
+        ),
+        (
             lambda payload: payload["benchmark_refresh"].update(status="stale"),
             "tiger",
         ),

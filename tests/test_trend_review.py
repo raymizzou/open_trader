@@ -10307,6 +10307,63 @@ def test_projection_v4_uses_one_benchmark_identity_for_all_windows(
     )
 
 
+def test_projection_retains_simulation_metrics_without_benchmark_facts(
+    tmp_path: Path,
+) -> None:
+    write_projection_metric_history(
+        tmp_path, "CN", discipline_days=4, actual_days=0, benchmark_days=4
+    )
+    for path in (tmp_path / "trend_review/facts/benchmark/CN").glob("*.json"):
+        path.unlink()
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["metrics"]["period_net_return"]["discipline"]["value"] is not None
+    assert projection["metrics"]["period_net_return"]["same_period_benchmark"] == {
+        "value": None,
+        "reason": "长期市场基准缺失",
+    }
+
+
+def test_projection_ignores_legacy_daily_benchmark_close_with_approved_snapshot(
+    tmp_path: Path,
+) -> None:
+    write_projection_metric_history(
+        tmp_path, "CN", discipline_days=2, actual_days=0, benchmark_days=2
+    )
+    legacy_path = tmp_path / "trend_review/daily/CN/2026-07-16.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_review.daily.v1",
+            "market": "CN",
+            "date": "2026-07-16",
+            "discipline_equity_after_fees": "100000",
+            "strategy_snapshot": strategy_snapshot("CN"),
+            "orders": [],
+            "benchmark": {
+                "date": "2026-07-16",
+                "close": "10.0",
+                "source_id": "CSI_ALL_SHARE_PRICE",
+                "futu_symbol": "SH.000985",
+            },
+        }),
+        encoding="utf-8",
+    )
+    write_rates(tmp_path)
+    trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "CN",
+        FiveYearQuote(symbol="SH.000905"),
+        now=datetime(2026, 8, 9, tzinfo=UTC),
+        process_git_sha="abc123",
+    )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["metrics"]["period_net_return"]["same_period_benchmark"]["value"] == "0.100"
+
+
 def test_projection_does_not_annualize_ratios_before_one_full_year(
     tmp_path: Path,
 ) -> None:

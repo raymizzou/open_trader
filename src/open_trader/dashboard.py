@@ -609,6 +609,8 @@ def _valid_trend_review_benchmark_metadata(
             not isinstance(window, dict)
             or set(window) != {"start", "cutoff", "observation_count", "return_basis"}
             or not _valid_iso_date(window["start"])
+            or not _valid_iso_date(window["cutoff"])
+            or window["start"] > window["cutoff"]
             or window["cutoff"] != refresh["cutoff"]
             or type(window["observation_count"]) is not int
             or window["observation_count"] < 2

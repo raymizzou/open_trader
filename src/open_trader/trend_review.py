@@ -7540,6 +7540,19 @@ def _series_cutoff(
     return cutoff
 
 
+def _equity_cutoff(
+    effective_from: str, fact_dates: set[str], equity_dates: set[str]
+) -> str | None:
+    if effective_from not in fact_dates or effective_from not in equity_dates:
+        return None
+    cutoff: str | None = None
+    for trading_date in sorted(day for day in fact_dates if day >= effective_from):
+        if trading_date not in equity_dates:
+            break
+        cutoff = trading_date
+    return cutoff
+
+
 def _common_cutoff(
     effective_from: str,
     discipline_dates: set[str],
@@ -7854,14 +7867,7 @@ def build_trend_review_projection(
         for fact in legacy
         if "actual_equity" in fact
     }
-    benchmark_by_date = {
-        str(fact["date"]): dict(fact["benchmark"])
-        for fact in legacy
-        if (
-            fact["benchmark"].get("source_id") == BENCHMARK_SOURCE_IDS[market]
-            and fact["benchmark"].get("futu_symbol") == BENCHMARK_FUTU_SYMBOLS[market]
-        )
-    }
+    benchmark_by_date: dict[str, dict[str, object]] = {}
     for fact in _load_dated_fact_stream(
         data_dir,
         "discipline",
@@ -7897,7 +7903,6 @@ def build_trend_review_projection(
             fact.get("benchmark"), market=market, trading_date=str(fact["date"])
         )
         benchmark_by_date[str(fact["date"])] = dict(benchmark)
-    current_benchmark_dates = set(benchmark_by_date)
     long_term_snapshot: dict[str, object] | None = None
     try:
         long_term_snapshot = read_long_term_benchmark_snapshot(data_dir, market)
@@ -8083,10 +8088,10 @@ def build_trend_review_projection(
         for trading_date, fact in discipline_by_date.items()
         if "discipline_equity_after_fees" in fact
     }
-    discipline_metric_cutoff = _series_cutoff(
+    discipline_metric_cutoff = _equity_cutoff(
         effective_from,
+        set(discipline_by_date),
         discipline_dates,
-        benchmark_dates if long_term_snapshot is not None else current_benchmark_dates,
     )
     actual_metric_cutoff = None
     if market == "US":
@@ -8096,10 +8101,10 @@ def build_trend_review_projection(
             for trading_date, fact in actual_by_date.items()
             if "actual_equity" in fact
         }
-        equity_cutoff = _series_cutoff(
+        equity_cutoff = _equity_cutoff(
             effective_from,
+            set(actual_by_date),
             actual_dates,
-            benchmark_dates if long_term_snapshot is not None else current_benchmark_dates,
         )
         if equity_cutoff is not None:
             for trading_date in sorted(
