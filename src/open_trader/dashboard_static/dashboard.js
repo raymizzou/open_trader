@@ -3953,9 +3953,12 @@ const TREND_REVIEW_METRICS = [
   {key:"sharpe", label:"夏普比率", percent:false},
 ];
 
-const TREND_REVIEW_COMPARISONS = [
-  {key:"discipline", title:"纪律模拟与市场", label:"纪律模拟"},
-  {key:"actual", title:"实际执行与市场", label:"实际执行"},
+const TREND_REVIEW_SERIES = [
+  {key:"discipline", label:"纪律模拟", shape:"solid-circle"},
+  {key:"actual", label:"实际执行", shape:"hollow-circle"},
+  {key:"same_period_benchmark", label:"同期市场", shape:"diamond"},
+  {key:"market_1y", label:"市场 1 年", shape:"square"},
+  {key:"market_5y", label:"市场 5 年", shape:"ring"},
 ];
 
 function formatTrendReviewValue(cell, percent) {
@@ -3965,45 +3968,92 @@ function formatTrendReviewValue(cell, percent) {
   return percent ? `${formatted}%` : formatted;
 }
 
-function renderTrendReviewMetric(review, metric, seriesDefinitions) {
-  const values = seriesDefinitions.map((series) => numericValue(review.metrics?.[metric.key]?.[series.key]?.value));
-  const maximum = Math.max(...values.filter((value) => value !== null).map(Math.abs), 0);
-  const rows = seriesDefinitions.map((series, index) => {
-    const cell = review.metrics?.[metric.key]?.[series.key] || {};
-    const value = values[index];
-    const width = value === null || maximum === 0 ? 0 : Math.round(Math.abs(value) / maximum * 50);
-    const direction = value !== null && value < 0 ? " negative" : " positive";
-    const unavailable = value === null ? " unavailable" : "";
-    return `<div class="trend-review-series${unavailable}" data-series="${series.dataKey || series.key}">
-      <span>${escapeHtml(series.label)}</span>
-      <span class="trend-review-track" aria-hidden="true"><i class="trend-review-bar ${series.dataKey || series.key}${direction}" style="--trend-review-width:${width}%"></i></span>
-      <strong>${escapeHtml(formatTrendReviewValue(cell, metric.percent))}</strong>
-    </div>`;
-  }).join("");
-  return `<section class="trend-review-metric"><h3>${escapeHtml(metric.label)}</h3>${rows}</section>`;
+function trendReviewWindow(review, series, metric) {
+  const context = review.benchmark_context || {};
+  if (series.key === "discipline" || series.key === "actual") {
+    const cutoff = review.metric_cutoffs?.[series.key];
+    return cutoff ? `同期 · 截至 ${formatPlain(cutoff)}` : "同期";
+  }
+  if (series.key === "same_period_benchmark") {
+    const dates = Array.isArray(context.same_period_dates) ? context.same_period_dates : [];
+    return dates.length ? `同期 · ${formatPlain(dates[0])} 至 ${formatPlain(dates[dates.length - 1])}` : "同期";
+  }
+  const windowKey = series.key === "market_1y" ? "1Y" : "5Y";
+  const window = context.windows?.[windowKey] || {};
+  const basis = windowKey === "5Y" && metric.key === "period_net_return" ? " · CAGR" : "";
+  return `${windowKey === "1Y" ? "1 年" : "5 年"}${window.start && window.cutoff ? ` · ${formatPlain(window.start)} 至 ${formatPlain(window.cutoff)}` : ""}${basis}`;
 }
 
-function renderTrendReviewComparison(review, comparison) {
-  const detail = review.sample_details?.[comparison.key];
-  const sampleCutoff = review.sample_cutoffs?.[comparison.key];
-  const metricCutoff = review.metric_cutoffs?.[comparison.key];
+function renderTrendReviewMetric(review, metric) {
+  const values = TREND_REVIEW_SERIES.map((series) => numericValue(review.metrics?.[metric.key]?.[series.key]?.value));
+  const numeric = values.filter((value) => value !== null);
+  let minimum = Math.min(0, ...numeric);
+  let maximum = Math.max(0, ...numeric);
+  if (minimum === maximum) {
+    minimum = -1;
+    maximum = 1;
+  }
+  const range = maximum - minimum;
+  const zeroPosition = Math.round((0 - minimum) / range * 10000) / 100;
+  const points = TREND_REVIEW_SERIES.map((series, index) => {
+    const value = values[index];
+    if (value === null) return "";
+    const cell = review.metrics?.[metric.key]?.[series.key] || {};
+    const display = formatTrendReviewValue(cell, metric.percent);
+    const window = trendReviewWindow(review, series, metric);
+    const position = Math.round((value - minimum) / range * 10000) / 100;
+    return `<i class="trend-review-point trend-review-shape-${series.shape}" data-series="${series.key}" data-value="${value}" style="--trend-review-position:${position}%" aria-label="${escapeHtml(`${series.label}，${metric.label}，${display}，${window}`)}"></i>`;
+  }).join("");
+  const rows = TREND_REVIEW_SERIES.map((series) => {
+    const cell = review.metrics?.[metric.key]?.[series.key] || {};
+    const value = numericValue(cell.value);
+    const display = formatTrendReviewValue(cell, metric.percent);
+    const window = trendReviewWindow(review, series, metric);
+    return `<li class="trend-review-series${value === null ? " unavailable" : ""}" data-series="${series.key}" aria-label="${escapeHtml(`${series.label}，${metric.label}，${display}，${window}`)}">
+      <span><i class="trend-review-marker trend-review-shape-${series.shape}" aria-hidden="true"></i>${escapeHtml(series.label)}</span>
+      <span class="trend-review-window">${escapeHtml(window)}</span>
+      <strong>${escapeHtml(display)}</strong>
+    </li>`;
+  }).join("");
+  return `<section class="trend-review-metric" data-domain-min="${minimum}" data-domain-max="${maximum}" style="--trend-review-zero:${zeroPosition}%">
+    <h3>${escapeHtml(metric.label)}</h3>
+    <div class="trend-review-axis" role="img" aria-label="${escapeHtml(`${metric.label}共享数值标尺`)}">${points}</div>
+    <div class="trend-review-domain" aria-hidden="true"><span>${escapeHtml(formatTrendReviewValue({value:minimum}, metric.percent))}</span><span>${escapeHtml(formatTrendReviewValue({value:maximum}, metric.percent))}</span></div>
+    <ul class="trend-review-values">${rows}</ul>
+  </section>`;
+}
+
+function renderTrendReviewStatisticsMeta(review, key, label) {
+  const detail = review.sample_details?.[key];
+  const sampleCutoff = review.sample_cutoffs?.[key];
+  const metricCutoff = review.metric_cutoffs?.[key];
   const disposition = detail?.available === true
     ? `<span>发现 ${detail.discovered_candidate_count} · 排除 ${detail.excluded_candidate_count} · 未闭环 ${detail.incomplete_open_candidate_count}</span>`
     : "<span>统计来源不可用</span>";
   const exclusions = Array.isArray(detail?.exclusion_reasons) && detail.exclusion_reasons.length
     ? `<span>排除原因 ${detail.exclusion_reasons.map((item) => `${TREND_REASON_LABELS[item.reason] || "其他原因"} ${item.count}`).join("、")}</span>`
     : "";
-  const seriesDefinitions = [
-    {key:comparison.key, label:comparison.label},
-    {key:`${comparison.key}_benchmark`, dataKey:"benchmark", label:"同期市场"},
-  ];
-  return `<figure class="trend-review-comparison" data-series="${comparison.key}"><figcaption>${escapeHtml(comparison.title)}</figcaption>
-    <div class="trend-entry-details trend-review-comparison-meta">
+  return `<div class="trend-review-statistics" data-series="${key}"><strong>${escapeHtml(label)}</strong>
+    <div class="trend-entry-details">
       ${sampleCutoff ? `<span>统计截至 ${escapeHtml(formatPlain(sampleCutoff))}</span>` : ""}
       ${metricCutoff ? `<span>指标截至 ${escapeHtml(formatPlain(metricCutoff))}</span>` : ""}
       ${disposition}${exclusions}
+    </div></div>`;
+}
+
+function renderTrendReviewMatrix(review) {
+  const refresh = review.benchmark_refresh || {};
+  return `<figure class="trend-review-matrix"><figcaption>策略与市场基准</figcaption>
+    <div class="trend-review-matrix-meta">
+      ${refresh.cutoff ? `<span>市场数据截至 ${escapeHtml(formatPlain(refresh.cutoff))}</span>` : ""}
+      ${refresh.completed_at ? `<span>快照更新 ${escapeHtml(formatPlain(refresh.completed_at))}</span>` : ""}
+      <span>5 年收益 CAGR</span>
     </div>
-    ${TREND_REVIEW_METRICS.map((metric) => renderTrendReviewMetric(review, metric, seriesDefinitions)).join("")}
+    <div class="trend-review-statistics-grid">
+      ${renderTrendReviewStatisticsMeta(review, "discipline", "纪律模拟")}
+      ${renderTrendReviewStatisticsMeta(review, "actual", "实际执行")}
+    </div>
+    ${TREND_REVIEW_METRICS.map((metric) => renderTrendReviewMetric(review, metric)).join("")}
   </figure>`;
 }
 
@@ -4043,9 +4093,7 @@ function renderTrendReviewWorkspace(review, embedded = false) {
         ${statisticsStatus}
       </div>
     </header>
-    <div class="trend-review-comparisons">
-      ${TREND_REVIEW_COMPARISONS.map((comparison) => renderTrendReviewComparison(review, comparison)).join("")}
-    </div>
+    ${renderTrendReviewMatrix(review)}
   </${root}>`;
 }
 

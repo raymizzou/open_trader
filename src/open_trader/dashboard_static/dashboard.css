@@ -1438,7 +1438,7 @@ table {
 
 .trend-review-header h1,
 .trend-review-header p,
-.trend-review-comparison,
+.trend-review-matrix,
 .trend-review-metric h3 {
   margin: 0;
 }
@@ -1455,9 +1455,10 @@ table {
 
 .trend-review-header > div:first-child > *,
 .trend-review-header-side > *,
-.trend-review-comparison figcaption,
+.trend-review-matrix figcaption,
 .trend-review-metric h3,
 .trend-review-series > span:first-child,
+.trend-review-series .trend-review-window,
 .trend-review-series strong {
   min-width: 0;
   overflow-wrap: anywhere;
@@ -1474,18 +1475,12 @@ table {
   margin: 4px 0;
 }
 
-.trend-review-comparison figcaption {
+.trend-review-matrix figcaption {
   font-size: 17px;
   font-weight: 700;
 }
 
-.trend-review-comparisons {
-  display: grid;
-  gap: 12px;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.trend-review-comparison {
+.trend-review-matrix {
   background: var(--surface-soft);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -1497,9 +1492,33 @@ table {
   padding: 16px;
 }
 
+.trend-review-matrix-meta,
+.trend-review-statistics-grid {
+  display: grid;
+  gap: 6px 12px;
+}
+
+.trend-review-matrix-meta {
+  color: var(--muted);
+  font-size: 12px;
+  grid-template-columns: repeat(3, minmax(0, auto));
+  justify-content: start;
+}
+
+.trend-review-statistics-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.trend-review-statistics {
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 5px;
+  padding-top: 10px;
+}
+
 .trend-review-metric {
   display: grid;
-  gap: 7px;
+  gap: 8px;
 }
 
 .trend-review-metric + .trend-review-metric {
@@ -1511,21 +1530,73 @@ table {
   font-size: 14px;
 }
 
-.trend-review-series {
-  align-items: center;
+.trend-review-axis {
+  background: var(--line);
+  height: 2px;
+  margin: 12px 7px 0;
+  position: relative;
+}
+
+.trend-review-axis::after {
+  background: var(--muted);
+  content: "";
+  height: 10px;
+  left: var(--trend-review-zero);
+  position: absolute;
+  top: -4px;
+  width: 1px;
+}
+
+.trend-review-point {
+  left: var(--trend-review-position);
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.trend-review-domain {
+  color: var(--muted);
+  display: flex;
+  font-size: 11px;
+  justify-content: space-between;
+}
+
+.trend-review-values {
   display: grid;
-  gap: 8px;
-  grid-template-columns: 64px minmax(80px, 1fr) minmax(56px, auto);
+  gap: 7px 12px;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  list-style: none;
+  margin: 2px 0 0;
+  padding: 0;
+}
+
+.trend-review-series {
+  display: grid;
+  gap: 3px;
   min-width: 0;
 }
 
-.trend-review-series strong {
-  text-align: right;
+.trend-review-series > span:first-child {
+  align-items: center;
+  display: flex;
+  gap: 6px;
 }
 
-.trend-review-series[data-series="discipline"] > span:first-child { color: var(--accent); }
+.trend-review-series .trend-review-window {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.trend-review-series strong {
+  font-size: 14px;
+}
+
+.trend-review-series[data-series="discipline"] > span:first-child,
 .trend-review-series[data-series="actual"] > span:first-child { color: var(--accent); }
-.trend-review-series[data-series="benchmark"] > span:first-child { color: var(--primary); }
+.trend-review-series[data-series="same_period_benchmark"] > span:first-child,
+.trend-review-series[data-series="market_1y"] > span:first-child,
+.trend-review-series[data-series="market_5y"] > span:first-child { color: var(--primary); }
 
 .trend-review-series.unavailable strong {
   color: var(--muted);
@@ -1534,33 +1605,35 @@ table {
   overflow-wrap: anywhere;
 }
 
-.trend-review-track {
-  background: var(--line);
-  border-radius: 3px;
+.trend-review-marker,
+.trend-review-point {
+  background-color: var(--surface-soft);
+  border: 2px solid var(--primary);
+  display: inline-block;
+  flex: 0 0 auto;
   height: 10px;
-  position: relative;
+  width: 10px;
 }
 
-.trend-review-track::after {
-  background: var(--line);
-  content: "";
-  inset: 0 auto 0 50%;
-  position: absolute;
-  width: 1px;
+.trend-review-shape-solid-circle {
+  background: var(--accent);
+  border-color: var(--accent);
+  border-radius: 50%;
 }
 
-.trend-review-bar {
-  background: currentColor;
-  height: 100%;
-  position: absolute;
-  width: var(--trend-review-width);
+.trend-review-shape-hollow-circle {
+  border-color: var(--accent);
+  border-radius: 50%;
 }
 
-.trend-review-bar.positive { left: 50%; }
-.trend-review-bar.negative { right: 50%; }
-.trend-review-bar.discipline { color: var(--accent); }
-.trend-review-bar.actual { color: var(--accent); }
-.trend-review-bar.benchmark { color: var(--primary); }
+.trend-review-shape-diamond { transform: rotate(45deg); }
+.trend-review-point.trend-review-shape-diamond { transform: translate(-50%, -50%) rotate(45deg); }
+.trend-review-shape-square { background: var(--primary); }
+.trend-review-shape-ring {
+  border-radius: 50%;
+  height: 12px;
+  width: 12px;
+}
 
 .trend-report-entry span {
   color: var(--muted);
@@ -5034,7 +5107,7 @@ tbody tr.active-row,
 .trend-option-dialog-category,
 .trend-audit-summary span,
 .trend-audit-reason-counts span,
-.trend-review-comparison,
+.trend-review-matrix,
 .trend-report-facts span,
 .trend-allocation-panel > header span,
 .trend-allocation-card,
@@ -5171,8 +5244,22 @@ table {
   }
 
   .trend-review-header,
-  .trend-review-comparisons {
+  .trend-review-statistics-grid,
+  .trend-review-matrix-meta {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-review-values {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-review-series {
+    align-items: start;
+    grid-template-columns: minmax(92px, auto) minmax(0, 1fr) minmax(64px, auto);
+  }
+
+  .trend-review-series strong {
+    text-align: right;
   }
 
   .trend-review-header-side {

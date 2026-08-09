@@ -8527,12 +8527,20 @@ const review=(broker,brokerLabel,market,marketLabel)=>({
       {group:"退出保护",name:"初始保护线",value:"成交均价减 2.0 倍 ATR14"},
     ]},
   metrics:{
-    period_net_return:{discipline:{value:"12.6",reason:null},actual:{value:"9.4",reason:null},discipline_benchmark:{value:"7.8",reason:null},actual_benchmark:{value:"7.8",reason:null}},
-    market_excess_return:{discipline:{value:"4.8",reason:null},actual:{value:"1.6",reason:null},discipline_benchmark:{value:"0",reason:null},actual_benchmark:{value:"0",reason:null}},
-    max_drawdown:{discipline:{value:"-8.9",reason:null},actual:{value:"-10.2",reason:null},discipline_benchmark:{value:"-12.2",reason:null},actual_benchmark:{value:"-12.2",reason:null}},
-    calmar:{discipline:{value:"1.42",reason:null},actual:{value:"0.92",reason:null},discipline_benchmark:{value:"0.64",reason:null},actual_benchmark:{value:"0.64",reason:null}},
-    sharpe:{discipline:{value:"1.07",reason:null},actual:{value:null,reason:"实际执行日终净值缺失"},discipline_benchmark:{value:"0.58",reason:null},actual_benchmark:{value:"0.58",reason:null}},
+    period_net_return:{discipline:{value:"12.6",reason:null},actual:{value:"9.4",reason:null},same_period_benchmark:{value:"7.8",reason:null},market_1y:{value:"18.2",reason:null},market_5y:{value:"11.4",reason:null}},
+    market_excess_return:{discipline:{value:"4.8",reason:null},actual:{value:"1.6",reason:null},same_period_benchmark:{value:null,reason:"基准自身"},market_1y:{value:null,reason:"基准自身"},market_5y:{value:null,reason:"基准自身"}},
+    max_drawdown:{discipline:{value:"-8.9",reason:null},actual:{value:"-10.2",reason:null},same_period_benchmark:{value:"-12.2",reason:null},market_1y:{value:"-16.3",reason:null},market_5y:{value:"-33.7",reason:null}},
+    calmar:{discipline:{value:null,reason:"观察期不足"},actual:{value:null,reason:"观察期不足"},same_period_benchmark:{value:null,reason:"观察期不足"},market_1y:{value:"1.12",reason:null},market_5y:{value:"0.34",reason:null}},
+    sharpe:{discipline:{value:null,reason:"观察期不足"},actual:{value:null,reason:"实际执行日终净值缺失"},same_period_benchmark:{value:null,reason:"观察期不足"},market_1y:{value:"0.82",reason:null},market_5y:{value:"0.61",reason:null}},
   },
+  benchmark_context:{name:market==="CN"?"中证 500":market==="HK"?"恒生指数":"S&P 500 ETF",
+    source_id:market==="CN"?"CSI_500_PRICE":market==="HK"?"HSI_PRICE":"SPY_QFQ",
+    futu_symbol:market==="CN"?"SH.000905":market==="HK"?"HK.800000":"US.SPY",
+    same_period_dates:["2026-07-16","2026-07-17"],windows:{
+      "1Y":{start:"2025-07-17",cutoff:"2026-07-17",observation_count:252,return_basis:"period_return"},
+      "5Y":{start:"2021-07-17",cutoff:"2026-07-17",observation_count:1256,return_basis:"CAGR"},
+    }},
+  benchmark_refresh:{status:"available",month:"2026-07",completed_at:"2026-07-18T08:00:00+08:00",process_git_sha:"abc1234",cutoff:"2026-07-17",refresh:{force:false,actor:null,reason:null}},
 });
 state.dashboard={trend_reports:{
   futu:{available:true,report_date:"2026-07-17",data_date:"2026-07-16"},
@@ -8559,9 +8567,9 @@ if (renderAccountSection(group("futu")).includes("复盘")) throw new Error("fut
 const html=renderTrendReviewWorkspace(state.dashboard.trend_reviews.eastmoney);
 for (const text of ["东方财富｜A股","A股趋势复盘","A股短线右侧趋势","第 1 版",
   "纪律模拟 31 笔","实际执行 29 / 30，数据不足","共同截止日 2026-07-17",
-  "纪律模拟与市场","实际执行与市场","期间净收益率","相对市场超额收益","最大回撤",
-  "卡玛比率","夏普比率","同期市场",
-  "12.6%","1.42","实际执行日终净值缺失"]) {
+  "策略与市场基准","期间净收益率","相对市场超额收益","最大回撤",
+  "卡玛比率","夏普比率","纪律模拟","实际执行","同期市场","市场 1 年","市场 5 年",
+  "市场数据截至 2026-07-17","5 年收益 CAGR","12.6%","18.2%","观察期不足","基准自身","实际执行日终净值缺失"]) {
   if (!html.includes(text)) throw new Error(text+"\n"+html);
 }
 for (const forbidden of [
@@ -8576,13 +8584,17 @@ if ((html.match(/class="trend-review-header-side"/g)||[]).length!==1) throw new 
 const side=html.match(/<div class="trend-review-header-side">([\s\S]*?)<\/div>/)?.[1]||"";
 const sideOrder=["data-close-trend-report","纪律模拟 31 笔","实际执行 29 / 30，数据不足","共同截止日 2026-07-17"];
 if (sideOrder.some((text,index)=>!side.includes(text)||(index&&side.indexOf(text)<=side.indexOf(sideOrder[index-1])))) throw new Error(side);
-const panels=html.match(/<figure class="trend-review-comparison"[\s\S]*?<\/figure>/g)||[];
-if (panels.length!==2) throw new Error(html);
-for (const panel of panels) {
-  if ((panel.match(/class="trend-review-metric"/g)||[]).length!==5) throw new Error(panel);
-  if ((panel.match(/class="trend-review-series/g)||[]).length!==10) throw new Error(panel);
-  if ((panel.match(/>同期市场</g)||[]).length!==5) throw new Error(panel);
+if ((html.match(/class="trend-review-matrix"/g)||[]).length!==1) throw new Error(html);
+if ((html.match(/class="trend-review-metric"/g)||[]).length!==5) throw new Error(html);
+if ((html.match(/class="trend-review-axis"/g)||[]).length!==5) throw new Error(html);
+if ((html.match(/class="trend-review-series/g)||[]).length!==25) throw new Error(html);
+for (const metric of html.match(/<section class="trend-review-metric"[\s\S]*?<\/section>/g)||[]) {
+  if ((metric.match(/class="trend-review-axis"/g)||[]).length!==1) throw new Error(metric);
+  if ((metric.match(/class="trend-review-series/g)||[]).length!==5) throw new Error(metric);
+  if (!/data-domain-min="-?[\d.]+" data-domain-max="-?[\d.]+"/.test(metric)) throw new Error(metric);
 }
+for (const shape of ["solid-circle","hollow-circle","diamond","square","ring"]) if (!html.includes(`trend-review-shape-${shape}`)) throw new Error(shape);
+if (!html.includes('aria-label="纪律模拟，期间净收益率，12.6%')) throw new Error(html);
 const noCutoff=renderTrendReviewWorkspace({...state.dashboard.trend_reviews.eastmoney,common_cutoff:null});
 if (noCutoff.includes("共同截止日")) throw new Error(noCutoff);
 for (const forbidden of ["复盘结论","运行状态","创建回测","导出参数","缺陷入口","Connected","Backtest","Sharpe","Calmar","Alpha","Beta","Sortino","胜率","盈亏比"]) {
@@ -8619,8 +8631,13 @@ const review={
     strategy_version:"v1",process_version:"abc1234",parameters:{},parameter_rows:[{group:"仓位",name:"上限",value:"10"}]},
   metrics:Object.fromEntries(TREND_REVIEW_METRICS.map(({key})=>[key,{
     discipline:{value:"12.6",reason:null},actual:{value:null,reason:"实际执行日终净值缺失"},
-    discipline_benchmark:{value:"7.8",reason:null},actual_benchmark:{value:"3.1",reason:null},
+    same_period_benchmark:{value:"7.8",reason:null},market_1y:{value:"8.2",reason:null},market_5y:{value:"6.1",reason:null},
   }])),
+  benchmark_context:{name:"中证 500",source_id:"CSI_500_PRICE",futu_symbol:"SH.000905",
+    same_period_dates:["2026-08-07","2026-08-08"],windows:{
+      "1Y":{start:"2025-08-08",cutoff:"2026-08-08",observation_count:252,return_basis:"period_return"},
+      "5Y":{start:"2021-08-08",cutoff:"2026-08-08",observation_count:1256,return_basis:"CAGR"}}},
+  benchmark_refresh:{status:"available",month:"2026-08",completed_at:"2026-08-09T08:00:00+08:00",process_git_sha:"abc1234",cutoff:"2026-08-08",refresh:{force:false,actor:null,reason:null}},
 };
 const html=renderTrendReviewWorkspace(review);
 for (const text of [
@@ -8630,10 +8647,8 @@ for (const text of [
   "统计刷新失败；报告继续使用上一个有效快照",
 ]) if (!html.includes(text)) throw new Error(text+"\n"+html);
 if (html.includes("共同截止日")) throw new Error(html);
-const panels=html.match(/<figure class="trend-review-comparison"[\s\S]*?<\/figure>/g)||[];
-if (panels.length!==2) throw new Error(html);
-if (!panels[0].includes("7.8%") || panels[0].includes("3.1%")) throw new Error(panels[0]);
-if (!panels[1].includes("3.1%") || panels[1].includes("7.8%")) throw new Error(panels[1]);
+if ((html.match(/class="trend-review-matrix"/g)||[]).length!==1) throw new Error(html);
+for (const value of ["7.8%","8.2%","6.1%"] ) if (!html.includes(value)) throw new Error(html);
 if ((html.match(/data-close-trend-report/g)||[]).length!==1) throw new Error(html);
 if (html.match(/<button/g).length!==1) throw new Error(html);
 const stale=renderTrendReviewWorkspace({...review,statistics_status:"stale"});

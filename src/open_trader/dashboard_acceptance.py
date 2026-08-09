@@ -152,10 +152,14 @@ TREND_REVIEW_METRIC_SPECS = (
     ("calmar", "卡玛比率", False),
     ("sharpe", "夏普比率", False),
 )
-TREND_REVIEW_COMPARISONS = (
-    ("discipline", "纪律模拟", "纪律模拟与市场"),
-    ("actual", "实际执行", "实际执行与市场"),
+TREND_REVIEW_SERIES = (
+    "discipline",
+    "actual",
+    "same_period_benchmark",
+    "market_1y",
+    "market_5y",
 )
+TREND_REVIEW_SERIES_LABELS = ("纪律模拟", "实际执行", "同期市场", "市场 1 年", "市场 5 年")
 TREND_REASON_LABELS = {
     "protection_line_already_triggered": "活动保护线已触发",
     "danger_signal": "危险信号触发",
@@ -4022,19 +4026,35 @@ def _check_trend_review_visual_contract(page: Any, broker: str) -> None:
           };
         };
         const workspace = document.querySelector("#trend-report-workspace");
-        const panels = [...workspace.querySelectorAll(".trend-review-comparison")];
+        const matrices = [...workspace.querySelectorAll(".trend-review-matrix")];
         const labels = [...workspace.querySelectorAll(
           ".trend-review-series > span:first-child"
         )];
+        const markers = [...workspace.querySelectorAll(".trend-review-marker")];
+        const channels = value => (value.match(/[\d.]+/g) || []).slice(0, 3).map(Number);
+        const luminance = value => {
+          const rgb = channels(value).map(channel => {
+            const normalized = channel / 255;
+            return normalized <= 0.03928 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
+          });
+          return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+        };
+        const contrast = (left, right) => {
+          const values = [luminance(left), luminance(right)].sort((a, b) => b - a);
+          return (values[0] + 0.05) / (values[1] + 0.05);
+        };
         const headerSpans = [...workspace.querySelectorAll(
           ".trend-review-header-side > span"
         )];
         return {
-          tokens, workspace: read(workspace), panels: panels.map(read),
+          tokens, workspace: read(workspace), matrices: matrices.map(read),
           side: read(workspace.querySelector(".trend-review-header-side")),
           button: read(workspace.querySelector(".trend-review-header-side button")),
           headerSpans: headerSpans.map(read),
           labels: labels.map(element => ({text: element.textContent.trim(), ...read(element)})),
+          markers: markers.map(read),
+          textContrast: contrast(tokens.text, tokens.surfaceSoft),
+          markerContrasts: markers.map(element => contrast(getComputedStyle(element).borderColor, tokens.surfaceSoft)),
         };
         }"""
     )
@@ -4052,9 +4072,9 @@ def _check_trend_review_visual_contract(page: Any, broker: str) -> None:
         "boxShadow": tokens["shadow"],
         "backgroundImage": "none",
     }, f"{broker} 趋势复盘工作区未使用暖色 token：{workspace}"
-    panels = styles.get("panels")
-    assert isinstance(panels, list) and len(panels) == 2, (
-        f"{broker} 趋势复盘 panel 样式数量不正确"
+    matrices = styles.get("matrices")
+    assert isinstance(matrices, list) and len(matrices) == 1, (
+        f"{broker} 趋势复盘统一矩阵样式数量不正确"
     )
     expected_panel = {
         "backgroundColor": tokens["surfaceSoft"],
@@ -4065,8 +4085,8 @@ def _check_trend_review_visual_contract(page: Any, broker: str) -> None:
         "boxShadow": "none",
         "backgroundImage": "none",
     }
-    assert all(panel == expected_panel for panel in panels), (
-        f"{broker} 趋势复盘 panel token、圆角或阴影漂移：{panels}"
+    assert matrices == [expected_panel], (
+        f"{broker} 趋势复盘矩阵 token、圆角或阴影漂移：{matrices}"
     )
     side = styles.get("side")
     assert isinstance(side, Mapping) and (
@@ -4112,14 +4132,24 @@ def _check_trend_review_visual_contract(page: Any, broker: str) -> None:
         }
 
     expected_labels = [
-        *([expected_label("纪律模拟", tokens["accent"]),
-           expected_label("同期市场", tokens["primary"])] * 5),
-        *([expected_label("实际执行", tokens["accent"]),
-           expected_label("同期市场", tokens["primary"])] * 5),
+        expected_label(label, tokens["accent"] if index < 2 else tokens["primary"])
+        for _metric in TREND_REVIEW_METRIC_SPECS
+        for index, label in enumerate(TREND_REVIEW_SERIES_LABELS)
     ]
     assert styles.get("labels") == expected_labels, (
         f"{broker} 趋势复盘 series 未同时使用文字与 token 颜色区分"
     )
+    markers = styles.get("markers")
+    assert isinstance(markers, list) and len(markers) == 25, (
+        f"{broker} 趋势复盘缺少五系列形状标记"
+    )
+    assert float(styles.get("textContrast", 0)) >= 4.5, (
+        f"{broker} 趋势复盘文字对比度低于 4.5:1"
+    )
+    marker_contrasts = styles.get("markerContrasts")
+    assert isinstance(marker_contrasts, list) and len(marker_contrasts) == 25 and all(
+        float(value) >= 3 for value in marker_contrasts
+    ), f"{broker} 趋势复盘图形标记对比度低于 3:1"
 
 
 def _check_trend_review_geometry(page: Any, broker: str) -> None:
@@ -4134,16 +4164,21 @@ def _check_trend_review_geometry(page: Any, broker: str) -> None:
         const textSelectors = [
           ".trend-review-header > div:first-child > *",
           ".trend-review-header-side > *",
-          ".trend-review-comparison figcaption",
+          ".trend-review-matrix figcaption",
           ".trend-review-metric h3",
           ".trend-review-series > span:first-child",
+          ".trend-review-series .trend-review-window",
           ".trend-review-series strong",
         ];
+        const matrix = workspace.querySelector(".trend-review-matrix");
         return {
           documentWidth: document.documentElement.scrollWidth,
           side: rect(side), sideItems: [...side.children].map(rect),
           button: rect(side.querySelector("button")),
-          panels: [...workspace.querySelectorAll(".trend-review-comparison")].map(rect),
+          matrix: rect(matrix),
+          axes: [...matrix.querySelectorAll(".trend-review-axis")].map(rect),
+          valueLists: [...matrix.querySelectorAll(".trend-review-values")].map(rect),
+          firstSeries: [...matrix.querySelector(".trend-review-metric").querySelectorAll(".trend-review-series")].map(rect),
           textGroups: textSelectors.map(selector => ({
             selector,
             layouts: [...workspace.querySelectorAll(selector)].map(element => {
@@ -4166,18 +4201,27 @@ def _check_trend_review_geometry(page: Any, broker: str) -> None:
     )
     assert isinstance(geometry, Mapping), f"{broker} 趋势复盘几何信息不可读"
     width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
-    panels = geometry.get("panels")
-    assert isinstance(panels, list) and len(panels) == 2, (
-        f"{broker} 趋势复盘 panel 几何数量不正确"
+    matrix = geometry.get("matrix")
+    assert isinstance(matrix, Mapping) and matrix["x"] >= -1 and (
+        matrix["x"] + matrix["width"] <= width + 1
+    ), f"{broker} 趋势复盘矩阵超出 {width}px 视口"
+    axes = geometry.get("axes")
+    value_lists = geometry.get("valueLists")
+    assert isinstance(axes, list) and len(axes) == 5 and all(
+        axis["width"] > 0 and axis["x"] >= matrix["x"] - 1
+        and axis["x"] + axis["width"] <= matrix["x"] + matrix["width"] + 1
+        for axis in axes
+    ), f"{broker} 趋势复盘每项指标未使用一条完整标尺"
+    assert isinstance(value_lists, list) and len(value_lists) == 5, (
+        f"{broker} 趋势复盘五项指标缺少直接数值列表"
     )
-    assert all(
-        panel["x"] >= -1 and panel["x"] + panel["width"] <= width + 1
-        for panel in panels
-    ), f"{broker} 趋势复盘 panel 超出 {width}px 视口"
+    first_series = geometry.get("firstSeries")
+    assert isinstance(first_series, list) and len(first_series) == 5
     if width == 1440:
-        assert abs(panels[0]["y"] - panels[1]["y"]) <= 1 and (
-            panels[1]["x"] >= panels[0]["x"] + panels[0]["width"]
-        ), f"{broker} 趋势复盘在 1440px 未并排显示"
+        assert all(abs(item["y"] - first_series[0]["y"]) <= 1 for item in first_series) and all(
+            later["x"] >= earlier["x"] + earlier["width"] - 1
+            for earlier, later in zip(first_series, first_series[1:])
+        ), f"{broker} 趋势复盘 1440px 五系列数值未单行对齐"
     if width != 375:
         return
     assert geometry.get("documentWidth") == 375, (
@@ -4194,16 +4238,18 @@ def _check_trend_review_geometry(page: Any, broker: str) -> None:
         later["y"] >= earlier["y"] + earlier["height"]
         for earlier, later in zip(side_items, side_items[1:])
     ), f"{broker} 趋势复盘 375px header side 未单列显示"
-    assert panels[1]["y"] >= panels[0]["y"] + panels[0]["height"], (
-        f"{broker} 趋势复盘 375px panel 未纵向显示"
-    )
+    assert all(
+        later["y"] >= earlier["y"] + earlier["height"] - 1
+        for earlier, later in zip(first_series, first_series[1:])
+    ), f"{broker} 趋势复盘 375px 五系列数值未纵向排列"
     expected_text_counts = {
         ".trend-review-header > div:first-child > *": 3,
         ".trend-review-header-side > *": 4,
-        ".trend-review-comparison figcaption": 2,
-        ".trend-review-metric h3": 10,
-        ".trend-review-series > span:first-child": 20,
-        ".trend-review-series strong": 20,
+        ".trend-review-matrix figcaption": 1,
+        ".trend-review-metric h3": 5,
+        ".trend-review-series > span:first-child": 25,
+        ".trend-review-series .trend-review-window": 25,
+        ".trend-review-series strong": 25,
     }
     text_groups = geometry.get("textGroups")
     assert isinstance(text_groups, list), f"{broker} 趋势复盘 375px 文本几何不可读"
@@ -4234,6 +4280,45 @@ def _check_trend_review_geometry(page: Any, broker: str) -> None:
     ), f"{broker} 趋势复盘 375px 长文本被截断或未换行"
 
 
+def _check_trend_review_domains(page: Any, broker: str) -> None:
+    rows = page.evaluate(
+        r"""() => { // trend-review-domain-contract
+        const workspace = document.querySelector("#trend-report-workspace");
+        return [...workspace.querySelectorAll(".trend-review-metric")].map(metric => {
+          const minimum = Number(metric.dataset.domainMin);
+          const maximum = Number(metric.dataset.domainMax);
+          return {
+            minimum, maximum,
+            axisCount: metric.querySelectorAll(".trend-review-axis").length,
+            points: [...metric.querySelectorAll(".trend-review-point")].map(point => ({
+              value: Number(point.dataset.value),
+              position: Number(getComputedStyle(point).getPropertyValue("--trend-review-position").replace("%", "")),
+            })),
+          };
+        });
+        }"""
+    )
+    assert isinstance(rows, list) and len(rows) == 5, (
+        f"{broker} 趋势复盘共享数值域不可读"
+    )
+    for row in rows:
+        assert isinstance(row, Mapping)
+        minimum = float(row.get("minimum", 1))
+        maximum = float(row.get("maximum", -1))
+        assert minimum <= 0 <= maximum and minimum < maximum, (
+            f"{broker} 趋势复盘数值域未包含零点"
+        )
+        assert row.get("axisCount") == 1, f"{broker} 趋势复盘指标标尺不唯一"
+        points = row.get("points")
+        assert isinstance(points, list)
+        for point in points:
+            assert isinstance(point, Mapping)
+            expected = (float(point["value"]) - minimum) / (maximum - minimum) * 100
+            assert abs(float(point["position"]) - expected) <= 0.02, (
+                f"{broker} 趋势复盘数值点未使用所在行的共享数值域"
+            )
+
+
 def _assert_no_trend_review_latin(
     texts: list[str],
     broker: str,
@@ -4241,12 +4326,15 @@ def _assert_no_trend_review_latin(
     *,
     allow_version: bool = False,
     allow_atr: bool = False,
+    allow_cagr: bool = False,
 ) -> None:
     for text in texts:
         inspected = re.sub(r"v\d+", "", text) if allow_version else text
         inspected = re.sub(r"A\s*股", "", inspected)
         if allow_atr:
             inspected = inspected.replace("ATR14", "")
+        if allow_cagr:
+            inspected = inspected.replace("CAGR", "")
         assert re.search(r"[A-Za-z]", inspected) is None, (
             f"{broker} 趋势复盘 {context} 包含拉丁界面词：{text}"
         )
@@ -4452,7 +4540,7 @@ def _check_trend_review(
     assert isinstance(details, Mapping), f"{broker} 趋势复盘样本明细无效"
     assert isinstance(sample_cutoffs, Mapping), f"{broker} 趋势复盘样本截止无效"
     assert isinstance(metric_cutoffs, Mapping), f"{broker} 趋势复盘指标截止无效"
-    for series, _label, _title in TREND_REVIEW_COMPARISONS:
+    for series, _label in (("discipline", "纪律模拟"), ("actual", "实际执行")):
         detail = details.get(series)
         if isinstance(detail, Mapping) and detail.get("available") is True:
             statistics_items.extend((
@@ -4483,8 +4571,9 @@ def _check_trend_review(
         _trend_review_strategy_version(snapshot.get("strategy_version")),
         *header_items,
         *statistics_items,
-        *(title for _series, _label, title in TREND_REVIEW_COMPARISONS),
-        "同期市场",
+        "策略与市场基准",
+        *TREND_REVIEW_SERIES_LABELS,
+        "5 年收益 CAGR",
     ):
         assert required in text, f"{broker} 趋势复盘缺少 {required}"
     assert workspace.locator(".trend-review-header-side").count() == 1, (
@@ -4500,45 +4589,59 @@ def _check_trend_review(
     assert workspace.locator(".trend-review-parameters").count() == 0, (
         f"{broker} 趋势复盘仍重复展示当前策略参数"
     )
-    assert workspace.locator(".trend-review-comparison").count() == 2, (
-        f"{broker} 趋势复盘比较 panel 数量不是 2"
+    refresh = review.get("benchmark_refresh")
+    assert isinstance(refresh, Mapping), f"{broker} 趋势复盘缺少基准刷新信息"
+    assert f"市场数据截至 {_plain(refresh.get('cutoff'))}" in text, (
+        f"{broker} 趋势复盘未显示基准截止日"
     )
-    comparison_titles = workspace.locator(
-        ".trend-review-comparison figcaption"
+    assert workspace.locator(".trend-review-matrix").count() == 1, (
+        f"{broker} 趋势复盘统一矩阵数量不是 1"
+    )
+    matrix_titles = workspace.locator(
+        ".trend-review-matrix figcaption"
     ).all_inner_texts()
-    assert comparison_titles == [
-        title for _series, _label, title in TREND_REVIEW_COMPARISONS
-    ], f"{broker} 趋势复盘比较 panel 顺序不正确"
+    assert matrix_titles == ["策略与市场基准"], (
+        f"{broker} 趋势复盘矩阵标题不正确"
+    )
     metric_labels = [label for _key, label, _percent in TREND_REVIEW_METRIC_SPECS]
-    benchmark_values: list[list[str]] = []
-    series_labels: list[str] = []
-    for series, label, _title in TREND_REVIEW_COMPARISONS:
-        panel = workspace.locator(
-            f'.trend-review-comparison[data-series="{series}"]'
+    metrics = workspace.locator(".trend-review-metric")
+    assert metrics.count() == 5, f"{broker} 复盘矩阵指标数量不是 5"
+    assert workspace.locator(".trend-review-metric h3").all_inner_texts() == metric_labels, (
+        f"{broker} 复盘矩阵指标不完整或顺序错误"
+    )
+    assert workspace.locator(".trend-review-axis").count() == 5, (
+        f"{broker} 复盘矩阵每项指标未共用一条标尺"
+    )
+    assert workspace.locator(".trend-review-series").count() == 25, (
+        f"{broker} 复盘矩阵 series 数量不是 25"
+    )
+    for index in range(metrics.count()):
+        metric = metrics.nth(index)
+        assert metric.locator(".trend-review-axis").count() == 1, (
+            f"{broker} 第 {index + 1} 个指标标尺数量不是 1"
         )
-        assert panel.count() == 1, f"{broker} 趋势复盘缺少 {label}比较 panel"
-        metrics = panel.locator(".trend-review-metric")
-        assert metrics.count() == 5, f"{broker} {label}比较 panel 指标数量不是 5"
-        assert panel.locator(
-            ".trend-review-metric h3"
-        ).all_inner_texts() == metric_labels, f"{broker} {label}指标不完整或顺序错误"
-        assert panel.locator(".trend-review-series").count() == 10, (
-            f"{broker} {label}比较 panel series 数量不是 10"
+        assert metric.locator(".trend-review-series").count() == 5, (
+            f"{broker} 第 {index + 1} 个指标 series 数量不是 5"
         )
-        for index in range(metrics.count()):
-            assert metrics.nth(index).locator(".trend-review-series").count() == 2, (
-                f"{broker} {label}第 {index + 1} 个指标 series 数量不是 2"
-            )
-        rendered_series_labels = panel.locator(
-            ".trend-review-series > span:first-child"
-        ).all_inner_texts()
-        assert rendered_series_labels == [
-            item for _metric in metric_labels for item in (label, "同期市场")
-        ], f"{broker} {label} series 文字标签不正确"
-        series_labels.extend(rendered_series_labels)
-        benchmark_values.append(panel.locator(
-            '.trend-review-series[data-series="benchmark"] strong'
-        ).all_inner_texts())
+    series_labels = workspace.locator(
+        ".trend-review-series > span:first-child"
+    ).all_inner_texts()
+    assert series_labels == list(TREND_REVIEW_SERIES_LABELS) * 5, (
+        f"{broker} 趋势复盘五系列文字标签不正确"
+    )
+    for series in TREND_REVIEW_SERIES:
+        assert workspace.locator(
+            f'.trend-review-series[data-series="{series}"]'
+        ).count() == 5, f"{broker} 趋势复盘 {series} 列不完整"
+    for series, shape in zip(
+        TREND_REVIEW_SERIES,
+        ("solid-circle", "hollow-circle", "diamond", "square", "ring"),
+        strict=True,
+    ):
+        assert workspace.locator(
+            f'.trend-review-series[data-series="{series}"] '
+            f'.trend-review-shape-{shape}'
+        ).count() == 5, f"{broker} 趋势复盘 {series} 形状标记不正确"
     metrics_payload = review.get("metrics")
     assert isinstance(metrics_payload, Mapping), f"{broker} 趋势复盘指标数据无效"
     metric_reasons = {
@@ -4551,26 +4654,26 @@ def _check_trend_review(
     }
     for reason in metric_reasons:
         assert reason in text, f"{broker} 趋势复盘缺少指标不可用原因 {reason}"
-    for index, (series, _label, _title) in enumerate(TREND_REVIEW_COMPARISONS):
-        expected_benchmark = [
-            _trend_review_display(
-                metrics_payload[key][f"{series}_benchmark"],
-                percent=percent,
-            )
-            for key, _label, percent in TREND_REVIEW_METRIC_SPECS
-        ]
-        assert benchmark_values[index] == expected_benchmark, (
-            f"{broker} {series} 市场基准未使用对应 API cell"
-        )
+    expected_values = [
+        _trend_review_display(metrics_payload[key][series], percent=percent)
+        for key, _label, percent in TREND_REVIEW_METRIC_SPECS
+        for series in TREND_REVIEW_SERIES
+    ]
     metric_values = workspace.locator(
         ".trend-review-series strong"
     ).all_inner_texts()
-    assert len(metric_values) == 20, f"{broker} 趋势复盘指标值数量不是 20"
     _assert_no_trend_review_latin(
-        [*header_items, *comparison_titles, *metric_labels,
+        metric_values, broker, "可见界面", allow_cagr=True
+    )
+    assert metric_values == expected_values, (
+        f"{broker} 趋势复盘直接数值与 API cells 不一致"
+    )
+    _assert_no_trend_review_latin(
+        [*header_items, *matrix_titles, *metric_labels,
          *series_labels, *metric_values],
         broker,
         "可见界面",
+        allow_cagr=True,
     )
     for forbidden in (
         "复盘结论", "运行状态", "回测", "导出", "缺陷", "Connected",
@@ -4585,6 +4688,7 @@ def _check_trend_review(
         "#trend-report-workspace:visible summary"
     )
     assert controls.count() == 1, f"{broker} 趋势复盘新增了交互控件"
+    _check_trend_review_domains(page, broker)
     _check_trend_review_visual_contract(page, broker)
     _check_trend_review_geometry(page, broker)
     width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
