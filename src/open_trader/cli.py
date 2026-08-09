@@ -144,6 +144,7 @@ from .trend_market_controller import (
 )
 from .trend_allocation import (
     allocation_reference_for_report,
+    load_allocation_reference,
     load_trend_allocation_status,
     run_trend_allocation_controller,
 )
@@ -1659,26 +1660,37 @@ def main(argv: list[str] | None = None) -> int:
             )
             if allocation_status_path.is_file():
                 allocation_status = load_trend_allocation_status(config, now=now)
-                if (
-                    allocation_status.get("attempted_for") == allocation_date
-                    and allocation_status.get("phase")
-                    in {"ready", "fallback", "holiday"}
-                ):
-                    allocation_day = date.fromisoformat(allocation_date)
-                    try:
-                        allocation_days = quote.get_trading_days(
-                            market="CN",
-                            start=(allocation_day - timedelta(days=35)).isoformat(),
-                            end=(allocation_day + timedelta(days=1)).isoformat(),
-                        )
-                    except (FutuQuoteError, OSError) as exc:
-                        allocation_calendar_error = str(exc) or exc.__class__.__name__
-                    else:
+                allocation_day = date.fromisoformat(allocation_date)
+                try:
+                    allocation_days = quote.get_trading_days(
+                        market="CN",
+                        start=(allocation_day - timedelta(days=35)).isoformat(),
+                        end=(allocation_day + timedelta(days=1)).isoformat(),
+                    )
+                except (FutuQuoteError, OSError) as exc:
+                    allocation_calendar_error = str(exc) or exc.__class__.__name__
+                else:
+                    if (
+                        allocation_status.get("attempted_for") == allocation_date
+                        and allocation_status.get("phase")
+                        in {"ready", "fallback", "holiday"}
+                    ):
                         allocation = allocation_reference_for_report(
                             config,
                             allocation_date=allocation_date,
                             a_trading_days=allocation_days,
                         )
+                    else:
+                        allocation = load_allocation_reference(
+                            config.data_dir,
+                            allocation_date=allocation_date,
+                            a_trading_days=allocation_days,
+                            status_failure_reason=None,
+                        )
+                        if allocation is not None and allocation.get(
+                            "stale_a_trading_days"
+                        ) != 0:
+                            allocation = None
             allocation_kwargs = (
                 {"allocation": allocation} if allocation is not None else {}
             )

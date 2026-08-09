@@ -1914,29 +1914,39 @@ def _check_frozen_trend_disciplines(
     assert context_section.count() == 1, f"{broker} 缺少行业上下文区"
     context_text = context_section.inner_text()
     context_rows = contexts if isinstance(contexts, list) else []
+    individual_global = (
+        isinstance(status, Mapping)
+        and status.get("ordering_mode") == "individual_global"
+    )
     if not context_rows and not has_rows:
         assert "当前行业上下文未提供，无法确认排序" in context_text, (
             f"{broker} 无行业上下文时缺少明确回退提示"
         )
     for context in context_rows:
         assert isinstance(context, Mapping), f"{broker} 行业上下文格式无效"
-        for key in ("industry", "temperature", "strength", "warm_to_hot_count"):
+        keys = (
+            ("industry", "temperature", "temperature_direction")
+            if individual_global
+            else ("industry", "temperature", "strength", "warm_to_hot_count")
+        )
+        for key in keys:
             value = context.get(key)
             if value is not None:
                 expected = _trend_context_display_value(key, value)
                 assert expected in context_text, (
                     f"{broker} 行业上下文缺少 {key}：{value}"
                 )
-        count_text = _trend_ratio_transition(
-            context.get("aggregate_right_count_ratio"),
-            context.get("prior_aggregate_right_count_ratio"),
-        )
-        market_cap_text = _trend_ratio_transition(
-            context.get("aggregate_right_market_cap_ratio"),
-            context.get("prior_aggregate_right_market_cap_ratio"),
-        )
-        assert count_text in context_text, f"{broker} 行业右侧个数占比未显示：{count_text}"
-        assert market_cap_text in context_text, f"{broker} 行业右侧市值占比未显示：{market_cap_text}"
+        if not individual_global:
+            count_text = _trend_ratio_transition(
+                context.get("aggregate_right_count_ratio"),
+                context.get("prior_aggregate_right_count_ratio"),
+            )
+            market_cap_text = _trend_ratio_transition(
+                context.get("aggregate_right_market_cap_ratio"),
+                context.get("prior_aggregate_right_market_cap_ratio"),
+            )
+            assert count_text in context_text, f"{broker} 行业右侧个数占比未显示：{count_text}"
+            assert market_cap_text in context_text, f"{broker} 行业右侧市值占比未显示：{market_cap_text}"
     if isinstance(status, Mapping) and (
         str(status.get("ordering_mode", "")).startswith("legacy")
         or status.get("current_complete") is False
@@ -3046,7 +3056,7 @@ def _check_trend_artifact_projection(
     }, f"{broker} 冻结报告计数与 API 投影不一致"
     signal_snapshots = payload.get("signal_snapshots")
     expected_candidates = judgments.get("top10_candidates", [])
-    if broker == "eastmoney" and isinstance(signal_snapshots, Mapping):
+    if isinstance(signal_snapshots, Mapping):
         expected_candidates = signal_snapshots.get("candidates", expected_candidates)
     assert audit.get("candidates") == expected_candidates, (
         f"{broker} 冻结报告候选榜与 API 投影不一致"

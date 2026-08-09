@@ -426,6 +426,87 @@ def test_trend_drawdown_preflight_uses_current_terminal_allocation(
     assert seen == [allocation, allocation, allocation]
 
 
+def test_trend_drawdown_preflight_reuses_latest_allocation_on_weekend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SimpleNamespace(
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        timezone="Asia/Shanghai",
+        trend_animals_a_share_tm_id=622466,
+        trend_animals_etf_tm_id=697199,
+        trend_animals_us_tm_ids=(622460,),
+        trend_animals_hk_tm_ids=(622494,),
+    )
+    status = config.data_dir / "trend_allocation/controller_status.json"
+    status.parent.mkdir(parents=True)
+    status.write_text("{}", encoding="utf-8")
+    allocation = {
+        "daily_path": "data/trend_allocation/daily/2026-08-07.json",
+        "sha256": "a" * 64,
+        "snapshot": {"allocation_date": "2026-08-07", "markets": {}},
+        "reused": True,
+        "stale_a_trading_days": 0,
+        "failure_reason": None,
+    }
+    seen: list[object] = []
+
+    class Quote:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_trading_days(self, **_: object) -> list[str]:
+            return ["2026-08-07", "2026-08-10"]
+
+        def close(self) -> None:
+            pass
+
+    def strategy_snapshot(
+        market: str,
+        process_version: str,
+        pool_ids: tuple[int, ...],
+        **kwargs: object,
+    ) -> dict[str, object]:
+        seen.append(kwargs.get("allocation"))
+        return {
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/current",
+            "strategy_version": "current",
+            "parameters": {"market": market},
+        }
+
+    monkeypatch.setattr(cli, "load_env_config", lambda path, dry_run: config)
+    monkeypatch.setattr(cli, "FutuQuoteClient", Quote)
+    monkeypatch.setattr(cli, "_process_version", lambda repo: "sha")
+    monkeypatch.setattr(
+        cli,
+        "_drawdown_preflight_now",
+        lambda: datetime.fromisoformat("2026-08-09T16:08:00+08:00"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_trend_allocation_status",
+        lambda config, now: {"phase": "waiting", "attempted_for": None},
+    )
+    monkeypatch.setattr(
+        cli, "load_allocation_reference", lambda *args, **kwargs: allocation,
+        raising=False,
+    )
+    monkeypatch.setattr(cli, "live_trend_strategy_snapshot", strategy_snapshot)
+    monkeypatch.setattr(
+        cli, "run_drawdown_preflight", lambda **kwargs: {"status": "ready"},
+    )
+
+    assert cli.main([
+        "trend-drawdown-preflight",
+        "--config", str(tmp_path / "daily.env"),
+        "--repo", str(tmp_path),
+        "--actor", "acceptance",
+    ]) == 0
+    assert seen == [allocation, allocation, allocation]
+
+
 def test_trend_drawdown_preflight_skips_missing_frozen_baseline_without_live_nav(
     tmp_path: Path, capsys, monkeypatch,
 ) -> None:

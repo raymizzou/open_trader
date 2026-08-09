@@ -1275,11 +1275,19 @@ def test_acceptance_rejects_unsafe_trend_artifact_name(tmp_path: Path) -> None:
         )
 
 
-def test_acceptance_checks_complete_cn_signal_candidate_projection(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("broker", "market", "directory"),
+    [
+        ("eastmoney", "CN", "trend_a_share"),
+        ("phillips", "HK", "trend_hk_phillips"),
+        ("tiger", "US", "trend_us_tiger"),
+    ],
+)
+def test_acceptance_checks_complete_signal_candidate_projection(
+    tmp_path: Path, broker: str, market: str, directory: str,
 ) -> None:
     reports = tmp_path / "reports"
-    artifact = reports / "trend_a_share" / "2026-07-15.json"
+    artifact = reports / directory / "2026-07-15.json"
     artifact.parent.mkdir(parents=True)
     complete = [
         {"symbol": "688046", "eligible": True, "rank": 1},
@@ -1297,7 +1305,7 @@ def test_acceptance_checks_complete_cn_signal_candidate_projection(
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T20:00:00+08:00",
         "account": serialized_trend_account(fresh=True),
-        "metadata": {"market": "CN", "broker": "eastmoney"},
+        "metadata": {"market": market, "broker": broker},
         "strategy_judgments": {
             "formal_actions": [],
             "holding_decisions": [review],
@@ -1321,7 +1329,7 @@ def test_acceptance_checks_complete_cn_signal_candidate_projection(
     }
 
     dashboard_acceptance._check_trend_artifact_projection(
-        reports, "eastmoney", projected
+        reports, broker, projected
     )
 
 
@@ -2555,7 +2563,44 @@ def test_acceptance_checks_truthful_unavailable_trade_stats_copy() -> None:
     dashboard_acceptance._check_integrated_trend_ui(Root(), report, "tiger")
 
 
-def test_acceptance_checks_displayed_current_lifecycle_cards_and_industry_context() -> None:
+@pytest.mark.parametrize(
+    ("ordering_mode", "industry_context", "displayed_context"),
+    [
+        (
+            "context_with_history",
+            {
+                "industry": "科技", "temperature": "热", "strength": "97.5",
+                "warm_to_hot_count": 3,
+                "aggregate_right_count_ratio": "0.8",
+                "aggregate_right_market_cap_ratio": "0.9",
+                "prior_aggregate_right_count_ratio": "0.6",
+                "prior_aggregate_right_market_cap_ratio": "0.7",
+                "valid": True,
+            },
+            "科技 当前温度 热 温度方向 上升 趋势强度 97.5 "
+            "温转热数量 3 右侧个数占比 60% → 80% 右侧市值占比 70% → 90%",
+        ),
+        (
+            "individual_global",
+            {
+                "industry": "科技", "temperature": "热",
+                "temperature_direction": "上升", "strength": "246802.22",
+                "warm_to_hot_count": 2468013579,
+                "aggregate_right_count_ratio": None,
+                "aggregate_right_market_cap_ratio": None,
+                "prior_aggregate_right_count_ratio": None,
+                "prior_aggregate_right_market_cap_ratio": None,
+                "valid": True,
+            },
+            "科技 当前温度 热 温度方向 上升",
+        ),
+    ],
+)
+def test_acceptance_checks_displayed_current_lifecycle_cards_and_industry_context(
+    ordering_mode: str,
+    industry_context: dict[str, object],
+    displayed_context: str,
+) -> None:
     rows = [
         {"group": "候选来源", "name": "组合", "value": "冻结"},
         {"group": "入场过滤", "name": "强度", "value": "不低于 95"},
@@ -2568,8 +2613,7 @@ def test_acceptance_checks_displayed_current_lifecycle_cards_and_industry_contex
     titles = ["入场门槛", "候选排序", "仓位与执行", "持有管理", "退出规则", "其他设置"]
     workspace_text = " ".join(
         [*(str(row[key]) for row in rows for key in ("group", "name", "value")),
-         "实际 API 成本 1.25 单位", "科技 当前温度 热 温度方向 上升 趋势强度 97.5",
-         "温转热数量 3 右侧个数占比 60% → 80% 右侧市值占比 70% → 90%",
+         "实际 API 成本 1.25 单位", displayed_context,
          "结构差较前值持平 0 个百分点 该指标不是账户仓位或上涨概率"]
     )
 
@@ -2670,18 +2714,10 @@ def test_acceptance_checks_displayed_current_lifecycle_cards_and_industry_contex
             "current_strategy_parameter_rows": rows,
             "api_cost": {"label": "实际 API 成本 1.25 单位"},
             "industry_context_status": {
-                "ordering_mode": "context_with_history",
+                "ordering_mode": ordering_mode,
                 "current_complete": True,
             },
-            "industry_contexts": [{
-                "industry": "科技", "temperature": "热", "strength": "97.5",
-                "warm_to_hot_count": 3,
-                "aggregate_right_count_ratio": "0.8",
-                "aggregate_right_market_cap_ratio": "0.9",
-                "prior_aggregate_right_count_ratio": "0.6",
-                "prior_aggregate_right_market_cap_ratio": "0.7",
-                "valid": True,
-            }],
+            "industry_contexts": [industry_context],
         },
         "eastmoney",
     )
