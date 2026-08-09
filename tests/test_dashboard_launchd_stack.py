@@ -265,6 +265,14 @@ def test_stack_dry_run_prints_two_valid_plists_without_side_effects(
 def test_retired_installer_mode_option_fails_without_side_effects(
     tmp_path: Path, retired_option: str
 ) -> None:
+    repo = tmp_path / "repo"
+    (repo / "ops/launchd").mkdir(parents=True)
+    (repo / "config").mkdir()
+    for template in (SINGLE_TEMPLATE, GATEWAY_TEMPLATE, LEGACY_TEMPLATE):
+        shutil.copy2(template, repo / "ops/launchd" / template.name)
+    (repo / "config/prediction_arbitrage.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
     agents = tmp_path / "LaunchAgents"
     agents.mkdir()
     runtime = tmp_path / "runtime"
@@ -272,17 +280,24 @@ def test_retired_installer_mode_option_fails_without_side_effects(
     calls = tmp_path / "launchctl-calls"
     launchctl = tmp_path / "launchctl"
     _write_executable(launchctl, '#!/bin/sh\nprintf x >> "$FAKE_CALLS"\n')
+    lsof = tmp_path / "lsof"
+    _write_executable(lsof, '#!/bin/sh\nprintf x >> "$FAKE_CALLS"\n')
+    curl = tmp_path / "curl"
+    _write_executable(curl, '#!/bin/sh\nprintf x >> "$FAKE_CALLS"\n')
     common = [
         str(INSTALLER),
-        "--dry-run",
         "--mode",
         "single",
         "--repo-root",
-        str(tmp_path / "missing-repo"),
+        str(repo),
         "--runtime-root",
         str(runtime),
         "--launch-agents-dir",
         str(agents),
+        "--python",
+        sys.executable,
+        "--wait-seconds",
+        "1",
     ]
     args = [*common, retired_option]
     if retired_option == "--cross-execution-mode":
@@ -294,8 +309,8 @@ def test_retired_installer_mode_option_fails_without_side_effects(
             **os.environ,
             "FAKE_CALLS": str(calls),
             "LAUNCHCTL_BIN": str(launchctl),
-            "LSOF_BIN": str(launchctl),
-            "CURL_BIN": str(launchctl),
+            "LSOF_BIN": str(lsof),
+            "CURL_BIN": str(curl),
         },
         capture_output=True,
         text=True,
@@ -306,6 +321,7 @@ def test_retired_installer_mode_option_fails_without_side_effects(
     assert not calls.exists()
     assert not list(agents.iterdir())
     assert not list(runtime.rglob("*"))
+    assert not (repo / "logs").exists()
 
 
 def test_dashboard_plists_have_no_cross_execution_environment_variable() -> None:
