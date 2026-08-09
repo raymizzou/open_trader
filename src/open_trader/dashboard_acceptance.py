@@ -4591,9 +4591,21 @@ def _check_trend_review(
     )
     refresh = review.get("benchmark_refresh")
     assert isinstance(refresh, Mapping), f"{broker} 趋势复盘缺少基准刷新信息"
-    assert f"市场数据截至 {_plain(refresh.get('cutoff'))}" in text, (
-        f"{broker} 趋势复盘未显示基准截止日"
-    )
+    if refresh.get("status") != "unavailable":
+        assert f"市场数据截至 {_plain(refresh.get('cutoff'))}" in text, (
+            f"{broker} 趋势复盘未显示基准截止日"
+        )
+    if refresh.get("status") == "failed":
+        assert f"本月刷新失败：{_plain(refresh.get('reason'))}" in text, (
+            f"{broker} 趋势复盘未显示基准失败原因"
+        )
+        assert f"尝试于 {_plain(refresh.get('attempted_at'))}" in text, (
+            f"{broker} 趋势复盘未显示基准失败时间"
+        )
+    elif refresh.get("status") == "unavailable":
+        assert f"长期市场基准不可用：{_plain(refresh.get('reason'))}" in text, (
+            f"{broker} 趋势复盘未显示基准不可用原因"
+        )
     assert workspace.locator(".trend-review-matrix").count() == 1, (
         f"{broker} 趋势复盘统一矩阵数量不是 1"
     )

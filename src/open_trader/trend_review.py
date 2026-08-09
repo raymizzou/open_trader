@@ -164,6 +164,86 @@ def _long_term_benchmark_attempt_path(data_dir: Path, market: str, month: str) -
     )
 
 
+def _read_current_long_term_benchmark_failure(
+    data_dir: Path,
+    market: str,
+    *,
+    latest_completed_at: str | None = None,
+) -> dict[str, object] | None:
+    market = _market(market)
+    month = datetime.now(MARKET_TIMEZONES[market]).strftime("%Y-%m")
+    candidates: list[tuple[datetime, dict[str, object]]] = []
+    for path in (
+        _long_term_benchmark_attempt_path(data_dir, market, month),
+        long_term_benchmark_cycle_path(data_dir, market, month),
+    ):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get(
+            "schema_version"
+        ) != "open_trader.trend_review.long_term_benchmark.attempt.v1":
+            continue
+        if (
+            payload.get("status") != "failed"
+            or payload.get("market") != market
+            or payload.get("month") != month
+            or not isinstance(payload.get("reason"), str)
+            or not payload["reason"].strip()
+            or not isinstance(payload.get("attempted_at"), str)
+            or not isinstance(payload.get("process_git_sha"), str)
+            or not payload["process_git_sha"].strip()
+        ):
+            continue
+        refresh = payload.get(
+            "refresh", {"force": False, "actor": None, "reason": None}
+        )
+        if (
+            not isinstance(refresh, Mapping)
+            or set(refresh) != {"force", "actor", "reason"}
+            or (
+                refresh.get("force") is True
+                and not all(
+                    isinstance(refresh.get(key), str)
+                    and str(refresh[key]).strip()
+                    for key in ("actor", "reason")
+                )
+            )
+            or (
+                refresh.get("force") is not True
+                and (
+                    refresh.get("force") is not False
+                    or refresh.get("actor") is not None
+                    or refresh.get("reason") is not None
+                )
+            )
+        ):
+            continue
+        try:
+            attempted_at = datetime.fromisoformat(str(payload["attempted_at"]))
+        except ValueError:
+            continue
+        if attempted_at.tzinfo is None or attempted_at.utcoffset() is None:
+            continue
+        if latest_completed_at:
+            try:
+                completed_at = datetime.fromisoformat(latest_completed_at)
+            except ValueError:
+                completed_at = None
+            if (
+                completed_at is not None
+                and completed_at.tzinfo is not None
+                and completed_at.utcoffset() is not None
+                and attempted_at <= completed_at
+            ):
+                continue
+        normalized = dict(payload)
+        normalized["refresh"] = dict(refresh)
+        candidates.append((attempted_at, normalized))
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
 def _record_long_term_benchmark_failure(
     data_dir: Path,
     market: str,
@@ -8070,6 +8150,15 @@ def build_trend_review_projection(
             if isinstance(close, Mapping)
         }
         benchmark_by_date = {**snapshot_benchmarks, **benchmark_by_date}
+    long_term_failure = _read_current_long_term_benchmark_failure(
+        data_dir,
+        market,
+        latest_completed_at=(
+            str(long_term_snapshot["completed_at"])
+            if long_term_snapshot is not None
+            else None
+        ),
+    )
     if not discipline_by_date and not actual_by_date and not benchmark_by_date:
         raise ValueError(f"no trend review facts for {market}")
 
@@ -8452,6 +8541,14 @@ def build_trend_review_projection(
             "cutoff": long_term_snapshot["cutoff"],
             "refresh": long_term_snapshot["refresh"],
         }
+        if long_term_failure is not None:
+            benchmark_refresh.update({
+                "status": "failed",
+                "reason": long_term_failure["reason"],
+                "attempted_at": long_term_failure["attempted_at"],
+                "attempt_process_git_sha": long_term_failure["process_git_sha"],
+                "attempt_refresh": long_term_failure.get("refresh"),
+            })
 
     projection = {
         "schema_version": "open_trader.trend_review.projection.v4",

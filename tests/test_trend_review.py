@@ -10711,6 +10711,87 @@ def test_projection_rejects_corrupt_long_term_benchmark_without_losing_simulatio
     }
 
 
+def test_projection_marks_current_month_benchmark_failure_with_prior_snapshot(
+    tmp_path: Path,
+) -> None:
+    write_projection_metric_history(
+        tmp_path, "US", discipline_days=4, actual_days=0, benchmark_days=4
+    )
+    write_rates(tmp_path)
+    trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        FiveYearQuote(),
+        now=datetime(2026, 8, 9, tzinfo=UTC),
+        process_git_sha="snapshot-sha",
+    )
+    attempt_path = trend_review._long_term_benchmark_attempt_path(
+        tmp_path, "US", "2026-08"
+    )
+    attempt_path.parent.mkdir(parents=True, exist_ok=True)
+    attempt_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_review.long_term_benchmark.attempt.v1",
+            "status": "failed",
+            "market": "US",
+            "month": "2026-08",
+            "attempt_count": 1,
+            "attempted_at": "2026-08-10T01:00:00+08:00",
+            "process_git_sha": "failed-sha",
+            "reason": "行情源不可用",
+        }),
+        encoding="utf-8",
+    )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "US")
+
+    refresh = projection["benchmark_refresh"]
+    assert refresh["status"] == "failed"
+    assert refresh["reason"] == "行情源不可用"
+    assert refresh["attempted_at"] == "2026-08-10T01:00:00+08:00"
+    assert refresh["attempt_process_git_sha"] == "failed-sha"
+    assert refresh["attempt_refresh"] == {
+        "force": False, "actor": None, "reason": None
+    }
+    assert refresh["cutoff"] == "2026-08-08"
+    assert refresh["process_git_sha"] == "snapshot-sha"
+    assert projection["metrics"]["period_net_return"]["market_1y"]["value"] is not None
+
+
+def test_projection_clears_stale_failure_after_same_month_success(
+    tmp_path: Path,
+) -> None:
+    write_projection_metric_history(
+        tmp_path, "US", discipline_days=4, actual_days=0, benchmark_days=4
+    )
+    write_rates(tmp_path)
+    trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        FiveYearQuote(),
+        now=datetime(2026, 8, 9, tzinfo=UTC),
+        process_git_sha="snapshot-sha",
+    )
+    attempt_path = trend_review._long_term_benchmark_attempt_path(
+        tmp_path, "US", "2026-08"
+    )
+    attempt_path.parent.mkdir(parents=True, exist_ok=True)
+    attempt_path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.trend_review.long_term_benchmark.attempt.v1",
+            "status": "failed", "market": "US", "month": "2026-08",
+            "attempt_count": 1, "attempted_at": "2026-08-08T01:00:00+08:00",
+            "process_git_sha": "stale-failed-sha", "reason": "旧失败",
+            "refresh": {"force": False, "actor": None, "reason": None},
+        }),
+        encoding="utf-8",
+    )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "US")
+
+    assert projection["benchmark_refresh"]["status"] == "available"
+
+
 def write_projection_stats(
     root: Path,
     fills: list[dict[str, object]],

@@ -4043,8 +4043,14 @@ function renderTrendReviewStatisticsMeta(review, key, label) {
 
 function renderTrendReviewMatrix(review) {
   const refresh = review.benchmark_refresh || {};
+  const refreshStatus = refresh.status === "failed"
+    ? `<span>本月刷新失败：${escapeHtml(formatPlain(refresh.reason || "未知原因"))}</span>${refresh.attempted_at ? `<span>尝试于 ${escapeHtml(formatPlain(refresh.attempted_at))}</span>` : ""}`
+    : refresh.status === "unavailable"
+      ? `<span>长期市场基准不可用：${escapeHtml(formatPlain(refresh.reason || "数据不足"))}</span>`
+      : "";
   return `<figure class="trend-review-matrix"><figcaption>策略与市场基准</figcaption>
     <div class="trend-review-matrix-meta">
+      ${refreshStatus}
       ${refresh.cutoff ? `<span>市场数据截至 ${escapeHtml(formatPlain(refresh.cutoff))}</span>` : ""}
       ${refresh.completed_at ? `<span>快照更新 ${escapeHtml(formatPlain(refresh.completed_at))}</span>` : ""}
       <span>5 年收益 CAGR</span>

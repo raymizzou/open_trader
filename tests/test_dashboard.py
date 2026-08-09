@@ -1301,6 +1301,33 @@ def test_dashboard_accepts_current_snapshot_after_historical_interval_start(
     assert review["strategy_snapshot"]["effective_from"] == "2026-07-20"
 
 
+def test_dashboard_accepts_failed_benchmark_refresh_with_prior_snapshot_metadata(
+    tmp_path: Path,
+) -> None:
+    payload = trend_review_projection_v3("US", "tiger")
+    payload["benchmark_refresh"] = {
+        "status": "failed",
+        "month": "2026-07",
+        "completed_at": "2026-07-17T16:00:00+08:00",
+        "process_git_sha": "abc1234",
+        "cutoff": "2026-07-17",
+        "refresh": {"force": False, "actor": None, "reason": None},
+        "reason": "行情源不可用",
+        "attempted_at": "2026-08-10T01:00:00+08:00",
+        "attempt_process_git_sha": "failed-sha",
+        "attempt_refresh": {"force": False, "actor": None, "reason": None},
+    }
+    path = tmp_path / "data/latest/trend_review_us.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    review = dashboard_module._load_trend_reviews(tmp_path / "data")["tiger"]
+
+    assert review["available"] is True
+    assert review["benchmark_refresh"]["status"] == "failed"
+    assert review["benchmark_refresh"]["cutoff"] == "2026-07-17"
+
+
 @pytest.mark.parametrize(
     ("mutation", "broker"),
     [

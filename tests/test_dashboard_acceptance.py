@@ -2819,6 +2819,27 @@ def test_acceptance_checks_stale_trend_statistics_status() -> None:
     )
 
 
+@pytest.mark.parametrize("status", ("failed", "unavailable"))
+def test_acceptance_checks_benchmark_refresh_status(status: str) -> None:
+    payload = valid_payload()
+    review = payload["trend_reviews"]["tiger"]
+    if status == "failed":
+        review["benchmark_refresh"] = {  # type: ignore[index]
+            "status": "failed", "month": "2026-07",
+            "completed_at": "2026-07-17T16:00:00+08:00", "process_git_sha": "abc1234",
+            "cutoff": "2026-07-17", "refresh": {"force": False, "actor": None, "reason": None},
+            "reason": "行情源不可用", "attempted_at": "2026-08-10T01:00:00+08:00",
+            "attempt_process_git_sha": "failed-sha",
+            "attempt_refresh": {"force": False, "actor": None, "reason": None},
+        }
+    else:
+        review["benchmark_refresh"] = {"status": "unavailable", "reason": "长期市场基准缺失"}  # type: ignore[index]
+    page = tabbed_account_page(payload)
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    dashboard_acceptance._check_trend_review(page, section, "tiger", review)
+
+
 def test_acceptance_rejects_trend_review_panel_style_drift() -> None:
     payload = valid_payload()
     page = tabbed_account_page(payload)
@@ -3096,6 +3117,19 @@ def trend_review_workspace_text(
 ) -> str:
     review = review or trend_reviews()[broker]
     snapshot = review["strategy_snapshot"]
+    benchmark_refresh = review.get("benchmark_refresh", {})
+    refresh_status = (
+        f"本月刷新失败：{benchmark_refresh.get('reason')} 尝试于 {benchmark_refresh.get('attempted_at')}"
+        if benchmark_refresh.get("status") == "failed"
+        else f"长期市场基准不可用：{benchmark_refresh.get('reason')}"
+        if benchmark_refresh.get("status") == "unavailable"
+        else ""
+    )
+    refresh_cutoff = (
+        f"市场数据截至 {benchmark_refresh.get('cutoff')}"
+        if benchmark_refresh.get("status") != "unavailable"
+        else ""
+    )
     status_text = (
         "统计快照已过期；报告继续使用上一个有效快照"
         if review.get("statistics_status") == "stale"
@@ -3108,7 +3142,7 @@ def trend_review_workspace_text(
         f"{status_text} "
         "统计截至 2026-08-08T15:00:00+08:00 指标截至 2026-08-08 "
         "发现 9 · 排除 4 · 未闭环 1 排除原因 成本不完整 4 统计来源不可用 "
-        "策略与市场基准 市场数据截至 2026-07-17 快照更新 2026-07-18T08:00:00+08:00 "
+        f"策略与市场基准 {refresh_cutoff} {refresh_status} 快照更新 2026-07-18T08:00:00+08:00 "
         "5 年收益 CAGR 期间净收益率 相对市场超额收益 最大回撤 卡玛比率 夏普比率 "
         "纪律模拟 实际执行 同期市场 市场 1 年 市场 5 年 基准自身 实际执行日终净值缺失"
     )

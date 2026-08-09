@@ -576,10 +576,28 @@ def _valid_trend_review_benchmark_metadata(
             and not dates
             and windows == {"1Y": None, "5Y": None}
         )
-    if refresh["status"] != "available" or set(refresh) != {
-        "status", "month", "completed_at", "process_git_sha", "cutoff", "refresh"
-    }:
+    if refresh["status"] not in {"available", "failed"}:
         return False
+    expected_keys = {
+        "status", "month", "completed_at", "process_git_sha", "cutoff", "refresh"
+    }
+    if refresh["status"] == "failed":
+        expected_keys |= {
+            "reason", "attempted_at", "attempt_process_git_sha", "attempt_refresh"
+        }
+    if set(refresh) != expected_keys:
+        return False
+
+    def valid_refresh_controls(value: object) -> bool:
+        if not isinstance(value, dict) or set(value) != {"force", "actor", "reason"}:
+            return False
+        if value["force"] is True:
+            return all(
+                isinstance(value[key], str) and value[key].strip()
+                for key in ("actor", "reason")
+            )
+        return value["force"] is False and value["actor"] is None and value["reason"] is None
+
     try:
         month = datetime.strptime(str(refresh["month"]), "%Y-%m")
     except ValueError:
@@ -590,18 +608,17 @@ def _valid_trend_review_benchmark_metadata(
         or not isinstance(refresh["process_git_sha"], str)
         or not refresh["process_git_sha"].strip()
         or not _valid_iso_date(refresh["cutoff"])
-        or not isinstance(refresh["refresh"], dict)
-        or set(refresh["refresh"]) != {"force", "actor", "reason"}
+        or not valid_refresh_controls(refresh["refresh"])
     ):
         return False
-    controls = refresh["refresh"]
-    if controls["force"] is True:
-        if not all(
-            isinstance(controls[key], str) and controls[key].strip()
-            for key in ("actor", "reason")
-        ):
-            return False
-    elif controls["force"] is not False or controls["actor"] is not None or controls["reason"] is not None:
+    if refresh["status"] == "failed" and (
+        not isinstance(refresh["reason"], str)
+        or not refresh["reason"].strip()
+        or not _valid_aware_datetime(refresh["attempted_at"])
+        or not isinstance(refresh["attempt_process_git_sha"], str)
+        or not refresh["attempt_process_git_sha"].strip()
+        or not valid_refresh_controls(refresh["attempt_refresh"])
+    ):
         return False
     for label, basis in (("1Y", "period_return"), ("5Y", "CAGR")):
         window = windows[label]
@@ -887,6 +904,8 @@ def _load_trend_reviews(data_dir: Path) -> dict[str, dict[str, Any]]:
             "common_cutoff": payload["common_cutoff"],
             "interval": payload["interval"],
             "metrics": payload["metrics"],
+            "benchmark_context": payload["benchmark_context"],
+            "benchmark_refresh": payload["benchmark_refresh"],
             "statistics_status": (
                 "stale"
                 if cycle.get("status") == "completed" and not artifact_available

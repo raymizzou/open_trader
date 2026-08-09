@@ -8653,6 +8653,16 @@ if ((html.match(/data-close-trend-report/g)||[]).length!==1) throw new Error(htm
 if (html.match(/<button/g).length!==1) throw new Error(html);
 const stale=renderTrendReviewWorkspace({...review,statistics_status:"stale"});
 if (!stale.includes("统计快照已过期；报告继续使用上一个有效快照")) throw new Error(stale);
+const failed=renderTrendReviewWorkspace({...review,benchmark_refresh:{
+  status:"failed",month:"2026-07",completed_at:"2026-07-17T16:00:00+08:00",
+  process_git_sha:"snapshot-sha",cutoff:"2026-07-17",
+  refresh:{force:false,actor:null,reason:null},reason:"行情源不可用",
+  attempted_at:"2026-08-10T01:00:00+08:00",attempt_process_git_sha:"failed-sha",
+  attempt_refresh:{force:false,actor:null,reason:null},
+}});
+if (!failed.includes("本月刷新失败：行情源不可用") || !failed.includes("尝试于 2026-08-10T01:00:00+08:00")) throw new Error(failed);
+const unavailable=renderTrendReviewWorkspace({...review,benchmark_refresh:{status:"unavailable",reason:"长期市场基准缺失"}});
+if (!unavailable.includes("长期市场基准不可用：长期市场基准缺失") || unavailable.includes("市场数据截至")) throw new Error(unavailable);
 console.log("ok");
 ''')
 
