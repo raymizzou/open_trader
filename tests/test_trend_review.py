@@ -7228,6 +7228,22 @@ def test_long_term_benchmark_uses_last_close_before_weekend_anniversary(
     assert snapshot["daily_closes"][0] == {"date": "2021-08-06", "close": "100"}
 
 
+def test_long_term_benchmark_rejects_first_close_after_anniversary() -> None:
+    closes = [
+        (date(2021, 8, 9), Decimal("100")),
+        (date(2026, 8, 8), Decimal("120")),
+    ]
+    rates = {date(2021, 8, 9): Decimal("4.0")}
+
+    with pytest.raises(ValueError, match="full period"):
+        trend_review._benchmark_window(
+            closes,
+            rates,
+            years=5,
+            cutoff=date(2026, 8, 8),
+        )
+
+
 def test_long_term_benchmark_cycle_month_is_bound_to_path(
     tmp_path: Path,
 ) -> None:

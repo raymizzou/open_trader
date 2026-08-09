@@ -205,7 +205,11 @@ def _benchmark_window(
         ([before_start[-1]] if before_start else [])
         + [(trading_date, close) for trading_date, close in closes if trading_date >= start]
     )
-    if len(window) < 2 or not any(trading_date >= start for trading_date, _ in window):
+    if (
+        len(window) < 2
+        or window[0][0] > start
+        or not any(trading_date >= start for trading_date, _ in window)
+    ):
         raise ValueError(f"benchmark {years}Y window must cover full period")
     curve = [
         {"date": trading_date.isoformat(), "equity": format(close, "f")}
