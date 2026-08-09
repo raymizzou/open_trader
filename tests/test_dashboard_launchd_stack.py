@@ -259,30 +259,43 @@ def test_stack_dry_run_prints_two_valid_plists_without_side_effects(
     assert not list(agents.iterdir())
 
 
-def test_retired_installer_mode_option_fails_without_launchctl_or_database_write(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "retired_option", ("--cross-execution-mode", "--cross-execution-mode=auto_submit")
+)
+def test_retired_installer_mode_option_fails_without_side_effects(
+    tmp_path: Path, retired_option: str
 ) -> None:
-    forbidden = tmp_path / "forbidden"
-    _write_executable(forbidden, "#!/bin/sh\nexit 99\n")
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    calls = tmp_path / "launchctl-calls"
+    launchctl = tmp_path / "launchctl"
+    _write_executable(launchctl, '#!/bin/sh\nprintf x >> "$FAKE_CALLS"\n')
+    common = [
+        str(INSTALLER),
+        "--dry-run",
+        "--mode",
+        "single",
+        "--repo-root",
+        str(tmp_path / "missing-repo"),
+        "--runtime-root",
+        str(runtime),
+        "--launch-agents-dir",
+        str(agents),
+    ]
+    args = [*common, retired_option]
+    if retired_option == "--cross-execution-mode":
+        args.append("auto_submit")
     result = subprocess.run(
-        [
-            str(INSTALLER),
-            "--dry-run",
-            "--mode",
-            "single",
-            "--repo-root",
-            str(ROOT),
-            "--runtime-root",
-            str(tmp_path),
-            "--cross-execution-mode",
-            "auto_submit",
-        ],
+        args,
         cwd=ROOT,
         env={
             **os.environ,
-            "LAUNCHCTL_BIN": str(forbidden),
-            "LSOF_BIN": str(forbidden),
-            "CURL_BIN": str(forbidden),
+            "FAKE_CALLS": str(calls),
+            "LAUNCHCTL_BIN": str(launchctl),
+            "LSOF_BIN": str(launchctl),
+            "CURL_BIN": str(launchctl),
         },
         capture_output=True,
         text=True,
@@ -290,6 +303,9 @@ def test_retired_installer_mode_option_fails_without_launchctl_or_database_write
     assert result.returncode == 2
     assert "cross-auto mode" in result.stderr
     assert result.stdout == ""
+    assert not calls.exists()
+    assert not list(agents.iterdir())
+    assert not list(runtime.rglob("*"))
 
 
 def test_dashboard_plists_have_no_cross_execution_environment_variable() -> None:
