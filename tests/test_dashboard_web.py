@@ -3002,7 +3002,7 @@ def test_prediction_venue_construction_failure_keeps_dashboard_state_available(
     assert state["cross_venue"]["status"] == "degraded"
 
 
-def test_build_cross_venue_monitor_uses_fail_closed_server_execution_mode(
+def test_build_cross_venue_monitor_injects_store_without_environment_mode_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import open_trader.dashboard_web as dashboard_web
@@ -3028,26 +3028,19 @@ def test_build_cross_venue_monitor_uses_fail_closed_server_execution_mode(
     )
     monkeypatch.setattr(dashboard_web, "PredictCrossVenueMonitor", FakeCrossVenueMonitor)
 
-    for raw, expected in (
-        (None, "observe_only"),
-        ("manual_confirm", "manual_confirm"),
-        (" manual_confirm ", "observe_only"),
-        ("MANUAL_CONFIRM", "observe_only"),
-        ("invalid", "observe_only"),
-    ):
-        if raw is None:
-            monkeypatch.delenv("OPEN_TRADER_CROSS_EXECUTION_MODE", raising=False)
-        else:
-            monkeypatch.setenv("OPEN_TRADER_CROSS_EXECUTION_MODE", raw)
-        dashboard_web._build_cross_venue_monitor(
-            trading_config=type("Config", (), {"predict": object()})(),
-            prediction_monitor=object(),
-            store=object(),
-            execution=FakeExecution(),
-            codex_model="test-model",
-            predict_trading=object(),
-        )
-        assert created[-1]["execution_mode"] == expected
+    store = object()
+    monkeypatch.setenv("OPEN_TRADER_CROSS_EXECUTION_MODE", "auto_submit")
+    dashboard_web._build_cross_venue_monitor(
+        trading_config=type("Config", (), {"predict": object()})(),
+        prediction_monitor=object(),
+        store=store,
+        execution=FakeExecution(),
+        codex_model="test-model",
+        predict_trading=object(),
+    )
+
+    assert created[-1]["store"] is store
+    assert "execution_mode" not in created[-1]
 
 
 def test_prediction_ids_cross_venue_reach_the_existing_preview_and_confirmation_routes(tmp_path: Path) -> None:
