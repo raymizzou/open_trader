@@ -5,10 +5,11 @@ import hashlib
 import json
 from dataclasses import asdict, replace
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from threading import Event, Lock
+from types import SimpleNamespace
 
 import pytest
 
@@ -7000,8 +7001,8 @@ def test_close_keeps_actual_equity_out_of_simulation_report_state(tmp_path: Path
         benchmark={
             "date": "2026-07-17",
             "close": "6123.45",
-            "source_id": "CSI_ALL_SHARE_PRICE",
-            "futu_symbol": "SH.000985",
+            "source_id": "CSI_500_PRICE",
+            "futu_symbol": "SH.000905",
         },
     )
 
@@ -7032,8 +7033,8 @@ def test_close_records_stale_or_misaligned_actual_equity_as_missing(
         benchmark={
             "date": "2026-07-17",
             "close": "6123.45",
-            "source_id": "CSI_ALL_SHARE_PRICE",
-            "futu_symbol": "SH.000985",
+            "source_id": "CSI_500_PRICE",
+            "futu_symbol": "SH.000905",
         },
     )
 
@@ -7059,23 +7060,315 @@ def test_close_rejects_report_without_strategy_snapshot(tmp_path: Path) -> None:
             benchmark={
                 "date": "2026-07-17",
                 "close": "6123.45",
-                "source_id": "CSI_ALL_SHARE_PRICE",
-                "futu_symbol": "SH.000985",
+                "source_id": "CSI_500_PRICE",
+                "futu_symbol": "SH.000905",
             },
         )
+
+
+class FiveYearQuote:
+    def __init__(self, symbol: str = "US.SPY") -> None:
+        self.symbol = symbol
+
+    def get_daily_kline(self, symbol: str, *, start: str, end: str) -> list[object]:
+        assert symbol == self.symbol
+        closes = ("100", "108", "102", "121", "117", "150")
+        years = range(2021, 2027)
+        return [
+            SimpleNamespace(date=f"{year}-08-08", close=close)
+            for year, close in zip(years, closes, strict=True)
+        ]
+
+
+class ExplodingQuote:
+    def get_daily_kline(self, *_args: object, **_kwargs: object) -> list[object]:
+        raise ValueError("quote failed")
+
+
+def write_rates(root: Path) -> None:
+    path = root / "rates/DGS3MO.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("DATE,DGS3MO\n2021-08-08,4.0\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("market", "source_id", "symbol"),
+    [
+        ("CN", "CSI_500_PRICE", "SH.000905"),
+        ("HK", "HSI_PRICE", "HK.800000"),
+        ("US", "SPY_QFQ", "US.SPY"),
+    ],
+)
+def test_long_term_benchmark_uses_approved_market_identity(
+    tmp_path: Path, market: str, source_id: str, symbol: str
+) -> None:
+    write_rates(tmp_path)
+    result = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        market,
+        FiveYearQuote(symbol=symbol),
+        now=datetime(2026, 8, 9, 12, tzinfo=UTC),
+        process_git_sha="abc123",
+    )
+
+    snapshot = json.loads(
+        trend_review.long_term_benchmark_snapshot_path(tmp_path, market).read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert snapshot["benchmark"] == {
+        "name": trend_review.BENCHMARK_IDENTITIES[market]["name"],
+        "source_id": source_id,
+        "futu_symbol": symbol,
+    }
+    assert set(snapshot["windows"]) == {"1Y", "5Y"}
+    assert Decimal(snapshot["windows"]["5Y"]["metrics"]["annualized_return_pct"]).is_finite()
+
+
+def test_long_term_benchmark_calculates_qfq_metrics_and_excess_returns(
+    tmp_path: Path,
+) -> None:
+    write_rates(tmp_path)
+    trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        FiveYearQuote(),
+        now=datetime(2026, 8, 9, 12, tzinfo=UTC),
+        process_git_sha="abc123",
+    )
+    snapshot = trend_review.read_long_term_benchmark_snapshot(tmp_path, "US")
+    window = snapshot["windows"]["5Y"]
+
+    assert snapshot["cutoff"] == "2026-08-08"
+    assert window["observation_count"] == 6
+    assert Decimal(window["metrics"]["max_drawdown_pct"]) == Decimal(50) / Decimal(9)
+    assert window["metrics"]["calmar_ratio"] == "1.519624991897783716339100412"
+    assert window["metrics"]["sharpe_ratio"] == "6.414798394700615362447213831"
+    assert window["daily_returns"][0] == {
+        "date": "2022-08-08",
+        "return": "0.08",
+        "risk_free_return": "0.04",
+        "excess_return": "0.04",
+    }
+
+
+def test_long_term_benchmark_refresh_is_monthly_and_failure_preserves_snapshot(
+    tmp_path: Path,
+) -> None:
+    write_rates(tmp_path)
+    first = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        FiveYearQuote(),
+        now=datetime(2026, 8, 9, tzinfo=UTC),
+        process_git_sha="first",
+    )
+    snapshot_path = trend_review.long_term_benchmark_snapshot_path(tmp_path, "US")
+    cycle_path = trend_review.long_term_benchmark_cycle_path(tmp_path, "US", "2026-08")
+    body = snapshot_path.read_bytes()
+    cycle = cycle_path.read_bytes()
+    snapshot_path.unlink()
+    skipped = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        ExplodingQuote(),
+        now=datetime(2026, 8, 20, tzinfo=UTC),
+        process_git_sha="second",
+    )
+    failed = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        ExplodingQuote(),
+        now=datetime(2026, 9, 1, tzinfo=UTC),
+        process_git_sha="third",
+    )
+
+    assert first["status"] == "completed"
+    assert skipped["status"] == "already_completed"
+    assert failed["status"] == "failed"
+    assert snapshot_path.read_bytes() == body
+    assert cycle_path.read_bytes() == cycle
+
+
+def test_long_term_benchmark_force_requires_audited_reason_and_preserves_success(
+    tmp_path: Path,
+) -> None:
+    write_rates(tmp_path)
+    trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        FiveYearQuote(),
+        now=datetime(2026, 8, 9, tzinfo=UTC),
+        process_git_sha="first",
+    )
+    with pytest.raises(ValueError, match="actor and reason"):
+        trend_review.refresh_long_term_benchmark(
+            tmp_path,
+            "US",
+            FiveYearQuote(),
+            now=datetime(2026, 8, 20, tzinfo=UTC),
+            process_git_sha="second",
+            force=True,
+        )
+    forced = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        FiveYearQuote(),
+        now=datetime(2026, 8, 20, tzinfo=UTC),
+        process_git_sha="second",
+        force=True,
+        actor="operator",
+        reason="reconcile provider data",
+    )
+    snapshot_path = trend_review.long_term_benchmark_snapshot_path(tmp_path, "US")
+    cycle_path = trend_review.long_term_benchmark_cycle_path(tmp_path, "US", "2026-08")
+    body = snapshot_path.read_bytes()
+    cycle = cycle_path.read_bytes()
+    failed = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        ExplodingQuote(),
+        now=datetime(2026, 8, 20, tzinfo=UTC),
+        process_git_sha="second",
+        force=True,
+        actor="operator",
+        reason="reconcile provider data",
+    )
+
+    assert forced["status"] == "completed"
+    assert trend_review.read_long_term_benchmark_snapshot(tmp_path, "US")["refresh"] == {
+        "force": True,
+        "actor": "operator",
+        "reason": "reconcile provider data",
+    }
+    assert failed["status"] == "failed"
+    assert snapshot_path.read_bytes() == body
+    assert cycle_path.read_bytes() == cycle
+
+
+def test_long_term_benchmark_rejects_unordered_or_short_history(tmp_path: Path) -> None:
+    write_rates(tmp_path)
+
+    class InvalidQuote:
+        def get_daily_kline(
+            self, _symbol: str, *, start: str, end: str
+        ) -> list[object]:
+            return [
+                SimpleNamespace(date="2026-08-08", close="100"),
+                SimpleNamespace(date="2021-08-08", close="90"),
+            ]
+
+    result = trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        InvalidQuote(),
+        now=datetime(2026, 8, 9, tzinfo=UTC),
+        process_git_sha="invalid",
+    )
+
+    assert result["status"] == "failed"
+    assert "strictly increasing" in result["error"]
+    assert not trend_review.long_term_benchmark_snapshot_path(tmp_path, "US").exists()
+
+
+def test_projection_keeps_newer_current_benchmark_facts_alongside_snapshot(
+    tmp_path: Path,
+) -> None:
+    write_rates(tmp_path)
+    snapshot = strategy_snapshot("US")
+    for trading_date, benchmark_close in (("2026-07-17", "1000"), ("2026-08-08", "1100")):
+        trend_review.freeze_discipline_fact(
+            tmp_path, "US", trading_date, "100000", [], snapshot
+        )
+        trend_review.freeze_benchmark_fact(
+            tmp_path,
+            "US",
+            trading_date,
+            {
+                "date": trading_date,
+                "close": benchmark_close,
+                "source_id": "SPY_QFQ",
+                "futu_symbol": "US.SPY",
+            },
+        )
+    assert trend_review.refresh_long_term_benchmark(
+        tmp_path,
+        "US",
+        FiveYearQuote(),
+        now=datetime(2026, 8, 9, tzinfo=UTC),
+        process_git_sha="snapshot",
+    )["status"] == "completed"
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "US")
+
+    assert projection["schema_version"] == "open_trader.trend_review.projection.v4"
+    assert projection["metrics"]["period_net_return"]["discipline_benchmark"]["value"] == "10.0"
+
+
+@pytest.mark.parametrize(
+    ("market", "trading_date", "legacy_identity"),
+    [
+        ("CN", "2026-07-16", ("CSI_ALL_SHARE_PRICE", "SH.000985")),
+        ("HK", "2026-07-17", ("HSCI_PRICE", "HK.800701")),
+    ],
+)
+def test_legacy_benchmark_facts_are_readable_but_cannot_drive_new_metrics(
+    tmp_path: Path,
+    market: str,
+    trading_date: str,
+    legacy_identity: tuple[str, str],
+) -> None:
+    legacy = {
+        "schema_version": "open_trader.trend_review.daily.v1",
+        "market": market,
+        "date": trading_date,
+        "discipline_equity_after_fees": "100000",
+        "actual_equity": "100000",
+        "strategy_snapshot": strategy_snapshot(market),
+        "orders": [],
+        "benchmark": {
+            "date": trading_date,
+            "close": "1000",
+            "source_id": legacy_identity[0],
+            "futu_symbol": legacy_identity[1],
+        },
+    }
+    destination = tmp_path / "trend_review/daily" / market / f"{trading_date}.json"
+    destination.parent.mkdir(parents=True)
+    destination.write_text(json.dumps(legacy), encoding="utf-8")
+    write_rates(tmp_path)
+
+    assert trend_review._load_daily_facts(tmp_path, market)[0]["benchmark"] == legacy["benchmark"]
+    with pytest.raises(ValueError, match="source_id"):
+        trend_review.freeze_benchmark_fact(
+            tmp_path,
+            market,
+            trading_date,
+            legacy["benchmark"],
+        )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, market)
+
+    assert projection["schema_version"] == "open_trader.trend_review.projection.v4"
+    assert projection["metrics"]["period_net_return"]["discipline_benchmark"] == {
+        "value": None,
+        "reason": "市场基准缺失",
+    }
 
 
 def test_benchmark_fact_uses_exact_market_qfq_close() -> None:
     class Quote:
         def get_daily_kline(self, symbol: str, *, start: str, end: str) -> list[object]:
-            assert (symbol, start, end) == ("SH.000985", "2026-07-17", "2026-07-17")
+            assert (symbol, start, end) == ("SH.000905", "2026-07-17", "2026-07-17")
             return [type("Bar", (), {"date": "2026-07-17", "close": 6123.45})()]
 
     assert trend_review.benchmark_fact(Quote(), "CN", "2026-07-17") == {
         "date": "2026-07-17",
         "close": "6123.45",
-        "source_id": "CSI_ALL_SHARE_PRICE",
-        "futu_symbol": "SH.000985",
+        "source_id": "CSI_500_PRICE",
+        "futu_symbol": "SH.000905",
     }
 
 
@@ -7736,8 +8029,8 @@ def test_separate_fact_legacy_snapshot_adapts_without_rewrite(
         {
             "date": "2026-07-16",
             "close": "1000",
-            "source_id": "CSI_ALL_SHARE_PRICE",
-            "futu_symbol": "SH.000985",
+            "source_id": "CSI_500_PRICE",
+            "futu_symbol": "SH.000905",
         },
     )
     trend_review.freeze_actual_fill_batch(
@@ -7856,8 +8149,8 @@ def write_separate_review_facts(
             {
                 "date": trading_date,
                 "close": str(1000 + index),
-                "source_id": "CSI_ALL_SHARE_PRICE",
-                "futu_symbol": "SH.000985",
+                "source_id": "CSI_500_PRICE",
+                "futu_symbol": "SH.000905",
             },
         )
         if index < actual_count:
@@ -7893,9 +8186,9 @@ def write_projection_strategy_facts(
 ) -> None:
     start = date.fromisoformat(trend_review.TREND_V1_EFFECTIVE_FROM[market])
     benchmark_source = {
-        "CN": ("CSI_ALL_SHARE_PRICE", "SH.000985"),
+        "CN": ("CSI_500_PRICE", "SH.000905"),
         "US": ("SPY_QFQ", "US.SPY"),
-        "HK": ("HSCI_PRICE", "HK.800701"),
+        "HK": ("HSI_PRICE", "HK.800000"),
     }[market]
     for index, snapshot in enumerate(snapshots):
         trading_date = (start + timedelta(days=index)).isoformat()
@@ -8522,8 +8815,8 @@ def write_review_history(
             {
                 "date": trading_date,
                 "close": str(1000 + index),
-                "source_id": "CSI_ALL_SHARE_PRICE",
-                "futu_symbol": "SH.000985",
+                "source_id": "CSI_500_PRICE",
+                "futu_symbol": "SH.000905",
             },
         )
         if index < actual_count:
@@ -8981,8 +9274,8 @@ def write_review_history(
             "benchmark": {
                 "date": trading_date,
                 "close": str(1000 + index),
-                "source_id": "CSI_ALL_SHARE_PRICE",
-                "futu_symbol": "SH.000985",
+                "source_id": "CSI_500_PRICE",
+                "futu_symbol": "SH.000905",
             },
         }
         (daily / f"{trading_date}.json").write_text(
@@ -9748,8 +10041,8 @@ def write_projection_metric_history(
     start = date.fromisoformat(trend_review.TREND_V1_EFFECTIVE_FROM[market])
     snapshot = strategy_snapshot(market)
     benchmark_source, benchmark_symbol = {
-        "CN": ("CSI_ALL_SHARE_PRICE", "SH.000985"),
-        "HK": ("HSCI_PRICE", "HK.800701"),
+        "CN": ("CSI_500_PRICE", "SH.000905"),
+        "HK": ("HSI_PRICE", "HK.800000"),
         "US": ("SPY_QFQ", "US.SPY"),
     }[market]
     for index in range(benchmark_days):

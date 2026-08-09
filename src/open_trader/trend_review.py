@@ -9,7 +9,7 @@ import os
 from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass, replace
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -27,15 +27,34 @@ MARKET_TIMEZONES = {
     "HK": ZoneInfo("Asia/Hong_Kong"),
     "US": ZoneInfo("America/New_York"),
 }
+BENCHMARK_IDENTITIES = {
+    "CN": {
+        "name": "中证 500",
+        "source_id": "CSI_500_PRICE",
+        "futu_symbol": "SH.000905",
+    },
+    "HK": {
+        "name": "恒生指数",
+        "source_id": "HSI_PRICE",
+        "futu_symbol": "HK.800000",
+    },
+    "US": {
+        "name": "S&P 500 ETF",
+        "source_id": "SPY_QFQ",
+        "futu_symbol": "US.SPY",
+    },
+}
+LEGACY_BENCHMARK_IDENTITIES = {
+    "CN": {"source_id": "CSI_ALL_SHARE_PRICE", "futu_symbol": "SH.000985"},
+    "HK": {"source_id": "HSCI_PRICE", "futu_symbol": "HK.800701"},
+}
 BENCHMARK_SOURCE_IDS = {
-    "CN": "CSI_ALL_SHARE_PRICE",
-    "US": "SPY_QFQ",
-    "HK": "HSCI_PRICE",
+    market: str(identity["source_id"])
+    for market, identity in BENCHMARK_IDENTITIES.items()
 }
 BENCHMARK_FUTU_SYMBOLS = {
-    "CN": "SH.000985",
-    "US": "US.SPY",
-    "HK": "HK.800701",
+    market: str(identity["futu_symbol"])
+    for market, identity in BENCHMARK_IDENTITIES.items()
 }
 TREND_V1_EFFECTIVE_FROM = {
     "CN": "2026-07-16",
@@ -112,6 +131,299 @@ def benchmark_fact(
         "source_id": BENCHMARK_SOURCE_IDS[market],
         "futu_symbol": symbol,
     }
+
+
+def long_term_benchmark_snapshot_path(data_dir: Path, market: str) -> Path:
+    return data_dir / "trend_review" / "long_term_benchmarks" / _market(market) / "latest.json"
+
+
+def long_term_benchmark_cycle_path(data_dir: Path, market: str, month: str) -> Path:
+    try:
+        parsed_month = datetime.strptime(month, "%Y-%m")
+    except ValueError as exc:
+        raise ValueError("benchmark month must be YYYY-MM") from exc
+    if parsed_month.strftime("%Y-%m") != month:
+        raise ValueError("benchmark month must be YYYY-MM")
+    return (
+        data_dir
+        / "trend_review"
+        / "long_term_benchmarks"
+        / _market(market)
+        / "cycles"
+        / f"{month}.json"
+    )
+
+
+def _years_before(value: date, years: int) -> date:
+    try:
+        return value.replace(year=value.year - years)
+    except ValueError:
+        return value.replace(year=value.year - years, day=28)
+
+
+def _validated_benchmark_closes(bars: Sequence[object]) -> list[tuple[date, Decimal]]:
+    closes: list[tuple[date, Decimal]] = []
+    previous: date | None = None
+    for bar in bars:
+        raw_date = str(
+            bar.get("date", "") if isinstance(bar, Mapping) else getattr(bar, "date", "")
+        )
+        try:
+            trading_date = date.fromisoformat(raw_date)
+        except ValueError as exc:
+            raise ValueError("benchmark date must be ISO-8601") from exc
+        if raw_date != trading_date.isoformat():
+            raise ValueError("benchmark date must be ISO-8601")
+        if previous is not None and trading_date <= previous:
+            raise ValueError("benchmark dates must be strictly increasing")
+        close = _required_decimal(
+            bar.get("close") if isinstance(bar, Mapping) else getattr(bar, "close", None),
+            "benchmark close",
+        )
+        if close <= 0:
+            raise ValueError("benchmark close must be positive")
+        closes.append((trading_date, close))
+        previous = trading_date
+    if not closes:
+        raise ValueError("benchmark series is empty")
+    return closes
+
+
+def _benchmark_window(
+    closes: Sequence[tuple[date, Decimal]],
+    rates: Mapping[date, Decimal],
+    *,
+    years: int,
+    cutoff: date,
+) -> dict[str, object]:
+    start = _years_before(cutoff, years)
+    window = [(trading_date, close) for trading_date, close in closes if trading_date >= start]
+    if not window:
+        raise ValueError(f"benchmark {years}Y window is empty")
+    curve = [
+        {"date": trading_date.isoformat(), "equity": format(close, "f")}
+        for trading_date, close in window
+    ]
+    metrics = _portfolio_metrics(curve, rates, window[0][1])
+    elapsed_days = max(1, (window[-1][0] - window[0][0]).days)
+    annualized_return = (
+        (window[-1][1] / window[0][1])
+        ** (Decimal("365") / Decimal(elapsed_days))
+        - Decimal("1")
+    ) * Decimal("100") if window[-1][1] > 0 else Decimal("-100")
+    daily_returns = []
+    for (previous_date, previous_close), (trading_date, close) in zip(window, window[1:]):
+        risk_free_return = (
+            Decimal("1") + _rate_on_or_before(rates, previous_date) / Decimal("100")
+        ) ** (Decimal((trading_date - previous_date).days) / Decimal("365")) - Decimal("1")
+        daily_return = close / previous_close - Decimal("1")
+        daily_returns.append(
+            {
+                "date": trading_date.isoformat(),
+                "return": format(daily_return, "f"),
+                "risk_free_return": format(risk_free_return, "f"),
+                "excess_return": format(daily_return - risk_free_return, "f"),
+            }
+        )
+    return {
+        "start": start.isoformat(),
+        "cutoff": cutoff.isoformat(),
+        "observation_count": len(window),
+        "daily_returns": daily_returns,
+        "metrics": {
+            **metrics,
+            "annualized_return_pct": format(annualized_return, "f"),
+        },
+    }
+
+
+def _validate_long_term_benchmark_snapshot(
+    payload: object, market: str
+) -> dict[str, object]:
+    if not isinstance(payload, Mapping):
+        raise ValueError("long-term benchmark snapshot must be an object")
+    market = _market(market)
+    identity = BENCHMARK_IDENTITIES[market]
+    if (
+        payload.get("schema_version") != "open_trader.trend_review.long_term_benchmark.v1"
+        or payload.get("market") != market
+        or payload.get("benchmark")
+        != {
+            "name": identity["name"],
+            "source_id": identity["source_id"],
+            "futu_symbol": identity["futu_symbol"],
+        }
+    ):
+        raise ValueError("invalid long-term benchmark snapshot identity")
+    closes = payload.get("daily_closes")
+    if not isinstance(closes, list):
+        raise ValueError("long-term benchmark snapshot closes must be a list")
+    parsed = _validated_benchmark_closes(closes)
+    if payload.get("cutoff") != parsed[-1][0].isoformat():
+        raise ValueError("long-term benchmark snapshot cutoff is invalid")
+    completed_at = payload.get("completed_at")
+    try:
+        completed_at_value = datetime.fromisoformat(str(completed_at))
+    except ValueError as exc:
+        raise ValueError("long-term benchmark snapshot timestamp is invalid") from exc
+    if completed_at_value.tzinfo is None or completed_at_value.utcoffset() is None:
+        raise ValueError("long-term benchmark snapshot timestamp must be timezone-aware")
+    refresh = payload.get("refresh")
+    if not isinstance(refresh, Mapping) or set(refresh) != {"force", "actor", "reason"}:
+        raise ValueError("long-term benchmark snapshot refresh is invalid")
+    if refresh.get("force") is True:
+        if not isinstance(refresh.get("actor"), str) or not refresh["actor"].strip():
+            raise ValueError("long-term benchmark force actor is invalid")
+        if not isinstance(refresh.get("reason"), str) or not refresh["reason"].strip():
+            raise ValueError("long-term benchmark force reason is invalid")
+    elif (
+        refresh.get("force") is not False
+        or refresh.get("actor") is not None
+        or refresh.get("reason") is not None
+    ):
+        raise ValueError("long-term benchmark snapshot refresh is invalid")
+    windows = payload.get("windows")
+    if not isinstance(windows, Mapping) or set(windows) != {"1Y", "5Y"}:
+        raise ValueError("long-term benchmark snapshot windows are invalid")
+    for label, years in (("1Y", 1), ("5Y", 5)):
+        window = windows[label]
+        if not isinstance(window, Mapping):
+            raise ValueError("long-term benchmark snapshot window is invalid")
+        window_start = _years_before(parsed[-1][0], years)
+        window_closes = [item for item in parsed if item[0] >= window_start]
+        if (
+            window.get("start") != window_start.isoformat()
+            or window.get("cutoff") != parsed[-1][0].isoformat()
+            or window.get("observation_count") != len(window_closes)
+            or not window_closes
+        ):
+            raise ValueError("long-term benchmark snapshot window is invalid")
+        daily_returns = window.get("daily_returns")
+        metrics = window.get("metrics")
+        if (
+            not isinstance(daily_returns, list)
+            or len(daily_returns) != len(window_closes) - 1
+            or not isinstance(metrics, Mapping)
+            or set(metrics)
+            != {
+                "total_return_pct",
+                "max_drawdown_pct",
+                "sharpe_ratio",
+                "calmar_ratio",
+                "annualized_return_pct",
+            }
+        ):
+            raise ValueError("long-term benchmark snapshot metrics are invalid")
+        for key, value in metrics.items():
+            if key in {"sharpe_ratio", "calmar_ratio"} and value is None:
+                continue
+            _required_decimal(value, f"benchmark {label} {key}")
+        for expected, daily_return in zip(window_closes[1:], daily_returns):
+            if (
+                not isinstance(daily_return, Mapping)
+                or daily_return.get("date") != expected[0].isoformat()
+                or set(daily_return)
+                != {"date", "return", "risk_free_return", "excess_return"}
+            ):
+                raise ValueError("long-term benchmark snapshot returns are invalid")
+            for key in ("return", "risk_free_return", "excess_return"):
+                _required_decimal(daily_return.get(key), f"benchmark {label} {key}")
+    return dict(payload)
+
+
+def read_long_term_benchmark_snapshot(data_dir: Path, market: str) -> dict[str, object]:
+    path = long_term_benchmark_snapshot_path(data_dir, market)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read long-term benchmark snapshot: {path}") from exc
+    return _validate_long_term_benchmark_snapshot(payload, market)
+
+
+def refresh_long_term_benchmark(
+    data_dir: Path,
+    market: str,
+    quote: object,
+    *,
+    now: datetime,
+    process_git_sha: str,
+    force: bool = False,
+    actor: str = "",
+    reason: str = "",
+) -> dict[str, object]:
+    market = _market(market)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("benchmark refresh now must be timezone-aware")
+    if force and (not actor.strip() or not reason.strip()):
+        raise ValueError("forced benchmark refresh requires actor and reason")
+    month = now.strftime("%Y-%m")
+    cycle_path = long_term_benchmark_cycle_path(data_dir, market, month)
+    snapshot_path = long_term_benchmark_snapshot_path(data_dir, market)
+    if cycle_path.exists() and not force:
+        try:
+            payload = _validate_long_term_benchmark_snapshot(
+                json.loads(cycle_path.read_text(encoding="utf-8")), market
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            return {"status": "failed", "market": market, "month": month, "error": str(exc)}
+        try:
+            current_snapshot = read_long_term_benchmark_snapshot(data_dir, market)
+        except ValueError:
+            _write_json_atomic(snapshot_path, payload)
+        else:
+            if _canonical_json_bytes(current_snapshot) != _canonical_json_bytes(payload):
+                _write_json_atomic(snapshot_path, payload)
+        return {
+            "status": "already_completed",
+            "market": market,
+            "month": month,
+            "cutoff": payload["cutoff"],
+        }
+    try:
+        as_of = now.date()
+        bars = quote.get_daily_kline(
+            BENCHMARK_FUTU_SYMBOLS[market],
+            start=(_years_before(as_of, 5) - timedelta(days=7)).isoformat(),
+            end=as_of.isoformat(),
+        )
+        closes = _validated_benchmark_closes(bars)
+        cutoff = closes[-1][0]
+        if closes[0][0] > _years_before(cutoff, 5):
+            raise ValueError("benchmark series must cover five years")
+        rates = _load_dgs3mo_csv(data_dir / "rates" / "DGS3MO.csv")
+        identity = BENCHMARK_IDENTITIES[market]
+        payload = {
+            "schema_version": "open_trader.trend_review.long_term_benchmark.v1",
+            "market": market,
+            "month": month,
+            "completed_at": now.isoformat(),
+            "process_git_sha": process_git_sha,
+            "refresh": {
+                "force": force,
+                "actor": actor.strip() if force else None,
+                "reason": reason.strip() if force else None,
+            },
+            "benchmark": {
+                "name": identity["name"],
+                "source_id": identity["source_id"],
+                "futu_symbol": identity["futu_symbol"],
+            },
+            "cutoff": cutoff.isoformat(),
+            "daily_closes": [
+                {"date": trading_date.isoformat(), "close": format(close, "f")}
+                for trading_date, close in closes
+            ],
+            "windows": {
+                "1Y": _benchmark_window(closes, rates, years=1, cutoff=cutoff),
+                "5Y": _benchmark_window(closes, rates, years=5, cutoff=cutoff),
+            },
+        }
+        _validate_long_term_benchmark_snapshot(payload, market)
+    except Exception as exc:
+        return {"status": "failed", "market": market, "month": month, "error": str(exc)}
+    _write_json_atomic(snapshot_path, payload)
+    _write_json_atomic(cycle_path, payload)
+    return {"status": "completed", "market": market, "month": month, "cutoff": payload["cutoff"]}
 
 
 def _json_value(value: object) -> object:
@@ -6710,17 +7022,30 @@ def _strategy_identity(snapshot: Mapping[str, object]) -> bytes:
 
 
 def _validate_benchmark(
-    benchmark: object, *, market: str, trading_date: str
+    benchmark: object,
+    *,
+    market: str,
+    trading_date: str,
+    allow_legacy: bool = False,
 ) -> Mapping[str, object]:
     if not isinstance(benchmark, Mapping):
         raise ValueError("trend review benchmark must be an object")
     if benchmark.get("date") != trading_date:
         raise ValueError("benchmark date does not match trend review date")
-    if benchmark.get("source_id") != BENCHMARK_SOURCE_IDS[market]:
+    identity = BENCHMARK_IDENTITIES[market]
+    expected = {
+        "source_id": identity["source_id"],
+        "futu_symbol": identity["futu_symbol"],
+    }
+    if allow_legacy and market in LEGACY_BENCHMARK_IDENTITIES:
+        legacy = LEGACY_BENCHMARK_IDENTITIES[market]
+        if all(benchmark.get(key) == value for key, value in legacy.items()):
+            expected = legacy
+    if benchmark.get("source_id") != expected["source_id"]:
         raise ValueError(
-            f"benchmark source_id must be {BENCHMARK_SOURCE_IDS[market]}"
+            f"benchmark source_id must be {expected['source_id']}"
         )
-    if benchmark.get("futu_symbol") != BENCHMARK_FUTU_SYMBOLS[market]:
+    if benchmark.get("futu_symbol") != expected["futu_symbol"]:
         raise ValueError("benchmark Futu symbol does not match market")
     if _required_decimal(benchmark.get("close"), "benchmark close") <= 0:
         raise ValueError("benchmark close must be positive")
@@ -6739,7 +7064,12 @@ def _load_daily_facts(data_dir: Path, market: str) -> list[dict[str, object]]:
             or payload.get("date") != path.stem
         ):
             raise ValueError(f"invalid trend review daily fact: {path}")
-        _validate_benchmark(payload.get("benchmark"), market=market, trading_date=path.stem)
+        _validate_benchmark(
+            payload.get("benchmark"),
+            market=market,
+            trading_date=path.stem,
+            allow_legacy=True,
+        )
         facts.append(_merge_rotation_orders(payload, data_dir, market, path.stem))
     if not facts:
         raise ValueError(f"no trend review daily facts for {market}")
@@ -7493,6 +7823,10 @@ def build_trend_review_projection(
     benchmark_by_date = {
         str(fact["date"]): dict(fact["benchmark"])
         for fact in legacy
+        if (
+            fact["benchmark"].get("source_id") == BENCHMARK_SOURCE_IDS[market]
+            and fact["benchmark"].get("futu_symbol") == BENCHMARK_FUTU_SYMBOLS[market]
+        )
     }
     for fact in _load_dated_fact_stream(
         data_dir,
@@ -7529,6 +7863,24 @@ def build_trend_review_projection(
             fact.get("benchmark"), market=market, trading_date=str(fact["date"])
         )
         benchmark_by_date[str(fact["date"])] = dict(benchmark)
+    try:
+        long_term_snapshot = read_long_term_benchmark_snapshot(data_dir, market)
+    except ValueError:
+        pass
+    else:
+        closes = long_term_snapshot["daily_closes"]
+        assert isinstance(closes, list)
+        snapshot_benchmarks = {
+            str(close["date"]): {
+                "date": close["date"],
+                "close": close["close"],
+                "source_id": BENCHMARK_SOURCE_IDS[market],
+                "futu_symbol": BENCHMARK_FUTU_SYMBOLS[market],
+            }
+            for close in closes
+            if isinstance(close, Mapping)
+        }
+        benchmark_by_date = {**snapshot_benchmarks, **benchmark_by_date}
     if not discipline_by_date and not actual_by_date and not benchmark_by_date:
         raise ValueError(f"no trend review facts for {market}")
 
@@ -7856,7 +8208,7 @@ def build_trend_review_projection(
     }
 
     projection = {
-        "schema_version": "open_trader.trend_review.projection.v3",
+        "schema_version": "open_trader.trend_review.projection.v4",
         "available": True,
         "market": market,
         "market_label": {"CN": "A 股", "US": "美股", "HK": "港股"}[market],
