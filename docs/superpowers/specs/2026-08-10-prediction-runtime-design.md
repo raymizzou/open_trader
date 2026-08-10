@@ -102,8 +102,9 @@ later mutation-ownership migration.
 
 If a core construction step fails, every already-created resource is cleaned,
 the lock is released, and the instance becomes terminal `FAILED`. If startup
-reconciliation fails after the owner is acquired, monitors do not start; the
-Runtime remains `NOT_READY` and holds the lock until explicit `stop()`.
+reconciliation raises or returns `state=locked` after the owner is acquired,
+monitors do not start; the Runtime remains `NOT_READY` and holds the lock until
+explicit `stop()`.
 
 ### Stop order
 

@@ -359,7 +359,16 @@ class PredictionRuntime:
             raise
 
         try:
-            self.execution.reconcile_startup()
+            reconcile = self.execution.reconcile_startup()
+            if isinstance(reconcile, Mapping) and reconcile.get("state") == "locked":
+                self._state = "NOT_READY"
+                logger.warning(
+                    "prediction_runtime_state state=NOT_READY pid=%s data_dir=%s reason=%s",
+                    os.getpid(),
+                    self._data_dir,
+                    reconcile.get("reason", "reconcile_locked"),
+                )
+                return
         except Exception:
             self._state = "NOT_READY"
             logger.exception(
@@ -406,7 +415,18 @@ class PredictionRuntime:
         errors = self._cleanup_resources()
         if errors:
             self._state = "STOPPING"
-            raise RuntimeError("prediction runtime cleanup failed") from errors[0]
+            details = "; ".join(
+                f"{type(error).__name__}: {error}" for error in errors
+            )
+            logger.error(
+                "prediction_runtime_state state=STOPPING pid=%s data_dir=%s cleanup_errors=%s",
+                os.getpid(),
+                self._data_dir,
+                details,
+            )
+            raise RuntimeError(
+                f"prediction runtime cleanup failed: {details}"
+            ) from errors[0]
         self._state = "STOPPED"
 
     def _cleanup_resources(self) -> list[BaseException]:

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
+import os
 from pathlib import Path
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +23,13 @@ def _hold_owner_lock(path: str, ready: object, release: object) -> None:
     ready.set()  # type: ignore[attr-defined]
     release.wait(10)  # type: ignore[attr-defined]
     lock.release()
+
+
+def _hold_owner_lock_then_exit(path: str, marker_path: str) -> None:
+    lock = _RuntimeOwnershipLock(Path(path))
+    lock.acquire()
+    Path(marker_path).write_text("ready", encoding="utf-8")
+    os._exit(0)
 
 
 def _try_owner_lock(path: str, result: object) -> None:
@@ -97,6 +106,32 @@ def test_runtime_owner_lock_excludes_a_real_second_process(tmp_path: Path) -> No
         assert result.get(timeout=1) == "acquired"
     finally:
         release.set()
+        first.join(5)
+
+
+def test_runtime_owner_lock_releases_after_owner_process_exit(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    path = tmp_path / "prediction_arbitrage" / "runtime.lock"
+    marker = tmp_path / "owner-ready"
+    first = context.Process(
+        target=_hold_owner_lock_then_exit,
+        args=(str(path), str(marker)),
+    )
+    first.start()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.05)
+        assert marker.exists()
+        first.join(5)
+        assert first.exitcode == 0
+
+        successor = _RuntimeOwnershipLock(path)
+        successor.acquire()
+        successor.release()
+    finally:
+        if first.is_alive():
+            first.kill()
         first.join(5)
 
 
@@ -355,6 +390,86 @@ def test_reconcile_failure_keeps_runtime_locked_and_does_not_start_monitors(
     runtime.stop()
     competing_owner.acquire()
     competing_owner.release()
+
+
+def test_locked_reconcile_result_keeps_runtime_not_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    events: list[str] = []
+
+    class FakeTrading:
+        def close(self) -> None:
+            pass
+
+    class FakeTradingClient:
+        @classmethod
+        def from_keychain(cls, _config: object) -> FakeTrading:
+            return FakeTrading()
+
+    class FakeMonitor:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+        def start(self) -> None:
+            events.append("monitor.start")
+
+        def stop(self) -> None:
+            events.append("monitor.stop")
+
+    class FakeExecution:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def reconcile_startup(self) -> dict[str, object]:
+            return {"state": "locked", "reason": "account_unavailable"}
+
+        def notify_ready_opportunity(self, *_: object) -> None:
+            pass
+
+        def notify_observation(self, *_: object) -> None:
+            pass
+
+        def notify_monitor_failure(self, *_: object) -> None:
+            pass
+
+        def set_cross_venue_monitor(self, _monitor: object) -> None:
+            pass
+
+    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", lambda _dir: object())
+    monkeypatch.setattr(runtime_module, "PolymarketTradingClient", FakeTradingClient)
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: None),
+    )
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
+    monkeypatch.setattr(runtime_module, "CodexRelationValidator", lambda *_a, **_k: object())
+    monkeypatch.setattr(runtime_module, "CodexTitleTranslator", lambda *_a, **_k: object())
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+    )
+    runtime.start()
+    try:
+        assert runtime.state == "NOT_READY"
+        assert events == []
+    finally:
+        runtime.stop()
 
 
 def test_core_initialization_failure_releases_resources_and_owner(

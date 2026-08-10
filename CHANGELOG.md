@@ -7,7 +7,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - #40 将 Legacy Dashboard 内的 Prediction 资源组装收拢为一个按数据目录持有
   `runtime.lock` 的 `PredictionRuntime`，固定启动/关闭顺序并接入 SIGTERM 优雅关闭；核心
-  初始化、重复 owner 和对账失败均 fail-closed。此阶段不启动 8769、不改 Gateway、API、
+  初始化、重复 owner 和对账未就绪（异常或 locked 返回）均 fail-closed。此阶段不启动 8769、不改 Gateway、API、
   SQLite、策略或订单语义。已验证 Prediction/执行聚焦套件、Dashboard 全量回归及隔离
   Legacy 启停工作流。
 
