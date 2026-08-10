@@ -1079,6 +1079,8 @@ class CodexCrossVenueEquivalenceValidator:
         timeout_seconds: float = 45.0,
         prompt_version: str = CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION,
         fallback_model: str | None = None,
+        fallback_enabled: bool = True,
+        max_codex_calls: int | None = None,
         fallback: (
             Callable[
                 [str, Mapping[str, object]],
@@ -1089,11 +1091,24 @@ class CodexCrossVenueEquivalenceValidator:
     ) -> None:
         if not model.strip():
             raise ValueError("Codex model is required")
+        if (
+            max_codex_calls is not None
+            and (
+                isinstance(max_codex_calls, bool)
+                or not isinstance(max_codex_calls, int)
+                or max_codex_calls < 0
+            )
+        ):
+            raise ValueError("max_codex_calls must be a non-negative integer")
         self.store = store
         self.model = model.strip()
         self.runner = runner
         self.timeout_seconds = timeout_seconds
         self.prompt_version = prompt_version
+        self.fallback_enabled = fallback_enabled
+        self.max_codex_calls = max_codex_calls
+        self.codex_calls = 0
+        self.codex_successes = 0
         fallback_model = (
             fallback_model
             or os.environ.get("OPEN_TRADER_LLM_FALLBACK_MODEL")
@@ -1146,6 +1161,11 @@ class CodexCrossVenueEquivalenceValidator:
             return self._result(pair, "MARKET_INVALID")
         if cached := self._cached(pair, cache_key):
             return cached
+        if (
+            self.max_codex_calls is not None
+            and self.codex_calls >= self.max_codex_calls
+        ):
+            return self._result(pair, "CODEX_BUDGET_EXHAUSTED")
         if self._breaker.disabled(time.monotonic()):
             return self._fallback(pair, cache_key, "CODEX_CIRCUIT_OPEN")
         command = [
@@ -1156,6 +1176,7 @@ class CodexCrossVenueEquivalenceValidator:
         prompt = f"{_cross_equivalence_prompt()}\nINPUT JSON\n{json.dumps({'predict': _equivalence_market_payload(pair.predict), 'polymarket': _equivalence_market_payload(pair.polymarket)}, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}\n"
         try:
             with tempfile.TemporaryDirectory(prefix="open-trader-codex-") as working_dir:
+                self.codex_calls += 1
                 completed = self.runner(command, input=prompt, text=True, capture_output=True, cwd=working_dir, timeout=self.timeout_seconds, check=False)
         except subprocess.TimeoutExpired:
             self._breaker.record_failure(time.monotonic())
@@ -1166,6 +1187,8 @@ class CodexCrossVenueEquivalenceValidator:
             self.store.record_llm_call(status="failed", usage={"provider": "codex"})
             return self._fallback(pair, cache_key, "CODEX_FAILED")
         structured, usage = _codex_events(completed.stdout or "")
+        if _valid_equivalence_result(structured):
+            self.codex_successes += 1
         if completed.returncode != 0:
             self._breaker.record_failure(time.monotonic())
             self.store.record_llm_call(status="failed", usage={**usage, "provider": "codex"})
@@ -1190,6 +1213,8 @@ class CodexCrossVenueEquivalenceValidator:
         codex_cache_key: str,
         codex_reason: str,
     ) -> CrossVenueValidation:
+        if not self.fallback_enabled:
+            return self._result(pair, codex_reason)
         fallback_cache_key = cross_exchange_equivalence_cache_key(
             pair, model=self.fallback_model, prompt_version=self.prompt_version
         )

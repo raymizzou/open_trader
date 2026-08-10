@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import multiprocessing
 import os
+import subprocess
+from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -15,6 +19,189 @@ from open_trader.prediction_runtime import (
     _CrossVenueRuntime,
     _RuntimeOwnershipLock,
 )
+from open_trader.predict_cross_venue import (
+    CodexCrossVenueEquivalenceValidator,
+    ExplicitMarketPair,
+    VenueMarket,
+)
+from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+
+
+def _shadow_cross_pair(index: int) -> ExplicitMarketPair:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    finish = datetime(2027, 1, 1, tzinfo=UTC)
+    return ExplicitMarketPair(
+        pair_id=f"shadow-pair-{index}",
+        predict=VenueMarket(
+            exchange="predict.fun",
+            market_id="predict-market",
+            condition_id="predict-condition",
+            question=f"Test market {index}",
+            rules=f"Predict rules {index}",
+            event_start_at=now,
+            event_end_at=finish,
+            yes_token_id="predict-yes",
+            no_token_id="predict-no",
+            settlement_asset="USDT",
+            minimum_order_size=Decimal("1"),
+            tick_size=Decimal("0.01"),
+            fee_rate_bps=Decimal("0"),
+            rules_fingerprint="predict-fingerprint",
+            category_slug="test",
+            resolution_provider="test oracle",
+        ),
+        polymarket=VenueMarket(
+            exchange="polymarket",
+            market_id="poly-market",
+            condition_id="poly-condition",
+            question=f"Test market {index}",
+            rules=f"Polymarket rules {index}",
+            close_at=finish,
+            settlement_at=finish,
+            yes_token_id="poly-yes",
+            no_token_id="poly-no",
+            settlement_asset="USDC",
+            minimum_order_size=Decimal("1"),
+            tick_size=Decimal("0.01"),
+            fee_rate_bps=Decimal("0"),
+            rules_fingerprint="poly-fingerprint",
+        ),
+    )
+
+
+def _shadow_cross_result() -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "decision": "REJECT",
+        "summary": "Not approved.",
+        "predict": {
+            "exchange": "predict.fun",
+            "market_id": "predict-market",
+            "condition_id": "predict-condition",
+            "rules_fingerprint": "predict-fingerprint",
+        },
+        "polymarket": {
+            "exchange": "polymarket",
+            "market_id": "poly-market",
+            "condition_id": "poly-condition",
+            "rules_fingerprint": "poly-fingerprint",
+        },
+        "direct_outcome_mapping": {
+            "predict_yes": "YES",
+            "predict_no": "NO",
+            "polymarket_yes": "YES",
+            "polymarket_no": "NO",
+        },
+        "canonical_cutoff": "2027-01-01T00:00:00Z",
+        "contract_shape": "BINARY",
+        "divergent_states": {
+            "PREDICT_YES_POLYMARKET_NO": {"possible": False, "reason": "same"},
+            "POLYMARKET_YES_PREDICT_NO": {"possible": False, "reason": "same"},
+        },
+        "evidence": [],
+        "uncertainties": ["ambiguous"],
+    }
+
+
+def _shadow_cross_jsonl() -> str:
+    return "\n".join(
+        (
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(_shadow_cross_result())}}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1}}),
+        )
+    )
+
+
+class _ShadowCrossRunner:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(
+        self, command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(command)
+        return subprocess.CompletedProcess(
+            command, 0, stdout=_shadow_cross_jsonl(), stderr=""
+        )
+
+
+def test_cross_venue_codex_rejects_negative_budget(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        CodexCrossVenueEquivalenceValidator(
+            PredictionArbitrageStore(tmp_path), model="gpt-test", max_codex_calls=-1
+        )
+
+
+def test_cross_venue_codex_budget_caps_only_uncached_calls(tmp_path: Path) -> None:
+    runner = _ShadowCrossRunner()
+    fallback_calls: list[str] = []
+    validator = CodexCrossVenueEquivalenceValidator(
+        PredictionArbitrageStore(tmp_path),
+        model="gpt-test",
+        runner=runner,
+        fallback_enabled=False,
+        max_codex_calls=3,
+        fallback=lambda *_: (fallback_calls.append("called") or None, "disabled"),
+    )
+
+    results = [validator.validate(_shadow_cross_pair(index)) for index in range(4)]
+
+    assert len(runner.calls) == 3
+    assert validator.codex_calls == 3
+    assert validator.codex_successes == 3
+    assert results[3].reason == "CODEX_BUDGET_EXHAUSTED"
+    assert fallback_calls == []
+
+
+def test_cross_venue_codex_cached_hit_does_not_consume_budget(tmp_path: Path) -> None:
+    store = PredictionArbitrageStore(tmp_path)
+    pair = _shadow_cross_pair(0)
+    assert CodexCrossVenueEquivalenceValidator(store, model="gpt-test", runner=_ShadowCrossRunner()).validate(pair).approved is False
+    runner = _ShadowCrossRunner()
+    validator = CodexCrossVenueEquivalenceValidator(
+        store, model="gpt-test", runner=runner, fallback_enabled=False, max_codex_calls=0
+    )
+
+    cached = validator.validate(pair)
+    exhausted = validator.validate(_shadow_cross_pair(1))
+
+    assert cached.reason == "LLM_REJECTED"
+    assert exhausted.reason == "CODEX_BUDGET_EXHAUSTED"
+    assert runner.calls == []
+    assert validator.codex_calls == validator.codex_successes == 0
+
+
+def test_cross_venue_codex_timeout_without_fallback_records_no_deepseek_usage(tmp_path: Path) -> None:
+    fallback_calls: list[str] = []
+
+    def timeout(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(command, 1)
+
+    store = PredictionArbitrageStore(tmp_path)
+    result = CodexCrossVenueEquivalenceValidator(
+        store,
+        model="gpt-test",
+        runner=timeout,
+        fallback_enabled=False,
+        fallback=lambda *_: (fallback_calls.append("called") or None, "disabled"),
+    ).validate(_shadow_cross_pair(0))
+
+    assert result.reason == "CODEX_TIMEOUT"
+    assert fallback_calls == []
+    assert store.llm_usage_24h_by_provider().get("deepseek", {}) == {}
+
+
+def test_cross_venue_codex_default_fallback_is_preserved(tmp_path: Path) -> None:
+    fallback_calls: list[str] = []
+    result = CodexCrossVenueEquivalenceValidator(
+        PredictionArbitrageStore(tmp_path),
+        model="gpt-test",
+        runner=lambda command, **_kwargs: subprocess.CompletedProcess(command, 1, stdout="", stderr="failed"),
+        fallback=lambda *_: (fallback_calls.append("called") or json.dumps(_shadow_cross_result()), None),
+    ).validate(_shadow_cross_pair(0))
+
+    assert result.reason == "LLM_REJECTED"
+    assert fallback_calls == ["called"]
 
 
 def _hold_owner_lock(path: str, ready: object, release: object) -> None:
