@@ -699,11 +699,14 @@ def run_shadow_validation(
                 codex=codex_delta,
                 deepseek_calls=int(_mapping(_mapping(report["provider_evidence"]).get("delta")).get("deepseek", {}).get("calls") or 0), deadline=False,
             )
-            if status in {"PASS", "FAIL"} or any(
-                int(_mapping(counter).get("attempts") or 0) >= 3
+            terminal_category = next((
+                category for category, counter in codex_delta.items()
+                if int(_mapping(counter).get("attempts") or 0) >= 3
                 and int(_mapping(counter).get("successes") or 0) == 0
-                for counter in codex_delta.values()
-            ):
+            ), None)
+            if terminal_category is not None:
+                status, reason = "BLOCKED", f"all {terminal_category} Codex canaries failed"
+            if status in {"PASS", "FAIL"} or terminal_category is not None:
                 break
             time.sleep(min(_POLL_SECONDS, _remaining(validation_deadline)))
         else:

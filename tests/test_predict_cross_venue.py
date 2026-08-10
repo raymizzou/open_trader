@@ -654,6 +654,8 @@ def test_equivalence_schema_requires_explicit_exchange_evidence_and_divergent_ch
     assert {"predict", "polymarket", "direct_outcome_mapping", "canonical_cutoff", "contract_shape", "divergent_states", "evidence", "uncertainties"} <= set(schema["required"])
     assert set(schema["properties"]["divergent_states"]["required"]) == {"PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"}
     assert set(schema["$defs"]["predict_market"]["required"]) == {"exchange", "market_id", "condition_id", "rules_fingerprint"}
+    assert schema["$defs"]["predict_market"]["properties"]["exchange"] == {"type": "string", "const": "predict.fun"}
+    assert schema["$defs"]["polymarket_market"]["properties"]["exchange"] == {"type": "string", "const": "polymarket"}
     assert "allOf" not in schema_path.read_text()
 
 

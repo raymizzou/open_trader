@@ -58,7 +58,7 @@
       "additionalProperties": false,
       "required": ["exchange", "market_id", "condition_id", "rules_fingerprint"],
       "properties": {
-        "exchange": { "const": "predict.fun" },
+        "exchange": { "type": "string", "const": "predict.fun" },
         "market_id": { "type": "string" },
         "condition_id": { "type": "string" },
         "rules_fingerprint": { "type": "string" }
@@ -69,7 +69,7 @@
       "additionalProperties": false,
       "required": ["exchange", "market_id", "condition_id", "rules_fingerprint"],
       "properties": {
-        "exchange": { "const": "polymarket" },
+        "exchange": { "type": "string", "const": "polymarket" },
         "market_id": { "type": "string" },
         "condition_id": { "type": "string" },
         "rules_fingerprint": { "type": "string" }

@@ -402,6 +402,8 @@ def test_shadow_validation_outcomes(
     report = _run_fake_validation(case, tmp_path, monkeypatch)
 
     assert report["status"] == expected
+    if case == "all_cross_canaries_failed":
+        assert report["reason"] == "all cross_venue Codex canaries failed"
 
 
 def test_shadow_validation_report_has_required_evidence(
