@@ -6,24 +6,19 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from tempfile import NamedTemporaryFile, TemporaryDirectory
+from tempfile import NamedTemporaryFile
 
 from .prediction_arbitrage_store import PredictionArbitrageStore
 
 _SNAPSHOT_RETRIES = 3
 
 
-def _source_files(source_path: Path) -> tuple[Path, ...]:
-    return tuple(Path(f"{source_path}{suffix}") for suffix in ("", "-wal", "-shm"))
-
-
 def _source_file_state(source_path: Path) -> tuple[tuple[bool, int, int], ...]:
     state: list[tuple[bool, int, int]] = []
-    for path in _source_files(source_path):
+    for path in (source_path, Path(f"{source_path}-wal")):
         try:
             stat = path.stat()
         except FileNotFoundError:
@@ -31,26 +26,6 @@ def _source_file_state(source_path: Path) -> tuple[tuple[bool, int, int], ...]:
         else:
             state.append((True, stat.st_size, stat.st_mtime_ns))
     return tuple(state)
-
-
-def _copy_source_snapshot(source_path: Path, target_path: Path) -> None:
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    for _ in range(_SNAPSHOT_RETRIES):
-        before = _source_file_state(source_path)
-        try:
-            for source_file, target_file in zip(
-                _source_files(source_path), _source_files(target_path)
-            ):
-                if source_file.exists():
-                    shutil.copyfile(source_file, target_file)
-                elif target_file.exists():
-                    target_file.unlink()
-            after = _source_file_state(source_path)
-        except FileNotFoundError:
-            continue
-        if before == after:
-            return
-    raise RuntimeError("source database changed while taking shadow snapshot")
 
 
 def seed_shadow_store(
@@ -72,10 +47,14 @@ def seed_shadow_store(
         raise ValueError("source and shadow must use different databases")
     destination = PredictionArbitrageStore(Path(shadow_data_dir))
 
-    with TemporaryDirectory(prefix="open-trader-shadow-seed-") as temporary:
-        snapshot_path = Path(temporary) / source_path.name
-        _copy_source_snapshot(source_path, snapshot_path)
-        source_uri = f"{snapshot_path.resolve().as_uri()}?mode=ro"
+    for _ in range(_SNAPSHOT_RETRIES):
+        before = _source_file_state(source_path)
+        has_wal = before[1][0]
+        # immutable is safe only for a quiescent main file with no WAL sidecar;
+        # a live WAL must be read by SQLite's normal read-only snapshot logic.
+        source_uri = f"{source_path.resolve().as_uri()}?mode=ro"
+        if not has_wal:
+            source_uri += "&immutable=1"
         source = sqlite3.connect(source_uri, uri=True)
         try:
             source.execute("BEGIN")
@@ -89,6 +68,10 @@ def seed_shadow_store(
             source.execute("COMMIT")
         finally:
             source.close()
+        if before == _source_file_state(source_path):
+            break
+    else:
+        raise RuntimeError("source database changed while reading shadow snapshot")
 
     canonical_rows = {
         "relation_state": relation_rows,

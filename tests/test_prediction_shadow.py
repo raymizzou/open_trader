@@ -111,12 +111,15 @@ def test_seed_shadow_store_excludes_every_forbidden_category_and_preserves_sourc
 ) -> None:
     source = _populated_store(tmp_path / "production")
     _populate_forbidden_categories(source)
+    wal_path = Path(f"{source.path}-wal")
+    with sqlite3.connect(source.path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    wal_path.unlink(missing_ok=True)
     source_files = {
         path: _file_snapshot(path)
         for path in (
             source.path,
             Path(f"{source.path}-wal"),
-            Path(f"{source.path}-shm"),
         )
     }
     import open_trader.prediction_shadow as shadow_module
@@ -157,9 +160,13 @@ def test_seed_shadow_store_excludes_every_forbidden_category_and_preserves_sourc
 
     assert all(count == 0 for count in counts.values())
     assert any(
-        str(database).endswith("prediction_arbitrage.sqlite3?mode=ro")
+        str(database).endswith("prediction_arbitrage.sqlite3?mode=ro&immutable=1")
         and kwargs.get("uri") is True
         for database, kwargs in connect_calls
+    )
+    assert any(
+        str(database) == f"{source.path.resolve().as_uri()}?mode=ro&immutable=1"
+        for database, _kwargs in connect_calls
     )
     assert read_only_connections
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
@@ -184,7 +191,9 @@ def test_seed_shadow_store_excludes_every_forbidden_category_and_preserves_sourc
     assert unchanged == {}
 
 
-def test_seed_shadow_store_reads_latest_rows_from_live_wal(tmp_path: Path) -> None:
+def test_seed_shadow_store_reads_latest_rows_from_live_wal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     source = _populated_store(tmp_path / "production")
     connection = sqlite3.connect(source.path)
     try:
@@ -206,9 +215,18 @@ def test_seed_shadow_store_reads_latest_rows_from_live_wal(tmp_path: Path) -> No
             for path in (
                 source.path,
                 Path(f"{source.path}-wal"),
-                Path(f"{source.path}-shm"),
             )
         }
+        import open_trader.prediction_shadow as shadow_module
+
+        connect_calls: list[object] = []
+        connect = shadow_module.sqlite3.connect
+
+        def recording_connect(database: object, *args: object, **kwargs: object):
+            connect_calls.append(database)
+            return connect(database, *args, **kwargs)
+
+        monkeypatch.setattr(shadow_module.sqlite3, "connect", recording_connect)
 
         seed_shadow_store(
             source_data_dir=source.data_dir,
@@ -220,6 +238,9 @@ def test_seed_shadow_store_reads_latest_rows_from_live_wal(tmp_path: Path) -> No
         }
         assert destination.load_llm_cache("wal-cache") == {"decision": "approve"}
         assert all(_file_snapshot(path) == snapshot for path, snapshot in source_files.items())
+        assert f"{source.path.resolve().as_uri()}?mode=ro" in {
+            str(database) for database in connect_calls
+        }
     finally:
         connection.close()
 
