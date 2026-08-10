@@ -2168,24 +2168,24 @@ def serve_dashboard(
             prediction_monitor = prediction_runtime.monitor
             prediction_execution = prediction_runtime.execution
             cross_venue_monitor = prediction_runtime.cross_venue_monitor
-    server = create_dashboard_server(
-        config=config,
-        host=host,
-        port=port,
-        trend_simulate_position_service=trend_simulate_position_service,
-        prediction_store=prediction_store,
-        prediction_monitor=prediction_monitor,
-        cross_venue_monitor=cross_venue_monitor,
-        prediction_execution_service=prediction_execution,
-        runtime_metadata=runtime_metadata,
-    )
-    _, actual_port = server.server_address
+    server = None
     previous_signal_handlers: dict[int, object] = {}
 
     def request_shutdown(_signum: int, _frame: object) -> None:
         raise KeyboardInterrupt
 
     try:
+        server = create_dashboard_server(
+            config=config,
+            host=host,
+            port=port,
+            trend_simulate_position_service=trend_simulate_position_service,
+            prediction_store=prediction_store,
+            prediction_monitor=prediction_monitor,
+            cross_venue_monitor=cross_venue_monitor,
+            prediction_execution_service=prediction_execution,
+            runtime_metadata=runtime_metadata,
+        )
         if threading.current_thread() is threading.main_thread():
             for signum in (signal.SIGTERM, signal.SIGINT):
                 previous_signal_handlers[signum] = signal.getsignal(signum)
@@ -2207,4 +2207,5 @@ def serve_dashboard(
                 prediction_runtime.stop()
             except Exception:
                 pass
-        server.server_close()
+        if server is not None:
+            server.server_close()

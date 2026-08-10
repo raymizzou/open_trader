@@ -4757,6 +4757,54 @@ def test_legacy_sigterm_routes_through_prediction_runtime_cleanup(
     assert order == ["runtime.start", "server.serve", "runtime.stop", "server.close"]
 
 
+def test_legacy_server_construction_failure_stops_prediction_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    order: list[str] = []
+    config = replace(
+        dashboard_config(tmp_path),
+        prediction_config_path=tmp_path / "prediction.json",
+    )
+    config.prediction_config_path.write_text("{}", encoding="utf-8")
+
+    class FakeTrendService:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def prewarm(self) -> None:
+            pass
+
+    class FakeRuntime:
+        store = None
+        monitor = None
+        cross_venue_monitor = None
+        execution = None
+
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def start(self) -> None:
+            order.append("runtime.start")
+
+        def stop(self) -> None:
+            order.append("runtime.stop")
+
+    def fail_server(**_: object) -> object:
+        order.append("server.construct")
+        raise RuntimeError("bind failed")
+
+    monkeypatch.setattr(dashboard_web, "TrendSimulatePositionService", FakeTrendService)
+    monkeypatch.setattr(dashboard_web, "PredictionRuntime", FakeRuntime)
+    monkeypatch.setattr(dashboard_web, "create_dashboard_server", fail_server)
+
+    with pytest.raises(RuntimeError, match="bind failed"):
+        dashboard_web.serve_dashboard(config, host="127.0.0.1", port=0)
+
+    assert order == ["runtime.start", "server.construct", "runtime.stop"]
+
+
 def test_legacy_real_sigterm_runs_runtime_cleanup_in_a_child_process(
     tmp_path: Path,
 ) -> None:

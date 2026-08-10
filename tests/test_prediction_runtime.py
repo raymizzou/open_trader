@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import multiprocessing
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ import pytest
 from open_trader.prediction_runtime import (
     PredictionRuntime,
     PredictionRuntimeOwnershipError,
+    _CrossVenueRuntime,
     _RuntimeOwnershipLock,
 )
 
@@ -226,6 +228,42 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
     assert events.index("trading.close") < events.index("store.close")
 
 
+def test_failed_runtime_is_terminal_and_stop_does_not_repeat_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    closed: list[str] = []
+
+    class FakeStore:
+        def __init__(self, _data_dir: Path) -> None:
+            pass
+
+        def close(self) -> None:
+            closed.append("store")
+
+    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
+    monkeypatch.setattr(
+        runtime_module,
+        "load_trading_config",
+        lambda _path: (_ for _ in ()).throw(RuntimeError("bad config")),
+    )
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+    )
+
+    with pytest.raises(RuntimeError, match="bad config"):
+        runtime.start()
+    with pytest.raises(RuntimeError, match="cannot start from FAILED"):
+        runtime.start()
+
+    runtime.stop()
+    runtime.stop()
+    assert closed == ["store"]
+
+
 def test_reconcile_failure_keeps_runtime_locked_and_does_not_start_monitors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -355,3 +393,182 @@ def test_core_initialization_failure_releases_resources_and_owner(
     )
     owner.acquire()
     owner.release()
+
+
+def test_cross_start_failure_degrades_only_cross_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    events: list[str] = []
+
+    class FakeStore:
+        def __init__(self, _data_dir: Path) -> None:
+            pass
+
+    class FakeTrading:
+        def close(self) -> None:
+            pass
+
+    class FakeTradingClient:
+        @classmethod
+        def from_keychain(cls, _config: object) -> FakeTrading:
+            return FakeTrading()
+
+    class FakeMonitor:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+        def start(self) -> None:
+            events.append("polymarket.start")
+
+        def stop(self) -> None:
+            events.append("polymarket.stop")
+
+    class FakeExecution:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def reconcile_startup(self) -> dict[str, object]:
+            return {"state": "ready"}
+
+        def notify_ready_opportunity(self, *_: object) -> None:
+            pass
+
+        def notify_observation(self, *_: object) -> None:
+            pass
+
+        def notify_monitor_failure(self, *_: object) -> None:
+            pass
+
+        def set_cross_venue_monitor(self, _monitor: object) -> None:
+            pass
+
+    class FailingCrossMonitor:
+        async def start(self) -> None:
+            raise RuntimeError("cross start failed")
+
+        async def stop(self) -> None:
+            pass
+
+        def snapshot(self) -> dict[str, object]:
+            return {"status": "degraded"}
+
+    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
+    monkeypatch.setattr(runtime_module, "PolymarketTradingClient", FakeTradingClient)
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: None),
+    )
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
+    monkeypatch.setattr(runtime_module, "CodexRelationValidator", lambda *_a, **_k: object())
+    monkeypatch.setattr(runtime_module, "CodexTitleTranslator", lambda *_a, **_k: object())
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        cross_venue_monitor=FailingCrossMonitor(),
+    )
+    runtime.start()
+    try:
+        assert runtime.state == "RUNNING"
+        assert events == ["polymarket.start"]
+        assert isinstance(
+            runtime.cross_venue_monitor,
+            runtime_module._UnavailableCrossVenueMonitor,
+        )
+    finally:
+        runtime.stop()
+
+
+def test_cross_runtime_start_timeout_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    class SlowCrossMonitor:
+        async def start(self) -> None:
+            await asyncio.sleep(0.05)
+
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(runtime_module, "_CROSS_VENUE_START_TIMEOUT", 0.001)
+    runtime = _CrossVenueRuntime(SlowCrossMonitor())
+
+    with pytest.raises(RuntimeError, match="did not start"):
+        runtime.start()
+    assert not runtime.thread_alive
+
+
+def test_cross_runtime_stop_failure_is_reported_and_keeps_owner_locked(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class FailingCrossMonitor:
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            events.append("cross.stop")
+            raise RuntimeError("cross stop failed")
+
+    class FakeResource:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            events.append(f"{self.name}.close")
+
+    class FakeMonitor:
+        def stop(self) -> None:
+            events.append("polymarket.stop")
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+    )
+    runtime._owner.acquire()
+    runtime._state = "RUNNING"
+    runtime._cross_runtime = _CrossVenueRuntime(FailingCrossMonitor())
+    runtime._cross_runtime.start()
+    runtime.monitor = FakeMonitor()  # type: ignore[assignment]
+    runtime.execution = FakeResource("execution")  # type: ignore[assignment]
+    runtime._prediction_trading = FakeResource("trading")
+    runtime._predict_trading = FakeResource("predict")
+    runtime.store = FakeResource("store")  # type: ignore[assignment]
+
+    try:
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            runtime.stop()
+        assert runtime.state == "STOPPING"
+        assert events == [
+            "cross.stop",
+            "polymarket.stop",
+            "execution.close",
+            "trading.close",
+            "predict.close",
+            "store.close",
+        ]
+        competing_owner = _RuntimeOwnershipLock(
+            tmp_path / "prediction_arbitrage" / "runtime.lock"
+        )
+        with pytest.raises(PredictionRuntimeOwnershipError):
+            competing_owner.acquire()
+    finally:
+        runtime._owner.release()

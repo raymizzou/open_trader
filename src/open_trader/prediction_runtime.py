@@ -27,6 +27,7 @@ from .prediction_arbitrage_store import PredictionArbitrageStore
 from .prediction_title_translation import CodexTitleTranslator
 
 logger = logging.getLogger(__name__)
+_CROSS_VENUE_START_TIMEOUT = 5
 
 # Keep the old spelling available for the existing Dashboard test seam.
 discover_threshold_relations = discover_threshold_relation_catalog
@@ -40,10 +41,6 @@ class _RuntimeOwnershipLock:
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
         self._handle = None
-
-    @property
-    def path(self) -> Path:
-        return self._path
 
     def acquire(self) -> None:
         if self._handle is not None:
@@ -94,6 +91,7 @@ class _CrossVenueRuntime:
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._start_error: BaseException | None = None
+        self._stop_error: BaseException | None = None
 
     @property
     def thread_alive(self) -> bool:
@@ -117,9 +115,12 @@ class _CrossVenueRuntime:
                 if self._start_error is not None:
                     return
                 await asyncio.to_thread(self._stop_requested.wait)
-                result = self._monitor.stop()
-                if inspect.isawaitable(result):
-                    await result
+                try:
+                    result = self._monitor.stop()
+                    if inspect.isawaitable(result):
+                        await result
+                except BaseException as exc:
+                    self._stop_error = exc
             finally:
                 self._loop = None
 
@@ -129,7 +130,14 @@ class _CrossVenueRuntime:
             daemon=True,
         )
         self._thread.start()
-        self._started.wait(timeout=5)
+        if not self._started.wait(timeout=_CROSS_VENUE_START_TIMEOUT):
+            self._stop_requested.set()
+            thread = self._thread
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=5)
+            if self.thread_alive:
+                raise RuntimeError("cross-venue monitor did not start or stop")
+            raise RuntimeError("cross-venue monitor did not start")
         if self._start_error is not None:
             error = self._start_error
             self.stop()
@@ -194,6 +202,9 @@ class _CrossVenueRuntime:
             thread.join(timeout=5)
         if self.thread_alive:
             raise RuntimeError("cross-venue monitor thread did not stop")
+        if self._stop_error is not None:
+            error = self._stop_error
+            raise RuntimeError("cross-venue monitor failed to stop") from error
 
 
 def _cross_venue_gamma_lookup(
@@ -416,21 +427,23 @@ class PredictionRuntime:
             except BaseException as exc:
                 errors.append(exc)
                 uncertain_thread = True
-            finally:
-                if not uncertain_thread:
-                    self.monitor = None
+            else:
+                self.monitor = None
         for resource in (
-            self.execution,
-            self._prediction_trading,
-            self._predict_trading,
-            self.store,
+            ("execution", self.execution),
+            ("_prediction_trading", self._prediction_trading),
+            ("_predict_trading", self._predict_trading),
+            ("store", self.store),
         ):
-            close = getattr(resource, "close", None)
+            name, value = resource
+            close = getattr(value, "close", None)
             if callable(close):
                 try:
                     close()
                 except BaseException as exc:
                     errors.append(exc)
+                finally:
+                    setattr(self, name, None)
         if not uncertain_thread:
             self._owner.release()
         return errors
