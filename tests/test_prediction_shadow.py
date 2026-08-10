@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -54,6 +55,19 @@ def test_seed_shadow_store_rejects_same_database(tmp_path: Path) -> None:
         seed_shadow_store(
             source_data_dir=source.data_dir,
             shadow_data_dir=source.data_dir,
+        )
+
+
+def test_seed_shadow_store_rejects_hardlinked_database(tmp_path: Path) -> None:
+    source = _populated_store(tmp_path / "production")
+    hardlink_dir = tmp_path / "hardlink" / "prediction_arbitrage"
+    hardlink_dir.mkdir(parents=True)
+    os.link(source.path, hardlink_dir / source.path.name)
+
+    with pytest.raises(ValueError, match="different databases"):
+        seed_shadow_store(
+            source_data_dir=source.data_dir,
+            shadow_data_dir=hardlink_dir.parent,
         )
 
 

@@ -5,7 +5,8 @@ import json
 import multiprocessing
 import os
 import subprocess
-from contextlib import contextmanager
+import threading
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -906,6 +907,8 @@ def test_shadow_runtime_stops_on_first_guard_violation_from_owner_thread(
 
     events: list[str] = []
     network_calls: list[str] = []
+    validator_kwargs: list[dict[str, object]] = []
+    cross_kwargs: list[dict[str, object]] = []
 
     class FakeStore:
         def __init__(self, _data_dir: Path) -> None:
@@ -918,6 +921,9 @@ def test_shadow_runtime_stops_on_first_guard_violation_from_owner_thread(
         def cancel_all(self) -> None:
             network_calls.append("cancel_all")
 
+        def place_order(self) -> None:
+            network_calls.append("place_order")
+
         def close(self) -> None:
             events.append("polymarket.close")
 
@@ -929,8 +935,8 @@ def test_shadow_runtime_stops_on_first_guard_violation_from_owner_thread(
 
     class FakePredictClient:
         @classmethod
-        def from_keychain(cls, _config: object) -> None:
-            return None
+        def from_keychain(cls, _config: object) -> object:
+            return object()
 
     class FakeMonitor:
         def __init__(self, **_: object) -> None:
@@ -986,7 +992,13 @@ def test_shadow_runtime_stops_on_first_guard_violation_from_owner_thread(
             self.attempts: list[dict[str, object]] = []
 
         def violation(self, method: str) -> None:
-            attempt = {"venue": "polymarket", "kind": "mutation", "method": method}
+            attempt = {
+                "venue": "polymarket",
+                "kind": "mutation",
+                "method": method,
+                "call_chain": [f"frame-{index}" for index in range(20)],
+                "api_key": "must-not-leak",
+            }
             self.attempts.append(attempt)
             self.on_violation(attempt)  # type: ignore[operator]
             raise RuntimeError("blocked")
@@ -994,17 +1006,20 @@ def test_shadow_runtime_stops_on_first_guard_violation_from_owner_thread(
     @contextmanager
     def fake_guard_polymarket(client: FakePolymarketClient, guard: Guard):
         events.append("guards.enter")
-        original = client.cancel_all
+        original = client.cancel_all, client.place_order
         client.cancel_all = lambda: guard.violation("cancel_all")
+        client.place_order = lambda: guard.violation("place_order")
         try:
             yield
         finally:
-            client.cancel_all = original
+            client.cancel_all, client.place_order = original
             events.append("guards.exit")
 
     @contextmanager
     def fake_guard_predict(_client: object, _guard: Guard):
+        events.append("predict_guard.enter")
         yield
+        events.append("predict_guard.exit")
 
     class Owner:
         def acquire(self) -> None:
@@ -1019,8 +1034,17 @@ def test_shadow_runtime_stops_on_first_guard_violation_from_owner_thread(
     monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
     monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
     monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
-    monkeypatch.setattr(runtime_module, "CodexRelationValidator", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        runtime_module,
+        "CodexRelationValidator",
+        lambda *_a, **kwargs: (validator_kwargs.append(kwargs) or object()),
+    )
     monkeypatch.setattr(runtime_module, "CodexTitleTranslator", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        runtime_module,
+        "_build_cross_venue_monitor",
+        lambda **kwargs: (cross_kwargs.append(kwargs) or FakeCrossMonitor()),
+    )
     monkeypatch.setattr(runtime_module, "PolymarketReadOnlyGuard", Guard)
     monkeypatch.setattr(runtime_module, "PredictReadOnlyGuard", Guard)
     monkeypatch.setattr(runtime_module, "guard_polymarket_client", fake_guard_polymarket)
@@ -1031,23 +1055,102 @@ def test_shadow_runtime_stops_on_first_guard_violation_from_owner_thread(
         prediction_config_path=tmp_path / "prediction.json",
         dashboard_url="http://127.0.0.1:8766/",
         mode="shadow",
-        cross_venue_monitor=FakeCrossMonitor(),
     )
     runtime._owner = Owner()  # type: ignore[assignment]
     runtime.start()
 
     with pytest.raises(RuntimeError, match="blocked"):
         runtime._prediction_trading.cancel_all()  # type: ignore[union-attr]
+    with pytest.raises(RuntimeError, match="blocked"):
+        runtime._prediction_trading.place_order()  # type: ignore[union-attr]
     assert network_calls == []
+    callback_result: list[dict[str, object] | None] = []
+    callback_thread = threading.Thread(
+        target=lambda: callback_result.append(runtime.poll_shadow_failure())
+    )
+    callback_thread.start()
+    callback_thread.join()
+    assert callback_result == [None]
+    assert runtime.state == "RUNNING"
     assert runtime.poll_shadow_failure() == {
-        "venue": "polymarket", "kind": "mutation", "method": "cancel_all"
+        "venue": "polymarket",
+        "kind": "mutation",
+        "method": "cancel_all",
+        "call_chain": [f"frame-{index}" for index in range(12)],
     }
     assert runtime.state == "STOPPED"
-    assert runtime.shadow_evidence["guard_attempts"] == [
-        {"venue": "polymarket", "kind": "mutation", "method": "cancel_all"}
-    ]
+    assert runtime.shadow_evidence["guard_attempts"][0]["method"] == "cancel_all"
+    assert runtime.shadow_evidence["guard_attempts"][1]["method"] == "place_order"
+    assert validator_kwargs[0]["fallback_enabled"] is False
+    assert validator_kwargs[0]["max_codex_calls"] == 3
+    assert cross_kwargs[0]["holding_reconciler"] is None
     assert events == [
         "shadow_owner.acquire", "shadow_store.open", "clients.open", "guards.enter",
-        "monitor.start", "cross.start", "cross.stop", "monitor.stop", "guards.exit",
+        "predict_guard.enter", "monitor.start", "cross.start", "cross.stop", "monitor.stop",
+        "predict_guard.exit", "guards.exit",
         "execution.close", "polymarket.close", "shadow_store.close", "shadow_owner.release",
     ]
+
+
+def test_shadow_cleanup_retains_lock_and_guards_when_monitor_thread_survives(
+    tmp_path: Path,
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    release = threading.Event()
+    exited: list[bool] = []
+
+    class FakeMonitor:
+        def __init__(self) -> None:
+            self._thread = threading.Thread(target=release.wait, daemon=True)
+            self._thread.start()
+
+        def stop(self) -> None:
+            pass
+
+    class FakeResource:
+        def close(self) -> None:
+            pass
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        mode="shadow",
+    )
+    runtime._owner.acquire()
+    runtime._state = "RUNNING"
+    monitor = FakeMonitor()
+    runtime.monitor = monitor  # type: ignore[assignment]
+    runtime.execution = FakeResource()  # type: ignore[assignment]
+    runtime._prediction_trading = FakeResource()
+    runtime.store = FakeResource()  # type: ignore[assignment]
+    runtime._shadow_guards = ExitStack()
+
+    @contextmanager
+    def guard_scope():
+        try:
+            yield
+        finally:
+            exited.append(True)
+
+    runtime._shadow_guards.enter_context(guard_scope())
+
+    try:
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            runtime.stop()
+        assert runtime.state == "STOPPING"
+        assert exited == []
+        competing_owner = runtime_module._RuntimeOwnershipLock(
+            tmp_path / "prediction_arbitrage" / "runtime.lock"
+        )
+        with pytest.raises(PredictionRuntimeOwnershipError):
+            competing_owner.acquire()
+        release.set()
+        runtime.monitor._thread.join(1)  # type: ignore[union-attr]
+        runtime.stop()
+        assert exited == [True]
+    finally:
+        release.set()
+        monitor._thread.join(1)
+        runtime._owner.release()

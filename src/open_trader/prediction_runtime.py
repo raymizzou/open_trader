@@ -9,7 +9,7 @@ import threading
 from collections.abc import Mapping
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from .notifications import NullNotifier
 from .polymarket_monitor import PolymarketMonitor
@@ -239,6 +239,7 @@ def _build_cross_venue_monitor(
     predict_trading: object | None = None,
     fallback_enabled: bool = True,
     max_codex_calls: int | None = None,
+    holding_reconciler: Callable[[], object] | None = None,
 ) -> PredictCrossVenueMonitor | _UnavailableCrossVenueMonitor:
     predict_config = getattr(trading_config, "predict", None)
     if predict_config is None:
@@ -259,7 +260,7 @@ def _build_cross_venue_monitor(
             predict_quote_fn=getattr(predict_trading, "quote_market_buy", None),
             store=store,
             ready_observer=execution.notify_ready_opportunity,
-            holding_reconciler=execution.reconcile_cross_holdings_once,
+            holding_reconciler=holding_reconciler,
         )
     except Exception:
         return _UnavailableCrossVenueMonitor("predict_construction_failed")
@@ -282,6 +283,7 @@ class PredictionRuntime:
         self._prediction_config_path = Path(prediction_config_path)
         self._dashboard_url = str(dashboard_url)
         self._mode = mode
+        self._owner_thread_id = threading.get_ident()
         self._notifier = NullNotifier() if mode == "shadow" else notifier or NullNotifier()
         self._injected_cross_venue_monitor = cross_venue_monitor
         self._owner = _RuntimeOwnershipLock(
@@ -299,6 +301,7 @@ class PredictionRuntime:
         self._shadow_failure_lock = threading.Lock()
         self._shadow_failure_event = threading.Event()
         self._shadow_failure: dict[str, object] | None = None
+        self._shadow_attempts: list[dict[str, object]] = []
         self._relation_validator: object | None = None
         self._cross_validator: object | None = None
 
@@ -316,9 +319,10 @@ class PredictionRuntime:
 
         with self._shadow_failure_lock:
             first = None if self._shadow_failure is None else dict(self._shadow_failure)
+            attempts = [dict(attempt) for attempt in self._shadow_attempts]
         return {
             "mode": self._mode,
-            "guard_attempts": [] if first is None else [first],
+            "guard_attempts": attempts,
             "first_violation": first,
             "codex": {
                 "relation": counters(self._relation_validator),
@@ -328,17 +332,25 @@ class PredictionRuntime:
 
     def _record_shadow_violation(self, attempt: dict[str, object]) -> None:
         sanitized = {
-            field: str(attempt[field])
-            for field in ("venue", "kind", "method")
-            if field in attempt
+            "venue": str(attempt.get("venue", "")),
+            "kind": str(attempt.get("kind", "")),
+            "method": str(attempt.get("method", "")),
+            "call_chain": [
+                str(frame) for frame in attempt.get("call_chain", [])
+            ][:12],
         }
         with self._shadow_failure_lock:
+            self._shadow_attempts.append(sanitized)
             if self._shadow_failure is None:
                 self._shadow_failure = sanitized
                 self._shadow_failure_event.set()
 
     def poll_shadow_failure(self) -> dict[str, object] | None:
-        if self._mode != "shadow" or not self._shadow_failure_event.is_set():
+        if (
+            self._mode != "shadow"
+            or threading.get_ident() != self._owner_thread_id
+            or not self._shadow_failure_event.is_set()
+        ):
             return None
         with self._shadow_failure_lock:
             failure = None if self._shadow_failure is None else dict(self._shadow_failure)
@@ -349,6 +361,7 @@ class PredictionRuntime:
     def start(self) -> None:
         if self._state != "NEW":
             raise RuntimeError(f"prediction runtime cannot start from {self._state}")
+        self._owner_thread_id = threading.get_ident()
         self._state = "STARTING"
         if self._mode == "shadow":
             self._start_shadow()
@@ -410,6 +423,9 @@ class PredictionRuntime:
                     execution=self.execution,
                     codex_model=codex_model,
                     predict_trading=self._predict_trading,
+                    holding_reconciler=getattr(
+                        self.execution, "reconcile_cross_holdings_once", None
+                    ),
                 )
             if not isinstance(cross_monitor, _UnavailableCrossVenueMonitor):
                 self._cross_runtime = _CrossVenueRuntime(cross_monitor)
@@ -524,6 +540,7 @@ class PredictionRuntime:
                     predict_trading=self._predict_trading,
                     fallback_enabled=False,
                     max_codex_calls=3,
+                    holding_reconciler=None,
                 )
             if not isinstance(cross_monitor, _UnavailableCrossVenueMonitor):
                 self._cross_runtime = _CrossVenueRuntime(cross_monitor)
@@ -609,7 +626,12 @@ class PredictionRuntime:
                 errors.append(exc)
                 uncertain_thread = True
             else:
-                self.monitor = None
+                monitor_thread = getattr(self.monitor, "_thread", None)
+                if monitor_thread is not None and monitor_thread.is_alive():
+                    errors.append(RuntimeError("prediction monitor thread did not stop"))
+                    uncertain_thread = True
+                else:
+                    self.monitor = None
         if not uncertain_thread and self._shadow_guards is not None:
             try:
                 self._shadow_guards.close()
