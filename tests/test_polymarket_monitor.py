@@ -612,6 +612,9 @@ def test_cross_venue_tokens_join_existing_subscription_and_refresh_once(
     }
     assert monitor._market_by_token == {"standard": "market-1"}
     assert monitor._relation_by_token == {"threshold": {"relation-1"}}
+    websocket = monitor.snapshot()["relation_discovery"]["websocket"]
+    assert websocket["standard_subscribed_tokens"] == 1
+    assert websocket["subscribed_tokens"] == 4
 
 
 def test_relation_token_union_controls_resubscribe_and_uses_only_buy_legs(
@@ -3433,28 +3436,116 @@ def test_relation_scan_logs_are_bounded_and_not_persisted(tmp_path: Path) -> Non
     ).snapshot()["relation_discovery"]["scan_logs"] == []
 
 
-def test_only_exact_active_binary_markets_are_subscribed_and_books_match_by_token_id(
+def test_only_execution_eligible_active_binary_markets_are_subscribed(
     tmp_path: Path,
 ) -> None:
     good = market("good", yes="yes-good", no="no-good")
-    monitor_only = market("fee", yes="yes-fee", no="no-fee", fees_enabled=True)
-    neg_risk = market("neg", yes="yes-neg", no="no-neg", neg_risk=True)
+    fee = market("fee", yes="yes-fee", no="no-fee", fees_enabled=True)
+    unknown = market(
+        "unknown", yes="yes-unknown", no="no-unknown", fees_enabled=None
+    )
+    neg = market("neg", yes="yes-neg", no="no-neg", neg_risk=True)
     malformed = ns(id="malformed", state=ns(active=True, closed=False), outcomes=[ns(label="YES", token_id="yes")])
-    setup_public([event("e", markets=(good, monitor_only, neg_risk, malformed))])
+    setup_public([event("e", markets=(good, fee, unknown, neg, malformed))])
 
     monitor = make_monitor(tmp_path)
     monitor.refresh_once()
     snapshot = monitor.snapshot()
 
-    assert [call for call in FakePublicClient.book_calls] == [["yes-good", "no-good"], ["yes-fee", "no-fee"], ["yes-neg", "no-neg"]]
-    spec = FakePublicClient.subscribe_specs[-1]
-    assert tuple(spec.token_ids) == ("no-fee", "no-good", "no-neg", "yes-fee", "yes-good", "yes-neg")
+    assert FakePublicClient.book_calls == [
+        ["yes-good", "no-good"],
+        ["yes-fee", "no-fee"],
+        ["yes-unknown", "no-unknown"],
+        ["yes-neg", "no-neg"],
+    ]
+    assert tuple(FakePublicClient.subscribe_specs[-1].token_ids) == (
+        "no-good",
+        "yes-good",
+    )
     markets = {row["market_id"]: row for row in snapshot["events"][0]["markets"]}
-    assert markets["good"]["actionable"] is True
-    assert markets["fee"]["actionable"] is False
+    assert set(markets) == {"good", "fee", "unknown", "neg"}
     assert markets["fee"]["eligibility_reason"] == "fee_unverified_or_enabled"
+    assert markets["unknown"]["eligibility_reason"] == "fee_unverified_or_enabled"
     assert markets["neg"]["eligibility_reason"] == "neg_risk"
     assert snapshot["diagnostics"]["malformed_markets"] == 1
+
+
+def test_execution_eligible_market_stays_subscribed_without_threshold_candidate(
+    tmp_path: Path,
+) -> None:
+    setup_public([event("e", markets=(market("m", yes="yes-m", no="no-m"),))])
+    FakePublicClient.books["yes-m"].asks = [
+        ns(price=Decimal("0.50"), size=Decimal("20"))
+    ]
+    FakePublicClient.books["no-m"].asks = [
+        ns(price=Decimal("0.50"), size=Decimal("20"))
+    ]
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    assert monitor.snapshot()["events"][0]["markets"][0]["eligibility_reason"] == "no_threshold_candidate"
+    assert tuple(FakePublicClient.subscribe_specs[-1].token_ids) == ("no-m", "yes-m")
+
+
+def test_execution_eligible_market_stays_subscribed_when_book_read_fails(
+    tmp_path: Path,
+) -> None:
+    setup_public([event("e", markets=(market("m", yes="yes-m", no="no-m"),))])
+    FakePublicClient.fail_get_order_books = True
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    assert tuple(FakePublicClient.subscribe_specs[-1].token_ids) == ("no-m", "yes-m")
+
+
+def test_execution_eligible_websocket_tick_still_confirms_paired_books(
+    tmp_path: Path,
+) -> None:
+    setup_public([event("e", markets=(market("m"),))])
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    FakePublicClient.book_calls.clear()
+    asyncio.run(monitor._process_stream_event(
+        FakePublicClient(),
+        ns(type="price_change", payload=ns(asset_id="yes-1", price_changes=())),
+    ))
+    assert FakePublicClient.book_calls == [["yes-1", "no-1"]]
+
+
+def test_ambiguous_empty_standard_pool_preserves_prior_subscription(tmp_path: Path) -> None:
+    setup_public([event("e", markets=(market("m", yes="yes-old", no="no-old"),))])
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    previous_tokens = dict(monitor._market_by_token)
+    setup_public([event("e", markets=(market(
+        "m", yes="yes-unknown", no="no-unknown", fees_enabled=None
+    ),))])
+    monitor.refresh_once()
+    snapshot = monitor.snapshot()
+    assert monitor._market_by_token == previous_tokens
+    assert snapshot["health"]["status"] == "degraded"
+    assert "universe_refresh_failed" in snapshot["health"]["degraded_reasons"]
+
+
+def test_explicitly_ineligible_universe_accepts_empty_standard_pool(tmp_path: Path) -> None:
+    setup_public([event("e", markets=(
+        market("fee", fees_enabled=True),
+        market("neg", yes="yes-neg", no="no-neg", neg_risk=True),
+    ))])
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    assert monitor._market_by_token == {}
+    assert FakePublicClient.subscribe_specs == []
+    assert monitor.snapshot()["health"]["status"] == "healthy"
+
+
+def test_unchanged_universe_token_union_does_not_reconnect(tmp_path: Path) -> None:
+    setup_public([event("e", markets=(market("m"),))])
+    monitor = make_monitor(tmp_path, relation_discovery=None)
+    client = FakePublicClient()
+    asyncio.run(monitor._refresh_universe(client))
+    first_handle = monitor._stream_handle
+    asyncio.run(monitor._refresh_universe(client))
+    assert len(FakePublicClient.subscribe_specs) == 1
+    assert monitor._stream_handle is first_handle
 
 
 def test_large_token_universe_is_subscribed_in_websocket_safe_chunks(
@@ -3465,7 +3556,6 @@ def test_large_token_universe_is_subscribed_in_websocket_safe_chunks(
             f"market-{index:03d}",
             yes=f"yes-{index:03d}",
             no=f"no-{index:03d}",
-            fees_enabled=True,
         )
         for index in range(126)
     )
@@ -3559,6 +3649,7 @@ def test_targeted_standard_refresh_rechecks_live_market_metadata(
     monitor = make_monitor(tmp_path)
     monitor.refresh_once()
     assert monitor.opportunity("e:m") is not None
+    monitor._subscription_dirty = False
     FakePublicClient.get_event_calls.clear()
     FakePublicClient.events = [
         event("e", markets=(market("m", fees_enabled=True),))
@@ -3569,6 +3660,44 @@ def test_targeted_standard_refresh_rechecks_live_market_metadata(
     assert refreshed is None
     assert FakePublicClient.get_event_calls == ["e"]
     assert monitor.opportunity("e:m") is None
+    assert monitor._market_by_token == {}
+    assert monitor._subscription_dirty is True
+
+
+def test_targeted_metadata_refresh_promotes_newly_eligible_market(
+    tmp_path: Path,
+) -> None:
+    setup_public([event("e", markets=(market("m", fees_enabled=True),))])
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    current = dict(monitor._markets["m"])
+    monitor._subscription_dirty = False
+    FakePublicClient.events = [event("e", markets=(market("m"),))]
+
+    asyncio.run(monitor._refresh_standard_market_metadata(FakePublicClient(), current))
+
+    assert set(monitor._market_by_token) == {"yes-1", "no-1"}
+    assert monitor._subscription_dirty is True
+
+
+def test_targeted_demotion_does_not_reconnect_when_other_layer_owns_tokens(
+    tmp_path: Path,
+) -> None:
+    setup_public([event("e", markets=(market("m"),))])
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    current = dict(monitor._markets["m"])
+    monitor._relation_by_token = {
+        "yes-1": {"relation"},
+        "no-1": {"relation"},
+    }
+    monitor._subscription_dirty = False
+    FakePublicClient.events = [event("e", markets=(market("m", fees_enabled=True),))]
+
+    asyncio.run(monitor._refresh_standard_market_metadata(FakePublicClient(), current))
+
+    assert monitor._market_by_token == {}
+    assert monitor._subscription_dirty is False
 
 
 def test_stale_snapshot_preserves_stronger_threshold_blocker(

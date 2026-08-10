@@ -3604,7 +3604,7 @@ def test_prediction_market_layout_a_uses_binary_health_and_four_truthful_metrics
 const healthy = {
   status:"healthy",
   health:{status:"healthy",degraded_reasons:[],heartbeat_age_seconds:"0.2"},
-  relation_discovery:{websocket:{status:"connected",last_message_age_seconds:0.2}},
+  relation_discovery:{websocket:{status:"connected",standard_subscribed_tokens:46,last_message_age_seconds:0.2}},
   heartbeat_at:"2026-07-28T08:18:42Z",
   readiness:{status:"ready",balance:"50.00",geoblock:"allowed",relayer:"ready"},
   masked_wallet:"0x1234…5678",
@@ -3664,6 +3664,10 @@ console.log(JSON.stringify({
     assert "可以交易" not in rendered["unavailableReadiness"]
     assert rendered["healthyMetrics"].count('<article class="pm-metric') == 4
     assert "WebSocket" not in rendered["healthyMetrics"]
+    assert "市场 / 实时 Token" in rendered["healthyMetrics"]
+    assert "240 / 46" in rendered["healthyMetrics"]
+    assert "不可参与市场定时刷新" in rendered["healthyMetrics"]
+    assert "不可参与市场仍持续监控" not in rendered["healthyMetrics"]
     assert "过去 24 小时信号" in rendered["healthyMetrics"]
     assert rendered["unavailableMetrics"].count("<strong>-</strong>") == 4
 
