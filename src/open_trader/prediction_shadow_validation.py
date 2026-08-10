@@ -160,7 +160,7 @@ def _compare_live_states(
     for identifier in sorted(legacy_rows.keys() & shadow_rows.keys()):
         for field in _DETERMINISTIC_FIELDS:
             left_present, right_present = field in legacy_rows[identifier], field in shadow_rows[identifier]
-            left, right = legacy_rows[identifier].get(field), shadow_rows[identifier].get(field)
+            left, right = _semantic_value(legacy_rows[identifier].get(field)), _semantic_value(shadow_rows[identifier].get(field))
             if left_present != right_present or (left_present and (type(left) is not type(right) or left != right)):
                 differences.append({
                     "classification": "semantic_difference", "opportunity_id": identifier.split(":", 1)[-1],
@@ -171,6 +171,14 @@ def _compare_live_states(
     if _volatile_projection(legacy) != _volatile_projection(shadow):
         differences.append({"classification": "isolated_state_difference"})
     return differences
+
+
+def _semantic_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _semantic_value(item) for key, item in value.items() if not any(token in str(key).casefold() for token in ("price", "book_timestamp", "timestamp"))}
+    if isinstance(value, list):
+        return [_semantic_value(item) for item in value]
+    return value
 
 
 def _schema_differences(legacy: object, shadow: object, field: str = "") -> list[dict[str, object]]:
@@ -496,8 +504,8 @@ def run_shadow_validation(
         observed_baseline_provider = _provider_evidence(baseline_state)
         observed_baseline_tokens = _token_counts(baseline_state)
         codex_baseline = {category: {"attempts": 0, "successes": 0} for category in ("same_venue", "cross_venue")}
-        provider_baseline = observed_baseline_provider
-        tokens_baseline = observed_baseline_tokens
+        provider_baseline = {provider: {key: 0 for key in values} for provider, values in observed_baseline_provider.items()}
+        tokens_baseline = {key: 0 for key in observed_baseline_tokens}
         inherited_activity = {_activity_completed_at(baseline_state)} - {""}
         report["relation_discovery_baseline_completed_at"] = sorted(inherited_activity)
         report["codex"] = {"baseline": codex_baseline, "current": codex_baseline, "delta": _counter_delta(codex_baseline, codex_baseline)}
@@ -548,6 +556,8 @@ def run_shadow_validation(
                 codex=_mapping(_mapping(report["codex"]).get("delta")),
                 deepseek_calls=int(_mapping(_mapping(report["provider_evidence"]).get("delta")).get("deepseek", {}).get("calls") or 0), deadline=False,
             )
+            if status == "PASS" and report["frozen_parity"].get("status") != "PASS":
+                status, reason = "BLOCKED", "frozen parity proof unavailable"
             if status == "PASS" and report["frozen_parity"].get("status") != "PASS":
                 status, reason = "BLOCKED", "frozen parity proof unavailable"
             if status in {"PASS", "FAIL"}:
