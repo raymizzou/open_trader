@@ -60,6 +60,26 @@ def test_installer_dry_run_renders_only_explicit_isolated_paths(tmp_path: Path) 
     assert "legacy-dashboard" not in result.stdout
 
 
+def test_installer_dry_run_canonicalizes_a_new_relative_runtime_root(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    monkeypatch.chdir(tmp_path)  # type: ignore[attr-defined]
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+
+    result = subprocess.run(
+        [str(INSTALLER), "--dry-run", "--runtime-root", "shadow-run", "--repo-root", str(ROOT),
+         "--python", sys.executable, "--config", str(tmp_path / "prediction.json"),
+         "--launch-agents-dir", str(agents)],
+        check=True, capture_output=True, text=True,
+    )
+
+    payload = plistlib.loads(result.stdout.encode())
+    runtime = tmp_path / "shadow-run"
+    assert payload["ProgramArguments"][7] == str(runtime / "data")
+    assert payload["StandardOutPath"] == str(runtime / "logs/prediction_service/launchd.out.log")
+
+
 def test_installer_restarts_only_its_label_and_checks_exact_shadow_health(tmp_path: Path) -> None:
     repo = _copy_repo(tmp_path)
     runtime = tmp_path / "runtime"
@@ -128,8 +148,10 @@ def test_installer_timeout_keeps_live_job_without_another_bootout(tmp_path: Path
         env={**os.environ, "LAUNCHCTL_BIN": str(launchctl), "LSOF_BIN": str(lsof), "CURL_BIN": str(curl), "FAKE_CALLS": str(calls), "FAKE_STATE": str(state), "FAKE_PENDING": str(pending), "FAKE_REPO": str(repo)},
     )
 
-    assert result.returncode == 0, result.stderr
-    assert "shadow health not confirmed within 1s, job left running" in result.stderr
+    assert result.returncode == 1
+    assert "shadow health not confirmed within 1s; job left running" in result.stderr
+    assert "installed launchd agent" not in result.stdout
+    assert (agents / f"{LABEL}.plist").exists()
     assert calls.read_text(encoding="utf-8").splitlines().count(f"bootout gui/{os.getuid()}/{LABEL}") == 1
 
 

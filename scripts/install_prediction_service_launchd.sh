@@ -28,7 +28,8 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$RUNTIME_ROOT" && "$WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]] || { usage; exit 2; }
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
-RUNTIME_ROOT="$(cd "$RUNTIME_ROOT" 2>/dev/null && pwd || printf '%s' "$RUNTIME_ROOT")"
+mkdir -p "$RUNTIME_ROOT"
+RUNTIME_ROOT="$(cd "$RUNTIME_ROOT" && pwd)"
 CONFIG="${CONFIG:-$RUNTIME_ROOT/config/prediction_arbitrage.json}"
 TEMPLATE="$REPO_ROOT/ops/launchd/$LABEL.plist.template"
 PLIST_PATH="$LAUNCH_AGENTS_DIR/$LABEL.plist"
@@ -95,7 +96,7 @@ wait_ready() {
     if [[ -n "$pid" ]] && process_cwd_matches "$pid" && loopback_listener_matches "$pid" && health="$("$CURL_BIN" -fsS http://127.0.0.1:8769/healthz 2>/dev/null)" && health_matches "$pid" "$REPO_ROOT" "$expected_sha" "$health"; then return 0; fi
     sleep 1
   done
-  if [[ "$alive" -eq 1 ]]; then echo "Prediction Service installed; shadow health not confirmed within ${WAIT_SECONDS}s, job left running" >&2; return 0; fi
+  if [[ "$alive" -eq 1 ]]; then echo "Prediction Service shadow health not confirmed within ${WAIT_SECONDS}s; job left running" >&2; return 1; fi
   bootout_if_loaded || true
   wait_agent_absent || return 1
   echo "Prediction Service did not start (no process bound to 8769)" >&2
