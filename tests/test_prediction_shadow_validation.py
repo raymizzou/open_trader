@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import signal
+import subprocess
 
 import pytest
 
 from open_trader import prediction_shadow_validation as validation
+from open_trader.prediction_read_model import prediction_state_payload
+from tests.test_prediction_service import _Runtime, _response, _server
 
 
 def _state(*, profit: str = "1.20", completed_at: str = "2026-08-10T00:00:00Z") -> dict[str, object]:
@@ -51,6 +55,120 @@ def test_compare_live_states_flags_deterministic_profit_formula_drift() -> None:
         "legacy": "1.20",
         "shadow": "1.10",
     }]
+
+
+def test_compare_live_states_flags_recursive_schema_and_strict_type_drift() -> None:
+    shadow = _state()
+    shadow["opportunities"] = [dict(shadow["opportunities"][0], actionable=1)]  # type: ignore[index]
+    shadow["relation_discovery"] = {"activity": []}
+
+    differences = validation._compare_live_states(_state(), shadow)
+
+    assert {item["classification"] for item in differences} == {"semantic_difference"}
+    assert any(str(item["field"]).endswith("actionable") for item in differences)
+    assert any(item["field"] == "schema" for item in differences)
+
+
+def test_compare_live_states_never_uses_opportunity_array_position_for_schema() -> None:
+    shadow = _state()
+    shadow["opportunities"] = [{"opportunity_id": "sampled-only"}, *shadow["opportunities"]]  # type: ignore[operator]
+
+    differences = validation._compare_live_states(_state(), shadow)
+
+    assert differences == [{"classification": "sampling_difference", "opportunity_id": "sampled-only", "side": "shadow"}]
+
+
+def test_compare_histories_classifies_isolated_contents() -> None:
+    differences = validation._compare_histories(
+        {"kind": "signals", "items": [{"signal_id": "legacy"}], "total": 1},
+        {"kind": "signals", "items": [{"signal_id": "shadow"}], "total": 1},
+    )
+
+    assert differences == [{"classification": "isolated_state_difference", "field": "history.items"}]
+
+
+def test_frozen_legacy_read_model_and_shadow_endpoint_match_except_session() -> None:
+    runtime = _Runtime()
+    legacy = prediction_state_payload(
+        store=runtime.store, monitor=runtime.monitor, execution=runtime.execution,
+        csrf_token="legacy-session", cross_venue_monitor=runtime.cross_venue_monitor,
+    )
+    with _server(runtime) as base:
+        status, shadow = _response(base + "/api/prediction-arbitrage/state")
+
+    assert status == 200
+    assert validation._compare_frozen_payloads(legacy, shadow) == []
+
+
+def test_install_shadow_passes_remaining_timeout_and_returns_verified_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed: list[object] = []
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed.append((command, kwargs["timeout"]))
+        return subprocess.CompletedProcess(command, 0, "installed", "")
+
+    monkeypatch.setattr(validation.subprocess, "run", run)
+    monkeypatch.setattr(validation.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(validation, "_service_evidence", lambda **_kwargs: {
+        "pid": 42, "cwd": "repo", "git_sha": "sha", "label": "com.open-trader.prediction-service",
+        "plist": "plist", "listener": "127.0.0.1:8769", "health": {"status": "running"},
+    })
+
+    evidence = validation._install_shadow(
+        repo_root=tmp_path, runtime_root=tmp_path / "runtime",
+        prediction_config_path=tmp_path / "config", deadline=25.0,
+    )
+
+    assert observed == [([
+        str(tmp_path / "scripts/install_prediction_service_launchd.sh"), "--runtime-root", str(tmp_path / "runtime"),
+        "--repo-root", str(tmp_path), "--python", validation.sys.executable, "--config", str(tmp_path / "config"),
+        "--wait-seconds", "25",
+    ], 25.0)]
+    assert evidence["pid"] == 42
+    assert evidence["health"] == {"status": "running"}
+
+
+def test_sigterm_uses_cleanup_and_writes_report_after_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handlers: dict[int, object] = {}
+    events: list[str] = []
+
+    monkeypatch.setattr(validation.signal, "getsignal", lambda signum: f"old-{signum}")
+    monkeypatch.setattr(validation.signal, "signal", lambda signum, handler: handlers.__setitem__(signum, handler))
+    monkeypatch.setattr(validation, "seed_shadow_store", lambda **_kwargs: handlers[signal.SIGTERM](signal.SIGTERM, None))
+    monkeypatch.setattr(validation, "_uninstall_and_verify_absent", lambda **_kwargs: events.append("cleanup") or {"label_absent": True, "plist_absent": True, "listener_absent": True})
+    monkeypatch.setattr(validation, "_write_report", lambda _path, report: events.append(f"report:{report['status']}") )
+    monkeypatch.setattr(validation, "_git_sha", lambda _repo, **_kwargs: "sha")
+
+    report = validation.run_shadow_validation(
+        repo_root=tmp_path, source_data_dir=tmp_path / "source", runtime_root=tmp_path / "runtime",
+        prediction_config_path=tmp_path / "config", legacy_url="http://127.0.0.1:8767",
+        shadow_url="http://127.0.0.1:8769", timeout_seconds=10,
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert events == ["cleanup", "report:BLOCKED"]
+    assert handlers == {signal.SIGINT: f"old-{signal.SIGINT}", signal.SIGTERM: f"old-{signal.SIGTERM}"}
+
+
+def test_deadline_carries_deepseek_provider_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    report = _run_fake_validation("deadline_before_three_cycles", tmp_path, monkeypatch)
+
+    assert report["provider_evidence"]["delta"]["deepseek"]["calls"] == 0
+    assert report["status"] == "BLOCKED"
+
+
+def test_deadline_still_fails_when_observed_deepseek_calls_are_nonzero() -> None:
+    status, _reason = validation._validation_status(
+        semantic=[], health={}, activity=set(),
+        codex={"same_venue": {"attempts": 0, "successes": 0}, "cross_venue": {"attempts": 0, "successes": 0}},
+        deepseek_calls=1, deadline=True,
+    )
+
+    assert status == "FAIL"
 
 
 @pytest.mark.parametrize(
@@ -125,15 +243,15 @@ def _run_fake_validation(
             return states[index]
         return {"kind": "signals", "items": [{"isolated": url.startswith("http://127.0.0.1:8769")}], "total": 1}
 
-    monotonic = iter(range(100))
+    clock = [0.0]
     monkeypatch.setattr(validation, "seed_shadow_store", lambda **_kwargs: {"sha256": "seed", "relation_state_rows": 1, "llm_cache_rows": 1})
     monkeypatch.setattr(validation, "_install_shadow", lambda **_kwargs: {"pid": 101, "cwd": "repo", "git_sha": "sha"})
     monkeypatch.setattr(validation, "_restart_shadow", lambda **_kwargs: {"pid": 102, "cwd": "repo", "git_sha": "sha"})
     monkeypatch.setattr(validation, "_uninstall_and_verify_absent", lambda **_kwargs: {"label_absent": True, "plist_absent": True, "listener_absent": True})
     monkeypatch.setattr(validation, "_fetch_json", fetch)
-    monkeypatch.setattr(validation, "_git_sha", lambda _repo: "sha")
-    monkeypatch.setattr(validation.time, "monotonic", lambda: next(monotonic))
-    monkeypatch.setattr(validation.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(validation, "_git_sha", lambda _repo, **_kwargs: "sha")
+    monkeypatch.setattr(validation.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(validation.time, "sleep", lambda _seconds: clock.__setitem__(0, clock[0] + 1))
 
     return validation.run_shadow_validation(
         repo_root=tmp_path / "repo",
