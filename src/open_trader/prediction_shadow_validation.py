@@ -39,6 +39,10 @@ _VOLATILE_FIELDS = {
 }
 _FROZEN_EXCLUSIONS = {"csrf_token", "pid", "cwd", "git_sha", "started_at", "heartbeat", "heartbeat_at", "session"}
 _OPERATIONAL_STATE_FIELDS = {"health", "venues", "relation_discovery", "cross_venue"}
+_TRANSIENT_GATING_REASONS = {
+    "book_stale", "book_unavailable", "book_timestamp_missing", "books_stale",
+    "monitor_degraded", "relation_discovery_degraded", "readiness_stale", "readiness_unavailable",
+}
 _USAGE_FIELDS = (
     "calls", "successes", "failures", "cache_hits",
     "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
@@ -169,8 +173,17 @@ def _compare_live_states(
             left_present, right_present = field in legacy_rows[identifier], field in shadow_rows[identifier]
             left, right = _semantic_value(legacy_rows[identifier].get(field)), _semantic_value(shadow_rows[identifier].get(field))
             if left_present != right_present or (left_present and (type(left) is not type(right) or left != right)):
+                classification = "semantic_difference"
+                if (
+                    field == "eligibility_reason"
+                    and legacy_rows[identifier].get("actionable") is False
+                    and shadow_rows[identifier].get("actionable") is False
+                    and isinstance(left, str) and left in _TRANSIENT_GATING_REASONS
+                    and isinstance(right, str) and right in _TRANSIENT_GATING_REASONS
+                ):
+                    classification = "sampling_difference"
                 differences.append({
-                    "classification": "semantic_difference", "opportunity_id": identifier.split(":", 1)[-1],
+                    "classification": classification, "opportunity_id": identifier.split(":", 1)[-1],
                     "field": field, "legacy": left, "shadow": right,
                 })
         differences.extend(_schema_differences(legacy_rows[identifier], shadow_rows[identifier], f"opportunity.{identifier}"))

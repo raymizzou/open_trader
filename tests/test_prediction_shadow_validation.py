@@ -126,6 +126,29 @@ def test_compare_live_states_flags_deterministic_profit_formula_drift() -> None:
     }]
 
 
+def test_compare_live_states_classifies_transient_non_actionable_reasons_as_sampling() -> None:
+    legacy = _state()
+    shadow = _state()
+    legacy["opportunities"][0].update(actionable=False, eligibility_reason="relation_discovery_degraded")  # type: ignore[index]
+    shadow["opportunities"][0].update(actionable=False, eligibility_reason="book_stale")  # type: ignore[index]
+
+    differences = validation._compare_live_states(legacy, shadow)
+
+    assert differences == [{
+        "classification": "sampling_difference",
+        "opportunity_id": "shared-1",
+        "field": "eligibility_reason",
+        "legacy": "relation_discovery_degraded",
+        "shadow": "book_stale",
+    }]
+
+    shadow["opportunities"][0]["eligibility_reason"] = "neg_risk"  # type: ignore[index]
+    assert any(
+        item["classification"] == "semantic_difference"
+        for item in validation._compare_live_states(legacy, shadow)
+    )
+
+
 def test_compare_live_states_flags_recursive_schema_and_strict_type_drift() -> None:
     shadow = _state()
     shadow["opportunities"] = [
