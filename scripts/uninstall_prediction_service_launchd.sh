@@ -12,15 +12,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 PLIST_PATH="$LAUNCH_AGENTS_DIR/$LABEL.plist"
+# Keep command/shell overhead inside the validator's existing 30-second cleanup reserve.
+CLEANUP_POLL_BUDGET=20
 wait_agent_absent() {
-  local attempt output status
-  for attempt in 1 2 3 4 5; do
+  local output status
+  while [[ "$CLEANUP_POLL_BUDGET" -gt 0 ]]; do
+    CLEANUP_POLL_BUDGET=$((CLEANUP_POLL_BUDGET - 1))
     if output="$("$LAUNCHCTL_BIN" print "gui/$UID/$LABEL" 2>&1)"; then status=0; else status=$?; fi
     if [[ "$status" -ne 0 && "$output" == *"Could not find service"* ]]; then return 0; fi
     if [[ "$status" -ne 0 ]]; then echo "failed to inspect launchd label: $LABEL" >&2; printf '%s\n' "$output" >&2; return 1; fi
-    [[ "$attempt" -lt 5 ]] && sleep 1
+    [[ "$CLEANUP_POLL_BUDGET" -gt 0 ]] && sleep 1
   done
-  echo "launchd job is still loaded: $LABEL; preserving $PLIST_PATH" >&2
+  echo "launchd job is still loaded after cleanup polling: $LABEL; preserving $PLIST_PATH" >&2
   return 1
 }
 listener_absent() {
@@ -36,10 +39,10 @@ listener_absent() {
   return "$status"
 }
 wait_listener_absent() {
-  local attempt
-  for attempt in 1 2 3 4 5; do
+  while [[ "$CLEANUP_POLL_BUDGET" -gt 0 ]]; do
+    CLEANUP_POLL_BUDGET=$((CLEANUP_POLL_BUDGET - 1))
     if listener_absent; then return 0; fi
-    [[ "$attempt" -lt 5 ]] && sleep 1
+    [[ "$CLEANUP_POLL_BUDGET" -gt 0 ]] && sleep 1
   done
   return 1
 }

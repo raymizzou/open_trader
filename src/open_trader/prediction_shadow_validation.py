@@ -38,6 +38,7 @@ _VOLATILE_FIELDS = {
     "breaker", "mode", "cross_auto", "history", "events", "counters",
 }
 _FROZEN_EXCLUSIONS = {"csrf_token", "pid", "cwd", "git_sha", "started_at", "heartbeat", "heartbeat_at", "session"}
+_OPERATIONAL_STATE_FIELDS = {"health", "venues", "relation_discovery", "cross_venue"}
 _USAGE_FIELDS = (
     "calls", "successes", "failures", "cache_hits",
     "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
@@ -173,10 +174,29 @@ def _compare_live_states(
                     "field": field, "legacy": left, "shadow": right,
                 })
         differences.extend(_schema_differences(legacy_rows[identifier], shadow_rows[identifier], f"opportunity.{identifier}"))
+    for field in sorted(_OPERATIONAL_STATE_FIELDS):
+        left = _operational_subtree(legacy.get(field), field)
+        right = _operational_subtree(shadow.get(field), field)
+        if left != right:
+            differences.append({"classification": "isolated_state_difference", "field": field})
     differences.extend(_schema_differences(legacy, shadow))
     if _volatile_projection(legacy) != _volatile_projection(shadow):
         differences.append({"classification": "isolated_state_difference"})
     return differences
+
+
+def _operational_subtree(value: object, field: str) -> object:
+    if field == "cross_venue" and isinstance(value, Mapping):
+        value = {key: item for key, item in value.items() if key != "opportunities"}
+    if isinstance(value, Mapping):
+        return {
+            key: _operational_subtree(item, "")
+            for key, item in value.items()
+            if str(key) not in _VOLATILE_FIELDS
+        }
+    if isinstance(value, list):
+        return [_operational_subtree(item, "") for item in value]
+    return value
 
 
 def _semantic_value(value: object) -> object:
@@ -194,7 +214,7 @@ def _schema_differences(legacy: object, shadow: object, field: str = "") -> list
         differences: list[dict[str, object]] = []
         keys = set(legacy) | set(shadow)  # type: ignore[arg-type]
         for key in sorted(str(key) for key in keys):
-            if key in _VOLATILE_FIELDS or (field.startswith("opportunity.") and ("price" in key or key.endswith("_at"))):
+            if key in _VOLATILE_FIELDS or (not field and key in _OPERATIONAL_STATE_FIELDS) or (field.startswith("opportunity.") and ("price" in key or key.endswith("_at"))):
                 continue
             path = f"{field}.{key}" if field else key
             if key not in legacy or key not in shadow:

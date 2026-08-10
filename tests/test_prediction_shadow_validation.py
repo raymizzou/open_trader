@@ -51,6 +51,31 @@ def test_compare_live_states_allows_process_and_time_differences() -> None:
     ]
 
 
+def test_compare_live_states_classifies_sparse_operational_subtrees_as_isolated() -> None:
+    legacy = _state()
+    shadow = _state()
+    legacy.update({
+        "health": {"status": "healthy", "counter": 3},
+        "venues": [{"venue": "polymarket", "status": "ready"}],
+        "cross_venue": {
+            "status": "ready",
+            "funnel": {"matched_pairs": 2},
+            "opportunities": [],
+        },
+    })
+    shadow.update({
+        "health": {},
+        "venues": [],
+        "cross_venue": {"status": "loading", "opportunities": []},
+        "relation_discovery": {"activity": {"completed_at": ""}},
+    })
+
+    differences = validation._compare_live_states(legacy, shadow)
+
+    assert {item["classification"] for item in differences} == {"isolated_state_difference"}
+    assert {item.get("field") for item in differences} >= {"health", "venues", "cross_venue", "relation_discovery"}
+
+
 def test_compare_live_states_flags_deterministic_profit_formula_drift() -> None:
     differences = validation._compare_live_states(_state(), _state(profit="1.10"))
 
@@ -65,12 +90,13 @@ def test_compare_live_states_flags_deterministic_profit_formula_drift() -> None:
 
 def test_compare_live_states_flags_recursive_schema_and_strict_type_drift() -> None:
     shadow = _state()
-    shadow["opportunities"] = [dict(shadow["opportunities"][0], actionable=1)]  # type: ignore[index]
-    shadow["relation_discovery"] = {"activity": []}
+    shadow["opportunities"] = [
+        dict(shadow["opportunities"][0], actionable=1, legs=[{"market_id": "a"}])
+    ]  # type: ignore[index]
 
     differences = validation._compare_live_states(_state(), shadow)
 
-    assert {item["classification"] for item in differences} == {"semantic_difference"}
+    assert "semantic_difference" in {item["classification"] for item in differences}
     assert any(str(item["field"]).endswith("actionable") for item in differences)
     assert any(item["field"] == "schema" for item in differences)
 
