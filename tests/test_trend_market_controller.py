@@ -2175,7 +2175,7 @@ def patch_cycle(monkeypatch: pytest.MonkeyPatch, cycle: ControllerCycle) -> None
         projection = config.data_dir / f"latest/trend_review_{market.lower()}.json"
         projection.parent.mkdir(parents=True, exist_ok=True)
         projection.write_text(
-            json.dumps({"schema_version": "open_trader.trend_review.projection.v3"}),
+            json.dumps({"schema_version": "open_trader.trend_review.projection.v4"}),
             encoding="utf-8",
         )
 
@@ -3484,7 +3484,7 @@ def test_close_review_recovery_completes_once_after_backoff(
         path = data_dir / "latest" / f"trend_review_{market.lower()}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps({"schema_version": "open_trader.trend_review.projection.v3"}),
+            json.dumps({"schema_version": "open_trader.trend_review.projection.v4"}),
             encoding="utf-8",
         )
         projections.append(market)
@@ -4652,7 +4652,7 @@ def test_close_capture_is_recovered_once_after_session_close(
         projection = config.data_dir / f"latest/trend_review_{market.lower()}.json"
         projection.parent.mkdir(parents=True, exist_ok=True)
         projection.write_text(
-            json.dumps({"schema_version": "open_trader.trend_review.projection.v3"}),
+            json.dumps({"schema_version": "open_trader.trend_review.projection.v4"}),
             encoding="utf-8",
         )
 
@@ -4684,7 +4684,7 @@ def test_closed_restart_rebuilds_legacy_trend_review_projection(
 
     def rebuild(*_args: object, **_kwargs: object) -> None:
         projection.write_text(
-            json.dumps({"schema_version": "open_trader.trend_review.projection.v3"}),
+            json.dumps({"schema_version": "open_trader.trend_review.projection.v4"}),
             encoding="utf-8",
         )
 
@@ -4693,7 +4693,7 @@ def test_closed_restart_rebuilds_legacy_trend_review_projection(
     run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
 
     assert json.loads(projection.read_text(encoding="utf-8"))["schema_version"] == (
-        "open_trader.trend_review.projection.v3"
+        "open_trader.trend_review.projection.v4"
     )
 
 
@@ -4730,7 +4730,7 @@ def test_stable_closed_restart_records_successful_reconciliation(
     projection = config.data_dir / "latest/trend_review_cn.json"
     projection.parent.mkdir(parents=True, exist_ok=True)
     projection.write_text(
-        json.dumps({"schema_version": "open_trader.trend_review.projection.v3"}),
+        json.dumps({"schema_version": "open_trader.trend_review.projection.v4"}),
         encoding="utf-8",
     )
     monkeypatch.setattr(controller, "_execute_locked_report", pytest.fail)

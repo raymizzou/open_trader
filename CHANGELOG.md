@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-10
 
+- 修复三市场 Controller 仍把 v3 趋势复盘投影当作当前版本、导致 v4 投影被重复捕获或旧文件不升级的问题；现与 Dashboard 和投影生成器统一要求 v4，控制器重启后会沿既有收盘恢复流程重建旧投影。验证：控制器回归通过。
+
 - 趋势复盘改为单一共享标尺，同时展示纪律模拟、实际执行、同期市场、市场 1 年与市场
   5 年；A 股固定对比中证 500（`SH.000905`）、港股固定对比恒生指数
   （`HK.800000`）、美股固定对比 SPY（`US.SPY`）。长期基准由现有三市场 Controller

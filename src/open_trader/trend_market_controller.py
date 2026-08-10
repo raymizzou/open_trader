@@ -194,7 +194,7 @@ def _trend_review_projection_current(
         )
     except ValueError:
         return False
-    return projection.get("schema_version") == "open_trader.trend_review.projection.v3"
+    return projection.get("schema_version") == "open_trader.trend_review.projection.v4"
 
 
 def _complete_close(
