@@ -614,6 +614,77 @@ def test_cross_venue_tokens_join_existing_subscription_and_refresh_once(
     assert monitor._relation_by_token == {"threshold": {"relation-1"}}
 
 
+def test_relation_token_union_controls_resubscribe_and_uses_only_buy_legs(
+    tmp_path: Path,
+) -> None:
+    setup_public([])
+    base = discover_threshold_relations([threshold_event()])[0]
+    old_relation = replace(base, relation_id="old-relation")
+    rotated_relation = replace(base, relation_id="rotated-relation")
+    changed_market_a = replace(
+        base.market_a,
+        yes_token_id="new-buy-a",
+    )
+    changed_relation = replace(
+        base,
+        relation_id="changed-relation",
+        market_a=changed_market_a,
+        buy_leg_a=replace(base.buy_leg_a, token_id="new-buy-a"),
+    )
+
+    class RotatingClient(FakePublicClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.created_streams = [self.stream]
+
+        def subscribe(self, spec: object) -> FakeStream:
+            self.subscribe_specs.append(spec)
+            stream = FakeStream()
+            self.created_streams.append(stream)
+            return stream
+
+    monitor = make_monitor(tmp_path)
+    monitor._relations = {old_relation.relation_id: old_relation}
+    monitor._active_relation_ids = {old_relation.relation_id}
+    monitor._realtime_relation_ids = {old_relation.relation_id}
+    monitor._rebuild_relation_subscriptions()
+    monitor._subscription_dirty = True
+    client = RotatingClient()
+    asyncio.run(monitor._refresh_subscription_if_dirty(client))
+    first_handle = monitor._stream_handle
+    first_connected_at = monitor._stream_connected_at
+
+    monitor._relations = {rotated_relation.relation_id: rotated_relation}
+    monitor._active_relation_ids = {rotated_relation.relation_id}
+    monitor._realtime_relation_ids = {rotated_relation.relation_id}
+    monitor._rebuild_relation_subscriptions()
+    asyncio.run(monitor._refresh_subscription_if_dirty(client))
+
+    assert set(monitor._relation_by_token) == {
+        rotated_relation.buy_leg_a.token_id,
+        rotated_relation.buy_leg_b.token_id,
+    }
+    assert set().union(*monitor._relation_by_token.values()) == {
+        rotated_relation.relation_id
+    }
+    assert monitor._subscription_dirty is False
+    assert len(FakePublicClient.subscribe_specs) == 1
+    assert monitor._stream_handle is first_handle
+    assert monitor._stream_connected_at == first_connected_at
+
+    monitor._relations = {changed_relation.relation_id: changed_relation}
+    monitor._active_relation_ids = {changed_relation.relation_id}
+    monitor._realtime_relation_ids = {changed_relation.relation_id}
+    monitor._rebuild_relation_subscriptions()
+    assert monitor._subscription_dirty is True
+    asyncio.run(monitor._refresh_subscription_if_dirty(client))
+
+    assert len(FakePublicClient.subscribe_specs) == 2
+    assert monitor._stream_handle is client.created_streams[-1]
+    assert first_handle is not None
+    assert first_handle.closed is True
+
+
 def test_cross_venue_rest_failure_does_not_block_same_venue_subscription(
     tmp_path: Path,
 ) -> None:
@@ -1656,11 +1727,6 @@ def test_background_activity_scan_republishes_fresh_relation_opportunity(
         assert refreshed["actionable"] is True
         assert refreshed["confirmed_age_seconds"] == 0
         assert FakePublicClient.subscribe_specs == []
-        assert monitor._subscription_dirty is True
-
-        await monitor._refresh_subscription_if_dirty(client)
-
-        assert len(FakePublicClient.subscribe_specs) == 1
         assert monitor._subscription_dirty is False
 
     asyncio.run(exercise())
@@ -2737,11 +2803,26 @@ def test_activity_diagnostic_pool_is_uncapped_but_realtime_pool_is_pre_warmed(
     assert activity["apr_target_limit"] == 100
     assert activity["apr_prewarm_relations"] == 100
     assert activity["apr_prewarm_limit"] == 100
-    assert len(monitor._relation_by_token) == 301 * 4
+    assert activity["subscribed_relations"] == 100
+    assert activity["relation_subscribed_tokens"] == 200
+    assert len(monitor._relation_by_token) == 100 * 2
+    subscribed_relation_ids = set().union(*monitor._relation_by_token.values())
+    assert subscribed_relation_ids == monitor._realtime_relation_ids
+    expected_tokens = {
+        token
+        for relation in relations
+        if relation.relation_id in monitor._realtime_relation_ids
+        for token in (relation.buy_leg_a.token_id, relation.buy_leg_b.token_id)
+    }
+    assert set(monitor._relation_by_token) == expected_tokens
     specs = FakePublicClient.subscribe_specs[-1]
-    assert isinstance(specs, list)
-    assert all(len(spec.token_ids) <= 250 for spec in specs)
-    assert len({token for spec in specs for token in spec.token_ids}) == 301 * 4
+    spec_list = specs if isinstance(specs, list) else [specs]
+    assert all(len(spec.token_ids) <= 250 for spec in spec_list)
+    assert {
+        token
+        for spec in spec_list
+        for token in spec.token_ids
+    } == expected_tokens
 
 
 def test_apr_prewarm_ranking_uses_remaining_duration_and_relation_id_ties(

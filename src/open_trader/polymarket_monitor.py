@@ -1412,7 +1412,6 @@ class PolymarketMonitor:
                     and row.get("actionable") is True
                     for row in self._opportunities.values()
                 )
-                self._subscription_dirty = True
         except Exception as exc:
             self._activity = {**self._activity, "status": "degraded"}
             self._relations_failed = True
@@ -1811,8 +1810,13 @@ class PolymarketMonitor:
     def _rebuild_relation_subscriptions(self) -> None:
         """Publish only live-pool relations to the WebSocket token map."""
 
+        previous_tokens = (
+            set(self._market_by_token)
+            | set(self._relation_by_token)
+            | self._cross_venue_tokens
+        )
         token_map: dict[str, set[str]] = {}
-        for relation_id in self._active_relation_ids:
+        for relation_id in self._realtime_relation_ids:
             status = self._codex_statuses.get(relation_id)
             if status in {"llm_rejected", "deterministic_rejected"}:
                 continue
@@ -1820,13 +1824,18 @@ class PolymarketMonitor:
             if relation is None:
                 continue
             for token in (
-                relation.market_a.yes_token_id,
-                relation.market_a.no_token_id,
-                relation.market_b.yes_token_id,
-                relation.market_b.no_token_id,
+                relation.buy_leg_a.token_id,
+                relation.buy_leg_b.token_id,
             ):
                 token_map.setdefault(token, set()).add(relation_id)
         self._relation_by_token = token_map
+        current_tokens = (
+            set(self._market_by_token)
+            | set(self._relation_by_token)
+            | self._cross_venue_tokens
+        )
+        if current_tokens != previous_tokens:
+            self._subscription_dirty = True
 
     async def _refresh_relation_event(self, client: object, event_id: str) -> bool:
         event_id = str(event_id).strip()
@@ -2362,7 +2371,7 @@ class PolymarketMonitor:
                 self._record_error(exc, "store")
             if resubscribe:
                 try:
-                    await self._subscribe(client)
+                    await self._refresh_subscription_if_dirty(client)
                 except Exception as exc:
                     self._record_error(exc, "stream")
             self._log_relation_scan(
@@ -2403,16 +2412,14 @@ class PolymarketMonitor:
         if relation is None:
             return ()
         return (
-            relation.market_a.yes_token_id,
-            relation.market_a.no_token_id,
-            relation.market_b.yes_token_id,
-            relation.market_b.no_token_id,
+            relation.buy_leg_a.token_id,
+            relation.buy_leg_b.token_id,
         )
 
     def _relation_ids_subscribed(self) -> tuple[str, ...]:
         return tuple(
             relation_id
-            for relation_id in self._active_relation_ids
+            for relation_id in self._realtime_relation_ids
             if self._codex_statuses.get(relation_id)
             not in {"llm_rejected", "deterministic_rejected"}
         )
