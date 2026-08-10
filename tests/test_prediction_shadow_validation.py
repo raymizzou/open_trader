@@ -392,6 +392,7 @@ def test_live_validation_does_not_require_cli_frozen_fixture(
         ("profit_formula_drift", "FAIL"),
         ("missing_same_venue_canary", "BLOCKED"),
         ("all_cross_canaries_failed", "BLOCKED"),
+        ("restart_warmup", "PASS"),
         ("mutation_attempt", "FAIL"),
         ("deadline_before_three_cycles", "BLOCKED"),
     ],
@@ -471,7 +472,11 @@ def _run_fake_validation(
     clock = [0.0]
     monkeypatch.setattr(validation, "_seed_shadow", lambda **_kwargs: {"sha256": "seed", "relation_state_rows": 1, "llm_cache_rows": 1})
     monkeypatch.setattr(validation, "_install_shadow", lambda **_kwargs: {"pid": 101, "cwd": "repo", "git_sha": "sha"})
-    monkeypatch.setattr(validation, "_restart_shadow", lambda **_kwargs: {"pid": 102, "cwd": "repo", "git_sha": "sha"})
+    restart = {"active": False, "comparisons": 0}
+    def restart_shadow(**_kwargs: object) -> dict[str, object]:
+        restart["active"] = True
+        return {"pid": 102, "cwd": "repo", "git_sha": "sha"}
+    monkeypatch.setattr(validation, "_restart_shadow", restart_shadow)
     monkeypatch.setattr(validation, "_uninstall_and_verify_absent", lambda **_kwargs: {"label_absent": True, "plist_absent": True, "listener_absent": True})
     monkeypatch.setattr(validation, "_fetch_json", fetch)
     monkeypatch.setattr(validation, "_git_sha", lambda _repo, **_kwargs: "sha")
@@ -481,6 +486,14 @@ def _run_fake_validation(
             raise AssertionError("terminal canary failure must not idle until deadline")
         clock[0] += 1
     monkeypatch.setattr(validation.time, "sleep", sleep)
+    if case == "restart_warmup":
+        compare_live_states = validation._compare_live_states
+        def compare_with_warmup(legacy: object, shadow: object) -> list[dict[str, object]]:
+            if restart["active"] and restart["comparisons"] == 0:
+                restart["comparisons"] += 1
+                return [{"classification": "semantic_difference", "field": "readiness.status"}]
+            return compare_live_states(legacy, shadow)  # type: ignore[arg-type]
+        monkeypatch.setattr(validation, "_compare_live_states", compare_with_warmup)
 
     return validation.run_shadow_validation(
         repo_root=tmp_path / "repo",
@@ -489,5 +502,5 @@ def _run_fake_validation(
         prediction_config_path=tmp_path / "config.json",
         legacy_url="http://127.0.0.1:8767",
         shadow_url="http://127.0.0.1:8769",
-        timeout_seconds=2 if case == "deadline_before_three_cycles" else 4,
+        timeout_seconds=2 if case == "deadline_before_three_cycles" else (10 if case == "restart_warmup" else 4),
     )

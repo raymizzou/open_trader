@@ -24,6 +24,7 @@ _LABEL = "com.open-trader.prediction-service"
 _POLL_SECONDS = 5
 _MAX_TIMEOUT_SECONDS = 900
 _CLEANUP_MAX_SECONDS = 30.0
+_RESTART_PARITY_SECONDS = 60.0
 _INSTALLER = "scripts/install_prediction_service_launchd.sh"
 _UNINSTALLER = "scripts/uninstall_prediction_service_launchd.sh"
 _DETERMINISTIC_FIELDS = (
@@ -721,11 +722,20 @@ def run_shadow_validation(
                 repo_root=repo_root, runtime_root=runtime_root,
                 prediction_config_path=prediction_config_path, deadline=validation_deadline,
             )
-            restart_health = _fetch_json(f"{shadow_url}/healthz", _remaining(validation_deadline))
-            restart_state = _fetch_json(f"{shadow_url}/api/prediction-arbitrage/state", _remaining(validation_deadline))
-            restart_differences = _compare_live_states(
-                _fetch_json(f"{legacy_url}/api/prediction-arbitrage/state", _remaining(validation_deadline)), restart_state
-            )
+            restart_deadline = min(validation_deadline, time.monotonic() + _RESTART_PARITY_SECONDS)
+            restart_health: dict[str, object] = {}
+            restart_differences: list[dict[str, object]] = []
+            while time.monotonic() < restart_deadline:
+                restart_health = _fetch_json(f"{shadow_url}/healthz", _remaining(restart_deadline))
+                _validate_health(restart_health, shadow=True)
+                restart_state = _fetch_json(f"{shadow_url}/api/prediction-arbitrage/state", _remaining(restart_deadline))
+                restart_differences = _compare_live_states(
+                    _fetch_json(f"{legacy_url}/api/prediction-arbitrage/state", _remaining(restart_deadline)), restart_state
+                )
+                restart_semantic = [item for item in restart_differences if item["classification"] == "semantic_difference"]
+                if not restart_semantic or restart_health.get("first_violation"):
+                    break
+                time.sleep(min(_POLL_SECONDS, _remaining(restart_deadline)))
             report["restart"].update({"health": restart_health, "differences": restart_differences})
             restart_semantic = [item for item in restart_differences if item["classification"] == "semantic_difference"]
             if restart_semantic or restart_health.get("first_violation") or (initial_pid and report["restart"].get("pid") == initial_pid):
