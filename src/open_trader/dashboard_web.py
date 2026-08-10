@@ -6,6 +6,7 @@ import os
 import secrets
 import signal
 import subprocess
+import threading
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from http import HTTPStatus
@@ -2179,14 +2180,28 @@ def serve_dashboard(
         runtime_metadata=runtime_metadata,
     )
     _, actual_port = server.server_address
+    previous_signal_handlers: dict[int, object] = {}
+
+    def request_shutdown(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
     try:
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                previous_signal_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, request_shutdown)
         print(f"dashboard_url: {resolved_public_url}", flush=True)
         if config.portfolio_path is not None:
             print(f"portfolio: {config.portfolio_path}")
         print(f"futu: {config.futu_host}:{config.futu_port}")
         print(f"poll_seconds: {config.poll_seconds}")
-        server.serve_forever()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
     finally:
+        for signum, handler in previous_signal_handlers.items():
+            signal.signal(signum, handler)
         if prediction_runtime is not None:
             try:
                 prediction_runtime.stop()
