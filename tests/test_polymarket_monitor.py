@@ -614,6 +614,77 @@ def test_cross_venue_tokens_join_existing_subscription_and_refresh_once(
     assert monitor._relation_by_token == {"threshold": {"relation-1"}}
 
 
+def test_relation_token_union_controls_resubscribe_and_uses_only_buy_legs(
+    tmp_path: Path,
+) -> None:
+    setup_public([])
+    base = discover_threshold_relations([threshold_event()])[0]
+    old_relation = replace(base, relation_id="old-relation")
+    rotated_relation = replace(base, relation_id="rotated-relation")
+    changed_market_a = replace(
+        base.market_a,
+        yes_token_id="new-buy-a",
+    )
+    changed_relation = replace(
+        base,
+        relation_id="changed-relation",
+        market_a=changed_market_a,
+        buy_leg_a=replace(base.buy_leg_a, token_id="new-buy-a"),
+    )
+
+    class RotatingClient(FakePublicClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.created_streams = [self.stream]
+
+        def subscribe(self, spec: object) -> FakeStream:
+            self.subscribe_specs.append(spec)
+            stream = FakeStream()
+            self.created_streams.append(stream)
+            return stream
+
+    monitor = make_monitor(tmp_path)
+    monitor._relations = {old_relation.relation_id: old_relation}
+    monitor._active_relation_ids = {old_relation.relation_id}
+    monitor._realtime_relation_ids = {old_relation.relation_id}
+    monitor._rebuild_relation_subscriptions()
+    monitor._subscription_dirty = True
+    client = RotatingClient()
+    asyncio.run(monitor._refresh_subscription_if_dirty(client))
+    first_handle = monitor._stream_handle
+    first_connected_at = monitor._stream_connected_at
+
+    monitor._relations = {rotated_relation.relation_id: rotated_relation}
+    monitor._active_relation_ids = {rotated_relation.relation_id}
+    monitor._realtime_relation_ids = {rotated_relation.relation_id}
+    monitor._rebuild_relation_subscriptions()
+    asyncio.run(monitor._refresh_subscription_if_dirty(client))
+
+    assert set(monitor._relation_by_token) == {
+        rotated_relation.buy_leg_a.token_id,
+        rotated_relation.buy_leg_b.token_id,
+    }
+    assert set().union(*monitor._relation_by_token.values()) == {
+        rotated_relation.relation_id
+    }
+    assert monitor._subscription_dirty is False
+    assert len(FakePublicClient.subscribe_specs) == 1
+    assert monitor._stream_handle is first_handle
+    assert monitor._stream_connected_at == first_connected_at
+
+    monitor._relations = {changed_relation.relation_id: changed_relation}
+    monitor._active_relation_ids = {changed_relation.relation_id}
+    monitor._realtime_relation_ids = {changed_relation.relation_id}
+    monitor._rebuild_relation_subscriptions()
+    assert monitor._subscription_dirty is True
+    asyncio.run(monitor._refresh_subscription_if_dirty(client))
+
+    assert len(FakePublicClient.subscribe_specs) == 2
+    assert monitor._stream_handle is client.created_streams[-1]
+    assert first_handle is not None
+    assert first_handle.closed is True
+
+
 def test_cross_venue_rest_failure_does_not_block_same_venue_subscription(
     tmp_path: Path,
 ) -> None:
@@ -1656,11 +1727,6 @@ def test_background_activity_scan_republishes_fresh_relation_opportunity(
         assert refreshed["actionable"] is True
         assert refreshed["confirmed_age_seconds"] == 0
         assert FakePublicClient.subscribe_specs == []
-        assert monitor._subscription_dirty is True
-
-        await monitor._refresh_subscription_if_dirty(client)
-
-        assert len(FakePublicClient.subscribe_specs) == 1
         assert monitor._subscription_dirty is False
 
     asyncio.run(exercise())
@@ -2673,7 +2739,9 @@ def test_rejected_relations_leave_pending_subscriptions_intact(tmp_path: Path) -
     asyncio.run(reject_one())
 
 
-def test_activity_pool_has_no_top_n_relation_cap(tmp_path: Path) -> None:
+def test_activity_diagnostic_pool_is_uncapped_but_realtime_pool_is_pre_warmed(
+    tmp_path: Path,
+) -> None:
     setup_public([])
     base = discover_threshold_relations([threshold_event()])[0]
     relations = []
@@ -2728,11 +2796,306 @@ def test_activity_pool_has_no_top_n_relation_cap(tmp_path: Path) -> None:
 
     asyncio.run(scan())
     assert len(monitor._active_relation_ids) == 301
-    assert len(monitor._relation_by_token) == 301 * 4
+    assert len(monitor._realtime_relation_ids) == 100
+    activity = monitor.snapshot()["relation_discovery"]["activity"]
+    assert activity["relations_within_5pct"] == 301
+    assert activity["apr_target_relations"] == 0
+    assert activity["apr_target_limit"] == 100
+    assert activity["apr_prewarm_relations"] == 100
+    assert activity["apr_prewarm_limit"] == 100
+    assert activity["subscribed_relations"] == 100
+    assert activity["relation_subscribed_tokens"] == 200
+    assert len(monitor._relation_by_token) == 100 * 2
+    subscribed_relation_ids = set().union(*monitor._relation_by_token.values())
+    assert subscribed_relation_ids == monitor._realtime_relation_ids
+    expected_tokens = {
+        token
+        for relation in relations
+        if relation.relation_id in monitor._realtime_relation_ids
+        for token in (relation.buy_leg_a.token_id, relation.buy_leg_b.token_id)
+    }
+    assert set(monitor._relation_by_token) == expected_tokens
     specs = FakePublicClient.subscribe_specs[-1]
-    assert isinstance(specs, list)
-    assert all(len(spec.token_ids) <= 250 for spec in specs)
-    assert len({token for spec in specs for token in spec.token_ids}) == 301 * 4
+    spec_list = specs if isinstance(specs, list) else [specs]
+    assert all(len(spec.token_ids) <= 250 for spec in spec_list)
+    assert {
+        token
+        for spec in spec_list
+        for token in spec.token_ids
+    } == expected_tokens
+
+
+def test_apr_prewarm_ranking_uses_remaining_duration_and_relation_id_ties(
+    tmp_path: Path,
+) -> None:
+    setup_public([])
+    base = discover_threshold_relations([threshold_event()])[0]
+
+    def variant(
+        relation_id: str,
+        *,
+        end_a: str = "2026-12-31T17:00:00Z",
+        end_b: str | None = None,
+    ):
+        market_a = replace(
+            base.market_a,
+            market_id=f"market-a-{relation_id}",
+            condition_id=f"condition-a-{relation_id}",
+            yes_token_id=f"yes-a-{relation_id}",
+            no_token_id=f"no-a-{relation_id}",
+            end_date=end_a,
+        )
+        market_b = replace(
+            base.market_b,
+            market_id=f"market-b-{relation_id}",
+            condition_id=f"condition-b-{relation_id}",
+            yes_token_id=f"yes-b-{relation_id}",
+            no_token_id=f"no-b-{relation_id}",
+            end_date=end_b or end_a,
+        )
+        return replace(
+            base,
+            relation_id=relation_id,
+            market_a=market_a,
+            market_b=market_b,
+            buy_leg_a=replace(
+                base.buy_leg_a,
+                market_id=market_a.market_id,
+                condition_id=market_a.condition_id,
+                token_id=market_a.yes_token_id,
+            ),
+            buy_leg_b=replace(
+                base.buy_leg_b,
+                market_id=market_b.market_id,
+                condition_id=market_b.condition_id,
+                token_id=market_b.no_token_id,
+            ),
+        )
+
+    relations = [variant(f"filler-{index:03d}") for index in range(99)]
+    relations.extend(
+        [
+            variant("short", end_a="2026-09-25T17:00:00Z"),
+            variant("long", end_a="2027-05-23T17:00:00Z"),
+        ]
+    )
+    for relation in relations:
+        FakePublicClient.books[relation.buy_leg_a.token_id] = threshold_book(
+            relation.buy_leg_a.token_id,
+            ask="0.49",
+            bid="0.48",
+        )
+        FakePublicClient.books[relation.buy_leg_b.token_id] = threshold_book(
+            relation.buy_leg_b.token_id,
+            ask="0.49",
+            bid="0.48",
+        )
+
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    monitor._set_relation_state(relations, ())
+    asyncio.run(monitor._refresh_relation_activity(FakePublicClient()))
+
+    assert len(monitor._realtime_relation_ids) == 100
+    assert "short" in monitor._realtime_relation_ids
+    assert "long" not in monitor._realtime_relation_ids
+    assert "filler-000" in monitor._realtime_relation_ids
+    assert "filler-098" in monitor._realtime_relation_ids
+
+
+def test_apr_pool_excludes_invalid_resolution_dates_and_rejections(
+    tmp_path: Path,
+) -> None:
+    setup_public([])
+    base = discover_threshold_relations([threshold_event()])[0]
+
+    def variant(
+        relation_id: str,
+        *,
+        end_a: str = "2026-12-31T17:00:00Z",
+        end_b: str | None = None,
+    ):
+        market_a = replace(
+            base.market_a,
+            market_id=f"market-a-{relation_id}",
+            condition_id=f"condition-a-{relation_id}",
+            yes_token_id=f"yes-a-{relation_id}",
+            no_token_id=f"no-a-{relation_id}",
+            end_date=end_a,
+        )
+        market_b = replace(
+            base.market_b,
+            market_id=f"market-b-{relation_id}",
+            condition_id=f"condition-b-{relation_id}",
+            yes_token_id=f"yes-b-{relation_id}",
+            no_token_id=f"no-b-{relation_id}",
+            end_date=end_b or end_a,
+        )
+        return replace(
+            base,
+            relation_id=relation_id,
+            market_a=market_a,
+            market_b=market_b,
+            buy_leg_a=replace(
+                base.buy_leg_a,
+                market_id=market_a.market_id,
+                condition_id=market_a.condition_id,
+                token_id=market_a.yes_token_id,
+            ),
+            buy_leg_b=replace(
+                base.buy_leg_b,
+                market_id=market_b.market_id,
+                condition_id=market_b.condition_id,
+                token_id=market_b.no_token_id,
+            ),
+        )
+
+    relations = [
+        variant("valid"),
+        variant("pending"),
+        variant("unavailable"),
+        variant("rejected"),
+        variant("expired", end_a="2026-07-26T17:00:00Z"),
+        variant(
+            "mismatched",
+            end_a="2026-12-31T17:00:00Z",
+            end_b="2027-01-01T17:00:00Z",
+        ),
+        variant("missing", end_a="", end_b=""),
+    ]
+    for relation in relations:
+        FakePublicClient.books[relation.buy_leg_a.token_id] = threshold_book(
+            relation.buy_leg_a.token_id,
+            ask="0.49",
+            bid="0.48",
+        )
+        FakePublicClient.books[relation.buy_leg_b.token_id] = threshold_book(
+            relation.buy_leg_b.token_id,
+            ask="0.49",
+            bid="0.48",
+        )
+
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    monitor._set_relation_state(relations, ())
+    monitor._codex_statuses["unavailable"] = "llm_unavailable"
+    monitor._codex_statuses["rejected"] = "llm_rejected"
+    asyncio.run(monitor._refresh_relation_activity(FakePublicClient()))
+
+    assert set(monitor._active_relation_ids) == {relation.relation_id for relation in relations}
+    assert {"valid", "pending", "unavailable"} <= monitor._realtime_relation_ids
+    assert not {
+        "rejected",
+        "expired",
+        "mismatched",
+        "missing",
+    } & monitor._realtime_relation_ids
+
+
+def test_apr_target_anomaly_preserves_last_pool_and_blocks_relation_actions(
+    tmp_path: Path,
+) -> None:
+    setup_public([])
+    base = discover_threshold_relations([threshold_event()])[0]
+
+    def variant(relation_id: str):
+        market_a = replace(
+            base.market_a,
+            market_id=f"market-a-{relation_id}",
+            condition_id=f"condition-a-{relation_id}",
+            yes_token_id=f"yes-a-{relation_id}",
+            no_token_id=f"no-a-{relation_id}",
+        )
+        market_b = replace(
+            base.market_b,
+            market_id=f"market-b-{relation_id}",
+            condition_id=f"condition-b-{relation_id}",
+            yes_token_id=f"yes-b-{relation_id}",
+            no_token_id=f"no-b-{relation_id}",
+        )
+        return replace(
+            base,
+            relation_id=relation_id,
+            market_a=market_a,
+            market_b=market_b,
+            buy_leg_a=replace(
+                base.buy_leg_a,
+                market_id=market_a.market_id,
+                condition_id=market_a.condition_id,
+                token_id=market_a.yes_token_id,
+            ),
+            buy_leg_b=replace(
+                base.buy_leg_b,
+                market_id=market_b.market_id,
+                condition_id=market_b.condition_id,
+                token_id=market_b.no_token_id,
+            ),
+        )
+
+    relations = [variant(f"target-{index:03d}") for index in range(101)]
+    for relation in relations:
+        FakePublicClient.books[relation.buy_leg_a.token_id] = threshold_book(
+            relation.buy_leg_a.token_id,
+            ask="0.40",
+            bid="0.39",
+        )
+        FakePublicClient.books[relation.buy_leg_b.token_id] = threshold_book(
+            relation.buy_leg_b.token_id,
+            ask="0.45",
+            bid="0.44",
+        )
+
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    monitor._catalog_loaded = True
+    monitor._catalog_status = "healthy"
+    monitor._catalog_full_scanned_at = NOW
+    monitor._set_relation_state([relations[0]], ())
+    client = FakePublicClient()
+    asyncio.run(monitor._refresh_relation_activity(client))
+    monitor._opportunities[relations[0].relation_id] = {
+        "opportunity_id": relations[0].relation_id,
+        "market_type": "threshold_hedge",
+        "relation_id": relations[0].relation_id,
+        "confirmed_at": NOW,
+        "actionable": True,
+        "eligibility_reason": "actionable",
+    }
+    previous_realtime_ids = set(monitor._realtime_relation_ids)
+    previous_token_map = {
+        token: set(relation_ids)
+        for token, relation_ids in monitor._relation_by_token.items()
+    }
+    previous_handle = monitor._stream_handle
+    monitor._set_relation_state(relations, ())
+
+    asyncio.run(monitor._refresh_relation_activity(client))
+
+    activity = monitor.snapshot()["relation_discovery"]["activity"]
+    assert activity["status"] == "degraded"
+    assert activity["apr_target_relations"] == 101
+    assert monitor._relations_failed is True
+    assert monitor._realtime_relation_ids == previous_realtime_ids
+    assert monitor._relation_by_token == previous_token_map
+    assert monitor._stream_handle is previous_handle
+    assert monitor.snapshot()["opportunities"][0]["actionable"] is False
+    assert monitor.opportunity(relations[0].relation_id)["actionable"] is False  # type: ignore[index]
+
+    monitor._set_relation_state(relations[:100], ())
+    asyncio.run(monitor._refresh_relation_activity(client))
+
+    assert monitor.snapshot()["relation_discovery"]["activity"]["status"] == "healthy"
+    assert monitor._relations_failed is False
+    assert len(monitor._realtime_relation_ids) == 100
 
 
 def test_codex_worker_does_not_block_activity_or_price_refresh(tmp_path: Path) -> None:

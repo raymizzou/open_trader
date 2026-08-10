@@ -12,6 +12,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   与 Sharpe 明确显示“观察期不足”，5 年收益按 CAGR 展示。真实 OpenD 刷新已验证三市场
   2026-08 快照、月内重复调用不改哈希，以及 v4 投影的批准身份和 1 年/5 年数值。
 
+- 同场阈值关系 WebSocket 监控改为 APR 感知池：60 秒完整 REST 扫描保持不变，实时订阅保留全部正常年化达标关系及年化门槛下最接近的预热关系；关系层只订阅两条对冲买腿，联合 token 集合未变化时不重连。扫描失败或年化达标关系异常超限时保留上一成功订阅池并 fail-closed。验证：监控回归、真实候选进程与最终 Dashboard acceptance 均已通过。
+
 ## 2026-08-09
 
 - 修复趋势复盘把 Kelly 策略版本边界误用于连续日终净值的问题：未满 30 笔仍显示已有模拟盘与同期市场绩效，30 笔门槛只控制 Kelly 启用；实盘缺少日终净值时继续明确不可用。
