@@ -39,8 +39,12 @@ listener_absent() {
   return "$status"
 }
 wait_listener_absent() {
-  while [[ "$CLEANUP_POLL_BUDGET" -gt 0 ]]; do
-    CLEANUP_POLL_BUDGET=$((CLEANUP_POLL_BUDGET - 1))
+  local initial_check=1
+  while [[ "$initial_check" -eq 1 || "$CLEANUP_POLL_BUDGET" -gt 0 ]]; do
+    if [[ "$CLEANUP_POLL_BUDGET" -gt 0 ]]; then
+      CLEANUP_POLL_BUDGET=$((CLEANUP_POLL_BUDGET - 1))
+    fi
+    initial_check=0
     if listener_absent; then return 0; fi
     [[ "$CLEANUP_POLL_BUDGET" -gt 0 ]] && sleep 1
   done

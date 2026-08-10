@@ -76,6 +76,18 @@ def test_compare_live_states_classifies_sparse_operational_subtrees_as_isolated(
     assert {item.get("field") for item in differences} >= {"health", "venues", "cross_venue", "relation_discovery"}
 
 
+def test_compare_live_states_flags_operational_type_shape_corruption() -> None:
+    legacy = _state()
+    shadow = _state()
+    legacy["health"] = {"status": "healthy", "counter": 3}
+    shadow["health"] = "healthy"
+
+    differences = validation._compare_live_states(legacy, shadow)
+
+    assert "semantic_difference" in {item["classification"] for item in differences}
+    assert any(item.get("field") == "health" for item in differences)
+
+
 def test_compare_live_states_flags_deterministic_profit_formula_drift() -> None:
     differences = validation._compare_live_states(_state(), _state(profit="1.10"))
 

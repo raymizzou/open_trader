@@ -232,6 +232,54 @@ def test_uninstaller_waits_past_five_polls_for_delayed_shutdown(tmp_path: Path) 
     assert not plist.exists()
 
 
+def test_uninstaller_checks_listener_when_label_absent_on_budget_boundary(tmp_path: Path) -> None:
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    plist = agents / f"{LABEL}.plist"
+    plist.write_text("keep", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    launchctl, lsof, sleep = fake_bin / "launchctl", fake_bin / "lsof", fake_bin / "sleep"
+    polls, listener_check = tmp_path / "polls", tmp_path / "listener-check"
+    launchctl.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = print ]; then\n"
+        "  n=$(cat \"$FAKE_POLLS\" 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" > \"$FAKE_POLLS\"\n"
+        "  if [ \"$n\" -lt 20 ]; then echo 'pid = 123'; exit 0; fi\n"
+        "  echo 'Could not find service' >&2; exit 113\n"
+        "fi\nexit 0\n",
+        encoding="utf-8",
+    )
+    lsof.write_text(
+        "#!/bin/sh\n"
+        "echo checked > \"$FAKE_LISTENER_CHECK\"\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    for command in (launchctl, lsof, sleep):
+        command.chmod(0o755)
+
+    result = subprocess.run(
+        [str(UNINSTALLER), "--launch-agents-dir", str(agents)],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "LAUNCHCTL_BIN": str(launchctl),
+            "LSOF_BIN": str(lsof),
+            "FAKE_POLLS": str(polls),
+            "FAKE_LISTENER_CHECK": str(listener_check),
+        },
+    )
+
+    assert result.returncode == 0
+    assert polls.read_text(encoding="utf-8") == "20\n"
+    assert listener_check.read_text(encoding="utf-8") == "checked\n"
+    assert not plist.exists()
+
+
 def _copy_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)

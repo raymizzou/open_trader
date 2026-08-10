@@ -175,10 +175,15 @@ def _compare_live_states(
                 })
         differences.extend(_schema_differences(legacy_rows[identifier], shadow_rows[identifier], f"opportunity.{identifier}"))
     for field in sorted(_OPERATIONAL_STATE_FIELDS):
+        left_present, right_present = field in legacy, field in shadow
+        if left_present != right_present:
+            differences.append({"classification": "isolated_state_difference", "field": field})
+            continue
         left = _operational_subtree(legacy.get(field), field)
         right = _operational_subtree(shadow.get(field), field)
         if left != right:
             differences.append({"classification": "isolated_state_difference", "field": field})
+            differences.extend(_operational_type_differences(left, right, field))
     differences.extend(_schema_differences(legacy, shadow))
     if _volatile_projection(legacy) != _volatile_projection(shadow):
         differences.append({"classification": "isolated_state_difference"})
@@ -197,6 +202,35 @@ def _operational_subtree(value: object, field: str) -> object:
     if isinstance(value, list):
         return [_operational_subtree(item, "") for item in value]
     return value
+
+
+def _operational_type_differences(
+    legacy: object, shadow: object, field: str
+) -> list[dict[str, object]]:
+    if type(legacy) is not type(shadow):
+        return [{
+            "classification": "semantic_difference",
+            "field": field,
+            "legacy_type": type(legacy).__name__,
+            "shadow_type": type(shadow).__name__,
+        }]
+    if isinstance(legacy, Mapping):
+        differences: list[dict[str, object]] = []
+        for key in set(legacy) & set(shadow):
+            differences.extend(
+                _operational_type_differences(
+                    legacy[key], shadow[key], f"{field}.{key}"
+                )
+            )
+        return differences
+    if isinstance(legacy, list):
+        differences = []
+        for index, (left, right) in enumerate(zip(legacy, shadow, strict=False)):
+            differences.extend(
+                _operational_type_differences(left, right, f"{field}[{index}]")
+            )
+        return differences
+    return []
 
 
 def _semantic_value(value: object) -> object:
