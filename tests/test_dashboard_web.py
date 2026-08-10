@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import http.client
 import json
+import multiprocessing
 import os
 from dataclasses import replace
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
@@ -33,6 +36,65 @@ from tests.test_dashboard import (
     write_csv,
     write_trend_history_report,
 )
+
+
+def _serve_dashboard_until_sigterm(marker_path: str) -> None:
+    from open_trader.dashboard import DashboardConfig
+    import open_trader.dashboard_web as dashboard_web
+
+    marker = Path(marker_path)
+
+    class FakeTrendService:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def prewarm(self) -> None:
+            pass
+
+    class FakeRuntime:
+        store = None
+        monitor = None
+        cross_venue_monitor = None
+        execution = None
+
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def start(self) -> None:
+            marker.with_name("runtime-started").write_text("1", encoding="utf-8")
+
+        def stop(self) -> None:
+            marker.with_name("runtime-stopped").write_text("1", encoding="utf-8")
+
+    class FakeServer:
+        server_address = ("127.0.0.1", 8765)
+
+        def serve_forever(self) -> None:
+            marker.with_name("server-ready").write_text("1", encoding="utf-8")
+            while True:
+                time.sleep(1)
+
+        def server_close(self) -> None:
+            marker.with_name("server-closed").write_text("1", encoding="utf-8")
+
+    config = DashboardConfig(
+        portfolio_path=None,
+        data_dir=marker.parent / "data",
+        reports_dir=marker.parent / "reports",
+        poll_seconds=1.0,
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        prediction_config_path=marker.parent / "prediction.json",
+    )
+    config.prediction_config_path.write_text("{}", encoding="utf-8")
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(dashboard_web, "TrendSimulatePositionService", FakeTrendService)
+    monkeypatch.setattr(dashboard_web, "PredictionRuntime", FakeRuntime)
+    monkeypatch.setattr(dashboard_web, "create_dashboard_server", lambda **_: FakeServer())
+    try:
+        dashboard_web.serve_dashboard(config, host="127.0.0.1", port=0)
+    finally:
+        monkeypatch.undo()
 
 
 def test_acceptance_gate_runs_prediction_playwright() -> None:
@@ -2992,6 +3054,7 @@ def test_prediction_venue_construction_failure_keeps_dashboard_state_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import open_trader.dashboard_web as dashboard_web
+    import open_trader.prediction_runtime as prediction_runtime
 
     class FakeMonitor:
         def snapshot(self) -> dict[str, object]:
@@ -3006,7 +3069,7 @@ def test_prediction_venue_construction_failure_keeps_dashboard_state_available(
     def fail_predict_source(_config: object) -> object:
         raise RuntimeError("missing predict config")
 
-    monkeypatch.setattr(dashboard_web, "PredictSource", fail_predict_source)
+    monkeypatch.setattr(prediction_runtime, "PredictSource", fail_predict_source)
     cross = dashboard_web._build_cross_venue_monitor(
         trading_config=type("Config", (), {"predict": object()})(),
         prediction_monitor=FakeMonitor(),
@@ -3033,6 +3096,7 @@ def test_build_cross_venue_monitor_injects_store_without_environment_mode_overri
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import open_trader.dashboard_web as dashboard_web
+    import open_trader.prediction_runtime as prediction_runtime
 
     created: list[dict[str, object]] = []
 
@@ -3047,13 +3111,13 @@ def test_build_cross_venue_monitor_injects_store_without_environment_mode_overri
         def reconcile_cross_holdings_once(self) -> None:
             return None
 
-    monkeypatch.setattr(dashboard_web, "PredictSource", lambda _config: object())
+    monkeypatch.setattr(prediction_runtime, "PredictSource", lambda _config: object())
     monkeypatch.setattr(
-        dashboard_web,
+        prediction_runtime,
         "CodexCrossVenueEquivalenceValidator",
         lambda *_args, **_kwargs: object(),
     )
-    monkeypatch.setattr(dashboard_web, "PredictCrossVenueMonitor", FakeCrossVenueMonitor)
+    monkeypatch.setattr(prediction_runtime, "PredictCrossVenueMonitor", FakeCrossVenueMonitor)
 
     store = object()
     monkeypatch.setenv("OPEN_TRADER_CROSS_EXECUTION_MODE", "auto_submit")
@@ -3130,6 +3194,7 @@ def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_firs
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import open_trader.dashboard_web as dashboard_web
+    import open_trader.prediction_runtime as prediction_runtime
 
     order: list[str] = []
     config = replace(
@@ -3206,14 +3271,14 @@ def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_firs
         def server_close(self) -> None:
             order.append("server.close")
 
-    monkeypatch.setattr(dashboard_web, "load_trading_config", lambda _path: object())
+    monkeypatch.setattr(prediction_runtime, "load_trading_config", lambda _path: object())
     monkeypatch.setattr(
-        dashboard_web.PolymarketTradingClient,
+        prediction_runtime.PolymarketTradingClient,
         "from_keychain",
         classmethod(lambda _cls, _config: FakeTrading()),
     )
-    monkeypatch.setattr(dashboard_web, "PolymarketMonitor", FakeMonitor)
-    monkeypatch.setattr(dashboard_web, "PredictionExecutionService", FakeExecution)
+    monkeypatch.setattr(prediction_runtime, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(prediction_runtime, "PredictionExecutionService", FakeExecution)
     monkeypatch.setattr(dashboard_web, "create_dashboard_server", lambda **_: FakeServer())
 
     dashboard_web.serve_dashboard(
@@ -3269,6 +3334,7 @@ def test_cross_venue_runtime_closes_unscheduled_snapshot_coroutine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import open_trader.dashboard_web as dashboard_web
+    import open_trader.prediction_runtime as prediction_runtime
 
     class FakeLoop:
         def is_closed(self) -> bool:
@@ -3288,7 +3354,7 @@ def test_cross_venue_runtime_closes_unscheduled_snapshot_coroutine(
         raise RuntimeError("loop closed")
 
     monkeypatch.setattr(
-        dashboard_web.asyncio, "run_coroutine_threadsafe", fail_schedule
+        prediction_runtime.asyncio, "run_coroutine_threadsafe", fail_schedule
     )
 
     assert runtime.snapshot() == {}
@@ -4525,6 +4591,7 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import open_trader.dashboard_web as dashboard_web
+    import open_trader.prediction_runtime as prediction_runtime
 
     order: list[str] = []
     config = replace(
@@ -4593,14 +4660,14 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
         def server_close(self) -> None:
             order.append("server.close")
 
-    monkeypatch.setattr(dashboard_web, "load_trading_config", lambda _path: object())
+    monkeypatch.setattr(prediction_runtime, "load_trading_config", lambda _path: object())
     monkeypatch.setattr(
-        dashboard_web.PolymarketTradingClient,
+        prediction_runtime.PolymarketTradingClient,
         "from_keychain",
         classmethod(lambda _cls, _config: FakeTrading()),
     )
-    monkeypatch.setattr(dashboard_web, "PolymarketMonitor", FakeMonitor)
-    monkeypatch.setattr(dashboard_web, "PredictionExecutionService", FakeExecution)
+    monkeypatch.setattr(prediction_runtime, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(prediction_runtime, "PredictionExecutionService", FakeExecution)
     monkeypatch.setattr(dashboard_web, "create_dashboard_server", lambda **_: FakeServer())
 
     dashboard_web.serve_dashboard(
@@ -4628,6 +4695,142 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
     assert "Dashboard：http://127.0.0.1:8766/" in notification
     assert callable(FakeMonitor.observer)
     assert callable(FakeMonitor.failure_observer)
+
+
+def test_legacy_sigterm_routes_through_prediction_runtime_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    order: list[str] = []
+    handlers: dict[object, object] = {}
+    config = replace(
+        dashboard_config(tmp_path),
+        prediction_config_path=tmp_path / "prediction.json",
+    )
+    config.prediction_config_path.write_text("{}", encoding="utf-8")
+
+    class FakeTrendService:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def prewarm(self) -> None:
+            pass
+
+    class FakeRuntime:
+        store = None
+        monitor = None
+        cross_venue_monitor = None
+        execution = None
+
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def start(self) -> None:
+            order.append("runtime.start")
+
+        def stop(self) -> None:
+            order.append("runtime.stop")
+
+    class FakeServer:
+        server_address = ("127.0.0.1", 8765)
+
+        def serve_forever(self) -> None:
+            order.append("server.serve")
+            handler = handlers.get(dashboard_web.signal.SIGTERM)
+            assert callable(handler)
+            try:
+                handler(dashboard_web.signal.SIGTERM, None)
+            except KeyboardInterrupt:
+                pass
+
+        def server_close(self) -> None:
+            order.append("server.close")
+
+    def capture_signal(signum: object, handler: object) -> object:
+        handlers[signum] = handler
+        return dashboard_web.signal.SIG_DFL
+
+    monkeypatch.setattr(dashboard_web, "TrendSimulatePositionService", FakeTrendService)
+    monkeypatch.setattr(dashboard_web, "PredictionRuntime", FakeRuntime)
+    monkeypatch.setattr(dashboard_web, "create_dashboard_server", lambda **_: FakeServer())
+    monkeypatch.setattr(dashboard_web.signal, "signal", capture_signal)
+
+    dashboard_web.serve_dashboard(config, host="127.0.0.1", port=0)
+
+    assert order == ["runtime.start", "server.serve", "runtime.stop", "server.close"]
+
+
+def test_legacy_server_construction_failure_stops_prediction_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.dashboard_web as dashboard_web
+
+    order: list[str] = []
+    config = replace(
+        dashboard_config(tmp_path),
+        prediction_config_path=tmp_path / "prediction.json",
+    )
+    config.prediction_config_path.write_text("{}", encoding="utf-8")
+
+    class FakeTrendService:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def prewarm(self) -> None:
+            pass
+
+    class FakeRuntime:
+        store = None
+        monitor = None
+        cross_venue_monitor = None
+        execution = None
+
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def start(self) -> None:
+            order.append("runtime.start")
+
+        def stop(self) -> None:
+            order.append("runtime.stop")
+
+    def fail_server(**_: object) -> object:
+        order.append("server.construct")
+        raise RuntimeError("bind failed")
+
+    monkeypatch.setattr(dashboard_web, "TrendSimulatePositionService", FakeTrendService)
+    monkeypatch.setattr(dashboard_web, "PredictionRuntime", FakeRuntime)
+    monkeypatch.setattr(dashboard_web, "create_dashboard_server", fail_server)
+
+    with pytest.raises(RuntimeError, match="bind failed"):
+        dashboard_web.serve_dashboard(config, host="127.0.0.1", port=0)
+
+    assert order == ["runtime.start", "server.construct", "runtime.stop"]
+
+
+def test_legacy_real_sigterm_runs_runtime_cleanup_in_a_child_process(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    marker = tmp_path / "markers" / "lifecycle"
+    marker.parent.mkdir()
+    child = context.Process(target=_serve_dashboard_until_sigterm, args=(str(marker),))
+    child.start()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not marker.with_name("server-ready").exists():
+            time.sleep(0.05)
+        assert marker.with_name("server-ready").exists()
+        os.kill(child.pid, signal.SIGTERM)
+        child.join(5)
+        assert child.exitcode == 0
+        assert marker.with_name("runtime-stopped").exists()
+        assert marker.with_name("server-closed").exists()
+    finally:
+        if child.is_alive():
+            child.kill()
+            child.join(5)
 
 
 def test_prediction_arbitrage_reset_schema_is_exact_and_calls_only_incident_id(
