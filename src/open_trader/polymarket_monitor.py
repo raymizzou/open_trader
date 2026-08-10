@@ -1251,11 +1251,25 @@ class PolymarketMonitor:
                 valid_markets.append(market_row)
                 market_id = str(market_row["market_id"])
                 markets[market_id] = market_row
-                token_map[str(market_row["yes_token_id"])] = market_id
-                token_map[str(market_row["no_token_id"])] = market_id
+                if self._standard_market_websocket_eligible(market_row):
+                    token_map[str(market_row["yes_token_id"])] = market_id
+                    token_map[str(market_row["no_token_id"])] = market_id
             event_row["markets"] = valid_markets
             event_row["market_count"] = len(valid_markets)
             event_row.pop("_raw_markets", None)
+        with self._lock:
+            prior_standard_pool = bool(self._market_by_token)
+            previous_union = (
+                set(self._market_by_token)
+                | set(self._relation_by_token)
+                | self._cross_venue_tokens
+            )
+        explicitly_ineligible = bool(markets) and all(
+            row.get("fees_enabled") is True or row.get("neg_risk") is True
+            for row in markets.values()
+        )
+        if prior_standard_pool and markets and not token_map and not explicitly_ineligible:
+            raise RuntimeError("ambiguous empty standard websocket pool")
         with self._lock:
             previous_opportunity_rows = copy.deepcopy(self._opportunities)
             previous_opportunities = set(previous_opportunity_rows)
@@ -1265,6 +1279,13 @@ class PolymarketMonitor:
             self._diagnostics["malformed_events"] = malformed_events
             self._universe_at = self._now()
             self._universe_failed = False
+            current_union = (
+                set(self._market_by_token)
+                | set(self._relation_by_token)
+                | self._cross_venue_tokens
+            )
+            if current_union != previous_union:
+                self._subscription_dirty = True
         self._apply_cached_title_projections()
         self._enqueue_title_translations(normalized)
         await self._refresh_readiness()
@@ -1288,7 +1309,7 @@ class PolymarketMonitor:
             if opportunity is not None:
                 current_opportunities[str(opportunity["opportunity_id"])] = opportunity
         if subscribe:
-            await self._subscribe(client)
+            await self._refresh_subscription_if_dirty(client)
         with self._lock:
             current_opportunities.update(
                 {
@@ -3236,6 +3257,10 @@ class PolymarketMonitor:
             "actionable": False,
             "gross_upper_bound": None,
         }
+
+    @staticmethod
+    def _standard_market_websocket_eligible(market: Mapping[str, object]) -> bool:
+        return market.get("fees_enabled") is False and market.get("neg_risk") is not True
 
     async def _refresh_readiness(self) -> None:
         now = self._now()
