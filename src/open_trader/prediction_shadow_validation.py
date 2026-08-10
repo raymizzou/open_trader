@@ -157,6 +157,18 @@ def _mapping(value: object) -> Mapping[str, object]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _transient_gate_sample(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
+    states = (
+        (left.get("actionable"), left.get("eligibility_reason")),
+        (right.get("actionable"), right.get("eligibility_reason")),
+    )
+    return any(actionable is False for actionable, _reason in states) and all(
+        (actionable is True and reason in {"actionable", "eligible"})
+        or (actionable is False and reason in _TRANSIENT_GATING_REASONS)
+        for actionable, reason in states
+    )
+
+
 def _compare_live_states(
     legacy: Mapping[str, object], shadow: Mapping[str, object]
 ) -> list[dict[str, object]]:
@@ -174,12 +186,8 @@ def _compare_live_states(
             left, right = _semantic_value(legacy_rows[identifier].get(field)), _semantic_value(shadow_rows[identifier].get(field))
             if left_present != right_present or (left_present and (type(left) is not type(right) or left != right)):
                 classification = "semantic_difference"
-                if (
-                    field == "eligibility_reason"
-                    and legacy_rows[identifier].get("actionable") is False
-                    and shadow_rows[identifier].get("actionable") is False
-                    and isinstance(left, str) and left in _TRANSIENT_GATING_REASONS
-                    and isinstance(right, str) and right in _TRANSIENT_GATING_REASONS
+                if field in {"actionable", "eligibility_reason"} and _transient_gate_sample(
+                    legacy_rows[identifier], shadow_rows[identifier]
                 ):
                     classification = "sampling_difference"
                 differences.append({

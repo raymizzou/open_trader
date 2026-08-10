@@ -142,6 +142,17 @@ def test_compare_live_states_classifies_transient_non_actionable_reasons_as_samp
         "shadow": "book_stale",
     }]
 
+    legacy["opportunities"][0].update(actionable=False, eligibility_reason="book_stale")  # type: ignore[index]
+    shadow["opportunities"][0].update(actionable=True, eligibility_reason="actionable")  # type: ignore[index]
+    assert {
+        (item["field"], item["classification"])
+        for item in validation._compare_live_states(legacy, shadow)
+    } == {
+        ("actionable", "sampling_difference"),
+        ("eligibility_reason", "sampling_difference"),
+    }
+
+    shadow["opportunities"][0]["actionable"] = False  # type: ignore[index]
     shadow["opportunities"][0]["eligibility_reason"] = "neg_risk"  # type: ignore[index]
     assert any(
         item["classification"] == "semantic_difference"
