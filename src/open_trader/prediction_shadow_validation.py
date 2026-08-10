@@ -29,7 +29,7 @@ _DETERMINISTIC_FIELDS = (
     "venue", "venues", "strategy", "relation", "market_type", "relation_direction", "legs",
     "fee", "fees", "fee_components", "maximum_fee", "cost", "max_cost", "total_max_cost", "yes_max_cost", "no_max_cost",
     "actionable", "eligibility_reason", "eligibility", "gating", "profit",
-    "minimum_profit", "estimated_profit", "profit_formula", "clear_signal",
+    "minimum_profit", "estimated_profit", "profit_formula", "profit_formula_version", "gross_profit", "net_profit", "net_edge", "max_profit", "maximum_fee", "clear_signal", "eligible", "gating_reason", "actionable_reason",
 )
 _VOLATILE_FIELDS = {
     "csrf_token", "heartbeat", "heartbeat_at", "started_at", "updated_at",
@@ -119,8 +119,11 @@ def _validate_health(payload: Mapping[str, object], *, shadow: bool) -> None:
         raise ValueError(f"{'shadow' if shadow else 'legacy'} health unavailable")
     if shadow and not (payload.get("mode") == "shadow" and payload.get("production_owner") is False and payload.get("mutations") == "prohibited"):
         raise ValueError("shadow identity mismatch")
-    if not shadow and payload.get("mode") == "shadow":
-        raise ValueError("legacy URL points at shadow service")
+    if not shadow:
+        if payload.get("schema_version") != "open_trader.legacy_dashboard.health.v1" or payload.get("module") != "legacy_dashboard":
+            raise ValueError("legacy identity mismatch")
+        if payload.get("mode") == "shadow":
+            raise ValueError("legacy URL points at shadow service")
 
 
 def _opportunities(state: Mapping[str, object]) -> dict[str, Mapping[str, object]]:
@@ -452,6 +455,7 @@ def run_shadow_validation(
         "seed": {}, "cycles": [], "allowed_differences": [], "semantic_differences": [],
         "codex": {"baseline": {}, "current": {}, "delta": {}}, "token_counts": {"baseline": {}, "current": {}, "delta": {}}, "guard_attempts": [], "restart": {}, "shutdown": {},
         "provider_evidence": {"baseline": {}, "current": {}, "delta": {}},
+        "frozen_parity": {"status": "BLOCKED", "differences": []},
     }
     status, reason = "FAIL", "validation did not start"
     owned = False
@@ -476,6 +480,7 @@ def run_shadow_validation(
         _remaining(validation_deadline)
         if _label_loaded(deadline=validation_deadline):
             raise RuntimeError("prediction shadow label already loaded; refusing ownership takeover")
+        owned = True  # pre-existing label was checked immediately before bootstrap; own any partial bootstrap failure.
         report["install"] = _install_shadow(
             repo_root=repo_root, runtime_root=runtime_root,
             prediction_config_path=prediction_config_path, deadline=validation_deadline,
@@ -486,6 +491,7 @@ def run_shadow_validation(
             report["guard_attempts"] = list(baseline_health["guard_attempts"])
         _validate_health(baseline_health, shadow=True)
         baseline_state = _fetch_json(f"{shadow_url}/api/prediction-arbitrage/state", _remaining(validation_deadline))
+        report["frozen_parity"] = {"status": "BLOCKED", "reason": "no deterministic fixture input was supplied to the CLI"}
         codex_baseline = _codex_evidence(baseline_health)
         provider_baseline = _provider_evidence(baseline_state)
         tokens_baseline = _token_counts(baseline_state)

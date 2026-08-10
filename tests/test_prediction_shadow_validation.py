@@ -260,7 +260,7 @@ def _run_fake_validation(
 ) -> dict[str, object]:
     states = [_state(completed_at=f"2026-08-10T00:0{index}:00Z") for index in range(4)]
     if case == "profit_formula_drift":
-        states[-1] = _state(profit="1.10", completed_at="2026-08-10T00:02:00Z")
+        states[2] = _state(profit="1.10", completed_at="2026-08-10T00:02:00Z")
     if case == "deadline_before_three_cycles":
         states = states[:1]
     health = {
@@ -280,7 +280,7 @@ def _run_fake_validation(
     def fetch(url: str, _timeout: float) -> dict[str, object]:
         if url.endswith("/healthz"):
             if url.startswith("http://127.0.0.1:8767"):
-                return {**health, "mode": "legacy"}
+                return {**health, "mode": "legacy", "schema_version": "open_trader.legacy_dashboard.health.v1", "module": "legacy_dashboard"}
             if url.startswith("http://127.0.0.1:8769"):
                 calls["shadow_health"] += 1
                 if calls["shadow_health"] == 1:
