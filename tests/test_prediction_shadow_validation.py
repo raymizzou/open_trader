@@ -99,6 +99,21 @@ def test_compare_live_states_allows_nullable_operational_values() -> None:
     assert {item["classification"] for item in differences} == {"isolated_state_difference"}
 
 
+@pytest.mark.parametrize("malformed", [{"status": "healthy"}, ["healthy"]])
+def test_compare_live_states_flags_operational_container_to_none(
+    malformed: object,
+) -> None:
+    legacy = _state()
+    shadow = _state()
+    legacy["health"] = malformed
+    shadow["health"] = None
+
+    differences = validation._compare_live_states(legacy, shadow)
+
+    assert "semantic_difference" in {item["classification"] for item in differences}
+    assert any(item.get("field") == "health" for item in differences)
+
+
 def test_compare_live_states_flags_deterministic_profit_formula_drift() -> None:
     differences = validation._compare_live_states(_state(), _state(profit="1.10"))
 

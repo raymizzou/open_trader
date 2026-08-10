@@ -207,8 +207,12 @@ def _operational_subtree(value: object, field: str) -> object:
 def _operational_type_differences(
     legacy: object, shadow: object, field: str
 ) -> list[dict[str, object]]:
-    if legacy is None or shadow is None:
+    if legacy is None and shadow is None:
         return []
+    if legacy is None or shadow is None:
+        other = shadow if legacy is None else legacy
+        if not isinstance(other, (Mapping, list)):
+            return []
     if type(legacy) is not type(shadow):
         return [{
             "classification": "semantic_difference",
