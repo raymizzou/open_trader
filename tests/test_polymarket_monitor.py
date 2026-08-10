@@ -612,6 +612,9 @@ def test_cross_venue_tokens_join_existing_subscription_and_refresh_once(
     }
     assert monitor._market_by_token == {"standard": "market-1"}
     assert monitor._relation_by_token == {"threshold": {"relation-1"}}
+    websocket = monitor.snapshot()["relation_discovery"]["websocket"]
+    assert websocket["standard_subscribed_tokens"] == 1
+    assert websocket["subscribed_tokens"] == 4
 
 
 def test_relation_token_union_controls_resubscribe_and_uses_only_buy_legs(

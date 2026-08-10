@@ -686,11 +686,14 @@ class PolymarketMonitor:
 
     def _websocket_snapshot(self, now: datetime) -> dict[str, object]:
         connected = self._stream_handle is not None and self._stream_disconnected_at is None
+        standard_tokens = set(self._market_by_token)
+        combined_tokens = (
+            standard_tokens | set(self._relation_by_token) | self._cross_venue_tokens
+        )
         return {
             "status": "connected" if connected else "disconnected",
-            "subscribed_tokens": len(
-                set(self._market_by_token) | set(self._relation_by_token)
-            ),
+            "standard_subscribed_tokens": len(standard_tokens),
+            "subscribed_tokens": len(combined_tokens),
             "last_message_at": self._stream_message_at,
             "last_message_age_seconds": _display_age(
                 _age(now, self._stream_message_at)

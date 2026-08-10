@@ -2648,7 +2648,7 @@ function predictionErrorAlert() {
 }
 
 function predictionMetricStrip(payload) {
-  const labels = ["当前可参与", "监控事件", "市场 / Token", "过去 24 小时信号"];
+  const labels = ["当前可参与", "监控事件", "市场 / 实时 Token", "过去 24 小时信号"];
   if (!predictionHealthIsNormal(payload)) {
     return `<section class="pm-metrics" aria-label="监控摘要不可用">${labels.map((label) => `<article class="pm-metric"><span>${label}</span><strong>-</strong><small>数据未返回</small></article>`).join("")}</section>`;
   }
@@ -2664,11 +2664,12 @@ function predictionMetricStrip(payload) {
       : "-";
   const eventCount = predictionHasValue(payload?.event_count) ? predictionNumber(payload.event_count) : "-";
   const marketCount = predictionHasValue(payload?.market_count) ? predictionNumber(payload.market_count) : "-";
-  const tokenCount = predictionHasValue(payload?.token_count) ? predictionNumber(payload.token_count) : "-";
+  const standardTokenCount = payload?.relation_discovery?.websocket?.standard_subscribed_tokens;
+  const tokenCount = predictionHasValue(standardTokenCount) ? predictionNumber(standardTokenCount) : "-";
   const signals = predictionHasValue(payload?.signals_24h ?? payload?.history_count_24h)
     ? predictionNumber(payload.signals_24h ?? payload.history_count_24h)
     : "-";
-  return `<section class="pm-metrics" aria-label="监控摘要"><article class="pm-metric primary"><span>当前可参与</span><strong>${actionable}</strong><small>后台检查全部通过后才显示</small></article><article class="pm-metric"><span>监控事件</span><strong>${eventCount}</strong><small>按 24h 成交量动态筛选</small></article><article class="pm-metric"><span>市场 / Token</span><strong>${escapeHtml(`${marketCount} / ${tokenCount}`)}</strong><small>不可参与市场仍持续监控</small></article><article class="pm-metric"><span>过去 24 小时信号</span><strong>${signals}</strong><small>曾达到可参与条件</small></article></section>`;
+  return `<section class="pm-metrics" aria-label="监控摘要"><article class="pm-metric primary"><span>当前可参与</span><strong>${actionable}</strong><small>后台检查全部通过后才显示</small></article><article class="pm-metric"><span>监控事件</span><strong>${eventCount}</strong><small>按 24h 成交量动态筛选</small></article><article class="pm-metric"><span>市场 / 实时 Token</span><strong>${escapeHtml(`${marketCount} / ${tokenCount}`)}</strong><small>不可参与市场定时刷新</small></article><article class="pm-metric"><span>过去 24 小时信号</span><strong>${signals}</strong><small>曾达到可参与条件</small></article></section>`;
 }
 
 function predictionReplacePositiveActionLabel(value, replacement) {
