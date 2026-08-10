@@ -88,6 +88,17 @@ def test_compare_live_states_flags_operational_type_shape_corruption() -> None:
     assert any(item.get("field") == "health" for item in differences)
 
 
+def test_compare_live_states_allows_nullable_operational_values() -> None:
+    legacy = _state()
+    shadow = _state()
+    legacy["venues"] = [{"venue": "polymarket", "last_success": "2026-08-10T00:00:00Z"}]
+    shadow["venues"] = [{"venue": "polymarket", "last_success": None}]
+
+    differences = validation._compare_live_states(legacy, shadow)
+
+    assert {item["classification"] for item in differences} == {"isolated_state_difference"}
+
+
 def test_compare_live_states_flags_deterministic_profit_formula_drift() -> None:
     differences = validation._compare_live_states(_state(), _state(profit="1.10"))
 
