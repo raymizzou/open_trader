@@ -3646,6 +3646,7 @@ def test_targeted_standard_refresh_rechecks_live_market_metadata(
     monitor = make_monitor(tmp_path)
     monitor.refresh_once()
     assert monitor.opportunity("e:m") is not None
+    monitor._subscription_dirty = False
     FakePublicClient.get_event_calls.clear()
     FakePublicClient.events = [
         event("e", markets=(market("m", fees_enabled=True),))
@@ -3656,6 +3657,44 @@ def test_targeted_standard_refresh_rechecks_live_market_metadata(
     assert refreshed is None
     assert FakePublicClient.get_event_calls == ["e"]
     assert monitor.opportunity("e:m") is None
+    assert monitor._market_by_token == {}
+    assert monitor._subscription_dirty is True
+
+
+def test_targeted_metadata_refresh_promotes_newly_eligible_market(
+    tmp_path: Path,
+) -> None:
+    setup_public([event("e", markets=(market("m", fees_enabled=True),))])
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    current = dict(monitor._markets["m"])
+    monitor._subscription_dirty = False
+    FakePublicClient.events = [event("e", markets=(market("m"),))]
+
+    asyncio.run(monitor._refresh_standard_market_metadata(FakePublicClient(), current))
+
+    assert set(monitor._market_by_token) == {"yes-1", "no-1"}
+    assert monitor._subscription_dirty is True
+
+
+def test_targeted_demotion_does_not_reconnect_when_other_layer_owns_tokens(
+    tmp_path: Path,
+) -> None:
+    setup_public([event("e", markets=(market("m"),))])
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    current = dict(monitor._markets["m"])
+    monitor._relation_by_token = {
+        "yes-1": {"relation"},
+        "no-1": {"relation"},
+    }
+    monitor._subscription_dirty = False
+    FakePublicClient.events = [event("e", markets=(market("m", fees_enabled=True),))]
+
+    asyncio.run(monitor._refresh_standard_market_metadata(FakePublicClient(), current))
+
+    assert monitor._market_by_token == {}
+    assert monitor._subscription_dirty is False
 
 
 def test_stale_snapshot_preserves_stronger_threshold_blocker(

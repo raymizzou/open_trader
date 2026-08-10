@@ -877,6 +877,11 @@ class PolymarketMonitor:
         if market_row is None:
             return None
         with self._lock:
+            previous_union = (
+                set(self._market_by_token)
+                | set(self._relation_by_token)
+                | self._cross_venue_tokens
+            )
             previous = self._markets.get(market_id, {})
             for token in (
                 str(previous.get("yes_token_id", "")),
@@ -885,8 +890,16 @@ class PolymarketMonitor:
                 if self._market_by_token.get(token) == market_id:
                     self._market_by_token.pop(token, None)
             self._markets[market_id] = market_row
-            self._market_by_token[str(market_row["yes_token_id"])] = market_id
-            self._market_by_token[str(market_row["no_token_id"])] = market_id
+            if self._standard_market_websocket_eligible(market_row):
+                self._market_by_token[str(market_row["yes_token_id"])] = market_id
+                self._market_by_token[str(market_row["no_token_id"])] = market_id
+            current_union = (
+                set(self._market_by_token)
+                | set(self._relation_by_token)
+                | self._cross_venue_tokens
+            )
+            if current_union != previous_union:
+                self._subscription_dirty = True
             existing_event = self._events.get(event_id)
             if existing_event is not None:
                 markets = [
