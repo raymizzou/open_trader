@@ -36,6 +36,7 @@ from .prediction_title_translation import CodexTitleTranslator
 
 logger = logging.getLogger(__name__)
 _CROSS_VENUE_START_TIMEOUT = 5
+_DEFAULT_HOLDING_RECONCILER = object()
 
 # Keep the old spelling available for the existing Dashboard test seam.
 discover_threshold_relations = discover_threshold_relation_catalog
@@ -239,13 +240,15 @@ def _build_cross_venue_monitor(
     predict_trading: object | None = None,
     fallback_enabled: bool = True,
     max_codex_calls: int | None = None,
-    holding_reconciler: Callable[[], object] | None = None,
+    holding_reconciler: Callable[[], object] | None | object = _DEFAULT_HOLDING_RECONCILER,
 ) -> PredictCrossVenueMonitor | _UnavailableCrossVenueMonitor:
     predict_config = getattr(trading_config, "predict", None)
     if predict_config is None:
         return _UnavailableCrossVenueMonitor("predict_not_configured")
     if predict_trading is None:
         return _UnavailableCrossVenueMonitor("predict_construction_failed")
+    if holding_reconciler is _DEFAULT_HOLDING_RECONCILER:
+        holding_reconciler = getattr(execution, "reconcile_cross_holdings_once", None)
     try:
         return PredictCrossVenueMonitor(
             predict_source=PredictSource(predict_config),

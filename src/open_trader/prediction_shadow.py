@@ -25,8 +25,10 @@ def seed_shadow_store(
     destination_path = (
         Path(shadow_data_dir) / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
     )
-    if source_path.exists() and destination_path.exists() and os.path.samefile(
-        source_path, destination_path
+    if source_path.resolve() == destination_path.resolve() or (
+        source_path.exists()
+        and destination_path.exists()
+        and os.path.samefile(source_path, destination_path)
     ):
         raise ValueError("source and shadow must use different databases")
     destination = PredictionArbitrageStore(Path(shadow_data_dir))

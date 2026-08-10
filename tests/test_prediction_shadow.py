@@ -58,6 +58,16 @@ def test_seed_shadow_store_rejects_same_database(tmp_path: Path) -> None:
         )
 
 
+def test_seed_shadow_store_rejects_identical_uncreated_paths(tmp_path: Path) -> None:
+    same_data_dir = tmp_path / "same"
+
+    with pytest.raises(ValueError, match="different databases"):
+        seed_shadow_store(
+            source_data_dir=same_data_dir,
+            shadow_data_dir=same_data_dir,
+        )
+
+
 def test_seed_shadow_store_rejects_hardlinked_database(tmp_path: Path) -> None:
     source = _populated_store(tmp_path / "production")
     hardlink_dir = tmp_path / "hardlink" / "prediction_arbitrage"
