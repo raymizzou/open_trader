@@ -1,0 +1,226 @@
+from __future__ import annotations
+
+import multiprocessing
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from open_trader.prediction_runtime import (
+    PredictionRuntime,
+    PredictionRuntimeOwnershipError,
+    _RuntimeOwnershipLock,
+)
+
+
+def _hold_owner_lock(path: str, ready: object, release: object) -> None:
+    lock = _RuntimeOwnershipLock(Path(path))
+    lock.acquire()
+    ready.set()  # type: ignore[attr-defined]
+    release.wait(10)  # type: ignore[attr-defined]
+    lock.release()
+
+
+def _try_owner_lock(path: str, result: object) -> None:
+    lock = _RuntimeOwnershipLock(Path(path))
+    try:
+        lock.acquire()
+    except PredictionRuntimeOwnershipError:
+        result.put("blocked")  # type: ignore[attr-defined]
+        return
+    result.put("acquired")  # type: ignore[attr-defined]
+    lock.release()
+
+
+def test_runtime_constructor_is_side_effect_free(tmp_path: Path) -> None:
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+    )
+
+    assert runtime.state == "NEW"
+    assert not (tmp_path / "prediction_arbitrage" / "runtime.lock").exists()
+    assert runtime.store is None
+    assert runtime.monitor is None
+    assert runtime.cross_venue_monitor is None
+    assert runtime.execution is None
+
+
+def test_runtime_owner_lock_rejects_a_second_owner_until_release(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "prediction_arbitrage" / "runtime.lock"
+    first = _RuntimeOwnershipLock(path)
+    second = _RuntimeOwnershipLock(path)
+
+    first.acquire()
+    try:
+        with pytest.raises(PredictionRuntimeOwnershipError):
+            second.acquire()
+    finally:
+        first.release()
+
+    second.acquire()
+    second.release()
+
+
+def test_runtime_owner_lock_excludes_a_real_second_process(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    path = tmp_path / "prediction_arbitrage" / "runtime.lock"
+    ready = context.Event()
+    release = context.Event()
+    result = context.Queue()
+    first = context.Process(
+        target=_hold_owner_lock,
+        args=(str(path), ready, release),
+    )
+    first.start()
+    try:
+        assert ready.wait(5)
+        second = context.Process(target=_try_owner_lock, args=(str(path), result))
+        second.start()
+        second.join(5)
+        assert second.exitcode == 0
+        assert result.get(timeout=1) == "blocked"
+
+        release.set()
+        first.join(5)
+        assert first.exitcode == 0
+
+        third = context.Process(target=_try_owner_lock, args=(str(path), result))
+        third.start()
+        third.join(5)
+        assert third.exitcode == 0
+        assert result.get(timeout=1) == "acquired"
+    finally:
+        release.set()
+        first.join(5)
+
+
+def test_runtime_starts_and_stops_prediction_resources_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    events: list[str] = []
+
+    class FakeStore:
+        def __init__(self, _data_dir: Path) -> None:
+            events.append("store.open")
+
+        def close(self) -> None:
+            events.append("store.close")
+
+    class FakeTrading:
+        def close(self) -> None:
+            events.append("trading.close")
+
+    class FakeTradingClient:
+        @classmethod
+        def from_keychain(cls, _config: object) -> FakeTrading:
+            return FakeTrading()
+
+    class FakeMonitor:
+        def __init__(self, **_: object) -> None:
+            events.append("monitor.construct")
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+        def start(self) -> None:
+            events.append("polymarket.start")
+
+        def stop(self) -> None:
+            events.append("polymarket.stop")
+
+    class FakeExecution:
+        def __init__(self, **_: object) -> None:
+            events.append("execution.construct")
+
+        def reconcile_startup(self) -> dict[str, object]:
+            events.append("reconcile")
+            return {"status": "ready"}
+
+        def notify_ready_opportunity(self, *_: object) -> dict[str, object]:
+            return {"status": "ignored"}
+
+        def notify_observation(self, *_: object) -> dict[str, object]:
+            return {"status": "ignored"}
+
+        def notify_monitor_failure(self, *_: object) -> dict[str, object]:
+            return {"status": "ignored"}
+
+        def set_cross_venue_monitor(self, _monitor: object) -> None:
+            pass
+
+        def close(self) -> None:
+            events.append("execution.close")
+
+    class FakeCrossMonitor:
+        async def start(self) -> None:
+            events.append("cross.start")
+
+        async def stop(self) -> None:
+            events.append("cross.stop")
+
+        def snapshot(self) -> dict[str, object]:
+            return {"status": "ready"}
+
+    monkeypatch.setattr(
+        runtime_module,
+        "load_trading_config",
+        lambda _path: SimpleNamespace(predict=None),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        FakeTradingClient,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: None),
+        raising=False,
+    )
+    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore, raising=False)
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor, raising=False)
+    monkeypatch.setattr(
+        runtime_module, "PredictionExecutionService", FakeExecution, raising=False
+    )
+    monkeypatch.setattr(
+        runtime_module, "CodexRelationValidator", lambda *_args, **_kwargs: object(), raising=False
+    )
+    monkeypatch.setattr(
+        runtime_module, "CodexTitleTranslator", lambda *_args, **_kwargs: object(), raising=False
+    )
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        cross_venue_monitor=FakeCrossMonitor(),
+    )
+    runtime.start()
+    try:
+        assert runtime.state == "RUNNING"
+        assert events.index("reconcile") < events.index("polymarket.start")
+        assert events.index("polymarket.start") < events.index("cross.start")
+        with pytest.raises(RuntimeError, match="cannot start from RUNNING"):
+            runtime.start()
+    finally:
+        runtime.stop()
+        runtime.stop()
+
+    assert events.index("cross.stop") < events.index("polymarket.stop")
+    assert events.index("polymarket.stop") < events.index("execution.close")
+    assert events.index("execution.close") < events.index("trading.close")
+    assert events.index("trading.close") < events.index("store.close")
