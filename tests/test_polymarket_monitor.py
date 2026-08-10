@@ -3460,6 +3460,7 @@ def test_only_execution_eligible_active_binary_markets_are_subscribed(
         "yes-good",
     )
     markets = {row["market_id"]: row for row in snapshot["events"][0]["markets"]}
+    assert set(markets) == {"good", "fee", "unknown", "neg"}
     assert markets["fee"]["eligibility_reason"] == "fee_unverified_or_enabled"
     assert markets["unknown"]["eligibility_reason"] == "fee_unverified_or_enabled"
     assert markets["neg"]["eligibility_reason"] == "neg_risk"
