@@ -440,7 +440,11 @@ def _run_fake_validation(
     monkeypatch.setattr(validation, "_fetch_json", fetch)
     monkeypatch.setattr(validation, "_git_sha", lambda _repo, **_kwargs: "sha")
     monkeypatch.setattr(validation.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(validation.time, "sleep", lambda _seconds: clock.__setitem__(0, clock[0] + 1))
+    def sleep(_seconds: float) -> None:
+        if case == "all_cross_canaries_failed":
+            raise AssertionError("terminal canary failure must not idle until deadline")
+        clock[0] += 1
+    monkeypatch.setattr(validation.time, "sleep", sleep)
 
     return validation.run_shadow_validation(
         repo_root=tmp_path / "repo",

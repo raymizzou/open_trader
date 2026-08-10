@@ -52,67 +52,28 @@
       "items": { "type": "string" }
     }
   },
-  "allOf": [
-    {
-      "if": { "properties": { "decision": { "const": "APPROVE" } } },
-      "then": {
-        "properties": {
-          "direct_outcome_mapping": {
-            "properties": {
-              "predict_yes": { "const": "YES" },
-              "predict_no": { "const": "NO" },
-              "polymarket_yes": { "const": "YES" },
-              "polymarket_no": { "const": "NO" }
-            }
-          },
-          "divergent_states": {
-            "properties": {
-              "PREDICT_YES_POLYMARKET_NO": { "properties": { "possible": { "const": false } } },
-              "POLYMARKET_YES_PREDICT_NO": { "properties": { "possible": { "const": false } } }
-            }
-          },
-          "evidence": {
-            "allOf": [
-              { "contains": { "properties": { "exchange": { "const": "predict.fun" } } } },
-              { "contains": { "properties": { "exchange": { "const": "polymarket" } } } }
-            ]
-          },
-          "uncertainties": { "maxItems": 0 }
-        }
-      }
-    },
-    {
-      "if": { "properties": { "contract_shape": { "const": "COMPOUND" } } },
-      "then": {
-        "properties": {
-          "decision": { "const": "REJECT" }
-        }
-      }
-    }
-  ],
   "$defs": {
-    "venue_market": {
+    "predict_market": {
       "type": "object",
       "additionalProperties": false,
       "required": ["exchange", "market_id", "condition_id", "rules_fingerprint"],
       "properties": {
-        "exchange": { "type": "string" },
+        "exchange": { "const": "predict.fun" },
         "market_id": { "type": "string" },
         "condition_id": { "type": "string" },
         "rules_fingerprint": { "type": "string" }
       }
     },
-    "predict_market": {
-      "allOf": [
-        { "$ref": "#/$defs/venue_market" },
-        { "properties": { "exchange": { "const": "predict.fun" } } }
-      ]
-    },
     "polymarket_market": {
-      "allOf": [
-        { "$ref": "#/$defs/venue_market" },
-        { "properties": { "exchange": { "const": "polymarket" } } }
-      ]
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exchange", "market_id", "condition_id", "rules_fingerprint"],
+      "properties": {
+        "exchange": { "const": "polymarket" },
+        "market_id": { "type": "string" },
+        "condition_id": { "type": "string" },
+        "rules_fingerprint": { "type": "string" }
+      }
     },
     "divergent_state": {
       "type": "object",
