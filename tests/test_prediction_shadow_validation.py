@@ -263,7 +263,7 @@ def _run_fake_validation(
     if case == "deadline_before_three_cycles":
         states = states[:1]
     health = {
-        "status": "running", "mode": "shadow", "mutations": "prohibited",
+        "status": "running", "mode": "shadow", "production_owner": False, "mutations": "prohibited",
         "first_violation": {"kind": "mutation"} if case == "mutation_attempt" else None,
         "guard_attempts": [{"kind": "mutation"}] if case == "mutation_attempt" else [],
         "codex": {
@@ -278,6 +278,8 @@ def _run_fake_validation(
 
     def fetch(url: str, _timeout: float) -> dict[str, object]:
         if url.endswith("/healthz"):
+            if url.startswith("http://127.0.0.1:8767"):
+                return {**health, "mode": "legacy"}
             if url.startswith("http://127.0.0.1:8769"):
                 calls["shadow_health"] += 1
                 if calls["shadow_health"] == 1:
