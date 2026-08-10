@@ -1731,8 +1731,6 @@ class CodexRelationValidator:
             )
             return self._fallback(relation, cache_key, "CODEX_FAILED")
         structured, usage = _codex_events(completed.stdout or "")
-        if _valid_structured_result(structured):
-            self.codex_successes += 1
         if completed.returncode != 0:
             self._breaker.record_failure(time.monotonic())
             self.store.record_llm_call(
@@ -1746,6 +1744,7 @@ class CodexRelationValidator:
             )
             return self._fallback(relation, cache_key, "CODEX_OUTPUT_INVALID")
         assert isinstance(structured, Mapping)
+        self.codex_successes += 1
         self._breaker.record_success()
         self.store.record_llm_call(
             status="success", usage={**usage, "provider": "codex"}

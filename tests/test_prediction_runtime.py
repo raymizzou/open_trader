@@ -204,6 +204,28 @@ def test_cross_venue_codex_default_fallback_is_preserved(tmp_path: Path) -> None
     assert fallback_calls == ["called"]
 
 
+def test_cross_venue_codex_nonzero_exit_with_fallback_does_not_count_success(
+    tmp_path: Path,
+) -> None:
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            command, 1, stdout=_shadow_cross_jsonl(), stderr="failed"
+        )
+
+    validator = CodexCrossVenueEquivalenceValidator(
+        PredictionArbitrageStore(tmp_path),
+        model="gpt-test",
+        runner=runner,
+        fallback_enabled=False,
+    )
+
+    result = validator.validate(_shadow_cross_pair(0))
+
+    assert result.reason == "CODEX_FAILED"
+    assert validator.codex_calls == 1
+    assert validator.codex_successes == 0
+
+
 def _hold_owner_lock(path: str, ready: object, release: object) -> None:
     lock = _RuntimeOwnershipLock(Path(path))
     lock.acquire()

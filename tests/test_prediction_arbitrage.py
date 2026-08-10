@@ -203,6 +203,28 @@ def test_relation_codex_default_fallback_is_preserved(tmp_path: Path) -> None:
     assert fallback_calls == ["called"]
 
 
+def test_relation_codex_nonzero_exit_with_fallback_does_not_count_success(
+    tmp_path: Path,
+) -> None:
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            command, 1, stdout=_shadow_relation_jsonl(), stderr="failed"
+        )
+
+    validator = CodexRelationValidator(
+        PredictionArbitrageStore(tmp_path),
+        model="gpt-test",
+        runner=runner,
+        fallback_enabled=False,
+    )
+
+    result = validator.validate(_shadow_relation(0))
+
+    assert result.reason_codes == ("CODEX_FAILED",)
+    assert validator.codex_calls == 1
+    assert validator.codex_successes == 0
+
+
 def market_facts(
     *,
     minimum_order_size: str = "1",
