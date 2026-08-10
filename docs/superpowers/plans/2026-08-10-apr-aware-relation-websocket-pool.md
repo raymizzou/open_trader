@@ -44,8 +44,8 @@
   assert activity["apr_target_limit"] == 100
   assert activity["apr_prewarm_relations"] == 100
   assert activity["apr_prewarm_limit"] == 100
-  assert activity["subscribed_relations"] == 100
-  assert activity["relation_subscribed_tokens"] == 200
+  assert activity["subscribed_relations"] <= 100
+  assert activity["relation_subscribed_tokens"] <= 2 * activity["subscribed_relations"]
   ```
 
   Add focused cases alongside it that use fixed UTC `monitor._now` values and relation end dates to prove:
@@ -410,8 +410,8 @@
 
   ```bash
   cd /Users/ray/projects/open_trader/.worktrees/apr-aware-relation-ws-pool
-  scripts/install_dashboard_launchd.sh --dry-run --repo-root "$PWD" --runtime-root /Users/ray/projects/open_trader
-  scripts/install_dashboard_launchd.sh --repo-root "$PWD" --runtime-root /Users/ray/projects/open_trader
+  scripts/install_dashboard_launchd.sh --dry-run --repo-root "$PWD" --runtime-root /Users/ray/projects/open_trader --python /Users/ray/projects/open_trader/.venv/bin/python
+  scripts/install_dashboard_launchd.sh --repo-root "$PWD" --runtime-root /Users/ray/projects/open_trader --python /Users/ray/projects/open_trader/.venv/bin/python
   curl -fsS --max-time 30 http://127.0.0.1:8766/api/prediction-arbitrage/state
   ```
 
@@ -421,10 +421,15 @@
   relation_discovery.activity.status = healthy
   relation_discovery.activity.apr_target_limit = 100
   relation_discovery.activity.apr_prewarm_limit = 100
-  relation_discovery.activity.subscribed_relations = apr_target_relations + apr_prewarm_relations
+  relation_discovery.activity.subscribed_relations <= apr_target_relations + apr_prewarm_relations
   relation_discovery.activity.relation_subscribed_tokens <= 2 * subscribed_relations
   relation_discovery.websocket.status = connected
   ```
+
+  `subscribed_relations` may be lower than the selected APR target plus prewarm
+  counts because validation can reject a relation after selection; the selected
+  pool is the upper bound, while the subscription map contains only relations
+  still eligible at rebuild time.
 
   Also inspect fresh monitor logs for a completed activity scan. Do not infer correctness only from process liveness or unit tests.
 
@@ -444,8 +449,8 @@
   ```bash
   ACCEPTED_RELATION_POOL_SHA=$(git rev-parse HEAD)
   git status --short
-  scripts/install_dashboard_launchd.sh --dry-run --repo-root "$PWD" --runtime-root /Users/ray/projects/open_trader
-  scripts/install_dashboard_launchd.sh --repo-root "$PWD" --runtime-root /Users/ray/projects/open_trader
+  scripts/install_dashboard_launchd.sh --dry-run --repo-root "$PWD" --runtime-root /Users/ray/projects/open_trader --python /Users/ray/projects/open_trader/.venv/bin/python
+  scripts/install_dashboard_launchd.sh --repo-root "$PWD" --runtime-root /Users/ray/projects/open_trader --python /Users/ray/projects/open_trader/.venv/bin/python
   ```
 
   This deployment must use the accepted worktree SHA and make no source or data changes afterward.
