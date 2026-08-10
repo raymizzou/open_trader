@@ -221,8 +221,8 @@ def test_deadline_still_fails_when_observed_deepseek_calls_are_nonzero() -> None
 @pytest.mark.parametrize(
     ("case", "expected"),
     [
-        ("timestamp_only", "PASS"),
-        ("isolated_history", "PASS"),
+        ("timestamp_only", "BLOCKED"),
+        ("isolated_history", "BLOCKED"),
         ("profit_formula_drift", "FAIL"),
         ("missing_same_venue_canary", "BLOCKED"),
         ("all_cross_canaries_failed", "BLOCKED"),

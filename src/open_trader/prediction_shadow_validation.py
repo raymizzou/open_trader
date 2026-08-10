@@ -548,6 +548,8 @@ def run_shadow_validation(
                 codex=_mapping(_mapping(report["codex"]).get("delta")),
                 deepseek_calls=int(_mapping(_mapping(report["provider_evidence"]).get("delta")).get("deepseek", {}).get("calls") or 0), deadline=False,
             )
+            if status == "PASS" and report["frozen_parity"].get("status") != "PASS":
+                status, reason = "BLOCKED", "frozen parity proof unavailable"
             if status in {"PASS", "FAIL"}:
                 break
             time.sleep(min(_POLL_SECONDS, _remaining(validation_deadline)))
