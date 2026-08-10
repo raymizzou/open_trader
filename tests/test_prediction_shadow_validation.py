@@ -4,6 +4,7 @@ from pathlib import Path
 import signal
 import subprocess
 import json
+import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 from contextlib import contextmanager
@@ -208,6 +209,62 @@ def test_deadline_carries_deepseek_provider_evidence(tmp_path: Path, monkeypatch
     assert report["status"] == "BLOCKED"
 
 
+def test_usage_baseline_reads_persistent_seeded_store_before_install(tmp_path: Path) -> None:
+    database = tmp_path / "data" / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE llm_usage (usage_id TEXT, kind TEXT, status TEXT, payload TEXT, created_at TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO llm_usage VALUES (?, ?, ?, ?, ?)",
+            [
+                ("codex-1", "call", "success", json.dumps({"provider": "codex", "input_tokens": 11, "cached_input_tokens": 2, "output_tokens": 7, "reasoning_output_tokens": 3}), "2099-01-01T00:00:00Z"),
+                ("deepseek-1", "call", "failed", json.dumps({"provider": "deepseek", "input_tokens": 5, "output_tokens": 4}), "2099-01-01T00:00:00Z"),
+                ("cache-1", "cache_hit", "success", json.dumps({"provider": "deepseek"}), "2099-01-01T00:00:00Z"),
+            ],
+        )
+        connection.commit()
+
+    providers, tokens = validation._llm_usage_baseline(tmp_path)
+
+    assert providers["codex"]["calls"] == 1
+    assert providers["codex"]["input_tokens"] == 11
+    assert providers["deepseek"]["calls"] == 1
+    assert providers["deepseek"]["output_tokens"] == 4
+    assert tokens == {
+        "input_tokens": 16,
+        "cached_input_tokens": 2,
+        "output_tokens": 11,
+        "reasoning_output_tokens": 3,
+    }
+
+
+def test_startup_provider_and_token_usage_is_retained_in_run_delta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider_baseline = {
+        "codex": {"calls": 3, "input_tokens": 8, "output_tokens": 5},
+        "deepseek": {"calls": 1, "input_tokens": 4, "output_tokens": 2},
+    }
+    provider_current = {
+        "codex": {"calls": 3, "input_tokens": 8, "output_tokens": 5},
+        "deepseek": {"calls": 2, "input_tokens": 7, "output_tokens": 4},
+    }
+    monkeypatch.setattr(
+        validation, "_llm_usage_baseline",
+        lambda _runtime_root: (provider_baseline, {"input_tokens": 8, "output_tokens": 5}),
+    )
+    monkeypatch.setattr(validation, "_provider_evidence", lambda _state: provider_current)
+    monkeypatch.setattr(validation, "_token_counts", lambda _state: {"input_tokens": 13, "output_tokens": 9})
+
+    report = _run_fake_validation("timestamp_only", tmp_path, monkeypatch)
+
+    assert report["status"] == "FAIL"
+    assert report["provider_evidence"]["delta"]["deepseek"]["calls"] == 1
+    assert report["token_counts"]["delta"] == {"input_tokens": 5, "output_tokens": 4}
+
+
 def test_deadline_still_fails_when_observed_deepseek_calls_are_nonzero() -> None:
     status, _reason = validation._validation_status(
         semantic=[], health={}, activity=set(),
@@ -216,6 +273,23 @@ def test_deadline_still_fails_when_observed_deepseek_calls_are_nonzero() -> None
     )
 
     assert status == "FAIL"
+
+
+def test_deadline_cannot_restart_when_frozen_parity_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = {"status": 0}
+
+    def status(**_kwargs: object) -> tuple[str, str]:
+        calls["status"] += 1
+        return ("BLOCKED", "sampling") if calls["status"] <= 2 else ("PASS", "canaries complete")
+
+    monkeypatch.setattr(validation, "_validation_status", status)
+    report = _run_fake_validation("deadline_before_three_cycles", tmp_path, monkeypatch)
+
+    assert report["status"] == "BLOCKED"
+    assert report["reason"] == "frozen parity proof unavailable"
+    assert report["restart"] == {}
 
 
 @pytest.mark.parametrize(

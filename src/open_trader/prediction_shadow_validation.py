@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -37,6 +38,11 @@ _VOLATILE_FIELDS = {
     "breaker", "mode", "cross_auto", "history", "events", "counters",
 }
 _FROZEN_EXCLUSIONS = {"csrf_token", "pid", "cwd", "git_sha", "started_at", "heartbeat", "heartbeat_at", "session"}
+_USAGE_FIELDS = (
+    "calls", "successes", "failures", "cache_hits",
+    "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
+)
+_TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
 
 
 class _DeadlineExceeded(RuntimeError):
@@ -377,6 +383,56 @@ def _uninstall_and_verify_absent(*, repo_root: Path, deadline: float) -> dict[st
     return evidence
 
 
+def _llm_usage_baseline(runtime_root: Path) -> tuple[dict[str, dict[str, int]], dict[str, int]]:
+    """Read retained provider/token usage without opening the store for writes."""
+
+    providers = {
+        name: {field: 0 for field in _USAGE_FIELDS}
+        for name in ("codex", "deepseek")
+    }
+    tokens = {field: 0 for field in _TOKEN_FIELDS}
+    database = runtime_root / "data" / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    if not database.is_file():
+        return providers, tokens
+    cutoff = (datetime.now(UTC).timestamp() - 24 * 60 * 60)
+    cutoff_text = datetime.fromtimestamp(cutoff, UTC).isoformat().replace("+00:00", "Z")
+    uri = f"{database.resolve().as_uri()}?mode=ro"
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT
+                COALESCE(json_extract(payload, '$.provider'), 'codex') AS provider,
+                COALESCE(SUM(CASE WHEN kind='call' THEN 1 ELSE 0 END), 0) AS calls,
+                COALESCE(SUM(CASE WHEN kind='call' AND status='success' THEN 1 ELSE 0 END), 0) AS successes,
+                COALESCE(SUM(CASE WHEN kind='call' AND status!='success' THEN 1 ELSE 0 END), 0) AS failures,
+                COALESCE(SUM(CASE WHEN kind='cache_hit' THEN 1 ELSE 0 END), 0) AS cache_hits,
+                COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.input_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS input_tokens,
+                COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.cached_input_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS cached_input_tokens,
+                COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.output_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS output_tokens,
+                COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.reasoning_output_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS reasoning_output_tokens
+            FROM llm_usage
+            WHERE created_at >= ?
+            GROUP BY provider
+            """,
+            (cutoff_text,),
+        ).fetchall()
+        for row in rows:
+            provider = str(row["provider"] or "codex")
+            if provider in providers:
+                providers[provider] = {field: int(row[field] or 0) for field in _USAGE_FIELDS}
+            for field in _TOKEN_FIELDS:
+                tokens[field] += int(row[field] or 0)
+    except (OSError, sqlite3.Error) as exc:
+        raise RuntimeError("unable to read seeded LLM usage baseline") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    return providers, tokens
+
+
 def _activity_completed_at(state: Mapping[str, object]) -> str:
     activity = _mapping(_mapping(state.get("relation_discovery")).get("activity"))
     value = activity.get("completed_at")
@@ -486,11 +542,17 @@ def run_shadow_validation(
             repo_root=repo_root, source_data_dir=source_data_dir, runtime_root=runtime_root, deadline=validation_deadline
         )
         _remaining(validation_deadline)
+        provider_baseline, tokens_baseline = _llm_usage_baseline(runtime_root)
+        report["provider_evidence"] = {
+            "baseline": provider_baseline, "current": provider_baseline,
+            "delta": _counter_delta(provider_baseline, provider_baseline),
+        }
+        report["token_counts"] = {
+            "baseline": tokens_baseline, "current": tokens_baseline,
+            "delta": _counter_delta(tokens_baseline, tokens_baseline),
+        }
         if _label_loaded(deadline=validation_deadline):
             raise RuntimeError("prediction shadow label already loaded; refusing ownership takeover")
-        # The seeded shadow store excludes operational/provider usage; this is the pre-install zero baseline.
-        provider_baseline = {"codex": {"calls": 0}, "deepseek": {"calls": 0}}
-        tokens_baseline: dict[str, int] = {}
         owned = True  # pre-existing label was checked immediately before bootstrap; own any partial bootstrap failure.
         report["install"] = _install_shadow(
             repo_root=repo_root, runtime_root=runtime_root,
@@ -557,10 +619,6 @@ def run_shadow_validation(
                 codex=_mapping(_mapping(report["codex"]).get("delta")),
                 deepseek_calls=int(_mapping(_mapping(report["provider_evidence"]).get("delta")).get("deepseek", {}).get("calls") or 0), deadline=False,
             )
-            if status == "PASS" and report["frozen_parity"].get("status") != "PASS":
-                status, reason = "BLOCKED", "frozen parity proof unavailable"
-            if status == "PASS" and report["frozen_parity"].get("status") != "PASS":
-                status, reason = "BLOCKED", "frozen parity proof unavailable"
             if status in {"PASS", "FAIL"}:
                 break
             time.sleep(min(_POLL_SECONDS, _remaining(validation_deadline)))
@@ -570,6 +628,9 @@ def run_shadow_validation(
                 codex=_mapping(_mapping(report["codex"]).get("delta")),
                 deepseek_calls=int(_mapping(_mapping(report["provider_evidence"]).get("delta")).get("deepseek", {}).get("calls") or 0), deadline=True,
             )
+        # Apply this after the while/else as well: a deadline path can otherwise restore PASS.
+        if status == "PASS" and report["frozen_parity"].get("status") != "PASS":
+            status, reason = "BLOCKED", "frozen parity proof unavailable"
         if status == "PASS":
             initial_pid = _mapping(report.get("install")).get("pid")
             report["restart"] = _restart_shadow(
