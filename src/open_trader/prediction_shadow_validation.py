@@ -457,6 +457,7 @@ def run_shadow_validation(
         "provider_evidence": {"baseline": {}, "current": {}, "delta": {}},
     }
     status, reason = "FAIL", "validation did not start"
+    owned = False
     previous_handlers: dict[int, object] = {}
     stopping = False
     def stop_handler(signum: int, _frame: object) -> None:
@@ -482,12 +483,14 @@ def run_shadow_validation(
             repo_root=repo_root, runtime_root=runtime_root,
             prediction_config_path=prediction_config_path, deadline=validation_deadline,
         )
+        owned = True
         baseline_health = _fetch_json(f"{shadow_url}/healthz", _remaining(validation_deadline))
         _validate_health(baseline_health, shadow=True)
         baseline_state = _fetch_json(f"{shadow_url}/api/prediction-arbitrage/state", _remaining(validation_deadline))
         codex_baseline = _codex_evidence(baseline_health)
         provider_baseline = _provider_evidence(baseline_state)
         tokens_baseline = _token_counts(baseline_state)
+        report["relation_discovery_baseline_completed_at"] = _activity_completed_at(baseline_state)
         report["codex"] = {"baseline": codex_baseline, "current": codex_baseline, "delta": _counter_delta(codex_baseline, codex_baseline)}
         report["provider_evidence"] = {"baseline": provider_baseline, "current": provider_baseline, "delta": _counter_delta(provider_baseline, provider_baseline)}
         report["token_counts"] = {"baseline": tokens_baseline, "current": tokens_baseline, "delta": _counter_delta(tokens_baseline, tokens_baseline)}
@@ -569,12 +572,15 @@ def run_shadow_validation(
     finally:
         for signum in previous_handlers:
             signal.signal(signum, signal.SIG_IGN)
-        try:
-            shutdown = _uninstall_and_verify_absent(repo_root=repo_root, deadline=deadline)
-        except Exception as exc:
-            shutdown = {"error": str(exc), "label_absent": False, "plist_absent": False, "listener_absent": False}
+        if owned:
+            try:
+                shutdown = _uninstall_and_verify_absent(repo_root=repo_root, deadline=deadline)
+            except Exception as exc:
+                shutdown = {"error": str(exc), "label_absent": False, "plist_absent": False, "listener_absent": False}
+        else:
+            shutdown = {"cleanup_skipped": "not_owner", "label_absent": None, "plist_absent": None, "listener_absent": None}
         report["shutdown"] = shutdown
-        if not all(shutdown.get(key) is True for key in ("label_absent", "plist_absent", "listener_absent")):
+        if owned and not all(shutdown.get(key) is True for key in ("label_absent", "plist_absent", "listener_absent")):
             status, reason = "FAIL", "shadow cleanup evidence incomplete"
         report["status"], report["reason"], report["ended_at"] = status, reason, _now()
         _write_report(runtime_root / "shadow-validation.json", report)

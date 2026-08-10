@@ -196,7 +196,8 @@ def test_sigterm_uses_cleanup_and_writes_report_after_cleanup(
     )
 
     assert report["status"] == "BLOCKED"
-    assert events == ["cleanup", "report:BLOCKED"]
+    assert events == ["report:BLOCKED"]
+    assert report["shutdown"]["cleanup_skipped"] == "not_owner"
     assert handlers == {signal.SIGINT: f"old-{signal.SIGINT}", signal.SIGTERM: f"old-{signal.SIGTERM}"}
 
 
