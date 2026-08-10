@@ -119,10 +119,11 @@ promise second-level diagnostic prices for markets the strategy cannot execute.
 
 - Do not let the new eligibility gate clear the prior standard token map when
   fetching or normalizing the replacement universe fails.
-- If the replacement standard pool is empty because fee metadata is unknown,
-  required fields are missing, or market parsing broadly failed, treat the
-  result as anomalous: retain the previous standard token map, mark monitoring
-  degraded, and keep new orders fail-closed until a normal refresh succeeds.
+- If a prior non-empty standard pool exists and its replacement is empty because
+  fee metadata is unknown, required fields are missing, or market parsing
+  broadly failed, treat the result as anomalous: retain the previous standard
+  token map, mark monitoring degraded, and keep new orders fail-closed until a
+  normal refresh succeeds.
 - If the replacement standard pool is empty because every normalized market is
   explicitly fee-enabled or `neg_risk is True`, accept the empty pool. This is a
   valid no-eligible-market result rather than an upstream-data anomaly.
