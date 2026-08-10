@@ -168,10 +168,22 @@ def create_prediction_server(
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
         def do_POST(self) -> None:
+            self.close_connection = True
             if urlparse(self.path).path.startswith("/api/prediction-arbitrage/"):
                 self._send_json(HTTPStatus.FORBIDDEN, _READ_ONLY_ERROR)
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+
+        def _unsupported_method(self) -> None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+
+        do_HEAD = _unsupported_method
+        do_PUT = _unsupported_method
+        do_DELETE = _unsupported_method
+        do_OPTIONS = _unsupported_method
+        do_PATCH = _unsupported_method
+        do_CONNECT = _unsupported_method
+        do_TRACE = _unsupported_method
 
     server = ThreadingHTTPServer((host, port), PredictionRequestHandler)
     server.timeout = 0.2
@@ -207,24 +219,25 @@ def serve_prediction_service(
         stopping = True
 
     try:
-        runtime.start()
-        server = create_prediction_server(runtime=runtime, host=host, port=port)
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[signum] = signal.getsignal(signum)
             signal.signal(signum, stop_handler)
+        runtime.start()
+        server = create_prediction_server(runtime=runtime, host=host, port=port)
         while not stopping:
             server.handle_request()
-            if runtime.poll_shadow_failure() is not None:
-                break
+            runtime.poll_shadow_failure()
         return 0
     finally:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
         try:
-            runtime.stop()
+            try:
+                runtime.stop()
+            finally:
+                if server is not None:
+                    server.server_close()
         finally:
-            if server is not None:
-                server.server_close()
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
 
 
 def main(argv: list[str] | None = None) -> int:

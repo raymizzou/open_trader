@@ -10,6 +10,7 @@ import threading
 import time
 from typing import Iterator
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 import pytest
@@ -185,6 +186,177 @@ def test_shadow_health_and_reads_fail_closed_after_a_violation() -> None:
 def test_shadow_service_rejects_non_loopback_before_binding() -> None:
     with pytest.raises(ValueError, match="loopback"):
         create_prediction_server(runtime=_Runtime(), host="0.0.0.0", port=0)
+
+
+@pytest.mark.parametrize("method", ("HEAD", "PUT", "DELETE", "OPTIONS"))
+def test_unsupported_http_methods_return_not_found(method: str) -> None:
+    with _server(_Runtime()) as base:
+        status = _status(Request(base + "/unsupported", method=method))
+
+    assert status == 404
+
+
+def _status(request: Request) -> int:
+    try:
+        with urlopen(request, timeout=5) as response:
+            return response.status
+    except HTTPError as error:
+        return error.code
+
+
+def test_shadow_mutations_do_not_read_body_or_dispatch_downstream() -> None:
+    runtime = _Runtime()
+    probes = []
+
+    class Probe:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            probes.append(self)
+
+        def __getattr__(self, name: str) -> object:
+            self.calls.append(name)
+            raise AssertionError(f"unexpected downstream access: {name}")
+
+    runtime.store = Probe()
+    runtime.monitor = Probe()
+    runtime.execution = Probe()
+    runtime.cross_venue_monitor = Probe()
+    runtime.session = Probe()
+    runtime.csrf = Probe()
+    with _server(runtime) as base:
+        parsed = urlsplit(base)
+        with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as connection:
+            connection.sendall(
+                (
+                    "POST /api/prediction-arbitrage/preview HTTP/1.1\r\n"
+                    f"Host: {parsed.netloc}\r\n"
+                    "Content-Length: 999999\r\n"
+                    "Content-Type: application/json\r\n\r\n"
+                ).encode("ascii")
+            )
+            response = connection.recv(1024)
+
+    assert b"403" in response.split(b"\r\n", 1)[0]
+    assert all(probe.calls == [] for probe in probes)
+
+
+def test_owner_loop_keeps_failed_shadow_listener_for_observability(tmp_path: Path) -> None:
+    trigger = tmp_path / "violate"
+    stopped = tmp_path / "stopped"
+    violation = {"venue": "predict", "kind": "mutation", "method": "submit_order", "call_chain": []}
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    script = f'''\
+from pathlib import Path
+import open_trader.prediction_service as service
+
+trigger = Path({str(trigger)!r})
+stopped = Path({str(stopped)!r})
+violation = {{"venue": "predict", "kind": "mutation", "method": "submit_order", "call_chain": []}}
+
+class FakeRuntime:
+    def __init__(self, **_kwargs):
+        self.state = "NEW"
+        self.shadow_evidence = {{"mode": "shadow", "first_violation": None, "codex": {{}}}}
+    def start(self):
+        self.state = "RUNNING"
+    def poll_shadow_failure(self):
+        if trigger.exists():
+            self.shadow_evidence["first_violation"] = violation
+            return violation
+        return None
+    def stop(self):
+        self.state = "STOPPED"
+        stopped.write_text("stopped", encoding="utf-8")
+
+service.PredictionRuntime = FakeRuntime
+raise SystemExit(service.serve_prediction_service(
+    data_dir=Path({str(tmp_path)!r}),
+    prediction_config_path=Path({str(tmp_path / "prediction.json")!r}),
+    port={port},
+))
+'''
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        env={"PYTHONPATH": str(Path(__file__).parents[1] / "src")},
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            raise AssertionError("shadow service did not bind")
+        trigger.write_text("violate", encoding="utf-8")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                status, payload = _response(f"http://127.0.0.1:{port}/healthz")
+                if status == 503:
+                    assert payload["first_violation"] == violation
+                    break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        else:
+            raise AssertionError("failed Shadow health was not observable")
+        status, payload = _response(f"http://127.0.0.1:{port}/api/prediction-arbitrage/state")
+        assert status == 503
+        assert payload == {"error": "shadow runtime is unavailable"}
+        process.terminate()
+        assert process.wait(timeout=5) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    assert stopped.read_text(encoding="utf-8") == "stopped"
+
+
+def test_signal_handler_is_installed_before_runtime_start(tmp_path: Path) -> None:
+    started = tmp_path / "started"
+    stopped = tmp_path / "stopped"
+    script = f'''\
+from pathlib import Path
+import os
+import signal
+import open_trader.prediction_service as service
+
+started = Path({str(started)!r})
+stopped = Path({str(stopped)!r})
+
+class FakeRuntime:
+    def __init__(self, **_kwargs):
+        self.state = "NEW"
+        self.shadow_evidence = {{"mode": "shadow", "first_violation": None, "codex": {{}}}}
+    def start(self):
+        started.write_text("started", encoding="utf-8")
+        os.kill(os.getpid(), signal.SIGTERM)
+        self.state = "RUNNING"
+    def poll_shadow_failure(self):
+        return None
+    def stop(self):
+        self.state = "STOPPED"
+        stopped.write_text("stopped", encoding="utf-8")
+
+service.PredictionRuntime = FakeRuntime
+raise SystemExit(service.serve_prediction_service(
+    data_dir=Path({str(tmp_path)!r}),
+    prediction_config_path=Path({str(tmp_path / "prediction.json")!r}),
+    port=0,
+))
+'''
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        env={"PYTHONPATH": str(Path(__file__).parents[1] / "src")},
+    )
+    assert process.wait(timeout=5) == 0
+    assert started.read_text(encoding="utf-8") == "started"
+    assert stopped.read_text(encoding="utf-8") == "stopped"
 
 
 def test_sigterm_stops_shadow_runtime_and_releases_its_lock(tmp_path: Path) -> None:
