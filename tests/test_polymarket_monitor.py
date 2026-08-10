@@ -617,6 +617,40 @@ def test_cross_venue_tokens_join_existing_subscription_and_refresh_once(
     assert websocket["subscribed_tokens"] == 4
 
 
+def test_failed_subscription_replacement_reports_installed_tokens(
+    tmp_path: Path,
+) -> None:
+    setup_public([])
+
+    class FailingReplacementClient(FakePublicClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.subscribe_calls = 0
+
+        def subscribe(self, spec: object) -> FakeStream:
+            self.subscribe_specs.append(spec)
+            self.subscribe_calls += 1
+            if self.subscribe_calls > 1:
+                raise ConnectionError("replacement failed")
+            return self.stream
+
+    monitor = make_monitor(tmp_path)
+    monitor._market_by_token = {"old-a": "market-1", "old-b": "market-1"}
+    monitor._subscription_dirty = True
+    client = FailingReplacementClient()
+    asyncio.run(monitor._refresh_subscription_if_dirty(client))
+
+    monitor._market_by_token = {"new": "market-2"}
+    monitor._subscription_dirty = True
+    with pytest.raises(ConnectionError, match="replacement failed"):
+        asyncio.run(monitor._refresh_subscription_if_dirty(client))
+
+    websocket = monitor.snapshot()["relation_discovery"]["websocket"]
+    assert monitor._stream_handle is client.stream
+    assert websocket["standard_subscribed_tokens"] == 0
+    assert websocket["subscribed_tokens"] == 2
+
+
 def test_relation_token_union_controls_resubscribe_and_uses_only_buy_legs(
     tmp_path: Path,
 ) -> None:
