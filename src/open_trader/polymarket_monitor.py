@@ -590,13 +590,27 @@ class PolymarketMonitor:
                 ):
                     opportunity["actionable"] = False
                     opportunity["eligibility_reason"] = "monitor_degraded"
+                relation_blocker = (
+                    relation_health["status"] == "degraded"
+                    or catalog["status"] != "healthy"
+                )
                 if (
                     opportunity.get("market_type") == "threshold_hedge"
-                    and catalog["status"] != "healthy"
+                    and relation_blocker
+                    and (
+                        opportunity.get("actionable") is True
+                        or opportunity.get("eligibility_reason")
+                        in {"actionable", "book_stale"}
+                    )
                 ):
                     opportunity["actionable"] = False
                     opportunity["eligibility_reason"] = (
-                        "relation_discovery_" + str(catalog["status"])
+                        "relation_discovery_"
+                        + (
+                            "degraded"
+                            if relation_health["status"] == "degraded"
+                            else str(catalog["status"])
+                        )
                     )
             return {
                 "status": health["status"],
@@ -710,13 +724,26 @@ class PolymarketMonitor:
                 result["eligibility_reason"] = "monitor_degraded"
             relation_health = self._relation_health(now)
             catalog = self._relation_catalog_snapshot(now)
+            relation_blocker = (
+                relation_health["status"] == "degraded"
+                or catalog["status"] != "healthy"
+            )
             if (
                 result.get("market_type") == "threshold_hedge"
-                and catalog["status"] != "healthy"
+                and relation_blocker
+                and (
+                    result.get("actionable") is True
+                    or result.get("eligibility_reason") in {"actionable", "book_stale"}
+                )
             ):
                 result["actionable"] = False
                 result["eligibility_reason"] = (
-                    "relation_discovery_" + str(catalog["status"])
+                    "relation_discovery_"
+                    + (
+                        "degraded"
+                        if relation_health["status"] == "degraded"
+                        else str(catalog["status"])
+                    )
                 )
             return result
 
@@ -2220,18 +2247,14 @@ class PolymarketMonitor:
             completed = self._now()
             duration = max(0.0, (completed - started).total_seconds())
             self._active_relation_ids = relation_ids
-            self._realtime_relation_ids = realtime_relation_ids
             for relation_id in relation_ids:
                 self._relation_rule_failures.discard(relation_id)
                 self._relation_rule_failure_fingerprints.pop(relation_id, None)
-            self._rebuild_relation_subscriptions()
             self._activity_scan_duration_seconds = duration
             self._activity_next_scan_at = started + timedelta(
                 seconds=RELATION_ACTIVITY_REFRESH_SECONDS
             )
             self._activity_scan_due_at = completed
-            subscribed_ids = set(self._active_relation_ids) & set(self._relation_ids_subscribed())
-            subscribed_tokens = set(self._market_by_token) | set(self._relation_by_token)
             statuses = [
                 self._codex_statuses.get(relation_id, "pending")
                 for relation_id in self._active_relation_ids
@@ -2262,9 +2285,11 @@ class PolymarketMonitor:
                 "apr_target_limit": RELATION_APR_TARGET_LIMIT,
                 "apr_prewarm_relations": len(prewarm_ids),
                 "apr_prewarm_limit": RELATION_APR_PREWARM_LIMIT,
-                "subscribed_relations": len(subscribed_ids),
-                "subscribed_tokens": len(subscribed_tokens),
-                "relation_subscribed_tokens": len(self._relation_by_token),
+                "subscribed_relations": int(previous.get("subscribed_relations", 0) or 0),
+                "subscribed_tokens": int(previous.get("subscribed_tokens", 0) or 0),
+                "relation_subscribed_tokens": int(
+                    previous.get("relation_subscribed_tokens", 0) or 0
+                ),
                 "positive_candidates": positive_candidates,
                 "order_ready": sum(
                     1
@@ -2277,6 +2302,47 @@ class PolymarketMonitor:
                 "next_scan_at": self._activity_next_scan_at,
                 "rejection_counts": rejection_counts,
             }
+            if len(target_ids) > RELATION_APR_TARGET_LIMIT:
+                activity["status"] = "degraded"
+                self._activity = activity
+                self._relations_failed = True
+                self._diagnostics["last_error"] = "relations:apr_target_limit"
+                try:
+                    self._store.record_relation_scan(
+                        scope="activity",
+                        status="failed",
+                        started_at=started.isoformat(),
+                        completed_at=completed.isoformat(),
+                        payload={
+                            **{
+                                key: value
+                                for key, value in activity.items()
+                                if key not in {"status", "started_at", "completed_at"}
+                            },
+                            "reason": "apr_target_limit",
+                        },
+                    )
+                except Exception as exc:
+                    self._store_failed = True
+                    self._record_error(exc, "store")
+                self._log_relation_scan(
+                    phase="activity",
+                    status="degraded",
+                    scope="activity",
+                    relation_count=len(relations),
+                    active_count=len(relation_ids),
+                    reason="apr_target_limit",
+                )
+                return
+            self._realtime_relation_ids = realtime_relation_ids
+            self._rebuild_relation_subscriptions()
+            subscribed_ids = set(self._active_relation_ids) & set(
+                self._relation_ids_subscribed()
+            )
+            subscribed_tokens = set(self._market_by_token) | set(self._relation_by_token)
+            activity["subscribed_relations"] = len(subscribed_ids)
+            activity["subscribed_tokens"] = len(subscribed_tokens)
+            activity["relation_subscribed_tokens"] = len(self._relation_by_token)
             self._activity = activity
             self._relations_failed = False
             try:

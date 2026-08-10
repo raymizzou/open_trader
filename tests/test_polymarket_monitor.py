@@ -2917,6 +2917,106 @@ def test_apr_pool_excludes_invalid_resolution_dates_and_rejections(
     } & monitor._realtime_relation_ids
 
 
+def test_apr_target_anomaly_preserves_last_pool_and_blocks_relation_actions(
+    tmp_path: Path,
+) -> None:
+    setup_public([])
+    base = discover_threshold_relations([threshold_event()])[0]
+
+    def variant(relation_id: str):
+        market_a = replace(
+            base.market_a,
+            market_id=f"market-a-{relation_id}",
+            condition_id=f"condition-a-{relation_id}",
+            yes_token_id=f"yes-a-{relation_id}",
+            no_token_id=f"no-a-{relation_id}",
+        )
+        market_b = replace(
+            base.market_b,
+            market_id=f"market-b-{relation_id}",
+            condition_id=f"condition-b-{relation_id}",
+            yes_token_id=f"yes-b-{relation_id}",
+            no_token_id=f"no-b-{relation_id}",
+        )
+        return replace(
+            base,
+            relation_id=relation_id,
+            market_a=market_a,
+            market_b=market_b,
+            buy_leg_a=replace(
+                base.buy_leg_a,
+                market_id=market_a.market_id,
+                condition_id=market_a.condition_id,
+                token_id=market_a.yes_token_id,
+            ),
+            buy_leg_b=replace(
+                base.buy_leg_b,
+                market_id=market_b.market_id,
+                condition_id=market_b.condition_id,
+                token_id=market_b.no_token_id,
+            ),
+        )
+
+    relations = [variant(f"target-{index:03d}") for index in range(101)]
+    for relation in relations:
+        FakePublicClient.books[relation.buy_leg_a.token_id] = threshold_book(
+            relation.buy_leg_a.token_id,
+            ask="0.40",
+            bid="0.39",
+        )
+        FakePublicClient.books[relation.buy_leg_b.token_id] = threshold_book(
+            relation.buy_leg_b.token_id,
+            ask="0.45",
+            bid="0.44",
+        )
+
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=FakeRelationValidator(),
+    )
+    monitor._catalog_loaded = True
+    monitor._catalog_status = "healthy"
+    monitor._catalog_full_scanned_at = NOW
+    monitor._set_relation_state([relations[0]], ())
+    client = FakePublicClient()
+    asyncio.run(monitor._refresh_relation_activity(client))
+    monitor._opportunities[relations[0].relation_id] = {
+        "opportunity_id": relations[0].relation_id,
+        "market_type": "threshold_hedge",
+        "relation_id": relations[0].relation_id,
+        "confirmed_at": NOW,
+        "actionable": True,
+        "eligibility_reason": "actionable",
+    }
+    previous_realtime_ids = set(monitor._realtime_relation_ids)
+    previous_token_map = {
+        token: set(relation_ids)
+        for token, relation_ids in monitor._relation_by_token.items()
+    }
+    previous_handle = monitor._stream_handle
+    monitor._set_relation_state(relations, ())
+
+    asyncio.run(monitor._refresh_relation_activity(client))
+
+    activity = monitor.snapshot()["relation_discovery"]["activity"]
+    assert activity["status"] == "degraded"
+    assert activity["apr_target_relations"] == 101
+    assert monitor._relations_failed is True
+    assert monitor._realtime_relation_ids == previous_realtime_ids
+    assert monitor._relation_by_token == previous_token_map
+    assert monitor._stream_handle is previous_handle
+    assert monitor.snapshot()["opportunities"][0]["actionable"] is False
+    assert monitor.opportunity(relations[0].relation_id)["actionable"] is False  # type: ignore[index]
+
+    monitor._set_relation_state(relations[:100], ())
+    asyncio.run(monitor._refresh_relation_activity(client))
+
+    assert monitor.snapshot()["relation_discovery"]["activity"]["status"] == "healthy"
+    assert monitor._relations_failed is False
+    assert len(monitor._realtime_relation_ids) == 100
+
+
 def test_codex_worker_does_not_block_activity_or_price_refresh(tmp_path: Path) -> None:
     setup_public([threshold_event()])
     setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
