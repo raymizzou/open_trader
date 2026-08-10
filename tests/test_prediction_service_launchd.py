@@ -21,7 +21,10 @@ def test_template_runs_only_the_loopback_shadow_service() -> None:
 
     assert payload["Label"] == LABEL
     assert payload["WorkingDirectory"] == "OPEN_TRADER_REPO"
-    assert payload["EnvironmentVariables"] == {"PYTHONPATH": "OPEN_TRADER_REPO/src"}
+    assert payload["EnvironmentVariables"] == {
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PYTHONPATH": "OPEN_TRADER_REPO/src",
+    }
     assert payload["ProgramArguments"] == [
         "OPEN_TRADER_PYTHON", "-m", "open_trader", "prediction-service",
         "--mode", "shadow", "--data-dir", "OPEN_TRADER_DATA_DIR",

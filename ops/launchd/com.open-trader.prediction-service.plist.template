@@ -3,7 +3,10 @@
 <plist version="1.0"><dict>
   <key>Label</key><string>com.open-trader.prediction-service</string>
   <key>WorkingDirectory</key><string>OPEN_TRADER_REPO</string>
-  <key>EnvironmentVariables</key><dict><key>PYTHONPATH</key><string>OPEN_TRADER_REPO/src</string></dict>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONPATH</key><string>OPEN_TRADER_REPO/src</string>
+  </dict>
   <key>ProgramArguments</key><array>
     <string>OPEN_TRADER_PYTHON</string><string>-m</string><string>open_trader</string><string>prediction-service</string>
     <string>--mode</string><string>shadow</string><string>--data-dir</string><string>OPEN_TRADER_DATA_DIR</string>
