@@ -5,7 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-10
 
-- 普通 YES/NO WebSocket 只保留当前执行规则允许的免手续费、非明确 neg-risk 市场；Top 20 展示与五分钟 REST 诊断保持不变，关系和跨所 token 仍独立保留。看板现显示标准层实时 Token，异常空池保留上一订阅并 fail-closed。验证：标准监控与 Dashboard 聚焦测试、完整 Python 套件及非变更 public monitor diagnostic 均通过。
+- 普通 YES/NO WebSocket 只保留当前执行规则允许的免手续费、非明确 neg-risk 市场；Top 20 展示与五分钟 REST 诊断保持不变，关系和跨所 token 仍独立保留。看板现显示标准层实际成功安装的实时 Token；畸形或全量解析失败导致的空池保留上一订阅并 fail-closed。验证：标准监控与 Dashboard 聚焦测试 503 通过、fixture-aware 完整 Python 套件 5340 通过及 public monitor diagnostic 均通过。
 
 - 修复三市场 Controller 仍把 v3 趋势复盘投影当作当前版本、导致 v4 投影被重复捕获或旧文件不升级的问题；现与 Dashboard 和投影生成器统一要求 v4，控制器重启后会沿既有收盘恢复流程重建旧投影。验证：控制器回归通过。
 
