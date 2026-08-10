@@ -258,7 +258,7 @@ def test_shadow_validation_report_has_required_evidence(
 def _run_fake_validation(
     case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> dict[str, object]:
-    states = [_state(completed_at=f"2026-08-10T00:0{index}:00Z") for index in range(3)]
+    states = [_state(completed_at=f"2026-08-10T00:0{index}:00Z") for index in range(4)]
     if case == "profit_formula_drift":
         states[-1] = _state(profit="1.10", completed_at="2026-08-10T00:02:00Z")
     if case == "deadline_before_three_cycles":
@@ -289,6 +289,7 @@ def _run_fake_validation(
         if url.endswith("/state"):
             if url.startswith("http://127.0.0.1:8769") and calls["baseline_state"]:
                 calls["baseline_state"] = False
+                calls["state"] += 1
                 return states[0]
             index = min(calls["state"] // 2, len(states) - 1)
             calls["state"] += 1

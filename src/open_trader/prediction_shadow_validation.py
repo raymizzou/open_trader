@@ -115,7 +115,7 @@ def _fetch_json(url: str, timeout: float) -> dict[str, object]:
 def _validate_health(payload: Mapping[str, object], *, shadow: bool) -> None:
     if shadow and (payload.get("first_violation") or payload.get("guard_attempts")):
         raise RuntimeError("shadow read-only violation reported by health")
-    if int(payload.get("_http_status") or 200) >= 400 or payload.get("status") not in {"running", "healthy"}:
+    if int(payload.get("_http_status") or 200) >= 400 or (shadow and payload.get("status") not in {"running", "healthy"}):
         raise ValueError(f"{'shadow' if shadow else 'legacy'} health unavailable")
     if shadow and not (payload.get("mode") == "shadow" and payload.get("production_owner") is False and payload.get("mutations") == "prohibited"):
         raise ValueError("shadow identity mismatch")
@@ -134,10 +134,7 @@ def _opportunities(state: Mapping[str, object]) -> dict[str, Mapping[str, object
             continue
         identifier = row.get("opportunity_id", row.get("id"))
         if identifier not in (None, ""):
-            key = str(identifier)
-            if key in result:
-                result[f"primary:{key}"] = result.pop(key)
-                key = f"{scope}:{key}"
+            key = f"{scope}:{identifier}"
             result[key] = row
     return result
 
@@ -154,16 +151,16 @@ def _compare_live_states(
     differences: list[dict[str, object]] = []
     legacy_rows, shadow_rows = _opportunities(legacy), _opportunities(shadow)
     for identifier in sorted(legacy_rows.keys() - shadow_rows.keys()):
-        differences.append({"classification": "sampling_difference", "opportunity_id": identifier, "side": "legacy"})
+        differences.append({"classification": "sampling_difference", "opportunity_id": identifier.split(":", 1)[-1], "side": "legacy"})
     for identifier in sorted(shadow_rows.keys() - legacy_rows.keys()):
-        differences.append({"classification": "sampling_difference", "opportunity_id": identifier, "side": "shadow"})
+        differences.append({"classification": "sampling_difference", "opportunity_id": identifier.split(":", 1)[-1], "side": "shadow"})
     for identifier in sorted(legacy_rows.keys() & shadow_rows.keys()):
         for field in _DETERMINISTIC_FIELDS:
             left_present, right_present = field in legacy_rows[identifier], field in shadow_rows[identifier]
             left, right = legacy_rows[identifier].get(field), shadow_rows[identifier].get(field)
             if left_present != right_present or (left_present and (type(left) is not type(right) or left != right)):
                 differences.append({
-                    "classification": "semantic_difference", "opportunity_id": identifier,
+                    "classification": "semantic_difference", "opportunity_id": identifier.split(":", 1)[-1],
                     "field": field, "legacy": left, "shadow": right,
                 })
         differences.extend(_schema_differences(legacy_rows[identifier], shadow_rows[identifier], f"opportunity.{identifier}"))
@@ -485,12 +482,15 @@ def run_shadow_validation(
         )
         owned = True
         baseline_health = _fetch_json(f"{shadow_url}/healthz", _remaining(validation_deadline))
+        if isinstance(baseline_health.get("guard_attempts"), list):
+            report["guard_attempts"] = list(baseline_health["guard_attempts"])
         _validate_health(baseline_health, shadow=True)
         baseline_state = _fetch_json(f"{shadow_url}/api/prediction-arbitrage/state", _remaining(validation_deadline))
         codex_baseline = _codex_evidence(baseline_health)
         provider_baseline = _provider_evidence(baseline_state)
         tokens_baseline = _token_counts(baseline_state)
-        report["relation_discovery_baseline_completed_at"] = _activity_completed_at(baseline_state)
+        inherited_activity = {_activity_completed_at(baseline_state)} - {""}
+        report["relation_discovery_baseline_completed_at"] = sorted(inherited_activity)
         report["codex"] = {"baseline": codex_baseline, "current": codex_baseline, "delta": _counter_delta(codex_baseline, codex_baseline)}
         report["provider_evidence"] = {"baseline": provider_baseline, "current": provider_baseline, "delta": _counter_delta(provider_baseline, provider_baseline)}
         report["token_counts"] = {"baseline": tokens_baseline, "current": tokens_baseline, "delta": _counter_delta(tokens_baseline, tokens_baseline)}
@@ -501,6 +501,8 @@ def run_shadow_validation(
         while time.monotonic() < validation_deadline:
             legacy_health = _fetch_json(f"{legacy_url}/healthz", _remaining(validation_deadline))
             shadow_health = _fetch_json(f"{shadow_url}/healthz", _remaining(validation_deadline))
+            if isinstance(shadow_health.get("guard_attempts"), list):
+                report["guard_attempts"] = list(shadow_health["guard_attempts"])
             _validate_health(legacy_health, shadow=False)
             _validate_health(shadow_health, shadow=True)
             legacy_state = _fetch_json(f"{legacy_url}/api/prediction-arbitrage/state", _remaining(validation_deadline))
@@ -513,7 +515,7 @@ def run_shadow_validation(
             semantic.extend(item for item in differences if item["classification"] == "semantic_difference")
             allowed.extend(item for item in differences if item["classification"] != "semantic_difference")
             completion = _activity_completed_at(shadow_state)
-            if completion:
+            if completion and completion not in inherited_activity:
                 completed.add(completion)
             last_health = shadow_health
             report["cycles"].append({
