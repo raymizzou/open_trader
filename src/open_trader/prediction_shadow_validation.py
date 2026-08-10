@@ -519,7 +519,6 @@ def run_shadow_validation(
         "seed": {}, "cycles": [], "allowed_differences": [], "semantic_differences": [],
         "codex": {"baseline": {}, "current": {}, "delta": {}}, "token_counts": {"baseline": {}, "current": {}, "delta": {}}, "guard_attempts": [], "restart": {}, "shutdown": {},
         "provider_evidence": {"baseline": {}, "current": {}, "delta": {}},
-        "frozen_parity": {"status": "BLOCKED", "differences": []},
     }
     status, reason = "FAIL", "validation did not start"
     owned = False
@@ -564,7 +563,6 @@ def run_shadow_validation(
             report["guard_attempts"] = list(baseline_health["guard_attempts"])
         _validate_health(baseline_health, shadow=True)
         baseline_state = _fetch_json(f"{shadow_url}/api/prediction-arbitrage/state", _remaining(validation_deadline))
-        report["frozen_parity"] = {"status": "BLOCKED", "reason": "no deterministic fixture input was supplied to the CLI"}
         observed_baseline_codex = _codex_evidence(baseline_health)
         observed_baseline_provider = _provider_evidence(baseline_state)
         observed_baseline_tokens = _token_counts(baseline_state)
@@ -628,9 +626,6 @@ def run_shadow_validation(
                 codex=_mapping(_mapping(report["codex"]).get("delta")),
                 deepseek_calls=int(_mapping(_mapping(report["provider_evidence"]).get("delta")).get("deepseek", {}).get("calls") or 0), deadline=True,
             )
-        # Apply this after the while/else as well: a deadline path can otherwise restore PASS.
-        if status == "PASS" and report["frozen_parity"].get("status") != "PASS":
-            status, reason = "BLOCKED", "frozen parity proof unavailable"
         if status == "PASS":
             initial_pid = _mapping(report.get("install")).get("pid")
             report["restart"] = _restart_shadow(

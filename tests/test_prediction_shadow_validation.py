@@ -5,7 +5,6 @@ import signal
 import subprocess
 import json
 import sqlite3
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 from contextlib import contextmanager
 from typing import Iterator
@@ -13,8 +12,9 @@ from typing import Iterator
 import pytest
 
 from open_trader import prediction_shadow_validation as validation
-from open_trader.prediction_read_model import prediction_state_payload
+from open_trader.dashboard_web import create_dashboard_server
 from tests.test_prediction_service import _Runtime, _response, _server
+from tests.test_dashboard import dashboard_config
 
 
 def _state(*, profit: str = "1.20", completed_at: str = "2026-08-10T00:00:00Z") -> dict[str, object]:
@@ -112,23 +112,18 @@ def test_shared_opportunity_missing_field_is_semantic_not_equal_to_none() -> Non
 
 
 @contextmanager
-def _legacy_endpoint(runtime: _Runtime) -> Iterator[str]:
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, _format: str, *_args: object) -> None:
-            return
-
-        def do_GET(self) -> None:
-            payload = prediction_state_payload(
-                store=runtime.store, monitor=runtime.monitor, execution=runtime.execution,
-                csrf_token="legacy-session", cross_venue_monitor=runtime.cross_venue_monitor,
-            )
-            body = json.dumps(payload).encode()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+def _legacy_endpoint(runtime: _Runtime, tmp_path: Path) -> Iterator[str]:
+    server = create_dashboard_server(
+        config=dashboard_config(tmp_path),
+        host="127.0.0.1",
+        port=0,
+        prediction_store=runtime.store,
+        prediction_monitor=runtime.monitor,
+        prediction_execution_service=runtime.execution,
+        cross_venue_monitor=runtime.cross_venue_monitor,
+        prediction_session_token="legacy-session",
+        prediction_csrf_token="legacy-csrf",
+    )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -137,14 +132,22 @@ def _legacy_endpoint(runtime: _Runtime) -> Iterator[str]:
         server.shutdown(); server.server_close(); thread.join(timeout=5)
 
 
-def test_frozen_legacy_and_shadow_http_endpoints_match_except_session() -> None:
+def test_frozen_legacy_and_shadow_http_endpoints_match_except_session(tmp_path: Path) -> None:
     runtime = _Runtime()
-    with _legacy_endpoint(runtime) as legacy_base, _server(runtime) as shadow_base:
-        legacy_status, legacy = _response(legacy_base + "/api/prediction-arbitrage/state")
-        status, shadow = _response(shadow_base + "/api/prediction-arbitrage/state")
+    with _legacy_endpoint(runtime, tmp_path) as legacy_base, _server(runtime) as shadow_base:
+        legacy_state_status, legacy_state = _response(legacy_base + "/api/prediction-arbitrage/state")
+        shadow_state_status, shadow_state = _response(shadow_base + "/api/prediction-arbitrage/state")
+        legacy_history_status, legacy_history = _response(
+            legacy_base + "/api/prediction-arbitrage/history?kind=signals&limit=100&offset=0"
+        )
+        shadow_history_status, shadow_history = _response(
+            shadow_base + "/api/prediction-arbitrage/history?kind=signals&limit=100&offset=0"
+        )
 
-    assert legacy_status == status == 200
-    assert validation._compare_frozen_payloads(legacy, shadow) == []
+    assert legacy_state_status == shadow_state_status == 200
+    assert legacy_history_status == shadow_history_status == 200
+    assert validation._compare_frozen_payloads(legacy_state, shadow_state) == []
+    assert validation._compare_frozen_payloads(legacy_history, shadow_history) == []
 
 
 def test_install_shadow_passes_remaining_timeout_and_returns_verified_facts(
@@ -275,28 +278,19 @@ def test_deadline_still_fails_when_observed_deepseek_calls_are_nonzero() -> None
     assert status == "FAIL"
 
 
-def test_deadline_cannot_restart_when_frozen_parity_is_unavailable(
+def test_live_validation_does_not_require_cli_frozen_fixture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls = {"status": 0}
+    report = _run_fake_validation("timestamp_only", tmp_path, monkeypatch)
 
-    def status(**_kwargs: object) -> tuple[str, str]:
-        calls["status"] += 1
-        return ("BLOCKED", "sampling") if calls["status"] <= 2 else ("PASS", "canaries complete")
-
-    monkeypatch.setattr(validation, "_validation_status", status)
-    report = _run_fake_validation("deadline_before_three_cycles", tmp_path, monkeypatch)
-
-    assert report["status"] == "BLOCKED"
-    assert report["reason"] == "frozen parity proof unavailable"
-    assert report["restart"] == {}
+    assert report["status"] == "PASS"
 
 
 @pytest.mark.parametrize(
     ("case", "expected"),
     [
-        ("timestamp_only", "BLOCKED"),
-        ("isolated_history", "BLOCKED"),
+        ("timestamp_only", "PASS"),
+        ("isolated_history", "PASS"),
         ("profit_formula_drift", "FAIL"),
         ("missing_same_venue_canary", "BLOCKED"),
         ("all_cross_canaries_failed", "BLOCKED"),
