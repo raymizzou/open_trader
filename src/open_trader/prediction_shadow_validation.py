@@ -488,6 +488,9 @@ def run_shadow_validation(
         _remaining(validation_deadline)
         if _label_loaded(deadline=validation_deadline):
             raise RuntimeError("prediction shadow label already loaded; refusing ownership takeover")
+        # The seeded shadow store excludes operational/provider usage; this is the pre-install zero baseline.
+        provider_baseline = {"codex": {"calls": 0}, "deepseek": {"calls": 0}}
+        tokens_baseline: dict[str, int] = {}
         owned = True  # pre-existing label was checked immediately before bootstrap; own any partial bootstrap failure.
         report["install"] = _install_shadow(
             repo_root=repo_root, runtime_root=runtime_root,
@@ -504,8 +507,6 @@ def run_shadow_validation(
         observed_baseline_provider = _provider_evidence(baseline_state)
         observed_baseline_tokens = _token_counts(baseline_state)
         codex_baseline = {category: {"attempts": 0, "successes": 0} for category in ("same_venue", "cross_venue")}
-        provider_baseline = {provider: {key: 0 for key in values} for provider, values in observed_baseline_provider.items()}
-        tokens_baseline = {key: 0 for key in observed_baseline_tokens}
         inherited_activity = {_activity_completed_at(baseline_state)} - {""}
         report["relation_discovery_baseline_completed_at"] = sorted(inherited_activity)
         report["codex"] = {"baseline": codex_baseline, "current": codex_baseline, "delta": _counter_delta(codex_baseline, codex_baseline)}
