@@ -26,7 +26,7 @@ _CLEANUP_MAX_SECONDS = 30.0
 _INSTALLER = "scripts/install_prediction_service_launchd.sh"
 _UNINSTALLER = "scripts/uninstall_prediction_service_launchd.sh"
 _DETERMINISTIC_FIELDS = (
-    "venue", "venues", "strategy", "relation", "market_type", "relation_direction", "legs",
+    "venue", "venues", "strategy", "relation", "direction", "market_type", "relation_direction", "legs", "buy_legs",
     "fee", "fees", "fee_components", "maximum_fee", "cost", "max_cost", "total_max_cost", "yes_max_cost", "no_max_cost",
     "actionable", "eligibility_reason", "eligibility", "gating", "profit",
     "minimum_profit", "estimated_profit", "profit_formula", "profit_formula_version", "gross_profit", "net_profit", "net_edge", "max_profit", "maximum_fee", "clear_signal", "eligible", "gating_reason", "actionable_reason",
@@ -492,9 +492,12 @@ def run_shadow_validation(
         _validate_health(baseline_health, shadow=True)
         baseline_state = _fetch_json(f"{shadow_url}/api/prediction-arbitrage/state", _remaining(validation_deadline))
         report["frozen_parity"] = {"status": "BLOCKED", "reason": "no deterministic fixture input was supplied to the CLI"}
-        codex_baseline = _codex_evidence(baseline_health)
-        provider_baseline = _provider_evidence(baseline_state)
-        tokens_baseline = _token_counts(baseline_state)
+        observed_baseline_codex = _codex_evidence(baseline_health)
+        observed_baseline_provider = _provider_evidence(baseline_state)
+        observed_baseline_tokens = _token_counts(baseline_state)
+        codex_baseline = {category: {"attempts": 0, "successes": 0} for category in ("same_venue", "cross_venue")}
+        provider_baseline = {provider: {key: 0 for key in values} for provider, values in observed_baseline_provider.items()}
+        tokens_baseline = {key: 0 for key in observed_baseline_tokens}
         inherited_activity = {_activity_completed_at(baseline_state)} - {""}
         report["relation_discovery_baseline_completed_at"] = sorted(inherited_activity)
         report["codex"] = {"baseline": codex_baseline, "current": codex_baseline, "delta": _counter_delta(codex_baseline, codex_baseline)}
