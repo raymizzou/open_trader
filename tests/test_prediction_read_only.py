@@ -126,6 +126,74 @@ def test_predict_guard_restores_client_after_context_exit() -> None:
     assert transport_calls == ["approval"]
 
 
+def test_predict_guard_preserves_builder_reads_and_signed_no_submit_construction() -> None:
+    calls: list[str] = []
+
+    class SigningBuilder:
+        def balance_of(self, asset: str) -> int:
+            calls.append("balance_of")
+            assert asset == "USDT"
+            return 10
+
+        def build_order(self) -> dict[str, str]:
+            calls.append("build_order")
+            return {"signature": "local-only"}
+
+    class SigningClient:
+        def __init__(self) -> None:
+            self._builder = SigningBuilder()
+
+        def approval_facts(self) -> dict[str, object]:
+            assert self._builder.balance_of("USDT") == 10
+            return {"approval": "read-only"}
+
+        def no_submit_buy_preflight(self) -> SimpleNamespace:
+            assert self._builder.build_order()["signature"] == "local-only"
+            return SimpleNamespace(accepted=True, status="preflight")
+
+    client = SigningClient()
+    guard = PredictReadOnlyGuard()
+
+    with guard_predict_client(client, guard):
+        assert client.approval_facts() == {"approval": "read-only"}
+        assert client.no_submit_buy_preflight().status == "preflight"
+
+    assert calls == ["balance_of", "build_order"]
+    assert guard.attempts == []
+
+
+def test_predict_guard_preserves_stateful_sdk_signing() -> None:
+    class Signer:
+        signature = "local-signature"
+
+        def sign(self) -> str:
+            return object.__getattribute__(self, "signature")
+
+    class StatefulSigningBuilder:
+        def __init__(self) -> None:
+            self._signer = Signer()
+
+        def sign_predict_account_message(self, message: str) -> str:
+            assert message == "predict-message"
+            return self._signer.sign()
+
+    class StatefulSigningClient:
+        def __init__(self) -> None:
+            self._builder = StatefulSigningBuilder()
+
+        def _authenticate(self) -> str:
+            assert self._builder.sign_predict_account_message("predict-message") == "local-signature"
+            return "jwt-fixture"
+
+    client = StatefulSigningClient()
+    guard = PredictReadOnlyGuard()
+
+    with guard_predict_client(client, guard):
+        assert client._authenticate() == "jwt-fixture"
+
+    assert guard.attempts == []
+
+
 @pytest.mark.parametrize(
     ("action", "kind"),
     (
