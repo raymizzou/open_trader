@@ -33,7 +33,7 @@ def seed_shadow_store(
         raise ValueError("source and shadow must use different databases")
     destination = PredictionArbitrageStore(Path(shadow_data_dir))
 
-    source_uri = f"{source_path.resolve().as_uri()}?mode=ro"
+    source_uri = f"{source_path.resolve().as_uri()}?mode=ro&immutable=1"
     with sqlite3.connect(source_uri, uri=True) as source:
         source.execute("BEGIN")
         relation_rows = source.execute(
