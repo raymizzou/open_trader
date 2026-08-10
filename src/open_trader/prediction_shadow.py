@@ -49,12 +49,7 @@ def seed_shadow_store(
 
     for _ in range(_SNAPSHOT_RETRIES):
         before = _source_file_state(source_path)
-        has_wal = before[1][0]
-        # immutable is safe only for a quiescent main file with no WAL sidecar;
-        # a live WAL must be read by SQLite's normal read-only snapshot logic.
         source_uri = f"{source_path.resolve().as_uri()}?mode=ro"
-        if not has_wal:
-            source_uri += "&immutable=1"
         source = sqlite3.connect(source_uri, uri=True)
         try:
             source.execute("BEGIN")

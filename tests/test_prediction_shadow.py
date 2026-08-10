@@ -106,15 +106,34 @@ def test_seed_shadow_store_copies_only_relations_and_llm_cache(tmp_path: Path) -
         assert connection.execute("SELECT COUNT(*) FROM relation_scan_runs").fetchone() == (0,)
 
 
+def test_seed_shadow_store_without_wal_reads_direct_mode_ro(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _populated_store(tmp_path / "production")
+    assert not Path(f"{source.path}-wal").exists()
+    import open_trader.prediction_shadow as shadow_module
+
+    calls: list[object] = []
+    connect = shadow_module.sqlite3.connect
+
+    def recording_connect(database: object, *args: object, **kwargs: object):
+        calls.append(database)
+        return connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(shadow_module.sqlite3, "connect", recording_connect)
+    seed_shadow_store(
+        source_data_dir=source.data_dir,
+        shadow_data_dir=tmp_path / "shadow",
+    )
+
+    assert f"{source.path.resolve().as_uri()}?mode=ro" in {
+        str(database) for database in calls
+    }
+
+
 def test_seed_shadow_store_excludes_every_forbidden_category_and_preserves_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = _populated_store(tmp_path / "production")
     _populate_forbidden_categories(source)
-    wal_path = Path(f"{source.path}-wal")
-    with sqlite3.connect(source.path) as connection:
-        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    wal_path.unlink(missing_ok=True)
     source_files = {
         path: _file_snapshot(path)
         for path in (
@@ -160,12 +179,12 @@ def test_seed_shadow_store_excludes_every_forbidden_category_and_preserves_sourc
 
     assert all(count == 0 for count in counts.values())
     assert any(
-        str(database).endswith("prediction_arbitrage.sqlite3?mode=ro&immutable=1")
+        str(database).endswith("prediction_arbitrage.sqlite3?mode=ro")
         and kwargs.get("uri") is True
         for database, kwargs in connect_calls
     )
     assert any(
-        str(database) == f"{source.path.resolve().as_uri()}?mode=ro&immutable=1"
+        str(database) == f"{source.path.resolve().as_uri()}?mode=ro"
         for database, _kwargs in connect_calls
     )
     assert read_only_connections
