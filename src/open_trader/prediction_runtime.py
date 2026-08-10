@@ -332,12 +332,16 @@ class PredictionRuntime:
                     codex_model=codex_model,
                     predict_trading=self._predict_trading,
                 )
-            self.cross_venue_monitor = cross_monitor
             if not isinstance(cross_monitor, _UnavailableCrossVenueMonitor):
                 self._cross_runtime = _CrossVenueRuntime(cross_monitor)
-            self.execution.set_cross_venue_monitor(
-                self._cross_runtime or self.cross_venue_monitor
+            self.cross_venue_monitor = self._cross_runtime or cross_monitor
+            set_cross_venue_monitor = getattr(
+                self.execution, "set_cross_venue_monitor", None
             )
+            if callable(set_cross_venue_monitor):
+                set_cross_venue_monitor(
+                    self._cross_runtime or self.cross_venue_monitor
+                )
         except Exception:
             self._state = "FAILED"
             self._cleanup_resources()
@@ -365,7 +369,11 @@ class PredictionRuntime:
                     self.cross_venue_monitor = _UnavailableCrossVenueMonitor(
                         "predict_runtime_failed"
                     )
-                    self.execution.set_cross_venue_monitor(self.cross_venue_monitor)
+                    set_cross_venue_monitor = getattr(
+                        self.execution, "set_cross_venue_monitor", None
+                    )
+                    if callable(set_cross_venue_monitor):
+                        set_cross_venue_monitor(self.cross_venue_monitor)
             self._state = "RUNNING"
             logger.info(
                 "prediction_runtime_state state=RUNNING pid=%s data_dir=%s",

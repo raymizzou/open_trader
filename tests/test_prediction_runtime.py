@@ -224,3 +224,134 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
     assert events.index("polymarket.stop") < events.index("execution.close")
     assert events.index("execution.close") < events.index("trading.close")
     assert events.index("trading.close") < events.index("store.close")
+
+
+def test_reconcile_failure_keeps_runtime_locked_and_does_not_start_monitors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    events: list[str] = []
+
+    class FakeStore:
+        def __init__(self, _data_dir: Path) -> None:
+            pass
+
+        def close(self) -> None:
+            events.append("store.close")
+
+    class FakeTrading:
+        def close(self) -> None:
+            events.append("trading.close")
+
+    class FakeTradingClient:
+        @classmethod
+        def from_keychain(cls, _config: object) -> FakeTrading:
+            return FakeTrading()
+
+    class FakeMonitor:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+        def start(self) -> None:
+            events.append("monitor.start")
+
+        def stop(self) -> None:
+            events.append("monitor.stop")
+
+    class FakeExecution:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def reconcile_startup(self) -> dict[str, object]:
+            raise RuntimeError("reconcile failed")
+
+        def notify_ready_opportunity(self, *_: object) -> dict[str, object]:
+            return {"state": "ignored"}
+
+        def notify_observation(self, *_: object) -> dict[str, object]:
+            return {"state": "ignored"}
+
+        def notify_monitor_failure(self, *_: object) -> dict[str, object]:
+            return {"state": "ignored"}
+
+        def set_cross_venue_monitor(self, _monitor: object) -> None:
+            pass
+
+    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
+    monkeypatch.setattr(runtime_module, "PolymarketTradingClient", FakeTradingClient)
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: None),
+    )
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
+    monkeypatch.setattr(runtime_module, "CodexRelationValidator", lambda *_a, **_k: object())
+    monkeypatch.setattr(runtime_module, "CodexTitleTranslator", lambda *_a, **_k: object())
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+    )
+    runtime.start()
+
+    assert runtime.state == "NOT_READY"
+    assert "monitor.start" not in events
+    competing_owner = _RuntimeOwnershipLock(
+        tmp_path / "prediction_arbitrage" / "runtime.lock"
+    )
+    with pytest.raises(PredictionRuntimeOwnershipError):
+        competing_owner.acquire()
+    runtime.stop()
+    competing_owner.acquire()
+    competing_owner.release()
+
+
+def test_core_initialization_failure_releases_resources_and_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    closed: list[str] = []
+
+    class FakeStore:
+        def __init__(self, _data_dir: Path) -> None:
+            pass
+
+        def close(self) -> None:
+            closed.append("store")
+
+    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
+    monkeypatch.setattr(
+        runtime_module,
+        "load_trading_config",
+        lambda _path: (_ for _ in ()).throw(RuntimeError("bad config")),
+    )
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+    )
+
+    with pytest.raises(RuntimeError, match="bad config"):
+        runtime.start()
+
+    assert runtime.state == "FAILED"
+    assert closed == ["store"]
+    owner = _RuntimeOwnershipLock(
+        tmp_path / "prediction_arbitrage" / "runtime.lock"
+    )
+    owner.acquire()
+    owner.release()

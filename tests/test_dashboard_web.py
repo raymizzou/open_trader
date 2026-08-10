@@ -2992,6 +2992,7 @@ def test_prediction_venue_construction_failure_keeps_dashboard_state_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import open_trader.dashboard_web as dashboard_web
+    import open_trader.prediction_runtime as prediction_runtime
 
     class FakeMonitor:
         def snapshot(self) -> dict[str, object]:
@@ -3006,7 +3007,7 @@ def test_prediction_venue_construction_failure_keeps_dashboard_state_available(
     def fail_predict_source(_config: object) -> object:
         raise RuntimeError("missing predict config")
 
-    monkeypatch.setattr(dashboard_web, "PredictSource", fail_predict_source)
+    monkeypatch.setattr(prediction_runtime, "PredictSource", fail_predict_source)
     cross = dashboard_web._build_cross_venue_monitor(
         trading_config=type("Config", (), {"predict": object()})(),
         prediction_monitor=FakeMonitor(),
@@ -3033,6 +3034,7 @@ def test_build_cross_venue_monitor_injects_store_without_environment_mode_overri
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import open_trader.dashboard_web as dashboard_web
+    import open_trader.prediction_runtime as prediction_runtime
 
     created: list[dict[str, object]] = []
 
@@ -3047,13 +3049,13 @@ def test_build_cross_venue_monitor_injects_store_without_environment_mode_overri
         def reconcile_cross_holdings_once(self) -> None:
             return None
 
-    monkeypatch.setattr(dashboard_web, "PredictSource", lambda _config: object())
+    monkeypatch.setattr(prediction_runtime, "PredictSource", lambda _config: object())
     monkeypatch.setattr(
-        dashboard_web,
+        prediction_runtime,
         "CodexCrossVenueEquivalenceValidator",
         lambda *_args, **_kwargs: object(),
     )
-    monkeypatch.setattr(dashboard_web, "PredictCrossVenueMonitor", FakeCrossVenueMonitor)
+    monkeypatch.setattr(prediction_runtime, "PredictCrossVenueMonitor", FakeCrossVenueMonitor)
 
     store = object()
     monkeypatch.setenv("OPEN_TRADER_CROSS_EXECUTION_MODE", "auto_submit")
@@ -3130,6 +3132,7 @@ def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_firs
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import open_trader.dashboard_web as dashboard_web
+    import open_trader.prediction_runtime as prediction_runtime
 
     order: list[str] = []
     config = replace(
@@ -3206,14 +3209,14 @@ def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_firs
         def server_close(self) -> None:
             order.append("server.close")
 
-    monkeypatch.setattr(dashboard_web, "load_trading_config", lambda _path: object())
+    monkeypatch.setattr(prediction_runtime, "load_trading_config", lambda _path: object())
     monkeypatch.setattr(
-        dashboard_web.PolymarketTradingClient,
+        prediction_runtime.PolymarketTradingClient,
         "from_keychain",
         classmethod(lambda _cls, _config: FakeTrading()),
     )
-    monkeypatch.setattr(dashboard_web, "PolymarketMonitor", FakeMonitor)
-    monkeypatch.setattr(dashboard_web, "PredictionExecutionService", FakeExecution)
+    monkeypatch.setattr(prediction_runtime, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(prediction_runtime, "PredictionExecutionService", FakeExecution)
     monkeypatch.setattr(dashboard_web, "create_dashboard_server", lambda **_: FakeServer())
 
     dashboard_web.serve_dashboard(
@@ -3269,6 +3272,7 @@ def test_cross_venue_runtime_closes_unscheduled_snapshot_coroutine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import open_trader.dashboard_web as dashboard_web
+    import open_trader.prediction_runtime as prediction_runtime
 
     class FakeLoop:
         def is_closed(self) -> bool:
@@ -3288,7 +3292,7 @@ def test_cross_venue_runtime_closes_unscheduled_snapshot_coroutine(
         raise RuntimeError("loop closed")
 
     monkeypatch.setattr(
-        dashboard_web.asyncio, "run_coroutine_threadsafe", fail_schedule
+        prediction_runtime.asyncio, "run_coroutine_threadsafe", fail_schedule
     )
 
     assert runtime.snapshot() == {}
@@ -4521,6 +4525,7 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import open_trader.dashboard_web as dashboard_web
+    import open_trader.prediction_runtime as prediction_runtime
 
     order: list[str] = []
     config = replace(
@@ -4589,14 +4594,14 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
         def server_close(self) -> None:
             order.append("server.close")
 
-    monkeypatch.setattr(dashboard_web, "load_trading_config", lambda _path: object())
+    monkeypatch.setattr(prediction_runtime, "load_trading_config", lambda _path: object())
     monkeypatch.setattr(
-        dashboard_web.PolymarketTradingClient,
+        prediction_runtime.PolymarketTradingClient,
         "from_keychain",
         classmethod(lambda _cls, _config: FakeTrading()),
     )
-    monkeypatch.setattr(dashboard_web, "PolymarketMonitor", FakeMonitor)
-    monkeypatch.setattr(dashboard_web, "PredictionExecutionService", FakeExecution)
+    monkeypatch.setattr(prediction_runtime, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(prediction_runtime, "PredictionExecutionService", FakeExecution)
     monkeypatch.setattr(dashboard_web, "create_dashboard_server", lambda **_: FakeServer())
 
     dashboard_web.serve_dashboard(

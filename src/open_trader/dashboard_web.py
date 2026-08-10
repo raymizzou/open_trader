@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import asyncio
-import inspect
 import json
 import ipaddress
 import os
 import secrets
+import signal
 import subprocess
-import threading
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from http import HTTPStatus
@@ -30,24 +28,8 @@ from .dashboard import (
     load_trend_report_history,
 )
 from .futu_quote import FutuQuoteClient
-from .polymarket_monitor import PolymarketMonitor
-from .polymarket_relation_discovery import (
-    CodexRelationValidator,
-    discover_threshold_relation_catalog,
-)
-from .predict_cross_venue import (
-    CodexCrossVenueEquivalenceValidator,
-    PredictCrossVenueMonitor,
-)
-from .predict_source import PredictSource
-from .predict_trading import PredictTradingClient
-
-# Keep the old module attribute for downstream test fakes while production
-# wiring uses the catalog result contract above.
-discover_threshold_relations = discover_threshold_relation_catalog
-from .polymarket_trading import PolymarketTradingClient, load_trading_config
 from .daily_premarket import build_notifier
-from .notifications import NullNotifier
+from .predict_cross_venue import PredictCrossVenueMonitor
 from .prediction_arbitrage import (
     MAX_CROSS_UNSETTLED_PRINCIPAL,
     MAX_EMERGENCY_LOSS,
@@ -57,12 +39,16 @@ from .prediction_arbitrage import (
     MIN_NET_EDGE,
     MIN_THRESHOLD_ANNUALIZED_YIELD,
 )
-from .prediction_arbitrage_execution import PredictionExecutionService
 from .prediction_arbitrage_store import PredictionArbitrageStore
-from .prediction_title_translation import (
-    CodexTitleTranslator,
-    cached_prediction_title_zh,
+from .prediction_runtime import (
+    PredictionRuntime,
+    _CrossVenueRuntime,
+    _UnavailableCrossVenueMonitor,
+    _build_cross_venue_monitor,
+    _cross_venue_gamma_lookup,
+    discover_threshold_relations,
 )
+from .prediction_title_translation import cached_prediction_title_zh
 from .research_chat import ResearchChatError, ResearchChatService
 from .standard_strategies import strategy_catalog
 from .strategy_backtest import (
@@ -2121,159 +2107,6 @@ def _dashboard_runtime_metadata() -> dict[str, object]:
     }
 
 
-class _UnavailableCrossVenueMonitor:
-    def __init__(self, reason: str) -> None:
-        self._reason = reason
-
-    def snapshot(self) -> dict[str, object]:
-        return {
-            "status": "degraded",
-            "mode": "observe_only",
-            "reason": self._reason,
-            "funnel": {},
-            "events": [],
-            "opportunities": [],
-        }
-
-
-class _CrossVenueRuntime:
-    def __init__(self, monitor: PredictCrossVenueMonitor) -> None:
-        self._monitor = monitor
-        self._predict = getattr(monitor, "_predict", None)
-        self._started = threading.Event()
-        self._stop_requested = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
-
-    def start(self) -> None:
-        if self._thread is not None:
-            return
-
-        async def run() -> None:
-            self._loop = asyncio.get_running_loop()
-            try:
-                try:
-                    result = self._monitor.start()
-                    if inspect.isawaitable(result):
-                        await result
-                finally:
-                    self._started.set()
-                await asyncio.to_thread(self._stop_requested.wait)
-                result = self._monitor.stop()
-                if inspect.isawaitable(result):
-                    await result
-            finally:
-                self._loop = None
-
-        self._thread = threading.Thread(
-            target=lambda: asyncio.run(run()),
-            name="predict-cross-venue-monitor",
-            daemon=True,
-        )
-        self._thread.start()
-        self._started.wait(timeout=5)
-
-    def snapshot(self) -> dict[str, object]:
-        loop = self._loop
-        if (
-            loop is None
-            or loop.is_closed()
-            or self._thread is threading.current_thread()
-        ):
-            return self._monitor.snapshot()
-        coroutine = self._snapshot_on_loop()
-        try:
-            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
-        except Exception:
-            coroutine.close()
-            return {}
-        try:
-            return future.result(timeout=1)
-        except Exception:
-            return {}
-
-    async def _snapshot_on_loop(self) -> dict[str, object]:
-        return self._monitor.snapshot()
-
-    def refresh_opportunity(self, opportunity_id: str) -> dict[str, object] | None:
-        loop = self._loop
-        if (
-            loop is None
-            or loop.is_closed()
-            or self._thread is threading.current_thread()
-        ):
-            return None
-        coroutine = self._refresh_on_loop(opportunity_id)
-        try:
-            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
-        except Exception:
-            coroutine.close()
-            return None
-        try:
-            return future.result(timeout=15)
-        except Exception:
-            return None
-
-    async def _refresh_on_loop(
-        self, opportunity_id: str
-    ) -> dict[str, object] | None:
-        refresh = getattr(self._monitor, "refresh_opportunity", None)
-        if not callable(refresh):
-            return None
-        value = refresh(opportunity_id)
-        if inspect.isawaitable(value):
-            value = await value
-        return dict(value) if isinstance(value, Mapping) else None
-
-    def stop(self) -> None:
-        self._stop_requested.set()
-        if self._thread is not None and self._thread is not threading.current_thread():
-            self._thread.join(timeout=5)
-
-
-def _cross_venue_gamma_lookup(
-    condition_ids: tuple[str, ...], *, closed: bool
-) -> tuple[object, ...]:
-    from polymarket import PublicClient
-
-    client = PublicClient()
-    try:
-        paginator = client.list_markets(condition_ids=condition_ids, closed=closed)
-        iter_items = getattr(paginator, "iter_items", None)
-        return tuple(iter_items()) if callable(iter_items) else tuple(paginator)
-    finally:
-        client.close()
-
-
-def _build_cross_venue_monitor(
-    *,
-    trading_config: object,
-    prediction_monitor: PolymarketMonitor,
-    store: PredictionArbitrageStore,
-    execution: PredictionExecutionService,
-    codex_model: str,
-    predict_trading: object | None = None,
-) -> PredictCrossVenueMonitor | _UnavailableCrossVenueMonitor:
-    predict_config = getattr(trading_config, "predict", None)
-    if predict_config is None:
-        return _UnavailableCrossVenueMonitor("predict_not_configured")
-    if predict_trading is None:
-        return _UnavailableCrossVenueMonitor("predict_construction_failed")
-    try:
-        return PredictCrossVenueMonitor(
-            predict_source=PredictSource(predict_config),
-            polymarket_monitor=prediction_monitor,
-            validator=CodexCrossVenueEquivalenceValidator(store, model=codex_model),
-            gamma_lookup=_cross_venue_gamma_lookup,
-            predict_quote_fn=getattr(predict_trading, "quote_market_buy", None),
-            store=store,
-            ready_observer=execution.notify_ready_opportunity,
-            holding_reconciler=execution.reconcile_cross_holdings_once,
-        )
-    except Exception:
-        return _UnavailableCrossVenueMonitor("predict_construction_failed")
-
-
 def serve_dashboard(
     config: DashboardConfig,
     *,
@@ -2306,100 +2139,34 @@ def serve_dashboard(
     prediction_store: PredictionArbitrageStore | None = None
     prediction_monitor: object | None = None
     prediction_execution: object | None = None
-    prediction_trading: object | None = None
-    predict_trading: object | None = None
-    cross_runtime: _CrossVenueRuntime | None = None
+    prediction_runtime: PredictionRuntime | None = None
     if config.prediction_config_path is not None:
-        prediction_path = config.prediction_config_path.expanduser()
+        prediction_runtime = PredictionRuntime(
+            data_dir=config.data_dir,
+            prediction_config_path=config.prediction_config_path.expanduser(),
+            dashboard_url=resolved_public_url,
+            notifier=prediction_notifier,
+            cross_venue_monitor=cross_venue_monitor,
+        )
         try:
-            prediction_store = PredictionArbitrageStore(config.data_dir)
-            trading_config = load_trading_config(prediction_path)
-            prediction_trading = PolymarketTradingClient.from_keychain(trading_config)
-            try:
-                predict_trading = PredictTradingClient.from_keychain(trading_config)
-            except Exception:
-                predict_trading = None
-            codex_model = os.environ.get("OPEN_TRADER_CODEX_MODEL", "gpt-5.6-sol").strip()
-            relation_validator = CodexRelationValidator(
-                prediction_store,
-                model=codex_model,
-            )
-            title_translator = CodexTitleTranslator(prediction_store)
-            prediction_monitor = PolymarketMonitor(
-                store=prediction_store,
-                trading=prediction_trading,
-                relation_discovery=discover_threshold_relation_catalog,
-                relation_validator=relation_validator,
-                title_translator=title_translator,
-            )
-            prediction_execution = PredictionExecutionService(
-                store=prediction_store,
-                monitor=prediction_monitor,
-                trading=prediction_trading,
-                notifier=prediction_notifier or NullNotifier(),
-                lock_path=config.data_dir / "prediction_arbitrage" / "execution.lock",
-                dashboard_url=resolved_public_url,
-                predict_trading=predict_trading,
-            )
-            prediction_monitor.set_ready_observer(
-                prediction_execution.notify_ready_opportunity
-            )
-            prediction_monitor.set_observation_observer(
-                prediction_execution.notify_observation
-            )
-            prediction_monitor.set_failure_observer(
-                prediction_execution.notify_monitor_failure
-            )
-            if cross_venue_monitor is None:
-                cross_venue_monitor = _build_cross_venue_monitor(
-                    trading_config=trading_config,
-                    prediction_monitor=prediction_monitor,
-                    store=prediction_store,
-                    execution=prediction_execution,
-                    codex_model=codex_model,
-                    predict_trading=predict_trading,
-                )
-            if cross_venue_monitor is not None and not isinstance(
-                cross_venue_monitor, _UnavailableCrossVenueMonitor
-            ):
-                cross_runtime = _CrossVenueRuntime(cross_venue_monitor)
-            set_cross_venue_monitor = getattr(
-                prediction_execution, "set_cross_venue_monitor", None
-            )
-            if callable(set_cross_venue_monitor):
-                set_cross_venue_monitor(cross_runtime or cross_venue_monitor)
+            prediction_runtime.start()
         except Exception:
             # A missing Keychain/config must leave a visible, schema-valid locked
             # Dashboard rather than aborting the existing portfolio surface.
-            if prediction_monitor is not None:
-                try:
-                    prediction_monitor.stop()
-                except Exception:
-                    pass
-            for resource in (prediction_execution, prediction_trading, predict_trading, prediction_store):
-                close = getattr(resource, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:
-                        pass
+            try:
+                prediction_runtime.stop()
+            except Exception:
+                pass
+            prediction_runtime = None
             prediction_store = None
             prediction_monitor = None
             prediction_execution = None
-            prediction_trading = None
             cross_venue_monitor = None
         else:
-            try:
-                # Reconcile authenticated state before any public monitor heartbeat.
-                prediction_execution.reconcile_startup()
-            except Exception:
-                # Keep the service visible and locked so the state API can expose
-                # the failed startup rather than silently dropping its ledger.
-                pass
-            else:
-                prediction_monitor.start()
-                if cross_runtime is not None:
-                    cross_runtime.start()
+            prediction_store = prediction_runtime.store
+            prediction_monitor = prediction_runtime.monitor
+            prediction_execution = prediction_runtime.execution
+            cross_venue_monitor = prediction_runtime.cross_venue_monitor
     server = create_dashboard_server(
         config=config,
         host=host,
@@ -2407,7 +2174,7 @@ def serve_dashboard(
         trend_simulate_position_service=trend_simulate_position_service,
         prediction_store=prediction_store,
         prediction_monitor=prediction_monitor,
-        cross_venue_monitor=cross_runtime or cross_venue_monitor,
+        cross_venue_monitor=cross_venue_monitor,
         prediction_execution_service=prediction_execution,
         runtime_metadata=runtime_metadata,
     )
@@ -2420,18 +2187,9 @@ def serve_dashboard(
         print(f"poll_seconds: {config.poll_seconds}")
         server.serve_forever()
     finally:
-        if cross_runtime is not None:
-            cross_runtime.stop()
-        if prediction_monitor is not None:
+        if prediction_runtime is not None:
             try:
-                prediction_monitor.stop()
+                prediction_runtime.stop()
             except Exception:
                 pass
-        for resource in (prediction_execution, prediction_trading, predict_trading, prediction_store):
-            close = getattr(resource, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
         server.server_close()
