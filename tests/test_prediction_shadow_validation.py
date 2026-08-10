@@ -3,6 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 import signal
 import subprocess
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
+from contextlib import contextmanager
+from typing import Iterator
 
 import pytest
 
@@ -87,16 +92,57 @@ def test_compare_histories_classifies_isolated_contents() -> None:
     assert differences == [{"classification": "isolated_state_difference", "field": "history.items"}]
 
 
-def test_frozen_legacy_read_model_and_shadow_endpoint_match_except_session() -> None:
-    runtime = _Runtime()
-    legacy = prediction_state_payload(
-        store=runtime.store, monitor=runtime.monitor, execution=runtime.execution,
-        csrf_token="legacy-session", cross_venue_monitor=runtime.cross_venue_monitor,
+def test_history_item_schema_drift_is_semantic_not_isolated() -> None:
+    differences = validation._compare_histories(
+        {"kind": "signals", "items": [{"signal_id": "same", "profit": "1"}], "total": 1},
+        {"kind": "signals", "items": [{"signal_id": "same", "profit": 1}], "total": 1},
     )
-    with _server(runtime) as base:
-        status, shadow = _response(base + "/api/prediction-arbitrage/state")
 
-    assert status == 200
+    assert any(item["classification"] == "semantic_difference" for item in differences)
+
+
+def test_shared_opportunity_missing_field_is_semantic_not_equal_to_none() -> None:
+    shadow = _state()
+    del shadow["opportunities"][0]["fee"]  # type: ignore[index]
+
+    differences = validation._compare_live_states(_state(), shadow)
+
+    assert any(item["classification"] == "semantic_difference" and item["field"] == "fee" for item in differences)
+
+
+@contextmanager
+def _legacy_endpoint(runtime: _Runtime) -> Iterator[str]:
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+        def do_GET(self) -> None:
+            payload = prediction_state_payload(
+                store=runtime.store, monitor=runtime.monitor, execution=runtime.execution,
+                csrf_token="legacy-session", cross_venue_monitor=runtime.cross_venue_monitor,
+            )
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=5)
+
+
+def test_frozen_legacy_and_shadow_http_endpoints_match_except_session() -> None:
+    runtime = _Runtime()
+    with _legacy_endpoint(runtime) as legacy_base, _server(runtime) as shadow_base:
+        legacy_status, legacy = _response(legacy_base + "/api/prediction-arbitrage/state")
+        status, shadow = _response(shadow_base + "/api/prediction-arbitrage/state")
+
+    assert legacy_status == status == 200
     assert validation._compare_frozen_payloads(legacy, shadow) == []
 
 
@@ -138,7 +184,7 @@ def test_sigterm_uses_cleanup_and_writes_report_after_cleanup(
 
     monkeypatch.setattr(validation.signal, "getsignal", lambda signum: f"old-{signum}")
     monkeypatch.setattr(validation.signal, "signal", lambda signum, handler: handlers.__setitem__(signum, handler))
-    monkeypatch.setattr(validation, "seed_shadow_store", lambda **_kwargs: handlers[signal.SIGTERM](signal.SIGTERM, None))
+    monkeypatch.setattr(validation, "_seed_shadow", lambda **_kwargs: handlers[signal.SIGTERM](signal.SIGTERM, None))
     monkeypatch.setattr(validation, "_uninstall_and_verify_absent", lambda **_kwargs: events.append("cleanup") or {"label_absent": True, "plist_absent": True, "listener_absent": True})
     monkeypatch.setattr(validation, "_write_report", lambda _path, report: events.append(f"report:{report['status']}") )
     monkeypatch.setattr(validation, "_git_sha", lambda _repo, **_kwargs: "sha")
@@ -228,12 +274,19 @@ def _run_fake_validation(
             },
         },
     }
-    calls = {"state": 0}
+    calls = {"state": 0, "shadow_health": 0, "baseline_state": True}
 
     def fetch(url: str, _timeout: float) -> dict[str, object]:
         if url.endswith("/healthz"):
+            if url.startswith("http://127.0.0.1:8769"):
+                calls["shadow_health"] += 1
+                if calls["shadow_health"] == 1:
+                    return {**health, "codex": {"relation": {"calls": 0, "successes": 0}, "cross_venue": {"calls": 0, "successes": 0}}}
             return health
         if url.endswith("/state"):
+            if url.startswith("http://127.0.0.1:8769") and calls["baseline_state"]:
+                calls["baseline_state"] = False
+                return states[0]
             index = min(calls["state"] // 2, len(states) - 1)
             calls["state"] += 1
             if case == "profit_formula_drift" and url.startswith("http://127.0.0.1:8769") and index == 2:
@@ -244,7 +297,7 @@ def _run_fake_validation(
         return {"kind": "signals", "items": [{"isolated": url.startswith("http://127.0.0.1:8769")}], "total": 1}
 
     clock = [0.0]
-    monkeypatch.setattr(validation, "seed_shadow_store", lambda **_kwargs: {"sha256": "seed", "relation_state_rows": 1, "llm_cache_rows": 1})
+    monkeypatch.setattr(validation, "_seed_shadow", lambda **_kwargs: {"sha256": "seed", "relation_state_rows": 1, "llm_cache_rows": 1})
     monkeypatch.setattr(validation, "_install_shadow", lambda **_kwargs: {"pid": 101, "cwd": "repo", "git_sha": "sha"})
     monkeypatch.setattr(validation, "_restart_shadow", lambda **_kwargs: {"pid": 102, "cwd": "repo", "git_sha": "sha"})
     monkeypatch.setattr(validation, "_uninstall_and_verify_absent", lambda **_kwargs: {"label_absent": True, "plist_absent": True, "listener_absent": True})

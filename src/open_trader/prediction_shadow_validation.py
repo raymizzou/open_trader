@@ -18,12 +18,10 @@ from typing import Mapping
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
-from .prediction_shadow import seed_shadow_store
-
-
 _LABEL = "com.open-trader.prediction-service"
 _POLL_SECONDS = 5
 _MAX_TIMEOUT_SECONDS = 900
+_CLEANUP_MAX_SECONDS = 30.0
 _INSTALLER = "scripts/install_prediction_service_launchd.sh"
 _UNINSTALLER = "scripts/uninstall_prediction_service_launchd.sh"
 _DETERMINISTIC_FIELDS = (
@@ -138,12 +136,14 @@ def _compare_live_states(
         differences.append({"classification": "sampling_difference", "opportunity_id": identifier, "side": "shadow"})
     for identifier in sorted(legacy_rows.keys() & shadow_rows.keys()):
         for field in _DETERMINISTIC_FIELDS:
+            left_present, right_present = field in legacy_rows[identifier], field in shadow_rows[identifier]
             left, right = legacy_rows[identifier].get(field), shadow_rows[identifier].get(field)
-            if type(left) is not type(right) or left != right:
+            if left_present != right_present or (left_present and (type(left) is not type(right) or left != right)):
                 differences.append({
                     "classification": "semantic_difference", "opportunity_id": identifier,
                     "field": field, "legacy": left, "shadow": right,
                 })
+        differences.extend(_schema_differences(legacy_rows[identifier], shadow_rows[identifier], f"opportunity.{identifier}"))
     differences.extend(_schema_differences(legacy, shadow))
     if _volatile_projection(legacy) != _volatile_projection(shadow):
         differences.append({"classification": "isolated_state_difference"})
@@ -157,7 +157,7 @@ def _schema_differences(legacy: object, shadow: object, field: str = "") -> list
         differences: list[dict[str, object]] = []
         keys = set(legacy) | set(shadow)  # type: ignore[arg-type]
         for key in sorted(str(key) for key in keys):
-            if key in _VOLATILE_FIELDS:
+            if key in _VOLATILE_FIELDS or (field.startswith("opportunity.") and ("price" in key or key.endswith("_at"))):
                 continue
             path = f"{field}.{key}" if field else key
             if key not in legacy or key not in shadow:
@@ -182,7 +182,16 @@ def _compare_histories(
         {key: value for key, value in legacy.items() if key != "items"},
         {key: value for key, value in shadow.items() if key != "items"}, "history",
     )
-    if legacy.get("items") != shadow.get("items"):
+    legacy_items, shadow_items = legacy.get("items"), shadow.get("items")
+    if isinstance(legacy_items, list) and isinstance(shadow_items, list):
+        differences.extend(
+            difference
+            for left, right in zip(legacy_items, shadow_items)
+            for difference in _schema_differences(left, right, "history.items")
+        )
+    elif type(legacy_items) is not type(shadow_items):
+        differences.append({"classification": "semantic_difference", "field": "history.items", "legacy_type": type(legacy_items).__name__, "shadow_type": type(shadow_items).__name__})
+    if legacy_items != shadow_items:
         differences.append({"classification": "isolated_state_difference", "field": "history.items"})
     return differences
 
@@ -242,6 +251,19 @@ def _install_shadow(
     return evidence
 
 
+def _seed_shadow(*, repo_root: Path, source_data_dir: Path, runtime_root: Path, deadline: float) -> dict[str, object]:
+    report_path = runtime_root / "seed-shadow.json"
+    command = [
+        sys.executable, "-m", "open_trader.prediction_shadow", "--source-data-dir", str(source_data_dir),
+        "--shadow-data-dir", str(runtime_root / "data"), "--report", str(report_path),
+    ]
+    subprocess.run(command, cwd=repo_root, capture_output=True, text=True, check=True, timeout=_remaining(deadline))
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("shadow seed report is not an object")
+    return payload
+
+
 def _restart_shadow(
     *, repo_root: Path, runtime_root: Path, prediction_config_path: Path, deadline: float
 ) -> dict[str, object]:
@@ -265,8 +287,14 @@ def _service_evidence(*, repo_root: Path, deadline: float) -> dict[str, object]:
         "plist": str(Path.home() / "Library/LaunchAgents" / f"{_LABEL}.plist"),
         "listener": next((line[1:] for line in (listener.stdout.splitlines() if listener else []) if line.startswith("n")), ""),
         "health": health,
+        "label_loaded": label.returncode == 0,
+        "plist_exists": (Path.home() / "Library/LaunchAgents" / f"{_LABEL}.plist").is_file(),
+        "label_stdout": label.stdout,
+        "label_stderr": label.stderr,
+        "cwd_raw": "" if cwd is None else cwd.stdout or cwd.stderr,
+        "listener_raw": "" if listener is None else listener.stdout or listener.stderr,
     }
-    if not (pid and values["cwd"] == str(repo_root) and values["git_sha"] == _git_sha(repo_root, deadline=deadline) and values["listener"] == "127.0.0.1:8769" and health.get("status") == "running"):
+    if not (values["label_loaded"] and values["plist_exists"] and pid and values["cwd"] == str(repo_root) and values["git_sha"] == _git_sha(repo_root, deadline=deadline) and values["listener"] == "127.0.0.1:8769" and health.get("schema_version") == "open_trader.prediction_service.health.v1" and health.get("module") == "prediction_service" and health.get("status") == "running" and health.get("mode") == "shadow" and health.get("production_owner") is False and health.get("mutations") == "prohibited"):
         raise RuntimeError("shadow installer evidence did not verify PID/cwd/SHA/listener/health")
     return values
 
@@ -332,6 +360,17 @@ def _token_counts(state: Mapping[str, object]) -> dict[str, int]:
     return {str(key): int(value) for key, value in usage.items() if "token" in str(key) and isinstance(value, int)}
 
 
+def _counter_delta(current: Mapping[str, object], baseline: Mapping[str, object]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key in set(current) | set(baseline):
+        now, before = current.get(key), baseline.get(key)
+        if isinstance(now, Mapping) or isinstance(before, Mapping):
+            result[str(key)] = _counter_delta(_mapping(now), _mapping(before))
+        elif isinstance(now, int) or isinstance(before, int):
+            result[str(key)] = int(now or 0) - int(before or 0)
+    return result
+
+
 def _validation_status(
     *, semantic: list[dict[str, object]], health: Mapping[str, object], activity: set[str], codex: Mapping[str, Mapping[str, int]], deepseek_calls: int, deadline: bool
 ) -> tuple[str, str]:
@@ -370,42 +409,56 @@ def run_shadow_validation(
     if not 1 <= timeout_seconds <= _MAX_TIMEOUT_SECONDS:
         raise ValueError(f"timeout_seconds must be between 1 and {_MAX_TIMEOUT_SECONDS}")
     legacy_url, shadow_url = _validate_loopback_url(legacy_url), _validate_loopback_url(shadow_url)
+    validation_deadline = deadline - min(_CLEANUP_MAX_SECONDS, timeout_seconds / 4)
     runtime_root.mkdir(parents=True, exist_ok=True)
     report: dict[str, object] = {
         "status": "FAIL", "reason": "validation did not start", "started_at": _now(),
         "urls": {"legacy": legacy_url, "shadow": shadow_url}, "git_sha": _git_sha(repo_root, deadline=deadline),
         "seed": {}, "cycles": [], "allowed_differences": [], "semantic_differences": [],
-        "codex": {"baseline": {"same_venue": {"attempts": 0, "successes": 0}, "cross_venue": {"attempts": 0, "successes": 0}}, "current": {}, "delta": {}}, "token_counts": {}, "guard_attempts": [], "restart": {}, "shutdown": {},
-        "provider_evidence": {"baseline": {"codex": {"calls": 0}, "deepseek": {"calls": 0}}, "current": {"codex": {}, "deepseek": {}}, "delta": {"codex": {"calls": 0}, "deepseek": {"calls": 0}}},
+        "codex": {"baseline": {}, "current": {}, "delta": {}}, "token_counts": {"baseline": {}, "current": {}, "delta": {}}, "guard_attempts": [], "restart": {}, "shutdown": {},
+        "provider_evidence": {"baseline": {}, "current": {}, "delta": {}},
     }
     status, reason = "FAIL", "validation did not start"
     previous_handlers: dict[int, object] = {}
+    stopping = False
     def stop_handler(signum: int, _frame: object) -> None:
+        nonlocal stopping
+        if stopping:
+            return
+        stopping = True
         raise _StopRequested(f"received signal {signum}")
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[signum] = signal.getsignal(signum)
             signal.signal(signum, stop_handler)
-        _remaining(deadline)
-        report["seed"] = seed_shadow_store(
-            source_data_dir=source_data_dir, shadow_data_dir=runtime_root / "data"
+        _remaining(validation_deadline)
+        report["seed"] = _seed_shadow(
+            repo_root=repo_root, source_data_dir=source_data_dir, runtime_root=runtime_root, deadline=validation_deadline
         )
-        _remaining(deadline)
+        _remaining(validation_deadline)
         report["install"] = _install_shadow(
             repo_root=repo_root, runtime_root=runtime_root,
-            prediction_config_path=prediction_config_path, deadline=deadline,
+            prediction_config_path=prediction_config_path, deadline=validation_deadline,
         )
+        baseline_health = _fetch_json(f"{shadow_url}/healthz", _remaining(validation_deadline))
+        baseline_state = _fetch_json(f"{shadow_url}/api/prediction-arbitrage/state", _remaining(validation_deadline))
+        codex_baseline = _codex_evidence(baseline_health)
+        provider_baseline = _provider_evidence(baseline_state)
+        tokens_baseline = _token_counts(baseline_state)
+        report["codex"] = {"baseline": codex_baseline, "current": codex_baseline, "delta": _counter_delta(codex_baseline, codex_baseline)}
+        report["provider_evidence"] = {"baseline": provider_baseline, "current": provider_baseline, "delta": _counter_delta(provider_baseline, provider_baseline)}
+        report["token_counts"] = {"baseline": tokens_baseline, "current": tokens_baseline, "delta": _counter_delta(tokens_baseline, tokens_baseline)}
         completed: set[str] = set()
         semantic: list[dict[str, object]] = []
         allowed: list[dict[str, object]] = []
         last_health: dict[str, object] = {}
-        while time.monotonic() < deadline:
-            legacy_health = _fetch_json(f"{legacy_url}/healthz", _remaining(deadline))
-            shadow_health = _fetch_json(f"{shadow_url}/healthz", _remaining(deadline))
-            legacy_state = _fetch_json(f"{legacy_url}/api/prediction-arbitrage/state", _remaining(deadline))
-            shadow_state = _fetch_json(f"{shadow_url}/api/prediction-arbitrage/state", _remaining(deadline))
-            legacy_history = _fetch_json(f"{legacy_url}/api/prediction-arbitrage/history?kind=signals&limit=100&offset=0", _remaining(deadline))
-            shadow_history = _fetch_json(f"{shadow_url}/api/prediction-arbitrage/history?kind=signals&limit=100&offset=0", _remaining(deadline))
+        while time.monotonic() < validation_deadline:
+            legacy_health = _fetch_json(f"{legacy_url}/healthz", _remaining(validation_deadline))
+            shadow_health = _fetch_json(f"{shadow_url}/healthz", _remaining(validation_deadline))
+            legacy_state = _fetch_json(f"{legacy_url}/api/prediction-arbitrage/state", _remaining(validation_deadline))
+            shadow_state = _fetch_json(f"{shadow_url}/api/prediction-arbitrage/state", _remaining(validation_deadline))
+            legacy_history = _fetch_json(f"{legacy_url}/api/prediction-arbitrage/history?kind=signals&limit=100&offset=0", _remaining(validation_deadline))
+            shadow_history = _fetch_json(f"{shadow_url}/api/prediction-arbitrage/history?kind=signals&limit=100&offset=0", _remaining(validation_deadline))
             differences = _compare_live_states(legacy_state, shadow_state)
             history_differences = _compare_histories(legacy_history, shadow_history)
             differences.extend(history_differences)
@@ -421,20 +474,24 @@ def run_shadow_validation(
                 "differences": differences, "relation_completed_at": completion,
             })
             codex = _codex_evidence(shadow_health)
-            report["codex"] = {"baseline": report["codex"]["baseline"], "current": codex, "delta": codex}  # type: ignore[index]
-            report["token_counts"] = _token_counts(shadow_state)
-            report["guard_attempts"] = list(_mapping(shadow_health).get("guard_attempts") or [])
+            report["codex"] = {"baseline": codex_baseline, "current": codex, "delta": _counter_delta(codex, codex_baseline)}
+            tokens = _token_counts(shadow_state)
+            report["token_counts"] = {"baseline": tokens_baseline, "current": tokens, "delta": _counter_delta(tokens, tokens_baseline)}
+            guard_attempts = _mapping(shadow_health).get("guard_attempts")
+            if not isinstance(guard_attempts, list):
+                raise ValueError("shadow health omitted guard_attempts")
+            report["guard_attempts"] = list(guard_attempts)
             provider = _provider_evidence(shadow_state)
-            report["provider_evidence"] = {"baseline": {"codex": {"calls": 0}, "deepseek": {"calls": 0}}, "current": provider, "delta": provider}
+            report["provider_evidence"] = {"baseline": provider_baseline, "current": provider, "delta": _counter_delta(provider, provider_baseline)}
             report["allowed_differences"], report["semantic_differences"] = allowed, semantic
             status, reason = _validation_status(
                 semantic=semantic, health=shadow_health, activity=completed,
                 codex=_mapping(_mapping(report["codex"]).get("delta")),
-                deepseek_calls=int(_mapping(provider.get("deepseek")).get("calls") or 0), deadline=False,
+                deepseek_calls=int(_mapping(_mapping(report["provider_evidence"]).get("delta")).get("deepseek", {}).get("calls") or 0), deadline=False,
             )
             if status in {"PASS", "FAIL"}:
                 break
-            time.sleep(min(_POLL_SECONDS, _remaining(deadline)))
+            time.sleep(min(_POLL_SECONDS, _remaining(validation_deadline)))
         else:
             status, reason = _validation_status(
                 semantic=semantic, health=last_health, activity=completed,
@@ -444,12 +501,12 @@ def run_shadow_validation(
         if status == "PASS":
             report["restart"] = _restart_shadow(
                 repo_root=repo_root, runtime_root=runtime_root,
-                prediction_config_path=prediction_config_path, deadline=deadline,
+                prediction_config_path=prediction_config_path, deadline=validation_deadline,
             )
-            restart_health = _fetch_json(f"{shadow_url}/healthz", _remaining(deadline))
-            restart_state = _fetch_json(f"{shadow_url}/api/prediction-arbitrage/state", _remaining(deadline))
+            restart_health = _fetch_json(f"{shadow_url}/healthz", _remaining(validation_deadline))
+            restart_state = _fetch_json(f"{shadow_url}/api/prediction-arbitrage/state", _remaining(validation_deadline))
             restart_differences = _compare_live_states(
-                _fetch_json(f"{legacy_url}/api/prediction-arbitrage/state", _remaining(deadline)), restart_state
+                _fetch_json(f"{legacy_url}/api/prediction-arbitrage/state", _remaining(validation_deadline)), restart_state
             )
             report["restart"].update({"health": restart_health, "differences": restart_differences})
             restart_semantic = [item for item in restart_differences if item["classification"] == "semantic_difference"]
@@ -464,6 +521,8 @@ def run_shadow_validation(
     except Exception as exc:
         status, reason = "FAIL", f"validation failed: {exc}"
     finally:
+        for signum in previous_handlers:
+            signal.signal(signum, signal.SIG_IGN)
         try:
             shutdown = _uninstall_and_verify_absent(repo_root=repo_root, deadline=deadline)
         except Exception as exc:

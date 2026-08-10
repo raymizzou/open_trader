@@ -126,6 +126,7 @@ def create_prediction_server(
                         **metadata,
                         "codex": evidence.get("codex", {}),
                         "first_violation": evidence.get("first_violation"),
+                        "guard_attempts": evidence.get("guard_attempts", []),
                     },
                 )
                 return

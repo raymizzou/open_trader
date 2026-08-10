@@ -100,6 +100,7 @@ def test_shadow_health_has_the_read_only_identity() -> None:
         "cross_venue": {"calls": 2, "successes": 1},
     }
     assert payload["first_violation"] is None
+    assert payload["guard_attempts"] == []
     assert isinstance(payload["pid"], int)
     assert isinstance(payload["started_at"], str)
 
@@ -180,6 +181,7 @@ def test_shadow_health_and_reads_fail_closed_after_a_violation() -> None:
 
     assert health_status == state_status == 503
     assert health["first_violation"] == violation
+    assert health["guard_attempts"] == [violation]
     assert state == {"error": "shadow runtime is unavailable"}
 
 
