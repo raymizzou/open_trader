@@ -66,6 +66,8 @@ RELATION_SCAN_LOG_LIMIT = 20
 RELATION_CATALOG_FRESHNESS_SECONDS = 24 * 60 * 60
 RELATION_ACTIVITY_REFRESH_SECONDS = 60
 RELATION_ACTIVITY_MIN_EDGE = Decimal("-0.05")
+RELATION_APR_TARGET_LIMIT = 100
+RELATION_APR_PREWARM_LIMIT = 100
 RELATION_VALIDATION_RETRY_SECONDS = 60 * 60
 
 
@@ -377,6 +379,7 @@ class PolymarketMonitor:
         self._activity_scan_task: asyncio.Task[None] | None = None
         self._activity_catchup_requested = False
         self._active_relation_ids: set[str] = set()
+        self._realtime_relation_ids: set[str] = set()
         self._activity: dict[str, object] = {
             "status": "stale" if relation_discovery is not None else "unavailable",
             "relations_considered": 0,
@@ -390,6 +393,11 @@ class PolymarketMonitor:
             "codex_rejected": 0,
             "subscribed_relations": 0,
             "subscribed_tokens": 0,
+            "apr_target_relations": 0,
+            "apr_target_limit": RELATION_APR_TARGET_LIMIT,
+            "apr_prewarm_relations": 0,
+            "apr_prewarm_limit": RELATION_APR_PREWARM_LIMIT,
+            "relation_subscribed_tokens": 0,
             "positive_candidates": 0,
             "order_ready": 0,
             "notifications_sent": 0,
@@ -1767,6 +1775,7 @@ class PolymarketMonitor:
         with self._lock:
             self._relations = relation_map
             self._active_relation_ids.intersection_update(relation_map)
+            self._realtime_relation_ids.intersection_update(relation_map)
             self._relation_volumes = volumes
             self._relations_at = scanned_at or self._now()
             self._relations_failed = False
@@ -2149,6 +2158,7 @@ class PolymarketMonitor:
             relations_with_books = 0
             relations_with_minimum_depth = 0
             positive_candidates = 0
+            ranked: list[tuple[str, Decimal, Decimal]] = []
             for relation in relations:
                 assessment = assess_threshold_relation_activity(
                     relation,
@@ -2170,9 +2180,47 @@ class PolymarketMonitor:
                     relation_ids.add(relation.relation_id)
                     if assessment.intent.minimum_profit > 0:
                         positive_candidates += 1
+                    if self._codex_statuses.get(relation.relation_id) not in {
+                        "llm_rejected",
+                        "deterministic_rejected",
+                    }:
+                        end_a = _timestamp_or_none(relation.market_a.end_date)
+                        end_b = _timestamp_or_none(relation.market_b.end_date)
+                        if (
+                            end_a is not None
+                            and end_b is not None
+                            and end_a == end_b
+                            and end_a > started
+                        ):
+                            annualized = simple_annualized_yield(
+                                assessment.intent,
+                                now=started,
+                                resolution_at=end_a,
+                            )
+                            if annualized is not None:
+                                ranked.append(
+                                    (
+                                        relation.relation_id,
+                                        annualized,
+                                        assessment.intent.net_edge,
+                                    )
+                                )
+            ranked.sort(key=lambda row: (-row[1], -row[2], row[0]))
+            target_ids = [
+                relation_id
+                for relation_id, annualized, _ in ranked
+                if annualized >= MIN_THRESHOLD_ANNUALIZED_YIELD
+            ]
+            prewarm_ids = [
+                relation_id
+                for relation_id, annualized, _ in ranked
+                if annualized < MIN_THRESHOLD_ANNUALIZED_YIELD
+            ][:RELATION_APR_PREWARM_LIMIT]
+            realtime_relation_ids = set(target_ids) | set(prewarm_ids)
             completed = self._now()
             duration = max(0.0, (completed - started).total_seconds())
             self._active_relation_ids = relation_ids
+            self._realtime_relation_ids = realtime_relation_ids
             for relation_id in relation_ids:
                 self._relation_rule_failures.discard(relation_id)
                 self._relation_rule_failure_fingerprints.pop(relation_id, None)
@@ -2210,8 +2258,13 @@ class PolymarketMonitor:
                     status in {"llm_rejected", "deterministic_rejected"}
                     for status in statuses
                 ),
+                "apr_target_relations": len(target_ids),
+                "apr_target_limit": RELATION_APR_TARGET_LIMIT,
+                "apr_prewarm_relations": len(prewarm_ids),
+                "apr_prewarm_limit": RELATION_APR_PREWARM_LIMIT,
                 "subscribed_relations": len(subscribed_ids),
                 "subscribed_tokens": len(subscribed_tokens),
+                "relation_subscribed_tokens": len(self._relation_by_token),
                 "positive_candidates": positive_candidates,
                 "order_ready": sum(
                     1
