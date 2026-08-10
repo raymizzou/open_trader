@@ -124,3 +124,171 @@ def test_predict_guard_restores_client_after_context_exit() -> None:
     assert client._builder.approval is original
     client._builder.approval()
     assert transport_calls == ["approval"]
+
+
+@pytest.mark.parametrize(
+    ("action", "kind"),
+    (
+        ("set_approval", "mutation"),
+        ("cleanup_allowance", "mutation"),
+        ("post_order", "mutation"),
+        ("transfer_usdt", "mutation"),
+        ("redeem_positions", "mutation"),
+        ("send_notification", "notification"),
+    ),
+)
+def test_polymarket_guard_blocks_nested_sdk_proxy_mutation(
+    action: str, kind: str
+) -> None:
+    calls: list[str] = []
+    nested = SimpleNamespace(
+        _ctx_inner=SimpleNamespace(**{action: lambda: calls.append(action)})
+    )
+    client = SimpleNamespace(_client=nested)
+    guard = PolymarketReadOnlyGuard()
+
+    with guard_polymarket_client(client, guard), pytest.raises(ReadOnlyViolation):
+        getattr(client._client._ctx_inner, action)()
+
+    assert calls == []
+    assert guard.attempts[0]["method"] == action
+    assert guard.attempts[0]["kind"] == kind
+    assert guard.mutation_calls == (0 if kind == "notification" else 1)
+    assert guard.live_notifications == (1 if kind == "notification" else 0)
+
+
+def test_polymarket_guard_blocks_raw_nested_transport_before_delivery() -> None:
+    posted: list[object] = []
+
+    class Transport:
+        def post_json(self, payload: object) -> object:
+            posted.append(payload)
+            return {"posted": True}
+
+    class Context:
+        def __init__(self) -> None:
+            self.transport = Transport()
+
+    class Adapter:
+        def __init__(self) -> None:
+            self._ctx = Context()
+
+        def read_account(self) -> object:
+            return self._ctx.transport.post_json({"probe": "secret"})
+
+    client = SimpleNamespace(_client=Adapter())
+    guard = PolymarketReadOnlyGuard()
+
+    with guard_polymarket_client(client, guard), pytest.raises(ReadOnlyViolation):
+        client._client.read_account()
+
+    assert posted == []
+    assert guard.mutation_calls == 1
+    assert guard.attempts[0]["method"] == "post_json"
+    assert "secret" not in str(guard.attempts[0])
+
+
+def test_polymarket_guard_preserves_nested_network_send() -> None:
+    class Transport:
+        def __init__(self) -> None:
+            self.send_calls = 0
+
+        def send(self) -> object:
+            self.send_calls += 1
+            return {"ok": True}
+
+    transport = Transport()
+    client = SimpleNamespace(_client=SimpleNamespace(transport=transport))
+    guard = PolymarketReadOnlyGuard()
+
+    with guard_polymarket_client(client, guard):
+        assert client._client.transport.send()["ok"] is True
+
+    assert transport.send_calls == 1
+    assert guard.attempts == []
+
+
+def test_polymarket_guard_preserves_nested_send_internal_iterator() -> None:
+    class Transport:
+        def __init__(self) -> None:
+            self.responses = iter(({"ok": True},))
+
+        def send(self) -> object:
+            return next(self.responses)
+
+    transport = Transport()
+    client = SimpleNamespace(_client=SimpleNamespace(transport=transport))
+    guard = PolymarketReadOnlyGuard()
+
+    with guard_polymarket_client(client, guard):
+        assert client._client.transport.send()["ok"] is True
+
+    assert guard.attempts == []
+
+
+def test_polymarket_guard_preserves_nested_local_signing() -> None:
+    class Adapter:
+        def __init__(self) -> None:
+            self.orders = iter(({"order_type": "FOK"},))
+
+        def create_market_order(self, **_: object) -> object:
+            return next(self.orders)
+
+    client = SimpleNamespace(_client=Adapter())
+    guard = PolymarketReadOnlyGuard()
+
+    with guard_polymarket_client(client, guard):
+        assert client._client.create_market_order(side="BUY")["order_type"] == "FOK"
+
+    assert guard.attempts == []
+
+
+def test_polymarket_guard_blocks_notifier_send_but_allows_network_send() -> None:
+    class Notifier:
+        def send(self) -> None:
+            raise AssertionError("notifier target called")
+
+    class Transport:
+        def send(self) -> object:
+            return {"ok": True}
+
+    client = SimpleNamespace(
+        _client=SimpleNamespace(transport=Transport()),
+        notifier=Notifier(),
+    )
+    guard = PolymarketReadOnlyGuard()
+
+    with guard_polymarket_client(client, guard), pytest.raises(ReadOnlyViolation):
+        client.notifier.send()
+    assert guard.live_notifications == 1
+    assert guard.attempts[0]["method"] == "send"
+
+    with guard_polymarket_client(client, guard):
+        assert client._client.transport.send()["ok"] is True
+    assert guard.live_notifications == 1
+
+
+def test_predict_guard_blocks_nested_raw_transaction_before_delivery() -> None:
+    sent: list[bytes] = []
+
+    class Builder:
+        def __init__(self) -> None:
+            self._web3 = SimpleNamespace(
+                eth=SimpleNamespace(
+                    send_raw_transaction=lambda raw: sent.append(raw)
+                )
+            )
+
+        def build_order(self) -> object:
+            return self._web3.eth.send_raw_transaction(b"secret-signed-transaction")
+
+    client = SimpleNamespace(_builder=Builder())
+    guard = PredictReadOnlyGuard()
+
+    with guard_predict_client(client, guard), pytest.raises(ReadOnlyViolation):
+        client._builder.build_order()
+
+    assert sent == []
+    assert guard.mutation_calls == 1
+    assert guard.attempts[0]["method"] == "send_raw_transaction"
+    assert "secret-signed-transaction" not in str(guard.attempts[0])
