@@ -5,6 +5,7 @@ import json
 import multiprocessing
 import os
 import subprocess
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -896,3 +897,157 @@ def test_cross_runtime_stop_failure_is_reported_and_keeps_owner_locked(
             competing_owner.acquire()
     finally:
         runtime._owner.release()
+
+
+def test_shadow_runtime_stops_on_first_guard_violation_from_owner_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    events: list[str] = []
+    network_calls: list[str] = []
+
+    class FakeStore:
+        def __init__(self, _data_dir: Path) -> None:
+            events.append("shadow_store.open")
+
+        def close(self) -> None:
+            events.append("shadow_store.close")
+
+    class FakePolymarketClient:
+        def cancel_all(self) -> None:
+            network_calls.append("cancel_all")
+
+        def close(self) -> None:
+            events.append("polymarket.close")
+
+    class FakePolymarketTradingClient:
+        @classmethod
+        def from_keychain(cls, _config: object) -> FakePolymarketClient:
+            events.append("clients.open")
+            return FakePolymarketClient()
+
+    class FakePredictClient:
+        @classmethod
+        def from_keychain(cls, _config: object) -> None:
+            return None
+
+    class FakeMonitor:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+        def start(self) -> None:
+            events.append("monitor.start")
+
+        def stop(self) -> None:
+            events.append("monitor.stop")
+
+    class FakeExecution:
+        def __init__(self, **kwargs: object) -> None:
+            assert isinstance(kwargs["notifier"], runtime_module.NullNotifier)
+
+        def reconcile_startup(self) -> None:
+            raise AssertionError("shadow must not reconcile")
+
+        def notify_ready_opportunity(self, *_: object) -> None:
+            raise AssertionError("shadow must not notify")
+
+        notify_observation = notify_ready_opportunity
+        notify_monitor_failure = notify_ready_opportunity
+
+        def set_cross_venue_monitor(self, _monitor: object) -> None:
+            pass
+
+        def close(self) -> None:
+            events.append("execution.close")
+
+    class FakeCrossMonitor:
+        async def start(self) -> None:
+            events.append("cross.start")
+
+        async def stop(self) -> None:
+            events.append("cross.stop")
+
+        def snapshot(self) -> dict[str, object]:
+            return {"status": "ready"}
+
+    class Guard:
+        def __init__(self, on_violation: object) -> None:
+            self.on_violation = on_violation
+            self.attempts: list[dict[str, object]] = []
+
+        def violation(self, method: str) -> None:
+            attempt = {"venue": "polymarket", "kind": "mutation", "method": method}
+            self.attempts.append(attempt)
+            self.on_violation(attempt)  # type: ignore[operator]
+            raise RuntimeError("blocked")
+
+    @contextmanager
+    def fake_guard_polymarket(client: FakePolymarketClient, guard: Guard):
+        events.append("guards.enter")
+        original = client.cancel_all
+        client.cancel_all = lambda: guard.violation("cancel_all")
+        try:
+            yield
+        finally:
+            client.cancel_all = original
+            events.append("guards.exit")
+
+    @contextmanager
+    def fake_guard_predict(_client: object, _guard: Guard):
+        yield
+
+    class Owner:
+        def acquire(self) -> None:
+            events.append("shadow_owner.acquire")
+
+        def release(self) -> None:
+            events.append("shadow_owner.release")
+
+    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
+    monkeypatch.setattr(runtime_module, "PolymarketTradingClient", FakePolymarketTradingClient)
+    monkeypatch.setattr(runtime_module, "PredictTradingClient", FakePredictClient)
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
+    monkeypatch.setattr(runtime_module, "CodexRelationValidator", lambda *_a, **_k: object())
+    monkeypatch.setattr(runtime_module, "CodexTitleTranslator", lambda *_a, **_k: object())
+    monkeypatch.setattr(runtime_module, "PolymarketReadOnlyGuard", Guard)
+    monkeypatch.setattr(runtime_module, "PredictReadOnlyGuard", Guard)
+    monkeypatch.setattr(runtime_module, "guard_polymarket_client", fake_guard_polymarket)
+    monkeypatch.setattr(runtime_module, "guard_predict_client", fake_guard_predict)
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path / "shadow",
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        mode="shadow",
+        cross_venue_monitor=FakeCrossMonitor(),
+    )
+    runtime._owner = Owner()  # type: ignore[assignment]
+    runtime.start()
+
+    with pytest.raises(RuntimeError, match="blocked"):
+        runtime._prediction_trading.cancel_all()  # type: ignore[union-attr]
+    assert network_calls == []
+    assert runtime.poll_shadow_failure() == {
+        "venue": "polymarket", "kind": "mutation", "method": "cancel_all"
+    }
+    assert runtime.state == "STOPPED"
+    assert runtime.shadow_evidence["guard_attempts"] == [
+        {"venue": "polymarket", "kind": "mutation", "method": "cancel_all"}
+    ]
+    assert events == [
+        "shadow_owner.acquire", "shadow_store.open", "clients.open", "guards.enter",
+        "monitor.start", "cross.start", "cross.stop", "monitor.stop", "guards.exit",
+        "execution.close", "polymarket.close", "shadow_store.close", "shadow_owner.release",
+    ]
