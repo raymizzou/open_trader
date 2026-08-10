@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-10
 
-**Status:** User-approved design
+**Status:** Grill-approved design
 
 **Scope:** Standard same-market YES/NO watcher inside the Top 20 event universe
 
@@ -94,6 +94,11 @@ This change does not alter:
 The existing set union continues to deduplicate tokens shared by multiple
 layers.
 
+Removing a token from the standard map removes only standard-watch ownership.
+If the relation or cross-venue layer still requests the same token, it remains
+in the final WebSocket subscription. Do not apply standard-market eligibility
+to those independent strategies.
+
 ## Capability Boundary
 
 The current execution policy cannot admit fee-unverified, fee-enabled, or
@@ -114,6 +119,13 @@ promise second-level diagnostic prices for markets the strategy cannot execute.
 
 - Do not let the new eligibility gate clear the prior standard token map when
   fetching or normalizing the replacement universe fails.
+- If the replacement standard pool is empty because fee metadata is unknown,
+  required fields are missing, or market parsing broadly failed, treat the
+  result as anomalous: retain the previous standard token map, mark monitoring
+  degraded, and keep new orders fail-closed until a normal refresh succeeds.
+- If the replacement standard pool is empty because every normalized market is
+  explicitly fee-enabled or `neg_risk is True`, accept the empty pool. This is a
+  valid no-eligible-market result rather than an upstream-data anomaly.
 - A book-confirmation failure does not demote an otherwise metadata-eligible
   market.
 - Unknown fee state remains fail-closed and display-only.
@@ -124,15 +136,21 @@ promise second-level diagnostic prices for markets the strategy cannot execute.
 
 ## Observability
 
-Add only the missing subscription audit count; do not add a Dashboard surface:
+Expose the real subscription topology without adding a Dashboard component:
 
 - the Top 20 snapshot continues to expose the full event and market universe;
 - WebSocket state exposes `standard_subscribed_tokens`, the size of the gated
   standard token map before union with relation and cross-venue tokens;
 - relation activity continues to expose relation-only subscription counts;
-- WebSocket state continues to expose the deduplicated combined subscription.
+- WebSocket `subscribed_tokens` reports the actual deduplicated union of
+  standard, relation, and cross-venue tokens;
+- the existing Dashboard metric is relabeled `市场 / 实时 Token`, uses
+  `standard_subscribed_tokens` for its token value, and changes its helper copy
+  to `不可参与市场定时刷新`.
 
-No Dashboard layout, copy, or interaction change is part of this work.
+No Dashboard layout or interaction change is part of this work. The existing
+metric's label, value source, and helper copy change only to keep its meaning
+truthful after the subscription split.
 
 ## Verification
 
@@ -149,10 +167,15 @@ Automated checks must cover:
 6. an unchanged combined token union does not reconnect the stream;
 7. relation and cross-venue tokens remain in the combined subscription;
 8. a failed universe fetch does not clear the last successful subscription;
-9. monitor-only rows remain present and receive their periodic diagnostic book
-   refresh;
-10. WebSocket state reports the gated standard token count separately from the
-    combined subscription count.
+9. an anomalous empty pool preserves the prior standard subscription and
+   degrades monitoring, while an explicitly ineligible universe accepts an
+   empty standard pool;
+10. monitor-only rows remain present and receive their periodic diagnostic book
+    refresh;
+11. WebSocket state reports the gated standard token count separately from the
+    real three-layer combined subscription count;
+12. the existing Dashboard metric displays the standard real-time token count
+    and describes ineligible markets as periodically refreshed.
 
 Before completion:
 
@@ -162,8 +185,18 @@ Before completion:
 - verify fresh PID, working directory, accepted Git SHA, logs, and HTTP 200;
 - run `make acceptance` only as the final Dashboard gate;
 - redeploy the exact accepted SHA;
-- observe the Hong Kong route after deployment without setting a numerical
-  traffic-reduction acceptance target.
+- compare multiple equal-duration pre-deploy and post-deploy Hong Kong route
+  windows, separating steady WebSocket periods from REST activity-scan periods;
+- use average or median transfer rate rather than one instantaneous value, peak,
+  or cumulative total;
+- report the traffic result as effective only when the post-deploy rate is
+  consistently lower across comparable windows. Overlapping or reversing
+  samples are inconclusive or ineffective, even when token counts fell.
+
+No fixed reduction percentage is an acceptance target. If the subscription
+gate works but route traffic has no directional decline, report that the
+traffic optimization was not shown effective and diagnose the remaining source
+instead of declaring success from token counts alone.
 
 ## Non-Goals
 
@@ -175,4 +208,8 @@ Before completion:
   standard markets.
 - Changing relation discovery, APR selection, or cross-venue monitoring.
 - Adding configuration, a Dashboard control, or a new persistence model.
+- Adding a runtime compatibility toggle; rollback uses the previous accepted
+  Git SHA and a service restart.
+- Changing the existing five-minute paired-book reads for display-only markets.
+- Setting a fixed numerical traffic-reduction target.
 - Guaranteeing discovery outside the existing Top 20 universe.
