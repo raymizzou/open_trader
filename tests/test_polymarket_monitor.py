@@ -3525,6 +3525,24 @@ def test_ambiguous_empty_standard_pool_preserves_prior_subscription(tmp_path: Pa
     assert "universe_refresh_failed" in snapshot["health"]["degraded_reasons"]
 
 
+def test_malformed_only_replacement_preserves_prior_subscription(tmp_path: Path) -> None:
+    setup_public([event("e", markets=(market("m", yes="yes-old", no="no-old"),))])
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+    previous_tokens = dict(monitor._market_by_token)
+    malformed = ns(
+        id="malformed",
+        state=ns(active=True, closed=False, ended=False),
+        outcomes=[ns(label="YES", token_id="yes")],
+    )
+    setup_public([event("e", markets=(malformed,))])
+    monitor.refresh_once()
+    snapshot = monitor.snapshot()
+    assert monitor._market_by_token == previous_tokens
+    assert snapshot["health"]["status"] == "degraded"
+    assert "universe_refresh_failed" in snapshot["health"]["degraded_reasons"]
+
+
 def test_explicitly_ineligible_universe_accepts_empty_standard_pool(tmp_path: Path) -> None:
     setup_public([event("e", markets=(
         market("fee", fees_enabled=True),
@@ -3843,7 +3861,7 @@ def test_signal_episode_peaks_close_and_restart(tmp_path: Path) -> None:
     monitor.refresh_once()
     assert len(monitor._store.signal_history("all")) == 1
 
-    setup_public([event("e", markets=())])
+    setup_public([event("e", markets=(market("m", yes="yes-m", no="no-m", fees_enabled=True),))])
     monitor.refresh_once()
     history = monitor._store.signal_history("all")
     assert len(history) == 1
@@ -3875,7 +3893,7 @@ def test_healthy_quiet_is_distinct_from_degraded_and_runtime_is_throttled(tmp_pa
     monitor.refresh_once()
     assert monitor.snapshot()["health"]["status"] == "healthy"
 
-    setup_public([event("e", markets=())])
+    setup_public([event("e", markets=(market("m", volume="100", fees_enabled=True),))])
     monitor.refresh_once()
     assert monitor.snapshot()["health"]["status"] == "healthy"
     assert monitor.snapshot()["health"]["opportunity_count"] == 0

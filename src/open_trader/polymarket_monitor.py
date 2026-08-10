@@ -1284,7 +1284,7 @@ class PolymarketMonitor:
             row.get("fees_enabled") is True or row.get("neg_risk") is True
             for row in markets.values()
         )
-        if prior_standard_pool and markets and not token_map and not explicitly_ineligible:
+        if prior_standard_pool and not token_map and not explicitly_ineligible:
             raise RuntimeError("ambiguous empty standard websocket pool")
         with self._lock:
             previous_opportunity_rows = copy.deepcopy(self._opportunities)
