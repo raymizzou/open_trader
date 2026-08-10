@@ -342,6 +342,7 @@ class PolymarketMonitor:
         self._thread: threading.Thread | None = None
         self._client: object | None = None
         self._stream_handle: object | None = None
+        self._stream_token_ids: set[str] = set()
         self._events: dict[str, dict[str, object]] = {}
         self._markets: dict[str, dict[str, object]] = {}
         self._market_by_token: dict[str, str] = {}
@@ -686,14 +687,13 @@ class PolymarketMonitor:
 
     def _websocket_snapshot(self, now: datetime) -> dict[str, object]:
         connected = self._stream_handle is not None and self._stream_disconnected_at is None
-        standard_tokens = set(self._market_by_token)
-        combined_tokens = (
-            standard_tokens | set(self._relation_by_token) | self._cross_venue_tokens
-        )
+        installed_tokens = self._stream_token_ids
         return {
             "status": "connected" if connected else "disconnected",
-            "standard_subscribed_tokens": len(standard_tokens),
-            "subscribed_tokens": len(combined_tokens),
+            "standard_subscribed_tokens": len(
+                installed_tokens & set(self._market_by_token)
+            ),
+            "subscribed_tokens": len(installed_tokens),
             "last_message_at": self._stream_message_at,
             "last_message_age_seconds": _display_age(
                 _age(now, self._stream_message_at)
@@ -1115,6 +1115,7 @@ class PolymarketMonitor:
     async def _close_stream(self) -> None:
         handle = self._stream_handle
         self._stream_handle = None
+        self._stream_token_ids = set()
         if handle is None:
             return
         close = getattr(handle, "close", None)
@@ -1126,6 +1127,7 @@ class PolymarketMonitor:
 
     def _disconnect_stream(self, exc: BaseException) -> None:
         self._stream_disconnected_at = self._now()
+        self._stream_token_ids = set()
         self._diagnostics["last_error"] = f"stream:{type(exc).__name__}"
         # The handle is closed by the next event-loop pass.  We deliberately do
         # not retain stream messages in the store.
@@ -1203,6 +1205,7 @@ class PolymarketMonitor:
             )
             if not subscription_changed:
                 self._stream_handle = handle
+                self._stream_token_ids = set(token_ids)
                 self._subscription_dirty = False
                 if refresh_cross_venue:
                     self._cross_venue_refresh_required = False
@@ -1284,7 +1287,7 @@ class PolymarketMonitor:
             row.get("fees_enabled") is True or row.get("neg_risk") is True
             for row in markets.values()
         )
-        if prior_standard_pool and markets and not token_map and not explicitly_ineligible:
+        if prior_standard_pool and not token_map and not explicitly_ineligible:
             raise RuntimeError("ambiguous empty standard websocket pool")
         with self._lock:
             previous_opportunity_rows = copy.deepcopy(self._opportunities)
