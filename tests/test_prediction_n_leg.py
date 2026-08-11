@@ -582,6 +582,15 @@ def test_blank_action_identity_is_path_addressed(field: str) -> None:
     assert any(issue.code == "INVALID_IDENTIFIER" and issue.path == f"actions[0].{field}" for issue in validate_problem(malformed))
 
 
+@pytest.mark.parametrize("field", ("action_id", "market_contract_id"))
+@pytest.mark.parametrize("value", ("", None))
+def test_blank_or_non_string_action_node_id_is_path_addressed(field: str, value: object) -> None:
+    problem = sample_problem()
+    malformed = replace(problem, actions=(replace(problem.actions[0], **{field: value}),))
+
+    assert any(issue.code == "INVALID_IDENTIFIER" and issue.path == f"actions[0].{field}" for issue in validate_problem(malformed))
+
+
 def test_blank_terminal_state_rule_version_is_path_addressed() -> None:
     problem = sample_problem()
     malformed = replace(problem, terminal_state_sets=(replace(problem.terminal_state_sets[0], rule_version=""),))
