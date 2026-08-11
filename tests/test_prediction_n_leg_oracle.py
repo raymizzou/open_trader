@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from fractions import Fraction
+import hashlib
+import json
+from pathlib import Path
 
 import pytest
 
@@ -35,7 +38,10 @@ from open_trader.prediction_n_leg import (
     TerminalKind,
     TerminalStateSet,
     UnknownReason,
+    canonical_payload,
     fingerprint,
+    request_from_payload,
+    result_from_payload,
 )
 import open_trader.prediction_n_leg_oracle as oracle
 from open_trader.prediction_n_leg_oracle import (
@@ -53,6 +59,58 @@ from open_trader.prediction_n_leg_oracle import (
 
 
 AS_OF = datetime(2026, 8, 12, tzinfo=UTC)
+
+
+ORACLE_CORPUS_PATH = Path(__file__).with_name("fixtures") / "prediction_n_leg_v1.json"
+ORACLE_CORPUS_SHA256 = "05d252e0c9f16b77430a09c8e692058b99c434151e3fcbd5a66245abae9e55bc"
+
+
+def _run_corpus_case(request: OracleRequest):
+    if request.mode == SearchMode.ADMISSION:
+        return oracle.find_qualified(request)
+    if request.mode == SearchMode.OPTIMIZATION:
+        return oracle.solve_optimal(request)
+    if request.mode == SearchMode.RAW_ARBITRAGE_DIAGNOSTIC:
+        return oracle.diagnose_raw_arbitrage(request.problem, request.budget)
+    raise AssertionError(f"unsupported corpus mode: {request.mode}")
+
+
+def _assert_corpus_replay(replay: dict[str, object]) -> None:
+    expected_request = request_from_payload(replay["request"])  # type: ignore[arg-type]
+    expected_result = result_from_payload(replay["expected_result"])  # type: ignore[arg-type]
+    assert fingerprint(expected_request) == replay["expected_request_fingerprint"]
+    assert fingerprint(expected_result) == replay["expected_result_fingerprint"]
+
+    first = _run_corpus_case(request_from_payload(replay["request"]))  # type: ignore[arg-type]
+    second = _run_corpus_case(request_from_payload(replay["request"]))  # type: ignore[arg-type]
+    assert canonical_payload(first) == replay["expected_result"]
+    assert canonical_payload(second) == replay["expected_result"]
+    assert fingerprint(first) == replay["expected_result_fingerprint"]
+    assert fingerprint(second) == replay["expected_result_fingerprint"]
+    assert first == expected_result == second
+
+
+def test_frozen_oracle_corpus_replays_literal_results_deterministically() -> None:
+    corpus_bytes = ORACLE_CORPUS_PATH.read_bytes()
+    corpus = json.loads(corpus_bytes)
+
+    assert hashlib.sha256(corpus_bytes).hexdigest() == ORACLE_CORPUS_SHA256
+    for case in corpus["cases"]:
+        for replay in (case, *case.get("additional_replays", ())):
+            _assert_corpus_replay(replay)
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    ("qualified-not-optimal", "no-qualified-positive-raw", "no-arbitrage"),
+    ids=("qualified_not_optimal", "no_qualified_positive_raw", "no_arbitrage"),
+)
+def test_oracle_corpus_direct_replay_cases(case_id: str) -> None:
+    corpus = json.loads(ORACLE_CORPUS_PATH.read_text(encoding="utf-8"))
+    case = next(item for item in corpus["cases"] if item["case_id"] == case_id)
+
+    for replay in (case, *case.get("additional_replays", ())):
+        _assert_corpus_replay(replay)
 
 
 def observation(suffix: str = "a") -> SettlementObservationKey:
@@ -1171,3 +1229,27 @@ def test_raw_arbitrage_returns_unknown_when_its_derived_optimization_cannot_clos
 
     assert result.business_status == BusinessStatus.UNKNOWN
     assert result.unknown_reason == UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED
+
+
+def test_oracle_classifies_incomplete_terminal_data_and_cross_asset_valuation_as_unknown() -> None:
+    key = observation()
+    complete = problem(
+        (action("contract-a", "action-a", key),),
+        (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 1),)),),
+    )
+    terminal_data_missing = replace(
+        complete,
+        terminal_state_sets=(
+            replace(
+                complete.terminal_state_sets[0],
+                atoms=(replace(complete.terminal_state_sets[0].atoms[0], payouts=()),),
+            ),
+        ),
+    )
+    cross_asset = replace(
+        complete,
+        actions=(replace(complete.actions[0], settlement_asset_id="eur", asset_valuation_rule_id="eur-usd-v1"),),
+    )
+
+    assert oracle.find_qualified(_admission_request(terminal_data_missing, OracleBudget(1, 1, 1))).unknown_reason == UnknownReason.UNKNOWN_TERMINAL_DATA
+    assert oracle.find_qualified(_admission_request(cross_asset, OracleBudget(1, 1, 1))).unknown_reason == UnknownReason.UNKNOWN_VALUATION

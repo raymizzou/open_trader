@@ -5,6 +5,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-12
 
+- #48 冻结 solver-independent、版本化的 N_LEG 模型与有界精确 Oracle 语料：Admission、
+  Optimization 与显式 Raw diagnostic 分离，确定性 support proof 和穷尽负证明均有可回放
+  的请求/结果指纹；补齐缺失终局 payout 与跨资产估值为 fail-closed `UNKNOWN`，并锁定
+  `NO_ARBITRAGE` 的闭合 bounds/source-proof wire invariant。已验证 N_LEG 聚焦套件
+  129 passed、Admission/Optimization/两类 diagnostic 直接回放 5 passed、Prediction
+  arithmetic 加 N_LEG 回归 180 passed。正常环境的 `python -m pytest -q` 为 BLOCKED：
+  `/opt/homebrew/opt/python@3.12/bin/python3.12: No module named pytest`；未改 Prediction
+  runtime、Dashboard、solver dependency 或 order path。
+
 - 完成通用 N_LEG Prediction 套利设计与开发 Ticket 契约收敛：热路径接受任一已验证合格
   连通组合而不等待全局最优，组件级负证明仅接受预算内完整 Oracle 或可独立检查证书；
   Entry/Repair 部分成交风险、OBSERVE_ONLY、Episode 重武装、scope Canary 与一次切换边界

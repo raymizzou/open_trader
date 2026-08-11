@@ -80,6 +80,17 @@ def _require_valid(problem: ArbitrageProblem) -> None:
         raise ValueError("invalid problem: " + "; ".join(issue.code for issue in issues))
 
 
+def _input_unknown_reason(problem: ArbitrageProblem) -> UnknownReason | None:
+    issues = validate_problem(problem)
+    if any(issue.code == "MISSING_ACTION_PAYOUT" for issue in issues):
+        return UnknownReason.UNKNOWN_TERMINAL_DATA
+    if any(issue.code == "MISSING_ASSET_VALUATION_RULE" for issue in issues) or any(
+        action.settlement_asset_id != problem.valuation_unit_id for action in problem.actions
+    ):
+        return UnknownReason.UNKNOWN_VALUATION
+    return UnknownReason.INVALID_MODEL if issues else None
+
+
 def build_relation_components(problem: ArbitrageProblem) -> tuple[RelationComponent, ...]:
     _require_valid(problem)
     contract_ids = tuple(sorted(state.market_contract_id for state in problem.terminal_state_sets))
@@ -638,9 +649,10 @@ def _search_request_unknown_reason(request: OracleRequest, mode: SearchMode) -> 
                 request.budget.max_support_rechecks,
             )
         )
-        or validate_problem(request.problem)
     ):
         return UnknownReason.INVALID_MODEL
+    if reason := _input_unknown_reason(request.problem):
+        return reason
     total_vectors = quantity_vector_count(request.problem)
     if total_vectors > request.budget.max_quantity_vectors:
         return UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED
@@ -783,9 +795,10 @@ def find_qualified(request: OracleRequest) -> OracleResult:
                 request.budget.max_support_rechecks,
             )
         )
-        or validate_problem(request.problem)
     ):
         return _unknown_result(UnknownReason.INVALID_MODEL)
+    if reason := _input_unknown_reason(request.problem):
+        return _unknown_result(reason)
 
     total_vectors = quantity_vector_count(request.problem)
     joint_states_per_vector = 1

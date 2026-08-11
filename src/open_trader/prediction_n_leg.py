@@ -765,7 +765,7 @@ def _sorted_problem(problem: ArbitrageProblem) -> ArbitrageProblem:
     return replace(problem, actions=actions, terminal_state_sets=state_sets, constraint_model=ConstraintModel(relations, forbidden), qualification_constraints=tuple(sorted(problem.qualification_constraints, key=lambda item: item.constraint_id)))
 
 
-def problem_from_payload(payload: Mapping[str, object]) -> ArbitrageProblem:
+def problem_from_payload(payload: Mapping[str, object], *, allow_unknown_data: bool = False) -> ArbitrageProblem:
     value = _object(payload, "problem", {"schema_version", "problem_id", "as_of", "valuation_unit_id", "actions", "terminal_state_sets", "constraint_model", "qualification_constraints"})
     constraint_model = _object(value["constraint_model"], "constraint_model", {"relations", "forbidden_atom_combinations"})
     problem = ArbitrageProblem(
@@ -776,7 +776,10 @@ def problem_from_payload(payload: Mapping[str, object]) -> ArbitrageProblem:
         tuple(_qualification_from_payload(item) for item in _array(value["qualification_constraints"], "qualification_constraints")),
     )
     issues = validate_problem(problem)
-    if issues:
+    if issues and not (
+        allow_unknown_data
+        and all(issue.code in {"MISSING_ACTION_PAYOUT", "MISSING_ASSET_VALUATION_RULE"} for issue in issues)
+    ):
         raise ModelDecodeError("invalid problem: " + "; ".join(f"{issue.path}: {issue.code}" for issue in issues))
     return _sorted_problem(problem)
 
@@ -791,7 +794,7 @@ def _budget_from_payload(payload: object) -> OracleBudget:
 
 def request_from_payload(payload: Mapping[str, object]) -> OracleRequest:
     value = _object(payload, "request", {"schema_version", "mode", "problem", "budget"})
-    return OracleRequest(_string(value["schema_version"], "schema_version"), _enum(SearchMode, value["mode"], "mode"), problem_from_payload(_object(value["problem"], "problem", {"schema_version", "problem_id", "as_of", "valuation_unit_id", "actions", "terminal_state_sets", "constraint_model", "qualification_constraints"})), _budget_from_payload(value["budget"]))
+    return OracleRequest(_string(value["schema_version"], "schema_version"), _enum(SearchMode, value["mode"], "mode"), problem_from_payload(_object(value["problem"], "problem", {"schema_version", "problem_id", "as_of", "valuation_unit_id", "actions", "terminal_state_sets", "constraint_model", "qualification_constraints"}), allow_unknown_data=True), _budget_from_payload(value["budget"]))
 
 
 def _quantity_from_payload(payload: object) -> ActionQuantity:
@@ -884,6 +887,11 @@ def _validate_result(result: OracleResult) -> None:
     if negative:
         if result.solve_status != SolveStatus.INFEASIBLE or result.proof_status != ProofStatus.PROVEN or result.optimality_status != OptimalityStatus.NOT_APPLICABLE or result.solution is not None or result.negative_proof is None or result.negative_proof.conclusion != result.business_status or result.negative_proof.quantity_vectors_total != result.negative_proof.quantity_vectors_examined or result.unknown_reason is not None:
             raise ModelDecodeError("negative conclusions require a matching exhaustive proof")
+    if result.business_status == BusinessStatus.NO_ARBITRAGE:
+        bounds = result.objective_bounds
+        proof = result.negative_proof
+        if not bounds.closed or bounds.lower_bound_units != bounds.upper_bound_units or bounds.gap_units != 0 or proof is None or proof.source_problem_fingerprint is None:
+            raise ModelDecodeError("NO_ARBITRAGE requires closed diagnostic bounds and a source proof")
     if result.solve_status == SolveStatus.UNKNOWN:
         if result.business_status != BusinessStatus.UNKNOWN or result.proof_status != ProofStatus.UNKNOWN or result.optimality_status != OptimalityStatus.NOT_APPLICABLE or result.solution is not None or result.negative_proof is not None or result.unknown_reason is None:
             raise ModelDecodeError("UNKNOWN requires only a matching unknown reason")

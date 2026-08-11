@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -54,6 +55,33 @@ from open_trader.prediction_n_leg import (
 
 
 AS_OF = datetime(2026, 8, 11, tzinfo=UTC)
+
+ORACLE_CORPUS_PATH = Path(__file__).with_name("fixtures") / "prediction_n_leg_v1.json"
+REQUIRED_ORACLE_CORPUS_CASE_IDS = {
+    "native-complement-n2",
+    "implication-two-contract",
+    "exactly-one-n3",
+    "quantity-selection-n4",
+    "void-refund-split",
+    "explicit-exception-link",
+    "disconnected-double-arbitrage",
+    "rounded-false-edge",
+    "qualified-not-optimal",
+    "no-qualified-positive-raw",
+    "no-arbitrage",
+    "unknown-state-budget",
+    "unknown-decision-budget",
+    "unknown-missing-atom-data",
+    "unknown-cross-asset",
+    "unknown-contradictory-model",
+}
+
+
+def test_oracle_corpus_declares_the_complete_v1_case_set() -> None:
+    corpus = json.loads(ORACLE_CORPUS_PATH.read_text(encoding="utf-8"))
+
+    assert corpus["schema_version"] == "open_trader.prediction_n_leg.oracle_corpus.v1"
+    assert {case["case_id"] for case in corpus["cases"]} == REQUIRED_ORACLE_CORPUS_CASE_IDS
 
 
 def sample_problem() -> ArbitrageProblem:
@@ -383,6 +411,16 @@ def test_request_from_payload_rejects_non_integer_budget() -> None:
         request_from_payload(payload)
 
 
+def test_request_from_payload_preserves_structurally_complete_unknown_terminal_data() -> None:
+    request = OracleRequest("open_trader.prediction_n_leg.request.v1", SearchMode.ADMISSION, sample_problem(), OracleBudget(1, 1, 1))
+    payload = canonical_payload(request)
+    payload["problem"]["terminal_state_sets"][0]["atoms"][0]["payouts"] = []
+
+    decoded = request_from_payload(payload)
+
+    assert validate_problem(decoded.problem)[0].code == "MISSING_ACTION_PAYOUT"
+
+
 def test_validate_problem_rejects_direct_non_buy_action_side() -> None:
     problem = sample_problem()
     malformed = replace(problem, actions=(replace(problem.actions[0], side="SELL"),))
@@ -426,6 +464,34 @@ def negative_result_payload() -> dict[str, object]:
 def test_result_from_payload_rejects_negative_quantity_lots() -> None:
     payload = canonical_payload(valid_result())
     payload["solution"]["quantities"][0]["quantity_lots"] = -1
+
+    with pytest.raises(ModelDecodeError):
+        result_from_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload["objective_bounds"].update(closed=False),
+        lambda payload: payload["objective_bounds"].update(upper_bound_units=1),
+        lambda payload: payload["objective_bounds"].update(gap_units=1),
+        lambda payload: payload["negative_proof"].update(source_problem_fingerprint=None),
+    ],
+)
+def test_result_from_payload_rejects_malformed_no_arbitrage_diagnostics(mutate: object) -> None:
+    payload = negative_result_payload()
+    payload.update(business_status="NO_ARBITRAGE")
+    payload["objective_bounds"] = {
+        "lower_bound_units": 0,
+        "upper_bound_units": 0,
+        "gap_units": 0,
+        "closed": True,
+    }
+    payload["negative_proof"].update(
+        conclusion="NO_ARBITRAGE",
+        source_problem_fingerprint="sha256:source-problem",
+    )
+    mutate(payload)  # type: ignore[operator]
 
     with pytest.raises(ModelDecodeError):
         result_from_payload(payload)
