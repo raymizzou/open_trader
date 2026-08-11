@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-11
 
+- Prediction Service release (#44): clean local Git checkouts can now be installed,
+  upgraded, stopped, or compatibly rolled back as the single managed 8769 owner.
+  Production startup checks the persisted minimum reader generation under the
+  owner lock before writable Store/client/thread construction, and launchd
+  transitions retain exact ready/failed/stopped evidence for the later #45 cutover.
+
 - #34 为独立 Prediction Service 增加固定 8 请求的全局 HTTP 准入边界，并对相同
   history 查询做 1 秒进程内 single-flight；过载在创建 handler 线程前返回带
   `Retry-After: 1` 的明确 503，state/health/写操作不缓存，既有鉴权、历史排序和
