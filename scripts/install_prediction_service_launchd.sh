@@ -228,6 +228,23 @@ if [[ "$MODE" == "production" ]]; then
   fi
   [[ -z "$SOURCE_STATUS" ]] || fail "release root is dirty: $REPO_ROOT"
   [[ -z "$EXPECTED_SHA" || "$EXPECTED_SHA" == "$ACTUAL_SHA" ]] || fail "requested SHA does not match checkout"
+  MANIFEST_RELATIVE=""
+  if ! MANIFEST_RELATIVE="$("$PYTHON_BIN" - "$REPO_ROOT" "$RELEASE_MANIFEST" <<'PY'
+from pathlib import Path
+import sys
+root, manifest = map(Path, sys.argv[1:])
+try:
+    print(manifest.relative_to(root).as_posix())
+except ValueError:
+    raise SystemExit(1)
+PY
+)"; then
+    fail "release manifest must be tracked by checkout"
+  fi
+  git -C "$REPO_ROOT" ls-files --error-unmatch -- "$MANIFEST_RELATIVE" >/dev/null 2>&1 \
+    || fail "release manifest must be tracked by checkout"
+  git -C "$REPO_ROOT" cat-file -e "$ACTUAL_SHA:$MANIFEST_RELATIVE" 2>/dev/null \
+    || fail "release manifest must be tracked by checkout"
   MANIFEST_JSON="$(PYTHONPATH="$REPO_ROOT/src" "$PYTHON_BIN" - "$RELEASE_MANIFEST" <<'PY'
 import json, sys
 from pathlib import Path
@@ -468,6 +485,12 @@ record_failed_and_exit() {
   exit 1
 }
 
+setup_failed_and_exit() {
+  local reason="$1"
+  remove_managed_plist || reason="candidate_cleanup_not_proven"
+  record_failed_and_exit "$reason"
+}
+
 write_record maintenance "" "$PREVIOUS_READY_JSON"
 
 if [[ "$MANAGED_OLD" -eq 1 ]]; then
@@ -487,13 +510,13 @@ remove_managed_plist \
   || record_failed_and_exit "candidate_cleanup_not_proven"
 
 mkdir -p "$LAUNCH_AGENTS_DIR" "$LOG_DIR" "$DATA_DIR" \
-  || record_failed_and_exit "candidate_exited"
+  || setup_failed_and_exit "candidate_exited"
 printf '%s\n' "$rendered" > "$PLIST_PATH" \
-  || record_failed_and_exit "candidate_exited"
+  || setup_failed_and_exit "candidate_exited"
 : > "$OUT_LOG" \
-  || record_failed_and_exit "candidate_exited"
+  || setup_failed_and_exit "candidate_exited"
 : > "$ERR_LOG" \
-  || record_failed_and_exit "candidate_exited"
+  || setup_failed_and_exit "candidate_exited"
 
 FAILURE_REASON="candidate_timeout"
 CANDIDATE_PID=""
@@ -501,7 +524,7 @@ READY_JSON=""
 
 ready_evidence() {
   "$PYTHON_BIN" - "$1" "$2" "$3" "$4" "$ACTUAL_SHA" "$MANIFEST_JSON" \
-    "$OUT_LOG" "$ERR_LOG" <<'PY'
+    "$5" "$6" <<'PY'
 import json, sys
 pid, cwd, listener, health_raw, expected_sha, manifest_raw, stdout, stderr = sys.argv[1:]
 try:
@@ -526,6 +549,8 @@ try:
         and listener == "127.0.0.1:8769"
         and isinstance(health.get("started_at"), str)
         and bool(health["started_at"])
+        and bool(stdout)
+        and bool(stderr)
     )
     if valid:
         print(json.dumps({
@@ -554,13 +579,16 @@ PY
 
 bootstrap_and_wait_for_exact_ready() {
   local attempt output status cwd listener health source_status
+  local observed_stdout observed_stderr
   if ! "$LAUNCHCTL_BIN" bootstrap "gui/$UID" "$PLIST_PATH"; then
     FAILURE_REASON="candidate_exited"
     return 1
   fi
   for ((attempt = 1; attempt <= WAIT_SECONDS; attempt++)); do
     if output="$("$LAUNCHCTL_BIN" print "gui/$UID/$LABEL" 2>&1)"; then
-      CANDIDATE_PID="$(printf '%s\n' "$output" | awk '$1 == "pid" && $2 == "=" && $3 ~ /^[0-9]+$/ { print $3; exit }')"
+      CANDIDATE_PID="$(printf '%s\n' "$output" | awk '$1 == "pid" && $2 == "=" && $3 ~ /^[1-9][0-9]*$/ { print $3; exit }')"
+      observed_stdout="$(printf '%s\n' "$output" | awk '$1 == "stdout" && $2 == "path" && $3 == "=" { sub(/^[^=]*= /, ""); print; exit }')"
+      observed_stderr="$(printf '%s\n' "$output" | awk '$1 == "stderr" && $2 == "path" && $3 == "=" { sub(/^[^=]*= /, ""); print; exit }')"
     else
       status=$?
       if [[ "$status" -ne 0 && "$output" == *"Could not find service"* ]]; then
@@ -581,7 +609,8 @@ bootstrap_and_wait_for_exact_ready() {
           FAILURE_REASON="wrong_health_identity"
           return 1
         fi
-        if READY_JSON="$(ready_evidence "$CANDIDATE_PID" "$cwd" "$listener" "$health")"; then
+        if READY_JSON="$(ready_evidence "$CANDIDATE_PID" "$cwd" "$listener" "$health" \
+          "$observed_stdout" "$observed_stderr")"; then
           if ! source_status="$(git -C "$REPO_ROOT" status --porcelain)"; then
             FAILURE_REASON="candidate_source_became_dirty"
             return 1
@@ -603,35 +632,43 @@ bootstrap_and_wait_for_exact_ready() {
 }
 
 cleanup_verified_candidate() {
-  local output status pid cwd listener_output listener_status listener_pid listener_addr listener_count
+  local output status pid cwd label_path label_cwd
+  local listener_output listener_status listener_pid listener_addr listener_count
   if output="$("$LAUNCHCTL_BIN" print "gui/$UID/$LABEL" 2>&1)"; then
-    pid="$(printf '%s\n' "$output" | awk '$1 == "pid" && $2 == "=" && $3 ~ /^[0-9]+$/ { print $3; exit }')"
-    [[ -n "$CANDIDATE_PID" && "$pid" == "$CANDIDATE_PID" ]] || return 1
-    cwd="$("$LSOF_BIN" -a -p "$pid" -d cwd -Fn 2>/dev/null \
-      | awk '$1 ~ /^n/ { print substr($1, 2); exit }' || true)"
-    [[ "$cwd" == "$REPO_ROOT" ]] || return 1
-    if listener_output="$("$LSOF_BIN" -nP -iTCP:8769 -sTCP:LISTEN -Fn 2>&1)"; then
-      listener_status=0
-    else
-      listener_status=$?
-      [[ "$listener_status" -eq 1 ]] || return 1
+    label_path="$(printf '%s\n' "$output" | awk '$1 == "path" && $2 == "=" { sub(/^[^=]*= /, ""); print; exit }')"
+    label_cwd="$(printf '%s\n' "$output" | awk '$1 == "working" && $2 == "directory" && $3 == "=" { sub(/^[^=]*= /, ""); print; exit }')"
+    [[ "$label_path" == "$PLIST_PATH" && "$label_cwd" == "$REPO_ROOT" ]] || return 1
+    pid="$(printf '%s\n' "$output" | awk '$1 == "pid" && $2 == "=" && $3 ~ /^[1-9][0-9]*$/ { print $3; exit }')"
+    if [[ -n "$pid" ]]; then
+      [[ -z "$CANDIDATE_PID" || "$pid" == "$CANDIDATE_PID" ]] || return 1
+      cwd="$("$LSOF_BIN" -a -p "$pid" -d cwd -Fn 2>/dev/null \
+        | awk '$1 ~ /^n/ { print substr($1, 2); exit }' || true)"
+      [[ "$cwd" == "$REPO_ROOT" ]] || return 1
+      if listener_output="$("$LSOF_BIN" -nP -iTCP:8769 -sTCP:LISTEN -Fn 2>&1)"; then
+        listener_status=0
+      else
+        listener_status=$?
+        [[ "$listener_status" -eq 1 ]] || return 1
+      fi
+      if [[ "$listener_status" -eq 0 ]]; then
+        listener_pid="$(printf '%s\n' "$listener_output" | awk '
+          /^p[0-9]+$/ { current = substr($1, 2) }
+          /^n/ { print current; exit }
+        ')"
+        listener_addr="$(printf '%s\n' "$listener_output" | awk '/^n/ { print substr($1, 2); exit }')"
+        listener_count="$(printf '%s\n' "$listener_output" | awk '/^n/ { count += 1 } END { print count + 0 }')"
+        [[ "$listener_count" -eq 1 && "$listener_pid" == "$pid" \
+          && "$listener_addr" == "127.0.0.1:8769" ]] || return 1
+      fi
     fi
-    if [[ "$listener_status" -eq 0 ]]; then
-      listener_pid="$(printf '%s\n' "$listener_output" | awk '
-        /^p[0-9]+$/ { current = substr($1, 2) }
-        /^n/ { print current; exit }
-      ')"
-      listener_addr="$(printf '%s\n' "$listener_output" | awk '/^n/ { print substr($1, 2); exit }')"
-      listener_count="$(printf '%s\n' "$listener_output" | awk '/^n/ { count += 1 } END { print count + 0 }')"
-      [[ "$listener_count" -eq 1 && "$listener_pid" == "$pid" \
-        && "$listener_addr" == "127.0.0.1:8769" ]] || return 1
-    fi
+    bootout_if_loaded || return 1
+    wait_agent_absent
+    return
   else
     status=$?
     [[ "$status" -ne 0 && "$output" == *"Could not find service"* ]] || return 1
   fi
-  bootout_if_loaded || return 1
-  wait_agent_absent
+  return 0
 }
 
 candidate_absent() {

@@ -60,16 +60,29 @@ if command == "launchctl":
     action = sys.argv[1]
     if action == "print":
         if state["loaded"]:
+            print(f"path = {state['plist']}")
+            print(f"working directory = {state['cwd']}")
+            print(f"stdout path = {state['stdout_log']}")
+            print(f"stderr path = {state['stderr_log']}")
             print(f"pid = {state['pid']}")
             raise SystemExit(0)
         print("Could not find service", file=sys.stderr)
         raise SystemExit(113)
     if action == "bootout":
-        state.update(loaded=False, pid=0, cwd="", listener=False, owner_available=True, health={})
+        state.update(loaded=False, pid=0, cwd="", listener=False,
+                     owner_available=True, health={}, plist="",
+                     stdout_log="", stderr_log="")
         save()
         raise SystemExit(0)
     if action == "bootstrap":
-        if state["case"] in {"bind_failure", "reconcile_failure", "incompatible_reader"}:
+        if state["case"] == "keepalive_exited":
+            state.update(loaded=True, pid=0,
+                         cwd=os.environ["FAKE_CANDIDATE_CWD"],
+                         listener=False, owner_available=True, health={},
+                         plist=sys.argv[-1],
+                         stdout_log=state["stdout_log"] or os.environ["FAKE_STDOUT_LOG"],
+                         stderr_log=state["stderr_log"] or os.environ["FAKE_STDERR_LOG"])
+        elif state["case"] in {"bind_failure", "reconcile_failure", "incompatible_reader"}:
             state.update(loaded=False, pid=0, listener=False, owner_available=True)
         else:
             pid = 4242
@@ -91,6 +104,9 @@ if command == "launchctl":
                 health["reader_generation"] += 1
             state.update(loaded=True, pid=pid, cwd=health["cwd"], listener=True,
                          owner_available=False, health=health,
+                         plist=sys.argv[-1],
+                         stdout_log=state["stdout_log"] or os.environ["FAKE_STDOUT_LOG"],
+                         stderr_log=state["stderr_log"] or os.environ["FAKE_STDERR_LOG"],
                          max_pids=max(int(state["max_pids"]), 1))
         save()
         raise SystemExit(0)
@@ -183,6 +199,9 @@ class ReleaseHarness:
             "owner_available": True,
             "health": {},
             "max_pids": 0,
+            "plist": "",
+            "stdout_log": "",
+            "stderr_log": "",
         }
         if case == "unknown_listener":
             state.update(pid=9999, cwd="/tmp/unknown", listener=True)
@@ -207,20 +226,27 @@ class ReleaseHarness:
             "FAKE_CANDIDATE_SHA": checkout.sha,
             "FAKE_READER_GENERATION": str(checkout.reader_generation),
             "FAKE_CONTRACT_GENERATION": str(checkout.contract_generation),
+            "FAKE_STDOUT_LOG": str(self.stdout_log),
+            "FAKE_STDERR_LOG": str(self.stderr_log),
         }
 
     def install(
         self, checkout: ReleaseCheckout | None = None, *, mode: str = "production",
-        dry_run: bool = False, expected_sha: str | None = None, check: bool = False,
+        dry_run: bool = False, expected_sha: str | None = None,
+        release_manifest: Path | None = None, check: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         checkout = self.candidate if checkout is None else checkout
+        release_manifest = (
+            checkout.path / "ops" / "prediction-service-release.json"
+            if release_manifest is None else release_manifest
+        )
         command = [
             str(checkout.path / "scripts" / "install_prediction_service_launchd.sh"),
             "--mode", mode, "--repo-root", str(checkout.path),
             "--runtime-root", str(self.runtime_root), "--python", sys.executable,
             "--config", str(self.root / "prediction.json"),
             "--launch-agents-dir", str(self.agents), "--wait-seconds", "1",
-            "--release-manifest", str(checkout.path / "ops" / "prediction-service-release.json"),
+            "--release-manifest", str(release_manifest),
         ]
         if dry_run:
             command.append("--dry-run")
@@ -287,6 +313,10 @@ class ReleaseHarness:
     def stdout_log(self) -> Path:
         return self.runtime_root / "logs" / "prediction_service" / "launchd.out.log"
 
+    @property
+    def stderr_log(self) -> Path:
+        return self.runtime_root / "logs" / "prediction_service" / "launchd.err.log"
+
 
 @pytest.fixture
 def release_harness(tmp_path: Path) -> ReleaseHarness:
@@ -338,6 +368,28 @@ def test_production_preflight_refuses_before_shutdown(
     assert release_harness.runtime_record is None
 
 
+@pytest.mark.parametrize("location", ["external", "ignored"])
+def test_production_requires_manifest_tracked_by_selected_checkout(
+    release_harness: ReleaseHarness, location: str
+) -> None:
+    checkout = release_harness.candidate
+    if location == "external":
+        manifest = release_harness.root / "external-release.json"
+    else:
+        manifest = checkout.path / "ignored-release.json"
+        (checkout.path / ".git" / "info" / "exclude").write_text(
+            "ignored-release.json\n", encoding="utf-8"
+        )
+    shutil.copy2(release_harness.manifest, manifest)
+
+    result = release_harness.install(release_manifest=manifest)
+
+    assert result.returncode == 1
+    assert "release manifest must be tracked by checkout" in result.stderr
+    assert release_harness.calls.all() == []
+    assert release_harness.runtime_record is None
+
+
 def test_production_dry_run_is_side_effect_free(release_harness: ReleaseHarness) -> None:
     result = release_harness.install(mode="production", dry_run=True)
     assert result.returncode == 0
@@ -373,6 +425,27 @@ def test_production_first_install_records_only_observed_ready_evidence(
     assert record["ready"]["health_module"] == "prediction_service"
     assert record["ready"]["process_started_at"] == release_harness.started_at
     assert record["ready"]["logs"]["stdout"].endswith("launchd.out.log")
+
+
+def test_ready_logs_come_from_observed_launchctl_state(
+    release_harness: ReleaseHarness,
+) -> None:
+    observed_stdout = release_harness.root / "observed" / "manager.out.log"
+    observed_stderr = release_harness.root / "observed" / "manager.err.log"
+    state = release_harness.state
+    state["stdout_log"] = str(observed_stdout)
+    state["stderr_log"] = str(observed_stderr)
+    release_harness.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    result = release_harness.install(mode="production")
+
+    assert result.returncode == 0
+    record = release_harness.runtime_record
+    assert record is not None
+    assert record["ready"]["logs"] == {
+        "stdout": str(observed_stdout),
+        "stderr": str(observed_stderr),
+    }
 
 
 def test_production_refuses_when_post_start_source_cannot_be_rechecked(
@@ -411,6 +484,68 @@ print(json.dumps(state["health"]))
     assert sum(
         " bootout " in f" {call} " for call in release_harness.calls.all()
     ) == 1
+
+
+def test_keepalive_loaded_exited_candidate_is_booted_out(
+    release_harness: ReleaseHarness,
+) -> None:
+    release_harness.configure("keepalive_exited")
+
+    result = release_harness.install(mode="production")
+
+    assert result.returncode == 1
+    assert "candidate_timeout" in result.stderr
+    assert release_harness.state["loaded"] is False
+    assert not release_harness.plist.exists()
+    record = release_harness.runtime_record
+    assert record is not None
+    assert record["state"] == "failed"
+    assert record["failure_reason"] == "candidate_timeout"
+    assert sum(
+        " bootstrap " in f" {call} " for call in release_harness.calls.all()
+    ) == 1
+    assert sum(
+        " bootout " in f" {call} " for call in release_harness.calls.all()
+    ) == 1
+
+
+def test_post_maintenance_log_setup_failure_removes_autoload_plist(
+    release_harness: ReleaseHarness,
+) -> None:
+    release_harness.stdout_log.mkdir(parents=True)
+
+    result = release_harness.install(mode="production")
+
+    assert result.returncode == 1
+    assert not release_harness.plist.exists()
+    assert release_harness.state["loaded"] is False
+    assert release_harness.calls.named("launchctl") == [
+        f"launchctl print gui/{os.getuid()}/{LABEL}",
+        f"launchctl print gui/{os.getuid()}/{LABEL}",
+    ]
+    record = release_harness.runtime_record
+    assert record is not None
+    assert record["state"] == "failed"
+    assert record["failure_reason"] == "candidate_exited"
+
+
+def test_absent_candidate_cleanup_never_boots_out_unobserved_label(
+    release_harness: ReleaseHarness,
+) -> None:
+    release_harness.configure("bind_failure")
+
+    result = release_harness.install(mode="production")
+
+    assert result.returncode == 1
+    assert all(
+        " bootout " not in f" {call} " for call in release_harness.calls.all()
+    )
+    assert release_harness.state["loaded"] is False
+    assert not release_harness.plist.exists()
+    record = release_harness.runtime_record
+    assert record is not None
+    assert record["state"] == "failed"
+    assert record["failure_reason"] == "candidate_exited"
 
 
 def test_same_sha_ready_install_is_a_noop(release_harness: ReleaseHarness) -> None:
