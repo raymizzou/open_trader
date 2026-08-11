@@ -264,6 +264,30 @@ def _row_payload(row: sqlite3.Row, *, fields: Mapping[str, object]) -> dict[str,
     return result
 
 
+def read_minimum_reader_generation(data_dir: Path) -> int:
+    path = Path(data_dir) / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    if not path.exists():
+        return 1
+    connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_metadata'"
+        ).fetchone()
+        if table is None:
+            return 1
+        row = connection.execute(
+            "SELECT minimum_reader_generation FROM schema_metadata WHERE singleton=1"
+        ).fetchone()
+        if row is None:
+            raise ValueError("prediction minimum reader generation is missing")
+        generation = row[0]
+        if type(generation) is not int or generation < 1:
+            raise ValueError("prediction minimum reader generation is invalid")
+        return generation
+    finally:
+        connection.close()
+
+
 class PredictionArbitrageStore:
     """Direct sqlite3 persistence with one short-lived connection per action."""
 
@@ -320,6 +344,16 @@ class PredictionArbitrageStore:
                 payload TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS schema_metadata (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                minimum_reader_generation INTEGER NOT NULL
+                    CHECK (minimum_reader_generation >= 1)
+            );
+
+            INSERT INTO schema_metadata(singleton, minimum_reader_generation)
+            VALUES (1, 1)
+            ON CONFLICT(singleton) DO NOTHING;
 
             CREATE TABLE IF NOT EXISTS signals (
                 signal_id TEXT PRIMARY KEY,
@@ -546,6 +580,9 @@ class PredictionArbitrageStore:
             version = 5
         if version < 6:
             connection.execute("PRAGMA user_version=6")
+            version = 6
+        if version < 7:
+            connection.execute("PRAGMA user_version=7")
 
     @staticmethod
     def _execution_fields(row: sqlite3.Row) -> dict[str, object]:
