@@ -3,6 +3,14 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-12
+
+- 完成通用 N_LEG Prediction 套利设计与开发 Ticket 契约收敛：热路径接受任一已验证合格
+  连通组合而不等待全局最优，组件级负证明仅接受预算内完整 Oracle 或可独立检查证书；
+  Entry/Repair 部分成交风险、OBSERVE_ONLY、Episode 重武装、scope Canary 与一次切换边界
+  均 fail-closed。已完成数学/架构双重审查，并逐项回读验证 GitHub Issues #48–#52、
+  #57–#58、#62–#63、#69–#70、#73 正文；本次仅更新设计与 Ticket，不改变生产行为。
+
 ## 2026-08-11
 
 - #41 新增独立的只读 Shadow Prediction Service（`127.0.0.1:8769`）及 launchd
