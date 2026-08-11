@@ -734,6 +734,28 @@ def test_control_maintenance_conflict_reuses_execution_lock(tmp_path: Path) -> N
         service._release_global_lock(held)
 
 
+def test_control_reset_maps_cross_venue_polymarket_position_without_crashing() -> None:
+    intent = _cross_intent()
+    polymarket_leg = next(
+        leg for leg in intent.legs if leg.exchange == "polymarket"
+    )
+
+    totals = PredictionExecutionService._position_totals(
+        {
+            "positions": [
+                {"token_id": polymarket_leg.token_id, "size": "2"},
+            ]
+        },
+        intent,
+    )
+
+    assert totals == {
+        "yes": Decimal("0"),
+        "no": Decimal("2"),
+        "unknown": [],
+    }
+
+
 def test_preview_refreshes_only_the_selected_opportunity(tmp_path: Path) -> None:
     class TargetedMonitor(FakeMonitor):
         def __init__(self) -> None:

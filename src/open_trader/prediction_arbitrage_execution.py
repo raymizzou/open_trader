@@ -4203,6 +4203,20 @@ class PredictionExecutionService:
         if isinstance(intent, ThresholdHedgeIntent):
             yes_token = intent.leg_a.token_id
             no_token = intent.leg_b.token_id
+        elif isinstance(intent, CrossVenueIntent):
+            polymarket_leg = next(
+                (leg for leg in intent.legs if leg.exchange == "polymarket"), None
+            )
+            yes_token = (
+                polymarket_leg.token_id
+                if polymarket_leg is not None and polymarket_leg.outcome == "YES"
+                else None
+            )
+            no_token = (
+                polymarket_leg.token_id
+                if polymarket_leg is not None and polymarket_leg.outcome == "NO"
+                else None
+            )
         else:
             yes_token = intent.yes_token_id if intent else None
             no_token = intent.no_token_id if intent else None
