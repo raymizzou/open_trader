@@ -565,6 +565,16 @@ def test_support_derivation_retains_only_needed_edges_and_splits_stably() -> Non
     )
     assert tuple(evaluate_fixed_portfolio(built, group, budget).payout_lower_bound_units for group in groups) == (10, 10)
 
+    with pytest.raises(ValueError, match="disconnected portfolio requires separate evaluation"):
+        build_portfolio_solution(built, evaluation, support)
+
+    child_solutions = []
+    for group in groups:
+        child_evaluation = evaluate_fixed_portfolio(built, group, budget)
+        child_support = derive_selected_support_graph(built, child_evaluation, budget)
+        child_solutions.append(build_portfolio_solution(built, child_evaluation, child_support))
+    assert tuple(solution.quantities for solution in child_solutions) == groups
+
 
 def test_support_derivation_returns_exact_unknown_reason_when_rechecks_exceed_budget() -> None:
     built = _two_independent_supported_portfolios()

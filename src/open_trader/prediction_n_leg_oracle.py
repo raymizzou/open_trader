@@ -405,6 +405,8 @@ def build_portfolio_solution(
     selected = _selected_quantities(problem, evaluation.quantities)
     if tuple(quantity.action_id for quantity in evaluation.quantities) != support_graph.action_ids:
         raise ValueError("support graph actions must match evaluated quantities")
+    if len(split_disconnected_solution(problem, evaluation, support_graph)) > 1:
+        raise ValueError("disconnected portfolio requires separate evaluation")
     if selected != evaluation.quantities or _cost_upper_bound_for_selected(problem, selected) != evaluation.cost_upper_bound_units:
         raise ValueError("evaluation does not match problem quantities or costs")
     current_cut = cut_from_scenario(problem, evaluation.worst_scenario)
