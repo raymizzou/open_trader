@@ -98,7 +98,7 @@ if command == "launchctl":
                 "reader_generation": int(os.environ["FAKE_READER_GENERATION"]),
                 "contract_generation": int(os.environ["FAKE_CONTRACT_GENERATION"]),
             }
-            if state["case"] == "wrong_health_sha":
+            if state["case"] in {"wrong_health_sha", "keepalive_restart"}:
                 health["git_sha"] = "wrong"
             if state["case"] == "wrong_health_generation":
                 health["reader_generation"] += 1
@@ -124,7 +124,16 @@ if command == "lsof":
 
 if command == "curl":
     if state["health"]:
-        print(json.dumps(state["health"]))
+        health = state["health"]
+        if state["case"] == "keepalive_restart":
+            restarted_pid = 4243
+            state.update(
+                pid=restarted_pid,
+                health={**health, "pid": restarted_pid},
+                restart_pids=[health["pid"], restarted_pid],
+            )
+            save()
+        print(json.dumps(health))
         raise SystemExit(0)
     raise SystemExit(22)
 
@@ -202,6 +211,7 @@ class ReleaseHarness:
             "plist": "",
             "stdout_log": "",
             "stderr_log": "",
+            "restart_pids": [],
         }
         if case == "unknown_listener":
             state.update(pid=9999, cwd="/tmp/unknown", listener=True)
@@ -504,6 +514,27 @@ def test_keepalive_loaded_exited_candidate_is_booted_out(
     assert sum(
         " bootstrap " in f" {call} " for call in release_harness.calls.all()
     ) == 1
+    assert sum(
+        " bootout " in f" {call} " for call in release_harness.calls.all()
+    ) == 1
+
+
+def test_keepalive_restarted_candidate_is_booted_out(
+    release_harness: ReleaseHarness,
+) -> None:
+    release_harness.configure("keepalive_restart")
+
+    result = release_harness.install(mode="production")
+
+    assert result.returncode == 1
+    assert "wrong_health_identity" in result.stderr
+    assert release_harness.state["restart_pids"] == [4242, 4243]
+    assert release_harness.state["loaded"] is False
+    assert not release_harness.plist.exists()
+    record = release_harness.runtime_record
+    assert record is not None
+    assert record["state"] == "failed"
+    assert record["failure_reason"] == "wrong_health_identity"
     assert sum(
         " bootout " in f" {call} " for call in release_harness.calls.all()
     ) == 1

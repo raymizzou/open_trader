@@ -640,7 +640,6 @@ cleanup_verified_candidate() {
     [[ "$label_path" == "$PLIST_PATH" && "$label_cwd" == "$REPO_ROOT" ]] || return 1
     pid="$(printf '%s\n' "$output" | awk '$1 == "pid" && $2 == "=" && $3 ~ /^[1-9][0-9]*$/ { print $3; exit }')"
     if [[ -n "$pid" ]]; then
-      [[ -z "$CANDIDATE_PID" || "$pid" == "$CANDIDATE_PID" ]] || return 1
       cwd="$("$LSOF_BIN" -a -p "$pid" -d cwd -Fn 2>/dev/null \
         | awk '$1 ~ /^n/ { print substr($1, 2); exit }' || true)"
       [[ "$cwd" == "$REPO_ROOT" ]] || return 1
