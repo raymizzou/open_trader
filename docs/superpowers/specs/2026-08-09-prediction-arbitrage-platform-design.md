@@ -60,13 +60,15 @@
 
 每个精确、版本化执行范围另有一个服务端能力上限：`OBSERVE_ONLY < MANUAL_CANARY < AUTO_ELIGIBLE`。这是关系类型、同/跨事件、同/跨交易所及 venue/account 集合的安全能力，不是第三种产品模式或第二套开关：
 
-- `OBSERVE_ONLY` 只能发现、证明、展示和生成 would-submit；
+- `OBSERVE_ONLY` 只能发现、证明、展示和生成 would-submit，并固定返回 `order_ready=false`、`reason=SCOPE_OBSERVE_ONLY`；
 - `MANUAL_CANARY` 只允许在 `OBSERVE_MANUAL` 下逐批人工确认；
 - `AUTO_ELIGIBLE` 仍需全局模式为 `AUTO`，且 exact scope version 已进入用户批准的 `enabled_execution_scope_version`。
 
 任何 scope version 不匹配均 fail-closed，并使整个 N_LEG 回到 `OBSERVE_MANUAL`。发布新的 observable scope 本身也属于安全范围扩大并先触发降级；可观察范围可以大于已启用执行范围，用户随后可以重新批准仍排除新范围的旧 enabled scope，而不必把新范围一并开放。
 
 同一已启用安全范围内，新批准的具体关系继承当前 N_LEG 模式；批准界面在 `AUTO` 时必须明确提示该关系达到 `ORDER_READY` 后可能自动提交。首次启用跨事件、跨交易所或其他新安全范围属于范围扩大，必须先退回观察。
+
+范围晋级不统一假设同一种 Canary：#68 的同交易所跨事件范围先以 `OBSERVE_ONLY` 交付，观察后可由用户直接把 exact scope version 提升为 `AUTO_ELIGIBLE`；#69 的跨交易所同 observation 范围保持 `OBSERVE_ONLY`，#70 开始时用户先把精确 venue/account version 提升为 `MANUAL_CANARY`，此后通过其余 Gate 的方案才可能成为 `ORDER_READY` 并执行 Canary，Canary 完成只为后续提升 `AUTO_ELIGIBLE` 提供证据；#73 同时跨交易所与跨事件的组合范围固定为 `OBSERVE_ONLY`，在未来独立 Canary Ticket 完成前不得进入 `enabled_execution_scope_version`。
 
 服务另有一个优先级更高的全局熔断器。熔断禁止所有真实订单与自动修复，但不停止行情、发现、证明、页面和历史记录。它不是第二个交易模式。
 
@@ -86,7 +88,7 @@ Prediction 套利工作区保留一个主机会列表。YES/NO、LLM、原生关
 - 每条腿的保守 `capital_release_at` 明确且仍在未来，最晚资本释放时间距离当前不超过 30 天；
 - 行情、成本、关系与规则仍在有效期内。
 
-数学证明有效但低于任一资格门槛的结果只进入漏斗或历史。通过资格但因余额、实际可下单深度或风险限制不足而不能下单的机会可以进入主列表，但必须明确显示“不可执行”及原因；自动交易只消费 `ORDER_READY` 机会。未获批准、过期、求解超时或证明失败的记录不能伪装成正式套利机会。
+数学证明有效但低于任一资格门槛的结果只进入漏斗或历史。通过资格但因余额、实际可下单深度或风险限制不足而不能下单的机会可以进入主列表，但必须明确显示“不可执行”及原因；`OBSERVE_ONLY` 可以展示完全相同的 would-submit 固定方案，但不能称为 `ORDER_READY`。只有 exact scope capability 至少为 `MANUAL_CANARY` 且全部真实执行 Gate 通过时才可能成为 `ORDER_READY`；自动交易只消费其中 scope 为 `AUTO_ELIGIBLE` 且当前获准的机会。未获批准、过期、求解超时或证明失败的记录不能伪装成正式套利机会。
 
 页面顶部显示一个 N_LEG 模式和全局熔断状态。另提供带数量徽标的“待批准关系”入口，展开后包含“待批准”和“已批准”两个视图。每个候选关系至少展示：
 
@@ -99,6 +101,8 @@ Prediction 套利工作区保留一个主机会列表。YES/NO、LLM、原生关
 待批准关系不展示预计收益、利润排序或“套利机会”标签，也不触发 Preview 求解；审批依据是关系语义、结算规则和证据，而不是当时价格。拒绝同一规则指纹后不重复打扰；规则文本或任一关键市场身份变化会产生新指纹。批准针对关系版本，不针对每次价格机会；只有 activation 成功进入 current production generation 后才开始生产监控。N_LEG 已为 `AUTO` 时，批准界面必须明确说明同一 enabled scope 内的关系在成为 `ORDER_READY` 后可能自动提交。
 
 观察面板分开呈现模拟机会与人工确认的真实订单。模拟记录不能写成真实成交或已验证成交率。
+
+#60 前部署的页面必须同时理解旧 contract generation 与 N_LEG contract generation，但只渲染并 mutation 当前 production generation 的控制。#60 在同一切换边界更新 owner 与 generation；不得出现新页面控制旧 owner、旧页面控制 N_LEG，或同一页面同时暴露两代生产写入口的混合窗口。
 
 ## 独立 Prediction Service
 
@@ -139,13 +143,13 @@ Frontend Gateway 继续作为浏览器唯一入口，并透明转发整个 `/api
 - `PortfolioSolution`：规范求解器选择的实际动作、方向、整数数量与目标值；最终正数量腿数为 N，不能预先枚举 Leg 子集。
 - `MarketSolution`：只使用市场深度、关系、结算、成本与统一资格约束形成的证明连通组合；不读取个人余额、模式或熔断。
 - `ExecutionSolution`：在同一个规范模型上加入实际余额、单笔上限、总未结算资本和执行风险后重新求解并验证的单一证明连通 support、固定方向、整数数量、订单语义与成本边界。
-- `PayoutProof`：结构、组合与行情指纹，最坏结算状态、赔付下界、成本上界、求解上下界、gap 和证明等级。
+- `PayoutProof`：结构、组合与行情指纹，最坏结算状态、赔付下界、成本上界、求解上下界、gap 和证明等级；同一记录类型也以明确 result kind 保存组件级资格约束不可行的负证明，不另建第二套 proof 模型。
 - `QualificationEvaluation`：使用版本化统一策略对 1 美元、1%、15% 和 30 天四项门槛逐项判断。
 - `PartialFillProof`：对固定 `ExecutionSolution` 的全部可达成交向量及联合终态给出最坏损失上界或超限反例。
 - `RepairPlan`：事故对账后基于 confirmed holdings 生成的固定补齐或退出动作。
 - `RepairPartialFillProof`：对固定 `RepairPlan` 的全部可达部分修复状态给出保守总损失上界或超限反例。
 
-规范问题必须稳定、可序列化且与求解器厂商无关。小规模精确 Oracle 直接求解完整问题：枚举受限的方向、整数数量和全部允许终态，返回全局最优组合；它不仅验证一个预先给定的仓位。Oracle 是测试与 Shadow 正确性基准，不是大模型生产 fallback，超过明确状态/决策预算时返回带原因的 `UNKNOWN`。
+规范问题必须稳定、可序列化且与求解器厂商无关。小规模精确 Oracle 直接求解完整问题：枚举受限的方向、整数数量和全部允许终态，返回全局最优组合；它不仅验证一个预先给定的仓位。Oracle 还可消费调用方提供的版本化资格约束，在明确预算内完整枚举全部候选并产生组件级不可行负证明；它不硬编码具体门槛，也不是正式求解器超时后的正向生产 fallback。超过状态/决策预算时返回带原因的 `UNKNOWN`。
 
 现有 YES/NO、现有 LLM 阈值两腿和现有跨所 YES/NO 在迁移期通过薄适配器进入同一底层。业务代码不能直接构造某个求解器厂商的模型；规范模型与求解器适配器之间必须有单一窄接口，以便基准后只保留一个生产实现。
 
@@ -171,11 +175,17 @@ Frontend Gateway 继续作为浏览器唯一入口，并透明转发整个 `/api
 
 审批单位是带证据和规则指纹的关系版本，不是每次行情产生的具体 Portfolio。关系批准确认语义并授权旁路编译与 activation 检查，不等于 authoritative production fact、结算模型完整、已经开始生产监控或当前可下单。已批准但终态、赔付或释放时间不完整的关系保留在审计目录和漏斗中，但不能进入可求解运行图。
 
+目录分别保存 `source_evidence_fingerprint`、`relation_semantics_fingerprint`、编译器版本和 `compiled_model_fingerprint`。人工或范围批准绑定来源证据与关系语义，运行图证明绑定编译产物。只有原始规则、来源内容和语义指纹完全不变，且编译器只是把批准时已经存在的事实确定性转换为 terminal atoms、payout 或 `capital_release_at` 时，批准状态才可保留；新的 compiled model 仍须重新通过完整性、一致性、预算和 activation 检查。从新来源补入事实，或改变市场身份、结算/异常规则、赔付、资本释放或关系约束，必须生成新版本、链接稳定 `relation_id` 与前序版本并重新批准，不能通过换 ID 绕过 Episode lineage。
+
 目录分别保存 `approval_status`、`model_completeness` 和 `activation_status`。每次新批准或新版本先在旁路构建候选 generation，检查完整性、一致性和求解预算；只有全部通过才原子激活。候选矛盾或超预算分别标记 `ACTIVATION_BLOCKED_INCONSISTENT` 或 `UNSUPPORTED_SIZE`，保留证据但不进入生产；last-known-good generation 继续运行，系统不得自动丢弃某条关系来让候选“通过”。若当前已激活关系被撤销、失效或来源变化，旧 generation 不能继续冒充有效，受影响组件立即进入重建或 `UNKNOWN`。
 
-跨版本稳定的 `relation_id`、不可变 `market_contract_id` 与会变化的关系/模型版本必须分开。关系目录保存机器可重放的 `event_identity_basis` 和 `settlement_observation_key`：同事件只能来自同交易所不可变官方 event/group ID，或结算机构/Oracle/数据源、被观测指标、观测时点或窗口、时区、规则版本和异常结算规则全部一致的确定性 key。标题或 LLM 相似性不能成为身份依据。
+批准只允许 candidate generation 做旁路编译和验证；candidate 没有生产求解、监控或下单权。若用户确认冲突候选正确，候选 activation 与冲突旧关系的撤销或修正必须放入同一个原子 `proposed change set`：先对完整候选图验证，成功后一次切换 current generation；任一步失败则整个 change set 不生效，旧 current generation 保持不变，不能先撤旧再尝试激活新关系。
+
+跨版本稳定的 `relation_id`、不可变 `market_contract_id` 与会变化的关系/模型版本必须分开。关系目录保存机器可重放的 `event_identity_basis` 和 `settlement_observation_key`：同事件只能来自同交易所不可变官方 event/group ID，或结算机构/Oracle/数据源、被观测指标、观测时点或窗口、时区、规则版本和异常结算规则全部一致的确定性 key。阈值或结果值只是同一 observation 上的谓词，不进入该 key；标题或 LLM 相似性不能成为身份依据。
 
 每个交易所合约默认拥有独立结算身份。标题或现实事件相同不能自动合并变量；跨交易所或跨合约等价、蕴含和互斥必须来自明确批准并成功激活的规则。同一 current generation 中，每个 `relation_id` 只能有一个激活版本和一个组件归属；重复发现只追加证据。
+
+关系目录的领域模型与 store 属于 `PredictionRuntime`。Shadow 只写隔离副本，不能把审批或 activation 隐式提升、复制或双写到生产；生产目录在任一时刻只有持有 production owner lock 的 Prediction Service 可以打开写连接。组件可以跨 generation 合并或拆分，但 candidate generation 中复制的关系没有交易权，current generation 的组件变化必须同时维护 Episode lineage 与既有执行锁。
 
 数学模型必须把每个合约的全部终态作为一等输入，包括正常 YES/NO、取消、无效、退款和特殊拆分赔付。除非交易所规则明确排除，联合状态必须允许“一条腿异常、其他腿正常”以及不同交易所作出不同官方结果。逻辑关系默认只约束正常终态；异常状态同步或联动必须有单独、版本化的规则证据。任何终态赔付、关系语义或资本释放时间无法确定时，结果为 `UNKNOWN`。
 
@@ -199,9 +209,11 @@ Frontend Gateway 继续作为浏览器唯一入口，并透明转发整个 `/api
 
 `max_total_unsettled_capital` 汇总全部尚未明确释放的 N_LEG 仓位保守占用资本与 active batch 最大资金预留；未知订单、余额、持仓或释放状态继续按最大占用计入。首版不做跨机会资本优化，只在每次准入时原子比较 projected total 并预留；事故 Repair 只能使用原批次仍锁定的预留，不能借用全局剩余额度或新增资本。
 
+总资本上限收紧到低于当前占用时不强制平仓，但立即阻止全部新 Entry。已经处于事故中的 Repair 只有在不新增或扩大预留、全局熔断关闭、`REPAIR_PARTIAL_FILL_SAFE` 与本轮原子准入均通过时，才可继续消费原批次既有预留。
+
 证明事实与业务资格分开。一个版本化且三个旧来源统一使用的资格策略要求：保证最低利润至少 1 美元、最低净边际至少 1%、保证年化至少 15%，并且所有 terminal atom 的保守 `capital_release_at` 明确且在未来、最晚资本释放时间不超过 30 天。占用天数从行情快照到最晚释放时间按 24 小时向上取整且至少 1 天；保证年化为“保证最低利润 / 保守占用资本 × 365 / 占用天数”，禁止平均时间或 `close_at` fallback。BUY-only 首版的保守占用资本是全部腿最大现金 debit 之和，包含成本、费用、滑点、安全余量和资产折价。1% 与 15% 边界使用定点整数交叉相乘判断，等于门槛视为通过。
 
-四项资格是正式准入问题的可行约束，不是先求无门槛最大利润后的页面过滤。最低组合赔付已知且不大于零时固定组合为 `NOT_QUALIFIED`；只有输入、terminal atom 或赔付未知时才是 `UNKNOWN`。低于门槛的正利润结果仍可保存为证明事实，但不是正式机会。观察、人工和 AUTO 引用同一资格策略版本；任何门槛放宽使整个 N_LEG 退回观察。
+四项资格是正式准入问题的可行约束，不是先求无门槛最大利润后的页面过滤。输入完整且任一资格谓词已知为 false 时，固定组合为 `NOT_QUALIFIED`，包括最低组合赔付已知且不大于零、利润/边际/年化不足、最保守释放时间已知但不晚于行情快照，或最晚释放超过 30 天；只有输入、terminal atom、赔付或释放上界缺失而使谓词不可判定时才是 `UNKNOWN`。低于门槛的正利润结果仍可保存为证明事实，但不是正式机会。观察、人工和 AUTO 引用同一资格策略版本；任何门槛放宽使整个 N_LEG 退回观察。
 
 每条腿必须绑定明确交易所、账户、链和结算资产。不同资产不得直接相加；首版只允许配置明确认可的共同计价资产，并计入保守折价、手续费和链上成本。跨所机会只能使用已经预存在各交易所的余额。余额不足不改变数学证明，但使机会不可下单。真正跨币种时，换汇或对冲必须成为组合腿并另行设计。
 
@@ -219,11 +231,15 @@ Frontend Gateway 继续作为浏览器唯一入口，并透明转发整个 `/api
 
 固定组合的最坏状态证明完整、四项资格通过且独立校验为 `VERIFIED` 时，即可成为 `QUALIFIED_VERIFIED` 正式机会，不要求整个候选空间的收益 gap 闭合。核心搜索只有在证明资格约束整体不可行后才返回 `NO_QUALIFIED_OPPORTUNITY`；没有在预算内找到合格证明只能返回 `UNKNOWN`。`NO_ARBITRAGE` 仅用于显式诊断：移除四项业务门槛后证明最大保证利润不大于零，不能进入实时准入关键路径。
 
-可选收益优化继续闭合全局上下界时，已有组合的证明/业务状态保持 `QUALIFIED_VERIFIED`，其最优性状态为 `QUALIFIED_FEASIBLE`；只有闭合后才标记 `OPTIMAL`。优化超时或 gap 未闭合不使已有正式机会失效，也不能把尚未完成固定组合安全证明的 incumbent 送入正式机会。Oracle 只承担小模型标准答案和 Shadow 差分，不作为生产超时 fallback。
+组件级 `NO_QUALIFIED_OPPORTUNITY` 必须作为现有 proof record 的负结果持久化，绑定 current component generation、完整关系集合、model/quote/cost fingerprints、`qualification_policy_version`、求解器资格约束不可行终态、独立验证方式/结果和重放输入。首版只接受小规模 Oracle 在预算内的完整枚举，或 #49 已证明可由独立 checker 验证的 infeasibility certificate；任一字段缺失、陈旧、版本不匹配或无法检查只能得到 `UNKNOWN`。固定组合 proof 与组件级负 proof 不能互相冒充。
+
+同一个独立 verifier 按 proof result kind 处理两种输入：固定组合分支重建该 `MarketSolution` 或 `ExecutionSolution` 的最坏终态问题；组件不可行分支从完整规范问题、current generation、关系集合、model/quote/cost fingerprints、资格版本和 solver terminal evidence 出发，只可运行预算内完整 Oracle 枚举，或检查已基准通过的 infeasibility certificate。它不能复用求解器厂商对象或信任求解器自报状态；重复运行同一求解器或换一个求解器得到相同结论也不构成独立负证明，不能检查时必须降为 `UNKNOWN`。
+
+可选收益优化继续闭合全局上下界时，已有组合的证明/业务状态保持 `QUALIFIED_VERIFIED`，其最优性状态为 `QUALIFIED_FEASIBLE`；只有闭合后才标记 `OPTIMAL`。优化超时或 gap 未闭合不使已有正式机会失效，也不能把尚未完成固定组合安全证明的 incumbent 送入正式机会。Oracle 只承担小模型标准答案、Shadow 差分和预算内组件级负证明，不作为生产超时后的正向机会 fallback。
 
 证明按影响范围分层指纹：关系与终态形成 `model_fingerprint`，固定动作和数量形成 `portfolio_fingerprint`，订单簿与成本形成 `quote_fingerprint`，资格判断保存 `qualification_policy_version`。关系变化使全部下游失效；数量变化使组合与行情证明失效；行情变化只重算成本与资格；门槛变化不篡改历史数学证明。
 
-`SOLVER_VERIFIED` 不是机器可验证的形式化定理证明，页面与审计必须如实显示。`FORMALLY_VERIFIED` 代表求解器输出可由独立证明检查器验证的证书。SCIP/VIPR 等精确证书能力从第一天参加基准，但是否强制使用取决于实时延迟和部署验证；若以后升级，观察与自动交易必须同时切换到同一证明等级。
+`SOLVER_VERIFIED` 不是机器可验证的形式化定理证明，页面与审计必须如实显示。`FORMALLY_VERIFIED` 代表求解器输出可由独立证明检查器验证的证书。SCIP/VIPR 等精确证书能力从第一天参加基准，但不强制成为首版正向机会证明等级；若大组件要产生 `NO_QUALIFIED_OPPORTUNITY` 并重新武装 Episode，则必须有该组件的可独立检查不可行证书，否则保持 `UNKNOWN`。以后升级统一正向证明等级时，观察与自动交易必须同时切换。
 
 HiGHS、SCIP 与 OR-Tools CP-SAT 使用同一规范语料逐一验证：
 
@@ -274,12 +290,14 @@ HiGHS、SCIP 与 OR-Tools CP-SAT 使用同一规范语料逐一验证：
 
 跨市场和跨交易所没有事务原子性。首个部分成交、未知回执或状态不一致必须在任何修复请求前原子持久化 `execution_incident_active`，阻止整个 N_LEG 的其他新订单，并把模式降到 `OBSERVE_MANUAL`；修复成功和完整对账可以释放事故 Gate，但不能自动恢复 AUTO。全成或全拒且状态明确不是事故。
 
+事故降级发生时，所有已经由 AUTO 生成但尚未发送第一条远端请求的 FIFO 项立即失效；它们不能在事故恢复后沿用旧模式、行情、证明或配置继续提交。
+
 事故处理固定为：
 
 1. 独立查询并对账订单、成交、余额、confirmed holdings 和原批次预留；未知状态不能进入自动修复证明。
 2. 在“补齐剩余腿”与“退出已成交腿”中生成一个固定、可重放的 `RepairPlan`；SELL 不得超过相同 venue/account 的 confirmed available inventory。
 3. 复用 Entry 的 fill-adversary 与 verifier，对当前 confirmed holdings、已发生现金流和固定 RepairPlan 的全部可达部分修复向量及 terminal atoms 求最坏保守总损失；只有有效全局安全上界不超过 `max_auto_repair_loss` 且 verifier 通过时才为安全，任一超限反例即为不安全，超时或输入不完整为 `UNKNOWN`。
-4. 只有 `REPAIR_PARTIAL_FILL_SAFE`、全局熔断关闭、全部指纹仍匹配且原批次尚未消耗的预留足够时，才可原子绑定该既有预留并发送自动修复请求。
+4. `REPAIR_PARTIAL_FILL_SAFE` 只证明固定 RepairPlan 的最坏损失；`repair_order_ready` 还必须在第一条远端请求前，以单一本地事务确认全局熔断关闭，并核对 incident、confirmed holdings、RepairPlan/proof、配置、余额、`total_unsettled_capital`、原批次预留和唯一 repair owner 的版本，再从原批次尚未消耗的预留中绑定本轮最大成本。proof 输入变化使证明失效；账本、余额、预留或 owner 冲突使 `repair_order_ready=false`，两者都禁止发单。
 5. 修复再次部分成交时重新对账、生成新的固定 RepairPlan 并重新证明；`UNKNOWN`、超限、超卖、预留不足或无方案均禁止自动修复并转全局熔断或人工处理。
 
 自动 Repair 不能创建或扩大资金预留，也不能因为全局资本上限或账户余额仍有空间而追加资本。服务重启必须先恢复 active batch、Episode 执行锁、事故 Gate、confirmed holdings、预留和总未结算资本并完成对账，之后才可 ready。
@@ -290,9 +308,9 @@ HiGHS、SCIP 与 OR-Tools CP-SAT 使用同一规范语料逐一验证：
 
 历史按机会 Episode 记录，而不是保存每个行情 tick。每个 Episode 有唯一 `opportunity_episode_id`、稳定 `episode_lineage_id`、必要的前驱 lineage 和至多一个 `executed_batch_id`。真实 batch 一经绑定，同一 lineage 的人工点击、新 tick、重新求解、收益优化、版本变化、组件拆分/合并、全拒、事故或重启都不能产生第二个真实 batch；该 Episode 继续更新行情和诊断，但标记 `EXECUTED_FOR_EPISODE`。
 
-Episode 只有在当前模型与资格版本下连续 5 分钟的新鲜快照都已证明 `NO_QUALIFIED_OPPORTUNITY` 后才真正结束。`episode_rearm_gap` 初始值为 5 分钟并纳入版本化 AUTO 安全配置；缩短属于安全放宽并使整个 N_LEG 退回观察。期间再次合格、`UNKNOWN`、陈旧行情、服务中断或版本变化都会重置计时；它们不能被统计成“无套利”。组件拆分或合并时，只要后继与尚未关闭前驱共享稳定 `relation_id` 或 `market_contract_id`，就继承已执行锁，并分别满足完整关闭窗口后才产生新的执行资格；首版不提供人工 reset。
+Episode 只有在当前模型与资格版本下连续 5 分钟的新鲜快照都携带与 current component generation、model/quote/cost fingerprints 和资格版本完全匹配，且由预算内完整 Oracle 枚举或可独立检查证书验证的 `NO_QUALIFIED_OPPORTUNITY` 负 proof record 后才真正结束，并持久化每次 proof ID。`episode_rearm_gap` 初始值为 5 分钟并纳入版本化 AUTO 安全配置；缩短属于安全放宽并使整个 N_LEG 退回观察。期间再次合格、`UNKNOWN`、负证明缺失/版本不匹配、超过 Oracle 预算且没有可检查证书、陈旧行情、服务中断或版本变化都会重置计时；它们不能被统计成“无套利”。组件拆分或合并时，只要后继与尚未关闭前驱共享稳定 `relation_id` 或 `market_contract_id`，就继承已执行锁，并分别满足完整关闭窗口后才产生新的执行资格；首版不提供人工 reset。
 
-模拟 Episode 至少保留四项资格版本、首次/末次可见时间、可下单持续时间、最佳和最差保证利润、求解与端到端延迟、总未结算资本、价格或 Gate 失效原因以及 would-submit 固定方案。人工或 AUTO 真实订单另行保留真实回执、各腿成交、事前部分成交损失上界、费用、滑点、修复证明、最终保证利润和实际利润。
+模拟 Episode 至少保留四项资格版本、首次/末次可见时间、would-submit-ready 持续时间、真实 `ORDER_READY` 持续时间、最佳和最差保证利润、求解与端到端延迟、总未结算资本、价格或 Gate 失效原因以及 would-submit 固定方案；`OBSERVE_ONLY` 只能累计前者。人工或 AUTO 真实订单另行保留真实回执、各腿成交、事前部分成交损失上界、费用、滑点、修复证明、最终保证利润和实际利润。
 
 证明、执行计划、N_LEG 模式变化、资格策略版本、关系批准/拒绝/撤销、规则失效、熔断和人工恢复均需带时间、操作者、代码版本和相关指纹，能够从生产账本重放。模拟可成交不能被统计为真实成交率；只有人工或自动真实订单能形成实际成交证据。
 
@@ -308,7 +326,13 @@ Episode 只有在当前模型与资格版本下连续 5 分钟的新鲜快照都
 6. 新服务非阻塞获取锁，在持锁状态下检查 generation 兼容，打开生产账本并启动对账；ready 后 Gateway 一次性把整个 `/api/prediction-arbitrage/*` 前缀切到新服务，不允许 GET/POST 分裂或双写。
 7. 删除 Legacy 的 Prediction 路由和运行所有权，并证明 Dashboard 与 Prediction 可以独立升级和回滚。
 
-Shadow 不复用生产 SQLite，不创建真实订单、不争抢生产锁，也不写生产通知去重或执行账本。服务所有权交接明确允许计划内 downtime，不为零停机引入双 writer、共享可写 SQLite、leader election 或热交接。切换前保存并验证完整生产快照；流量重新开放前若失败，可以在单一 owner 和 503 下完整恢复快照。首条只有新 generation 才能理解的业务写入必须与 `minimum_reader_generation` 推进原子提交，形成 irreversible boundary；越界后旧 release 必须在打开写连接前被拒绝，只能使用兼容 release、forward-fix 或继续维护 503。
+Shadow 不复用生产 SQLite，不创建真实订单、不争抢生产锁，也不写生产通知去重或执行账本。服务所有权交接明确允许计划内 downtime，不为零停机引入双 writer、共享可写 SQLite、leader election 或热交接。
+
+#45 完成后到 #60 maintenance 前，生产关系目录只允许经真实旧 release 回读验证的 backward-compatible expand-only 写入：旧 reader 必须能安全忽略新增表、字段或独立记录；不得删除、重命名、改义旧字段，不得提前写入只有 N_LEG reader 才能理解的 Episode、账本或执行状态，也不得推进 `minimum_reader_generation`。任何无法证明旧 reader 可安全忽略的 schema 或 data 写入必须延迟到 #60 maintenance。
+
+#60 进入维护时先保存并校验包含 schema、目录、账本和 generation metadata 的完整快照。maintenance 内第一笔必须由 N_LEG reader 才能理解的写入，必须与 `minimum_reader_generation=N_LEG_v1` 在同一原子事务提交；若 maintenance 没有此类写入，则流量开放后的第一条 N_LEG 业务写入承担同一原子推进。流量尚未开放且没有 post-cutover N_LEG 业务写入时，失败只能在单一 owner 和 503 下完整恢复该快照，不能选择性回退表或 generation 字段；流量开放并完成首条 N_LEG 业务写入后即越过 irreversible boundary，禁止恢复 pre-N_LEG 快照，只能使用兼容 release、forward-fix 或继续维护 503。
+
+#47 是 #60 前的最终 rehearsal/freeze Gate：它在隔离的生产等价完整快照上演练迁移、故障、完整回退和旧 release 拒绝，并冻结代码、迁移程序及 exact release SHA。#60 只是使用该 exact SHA 执行真实运营 cutover；若准备或执行中需要修改代码、迁移逻辑或 artifact，必须中止切换、保持 503 或完整恢复快照，并返回 #47 重新 rehearsal 与 acceptance，不能沿用旧 PASS。
 
 通用计算引擎另有一次明确的 expand-contract 切换：
 
@@ -334,7 +358,7 @@ Shadow 不复用生产 SQLite，不创建真实订单、不争抢生产锁，也
 - 资格约束整体被证明不可行：`NO_QUALIFIED_OPPORTUNITY`；不能用单个候选失败、超时或 `UNKNOWN` 推出该状态。
 - 证明快照过期：机会失效，重新求解，不沿用旧证明。
 - 固定 Entry 的部分成交证明为 `PARTIAL_FILL_UNSAFE`、`UNKNOWN` 或缺失：保留市场机会，但 `order_ready=false` 并禁止真实 submit。
-- N_LEG 模式为观察：只有 exact scope capability 至少为 `MANUAL_CANARY` 时才允许用户确认后走完整真实 preflight；`OBSERVE_ONLY` 硬拒绝全部真实 submit。
+- N_LEG 模式为观察：只有 exact scope capability 至少为 `MANUAL_CANARY` 时才允许用户确认后走完整真实 preflight；`OBSERVE_ONLY` 返回 `order_ready=false`、`reason=SCOPE_OBSERVE_ONLY` 并硬拒绝全部真实 submit。
 - 全局熔断：禁止人工与自动真实 submit 及自动修复，保持只读监控和审计。
 - 未知订单回执、部分成交或状态不一致：持久化事故、停止全部新 Entry 并将模式降为观察；Repair proof 不安全、不明、预留不足或无方案时禁止自动修复并升级熔断/人工处理。
 
@@ -351,13 +375,16 @@ Shadow 不复用生产 SQLite，不创建真实订单、不争抢生产锁，也
 - 1 美元、1%、15%、30 天边界，最晚资本释放时间和禁止 close_at fallback 测试；
 - 约束矛盾、逐合约异常终态、正常关系作用域和跨合约独立异常组合测试；
 - 任意合格连通组合可先准入、可选收益优化不阻塞、`QUALIFIED_VERIFIED`/`OPTIMAL`/`NO_QUALIFIED_OPPORTUNITY`/`NO_ARBITRAGE`/`UNKNOWN` 状态分离；
+- 组件级 `NO_QUALIFIED_OPPORTUNITY` 负 proof record 的 generation、关系集合、model/quote/cost 指纹、资格版本、预算内完整 Oracle 或可检查不可行证书，以及陈旧、缺字段或无法独立检查时降级为 `UNKNOWN`；
 - 陈旧行情、缺失费用、异常结算、不同资产、余额不足和超时均 fail-closed；
 - 固定 Entry 与 RepairPlan 的所有可达部分成交向量、FOK 语义、cap 边界和小规模 Oracle 差分，抽样或超时不能证明安全；
-- 全填、部分填、全拒、未知回执、补齐、退出、confirmed inventory、原预留不足、超限熔断和重启对账；
+- 全填、部分填、全拒、未知回执、补齐、退出、confirmed inventory、原预留不足、禁止借用全局剩余额度、Repair 原子 preflight、超限熔断和重启对账；
 - 全局 single-flight、FIFO、Episode 每 lineage 至多一个真实 batch、连续 5 分钟重新武装及组件拆分/合并继承；
 - exact scope capability、enabled scope version、范围扩大降级和旧范围重新 Go 不误授权新范围；
+- `OBSERVE_ONLY` 只产生 would-submit、固定 `order_ready=false(reason=SCOPE_OBSERVE_ONLY)`，且页面和 API 不把它渲染为可提交；
 - Shadow 与生产数据库、锁、通知和订单写入隔离；
 - API 契约 parity、整个前缀原子切换及 Legacy 所有权删除；
+- 旧 reader 对 pre-cutover expand-only 目录写入的真实回读、generation fence 原子故障注入、开放前完整快照恢复、开放后旧快照拒绝，以及 #47 冻结 SHA 与 #60 实际 SHA 相等；
 - 多标签页持续轮询下线程、FD、SQLite 连接和响应延迟有界，覆盖 #34 的故障形态；
 - 聚焦测试、真实 no-submit/人工小单工作流、进程 PID/cwd/SHA/日志和最终 `make acceptance`。
 
@@ -382,13 +409,13 @@ Dashboard 任务只有最终 `make acceptance` 为 `PASS` 后才可交付；随�
 
 当前关键依赖链固定为：
 
-- Prediction Service：#39 → #40 → #41 → #42 → #43 → #44 → #45 → #46 → #47；#44 另受 #34 阻塞，#47 另受 #30 阻塞。
+- Prediction Service 基础：#39 → #40 → #41 → #42 → #43 → #44 → #45 → #46；#44 另受 #34 阻塞。
 - 规范数学：#48 → #49 → #50 → #51；#59 依赖 #48/#42，#52 依赖 #51/#59，#53 依赖 #43/#51。
 - 旧路径与控制：#54/#55 依赖 #41/#51，#56 另依赖 #27；#58 依赖 #42/#53；#57 汇合 #46、#54–#56、#58、#59。
-- 切换 Gate：#71 汇合 #41/#52/#53/#59；#60 再汇合 #46/#47/#52/#53/#54–#56/#58/#71，之后 #61 删除旧计算器与模式。
+- 切换 Gate：#71 汇合 #41/#52/#53/#59；#47 是最终 rehearsal/freeze Gate，显式等待 #30、#46、#52、#53、#54–#59 与 #71；#60 只依赖 #47 并使用其冻结的 exact SHA 执行真实 cutover，之后 #61 删除旧计算器与模式。
 - 观察垂直切片：#62 汇合 #52/#60/#57/#58；#63 再汇合 #53/#60/#59/#62，首版仅同交易所同事件 Observe-only。
 - 真实执行证明：#74 依赖 #52；#75 依赖 #53/#74；#64 必须同时等待 #47/#58/#63/#74/#75，之后 #65 → #66 → #67 才能由用户决定是否开启 AUTO。
-- 范围扩展：#68 是同所跨事件观察；#69 是跨所同 observation；#70 是跨所人工 Canary；#73 在 #68/#69 后组合跨所与跨事件，仍只 Observe/order-ready。
+- 范围扩展：#68 依赖 #59/#63，交付同所跨事件观察；#69 依赖 #56/#59/#63，交付跨所同 observation；#70 依赖 #64/#69，完成跨所人工 Canary；#73 依赖 #68/#69，组合跨所与跨事件并保持 `OBSERVE_ONLY`。
 - 可选收益优化：#72 依赖 #52/#57，但不阻塞 #60、#63、真实执行或 AUTO。
 
 现有 #32 的年化、短结算和深度取向统一收敛为 1 美元最低利润、1% 最低净边际、15% 保证年化和最晚资本释放不超过 30 天；任何与旧路径不同的机会集合必须在 Shadow 差分中解释。现有 #34 的线程/FD 故障必须由独立服务与有界状态读取验收覆盖，而不是另写临时 Dashboard 补丁。
