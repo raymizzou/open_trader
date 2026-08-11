@@ -548,8 +548,8 @@ def build_exhaustive_search_proof(
     conclusion: BusinessStatus,
     source_problem_fingerprint: str | None = None,
 ) -> ExhaustiveSearchProof:
-    if conclusion != BusinessStatus.NO_QUALIFIED_OPPORTUNITY:
-        raise ValueError("exhaustive admission proof only supports NO_QUALIFIED_OPPORTUNITY")
+    if conclusion not in {BusinessStatus.NO_QUALIFIED_OPPORTUNITY, BusinessStatus.NO_ARBITRAGE}:
+        raise ValueError("exhaustive proof requires a negative business conclusion")
     return ExhaustiveSearchProof(
         "EXHAUSTIVE_ORACLE_V1",
         conclusion,
@@ -593,25 +593,179 @@ def _connected_qualified_solution(
     budget: OracleBudget,
     rejection_ids: set[str],
 ) -> PortfolioSolution | UnknownReason | None:
+    solutions = _connected_qualified_solutions(problem, evaluation, budget, rejection_ids)
+    if isinstance(solutions, UnknownReason):
+        return solutions
+    return solutions[0] if solutions else None
+
+
+def _connected_qualified_solutions(
+    problem: ArbitrageProblem,
+    evaluation: PortfolioEvaluation,
+    budget: OracleBudget,
+    rejection_ids: set[str],
+) -> tuple[PortfolioSolution, ...] | UnknownReason:
     support_graph = derive_selected_support_graph(problem, evaluation, budget)
     if isinstance(support_graph, UnknownReason):
         return support_graph
     groups = split_disconnected_solution(problem, evaluation, support_graph)
     if len(groups) == 1:
-        return build_portfolio_solution(problem, evaluation, support_graph)
+        return (build_portfolio_solution(problem, evaluation, support_graph),)
 
     children = tuple(evaluate_fixed_portfolio(problem, quantities, budget) for quantities in groups)
-    qualified_children = []
+    solutions = []
     for child in children:
         if child.failed_qualification_ids:
             _record_rejections(rejection_ids, child)
         else:
-            qualified_children.append(child)
-    for child in qualified_children:
-        solution = _connected_qualified_solution(problem, child, budget, rejection_ids)
-        if solution is not None:
-            return solution
-    return None
+            child_solutions = _connected_qualified_solutions(problem, child, budget, rejection_ids)
+            if isinstance(child_solutions, UnknownReason):
+                return child_solutions
+            solutions.extend(child_solutions)
+    return tuple(solutions)
+
+
+def _search_request_unknown_reason(request: OracleRequest, mode: SearchMode) -> UnknownReason | None:
+    if (
+        not isinstance(request, OracleRequest)
+        or request.mode != mode
+        or not isinstance(request.budget, OracleBudget)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (
+                request.budget.max_quantity_vectors,
+                request.budget.max_joint_states,
+                request.budget.max_support_rechecks,
+            )
+        )
+        or validate_problem(request.problem)
+    ):
+        return UnknownReason.INVALID_MODEL
+    total_vectors = quantity_vector_count(request.problem)
+    if total_vectors > request.budget.max_quantity_vectors:
+        return UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED
+    joint_states = prod(len(state_set.atoms) for state_set in request.problem.terminal_state_sets)
+    if joint_states > request.budget.max_joint_states:
+        return UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED
+    enumeration = enumerate_allowed_scenarios(request.problem, request.budget)
+    return enumeration.unknown_reason
+
+
+def _solution_objective(solution: PortfolioSolution) -> tuple[object, ...]:
+    payout_proof = solution.payout_proof
+    return (
+        -payout_proof.guaranteed_profit_units,
+        payout_proof.cost_upper_bound_units,
+        len(solution.quantities),
+        tuple((quantity.action_id, quantity.quantity_lots) for quantity in solution.quantities),
+    )
+
+
+def _solve_exhaustive(request: OracleRequest, mode: SearchMode) -> OracleResult:
+    reason = _search_request_unknown_reason(request, mode)
+    if reason is not None:
+        return _unknown_result(reason)
+
+    actions = tuple(sorted(request.problem.actions, key=lambda action: action.action_id))
+    rejection_counts: dict[str, int] = {}
+    candidates: list[PortfolioSolution] = []
+    examined = 0
+    for lots in product(*_quantity_ranges(actions)):
+        examined += 1
+        vector_rejection_ids: set[str] = set()
+        if not any(lots):
+            vector_rejection_ids.add("ALL_ZERO")
+            _merge_rejections(rejection_counts, vector_rejection_ids)
+            continue
+        evaluation = evaluate_fixed_portfolio(
+            request.problem,
+            tuple(ActionQuantity(action.action_id, quantity) for action, quantity in zip(actions, lots, strict=True) if quantity),
+            request.budget,
+        )
+        if evaluation.failed_qualification_ids:
+            _record_rejections(vector_rejection_ids, evaluation)
+            _merge_rejections(rejection_counts, vector_rejection_ids)
+            continue
+        solutions = _connected_qualified_solutions(request.problem, evaluation, request.budget, vector_rejection_ids)
+        if isinstance(solutions, UnknownReason):
+            return _unknown_result(solutions)
+        candidates.extend(solutions)
+        _merge_rejections(rejection_counts, vector_rejection_ids)
+
+    audit = SearchAudit(
+        quantity_vector_count(request.problem),
+        examined,
+        prod(len(state_set.atoms) for state_set in request.problem.terminal_state_sets),
+        tuple(sorted(rejection_counts.items())),
+    )
+    if not candidates:
+        proof = build_exhaustive_search_proof(request, audit, BusinessStatus.NO_QUALIFIED_OPPORTUNITY)
+        return OracleResult(
+            SolveStatus.INFEASIBLE,
+            ProofStatus.PROVEN,
+            BusinessStatus.NO_QUALIFIED_OPPORTUNITY,
+            OptimalityStatus.NOT_APPLICABLE,
+            ObjectiveBounds(None, None, None, False),
+            None,
+            proof,
+            None,
+        )
+    solution = min(candidates, key=_solution_objective)
+    profit = solution.payout_proof.guaranteed_profit_units
+    return OracleResult(
+        SolveStatus.FEASIBLE,
+        ProofStatus.PROVEN,
+        BusinessStatus.QUALIFIED_FEASIBLE,
+        OptimalityStatus.OPTIMAL,
+        ObjectiveBounds(profit, profit, 0, True),
+        solution,
+        None,
+        None,
+    )
+
+
+def solve_optimal(request: OracleRequest) -> OracleResult:
+    return _solve_exhaustive(request, SearchMode.OPTIMIZATION)
+
+
+def diagnose_raw_arbitrage(problem: ArbitrageProblem, budget: OracleBudget) -> OracleResult:
+    if not isinstance(problem, ArbitrageProblem) or not isinstance(budget, OracleBudget):
+        return _unknown_result(UnknownReason.INVALID_MODEL)
+    diagnostic_problem = replace(
+        problem,
+        problem_id=f"{problem.problem_id}:raw-arbitrage-diagnostic",
+        qualification_constraints=(),
+    )
+    request = OracleRequest(
+        "open_trader.prediction_n_leg.request.v1",
+        SearchMode.RAW_ARBITRAGE_DIAGNOSTIC,
+        diagnostic_problem,
+        budget,
+    )
+    result = _solve_exhaustive(request, SearchMode.RAW_ARBITRAGE_DIAGNOSTIC)
+    if result.business_status != BusinessStatus.QUALIFIED_FEASIBLE:
+        return result
+    assert result.solution is not None
+    if result.solution.payout_proof.guaranteed_profit_units > 0:
+        return result
+    total_vectors = quantity_vector_count(diagnostic_problem)
+    joint_states = prod(len(state_set.atoms) for state_set in diagnostic_problem.terminal_state_sets)
+    proof = build_exhaustive_search_proof(
+        request,
+        SearchAudit(total_vectors, total_vectors, joint_states, (("ALL_ZERO", 1),)),
+        BusinessStatus.NO_ARBITRAGE,
+        fingerprint(problem),
+    )
+    return OracleResult(
+        SolveStatus.INFEASIBLE,
+        ProofStatus.PROVEN,
+        BusinessStatus.NO_ARBITRAGE,
+        OptimalityStatus.NOT_APPLICABLE,
+        result.objective_bounds,
+        None,
+        proof,
+        None,
+    )
 
 
 def find_qualified(request: OracleRequest) -> OracleResult:

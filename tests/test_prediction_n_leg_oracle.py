@@ -766,6 +766,10 @@ def _admission_request(built: ArbitrageProblem, budget: OracleBudget) -> OracleR
     return OracleRequest("open_trader.prediction_n_leg.request.v1", SearchMode.ADMISSION, built, budget)
 
 
+def _optimization_request(built: ArbitrageProblem, budget: OracleBudget) -> OracleRequest:
+    return OracleRequest("open_trader.prediction_n_leg.request.v1", SearchMode.OPTIMIZATION, built, budget)
+
+
 def _minimum_profit(units: int) -> QualificationConstraint:
     return QualificationConstraint(
         "minimum-profit",
@@ -959,3 +963,201 @@ def test_admission_rejects_non_admission_modes_as_invalid_model() -> None:
 
     assert result.business_status == BusinessStatus.UNKNOWN
     assert result.unknown_reason == UnknownReason.INVALID_MODEL
+
+
+def test_optimal_finds_the_global_profit_maximum_after_admission_stops() -> None:
+    key = observation()
+    built = replace(
+        problem(
+            (action("contract-a", "action-a", key, (ExecutableCostSlice(1, 2, 1),)),),
+            (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 11),)),),
+        ),
+        qualification_constraints=(_minimum_profit(1),),
+    )
+
+    admission = oracle.find_qualified(_admission_request(built, OracleBudget(3, 1, 1)))
+    optimal = oracle.solve_optimal(_optimization_request(built, OracleBudget(3, 1, 1)))
+
+    assert admission.business_status == BusinessStatus.QUALIFIED_FEASIBLE
+    assert admission.optimality_status == OptimalityStatus.NOT_PROVEN
+    assert admission.objective_bounds.closed is False
+    assert admission.solution is not None
+    assert admission.solution.payout_proof.guaranteed_profit_units == 10
+    assert optimal.business_status == BusinessStatus.QUALIFIED_FEASIBLE
+    assert optimal.optimality_status == OptimalityStatus.OPTIMAL
+    assert optimal.objective_bounds == oracle.ObjectiveBounds(20, 20, 0, True)
+    assert optimal.solution is not None
+    assert optimal.solution.payout_proof.guaranteed_profit_units == 20
+
+
+def test_optimal_tie_break_prefers_lower_cost_for_equal_profit() -> None:
+    key_a, key_z = observation("a"), observation("z")
+    built = problem(
+        (
+            action("contract-z", "action-z", key_z, (ExecutableCostSlice(1, 1, 2),)),
+            action("contract-a", "action-a", key_a, (ExecutableCostSlice(1, 1, 1),)),
+        ),
+        (
+            state("contract-z", key_z, "action-z", (("z", TerminalKind.NORMAL_YES, 12),)),
+            state("contract-a", key_a, "action-a", (("a", TerminalKind.NORMAL_YES, 11),)),
+        ),
+    )
+    built = replace(built, qualification_constraints=(_minimum_profit(10),))
+
+    result = oracle.solve_optimal(_optimization_request(built, OracleBudget(4, 1, 1)))
+
+    assert result.solution is not None
+    assert result.solution.quantities == (ActionQuantity("action-a", 1),)
+    assert result.solution.payout_proof.guaranteed_profit_units == 10
+    assert result.solution.payout_proof.cost_upper_bound_units == 1
+
+
+def test_optimal_tie_break_prefers_fewer_legs_after_profit_and_cost() -> None:
+    key_a, shared = observation("a"), observation("shared")
+    built = replace(
+        problem(
+            (
+                action("contract-a", "action-a", key_a, (ExecutableCostSlice(1, 1, 2),)),
+                action("contract-b", "action-b", shared),
+                action("contract-z", "action-z", shared),
+            ),
+            (
+                state("contract-a", key_a, "action-a", (("a", TerminalKind.NORMAL_YES, 12),)),
+                state("contract-b", shared, "action-b", (("b", TerminalKind.NORMAL_YES, 6),)),
+                state("contract-z", shared, "action-z", (("z", TerminalKind.NORMAL_YES, 6),)),
+            ),
+        ),
+        qualification_constraints=(_minimum_profit(10),),
+    )
+
+    result = oracle.solve_optimal(_optimization_request(built, OracleBudget(8, 1, 1)))
+
+    assert result.solution is not None
+    assert result.solution.quantities == (ActionQuantity("action-a", 1),)
+    assert result.solution.payout_proof.guaranteed_profit_units == 10
+    assert result.solution.payout_proof.cost_upper_bound_units == 2
+
+
+def test_optimal_tie_break_uses_stable_action_quantities_last() -> None:
+    key_a, key_z = observation("a"), observation("z")
+    built = replace(
+        problem(
+            (
+                action("contract-z", "action-z", key_z),
+                action("contract-a", "action-a", key_a),
+            ),
+            (
+                state("contract-z", key_z, "action-z", (("z", TerminalKind.NORMAL_YES, 11),)),
+                state("contract-a", key_a, "action-a", (("a", TerminalKind.NORMAL_YES, 11),)),
+            ),
+        ),
+        qualification_constraints=(_minimum_profit(10),),
+    )
+
+    result = oracle.solve_optimal(_optimization_request(built, OracleBudget(4, 1, 1)))
+
+    assert result.solution is not None
+    assert result.solution.quantities == (ActionQuantity("action-a", 1),)
+
+
+def test_optimal_is_unknown_when_budget_cannot_close_even_after_admission_proves_a_solution() -> None:
+    key = observation()
+    built = replace(
+        problem(
+            (action("contract-a", "action-a", key, (ExecutableCostSlice(1, 2, 1),)),),
+            (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 11),)),),
+        ),
+        qualification_constraints=(_minimum_profit(1),),
+    )
+
+    admission = oracle.find_qualified(_admission_request(built, OracleBudget(3, 1, 1)))
+    incomplete = oracle.solve_optimal(_optimization_request(built, OracleBudget(2, 1, 1)))
+
+    assert admission.business_status == BusinessStatus.QUALIFIED_FEASIBLE
+    assert incomplete.business_status == BusinessStatus.UNKNOWN
+    assert incomplete.optimality_status != OptimalityStatus.OPTIMAL
+    assert incomplete.unknown_reason == UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED
+
+
+def test_optimal_rejects_non_optimization_mode_and_proves_exhaustive_no_qualification() -> None:
+    key = observation()
+    built = replace(
+        problem(
+            (action("contract-a", "action-a", key),),
+            (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 1),)),),
+        ),
+        qualification_constraints=(_minimum_profit(1),),
+    )
+
+    invalid = oracle.solve_optimal(_admission_request(built, OracleBudget(2, 1, 1)))
+    exhausted = oracle.solve_optimal(_optimization_request(built, OracleBudget(2, 1, 1)))
+
+    assert invalid.business_status == BusinessStatus.UNKNOWN
+    assert invalid.unknown_reason == UnknownReason.INVALID_MODEL
+    assert exhausted.business_status == BusinessStatus.NO_QUALIFIED_OPPORTUNITY
+    assert exhausted.negative_proof is not None
+    assert exhausted.negative_proof.quantity_vectors_total == exhausted.negative_proof.quantity_vectors_examined == 2
+
+
+@pytest.mark.parametrize("payout", [1, 0])
+def test_raw_arbitrage_proves_no_arbitrage_only_when_global_profit_is_not_positive(payout: int) -> None:
+    key = observation()
+    built = problem(
+        (action("contract-a", "action-a", key),),
+        (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, payout),)),),
+    )
+
+    result = oracle.diagnose_raw_arbitrage(built, OracleBudget(2, 1, 1))
+
+    assert result.business_status == BusinessStatus.NO_ARBITRAGE
+    assert result.objective_bounds == oracle.ObjectiveBounds(payout - 1, payout - 1, 0, True)
+    assert result.negative_proof is not None
+    assert result.negative_proof.proof_method == "EXHAUSTIVE_ORACLE_V1"
+    assert result.negative_proof.problem_fingerprint != fingerprint(built)
+    diagnostic_problem = replace(built, problem_id=f"{built.problem_id}:raw-arbitrage-diagnostic", qualification_constraints=())
+    assert result.negative_proof.problem_fingerprint == fingerprint(diagnostic_problem)
+    assert result.negative_proof.request_fingerprint == fingerprint(
+        OracleRequest(
+            "open_trader.prediction_n_leg.request.v1",
+            SearchMode.RAW_ARBITRAGE_DIAGNOSTIC,
+            diagnostic_problem,
+            OracleBudget(2, 1, 1),
+        )
+    )
+    assert result.negative_proof.source_problem_fingerprint == fingerprint(built)
+    assert result.negative_proof.quantity_vectors_total == result.negative_proof.quantity_vectors_examined == 2
+
+
+def test_raw_arbitrage_keeps_positive_raw_profit_separate_from_admission_and_is_never_automatic(monkeypatch: pytest.MonkeyPatch) -> None:
+    key = observation()
+    built = replace(
+        problem(
+            (action("contract-a", "action-a", key),),
+            (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 11),)),),
+        ),
+        qualification_constraints=(_minimum_profit(11),),
+    )
+    monkeypatch.setattr(oracle, "diagnose_raw_arbitrage", lambda *_: (_ for _ in ()).throw(AssertionError("must be explicit")), raising=False)
+
+    admission = oracle.find_qualified(_admission_request(built, OracleBudget(2, 1, 1)))
+    monkeypatch.undo()
+    diagnostic = oracle.diagnose_raw_arbitrage(built, OracleBudget(2, 1, 1))
+
+    assert admission.business_status == BusinessStatus.NO_QUALIFIED_OPPORTUNITY
+    assert diagnostic.business_status == BusinessStatus.QUALIFIED_FEASIBLE
+    assert diagnostic.business_status != BusinessStatus.NO_ARBITRAGE
+    assert diagnostic.solution is not None
+    assert diagnostic.solution.payout_proof.guaranteed_profit_units == 10
+
+
+def test_raw_arbitrage_returns_unknown_when_its_derived_optimization_cannot_close() -> None:
+    key = observation()
+    built = problem(
+        (action("contract-a", "action-a", key, (ExecutableCostSlice(1, 2, 1),)),),
+        (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 11),)),),
+    )
+
+    result = oracle.diagnose_raw_arbitrage(built, OracleBudget(2, 1, 1))
+
+    assert result.business_status == BusinessStatus.UNKNOWN
+    assert result.unknown_reason == UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED
