@@ -424,6 +424,9 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
         def set_observation_observer(self, _observer: object) -> None:
             pass
 
+        def set_auto_eat_observer(self, _observer: object) -> None:
+            events.append("auto_eat.bind")
+
         def set_failure_observer(self, _observer: object) -> None:
             pass
 
@@ -448,6 +451,9 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
             return {"status": "ignored"}
 
         def notify_monitor_failure(self, *_: object) -> dict[str, object]:
+            return {"status": "ignored"}
+
+        def auto_eat_threshold(self, *_: object) -> dict[str, object]:
             return {"status": "ignored"}
 
         def set_cross_venue_monitor(self, _monitor: object) -> None:
@@ -512,6 +518,7 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
         assert runtime.state == "RUNNING"
         assert runtime.production_owner is True
         assert events.index("policy.apply") < events.index("execution.construct")
+        assert events.index("auto_eat.bind") < events.index("reconcile")
         assert events.index("reconcile") < events.index("polymarket.start")
         assert events.index("polymarket.start") < events.index("cross.start")
         with pytest.raises(RuntimeError, match="cannot start from RUNNING"):
@@ -596,6 +603,9 @@ def test_reconcile_failure_keeps_runtime_locked_and_does_not_start_monitors(
         def set_observation_observer(self, _observer: object) -> None:
             pass
 
+        def set_auto_eat_observer(self, _observer: object) -> None:
+            pass
+
         def set_failure_observer(self, _observer: object) -> None:
             pass
 
@@ -616,6 +626,9 @@ def test_reconcile_failure_keeps_runtime_locked_and_does_not_start_monitors(
             return {"state": "ignored"}
 
         def notify_observation(self, *_: object) -> dict[str, object]:
+            return {"state": "ignored"}
+
+        def auto_eat_threshold(self, *_: object) -> dict[str, object]:
             return {"state": "ignored"}
 
         def notify_monitor_failure(self, *_: object) -> dict[str, object]:
@@ -684,6 +697,9 @@ def test_locked_reconcile_result_keeps_runtime_not_ready(
         def set_observation_observer(self, _observer: object) -> None:
             pass
 
+        def set_auto_eat_observer(self, _observer: object) -> None:
+            pass
+
         def set_failure_observer(self, _observer: object) -> None:
             pass
 
@@ -704,6 +720,9 @@ def test_locked_reconcile_result_keeps_runtime_not_ready(
             pass
 
         def notify_observation(self, *_: object) -> None:
+            pass
+
+        def auto_eat_threshold(self, *_: object) -> None:
             pass
 
         def notify_monitor_failure(self, *_: object) -> None:
@@ -806,6 +825,9 @@ def test_cross_start_failure_degrades_only_cross_source(
         def set_observation_observer(self, _observer: object) -> None:
             pass
 
+        def set_auto_eat_observer(self, _observer: object) -> None:
+            pass
+
         def set_failure_observer(self, _observer: object) -> None:
             pass
 
@@ -826,6 +848,9 @@ def test_cross_start_failure_degrades_only_cross_source(
             pass
 
         def notify_observation(self, *_: object) -> None:
+            pass
+
+        def auto_eat_threshold(self, *_: object) -> None:
             pass
 
         def notify_monitor_failure(self, *_: object) -> None:

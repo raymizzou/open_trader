@@ -514,6 +514,13 @@ def test_production_http_confirmation_preserves_execution_idempotency(
     runtime.cross_venue_monitor = None  # type: ignore[assignment]
 
     with _production_server(runtime) as (base, _runtime):
+        rejection_status, rejection = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/preview",
+                data=b'{"opportunity_id":"missing"}',
+            )
+        )
         preview_status, preview = _response(
             _production_request(
                 base,
@@ -539,7 +546,12 @@ def test_production_http_confirmation_preserves_execution_idempotency(
         )
 
     final = wait_until_terminal(execution_service, str(first["execution_id"]))
-    assert preview_status == first_status == second_status == 200
+    assert rejection_status == preview_status == first_status == second_status == 200
+    assert rejection == {"state": "rejected", "reason": "opportunity_unavailable"}
+    assert preview["total_max_cost"] == "8.00"
+    assert preview["minimum_profit"] == "2.00"
+    assert preview["wallet_address"] == "0x1111…1111"
+    assert "intent" not in preview
     assert second["execution_id"] == first["execution_id"]
     assert final["state"] == "both_rejected"
     assert trading.batch_calls == 1

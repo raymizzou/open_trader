@@ -16,7 +16,11 @@ import subprocess
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
-from .prediction_read_model import prediction_history_payload, prediction_state_payload
+from .prediction_read_model import (
+    _prediction_safe_value,
+    prediction_history_payload,
+    prediction_state_payload,
+)
 from .prediction_runtime import PredictionRuntime
 
 
@@ -290,7 +294,10 @@ def create_prediction_server(
                     and result.get("state") == "busy"
                 ):
                     status = HTTPStatus.CONFLICT
-                self._send_json(status, dict(result))
+                safe_result = _prediction_safe_value(result)
+                if not isinstance(safe_result, Mapping):
+                    raise RuntimeError("prediction mutation result is invalid")
+                self._send_json(status, safe_result)
             except PermissionError as exc:
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
             except OverflowError as exc:

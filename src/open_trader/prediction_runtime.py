@@ -477,6 +477,9 @@ class PredictionRuntime:
             self.monitor.set_observation_observer(
                 self.execution.notify_observation
             )
+            self.monitor.set_auto_eat_observer(
+                self.execution.auto_eat_threshold
+            )
             self.monitor.set_failure_observer(
                 self.execution.notify_monitor_failure
             )
