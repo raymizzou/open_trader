@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-11
 
+- #42 为独立 Prediction Service 增加 production owner 与四项控制操作（模式切换、
+  熔断重置、Predict allowance 清理、跨所自动暂停）：仅在持有唯一 runtime lock、
+  安全策略已登记且启动对账为 RUNNING 后才绑定端口；控制请求沿用 loopback、
+  Host/Origin、session/CSRF、严格 JSON 与 1 MiB 限制，并将幂等结果和安全降级写入
+  SQLite 审计。此票未部署、未改 Gateway/Legacy/UI/launchd；已通过临时数据/fake venue
+  直接工作流、410 项相关回归及跨所 monitor 兼容检查，退出后无残留 8769 listener。
+
 - #41 新增独立的只读 Shadow Prediction Service（`127.0.0.1:8769`）及 launchd
   安装、重启、卸载和有界双路 parity 验证；Shadow 使用独立 SQLite、禁止网络提交，并在
   任何写入尝试或语义差异时 fail-closed。最终 live 验证同市场与跨所 Codex 均为 3/3、
