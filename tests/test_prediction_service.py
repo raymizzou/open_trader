@@ -514,6 +514,9 @@ def test_shadow_health_has_the_read_only_identity() -> None:
     assert payload["guard_attempts"] == []
     assert isinstance(payload["pid"], int)
     assert isinstance(payload["started_at"], str)
+    assert "release_schema_version" not in payload
+    assert "reader_generation" not in payload
+    assert "contract_generation" not in payload
 
 
 def test_shadow_state_and_history_use_the_shared_read_model() -> None:
@@ -1309,6 +1312,9 @@ def test_sigterm_stops_prediction_runtime_and_releases_its_lock(
 ) -> None:
     lock_path = tmp_path / "prediction_arbitrage" / "runtime.lock"
     marker = tmp_path / "stopped"
+    release_manifest = (
+        Path(__file__).resolve().parents[1] / "ops" / "prediction-service-release.json"
+    )
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -1344,6 +1350,7 @@ raise SystemExit(service.serve_prediction_service(
     prediction_config_path=data_dir / "prediction.json",
     port={port},
     mode={mode!r},
+    release_manifest_path=Path({str(release_manifest)!r}),
 ))
 '''
     process = subprocess.Popen(
@@ -1412,10 +1419,60 @@ def test_production_owner_must_be_ready_before_server_bind(
             prediction_config_path=tmp_path / "prediction.json",
             port=0,
             mode="production",
+            release_manifest_path=Path(__file__).resolve().parents[1]
+            / "ops"
+            / "prediction-service-release.json",
         )
 
     assert len(instances) == 1
     assert instances[0].state == "STOPPED"
+
+
+def test_production_service_requires_release_manifest_before_runtime_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_service as service
+
+    monkeypatch.setattr(
+        service,
+        "PredictionRuntime",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("runtime constructed")),
+    )
+    with pytest.raises(ValueError, match="release manifest is required"):
+        service.serve_prediction_service(
+            data_dir=tmp_path,
+            prediction_config_path=tmp_path / "prediction.json",
+            port=0,
+            mode="production",
+        )
+
+
+def test_cli_passes_release_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+    import open_trader.prediction_service as service
+
+    captured: dict[str, object] = {}
+
+    def serve(**kwargs: object) -> int:
+        captured.update(kwargs)
+        return 7
+
+    monkeypatch.setattr(service, "serve_prediction_service", serve)
+
+    result = service.main(
+        [
+            "--mode",
+            "production",
+            "--data-dir",
+            "/tmp/data",
+            "--config",
+            "/tmp/prediction.json",
+            "--release-manifest",
+            "/tmp/release.json",
+        ]
+    )
+
+    assert result == 7
+    assert captured["release_manifest_path"] == Path("/tmp/release.json")
 
 
 def test_production_bind_failure_stops_runtime_and_uses_one_metadata_snapshot(
@@ -1447,7 +1504,12 @@ def test_production_bind_failure_stops_runtime_and_uses_one_metadata_snapshot(
 
     def fail_bind(**kwargs: object) -> object:
         assert kwargs["runtime"] is instances[0]
-        assert kwargs["runtime_metadata"] == metadata
+        assert kwargs["runtime_metadata"] == {
+            **metadata,
+            "release_schema_version": "open_trader.prediction_service.release.v1",
+            "reader_generation": 1,
+            "contract_generation": 1,
+        }
         raise OSError("bind failed")
 
     monkeypatch.setattr(service, "PredictionRuntime", FakeRuntime)
@@ -1463,9 +1525,13 @@ def test_production_bind_failure_stops_runtime_and_uses_one_metadata_snapshot(
             prediction_config_path=tmp_path / "prediction.json",
             port=0,
             mode="production",
+            release_manifest_path=Path(__file__).resolve().parents[1]
+            / "ops"
+            / "prediction-service-release.json",
         )
 
     assert instances[0].kwargs["git_sha"] == "abc123"
+    assert instances[0].kwargs["reader_generation"] == 1
     assert instances[0].state == "STOPPED"
     assert {
         signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)

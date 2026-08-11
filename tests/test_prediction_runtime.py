@@ -271,6 +271,19 @@ def test_runtime_constructor_is_side_effect_free(tmp_path: Path) -> None:
     assert runtime.execution is None
 
 
+@pytest.mark.parametrize("reader_generation", (True, False, 0, -1))
+def test_reader_generation_must_be_a_positive_integer(
+    tmp_path: Path, reader_generation: object
+) -> None:
+    with pytest.raises(ValueError):
+        PredictionRuntime(
+            data_dir=tmp_path,
+            prediction_config_path=tmp_path / "prediction.json",
+            dashboard_url="http://127.0.0.1:8766/",
+            reader_generation=reader_generation,  # type: ignore[arg-type]
+        )
+
+
 def test_prediction_safety_policy_contains_only_semantic_public_inputs() -> None:
     import open_trader.prediction_runtime as runtime_module
 
@@ -389,9 +402,20 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
     import open_trader.prediction_runtime as runtime_module
 
     events: list[str] = []
+    original_acquire = runtime_module._RuntimeOwnershipLock.acquire
+    original_release = runtime_module._RuntimeOwnershipLock.release
+
+    def acquire(lock: object) -> None:
+        original_acquire(lock)  # type: ignore[arg-type]
+        events.append("owner.acquire")
+
+    def release(lock: object) -> None:
+        original_release(lock)  # type: ignore[arg-type]
+        events.append("owner.release")
 
     class FakeStore:
         def __init__(self, _data_dir: Path) -> None:
+            events.append("store.construct")
             events.append("store.open")
 
         def apply_safety_policy(
@@ -412,6 +436,7 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
     class FakeTradingClient:
         @classmethod
         def from_keychain(cls, _config: object) -> FakeTrading:
+            events.append("client.construct")
             return FakeTrading()
 
     class FakeMonitor:
@@ -482,6 +507,14 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
         ),
         raising=False,
     )
+    monkeypatch.setattr(runtime_module._RuntimeOwnershipLock, "acquire", acquire)
+    monkeypatch.setattr(runtime_module._RuntimeOwnershipLock, "release", release)
+    monkeypatch.setattr(
+        runtime_module,
+        "read_minimum_reader_generation",
+        lambda _data_dir: events.append("generation.read") or 1,
+        raising=False,
+    )
     monkeypatch.setattr(
         runtime_module,
         "PolymarketTradingClient",
@@ -512,11 +545,16 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
         dashboard_url="http://127.0.0.1:8766/",
         cross_venue_monitor=FakeCrossMonitor(),
         git_sha="sha-1",
+        reader_generation=1,
     )
     runtime.start()
     try:
         assert runtime.state == "RUNNING"
         assert runtime.production_owner is True
+        assert events.index("owner.acquire") < events.index("generation.read")
+        assert events.count("generation.read") == 1
+        assert events.index("generation.read") < events.index("store.construct")
+        assert events.index("store.construct") < events.index("client.construct")
         assert events.index("policy.apply") < events.index("execution.construct")
         assert events.index("auto_eat.bind") < events.index("reconcile")
         assert events.index("reconcile") < events.index("polymarket.start")
@@ -532,6 +570,88 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
     assert events.index("polymarket.stop") < events.index("execution.close")
     assert events.index("execution.close") < events.index("trading.close")
     assert events.index("trading.close") < events.index("store.close")
+    assert events.index("store.close") < events.index("owner.release")
+
+
+def test_incompatible_release_stops_before_writable_resources_and_releases_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    constructed: list[str] = []
+    probes: list[Path] = []
+    monkeypatch.setattr(
+        runtime_module,
+        "read_minimum_reader_generation",
+        lambda path: probes.append(path) or 2,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictionArbitrageStore",
+        lambda _path: constructed.append("store") or object(),
+    )
+    monkeypatch.setattr(
+        runtime_module.PolymarketTradingClient,
+        "from_keychain",
+        lambda _config: constructed.append("client") or object(),
+    )
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8769",
+        reader_generation=1,
+    )
+
+    with pytest.raises(
+        runtime_module.PredictionRuntimeCompatibilityError,
+        match="reader generation 1 is below required 2",
+    ):
+        runtime.start()
+
+    assert constructed == []
+    assert probes == [tmp_path]
+    assert runtime.production_owner is False
+    probe = runtime_module._RuntimeOwnershipLock(
+        tmp_path / "prediction_arbitrage" / "runtime.lock"
+    )
+    probe.acquire()
+    probe.release()
+
+
+def test_legacy_runtime_without_release_generation_skips_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    class FakeStore:
+        def __init__(self, _data_dir: Path) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        runtime_module,
+        "read_minimum_reader_generation",
+        lambda _path: (_ for _ in ()).throw(AssertionError("generation probed")),
+        raising=False,
+    )
+    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
+    monkeypatch.setattr(
+        runtime_module,
+        "load_trading_config",
+        lambda _path: (_ for _ in ()).throw(RuntimeError("config reached")),
+    )
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766",
+    )
+
+    with pytest.raises(RuntimeError, match="config reached"):
+        runtime.start()
+    runtime.stop()
 
 
 def test_failed_runtime_is_terminal_and_stop_does_not_repeat_cleanup(
