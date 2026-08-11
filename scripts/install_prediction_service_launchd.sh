@@ -168,7 +168,19 @@ listener_absent() {
   else
     status=$?
   fi
-  [[ "$status" -eq 1 ]]
+  [[ "$status" -eq 1 && -z "$output" ]]
+}
+
+pid_absent() {
+  local output status
+  if output="$("$PS_BIN" -p "$1" 2>&1)"; then
+    return 1
+  else
+    status=$?
+  fi
+  [[ "$status" -eq 1 ]] && return 0
+  printf '%s\n' "$output" >&2
+  return "$status"
 }
 
 owner_available() {
@@ -327,7 +339,8 @@ if LISTENER_OUTPUT="$("$LSOF_BIN" -nP -iTCP:8769 -sTCP:LISTEN -Fn 2>&1)"; then
   LISTENER_STATUS=0
 else
   LISTENER_STATUS=$?
-  [[ "$LISTENER_STATUS" -eq 1 ]] || fail "failed to inspect listener on 8769"
+  [[ "$LISTENER_STATUS" -eq 1 && -z "$LISTENER_OUTPUT" ]] \
+    || fail "failed to inspect listener on 8769"
 fi
 LISTENER_PID="$(printf '%s\n' "$LISTENER_OUTPUT" | awk '
   /^p[0-9]+$/ { pid = substr($1, 2) }
@@ -387,7 +400,9 @@ try:
         and ready.get("mutations") == health.get("mutations")
         and ready.get("git_sha") == health.get("git_sha")
         and ready.get("release_schema_version") == health.get("release_schema_version")
+        and type(ready.get("reader_generation")) is int
         and ready.get("reader_generation") == health.get("reader_generation")
+        and type(ready.get("contract_generation")) is int
         and ready.get("contract_generation") == health.get("contract_generation")
         and ready.get("process_started_at") == health.get("started_at")
     )
@@ -499,7 +514,7 @@ if [[ "$MANAGED_OLD" -eq 1 ]]; then
 fi
 wait_agent_absent \
   || record_failed_and_exit "candidate_cleanup_not_proven"
-if [[ -n "$OLD_PID" ]] && "$PS_BIN" -p "$OLD_PID" >/dev/null 2>&1; then
+if [[ -n "$OLD_PID" ]] && ! pid_absent "$OLD_PID"; then
   record_failed_and_exit "candidate_cleanup_not_proven"
 fi
 listener_absent \
@@ -649,7 +664,7 @@ cleanup_verified_candidate() {
         listener_status=0
       else
         listener_status=$?
-        [[ "$listener_status" -eq 1 ]] || return 1
+        [[ "$listener_status" -eq 1 && -z "$listener_output" ]] || return 1
       fi
       if [[ "$listener_status" -eq 0 ]]; then
         listener_pid="$(printf '%s\n' "$listener_output" | awk '
@@ -674,11 +689,11 @@ cleanup_verified_candidate() {
 
 candidate_absent() {
   wait_agent_absent || return 1
-  if [[ -n "$CANDIDATE_PID" ]] && "$PS_BIN" -p "$CANDIDATE_PID" >/dev/null 2>&1; then
+  if [[ -n "$CANDIDATE_PID" ]] && ! pid_absent "$CANDIDATE_PID"; then
     return 1
   fi
   if [[ -n "$CLEANUP_PID" && "$CLEANUP_PID" != "$CANDIDATE_PID" ]] \
-    && "$PS_BIN" -p "$CLEANUP_PID" >/dev/null 2>&1; then
+    && ! pid_absent "$CLEANUP_PID"; then
     return 1
   fi
   listener_absent || return 1

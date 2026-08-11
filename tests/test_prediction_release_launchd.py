@@ -72,7 +72,7 @@ if command == "launchctl":
         case = state["case"]
         old_pid = state["pid"]
         state.update(loaded=False, pid=0, cwd="", listener=False,
-                     owner_available=True, health={})
+                     owner_available=True, health={}, bootout_seen=True)
         if case in {"pid_still_present", "keepalive_restart_survivor"}:
             state["pid"] = old_pid
         if case == "listener_still_present":
@@ -137,7 +137,9 @@ if command == "lsof":
             print(f"p{state['pid']}\nfcwd\nn{state['cwd']}")
             raise SystemExit(0)
         raise SystemExit(1)
-    if state["case"] == "listener_inspection_error" and not state["loaded"]:
+    if (state["case"] == "listener_inspection_error"
+            or (state.get("listener_inspection_error_after_bootout")
+                and state.get("bootout_seen"))) and not state["loaded"]:
         print("lsof: inspection failed", file=sys.stderr)
         raise SystemExit(1)
     if state["listener"]:
@@ -161,7 +163,7 @@ if command == "curl":
     raise SystemExit(22)
 
 if command == "ps":
-    if state["case"] == "ps_inspection_error":
+    if state["case"] == "ps_inspection_error" or state.get("ps_inspection_error"):
         print("ps: inspection failed", file=sys.stderr)
         raise SystemExit(2)
     raise SystemExit(0 if state["pid"] and str(state["pid"]) in sys.argv else 1)
@@ -367,6 +369,7 @@ def release_harness(tmp_path: Path) -> ReleaseHarness:
         ("wrong_sha", "requested SHA does not match checkout"),
         ("invalid_manifest", "prediction release manifest"),
         ("unknown_listener", "unknown listener on 8769"),
+        ("listener_inspection_error", "failed to inspect listener on 8769"),
         ("unknown_label_identity", "managed launchd identity is not verified"),
         ("unknown_owner", "prediction runtime owner is held by an unknown process"),
     ],
@@ -587,6 +590,51 @@ def test_keepalive_restarted_survivor_fails_pid_absence_proof(
     assert record["failure_reason"] == "candidate_cleanup_not_proven"
 
 
+def test_upgrade_refuses_old_pid_inspection_error_before_bootstrap(
+    release_harness: ReleaseHarness,
+) -> None:
+    old = release_harness.candidate
+    new = release_harness.make_checkout("new-candidate")
+    release_harness.install(old, check=True)
+    state = release_harness.state
+    state["ps_inspection_error"] = True
+    release_harness.state_path.write_text(json.dumps(state), encoding="utf-8")
+    release_harness.calls.clear()
+
+    result = release_harness.install(new)
+
+    assert result.returncode == 1
+    assert "candidate_cleanup_not_proven" in result.stderr
+    assert release_harness.calls.named("launchctl") == [
+        f"launchctl print gui/{os.getuid()}/{LABEL}",
+        f"launchctl bootout gui/{os.getuid()}/{LABEL}",
+        f"launchctl print gui/{os.getuid()}/{LABEL}",
+    ]
+
+
+@pytest.mark.parametrize("inspection", ["ps", "listener"])
+def test_failed_candidate_refuses_cleanup_inspection_error(
+    release_harness: ReleaseHarness, inspection: str
+) -> None:
+    state = release_harness.state
+    state["case"] = "wrong_health_sha"
+    state[
+        "ps_inspection_error"
+        if inspection == "ps"
+        else "listener_inspection_error_after_bootout"
+    ] = True
+    release_harness.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    result = release_harness.install(mode="production")
+
+    assert result.returncode == 1
+    assert "candidate_cleanup_not_proven" in result.stderr
+    record = release_harness.runtime_record
+    assert record is not None
+    assert record["state"] == "failed"
+    assert record["failure_reason"] == "candidate_cleanup_not_proven"
+
+
 def test_post_maintenance_log_setup_failure_removes_autoload_plist(
     release_harness: ReleaseHarness,
 ) -> None:
@@ -634,6 +682,25 @@ def test_same_sha_ready_install_is_a_noop(release_harness: ReleaseHarness) -> No
     assert "already ready" in result.stdout
     assert all(" bootout " not in f" {call} " for call in release_harness.calls.all())
     assert all(" bootstrap " not in f" {call} " for call in release_harness.calls.all())
+
+
+@pytest.mark.parametrize("field", ["reader_generation", "contract_generation"])
+def test_install_rejects_boolean_ready_generation_without_bootout(
+    release_harness: ReleaseHarness, field: str
+) -> None:
+    release_harness.install(mode="production", check=True)
+    record_path = release_harness.runtime_root / "prediction-service-runtime.json"
+    record = release_harness.runtime_record
+    assert record is not None
+    record["ready"][field] = True
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+    release_harness.calls.clear()
+
+    result = release_harness.install(mode="production")
+
+    assert result.returncode == 1
+    assert "managed launchd identity is not verified" in result.stderr
+    assert all(" bootout " not in f" {call} " for call in release_harness.calls.all())
 
 
 @pytest.mark.parametrize("direction", ["upgrade", "rollback"])

@@ -10,6 +10,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   Production startup checks the persisted minimum reader generation under the
   owner lock before writable Store/client/thread construction, and launchd
   transitions retain exact ready/failed/stopped evidence for the later #45 cutover.
+  Shell/plist checks, the isolated install/upgrade/rollback/stop workflow, and
+  relevant regressions passed; the full branch gate remains blocked only by an
+  unavailable external macOS Keychain integration.
 
 - #34 为独立 Prediction Service 增加固定 8 请求的全局 HTTP 准入边界，并对相同
   history 查询做 1 秒进程内 single-flight；过载在创建 handler 线程前返回带
