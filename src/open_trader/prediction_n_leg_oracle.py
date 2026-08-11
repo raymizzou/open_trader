@@ -668,7 +668,7 @@ def _solve_exhaustive(request: OracleRequest, mode: SearchMode) -> OracleResult:
 
     actions = tuple(sorted(request.problem.actions, key=lambda action: action.action_id))
     rejection_counts: dict[str, int] = {}
-    candidates: list[PortfolioSolution] = []
+    best_solution: PortfolioSolution | None = None
     examined = 0
     for lots in product(*_quantity_ranges(actions)):
         examined += 1
@@ -689,7 +689,9 @@ def _solve_exhaustive(request: OracleRequest, mode: SearchMode) -> OracleResult:
         solutions = _connected_qualified_solutions(request.problem, evaluation, request.budget, vector_rejection_ids)
         if isinstance(solutions, UnknownReason):
             return _unknown_result(solutions)
-        candidates.extend(solutions)
+        for solution in solutions:
+            if best_solution is None or _solution_objective(solution) < _solution_objective(best_solution):
+                best_solution = solution
         _merge_rejections(rejection_counts, vector_rejection_ids)
 
     audit = SearchAudit(
@@ -698,7 +700,7 @@ def _solve_exhaustive(request: OracleRequest, mode: SearchMode) -> OracleResult:
         prod(len(state_set.atoms) for state_set in request.problem.terminal_state_sets),
         tuple(sorted(rejection_counts.items())),
     )
-    if not candidates:
+    if best_solution is None:
         proof = build_exhaustive_search_proof(request, audit, BusinessStatus.NO_QUALIFIED_OPPORTUNITY)
         return OracleResult(
             SolveStatus.INFEASIBLE,
@@ -710,7 +712,7 @@ def _solve_exhaustive(request: OracleRequest, mode: SearchMode) -> OracleResult:
             proof,
             None,
         )
-    solution = min(candidates, key=_solution_objective)
+    solution = best_solution
     profit = solution.payout_proof.guaranteed_profit_units
     return OracleResult(
         SolveStatus.FEASIBLE,

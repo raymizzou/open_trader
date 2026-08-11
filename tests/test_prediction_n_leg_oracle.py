@@ -1096,7 +1096,17 @@ def test_optimal_rejects_non_optimization_mode_and_proves_exhaustive_no_qualific
     assert invalid.unknown_reason == UnknownReason.INVALID_MODEL
     assert exhausted.business_status == BusinessStatus.NO_QUALIFIED_OPPORTUNITY
     assert exhausted.negative_proof is not None
-    assert exhausted.negative_proof.quantity_vectors_total == exhausted.negative_proof.quantity_vectors_examined == 2
+    proof = exhausted.negative_proof
+    request = _optimization_request(built, OracleBudget(2, 1, 1))
+    assert proof.proof_method == "EXHAUSTIVE_ORACLE_V1"
+    assert proof.conclusion == BusinessStatus.NO_QUALIFIED_OPPORTUNITY
+    assert proof.request_fingerprint == fingerprint(request)
+    assert proof.problem_fingerprint == fingerprint(built)
+    assert proof.source_problem_fingerprint is None
+    assert proof.qualification_fingerprint == fingerprint({"qualification_constraints": built.qualification_constraints})
+    assert proof.quantity_vectors_total == proof.quantity_vectors_examined == 2
+    assert proof.joint_states_per_vector == 1
+    assert proof.rejection_counts == (("ALL_ZERO", 1), ("minimum-profit", 1))
 
 
 @pytest.mark.parametrize("payout", [1, 0])
