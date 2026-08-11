@@ -69,12 +69,16 @@ if command == "launchctl":
         print("Could not find service", file=sys.stderr)
         raise SystemExit(113)
     if action == "bootout":
-        surviving_pid = (
-            state["pid"] if state["case"] == "keepalive_restart_survivor" else 0
-        )
-        state.update(loaded=False, pid=surviving_pid, cwd="", listener=False,
-                     owner_available=True, health={}, plist="",
-                     stdout_log="", stderr_log="")
+        case = state["case"]
+        old_pid = state["pid"]
+        state.update(loaded=False, pid=0, cwd="", listener=False,
+                     owner_available=True, health={})
+        if case in {"pid_still_present", "keepalive_restart_survivor"}:
+            state["pid"] = old_pid
+        if case == "listener_still_present":
+            state.update(pid=old_pid, listener=True)
+        if case == "owner_still_held":
+            state["owner_available"] = False
         save()
         raise SystemExit(0)
     if action == "bootstrap":
@@ -86,6 +90,15 @@ if command == "launchctl":
                          stdout_log=state["stdout_log"] or os.environ["FAKE_STDOUT_LOG"],
                          stderr_log=state["stderr_log"] or os.environ["FAKE_STDERR_LOG"])
         elif state["case"] in {"bind_failure", "reconcile_failure", "incompatible_reader"}:
+            state.update(loaded=True, pid=0,
+                         cwd=os.environ["FAKE_CANDIDATE_CWD"],
+                         listener=False, owner_available=True, health={},
+                         plist=sys.argv[-1],
+                         stdout_log=state["stdout_log"] or os.environ["FAKE_STDOUT_LOG"],
+                         stderr_log=state["stderr_log"] or os.environ["FAKE_STDERR_LOG"])
+            save()
+            raise SystemExit(1)
+        elif state["case"] == "bootstrap_absent":
             state.update(loaded=False, pid=0, listener=False, owner_available=True)
         else:
             pid = 4242
@@ -202,7 +215,7 @@ class ReleaseHarness:
         dispatcher = self.fake_bin / "fake-command"
         dispatcher.write_text(FAKE_COMMAND_SOURCE, encoding="utf-8")
         dispatcher.chmod(0o755)
-        for name in ("launchctl", "lsof", "curl", "ps", "owner-probe"):
+        for name in ("launchctl", "lsof", "curl", "ps", "owner-probe", "sleep"):
             (self.fake_bin / name).symlink_to(dispatcher)
 
     def configure(self, case: str) -> None:
@@ -231,6 +244,7 @@ class ReleaseHarness:
     def _env(self, checkout: ReleaseCheckout) -> dict[str, str]:
         return {
             **os.environ,
+            "PATH": f"{self.fake_bin}:{os.environ['PATH']}",
             "PYTHONPATH": str(checkout.path / "src"),
             "LAUNCHCTL_BIN": str(self.fake_bin / "launchctl"),
             "LSOF_BIN": str(self.fake_bin / "lsof"),
@@ -590,7 +604,7 @@ def test_post_maintenance_log_setup_failure_removes_autoload_plist(
 def test_absent_candidate_cleanup_never_boots_out_unobserved_label(
     release_harness: ReleaseHarness,
 ) -> None:
-    release_harness.configure("bind_failure")
+    release_harness.configure("bootstrap_absent")
 
     result = release_harness.install(mode="production")
 
@@ -635,3 +649,162 @@ def test_compatible_transition_uses_one_downtime_handoff(
     assert record is not None
     assert record["candidate"]["git_sha"] == candidate.sha
     assert record["previous_release"]["git_sha"] == first.sha
+
+
+def test_incompatible_rollback_stays_single_owner_and_non_ready(
+    release_harness: ReleaseHarness,
+) -> None:
+    older = release_harness.candidate
+    newer = release_harness.make_checkout("newer-candidate")
+    release_harness.install(newer, check=True)
+    state = release_harness.state
+    state["case"] = "incompatible_reader"
+    release_harness.state_path.write_text(json.dumps(state), encoding="utf-8")
+    result = release_harness.install(older)
+    assert result.returncode == 1
+    assert "candidate_exited" in result.stderr
+    assert release_harness.state["max_pids"] == 1
+    record = release_harness.runtime_record
+    assert record is not None
+    assert record["state"] == "failed"
+    assert record["previous_release"]["git_sha"] == newer.sha
+    assert release_harness.listener_pids == []
+    assert release_harness.owner_is_available()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["reconcile_failure", "wrong_health_sha", "wrong_health_generation", "bind_failure"],
+)
+def test_failed_candidate_is_removed_and_previous_is_not_auto_restarted(
+    release_harness: ReleaseHarness, failure: str
+) -> None:
+    state = release_harness.state
+    state["case"] = failure
+    release_harness.state_path.write_text(json.dumps(state), encoding="utf-8")
+    result = release_harness.install(mode="production")
+    assert result.returncode == 1
+    record = release_harness.runtime_record
+    assert record is not None
+    assert record["state"] == "failed"
+    assert len(release_harness.calls.named("launchctl")) >= 2
+    assert sum(" bootstrap " in f" {call} " for call in release_harness.calls.all()) == 1
+    assert sum(" bootout " in f" {call} " for call in release_harness.calls.all()) == 1
+    assert release_harness.listener_pids == []
+    assert release_harness.owner_is_available()
+
+
+def test_production_uninstall_preserves_data_logs_and_marks_stopped(
+    release_harness: ReleaseHarness,
+) -> None:
+    release_harness.install(mode="production", check=True)
+    release_harness.database.parent.mkdir(parents=True, exist_ok=True)
+    release_harness.database.write_bytes(b"test-database")
+    release_harness.stdout_log.parent.mkdir(parents=True, exist_ok=True)
+    release_harness.stdout_log.write_text("keep-log\n", encoding="utf-8")
+    config = release_harness.root / "prediction.json"
+    config.write_text('{"mode":"test"}\n', encoding="utf-8")
+    evidence = release_harness.runtime_root / "data" / "operator-evidence.json"
+    evidence.write_text('{"keep":true}\n', encoding="utf-8")
+    database_before = release_harness.database.read_bytes()
+    log_before = release_harness.stdout_log.read_text(encoding="utf-8")
+    record_before = release_harness.runtime_record
+    assert record_before is not None
+    ready_before = record_before["ready"]
+    result = release_harness.uninstall(mode="production")
+    assert result.returncode == 0
+    record = release_harness.runtime_record
+    assert record is not None
+    assert record["state"] == "stopped"
+    assert record["candidate"]["git_sha"] == release_harness.sha
+    assert record["ready"] == ready_before
+    assert release_harness.database.read_bytes() == database_before
+    assert release_harness.stdout_log.read_text(encoding="utf-8") == log_before
+    assert config.read_text(encoding="utf-8") == '{"mode":"test"}\n'
+    assert evidence.read_text(encoding="utf-8") == '{"keep":true}\n'
+    assert not release_harness.plist.exists()
+    assert release_harness.listener_pids == []
+    assert release_harness.owner_is_available()
+
+    repeated = release_harness.uninstall(mode="production")
+    assert repeated.returncode == 0
+    assert sum(" bootout " in f" {call} " for call in release_harness.calls.all()) == 1
+
+
+def test_uninstall_refuses_unknown_identity_without_bootout_or_plist_removal(
+    release_harness: ReleaseHarness,
+) -> None:
+    release_harness.install(mode="production", check=True)
+    release_harness.configure("unknown_label_identity")
+    release_harness.calls.clear()
+    result = release_harness.uninstall(mode="production")
+    assert result.returncode == 1
+    assert all(" bootout " not in f" {call} " for call in release_harness.calls.all())
+    assert release_harness.plist.exists()
+
+
+@pytest.mark.parametrize("case", ["pid_still_present", "listener_still_present", "owner_still_held"])
+def test_uninstall_requires_every_absence_proof(
+    release_harness: ReleaseHarness, case: str
+) -> None:
+    release_harness.install(mode="production", check=True)
+    state = release_harness.state
+    state["case"] = case
+    release_harness.state_path.write_text(json.dumps(state), encoding="utf-8")
+    result = release_harness.uninstall(mode="production")
+    assert result.returncode == 1
+    assert release_harness.plist.exists()
+    record = release_harness.runtime_record
+    assert record is not None
+    assert record["state"] != "stopped"
+
+
+def test_checkout_release_direct_workflow(release_harness: ReleaseHarness) -> None:
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+
+    old = release_harness.candidate
+    new = release_harness.make_checkout("direct-new")
+    observed: list[dict[str, object]] = []
+    PredictionArbitrageStore(release_harness.runtime_root / "data")
+
+    for checkout in (old, new, old):
+        result = release_harness.install(checkout)
+        assert result.returncode == 0, result.stderr
+        record = release_harness.runtime_record
+        assert record is not None
+        observed.append({
+            "state": record["state"],
+            "git_sha": record["candidate"]["git_sha"],
+            "reader_generation": record["candidate"]["reader_generation"],
+            "contract_generation": record["candidate"]["contract_generation"],
+        })
+
+    stopped = release_harness.uninstall()
+    assert stopped.returncode == 0, stopped.stderr
+    final_record = release_harness.runtime_record
+    assert final_record is not None
+    assert final_record["previous_release"]["git_sha"] == new.sha
+    evidence = {
+        "states": [item["state"] for item in observed] + [final_record["state"]],
+        "candidate_shas": [item["git_sha"] for item in observed],
+        "reader_generations": [item["reader_generation"] for item in observed],
+        "contract_generations": [item["contract_generation"] for item in observed],
+        "max_simultaneous_managed_pids": release_harness.state["max_pids"],
+        "final_listener": release_harness.listener_pids or None,
+        "final_owner_available": release_harness.owner_is_available(),
+    }
+    print(json.dumps(evidence, sort_keys=True))
+
+    assert evidence == {
+        "states": ["ready", "ready", "ready", "stopped"],
+        "candidate_shas": [old.sha, new.sha, old.sha],
+        "reader_generations": [1, 1, 1],
+        "contract_generations": [1, 1, 1],
+        "max_simultaneous_managed_pids": 1,
+        "final_listener": None,
+        "final_owner_available": True,
+    }
+    calls = release_harness.calls.all()
+    assert all("/bin/launchctl" not in call for call in calls)
+    assert all("/usr/sbin/lsof" not in call for call in calls)
+    assert all("/Users/ray/projects/open_trader" not in call for call in calls)
