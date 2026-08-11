@@ -675,6 +675,65 @@ def execution_fixture(tmp_path: Path, *, result: str = "both_filled"):
     return service, trading, store, monitor
 
 
+def test_control_mode_allows_only_risk_reduction_while_breaker_is_open(
+    tmp_path: Path,
+) -> None:
+    service, _trading, store, _monitor = execution_fixture(tmp_path)
+    audit = {"actor": "local_operator", "git_sha": "abc123"}
+    store.set_validation_mode("auto")
+    service._breaker_open = True
+
+    assert service.set_validation_mode("manual", audit=audit) == {
+        "state": "ok",
+        "mode": "manual",
+    }
+    store.set_validation_mode("observe_only")
+    assert service.set_validation_mode("manual", audit=audit) == {
+        "state": "locked",
+        "reason": "circuit_breaker_open",
+    }
+    assert service.set_validation_mode("auto", audit=audit) == {
+        "state": "locked",
+        "reason": "circuit_breaker_open",
+    }
+
+
+def test_control_pause_is_immediate_but_upgrade_waits_for_active_execution(
+    tmp_path: Path,
+) -> None:
+    service, _trading, store, _monitor = execution_fixture(tmp_path)
+    audit = {"actor": "local_operator"}
+    store.set_cross_auto_mode("auto_submit", "operator_configured")
+    store.arm_cross_auto()
+    preview = service.preview("opp-1")
+    store.consume_preview_and_create_execution(
+        str(preview["preview_id"]), "active-control"
+    )
+
+    paused = service.pause_cross_auto(audit=audit)
+    assert paused["armed"] is False
+    assert paused["reason"] == "operator_paused"
+    assert service.set_validation_mode("auto", audit=audit) == {
+        "state": "busy",
+        "reason": "active_execution",
+    }
+
+
+def test_control_maintenance_conflict_reuses_execution_lock(tmp_path: Path) -> None:
+    service, _trading, _store, _monitor = execution_fixture(tmp_path)
+    held = service._acquire_global_lock()
+    assert held is not None
+    try:
+        assert service.reset_breaker(
+            "incident-1", audit={"actor": "local_operator"}
+        ) == {"state": "busy", "reason": "control_in_progress"}
+        assert service.cleanup_predict_allowance(
+            confirm=True, audit={"actor": "local_operator"}
+        ) == {"state": "busy", "reason": "control_in_progress"}
+    finally:
+        service._release_global_lock(held)
+
+
 def test_preview_refreshes_only_the_selected_opportunity(tmp_path: Path) -> None:
     class TargetedMonitor(FakeMonitor):
         def __init__(self) -> None:
@@ -2094,15 +2153,83 @@ def test_predict_allowance_cleanup_rejects_insufficient_bnb_without_mutation(
     assert predict.clear_calls == []
 
 
-def test_predict_allowance_cleanup_rejects_already_zero_without_mutation(
+def test_control_cleanup_predict_allowance_is_idempotent_when_already_zero(
     tmp_path: Path,
 ) -> None:
     service, _store, _trading, _cross, predict = _cross_service(tmp_path)
 
     result = service.cleanup_predict_allowance(confirm=True)
 
-    assert result == {"state": "locked", "reason": "allowance_already_zero"}
+    assert result == {
+        "state": "ready",
+        "before_allowance": "0",
+        "after_allowance": "0",
+        "usdt_moved": False,
+    }
     assert predict.clear_calls == []
+
+
+def test_control_cleanup_predict_allowance_does_not_mutate_when_audit_start_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "2.4"
+
+    def fail_start(**_kwargs: object) -> str:
+        raise sqlite3.OperationalError("audit unavailable")
+
+    monkeypatch.setattr(store, "begin_control_event", fail_start)
+
+    result = service.cleanup_predict_allowance(
+        confirm=True, audit={"actor": "local_operator"}
+    )
+
+    assert result == {"state": "locked", "reason": "audit_persistence_failed"}
+    assert predict.clear_calls == []
+
+
+def test_control_cleanup_predict_allowance_recovers_started_audit_without_second_chain_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, store, _trading, _cross, predict = _cross_service(tmp_path)
+    predict.allowance = "2.4"
+    original_finish = store.finish_control_event
+    finish_calls = 0
+
+    def fail_first_finish(
+        event_id: str, *, outcome: str, payload: Mapping[str, object]
+    ) -> dict[str, object]:
+        nonlocal finish_calls
+        finish_calls += 1
+        if finish_calls == 1:
+            raise sqlite3.OperationalError("audit unavailable")
+        return original_finish(event_id, outcome=outcome, payload=payload)
+
+    monkeypatch.setattr(store, "finish_control_event", fail_first_finish)
+
+    first = service.cleanup_predict_allowance(
+        confirm=True, audit={"actor": "local_operator"}
+    )
+    started = store.latest_control_event(
+        "cleanup_predict_allowance", "predict_allowance"
+    )
+    second = service.cleanup_predict_allowance(
+        confirm=True, audit={"actor": "local_operator"}
+    )
+
+    assert first == {"state": "locked", "reason": "audit_persistence_failed"}
+    assert started is not None and started["outcome"] == "started"
+    assert second == {
+        "state": "ready",
+        "before_allowance": "2.4",
+        "after_allowance": "0",
+        "usdt_moved": False,
+    }
+    assert predict.clear_calls == ["predict-market"]
+    finished = store.latest_control_event(
+        "cleanup_predict_allowance", "predict_allowance"
+    )
+    assert finished is not None and finished["outcome"] == "succeeded"
 
 
 def test_predict_allowance_cleanup_rejects_changed_identity_after_clear(
@@ -5057,16 +5184,32 @@ def test_reset_breaker_denies_directional_imbalance_without_orders(tmp_path: Pat
     assert trading.batch_calls == 0
 
 
-def test_reset_breaker_requires_fresh_clean_account_and_acknowledges_incident(tmp_path: Path) -> None:
+def test_reset_breaker_requires_fresh_clean_account_and_acknowledges_incident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
     preview = service.preview("opp-1")
     execution = store.consume_preview_and_create_execution(str(preview["id"]), "reset-clean")
     incident_id = store.open_incident(str(execution["execution_id"]), {"state": "directional_incident"})
+    original_acknowledge = store.acknowledge_incident
+    acknowledgement_calls = 0
+
+    def acknowledge_once(
+        target_incident_id: str, payload: Mapping[str, object]
+    ) -> None:
+        nonlocal acknowledgement_calls
+        acknowledgement_calls += 1
+        original_acknowledge(target_incident_id, payload)
+
+    monkeypatch.setattr(store, "acknowledge_incident", acknowledge_once)
 
     result = service.reset_breaker(incident_id)
+    repeated = service.reset_breaker(incident_id)
 
     assert result["state"] == "ready"
     assert result["reason"] == "reset_confirmed"
+    assert repeated == result
+    assert acknowledgement_calls == 1
     assert store.unacknowledged_incident() is None
     assert service.preview("opp-1")["state"] == "previewed"
     assert trading.batch_calls == 0

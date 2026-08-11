@@ -518,9 +518,32 @@ class PredictionExecutionService:
             return {"state": "ignored", "reason": "signal_closed"}
         return {"state": "failed", "reason": "notification_failed"}
 
-    def set_validation_mode(self, mode: str) -> dict[str, object]:
+    def set_validation_mode(
+        self, mode: str, *, audit: Mapping[str, object] | None = None
+    ) -> dict[str, object]:
+        ranks = {"observe_only": 0, "manual": 1, "auto": 2}
+        current = self._store.get_validation_mode()
+        if mode in ranks and ranks[mode] > ranks[current]:
+            if self._breaker_is_open():
+                return {"state": "locked", "reason": "circuit_breaker_open"}
+            if self._store.active_execution() is not None:
+                return {"state": "busy", "reason": "active_execution"}
+            lock = self._acquire_global_lock()
+            if lock is None:
+                return {"state": "busy", "reason": "control_in_progress"}
+            try:
+                if self._breaker_is_open():
+                    return {"state": "locked", "reason": "circuit_breaker_open"}
+                if self._store.active_execution() is not None:
+                    return {"state": "busy", "reason": "active_execution"}
+                value = self._store.set_validation_mode(mode, audit=audit)
+            except ValueError as exc:
+                return {"state": "rejected", "reason": str(exc)}
+            finally:
+                self._release_global_lock(lock)
+            return {"state": "ok", "mode": value}
         try:
-            value = self._store.set_validation_mode(mode)
+            value = self._store.set_validation_mode(mode, audit=audit)
         except ValueError as exc:
             return {"state": "rejected", "reason": str(exc)}
         return {"state": "ok", "mode": value}
@@ -993,8 +1016,13 @@ class PredictionExecutionService:
             "latest_attempt": latest[0] if latest else None,
         }
 
-    def pause_cross_auto(self, reason: str = "operator_paused") -> dict[str, object]:
-        return self._store.pause_cross_auto(reason)
+    def pause_cross_auto(
+        self,
+        reason: str = "operator_paused",
+        *,
+        audit: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        return self._store.pause_cross_auto(reason, audit=audit)
 
     def _notify_cross_gas_blocked_signal(
         self, signal_id: str, signal: Mapping[str, object]
@@ -1755,16 +1783,77 @@ class PredictionExecutionService:
         )
         return {"state": "ready", "readiness": "fresh"}
 
-    def reset_breaker(self, incident_id: str) -> dict[str, object]:
+    def reset_breaker(
+        self,
+        incident_id: str,
+        *,
+        audit: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        lock = self._acquire_global_lock()
+        if lock is None:
+            return {"state": "busy", "reason": "control_in_progress"}
+        try:
+            event_id: str | None = None
+            if audit is not None:
+                latest = self._store.latest_control_event(
+                    "reset_breaker", str(incident_id)
+                )
+                if latest is not None and latest.get("outcome") == "started":
+                    event_id = str(latest["event_id"])
+                else:
+                    try:
+                        event_id = self._store.begin_control_event(
+                            action="reset_breaker",
+                            target=str(incident_id),
+                            payload=dict(audit),
+                        )
+                    except Exception:
+                        return {
+                            "state": "locked",
+                            "reason": "audit_persistence_failed",
+                        }
+            result = self._reset_breaker(incident_id)
+            if event_id is not None:
+                try:
+                    self._store.finish_control_event(
+                        event_id,
+                        outcome=(
+                            "succeeded" if result.get("state") == "ready" else "rejected"
+                        ),
+                        payload={"result": result},
+                    )
+                except Exception:
+                    self._breaker_open = True
+                    return {
+                        "state": "locked",
+                        "reason": "audit_persistence_failed",
+                    }
+            return result
+        finally:
+            self._release_global_lock(lock)
+
+    def _reset_breaker(self, incident_id: str) -> dict[str, object]:
         incident = next(
             (
                 row
                 for row in self._store.histories("incidents")
                 if str(row.get("incident_id", "")) == str(incident_id)
-                and row.get("acknowledged") is not True
             ),
             None,
         )
+        if incident is not None and incident.get("acknowledged") is True:
+            acknowledgement = incident.get("acknowledgement")
+            if (
+                isinstance(acknowledgement, Mapping)
+                and acknowledgement.get("reconciliation") == "fresh_clean"
+            ):
+                self._breaker_open = False
+                return {
+                    "state": "ready",
+                    "reason": "reset_confirmed",
+                    "incident_id": str(incident_id),
+                }
+            incident = None
         if incident is None:
             self._breaker_open = True
             return {"state": "locked", "reason": "incident_not_found", "incident_id": str(incident_id)}
@@ -1867,9 +1956,25 @@ class PredictionExecutionService:
         self._breaker_open = False
         return {"state": "ready", "reason": "reset_confirmed", "incident_id": str(incident_id)}
 
-    def cleanup_predict_allowance(self, *, confirm: bool) -> dict[str, object]:
+    def cleanup_predict_allowance(
+        self,
+        *,
+        confirm: bool,
+        audit: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
         if confirm is not True:
             return {"state": "locked", "reason": "confirmation_required"}
+        lock = self._acquire_global_lock()
+        if lock is None:
+            return {"state": "busy", "reason": "control_in_progress"}
+        try:
+            return self._cleanup_predict_allowance(audit=audit)
+        finally:
+            self._release_global_lock(lock)
+
+    def _cleanup_predict_allowance(
+        self, *, audit: Mapping[str, object] | None = None
+    ) -> dict[str, object]:
         if self._store.active_execution() is not None:
             return {"state": "locked", "reason": "active_execution"}
         before = self._fresh_predict_account_snapshot()
@@ -1879,8 +1984,39 @@ class PredictionExecutionService:
         allowance_raw = _decimal(before.get("allowance_raw"))
         if allowance is None or allowance_raw is None:
             return {"state": "locked", "reason": "allowance_unavailable"}
+        event_id: str | None = None
+        prior_allowance = allowance
+        if audit is not None:
+            latest = self._store.latest_control_event(
+                "cleanup_predict_allowance", "predict_allowance"
+            )
+            if latest is not None and latest.get("outcome") == "started":
+                event_id = str(latest["event_id"])
+                payload = latest.get("payload")
+                if isinstance(payload, Mapping):
+                    prior_allowance = (
+                        _decimal(payload.get("before_allowance")) or allowance
+                    )
         if allowance == 0 and allowance_raw == 0:
-            return {"state": "locked", "reason": "allowance_already_zero"}
+            if audit is not None and event_id is None:
+                try:
+                    event_id = self._store.begin_control_event(
+                        action="cleanup_predict_allowance",
+                        target="predict_allowance",
+                        payload={
+                            **dict(audit),
+                            "confirm": True,
+                            "before_allowance": _safe_decimal(allowance),
+                        },
+                    )
+                except Exception:
+                    return {
+                        "state": "locked",
+                        "reason": "audit_persistence_failed",
+                    }
+            return self._complete_predict_allowance_cleanup(
+                prior_allowance, event_id=event_id
+            )
         if (
             before.get("gas_ready") is not True
             or (_decimal(before.get("minimum_top_up_bnb")) or Decimal("0")) > 0
@@ -1893,6 +2029,19 @@ class PredictionExecutionService:
         market_id = self._current_predict_market_id()
         if not market_id:
             return {"state": "locked", "reason": "predict_market_unavailable"}
+        if audit is not None and event_id is None:
+            try:
+                event_id = self._store.begin_control_event(
+                    action="cleanup_predict_allowance",
+                    target="predict_allowance",
+                    payload={
+                        **dict(audit),
+                        "confirm": True,
+                        "before_allowance": _safe_decimal(allowance),
+                    },
+                )
+            except Exception:
+                return {"state": "locked", "reason": "audit_persistence_failed"}
         proof = self._clear_predict_allowance_zero(market_id)
         after = self._fresh_predict_account_snapshot()
         if (
@@ -1914,6 +2063,27 @@ class PredictionExecutionService:
                 },
             )
             return {"state": "locked", "reason": "predict_allowance_cleanup_failed"}
+        return self._complete_predict_allowance_cleanup(
+            prior_allowance, event_id=event_id
+        )
+
+    def _complete_predict_allowance_cleanup(
+        self, before_allowance: Decimal, *, event_id: str | None
+    ) -> dict[str, object]:
+        result = {
+            "state": "ready",
+            "before_allowance": _safe_decimal(before_allowance),
+            "after_allowance": "0",
+            "usdt_moved": False,
+        }
+        if event_id is not None:
+            try:
+                self._store.finish_control_event(
+                    event_id, outcome="succeeded", payload=result
+                )
+            except Exception:
+                self._cross_breaker_open = True
+                return {"state": "locked", "reason": "audit_persistence_failed"}
         for incident in self._store.histories("incidents"):
             if (
                 incident.get("acknowledged") is not True
@@ -1931,12 +2101,7 @@ class PredictionExecutionService:
                 except Exception:
                     pass
         self._cross_breaker_open = False
-        return {
-            "state": "ready",
-            "before_allowance": _safe_decimal(allowance),
-            "after_allowance": "0",
-            "usdt_moved": False,
-        }
+        return result
 
     def _run_execution(self, execution_id: str, lock: tuple[threading.Lock, Any]) -> None:
         try:
