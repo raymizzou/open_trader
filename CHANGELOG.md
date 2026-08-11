@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-11
 
+- #34 为独立 Prediction Service 增加固定 8 请求的全局 HTTP 准入边界，并对相同
+  history 查询做 1 秒进程内 single-flight；过载在创建 handler 线程前返回带
+  `Retry-After: 1` 的明确 503，state/health/写操作不缓存，既有鉴权、历史排序和
+  mutation 语义不变。使用生产 SQLite 的只读一致性副本连续验证 30 分钟：1,201 轮、
+  9,656 请求、最大延迟 2.882 秒、峰值 active 8、最终 active 0、零交易调用；最终
+  5,518 项全库测试通过。此票未部署、未改 Gateway/Dashboard/launchd 或生产数据。
+
 - #43 在独立 Prediction Service 的 production owner 上开放 Preview、人工确认及 LLM
   自动执行 observer：8769 复用既有 `PredictionExecutionService` 的实时校验、幂等
   execution lock、资金预留、回执与启动对账，不另建交易状态机；mutation 响应沿用 Legacy
