@@ -405,7 +405,7 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
     issues: list[ModelIssue] = []
     if not isinstance(problem, ArbitrageProblem):
         return (ModelIssue("INVALID_PROBLEM", "$", "must be an ArbitrageProblem"),)
-    _validate_datetime(issues, problem.as_of, "as_of")
+    as_of_valid = _validate_datetime(issues, problem.as_of, "as_of")
     action_ids: set[str] = set()
     actions_by_contract: dict[str, list[CandidateAction]] = {}
     for action_index, action in enumerate(problem.actions):
@@ -414,6 +414,8 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
             _issue(issues, "DUPLICATE_ID", f"{prefix}.action_id", "action_id must be unique")
         action_ids.add(action.action_id)
         actions_by_contract.setdefault(action.market_contract_id, []).append(action)
+        if not isinstance(action.side, ActionSide):
+            _issue(issues, "INVALID_ACTION_SIDE", f"{prefix}.side", "must be BUY_YES or BUY_NO")
         for name in ("lot_step_units", "quantity_scale"):
             _validate_int(issues, getattr(action, name), f"{prefix}.{name}")
         if isinstance(action.lot_step_units, int) and not isinstance(action.lot_step_units, bool) and action.lot_step_units <= 0:
@@ -462,8 +464,8 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
             if atom.atom_id in atom_ids:
                 _issue(issues, "DUPLICATE_ID", f"{atom_path}.atom_id", "atom_id must be globally unique")
             atom_ids.add(atom.atom_id)
-            _validate_datetime(issues, atom.capital_release_at, f"{atom_path}.capital_release_at")
-            if isinstance(problem.as_of, datetime) and isinstance(atom.capital_release_at, datetime) and atom.capital_release_at.tzinfo is not None and problem.as_of.tzinfo is not None and atom.capital_release_at < problem.as_of:
+            release_at_valid = _validate_datetime(issues, atom.capital_release_at, f"{atom_path}.capital_release_at")
+            if as_of_valid and release_at_valid and atom.capital_release_at < problem.as_of:
                 _issue(issues, "STALE_CAPITAL_RELEASE_AT", f"{atom_path}.capital_release_at", "must be after problem as_of")
             payout_ids = {payout.action_id for payout in atom.payouts}
             required = {action.action_id for action in actions_by_contract.get(state_set.market_contract_id, ())}
@@ -688,7 +690,10 @@ def request_from_payload(payload: Mapping[str, object]) -> OracleRequest:
 
 def _quantity_from_payload(payload: object) -> ActionQuantity:
     value = _object(payload, "action_quantity", {"action_id", "quantity_lots"})
-    return ActionQuantity(_string(value["action_id"], "action_id"), _integer(value["quantity_lots"], "quantity_lots"))
+    quantity_lots = _integer(value["quantity_lots"], "quantity_lots")
+    if quantity_lots < 0:
+        raise ModelDecodeError("quantity_lots must be non-negative")
+    return ActionQuantity(_string(value["action_id"], "action_id"), quantity_lots)
 
 
 def _selected_atom_from_payload(payload: object) -> SelectedAtom:
@@ -742,8 +747,18 @@ def _negative_proof_from_payload(payload: object) -> ExhaustiveSearchProof:
         pair = _array(item, "rejection_count")
         if len(pair) != 2:
             raise ModelDecodeError("rejection_count must contain an ID and count")
-        rejection_counts.append((_string(pair[0], "rejection_count.id"), _integer(pair[1], "rejection_count.count")))
-    return ExhaustiveSearchProof(_string(value["proof_method"], "proof_method"), _enum(BusinessStatus, value["conclusion"], "conclusion"), _string(value["request_fingerprint"], "request_fingerprint"), _string(value["problem_fingerprint"], "problem_fingerprint"), source, _string(value["qualification_fingerprint"], "qualification_fingerprint"), _integer(value["quantity_vectors_total"], "quantity_vectors_total"), _integer(value["quantity_vectors_examined"], "quantity_vectors_examined"), _integer(value["joint_states_per_vector"], "joint_states_per_vector"), tuple(rejection_counts))
+        count = _integer(pair[1], "rejection_count.count")
+        if count < 0:
+            raise ModelDecodeError("rejection_count.count must be non-negative")
+        rejection_counts.append((_string(pair[0], "rejection_count.id"), count))
+    quantity_vectors_total = _integer(value["quantity_vectors_total"], "quantity_vectors_total")
+    quantity_vectors_examined = _integer(value["quantity_vectors_examined"], "quantity_vectors_examined")
+    joint_states_per_vector = _integer(value["joint_states_per_vector"], "joint_states_per_vector")
+    if any(count < 0 for count in (quantity_vectors_total, quantity_vectors_examined, joint_states_per_vector)):
+        raise ModelDecodeError("exhaustive proof counts must be non-negative")
+    if quantity_vectors_total != quantity_vectors_examined:
+        raise ModelDecodeError("exhaustive proof must examine every quantity vector")
+    return ExhaustiveSearchProof(_string(value["proof_method"], "proof_method"), _enum(BusinessStatus, value["conclusion"], "conclusion"), _string(value["request_fingerprint"], "request_fingerprint"), _string(value["problem_fingerprint"], "problem_fingerprint"), source, _string(value["qualification_fingerprint"], "qualification_fingerprint"), quantity_vectors_total, quantity_vectors_examined, joint_states_per_vector, tuple(rejection_counts))
 
 
 def _validate_result(result: OracleResult) -> None:

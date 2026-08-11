@@ -381,3 +381,68 @@ def test_request_from_payload_rejects_non_integer_budget() -> None:
 
     with pytest.raises(ModelDecodeError):
         request_from_payload(payload)
+
+
+def test_validate_problem_rejects_direct_non_buy_action_side() -> None:
+    problem = sample_problem()
+    malformed = replace(problem, actions=(replace(problem.actions[0], side="SELL"),))
+
+    assert "INVALID_ACTION_SIDE" in {issue.code for issue in validate_problem(malformed)}
+
+
+def test_validate_problem_reports_naive_as_of_without_comparison_error() -> None:
+    malformed = replace(sample_problem(), as_of=datetime(2026, 8, 11))
+
+    assert "NAIVE_DATETIME" in {issue.code for issue in validate_problem(malformed)}
+
+
+def negative_result_payload() -> dict[str, object]:
+    proof = ExhaustiveSearchProof(
+        proof_method="EXHAUSTIVE_ORACLE_V1",
+        conclusion=BusinessStatus.NO_QUALIFIED_OPPORTUNITY,
+        request_fingerprint="sha256:request",
+        problem_fingerprint="sha256:problem",
+        source_problem_fingerprint=None,
+        qualification_fingerprint="sha256:qualification",
+        quantity_vectors_total=1,
+        quantity_vectors_examined=1,
+        joint_states_per_vector=1,
+        rejection_counts=(("qualified-profit", 1),),
+    )
+    return canonical_payload(
+        OracleResult(
+            solve_status=SolveStatus.INFEASIBLE,
+            proof_status=ProofStatus.PROVEN,
+            business_status=BusinessStatus.NO_QUALIFIED_OPPORTUNITY,
+            optimality_status=OptimalityStatus.NOT_APPLICABLE,
+            objective_bounds=ObjectiveBounds(None, None, None, False),
+            solution=None,
+            negative_proof=proof,
+            unknown_reason=None,
+        )
+    )
+
+
+def test_result_from_payload_rejects_negative_quantity_lots() -> None:
+    payload = canonical_payload(valid_result())
+    payload["solution"]["quantities"][0]["quantity_lots"] = -1
+
+    with pytest.raises(ModelDecodeError):
+        result_from_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda proof: proof.update(quantity_vectors_total=-1, quantity_vectors_examined=-1),
+        lambda proof: proof.update(quantity_vectors_total=1, quantity_vectors_examined=0),
+        lambda proof: proof.update(joint_states_per_vector=-1),
+        lambda proof: proof["rejection_counts"][0].__setitem__(1, -1),
+    ],
+)
+def test_result_from_payload_rejects_non_exhaustive_or_negative_proof_counts(mutate: object) -> None:
+    payload = negative_result_payload()
+    mutate(payload["negative_proof"])  # type: ignore[operator]
+
+    with pytest.raises(ModelDecodeError):
+        result_from_payload(payload)
