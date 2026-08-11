@@ -415,6 +415,13 @@ def _nodes(issues: list[ModelIssue], value: object, code: str, path: str) -> tup
     return value
 
 
+def _identifier(issues: list[ModelIssue], value: object, path: str) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        _issue(issues, "INVALID_IDENTIFIER", path, "must be a non-empty string")
+        return None
+    return value
+
+
 def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
     issues: list[ModelIssue] = []
     if not isinstance(problem, ArbitrageProblem):
@@ -427,10 +434,14 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
         if not isinstance(action, CandidateAction):
             _issue(issues, "INVALID_ACTION", prefix, "must be a CandidateAction")
             continue
-        if action.action_id in action_ids:
+        action_id = _identifier(issues, action.action_id, f"{prefix}.action_id")
+        contract_id = _identifier(issues, action.market_contract_id, f"{prefix}.market_contract_id")
+        if action_id is not None and action_id in action_ids:
             _issue(issues, "DUPLICATE_ID", f"{prefix}.action_id", "action_id must be unique")
-        action_ids.add(action.action_id)
-        actions_by_contract.setdefault(action.market_contract_id, []).append(action)
+        if action_id is not None:
+            action_ids.add(action_id)
+        if action_id is not None and contract_id is not None:
+            actions_by_contract.setdefault(contract_id, []).append(action)
         _validate_enum(issues, action.side, ActionSide, "INVALID_ACTION_SIDE", f"{prefix}.side")
         for name in ("lot_step_units", "quantity_scale"):
             _validate_int(issues, getattr(action, name), f"{prefix}.{name}")
@@ -475,17 +486,20 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
         if not isinstance(state_set, TerminalStateSet):
             _issue(issues, "INVALID_TERMINAL_STATE_SET", prefix, "must be a TerminalStateSet")
             continue
-        if state_set.market_contract_id in contract_ids:
+        state_contract_id = _identifier(issues, state_set.market_contract_id, f"{prefix}.market_contract_id")
+        if state_contract_id is not None and state_contract_id in contract_ids:
             _issue(issues, "DUPLICATE_ID", f"{prefix}.market_contract_id", "market_contract_id must be unique")
-        contract_ids.add(state_set.market_contract_id)
-        if state_set.market_contract_id not in actions_by_contract:
+        if state_contract_id is not None:
+            contract_ids.add(state_contract_id)
+        if state_contract_id is not None and state_contract_id not in actions_by_contract:
             _issue(issues, "UNKNOWN_CONTRACT_REFERENCE", f"{prefix}.market_contract_id", "must reference an action contract")
         if not isinstance(state_set.settlement_observation_key, SettlementObservationKey):
             _issue(issues, "INVALID_SETTLEMENT_OBSERVATION_KEY", f"{prefix}.settlement_observation_key", "must be a SettlementObservationKey")
         atoms = _nodes(issues, state_set.atoms, "INVALID_TERMINAL_ATOM_CONTAINER", f"{prefix}.atoms")
         if not atoms:
             _issue(issues, "MISSING_TERMINAL_ATOMS", f"{prefix}.atoms", "must contain at least one terminal atom")
-        for action in actions_by_contract.get(state_set.market_contract_id, ()):
+        state_actions = actions_by_contract.get(state_contract_id, ()) if state_contract_id is not None else ()
+        for action in state_actions:
             if action.settlement_observation_key != state_set.settlement_observation_key:
                 _issue(issues, "OBSERVATION_KEY_MISMATCH", f"{prefix}.settlement_observation_key", "must match each action for this contract")
         for atom_index, atom in enumerate(atoms):
@@ -493,17 +507,23 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
             if not isinstance(atom, TerminalAtom):
                 _issue(issues, "INVALID_TERMINAL_ATOM", atom_path, "must be a TerminalAtom")
                 continue
-            if atom.atom_id in atom_ids:
+            atom_id = _identifier(issues, atom.atom_id, f"{atom_path}.atom_id")
+            if atom_id is not None and atom_id in atom_ids:
                 _issue(issues, "DUPLICATE_ID", f"{atom_path}.atom_id", "atom_id must be globally unique")
-            atom_ids.add(atom.atom_id)
+            if atom_id is not None:
+                atom_ids.add(atom_id)
             _validate_enum(issues, atom.kind, TerminalKind, "INVALID_TERMINAL_KIND", f"{atom_path}.kind")
             release_at_valid = _validate_datetime(issues, atom.capital_release_at, f"{atom_path}.capital_release_at")
             if as_of_valid and release_at_valid and atom.capital_release_at < problem.as_of:
                 _issue(issues, "STALE_CAPITAL_RELEASE_AT", f"{atom_path}.capital_release_at", "must be after problem as_of")
             payouts = _nodes(issues, atom.payouts, "INVALID_ACTION_PAYOUT_CONTAINER", f"{atom_path}.payouts")
             valid_payouts = tuple(payout for payout in payouts if isinstance(payout, ActionPayout))
-            payout_ids = {payout.action_id for payout in valid_payouts}
-            required = {action.action_id for action in actions_by_contract.get(state_set.market_contract_id, ())}
+            payout_ids = {
+                action_id
+                for payout in valid_payouts
+                if (action_id := _identifier(issues, payout.action_id, f"{atom_path}.payouts.action_id")) is not None
+            }
+            required = {action.action_id for action in state_actions if isinstance(action.action_id, str) and action.action_id.strip()}
             if not required.issubset(payout_ids):
                 _issue(issues, "MISSING_ACTION_PAYOUT", f"{atom_path}.payouts", "must include every action for this contract")
             if len(payout_ids) != len(valid_payouts):
@@ -513,9 +533,12 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
                     _issue(issues, "INVALID_ACTION_PAYOUT", f"{atom_path}.payouts[{payout_index}]", "must be an ActionPayout")
                     continue
                 _validate_int(issues, payout.payout_lower_bound_per_lot_units, f"{atom_path}.payouts[{payout_index}].payout_lower_bound_per_lot_units")
-                if payout.action_id not in action_ids:
+                payout_action_id = _identifier(issues, payout.action_id, f"{atom_path}.payouts[{payout_index}].action_id")
+                if payout_action_id is None:
+                    continue
+                if payout_action_id not in action_ids:
                     _issue(issues, "UNKNOWN_ACTION_REFERENCE", f"{atom_path}.payouts[{payout_index}].action_id", "must reference an action")
-                elif payout.action_id not in required:
+                elif payout_action_id not in required:
                     _issue(issues, "UNKNOWN_ACTION_REFERENCE", f"{atom_path}.payouts[{payout_index}].action_id", "must reference an action on this contract")
     for contract_id in actions_by_contract:
         if contract_id not in contract_ids:
@@ -533,28 +556,34 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
         if not isinstance(relation, RelationConstraint):
             _issue(issues, "INVALID_RELATION", path, "must be a RelationConstraint")
             continue
-        if relation.constraint_id in constraint_ids:
+        constraint_id = _identifier(issues, relation.constraint_id, f"{path}.constraint_id")
+        if constraint_id is not None and constraint_id in constraint_ids:
             _issue(issues, "DUPLICATE_ID", f"{path}.constraint_id", "constraint_id must be unique")
-        constraint_ids.add(relation.constraint_id)
+        if constraint_id is not None:
+            constraint_ids.add(constraint_id)
         _validate_enum(issues, relation.kind, RelationKind, "INVALID_RELATION_KIND", f"{path}.kind")
         contract_references = _nodes(issues, relation.contract_ids, "INVALID_CONTRACT_REFERENCE_CONTAINER", f"{path}.contract_ids")
         if relation.kind == RelationKind.IMPLIES and len(contract_references) != 2:
             _issue(issues, "INVALID_RELATION_ARITY", f"{path}.contract_ids", "IMPLIES requires ordered antecedent and consequent")
         if relation.kind != RelationKind.IMPLIES and len(contract_references) < 2:
             _issue(issues, "INVALID_RELATION_ARITY", f"{path}.contract_ids", "relation requires at least two contracts")
-        for contract_id in contract_references:
-            if contract_id not in contract_ids:
+        for reference_index, contract_id in enumerate(contract_references):
+            contract_id = _identifier(issues, contract_id, f"{path}.contract_ids[{reference_index}]")
+            if contract_id is not None and contract_id not in contract_ids:
                 _issue(issues, "UNKNOWN_CONTRACT_REFERENCE", f"{path}.contract_ids", "must reference a terminal contract")
     for forbidden_index, forbidden in enumerate(forbidden_combinations):
         path = f"constraint_model.forbidden_atom_combinations[{forbidden_index}]"
         if not isinstance(forbidden, ForbiddenAtomCombination):
             _issue(issues, "INVALID_FORBIDDEN_ATOM_COMBINATION", path, "must be a ForbiddenAtomCombination")
             continue
-        if forbidden.constraint_id in constraint_ids:
+        constraint_id = _identifier(issues, forbidden.constraint_id, f"{path}.constraint_id")
+        if constraint_id is not None and constraint_id in constraint_ids:
             _issue(issues, "DUPLICATE_ID", f"{path}.constraint_id", "constraint_id must be unique")
-        constraint_ids.add(forbidden.constraint_id)
-        for atom_id in _nodes(issues, forbidden.atom_ids, "INVALID_ATOM_REFERENCE_CONTAINER", f"{path}.atom_ids"):
-            if atom_id not in atom_ids:
+        if constraint_id is not None:
+            constraint_ids.add(constraint_id)
+        for atom_index, atom_id in enumerate(_nodes(issues, forbidden.atom_ids, "INVALID_ATOM_REFERENCE_CONTAINER", f"{path}.atom_ids")):
+            atom_id = _identifier(issues, atom_id, f"{path}.atom_ids[{atom_index}]")
+            if atom_id is not None and atom_id not in atom_ids:
                 _issue(issues, "UNKNOWN_ATOM_REFERENCE", f"{path}.atom_ids", "must reference a terminal atom")
     qualification_ids: set[str] = set()
     for qualification_index, qualification in enumerate(_nodes(issues, problem.qualification_constraints, "INVALID_QUALIFICATION_CONSTRAINT_CONTAINER", "qualification_constraints")):
@@ -562,9 +591,11 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
         if not isinstance(qualification, QualificationConstraint):
             _issue(issues, "INVALID_QUALIFICATION_CONSTRAINT", path, "must be a QualificationConstraint")
             continue
-        if qualification.constraint_id in qualification_ids:
+        qualification_id = _identifier(issues, qualification.constraint_id, f"{path}.constraint_id")
+        if qualification_id is not None and qualification_id in qualification_ids:
             _issue(issues, "DUPLICATE_ID", f"{path}.constraint_id", "qualification constraint_id must be unique")
-        qualification_ids.add(qualification.constraint_id)
+        if qualification_id is not None:
+            qualification_ids.add(qualification_id)
         _validate_enum(issues, qualification.metric, QualificationMetric, "INVALID_QUALIFICATION_METRIC", f"{path}.metric")
         _validate_enum(issues, qualification.comparison, Comparison, "INVALID_COMPARISON", f"{path}.comparison")
         _validate_int(issues, qualification.threshold_numerator, f"{path}.threshold_numerator")

@@ -506,3 +506,20 @@ def test_validate_problem_reports_invalid_terminal_atom_node_without_raising() -
     malformed = replace(problem, terminal_state_sets=(replace(problem.terminal_state_sets[0], atoms=(object(),)),))
 
     assert "INVALID_TERMINAL_ATOM" in {issue.code for issue in validate_problem(malformed)}
+
+
+def test_validate_problem_reports_unhashable_action_id_without_raising() -> None:
+    problem = sample_problem()
+    malformed = replace(problem, actions=(replace(problem.actions[0], action_id=[]),))
+
+    assert "INVALID_IDENTIFIER" in {issue.code for issue in validate_problem(malformed)}
+
+
+def test_validate_problem_reports_unhashable_relation_references_without_raising() -> None:
+    problem = sample_problem()
+    malformed = replace(
+        problem,
+        constraint_model=ConstraintModel((RelationConstraint("relation-x", RelationKind.IMPLIES, ([], []), "v1"),), ()),
+    )
+
+    assert "INVALID_IDENTIFIER" in {issue.code for issue in validate_problem(malformed)}
