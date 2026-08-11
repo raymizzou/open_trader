@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+import hashlib
+import json
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, is_dataclass, replace
+from datetime import UTC, datetime
 from enum import StrEnum
 
 
@@ -279,3 +282,499 @@ class OracleResult:
     solution: PortfolioSolution | None
     negative_proof: ExhaustiveSearchProof | None
     unknown_reason: UnknownReason | None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelIssue:
+    code: str
+    path: str
+    message: str
+
+
+class ModelDecodeError(ValueError):
+    pass
+
+
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+
+def _canonical_datetime(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+        raise ValueError("canonical datetimes must be UTC-aware")
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _sort_values(owner: object, name: str, values: list[object]) -> list[object]:
+    if isinstance(owner, RelationConstraint) and name == "contract_ids":
+        return values if owner.kind == RelationKind.IMPLIES else sorted(values)
+    if isinstance(owner, SettlementScenario) and name == "atoms":
+        return sorted(values, key=lambda value: value["market_contract_id"])
+    if name in {"action_ids", "contract_ids", "constraint_ids", "atom_ids"}:
+        return sorted(values)
+    stable_ids = {
+        "actions": "action_id",
+        "terminal_state_sets": "market_contract_id",
+        "relations": "constraint_id",
+        "forbidden_atom_combinations": "constraint_id",
+        "qualification_constraints": "constraint_id",
+        "atoms": "atom_id",
+        "payouts": "action_id",
+        "quantities": "action_id",
+        "payout_per_lot": "action_id",
+        "rejection_counts": None,
+        "hyperedges": None,
+    }
+    key = stable_ids.get(name, ...)
+    if key is ...:
+        return values
+    if key is None:
+        return sorted(values, key=lambda value: value[0])
+    return sorted(values, key=lambda value: value[key])
+
+
+def _canonical_value(value: object, owner: object | None = None, name: str = "") -> object:
+    if isinstance(value, StrEnum):
+        return value.value
+    if isinstance(value, datetime):
+        return _canonical_datetime(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _canonical_value(getattr(value, field.name), value, field.name)
+            for field in fields(value)
+        }
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise ValueError("canonical mappings require string keys")
+        return {key: _canonical_value(item) for key, item in value.items()}
+    if isinstance(value, tuple | list):
+        values = [_canonical_value(item) for item in value]
+        return _sort_values(owner, name, values) if owner is not None else values
+    if isinstance(value, float):
+        raise ValueError("canonical models do not permit floats")
+    if value is None or isinstance(value, str | int | bool):
+        return value
+    raise ValueError(f"unsupported canonical value: {type(value).__name__}")
+
+
+def canonical_payload(value: object) -> dict[str, object]:
+    payload = _canonical_value(value)
+    if not isinstance(payload, dict):
+        raise ValueError("canonical payload must be an object")
+    return payload
+
+
+def canonical_json(value: object) -> str:
+    return json.dumps(canonical_payload(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def fingerprint(value: object) -> str:
+    return f"sha256:{hashlib.sha256(canonical_json(value).encode()).hexdigest()}"
+
+
+def _issue(issues: list[ModelIssue], code: str, path: str, message: str) -> None:
+    issues.append(ModelIssue(code, path, message))
+
+
+def _validate_int(issues: list[ModelIssue], value: object, path: str) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int):
+        _issue(issues, "INVALID_INTEGER", path, "must be a signed 64-bit integer")
+        return False
+    if not _INT64_MIN <= value <= _INT64_MAX:
+        _issue(issues, "INTEGER_OUT_OF_RANGE", path, "must fit signed 64-bit range")
+        return False
+    return True
+
+
+def _validate_product(issues: list[ModelIssue], left: int, right: int, path: str) -> None:
+    if not _INT64_MIN <= left * right <= _INT64_MAX:
+        _issue(issues, "DERIVED_INTEGER_OUT_OF_RANGE", path, "derived product must fit signed 64-bit range")
+
+
+def _validate_datetime(issues: list[ModelIssue], value: object, path: str) -> bool:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        _issue(issues, "NAIVE_DATETIME", path, "must be UTC-aware")
+        return False
+    if value.utcoffset() != UTC.utcoffset(value):
+        _issue(issues, "NON_UTC_DATETIME", path, "must be UTC")
+        return False
+    return True
+
+
+def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
+    issues: list[ModelIssue] = []
+    if not isinstance(problem, ArbitrageProblem):
+        return (ModelIssue("INVALID_PROBLEM", "$", "must be an ArbitrageProblem"),)
+    _validate_datetime(issues, problem.as_of, "as_of")
+    action_ids: set[str] = set()
+    actions_by_contract: dict[str, list[CandidateAction]] = {}
+    for action_index, action in enumerate(problem.actions):
+        prefix = f"actions[{action_index}]"
+        if action.action_id in action_ids:
+            _issue(issues, "DUPLICATE_ID", f"{prefix}.action_id", "action_id must be unique")
+        action_ids.add(action.action_id)
+        actions_by_contract.setdefault(action.market_contract_id, []).append(action)
+        for name in ("lot_step_units", "quantity_scale"):
+            _validate_int(issues, getattr(action, name), f"{prefix}.{name}")
+        if isinstance(action.lot_step_units, int) and not isinstance(action.lot_step_units, bool) and action.lot_step_units <= 0:
+            _issue(issues, "NON_POSITIVE_LOT_STEP", f"{prefix}.lot_step_units", "must be positive")
+        if isinstance(action.quantity_scale, int) and not isinstance(action.quantity_scale, bool) and action.quantity_scale <= 0:
+            _issue(issues, "NON_POSITIVE_QUANTITY_SCALE", f"{prefix}.quantity_scale", "must be positive")
+        if isinstance(action.lot_step_units, int) and isinstance(action.quantity_scale, int) and not isinstance(action.lot_step_units, bool) and not isinstance(action.quantity_scale, bool):
+            _validate_product(issues, action.lot_step_units, action.quantity_scale, f"{prefix}.lot_step_units*quantity_scale")
+        if action.valuation_unit_id != problem.valuation_unit_id:
+            _issue(issues, "VALUATION_UNIT_MISMATCH", f"{prefix}.valuation_unit_id", "must equal problem valuation_unit_id")
+        if action.settlement_asset_id != problem.valuation_unit_id and (not isinstance(action.asset_valuation_rule_id, str) or not action.asset_valuation_rule_id.strip()):
+            _issue(issues, "MISSING_ASSET_VALUATION_RULE", f"{prefix}.asset_valuation_rule_id", "non-native settlement assets require a versioned valuation rule")
+        _validate_datetime(issues, action.settlement_observation_key.observation_start, f"{prefix}.settlement_observation_key.observation_start")
+        _validate_datetime(issues, action.settlement_observation_key.observation_end, f"{prefix}.settlement_observation_key.observation_end")
+        if isinstance(action.settlement_observation_key.observation_start, datetime) and isinstance(action.settlement_observation_key.observation_end, datetime) and action.settlement_observation_key.observation_start > action.settlement_observation_key.observation_end:
+            _issue(issues, "INVALID_OBSERVATION_WINDOW", f"{prefix}.settlement_observation_key", "observation_start must not be after observation_end")
+        previous_last = 0
+        if not action.cost_slices:
+            _issue(issues, "MISSING_COST_SLICES", f"{prefix}.cost_slices", "must contain at least one executable cost slice")
+        for slice_index, cost_slice in enumerate(action.cost_slices):
+            slice_path = f"{prefix}.cost_slices[{slice_index}]"
+            for name in ("first_lot", "last_lot", "incremental_cost_upper_bound_units"):
+                _validate_int(issues, getattr(cost_slice, name), f"{slice_path}.{name}")
+            if all(isinstance(value, int) and not isinstance(value, bool) for value in (cost_slice.first_lot, cost_slice.last_lot)) and (cost_slice.first_lot != previous_last + 1 or cost_slice.last_lot < cost_slice.first_lot):
+                _issue(issues, "NON_CONTIGUOUS_COST_SLICES", slice_path, "cost slices must start at one and be contiguous")
+            if isinstance(cost_slice.last_lot, int) and not isinstance(cost_slice.last_lot, bool):
+                previous_last = cost_slice.last_lot
+            if isinstance(cost_slice.last_lot, int) and isinstance(cost_slice.incremental_cost_upper_bound_units, int) and not isinstance(cost_slice.last_lot, bool) and not isinstance(cost_slice.incremental_cost_upper_bound_units, bool):
+                _validate_product(issues, cost_slice.last_lot, cost_slice.incremental_cost_upper_bound_units, f"{slice_path}.total_cost")
+    contract_ids: set[str] = set()
+    atom_ids: set[str] = set()
+    for state_index, state_set in enumerate(problem.terminal_state_sets):
+        prefix = f"terminal_state_sets[{state_index}]"
+        if state_set.market_contract_id in contract_ids:
+            _issue(issues, "DUPLICATE_ID", f"{prefix}.market_contract_id", "market_contract_id must be unique")
+        contract_ids.add(state_set.market_contract_id)
+        if state_set.market_contract_id not in actions_by_contract:
+            _issue(issues, "UNKNOWN_CONTRACT_REFERENCE", f"{prefix}.market_contract_id", "must reference an action contract")
+        if not state_set.atoms:
+            _issue(issues, "MISSING_TERMINAL_ATOMS", f"{prefix}.atoms", "must contain at least one terminal atom")
+        for action in actions_by_contract.get(state_set.market_contract_id, ()):
+            if action.settlement_observation_key != state_set.settlement_observation_key:
+                _issue(issues, "OBSERVATION_KEY_MISMATCH", f"{prefix}.settlement_observation_key", "must match each action for this contract")
+        for atom_index, atom in enumerate(state_set.atoms):
+            atom_path = f"{prefix}.atoms[{atom_index}]"
+            if atom.atom_id in atom_ids:
+                _issue(issues, "DUPLICATE_ID", f"{atom_path}.atom_id", "atom_id must be globally unique")
+            atom_ids.add(atom.atom_id)
+            _validate_datetime(issues, atom.capital_release_at, f"{atom_path}.capital_release_at")
+            if isinstance(problem.as_of, datetime) and isinstance(atom.capital_release_at, datetime) and atom.capital_release_at.tzinfo is not None and problem.as_of.tzinfo is not None and atom.capital_release_at < problem.as_of:
+                _issue(issues, "STALE_CAPITAL_RELEASE_AT", f"{atom_path}.capital_release_at", "must be after problem as_of")
+            payout_ids = {payout.action_id for payout in atom.payouts}
+            required = {action.action_id for action in actions_by_contract.get(state_set.market_contract_id, ())}
+            if not required.issubset(payout_ids):
+                _issue(issues, "MISSING_ACTION_PAYOUT", f"{atom_path}.payouts", "must include every action for this contract")
+            if len(payout_ids) != len(atom.payouts):
+                _issue(issues, "DUPLICATE_ID", f"{atom_path}.payouts", "action payouts must be unique")
+            for payout_index, payout in enumerate(atom.payouts):
+                _validate_int(issues, payout.payout_lower_bound_per_lot_units, f"{atom_path}.payouts[{payout_index}].payout_lower_bound_per_lot_units")
+                if payout.action_id not in action_ids:
+                    _issue(issues, "UNKNOWN_ACTION_REFERENCE", f"{atom_path}.payouts[{payout_index}].action_id", "must reference an action")
+                elif payout.action_id not in required:
+                    _issue(issues, "UNKNOWN_ACTION_REFERENCE", f"{atom_path}.payouts[{payout_index}].action_id", "must reference an action on this contract")
+    for contract_id in actions_by_contract:
+        if contract_id not in contract_ids:
+            _issue(issues, "MISSING_TERMINAL_STATE_SET", "terminal_state_sets", f"missing terminal states for {contract_id}")
+    constraint_ids: set[str] = set()
+    for relation_index, relation in enumerate(problem.constraint_model.relations):
+        path = f"constraint_model.relations[{relation_index}]"
+        if relation.constraint_id in constraint_ids:
+            _issue(issues, "DUPLICATE_ID", f"{path}.constraint_id", "constraint_id must be unique")
+        constraint_ids.add(relation.constraint_id)
+        if relation.kind == RelationKind.IMPLIES and len(relation.contract_ids) != 2:
+            _issue(issues, "INVALID_RELATION_ARITY", f"{path}.contract_ids", "IMPLIES requires ordered antecedent and consequent")
+        if relation.kind != RelationKind.IMPLIES and len(relation.contract_ids) < 2:
+            _issue(issues, "INVALID_RELATION_ARITY", f"{path}.contract_ids", "relation requires at least two contracts")
+        for contract_id in relation.contract_ids:
+            if contract_id not in contract_ids:
+                _issue(issues, "UNKNOWN_CONTRACT_REFERENCE", f"{path}.contract_ids", "must reference a terminal contract")
+    for forbidden_index, forbidden in enumerate(problem.constraint_model.forbidden_atom_combinations):
+        path = f"constraint_model.forbidden_atom_combinations[{forbidden_index}]"
+        if forbidden.constraint_id in constraint_ids:
+            _issue(issues, "DUPLICATE_ID", f"{path}.constraint_id", "constraint_id must be unique")
+        constraint_ids.add(forbidden.constraint_id)
+        for atom_id in forbidden.atom_ids:
+            if atom_id not in atom_ids:
+                _issue(issues, "UNKNOWN_ATOM_REFERENCE", f"{path}.atom_ids", "must reference a terminal atom")
+    qualification_ids: set[str] = set()
+    for qualification_index, qualification in enumerate(problem.qualification_constraints):
+        path = f"qualification_constraints[{qualification_index}]"
+        if qualification.constraint_id in qualification_ids:
+            _issue(issues, "DUPLICATE_ID", f"{path}.constraint_id", "qualification constraint_id must be unique")
+        qualification_ids.add(qualification.constraint_id)
+        _validate_int(issues, qualification.threshold_numerator, f"{path}.threshold_numerator")
+        denominator_valid = _validate_int(issues, qualification.threshold_denominator, f"{path}.threshold_denominator")
+        if denominator_valid and qualification.threshold_denominator <= 0:
+            _issue(issues, "NON_POSITIVE_DENOMINATOR", f"{path}.threshold_denominator", "must be positive")
+    return tuple(issues)
+
+
+def _object(payload: object, name: str, required: set[str]) -> Mapping[str, object]:
+    if not isinstance(payload, Mapping) or set(payload) != required or not all(isinstance(key, str) for key in payload):
+        raise ModelDecodeError(f"{name} must contain exactly {sorted(required)}")
+    return payload
+
+
+def _array(payload: object, name: str) -> list[object]:
+    if not isinstance(payload, list):
+        raise ModelDecodeError(f"{name} must be a JSON array")
+    return payload
+
+
+def _string(payload: object, name: str) -> str:
+    if not isinstance(payload, str) or not payload.strip():
+        raise ModelDecodeError(f"{name} must be a non-empty string")
+    return payload
+
+
+def _text(payload: object, name: str) -> str:
+    if not isinstance(payload, str):
+        raise ModelDecodeError(f"{name} must be a string")
+    return payload
+
+
+def _integer(payload: object, name: str) -> int:
+    if isinstance(payload, bool) or not isinstance(payload, int) or not _INT64_MIN <= payload <= _INT64_MAX:
+        raise ModelDecodeError(f"{name} must be a signed 64-bit integer")
+    return payload
+
+
+def _optional_integer(payload: object, name: str) -> int | None:
+    return None if payload is None else _integer(payload, name)
+
+
+def _boolean(payload: object, name: str) -> bool:
+    if not isinstance(payload, bool):
+        raise ModelDecodeError(f"{name} must be a boolean")
+    return payload
+
+
+def _datetime_from_payload(payload: object, name: str) -> datetime:
+    value = _string(payload, name)
+    if not value.endswith("Z"):
+        raise ModelDecodeError(f"{name} must be an RFC3339 UTC datetime ending in Z")
+    try:
+        decoded = datetime.fromisoformat(f"{value[:-1]}+00:00")
+    except ValueError as error:
+        raise ModelDecodeError(f"{name} must be an RFC3339 UTC datetime ending in Z") from error
+    if decoded.tzinfo is None or decoded.utcoffset() != UTC.utcoffset(decoded):
+        raise ModelDecodeError(f"{name} must be UTC")
+    return decoded.astimezone(UTC)
+
+
+def _enum(enum_type: type[StrEnum], payload: object, name: str) -> StrEnum:
+    try:
+        return enum_type(_string(payload, name))
+    except ValueError as error:
+        raise ModelDecodeError(f"{name} is not a valid {enum_type.__name__}") from error
+
+
+def _observation_from_payload(payload: object) -> SettlementObservationKey:
+    value = _object(payload, "settlement_observation_key", {"schema_version", "oracle_id", "indicator_id", "observation_start", "observation_end", "timezone", "rule_version"})
+    return SettlementObservationKey(
+        _string(value["schema_version"], "schema_version"), _string(value["oracle_id"], "oracle_id"),
+        _string(value["indicator_id"], "indicator_id"), _datetime_from_payload(value["observation_start"], "observation_start"),
+        _datetime_from_payload(value["observation_end"], "observation_end"), _string(value["timezone"], "timezone"),
+        _string(value["rule_version"], "rule_version"),
+    )
+
+
+def _cost_slice_from_payload(payload: object) -> ExecutableCostSlice:
+    value = _object(payload, "cost_slice", {"first_lot", "last_lot", "incremental_cost_upper_bound_units"})
+    return ExecutableCostSlice(_integer(value["first_lot"], "first_lot"), _integer(value["last_lot"], "last_lot"), _integer(value["incremental_cost_upper_bound_units"], "incremental_cost_upper_bound_units"))
+
+
+def _action_from_payload(payload: object) -> CandidateAction:
+    value = _object(payload, "action", {"action_id", "market_contract_id", "settlement_observation_key", "side", "lot_step_units", "quantity_scale", "settlement_asset_id", "valuation_unit_id", "asset_valuation_rule_id", "cost_slices"})
+    return CandidateAction(
+        _string(value["action_id"], "action_id"), _string(value["market_contract_id"], "market_contract_id"),
+        _observation_from_payload(value["settlement_observation_key"]), _enum(ActionSide, value["side"], "side"),
+        _integer(value["lot_step_units"], "lot_step_units"), _integer(value["quantity_scale"], "quantity_scale"),
+        _string(value["settlement_asset_id"], "settlement_asset_id"), _string(value["valuation_unit_id"], "valuation_unit_id"),
+        _text(value["asset_valuation_rule_id"], "asset_valuation_rule_id"), tuple(_cost_slice_from_payload(item) for item in _array(value["cost_slices"], "cost_slices")),
+    )
+
+
+def _payout_from_payload(payload: object) -> ActionPayout:
+    value = _object(payload, "action_payout", {"action_id", "payout_lower_bound_per_lot_units"})
+    return ActionPayout(_string(value["action_id"], "action_id"), _integer(value["payout_lower_bound_per_lot_units"], "payout_lower_bound_per_lot_units"))
+
+
+def _atom_from_payload(payload: object) -> TerminalAtom:
+    value = _object(payload, "terminal_atom", {"atom_id", "kind", "rule_version", "payouts", "capital_release_at"})
+    return TerminalAtom(_string(value["atom_id"], "atom_id"), _enum(TerminalKind, value["kind"], "kind"), _string(value["rule_version"], "rule_version"), tuple(_payout_from_payload(item) for item in _array(value["payouts"], "payouts")), _datetime_from_payload(value["capital_release_at"], "capital_release_at"))
+
+
+def _state_set_from_payload(payload: object) -> TerminalStateSet:
+    value = _object(payload, "terminal_state_set", {"market_contract_id", "settlement_observation_key", "rule_version", "atoms"})
+    return TerminalStateSet(_string(value["market_contract_id"], "market_contract_id"), _observation_from_payload(value["settlement_observation_key"]), _string(value["rule_version"], "rule_version"), tuple(_atom_from_payload(item) for item in _array(value["atoms"], "atoms")))
+
+
+def _relation_from_payload(payload: object) -> RelationConstraint:
+    value = _object(payload, "relation", {"constraint_id", "kind", "contract_ids", "rule_version"})
+    return RelationConstraint(_string(value["constraint_id"], "constraint_id"), _enum(RelationKind, value["kind"], "kind"), tuple(_string(item, "contract_ids[]") for item in _array(value["contract_ids"], "contract_ids")), _string(value["rule_version"], "rule_version"))
+
+
+def _forbidden_from_payload(payload: object) -> ForbiddenAtomCombination:
+    value = _object(payload, "forbidden_atom_combination", {"constraint_id", "atom_ids", "rule_version"})
+    return ForbiddenAtomCombination(_string(value["constraint_id"], "constraint_id"), tuple(_string(item, "atom_ids[]") for item in _array(value["atom_ids"], "atom_ids")), _string(value["rule_version"], "rule_version"))
+
+
+def _qualification_from_payload(payload: object) -> QualificationConstraint:
+    value = _object(payload, "qualification_constraint", {"constraint_id", "rule_version", "metric", "comparison", "threshold_numerator", "threshold_denominator"})
+    return QualificationConstraint(_string(value["constraint_id"], "constraint_id"), _string(value["rule_version"], "rule_version"), _enum(QualificationMetric, value["metric"], "metric"), _enum(Comparison, value["comparison"], "comparison"), _integer(value["threshold_numerator"], "threshold_numerator"), _integer(value["threshold_denominator"], "threshold_denominator"))
+
+
+def _sorted_problem(problem: ArbitrageProblem) -> ArbitrageProblem:
+    actions = tuple(sorted(problem.actions, key=lambda action: action.action_id))
+    state_sets = tuple(
+        sorted(
+            (
+                replace(
+                    state_set,
+                    atoms=tuple(
+                        sorted(
+                            (
+                                replace(atom, payouts=tuple(sorted(atom.payouts, key=lambda payout: payout.action_id)))
+                                for atom in state_set.atoms
+                            ),
+                            key=lambda atom: atom.atom_id,
+                        )
+                    ),
+                )
+                for state_set in problem.terminal_state_sets
+            ),
+            key=lambda state_set: state_set.market_contract_id,
+        )
+    )
+    relations = tuple(sorted((replace(relation, contract_ids=relation.contract_ids if relation.kind == RelationKind.IMPLIES else tuple(sorted(relation.contract_ids))) for relation in problem.constraint_model.relations), key=lambda relation: relation.constraint_id))
+    forbidden = tuple(sorted((replace(item, atom_ids=tuple(sorted(item.atom_ids))) for item in problem.constraint_model.forbidden_atom_combinations), key=lambda item: item.constraint_id))
+    return replace(problem, actions=actions, terminal_state_sets=state_sets, constraint_model=ConstraintModel(relations, forbidden), qualification_constraints=tuple(sorted(problem.qualification_constraints, key=lambda item: item.constraint_id)))
+
+
+def problem_from_payload(payload: Mapping[str, object]) -> ArbitrageProblem:
+    value = _object(payload, "problem", {"schema_version", "problem_id", "as_of", "valuation_unit_id", "actions", "terminal_state_sets", "constraint_model", "qualification_constraints"})
+    constraint_model = _object(value["constraint_model"], "constraint_model", {"relations", "forbidden_atom_combinations"})
+    problem = ArbitrageProblem(
+        _string(value["schema_version"], "schema_version"), _string(value["problem_id"], "problem_id"), _datetime_from_payload(value["as_of"], "as_of"), _string(value["valuation_unit_id"], "valuation_unit_id"),
+        tuple(_action_from_payload(item) for item in _array(value["actions"], "actions")),
+        tuple(_state_set_from_payload(item) for item in _array(value["terminal_state_sets"], "terminal_state_sets")),
+        ConstraintModel(tuple(_relation_from_payload(item) for item in _array(constraint_model["relations"], "relations")), tuple(_forbidden_from_payload(item) for item in _array(constraint_model["forbidden_atom_combinations"], "forbidden_atom_combinations"))),
+        tuple(_qualification_from_payload(item) for item in _array(value["qualification_constraints"], "qualification_constraints")),
+    )
+    issues = validate_problem(problem)
+    if issues:
+        raise ModelDecodeError("invalid problem: " + "; ".join(f"{issue.path}: {issue.code}" for issue in issues))
+    return _sorted_problem(problem)
+
+
+def _budget_from_payload(payload: object) -> OracleBudget:
+    value = _object(payload, "budget", {"max_quantity_vectors", "max_joint_states", "max_support_rechecks"})
+    budget = OracleBudget(_integer(value["max_quantity_vectors"], "max_quantity_vectors"), _integer(value["max_joint_states"], "max_joint_states"), _integer(value["max_support_rechecks"], "max_support_rechecks"))
+    if any(item <= 0 for item in (budget.max_quantity_vectors, budget.max_joint_states, budget.max_support_rechecks)):
+        raise ModelDecodeError("budget limits must be positive")
+    return budget
+
+
+def request_from_payload(payload: Mapping[str, object]) -> OracleRequest:
+    value = _object(payload, "request", {"schema_version", "mode", "problem", "budget"})
+    return OracleRequest(_string(value["schema_version"], "schema_version"), _enum(SearchMode, value["mode"], "mode"), problem_from_payload(_object(value["problem"], "problem", {"schema_version", "problem_id", "as_of", "valuation_unit_id", "actions", "terminal_state_sets", "constraint_model", "qualification_constraints"})), _budget_from_payload(value["budget"]))
+
+
+def _quantity_from_payload(payload: object) -> ActionQuantity:
+    value = _object(payload, "action_quantity", {"action_id", "quantity_lots"})
+    return ActionQuantity(_string(value["action_id"], "action_id"), _integer(value["quantity_lots"], "quantity_lots"))
+
+
+def _selected_atom_from_payload(payload: object) -> SelectedAtom:
+    value = _object(payload, "selected_atom", {"market_contract_id", "atom_id"})
+    return SelectedAtom(_string(value["market_contract_id"], "market_contract_id"), _string(value["atom_id"], "atom_id"))
+
+
+def _scenario_from_payload(payload: object) -> SettlementScenario:
+    value = _object(payload, "scenario", {"atoms"})
+    return SettlementScenario(tuple(_selected_atom_from_payload(item) for item in _array(value["atoms"], "atoms")))
+
+
+def _cut_from_payload(payload: object) -> WorstStateCut:
+    value = _object(payload, "worst_state_cut", {"cut_id", "scenario", "payout_per_lot"})
+    return WorstStateCut(_string(value["cut_id"], "cut_id"), _scenario_from_payload(value["scenario"]), tuple(_payout_from_payload(item) for item in _array(value["payout_per_lot"], "payout_per_lot")))
+
+
+def _support_graph_from_payload(payload: object) -> SelectedSupportGraph:
+    value = _object(payload, "selected_support_graph", {"action_ids", "contract_ids", "constraint_ids", "hyperedges"})
+    hyperedges = []
+    for item in _array(value["hyperedges"], "hyperedges"):
+        edge = _array(item, "hyperedge")
+        if len(edge) != 2:
+            raise ModelDecodeError("hyperedge must contain a constraint ID and contract IDs")
+        hyperedges.append((_string(edge[0], "hyperedge.constraint_id"), tuple(_string(contract, "hyperedge.contract_ids[]") for contract in _array(edge[1], "hyperedge.contract_ids"))))
+    return SelectedSupportGraph(tuple(_string(item, "action_ids[]") for item in _array(value["action_ids"], "action_ids")), tuple(_string(item, "contract_ids[]") for item in _array(value["contract_ids"], "contract_ids")), tuple(_string(item, "constraint_ids[]") for item in _array(value["constraint_ids"], "constraint_ids")), tuple(hyperedges))
+
+
+def _payout_proof_from_payload(payload: object) -> PayoutProof:
+    value = _object(payload, "payout_proof", {"problem_fingerprint", "portfolio_fingerprint", "worst_scenario", "worst_state_cut", "payout_lower_bound_units", "cost_upper_bound_units", "guaranteed_profit_units", "conservative_capital_release_at", "selected_support_graph"})
+    return PayoutProof(_string(value["problem_fingerprint"], "problem_fingerprint"), _string(value["portfolio_fingerprint"], "portfolio_fingerprint"), _scenario_from_payload(value["worst_scenario"]), _cut_from_payload(value["worst_state_cut"]), _integer(value["payout_lower_bound_units"], "payout_lower_bound_units"), _integer(value["cost_upper_bound_units"], "cost_upper_bound_units"), _integer(value["guaranteed_profit_units"], "guaranteed_profit_units"), _datetime_from_payload(value["conservative_capital_release_at"], "conservative_capital_release_at"), _support_graph_from_payload(value["selected_support_graph"]))
+
+
+def _solution_from_payload(payload: object) -> PortfolioSolution:
+    value = _object(payload, "solution", {"quantities", "payout_proof"})
+    return PortfolioSolution(tuple(_quantity_from_payload(item) for item in _array(value["quantities"], "quantities")), _payout_proof_from_payload(value["payout_proof"]))
+
+
+def _bounds_from_payload(payload: object) -> ObjectiveBounds:
+    value = _object(payload, "objective_bounds", {"lower_bound_units", "upper_bound_units", "gap_units", "closed"})
+    return ObjectiveBounds(_optional_integer(value["lower_bound_units"], "lower_bound_units"), _optional_integer(value["upper_bound_units"], "upper_bound_units"), _optional_integer(value["gap_units"], "gap_units"), _boolean(value["closed"], "closed"))
+
+
+def _negative_proof_from_payload(payload: object) -> ExhaustiveSearchProof:
+    value = _object(payload, "negative_proof", {"proof_method", "conclusion", "request_fingerprint", "problem_fingerprint", "source_problem_fingerprint", "qualification_fingerprint", "quantity_vectors_total", "quantity_vectors_examined", "joint_states_per_vector", "rejection_counts"})
+    source = value["source_problem_fingerprint"]
+    if source is not None:
+        source = _string(source, "source_problem_fingerprint")
+    rejection_counts = []
+    for item in _array(value["rejection_counts"], "rejection_counts"):
+        pair = _array(item, "rejection_count")
+        if len(pair) != 2:
+            raise ModelDecodeError("rejection_count must contain an ID and count")
+        rejection_counts.append((_string(pair[0], "rejection_count.id"), _integer(pair[1], "rejection_count.count")))
+    return ExhaustiveSearchProof(_string(value["proof_method"], "proof_method"), _enum(BusinessStatus, value["conclusion"], "conclusion"), _string(value["request_fingerprint"], "request_fingerprint"), _string(value["problem_fingerprint"], "problem_fingerprint"), source, _string(value["qualification_fingerprint"], "qualification_fingerprint"), _integer(value["quantity_vectors_total"], "quantity_vectors_total"), _integer(value["quantity_vectors_examined"], "quantity_vectors_examined"), _integer(value["joint_states_per_vector"], "joint_states_per_vector"), tuple(rejection_counts))
+
+
+def _validate_result(result: OracleResult) -> None:
+    feasible = result.solve_status == SolveStatus.FEASIBLE
+    negative = result.business_status in {BusinessStatus.NO_QUALIFIED_OPPORTUNITY, BusinessStatus.NO_ARBITRAGE}
+    if feasible:
+        if result.solution is None or result.proof_status != ProofStatus.PROVEN or result.business_status != BusinessStatus.QUALIFIED_FEASIBLE or result.negative_proof is not None or result.unknown_reason is not None:
+            raise ModelDecodeError("FEASIBLE requires a proved qualified solution and no negative or unknown state")
+        if result.optimality_status == OptimalityStatus.NOT_PROVEN and (result.objective_bounds.closed or result.objective_bounds.lower_bound_units is None or result.objective_bounds.upper_bound_units is not None or result.objective_bounds.gap_units is not None):
+            raise ModelDecodeError("non-optimal feasible results require only an open lower bound")
+        if result.optimality_status not in {OptimalityStatus.NOT_PROVEN, OptimalityStatus.OPTIMAL}:
+            raise ModelDecodeError("FEASIBLE requires an optimal or not-proven optimality status")
+    if result.optimality_status == OptimalityStatus.OPTIMAL:
+        bounds = result.objective_bounds
+        if not feasible or result.solution is None or result.proof_status != ProofStatus.PROVEN or not bounds.closed or bounds.lower_bound_units is None or bounds.lower_bound_units != bounds.upper_bound_units or bounds.gap_units != 0:
+            raise ModelDecodeError("OPTIMAL requires a proved solution and equal closed objective bounds")
+    if negative:
+        if result.solve_status != SolveStatus.INFEASIBLE or result.proof_status != ProofStatus.PROVEN or result.optimality_status != OptimalityStatus.NOT_APPLICABLE or result.solution is not None or result.negative_proof is None or result.negative_proof.conclusion != result.business_status or result.negative_proof.quantity_vectors_total != result.negative_proof.quantity_vectors_examined or result.unknown_reason is not None:
+            raise ModelDecodeError("negative conclusions require a matching exhaustive proof")
+    if result.solve_status == SolveStatus.UNKNOWN:
+        if result.business_status != BusinessStatus.UNKNOWN or result.proof_status != ProofStatus.UNKNOWN or result.optimality_status != OptimalityStatus.NOT_APPLICABLE or result.solution is not None or result.negative_proof is not None or result.unknown_reason is None:
+            raise ModelDecodeError("UNKNOWN requires only a matching unknown reason")
+    if result.solve_status == SolveStatus.INFEASIBLE and not negative:
+        raise ModelDecodeError("INFEASIBLE requires an exhaustive negative conclusion")
+
+
+def result_from_payload(payload: Mapping[str, object]) -> OracleResult:
+    value = _object(payload, "result", {"solve_status", "proof_status", "business_status", "optimality_status", "objective_bounds", "solution", "negative_proof", "unknown_reason"})
+    solution = None if value["solution"] is None else _solution_from_payload(value["solution"])
+    negative_proof = None if value["negative_proof"] is None else _negative_proof_from_payload(value["negative_proof"])
+    unknown_reason = None if value["unknown_reason"] is None else _enum(UnknownReason, value["unknown_reason"], "unknown_reason")
+    result = OracleResult(_enum(SolveStatus, value["solve_status"], "solve_status"), _enum(ProofStatus, value["proof_status"], "proof_status"), _enum(BusinessStatus, value["business_status"], "business_status"), _enum(OptimalityStatus, value["optimality_status"], "optimality_status"), _bounds_from_payload(value["objective_bounds"]), solution, negative_proof, unknown_reason)
+    _validate_result(result)
+    return result
