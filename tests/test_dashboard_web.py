@@ -9529,7 +9529,7 @@ const base={status:"active",status_label:"风险预算内",
   single_entry_risk_limit_pct:"0.004",abnormal_loss_buffer:"1000",
   abnormal_loss_buffer_pct:"0.01",disclaimer:"风险提示",portfolio_remaining_risk_note:"说明"};
 const available=renderTrendRiskSummary({...base,trade_stats:{available:true,
-  statistics_cutoff_at:"2026-07-20T11:59:59+08:00",
+  statistics_cutoff_at:"2026-07-20T11:59:59.328859+08:00",
   actual_broker_label:"东方财富",
   simulation:{win_rate:"0.5",payoff_ratio:"1.25",payoff_ratio_status:"available",eligible_sample_count:4},
   actual:{win_rate:null,payoff_ratio:null,payoff_ratio_status:"no_wins",eligible_sample_count:0}}});

@@ -1467,6 +1467,8 @@ class CodexRelationValidator:
         timeout_seconds: float = 45.0,
         prompt_version: str = CODEX_PROMPT_VERSION,
         fallback_model: str | None = None,
+        fallback_enabled: bool = True,
+        max_codex_calls: int | None = None,
         fallback: (
             Callable[
                 [str, Mapping[str, object]],
@@ -1477,11 +1479,24 @@ class CodexRelationValidator:
     ) -> None:
         if not model.strip():
             raise ValueError("Codex model is required")
+        if (
+            max_codex_calls is not None
+            and (
+                isinstance(max_codex_calls, bool)
+                or not isinstance(max_codex_calls, int)
+                or max_codex_calls < 0
+            )
+        ):
+            raise ValueError("max_codex_calls must be a non-negative integer")
         self.store = store
         self.model = model.strip()
         self.runner = runner
         self.timeout_seconds = timeout_seconds
         self.prompt_version = prompt_version
+        self.fallback_enabled = fallback_enabled
+        self.max_codex_calls = max_codex_calls
+        self.codex_calls = 0
+        self.codex_successes = 0
         fallback_model = (
             fallback_model
             or os.environ.get("OPEN_TRADER_LLM_FALLBACK_MODEL")
@@ -1545,6 +1560,7 @@ class CodexRelationValidator:
             "CODEX_TIMEOUT": "Codex 语义校验超时，当前不可下单。",
             "CODEX_FAILED": "Codex 语义校验不可用，当前不可下单。",
             "CODEX_OUTPUT_INVALID": "Codex 返回的结构化结果无效，当前不可下单。",
+            "CODEX_BUDGET_EXHAUSTED": "Codex 校验额度已耗尽，当前不可下单。",
             "CODEX_CIRCUIT_OPEN": "Codex 连续失败已临时熔断，当前使用 DeepSeek 校验。",
             "DEEPSEEK_FAILED": "Codex 与 DeepSeek 校验均不可用，当前不可下单。",
             "DEEPSEEK_OUTPUT_INVALID": "Codex 与 DeepSeek 校验均不可用，当前不可下单。",
@@ -1652,6 +1668,17 @@ class CodexRelationValidator:
             model=self.model,
             prompt_version=self.prompt_version,
         )
+        if (
+            self.max_codex_calls is not None
+            and self.codex_calls >= self.max_codex_calls
+        ):
+            return self._validation(
+                relation=relation,
+                cache_key=cache_key,
+                structured=None,
+                status="llm_unavailable",
+                reason="CODEX_BUDGET_EXHAUSTED",
+            )
         if self._breaker.disabled(time.monotonic()):
             return self._fallback(relation, cache_key, "CODEX_CIRCUIT_OPEN")
 
@@ -1681,6 +1708,7 @@ class CodexRelationValidator:
             with tempfile.TemporaryDirectory(
                 prefix="open-trader-codex-"
             ) as working_dir:
+                self.codex_calls += 1
                 completed = self.runner(
                     command,
                     input=prompt,
@@ -1716,6 +1744,7 @@ class CodexRelationValidator:
             )
             return self._fallback(relation, cache_key, "CODEX_OUTPUT_INVALID")
         assert isinstance(structured, Mapping)
+        self.codex_successes += 1
         self._breaker.record_success()
         self.store.record_llm_call(
             status="success", usage={**usage, "provider": "codex"}
@@ -1743,6 +1772,14 @@ class CodexRelationValidator:
         codex_cache_key: str,
         codex_reason: str,
     ) -> RelationValidation:
+        if not self.fallback_enabled:
+            return self._validation(
+                relation=relation,
+                cache_key=codex_cache_key,
+                structured=None,
+                status="llm_unavailable",
+                reason=codex_reason,
+            )
         fallback_cache_key = codex_relation_cache_key(
             relation,
             model=self.fallback_model,

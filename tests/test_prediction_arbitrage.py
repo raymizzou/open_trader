@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import time
+import json
+import subprocess
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -25,15 +28,201 @@ from open_trader.prediction_arbitrage import (
 def test_cross_venue_unsettled_principal_policy_is_one_hundred_usdt() -> None:
     assert MAX_CROSS_UNSETTLED_PRINCIPAL == Decimal("100")
 from open_trader.polymarket_relation_discovery import (
+    CodexRelationValidator,
     ThresholdBuyLeg,
     ThresholdMarket,
     ThresholdRelation,
     build_threshold_hedge_intent,
+    discover_threshold_relations,
     positive_edge_depth,
     simple_annualized_yield,
     simple_annualized_yield_from_values,
     _fee,
 )
+from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+
+
+def _shadow_relation(index: int) -> ThresholdRelation:
+    suffix = f" candidate {index}"
+    markets = []
+    for market_id, threshold in (("lower", "90,000"), ("higher", "100,000")):
+        markets.append(
+            {
+                "id": market_id,
+                "conditionId": f"condition-{market_id}",
+                "question": f"Will Bitcoin be above ${threshold} on December 31?{suffix}",
+                "description": "This market resolves from the Binance BTC/USDT close at 12:00 ET.",
+                "resolutionSource": "Binance",
+                "endDate": "2026-12-31T17:00:00Z",
+                "active": True,
+                "closed": False,
+                "acceptingOrders": True,
+                "enableOrderBook": True,
+                "negRisk": False,
+                "outcomes": '["Yes", "No"]',
+                "clobTokenIds": f'["yes-{market_id}", "no-{market_id}"]',
+                "feesEnabled": False,
+                "orderMinSize": 1,
+                "orderPriceMinTickSize": 0.01,
+            }
+        )
+    return discover_threshold_relations(
+        [{"id": "shadow-event", "title": "Bitcoin", "active": True, "closed": False, "ended": False, "negRisk": False, "markets": markets}]
+    )[0]
+
+
+def _shadow_relation_result() -> dict[str, object]:
+    def market(condition_id: str, threshold: str) -> dict[str, object]:
+        return {
+            "condition_id": condition_id,
+            "subject": "Bitcoin",
+            "metric": "Binance BTC/USDT close",
+            "operator": ">",
+            "threshold": threshold,
+            "unit": "USD",
+            "currency": "USD",
+            "observation_start": "2026-12-31T17:00:00Z",
+            "observation_end": "2026-12-31T17:00:00Z",
+            "timezone": "America/New_York",
+            "resolution_source": "Binance",
+            "special_settlement": None,
+        }
+
+    return {
+        "schema_version": 1,
+        "decision": "REJECT",
+        "relation": "NONE",
+        "market_a": market("condition-lower", "90000"),
+        "market_b": market("condition-higher", "100000"),
+        "proof": {"excluded_state": None, "why_excluded": None},
+        "reason_codes": ["AMBIGUOUS_RULES"],
+        "summary": "Not approved.",
+        "evidence": [],
+        "uncertainties": ["ambiguous"],
+    }
+
+
+def _shadow_relation_jsonl() -> str:
+    return "\n".join(
+        (
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(_shadow_relation_result())}}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1}}),
+        )
+    )
+
+
+class _ShadowRelationRunner:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(
+        self, command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(command)
+        return subprocess.CompletedProcess(
+            command, 0, stdout=_shadow_relation_jsonl(), stderr=""
+        )
+
+
+def test_relation_codex_rejects_negative_budget(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        CodexRelationValidator(
+            PredictionArbitrageStore(tmp_path), model="gpt-test", max_codex_calls=-1
+        )
+
+
+def test_relation_codex_budget_caps_only_uncached_calls(tmp_path: Path) -> None:
+    runner = _ShadowRelationRunner()
+    fallback_calls: list[str] = []
+    validator = CodexRelationValidator(
+        PredictionArbitrageStore(tmp_path),
+        model="gpt-test",
+        runner=runner,
+        fallback_enabled=False,
+        max_codex_calls=3,
+        fallback=lambda *_: (fallback_calls.append("called") or None, "disabled"),
+    )
+
+    results = [validator.validate(_shadow_relation(index)) for index in range(4)]
+
+    assert len(runner.calls) == 3
+    assert validator.codex_calls == 3
+    assert validator.codex_successes == 3
+    assert results[3].reason_codes == ("CODEX_BUDGET_EXHAUSTED",)
+    assert fallback_calls == []
+
+
+def test_relation_codex_cached_hit_does_not_consume_budget(tmp_path: Path) -> None:
+    store = PredictionArbitrageStore(tmp_path)
+    relation = _shadow_relation(0)
+    assert CodexRelationValidator(store, model="gpt-test", runner=_ShadowRelationRunner()).validate(relation).cached is False
+    runner = _ShadowRelationRunner()
+    validator = CodexRelationValidator(
+        store, model="gpt-test", runner=runner, fallback_enabled=False, max_codex_calls=0
+    )
+
+    cached = validator.validate(relation)
+    exhausted = validator.validate(_shadow_relation(1))
+
+    assert cached.cached is True
+    assert exhausted.reason_codes == ("CODEX_BUDGET_EXHAUSTED",)
+    assert runner.calls == []
+    assert validator.codex_calls == validator.codex_successes == 0
+
+
+def test_relation_codex_timeout_without_fallback_records_no_deepseek_usage(tmp_path: Path) -> None:
+    fallback_calls: list[str] = []
+
+    def timeout(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(command, 1)
+
+    store = PredictionArbitrageStore(tmp_path)
+    result = CodexRelationValidator(
+        store,
+        model="gpt-test",
+        runner=timeout,
+        fallback_enabled=False,
+        fallback=lambda *_: (fallback_calls.append("called") or None, "disabled"),
+    ).validate(_shadow_relation(0))
+
+    assert result.reason_codes == ("CODEX_TIMEOUT",)
+    assert fallback_calls == []
+    assert store.llm_usage_24h_by_provider().get("deepseek", {}) == {}
+
+
+def test_relation_codex_default_fallback_is_preserved(tmp_path: Path) -> None:
+    fallback_calls: list[str] = []
+    result = CodexRelationValidator(
+        PredictionArbitrageStore(tmp_path),
+        model="gpt-test",
+        runner=lambda command, **_kwargs: subprocess.CompletedProcess(command, 1, stdout="", stderr="failed"),
+        fallback=lambda *_: (fallback_calls.append("called") or json.dumps(_shadow_relation_result()), None),
+    ).validate(_shadow_relation(0))
+
+    assert result.status == "llm_rejected"
+    assert fallback_calls == ["called"]
+
+
+def test_relation_codex_nonzero_exit_with_fallback_does_not_count_success(
+    tmp_path: Path,
+) -> None:
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            command, 1, stdout=_shadow_relation_jsonl(), stderr="failed"
+        )
+
+    validator = CodexRelationValidator(
+        PredictionArbitrageStore(tmp_path),
+        model="gpt-test",
+        runner=runner,
+        fallback_enabled=False,
+    )
+
+    result = validator.validate(_shadow_relation(0))
+
+    assert result.reason_codes == ("CODEX_FAILED",)
+    assert validator.codex_calls == 1
+    assert validator.codex_successes == 0
 
 
 def market_facts(

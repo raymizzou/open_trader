@@ -653,12 +653,10 @@ def test_equivalence_schema_requires_explicit_exchange_evidence_and_divergent_ch
     assert schema["properties"]["schema_version"]["const"] == 2
     assert {"predict", "polymarket", "direct_outcome_mapping", "canonical_cutoff", "contract_shape", "divergent_states", "evidence", "uncertainties"} <= set(schema["required"])
     assert set(schema["properties"]["divergent_states"]["required"]) == {"PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"}
-    assert set(schema["$defs"]["venue_market"]["required"]) == {"exchange", "market_id", "condition_id", "rules_fingerprint"}
-    assert any(
-        clause.get("if", {}).get("properties", {}).get("contract_shape", {}).get("const") == "COMPOUND"
-        and clause.get("then", {}).get("properties", {}).get("decision", {}).get("const") == "REJECT"
-        for clause in schema["allOf"]
-    )
+    assert set(schema["$defs"]["predict_market"]["required"]) == {"exchange", "market_id", "condition_id", "rules_fingerprint"}
+    assert schema["$defs"]["predict_market"]["properties"]["exchange"] == {"type": "string", "const": "predict.fun"}
+    assert schema["$defs"]["polymarket_market"]["properties"]["exchange"] == {"type": "string", "const": "polymarket"}
+    assert "allOf" not in schema_path.read_text()
 
 
 def test_equivalence_cache_and_hot_pool_invalidate_every_admission_input() -> None:

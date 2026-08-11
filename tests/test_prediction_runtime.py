@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import multiprocessing
 import os
+import subprocess
+import threading
+from contextlib import ExitStack, contextmanager
+from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -15,6 +21,211 @@ from open_trader.prediction_runtime import (
     _CrossVenueRuntime,
     _RuntimeOwnershipLock,
 )
+from open_trader.predict_cross_venue import (
+    CodexCrossVenueEquivalenceValidator,
+    ExplicitMarketPair,
+    VenueMarket,
+)
+from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+
+
+def _shadow_cross_pair(index: int) -> ExplicitMarketPair:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    finish = datetime(2027, 1, 1, tzinfo=UTC)
+    return ExplicitMarketPair(
+        pair_id=f"shadow-pair-{index}",
+        predict=VenueMarket(
+            exchange="predict.fun",
+            market_id="predict-market",
+            condition_id="predict-condition",
+            question=f"Test market {index}",
+            rules=f"Predict rules {index}",
+            event_start_at=now,
+            event_end_at=finish,
+            yes_token_id="predict-yes",
+            no_token_id="predict-no",
+            settlement_asset="USDT",
+            minimum_order_size=Decimal("1"),
+            tick_size=Decimal("0.01"),
+            fee_rate_bps=Decimal("0"),
+            rules_fingerprint="predict-fingerprint",
+            category_slug="test",
+            resolution_provider="test oracle",
+        ),
+        polymarket=VenueMarket(
+            exchange="polymarket",
+            market_id="poly-market",
+            condition_id="poly-condition",
+            question=f"Test market {index}",
+            rules=f"Polymarket rules {index}",
+            close_at=finish,
+            settlement_at=finish,
+            yes_token_id="poly-yes",
+            no_token_id="poly-no",
+            settlement_asset="USDC",
+            minimum_order_size=Decimal("1"),
+            tick_size=Decimal("0.01"),
+            fee_rate_bps=Decimal("0"),
+            rules_fingerprint="poly-fingerprint",
+        ),
+    )
+
+
+def _shadow_cross_result() -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "decision": "REJECT",
+        "summary": "Not approved.",
+        "predict": {
+            "exchange": "predict.fun",
+            "market_id": "predict-market",
+            "condition_id": "predict-condition",
+            "rules_fingerprint": "predict-fingerprint",
+        },
+        "polymarket": {
+            "exchange": "polymarket",
+            "market_id": "poly-market",
+            "condition_id": "poly-condition",
+            "rules_fingerprint": "poly-fingerprint",
+        },
+        "direct_outcome_mapping": {
+            "predict_yes": "YES",
+            "predict_no": "NO",
+            "polymarket_yes": "YES",
+            "polymarket_no": "NO",
+        },
+        "canonical_cutoff": "2027-01-01T00:00:00Z",
+        "contract_shape": "BINARY",
+        "divergent_states": {
+            "PREDICT_YES_POLYMARKET_NO": {"possible": False, "reason": "same"},
+            "POLYMARKET_YES_PREDICT_NO": {"possible": False, "reason": "same"},
+        },
+        "evidence": [],
+        "uncertainties": ["ambiguous"],
+    }
+
+
+def _shadow_cross_jsonl() -> str:
+    return "\n".join(
+        (
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(_shadow_cross_result())}}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1}}),
+        )
+    )
+
+
+class _ShadowCrossRunner:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(
+        self, command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(command)
+        return subprocess.CompletedProcess(
+            command, 0, stdout=_shadow_cross_jsonl(), stderr=""
+        )
+
+
+def test_cross_venue_codex_rejects_negative_budget(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        CodexCrossVenueEquivalenceValidator(
+            PredictionArbitrageStore(tmp_path), model="gpt-test", max_codex_calls=-1
+        )
+
+
+def test_cross_venue_codex_budget_caps_only_uncached_calls(tmp_path: Path) -> None:
+    runner = _ShadowCrossRunner()
+    fallback_calls: list[str] = []
+    validator = CodexCrossVenueEquivalenceValidator(
+        PredictionArbitrageStore(tmp_path),
+        model="gpt-test",
+        runner=runner,
+        fallback_enabled=False,
+        max_codex_calls=3,
+        fallback=lambda *_: (fallback_calls.append("called") or None, "disabled"),
+    )
+
+    results = [validator.validate(_shadow_cross_pair(index)) for index in range(4)]
+
+    assert len(runner.calls) == 3
+    assert validator.codex_calls == 3
+    assert validator.codex_successes == 3
+    assert results[3].reason == "CODEX_BUDGET_EXHAUSTED"
+    assert fallback_calls == []
+
+
+def test_cross_venue_codex_cached_hit_does_not_consume_budget(tmp_path: Path) -> None:
+    store = PredictionArbitrageStore(tmp_path)
+    pair = _shadow_cross_pair(0)
+    assert CodexCrossVenueEquivalenceValidator(store, model="gpt-test", runner=_ShadowCrossRunner()).validate(pair).approved is False
+    runner = _ShadowCrossRunner()
+    validator = CodexCrossVenueEquivalenceValidator(
+        store, model="gpt-test", runner=runner, fallback_enabled=False, max_codex_calls=0
+    )
+
+    cached = validator.validate(pair)
+    exhausted = validator.validate(_shadow_cross_pair(1))
+
+    assert cached.reason == "LLM_REJECTED"
+    assert exhausted.reason == "CODEX_BUDGET_EXHAUSTED"
+    assert runner.calls == []
+    assert validator.codex_calls == validator.codex_successes == 0
+
+
+def test_cross_venue_codex_timeout_without_fallback_records_no_deepseek_usage(tmp_path: Path) -> None:
+    fallback_calls: list[str] = []
+
+    def timeout(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(command, 1)
+
+    store = PredictionArbitrageStore(tmp_path)
+    result = CodexCrossVenueEquivalenceValidator(
+        store,
+        model="gpt-test",
+        runner=timeout,
+        fallback_enabled=False,
+        fallback=lambda *_: (fallback_calls.append("called") or None, "disabled"),
+    ).validate(_shadow_cross_pair(0))
+
+    assert result.reason == "CODEX_TIMEOUT"
+    assert fallback_calls == []
+    assert store.llm_usage_24h_by_provider().get("deepseek", {}) == {}
+
+
+def test_cross_venue_codex_default_fallback_is_preserved(tmp_path: Path) -> None:
+    fallback_calls: list[str] = []
+    result = CodexCrossVenueEquivalenceValidator(
+        PredictionArbitrageStore(tmp_path),
+        model="gpt-test",
+        runner=lambda command, **_kwargs: subprocess.CompletedProcess(command, 1, stdout="", stderr="failed"),
+        fallback=lambda *_: (fallback_calls.append("called") or json.dumps(_shadow_cross_result()), None),
+    ).validate(_shadow_cross_pair(0))
+
+    assert result.reason == "LLM_REJECTED"
+    assert fallback_calls == ["called"]
+
+
+def test_cross_venue_codex_nonzero_exit_with_fallback_does_not_count_success(
+    tmp_path: Path,
+) -> None:
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            command, 1, stdout=_shadow_cross_jsonl(), stderr="failed"
+        )
+
+    validator = CodexCrossVenueEquivalenceValidator(
+        PredictionArbitrageStore(tmp_path),
+        model="gpt-test",
+        runner=runner,
+        fallback_enabled=False,
+    )
+
+    result = validator.validate(_shadow_cross_pair(0))
+
+    assert result.reason == "CODEX_FAILED"
+    assert validator.codex_calls == 1
+    assert validator.codex_successes == 0
 
 
 def _hold_owner_lock(path: str, ready: object, release: object) -> None:
@@ -686,4 +897,260 @@ def test_cross_runtime_stop_failure_is_reported_and_keeps_owner_locked(
         with pytest.raises(PredictionRuntimeOwnershipError):
             competing_owner.acquire()
     finally:
+        runtime._owner.release()
+
+
+def test_shadow_runtime_stops_on_first_guard_violation_from_owner_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    events: list[str] = []
+    network_calls: list[str] = []
+    validator_kwargs: list[dict[str, object]] = []
+    cross_kwargs: list[dict[str, object]] = []
+
+    class FakeStore:
+        def __init__(self, _data_dir: Path) -> None:
+            events.append("shadow_store.open")
+
+        def close(self) -> None:
+            events.append("shadow_store.close")
+
+    class FakePolymarketClient:
+        def cancel_all(self) -> None:
+            network_calls.append("cancel_all")
+
+        def place_order(self) -> None:
+            network_calls.append("place_order")
+
+        def close(self) -> None:
+            events.append("polymarket.close")
+
+    class FakePolymarketTradingClient:
+        @classmethod
+        def from_keychain(cls, _config: object) -> FakePolymarketClient:
+            events.append("clients.open")
+            return FakePolymarketClient()
+
+    class FakePredictClient:
+        @classmethod
+        def from_keychain(cls, _config: object) -> object:
+            return object()
+
+    class FakeMonitor:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+        def start(self) -> None:
+            events.append("monitor.start")
+
+        def stop(self) -> None:
+            events.append("monitor.stop")
+
+    class FakeExecution:
+        def __init__(self, **kwargs: object) -> None:
+            assert isinstance(kwargs["notifier"], runtime_module.NullNotifier)
+
+        def reconcile_startup(self) -> None:
+            raise AssertionError("shadow must not reconcile")
+
+        def notify_ready_opportunity(self, *_: object) -> None:
+            raise AssertionError("shadow must not notify")
+
+        notify_observation = notify_ready_opportunity
+        notify_monitor_failure = notify_ready_opportunity
+
+        def set_cross_venue_monitor(self, _monitor: object) -> None:
+            pass
+
+        def close(self) -> None:
+            events.append("execution.close")
+
+    class FakeCrossMonitor:
+        async def start(self) -> None:
+            events.append("cross.start")
+
+        async def stop(self) -> None:
+            events.append("cross.stop")
+
+        def snapshot(self) -> dict[str, object]:
+            return {"status": "ready"}
+
+    class Guard:
+        def __init__(self, on_violation: object) -> None:
+            self.on_violation = on_violation
+            self.attempts: list[dict[str, object]] = []
+
+        def violation(self, method: str) -> None:
+            attempt = {
+                "venue": "polymarket",
+                "kind": "mutation",
+                "method": method,
+                "call_chain": [f"frame-{index}" for index in range(20)],
+                "api_key": "must-not-leak",
+            }
+            self.attempts.append(attempt)
+            self.on_violation(attempt)  # type: ignore[operator]
+            raise RuntimeError("blocked")
+
+    @contextmanager
+    def fake_guard_polymarket(client: FakePolymarketClient, guard: Guard):
+        events.append("guards.enter")
+        original = client.cancel_all, client.place_order
+        client.cancel_all = lambda: guard.violation("cancel_all")
+        client.place_order = lambda: guard.violation("place_order")
+        try:
+            yield
+        finally:
+            client.cancel_all, client.place_order = original
+            events.append("guards.exit")
+
+    @contextmanager
+    def fake_guard_predict(_client: object, _guard: Guard):
+        events.append("predict_guard.enter")
+        yield
+        events.append("predict_guard.exit")
+
+    class Owner:
+        def acquire(self) -> None:
+            events.append("shadow_owner.acquire")
+
+        def release(self) -> None:
+            events.append("shadow_owner.release")
+
+    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
+    monkeypatch.setattr(runtime_module, "PolymarketTradingClient", FakePolymarketTradingClient)
+    monkeypatch.setattr(runtime_module, "PredictTradingClient", FakePredictClient)
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
+    monkeypatch.setattr(
+        runtime_module,
+        "CodexRelationValidator",
+        lambda *_a, **kwargs: (validator_kwargs.append(kwargs) or object()),
+    )
+    monkeypatch.setattr(runtime_module, "CodexTitleTranslator", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        runtime_module,
+        "_build_cross_venue_monitor",
+        lambda **kwargs: (cross_kwargs.append(kwargs) or FakeCrossMonitor()),
+    )
+    monkeypatch.setattr(runtime_module, "PolymarketReadOnlyGuard", Guard)
+    monkeypatch.setattr(runtime_module, "PredictReadOnlyGuard", Guard)
+    monkeypatch.setattr(runtime_module, "guard_polymarket_client", fake_guard_polymarket)
+    monkeypatch.setattr(runtime_module, "guard_predict_client", fake_guard_predict)
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path / "shadow",
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        mode="shadow",
+    )
+    runtime._owner = Owner()  # type: ignore[assignment]
+    runtime.start()
+
+    with pytest.raises(RuntimeError, match="blocked"):
+        runtime._prediction_trading.cancel_all()  # type: ignore[union-attr]
+    with pytest.raises(RuntimeError, match="blocked"):
+        runtime._prediction_trading.place_order()  # type: ignore[union-attr]
+    assert network_calls == []
+    callback_result: list[dict[str, object] | None] = []
+    callback_thread = threading.Thread(
+        target=lambda: callback_result.append(runtime.poll_shadow_failure())
+    )
+    callback_thread.start()
+    callback_thread.join()
+    assert callback_result == [None]
+    assert runtime.state == "RUNNING"
+    assert runtime.poll_shadow_failure() == {
+        "venue": "polymarket",
+        "kind": "mutation",
+        "method": "cancel_all",
+        "call_chain": [f"frame-{index}" for index in range(12)],
+    }
+    assert runtime.state == "STOPPED"
+    assert runtime.shadow_evidence["guard_attempts"][0]["method"] == "cancel_all"
+    assert runtime.shadow_evidence["guard_attempts"][1]["method"] == "place_order"
+    assert validator_kwargs[0]["fallback_enabled"] is False
+    assert validator_kwargs[0]["max_codex_calls"] == 3
+    assert cross_kwargs[0]["holding_reconciler"] is None
+    assert events == [
+        "shadow_owner.acquire", "shadow_store.open", "clients.open", "guards.enter",
+        "predict_guard.enter", "monitor.start", "cross.start", "cross.stop", "monitor.stop",
+        "predict_guard.exit", "guards.exit",
+        "execution.close", "polymarket.close", "shadow_store.close", "shadow_owner.release",
+    ]
+
+
+def test_shadow_cleanup_retains_lock_and_guards_when_monitor_thread_survives(
+    tmp_path: Path,
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    release = threading.Event()
+    exited: list[bool] = []
+
+    class FakeMonitor:
+        def __init__(self) -> None:
+            self._thread = threading.Thread(target=release.wait, daemon=True)
+            self._thread.start()
+
+        def stop(self) -> None:
+            pass
+
+    class FakeResource:
+        def close(self) -> None:
+            pass
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        mode="shadow",
+    )
+    runtime._owner.acquire()
+    runtime._state = "RUNNING"
+    monitor = FakeMonitor()
+    runtime.monitor = monitor  # type: ignore[assignment]
+    runtime.execution = FakeResource()  # type: ignore[assignment]
+    runtime._prediction_trading = FakeResource()
+    runtime.store = FakeResource()  # type: ignore[assignment]
+    runtime._shadow_guards = ExitStack()
+
+    @contextmanager
+    def guard_scope():
+        try:
+            yield
+        finally:
+            exited.append(True)
+
+    runtime._shadow_guards.enter_context(guard_scope())
+
+    try:
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            runtime.stop()
+        assert runtime.state == "STOPPING"
+        assert exited == []
+        competing_owner = runtime_module._RuntimeOwnershipLock(
+            tmp_path / "prediction_arbitrage" / "runtime.lock"
+        )
+        with pytest.raises(PredictionRuntimeOwnershipError):
+            competing_owner.acquire()
+        release.set()
+        runtime.monitor._thread.join(1)  # type: ignore[union-attr]
+        runtime.stop()
+        assert exited == [True]
+    finally:
+        release.set()
+        monitor._thread.join(1)
         runtime._owner.release()

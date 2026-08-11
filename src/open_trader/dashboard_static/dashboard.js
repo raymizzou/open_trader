@@ -4435,7 +4435,7 @@ function renderTrendRiskSummary(summary, drawdown, reportDate) {
       </dl>
       ${hasValue(summary.kelly_reason) ? `<p>${escapeHtml(formatPlain(summary.kelly_reason))}</p>` : ""}
       ${hasValue(summary.kelly_source) ? `<p>${escapeHtml(formatPlain(summary.kelly_source))}</p>` : ""}
-      ${summary.trade_stats?.available === true && hasValue(summary.trade_stats.statistics_cutoff_at) ? `<p>统计截至 ${escapeHtml(formatPlain(summary.trade_stats.statistics_cutoff_at))}</p>` : ""}
+      ${summary.trade_stats?.available === true && hasValue(summary.trade_stats.statistics_cutoff_at) ? `<p>统计截至 ${escapeHtml(formatPlain(summary.trade_stats.statistics_cutoff_at).replace(/\.\d+(?=(?:Z|[+-]\d{2}:\d{2})$)/, ""))}</p>` : ""}
       <p>${escapeHtml(formatPlain(summary.portfolio_remaining_risk_note))}</p>
       <p>${escapeHtml(formatPlain(summary.disclaimer))}</p>` : ""}
     ${hasDrawdown ? `<div class="trend-drawdown-summary"><header><strong>策略累计回撤</strong><span>${escapeHtml(formatPlain(drawdown.status_label))}</span></header>

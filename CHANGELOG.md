@@ -3,6 +3,14 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-11
+
+- #41 新增独立的只读 Shadow Prediction Service（`127.0.0.1:8769`）及 launchd
+  安装、重启、卸载和有界双路 parity 验证；Shadow 使用独立 SQLite、禁止网络提交，并在
+  任何写入尝试或语义差异时 fail-closed。最终 live 验证同市场与跨所 Codex 均为 3/3、
+  三次关系扫描完成、无 DeepSeek/只读违规/语义差异，重启后 PID/SHA/监听一致，随后
+  launchd label、plist 与 8769 均已清理。
+
 ## 2026-08-10
 
 - #40 将 Legacy Dashboard 内的 Prediction 资源组装收拢为一个按数据目录持有
