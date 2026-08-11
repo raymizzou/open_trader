@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from open_trader.prediction_n_leg import (
     ActionPayout,
     ActionSide,
@@ -21,6 +23,7 @@ from open_trader.prediction_n_leg import (
     TerminalKind,
     TerminalStateSet,
     UnknownReason,
+    fingerprint,
 )
 from open_trader.prediction_n_leg_oracle import (
     RelationComponent,
@@ -285,9 +288,62 @@ def test_cut_carries_each_selected_action_payout_coefficient() -> None:
 
     cut = cut_from_scenario(built, scenario)
 
-    assert cut.cut_id == "cut:a-yes:b-no"
+    assert cut.cut_id == f"cut:{fingerprint(scenario)}"
     assert cut.scenario == scenario
     assert cut.payout_per_lot == (ActionPayout("action-a", -3), ActionPayout("action-z", 17))
+
+
+def test_cut_rejects_duplicate_contract_selection() -> None:
+    key_a, key_b = observation("a"), observation("b")
+    built = problem(
+        (action("contract-a", "action-a", key_a), action("contract-b", "action-b", key_b)),
+        (
+            state("contract-a", key_a, "action-a", (("a-yes", TerminalKind.NORMAL_YES, 1),)),
+            state("contract-b", key_b, "action-b", (("b-no", TerminalKind.NORMAL_NO, 2),)),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="contract more than once"):
+        cut_from_scenario(
+            built,
+            SettlementScenario(
+                (
+                    SelectedAtom("contract-a", "a-yes"),
+                    SelectedAtom("contract-a", "a-yes"),
+                    SelectedAtom("contract-b", "b-no"),
+                )
+            ),
+        )
+
+
+def test_cut_id_uses_canonical_scenario_fingerprint_without_delimiter_collisions() -> None:
+    key_a, key_b = observation("a"), observation("b")
+    built = problem(
+        (action("contract-a", "action-a", key_a), action("contract-b", "action-b", key_b)),
+        (
+            state(
+                "contract-a",
+                key_a,
+                "action-a",
+                (("a:b", TerminalKind.NORMAL_YES, 1), ("a", TerminalKind.NORMAL_NO, 2)),
+            ),
+            state(
+                "contract-b",
+                key_b,
+                "action-b",
+                (("c", TerminalKind.NORMAL_YES, 3), ("b:c", TerminalKind.NORMAL_NO, 4)),
+            ),
+        ),
+    )
+    first = SettlementScenario((SelectedAtom("contract-a", "a:b"), SelectedAtom("contract-b", "c")))
+    second = SettlementScenario((SelectedAtom("contract-a", "a"), SelectedAtom("contract-b", "b:c")))
+
+    first_cut = cut_from_scenario(built, first)
+    second_cut = cut_from_scenario(built, second)
+
+    assert first_cut.cut_id == f"cut:{fingerprint(first)}"
+    assert second_cut.cut_id == f"cut:{fingerprint(second)}"
+    assert first_cut.cut_id != second_cut.cut_id
 
 
 def test_enumeration_reports_the_state_limit_before_partial_enumeration() -> None:

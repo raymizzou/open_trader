@@ -146,6 +146,8 @@ def _violates_normal_relation(problem: ArbitrageProblem, atoms_by_contract: dict
 def cut_from_scenario(problem: ArbitrageProblem, scenario: SettlementScenario) -> WorstStateCut:
     _require_valid(problem)
     selected_atom_ids = {selected.market_contract_id: selected.atom_id for selected in scenario.atoms}
+    if len(selected_atom_ids) != len(scenario.atoms):
+        raise ValueError("scenario selects a contract more than once")
     payouts = []
     for state in problem.terminal_state_sets:
         atom_id = selected_atom_ids.get(state.market_contract_id)
@@ -158,7 +160,7 @@ def cut_from_scenario(problem: ArbitrageProblem, scenario: SettlementScenario) -
     if len(selected_atom_ids) != len(problem.terminal_state_sets):
         raise ValueError("scenario selects an unknown contract")
     return WorstStateCut(
-        f"cut:{':'.join(sorted(selected_atom_ids.values()))}",
+        f"cut:{fingerprint(scenario)}",
         scenario,
         tuple(sorted(payouts, key=lambda payout: payout.action_id)),
     )
