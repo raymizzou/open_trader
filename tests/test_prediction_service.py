@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import signal
 import socket
@@ -72,20 +73,6 @@ class _Runtime:
 
 
 @contextmanager
-def _server(runtime: object, **kwargs: object) -> Iterator[str]:
-    server = create_prediction_server(runtime=runtime, port=0, **kwargs)  # type: ignore[arg-type]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        host, port = server.server_address[:2]
-        yield f"http://{host}:{port}"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-
-@contextmanager
 def _running_server(runtime: object, **kwargs: object) -> Iterator[tuple[str, object]]:
     server = create_prediction_server(runtime=runtime, port=0, **kwargs)  # type: ignore[arg-type]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -99,21 +86,24 @@ def _running_server(runtime: object, **kwargs: object) -> Iterator[tuple[str, ob
         thread.join(timeout=5)
 
 
+@contextmanager
+def _server(runtime: object, **kwargs: object) -> Iterator[str]:
+    with _running_server(runtime, **kwargs) as (base, _server_instance):
+        yield base
+
+
 def _response(
     request: str | Request, *, timeout: float = 5
 ) -> tuple[int, dict[str, object]]:
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            return response.status, json.loads(response.read().decode("utf-8"))
-    except HTTPError as error:
-        return error.code, json.loads(error.read().decode("utf-8"))
+    status, payload, _headers = _response_with_headers(request, timeout=timeout)
+    return status, payload
 
 
 def _response_with_headers(
-    request: str | Request,
+    request: str | Request, *, timeout: float = 5
 ) -> tuple[int, dict[str, object], Mapping[str, str]]:
     try:
-        with urlopen(request, timeout=5) as response:
+        with urlopen(request, timeout=timeout) as response:
             return (
                 response.status,
                 json.loads(response.read().decode("utf-8")),
@@ -125,6 +115,29 @@ def _response_with_headers(
             json.loads(error.read().decode("utf-8")),
             dict(error.headers.items()),
         )
+
+
+def _socket_fd_count() -> int:
+    count = 0
+    for name in os.listdir("/dev/fd"):
+        try:
+            duplicate = socket.fromfd(int(name), socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                duplicate.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+            finally:
+                duplicate.close()
+        except OSError:
+            continue
+        count += 1
+    return count
+
+
+def _handler_thread_ids() -> set[int | None]:
+    return {
+        thread.ident
+        for thread in threading.enumerate()
+        if "process_request_thread" in thread.name
+    }
 
 
 class _ProductionExecution:
@@ -292,6 +305,8 @@ def test_global_http_capacity_rejects_overflow_and_releases_read_contexts(
 
     monkeypatch.setattr(prediction_service, "prediction_state_payload", blocked_state_payload)
     with _running_server(_Runtime()) as (base, server):
+        baseline_handler_ids = _handler_thread_ids()
+        baseline_socket_fds = _socket_fd_count()
         try:
             with ThreadPoolExecutor(max_workers=48) as clients:
                 leader_timeout = 15
@@ -309,6 +324,7 @@ def test_global_http_capacity_rejects_overflow_and_releases_read_contexts(
 
                 assert counts["max_active"] == 8
                 assert server.http_load_snapshot()["active"] == 8  # type: ignore[attr-defined]
+                assert len(_handler_thread_ids() - baseline_handler_ids) == 8
                 overflow_results = [future.result(timeout=5) for future in overflow]
                 overflow_statuses = [result[0] for result in overflow_results]
                 overflow_payloads = [result[1] for result in overflow_results]
@@ -329,6 +345,13 @@ def test_global_http_capacity_rejects_overflow_and_releases_read_contexts(
                 while server.http_load_snapshot()["active"] != 0 and time.monotonic() < deadline:  # type: ignore[attr-defined]
                     time.sleep(0.01)
                 assert server.http_load_snapshot()["active"] == 0  # type: ignore[attr-defined]
+                while (
+                    _handler_thread_ids() - baseline_handler_ids
+                    or _socket_fd_count() > baseline_socket_fds
+                ) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert _handler_thread_ids() == baseline_handler_ids
+                assert _socket_fd_count() == baseline_socket_fds
                 assert tracking_store.live_contexts == 0
         finally:
             release.set()
@@ -732,6 +755,7 @@ def test_history_cache_never_serves_expired_payload_after_recompute_failure(
     (
         ("kind=signals&limit=0", "limit must be positive"),
         ("kind=unknown&limit=1", "kind must be signals, executions, or incidents"),
+        ("kind=unknown&limit=0", "limit must be positive"),
     ),
 )
 def test_shadow_history_rejects_invalid_query(query: str, expected: str) -> None:

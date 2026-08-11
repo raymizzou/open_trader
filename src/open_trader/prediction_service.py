@@ -324,10 +324,10 @@ def create_prediction_server(
             try:
                 query = parse_qs(parsed.query, keep_blank_values=True)
                 kind = str(query.get("kind", [""])[0]).strip()
-                if kind not in PREDICTION_HISTORY_KINDS:
-                    raise ValueError("kind must be signals, executions, or incidents")
                 limit = _query_int(query, "limit", _HISTORY_DEFAULT_LIMIT)
                 offset = _query_int(query, "offset", 0)
+                if kind not in PREDICTION_HISTORY_KINDS:
+                    raise ValueError("kind must be signals, executions, or incidents")
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return

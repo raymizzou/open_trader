@@ -281,6 +281,7 @@
   {
       "status": "PASS" | "FAIL",
       "git_sha": str,
+      "command": list[str],
       "duration_seconds": float,
       "source_access_mode": "mode=ro; query_only=ON",
       "source": {"path": str, "bytes": int, "rows": dict, "hashes": dict},
