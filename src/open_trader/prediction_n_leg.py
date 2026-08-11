@@ -890,7 +890,7 @@ def _validate_result(result: OracleResult) -> None:
     if result.business_status == BusinessStatus.NO_ARBITRAGE:
         bounds = result.objective_bounds
         proof = result.negative_proof
-        if not bounds.closed or bounds.lower_bound_units is None or bounds.upper_bound_units is None or bounds.lower_bound_units != bounds.upper_bound_units or bounds.gap_units != 0 or proof is None or proof.source_problem_fingerprint is None:
+        if not bounds.closed or bounds.lower_bound_units is None or bounds.upper_bound_units is None or bounds.lower_bound_units != bounds.upper_bound_units or bounds.lower_bound_units > 0 or bounds.gap_units != 0 or proof is None or proof.source_problem_fingerprint is None:
             raise ModelDecodeError("NO_ARBITRAGE requires closed diagnostic bounds and a source proof")
     if result.solve_status == SolveStatus.UNKNOWN:
         if result.business_status != BusinessStatus.UNKNOWN or result.proof_status != ProofStatus.UNKNOWN or result.optimality_status != OptimalityStatus.NOT_APPLICABLE or result.solution is not None or result.negative_proof is not None or result.unknown_reason is None:

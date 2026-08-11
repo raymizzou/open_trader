@@ -9,8 +9,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   Optimization 与显式 Raw diagnostic 分离，确定性 support proof 和穷尽负证明均有可回放
   的请求/结果指纹；补齐缺失终局 payout 与跨资产估值为 fail-closed `UNKNOWN`，并锁定
   `NO_ARBITRAGE` 的闭合 bounds/source-proof wire invariant。已验证 N_LEG 聚焦套件
-  136 passed、Admission/Optimization/两类 diagnostic 直接回放 5 passed、Prediction
-  arithmetic 加 N_LEG 回归 187 passed。正常环境的 `python -m pytest -q` 为 BLOCKED：
+  137 passed、Admission/Optimization/两类 diagnostic 直接回放 5 passed、Prediction
+  arithmetic 加 N_LEG 回归 188 passed。正常环境的 `python -m pytest -q` 为 BLOCKED：
   `/opt/homebrew/opt/python@3.12/bin/python3.12: No module named pytest`；未改 Prediction
   runtime、Dashboard、solver dependency 或 order path。
 

@@ -475,6 +475,7 @@ def test_result_from_payload_rejects_negative_quantity_lots() -> None:
         lambda payload: payload["objective_bounds"].update(closed=False),
         lambda payload: payload["objective_bounds"].update(lower_bound_units=None),
         lambda payload: payload["objective_bounds"].update(upper_bound_units=None),
+        lambda payload: payload["objective_bounds"].update(lower_bound_units=1, upper_bound_units=1),
         lambda payload: payload["objective_bounds"].update(upper_bound_units=1),
         lambda payload: payload["objective_bounds"].update(gap_units=1),
         lambda payload: payload["negative_proof"].update(source_problem_fingerprint=None),
