@@ -107,8 +107,20 @@ def test_release_manifest_rejects_wrong_shape(tmp_path: Path, payload: object) -
 Append tests that prove schema/state validation, replacement, and prior-release preservation:
 
 ```python
-def test_runtime_record_is_atomically_replaced_and_round_trips(tmp_path: Path) -> None:
+def test_runtime_record_is_atomically_replaced_and_round_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_release as release_module
+
     path = tmp_path / "prediction-service-runtime.json"
+    replacements: list[tuple[Path, Path]] = []
+    real_replace = release_module.os.replace
+
+    def replace(source: str, destination: Path) -> None:
+        replacements.append((Path(source), Path(destination)))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(release_module.os, "replace", replace)
     previous = {"git_sha": "old", "reader_generation": 1, "contract_generation": 1}
     write_prediction_runtime_record(path, {
         "state": "maintenance",
@@ -118,7 +130,6 @@ def test_runtime_record_is_atomically_replaced_and_round_trips(tmp_path: Path) -
         "updated_at": "2026-08-11T10:00:00+08:00",
         "failure_reason": "",
     })
-    first_inode = path.stat().st_ino
     write_prediction_runtime_record(path, {
         "state": "failed",
         "candidate": {"git_sha": "new", "checkout": "/tmp/new", "source_state": "clean", "reader_generation": 1, "contract_generation": 1},
@@ -133,7 +144,8 @@ def test_runtime_record_is_atomically_replaced_and_round_trips(tmp_path: Path) -
     assert record["schema_version"] == "open_trader.prediction_service.runtime.v1"
     assert record["state"] == "failed"
     assert record["previous_release"] == previous
-    assert path.stat().st_ino != first_inode
+    assert len(replacements) == 2
+    assert all(destination == path for _source, destination in replacements)
     assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
 
 
