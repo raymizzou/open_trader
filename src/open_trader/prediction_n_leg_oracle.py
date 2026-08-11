@@ -81,6 +81,10 @@ def _require_valid(problem: ArbitrageProblem) -> None:
 
 
 def _input_unknown_reason(problem: ArbitrageProblem) -> UnknownReason | None:
+    if not isinstance(problem, ArbitrageProblem) or not isinstance(problem.actions, tuple) or any(
+        not isinstance(action, CandidateAction) for action in problem.actions
+    ):
+        return UnknownReason.INVALID_MODEL
     issues = validate_problem(problem)
     if any(issue.code == "MISSING_ACTION_PAYOUT" for issue in issues):
         return UnknownReason.UNKNOWN_TERMINAL_DATA

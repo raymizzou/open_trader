@@ -885,12 +885,12 @@ def _validate_result(result: OracleResult) -> None:
         if not feasible or result.solution is None or result.proof_status != ProofStatus.PROVEN or not bounds.closed or bounds.lower_bound_units is None or bounds.lower_bound_units != bounds.upper_bound_units or bounds.gap_units != 0:
             raise ModelDecodeError("OPTIMAL requires a proved solution and equal closed objective bounds")
     if negative:
-        if result.solve_status != SolveStatus.INFEASIBLE or result.proof_status != ProofStatus.PROVEN or result.optimality_status != OptimalityStatus.NOT_APPLICABLE or result.solution is not None or result.negative_proof is None or result.negative_proof.conclusion != result.business_status or result.negative_proof.quantity_vectors_total != result.negative_proof.quantity_vectors_examined or result.unknown_reason is not None:
+        if result.solve_status != SolveStatus.INFEASIBLE or result.proof_status != ProofStatus.PROVEN or result.optimality_status != OptimalityStatus.NOT_APPLICABLE or result.solution is not None or result.negative_proof is None or result.negative_proof.conclusion != result.business_status or result.negative_proof.quantity_vectors_total <= 0 or result.negative_proof.quantity_vectors_examined != result.negative_proof.quantity_vectors_total or result.negative_proof.joint_states_per_vector <= 0 or result.unknown_reason is not None:
             raise ModelDecodeError("negative conclusions require a matching exhaustive proof")
     if result.business_status == BusinessStatus.NO_ARBITRAGE:
         bounds = result.objective_bounds
         proof = result.negative_proof
-        if not bounds.closed or bounds.lower_bound_units != bounds.upper_bound_units or bounds.gap_units != 0 or proof is None or proof.source_problem_fingerprint is None:
+        if not bounds.closed or bounds.lower_bound_units is None or bounds.upper_bound_units is None or bounds.lower_bound_units != bounds.upper_bound_units or bounds.gap_units != 0 or proof is None or proof.source_problem_fingerprint is None:
             raise ModelDecodeError("NO_ARBITRAGE requires closed diagnostic bounds and a source proof")
     if result.solve_status == SolveStatus.UNKNOWN:
         if result.business_status != BusinessStatus.UNKNOWN or result.proof_status != ProofStatus.UNKNOWN or result.optimality_status != OptimalityStatus.NOT_APPLICABLE or result.solution is not None or result.negative_proof is not None or result.unknown_reason is None:

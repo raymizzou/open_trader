@@ -473,6 +473,8 @@ def test_result_from_payload_rejects_negative_quantity_lots() -> None:
     "mutate",
     [
         lambda payload: payload["objective_bounds"].update(closed=False),
+        lambda payload: payload["objective_bounds"].update(lower_bound_units=None),
+        lambda payload: payload["objective_bounds"].update(upper_bound_units=None),
         lambda payload: payload["objective_bounds"].update(upper_bound_units=1),
         lambda payload: payload["objective_bounds"].update(gap_units=1),
         lambda payload: payload["negative_proof"].update(source_problem_fingerprint=None),
@@ -501,8 +503,10 @@ def test_result_from_payload_rejects_malformed_no_arbitrage_diagnostics(mutate: 
     "mutate",
     [
         lambda proof: proof.update(quantity_vectors_total=-1, quantity_vectors_examined=-1),
+        lambda proof: proof.update(quantity_vectors_total=0, quantity_vectors_examined=0),
         lambda proof: proof.update(quantity_vectors_total=1, quantity_vectors_examined=0),
         lambda proof: proof.update(joint_states_per_vector=-1),
+        lambda proof: proof.update(joint_states_per_vector=0),
         lambda proof: proof["rejection_counts"][0].__setitem__(1, -1),
     ],
 )

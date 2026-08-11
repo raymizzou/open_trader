@@ -1253,3 +1253,25 @@ def test_oracle_classifies_incomplete_terminal_data_and_cross_asset_valuation_as
 
     assert oracle.find_qualified(_admission_request(terminal_data_missing, OracleBudget(1, 1, 1))).unknown_reason == UnknownReason.UNKNOWN_TERMINAL_DATA
     assert oracle.find_qualified(_admission_request(cross_asset, OracleBudget(1, 1, 1))).unknown_reason == UnknownReason.UNKNOWN_VALUATION
+
+
+@pytest.mark.parametrize("mode", (SearchMode.ADMISSION, SearchMode.OPTIMIZATION, SearchMode.RAW_ARBITRAGE_DIAGNOSTIC))
+def test_oracle_rejects_malformed_action_containers_without_dereferencing_them(mode: SearchMode) -> None:
+    key = observation()
+    complete = problem(
+        (action("contract-a", "action-a", key),),
+        (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 1),)),),
+    )
+    malformed = replace(complete, actions=None)
+    request = OracleRequest("open_trader.prediction_n_leg.request.v1", mode, malformed, OracleBudget(1, 1, 1))
+
+    result = (
+        oracle.diagnose_raw_arbitrage(malformed, request.budget)
+        if mode == SearchMode.RAW_ARBITRAGE_DIAGNOSTIC
+        else oracle.find_qualified(request)
+        if mode == SearchMode.ADMISSION
+        else oracle.solve_optimal(request)
+    )
+
+    assert result.business_status == BusinessStatus.UNKNOWN
+    assert result.unknown_reason == UnknownReason.INVALID_MODEL
