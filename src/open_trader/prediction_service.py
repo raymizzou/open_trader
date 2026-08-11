@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from http.cookies import SimpleCookie
 from datetime import datetime
 import ipaddress
 import json
@@ -8,7 +9,9 @@ import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import secrets
 import signal
+import sqlite3
 import subprocess
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
@@ -19,6 +22,7 @@ from .prediction_runtime import PredictionRuntime
 
 _HISTORY_DEFAULT_LIMIT = 100
 _HISTORY_MAX_LIMIT = 500
+_MAX_JSON_BODY_BYTES = 1024 * 1024
 _READ_ONLY_ERROR = {
     "code": "shadow_read_only",
     "message": "Shadow Prediction Service is read-only",
@@ -66,6 +70,13 @@ def _is_available(runtime: PredictionRuntime) -> bool:
     )
 
 
+def _is_production_available(runtime: PredictionRuntime) -> bool:
+    return (
+        getattr(runtime, "state", None) == "RUNNING"
+        and getattr(runtime, "production_owner", False) is True
+    )
+
+
 def _query_int(query: Mapping[str, list[str]], key: str, default: int) -> int:
     raw = str(query.get(key, [str(default)])[0] or str(default))
     try:
@@ -80,22 +91,44 @@ def _query_int(query: Mapping[str, list[str]], key: str, default: int) -> int:
 
 
 def create_prediction_server(
-    *, runtime: PredictionRuntime, host: str = "127.0.0.1", port: int = 8769
+    *,
+    runtime: PredictionRuntime,
+    host: str = "127.0.0.1",
+    port: int = 8769,
+    session_token: str | None = None,
+    csrf_token: str | None = None,
+    runtime_metadata: Mapping[str, object] | None = None,
 ) -> ThreadingHTTPServer:
     _require_loopback_host(host)
-    if _shadow_evidence(runtime).get("mode") != "shadow":
-        raise ValueError("prediction service requires shadow mode")
-    metadata = _runtime_metadata()
+    mode = str(getattr(runtime, "mode", _shadow_evidence(runtime).get("mode", "")))
+    if mode not in {"shadow", "production"}:
+        raise ValueError("prediction service mode is invalid")
+    if mode == "production" and not _is_production_available(runtime):
+        raise RuntimeError("production runtime is not ready")
+    prediction_session = session_token or secrets.token_urlsafe(32)
+    prediction_csrf = csrf_token or secrets.token_urlsafe(32)
+    metadata = dict(runtime_metadata if runtime_metadata is not None else _runtime_metadata())
 
     class PredictionRequestHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
             return
 
-        def _send_json(self, status: HTTPStatus, payload: Mapping[str, object]) -> None:
+        def _send_json(
+            self,
+            status: HTTPStatus,
+            payload: Mapping[str, object],
+            *,
+            set_session: bool = False,
+        ) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            if set_session:
+                self.send_header(
+                    "Set-Cookie",
+                    f"ot_prediction_session={prediction_session}; SameSite=Strict; HttpOnly; Path=/",
+                )
             self.end_headers()
             try:
                 self.wfile.write(body)
@@ -105,23 +138,29 @@ def create_prediction_server(
         def _send_unavailable(self) -> None:
             self._send_json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                {"error": "shadow runtime is unavailable"},
+                {"error": f"{mode} runtime is unavailable"},
             )
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path == "/healthz":
                 evidence = _shadow_evidence(runtime)
-                available = _is_available(runtime)
+                available = (
+                    _is_available(runtime)
+                    if mode == "shadow"
+                    else _is_production_available(runtime)
+                )
                 self._send_json(
                     HTTPStatus.OK if available else HTTPStatus.SERVICE_UNAVAILABLE,
                     {
                         "schema_version": "open_trader.prediction_service.health.v1",
                         "module": "prediction_service",
                         "status": "running" if available else "unavailable",
-                        "mode": "shadow",
-                        "production_owner": False,
-                        "mutations": "prohibited",
+                        "mode": mode,
+                        "production_owner": (
+                            getattr(runtime, "production_owner", False) is True
+                        ),
+                        "mutations": "prohibited" if mode == "shadow" else "enabled",
                         "runtime_state": str(getattr(runtime, "state", "")),
                         **metadata,
                         "codex": evidence.get("codex", {}),
@@ -136,7 +175,12 @@ def create_prediction_server(
             }:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
-            if not _is_available(runtime):
+            if (
+                mode == "shadow"
+                and not _is_available(runtime)
+                or mode == "production"
+                and not _is_production_available(runtime)
+            ):
                 self._send_unavailable()
                 return
             if parsed.path == "/api/prediction-arbitrage/state":
@@ -146,9 +190,10 @@ def create_prediction_server(
                         store=getattr(runtime, "store", None),
                         monitor=getattr(runtime, "monitor", None),
                         execution=getattr(runtime, "execution", None),
-                        csrf_token="",
+                        csrf_token="" if mode == "shadow" else prediction_csrf,
                         cross_venue_monitor=getattr(runtime, "cross_venue_monitor", None),
                     ),
+                    set_session=mode == "production",
                 )
                 return
             try:
@@ -170,10 +215,160 @@ def create_prediction_server(
 
         def do_POST(self) -> None:
             self.close_connection = True
-            if urlparse(self.path).path.startswith("/api/prediction-arbitrage/"):
+            path = urlparse(self.path).path
+            if mode == "shadow" and path.startswith("/api/prediction-arbitrage/"):
                 self._send_json(HTTPStatus.FORBIDDEN, _READ_ONLY_ERROR)
                 return
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            if mode == "production" and path.startswith(
+                "/api/prediction-arbitrage/"
+            ):
+                try:
+                    self._require_production_auth()
+                except PermissionError as exc:
+                    self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
+                    return
+                if not _is_production_available(runtime):
+                    self._send_unavailable()
+                    return
+            if path in {
+                "/api/prediction-arbitrage/preview",
+                "/api/prediction-arbitrage/executions",
+            }:
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": "prediction mutation is unavailable"},
+                )
+                return
+            if path not in {
+                "/api/prediction-arbitrage/mode",
+                "/api/prediction-arbitrage/circuit-breaker/reset",
+                "/api/prediction-arbitrage/predict-allowance/cleanup",
+                "/api/prediction-arbitrage/cross-auto/pause",
+            }:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                return
+            try:
+                payload = self._read_json_body()
+                execution = getattr(runtime, "execution", None)
+                if execution is None:
+                    raise RuntimeError("prediction execution service is unavailable")
+                audit = self._audit_context()
+                if path.endswith("/mode"):
+                    self._require_schema(payload, {"mode"})
+                    result = execution.set_validation_mode(
+                        self._required_string(payload, "mode"), audit=audit
+                    )
+                elif path.endswith("/circuit-breaker/reset"):
+                    self._require_schema(payload, {"incident_id"})
+                    result = execution.reset_breaker(
+                        self._required_string(payload, "incident_id"), audit=audit
+                    )
+                elif path.endswith("/cross-auto/pause"):
+                    self._require_confirm(payload)
+                    result = execution.pause_cross_auto(audit=audit)
+                else:
+                    self._require_confirm(payload)
+                    result = execution.cleanup_predict_allowance(
+                        confirm=True, audit=audit
+                    )
+                status = (
+                    HTTPStatus.CONFLICT
+                    if isinstance(result, Mapping) and result.get("state") == "busy"
+                    else HTTPStatus.OK
+                )
+                self._send_json(status, dict(result))
+            except PermissionError as exc:
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
+            except OverflowError as exc:
+                self._send_json(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": str(exc)}
+                )
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            except (sqlite3.Error, OSError, RuntimeError) as exc:
+                self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+
+        def _listener_host_header(self) -> str:
+            bound_host = str(host)
+            if ":" in bound_host and not bound_host.startswith("["):
+                bound_host = f"[{bound_host}]"
+            return f"{bound_host}:{int(self.server.server_address[1])}"
+
+        def _require_production_auth(self) -> None:
+            try:
+                if not ipaddress.ip_address(str(self.client_address[0])).is_loopback:
+                    raise PermissionError("prediction mutations require loopback")
+            except ValueError as exc:
+                raise PermissionError("prediction mutations require loopback") from exc
+            expected_host = self._listener_host_header()
+            if self.headers.get("Host", "") != expected_host:
+                raise PermissionError("prediction mutation Host is invalid")
+            if self.headers.get("Origin", "") != f"http://{expected_host}":
+                raise PermissionError("prediction mutation Origin is invalid")
+            cookie = SimpleCookie()
+            try:
+                cookie.load(self.headers.get("Cookie", ""))
+            except Exception as exc:
+                raise PermissionError("prediction session is invalid") from exc
+            provided_session = cookie.get("ot_prediction_session")
+            if provided_session is None or not secrets.compare_digest(
+                provided_session.value, prediction_session
+            ):
+                raise PermissionError("prediction session is invalid")
+            if not secrets.compare_digest(
+                self.headers.get("X-CSRF-Token", ""), prediction_csrf
+            ):
+                raise PermissionError("prediction CSRF token is invalid")
+
+        def _read_json_body(self) -> dict[str, object]:
+            raw_length = self.headers.get("Content-Length") or "0"
+            try:
+                content_length = int(raw_length)
+            except ValueError as exc:
+                raise ValueError("Content-Length must be a non-negative integer") from exc
+            if content_length < 0:
+                raise ValueError("Content-Length must be a non-negative integer")
+            if content_length > _MAX_JSON_BODY_BYTES:
+                raise OverflowError("request body cannot exceed 1 MiB")
+            body = self.rfile.read(content_length) if content_length else b"{}"
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise ValueError("request body must be a JSON object") from exc
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be a JSON object")
+            return payload
+
+        @staticmethod
+        def _require_schema(payload: Mapping[str, object], expected: set[str]) -> None:
+            if set(payload) != expected:
+                raise ValueError("prediction request fields are invalid")
+
+        @staticmethod
+        def _required_string(payload: Mapping[str, object], key: str) -> str:
+            value = payload.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{key} is required")
+            return value.strip()
+
+        @classmethod
+        def _require_confirm(cls, payload: Mapping[str, object]) -> None:
+            cls._require_schema(payload, {"confirm"})
+            if payload.get("confirm") is not True:
+                raise ValueError("confirm must be true")
+
+        def _audit_context(self) -> dict[str, object]:
+            audit = {
+                "actor": "local_operator",
+                "git_sha": str(metadata.get("git_sha", "")),
+            }
+            store = getattr(runtime, "store", None)
+            policy = getattr(store, "safety_policy", None)
+            if callable(policy):
+                current = policy()
+                if isinstance(current, Mapping):
+                    audit["safety_fingerprint"] = str(current.get("fingerprint", ""))
+            return audit
 
         def _unsupported_method(self) -> None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -203,13 +398,15 @@ def serve_prediction_service(
     mode: str = "shadow",
 ) -> int:
     _require_loopback_host(host)
-    if mode != "shadow":
-        raise ValueError("prediction service only supports shadow mode")
+    if mode not in {"shadow", "production"}:
+        raise ValueError("prediction service mode is invalid")
+    metadata = _runtime_metadata()
     runtime = PredictionRuntime(
         data_dir=Path(data_dir),
         prediction_config_path=Path(prediction_config_path),
         dashboard_url=f"http://{host}:{port}",
-        mode="shadow",
+        mode=mode,
+        git_sha=str(metadata.get("git_sha", "")),
     )
     server: ThreadingHTTPServer | None = None
     previous_handlers: dict[int, Any] = {}
@@ -224,10 +421,20 @@ def serve_prediction_service(
             previous_handlers[signum] = signal.getsignal(signum)
             signal.signal(signum, stop_handler)
         runtime.start()
-        server = create_prediction_server(runtime=runtime, host=host, port=port)
+        if mode == "production" and not (
+            runtime.state == "RUNNING" and runtime.production_owner is True
+        ):
+            raise RuntimeError("production runtime is not ready")
+        server = create_prediction_server(
+            runtime=runtime,
+            host=host,
+            port=port,
+            runtime_metadata=metadata,
+        )
         while not stopping:
             server.handle_request()
-            runtime.poll_shadow_failure()
+            if mode == "shadow":
+                runtime.poll_shadow_failure()
         return 0
     finally:
         try:

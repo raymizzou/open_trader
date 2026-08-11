@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 
 from open_trader.dashboard_web import create_dashboard_server
+from open_trader.prediction_service import create_prediction_server
 from tests.test_dashboard import dashboard_config
 
 
@@ -69,17 +70,23 @@ class _Execution:
             "idempotency_key": idempotency_key,
         }
 
-    def set_validation_mode(self, mode: str) -> dict[str, object]:
+    def set_validation_mode(
+        self, mode: str, *, audit: object | None = None
+    ) -> dict[str, object]:
         return {"state": "ok", "mode": mode}
 
-    def reset_breaker(self, incident_id: str) -> dict[str, object]:
+    def reset_breaker(
+        self, incident_id: str, *, audit: object | None = None
+    ) -> dict[str, object]:
         return {
             "state": "ready",
             "reason": "reset_confirmed",
             "incident_id": incident_id,
         }
 
-    def cleanup_predict_allowance(self, *, confirm: bool) -> dict[str, object]:
+    def cleanup_predict_allowance(
+        self, *, confirm: bool, audit: object | None = None
+    ) -> dict[str, object]:
         assert confirm is True
         return {
             "state": "ready",
@@ -88,7 +95,7 @@ class _Execution:
             "usdt_moved": False,
         }
 
-    def pause_cross_auto(self) -> dict[str, object]:
+    def pause_cross_auto(self, *, audit: object | None = None) -> dict[str, object]:
         return {
             "configured_mode": "manual_confirm",
             "armed": False,
@@ -102,6 +109,76 @@ class _Execution:
             "effective_mode": "manual_confirm",
             "armed": False,
         }
+
+
+CONTROL_CASES = (
+    (
+        "/api/prediction-arbitrage/mode",
+        {"mode": "manual"},
+        {"state": "ok", "mode": "manual"},
+    ),
+    (
+        "/api/prediction-arbitrage/circuit-breaker/reset",
+        {"incident_id": "incident-1"},
+        {
+            "state": "ready",
+            "reason": "reset_confirmed",
+            "incident_id": "incident-1",
+        },
+    ),
+    (
+        "/api/prediction-arbitrage/predict-allowance/cleanup",
+        {"confirm": True},
+        {
+            "state": "ready",
+            "before_allowance": "1",
+            "after_allowance": "0",
+            "usdt_moved": False,
+        },
+    ),
+    (
+        "/api/prediction-arbitrage/cross-auto/pause",
+        {"confirm": True},
+        {
+            "configured_mode": "manual_confirm",
+            "armed": False,
+            "reason": "operator_paused",
+            "updated_at": "2026-08-10T00:00:00Z",
+        },
+    ),
+)
+
+
+class _ProductionRuntime:
+    state = "RUNNING"
+    mode = "production"
+    production_owner = True
+
+    def __init__(self) -> None:
+        self.store = _Store()
+        self.monitor = _Monitor()
+        self.execution = _Execution()
+        self.cross_venue_monitor = None
+
+
+@contextmanager
+def _prediction_server() -> Iterator[str]:
+    server = create_prediction_server(
+        runtime=_ProductionRuntime(),  # type: ignore[arg-type]
+        port=0,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 @contextmanager
@@ -194,40 +271,7 @@ def test_legacy_prediction_http_surface_matches_contract_v1(tmp_path: Path) -> N
                     "idempotency_key": "key-1",
                 },
             ),
-            (
-                "/api/prediction-arbitrage/mode",
-                {"mode": "manual"},
-                {"state": "ok", "mode": "manual"},
-            ),
-            (
-                "/api/prediction-arbitrage/circuit-breaker/reset",
-                {"incident_id": "incident-1"},
-                {
-                    "state": "ready",
-                    "reason": "reset_confirmed",
-                    "incident_id": "incident-1",
-                },
-            ),
-            (
-                "/api/prediction-arbitrage/predict-allowance/cleanup",
-                {"confirm": True},
-                {
-                    "state": "ready",
-                    "before_allowance": "1",
-                    "after_allowance": "0",
-                    "usdt_moved": False,
-                },
-            ),
-            (
-                "/api/prediction-arbitrage/cross-auto/pause",
-                {"confirm": True},
-                {
-                    "configured_mode": "manual_confirm",
-                    "armed": False,
-                    "reason": "operator_paused",
-                    "updated_at": "2026-08-10T00:00:00Z",
-                },
-            ),
+            *CONTROL_CASES,
         )
         for path, payload, expected in cases:
             status, _headers, body = _json_response(_post(base, path, payload))
@@ -254,6 +298,23 @@ def test_legacy_prediction_http_surface_matches_contract_v1(tmp_path: Path) -> N
             assert error.code == 400
         else:
             raise AssertionError("unexpected request fields must fail")
+
+
+def test_production_prediction_controls_match_frozen_legacy_contract() -> None:
+    with _prediction_server() as base:
+        status, headers, state = _json_response(
+            base + "/api/prediction-arbitrage/state"
+        )
+        assert status == 200
+        assert "ot_prediction_session=session-token" in headers["Set-Cookie"]
+        assert "SameSite=Strict" in headers["Set-Cookie"]
+        assert "HttpOnly" in headers["Set-Cookie"]
+        assert state["csrf_token"] == "csrf-token"
+
+        for path, payload, expected in CONTROL_CASES:
+            status, _headers, body = _json_response(_post(base, path, payload))
+            assert status == 200, path
+            assert body == expected, path
 
 
 def test_legacy_unavailable_state_is_the_documented_migration_gap(tmp_path: Path) -> None:
