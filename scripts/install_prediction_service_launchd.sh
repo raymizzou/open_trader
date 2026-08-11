@@ -520,6 +520,7 @@ printf '%s\n' "$rendered" > "$PLIST_PATH" \
 
 FAILURE_REASON="candidate_timeout"
 CANDIDATE_PID=""
+CLEANUP_PID=""
 READY_JSON=""
 
 ready_evidence() {
@@ -639,6 +640,7 @@ cleanup_verified_candidate() {
     label_cwd="$(printf '%s\n' "$output" | awk '$1 == "working" && $2 == "directory" && $3 == "=" { sub(/^[^=]*= /, ""); print; exit }')"
     [[ "$label_path" == "$PLIST_PATH" && "$label_cwd" == "$REPO_ROOT" ]] || return 1
     pid="$(printf '%s\n' "$output" | awk '$1 == "pid" && $2 == "=" && $3 ~ /^[1-9][0-9]*$/ { print $3; exit }')"
+    CLEANUP_PID="$pid"
     if [[ -n "$pid" ]]; then
       cwd="$("$LSOF_BIN" -a -p "$pid" -d cwd -Fn 2>/dev/null \
         | awk '$1 ~ /^n/ { print substr($1, 2); exit }' || true)"
@@ -673,6 +675,10 @@ cleanup_verified_candidate() {
 candidate_absent() {
   wait_agent_absent || return 1
   if [[ -n "$CANDIDATE_PID" ]] && "$PS_BIN" -p "$CANDIDATE_PID" >/dev/null 2>&1; then
+    return 1
+  fi
+  if [[ -n "$CLEANUP_PID" && "$CLEANUP_PID" != "$CANDIDATE_PID" ]] \
+    && "$PS_BIN" -p "$CLEANUP_PID" >/dev/null 2>&1; then
     return 1
   fi
   listener_absent || return 1
