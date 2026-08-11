@@ -22,6 +22,12 @@ from open_trader.prediction_read_model import (
     prediction_state_payload,
 )
 from open_trader.prediction_service import create_prediction_server
+from tests.test_prediction_arbitrage_execution import (
+    _cross_service,
+    execution_fixture,
+    threshold_execution_fixture,
+    wait_until_terminal,
+)
 from tests.test_prediction_read_model import (
     _CrossVenueMonitor,
     _Execution,
@@ -90,6 +96,29 @@ class _ProductionExecution:
         self.calls: list[tuple[str, object, Mapping[str, object]]] = []
         self.mode_result: dict[str, object] = {"state": "ok", "mode": "manual"}
         self.error: Exception | None = None
+
+    def preview(self, opportunity_id: str) -> dict[str, object]:
+        self.calls.append(("preview", opportunity_id, {}))
+        return {
+            "state": "previewed",
+            "preview_id": "preview-1",
+            "opportunity_id": opportunity_id,
+        }
+
+    def confirm(self, preview_id: str, idempotency_key: str) -> dict[str, object]:
+        self.calls.append(
+            (
+                "confirm",
+                {"preview_id": preview_id, "idempotency_key": idempotency_key},
+                {},
+            )
+        )
+        return {
+            "state": "validating",
+            "execution_id": "execution-1",
+            "preview_id": preview_id,
+            "idempotency_key": idempotency_key,
+        }
 
     def set_validation_mode(
         self, mode: str, *, audit: Mapping[str, object]
@@ -342,14 +371,14 @@ def test_shadow_mutations_do_not_read_body_or_dispatch_downstream() -> None:
         ("X-CSRF-Token", "wrong"),
     ),
 )
-def test_production_control_rejects_invalid_request_identity_before_dispatch(
+def test_production_mutation_rejects_invalid_request_identity_before_dispatch(
     header: str, value: str
 ) -> None:
     with _production_server() as (base, runtime):
         status, _payload = _response(
             _production_request(
                 base,
-                "/api/prediction-arbitrage/mode",
+                "/api/prediction-arbitrage/preview",
                 headers={header: value},
             )
         )
@@ -358,7 +387,7 @@ def test_production_control_rejects_invalid_request_identity_before_dispatch(
     assert runtime.execution.calls == []
 
 
-def test_production_auth_precedes_body_limits_and_disabled_route_dispatch() -> None:
+def test_production_auth_precedes_body_limits_and_route_dispatch() -> None:
     with _production_server() as (base, runtime):
         parsed = urlsplit(base)
         with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as connection:
@@ -397,6 +426,31 @@ def test_production_control_rejects_invalid_json_schema(body: bytes) -> None:
     assert runtime.execution.calls == []
 
 
+@pytest.mark.parametrize(
+    ("path", "body"),
+    (
+        (
+            "/api/prediction-arbitrage/preview",
+            b'{"opportunity_id":"opp-1","unexpected":true}',
+        ),
+        (
+            "/api/prediction-arbitrage/executions",
+            b'{"preview_id":"preview-1"}',
+        ),
+    ),
+)
+def test_production_execution_mutations_reject_invalid_schema(
+    path: str, body: bytes
+) -> None:
+    with _production_server() as (base, runtime):
+        status, _payload = _response(
+            _production_request(base, path, data=body)
+        )
+
+    assert status == 400
+    assert runtime.execution.calls == []
+
+
 def test_production_control_rejects_body_over_one_mib_before_reading() -> None:
     with _production_server() as (base, runtime):
         parsed = urlsplit(base)
@@ -417,23 +471,142 @@ def test_production_control_rejects_body_over_one_mib_before_reading() -> None:
     assert runtime.execution.calls == []
 
 
-@pytest.mark.parametrize(
-    ("path", "expected"),
-    (
-        ("/api/prediction-arbitrage/unknown", 404),
-        ("/api/prediction-arbitrage/preview", 503),
-        ("/api/prediction-arbitrage/executions", 503),
-    ),
-)
-def test_production_exposes_only_four_control_mutations(
-    path: str, expected: int
-) -> None:
+def test_production_exposes_prediction_preview_and_confirmation() -> None:
     with _production_server() as (base, runtime):
-        status, payload = _response(_production_request(base, path))
+        preview_status, preview = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/preview",
+                data=b'{"opportunity_id":"opp-1"}',
+            )
+        )
+        execution_status, execution = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/executions",
+                data=b'{"preview_id":"preview-1","idempotency_key":"key-1"}',
+            )
+        )
 
-    assert status == expected
-    if expected == 503:
-        assert payload == {"error": "prediction mutation is unavailable"}
+    assert preview_status == execution_status == 200
+    assert preview["preview_id"] == execution["preview_id"] == "preview-1"
+    assert execution["idempotency_key"] == "key-1"
+    assert runtime.execution.calls == [
+        ("preview", "opp-1", {}),
+        (
+            "confirm",
+            {"preview_id": "preview-1", "idempotency_key": "key-1"},
+            {},
+        ),
+    ]
+
+
+def test_production_http_confirmation_preserves_execution_idempotency(
+    tmp_path: Path,
+) -> None:
+    execution_service, trading, store, monitor = execution_fixture(
+        tmp_path, result="both_rejected"
+    )
+    runtime = _ProductionRuntime()
+    runtime.store = store  # type: ignore[assignment]
+    runtime.monitor = monitor  # type: ignore[assignment]
+    runtime.execution = execution_service  # type: ignore[assignment]
+    runtime.cross_venue_monitor = None  # type: ignore[assignment]
+
+    with _production_server(runtime) as (base, _runtime):
+        preview_status, preview = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/preview",
+                data=b'{"opportunity_id":"opp-1"}',
+            )
+        )
+        request = json.dumps(
+            {
+                "preview_id": preview["preview_id"],
+                "idempotency_key": "same-request",
+            }
+        ).encode("utf-8")
+        first_status, first = _response(
+            _production_request(
+                base, "/api/prediction-arbitrage/executions", data=request
+            )
+        )
+        second_status, second = _response(
+            _production_request(
+                base, "/api/prediction-arbitrage/executions", data=request
+            )
+        )
+
+    final = wait_until_terminal(execution_service, str(first["execution_id"]))
+    assert preview_status == first_status == second_status == 200
+    assert second["execution_id"] == first["execution_id"]
+    assert final["state"] == "both_rejected"
+    assert trading.batch_calls == 1
+
+
+def test_production_http_previews_llm_relationship_economics(tmp_path: Path) -> None:
+    execution_service, _trading, store, _monitor = threshold_execution_fixture(
+        tmp_path
+    )
+    runtime = _ProductionRuntime()
+    runtime.store = store  # type: ignore[assignment]
+    runtime.execution = execution_service  # type: ignore[assignment]
+
+    with _production_server(runtime) as (base, _runtime):
+        status, preview = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/preview",
+                data=b'{"opportunity_id":"threshold-opp-1"}',
+            )
+        )
+
+    assert status == 200
+    assert preview["state"] == "previewed"
+    assert preview["intent_type"] == "threshold_hedge"
+    assert preview["total_max_cost"] == "2.12"
+    assert preview["minimum_profit"] == "7.88"
+    assert preview["llm_status"] == "approved"
+
+
+def test_production_http_previews_cross_venue_economics(tmp_path: Path) -> None:
+    execution_service, store, _trading, _cross, _predict = _cross_service(tmp_path)
+    runtime = _ProductionRuntime()
+    runtime.store = store  # type: ignore[assignment]
+    runtime.execution = execution_service  # type: ignore[assignment]
+
+    with _production_server(runtime) as (base, _runtime):
+        status, preview = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/preview",
+                data=(
+                    b'{"opportunity_id":'
+                    b'"cross:public-pair:PREDICT_YES_POLYMARKET_NO"}'
+                ),
+            )
+        )
+
+    assert status == 200
+    assert preview["state"] == "previewed"
+    assert preview["market_type"] == "cross_venue_yes_no"
+    assert preview["maximum_total_cost"] == "4.80"
+    assert preview["minimum_profit"] == "0.20"
+    assert [leg["exchange"] for leg in preview["buy_legs"]] == [
+        "predict.fun",
+        "polymarket",
+    ]
+
+
+def test_production_rejects_unknown_prediction_mutation() -> None:
+    with _production_server() as (base, runtime):
+        status, payload = _response(
+            _production_request(base, "/api/prediction-arbitrage/unknown")
+        )
+
+    assert status == 404
+    assert payload == {"error": "not found"}
     assert runtime.execution.calls == []
 
 

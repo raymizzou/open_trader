@@ -230,16 +230,13 @@ def create_prediction_server(
                 if not _is_production_available(runtime):
                     self._send_unavailable()
                     return
-            if path in {
+            execution_mutation = path in {
                 "/api/prediction-arbitrage/preview",
                 "/api/prediction-arbitrage/executions",
-            }:
-                self._send_json(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    {"error": "prediction mutation is unavailable"},
-                )
-                return
+            }
             if path not in {
+                "/api/prediction-arbitrage/preview",
+                "/api/prediction-arbitrage/executions",
                 "/api/prediction-arbitrage/mode",
                 "/api/prediction-arbitrage/circuit-breaker/reset",
                 "/api/prediction-arbitrage/predict-allowance/cleanup",
@@ -252,8 +249,23 @@ def create_prediction_server(
                 execution = getattr(runtime, "execution", None)
                 if execution is None:
                     raise RuntimeError("prediction execution service is unavailable")
-                audit = self._audit_context()
-                if path.endswith("/mode"):
+                audit = (
+                    {}
+                    if execution_mutation
+                    else self._audit_context()
+                )
+                if path.endswith("/preview"):
+                    self._require_schema(payload, {"opportunity_id"})
+                    result = execution.preview(
+                        self._required_string(payload, "opportunity_id")
+                    )
+                elif path.endswith("/executions"):
+                    self._require_schema(payload, {"preview_id", "idempotency_key"})
+                    result = execution.confirm(
+                        self._required_string(payload, "preview_id"),
+                        self._required_string(payload, "idempotency_key"),
+                    )
+                elif path.endswith("/mode"):
                     self._require_schema(payload, {"mode"})
                     result = execution.set_validation_mode(
                         self._required_string(payload, "mode"), audit=audit
@@ -271,11 +283,13 @@ def create_prediction_server(
                     result = execution.cleanup_predict_allowance(
                         confirm=True, audit=audit
                     )
-                status = (
-                    HTTPStatus.CONFLICT
-                    if isinstance(result, Mapping) and result.get("state") == "busy"
-                    else HTTPStatus.OK
-                )
+                status = HTTPStatus.OK
+                if (
+                    not execution_mutation
+                    and isinstance(result, Mapping)
+                    and result.get("state") == "busy"
+                ):
+                    status = HTTPStatus.CONFLICT
                 self._send_json(status, dict(result))
             except PermissionError as exc:
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})

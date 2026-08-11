@@ -300,7 +300,7 @@ def test_legacy_prediction_http_surface_matches_contract_v1(tmp_path: Path) -> N
             raise AssertionError("unexpected request fields must fail")
 
 
-def test_production_prediction_controls_match_frozen_legacy_contract() -> None:
+def test_production_prediction_mutations_match_frozen_legacy_contract() -> None:
     with _prediction_server() as base:
         status, headers, state = _json_response(
             base + "/api/prediction-arbitrage/state"
@@ -315,6 +315,36 @@ def test_production_prediction_controls_match_frozen_legacy_contract() -> None:
             status, _headers, body = _json_response(_post(base, path, payload))
             assert status == 200, path
             assert body == expected, path
+
+        status, _headers, preview = _json_response(
+            _post(
+                base,
+                "/api/prediction-arbitrage/preview",
+                {"opportunity_id": "opp-1"},
+            )
+        )
+        assert status == 200
+        assert preview == {
+            "state": "previewed",
+            "id": "preview-1",
+            "preview_id": "preview-1",
+            "opportunity_id": "opp-1",
+        }
+
+        status, _headers, execution = _json_response(
+            _post(
+                base,
+                "/api/prediction-arbitrage/executions",
+                {"preview_id": "preview-1", "idempotency_key": "key-1"},
+            )
+        )
+        assert status == 200
+        assert execution == {
+            "state": "validating",
+            "execution_id": "execution-1",
+            "preview_id": "preview-1",
+            "idempotency_key": "key-1",
+        }
 
 
 def test_legacy_unavailable_state_is_the_documented_migration_gap(tmp_path: Path) -> None:

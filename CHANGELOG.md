@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-11
 
+- #43 在独立 Prediction Service 的 production owner 上开放 Preview 与人工确认执行：
+  8769 复用既有 `PredictionExecutionService` 的实时校验、幂等 execution lock、资金预留、
+  回执与启动对账，不另建交易状态机；YES/NO、LLM 关系及跨所 Preview 均通过隔离临时
+  SQLite/fake venue 的真实 HTTP 工作流，Shadow 仍在读取 body 或调用下游前拒绝所有写入。
+  此票未部署、未改 Gateway/Legacy/UI/launchd、未触发真实订单；直接幂等确认只产生一个
+  execution 和一个假下单批次，相关执行回归 496 项通过。
+
 - #42 为独立 Prediction Service 增加 production owner 与四项控制操作（模式切换、
   熔断重置、Predict allowance 清理、跨所自动暂停）：仅在持有唯一 runtime lock、
   安全策略已登记且启动对账为 RUNNING 后才绑定端口；控制请求沿用 loopback、
