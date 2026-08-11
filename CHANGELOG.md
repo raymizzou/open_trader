@@ -8,11 +8,14 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - #48 冻结 solver-independent、版本化的 N_LEG 模型与有界精确 Oracle 语料：Admission、
   Optimization 与显式 Raw diagnostic 分离，确定性 support proof 和穷尽负证明均有可回放
   的请求/结果指纹；补齐缺失终局 payout 与跨资产估值为 fail-closed `UNKNOWN`，并锁定
-  `NO_ARBITRAGE` 的闭合 bounds/source-proof wire invariant。已验证 N_LEG 聚焦套件
-  137 passed、Admission/Optimization/两类 diagnostic 直接回放 5 passed、Prediction
-  arithmetic 加 N_LEG 回归 188 passed。正常环境的 `python -m pytest -q` 为 BLOCKED：
-  `/opt/homebrew/opt/python@3.12/bin/python3.12: No module named pytest`；未改 Prediction
-  runtime、Dashboard、solver dependency 或 order path。
+  `NO_ARBITRAGE` 的闭合 bounds/source-proof wire invariant；最终修复 identity-only proof
+  合并、signed-64 派生运算溢出和亚秒 release delay 向下取整。已验证 N_LEG 聚焦套件
+  141 passed、Admission/Optimization/两类 diagnostic 直接回放 5 passed、Prediction
+  arithmetic 加 N_LEG 回归 192 passed。项目 venv 全库实际运行结果为 `205 failed,
+  5447 passed, 3 skipped, 1 warning in 165.63s`，不是 green gate；失败与 #48 无关，主要为
+  legacy fixture 缺失和 sandbox 禁止 localhost socket bind。系统解释器另有
+  `/opt/homebrew/opt/python@3.12/bin/python3.12: No module named pytest` blocker。未改
+  Prediction runtime、Dashboard、solver dependency 或 order path。
 
 - 完成通用 N_LEG Prediction 套利设计与开发 Ticket 契约收敛：热路径接受任一已验证合格
   连通组合而不等待全局最优，组件级负证明仅接受预算内完整 Oracle 或可独立检查证书；

@@ -840,7 +840,7 @@
     },
     {
       "case_id": "quantity-selection-n4",
-      "expected_request_fingerprint": "sha256:59b0027cf20128eef0465cc20f3f18d84acd862e3b335d208a5d487f5b00ed12",
+      "expected_request_fingerprint": "sha256:daecd4b7c0a4a57c386675d40dc8bfbabdfed674f055613b51e5cbc4eb346cca",
       "expected_result": {
         "business_status": "QUALIFIED_FEASIBLE",
         "negative_proof": null,
@@ -859,20 +859,31 @@
             "guaranteed_profit_units": 6,
             "payout_lower_bound_units": 12,
             "portfolio_fingerprint": "sha256:80b417ae7fe977bef74c46545617166e500e75db94e7952b13821b30d8413017",
-            "problem_fingerprint": "sha256:326f06f1b2fcbf2362b0c31c7a37b2b6ef8293eafd4eaef80099d9eb7a4c6ce0",
+            "problem_fingerprint": "sha256:8c9ea372713ac7907b1d6ea9b42776b7c4cf8f680cf9b9fdb7ac4976dcd38bf0",
             "selected_support_graph": {
               "action_ids": [
                 "b",
                 "c",
                 "d"
               ],
-              "constraint_ids": [],
+              "constraint_ids": [
+                "exactly-one-bcd"
+              ],
               "contract_ids": [
                 "b",
                 "c",
                 "d"
               ],
-              "hyperedges": []
+              "hyperedges": [
+                [
+                  "exactly-one-bcd",
+                  [
+                    "b",
+                    "c",
+                    "d"
+                  ]
+                ]
+              ]
             },
             "worst_scenario": {
               "atoms": [
@@ -881,7 +892,7 @@
                   "market_contract_id": "a"
                 },
                 {
-                  "atom_id": "b-yes",
+                  "atom_id": "b-no",
                   "market_contract_id": "b"
                 },
                 {
@@ -889,13 +900,13 @@
                   "market_contract_id": "c"
                 },
                 {
-                  "atom_id": "d-yes",
+                  "atom_id": "d-no",
                   "market_contract_id": "d"
                 }
               ]
             },
             "worst_state_cut": {
-              "cut_id": "cut:sha256:16bd8d6cbb8db13c8e966e8518ac04e457cec85383754a6417552c2ff430f682",
+              "cut_id": "cut:sha256:05923ae221463ad34fc2d17f13320fcc2e554c88cf6630e8814499085b1afd78",
               "payout_per_lot": [
                 {
                   "action_id": "a",
@@ -903,15 +914,15 @@
                 },
                 {
                   "action_id": "b",
-                  "payout_lower_bound_per_lot_units": 2
+                  "payout_lower_bound_per_lot_units": 0
                 },
                 {
                   "action_id": "c",
-                  "payout_lower_bound_per_lot_units": 2
+                  "payout_lower_bound_per_lot_units": 6
                 },
                 {
                   "action_id": "d",
-                  "payout_lower_bound_per_lot_units": 2
+                  "payout_lower_bound_per_lot_units": 0
                 }
               ],
               "scenario": {
@@ -921,7 +932,7 @@
                     "market_contract_id": "a"
                   },
                   {
-                    "atom_id": "b-yes",
+                    "atom_id": "b-no",
                     "market_contract_id": "b"
                   },
                   {
@@ -929,7 +940,7 @@
                     "market_contract_id": "c"
                   },
                   {
-                    "atom_id": "d-yes",
+                    "atom_id": "d-no",
                     "market_contract_id": "d"
                   }
                 ]
@@ -954,10 +965,10 @@
         "solve_status": "FEASIBLE",
         "unknown_reason": null
       },
-      "expected_result_fingerprint": "sha256:323d553784b2a5ed6fdd32a89d927c880cc59e3ffe96a51bc620331e0c3066a2",
+      "expected_result_fingerprint": "sha256:10b1689727843e5a3121f3c75e3254bb252f3c36e2884d8ee5a4d0e3156cbdfa",
       "request": {
         "budget": {
-          "max_joint_states": 1,
+          "max_joint_states": 8,
           "max_quantity_vectors": 48,
           "max_support_rechecks": 1
         },
@@ -1072,7 +1083,18 @@
           "as_of": "2026-08-12T00:00:00Z",
           "constraint_model": {
             "forbidden_atom_combinations": [],
-            "relations": []
+            "relations": [
+              {
+                "constraint_id": "exactly-one-bcd",
+                "contract_ids": [
+                  "b",
+                  "c",
+                  "d"
+                ],
+                "kind": "EXACTLY_ONE",
+                "rule_version": "v1"
+              }
+            ]
           },
           "problem_id": "quantity-selection-n4",
           "qualification_constraints": [
@@ -1123,7 +1145,19 @@
                   "payouts": [
                     {
                       "action_id": "b",
-                      "payout_lower_bound_per_lot_units": 2
+                      "payout_lower_bound_per_lot_units": 12
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "b-no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "b",
+                      "payout_lower_bound_per_lot_units": 0
                     }
                   ],
                   "rule_version": "v1"
@@ -1150,7 +1184,19 @@
                   "payouts": [
                     {
                       "action_id": "c",
-                      "payout_lower_bound_per_lot_units": 2
+                      "payout_lower_bound_per_lot_units": 6
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "c-no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "c",
+                      "payout_lower_bound_per_lot_units": 0
                     }
                   ],
                   "rule_version": "v1"
@@ -1177,7 +1223,19 @@
                   "payouts": [
                     {
                       "action_id": "d",
-                      "payout_lower_bound_per_lot_units": 2
+                      "payout_lower_bound_per_lot_units": 4
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "d-no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "d",
+                      "payout_lower_bound_per_lot_units": 0
                     }
                   ],
                   "rule_version": "v1"

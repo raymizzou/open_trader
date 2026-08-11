@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime
 from itertools import product
-from math import prod
 
 from open_trader.prediction_n_leg import (
     ActionPayout,
@@ -37,6 +36,35 @@ from open_trader.prediction_n_leg import (
     fingerprint,
     validate_problem,
 )
+
+
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+
+def _checked(value: int) -> int:
+    if not _INT64_MIN <= value <= _INT64_MAX:
+        raise OverflowError
+    return value
+
+
+def _checked_add(left: int, right: int) -> int:
+    return _checked(left + right)
+
+
+def _checked_subtract(left: int, right: int) -> int:
+    return _checked(left - right)
+
+
+def _checked_multiply(left: int, right: int) -> int:
+    return _checked(left * right)
+
+
+def _checked_product(*values: int) -> int:
+    result = 1
+    for value in values:
+        result = _checked_multiply(result, value)
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,8 +198,11 @@ def enumerate_allowed_scenarios(problem: ArbitrageProblem, budget: OracleBudget)
         return ScenarioEnumeration(None, 0, UnknownReason.INVALID_MODEL)
     state_sets = tuple(sorted(problem.terminal_state_sets, key=lambda state: state.market_contract_id))
     raw_joint_state_count = 1
-    for state in state_sets:
-        raw_joint_state_count *= len(state.atoms)
+    try:
+        for state in state_sets:
+            raw_joint_state_count = _checked_multiply(raw_joint_state_count, len(state.atoms))
+    except OverflowError:
+        return ScenarioEnumeration(None, 0, UnknownReason.NUMERIC_OVERFLOW)
     if raw_joint_state_count > budget.max_joint_states:
         return ScenarioEnumeration(None, raw_joint_state_count, UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED)
 
@@ -243,7 +274,11 @@ def _selected_quantities(problem: ArbitrageProblem, quantities: tuple[ActionQuan
             raise ValueError("quantities must contain ActionQuantity values")
         if quantity.action_id not in actions_by_id:
             raise ValueError(f"unknown action quantity: {quantity.action_id}")
-        if isinstance(quantity.quantity_lots, bool) or not isinstance(quantity.quantity_lots, int) or quantity.quantity_lots < 0:
+        if (
+            isinstance(quantity.quantity_lots, bool)
+            or not isinstance(quantity.quantity_lots, int)
+            or not 0 <= quantity.quantity_lots <= _INT64_MAX
+        ):
             raise ValueError(f"invalid action quantity: {quantity.action_id}")
         if quantity.action_id in selected:
             raise ValueError(f"duplicate action quantity: {quantity.action_id}")
@@ -262,7 +297,11 @@ def _cost_upper_bound_for_selected(problem: ArbitrageProblem, quantities: tuple[
             if remaining < cost_slice.first_lot:
                 break
             covered_last_lot = min(remaining, cost_slice.last_lot)
-            total += (covered_last_lot - cost_slice.first_lot + 1) * cost_slice.incremental_cost_upper_bound_units
+            covered_lots = _checked_add(_checked_subtract(covered_last_lot, cost_slice.first_lot), 1)
+            total = _checked_add(
+                total,
+                _checked_multiply(covered_lots, cost_slice.incremental_cost_upper_bound_units),
+            )
         if remaining > action.cost_slices[-1].last_lot:
             raise ValueError(f"quantity exceeds executable cost slices: {quantity.action_id}")
     return total
@@ -275,22 +314,37 @@ def cost_upper_bound(problem: ArbitrageProblem, quantities: tuple[ActionQuantity
 
 def _qualification_passes(problem: ArbitrageProblem, constraint: QualificationConstraint, evaluation: PortfolioEvaluation) -> bool:
     if constraint.metric == QualificationMetric.GUARANTEED_PROFIT_UNITS:
-        left = evaluation.guaranteed_profit_units * constraint.threshold_denominator
+        left = _checked_multiply(evaluation.guaranteed_profit_units, constraint.threshold_denominator)
         right = constraint.threshold_numerator
     elif constraint.metric == QualificationMetric.NET_MARGIN_PPM:
-        left = evaluation.guaranteed_profit_units * 1_000_000 * constraint.threshold_denominator
-        right = constraint.threshold_numerator * evaluation.cost_upper_bound_units
+        left = _checked_product(evaluation.guaranteed_profit_units, 1_000_000, constraint.threshold_denominator)
+        right = _checked_multiply(constraint.threshold_numerator, evaluation.cost_upper_bound_units)
     elif constraint.metric == QualificationMetric.ANNUALIZED_RETURN_PPM:
-        release_delay_seconds = int((evaluation.conservative_capital_release_at - problem.as_of).total_seconds())
-        left = evaluation.guaranteed_profit_units * 365 * 24 * 60 * 60 * 1_000_000 * constraint.threshold_denominator
-        right = constraint.threshold_numerator * evaluation.cost_upper_bound_units * release_delay_seconds
+        release_delay_seconds = _release_delay_seconds(problem, evaluation)
+        left = _checked_product(
+            evaluation.guaranteed_profit_units,
+            365 * 24 * 60 * 60,
+            1_000_000,
+            constraint.threshold_denominator,
+        )
+        right = _checked_product(
+            constraint.threshold_numerator,
+            evaluation.cost_upper_bound_units,
+            release_delay_seconds,
+        )
     elif constraint.metric == QualificationMetric.MAX_CAPITAL_RELEASE_DELAY_SECONDS:
-        release_delay_seconds = int((evaluation.conservative_capital_release_at - problem.as_of).total_seconds())
-        left = release_delay_seconds * constraint.threshold_denominator
+        release_delay_seconds = _release_delay_seconds(problem, evaluation)
+        left = _checked_multiply(release_delay_seconds, constraint.threshold_denominator)
         right = constraint.threshold_numerator
     else:
         raise AssertionError(constraint.metric)
     return left >= right if constraint.comparison == Comparison.GREATER_THAN_OR_EQUAL else left <= right
+
+
+def _release_delay_seconds(problem: ArbitrageProblem, evaluation: PortfolioEvaluation) -> int:
+    delay = evaluation.conservative_capital_release_at - problem.as_of
+    whole_seconds = _checked_add(_checked_multiply(delay.days, 24 * 60 * 60), delay.seconds)
+    return _checked_add(whole_seconds, int(bool(delay.microseconds)))
 
 
 def evaluate_fixed_portfolio(
@@ -308,10 +362,16 @@ def evaluate_fixed_portfolio(
     quantities_by_action = {quantity.action_id: quantity.quantity_lots for quantity in selected}
 
     def payout(scenario: SettlementScenario) -> int:
-        return sum(
-            payout.payout_lower_bound_per_lot_units * quantities_by_action.get(payout.action_id, 0)
-            for payout in cut_from_scenario(problem, scenario).payout_per_lot
-        )
+        total = 0
+        for payout in cut_from_scenario(problem, scenario).payout_per_lot:
+            total = _checked_add(
+                total,
+                _checked_multiply(
+                    payout.payout_lower_bound_per_lot_units,
+                    quantities_by_action.get(payout.action_id, 0),
+                ),
+            )
+        return total
 
     payout_lower_bound_units, _, worst_scenario = min(
         (payout(scenario), fingerprint(scenario), scenario) for scenario in enumeration.scenarios
@@ -334,7 +394,7 @@ def evaluate_fixed_portfolio(
         selected,
         payout_lower_bound_units,
         cost_upper_bound_units,
-        payout_lower_bound_units - cost_upper_bound_units,
+        _checked_subtract(payout_lower_bound_units, cost_upper_bound_units),
         worst_scenario,
         cut_from_scenario(problem, worst_scenario),
         conservative_capital_release_at,
@@ -463,7 +523,12 @@ def build_portfolio_solution(
         raise ValueError("evaluation does not match problem quantities or costs")
     current_cut = cut_from_scenario(problem, evaluation.worst_scenario)
     payout_by_action = {payout.action_id: payout.payout_lower_bound_per_lot_units for payout in current_cut.payout_per_lot}
-    current_payout = sum(payout_by_action[quantity.action_id] * quantity.quantity_lots for quantity in selected)
+    current_payout = 0
+    for quantity in selected:
+        current_payout = _checked_add(
+            current_payout,
+            _checked_multiply(payout_by_action[quantity.action_id], quantity.quantity_lots),
+        )
     selected_contract_ids = {
         action.market_contract_id for action in problem.actions if action.action_id in {quantity.action_id for quantity in selected}
     }
@@ -479,7 +544,8 @@ def build_portfolio_solution(
     if (
         current_cut != evaluation.worst_state_cut
         or current_payout != evaluation.payout_lower_bound_units
-        or evaluation.guaranteed_profit_units != evaluation.payout_lower_bound_units - evaluation.cost_upper_bound_units
+        or evaluation.guaranteed_profit_units
+        != _checked_subtract(evaluation.payout_lower_bound_units, evaluation.cost_upper_bound_units)
         or evaluation.conservative_capital_release_at < worst_scenario_release_at
         or evaluation.conservative_capital_release_at < problem.as_of
     ):
@@ -526,13 +592,6 @@ def split_disconnected_solution(
             if head != tail:
                 parent[tail] = head
 
-    identity_contracts: dict[str, list[str]] = {}
-    for state in problem.terminal_state_sets:
-        if state.market_contract_id in parent:
-            identity_contracts.setdefault(fingerprint(state.settlement_observation_key), []).append(state.market_contract_id)
-    for contract_ids in identity_contracts.values():
-        join(tuple(sorted(contract_ids)))
-
     for _, contract_ids in support_graph.hyperedges:
         connected = tuple(contract_id for contract_id in contract_ids if contract_id in parent)
         join(connected)
@@ -550,7 +609,10 @@ def split_disconnected_solution(
 
 def quantity_vector_count(problem: ArbitrageProblem) -> int:
     _require_valid(problem)
-    return prod(len(quantity_range) for quantity_range in _quantity_ranges(problem.actions))
+    total = 1
+    for quantity_range in _quantity_ranges(problem.actions):
+        total = _checked_multiply(total, len(quantity_range))
+    return total
 
 
 def _quantity_ranges(actions: tuple[CandidateAction, ...]) -> tuple[range, ...]:
@@ -620,7 +682,10 @@ def _connected_qualified_solutions(
     budget: OracleBudget,
     rejection_ids: set[str],
 ) -> tuple[PortfolioSolution, ...] | UnknownReason:
-    support_graph = derive_selected_support_graph(problem, evaluation, budget)
+    try:
+        support_graph = derive_selected_support_graph(problem, evaluation, budget)
+    except OverflowError:
+        return UnknownReason.NUMERIC_OVERFLOW
     if isinstance(support_graph, UnknownReason):
         return support_graph
     groups = split_disconnected_solution(problem, evaluation, support_graph)
@@ -657,14 +722,35 @@ def _search_request_unknown_reason(request: OracleRequest, mode: SearchMode) -> 
         return UnknownReason.INVALID_MODEL
     if reason := _input_unknown_reason(request.problem):
         return reason
-    total_vectors = quantity_vector_count(request.problem)
+    try:
+        total_vectors = quantity_vector_count(request.problem)
+    except OverflowError:
+        return UnknownReason.NUMERIC_OVERFLOW
     if total_vectors > request.budget.max_quantity_vectors:
         return UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED
-    joint_states = prod(len(state_set.atoms) for state_set in request.problem.terminal_state_sets)
-    if joint_states > request.budget.max_joint_states:
-        return UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED
     enumeration = enumerate_allowed_scenarios(request.problem, request.budget)
-    return enumeration.unknown_reason
+    if enumeration.unknown_reason is not None:
+        return enumeration.unknown_reason
+    try:
+        _numeric_domain_preflight(request.problem, request.budget)
+    except OverflowError:
+        return UnknownReason.NUMERIC_OVERFLOW
+    return None
+
+
+def _numeric_domain_preflight(problem: ArbitrageProblem, budget: OracleBudget) -> None:
+    actions = tuple(sorted(problem.actions, key=lambda action: action.action_id))
+    for lots in product(*_quantity_ranges(actions)):
+        if any(lots):
+            evaluate_fixed_portfolio(
+                problem,
+                tuple(
+                    ActionQuantity(action.action_id, quantity)
+                    for action, quantity in zip(actions, lots, strict=True)
+                    if quantity
+                ),
+                budget,
+            )
 
 
 def _solution_objective(solution: PortfolioSolution) -> tuple[object, ...]:
@@ -713,7 +799,7 @@ def _solve_exhaustive(request: OracleRequest, mode: SearchMode) -> OracleResult:
     audit = SearchAudit(
         quantity_vector_count(request.problem),
         examined,
-        prod(len(state_set.atoms) for state_set in request.problem.terminal_state_sets),
+        _checked_product(*(len(state_set.atoms) for state_set in request.problem.terminal_state_sets)),
         tuple(sorted(rejection_counts.items())),
     )
     if best_solution is None:
@@ -767,7 +853,7 @@ def diagnose_raw_arbitrage(problem: ArbitrageProblem, budget: OracleBudget) -> O
     if result.solution.payout_proof.guaranteed_profit_units > 0:
         return result
     total_vectors = quantity_vector_count(diagnostic_problem)
-    joint_states = prod(len(state_set.atoms) for state_set in diagnostic_problem.terminal_state_sets)
+    joint_states = _checked_product(*(len(state_set.atoms) for state_set in diagnostic_problem.terminal_state_sets))
     proof = build_exhaustive_search_proof(
         request,
         SearchAudit(total_vectors, total_vectors, joint_states, (("ALL_ZERO", 1),)),
@@ -787,34 +873,13 @@ def diagnose_raw_arbitrage(problem: ArbitrageProblem, budget: OracleBudget) -> O
 
 
 def find_qualified(request: OracleRequest) -> OracleResult:
-    if (
-        not isinstance(request, OracleRequest)
-        or request.mode != SearchMode.ADMISSION
-        or not isinstance(request.budget, OracleBudget)
-        or any(
-            isinstance(value, bool) or not isinstance(value, int) or value <= 0
-            for value in (
-                request.budget.max_quantity_vectors,
-                request.budget.max_joint_states,
-                request.budget.max_support_rechecks,
-            )
-        )
-    ):
-        return _unknown_result(UnknownReason.INVALID_MODEL)
-    if reason := _input_unknown_reason(request.problem):
+    if reason := _search_request_unknown_reason(request, SearchMode.ADMISSION):
         return _unknown_result(reason)
 
     total_vectors = quantity_vector_count(request.problem)
     joint_states_per_vector = 1
     for state_set in request.problem.terminal_state_sets:
         joint_states_per_vector *= len(state_set.atoms)
-    if total_vectors > request.budget.max_quantity_vectors:
-        return _unknown_result(UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED)
-    if joint_states_per_vector > request.budget.max_joint_states:
-        return _unknown_result(UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED)
-    if enumerate_allowed_scenarios(request.problem, request.budget).unknown_reason is not None:
-        return _unknown_result(UnknownReason.CONTRADICTORY_CONSTRAINT_MODEL)
-
     actions = tuple(sorted(request.problem.actions, key=lambda action: action.action_id))
     rejection_counts: dict[str, int] = {}
     examined = 0

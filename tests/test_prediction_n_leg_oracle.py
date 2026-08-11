@@ -62,7 +62,7 @@ AS_OF = datetime(2026, 8, 12, tzinfo=UTC)
 
 
 ORACLE_CORPUS_PATH = Path(__file__).with_name("fixtures") / "prediction_n_leg_v1.json"
-ORACLE_CORPUS_SHA256 = "05d252e0c9f16b77430a09c8e692058b99c434151e3fcbd5a66245abae9e55bc"
+ORACLE_CORPUS_SHA256 = "dbac567c50fc3bb33f38ae9346a25f66256a94a893a16b84677fbf6ac6befbe4"
 
 
 def _run_corpus_case(request: OracleRequest):
@@ -576,6 +576,146 @@ def test_fixed_portfolio_qualifies_only_from_exact_integer_constraints() -> None
     assert rounded_down.failed_qualification_ids == ("profit",)
 
 
+def test_subsecond_release_delay_is_conservatively_rounded_up() -> None:
+    key = observation()
+    built = replace(
+        problem(
+            (action("contract-a", "action-a", key),),
+            (
+                state(
+                    "contract-a",
+                    key,
+                    "action-a",
+                    (("a", TerminalKind.NORMAL_YES, 2),),
+                    AS_OF + timedelta(microseconds=500_000),
+                ),
+            ),
+        ),
+        qualification_constraints=(
+            QualificationConstraint(
+                "annual",
+                "v1",
+                QualificationMetric.ANNUALIZED_RETURN_PPM,
+                Comparison.GREATER_THAN_OR_EQUAL,
+                31_536_000_000_001,
+                1,
+            ),
+            QualificationConstraint(
+                "max-zero-delay",
+                "v1",
+                QualificationMetric.MAX_CAPITAL_RELEASE_DELAY_SECONDS,
+                Comparison.LESS_THAN_OR_EQUAL,
+                0,
+                1,
+            ),
+        ),
+    )
+
+    evaluation = evaluate_fixed_portfolio(
+        built,
+        (ActionQuantity("action-a", 1),),
+        OracleBudget(2, 1, 1),
+    )
+
+    assert evaluation.failed_qualification_ids == ("annual", "max-zero-delay")
+
+
+def test_admission_preflights_payout_aggregate_overflow_before_early_result() -> None:
+    maximum = 2**63 - 1
+    key = observation()
+    built = problem(
+        (action("contract-a", "action-a", key), action("contract-a", "action-b", key)),
+        (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, maximum),)),),
+    )
+    built = replace(
+        built,
+        terminal_state_sets=(
+            replace(
+                built.terminal_state_sets[0],
+                atoms=(
+                    replace(
+                        built.terminal_state_sets[0].atoms[0],
+                        payouts=(ActionPayout("action-a", maximum), ActionPayout("action-b", maximum)),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    result = oracle.find_qualified(_admission_request(built, OracleBudget(4, 1, 1)))
+
+    assert result == result_from_payload(canonical_payload(result))
+    assert result.business_status == BusinessStatus.UNKNOWN
+    assert result.unknown_reason == UnknownReason.NUMERIC_OVERFLOW
+
+
+def test_oracle_returns_unknown_for_cost_aggregate_and_profit_overflow() -> None:
+    maximum = 2**63 - 1
+    minimum = -(2**63)
+    key = observation()
+    aggregate_cost = problem(
+        (
+            action("contract-a", "action-a", key, (ExecutableCostSlice(1, 1, maximum),)),
+            action("contract-a", "action-b", key, (ExecutableCostSlice(1, 1, maximum),)),
+        ),
+        (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 0),)),),
+    )
+    aggregate_cost = replace(
+        aggregate_cost,
+        terminal_state_sets=(
+            replace(
+                aggregate_cost.terminal_state_sets[0],
+                atoms=(
+                    replace(
+                        aggregate_cost.terminal_state_sets[0].atoms[0],
+                        payouts=(ActionPayout("action-a", 0), ActionPayout("action-b", 0)),
+                    ),
+                ),
+            ),
+        ),
+    )
+    profit = problem(
+        (action("contract-a", "action-a", key),),
+        (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, minimum),)),),
+    )
+
+    results = (
+        oracle.find_qualified(_admission_request(aggregate_cost, OracleBudget(4, 1, 1))),
+        oracle.find_qualified(_admission_request(profit, OracleBudget(2, 1, 1))),
+    )
+
+    assert all(result == result_from_payload(canonical_payload(result)) for result in results)
+    assert all(result.business_status == BusinessStatus.UNKNOWN for result in results)
+    assert all(result.unknown_reason == UnknownReason.NUMERIC_OVERFLOW for result in results)
+
+
+def test_oracle_returns_unknown_for_qualification_cross_product_overflow() -> None:
+    maximum = 2**63 - 1
+    key = observation()
+    built = replace(
+        problem(
+            (action("contract-a", "action-a", key, (ExecutableCostSlice(1, 1, 0),)),),
+            (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, maximum),)),),
+        ),
+        qualification_constraints=(
+            QualificationConstraint(
+                "minimum-profit",
+                "v1",
+                QualificationMetric.GUARANTEED_PROFIT_UNITS,
+                Comparison.GREATER_THAN_OR_EQUAL,
+                1,
+                2,
+            ),
+        ),
+    )
+
+    result = oracle.solve_optimal(_optimization_request(built, OracleBudget(2, 1, 1)))
+
+    assert result == result_from_payload(canonical_payload(result))
+    assert result.business_status == BusinessStatus.UNKNOWN
+    assert result.unknown_reason == UnknownReason.NUMERIC_OVERFLOW
+
+
 def test_fixed_portfolio_rejects_a_nominal_spread_after_conservative_integer_rounding() -> None:
     raw_payout, raw_cost = Fraction(106, 10), Fraction(104, 10)
     key = observation()
@@ -890,7 +1030,7 @@ def test_admission_rechecks_disconnected_parts_and_continues_to_a_later_vector()
     assert result.solution.payout_proof.guaranteed_profit_units == 4
 
 
-def test_admission_keeps_equal_observation_identity_actions_in_one_component() -> None:
+def test_admission_splits_identity_only_actions_and_rechecks_each_child() -> None:
     key = observation("shared")
     built = replace(
         problem(
@@ -905,10 +1045,10 @@ def test_admission_keeps_equal_observation_identity_actions_in_one_component() -
 
     result = oracle.find_qualified(_admission_request(built, OracleBudget(4, 1, 1)))
 
-    assert result.business_status == BusinessStatus.QUALIFIED_FEASIBLE
-    assert result.solution is not None
-    assert result.solution.quantities == (ActionQuantity("action-a", 1), ActionQuantity("action-b", 1))
-    assert result.solution.payout_proof.selected_support_graph.hyperedges == ()
+    assert result.business_status == BusinessStatus.NO_QUALIFIED_OPPORTUNITY
+    assert result.solution is None
+    assert result.negative_proof is not None
+    assert result.negative_proof.rejection_counts == (("ALL_ZERO", 1), ("minimum-profit", 3))
 
 
 def test_disconnected_qualified_portfolio_returns_its_first_qualified_part() -> None:
