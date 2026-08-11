@@ -512,14 +512,228 @@ def test_shadow_state_and_history_use_the_shared_read_model() -> None:
     assert history == expected_history
 
 
-def test_shadow_history_rejects_invalid_query() -> None:
-    with _server(_Runtime()) as base:
+def test_history_single_flight_reuses_identical_inflight_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    calls_lock = threading.Lock()
+    leader_entered = threading.Event()
+    release_leader = threading.Event()
+
+    def controlled_history(_store: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call = calls
+        leader_entered.set()
+        assert release_leader.wait(timeout=5)
+        return {"call": call}
+
+    monkeypatch.setattr(prediction_service, "prediction_history_payload", controlled_history)
+    with _running_server(_Runtime()) as (base, server):
+        try:
+            with ThreadPoolExecutor(max_workers=8) as clients:
+                requests = [
+                    clients.submit(
+                        _response,
+                        base + "/api/prediction-arbitrage/history?kind=signals&limit=1&offset=0",
+                    )
+                    for _ in range(8)
+                ]
+                assert leader_entered.wait(timeout=5)
+                for _ in range(100):
+                    if server.http_load_snapshot()["history_cache_hits"] == 7:  # type: ignore[attr-defined]
+                        break
+                    time.sleep(0.01)
+                assert calls == 1
+                load = server.http_load_snapshot()  # type: ignore[attr-defined]
+                assert load["history_cache_misses"] == 1
+                assert load["history_cache_hits"] == 7
+
+                release_leader.set()
+                assert [future.result(timeout=5) for future in requests] == [
+                    (200, {"call": 1})
+                ] * 8
+        finally:
+            release_leader.set()
+
+
+def test_history_cache_ttl_expires_and_keeps_pagination_keys_separate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    clock = [0.0]
+
+    def controlled_history(_store: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"call": calls}
+
+    monkeypatch.setattr(prediction_service, "prediction_history_payload", controlled_history)
+    monkeypatch.setattr(prediction_service.time, "monotonic", lambda: clock[0])
+    with _running_server(_Runtime()) as (base, server):
+        def get_history(query: str) -> tuple[int, dict[str, object]]:
+            return _response(base + "/api/prediction-arbitrage/history?" + query)
+
+        first_payload = (200, {"call": 1})
+        assert get_history("kind=signals&limit=1&offset=0") == first_payload
+        assert calls == 1
+
+        clock[0] = 0.999
+        assert get_history("kind=signals&limit=1&offset=0") == first_payload
+        assert calls == 1
+
+        clock[0] = 1.001
+        second_payload = (200, {"call": 2})
+        assert get_history("kind=signals&limit=1&offset=0") == second_payload
+        assert calls == 2
+
+        assert get_history("kind=executions&limit=1&offset=0") == (200, {"call": 3})
+        assert get_history("kind=executions&limit=1&offset=1") == (200, {"call": 4})
+        assert calls == 4
+        assert server.http_load_snapshot()["history_cache_misses"] == 4  # type: ignore[attr-defined]
+
+
+def test_history_flight_failure_wakes_followers_and_recomputes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    calls_lock = threading.Lock()
+    leader_entered = threading.Event()
+    release_leader = threading.Event()
+
+    def failing_history(_store: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call = calls
+        if call == 1:
+            leader_entered.set()
+            assert release_leader.wait(timeout=5)
+            raise sqlite3.OperationalError("database is locked")
+        return {"call": call}
+
+    monkeypatch.setattr(prediction_service, "prediction_history_payload", failing_history)
+    query = "kind=signals&limit=1&offset=0"
+    key = ("signals", 1, 0)
+    with _running_server(_Runtime()) as (base, server):
+        try:
+            with ThreadPoolExecutor(max_workers=8) as clients:
+                requests = [
+                    clients.submit(
+                        _response,
+                        base + "/api/prediction-arbitrage/history?" + query,
+                    )
+                    for _ in range(8)
+                ]
+                assert leader_entered.wait(timeout=5)
+                for _ in range(100):
+                    if server.http_load_snapshot()["history_cache_hits"] == 7:  # type: ignore[attr-defined]
+                        break
+                    time.sleep(0.01)
+                release_leader.set()
+
+                assert [future.result(timeout=5) for future in requests] == [
+                    (503, {"error": "prediction history unavailable"})
+                ] * 8
+            assert calls == 1
+            assert key not in server._history_cache  # type: ignore[attr-defined]
+            assert _response(base + "/api/prediction-arbitrage/history?" + query) == (
+                200,
+                {"call": 2},
+            )
+            assert calls == 2
+        finally:
+            release_leader.set()
+
+
+def test_history_wait_timeout_keeps_the_leader_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    leader_entered = threading.Event()
+    release_leader = threading.Event()
+
+    def blocked_history(_store: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        leader_entered.set()
+        assert release_leader.wait(timeout=5)
+        return {"call": calls}
+
+    monkeypatch.setattr(prediction_service, "prediction_history_payload", blocked_history)
+    monkeypatch.setattr(prediction_service, "_HISTORY_WAIT_SECONDS", 0.05)
+    query = "kind=signals&limit=1&offset=0"
+    key = ("signals", 1, 0)
+    with _running_server(_Runtime()) as (base, server):
+        try:
+            with ThreadPoolExecutor(max_workers=2) as clients:
+                leader = clients.submit(
+                    _response,
+                    base + "/api/prediction-arbitrage/history?" + query,
+                )
+                assert leader_entered.wait(timeout=5)
+                follower = clients.submit(
+                    _response,
+                    base + "/api/prediction-arbitrage/history?" + query,
+                )
+                assert follower.result(timeout=5) == (
+                    503,
+                    {"error": "prediction history unavailable"},
+                )
+                assert calls == 1
+                assert key in server._history_flights  # type: ignore[attr-defined]
+                assert server.http_load_snapshot()["active"] == 1  # type: ignore[attr-defined]
+
+                release_leader.set()
+                assert leader.result(timeout=5) == (200, {"call": 1})
+        finally:
+            release_leader.set()
+
+
+def test_history_cache_never_serves_expired_payload_after_recompute_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    clock = [0.0]
+
+    def stale_history(_store: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise sqlite3.OperationalError("database is locked")
+        return {"call": calls}
+
+    monkeypatch.setattr(prediction_service, "prediction_history_payload", stale_history)
+    monkeypatch.setattr(prediction_service.time, "monotonic", lambda: clock[0])
+    with _running_server(_Runtime()) as (base, _server_instance):
+        path = base + "/api/prediction-arbitrage/history?kind=signals&limit=1&offset=0"
+        assert _response(path) == (200, {"call": 1})
+        clock[0] = 1.001
+        assert _response(path) == (
+            503,
+            {"error": "prediction history unavailable"},
+        )
+        assert calls == 2
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    (
+        ("kind=signals&limit=0", "limit must be positive"),
+        ("kind=unknown&limit=1", "kind must be signals, executions, or incidents"),
+    ),
+)
+def test_shadow_history_rejects_invalid_query(query: str, expected: str) -> None:
+    with _running_server(_Runtime()) as (base, server):
         status, payload = _response(
-            base + "/api/prediction-arbitrage/history?kind=signals&limit=0"
+            base + "/api/prediction-arbitrage/history?" + query
         )
 
     assert status == 400
-    assert payload == {"error": "limit must be positive"}
+    assert payload == {"error": expected}
+    assert server.http_load_snapshot()["history_cache_hits"] == 0  # type: ignore[attr-defined]
+    assert server.http_load_snapshot()["history_cache_misses"] == 0  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize("path", FROZEN_PREDICTION_MUTATION_PATHS)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future
 from http.cookies import SimpleCookie
 from datetime import datetime
 import ipaddress
@@ -14,10 +15,12 @@ import signal
 import sqlite3
 import subprocess
 import threading
-from typing import Any, Mapping
+import time
+from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, urlparse
 
 from .prediction_read_model import (
+    PREDICTION_HISTORY_KINDS,
     _prediction_safe_value,
     prediction_history_payload,
     prediction_state_payload,
@@ -29,6 +32,8 @@ _HISTORY_DEFAULT_LIMIT = 100
 _HISTORY_MAX_LIMIT = 500
 _MAX_JSON_BODY_BYTES = 1024 * 1024
 _MAX_CONCURRENT_HTTP_REQUESTS = 8
+_HISTORY_CACHE_SECONDS = 1.0
+_HISTORY_WAIT_SECONDS = 5.0
 _BUSY_BODY = b'{"error":"prediction service busy"}'
 _READ_ONLY_ERROR = {
     "code": "shadow_read_only",
@@ -45,6 +50,12 @@ class _PredictionHTTPServer(ThreadingHTTPServer):
         self._overload_rejections = 0
         self._history_cache_hits = 0
         self._history_cache_misses = 0
+        self._history_cache: dict[
+            tuple[str, int, int], tuple[float, dict[str, object]]
+        ] = {}
+        self._history_flights: dict[
+            tuple[str, int, int], Future[dict[str, object]]
+        ] = {}
         self._busy_response = (
             b"HTTP/1.1 503 Service Unavailable\r\n"
             b"Content-Type: application/json; charset=utf-8\r\n"
@@ -86,6 +97,47 @@ class _PredictionHTTPServer(ThreadingHTTPServer):
                 "history_cache_hits": self._history_cache_hits,
                 "history_cache_misses": self._history_cache_misses,
             }
+
+    def history_payload(
+        self,
+        key: tuple[str, int, int],
+        compute: Callable[[], dict[str, object]],
+    ) -> dict[str, object]:
+        with self._http_load_lock:
+            now = time.monotonic()
+            for cache_key, (expires_at, _) in tuple(self._history_cache.items()):
+                if expires_at <= now:
+                    del self._history_cache[cache_key]
+            cached = self._history_cache.get(key)
+            if cached is not None:
+                self._history_cache_hits += 1
+                return cached[1]
+            flight = self._history_flights.get(key)
+            if flight is None:
+                flight = Future()
+                self._history_flights[key] = flight
+                self._history_cache_misses += 1
+                leader = True
+            else:
+                self._history_cache_hits += 1
+                leader = False
+
+        if not leader:
+            return flight.result(timeout=_HISTORY_WAIT_SECONDS)
+        try:
+            payload = compute()
+        except BaseException as exc:
+            with self._http_load_lock:
+                if self._history_flights.get(key) is flight:
+                    del self._history_flights[key]
+                    flight.set_exception(exc)
+            raise
+        with self._http_load_lock:
+            self._history_cache[key] = (time.monotonic() + _HISTORY_CACHE_SECONDS, payload)
+            if self._history_flights.get(key) is flight:
+                del self._history_flights[key]
+                flight.set_result(payload)
+        return payload
 
     def _record_admitted(self) -> None:
         with self._http_load_lock:
@@ -271,20 +323,35 @@ def create_prediction_server(
                 return
             try:
                 query = parse_qs(parsed.query, keep_blank_values=True)
-                self._send_json(
-                    HTTPStatus.OK,
-                    prediction_history_payload(
-                        getattr(runtime, "store", None),
-                        kind=str(query.get("kind", [""])[0]).strip(),
-                        limit=_query_int(query, "limit", _HISTORY_DEFAULT_LIMIT),
-                        offset=_query_int(query, "offset", 0),
-                        monitor=getattr(runtime, "monitor", None),
-                        execution=getattr(runtime, "execution", None),
-                        cross_venue_monitor=getattr(runtime, "cross_venue_monitor", None),
-                    ),
-                )
+                kind = str(query.get("kind", [""])[0]).strip()
+                if kind not in PREDICTION_HISTORY_KINDS:
+                    raise ValueError("kind must be signals, executions, or incidents")
+                limit = _query_int(query, "limit", _HISTORY_DEFAULT_LIMIT)
+                offset = _query_int(query, "offset", 0)
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            try:
+                self._send_json(
+                    HTTPStatus.OK,
+                    self.server.history_payload(  # type: ignore[attr-defined]
+                        (kind, limit, offset),
+                        lambda: prediction_history_payload(
+                            getattr(runtime, "store", None),
+                            kind=kind,
+                            limit=limit,
+                            offset=offset,
+                            monitor=getattr(runtime, "monitor", None),
+                            execution=getattr(runtime, "execution", None),
+                            cross_venue_monitor=getattr(runtime, "cross_venue_monitor", None),
+                        ),
+                    ),
+                )
+            except Exception:
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": "prediction history unavailable"},
+                )
 
         def do_POST(self) -> None:
             self.close_connection = True
