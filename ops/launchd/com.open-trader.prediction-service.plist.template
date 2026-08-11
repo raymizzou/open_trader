@@ -9,8 +9,9 @@
   </dict>
   <key>ProgramArguments</key><array>
     <string>OPEN_TRADER_PYTHON</string><string>-m</string><string>open_trader</string><string>prediction-service</string>
-    <string>--mode</string><string>shadow</string><string>--data-dir</string><string>OPEN_TRADER_DATA_DIR</string>
+    <string>--mode</string><string>OPEN_TRADER_PREDICTION_MODE</string><string>--data-dir</string><string>OPEN_TRADER_DATA_DIR</string>
     <string>--config</string><string>OPEN_TRADER_PREDICTION_CONFIG</string><string>--host</string><string>127.0.0.1</string><string>--port</string><string>8769</string>
+    <string>--release-manifest</string><string>OPEN_TRADER_RELEASE_MANIFEST</string>
   </array>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ProcessType</key><string>Interactive</string><key>ThrottleInterval</key><integer>5</integer>
   <key>StandardOutPath</key><string>OPEN_TRADER_RUNTIME_ROOT/logs/prediction_service/launchd.out.log</string>

@@ -25,6 +25,7 @@ from .prediction_read_model import (
     prediction_history_payload,
     prediction_state_payload,
 )
+from .prediction_release import load_prediction_release_manifest
 from .prediction_runtime import PredictionRuntime
 
 
@@ -553,17 +554,32 @@ def serve_prediction_service(
     host: str = "127.0.0.1",
     port: int = 8769,
     mode: str = "shadow",
+    release_manifest_path: Path | None = None,
 ) -> int:
     _require_loopback_host(host)
     if mode not in {"shadow", "production"}:
         raise ValueError("prediction service mode is invalid")
+    release = None
+    if mode == "production":
+        if release_manifest_path is None:
+            raise ValueError("production release manifest is required")
+        release = load_prediction_release_manifest(release_manifest_path)
     metadata = _runtime_metadata()
+    if release is not None:
+        metadata.update(
+            {
+                "release_schema_version": release.schema_version,
+                "reader_generation": release.reader_generation,
+                "contract_generation": release.contract_generation,
+            }
+        )
     runtime = PredictionRuntime(
         data_dir=Path(data_dir),
         prediction_config_path=Path(prediction_config_path),
         dashboard_url=f"http://{host}:{port}",
         mode=mode,
         git_sha=str(metadata.get("git_sha", "")),
+        reader_generation=None if release is None else release.reader_generation,
     )
     server: ThreadingHTTPServer | None = None
     previous_handlers: dict[int, Any] = {}
@@ -612,6 +628,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8769)
+    parser.add_argument("--release-manifest", type=Path)
     args = parser.parse_args(argv)
     return serve_prediction_service(
         data_dir=args.data_dir,
@@ -619,4 +636,5 @@ def main(argv: list[str] | None = None) -> int:
         host=args.host,
         port=args.port,
         mode=args.mode,
+        release_manifest_path=args.release_manifest,
     )

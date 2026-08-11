@@ -185,7 +185,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] > 0
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         names = {
             row[1]
             for row in connection.execute("PRAGMA table_list")
@@ -227,6 +227,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "cross_auto_attempts",
         "safety_policy",
         "control_events",
+        "schema_metadata",
     }
     assert "signals_market_started_at" in indexes
     assert "signals_started_at" in indexes
@@ -2296,3 +2297,88 @@ def test_cross_venue_signal_episode_preserves_public_legs_and_rearms_after_close
     assert closed["trigger_total_max_cost"] == "9.45"
     assert closed["trigger_minimum_profit"] == "0.55"
     assert db.upsert_signal(payload) != signal_id
+
+
+def test_missing_database_has_baseline_reader_generation_without_creation(tmp_path: Path) -> None:
+    from open_trader.prediction_arbitrage_store import read_minimum_reader_generation
+
+    database = tmp_path / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    assert read_minimum_reader_generation(tmp_path) == 1
+    assert not database.exists()
+
+
+def test_missing_metadata_table_reads_baseline_without_mutating_database(tmp_path: Path) -> None:
+    from open_trader.prediction_arbitrage_store import read_minimum_reader_generation
+
+    database = tmp_path / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE existing(value INTEGER)")
+    before = database.read_bytes()
+
+    assert read_minimum_reader_generation(tmp_path) == 1
+    assert database.read_bytes() == before
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name='schema_metadata'"
+        ).fetchone() is None
+
+
+def test_store_persists_baseline_and_probe_reads_future_minimum(tmp_path: Path) -> None:
+    from open_trader.prediction_arbitrage_store import read_minimum_reader_generation
+
+    PredictionArbitrageStore(tmp_path)
+    database = tmp_path / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT minimum_reader_generation FROM schema_metadata WHERE singleton=1"
+        ).fetchone() == (1,)
+        connection.execute(
+            "UPDATE schema_metadata SET minimum_reader_generation=2 WHERE singleton=1"
+        )
+
+    assert read_minimum_reader_generation(tmp_path) == 2
+    PredictionArbitrageStore(tmp_path)
+    assert read_minimum_reader_generation(tmp_path) == 2
+
+
+def test_reader_probe_closes_its_mode_ro_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import open_trader.prediction_arbitrage_store as store_module
+
+    PredictionArbitrageStore(tmp_path)
+    real_connect = sqlite3.connect
+    observed: dict[str, object] = {}
+
+    class RecordingConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
+
+        def execute(self, statement: str, parameters: tuple[object, ...] = ()):
+            return self.connection.execute(statement, parameters)
+
+        def close(self) -> None:
+            observed["closed"] = True
+            self.connection.close()
+
+    def connect(database: str, **kwargs: object) -> RecordingConnection:
+        observed.update(uri=database, kwargs=kwargs)
+        return RecordingConnection(real_connect(database, **kwargs))
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", connect)
+    assert store_module.read_minimum_reader_generation(tmp_path) == 1
+    assert str(observed["uri"]).endswith("?mode=ro")
+    assert observed["kwargs"] == {"uri": True}
+    assert observed["closed"] is True
+
+
+def test_existing_metadata_table_without_singleton_fails_closed(tmp_path: Path) -> None:
+    from open_trader.prediction_arbitrage_store import read_minimum_reader_generation
+
+    database = tmp_path / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE schema_metadata(singleton INTEGER PRIMARY KEY, minimum_reader_generation INTEGER NOT NULL)"
+        )
+    with pytest.raises(ValueError, match="generation is missing"):
+        read_minimum_reader_generation(tmp_path)

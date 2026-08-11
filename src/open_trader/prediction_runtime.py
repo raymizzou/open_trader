@@ -39,6 +39,7 @@ from .prediction_arbitrage_execution import (
 from .prediction_arbitrage_store import (
     _CROSS_AUTO_DAILY_PRINCIPAL_CAP,
     PredictionArbitrageStore,
+    read_minimum_reader_generation,
 )
 from .prediction_read_only import (
     PolymarketReadOnlyGuard,
@@ -58,6 +59,10 @@ discover_threshold_relations = discover_threshold_relation_catalog
 
 class PredictionRuntimeOwnershipError(RuntimeError):
     """The Prediction data directory already has a live Runtime owner."""
+
+
+class PredictionRuntimeCompatibilityError(RuntimeError):
+    pass
 
 
 class _RuntimeOwnershipLock:
@@ -327,14 +332,20 @@ class PredictionRuntime:
         cross_venue_monitor: object | None = None,
         mode: Literal["production", "shadow"] = "production",
         git_sha: str = "",
+        reader_generation: int | None = None,
     ) -> None:
         if mode not in {"production", "shadow"}:
             raise ValueError("prediction runtime mode must be production or shadow")
+        if reader_generation is not None and (
+            type(reader_generation) is not int or reader_generation < 1
+        ):
+            raise ValueError("prediction reader generation must be a positive integer")
         self._data_dir = Path(data_dir)
         self._prediction_config_path = Path(prediction_config_path)
         self._dashboard_url = str(dashboard_url)
         self._mode = mode
         self._git_sha = str(git_sha)
+        self._reader_generation = reader_generation
         self._owner_thread_id = threading.get_ident()
         self._notifier = NullNotifier() if mode == "shadow" else notifier or NullNotifier()
         self._injected_cross_venue_monitor = cross_venue_monitor
@@ -428,6 +439,15 @@ class PredictionRuntime:
             return
         try:
             self._owner.acquire()
+            if self._reader_generation is not None:
+                minimum_reader_generation = read_minimum_reader_generation(
+                    self._data_dir
+                )
+                if self._reader_generation < minimum_reader_generation:
+                    raise PredictionRuntimeCompatibilityError(
+                        f"prediction reader generation {self._reader_generation} "
+                        f"is below required {minimum_reader_generation}"
+                    )
             self.store = PredictionArbitrageStore(self._data_dir)
             trading_config = load_trading_config(self._prediction_config_path)
             apply_safety_policy = getattr(self.store, "apply_safety_policy", None)
@@ -730,6 +750,7 @@ class PredictionRuntime:
 
 __all__ = [
     "PredictionRuntime",
+    "PredictionRuntimeCompatibilityError",
     "PredictionRuntimeOwnershipError",
     "_CrossVenueRuntime",
     "_UnavailableCrossVenueMonitor",
