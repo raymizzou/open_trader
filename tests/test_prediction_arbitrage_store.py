@@ -185,7 +185,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] > 0
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         names = {
             row[1]
             for row in connection.execute("PRAGMA table_list")
@@ -225,6 +225,8 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "auto_eat_attempts",
         "cross_auto_state",
         "cross_auto_attempts",
+        "safety_policy",
+        "control_events",
     }
     assert "signals_market_started_at" in indexes
     assert "signals_started_at" in indexes
@@ -232,6 +234,190 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
     assert any("signals_market_started_at" in row[3] for row in query_plan)
     assert any("signals_started_at" in row[3] for row in history_query_plan)
     assert any("signals_open_started_at" in row[3] for row in open_query_plan)
+
+
+def test_first_safety_policy_enrollment_preserves_legacy_automatic_modes(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    db.set_validation_mode("auto")
+    db.set_cross_auto_mode("auto_submit", "operator_configured")
+    db.arm_cross_auto()
+
+    result = db.apply_safety_policy(
+        {"policy_version": "v1", "max_normal_cost": "20"},
+        git_sha="abc123",
+    )
+
+    assert result == {
+        "state": "baseline_enrolled",
+        "fingerprint": "bf39dc3e71ec56386ee2bc1fe90daa498fb243949b9679c9972ad4bb210e4e9c",
+        "previous_fingerprint": None,
+        "downgraded": False,
+    }
+    assert db.get_validation_mode() == "auto"
+    assert db.cross_auto_state()["configured_mode"] == "auto_submit"
+    assert db.cross_auto_state()["armed"] is True
+    saved = db.safety_policy()
+    assert saved is not None
+    updated_at = saved.pop("updated_at")
+    assert isinstance(updated_at, str) and updated_at.endswith("Z")
+    assert saved == {
+        "fingerprint": "bf39dc3e71ec56386ee2bc1fe90daa498fb243949b9679c9972ad4bb210e4e9c",
+        "policy": {"policy_version": "v1", "max_normal_cost": "20"},
+        "git_sha": "abc123",
+    }
+    event = db.latest_control_event("safety_policy", "production")
+    assert event is not None
+    assert event["outcome"] == "baseline_enrolled"
+    assert event["payload"] == {
+        "actor": "system",
+        "after_fingerprint": "bf39dc3e71ec56386ee2bc1fe90daa498fb243949b9679c9972ad4bb210e4e9c",
+        "before_fingerprint": None,
+        "downgraded": False,
+        "git_sha": "abc123",
+    }
+
+
+def test_identical_safety_policy_restart_is_a_no_op(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    policy = {"policy_version": "v1", "max_normal_cost": "20"}
+    db.apply_safety_policy(policy, git_sha="abc123")
+
+    result = db.apply_safety_policy(policy, git_sha="def456")
+
+    assert result == {
+        "state": "unchanged",
+        "fingerprint": "bf39dc3e71ec56386ee2bc1fe90daa498fb243949b9679c9972ad4bb210e4e9c",
+        "previous_fingerprint": "bf39dc3e71ec56386ee2bc1fe90daa498fb243949b9679c9972ad4bb210e4e9c",
+        "downgraded": False,
+    }
+    assert db.latest_control_event("safety_policy", "production")["outcome"] == (
+        "baseline_enrolled"
+    )
+
+
+def test_changed_safety_policy_atomically_downgrades_automatic_modes(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    db.set_validation_mode("auto")
+    db.set_cross_auto_mode("auto_submit", "operator_configured")
+    db.arm_cross_auto()
+    db.apply_safety_policy(
+        {"policy_version": "v1", "max_normal_cost": "20"},
+        git_sha="abc123",
+    )
+
+    result = db.apply_safety_policy(
+        {"policy_version": "v2", "max_normal_cost": "25"},
+        git_sha="def456",
+    )
+
+    assert result == {
+        "state": "downgraded",
+        "fingerprint": "a90c3a8bc1439f0035ba56aed23cd4fed379f982e28d0eacba4a8cea6e9158e3",
+        "previous_fingerprint": "bf39dc3e71ec56386ee2bc1fe90daa498fb243949b9679c9972ad4bb210e4e9c",
+        "downgraded": True,
+    }
+    assert db.get_validation_mode() == "manual"
+    assert db.cross_auto_state()["configured_mode"] == "manual_confirm"
+    assert db.cross_auto_state()["armed"] is False
+    event = db.latest_control_event("safety_policy", "production")
+    assert event is not None
+    assert event["outcome"] == "safety_policy_changed"
+    assert event["payload"] == {
+        "actor": "system",
+        "after_fingerprint": "a90c3a8bc1439f0035ba56aed23cd4fed379f982e28d0eacba4a8cea6e9158e3",
+        "before_fingerprint": "bf39dc3e71ec56386ee2bc1fe90daa498fb243949b9679c9972ad4bb210e4e9c",
+        "downgraded": True,
+        "git_sha": "def456",
+    }
+
+
+def test_audited_validation_mode_and_pause_are_naturally_idempotent(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    audit = {
+        "actor": "local_operator",
+        "git_sha": "abc123",
+        "safety_fingerprint": "policy-1",
+    }
+
+    assert db.set_validation_mode("manual", audit=audit) == "manual"
+    assert db.set_validation_mode("manual", audit=audit) == "manual"
+    mode_event = db.latest_control_event("set_validation_mode", "validation_mode")
+    assert mode_event is not None
+    assert mode_event["outcome"] == "no_op"
+    assert mode_event["payload"] == {
+        **audit,
+        "after": "manual",
+        "before": "manual",
+    }
+
+    db.set_cross_auto_mode("auto_submit", "operator_configured")
+    db.arm_cross_auto()
+    first_pause = db.pause_cross_auto("operator_paused", audit=audit)
+    second_pause = db.pause_cross_auto("operator_paused", audit=audit)
+    assert second_pause == first_pause
+    pause_event = db.latest_control_event("pause_cross_auto", "cross_auto")
+    assert pause_event is not None
+    assert pause_event["outcome"] == "no_op"
+    assert pause_event["payload"]["before"] == pause_event["payload"]["after"]
+
+
+def test_audit_failure_rolls_back_validation_mode_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = store(tmp_path)
+
+    def fail_audit(*_args: object, **_kwargs: object) -> str:
+        raise sqlite3.OperationalError("audit unavailable")
+
+    monkeypatch.setattr(db, "_insert_control_event", fail_audit)
+
+    with pytest.raises(sqlite3.OperationalError, match="audit unavailable"):
+        db.set_validation_mode("manual", audit={"actor": "local_operator"})
+
+    assert db.get_validation_mode() == "observe_only"
+    assert db.latest_control_event("set_validation_mode", "validation_mode") is None
+
+
+def test_control_event_transitions_from_started_to_one_terminal_outcome(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    event_id = db.begin_control_event(
+        action="cleanup_predict_allowance",
+        target="predict_allowance",
+        payload={"actor": "local_operator", "confirm": True},
+    )
+
+    started = db.latest_control_event(
+        "cleanup_predict_allowance", "predict_allowance"
+    )
+    assert started is not None
+    assert started["event_id"] == event_id
+    assert started["outcome"] == "started"
+    finished = db.finish_control_event(
+        event_id,
+        outcome="succeeded",
+        payload={"before_allowance": "1", "after_allowance": "0"},
+    )
+    assert finished["outcome"] == "succeeded"
+    assert finished["payload"] == {
+        "actor": "local_operator",
+        "confirm": True,
+        "before_allowance": "1",
+        "after_allowance": "0",
+    }
+    with pytest.raises(ValueError, match="already terminal"):
+        db.finish_control_event(
+            event_id,
+            outcome="failed",
+            payload={"reason": "late rewrite"},
+        )
 
 
 def test_cross_auto_pause_is_durable_and_runtime_writes_do_not_clear_it(

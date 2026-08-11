@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -486,6 +487,27 @@ class PredictionArbitrageStore:
 
             CREATE INDEX IF NOT EXISTS cross_auto_attempts_created_at
             ON cross_auto_attempts(created_at DESC, signal_id DESC);
+
+            CREATE TABLE IF NOT EXISTS safety_policy (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                fingerprint TEXT NOT NULL,
+                policy TEXT NOT NULL,
+                git_sha TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS control_events (
+                event_id TEXT PRIMARY KEY,
+                action TEXT NOT NULL,
+                target TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS control_events_action_target
+            ON control_events(action, target, created_at DESC);
             """
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -521,6 +543,9 @@ class PredictionArbitrageStore:
                 """
             )
             connection.execute("PRAGMA user_version=5")
+            version = 5
+        if version < 6:
+            connection.execute("PRAGMA user_version=6")
 
     @staticmethod
     def _execution_fields(row: sqlite3.Row) -> dict[str, object]:
@@ -702,6 +727,222 @@ class PredictionArbitrageStore:
         return None if row is None else _load_payload(str(row["payload"]))
 
     @staticmethod
+    def _insert_control_event(
+        connection: sqlite3.Connection,
+        *,
+        action: str,
+        target: str,
+        outcome: str,
+        payload: Mapping[str, object],
+        event_id: str | None = None,
+        now: str | None = None,
+    ) -> str:
+        identifier = event_id or _new_id()
+        timestamp = now or _utc_now()
+        connection.execute(
+            """
+            INSERT INTO control_events(
+                event_id, action, target, outcome, payload, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                identifier,
+                str(action),
+                str(target),
+                str(outcome),
+                _dump_payload(payload),
+                timestamp,
+                timestamp,
+            ),
+        )
+        return identifier
+
+    def latest_control_event(
+        self, action: str, target: str
+    ) -> dict[str, object] | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT event_id, action, target, outcome, payload, created_at, updated_at
+                FROM control_events
+                WHERE action=? AND target=?
+                ORDER BY created_at DESC, event_id DESC
+                LIMIT 1
+                """,
+                (str(action), str(target)),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._control_event_result(row)
+
+    @staticmethod
+    def _control_event_result(row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "event_id": str(row["event_id"]),
+            "action": str(row["action"]),
+            "target": str(row["target"]),
+            "outcome": str(row["outcome"]),
+            "payload": _load_payload(str(row["payload"])),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def begin_control_event(
+        self, *, action: str, target: str, payload: Mapping[str, object]
+    ) -> str:
+        with self._transaction() as connection:
+            return self._insert_control_event(
+                connection,
+                action=action,
+                target=target,
+                outcome="started",
+                payload=payload,
+            )
+
+    def finish_control_event(
+        self,
+        event_id: str,
+        *,
+        outcome: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        if outcome not in {"succeeded", "rejected", "failed"}:
+            raise ValueError("invalid terminal control outcome")
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT outcome, payload FROM control_events WHERE event_id=?",
+                (str(event_id),),
+            ).fetchone()
+            if row is None:
+                raise ValueError("control event does not exist")
+            if str(row["outcome"]) != "started":
+                raise ValueError("control event is already terminal")
+            merged = _load_payload(str(row["payload"]))
+            merged.update(dict(payload))
+            connection.execute(
+                """
+                UPDATE control_events
+                SET outcome=?, payload=?, updated_at=?
+                WHERE event_id=? AND outcome='started'
+                """,
+                (outcome, _dump_payload(merged), now, str(event_id)),
+            )
+            finished = connection.execute(
+                """
+                SELECT event_id, action, target, outcome, payload, created_at, updated_at
+                FROM control_events WHERE event_id=?
+                """,
+                (str(event_id),),
+            ).fetchone()
+            assert finished is not None
+            return self._control_event_result(finished)
+
+    def safety_policy(self) -> dict[str, object] | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT fingerprint, policy, git_sha, updated_at
+                FROM safety_policy WHERE singleton=1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "fingerprint": str(row["fingerprint"]),
+            "policy": _load_payload(str(row["policy"])),
+            "git_sha": str(row["git_sha"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def apply_safety_policy(
+        self, policy: Mapping[str, object], *, git_sha: str
+    ) -> dict[str, object]:
+        encoded = _dump_payload(policy)
+        fingerprint = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        now = _utc_now()
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT fingerprint FROM safety_policy WHERE singleton=1"
+            ).fetchone()
+            previous = None if existing is None else str(existing["fingerprint"])
+            if previous == fingerprint:
+                return {
+                    "state": "unchanged",
+                    "fingerprint": fingerprint,
+                    "previous_fingerprint": previous,
+                    "downgraded": False,
+                }
+
+            downgraded = False
+            if previous is not None:
+                mode = connection.execute(
+                    "SELECT mode FROM validation_mode WHERE singleton=1"
+                ).fetchone()
+                if mode is not None and str(mode["mode"]) == "auto":
+                    connection.execute(
+                        "UPDATE validation_mode SET mode='manual', updated_at=? WHERE singleton=1",
+                        (now,),
+                    )
+                    downgraded = True
+                cross = self._cross_auto_state_from_connection(connection)
+                if cross["configured_mode"] == "auto_submit" or cross["armed"] is True:
+                    connection.execute(
+                        """
+                        INSERT INTO cross_auto_state(
+                            singleton, configured_mode, armed, reason, updated_at
+                        ) VALUES (1, 'manual_confirm', 0, 'safety_policy_changed', ?)
+                        ON CONFLICT(singleton) DO UPDATE SET
+                            configured_mode='manual_confirm',
+                            armed=0,
+                            reason='safety_policy_changed',
+                            updated_at=excluded.updated_at
+                        """,
+                        (now,),
+                    )
+                    downgraded = True
+
+            connection.execute(
+                """
+                INSERT INTO safety_policy(singleton, fingerprint, policy, git_sha, updated_at)
+                VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    fingerprint=excluded.fingerprint,
+                    policy=excluded.policy,
+                    git_sha=excluded.git_sha,
+                    updated_at=excluded.updated_at
+                """,
+                (fingerprint, encoded, str(git_sha), now),
+            )
+            outcome = (
+                "baseline_enrolled" if previous is None else "safety_policy_changed"
+            )
+            self._insert_control_event(
+                connection,
+                action="safety_policy",
+                target="production",
+                outcome=outcome,
+                payload={
+                    "actor": "system",
+                    "before_fingerprint": previous,
+                    "after_fingerprint": fingerprint,
+                    "downgraded": downgraded,
+                    "git_sha": str(git_sha),
+                },
+                now=now,
+            )
+        return {
+            "state": (
+                "baseline_enrolled"
+                if previous is None
+                else "downgraded" if downgraded else "updated"
+            ),
+            "fingerprint": fingerprint,
+            "previous_fingerprint": previous,
+            "downgraded": downgraded,
+        }
+
+    @staticmethod
     def _cross_auto_state_from_connection(
         connection: sqlite3.Connection,
     ) -> dict[str, object]:
@@ -752,6 +993,7 @@ class PredictionArbitrageStore:
         armed: bool,
         reason: str,
         configured_mode: str | None = None,
+        audit: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("cross auto state reason is required")
@@ -760,26 +1002,37 @@ class PredictionArbitrageStore:
         updated_at = _utc_now()
         with self._transaction() as connection:
             current = self._cross_auto_state_from_connection(connection)
-            connection.execute(
-                """
-                INSERT INTO cross_auto_state(singleton, configured_mode, armed, reason, updated_at)
-                VALUES (1, ?, ?, ?, ?)
-                ON CONFLICT(singleton) DO UPDATE SET
-                    configured_mode=excluded.configured_mode,
-                    armed=excluded.armed,
-                    reason=excluded.reason,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    current["configured_mode"]
-                    if configured_mode is None
-                    else configured_mode,
-                    int(armed),
-                    reason,
-                    updated_at,
-                ),
+            target_mode = (
+                current["configured_mode"] if configured_mode is None else configured_mode
             )
-            return self._cross_auto_state_from_connection(connection)
+            changed = not (
+                current["configured_mode"] == target_mode
+                and current["armed"] is armed
+                and current["reason"] == reason
+            )
+            if changed:
+                connection.execute(
+                    """
+                    INSERT INTO cross_auto_state(singleton, configured_mode, armed, reason, updated_at)
+                    VALUES (1, ?, ?, ?, ?)
+                    ON CONFLICT(singleton) DO UPDATE SET
+                        configured_mode=excluded.configured_mode,
+                        armed=excluded.armed,
+                        reason=excluded.reason,
+                        updated_at=excluded.updated_at
+                    """,
+                    (target_mode, int(armed), reason, updated_at),
+                )
+            result = self._cross_auto_state_from_connection(connection)
+            if audit is not None:
+                self._insert_control_event(
+                    connection,
+                    action="pause_cross_auto",
+                    target="cross_auto",
+                    outcome="succeeded" if changed else "no_op",
+                    payload={**dict(audit), "before": current, "after": result},
+                )
+            return result
 
     def set_cross_auto_mode(self, mode: str, reason: str) -> dict[str, object]:
         if not isinstance(mode, str) or mode not in _CROSS_AUTO_MODES:
@@ -790,8 +1043,10 @@ class PredictionArbitrageStore:
             reason=reason,
         )
 
-    def pause_cross_auto(self, reason: str) -> dict[str, object]:
-        return self._set_cross_auto_state(armed=False, reason=reason)
+    def pause_cross_auto(
+        self, reason: str, *, audit: Mapping[str, object] | None = None
+    ) -> dict[str, object]:
+        return self._set_cross_auto_state(armed=False, reason=reason, audit=audit)
 
     def arm_cross_auto(self) -> dict[str, object]:
         return self._set_cross_auto_state(
@@ -990,18 +1245,39 @@ class PredictionArbitrageStore:
             return "observe_only"
         return str(row["mode"])
 
-    def set_validation_mode(self, mode: str) -> str:
+    def set_validation_mode(
+        self, mode: str, *, audit: Mapping[str, object] | None = None
+    ) -> str:
         if mode not in self.VALIDATION_MODES:
             raise ValueError(f"invalid validation mode: {mode}")
         with self._transaction() as connection:
-            connection.execute(
-                """
-                INSERT INTO validation_mode(singleton, mode, updated_at)
-                VALUES (1, ?, ?)
-                ON CONFLICT(singleton) DO UPDATE SET mode=excluded.mode, updated_at=excluded.updated_at
-                """,
-                (mode, _utc_now()),
+            row = connection.execute(
+                "SELECT mode FROM validation_mode WHERE singleton=1"
+            ).fetchone()
+            before = (
+                str(row["mode"])
+                if row is not None and str(row["mode"]) in self.VALIDATION_MODES
+                else "observe_only"
             )
+            if before != mode:
+                connection.execute(
+                    """
+                    INSERT INTO validation_mode(singleton, mode, updated_at)
+                    VALUES (1, ?, ?)
+                    ON CONFLICT(singleton) DO UPDATE SET
+                        mode=excluded.mode,
+                        updated_at=excluded.updated_at
+                    """,
+                    (mode, _utc_now()),
+                )
+            if audit is not None:
+                self._insert_control_event(
+                    connection,
+                    action="set_validation_mode",
+                    target="validation_mode",
+                    outcome="succeeded" if before != mode else "no_op",
+                    payload={**dict(audit), "before": before, "after": mode},
+                )
         return mode
 
     def record_auto_eat_attempt(
