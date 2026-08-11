@@ -545,3 +545,77 @@ def test_validate_problem_rejects_blank_observation_identity_and_rule_versions()
     blank_atom_rule = replace(problem.terminal_state_sets[0].atoms[0], rule_version="")
     blank_atom_state = replace(problem.terminal_state_sets[0], atoms=(blank_atom_rule,))
     assert any(issue.code == "INVALID_IDENTIFIER" for issue in validate_problem(replace(problem, terminal_state_sets=(blank_atom_state,))))
+
+
+@pytest.mark.parametrize("field", ("schema_version", "oracle_id", "indicator_id", "timezone", "rule_version"))
+@pytest.mark.parametrize("value", ("", None))
+def test_blank_or_non_string_action_observation_identity_is_path_addressed(field: str, value: object) -> None:
+    problem = sample_problem()
+    key = replace(problem.actions[0].settlement_observation_key, **{field: value})
+    malformed = replace(problem, actions=(replace(problem.actions[0], settlement_observation_key=key),))
+
+    assert any(issue.code == "INVALID_IDENTIFIER" and issue.path == f"actions[0].settlement_observation_key.{field}" for issue in validate_problem(malformed))
+
+
+@pytest.mark.parametrize("field", ("schema_version", "oracle_id", "indicator_id", "timezone", "rule_version"))
+@pytest.mark.parametrize("value", ("", None))
+def test_blank_or_non_string_terminal_state_observation_identity_is_path_addressed(field: str, value: object) -> None:
+    problem = sample_problem()
+    key = replace(problem.terminal_state_sets[0].settlement_observation_key, **{field: value})
+    malformed = replace(problem, terminal_state_sets=(replace(problem.terminal_state_sets[0], settlement_observation_key=key),))
+
+    assert any(issue.code == "INVALID_IDENTIFIER" and issue.path == f"terminal_state_sets[0].settlement_observation_key.{field}" for issue in validate_problem(malformed))
+
+
+@pytest.mark.parametrize("field", ("schema_version", "problem_id", "valuation_unit_id"))
+def test_blank_problem_identity_is_path_addressed(field: str) -> None:
+    malformed = replace(sample_problem(), **{field: ""})
+
+    assert any(issue.code == "INVALID_IDENTIFIER" and issue.path == field for issue in validate_problem(malformed))
+
+
+@pytest.mark.parametrize("field", ("settlement_asset_id", "valuation_unit_id", "asset_valuation_rule_id"))
+def test_blank_action_identity_is_path_addressed(field: str) -> None:
+    problem = sample_problem()
+    malformed = replace(problem, actions=(replace(problem.actions[0], **{field: ""}),))
+
+    assert any(issue.code == "INVALID_IDENTIFIER" and issue.path == f"actions[0].{field}" for issue in validate_problem(malformed))
+
+
+def test_blank_terminal_state_rule_version_is_path_addressed() -> None:
+    problem = sample_problem()
+    malformed = replace(problem, terminal_state_sets=(replace(problem.terminal_state_sets[0], rule_version=""),))
+
+    assert any(issue.code == "INVALID_IDENTIFIER" and issue.path == "terminal_state_sets[0].rule_version" for issue in validate_problem(malformed))
+
+
+def test_blank_terminal_atom_rule_version_is_path_addressed() -> None:
+    problem = sample_problem()
+    atom = replace(problem.terminal_state_sets[0].atoms[0], rule_version="")
+    malformed = replace(problem, terminal_state_sets=(replace(problem.terminal_state_sets[0], atoms=(atom,)),))
+
+    assert any(issue.code == "INVALID_IDENTIFIER" and issue.path == "terminal_state_sets[0].atoms[0].rule_version" for issue in validate_problem(malformed))
+
+
+def test_blank_relation_rule_version_is_path_addressed() -> None:
+    problem = sample_problem()
+    relation = RelationConstraint("relation-x", RelationKind.IMPLIES, ("contract-a", "contract-a"), "")
+    malformed = replace(problem, constraint_model=ConstraintModel((relation,), problem.constraint_model.forbidden_atom_combinations))
+
+    assert any(issue.code == "INVALID_IDENTIFIER" and issue.path == "constraint_model.relations[0].rule_version" for issue in validate_problem(malformed))
+
+
+def test_blank_forbidden_rule_version_is_path_addressed() -> None:
+    problem = sample_problem()
+    forbidden = replace(problem.constraint_model.forbidden_atom_combinations[0], rule_version="")
+    malformed = replace(problem, constraint_model=replace(problem.constraint_model, forbidden_atom_combinations=(forbidden,)))
+
+    assert any(issue.code == "INVALID_IDENTIFIER" and issue.path == "constraint_model.forbidden_atom_combinations[0].rule_version" for issue in validate_problem(malformed))
+
+
+def test_blank_qualification_rule_version_is_path_addressed() -> None:
+    problem = sample_problem()
+    qualification = replace(problem.qualification_constraints[0], rule_version="")
+    malformed = replace(problem, qualification_constraints=(qualification,))
+
+    assert any(issue.code == "INVALID_IDENTIFIER" and issue.path == "qualification_constraints[0].rule_version" for issue in validate_problem(malformed))
