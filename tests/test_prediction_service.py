@@ -99,9 +99,11 @@ def _running_server(runtime: object, **kwargs: object) -> Iterator[tuple[str, ob
         thread.join(timeout=5)
 
 
-def _response(request: str | Request) -> tuple[int, dict[str, object]]:
+def _response(
+    request: str | Request, *, timeout: float = 5
+) -> tuple[int, dict[str, object]]:
     try:
-        with urlopen(request, timeout=5) as response:
+        with urlopen(request, timeout=timeout) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         return error.code, json.loads(error.read().decode("utf-8"))
@@ -292,8 +294,13 @@ def test_global_http_capacity_rejects_overflow_and_releases_read_contexts(
     with _running_server(_Runtime()) as (base, server):
         try:
             with ThreadPoolExecutor(max_workers=48) as clients:
+                leader_timeout = 15
                 leaders = [
-                    clients.submit(_response, base + "/api/prediction-arbitrage/state")
+                    clients.submit(
+                        _response,
+                        base + "/api/prediction-arbitrage/state",
+                        timeout=leader_timeout,
+                    )
                     for _ in range(8)
                 ]
                 assert entered.wait(timeout=5)
@@ -314,7 +321,10 @@ def test_global_http_capacity_rejects_overflow_and_releases_read_contexts(
                 assert server.http_load_snapshot()["overload_rejections"] == 40  # type: ignore[attr-defined]
 
                 release.set()
-                assert [future.result(timeout=5)[0] for future in leaders] == [200] * 8
+                leader_results = [
+                    future.result(timeout=leader_timeout) for future in leaders
+                ]
+                assert [result[0] for result in leader_results] == [200] * 8
                 deadline = time.monotonic() + 5
                 while server.http_load_snapshot()["active"] != 0 and time.monotonic() < deadline:  # type: ignore[attr-defined]
                     time.sleep(0.01)
