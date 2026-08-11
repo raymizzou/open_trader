@@ -8,6 +8,7 @@ from pathlib import Path
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -121,15 +122,22 @@ def _socket_fd_count() -> int:
     count = 0
     for name in os.listdir("/dev/fd"):
         try:
-            duplicate = socket.fromfd(int(name), socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                duplicate.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
-            finally:
-                duplicate.close()
-        except OSError:
+            count += stat.S_ISSOCK(os.fstat(int(name)).st_mode)
+        except (OSError, ValueError):
             continue
-        count += 1
     return count
+
+
+def test_socket_fd_count_does_not_leak_non_socket_descriptors() -> None:
+    read_fd, write_fd = os.pipe()
+    try:
+        before = len(os.listdir("/dev/fd"))
+        for _ in range(3):
+            _socket_fd_count()
+        assert len(os.listdir("/dev/fd")) == before
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
 
 
 def _handler_thread_ids() -> set[int | None]:
