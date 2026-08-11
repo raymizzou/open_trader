@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from fractions import Fraction
 
 import pytest
 
 from open_trader.prediction_n_leg import (
     ActionPayout,
+    ActionQuantity,
     ActionSide,
     ArbitrageProblem,
     CandidateAction,
@@ -14,9 +16,13 @@ from open_trader.prediction_n_leg import (
     ExecutableCostSlice,
     ForbiddenAtomCombination,
     OracleBudget,
+    QualificationConstraint,
+    QualificationMetric,
+    Comparison,
     RelationConstraint,
     RelationKind,
     SelectedAtom,
+    SelectedSupportGraph,
     SettlementObservationKey,
     SettlementScenario,
     TerminalAtom,
@@ -26,10 +32,16 @@ from open_trader.prediction_n_leg import (
     fingerprint,
 )
 from open_trader.prediction_n_leg_oracle import (
+    PortfolioEvaluation,
     RelationComponent,
     build_relation_components,
+    build_portfolio_solution,
     cut_from_scenario,
+    cost_upper_bound,
+    derive_selected_support_graph,
     enumerate_allowed_scenarios,
+    evaluate_fixed_portfolio,
+    split_disconnected_solution,
 )
 
 
@@ -48,7 +60,12 @@ def observation(suffix: str = "a") -> SettlementObservationKey:
     )
 
 
-def action(contract_id: str, action_id: str, key: SettlementObservationKey) -> CandidateAction:
+def action(
+    contract_id: str,
+    action_id: str,
+    key: SettlementObservationKey,
+    cost_slices: tuple[ExecutableCostSlice, ...] = (ExecutableCostSlice(1, 1, 1),),
+) -> CandidateAction:
     return CandidateAction(
         action_id,
         contract_id,
@@ -59,7 +76,7 @@ def action(contract_id: str, action_id: str, key: SettlementObservationKey) -> C
         "usd-cents",
         "usd-cents",
         "usd-cents-v1",
-        (ExecutableCostSlice(1, 1, 1),),
+        cost_slices,
     )
 
 
@@ -68,13 +85,14 @@ def state(
     key: SettlementObservationKey,
     action_id: str,
     atoms: tuple[tuple[str, TerminalKind, int], ...],
+    capital_release_at: datetime = AS_OF,
 ) -> TerminalStateSet:
     return TerminalStateSet(
         contract_id,
         key,
         "v1",
         tuple(
-            TerminalAtom(atom_id, kind, "v1", (ActionPayout(action_id, payout),), AS_OF)
+            TerminalAtom(atom_id, kind, "v1", (ActionPayout(action_id, payout),), capital_release_at)
             for atom_id, kind, payout in atoms
         ),
     )
@@ -379,3 +397,270 @@ def test_enumeration_reports_a_contradictory_constraint_model() -> None:
     assert result.scenarios is None
     assert result.raw_joint_state_count == 1
     assert result.unknown_reason == UnknownReason.CONTRADICTORY_CONSTRAINT_MODEL
+
+
+def test_fixed_portfolio_accumulates_integer_costs_and_discards_zero_quantities() -> None:
+    key = observation()
+    priced = action(
+        "contract-a",
+        "action-a",
+        key,
+        (ExecutableCostSlice(1, 2, 3), ExecutableCostSlice(3, 4, 5)),
+    )
+    zero = action("contract-a", "action-zero", key)
+    built = problem((priced, zero), (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 7),)),))
+    built = replace(
+        built,
+        terminal_state_sets=(
+            replace(
+                built.terminal_state_sets[0],
+                atoms=(
+                    replace(
+                        built.terminal_state_sets[0].atoms[0],
+                        payouts=(ActionPayout("action-a", 7), ActionPayout("action-zero", 99)),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    quantities = (ActionQuantity("action-zero", 0), ActionQuantity("action-a", 3))
+    evaluation = evaluate_fixed_portfolio(built, quantities, OracleBudget(1, 1, 1))
+
+    assert cost_upper_bound(built, quantities) == 11
+    assert evaluation.quantities == (ActionQuantity("action-a", 3),)
+    assert evaluation.payout_lower_bound_units == 21
+    assert evaluation.cost_upper_bound_units == 11
+    assert evaluation.guaranteed_profit_units == 10
+
+
+def test_fixed_portfolio_uses_stable_worst_scenario_and_independent_latest_release() -> None:
+    key = observation()
+    built = problem(
+        (action("contract-a", "action-a", key),),
+        (
+            state(
+                "contract-a",
+                key,
+                "action-a",
+                (("z-payout", TerminalKind.NORMAL_YES, 10), ("a-payout", TerminalKind.NORMAL_NO, 10)),
+                AS_OF + timedelta(days=1),
+            ),
+        ),
+    )
+    built = replace(
+        built,
+        terminal_state_sets=(
+            replace(
+                built.terminal_state_sets[0],
+                atoms=(
+                    replace(built.terminal_state_sets[0].atoms[0], capital_release_at=AS_OF + timedelta(days=4)),
+                    built.terminal_state_sets[0].atoms[1],
+                ),
+            ),
+        ),
+    )
+
+    evaluation = evaluate_fixed_portfolio(built, (ActionQuantity("action-a", 1),), OracleBudget(1, 2, 1))
+    scenarios = enumerate_allowed_scenarios(built, OracleBudget(1, 2, 1)).scenarios
+
+    assert scenarios is not None
+    assert evaluation.worst_scenario == min(scenarios, key=fingerprint)
+    assert evaluation.conservative_capital_release_at == AS_OF + timedelta(days=4)
+
+
+def test_fixed_portfolio_qualifies_only_from_exact_integer_constraints() -> None:
+    key = observation()
+    built = problem(
+        (action("contract-a", "action-a", key, (ExecutableCostSlice(1, 1, 2),)),),
+        (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 3),), AS_OF + timedelta(days=365)),),
+    )
+    built = replace(
+        built,
+        qualification_constraints=(
+            QualificationConstraint("profit", "v1", QualificationMetric.GUARANTEED_PROFIT_UNITS, Comparison.GREATER_THAN_OR_EQUAL, 1, 1),
+            QualificationConstraint("margin", "v1", QualificationMetric.NET_MARGIN_PPM, Comparison.GREATER_THAN_OR_EQUAL, 500_000, 1),
+            QualificationConstraint("annual", "v1", QualificationMetric.ANNUALIZED_RETURN_PPM, Comparison.GREATER_THAN_OR_EQUAL, 500_000, 1),
+        ),
+    )
+
+    passed = evaluate_fixed_portfolio(built, (ActionQuantity("action-a", 1),), OracleBudget(1, 1, 1))
+    rounded_down = evaluate_fixed_portfolio(
+        replace(built, qualification_constraints=(replace(built.qualification_constraints[0], threshold_numerator=2),)),
+        (ActionQuantity("action-a", 1),),
+        OracleBudget(1, 1, 1),
+    )
+
+    assert passed.failed_qualification_ids == ()
+    assert rounded_down.guaranteed_profit_units == 1
+    assert rounded_down.failed_qualification_ids == ("profit",)
+
+
+def test_fixed_portfolio_rejects_a_nominal_spread_after_conservative_integer_rounding() -> None:
+    raw_payout, raw_cost = Fraction(106, 10), Fraction(104, 10)
+    key = observation()
+    built = problem(
+        (action("contract-a", "action-a", key, (ExecutableCostSlice(1, 1, 11),)),),
+        (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 10),)),),
+    )
+    built = replace(
+        built,
+        qualification_constraints=(
+            QualificationConstraint("non-negative", "v1", QualificationMetric.GUARANTEED_PROFIT_UNITS, Comparison.GREATER_THAN_OR_EQUAL, 0, 1),
+        ),
+    )
+
+    evaluation = evaluate_fixed_portfolio(built, (ActionQuantity("action-a", 1),), OracleBudget(1, 1, 1))
+
+    assert raw_payout - raw_cost > 0
+    assert evaluation.guaranteed_profit_units == -1
+    assert evaluation.failed_qualification_ids == ("non-negative",)
+
+
+def _two_independent_supported_portfolios() -> ArbitrageProblem:
+    keys = tuple(observation(suffix) for suffix in "abcd")
+    actions = tuple(action(f"contract-{suffix}", f"action-{suffix}", key) for suffix, key in zip("abcd", keys, strict=True))
+    states = tuple(
+        state(
+            f"contract-{suffix}",
+            key,
+            f"action-{suffix}",
+            ((f"{suffix}-yes", TerminalKind.NORMAL_YES, 0), (f"{suffix}-no", TerminalKind.NORMAL_NO, 10)),
+        )
+        for suffix, key in zip("ac", keys[::2], strict=True)
+    ) + tuple(
+        state(
+            f"contract-{suffix}",
+            key,
+            f"action-{suffix}",
+            ((f"{suffix}-yes", TerminalKind.NORMAL_YES, 10), (f"{suffix}-no", TerminalKind.NORMAL_NO, 0)),
+        )
+        for suffix, key in zip("bd", keys[1::2], strict=True)
+    )
+    return problem(
+        actions,
+        states,
+        (
+            RelationConstraint("support-a", RelationKind.IMPLIES, ("contract-a", "contract-b"), "v1"),
+            RelationConstraint("support-c", RelationKind.IMPLIES, ("contract-c", "contract-d"), "v1"),
+            RelationConstraint("redundant", RelationKind.IMPLIES, ("contract-a", "contract-c"), "v1"),
+        ),
+    )
+
+
+def test_support_derivation_retains_only_needed_edges_and_splits_stably() -> None:
+    built = _two_independent_supported_portfolios()
+    quantities = tuple(ActionQuantity(f"action-{suffix}", 1) for suffix in "abcd")
+    budget = OracleBudget(1, 16, 3)
+    evaluation = evaluate_fixed_portfolio(built, quantities, budget)
+
+    support = derive_selected_support_graph(built, evaluation, budget)
+    groups = split_disconnected_solution(built, evaluation, support)
+
+    assert support.constraint_ids == ("support-a", "support-c")
+    assert support.hyperedges == (("support-a", ("contract-a", "contract-b")), ("support-c", ("contract-c", "contract-d")))
+    assert groups == (
+        (ActionQuantity("action-a", 1), ActionQuantity("action-b", 1)),
+        (ActionQuantity("action-c", 1), ActionQuantity("action-d", 1)),
+    )
+    assert tuple(evaluate_fixed_portfolio(built, group, budget).payout_lower_bound_units for group in groups) == (10, 10)
+
+
+def test_support_derivation_returns_exact_unknown_reason_when_rechecks_exceed_budget() -> None:
+    built = _two_independent_supported_portfolios()
+    evaluation = evaluate_fixed_portfolio(built, tuple(ActionQuantity(f"action-{suffix}", 1) for suffix in "abcd"), OracleBudget(1, 16, 3))
+
+    assert derive_selected_support_graph(built, evaluation, OracleBudget(1, 16, 2)) == UnknownReason.ORACLE_SUPPORT_LIMIT_EXCEEDED
+
+
+def test_forbidden_combination_can_be_the_only_selected_proof_support() -> None:
+    key_a, key_b = observation("a"), observation("b")
+    built = problem(
+        (action("contract-a", "action-a", key_a), action("contract-b", "action-b", key_b)),
+        (
+            state("contract-a", key_a, "action-a", (("a-yes", TerminalKind.NORMAL_YES, 0), ("a-no", TerminalKind.NORMAL_NO, 10))),
+            state("contract-b", key_b, "action-b", (("b-yes", TerminalKind.NORMAL_YES, 10), ("b-no", TerminalKind.NORMAL_NO, 0))),
+        ),
+        forbidden=(ForbiddenAtomCombination("forbid-loss", ("a-yes", "b-no"), "v1"),),
+    )
+    evaluation = evaluate_fixed_portfolio(built, (ActionQuantity("action-a", 1), ActionQuantity("action-b", 1)), OracleBudget(1, 4, 1))
+
+    support = derive_selected_support_graph(built, evaluation, OracleBudget(1, 4, 1))
+
+    assert support.constraint_ids == ("forbid-loss",)
+    assert support.hyperedges == (("forbid-loss", ("contract-a", "contract-b")),)
+
+
+def test_split_keeps_actions_on_one_contract_together_without_identity_support_edges() -> None:
+    key = observation()
+    built = problem(
+        (action("contract-a", "action-a", key), action("contract-a", "action-b", key)),
+        (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 1),)),),
+    )
+    built = replace(
+        built,
+        terminal_state_sets=(
+            replace(
+                built.terminal_state_sets[0],
+                atoms=(replace(built.terminal_state_sets[0].atoms[0], payouts=(ActionPayout("action-a", 1), ActionPayout("action-b", 1))),),
+            ),
+        ),
+    )
+    evaluation = evaluate_fixed_portfolio(built, (ActionQuantity("action-a", 1), ActionQuantity("action-b", 1)), OracleBudget(1, 1, 1))
+    support = derive_selected_support_graph(built, evaluation, OracleBudget(1, 1, 1))
+
+    assert support.constraint_ids == ()
+    assert split_disconnected_solution(built, evaluation, support) == ((ActionQuantity("action-a", 1), ActionQuantity("action-b", 1)),)
+    assert build_portfolio_solution(built, evaluation, support).payout_proof.portfolio_fingerprint == fingerprint({"quantities": evaluation.quantities})
+
+
+def test_transitive_support_contracts_keep_selected_actions_in_one_component() -> None:
+    key_a, key_b, key_c = observation("a"), observation("b"), observation("c")
+    built = problem(
+        (
+            action("contract-a", "action-a", key_a),
+            action("contract-b", "action-b", key_b),
+            action("contract-c", "action-c", key_c),
+        ),
+        (
+            state("contract-a", key_a, "action-a", (("a-yes", TerminalKind.NORMAL_YES, 0), ("a-no", TerminalKind.NORMAL_NO, 10))),
+            state("contract-b", key_b, "action-b", (("b-yes", TerminalKind.NORMAL_YES, 0), ("b-no", TerminalKind.NORMAL_NO, 0))),
+            state("contract-c", key_c, "action-c", (("c-yes", TerminalKind.NORMAL_YES, 0), ("c-no", TerminalKind.NORMAL_NO, 0))),
+        ),
+        (
+            RelationConstraint("a-implies-b", RelationKind.IMPLIES, ("contract-a", "contract-b"), "v1"),
+            RelationConstraint("b-implies-c", RelationKind.IMPLIES, ("contract-b", "contract-c"), "v1"),
+            RelationConstraint("b-exclusive-c", RelationKind.MUTUALLY_EXCLUSIVE, ("contract-b", "contract-c"), "v1"),
+        ),
+    )
+    evaluation = evaluate_fixed_portfolio(built, (ActionQuantity("action-a", 1), ActionQuantity("action-c", 1)), OracleBudget(1, 8, 3))
+
+    support = derive_selected_support_graph(built, evaluation, OracleBudget(1, 8, 3))
+
+    assert support.constraint_ids == ("a-implies-b", "b-exclusive-c", "b-implies-c")
+    assert split_disconnected_solution(built, evaluation, support) == ((ActionQuantity("action-a", 1), ActionQuantity("action-c", 1)),)
+
+
+def test_solution_builder_does_not_reenumerate_a_huge_bounded_evaluation() -> None:
+    indexes = tuple(range(30))
+    keys = tuple(observation(str(index)) for index in indexes)
+    built = problem(
+        tuple(action(f"contract-{index}", f"action-{index}", key) for index, key in zip(indexes, keys, strict=True)),
+        tuple(
+            state(
+                f"contract-{index}",
+                key,
+                f"action-{index}",
+                ((f"atom-{index}-yes", TerminalKind.NORMAL_YES, 10 if index == 0 else 0), (f"atom-{index}-no", TerminalKind.NORMAL_NO, 10 if index == 0 else 0)),
+            )
+            for index, key in zip(indexes, keys, strict=True)
+        ),
+    )
+    scenario = SettlementScenario(tuple(SelectedAtom(f"contract-{index}", f"atom-{index}-yes") for index in indexes))
+    quantities = (ActionQuantity("action-0", 1),)
+    evaluation = PortfolioEvaluation(quantities, 10, 1, 9, scenario, cut_from_scenario(built, scenario), AS_OF, ())
+    support = SelectedSupportGraph(("action-0",), ("contract-0",), (), ())
+
+    solution = build_portfolio_solution(built, evaluation, support)
+
+    assert solution.quantities == quantities
