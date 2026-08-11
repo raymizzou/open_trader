@@ -137,6 +137,9 @@ if command == "lsof":
             print(f"p{state['pid']}\nfcwd\nn{state['cwd']}")
             raise SystemExit(0)
         raise SystemExit(1)
+    if state["case"] == "listener_inspection_error" and not state["loaded"]:
+        print("lsof: inspection failed", file=sys.stderr)
+        raise SystemExit(1)
     if state["listener"]:
         print(f"p{state['pid']}\nn127.0.0.1:8769")
         raise SystemExit(0)
@@ -158,6 +161,9 @@ if command == "curl":
     raise SystemExit(22)
 
 if command == "ps":
+    if state["case"] == "ps_inspection_error":
+        print("ps: inspection failed", file=sys.stderr)
+        raise SystemExit(2)
     raise SystemExit(0 if state["pid"] and str(state["pid"]) in sys.argv else 1)
 
 if command == "owner-probe":
@@ -757,6 +763,66 @@ def test_uninstall_requires_every_absence_proof(
     record = release_harness.runtime_record
     assert record is not None
     assert record["state"] != "stopped"
+
+
+@pytest.mark.parametrize(
+    "case", ["listener_inspection_error", "ps_inspection_error"]
+)
+def test_uninstall_refuses_absence_inspection_error(
+    release_harness: ReleaseHarness, case: str
+) -> None:
+    release_harness.install(mode="production", check=True)
+    state = release_harness.state
+    state["case"] = case
+    release_harness.state_path.write_text(json.dumps(state), encoding="utf-8")
+    result = release_harness.uninstall(mode="production")
+    assert result.returncode == 1
+    assert release_harness.plist.exists()
+    record = release_harness.runtime_record
+    assert record is not None
+    assert record["state"] == "ready"
+
+
+def test_uninstall_rejects_maintenance_record_without_side_effects(
+    release_harness: ReleaseHarness,
+) -> None:
+    release_harness.install(mode="production", check=True)
+    record_path = release_harness.runtime_root / "prediction-service-runtime.json"
+    record = release_harness.runtime_record
+    assert record is not None
+    record["state"] = "maintenance"
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+    record_before = record_path.read_bytes()
+    release_harness.configure("absent")
+    release_harness.calls.clear()
+
+    result = release_harness.uninstall(mode="production")
+
+    assert result.returncode == 1
+    assert all(" bootout " not in f" {call} " for call in release_harness.calls.all())
+    assert release_harness.plist.exists()
+    assert record_path.read_bytes() == record_before
+
+
+@pytest.mark.parametrize("field", ["reader_generation", "contract_generation"])
+def test_uninstall_rejects_boolean_ready_generation_without_bootout(
+    release_harness: ReleaseHarness, field: str
+) -> None:
+    release_harness.install(mode="production", check=True)
+    record_path = release_harness.runtime_root / "prediction-service-runtime.json"
+    record = release_harness.runtime_record
+    assert record is not None
+    record["ready"][field] = True
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+    record_before = record_path.read_bytes()
+    release_harness.calls.clear()
+
+    result = release_harness.uninstall(mode="production")
+
+    assert result.returncode == 1
+    assert all(" bootout " not in f" {call} " for call in release_harness.calls.all())
+    assert release_harness.plist.exists()
+    assert record_path.read_bytes() == record_before
 
 
 def test_checkout_release_direct_workflow(release_harness: ReleaseHarness) -> None:

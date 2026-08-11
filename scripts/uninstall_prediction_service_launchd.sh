@@ -54,7 +54,7 @@ listener_absent() {
     printf '%s\n' "$output" >&2
     return 1
   else status=$?; fi
-  [[ "$status" -eq 1 ]] && return 0
+  [[ "$status" -eq 1 && -z "$output" ]] && return 0
   printf '%s\n' "$output" >&2
   return "$status"
 }
@@ -88,6 +88,8 @@ import json, sys
 from pathlib import Path
 from open_trader.prediction_release import load_prediction_runtime_record
 record = load_prediction_runtime_record(Path(sys.argv[1]))
+if record is not None and record["state"] not in {"ready", "failed", "stopped"}:
+    raise ValueError(f"prediction runtime state cannot be uninstalled: {record['state']}")
 print("null" if record is None else json.dumps(record, separators=(",", ":")))
 PY
 )"
@@ -106,6 +108,19 @@ lock = _RuntimeOwnershipLock(Path(sys.argv[1]) / "prediction_arbitrage" / "runti
 lock.acquire()
 lock.release()
 PY
+}
+
+pid_absent() {
+  local output status
+  if output="$("$PS_BIN" -p "$1" 2>&1)"; then
+    echo "prediction service PID is still present: $1" >&2
+    return 1
+  else
+    status=$?
+  fi
+  [[ "$status" -eq 1 ]] && return 0
+  printf '%s\n' "$output" >&2
+  return "$status"
 }
 
 managed_identity_matches() {
@@ -151,7 +166,9 @@ try:
         and ready.get("mutations") == health.get("mutations")
         and ready.get("git_sha") == health.get("git_sha")
         and ready.get("release_schema_version") == health.get("release_schema_version")
+        and type(ready.get("reader_generation")) is int
         and ready.get("reader_generation") == health.get("reader_generation")
+        and type(ready.get("contract_generation")) is int
         and ready.get("contract_generation") == health.get("contract_generation")
         and ready.get("process_started_at") == health.get("started_at")
     )
@@ -193,9 +210,8 @@ fi
 
 wait_agent_absent
 wait_listener_absent
-if [[ -n "$OLD_PID" ]] && "$PS_BIN" -p "$OLD_PID" >/dev/null 2>&1; then
-  fail "prediction service PID is still present: $OLD_PID"
-fi
+[[ -z "$OLD_PID" ]] || pid_absent "$OLD_PID" \
+  || fail "failed to prove prediction service PID absence: $OLD_PID"
 owner_available || fail "prediction runtime owner is still held"
 if [[ -e "$PLIST_PATH" || -L "$PLIST_PATH" ]]; then rm "$PLIST_PATH"; fi
 
