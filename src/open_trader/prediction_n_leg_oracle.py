@@ -3,22 +3,33 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime
 from itertools import product
+from math import prod
 
 from open_trader.prediction_n_leg import (
     ActionPayout,
     ActionQuantity,
     ArbitrageProblem,
+    BusinessStatus,
+    CandidateAction,
     Comparison,
     ConstraintModel,
+    ExhaustiveSearchProof,
+    ObjectiveBounds,
+    OptimalityStatus,
     OracleBudget,
+    OracleRequest,
+    OracleResult,
     PortfolioSolution,
     PayoutProof,
+    ProofStatus,
     QualificationConstraint,
     QualificationMetric,
     RelationKind,
+    SearchMode,
     SelectedSupportGraph,
     SelectedAtom,
     SettlementScenario,
+    SolveStatus,
     TerminalAtom,
     TerminalKind,
     UnknownReason,
@@ -55,6 +66,14 @@ class PortfolioEvaluation:
     failed_qualification_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class SearchAudit:
+    quantity_vectors_total: int
+    quantity_vectors_examined: int
+    joint_states_per_vector: int
+    rejection_counts: tuple[tuple[str, int], ...]
+
+
 def _require_valid(problem: ArbitrageProblem) -> None:
     issues = validate_problem(problem)
     if issues:
@@ -86,6 +105,13 @@ def build_relation_components(problem: ArbitrageProblem) -> tuple[RelationCompon
     for contracts in identity_contracts.values():
         if len(contracts) > 1:
             join(tuple(sorted(contracts)))
+    atoms_to_contract = {
+        atom.atom_id: state.market_contract_id
+        for state in problem.terminal_state_sets
+        for atom in state.atoms
+    }
+    for forbidden in problem.constraint_model.forbidden_atom_combinations:
+        join(tuple(sorted({atoms_to_contract[atom_id] for atom_id in forbidden.atom_ids})))
     for relation in problem.constraint_model.relations:
         join(relation.contract_ids)
 
@@ -101,9 +127,16 @@ def build_relation_components(problem: ArbitrageProblem) -> tuple[RelationCompon
         component_actions = tuple(sorted(action_id for contract_id in component_contracts for action_id in actions_by_contract[contract_id]))
         component_constraints = tuple(
             sorted(
-                relation.constraint_id
-                for relation in problem.constraint_model.relations
-                if set(relation.contract_ids).issubset(component_contracts)
+                [
+                    relation.constraint_id
+                    for relation in problem.constraint_model.relations
+                    if set(relation.contract_ids).issubset(component_contracts)
+                ]
+                + [
+                    forbidden.constraint_id
+                    for forbidden in problem.constraint_model.forbidden_atom_combinations
+                    if set(atoms_to_contract[atom_id] for atom_id in forbidden.atom_ids).issubset(component_contracts)
+                ]
             )
         )
         components.append(
@@ -379,7 +412,11 @@ def derive_selected_support_graph(
             evaluation.quantities,
             budget,
         )
-        if trial_evaluation.payout_lower_bound_units == current_bound:
+        if (
+            trial_evaluation.payout_lower_bound_units == current_bound
+            and trial_evaluation.conservative_capital_release_at == evaluation.conservative_capital_release_at
+            and trial_evaluation.failed_qualification_ids == evaluation.failed_qualification_ids
+        ):
             active_constraint_ids = trial
     constraint_ids = tuple(sorted(active_constraint_ids))
     contract_ids = tuple(
@@ -465,14 +502,25 @@ def split_disconnected_solution(
             contract_id = parent[contract_id]
         return contract_id
 
+    def join(contract_ids: tuple[str, ...]) -> None:
+        if not contract_ids:
+            return
+        head = find(contract_ids[0])
+        for contract_id in contract_ids[1:]:
+            tail = find(contract_id)
+            if head != tail:
+                parent[tail] = head
+
+    identity_contracts: dict[str, list[str]] = {}
+    for state in problem.terminal_state_sets:
+        if state.market_contract_id in parent:
+            identity_contracts.setdefault(fingerprint(state.settlement_observation_key), []).append(state.market_contract_id)
+    for contract_ids in identity_contracts.values():
+        join(tuple(sorted(contract_ids)))
+
     for _, contract_ids in support_graph.hyperedges:
         connected = tuple(contract_id for contract_id in contract_ids if contract_id in parent)
-        if connected:
-            head = find(connected[0])
-            for contract_id in connected[1:]:
-                tail = find(contract_id)
-                if head != tail:
-                    parent[tail] = head
+        join(connected)
     groups: dict[str, list[ActionQuantity]] = {}
     for quantity in evaluation.quantities:
         groups.setdefault(find(actions_by_id[quantity.action_id].market_contract_id), []).append(quantity)
@@ -483,3 +531,161 @@ def split_disconnected_solution(
         component_contract_ids = tuple(sorted(contract_id for contract_id in parent if find(contract_id) == component_root))
         identified_groups.append((f"component:{':'.join(component_contract_ids)}", sorted_quantities))
     return tuple(quantities for _, quantities in sorted(identified_groups))
+
+
+def quantity_vector_count(problem: ArbitrageProblem) -> int:
+    _require_valid(problem)
+    return prod(len(quantity_range) for quantity_range in _quantity_ranges(problem.actions))
+
+
+def _quantity_ranges(actions: tuple[CandidateAction, ...]) -> tuple[range, ...]:
+    return tuple(range(action.cost_slices[-1].last_lot + 1) for action in actions)
+
+
+def build_exhaustive_search_proof(
+    request: OracleRequest,
+    audit: SearchAudit,
+    conclusion: BusinessStatus,
+    source_problem_fingerprint: str | None = None,
+) -> ExhaustiveSearchProof:
+    if conclusion != BusinessStatus.NO_QUALIFIED_OPPORTUNITY:
+        raise ValueError("exhaustive admission proof only supports NO_QUALIFIED_OPPORTUNITY")
+    return ExhaustiveSearchProof(
+        "EXHAUSTIVE_ORACLE_V1",
+        conclusion,
+        fingerprint(request),
+        fingerprint(request.problem),
+        source_problem_fingerprint,
+        fingerprint({"qualification_constraints": request.problem.qualification_constraints}),
+        audit.quantity_vectors_total,
+        audit.quantity_vectors_examined,
+        audit.joint_states_per_vector,
+        audit.rejection_counts,
+    )
+
+
+def _unknown_result(reason: UnknownReason) -> OracleResult:
+    return OracleResult(
+        SolveStatus.UNKNOWN,
+        ProofStatus.UNKNOWN,
+        BusinessStatus.UNKNOWN,
+        OptimalityStatus.NOT_APPLICABLE,
+        ObjectiveBounds(None, None, None, False),
+        None,
+        None,
+        reason,
+    )
+
+
+def _record_rejections(rejection_ids: set[str], evaluation: PortfolioEvaluation) -> None:
+    for constraint_id in evaluation.failed_qualification_ids:
+        rejection_ids.add(constraint_id)
+
+
+def _merge_rejections(rejection_counts: dict[str, int], rejection_ids: set[str]) -> None:
+    for rejection_id in rejection_ids:
+        rejection_counts[rejection_id] = rejection_counts.get(rejection_id, 0) + 1
+
+
+def _connected_qualified_solution(
+    problem: ArbitrageProblem,
+    evaluation: PortfolioEvaluation,
+    budget: OracleBudget,
+    rejection_ids: set[str],
+) -> PortfolioSolution | UnknownReason | None:
+    support_graph = derive_selected_support_graph(problem, evaluation, budget)
+    if isinstance(support_graph, UnknownReason):
+        return support_graph
+    groups = split_disconnected_solution(problem, evaluation, support_graph)
+    if len(groups) == 1:
+        return build_portfolio_solution(problem, evaluation, support_graph)
+
+    children = tuple(evaluate_fixed_portfolio(problem, quantities, budget) for quantities in groups)
+    qualified_children = []
+    for child in children:
+        if child.failed_qualification_ids:
+            _record_rejections(rejection_ids, child)
+        else:
+            qualified_children.append(child)
+    for child in qualified_children:
+        solution = _connected_qualified_solution(problem, child, budget, rejection_ids)
+        if solution is not None:
+            return solution
+    return None
+
+
+def find_qualified(request: OracleRequest) -> OracleResult:
+    if (
+        not isinstance(request, OracleRequest)
+        or request.mode != SearchMode.ADMISSION
+        or not isinstance(request.budget, OracleBudget)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (
+                request.budget.max_quantity_vectors,
+                request.budget.max_joint_states,
+                request.budget.max_support_rechecks,
+            )
+        )
+        or validate_problem(request.problem)
+    ):
+        return _unknown_result(UnknownReason.INVALID_MODEL)
+
+    total_vectors = quantity_vector_count(request.problem)
+    joint_states_per_vector = 1
+    for state_set in request.problem.terminal_state_sets:
+        joint_states_per_vector *= len(state_set.atoms)
+    if total_vectors > request.budget.max_quantity_vectors:
+        return _unknown_result(UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED)
+    if joint_states_per_vector > request.budget.max_joint_states:
+        return _unknown_result(UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED)
+    if enumerate_allowed_scenarios(request.problem, request.budget).unknown_reason is not None:
+        return _unknown_result(UnknownReason.CONTRADICTORY_CONSTRAINT_MODEL)
+
+    actions = tuple(sorted(request.problem.actions, key=lambda action: action.action_id))
+    rejection_counts: dict[str, int] = {}
+    examined = 0
+    for lots in product(*_quantity_ranges(actions)):
+        examined += 1
+        vector_rejection_ids: set[str] = set()
+        if not any(lots):
+            vector_rejection_ids.add("ALL_ZERO")
+            _merge_rejections(rejection_counts, vector_rejection_ids)
+            continue
+        evaluation = evaluate_fixed_portfolio(
+            request.problem,
+            tuple(ActionQuantity(action.action_id, quantity) for action, quantity in zip(actions, lots, strict=True) if quantity),
+            request.budget,
+        )
+        if evaluation.failed_qualification_ids:
+            _record_rejections(vector_rejection_ids, evaluation)
+            _merge_rejections(rejection_counts, vector_rejection_ids)
+            continue
+        solution = _connected_qualified_solution(request.problem, evaluation, request.budget, vector_rejection_ids)
+        if isinstance(solution, UnknownReason):
+            return _unknown_result(solution)
+        if solution is not None:
+            profit = solution.payout_proof.guaranteed_profit_units
+            return OracleResult(
+                SolveStatus.FEASIBLE,
+                ProofStatus.PROVEN,
+                BusinessStatus.QUALIFIED_FEASIBLE,
+                OptimalityStatus.NOT_PROVEN,
+                ObjectiveBounds(profit, None, None, False),
+                solution,
+                None,
+                None,
+            )
+        _merge_rejections(rejection_counts, vector_rejection_ids)
+    audit = SearchAudit(total_vectors, examined, joint_states_per_vector, tuple(sorted(rejection_counts.items())))
+    proof = build_exhaustive_search_proof(request, audit, BusinessStatus.NO_QUALIFIED_OPPORTUNITY)
+    return OracleResult(
+        SolveStatus.INFEASIBLE,
+        ProofStatus.PROVEN,
+        BusinessStatus.NO_QUALIFIED_OPPORTUNITY,
+        OptimalityStatus.NOT_APPLICABLE,
+        ObjectiveBounds(None, None, None, False),
+        None,
+        proof,
+        None,
+    )

@@ -11,26 +11,33 @@ from open_trader.prediction_n_leg import (
     ActionQuantity,
     ActionSide,
     ArbitrageProblem,
+    BusinessStatus,
     CandidateAction,
     ConstraintModel,
     ExecutableCostSlice,
     ForbiddenAtomCombination,
     OracleBudget,
+    OracleRequest,
+    OptimalityStatus,
+    ProofStatus,
     QualificationConstraint,
     QualificationMetric,
     Comparison,
     RelationConstraint,
     RelationKind,
+    SearchMode,
     SelectedAtom,
     SelectedSupportGraph,
     SettlementObservationKey,
     SettlementScenario,
+    SolveStatus,
     TerminalAtom,
     TerminalKind,
     TerminalStateSet,
     UnknownReason,
     fingerprint,
 )
+import open_trader.prediction_n_leg_oracle as oracle
 from open_trader.prediction_n_leg_oracle import (
     PortfolioEvaluation,
     RelationComponent,
@@ -198,6 +205,21 @@ def test_components_join_explicit_versioned_relations_transitively_only() -> Non
         ),
     )
 
+
+def test_components_join_cross_contract_forbidden_atom_constraints() -> None:
+    key_a, key_b = observation("a"), observation("b")
+    built = problem(
+        (action("contract-a", "action-a", key_a), action("contract-b", "action-b", key_b)),
+        (
+            state("contract-a", key_a, "action-a", (("a-yes", TerminalKind.NORMAL_YES, 1), ("a-no", TerminalKind.NORMAL_NO, 0))),
+            state("contract-b", key_b, "action-b", (("b-yes", TerminalKind.NORMAL_YES, 1), ("b-no", TerminalKind.NORMAL_NO, 0))),
+        ),
+        forbidden=(ForbiddenAtomCombination("forbid", ("a-yes", "b-no"), "v1"),),
+    )
+
+    assert build_relation_components(built) == (
+        RelationComponent("component:contract-a:contract-b", ("action-a", "action-b"), ("contract-a", "contract-b"), ("forbid",)),
+    )
 
 def test_enumeration_selects_one_atom_per_contract_and_implies_only_normal_yes_no() -> None:
     key_a, key_b = observation("a"), observation("b")
@@ -583,6 +605,70 @@ def test_support_derivation_returns_exact_unknown_reason_when_rechecks_exceed_bu
     assert derive_selected_support_graph(built, evaluation, OracleBudget(1, 16, 2)) == UnknownReason.ORACLE_SUPPORT_LIMIT_EXCEEDED
 
 
+def test_support_minimization_retains_constraint_when_release_qualification_changes() -> None:
+    key_a, key_b = observation("a"), observation("b")
+    active_release = AS_OF + timedelta(hours=1)
+    late_release = AS_OF + timedelta(days=10)
+    built = problem(
+        (action("contract-a", "action-a", key_a), action("contract-b", "action-b", key_b)),
+        (
+            state(
+                "contract-a",
+                key_a,
+                "action-a",
+                (("a-no", TerminalKind.NORMAL_NO, 10), ("a-yes", TerminalKind.NORMAL_YES, 10)),
+                active_release,
+            ),
+            state(
+                "contract-b",
+                key_b,
+                "action-b",
+                (("b-no", TerminalKind.NORMAL_NO, 10), ("b-yes", TerminalKind.NORMAL_YES, 10)),
+                active_release,
+            ),
+        ),
+        (RelationConstraint("support", RelationKind.IMPLIES, ("contract-a", "contract-b"), "v1"),),
+        forbidden=(ForbiddenAtomCombination("block-no-no", ("a-no", "b-no"), "v1"),),
+    )
+    built = replace(
+        built,
+        terminal_state_sets=(
+            built.terminal_state_sets[0],
+            replace(
+                built.terminal_state_sets[1],
+                atoms=(
+                    replace(built.terminal_state_sets[1].atoms[0], capital_release_at=late_release),
+                    built.terminal_state_sets[1].atoms[1],
+                ),
+            ),
+        ),
+        qualification_constraints=(
+            QualificationConstraint(
+                "release",
+                "v1",
+                QualificationMetric.MAX_CAPITAL_RELEASE_DELAY_SECONDS,
+                Comparison.LESS_THAN_OR_EQUAL,
+                2 * 60 * 60,
+                1,
+            ),
+        ),
+    )
+    budget = OracleBudget(1, 4, 2)
+    evaluation = evaluate_fixed_portfolio(
+        built,
+        (ActionQuantity("action-a", 1), ActionQuantity("action-b", 1)),
+        budget,
+    )
+
+    assert evaluation.payout_lower_bound_units == 20
+    assert evaluation.conservative_capital_release_at == active_release
+    assert evaluation.failed_qualification_ids == ()
+    support = derive_selected_support_graph(built, evaluation, budget)
+
+    assert isinstance(support, SelectedSupportGraph)
+    assert support.constraint_ids == ("block-no-no", "support")
+
+
 def test_forbidden_combination_can_be_the_only_selected_proof_support() -> None:
     key_a, key_b = observation("a"), observation("b")
     built = problem(
@@ -674,3 +760,202 @@ def test_solution_builder_does_not_reenumerate_a_huge_bounded_evaluation() -> No
     solution = build_portfolio_solution(built, evaluation, support)
 
     assert solution.quantities == quantities
+
+
+def _admission_request(built: ArbitrageProblem, budget: OracleBudget) -> OracleRequest:
+    return OracleRequest("open_trader.prediction_n_leg.request.v1", SearchMode.ADMISSION, built, budget)
+
+
+def _minimum_profit(units: int) -> QualificationConstraint:
+    return QualificationConstraint(
+        "minimum-profit",
+        "v1",
+        QualificationMetric.GUARANTEED_PROFIT_UNITS,
+        Comparison.GREATER_THAN_OR_EQUAL,
+        units,
+        1,
+    )
+
+
+def test_admission_chooses_the_first_stable_integer_vector_without_claiming_global_optimum() -> None:
+    key_a, key_z = observation("a"), observation("z")
+    built = replace(
+        problem(
+            (action("contract-z", "action-z", key_z), action("contract-a", "action-a", key_a)),
+            (
+                state("contract-z", key_z, "action-z", (("z", TerminalKind.NORMAL_YES, 3),)),
+                state("contract-a", key_a, "action-a", (("a", TerminalKind.NORMAL_YES, 21),)),
+            ),
+        ),
+        qualification_constraints=(_minimum_profit(1),),
+    )
+
+    result = oracle.find_qualified(_admission_request(built, OracleBudget(4, 1, 1)))
+
+    assert oracle.quantity_vector_count(built) == 4
+    assert result.solve_status == SolveStatus.FEASIBLE
+    assert result.proof_status == ProofStatus.PROVEN
+    assert result.business_status == BusinessStatus.QUALIFIED_FEASIBLE
+    assert result.optimality_status == OptimalityStatus.NOT_PROVEN
+    assert result.objective_bounds.lower_bound_units == 2
+    assert result.objective_bounds.upper_bound_units is None
+    assert result.objective_bounds.gap_units is None
+    assert result.objective_bounds.closed is False
+    assert result.solution is not None
+    assert result.solution.quantities == (ActionQuantity("action-z", 1),)
+
+
+def test_admission_rechecks_disconnected_parts_and_continues_to_a_later_vector() -> None:
+    key_a, key_b = observation("a"), observation("b")
+    built = replace(
+        problem(
+            (
+                action("contract-a", "action-a", key_a, (ExecutableCostSlice(1, 2, 1),)),
+                action("contract-b", "action-b", key_b),
+            ),
+            (
+                state("contract-a", key_a, "action-a", (("a", TerminalKind.NORMAL_YES, 3),)),
+                state("contract-b", key_b, "action-b", (("b", TerminalKind.NORMAL_YES, 3),)),
+            ),
+        ),
+        qualification_constraints=(_minimum_profit(3),),
+    )
+
+    result = oracle.find_qualified(_admission_request(built, OracleBudget(6, 1, 1)))
+
+    assert result.solution is not None
+    assert result.solution.quantities == (ActionQuantity("action-a", 2),)
+    assert result.solution.payout_proof.guaranteed_profit_units == 4
+
+
+def test_admission_keeps_equal_observation_identity_actions_in_one_component() -> None:
+    key = observation("shared")
+    built = replace(
+        problem(
+            (action("contract-a", "action-a", key), action("contract-b", "action-b", key)),
+            (
+                state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 3),)),
+                state("contract-b", key, "action-b", (("b", TerminalKind.NORMAL_YES, 3),)),
+            ),
+        ),
+        qualification_constraints=(_minimum_profit(3),),
+    )
+
+    result = oracle.find_qualified(_admission_request(built, OracleBudget(4, 1, 1)))
+
+    assert result.business_status == BusinessStatus.QUALIFIED_FEASIBLE
+    assert result.solution is not None
+    assert result.solution.quantities == (ActionQuantity("action-a", 1), ActionQuantity("action-b", 1))
+    assert result.solution.payout_proof.selected_support_graph.hyperedges == ()
+
+
+def test_disconnected_qualified_portfolio_returns_its_first_qualified_part() -> None:
+    key_a, key_b = observation("a"), observation("b")
+    built = replace(
+        problem(
+            (action("contract-a", "action-a", key_a), action("contract-b", "action-b", key_b)),
+            (
+                state("contract-a", key_a, "action-a", (("a", TerminalKind.NORMAL_YES, 3),)),
+                state("contract-b", key_b, "action-b", (("b", TerminalKind.NORMAL_YES, 3),)),
+            ),
+        ),
+        qualification_constraints=(_minimum_profit(1),),
+    )
+    budget = OracleBudget(4, 1, 1)
+    evaluation = evaluate_fixed_portfolio(built, (ActionQuantity("action-a", 1), ActionQuantity("action-b", 1)), budget)
+
+    solution = oracle._connected_qualified_solution(built, evaluation, budget, set())
+
+    assert solution is not None
+    assert not isinstance(solution, UnknownReason)
+    assert solution.quantities == (ActionQuantity("action-a", 1),)
+
+
+def test_admission_emits_replayable_exhaustive_negative_proof_only_after_full_exhaustion() -> None:
+    key = observation()
+    built = replace(
+        problem(
+            (action("contract-a", "action-a", key),),
+            (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 1),)),),
+        ),
+        qualification_constraints=(_minimum_profit(1),),
+    )
+    request = _admission_request(built, OracleBudget(2, 1, 1))
+
+    result = oracle.find_qualified(request)
+    replay = oracle.find_qualified(request)
+
+    assert result.solve_status == SolveStatus.INFEASIBLE
+    assert result.proof_status == ProofStatus.PROVEN
+    assert result.business_status == BusinessStatus.NO_QUALIFIED_OPPORTUNITY
+    assert result.negative_proof is not None
+    assert result.negative_proof.proof_method == "EXHAUSTIVE_ORACLE_V1"
+    assert result.negative_proof.request_fingerprint == fingerprint(request)
+    assert result.negative_proof.problem_fingerprint == fingerprint(built)
+    assert result.negative_proof.qualification_fingerprint == fingerprint({"qualification_constraints": built.qualification_constraints})
+    assert result.negative_proof.quantity_vectors_total == 2
+    assert result.negative_proof.quantity_vectors_examined == 2
+    assert result.negative_proof.joint_states_per_vector == 1
+    assert result.negative_proof.rejection_counts == (("ALL_ZERO", 1), ("minimum-profit", 1))
+    assert replay.negative_proof == result.negative_proof
+    assert fingerprint(replay.negative_proof) == fingerprint(result.negative_proof)
+
+    limited = oracle.find_qualified(_admission_request(built, OracleBudget(1, 1, 1)))
+
+    assert limited.business_status == BusinessStatus.UNKNOWN
+    assert limited.unknown_reason == UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED
+    assert limited.negative_proof is None
+
+    state_limited = oracle.find_qualified(
+        _admission_request(
+            replace(
+                built,
+                terminal_state_sets=(
+                    replace(
+                        built.terminal_state_sets[0],
+                        atoms=(
+                            built.terminal_state_sets[0].atoms[0],
+                            replace(built.terminal_state_sets[0].atoms[0], atom_id="a-other"),
+                        ),
+                    ),
+                ),
+            ),
+            OracleBudget(2, 1, 1),
+        )
+    )
+
+    assert state_limited.business_status == BusinessStatus.UNKNOWN
+    assert state_limited.unknown_reason == UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED
+    assert state_limited.negative_proof is None
+
+
+def test_negative_proof_rejection_counts_deduplicate_disconnected_children_per_vector() -> None:
+    key_a, key_b = observation("a"), observation("b")
+    built = replace(
+        problem(
+            (action("contract-a", "action-a", key_a), action("contract-b", "action-b", key_b)),
+            (
+                state("contract-a", key_a, "action-a", (("a", TerminalKind.NORMAL_YES, 3),)),
+                state("contract-b", key_b, "action-b", (("b", TerminalKind.NORMAL_YES, 3),)),
+            ),
+        ),
+        qualification_constraints=(_minimum_profit(3),),
+    )
+
+    result = oracle.find_qualified(_admission_request(built, OracleBudget(4, 1, 1)))
+
+    assert result.business_status == BusinessStatus.NO_QUALIFIED_OPPORTUNITY
+    assert result.negative_proof is not None
+    assert result.negative_proof.quantity_vectors_total == 4
+    assert result.negative_proof.quantity_vectors_examined == 4
+    assert result.negative_proof.rejection_counts == (("ALL_ZERO", 1), ("minimum-profit", 3))
+
+
+def test_admission_rejects_non_admission_modes_as_invalid_model() -> None:
+    key = observation()
+    built = problem((action("contract-a", "action-a", key),), (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 2),)),))
+
+    result = oracle.find_qualified(OracleRequest("open_trader.prediction_n_leg.request.v1", SearchMode.OPTIMIZATION, built, OracleBudget(2, 1, 1)))
+
+    assert result.business_status == BusinessStatus.UNKNOWN
+    assert result.unknown_reason == UnknownReason.INVALID_MODEL
