@@ -265,6 +265,26 @@ def _build_cross_venue_monitor(
         return _UnavailableCrossVenueMonitor("predict_not_configured")
     if predict_trading is None:
         return _UnavailableCrossVenueMonitor("predict_construction_failed")
+    if holding_reconciler is _DEFAULT_HOLDING_RECONCILER:
+        holding_reconciler = getattr(execution, "reconcile_cross_holdings_once", None)
+    try:
+        return PredictCrossVenueMonitor(
+            predict_source=PredictSource(predict_config),
+            polymarket_monitor=prediction_monitor,
+            validator=CodexCrossVenueEquivalenceValidator(
+                store,
+                model=codex_model,
+                fallback_enabled=fallback_enabled,
+                max_codex_calls=max_codex_calls,
+            ),
+            gamma_lookup=_cross_venue_gamma_lookup,
+            predict_quote_fn=getattr(predict_trading, "quote_market_buy", None),
+            store=store,
+            ready_observer=execution.notify_ready_opportunity,
+            holding_reconciler=holding_reconciler,
+        )
+    except Exception:
+        return _UnavailableCrossVenueMonitor("predict_construction_failed")
 
 
 def _prediction_safety_policy(trading_config: object) -> dict[str, object]:
@@ -294,26 +314,6 @@ def _prediction_safety_policy(trading_config: object) -> dict[str, object]:
             ),
         },
     }
-    if holding_reconciler is _DEFAULT_HOLDING_RECONCILER:
-        holding_reconciler = getattr(execution, "reconcile_cross_holdings_once", None)
-    try:
-        return PredictCrossVenueMonitor(
-            predict_source=PredictSource(predict_config),
-            polymarket_monitor=prediction_monitor,
-            validator=CodexCrossVenueEquivalenceValidator(
-                store,
-                model=codex_model,
-                fallback_enabled=fallback_enabled,
-                max_codex_calls=max_codex_calls,
-            ),
-            gamma_lookup=_cross_venue_gamma_lookup,
-            predict_quote_fn=getattr(predict_trading, "quote_market_buy", None),
-            store=store,
-            ready_observer=execution.notify_ready_opportunity,
-            holding_reconciler=holding_reconciler,
-        )
-    except Exception:
-        return _UnavailableCrossVenueMonitor("predict_construction_failed")
 
 
 class PredictionRuntime:
