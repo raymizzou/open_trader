@@ -50,7 +50,7 @@ def load_prediction_runtime_record(path: Path) -> dict[str, object] | None:
         raise ValueError(f"prediction runtime record is unreadable: {path}") from exc
     if not isinstance(payload, dict) or payload.get("schema_version") != RUNTIME_SCHEMA:
         raise ValueError("prediction runtime record has invalid schema")
-    if payload.get("state") not in RUNTIME_STATES:
+    if not isinstance(payload.get("state"), str) or payload["state"] not in RUNTIME_STATES:
         raise ValueError("prediction runtime record has invalid state")
     return payload
 
@@ -59,9 +59,9 @@ def write_prediction_runtime_record(
     path: Path, payload: Mapping[str, object]
 ) -> None:
     state = payload.get("state")
-    if state not in RUNTIME_STATES:
+    if not isinstance(state, str) or state not in RUNTIME_STATES:
         raise ValueError("prediction runtime state is invalid")
-    record = {"schema_version": RUNTIME_SCHEMA, **dict(payload)}
+    record = {**dict(payload), "schema_version": RUNTIME_SCHEMA}
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = ""

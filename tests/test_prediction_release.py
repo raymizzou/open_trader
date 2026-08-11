@@ -90,3 +90,34 @@ def test_runtime_record_rejects_unknown_state_and_schema(tmp_path: Path) -> None
     path.write_text('{"schema_version":"wrong","state":"ready"}', encoding="utf-8")
     with pytest.raises(ValueError, match="runtime record"):
         load_prediction_runtime_record(path)
+
+
+def test_runtime_writer_keeps_the_fixed_schema(tmp_path: Path) -> None:
+    path = tmp_path / "prediction-service-runtime.json"
+
+    write_prediction_runtime_record(
+        path, {"schema_version": "wrong", "state": "ready"}
+    )
+
+    record = load_prediction_runtime_record(path)
+    assert record is not None
+    assert record["schema_version"] == "open_trader.prediction_service.runtime.v1"
+
+
+@pytest.mark.parametrize("state", [[], {}])
+def test_runtime_record_rejects_unhashable_state(
+    tmp_path: Path, state: object
+) -> None:
+    path = tmp_path / "prediction-service-runtime.json"
+
+    with pytest.raises(ValueError, match="runtime state"):
+        write_prediction_runtime_record(path, {"state": state})
+    path.write_text(
+        json.dumps({
+            "schema_version": "open_trader.prediction_service.runtime.v1",
+            "state": state,
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="runtime record"):
+        load_prediction_runtime_record(path)
