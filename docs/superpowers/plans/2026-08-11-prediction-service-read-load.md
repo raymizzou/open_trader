@@ -19,7 +19,7 @@
 - State, health, and every mutation remain uncached and keep their existing response/auth/audit behavior.
 - Add only `http_load={limit,active,overload_rejections,history_cache_hits,history_cache_misses}` to successful or unavailable `/healthz` payloads; `active` includes the health request itself.
 - Add no dependency, configuration knob, connection pool, long-lived SQLite connection, generic cache framework, route priority, background refresh, Gateway/Dashboard/launchd/release change, or production write.
-- Verification may read the production SQLite database only through a read-only backup into a temporary directory. It must never submit an order or mutate the production DB/WAL.
+- Verification may open the production SQLite source once with URI `mode=ro` and `PRAGMA query_only=ON`, back it up into a temporary directory, and then must close the source before load begins. It must never submit an order or mutate the production DB/WAL; hashes and the existing writer PID are observational evidence, not an unchanged-source gate.
 
 ---
 
@@ -262,8 +262,9 @@
 
   The script must:
 
-  - record SHA-256 and stat data for the source main DB and existing `-wal` before backup;
-  - open the source with SQLite URI `mode=ro`, use `Connection.backup()` into a `TemporaryDirectory`, and explicitly close both connections;
+  - record SHA-256, stat data, and active-writer evidence for the source main DB and existing `-wal` before backup;
+  - open the source once with SQLite URI `mode=ro`, set and verify `PRAGMA query_only=ON`, use `Connection.backup()` into a `TemporaryDirectory`, and explicitly close both connections before load begins;
+  - run `PRAGMA integrity_check` and row counts on the copied database, and use only copied paths for the load workflow; the final source hash/lsof observation remains read-only;
   - instantiate `PredictionArbitrageStore` only on the copied data directory;
   - start `create_prediction_server(runtime=fake_production_runtime, port=0)` on loopback, where every mutation/trading method raises `AssertionError`;
   - record baseline `threading.enumerate()`, `/dev/fd`, and `/usr/sbin/lsof` rows for only the copied DB/WAL;
@@ -271,8 +272,8 @@
   - wrap the real history projection with a controllable delay for one 48-client burst, requiring no more than eight active handlers and every overflow to be the exact busy 503 with `Retry-After: 1`;
   - after every wave, after the burst, and at exit, wait at most five seconds for `active == 0`, then require handler threads, FDs, and copied-DB/WAL handles to return to baseline plus at most two transient descriptors;
   - close the HTTP server and store references in `finally`, join all client/server threads, and write the report atomically even on failure;
-  - re-hash the production main DB and WAL and fail if either changed;
-  - exit nonzero on any timeout, unexpected status, mutation/trading access, resource-bound breach, hash change, or cleanup residue.
+  - re-hash the production main DB and WAL and record deltas plus active-writer evidence as observations; do not fail solely because the existing writer changed them;
+  - exit nonzero on any timeout, unexpected status, mutation/trading access, production SQLite connection after backup, resource-bound breach, or cleanup residue.
 
   Report these literal top-level keys so the evidence is reviewable:
 
@@ -281,11 +282,12 @@
       "status": "PASS" | "FAIL",
       "git_sha": str,
       "duration_seconds": float,
+      "source_access_mode": "mode=ro; query_only=ON",
       "source": {"path": str, "bytes": int, "rows": dict, "hashes": dict},
+      "backup": {"integrity_check": str, "rows": dict},
       "requests": {"by_status": dict, "count": int, "max_latency_seconds": float},
       "resources": {"baseline": dict, "peak": dict, "final": dict},
       "http_load": dict,
-      "production_unchanged": bool,
       "trading_calls": int,
       "errors": list,
   }
@@ -304,7 +306,7 @@
     --report .superpowers/sdd/2026-08-11-prediction-service-read-load/direct-load-report.json
   ```
 
-  Expected: exit 0 and report `status=PASS`, `trading_calls=0`, `production_unchanged=true`, normal waves all 200 within five seconds, slow-burst active peak no greater than eight, explicit overflow 503s, and final resources back within the specified bounds.
+  Expected: exit 0 and report `status=PASS`, `source_access_mode="mode=ro; query_only=ON"`, backup integrity `ok`, `trading_calls=0`, observed source hash/writer evidence, normal waves all 200 within five seconds, slow-burst active peak no greater than eight, explicit overflow 503s, and final resources back within the specified bounds.
 
 - [ ] **Step 3: Remove the temporary harness and prove no residue**
 
@@ -338,4 +340,4 @@
 
   Run the repository code-review workflow against fixed point `main`, fix every blocking Standards or Spec finding with a fresh RED/GREEN cycle, and rerun Step 4 plus any review-targeted test.
 
-  Report the branch SHA, exact focused/full test output, direct-report path and summary, production hash proof, and no-listener/process proof. Do not add a dependency, update `CHANGELOG.md`, merge, push, deploy, install launchd, route Gateway, or stop Legacy until the user explicitly requests the next action.
+  Report the branch SHA, exact focused/full test output, direct-report path and summary, read-only source access plus observed hash/writer evidence, and no-listener/process proof. Do not add a dependency, update `CHANGELOG.md`, merge, push, deploy, install launchd, route Gateway, or stop Legacy until the user explicitly requests the next action.

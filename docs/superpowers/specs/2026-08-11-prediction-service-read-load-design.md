@@ -159,8 +159,13 @@ diagnostic evidence, not a new metrics system or durable audit record.
 
 ### Direct 30-minute load run
 
-Use a temporary SQLite backup and fake trading clients; never open the
-production ledger for writes or submit an order.
+Open the production SQLite source once with URI `mode=ro` and
+`PRAGMA query_only=ON`, create a consistent temporary backup, then close the
+source connection before load begins. Run all load against that copy with fake
+trading clients; never open the production ledger for writes or submit an
+order. Record source main/WAL hashes and the existing writer PID before and
+after as observations; changes made by that already-running writer do not fail
+this read-only proof.
 
 - Every 1.5 seconds, issue the measured four-tab wave: four state and four
   identical signals-history requests.
@@ -175,10 +180,10 @@ production ledger for writes or submit an order.
   descriptor, and copied-SQLite handle counts return to the same baseline
   bounds.
 
-The direct-run report records command, Git SHA, database size and row counts,
-request counts by status, maximum latency, maximum active handlers, baseline and
-final thread/FD/SQLite-handle counts, and the final `/healthz` `http_load`
-object.
+The direct-run report records command, Git SHA, source access mode, backup
+integrity and row counts, observed source hash deltas and writer PID, request
+counts by status, maximum latency, maximum active handlers, baseline and final
+thread/FD/SQLite-handle counts, and the final `/healthz` `http_load` object.
 
 ## Scope Guard
 
