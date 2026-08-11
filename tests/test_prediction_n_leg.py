@@ -446,3 +446,28 @@ def test_result_from_payload_rejects_non_exhaustive_or_negative_proof_counts(mut
 
     with pytest.raises(ModelDecodeError):
         result_from_payload(payload)
+
+
+def test_validate_problem_reports_mixed_observation_datetimes_without_comparison_error() -> None:
+    problem = sample_problem()
+    key = replace(problem.actions[0].settlement_observation_key, observation_start=datetime(2026, 8, 11))
+    malformed = replace(
+        problem,
+        actions=(replace(problem.actions[0], settlement_observation_key=key),),
+        terminal_state_sets=(replace(problem.terminal_state_sets[0], settlement_observation_key=key),),
+    )
+
+    assert "NAIVE_DATETIME" in {issue.code for issue in validate_problem(malformed)}
+
+
+@pytest.mark.parametrize(
+    ("mutate", "code"),
+    [
+        (lambda problem: replace(problem, terminal_state_sets=(replace(problem.terminal_state_sets[0], atoms=(replace(problem.terminal_state_sets[0].atoms[0], kind="INVALID"),)),)), "INVALID_TERMINAL_KIND"),
+        (lambda problem: replace(problem, constraint_model=ConstraintModel((RelationConstraint("relation-x", "INVALID", ("contract-a", "contract-a"), "v1"),), problem.constraint_model.forbidden_atom_combinations)), "INVALID_RELATION_KIND"),
+        (lambda problem: replace(problem, qualification_constraints=(replace(problem.qualification_constraints[0], metric="INVALID"),)), "INVALID_QUALIFICATION_METRIC"),
+        (lambda problem: replace(problem, qualification_constraints=(replace(problem.qualification_constraints[0], comparison="INVALID"),)), "INVALID_COMPARISON"),
+    ],
+)
+def test_validate_problem_rejects_direct_invalid_enum_values(mutate: object, code: str) -> None:
+    assert code in {issue.code for issue in validate_problem(mutate(sample_problem()))}  # type: ignore[operator]
