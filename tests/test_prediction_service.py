@@ -306,9 +306,11 @@ def test_global_http_capacity_rejects_overflow_and_releases_read_contexts(
                 overflow_statuses = [result[0] for result in overflow_results]
                 overflow_payloads = [result[1] for result in overflow_results]
                 overflow_retry_after = [result[2]["Retry-After"] for result in overflow_results]
+                overflow_connections = [result[2]["Connection"] for result in overflow_results]
                 assert overflow_statuses == [503] * 40
                 assert overflow_payloads == [{"error": "prediction service busy"}] * 40
                 assert overflow_retry_after == ["1"] * 40
+                assert overflow_connections == ["close"] * 40
                 assert server.http_load_snapshot()["overload_rejections"] == 40  # type: ignore[attr-defined]
 
                 release.set()
@@ -420,6 +422,7 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
                     assert status == 503
                     assert payload == {"error": "prediction service busy"}
                     assert headers["Retry-After"] == "1"
+                    assert headers["Connection"] == "close"
                 assert counts == {"state": 4, "auth": 4, "body": 4, "preview": 4}
                 assert server.http_load_snapshot()["overload_rejections"] == 2  # type: ignore[attr-defined]
 
