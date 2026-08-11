@@ -27,9 +27,10 @@ def test_template_runs_only_the_loopback_shadow_service() -> None:
     }
     assert payload["ProgramArguments"] == [
         "OPEN_TRADER_PYTHON", "-m", "open_trader", "prediction-service",
-        "--mode", "shadow", "--data-dir", "OPEN_TRADER_DATA_DIR",
+        "--mode", "OPEN_TRADER_PREDICTION_MODE",
+        "--data-dir", "OPEN_TRADER_DATA_DIR",
         "--config", "OPEN_TRADER_PREDICTION_CONFIG", "--host", "127.0.0.1",
-        "--port", "8769",
+        "--port", "8769", "--release-manifest", "OPEN_TRADER_RELEASE_MANIFEST",
     ]
     assert payload["RunAtLoad"] is True
     assert payload["KeepAlive"] is True
@@ -54,7 +55,8 @@ def test_installer_dry_run_renders_only_explicit_isolated_paths(tmp_path: Path) 
     assert payload["ProgramArguments"] == [
         sys.executable, "-m", "open_trader", "prediction-service", "--mode", "shadow",
         "--data-dir", str(runtime / "data"), "--config", str(config), "--host", "127.0.0.1",
-        "--port", "8769",
+        "--port", "8769", "--release-manifest",
+        str(ROOT / "ops/prediction-service-release.json"),
     ]
     assert payload["StandardOutPath"] == str(runtime / "logs/prediction_service/launchd.out.log")
     assert payload["StandardErrorPath"] == str(runtime / "logs/prediction_service/launchd.err.log")
