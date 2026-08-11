@@ -422,11 +422,23 @@ def _identifier(issues: list[ModelIssue], value: object, path: str) -> str | Non
     return value
 
 
+def _validate_observation_key(issues: list[ModelIssue], value: object, path: str) -> bool:
+    if not isinstance(value, SettlementObservationKey):
+        _issue(issues, "INVALID_SETTLEMENT_OBSERVATION_KEY", path, "must be a SettlementObservationKey")
+        return False
+    for field in ("schema_version", "oracle_id", "indicator_id", "timezone", "rule_version"):
+        _identifier(issues, getattr(value, field), f"{path}.{field}")
+    return True
+
+
 def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
     issues: list[ModelIssue] = []
     if not isinstance(problem, ArbitrageProblem):
         return (ModelIssue("INVALID_PROBLEM", "$", "must be an ArbitrageProblem"),)
     as_of_valid = _validate_datetime(issues, problem.as_of, "as_of")
+    _identifier(issues, problem.schema_version, "schema_version")
+    _identifier(issues, problem.problem_id, "problem_id")
+    valuation_unit_id = _identifier(issues, problem.valuation_unit_id, "valuation_unit_id")
     action_ids: set[str] = set()
     actions_by_contract: dict[str, list[CandidateAction]] = {}
     for action_index, action in enumerate(_nodes(issues, problem.actions, "INVALID_ACTION_CONTAINER", "actions")):
@@ -442,6 +454,11 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
             action_ids.add(action_id)
         if action_id is not None and contract_id is not None:
             actions_by_contract.setdefault(contract_id, []).append(action)
+        _identifier(issues, action.settlement_asset_id, f"{prefix}.settlement_asset_id")
+        action_valuation_unit_id = _identifier(issues, action.valuation_unit_id, f"{prefix}.valuation_unit_id")
+        if action_valuation_unit_id != valuation_unit_id:
+            _issue(issues, "VALUATION_UNIT_MISMATCH", f"{prefix}.valuation_unit_id", "must equal problem valuation_unit_id")
+        _identifier(issues, action.asset_valuation_rule_id, f"{prefix}.asset_valuation_rule_id")
         _validate_enum(issues, action.side, ActionSide, "INVALID_ACTION_SIDE", f"{prefix}.side")
         for name in ("lot_step_units", "quantity_scale"):
             _validate_int(issues, getattr(action, name), f"{prefix}.{name}")
@@ -451,13 +468,9 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
             _issue(issues, "NON_POSITIVE_QUANTITY_SCALE", f"{prefix}.quantity_scale", "must be positive")
         if isinstance(action.lot_step_units, int) and isinstance(action.quantity_scale, int) and not isinstance(action.lot_step_units, bool) and not isinstance(action.quantity_scale, bool):
             _validate_product(issues, action.lot_step_units, action.quantity_scale, f"{prefix}.lot_step_units*quantity_scale")
-        if action.valuation_unit_id != problem.valuation_unit_id:
-            _issue(issues, "VALUATION_UNIT_MISMATCH", f"{prefix}.valuation_unit_id", "must equal problem valuation_unit_id")
         if action.settlement_asset_id != problem.valuation_unit_id and (not isinstance(action.asset_valuation_rule_id, str) or not action.asset_valuation_rule_id.strip()):
             _issue(issues, "MISSING_ASSET_VALUATION_RULE", f"{prefix}.asset_valuation_rule_id", "non-native settlement assets require a versioned valuation rule")
-        if not isinstance(action.settlement_observation_key, SettlementObservationKey):
-            _issue(issues, "INVALID_SETTLEMENT_OBSERVATION_KEY", f"{prefix}.settlement_observation_key", "must be a SettlementObservationKey")
-        else:
+        if _validate_observation_key(issues, action.settlement_observation_key, f"{prefix}.settlement_observation_key"):
             observation_start_valid = _validate_datetime(issues, action.settlement_observation_key.observation_start, f"{prefix}.settlement_observation_key.observation_start")
             observation_end_valid = _validate_datetime(issues, action.settlement_observation_key.observation_end, f"{prefix}.settlement_observation_key.observation_end")
             if observation_start_valid and observation_end_valid and action.settlement_observation_key.observation_start > action.settlement_observation_key.observation_end:
@@ -493,8 +506,8 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
             contract_ids.add(state_contract_id)
         if state_contract_id is not None and state_contract_id not in actions_by_contract:
             _issue(issues, "UNKNOWN_CONTRACT_REFERENCE", f"{prefix}.market_contract_id", "must reference an action contract")
-        if not isinstance(state_set.settlement_observation_key, SettlementObservationKey):
-            _issue(issues, "INVALID_SETTLEMENT_OBSERVATION_KEY", f"{prefix}.settlement_observation_key", "must be a SettlementObservationKey")
+        _validate_observation_key(issues, state_set.settlement_observation_key, f"{prefix}.settlement_observation_key")
+        _identifier(issues, state_set.rule_version, f"{prefix}.rule_version")
         atoms = _nodes(issues, state_set.atoms, "INVALID_TERMINAL_ATOM_CONTAINER", f"{prefix}.atoms")
         if not atoms:
             _issue(issues, "MISSING_TERMINAL_ATOMS", f"{prefix}.atoms", "must contain at least one terminal atom")
@@ -513,6 +526,7 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
             if atom_id is not None:
                 atom_ids.add(atom_id)
             _validate_enum(issues, atom.kind, TerminalKind, "INVALID_TERMINAL_KIND", f"{atom_path}.kind")
+            _identifier(issues, atom.rule_version, f"{atom_path}.rule_version")
             release_at_valid = _validate_datetime(issues, atom.capital_release_at, f"{atom_path}.capital_release_at")
             if as_of_valid and release_at_valid and atom.capital_release_at < problem.as_of:
                 _issue(issues, "STALE_CAPITAL_RELEASE_AT", f"{atom_path}.capital_release_at", "must be after problem as_of")
@@ -562,6 +576,7 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
         if constraint_id is not None:
             constraint_ids.add(constraint_id)
         _validate_enum(issues, relation.kind, RelationKind, "INVALID_RELATION_KIND", f"{path}.kind")
+        _identifier(issues, relation.rule_version, f"{path}.rule_version")
         contract_references = _nodes(issues, relation.contract_ids, "INVALID_CONTRACT_REFERENCE_CONTAINER", f"{path}.contract_ids")
         if relation.kind == RelationKind.IMPLIES and len(contract_references) != 2:
             _issue(issues, "INVALID_RELATION_ARITY", f"{path}.contract_ids", "IMPLIES requires ordered antecedent and consequent")
@@ -581,6 +596,7 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
             _issue(issues, "DUPLICATE_ID", f"{path}.constraint_id", "constraint_id must be unique")
         if constraint_id is not None:
             constraint_ids.add(constraint_id)
+        _identifier(issues, forbidden.rule_version, f"{path}.rule_version")
         for atom_index, atom_id in enumerate(_nodes(issues, forbidden.atom_ids, "INVALID_ATOM_REFERENCE_CONTAINER", f"{path}.atom_ids")):
             atom_id = _identifier(issues, atom_id, f"{path}.atom_ids[{atom_index}]")
             if atom_id is not None and atom_id not in atom_ids:
@@ -596,6 +612,7 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
             _issue(issues, "DUPLICATE_ID", f"{path}.constraint_id", "qualification constraint_id must be unique")
         if qualification_id is not None:
             qualification_ids.add(qualification_id)
+        _identifier(issues, qualification.rule_version, f"{path}.rule_version")
         _validate_enum(issues, qualification.metric, QualificationMetric, "INVALID_QUALIFICATION_METRIC", f"{path}.metric")
         _validate_enum(issues, qualification.comparison, Comparison, "INVALID_COMPARISON", f"{path}.comparison")
         _validate_int(issues, qualification.threshold_numerator, f"{path}.threshold_numerator")

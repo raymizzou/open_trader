@@ -523,3 +523,25 @@ def test_validate_problem_reports_unhashable_relation_references_without_raising
     )
 
     assert "INVALID_IDENTIFIER" in {issue.code for issue in validate_problem(malformed)}
+
+
+def test_validate_problem_rejects_blank_observation_identity_and_rule_versions() -> None:
+    problem = sample_problem()
+    observation = problem.actions[0].settlement_observation_key
+
+    for field in ("schema_version", "oracle_id", "indicator_id", "timezone", "rule_version"):
+        malformed_observation = replace(observation, **{field: ""})
+        malformed = replace(
+            problem,
+            actions=(replace(problem.actions[0], settlement_observation_key=malformed_observation),),
+            terminal_state_sets=(replace(problem.terminal_state_sets[0], settlement_observation_key=malformed_observation),),
+        )
+        issues = validate_problem(malformed)
+        assert any(issue.code == "INVALID_IDENTIFIER" and issue.path.endswith(field) for issue in issues)
+
+    blank_state_rule = replace(problem.terminal_state_sets[0], rule_version="")
+    assert any(issue.code == "INVALID_IDENTIFIER" for issue in validate_problem(replace(problem, terminal_state_sets=(blank_state_rule,))))
+
+    blank_atom_rule = replace(problem.terminal_state_sets[0].atoms[0], rule_version="")
+    blank_atom_state = replace(problem.terminal_state_sets[0], atoms=(blank_atom_rule,))
+    assert any(issue.code == "INVALID_IDENTIFIER" for issue in validate_problem(replace(problem, terminal_state_sets=(blank_atom_state,))))
