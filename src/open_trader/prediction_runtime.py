@@ -24,8 +24,22 @@ from .predict_cross_venue import (
 )
 from .predict_source import PredictSource
 from .predict_trading import PredictTradingClient
-from .prediction_arbitrage_execution import PredictionExecutionService
-from .prediction_arbitrage_store import PredictionArbitrageStore
+from .prediction_arbitrage import (
+    MAX_CROSS_UNSETTLED_PRINCIPAL,
+    MAX_EMERGENCY_LOSS,
+    MAX_NORMAL_COST,
+    MAX_WALLET_BALANCE,
+    MIN_ESTIMATED_PROFIT,
+    MIN_THRESHOLD_ANNUALIZED_YIELD,
+)
+from .prediction_arbitrage_execution import (
+    BOOK_FRESHNESS_SECONDS,
+    PredictionExecutionService,
+)
+from .prediction_arbitrage_store import (
+    _CROSS_AUTO_DAILY_PRINCIPAL_CAP,
+    PredictionArbitrageStore,
+)
 from .prediction_read_only import (
     PolymarketReadOnlyGuard,
     PredictReadOnlyGuard,
@@ -74,6 +88,10 @@ class _RuntimeOwnershipLock:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
+
+    @property
+    def held(self) -> bool:
+        return self._handle is not None
 
 
 class _UnavailableCrossVenueMonitor:
@@ -247,6 +265,35 @@ def _build_cross_venue_monitor(
         return _UnavailableCrossVenueMonitor("predict_not_configured")
     if predict_trading is None:
         return _UnavailableCrossVenueMonitor("predict_construction_failed")
+
+
+def _prediction_safety_policy(trading_config: object) -> dict[str, object]:
+    predict = getattr(trading_config, "predict", None)
+    return {
+        "policy_version": "prediction-controls-v1",
+        "identity": {
+            "signer_address": str(getattr(trading_config, "signer_address", "")),
+            "wallet_address": str(getattr(trading_config, "wallet_address", "")),
+            "predict_wallet_address": str(getattr(predict, "wallet_address", "")),
+            "predict_environment": str(getattr(predict, "environment", "")),
+        },
+        "limits": {
+            "book_freshness_seconds": format(BOOK_FRESHNESS_SECONDS, "f"),
+            "cross_auto_daily_principal_cap": format(
+                _CROSS_AUTO_DAILY_PRINCIPAL_CAP, "f"
+            ),
+            "max_cross_unsettled_principal": format(
+                MAX_CROSS_UNSETTLED_PRINCIPAL, "f"
+            ),
+            "max_emergency_loss": format(MAX_EMERGENCY_LOSS, "f"),
+            "max_normal_cost": format(MAX_NORMAL_COST, "f"),
+            "max_wallet_balance": format(MAX_WALLET_BALANCE, "f"),
+            "min_estimated_profit": format(MIN_ESTIMATED_PROFIT, "f"),
+            "min_threshold_annualized_yield": format(
+                MIN_THRESHOLD_ANNUALIZED_YIELD, "f"
+            ),
+        },
+    }
     if holding_reconciler is _DEFAULT_HOLDING_RECONCILER:
         holding_reconciler = getattr(execution, "reconcile_cross_holdings_once", None)
     try:
@@ -279,6 +326,7 @@ class PredictionRuntime:
         notifier: object | None = None,
         cross_venue_monitor: object | None = None,
         mode: Literal["production", "shadow"] = "production",
+        git_sha: str = "",
     ) -> None:
         if mode not in {"production", "shadow"}:
             raise ValueError("prediction runtime mode must be production or shadow")
@@ -286,6 +334,7 @@ class PredictionRuntime:
         self._prediction_config_path = Path(prediction_config_path)
         self._dashboard_url = str(dashboard_url)
         self._mode = mode
+        self._git_sha = str(git_sha)
         self._owner_thread_id = threading.get_ident()
         self._notifier = NullNotifier() if mode == "shadow" else notifier or NullNotifier()
         self._injected_cross_venue_monitor = cross_venue_monitor
@@ -311,6 +360,14 @@ class PredictionRuntime:
     @property
     def state(self) -> str:
         return self._state
+
+    @property
+    def mode(self) -> Literal["production", "shadow"]:
+        return self._mode
+
+    @property
+    def production_owner(self) -> bool:
+        return self._mode == "production" and self._owner.held
 
     @property
     def shadow_evidence(self) -> dict[str, object]:
@@ -373,6 +430,12 @@ class PredictionRuntime:
             self._owner.acquire()
             self.store = PredictionArbitrageStore(self._data_dir)
             trading_config = load_trading_config(self._prediction_config_path)
+            apply_safety_policy = getattr(self.store, "apply_safety_policy", None)
+            if callable(apply_safety_policy):
+                apply_safety_policy(
+                    _prediction_safety_policy(trading_config),
+                    git_sha=self._git_sha,
+                )
             self._prediction_trading = PolymarketTradingClient.from_keychain(
                 trading_config
             )

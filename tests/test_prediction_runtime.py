@@ -262,11 +262,48 @@ def test_runtime_constructor_is_side_effect_free(tmp_path: Path) -> None:
     )
 
     assert runtime.state == "NEW"
+    assert runtime.mode == "production"
+    assert runtime.production_owner is False
     assert not (tmp_path / "prediction_arbitrage" / "runtime.lock").exists()
     assert runtime.store is None
     assert runtime.monitor is None
     assert runtime.cross_venue_monitor is None
     assert runtime.execution is None
+
+
+def test_prediction_safety_policy_contains_only_semantic_public_inputs() -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    policy = runtime_module._prediction_safety_policy(
+        SimpleNamespace(
+            signer_address="0x1111111111111111111111111111111111111111",
+            wallet_address="0x2222222222222222222222222222222222222222",
+            predict=SimpleNamespace(
+                wallet_address="0x3333333333333333333333333333333333333333",
+                environment="mainnet",
+            ),
+        )
+    )
+
+    assert policy == {
+        "policy_version": "prediction-controls-v1",
+        "identity": {
+            "signer_address": "0x1111111111111111111111111111111111111111",
+            "wallet_address": "0x2222222222222222222222222222222222222222",
+            "predict_wallet_address": "0x3333333333333333333333333333333333333333",
+            "predict_environment": "mainnet",
+        },
+        "limits": {
+            "book_freshness_seconds": "10",
+            "cross_auto_daily_principal_cap": "100",
+            "max_cross_unsettled_principal": "100",
+            "max_emergency_loss": "2.00",
+            "max_normal_cost": "20.00",
+            "max_wallet_balance": "65.00",
+            "min_estimated_profit": "1.00",
+            "min_threshold_annualized_yield": "0.15",
+        },
+    }
 
 
 def test_runtime_owner_lock_rejects_a_second_owner_until_release(
@@ -357,6 +394,14 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
         def __init__(self, _data_dir: Path) -> None:
             events.append("store.open")
 
+        def apply_safety_policy(
+            self, policy: object, *, git_sha: str
+        ) -> dict[str, object]:
+            events.append("policy.apply")
+            assert isinstance(policy, dict)
+            assert git_sha == "sha-1"
+            return {"state": "baseline_enrolled"}
+
         def close(self) -> None:
             events.append("store.close")
 
@@ -424,7 +469,11 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
     monkeypatch.setattr(
         runtime_module,
         "load_trading_config",
-        lambda _path: SimpleNamespace(predict=None),
+        lambda _path: SimpleNamespace(
+            signer_address="0x1111111111111111111111111111111111111111",
+            wallet_address="0x2222222222222222222222222222222222222222",
+            predict=None,
+        ),
         raising=False,
     )
     monkeypatch.setattr(
@@ -456,10 +505,13 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
         prediction_config_path=tmp_path / "prediction.json",
         dashboard_url="http://127.0.0.1:8766/",
         cross_venue_monitor=FakeCrossMonitor(),
+        git_sha="sha-1",
     )
     runtime.start()
     try:
         assert runtime.state == "RUNNING"
+        assert runtime.production_owner is True
+        assert events.index("policy.apply") < events.index("execution.construct")
         assert events.index("reconcile") < events.index("polymarket.start")
         assert events.index("polymarket.start") < events.index("cross.start")
         with pytest.raises(RuntimeError, match="cannot start from RUNNING"):
@@ -468,6 +520,7 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
         runtime.stop()
         runtime.stop()
 
+    assert runtime.production_owner is False
     assert events.index("cross.stop") < events.index("polymarket.stop")
     assert events.index("polymarket.stop") < events.index("execution.close")
     assert events.index("execution.close") < events.index("trading.close")
@@ -592,6 +645,7 @@ def test_reconcile_failure_keeps_runtime_locked_and_does_not_start_monitors(
     runtime.start()
 
     assert runtime.state == "NOT_READY"
+    assert runtime.production_owner is True
     assert "monitor.start" not in events
     competing_owner = _RuntimeOwnershipLock(
         tmp_path / "prediction_arbitrage" / "runtime.lock"
@@ -599,6 +653,7 @@ def test_reconcile_failure_keeps_runtime_locked_and_does_not_start_monitors(
     with pytest.raises(PredictionRuntimeOwnershipError):
         competing_owner.acquire()
     runtime.stop()
+    assert runtime.production_owner is False
     competing_owner.acquire()
     competing_owner.release()
 
@@ -914,6 +969,9 @@ def test_shadow_runtime_stops_on_first_guard_violation_from_owner_thread(
         def __init__(self, _data_dir: Path) -> None:
             events.append("shadow_store.open")
 
+        def apply_safety_policy(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("shadow must not enroll a production safety policy")
+
         def close(self) -> None:
             events.append("shadow_store.close")
 
@@ -1058,6 +1116,8 @@ def test_shadow_runtime_stops_on_first_guard_violation_from_owner_thread(
     )
     runtime._owner = Owner()  # type: ignore[assignment]
     runtime.start()
+    assert runtime.mode == "shadow"
+    assert runtime.production_owner is False
 
     with pytest.raises(RuntimeError, match="blocked"):
         runtime._prediction_trading.cancel_all()  # type: ignore[union-attr]
