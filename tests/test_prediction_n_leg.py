@@ -471,3 +471,38 @@ def test_validate_problem_reports_mixed_observation_datetimes_without_comparison
 )
 def test_validate_problem_rejects_direct_invalid_enum_values(mutate: object, code: str) -> None:
     assert code in {issue.code for issue in validate_problem(mutate(sample_problem()))}  # type: ignore[operator]
+
+
+def test_validate_problem_reports_invalid_direct_graph_nodes_without_raising() -> None:
+    problem = sample_problem()
+    malformed = replace(
+        problem,
+        actions=(object(),),
+        terminal_state_sets=(object(),),
+        constraint_model=ConstraintModel((object(),), (object(),)),
+        qualification_constraints=(object(),),
+    )
+
+    codes = {issue.code for issue in validate_problem(malformed)}
+
+    assert {"INVALID_ACTION", "INVALID_TERMINAL_STATE_SET", "INVALID_RELATION", "INVALID_FORBIDDEN_ATOM_COMBINATION", "INVALID_QUALIFICATION_CONSTRAINT"} <= codes
+
+
+def test_validate_problem_reports_invalid_observation_and_payout_nodes_without_raising() -> None:
+    problem = sample_problem()
+    malformed = replace(
+        problem,
+        actions=(replace(problem.actions[0], settlement_observation_key=None),),
+        terminal_state_sets=(replace(problem.terminal_state_sets[0], settlement_observation_key=None, atoms=(replace(problem.terminal_state_sets[0].atoms[0], payouts=(object(),)),)),),
+    )
+
+    codes = {issue.code for issue in validate_problem(malformed)}
+
+    assert {"INVALID_SETTLEMENT_OBSERVATION_KEY", "INVALID_ACTION_PAYOUT"} <= codes
+
+
+def test_validate_problem_reports_invalid_terminal_atom_node_without_raising() -> None:
+    problem = sample_problem()
+    malformed = replace(problem, terminal_state_sets=(replace(problem.terminal_state_sets[0], atoms=(object(),)),))
+
+    assert "INVALID_TERMINAL_ATOM" in {issue.code for issue in validate_problem(malformed)}
