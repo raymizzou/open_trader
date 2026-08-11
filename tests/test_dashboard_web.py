@@ -3224,6 +3224,9 @@ def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_firs
         def set_observation_observer(self, _observer: object) -> None:
             pass
 
+        def set_auto_eat_observer(self, _observer: object) -> None:
+            pass
+
         def set_failure_observer(self, _observer: object) -> None:
             pass
 
@@ -3241,6 +3244,9 @@ def test_prediction_cross_venue_lifecycle_starts_after_polymarket_and_stops_firs
             return {"status": "ignored"}
 
         def notify_observation(self, *_: object) -> dict[str, object]:
+            return {"status": "ignored"}
+
+        def auto_eat_threshold(self, *_: object) -> dict[str, object]:
             return {"status": "ignored"}
 
         def notify_monitor_failure(self, *_: object) -> dict[str, object]:
@@ -4607,6 +4613,7 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
     class FakeMonitor:
         kwargs: dict[str, object] = {}
         observer: object | None = None
+        auto_observer: object | None = None
         failure_observer: object | None = None
 
         def __init__(self, **_: object) -> None:
@@ -4624,6 +4631,9 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
         def set_observation_observer(self, observer: object) -> None:
             self.__class__.observation_observer = observer
 
+        def set_auto_eat_observer(self, observer: object) -> None:
+            self.__class__.auto_observer = observer
+
         def set_failure_observer(self, observer: object) -> None:
             self.__class__.failure_observer = observer
 
@@ -4640,6 +4650,9 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
             self, opportunity: object, signal_id: str, lease_id: str
         ) -> dict[str, object]:
             return {"state": "ignored", "signal_id": signal_id, "lease_id": lease_id}
+
+        def auto_eat_threshold(self, *_: object) -> dict[str, object]:
+            return {"state": "ignored"}
 
         def notify_monitor_failure(self, failure: object) -> dict[str, object]:
             return {"state": "sent", "failure": failure}
@@ -4694,6 +4707,7 @@ def test_prediction_arbitrage_configured_lifecycle_reconciles_before_start_and_s
     )
     assert "Dashboard：http://127.0.0.1:8766/" in notification
     assert callable(FakeMonitor.observer)
+    assert callable(FakeMonitor.auto_observer)
     assert callable(FakeMonitor.failure_observer)
 
 
