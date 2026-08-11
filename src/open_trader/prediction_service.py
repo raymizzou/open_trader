@@ -13,6 +13,7 @@ import secrets
 import signal
 import sqlite3
 import subprocess
+import threading
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
@@ -27,10 +28,77 @@ from .prediction_runtime import PredictionRuntime
 _HISTORY_DEFAULT_LIMIT = 100
 _HISTORY_MAX_LIMIT = 500
 _MAX_JSON_BODY_BYTES = 1024 * 1024
+_MAX_CONCURRENT_HTTP_REQUESTS = 8
+_BUSY_BODY = b'{"error":"prediction service busy"}'
 _READ_ONLY_ERROR = {
     "code": "shadow_read_only",
     "message": "Shadow Prediction Service is read-only",
 }
+
+
+class _PredictionHTTPServer(ThreadingHTTPServer):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._request_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_HTTP_REQUESTS)
+        self._http_load_lock = threading.Lock()
+        self._http_active = 0
+        self._overload_rejections = 0
+        self._history_cache_hits = 0
+        self._history_cache_misses = 0
+        self._busy_response = (
+            b"HTTP/1.1 503 Service Unavailable\r\n"
+            b"Content-Type: application/json; charset=utf-8\r\n"
+            b"Content-Length: "
+            + str(len(_BUSY_BODY)).encode("ascii")
+            + b"\r\nRetry-After: 1\r\nConnection: close\r\n\r\n"
+            + _BUSY_BODY
+        )
+
+    def process_request(self, request: object, client_address: object) -> None:
+        if not self._request_slots.acquire(blocking=False):
+            self._record_overload()
+            try:
+                request.sendall(self._busy_response)  # type: ignore[attr-defined]
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)  # type: ignore[arg-type]
+            return
+        self._record_admitted()
+        try:
+            super().process_request(request, client_address)  # type: ignore[arg-type]
+        except BaseException:
+            self._release_admitted()
+            raise
+
+    def process_request_thread(self, request: object, client_address: object) -> None:
+        try:
+            super().process_request_thread(request, client_address)  # type: ignore[arg-type]
+        finally:
+            self._release_admitted()
+
+    def http_load_snapshot(self) -> dict[str, int]:
+        with self._http_load_lock:
+            return {
+                "limit": _MAX_CONCURRENT_HTTP_REQUESTS,
+                "active": self._http_active,
+                "overload_rejections": self._overload_rejections,
+                "history_cache_hits": self._history_cache_hits,
+                "history_cache_misses": self._history_cache_misses,
+            }
+
+    def _record_admitted(self) -> None:
+        with self._http_load_lock:
+            self._http_active += 1
+
+    def _release_admitted(self) -> None:
+        with self._http_load_lock:
+            self._http_active -= 1
+        self._request_slots.release()
+
+    def _record_overload(self) -> None:
+        with self._http_load_lock:
+            self._overload_rejections += 1
 
 
 def _require_loopback_host(host: str) -> None:
@@ -170,6 +238,7 @@ def create_prediction_server(
                         "codex": evidence.get("codex", {}),
                         "first_violation": evidence.get("first_violation"),
                         "guard_attempts": evidence.get("guard_attempts", []),
+                        "http_load": self.server.http_load_snapshot(),  # type: ignore[attr-defined]
                     },
                 )
                 return
@@ -402,7 +471,7 @@ def create_prediction_server(
         do_CONNECT = _unsupported_method
         do_TRACE = _unsupported_method
 
-    server = ThreadingHTTPServer((host, port), PredictionRequestHandler)
+    server = _PredictionHTTPServer((host, port), PredictionRequestHandler)
     server.timeout = 0.2
     return server
 

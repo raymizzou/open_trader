@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import json
 from pathlib import Path
@@ -17,6 +18,7 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+import open_trader.prediction_service as prediction_service
 from open_trader.prediction_read_model import (
     prediction_history_payload,
     prediction_state_payload,
@@ -83,12 +85,44 @@ def _server(runtime: object, **kwargs: object) -> Iterator[str]:
         thread.join(timeout=5)
 
 
+@contextmanager
+def _running_server(runtime: object, **kwargs: object) -> Iterator[tuple[str, object]]:
+    server = create_prediction_server(runtime=runtime, port=0, **kwargs)  # type: ignore[arg-type]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        yield f"http://{host}:{port}", server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def _response(request: str | Request) -> tuple[int, dict[str, object]]:
     try:
         with urlopen(request, timeout=5) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         return error.code, json.loads(error.read().decode("utf-8"))
+
+
+def _response_with_headers(
+    request: str | Request,
+) -> tuple[int, dict[str, object], Mapping[str, str]]:
+    try:
+        with urlopen(request, timeout=5) as response:
+            return (
+                response.status,
+                json.loads(response.read().decode("utf-8")),
+                dict(response.headers.items()),
+            )
+    except HTTPError as error:
+        return (
+            error.code,
+            json.loads(error.read().decode("utf-8")),
+            dict(error.headers.items()),
+        )
 
 
 class _ProductionExecution:
@@ -201,6 +235,227 @@ def _production_server(
         runtime_metadata={"git_sha": "abc123"},
     ) as base:
         yield base, current
+
+
+def test_global_http_capacity_rejects_overflow_and_releases_read_contexts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class TrackingReadStore:
+        def __init__(self) -> None:
+            self.path = tmp_path / "tracked_reads.sqlite3"
+            with sqlite3.connect(self.path) as connection:
+                connection.execute("CREATE TABLE reads (value INTEGER)")
+            self.lock = threading.Lock()
+            self.live_contexts = 0
+
+        @contextmanager
+        def read_context(self) -> Iterator[None]:
+            connection = sqlite3.connect(self.path)
+            with self.lock:
+                self.live_contexts += 1
+            try:
+                yield
+            finally:
+                connection.close()
+                with self.lock:
+                    self.live_contexts -= 1
+
+    tracking_store = TrackingReadStore()
+    counts = {"active": 0, "max_active": 0, "attempts": 0}
+    counts_lock = threading.Lock()
+    entered = threading.Event()
+    overflow_attempted = threading.Event()
+    release = threading.Event()
+
+    def blocked_state_payload(**_kwargs: object) -> dict[str, object]:
+        with tracking_store.read_context():
+            with counts_lock:
+                counts["active"] += 1
+                counts["max_active"] = max(counts["max_active"], counts["active"])
+                if counts["active"] == 8:
+                    entered.set()
+            try:
+                assert release.wait(timeout=10)
+                return {"state": "blocked"}
+            finally:
+                with counts_lock:
+                    counts["active"] -= 1
+
+    def overflow_request(base: str) -> tuple[int, dict[str, object], Mapping[str, str]]:
+        with counts_lock:
+            counts["attempts"] += 1
+            if counts["attempts"] == 40:
+                overflow_attempted.set()
+        return _response_with_headers(base + "/api/prediction-arbitrage/state")
+
+    monkeypatch.setattr(prediction_service, "prediction_state_payload", blocked_state_payload)
+    with _running_server(_Runtime()) as (base, server):
+        try:
+            with ThreadPoolExecutor(max_workers=48) as clients:
+                leaders = [
+                    clients.submit(_response, base + "/api/prediction-arbitrage/state")
+                    for _ in range(8)
+                ]
+                assert entered.wait(timeout=5)
+                overflow = [clients.submit(overflow_request, base) for _ in range(40)]
+                assert overflow_attempted.wait(timeout=5)
+
+                assert counts["max_active"] == 8
+                assert server.http_load_snapshot()["active"] == 8  # type: ignore[attr-defined]
+                overflow_results = [future.result(timeout=5) for future in overflow]
+                overflow_statuses = [result[0] for result in overflow_results]
+                overflow_payloads = [result[1] for result in overflow_results]
+                overflow_retry_after = [result[2]["Retry-After"] for result in overflow_results]
+                assert overflow_statuses == [503] * 40
+                assert overflow_payloads == [{"error": "prediction service busy"}] * 40
+                assert overflow_retry_after == ["1"] * 40
+                assert server.http_load_snapshot()["overload_rejections"] == 40  # type: ignore[attr-defined]
+
+                release.set()
+                assert [future.result(timeout=5)[0] for future in leaders] == [200] * 8
+                deadline = time.monotonic() + 5
+                while server.http_load_snapshot()["active"] != 0 and time.monotonic() < deadline:  # type: ignore[attr-defined]
+                    time.sleep(0.01)
+                assert server.http_load_snapshot()["active"] == 0  # type: ignore[attr-defined]
+                assert tracking_store.live_contexts == 0
+        finally:
+            release.set()
+
+
+def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _ProductionRuntime()
+    counts = {"state": 0, "auth": 0, "body": 0, "preview": 0}
+    counts_lock = threading.Lock()
+    state_entered = threading.Event()
+    preview_entered = threading.Event()
+    preview_reentered = threading.Event()
+    release_slots = threading.Semaphore(0)
+
+    def blocked_state_payload(**_kwargs: object) -> dict[str, object]:
+        with counts_lock:
+            counts["state"] += 1
+            if counts["state"] == 4:
+                state_entered.set()
+        assert release_slots.acquire(timeout=10)
+        return {"state": "blocked"}
+
+    def blocked_preview(opportunity_id: str) -> dict[str, object]:
+        with counts_lock:
+            counts["preview"] += 1
+            if counts["preview"] == 4:
+                preview_entered.set()
+            if counts["preview"] == 5:
+                preview_reentered.set()
+        assert release_slots.acquire(timeout=10)
+        return {
+            "state": "previewed",
+            "preview_id": "preview-1",
+            "opportunity_id": opportunity_id,
+        }
+
+    monkeypatch.setattr(prediction_service, "prediction_state_payload", blocked_state_payload)
+    monkeypatch.setattr(runtime.execution, "preview", blocked_preview)
+    with _running_server(
+        runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    ) as (base, server):
+        handler_class = server.RequestHandlerClass  # type: ignore[attr-defined]
+        original_auth = handler_class._require_production_auth
+        original_read = handler_class._read_json_body
+
+        def traced_auth(handler: object) -> None:
+            with counts_lock:
+                counts["auth"] += 1
+            original_auth(handler)
+
+        def traced_read(handler: object) -> dict[str, object]:
+            with counts_lock:
+                counts["body"] += 1
+            return original_read(handler)
+
+        monkeypatch.setattr(handler_class, "_require_production_auth", traced_auth)
+        monkeypatch.setattr(handler_class, "_read_json_body", traced_read)
+        try:
+            with ThreadPoolExecutor(max_workers=10) as clients:
+                state_calls = [
+                    clients.submit(_response, base + "/api/prediction-arbitrage/state")
+                    for _ in range(4)
+                ]
+                preview_calls = [
+                    clients.submit(
+                        _response,
+                        _production_request(
+                            base,
+                            "/api/prediction-arbitrage/preview",
+                            data=b'{"opportunity_id":"opp-1"}',
+                        ),
+                    )
+                    for _ in range(4)
+                ]
+                assert state_entered.wait(timeout=5)
+                assert preview_entered.wait(timeout=5)
+
+                overflow_get = clients.submit(
+                    _response_with_headers,
+                    base + "/api/prediction-arbitrage/state",
+                )
+                overflow_post = clients.submit(
+                    _response_with_headers,
+                    _production_request(
+                        base,
+                        "/api/prediction-arbitrage/preview",
+                        data=b'{"opportunity_id":"opp-1"}',
+                    ),
+                )
+                assert server.http_load_snapshot()["active"] == 8  # type: ignore[attr-defined]
+
+                for status, payload, headers in (
+                    overflow_get.result(timeout=5),
+                    overflow_post.result(timeout=5),
+                ):
+                    assert status == 503
+                    assert payload == {"error": "prediction service busy"}
+                    assert headers["Retry-After"] == "1"
+                assert counts == {"state": 4, "auth": 4, "body": 4, "preview": 4}
+                assert server.http_load_snapshot()["overload_rejections"] == 2  # type: ignore[attr-defined]
+
+                release_slots.release()
+                replacement = clients.submit(
+                    _response,
+                    _production_request(
+                        base,
+                        "/api/prediction-arbitrage/preview",
+                        data=b'{"opportunity_id":"opp-1"}',
+                    ),
+                )
+                assert preview_reentered.wait(timeout=5)
+
+                for _ in range(8):
+                    release_slots.release()
+                assert [future.result(timeout=5)[0] for future in state_calls] == [200] * 4
+                assert [future.result(timeout=5)[0] for future in preview_calls] == [200] * 4
+                assert replacement.result(timeout=5)[0] == 200
+                deadline = time.monotonic() + 5
+                while server.http_load_snapshot()["active"] != 0 and time.monotonic() < deadline:  # type: ignore[attr-defined]
+                    time.sleep(0.01)
+                assert server.http_load_snapshot()["active"] == 0  # type: ignore[attr-defined]
+
+                health_status, health = _response(base + "/healthz")
+                assert health_status == 200
+                assert health["http_load"] == {
+                    "limit": 8,
+                    "active": 1,
+                    "overload_rejections": 2,
+                    "history_cache_hits": 0,
+                    "history_cache_misses": 0,
+                }
+        finally:
+            for _ in range(16):
+                release_slots.release()
 
 
 def test_shadow_health_has_the_read_only_identity() -> None:
