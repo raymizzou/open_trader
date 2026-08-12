@@ -339,8 +339,14 @@ conservative release is the latest `capital_release_at` among reachable atoms.
 Any `UNKNOWN` reachability solve that could change that maximum makes the whole
 request `UNKNOWN`.
 
-Create one `ReleaseProfile(delay_seconds, occupied_days, release_at)` per
-distinct reachable action release. For a profile-specific master:
+Create one
+`ReleaseProfile(delay_seconds, occupied_days, release_at,
+eligible_action_ids, exact_action_ids)` per distinct reachable action release.
+The two action-ID tuples are canonical ascending tuples derived from proved
+conservative reachable releases: eligible actions release at or before the
+profile and exact actions release exactly at it. Public `compile_master()` uses
+these fields directly; there is no engine-only reachable-release bypass. For a
+profile-specific master:
 
 - disallow actions later than the profile;
 - require at least one selected action exactly at the profile;
@@ -411,10 +417,11 @@ candidates with the same parent-side key as #48:
 ```
 
 Within a model, solve sequentially and lock each completed objective: maximize
-profit, minimize cost, minimize leg count, maximize selection of each ascending
-action ID to obtain the lexicographically earliest selected IDs, then minimize
-each selected quantity in ascending action order. Do not encode the tuple as one
-weighted scalar.
+profit, minimize cost, and minimize leg count. Then process ascending action
+IDs. For each ID, maximize and lock its selection bit; whenever that action is
+selected, immediately minimize and lock its quantity before moving to the next
+ID. This is the exact #48 tuple-of-pairs order: for example, `(a,1),(c,1)` is
+earlier than `(a,2),(b,1)`. Do not encode the tuple as one weighted scalar.
 
 - [ ] **Step 9: Differential-test the common engine with the #48 Oracle**
 

@@ -78,6 +78,10 @@ class UnsafeSolverResult(ValueError):
     pass
 
 
+class _NumericUnsafeError(OverflowError, ValueError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class IntVariable:
     name: str
@@ -164,12 +168,22 @@ class ReleaseProfile:
     delay_seconds: int
     occupied_days: int
     release_at: datetime
+    eligible_action_ids: tuple[str, ...]
+    exact_action_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
         _nonnegative_int(self.delay_seconds, "delay_seconds")
         _positive_int(self.occupied_days, "occupied_days")
         if not isinstance(self.release_at, datetime):
             raise ValueError("release_at must be a datetime")
+        eligible_action_ids = _canonical_action_ids(self.eligible_action_ids, "eligible_action_ids")
+        exact_action_ids = _canonical_action_ids(self.exact_action_ids, "exact_action_ids")
+        if not exact_action_ids:
+            raise ValueError("exact_action_ids must not be empty")
+        if not set(exact_action_ids) <= set(eligible_action_ids):
+            raise ValueError("exact_action_ids must be a subset of eligible_action_ids")
+        object.__setattr__(self, "eligible_action_ids", eligible_action_ids)
+        object.__setattr__(self, "exact_action_ids", exact_action_ids)
 
 
 @dataclass(frozen=True, slots=True)
@@ -502,23 +516,22 @@ def compile_master(
     cuts: tuple[WorstStateCut, ...],
     excluded_vectors: tuple[tuple[ActionQuantity, ...], ...],
 ) -> CompiledMaster:
-    return _compile_master(problem, component, release_profile, cuts, excluded_vectors, None)
-
-
-def _compile_master(
-    problem: ArbitrageProblem,
-    component: RelationComponent,
-    release_profile: ReleaseProfile,
-    cuts: tuple[WorstStateCut, ...],
-    excluded_vectors: tuple[tuple[ActionQuantity, ...], ...],
-    action_releases: dict[str, datetime] | None,
-) -> CompiledMaster:
     actions_by_id = {action.action_id: action for action in problem.actions}
+    if (release_profile.delay_seconds, release_profile.occupied_days) != _release_timing(
+        problem,
+        release_profile.release_at,
+    ):
+        raise ValueError("release profile timing does not match release_at")
     if tuple(cut_from_scenario(problem, cut.scenario) for cut in cuts) != cuts:
         raise ValueError("master requires canonical settlement cuts")
     if len({cut.cut_id for cut in cuts}) != len(cuts):
         raise ValueError("repeated settlement cut")
     actions = tuple(actions_by_id[action_id] for action_id in component.action_ids)
+    component_action_ids = set(component.action_ids)
+    if not set(release_profile.eligible_action_ids) <= component_action_ids:
+        raise ValueError("release profile contains an eligible action outside the component")
+    if not set(release_profile.exact_action_ids) <= component_action_ids:
+        raise ValueError("release profile contains an exact action outside the component")
     variables: list[IntVariable] = []
     constraints: list[LinearConstraint] = []
     quantity_variables: list[tuple[str, str]] = []
@@ -688,16 +701,60 @@ def _compile_master(
     variables.append(IntVariable(profit_name, profit_minimum, profit_maximum))
     constraints.append(LinearConstraint("profit:def", ((profit_name, 1), (payout_name, -1), (cost_name, 1)), 0, 0))
 
+    qualification_payout_name = payout_name
+    qualification_profit_name = profit_name
+    if problem.qualification_constraints:
+        minimum_payouts = _minimum_action_payouts(problem)
+        payout_floor_terms = tuple(
+            (quantity_name, minimum_payouts[action_id])
+            for action_id, quantity_name in quantity_variables
+        )
+        payout_floor_minimum, _ = _terms_bounds(payout_floor_terms, variable_map)
+        qualification_payout_name = "qualification-payout"
+        variables.append(IntVariable(qualification_payout_name, payout_floor_minimum, payout_maximum))
+        constraints.extend(
+            (
+                LinearConstraint(
+                    "qualification-payout:known-cut-upper",
+                    ((qualification_payout_name, 1), (payout_name, -1)),
+                    None,
+                    0,
+                ),
+                LinearConstraint(
+                    "qualification-payout:terminal-floor",
+                    ((qualification_payout_name, 1), *((name, -coefficient) for name, coefficient in payout_floor_terms)),
+                    0,
+                    None,
+                ),
+            )
+        )
+        qualification_profit_name = "qualification-profit"
+        qualification_profit_minimum = _int64(payout_floor_minimum - cost_maximum, "qualification-profit.lower")
+        qualification_profit_maximum = _int64(payout_maximum - cost_minimum, "qualification-profit.upper")
+        variables.append(IntVariable(qualification_profit_name, qualification_profit_minimum, qualification_profit_maximum))
+        constraints.append(
+            LinearConstraint(
+                "qualification-profit:def",
+                ((qualification_profit_name, 1), (qualification_payout_name, -1), (cost_name, 1)),
+                0,
+                0,
+            )
+        )
+
     qualification_variables = {
-        "profit": profit_name,
-        "payout": payout_name,
+        "profit": qualification_profit_name,
+        "payout": qualification_payout_name,
         "cost": cost_name,
     }
     for qualification in problem.qualification_constraints:
         name = f"qualification:{qualification.constraint_id}"
-        formula = _qualification_formula(qualification, release_profile)
+        formula = _qualification_formula(
+            qualification,
+            delay_seconds=release_profile.delay_seconds,
+            occupied_days=release_profile.occupied_days,
+        )
         if formula.requires_positive_payout:
-            constraints.append(LinearConstraint(f"{name}:positive-payout", ((payout_name, 1),), 1, None))
+            constraints.append(LinearConstraint(f"{name}:positive-payout", ((qualification_payout_name, 1),), 1, None))
         terms = tuple(
             (qualification_variables[semantic_name], coefficient)
             for semantic_name, coefficient in formula.left_coefficients
@@ -717,26 +774,17 @@ def _compile_master(
             )
             constraints.append(LinearConstraint(name, (), 0 if passed else 1, None))
 
-    releases_by_contract = {
-        state.market_contract_id: max(atom.capital_release_at for atom in state.atoms)
-        for state in problem.terminal_state_sets
-    }
-    release_by_action = action_releases or {
-        action.action_id: releases_by_contract[action.market_contract_id]
-        for action in problem.actions
-    }
+    eligible_action_ids = set(release_profile.eligible_action_ids)
+    exact_action_ids = set(release_profile.exact_action_ids)
     exact_release_variables = tuple(
         selected_name
         for action_id, selected_name in selected_variables
-        if release_by_action[action_id] == release_profile.release_at
+        if action_id in exact_action_ids
     )
-    if not exact_release_variables:
-        constraints.append(LinearConstraint("release:exact", (), 1, None))
-    else:
-        constraints.append(LinearConstraint("release:exact", tuple((name, 1) for name in exact_release_variables), 1, None))
+    constraints.append(LinearConstraint("release:exact", tuple((name, 1) for name in exact_release_variables), 1, None))
     for action_id, selected_name in selected_variables:
-        if release_by_action[action_id] > release_profile.release_at:
-            constraints.append(LinearConstraint(f"release:late:{action_id}", ((selected_name, 1),), 0, 0))
+        if action_id not in eligible_action_ids:
+            constraints.append(LinearConstraint(f"release:ineligible:{action_id}", ((selected_name, 1),), 0, 0))
 
     model = LinearModel(tuple(variables), tuple(constraints), LinearObjective("MAX", ((profit_name, 1),)))
     validate_linear_model(model)
@@ -750,6 +798,25 @@ def _compile_master(
         cost_name,
         profit_name,
     )
+
+
+def _minimum_action_payouts(problem: ArbitrageProblem) -> dict[str, int]:
+    states_by_contract = {
+        state.market_contract_id: state
+        for state in problem.terminal_state_sets
+    }
+    minimums = {}
+    for action in problem.actions:
+        state = states_by_contract[action.market_contract_id]
+        minimums[action.action_id] = min(
+            next(
+                payout.payout_lower_bound_per_lot_units
+                for payout in atom.payouts
+                if payout.action_id == action.action_id
+            )
+            for atom in state.atoms
+        )
+    return minimums
 
 
 def _canonical_quantities(
@@ -772,6 +839,14 @@ def _canonical_quantities(
     return tuple(sorted(selected, key=lambda item: item.action_id))
 
 
+def _canonical_action_ids(value: object, name: str) -> tuple[str, ...]:
+    if not isinstance(value, tuple) or not all(isinstance(action_id, str) and action_id for action_id in value):
+        raise ValueError(f"{name} must be a tuple of nonempty action IDs")
+    if len(set(value)) != len(value):
+        raise ValueError(f"{name} must not contain duplicate action IDs")
+    return tuple(sorted(value))
+
+
 def _comparison_row(
     name: str,
     terms: tuple[tuple[str, int], ...],
@@ -791,7 +866,9 @@ def _comparison_passes(left: int, right: int, comparison: Comparison) -> bool:
 
 def _qualification_formula(
     constraint: QualificationConstraint,
-    release_profile: ReleaseProfile,
+    *,
+    delay_seconds: int,
+    occupied_days: int,
 ) -> _QualificationFormula:
     if constraint.metric == QualificationMetric.GUARANTEED_PROFIT_UNITS:
         return _QualificationFormula(
@@ -811,7 +888,7 @@ def _qualification_formula(
     if constraint.metric == QualificationMetric.ANNUALIZED_RETURN_PPM:
         return _QualificationFormula(
             (("profit", _product64(365, 1_000_000, constraint.threshold_denominator)),),
-            (("cost", _product64(constraint.threshold_numerator, release_profile.occupied_days)),),
+            (("cost", _product64(constraint.threshold_numerator, occupied_days)),),
             0,
             0,
         )
@@ -819,7 +896,7 @@ def _qualification_formula(
         return _QualificationFormula(
             (),
             (),
-            _product64(release_profile.delay_seconds, constraint.threshold_denominator),
+            _product64(delay_seconds, constraint.threshold_denominator),
             constraint.threshold_numerator,
         )
     raise AssertionError(constraint.metric)
@@ -905,7 +982,7 @@ def solve_with_constraint_generation(
                             adversary_rounds=adversary_rounds,
                             cuts=tuple(cuts),
                         )
-                    compiled = _compile_master(problem, component, profile, tuple(cuts), excluded, releases)
+                    compiled = compile_master(problem, component, profile, tuple(cuts), excluded)
                     master_result, master_closed = _solve_master_lexicographically(
                         compiled,
                         backend,
@@ -961,6 +1038,9 @@ def solve_with_constraint_generation(
                         )
                     cost = master_values[compiled.cost_variable]
                     profit = _int64(payout - cost, "guaranteed profit")
+                    if _failed_qualification_ids(problem, payout, cost, profile.release_at):
+                        excluded = (*excluded, quantities)
+                        continue
                     support = _minimize_support(
                         problem,
                         quantities,
@@ -1029,14 +1109,6 @@ def solve_with_constraint_generation(
                 cuts=tuple(cuts),
             )
         assert best.guaranteed_profit_units is not None
-        if request.mode == SearchMode.RAW_ARBITRAGE_DIAGNOSTIC and best.guaranteed_profit_units <= 0:
-            return replace(
-                best,
-                native_status=BusinessStatus.NO_ARBITRAGE.value,
-                candidate=None,
-                fixed_portfolio_closed=False,
-                global_search_closed=True,
-            )
         profit = best.guaranteed_profit_units
         if not all_searches_closed:
             return replace(
@@ -1048,6 +1120,14 @@ def solve_with_constraint_generation(
                 adversary_rounds=adversary_rounds,
                 cuts=tuple(cuts),
             )
+        if request.mode == SearchMode.RAW_ARBITRAGE_DIAGNOSTIC and profit <= 0:
+            return replace(
+                best,
+                native_status=BusinessStatus.NO_ARBITRAGE.value,
+                candidate=None,
+                fixed_portfolio_closed=False,
+                global_search_closed=True,
+            )
         return replace(
             best,
             objective_bounds=ObjectiveBounds(profit, profit, 0, True),
@@ -1056,7 +1136,9 @@ def solve_with_constraint_generation(
             adversary_rounds=adversary_rounds,
             cuts=tuple(cuts),
         )
-    except (OverflowError, UnsafeSolverResult, ValueError, KeyError, TypeError):
+    except UnsafeSolverResult:
+        return _empty_evidence(TerminationReason.INVALID_OUTPUT.value)
+    except _NumericUnsafeError:
         return _empty_evidence(TerminationReason.NUMERIC_UNSAFE.value)
 
 
@@ -1175,11 +1257,15 @@ def _failed_qualification_ids(
     release_at: datetime,
 ) -> tuple[str, ...]:
     profit = _int64(payout - cost, "qualification profit")
-    release_profile = _release_profile(problem, release_at)
+    delay_seconds, occupied_days = _release_timing(problem, release_at)
     values = {"profit": profit, "payout": payout, "cost": cost}
     failures = []
     for constraint in sorted(problem.qualification_constraints, key=lambda item: item.constraint_id):
-        formula = _qualification_formula(constraint, release_profile)
+        formula = _qualification_formula(
+            constraint,
+            delay_seconds=delay_seconds,
+            occupied_days=occupied_days,
+        )
         if formula.requires_positive_payout and payout <= 0:
             failures.append(constraint.constraint_id)
             continue
@@ -1215,37 +1301,54 @@ def _solve_master_lexicographically(
     backend: SolverBackend,
     time_limit_ms: int,
 ) -> tuple[BackendResult, bool]:
-    selected = tuple(name for _, name in sorted(compiled.selected_variables))
-    quantities = tuple(name for _, name in sorted(compiled.quantity_variables))
-    objectives = (
+    selected = dict(compiled.selected_variables)
+    quantities = dict(compiled.quantity_variables)
+    leading_objectives = (
         LinearObjective("MAX", ((compiled.profit_variable, 1),)),
         LinearObjective("MIN", ((compiled.cost_variable, 1),)),
-        LinearObjective("MIN", tuple((name, 1) for name in selected)),
-        *(LinearObjective("MAX", ((name, 1),)) for name in selected),
-        *(LinearObjective("MIN", ((name, 1),)) for name in quantities),
+        LinearObjective("MIN", tuple((name, 1) for name in selected.values())),
     )
     model = compiled.model
     result: BackendResult | None = None
-    for index, objective in enumerate(objectives):
+    objective_index = 0
+
+    def solve_and_lock(objective: LinearObjective) -> BackendResult:
+        nonlocal model, objective_index
         solved_model = replace(model, objective=objective)
-        result = _checked_backend_solve(solved_model, backend, time_limit_ms)
-        if result.status != NativeSolveStatus.OPTIMAL:
-            if index:
-                return replace(result, status=NativeSolveStatus.UNKNOWN), False
-            return result, False
-        value = _objective_activity(solved_model, result)
+        solved = _checked_backend_solve(solved_model, backend, time_limit_ms)
+        if solved.status != NativeSolveStatus.OPTIMAL:
+            return solved
+        value = _objective_activity(solved_model, solved)
         model = replace(
             model,
             constraints=model.constraints
             + (
                 LinearConstraint(
-                    f"objective-lock:{index}",
+                    f"objective-lock:{objective_index}",
                     objective.coefficients,
                     value,
                     value,
                 ),
             ),
         )
+        objective_index += 1
+        return solved
+
+    for objective in leading_objectives:
+        result = solve_and_lock(objective)
+        if result.status != NativeSolveStatus.OPTIMAL:
+            if objective_index:
+                return replace(result, status=NativeSolveStatus.UNKNOWN), False
+            return result, False
+
+    for action_id in sorted(selected):
+        result = solve_and_lock(LinearObjective("MAX", ((selected[action_id], 1),)))
+        if result.status != NativeSolveStatus.OPTIMAL:
+            return replace(result, status=NativeSolveStatus.UNKNOWN), False
+        if dict(result.values)[selected[action_id]]:
+            result = solve_and_lock(LinearObjective("MIN", ((quantities[action_id], 1),)))
+            if result.status != NativeSolveStatus.OPTIMAL:
+                return replace(result, status=NativeSolveStatus.UNKNOWN), False
     assert result is not None
     return result, True
 
@@ -1341,17 +1444,33 @@ def _release_profiles(
     component: RelationComponent,
     releases: dict[str, datetime],
 ) -> tuple[ReleaseProfile, ...]:
+    action_ids = tuple(sorted(component.action_ids))
     return tuple(
-        _release_profile(problem, release_at)
+        _release_profile(
+            problem,
+            release_at,
+            tuple(action_id for action_id in action_ids if releases[action_id] <= release_at),
+            tuple(action_id for action_id in action_ids if releases[action_id] == release_at),
+        )
         for release_at in sorted({releases[action_id] for action_id in component.action_ids})
     )
 
 
-def _release_profile(problem: ArbitrageProblem, release_at: datetime) -> ReleaseProfile:
+def _release_profile(
+    problem: ArbitrageProblem,
+    release_at: datetime,
+    eligible_action_ids: tuple[str, ...],
+    exact_action_ids: tuple[str, ...],
+) -> ReleaseProfile:
+    seconds, occupied_days = _release_timing(problem, release_at)
+    return ReleaseProfile(seconds, occupied_days, release_at, eligible_action_ids, exact_action_ids)
+
+
+def _release_timing(problem: ArbitrageProblem, release_at: datetime) -> tuple[int, int]:
     delta = release_at - problem.as_of
     seconds = _int64(delta.days * 86_400 + delta.seconds + int(bool(delta.microseconds)), "release delay")
     occupied_days = max(1, _int64(seconds + 86_399, "occupied day numerator") // 86_400)
-    return ReleaseProfile(seconds, occupied_days, release_at)
+    return seconds, occupied_days
 
 
 def _scenario_from_result(compiled: CompiledAdversary, result: BackendResult) -> SettlementScenario:
@@ -1438,17 +1557,20 @@ def validate_linear_model(model: LinearModel) -> None:
             raise ValueError("objective must use MAX or MIN")
         terms = _validate_terms("objective", model.objective.coefficients, variables)
         if not _expression_activity_fits_int64(terms, variables):
-            raise ValueError("possible objective activity exceeds signed int64")
+            raise _NumericUnsafeError("possible objective activity exceeds signed int64")
 
 
 def validate_backend_result(model: LinearModel, result: BackendResult) -> None:
     validate_linear_model(model)
     if not isinstance(result, BackendResult) or not isinstance(result.status, NativeSolveStatus):
         raise UnsafeSolverResult("invalid backend result status")
-    _string(result.native_status, "native_status")
-    _nonnegative_int(result.solve_ns, "solve_ns")
-    _optional_int64(result.objective_value, "objective_value")
-    _optional_int64(result.objective_bound, "objective_bound")
+    try:
+        _string(result.native_status, "native_status")
+        _nonnegative_int(result.solve_ns, "solve_ns")
+        _optional_int64(result.objective_value, "objective_value")
+        _optional_int64(result.objective_bound, "objective_bound")
+    except (OverflowError, ValueError) as exc:
+        raise UnsafeSolverResult(str(exc)) from exc
     if not isinstance(result.values, tuple):
         raise UnsafeSolverResult("backend values must be a tuple")
     values: dict[str, int] = {}
@@ -1492,7 +1614,7 @@ def _validate_row(name: str, coefficients: object, lower: int | None, upper: int
     if lower is not None and upper is not None and lower > upper:
         raise ValueError(f"constraint lower bound exceeds upper bound: {name}")
     if not _expression_activity_fits_int64(terms, variables):
-        raise ValueError(f"possible row activity exceeds signed int64: {name}")
+        raise _NumericUnsafeError(f"possible row activity exceeds signed int64: {name}")
 
 
 def _expression_activity_fits_int64(terms: tuple[tuple[str, int], ...], variables: dict[str, IntVariable]) -> bool:
@@ -1543,14 +1665,14 @@ def _strict_int(value: object, name: str) -> int:
 def _int64(value: object, name: str) -> int:
     value = _strict_int(value, name)
     if not INT64_MIN <= value <= INT64_MAX:
-        raise ValueError(f"{name} must fit signed int64")
+        raise _NumericUnsafeError(f"{name} must fit signed int64")
     return value
 
 
 def _result_int64(value: object, name: str) -> int:
     try:
         return _int64(value, name)
-    except ValueError as exc:
+    except (OverflowError, ValueError) as exc:
         raise UnsafeSolverResult(str(exc)) from exc
 
 
