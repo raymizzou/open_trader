@@ -21,6 +21,9 @@ from open_trader.frontend_gateway import (
 )
 
 
+_PREDICTION_ROUTE_SCHEMA = "open_trader.frontend_gateway.prediction_route.v1"
+
+
 class _Upstream(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -106,20 +109,50 @@ def _write_static_files(static_dir: Path) -> dict[str, bytes]:
     return files
 
 
+def _write_route(path: Path, mode: str) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": _PREDICTION_ROUTE_SCHEMA,
+                "mode": mode,
+                "operation_id": "operation-1",
+                "updated_at": "2026-08-12T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _prediction_request(base: str, method: str, path: str) -> None:
+    connection = http.client.HTTPConnection(base.removeprefix("http://"), timeout=5)
+    connection.request(method, path, body=b"{}" if method == "POST" else None)
+    response = connection.getresponse()
+    response.read()
+    assert response.status == HTTPStatus.OK
+    connection.close()
+
+
 @contextmanager
 def _gateway(
     static_dir: Path,
     upstream_port: int,
     account_upstream_port: int | None = None,
     *,
+    prediction_port: int | None = None,
+    prediction_route_path: Path | None = None,
     timeout: float = 1.0,
     max_request_body_bytes: int = 20 * 1024 * 1024,
 ) -> Iterator[str]:
+    route = prediction_route_path or static_dir.parent / "prediction-route.json"
+    if prediction_route_path is None:
+        _write_route(route, "legacy")
     server = create_frontend_gateway(
         config=FrontendGatewayConfig(
             static_dir=static_dir,
             upstream_port=upstream_port,
             account_upstream_port=account_upstream_port or upstream_port,
+            prediction_route_path=route,
+            prediction_upstream_port=prediction_port or upstream_port,
             public_origin="http://127.0.0.1:8766",
             upstream_timeout_seconds=timeout,
             max_request_body_bytes=max_request_body_bytes,
@@ -129,6 +162,189 @@ def _gateway(
     )
     with _running(server):
         yield f"http://127.0.0.1:{server.server_address[1]}"
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_prediction_prefix_routes_as_one_unit(tmp_path: Path, method: str) -> None:
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    prediction = _Upstream()
+    route = tmp_path / "prediction-route.json"
+    _write_route(route, "service")
+    with _running(legacy), _running(prediction), _gateway(
+        tmp_path / "static",
+        legacy.server_address[1],
+        prediction_port=prediction.server_address[1],
+        prediction_route_path=route,
+    ) as base:
+        _prediction_request(base, method, "/api/prediction-arbitrage/state")
+
+    assert legacy.requests == []
+    assert [item["path"] for item in prediction.requests] == [
+        "/api/prediction-arbitrage/state"
+    ]
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_prediction_prefix_legacy_mode_routes_as_one_unit(
+    tmp_path: Path, method: str
+) -> None:
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    prediction = _Upstream()
+    route = tmp_path / "prediction-route.json"
+    _write_route(route, "legacy")
+    with _running(legacy), _running(prediction), _gateway(
+        tmp_path / "static",
+        legacy.server_address[1],
+        prediction_port=prediction.server_address[1],
+        prediction_route_path=route,
+    ) as base:
+        _prediction_request(base, method, "/api/prediction-arbitrage/state")
+
+    assert [item["path"] for item in legacy.requests] == [
+        "/api/prediction-arbitrage/state"
+    ]
+    assert prediction.requests == []
+
+
+def test_prediction_route_keeps_nonprefix_and_account_routes_unchanged(
+    tmp_path: Path,
+) -> None:
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    account = _Upstream()
+    prediction = _Upstream()
+    route = tmp_path / "prediction-route.json"
+    _write_route(route, "service")
+    with _running(legacy), _running(account), _running(prediction), _gateway(
+        tmp_path / "static",
+        legacy.server_address[1],
+        account.server_address[1],
+        prediction_port=prediction.server_address[1],
+        prediction_route_path=route,
+    ) as base:
+        _prediction_request(base, "GET", "/api/prediction-arbitragex")
+        _prediction_request(base, "GET", "/api/v1/account/snapshot")
+
+    assert [item["path"] for item in legacy.requests] == [
+        "/api/prediction-arbitragex"
+    ]
+    assert [item["path"] for item in account.requests] == ["/api/v1/account/snapshot"]
+    assert prediction.requests == []
+
+
+def test_prediction_service_preserves_headers_body_and_response(tmp_path: Path) -> None:
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    prediction = _Upstream()
+    route = tmp_path / "prediction-route.json"
+    _write_route(route, "service")
+    prediction.response_status = HTTPStatus.ACCEPTED
+    prediction.response_reason = "Prediction Accepted"
+    prediction.response_body = b"prediction bytes"
+    prediction.response_headers = [
+        ("ETag", '"prediction-v1"'),
+        ("Set-Cookie", "prediction=one; Path=/"),
+    ]
+    body = b'{"preview_id":"p1"}'
+    with _running(legacy), _running(prediction), _gateway(
+        tmp_path / "static",
+        legacy.server_address[1],
+        prediction_port=prediction.server_address[1],
+        prediction_route_path=route,
+    ) as base:
+        connection = http.client.HTTPConnection(base.removeprefix("http://"), timeout=5)
+        connection.putrequest("POST", "/api/prediction-arbitrage/executions")
+        connection.putheader("Content-Type", "application/json")
+        connection.putheader("Content-Length", str(len(body)))
+        connection.putheader("Cookie", "ot_prediction_session=session")
+        connection.putheader("Origin", "http://127.0.0.1:8766")
+        connection.putheader("Referer", "http://127.0.0.1:8766/prediction")
+        connection.putheader("X-CSRF-Token", "csrf")
+        connection.endheaders(body)
+        response = connection.getresponse()
+        response_body = response.read()
+        response_headers = response.getheaders()
+        connection.close()
+
+    prediction_origin = f"http://127.0.0.1:{prediction.server_address[1]}"
+    assert (response.status, response.reason, response_body) == (
+        HTTPStatus.ACCEPTED,
+        "Prediction Accepted",
+        b"prediction bytes",
+    )
+    assert ("ETag", '"prediction-v1"') in response_headers
+    assert ("Set-Cookie", "prediction=one; Path=/") in response_headers
+    assert prediction.requests[0]["body"] == body
+    headers = {
+        name.lower(): value for name, value in prediction.requests[0]["headers"].items()
+    }
+    assert headers["host"] == f"127.0.0.1:{prediction.server_address[1]}"
+    assert headers["origin"] == prediction_origin
+    assert headers["referer"] == prediction_origin + "/prediction"
+    assert headers["cookie"] == "ot_prediction_session=session"
+    assert headers["x-csrf-token"] == "csrf"
+    assert legacy.requests == []
+
+
+def test_prediction_route_health_reports_selected_service_status(tmp_path: Path) -> None:
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    prediction = _Upstream()
+    prediction.health_body = json.dumps({"module": "prediction_service"}).encode()
+    route = tmp_path / "prediction-route.json"
+    _write_route(route, "service")
+    with _running(legacy), _running(prediction), _gateway(
+        tmp_path / "static",
+        legacy.server_address[1],
+        prediction_port=prediction.server_address[1],
+        prediction_route_path=route,
+    ) as base:
+        with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
+            payload = json.load(response)
+
+    assert payload["prediction_route_mode"] == "service"
+    assert payload["prediction_inflight_requests"] == 0
+    assert payload["prediction_upstream_status"] == "ok"
+
+
+@pytest.mark.parametrize("record", [None, "{", "unknown", "maintenance"])
+def test_prediction_route_maintenance_rejects_before_body_or_upstream(
+    tmp_path: Path, record: str | None
+) -> None:
+    _write_static_files(tmp_path / "static")
+    route = tmp_path / "prediction-route.json"
+    if record == "{":
+        route.write_text(record, encoding="utf-8")
+    elif record is not None:
+        _write_route(route, record)
+    legacy = _Upstream()
+    prediction = _Upstream()
+    with _running(legacy), _running(prediction), _gateway(
+        tmp_path / "static",
+        legacy.server_address[1],
+        prediction_port=prediction.server_address[1],
+        prediction_route_path=route,
+    ) as base:
+        connection = http.client.HTTPConnection(base.removeprefix("http://"), timeout=5)
+        connection.putrequest("POST", "/api/prediction-arbitrage/executions")
+        connection.putheader("Content-Length", "1")
+        connection.endheaders()
+        connection.sock.shutdown(socket.SHUT_WR)
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        connection.close()
+
+    assert response.status == HTTPStatus.SERVICE_UNAVAILABLE
+    assert payload == {
+        "schema_version": "open_trader.frontend_gateway.error.v1",
+        "code": "prediction_maintenance",
+        "message": "Prediction service is in maintenance",
+        "route_mode": "maintenance",
+    }
+    assert legacy.requests == []
+    assert prediction.requests == []
 
 
 def test_gateway_serves_dashboard_assets_without_contacting_upstream(

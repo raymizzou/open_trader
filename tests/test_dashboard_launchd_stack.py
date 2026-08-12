@@ -199,6 +199,13 @@ def test_stack_templates_define_separate_loopback_jobs() -> None:
     ]
     assert gateway_args[gateway_args.index("--port") + 1] == "8766"
     assert gateway_args[gateway_args.index("--upstream-port") + 1] == "8767"
+    assert gateway_args[gateway_args.index("--prediction-route-state") + 1] == (
+        "OPEN_TRADER_PREDICTION_ROUTE_STATE"
+    )
+    assert gateway_args[gateway_args.index("--prediction-upstream-host") + 1] == (
+        "127.0.0.1"
+    )
+    assert gateway_args[gateway_args.index("--prediction-upstream-port") + 1] == "8769"
     assert legacy_args[legacy_args.index("-m") : legacy_args.index("-m") + 3] == [
         "-m",
         "open_trader",
@@ -253,6 +260,8 @@ def test_stack_dry_run_prints_two_valid_plists_without_side_effects(
     sections = _dry_run_sections(result.stdout)
     assert set(sections) == {GATEWAY_LABEL, LEGACY_LABEL}
     assert sections[GATEWAY_LABEL]["WorkingDirectory"] == str(ROOT)
+    gateway_args = sections[GATEWAY_LABEL]["ProgramArguments"]
+    assert str(runtime / "config/prediction-route.json") in gateway_args
     legacy_args = sections[LEGACY_LABEL]["ProgramArguments"]
     assert str(runtime / "data") in legacy_args
     assert str(runtime / "config/prediction_arbitrage.json") in legacy_args

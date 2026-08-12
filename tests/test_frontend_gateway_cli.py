@@ -37,6 +37,7 @@ print("\\n".join(sorted(sys.modules)))
 
 
 def test_frontend_gateway_cli_uses_loopback_defaults(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -50,7 +51,8 @@ def test_frontend_gateway_cli_uses_loopback_defaults(
         frontend_gateway, "serve_frontend_gateway", fake_serve_frontend_gateway
     )
 
-    assert frontend_gateway.main([]) == 0
+    route = tmp_path / "prediction-route.json"
+    assert frontend_gateway.main(["--prediction-route-state", str(route)]) == 0
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8766
     config = captured["config"]
@@ -60,6 +62,9 @@ def test_frontend_gateway_cli_uses_loopback_defaults(
     )
     assert config.upstream_host == "127.0.0.1"
     assert config.upstream_port == 8767
+    assert config.prediction_route_path == route
+    assert config.prediction_upstream_host == "127.0.0.1"
+    assert config.prediction_upstream_port == 8769
     assert config.public_origin == "http://127.0.0.1:8766"
     assert config.upstream_timeout_seconds == 30.0
 
@@ -81,6 +86,12 @@ def test_frontend_gateway_cli_dispatches_explicit_upstream_and_origin(
 
     assert frontend_gateway.main(
         [
+            "--prediction-route-state",
+            str(tmp_path / "prediction-route.json"),
+            "--prediction-upstream-host",
+            "localhost",
+            "--prediction-upstream-port",
+            "18769",
             "--host",
             "localhost",
             "--port",
@@ -105,5 +116,8 @@ def test_frontend_gateway_cli_dispatches_explicit_upstream_and_origin(
     assert config.static_dir == tmp_path
     assert config.upstream_host == "localhost"
     assert config.upstream_port == 18767
+    assert config.prediction_route_path == tmp_path / "prediction-route.json"
+    assert config.prediction_upstream_host == "localhost"
+    assert config.prediction_upstream_port == 18769
     assert config.public_origin == "http://localhost:18766"
     assert config.upstream_timeout_seconds == 2.5

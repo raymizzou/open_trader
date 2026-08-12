@@ -58,6 +58,7 @@ REPORTS_DIR="$RUNTIME_ROOT/reports"
 PORTFOLIO="$DATA_DIR/latest/portfolio.csv"
 DAILY_CONFIG="$RUNTIME_ROOT/config/daily_premarket.env"
 PREDICTION_CONFIG="$RUNTIME_ROOT/config/prediction_arbitrage.json"
+PREDICTION_ROUTE_STATE="$RUNTIME_ROOT/config/prediction-route.json"
 OUT_LOG="$REPO_ROOT/logs/dashboard/launchd.out.log"
 ERR_LOG="$REPO_ROOT/logs/dashboard/launchd.err.log"
 GATEWAY_OUT_LOG="$REPO_ROOT/logs/frontend_gateway/launchd.out.log"
@@ -77,7 +78,7 @@ sed_escape() {
 }
 
 render_template() {
-  local template="$1" repo python data reports portfolio daily_config prediction
+  local template="$1" repo python data reports portfolio daily_config prediction prediction_route_state
   repo="$(sed_escape "$REPO_ROOT")"
   python="$(sed_escape "$PYTHON_BIN")"
   data="$(sed_escape "$DATA_DIR")"
@@ -85,6 +86,7 @@ render_template() {
   portfolio="$(sed_escape "$PORTFOLIO")"
   daily_config="$(sed_escape "$DAILY_CONFIG")"
   prediction="$(sed_escape "$PREDICTION_CONFIG")"
+  prediction_route_state="$(sed_escape "$PREDICTION_ROUTE_STATE")"
   sed \
     -e "s|OPEN_TRADER_PYTHON|$python|g" \
     -e "s|OPEN_TRADER_PORTFOLIO|$portfolio|g" \
@@ -92,8 +94,24 @@ render_template() {
     -e "s|OPEN_TRADER_REPORTS_DIR|$reports|g" \
     -e "s|OPEN_TRADER_DAILY_CONFIG|$daily_config|g" \
     -e "s|OPEN_TRADER_PREDICTION_CONFIG|$prediction|g" \
+    -e "s|OPEN_TRADER_PREDICTION_ROUTE_STATE|$prediction_route_state|g" \
     -e "s|OPEN_TRADER_REPO|$repo|g" \
     "$template"
+}
+
+seed_prediction_route() {
+  local directory temporary
+  [[ -e "$PREDICTION_ROUTE_STATE" ]] && return
+  directory="$(dirname "$PREDICTION_ROUTE_STATE")"
+  mkdir -p "$directory"
+  temporary="$(mktemp "$directory/.prediction-route.XXXXXX")"
+  printf '%s\n' '{"schema_version":"open_trader.frontend_gateway.prediction_route.v1","mode":"legacy","operation_id":"bootstrap","updated_at":"1970-01-01T00:00:00Z"}' > "$temporary"
+  if ln "$temporary" "$PREDICTION_ROUTE_STATE" 2>/dev/null; then
+    rm -f "$temporary"
+    return
+  fi
+  rm -f "$temporary"
+  [[ -e "$PREDICTION_ROUTE_STATE" ]] || return 1
 }
 
 lint_plist() {
@@ -258,6 +276,7 @@ install_stack() {
   lint_plist "$legacy_rendered"
   mkdir -p "$LAUNCH_AGENTS_DIR" "$REPO_ROOT/logs/frontend_gateway" \
     "$REPO_ROOT/logs/legacy_dashboard" "$DATA_DIR" "$REPORTS_DIR"
+  seed_prediction_route
   printf '%s\n' "$gateway_rendered" > "$GATEWAY_PLIST"
   printf '%s\n' "$legacy_rendered" > "$LEGACY_PLIST"
   : > "$GATEWAY_OUT_LOG"
