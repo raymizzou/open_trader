@@ -18,7 +18,6 @@ from open_trader.prediction_n_leg import (
     Comparison,
     ConstraintModel,
     ExecutableCostSlice,
-    ExhaustiveSearchProof,
     ForbiddenAtomCombination,
     ObjectiveBounds,
     OptimalityStatus,
@@ -180,6 +179,8 @@ def test_canonical_contract_separates_master_adversary_and_result_statuses() -> 
         hyperedges=(("relation-1", ("contract-a",)),),
     )
     proof = PayoutProof(
+        schema_version=n_leg.PAYOUT_PROOF_SCHEMA_V1,
+        result_kind=n_leg.ProofResultKind.PORTFOLIO,
         problem_fingerprint="problem-fingerprint",
         portfolio_fingerprint="portfolio-fingerprint",
         worst_scenario=scenario,
@@ -189,6 +190,14 @@ def test_canonical_contract_separates_master_adversary_and_result_statuses() -> 
         guaranteed_profit_units=10,
         conservative_capital_release_at=AS_OF,
         selected_support_graph=support_graph,
+        proof_method="BOUNDED_EXACT_ORACLE_V1",
+        request_fingerprint=None,
+        source_problem_fingerprint=None,
+        qualification_fingerprint="qualification-fingerprint",
+        quantity_vectors_total=None,
+        quantity_vectors_examined=None,
+        joint_states_per_vector=None,
+        rejection_counts=(),
     )
     solution = PortfolioSolution(quantities=candidate.quantities, payout_proof=proof)
     request = OracleRequest(
@@ -197,11 +206,20 @@ def test_canonical_contract_separates_master_adversary_and_result_statuses() -> 
         problem=problem,
         budget=OracleBudget(1, 1, 1),
     )
-    negative_proof = ExhaustiveSearchProof(
-        proof_method="exhaustive-v1",
-        conclusion=BusinessStatus.NO_QUALIFIED_OPPORTUNITY,
-        request_fingerprint="request-fingerprint",
+    negative_proof = PayoutProof(
+        schema_version=n_leg.PAYOUT_PROOF_SCHEMA_V1,
+        result_kind=n_leg.ProofResultKind.NO_QUALIFIED_OPPORTUNITY,
         problem_fingerprint="problem-fingerprint",
+        portfolio_fingerprint=None,
+        worst_scenario=None,
+        worst_state_cut=None,
+        payout_lower_bound_units=None,
+        cost_upper_bound_units=None,
+        guaranteed_profit_units=None,
+        conservative_capital_release_at=None,
+        selected_support_graph=None,
+        proof_method="exhaustive-v1",
+        request_fingerprint="request-fingerprint",
         source_problem_fingerprint=None,
         qualification_fingerprint="qualification-fingerprint",
         quantity_vectors_total=1,
@@ -361,6 +379,8 @@ def valid_result() -> OracleResult:
     problem = sample_problem()
     scenario = SettlementScenario((SelectedAtom("contract-a", "a-no"),))
     proof = PayoutProof(
+        schema_version=n_leg.PAYOUT_PROOF_SCHEMA_V1,
+        result_kind=n_leg.ProofResultKind.PORTFOLIO,
         problem_fingerprint=fingerprint(problem),
         portfolio_fingerprint="sha256:portfolio",
         worst_scenario=scenario,
@@ -370,6 +390,14 @@ def valid_result() -> OracleResult:
         guaranteed_profit_units=10,
         conservative_capital_release_at=AS_OF + timedelta(days=1),
         selected_support_graph=SelectedSupportGraph(("buy-no-a",), ("contract-a",), (), ()),
+        proof_method="BOUNDED_EXACT_ORACLE_V1",
+        request_fingerprint=None,
+        source_problem_fingerprint=None,
+        qualification_fingerprint="sha256:qualification",
+        quantity_vectors_total=None,
+        quantity_vectors_examined=None,
+        joint_states_per_vector=None,
+        rejection_counts=(),
     )
     return OracleResult(
         solve_status=SolveStatus.FEASIBLE,
@@ -381,6 +409,42 @@ def valid_result() -> OracleResult:
         negative_proof=None,
         unknown_reason=None,
     )
+
+
+def test_portfolio_payout_proof_round_trips_only_portfolio_fields() -> None:
+    result = valid_result()
+
+    decoded = result_from_payload(canonical_payload(result))
+
+    assert decoded == result
+    assert decoded.solution is not None
+    proof = decoded.solution.payout_proof
+    assert proof.schema_version == n_leg.PAYOUT_PROOF_SCHEMA_V1
+    assert proof.result_kind == n_leg.ProofResultKind.PORTFOLIO
+    assert proof.proof_method == "BOUNDED_EXACT_ORACLE_V1"
+    assert proof.portfolio_fingerprint is not None
+    assert proof.worst_scenario is not None
+    assert proof.worst_state_cut is not None
+    assert proof.payout_lower_bound_units is not None
+    assert proof.cost_upper_bound_units is not None
+    assert proof.guaranteed_profit_units is not None
+    assert proof.conservative_capital_release_at is not None
+    assert proof.selected_support_graph is not None
+    assert proof.request_fingerprint is None
+    assert proof.source_problem_fingerprint is None
+    assert proof.qualification_fingerprint is not None
+    assert proof.quantity_vectors_total is None
+    assert proof.quantity_vectors_examined is None
+    assert proof.joint_states_per_vector is None
+    assert proof.rejection_counts == ()
+
+
+def test_result_from_payload_rejects_portfolio_proof_with_negative_branch_field() -> None:
+    payload = canonical_payload(valid_result())
+    payload["solution"]["payout_proof"]["request_fingerprint"] = "sha256:request"
+
+    with pytest.raises(ModelDecodeError):
+        result_from_payload(payload)
 
 
 @pytest.mark.parametrize(
@@ -449,11 +513,20 @@ def test_validate_problem_reports_naive_as_of_without_comparison_error() -> None
 
 
 def negative_result_payload() -> dict[str, object]:
-    proof = ExhaustiveSearchProof(
-        proof_method="EXHAUSTIVE_ORACLE_V1",
-        conclusion=BusinessStatus.NO_QUALIFIED_OPPORTUNITY,
-        request_fingerprint="sha256:request",
+    proof = PayoutProof(
+        schema_version=n_leg.PAYOUT_PROOF_SCHEMA_V1,
+        result_kind=n_leg.ProofResultKind.NO_QUALIFIED_OPPORTUNITY,
         problem_fingerprint="sha256:problem",
+        portfolio_fingerprint=None,
+        worst_scenario=None,
+        worst_state_cut=None,
+        payout_lower_bound_units=None,
+        cost_upper_bound_units=None,
+        guaranteed_profit_units=None,
+        conservative_capital_release_at=None,
+        selected_support_graph=None,
+        proof_method="EXHAUSTIVE_ORACLE_V1",
+        request_fingerprint="sha256:request",
         source_problem_fingerprint=None,
         qualification_fingerprint="sha256:qualification",
         quantity_vectors_total=1,
@@ -505,7 +578,7 @@ def test_result_from_payload_rejects_malformed_no_arbitrage_diagnostics(mutate: 
         "closed": True,
     }
     payload["negative_proof"].update(
-        conclusion="NO_ARBITRAGE",
+        result_kind="NO_ARBITRAGE",
         source_problem_fingerprint="sha256:source-problem",
     )
     mutate(payload)  # type: ignore[operator]

@@ -12,7 +12,6 @@ from open_trader.prediction_n_leg import (
     CandidateAction,
     Comparison,
     ConstraintModel,
-    ExhaustiveSearchProof,
     ObjectiveBounds,
     OptimalityStatus,
     OracleBudget,
@@ -20,7 +19,10 @@ from open_trader.prediction_n_leg import (
     OracleResult,
     PortfolioSolution,
     PayoutProof,
+    ProofResultKind,
     ProofStatus,
+    PAYOUT_PROOF_SCHEMA_V1,
+    PROBLEM_SCHEMA_V1,
     QualificationConstraint,
     QualificationMetric,
     REQUEST_SCHEMA_V1,
@@ -559,15 +561,25 @@ def build_portfolio_solution(
     return PortfolioSolution(
         evaluation.quantities,
         PayoutProof(
-            fingerprint(problem),
-            fingerprint({"quantities": evaluation.quantities}),
-            evaluation.worst_scenario,
-            evaluation.worst_state_cut,
-            evaluation.payout_lower_bound_units,
-            evaluation.cost_upper_bound_units,
-            evaluation.guaranteed_profit_units,
-            evaluation.conservative_capital_release_at,
-            support_graph,
+            schema_version=PAYOUT_PROOF_SCHEMA_V1,
+            result_kind=ProofResultKind.PORTFOLIO,
+            problem_fingerprint=fingerprint(problem),
+            portfolio_fingerprint=fingerprint({"quantities": evaluation.quantities}),
+            worst_scenario=evaluation.worst_scenario,
+            worst_state_cut=evaluation.worst_state_cut,
+            payout_lower_bound_units=evaluation.payout_lower_bound_units,
+            cost_upper_bound_units=evaluation.cost_upper_bound_units,
+            guaranteed_profit_units=evaluation.guaranteed_profit_units,
+            conservative_capital_release_at=evaluation.conservative_capital_release_at,
+            selected_support_graph=support_graph,
+            proof_method="BOUNDED_EXACT_ORACLE_V1",
+            request_fingerprint=None,
+            source_problem_fingerprint=None,
+            qualification_fingerprint=_qualification_fingerprint(problem),
+            quantity_vectors_total=None,
+            quantity_vectors_examined=None,
+            joint_states_per_vector=None,
+            rejection_counts=(),
         ),
     )
 
@@ -633,21 +645,40 @@ def build_exhaustive_search_proof(
     audit: SearchAudit,
     conclusion: BusinessStatus,
     source_problem_fingerprint: str | None = None,
-) -> ExhaustiveSearchProof:
+) -> PayoutProof:
     if conclusion not in {BusinessStatus.NO_QUALIFIED_OPPORTUNITY, BusinessStatus.NO_ARBITRAGE}:
         raise ValueError("exhaustive proof requires a negative business conclusion")
-    return ExhaustiveSearchProof(
-        "EXHAUSTIVE_ORACLE_V1",
-        conclusion,
-        fingerprint(request),
-        fingerprint(request.problem),
-        source_problem_fingerprint,
-        fingerprint({"qualification_constraints": request.problem.qualification_constraints}),
-        audit.quantity_vectors_total,
-        audit.quantity_vectors_examined,
-        audit.joint_states_per_vector,
-        audit.rejection_counts,
+    return PayoutProof(
+        schema_version=PAYOUT_PROOF_SCHEMA_V1,
+        result_kind=ProofResultKind(conclusion.value),
+        problem_fingerprint=fingerprint(request.problem),
+        portfolio_fingerprint=None,
+        worst_scenario=None,
+        worst_state_cut=None,
+        payout_lower_bound_units=None,
+        cost_upper_bound_units=None,
+        guaranteed_profit_units=None,
+        conservative_capital_release_at=None,
+        selected_support_graph=None,
+        proof_method="EXHAUSTIVE_ORACLE_V1",
+        request_fingerprint=fingerprint(request),
+        source_problem_fingerprint=source_problem_fingerprint,
+        qualification_fingerprint=_qualification_fingerprint(request.problem),
+        quantity_vectors_total=audit.quantity_vectors_total,
+        quantity_vectors_examined=audit.quantity_vectors_examined,
+        joint_states_per_vector=audit.joint_states_per_vector,
+        rejection_counts=audit.rejection_counts,
     )
+
+
+def _qualification_fingerprint(problem: ArbitrageProblem) -> str:
+    constraints = tuple(
+        sorted(problem.qualification_constraints, key=lambda item: item.constraint_id)
+    )
+    return fingerprint({
+        "schema_version": PROBLEM_SCHEMA_V1,
+        "qualification_constraints": constraints,
+    })
 
 
 def _unknown_result(reason: UnknownReason) -> OracleResult:

@@ -21,10 +21,12 @@ from open_trader.prediction_n_leg import (
     ForbiddenAtomCombination,
     ModelDecodeError,
     OBSERVATION_SCHEMA_V1,
+    PAYOUT_PROOF_SCHEMA_V1,
     OracleBudget,
     OracleRequest,
     OptimalityStatus,
     ProofStatus,
+    ProofResultKind,
     PROBLEM_SCHEMA_V1,
     QualificationConstraint,
     QualificationMetric,
@@ -67,7 +69,7 @@ AS_OF = datetime(2026, 8, 12, tzinfo=UTC)
 
 
 ORACLE_CORPUS_PATH = Path(__file__).with_name("fixtures") / "prediction_n_leg_v1.json"
-ORACLE_CORPUS_SHA256 = "8de03c98691ed0af9b64499530582f9d3aa8e1b395f75a7531edbb3c6496ae59"
+ORACLE_CORPUS_SHA256 = "a4680fb2c66dedac9e85db9cd06d0872882ca69b09fba6d9f338d0b97243ecc7"
 
 
 def _run_corpus_case(request: OracleRequest):
@@ -1188,7 +1190,10 @@ def test_admission_emits_replayable_exhaustive_negative_proof_only_after_full_ex
     assert result.negative_proof.proof_method == "EXHAUSTIVE_ORACLE_V1"
     assert result.negative_proof.request_fingerprint == fingerprint(request)
     assert result.negative_proof.problem_fingerprint == fingerprint(built)
-    assert result.negative_proof.qualification_fingerprint == fingerprint({"qualification_constraints": built.qualification_constraints})
+    assert result.negative_proof.qualification_fingerprint == fingerprint({
+        "schema_version": PROBLEM_SCHEMA_V1,
+        "qualification_constraints": built.qualification_constraints,
+    })
     assert result.negative_proof.quantity_vectors_total == 2
     assert result.negative_proof.quantity_vectors_examined == 2
     assert result.negative_proof.joint_states_per_vector == 1
@@ -1223,6 +1228,76 @@ def test_admission_emits_replayable_exhaustive_negative_proof_only_after_full_ex
     assert state_limited.business_status == BusinessStatus.UNKNOWN
     assert state_limited.unknown_reason == UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED
     assert state_limited.negative_proof is None
+
+
+def test_no_qualified_payout_proof_round_trips_only_negative_fields() -> None:
+    key = observation()
+    built = replace(
+        problem(
+            (action("contract-a", "action-a", key),),
+            (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 1),)),),
+        ),
+        qualification_constraints=(_minimum_profit(1),),
+    )
+    result = oracle.find_qualified(_admission_request(built, OracleBudget(2, 1, 1)))
+
+    decoded = result_from_payload(canonical_payload(result))
+
+    assert decoded == result
+    assert decoded.negative_proof is not None
+    proof = decoded.negative_proof
+    assert proof.schema_version == PAYOUT_PROOF_SCHEMA_V1
+    assert proof.result_kind == ProofResultKind.NO_QUALIFIED_OPPORTUNITY
+    assert proof.proof_method == "EXHAUSTIVE_ORACLE_V1"
+    assert proof.portfolio_fingerprint is None
+    assert proof.worst_scenario is None
+    assert proof.worst_state_cut is None
+    assert proof.payout_lower_bound_units is None
+    assert proof.cost_upper_bound_units is None
+    assert proof.guaranteed_profit_units is None
+    assert proof.conservative_capital_release_at is None
+    assert proof.selected_support_graph is None
+    assert proof.request_fingerprint is not None
+    assert proof.source_problem_fingerprint is None
+    assert proof.qualification_fingerprint is not None
+    assert proof.quantity_vectors_total == proof.quantity_vectors_examined == 2
+    assert proof.joint_states_per_vector == 1
+    assert proof.rejection_counts == (("ALL_ZERO", 1), ("minimum-profit", 1))
+
+    payload = canonical_payload(result)
+    payload["negative_proof"]["portfolio_fingerprint"] = "sha256:portfolio"
+    with pytest.raises(ModelDecodeError):
+        result_from_payload(payload)
+
+
+def test_qualification_order_does_not_change_negative_proof_or_result_identity() -> None:
+    key = observation()
+    built = problem(
+        (action("contract-a", "action-a", key),),
+        (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 1),)),),
+    )
+    constraints = (
+        _minimum_profit(1),
+        QualificationConstraint(
+            "maximum-delay",
+            "v1",
+            QualificationMetric.MAX_CAPITAL_RELEASE_DELAY_SECONDS,
+            Comparison.LESS_THAN_OR_EQUAL,
+            1,
+            1,
+        ),
+    )
+    first_request = _admission_request(replace(built, qualification_constraints=constraints), OracleBudget(2, 1, 1))
+    second_request = _admission_request(replace(built, qualification_constraints=tuple(reversed(constraints))), OracleBudget(2, 1, 1))
+
+    assert fingerprint(first_request) == fingerprint(second_request)
+    first = oracle.find_qualified(first_request)
+    second = oracle.find_qualified(second_request)
+
+    assert first.negative_proof is not None
+    assert second.negative_proof is not None
+    assert first.negative_proof.qualification_fingerprint == second.negative_proof.qualification_fingerprint
+    assert fingerprint(first) == fingerprint(second)
 
 
 def test_negative_proof_rejection_counts_deduplicate_disconnected_children_per_vector() -> None:
@@ -1391,11 +1466,14 @@ def test_optimal_rejects_non_optimization_mode_and_proves_exhaustive_no_qualific
     proof = exhausted.negative_proof
     request = _optimization_request(built, OracleBudget(2, 1, 1))
     assert proof.proof_method == "EXHAUSTIVE_ORACLE_V1"
-    assert proof.conclusion == BusinessStatus.NO_QUALIFIED_OPPORTUNITY
+    assert proof.result_kind == ProofResultKind.NO_QUALIFIED_OPPORTUNITY
     assert proof.request_fingerprint == fingerprint(request)
     assert proof.problem_fingerprint == fingerprint(built)
     assert proof.source_problem_fingerprint is None
-    assert proof.qualification_fingerprint == fingerprint({"qualification_constraints": built.qualification_constraints})
+    assert proof.qualification_fingerprint == fingerprint({
+        "schema_version": PROBLEM_SCHEMA_V1,
+        "qualification_constraints": built.qualification_constraints,
+    })
     assert proof.quantity_vectors_total == proof.quantity_vectors_examined == 2
     assert proof.joint_states_per_vector == 1
     assert proof.rejection_counts == (("ALL_ZERO", 1), ("minimum-profit", 1))
@@ -1428,6 +1506,46 @@ def test_raw_arbitrage_proves_no_arbitrage_only_when_global_profit_is_not_positi
     )
     assert result.negative_proof.source_problem_fingerprint == fingerprint(built)
     assert result.negative_proof.quantity_vectors_total == result.negative_proof.quantity_vectors_examined == 2
+
+
+def test_no_arbitrage_payout_proof_round_trips_only_negative_fields() -> None:
+    key = observation()
+    built = problem(
+        (action("contract-a", "action-a", key),),
+        (state("contract-a", key, "action-a", (("a", TerminalKind.NORMAL_YES, 1),)),),
+    )
+    result = oracle.diagnose_raw_arbitrage(built, OracleBudget(2, 1, 1))
+
+    decoded = result_from_payload(canonical_payload(result))
+
+    assert decoded == result
+    assert decoded.negative_proof is not None
+    proof = decoded.negative_proof
+    assert proof.schema_version == PAYOUT_PROOF_SCHEMA_V1
+    assert proof.result_kind == ProofResultKind.NO_ARBITRAGE
+    assert proof.proof_method == "EXHAUSTIVE_ORACLE_V1"
+    assert proof.portfolio_fingerprint is None
+    assert proof.worst_scenario is None
+    assert proof.worst_state_cut is None
+    assert proof.payout_lower_bound_units is None
+    assert proof.cost_upper_bound_units is None
+    assert proof.guaranteed_profit_units is None
+    assert proof.conservative_capital_release_at is None
+    assert proof.selected_support_graph is None
+    assert proof.request_fingerprint is not None
+    assert proof.source_problem_fingerprint == fingerprint(built)
+    assert proof.qualification_fingerprint == fingerprint({
+        "schema_version": PROBLEM_SCHEMA_V1,
+        "qualification_constraints": (),
+    })
+    assert proof.quantity_vectors_total == proof.quantity_vectors_examined == 2
+    assert proof.joint_states_per_vector == 1
+    assert proof.rejection_counts == (("ALL_ZERO", 1),)
+
+    payload = canonical_payload(result)
+    payload["negative_proof"]["worst_scenario"] = {"atoms": []}
+    with pytest.raises(ModelDecodeError):
+        result_from_payload(payload)
 
 
 def test_raw_arbitrage_keeps_positive_raw_profit_separate_from_admission_and_is_never_automatic(monkeypatch: pytest.MonkeyPatch) -> None:

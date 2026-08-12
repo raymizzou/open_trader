@@ -69,6 +69,12 @@ class BusinessStatus(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class ProofResultKind(StrEnum):
+    PORTFOLIO = "PORTFOLIO"
+    NO_QUALIFIED_OPPORTUNITY = "NO_QUALIFIED_OPPORTUNITY"
+    NO_ARBITRAGE = "NO_ARBITRAGE"
+
+
 class OptimalityStatus(StrEnum):
     OPTIMAL = "OPTIMAL"
     NOT_PROVEN = "NOT_PROVEN"
@@ -229,15 +235,25 @@ class SelectedSupportGraph:
 
 @dataclass(frozen=True, slots=True)
 class PayoutProof:
+    schema_version: str
+    result_kind: ProofResultKind
     problem_fingerprint: str
-    portfolio_fingerprint: str
-    worst_scenario: SettlementScenario
-    worst_state_cut: WorstStateCut
-    payout_lower_bound_units: int
-    cost_upper_bound_units: int
-    guaranteed_profit_units: int
-    conservative_capital_release_at: datetime
-    selected_support_graph: SelectedSupportGraph
+    portfolio_fingerprint: str | None
+    worst_scenario: SettlementScenario | None
+    worst_state_cut: WorstStateCut | None
+    payout_lower_bound_units: int | None
+    cost_upper_bound_units: int | None
+    guaranteed_profit_units: int | None
+    conservative_capital_release_at: datetime | None
+    selected_support_graph: SelectedSupportGraph | None
+    proof_method: str
+    request_fingerprint: str | None
+    source_problem_fingerprint: str | None
+    qualification_fingerprint: str | None
+    quantity_vectors_total: int | None
+    quantity_vectors_examined: int | None
+    joint_states_per_vector: int | None
+    rejection_counts: tuple[tuple[str, int], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,20 +286,6 @@ class OracleRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class ExhaustiveSearchProof:
-    proof_method: str
-    conclusion: BusinessStatus
-    request_fingerprint: str
-    problem_fingerprint: str
-    source_problem_fingerprint: str | None
-    qualification_fingerprint: str
-    quantity_vectors_total: int
-    quantity_vectors_examined: int
-    joint_states_per_vector: int
-    rejection_counts: tuple[tuple[str, int], ...]
-
-
-@dataclass(frozen=True, slots=True)
 class OracleResult:
     solve_status: SolveStatus
     proof_status: ProofStatus
@@ -291,7 +293,7 @@ class OracleResult:
     optimality_status: OptimalityStatus
     objective_bounds: ObjectiveBounds
     solution: PortfolioSolution | None
-    negative_proof: ExhaustiveSearchProof | None
+    negative_proof: PayoutProof | None
     unknown_reason: UnknownReason | None
 
 
@@ -894,27 +896,53 @@ def _support_graph_from_payload(payload: object) -> SelectedSupportGraph:
 
 
 def _payout_proof_from_payload(payload: object) -> PayoutProof:
-    value = _object(payload, "payout_proof", {"problem_fingerprint", "portfolio_fingerprint", "worst_scenario", "worst_state_cut", "payout_lower_bound_units", "cost_upper_bound_units", "guaranteed_profit_units", "conservative_capital_release_at", "selected_support_graph"})
-    return PayoutProof(_string(value["problem_fingerprint"], "problem_fingerprint"), _string(value["portfolio_fingerprint"], "portfolio_fingerprint"), _scenario_from_payload(value["worst_scenario"]), _cut_from_payload(value["worst_state_cut"]), _integer(value["payout_lower_bound_units"], "payout_lower_bound_units"), _integer(value["cost_upper_bound_units"], "cost_upper_bound_units"), _integer(value["guaranteed_profit_units"], "guaranteed_profit_units"), _datetime_from_payload(value["conservative_capital_release_at"], "conservative_capital_release_at"), _support_graph_from_payload(value["selected_support_graph"]))
+    value = _object(payload, "payout_proof", {"schema_version", "result_kind", "problem_fingerprint", "portfolio_fingerprint", "worst_scenario", "worst_state_cut", "payout_lower_bound_units", "cost_upper_bound_units", "guaranteed_profit_units", "conservative_capital_release_at", "selected_support_graph", "proof_method", "request_fingerprint", "source_problem_fingerprint", "qualification_fingerprint", "quantity_vectors_total", "quantity_vectors_examined", "joint_states_per_vector", "rejection_counts"})
+    proof = PayoutProof(
+        schema_version=_string(value["schema_version"], "schema_version"),
+        result_kind=_enum(ProofResultKind, value["result_kind"], "result_kind"),
+        problem_fingerprint=_string(value["problem_fingerprint"], "problem_fingerprint"),
+        portfolio_fingerprint=None if value["portfolio_fingerprint"] is None else _string(value["portfolio_fingerprint"], "portfolio_fingerprint"),
+        worst_scenario=None if value["worst_scenario"] is None else _scenario_from_payload(value["worst_scenario"]),
+        worst_state_cut=None if value["worst_state_cut"] is None else _cut_from_payload(value["worst_state_cut"]),
+        payout_lower_bound_units=_optional_integer(value["payout_lower_bound_units"], "payout_lower_bound_units"),
+        cost_upper_bound_units=_optional_integer(value["cost_upper_bound_units"], "cost_upper_bound_units"),
+        guaranteed_profit_units=_optional_integer(value["guaranteed_profit_units"], "guaranteed_profit_units"),
+        conservative_capital_release_at=None if value["conservative_capital_release_at"] is None else _datetime_from_payload(value["conservative_capital_release_at"], "conservative_capital_release_at"),
+        selected_support_graph=None if value["selected_support_graph"] is None else _support_graph_from_payload(value["selected_support_graph"]),
+        proof_method=_string(value["proof_method"], "proof_method"),
+        request_fingerprint=None if value["request_fingerprint"] is None else _string(value["request_fingerprint"], "request_fingerprint"),
+        source_problem_fingerprint=None if value["source_problem_fingerprint"] is None else _string(value["source_problem_fingerprint"], "source_problem_fingerprint"),
+        qualification_fingerprint=None if value["qualification_fingerprint"] is None else _string(value["qualification_fingerprint"], "qualification_fingerprint"),
+        quantity_vectors_total=_optional_integer(value["quantity_vectors_total"], "quantity_vectors_total"),
+        quantity_vectors_examined=_optional_integer(value["quantity_vectors_examined"], "quantity_vectors_examined"),
+        joint_states_per_vector=_optional_integer(value["joint_states_per_vector"], "joint_states_per_vector"),
+        rejection_counts=_rejection_counts_from_payload(value["rejection_counts"]),
+    )
+    if proof.schema_version != PAYOUT_PROOF_SCHEMA_V1:
+        raise ModelDecodeError(f"schema_version must equal {PAYOUT_PROOF_SCHEMA_V1}")
+    if proof.result_kind == ProofResultKind.PORTFOLIO and (
+        proof.proof_method != "BOUNDED_EXACT_ORACLE_V1"
+        or any(item is None for item in (proof.portfolio_fingerprint, proof.worst_scenario, proof.worst_state_cut, proof.payout_lower_bound_units, proof.cost_upper_bound_units, proof.guaranteed_profit_units, proof.conservative_capital_release_at, proof.selected_support_graph, proof.qualification_fingerprint))
+        or any(item is not None for item in (proof.request_fingerprint, proof.source_problem_fingerprint, proof.quantity_vectors_total, proof.quantity_vectors_examined, proof.joint_states_per_vector))
+        or proof.rejection_counts
+    ):
+        raise ModelDecodeError("PORTFOLIO payout proof contains invalid branch fields")
+    if proof.result_kind != ProofResultKind.PORTFOLIO and (
+        proof.proof_method != "EXHAUSTIVE_ORACLE_V1"
+        or any(item is not None for item in (proof.portfolio_fingerprint, proof.worst_scenario, proof.worst_state_cut, proof.payout_lower_bound_units, proof.cost_upper_bound_units, proof.guaranteed_profit_units, proof.conservative_capital_release_at, proof.selected_support_graph))
+        or any(item is None for item in (proof.request_fingerprint, proof.qualification_fingerprint, proof.quantity_vectors_total, proof.quantity_vectors_examined, proof.joint_states_per_vector))
+        or proof.quantity_vectors_total != proof.quantity_vectors_examined
+        or proof.quantity_vectors_total <= 0
+        or proof.joint_states_per_vector <= 0
+        or (proof.result_kind == ProofResultKind.NO_QUALIFIED_OPPORTUNITY) != (proof.source_problem_fingerprint is None)
+    ):
+        raise ModelDecodeError("negative payout proof contains invalid branch fields")
+    return proof
 
 
-def _solution_from_payload(payload: object) -> PortfolioSolution:
-    value = _object(payload, "solution", {"quantities", "payout_proof"})
-    return PortfolioSolution(tuple(_quantity_from_payload(item) for item in _array(value["quantities"], "quantities")), _payout_proof_from_payload(value["payout_proof"]))
-
-
-def _bounds_from_payload(payload: object) -> ObjectiveBounds:
-    value = _object(payload, "objective_bounds", {"lower_bound_units", "upper_bound_units", "gap_units", "closed"})
-    return ObjectiveBounds(_optional_integer(value["lower_bound_units"], "lower_bound_units"), _optional_integer(value["upper_bound_units"], "upper_bound_units"), _optional_integer(value["gap_units"], "gap_units"), _boolean(value["closed"], "closed"))
-
-
-def _negative_proof_from_payload(payload: object) -> ExhaustiveSearchProof:
-    value = _object(payload, "negative_proof", {"proof_method", "conclusion", "request_fingerprint", "problem_fingerprint", "source_problem_fingerprint", "qualification_fingerprint", "quantity_vectors_total", "quantity_vectors_examined", "joint_states_per_vector", "rejection_counts"})
-    source = value["source_problem_fingerprint"]
-    if source is not None:
-        source = _string(source, "source_problem_fingerprint")
+def _rejection_counts_from_payload(payload: object) -> tuple[tuple[str, int], ...]:
     rejection_counts = []
-    for item in _array(value["rejection_counts"], "rejection_counts"):
+    for item in _array(payload, "rejection_counts"):
         pair = _array(item, "rejection_count")
         if len(pair) != 2:
             raise ModelDecodeError("rejection_count must contain an ID and count")
@@ -922,14 +950,20 @@ def _negative_proof_from_payload(payload: object) -> ExhaustiveSearchProof:
         if count < 0:
             raise ModelDecodeError("rejection_count.count must be non-negative")
         rejection_counts.append((_string(pair[0], "rejection_count.id"), count))
-    quantity_vectors_total = _integer(value["quantity_vectors_total"], "quantity_vectors_total")
-    quantity_vectors_examined = _integer(value["quantity_vectors_examined"], "quantity_vectors_examined")
-    joint_states_per_vector = _integer(value["joint_states_per_vector"], "joint_states_per_vector")
-    if any(count < 0 for count in (quantity_vectors_total, quantity_vectors_examined, joint_states_per_vector)):
-        raise ModelDecodeError("exhaustive proof counts must be non-negative")
-    if quantity_vectors_total != quantity_vectors_examined:
-        raise ModelDecodeError("exhaustive proof must examine every quantity vector")
-    return ExhaustiveSearchProof(_string(value["proof_method"], "proof_method"), _enum(BusinessStatus, value["conclusion"], "conclusion"), _string(value["request_fingerprint"], "request_fingerprint"), _string(value["problem_fingerprint"], "problem_fingerprint"), source, _string(value["qualification_fingerprint"], "qualification_fingerprint"), quantity_vectors_total, quantity_vectors_examined, joint_states_per_vector, tuple(rejection_counts))
+    return tuple(rejection_counts)
+
+
+def _solution_from_payload(payload: object) -> PortfolioSolution:
+    value = _object(payload, "solution", {"quantities", "payout_proof"})
+    proof = _payout_proof_from_payload(value["payout_proof"])
+    if proof.result_kind != ProofResultKind.PORTFOLIO:
+        raise ModelDecodeError("solution requires a PORTFOLIO payout proof")
+    return PortfolioSolution(tuple(_quantity_from_payload(item) for item in _array(value["quantities"], "quantities")), proof)
+
+
+def _bounds_from_payload(payload: object) -> ObjectiveBounds:
+    value = _object(payload, "objective_bounds", {"lower_bound_units", "upper_bound_units", "gap_units", "closed"})
+    return ObjectiveBounds(_optional_integer(value["lower_bound_units"], "lower_bound_units"), _optional_integer(value["upper_bound_units"], "upper_bound_units"), _optional_integer(value["gap_units"], "gap_units"), _boolean(value["closed"], "closed"))
 
 
 def _validate_result(result: OracleResult) -> None:
@@ -947,7 +981,7 @@ def _validate_result(result: OracleResult) -> None:
         if not feasible or result.solution is None or result.proof_status != ProofStatus.PROVEN or not bounds.closed or bounds.lower_bound_units is None or bounds.lower_bound_units != bounds.upper_bound_units or bounds.gap_units != 0:
             raise ModelDecodeError("OPTIMAL requires a proved solution and equal closed objective bounds")
     if negative:
-        if result.solve_status != SolveStatus.INFEASIBLE or result.proof_status != ProofStatus.PROVEN or result.optimality_status != OptimalityStatus.NOT_APPLICABLE or result.solution is not None or result.negative_proof is None or result.negative_proof.conclusion != result.business_status or result.negative_proof.quantity_vectors_total <= 0 or result.negative_proof.quantity_vectors_examined != result.negative_proof.quantity_vectors_total or result.negative_proof.joint_states_per_vector <= 0 or result.unknown_reason is not None:
+        if result.solve_status != SolveStatus.INFEASIBLE or result.proof_status != ProofStatus.PROVEN or result.optimality_status != OptimalityStatus.NOT_APPLICABLE or result.solution is not None or result.negative_proof is None or result.negative_proof.result_kind.value != result.business_status.value or result.negative_proof.quantity_vectors_total <= 0 or result.negative_proof.quantity_vectors_examined != result.negative_proof.quantity_vectors_total or result.negative_proof.joint_states_per_vector <= 0 or result.unknown_reason is not None:
             raise ModelDecodeError("negative conclusions require a matching exhaustive proof")
     if result.business_status == BusinessStatus.NO_ARBITRAGE:
         bounds = result.objective_bounds
@@ -964,7 +998,7 @@ def _validate_result(result: OracleResult) -> None:
 def result_from_payload(payload: Mapping[str, object]) -> OracleResult:
     value = _object(payload, "result", {"solve_status", "proof_status", "business_status", "optimality_status", "objective_bounds", "solution", "negative_proof", "unknown_reason"})
     solution = None if value["solution"] is None else _solution_from_payload(value["solution"])
-    negative_proof = None if value["negative_proof"] is None else _negative_proof_from_payload(value["negative_proof"])
+    negative_proof = None if value["negative_proof"] is None else _payout_proof_from_payload(value["negative_proof"])
     unknown_reason = None if value["unknown_reason"] is None else _enum(UnknownReason, value["unknown_reason"], "unknown_reason")
     result = OracleResult(_enum(SolveStatus, value["solve_status"], "solve_status"), _enum(ProofStatus, value["proof_status"], "proof_status"), _enum(BusinessStatus, value["business_status"], "business_status"), _enum(OptimalityStatus, value["optimality_status"], "optimality_status"), _bounds_from_payload(value["objective_bounds"]), solution, negative_proof, unknown_reason)
     _validate_result(result)
