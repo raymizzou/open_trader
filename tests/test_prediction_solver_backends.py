@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
+import pytest
+
+from open_trader.prediction_solver import (
+    IntVariable,
+    LinearConstraint,
+    LinearModel,
+    LinearObjective,
+    NativeSolveStatus,
+    validate_backend_result,
+)
+from open_trader.prediction_solver_backends import HighsBackend
 
 ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK = ROOT / "benchmarks" / "prediction_solver"
@@ -109,3 +122,112 @@ def test_license_manifest_has_explicit_pinned_evidence_without_commercial_keys()
     vipr = licenses["vipr"]
     assert vipr["evidence_path"] == "code/viprchk.cpp"
     assert vipr["evidence_sha256"] == "2baf9c4593f5b8ef42323fbfb7cbfa0e4dfafff65e636cf6a143561b9dca2738"
+
+
+@pytest.fixture(scope="module")
+def highs_backend() -> HighsBackend:
+    pytest.importorskip("highspy")
+    return HighsBackend()
+
+
+def test_highs_translates_integer_rows_and_maximizes(highs_backend: HighsBackend) -> None:
+    model = LinearModel(
+        variables=(IntVariable("x", 0, 10), IntVariable("y", 0, 10)),
+        constraints=(LinearConstraint("capacity", (("x", 1), ("y", 1)), None, 7),),
+        objective=LinearObjective("MAX", (("x", 3), ("y", 1))),
+    )
+
+    result = highs_backend.solve(model, time_limit_ms=1_000)
+
+    assert result.status == NativeSolveStatus.OPTIMAL
+    assert dict(result.values) == {"x": 7, "y": 0}
+    assert result.objective_value == 21
+    validate_backend_result(model, result)
+
+
+def test_highs_translates_minimize_objective(highs_backend: HighsBackend) -> None:
+    model = LinearModel(
+        variables=(IntVariable("x", 0, 10), IntVariable("y", 0, 10)),
+        constraints=(LinearConstraint("minimum", (("x", 1), ("y", 1)), 7, None),),
+        objective=LinearObjective("MIN", (("x", 2), ("y", 1))),
+    )
+
+    result = highs_backend.solve(model, time_limit_ms=1_000)
+
+    assert result.status == NativeSolveStatus.OPTIMAL
+    assert dict(result.values) == {"x": 0, "y": 7}
+    assert result.objective_value == 7
+    validate_backend_result(model, result)
+
+
+def test_highs_reports_infeasible_model_without_an_incumbent(highs_backend: HighsBackend) -> None:
+    model = LinearModel(
+        variables=(IntVariable("x", 0, 1),),
+        constraints=(LinearConstraint("impossible", (("x", 1),), 2, None),),
+        objective=None,
+    )
+
+    result = highs_backend.solve(model, time_limit_ms=1_000)
+
+    assert result.status == NativeSolveStatus.INFEASIBLE
+    assert result.values == ()
+    assert result.objective_value is None
+    validate_backend_result(model, result)
+
+
+def _timed_knapsack(size: int) -> LinearModel:
+    weights = tuple(1 + (index * 37) % 97 for index in range(size))
+    values = tuple(1 + (index * 53) % 101 for index in range(size))
+    return LinearModel(
+        variables=tuple(IntVariable(f"x:{index}", 0, 1) for index in range(size)),
+        constraints=(
+            LinearConstraint(
+                "capacity",
+                tuple((f"x:{index}", weight) for index, weight in enumerate(weights)),
+                None,
+                sum(weights) // 3,
+            ),
+        ),
+        objective=LinearObjective("MAX", tuple((f"x:{index}", value) for index, value in enumerate(values))),
+    )
+
+
+def test_highs_keeps_a_time_limit_incumbent_feasible(highs_backend: HighsBackend) -> None:
+    result = highs_backend.solve(_timed_knapsack(150), time_limit_ms=5)
+
+    assert result.native_status == "Time limit reached"
+    assert result.status == NativeSolveStatus.FEASIBLE
+    assert result.values
+    assert result.status != NativeSolveStatus.OPTIMAL
+    validate_backend_result(_timed_knapsack(150), result)
+
+
+def test_highs_reports_a_time_limit_without_an_incumbent_as_unknown(highs_backend: HighsBackend) -> None:
+    model = _timed_knapsack(250)
+    result = highs_backend.solve(model, time_limit_ms=5)
+
+    assert result.native_status == "Time limit reached"
+    assert result.status == NativeSolveStatus.UNKNOWN
+    assert result.values == ()
+    assert result.objective_value is None
+    validate_backend_result(model, result)
+
+
+def test_highs_backend_exposes_pinned_solver_identity_without_candidate_imports() -> None:
+    assert HighsBackend.name == "highs"
+    assert HighsBackend.version == "1.15.1"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT / "src")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import open_trader.prediction_solver_backends; print('highspy' in sys.modules, 'pyscipopt' in sys.modules, 'ortools' in sys.modules)",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert result.stdout.strip() == "False False False"
