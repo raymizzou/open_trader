@@ -16,6 +16,7 @@ UNINSTALLER = ROOT / "scripts" / "uninstall_dashboard_launchd.sh"
 SINGLE_LABEL = "com.open-trader.dashboard"
 GATEWAY_LABEL = "com.open-trader.frontend-gateway"
 LEGACY_LABEL = "com.open-trader.legacy-dashboard"
+ACCOUNT_LABEL = "com.open-trader.account-api"
 SINGLE_TEMPLATE = ROOT / f"ops/launchd/{SINGLE_LABEL}.plist.template"
 GATEWAY_TEMPLATE = ROOT / f"ops/launchd/{GATEWAY_LABEL}.plist.template"
 LEGACY_TEMPLATE = ROOT / f"ops/launchd/{LEGACY_LABEL}.plist.template"
@@ -56,8 +57,13 @@ def _run_installer(
     calls_path = tmp_path / "fake-calls"
     state_dir = tmp_path / "launchd-state"
     state_dir.mkdir()
-    for label in (SINGLE_LABEL, GATEWAY_LABEL, LEGACY_LABEL):
-        (state_dir / label).touch()
+    for label, pid in (
+        (SINGLE_LABEL, 4101),
+        (GATEWAY_LABEL, 4102),
+        (LEGACY_LABEL, 4103),
+        (ACCOUNT_LABEL, 4104),
+    ):
+        (state_dir / label).write_text(f"{pid}\n", encoding="utf-8")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
 
@@ -67,6 +73,14 @@ def _run_installer(
         """#!/bin/bash
 echo "launchctl $*" >> "$FAKE_CALLS"
 label="${2##*/}"
+job_pid() {
+  case "$1" in
+    com.open-trader.dashboard) echo 4101 ;;
+    com.open-trader.frontend-gateway) echo 4102 ;;
+    com.open-trader.legacy-dashboard) echo 4103 ;;
+    com.open-trader.account-api) echo 4104 ;;
+  esac
+}
 if [[ "$1" == "bootout" ]]; then
   if [[ "$label" != "${FAKE_STUCK_LABEL:-}" ]]; then
     rm -f "$FAKE_LAUNCHD_STATE_DIR/$label"
@@ -78,7 +92,7 @@ if [[ "$1" == "bootstrap" ]]; then
   if [[ "$label" == "com.open-trader.frontend-gateway" && "${FAKE_FAIL_GATEWAY_BOOTSTRAP:-0}" == "1" ]]; then
     exit 5
   fi
-  : > "$FAKE_LAUNCHD_STATE_DIR/$label"
+  job_pid "$label" > "$FAKE_LAUNCHD_STATE_DIR/$label"
   exit 0
 fi
 if [[ "$1" == "print" ]]; then
@@ -86,11 +100,7 @@ if [[ "$1" == "print" ]]; then
     echo "Could not find service" >&2
     exit 113
   fi
-  case "$2" in
-    *com.open-trader.dashboard) echo "pid = 4101" ;;
-    *com.open-trader.frontend-gateway) echo "pid = 4102" ;;
-    *com.open-trader.legacy-dashboard) echo "pid = 4103" ;;
-  esac
+  echo "pid = $(cat "$FAKE_LAUNCHD_STATE_DIR/$label")"
 fi
 exit 0
 """,
@@ -103,6 +113,7 @@ echo "lsof $*" >> "$FAKE_CALLS"
 case "$*" in
   *tiTCP:8766*) [[ -n "${FAKE_8766_PID:-4101}" ]] && echo "${FAKE_8766_PID:-4101}" ;;
   *tiTCP:8767*) [[ -n "${FAKE_8767_PID:-}" ]] && echo "$FAKE_8767_PID" ;;
+  *tiTCP:8768*) [[ -n "${FAKE_8768_PID:-4104}" ]] && echo "${FAKE_8768_PID:-4104}" ;;
 esac
 """,
     )
@@ -154,16 +165,26 @@ exit 0
     (agents / f"{SINGLE_LABEL}.plist").write_text(
         single_dry_run.stdout, encoding="utf-8"
     )
-    if mode == "single":
-        stack_dry_run = subprocess.run(
-            [str(INSTALLER), "--dry-run", *common_args[1:]],
-            cwd=ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
+    stack_dry_run = subprocess.run(
+        [str(INSTALLER), "--dry-run", *common_args[1:]],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    for label, payload in _dry_run_sections(stack_dry_run.stdout).items():
+        (agents / f"{label}.plist").write_bytes(plistlib.dumps(payload))
+    if mode == "legacy":
+        (agents / f"{ACCOUNT_LABEL}.plist").write_bytes(
+            plistlib.dumps(
+                {"Label": ACCOUNT_LABEL, "ProgramArguments": ["account-sentinel"]}
+            )
         )
-        for label, payload in _dry_run_sections(stack_dry_run.stdout).items():
-            (agents / f"{label}.plist").write_bytes(plistlib.dumps(payload))
+        snapshots = tmp_path / "legacy-nonlegacy-snapshots"
+        snapshots.mkdir()
+        for label in (SINGLE_LABEL, GATEWAY_LABEL, ACCOUNT_LABEL):
+            shutil.copy2(agents / f"{label}.plist", snapshots / f"{label}.plist")
+            shutil.copy2(state_dir / label, snapshots / label)
 
     env = {
         **os.environ,
@@ -287,6 +308,7 @@ def test_legacy_only_disables_prediction_owner_without_touching_gateway_or_singl
     domain = f"gui/{os.getuid()}"
     legacy = plistlib.loads((agents / f"{LEGACY_LABEL}.plist").read_bytes())
     legacy_args = legacy["ProgramArguments"]
+    snapshots = tmp_path / "legacy-nonlegacy-snapshots"
 
     assert result.returncode == 0
     assert legacy_args[legacy_args.index("--prediction-config") + 2 :][:2] == [
@@ -307,6 +329,17 @@ def test_legacy_only_disables_prediction_owner_without_touching_gateway_or_singl
         for label in (GATEWAY_LABEL, SINGLE_LABEL, "com.open-trader.account-")
     )
     assert not any("8766" in call for call in calls)
+    assert not any("8768" in call for call in calls)
+    assert [call for call in calls if call.startswith("lsof ")] == [
+        "lsof -nP -tiTCP:8767 -sTCP:LISTEN"
+    ]
+    for label in (SINGLE_LABEL, GATEWAY_LABEL, ACCOUNT_LABEL):
+        assert (agents / f"{label}.plist").read_bytes() == (
+            snapshots / f"{label}.plist"
+        ).read_bytes()
+        assert (tmp_path / "launchd-state" / label).read_bytes() == (
+            snapshots / label
+        ).read_bytes()
 
 
 def test_legacy_prediction_owner_defaults_enabled(tmp_path: Path) -> None:

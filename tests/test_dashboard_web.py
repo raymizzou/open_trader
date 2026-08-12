@@ -5072,6 +5072,16 @@ def test_dashboard_prediction_owner_disabled_omits_runtime(
     observed: dict[str, object] = {}
     monkeypatch.setattr(
         cli,
+        "load_env_config",
+        lambda *_args, **_kwargs: pytest.fail("disabled owner loaded prediction config"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_notifier",
+        lambda *_args, **_kwargs: pytest.fail("disabled owner built prediction notifier"),
+    )
+    monkeypatch.setattr(
+        cli,
         "serve_dashboard",
         lambda config, **_: observed.update(
             prediction_config_path=config.prediction_config_path
@@ -5100,7 +5110,18 @@ def test_dashboard_prediction_owner_enabled_retains_runtime(
     import open_trader.cli as cli
 
     observed: dict[str, object] = {}
+    notifier_calls: list[str] = []
     prediction_config = tmp_path / "prediction.json"
+    monkeypatch.setattr(
+        cli,
+        "load_env_config",
+        lambda *_args, **_kwargs: notifier_calls.append("load") or object(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_notifier",
+        lambda *_args, **_kwargs: notifier_calls.append("build") or object(),
+    )
     monkeypatch.setattr(
         cli,
         "serve_dashboard",
@@ -5121,6 +5142,7 @@ def test_dashboard_prediction_owner_enabled_retains_runtime(
         == 0
     )
     assert observed["prediction_config_path"] == prediction_config
+    assert notifier_calls == ["load", "build"]
 
 
 def test_dashboard_prediction_owner_rejects_unknown_value() -> None:
