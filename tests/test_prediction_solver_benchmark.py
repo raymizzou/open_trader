@@ -869,6 +869,7 @@ _MANIFEST_SCHEMA_V1 = "open_trader.prediction_solver.run_manifest.v1"
 _SHA_A = "sha256:" + "a" * 64
 _SHA_B = "sha256:" + "b" * 64
 _SHA_C = "sha256:" + "c" * 64
+_SHA_D = "sha256:" + "d" * 64
 
 
 def _record_semantic_fingerprint(record: dict[str, object]) -> str:
@@ -881,14 +882,24 @@ def _record_semantic_fingerprint(record: dict[str, object]) -> str:
         "check_hard_failure": record["check_hard_failure"],
         "classification": run["classification"],
         "evidence": None if evidence is None else {
-            field: evidence[field]
-            for field in (
+            **{
+                field: evidence[field]
+                for field in (
                 "adversary_rounds", "candidate", "conservative_capital_release_at",
                 "cost_upper_bound_units", "cuts", "fixed_portfolio_closed",
                 "global_search_closed", "guaranteed_profit_units", "master_rounds",
                 "native_status", "objective_bounds", "payout_lower_bound_units",
                 "worst_scenario",
-            )
+                )
+            },
+            "certificate": None if evidence["certificate"] is None else {
+                field: evidence["certificate"][field]
+                for field in (
+                    "certificate_sha256", "certificate_size_bytes",
+                    "completed_certificate_sha256", "completed_certificate_size_bytes",
+                    "checker_name", "checker_version", "checker_exit_code", "checker_succeeded",
+                )
+            },
         },
         "objective_bounds": run["objective_bounds"],
         "optimality_status": run["optimality_status"],
@@ -995,7 +1006,7 @@ def _benchmark_record(
         "truth_method": "exact_oracle_v1",
         "worker_count": worker_count,
         "worker_id": f"worker-{worker_count}",
-        "worker_rebuild_count": 0,
+        "worker_rebuild_count": int(sample_kind == "rebuild"),
         "worker_start_count": 1,
     }
     record["semantic_fingerprint"] = _record_semantic_fingerprint(record)
@@ -1008,19 +1019,44 @@ def _benchmark_manifest(*, profile: str = "full", solvers: tuple[str, ...] = ("h
     return {
         "approved_case_count": 1,
         "cold_probe_case_ids": probes,
+        "cases": {
+            "case-a": {
+                "model_dimensions": {
+                    "action_count": 2,
+                    "contract_count": 1,
+                    "cost_slice_count": 2,
+                    "joint_state_count": 2,
+                    "quantity_domain_size": 4,
+                    "relationship_count": 0,
+                    "terminal_atom_count": 2,
+                },
+                "oracle_limits": {
+                    "max_joint_states": 100,
+                    "max_quantity_vectors": 200,
+                    "max_support_rechecks": 300,
+                },
+                "problem_fingerprint": _SHA_C,
+                "request_fingerprint": _SHA_A,
+                "request_id": "request-1",
+            }
+        },
         "corpus_manifest_sha256": _SHA_A,
         "environments": {
             environment: {
                 "available": True,
-                "build_id": f"{environment}-build",
+                "build_id": f"{environment}-build-artifact",
                 "environment_id": f"{environment}-build",
+                "git_sha": "1" * 40,
                 "image_id": "none" if environment == "macos" else "image-1",
             }
             for environment in environments
         },
         "first_qualified_case_ids": ["case-a"],
+        "hard_time_limit_ms": 2_000,
         "license_manifest_sha256": _SHA_B,
         "measured_samples": 30 if profile == "full" else 1,
+        "memory_limit_bytes": 10_000,
+        "max_constraint_generation_rounds": 8,
         "optimal_case_ids": ["case-a"],
         "profile": profile,
         "rebuild_probe_case_ids": probes,
@@ -1031,19 +1067,26 @@ def _benchmark_manifest(*, profile: str = "full", solvers: tuple[str, ...] = ("h
         "solvers": {
             solver: {
                 "commercial_key_required": False,
-                "install_succeeded": True,
-                "installation_ns": 10,
+                "environments": {
+                    environment: {
+                        "build_id": f"{environment}-build-artifact",
+                        "install_succeeded": True,
+                        "installation_ns": 10,
+                        "reuse_succeeded": True,
+                        "run_succeeded": True,
+                    }
+                    for environment in environments
+                },
                 "license_evidence_present": True,
                 "manual_interventions": 0,
                 "open_source": True,
-                "reuse_succeeded": True,
-                "run_succeeded": True,
                 "source_evidence_present": True,
                 "whole_claim_certificate_bound": False,
             }
             for solver in solvers
         },
         "throughput_probe_case_ids": probes,
+        "soft_time_limit_ms": 1_000,
         "warmup_samples": 5 if profile == "full" else 0,
         "worker_counts": [1, 2, 4] if profile == "full" else [1],
     }
@@ -1111,6 +1154,10 @@ def test_aggregate_requires_exact_five_warmups_and_thirty_measurements_per_envir
     assert all(isinstance(value, int | dict) and not isinstance(value, float) for cell in cells for value in cell["request_wall_ns"].values())
 
 
+def test_measurement_order_statistics_are_exact_rationals_before_serialization() -> None:
+    assert benchmark._summary(range(30))["p95"] == {"numerator": 551, "denominator": 20}
+
+
 def test_aggregate_keeps_exact_rational_throughput_without_pooling_environments() -> None:
     manifest = _benchmark_manifest()
     records = _full_records()
@@ -1123,6 +1170,72 @@ def test_aggregate_keeps_exact_rational_throughput_without_pooling_environments(
     }
     assert all(cell["requests_per_second"]["p50"] == {"numerator": 1_000_000_000, "denominator": 3} for cell in cells)
     assert Fraction(cells[0]["requests_per_second"]["p50"]["numerator"], cells[0]["requests_per_second"]["p50"]["denominator"]) == Fraction(1_000_000_000, 3)
+
+
+def test_throughput_worst_is_the_minimum_exact_rate_because_higher_is_better() -> None:
+    assert benchmark._throughput_summary([Fraction(1, 3), Fraction(2, 3)])["worst"] == {
+        "numerator": 1,
+        "denominator": 3,
+    }
+    records = _full_records()
+    cell = [
+        record for record in records
+        if record["environment"] == "macos" and record["solver_name"] == "highs"
+        and record["sample_kind"] == "throughput" and record["worker_count"] == 1
+    ]
+    for index, record in enumerate(cell):
+        record["request_wall_ns"] = index + 1
+
+    metrics = aggregate_benchmark_records(records, _benchmark_manifest())["solvers"]["highs"]["metrics"]["throughput"]
+    metric = next(item for item in metrics if item["environment"] == "macos" and item["worker_count"] == 1)["requests_per_second"]
+
+    assert metric["worst"] == {"numerator": 100_000_000, "denominator": 3}
+
+
+@pytest.mark.parametrize(
+    ("kind", "counter"),
+    (("cold", "worker_start_count"), ("rebuild", "worker_rebuild_count")),
+)
+def test_aggregate_rejects_sample_kind_labels_without_the_required_worker_event(kind: str, counter: str) -> None:
+    records = _full_records()
+    next(record for record in records if record["sample_kind"] == kind)[counter] = 0
+
+    with pytest.raises(ValueError, match=counter):
+        aggregate_benchmark_records(records, _benchmark_manifest())
+
+
+@pytest.mark.parametrize("identity", ("build_id", "git_sha", "request_fingerprint", "problem_fingerprint"))
+def test_aggregate_binds_every_environment_and_case_identity(identity: str) -> None:
+    manifest = _benchmark_manifest(profile="quick")
+    records = _quick_records()
+    if identity == "build_id":
+        manifest["environments"]["macos"]["build_id"] = "other-build"
+    elif identity == "git_sha":
+        records[0][identity] = "2" * 40
+    else:
+        records[0][identity] = _SHA_D
+
+    with pytest.raises(ValueError, match=identity):
+        aggregate_benchmark_records(records, manifest)
+
+
+def test_aggregate_binds_each_run_to_its_case_request_id() -> None:
+    records = _quick_records()
+    records[0]["solver_run"]["request_id"] = "case-b"
+
+    with pytest.raises(ValueError, match="request_id"):
+        aggregate_benchmark_records(records, _benchmark_manifest(profile="quick"))
+
+
+@pytest.mark.parametrize("field", ("install_succeeded", "run_succeeded", "reuse_succeeded"))
+def test_hard_gate_requires_install_run_and_reuse_evidence_for_each_environment(field: str) -> None:
+    manifest = _benchmark_manifest()
+    manifest["solvers"]["highs"]["environments"]["linux"][field] = False
+
+    summary = aggregate_benchmark_records(_full_records(), manifest)
+
+    assert summary["solvers"]["highs"]["hard_gate_failures"] == ["ENVIRONMENT_EVIDENCE_FAILED"]
+    assert summary["solvers"]["highs"]["operational_evidence"]["environments"]["linux"][field] is False
 
 
 @pytest.mark.parametrize("mutation", ("missing", "duplicate"))
@@ -1161,8 +1274,8 @@ def test_aggregate_rejects_a_full_manifest_that_skips_a_mandatory_phase_or_probe
         (lambda records, manifest: records[0].update({"check_hard_failure": True, "check_failure_reason": "FALSE_SAFE"}), "CHECK_HARD_FAILURE"),
         (lambda records, manifest: records[0].__setitem__("cleanup_proven", False), "CLEANUP_UNPROVEN"),
         (lambda records, manifest: records[0].__setitem__("peak_aggregate_rss_bytes", 10_001), "MEMORY_LIMIT_EXCEEDED"),
-        (lambda records, manifest: records[0].__setitem__("memory_limit_bytes", 0), "MEMORY_LIMIT_UNBOUNDED"),
-        (lambda records, manifest: manifest["solvers"]["highs"].__setitem__("run_succeeded", False), "ENVIRONMENT_EVIDENCE_FAILED"),
+        (lambda records, manifest: (manifest.__setitem__("memory_limit_bytes", 0), [record.__setitem__("memory_limit_bytes", 0) for record in records]), "MEMORY_LIMIT_UNBOUNDED"),
+        (lambda records, manifest: manifest["solvers"]["highs"]["environments"]["macos"].__setitem__("run_succeeded", False), "ENVIRONMENT_EVIDENCE_FAILED"),
         (lambda records, manifest: manifest["solvers"]["highs"].__setitem__("open_source", False), "LICENSE_EVIDENCE_FAILED"),
         (lambda records, manifest: manifest["solvers"]["highs"].__setitem__("commercial_key_required", True), "LICENSE_EVIDENCE_FAILED"),
     ),
@@ -1185,14 +1298,16 @@ def test_hard_gate_allows_truthful_unknown_failure_but_rejects_unsafe_nonunknown
         {
             "business_status": "UNKNOWN",
             "classification": "UNKNOWN",
+            "evidence": None,
+            "objective_bounds": {"closed": False, "gap_units": None, "lower_bound_units": None, "upper_bound_units": None},
+            "optimality_status": "NOT_APPLICABLE",
             "solve_status": "UNKNOWN",
             "termination_reason": "HARD_TIMEOUT",
         }
     )
-    unsafe = deepcopy(truthful)
+    unsafe = _quick_records()
+    unsafe[0]["solver_run"]["termination_reason"] = "HARD_TIMEOUT"
     unsafe[0]["solver_run"]["classification"] = "MEASUREMENT_ONLY"
-    unsafe[0]["solver_run"]["solve_status"] = "FEASIBLE"
-    unsafe[0]["solver_run"]["business_status"] = "QUALIFIED_FEASIBLE"
     _refresh_semantic_fingerprints(truthful)
     _refresh_semantic_fingerprints(unsafe)
 
@@ -1205,12 +1320,36 @@ def test_hard_gate_allows_truthful_unknown_failure_but_rejects_unsafe_nonunknown
 
 def test_hard_gate_detects_semantic_nondeterminism_for_repeated_case() -> None:
     records = _full_records()
-    records[5]["solver_run"]["evidence"]["candidate"]["claimed_guaranteed_profit_units"] += 1
+    records[5]["solver_run"]["evidence"]["worst_scenario"]["atoms"][0]["atom_id"] = "no"
     _refresh_semantic_fingerprints(records)
 
     summary = aggregate_benchmark_records(records, _benchmark_manifest())
 
     assert summary["solvers"]["highs"]["hard_gate_failures"] == ["SEMANTIC_NONDETERMINISM"]
+
+
+def test_semantic_fingerprint_includes_certificate_result_but_excludes_certificate_timing() -> None:
+    record = _benchmark_record()
+    record["solver_run"]["evidence"]["certificate"] = {
+        "certificate_sha256": _SHA_A,
+        "certificate_size_bytes": 10,
+        "completed_certificate_sha256": _SHA_B,
+        "completed_certificate_size_bytes": 12,
+        "checker_name": "viprcomplete",
+        "checker_version": "1.0",
+        "checker_exit_code": 0,
+        "checker_succeeded": True,
+        "generation_ns": 1,
+        "completion_ns": 2,
+        "check_ns": 3,
+    }
+    changed_result = deepcopy(record)
+    changed_result["solver_run"]["evidence"]["certificate"]["checker_succeeded"] = False
+    changed_timing = deepcopy(record)
+    changed_timing["solver_run"]["evidence"]["certificate"]["check_ns"] = 999
+
+    assert benchmark._semantic_fingerprint(record) != benchmark._semantic_fingerprint(changed_result)
+    assert benchmark._semantic_fingerprint(record) == benchmark._semantic_fingerprint(changed_timing)
 
 
 @pytest.mark.parametrize(
@@ -1278,6 +1417,42 @@ def test_recommendation_selects_by_descending_worst_cell_vector_and_records_cont
     assert decision["selected_solver"] == "highs"
     assert decision["decisive_stage"] == "FIRST_QUALIFIED_P95"
     assert decision["contributing_cells"] == ["linux/case-a", "macos/case-a"]
+
+
+def test_recommendation_memory_stage_includes_every_throughput_worker_cell() -> None:
+    records = _full_records()
+    for record in records:
+        if record["sample_kind"] == "throughput" and record["solver_name"] in {"highs", "scip"}:
+            record["peak_aggregate_rss_bytes"] = 800 if record["solver_name"] == "highs" else 900
+    next(record for record in records if record["solver_name"] == "cp_sat").update(
+        {"check_hard_failure": True, "check_failure_reason": "FALSE_SAFE"}
+    )
+    _refresh_semantic_fingerprints(records)
+
+    decision = aggregate_benchmark_records(records, _benchmark_manifest())["decision"]
+
+    assert decision["selected_solver"] == "highs"
+    assert decision["decisive_stage"] == "PEAK_RSS_P95"
+    assert any("workers-4" in label for label in decision["contributing_cells"])
+
+
+def test_recommendation_selects_the_only_hard_gate_survivor_by_elimination() -> None:
+    records = _full_records()
+    for solver in ("scip", "cp_sat"):
+        next(record for record in records if record["solver_name"] == solver).update(
+            {"check_hard_failure": True, "check_failure_reason": "FALSE_SAFE"}
+        )
+    _refresh_semantic_fingerprints(records)
+
+    decision = aggregate_benchmark_records(records, _benchmark_manifest())["decision"]
+
+    assert decision == {
+        "status": "SELECTED",
+        "reason": "ONLY_SURVIVOR_AFTER_HARD_GATES",
+        "selected_solver": "highs",
+        "decisive_stage": "HARD_GATE_ELIMINATION",
+        "contributing_cells": [],
+    }
 
 
 def test_recommendation_emits_no_survivor_and_no_decisive_winner_without_name_tiebreak() -> None:
@@ -1387,20 +1562,57 @@ def test_aggregate_validates_all_solver_run_invariants_used_by_the_report(violat
         aggregate_benchmark_records(records, _benchmark_manifest(profile="quick"))
 
 
-def test_objective_gap_quality_ranks_only_all_closed_samples_as_closed() -> None:
+@pytest.mark.parametrize("violation", ("closed_bounds", "evidence_bounds", "candidate_profit", "closure", "solve_status", "optimality_status"))
+def test_aggregate_rejects_contradictory_or_unbound_solver_claim_fields(violation: str) -> None:
+    records = _quick_records()
+    run = records[0]["solver_run"]
+    if violation == "closed_bounds":
+        run["objective_bounds"] = {"closed": True, "gap_units": 1, "lower_bound_units": 7, "upper_bound_units": 8}
+        run["evidence"]["objective_bounds"] = deepcopy(run["objective_bounds"])
+        run["evidence"]["global_search_closed"] = True
+    elif violation == "evidence_bounds":
+        run["evidence"]["objective_bounds"]["gap_units"] = 3
+    elif violation == "candidate_profit":
+        run["evidence"]["candidate"]["claimed_guaranteed_profit_units"] = 8
+    elif violation == "closure":
+        run["evidence"]["global_search_closed"] = True
+    elif violation == "solve_status":
+        run["solve_status"] = "INFEASIBLE"
+    else:
+        run["optimality_status"] = "OPTIMAL"
+    _refresh_semantic_fingerprints(records)
+
+    with pytest.raises(ValueError):
+        aggregate_benchmark_records(records, _benchmark_manifest(profile="quick"))
+
+
+def test_objective_gap_quality_ranks_labelled_cells_worst_first_independent_of_input_order() -> None:
     cells = [
         {
             "case_id": "case-a",
+            "environment": "macos",
             "objective_gap_quality": {
                 "closed_samples": 1,
                 "known_gap_samples": 30,
                 "unknown_gap_samples": 0,
                 "gap_units": {"p50": 0, "p95": 0, "worst": 0},
             },
-        }
+        },
+        {
+            "case_id": "case-a",
+            "environment": "linux",
+            "objective_gap_quality": {
+                "closed_samples": 0,
+                "known_gap_samples": 0,
+                "unknown_gap_samples": 30,
+                "gap_units": None,
+            },
+        },
     ]
 
-    assert benchmark._gap_vector(cells, ("case-a",)) == (Fraction(1), Fraction(0))
+    expected = ((Fraction(2), Fraction(0)), (Fraction(1), Fraction(0)))
+    assert benchmark._gap_vector(cells, ("case-a",)) == expected
+    assert benchmark._gap_vector(list(reversed(cells)), ("case-a",)) == expected
 
 
 def test_generate_report_is_order_independent_and_verify_detects_changed_or_extra_bytes(tmp_path: Path) -> None:
@@ -1437,11 +1649,46 @@ def test_generate_report_is_order_independent_and_verify_detects_changed_or_extr
         "solver": None,
         "status": "BLOCKED_MISSING_ENVIRONMENT",
     }
+    assert envelope["hard_limits"] == {
+        "hard_time_limit_ms": 2_000,
+        "memory_limit_bytes": 10_000,
+        "max_constraint_generation_rounds": 8,
+        "oracle_limits": {
+            "case-a": {
+                "max_joint_states": 100,
+                "max_quantity_vectors": 200,
+                "max_support_rechecks": 300,
+            }
+        },
+        "unknown_mappings": {
+            "hard_time_limit_ms": "HARD_TIMEOUT",
+            "max_constraint_generation_rounds": "PROOF_UNCLOSED",
+            "memory_limit_bytes": "MEMORY_LIMIT",
+            "oracle_limits": {
+                "max_joint_states": "ORACLE_STATE_LIMIT_EXCEEDED",
+                "max_quantity_vectors": "ORACLE_DECISION_LIMIT_EXCEEDED",
+                "max_support_rechecks": "ORACLE_SUPPORT_LIMIT_EXCEEDED",
+            },
+            "soft_time_limit_ms": "SOFT_TIMEOUT",
+        },
+        "soft_time_limit_ms": 1_000,
+    }
     assert envelope["measured_dimensions"] == {
         "case_ids": ["case-a"],
         "cold_probe_case_ids": [],
         "first_qualified_case_ids": ["case-a"],
         "measured_samples": 1,
+        "model_dimensions": {
+            "case-a": {
+                "action_count": 2,
+                "contract_count": 1,
+                "cost_slice_count": 2,
+                "joint_state_count": 2,
+                "quantity_domain_size": 4,
+                "relationship_count": 0,
+                "terminal_atom_count": 2,
+            }
+        },
         "optimal_case_ids": ["case-a"],
         "profiles": ["quick"],
         "rebuild_probe_case_ids": [],

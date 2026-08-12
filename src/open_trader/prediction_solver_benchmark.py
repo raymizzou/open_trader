@@ -99,7 +99,8 @@ _MANIFEST_KEYS = {
     "required_solvers", "required_case_ids", "first_qualified_case_ids", "optimal_case_ids",
     "throughput_probe_case_ids", "cold_probe_case_ids", "rebuild_probe_case_ids",
     "worker_counts", "warmup_samples", "measured_samples", "corpus_manifest_sha256",
-    "license_manifest_sha256", "environments", "solvers",
+    "license_manifest_sha256", "environments", "solvers", "cases", "memory_limit_bytes",
+    "soft_time_limit_ms", "hard_time_limit_ms", "max_constraint_generation_rounds",
 }
 _RUN_KEYS = {
     "schema_version", "request_id", "solver_name", "solver_version", "adapter_version",
@@ -111,13 +112,19 @@ _PHASE_NAMES = {
     "backend", "certificate_check", "certificate_completion", "certificate_generation",
     "first_qualified", "independent_check", "optimal", "serialization",
 }
-_ENVIRONMENT_KEYS = {"available", "build_id", "environment_id", "image_id"}
+_ENVIRONMENT_KEYS = {"available", "build_id", "environment_id", "git_sha", "image_id"}
 _SOLVER_KEYS = {
-    "commercial_key_required", "install_succeeded", "installation_ns",
-    "license_evidence_present", "manual_interventions", "open_source",
-    "reuse_succeeded", "run_succeeded", "source_evidence_present",
+    "commercial_key_required", "environments", "license_evidence_present",
+    "manual_interventions", "open_source", "source_evidence_present",
     "whole_claim_certificate_bound",
 }
+_SOLVER_ENVIRONMENT_KEYS = {"build_id", "install_succeeded", "installation_ns", "reuse_succeeded", "run_succeeded"}
+_CASE_KEYS = {"model_dimensions", "oracle_limits", "problem_fingerprint", "request_fingerprint", "request_id"}
+_DIMENSION_KEYS = {
+    "action_count", "contract_count", "cost_slice_count", "joint_state_count",
+    "quantity_domain_size", "relationship_count", "terminal_atom_count",
+}
+_ORACLE_LIMIT_KEYS = {"max_joint_states", "max_quantity_vectors", "max_support_rechecks"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +173,7 @@ def aggregate_benchmark_records(
         solvers[solver] = {
             "hard_gate_failures": _hard_gate_failures(solver_records, manifest_value, solver),
             "metrics": _aggregate_solver_metrics(decoded, manifest_value, solver),
+            "operational_evidence": manifest_value["solvers"][solver],
         }
     decision = _benchmark_decision(solvers, manifest_value)
     return {
@@ -197,14 +205,35 @@ def generate_benchmark_report(
         "decision": summary["decision"],
         "environments": manifest_value["environments"],
         "hard_limits": {
-            "memory_limit_bytes": sorted({record["memory_limit_bytes"] for record in records}),
-            "unknown_mappings": ["HARD_TIMEOUT", "MEMORY_LIMIT", "ORACLE_DECISION_LIMIT_EXCEEDED", "ORACLE_STATE_LIMIT_EXCEEDED", "ORACLE_SUPPORT_LIMIT_EXCEEDED"],
+            "hard_time_limit_ms": manifest_value["hard_time_limit_ms"],
+            "memory_limit_bytes": manifest_value["memory_limit_bytes"],
+            "max_constraint_generation_rounds": manifest_value["max_constraint_generation_rounds"],
+            "oracle_limits": {
+                case_id: manifest_value["cases"][case_id]["oracle_limits"]
+                for case_id in sorted(manifest_value["required_case_ids"])
+            },
+            "unknown_mappings": {
+                "hard_time_limit_ms": "HARD_TIMEOUT",
+                "max_constraint_generation_rounds": "PROOF_UNCLOSED",
+                "memory_limit_bytes": "MEMORY_LIMIT",
+                "oracle_limits": {
+                    "max_joint_states": "ORACLE_STATE_LIMIT_EXCEEDED",
+                    "max_quantity_vectors": "ORACLE_DECISION_LIMIT_EXCEEDED",
+                    "max_support_rechecks": "ORACLE_SUPPORT_LIMIT_EXCEEDED",
+                },
+                "soft_time_limit_ms": "SOFT_TIMEOUT",
+            },
+            "soft_time_limit_ms": manifest_value["soft_time_limit_ms"],
         },
         "measured_dimensions": {
             "case_ids": list(manifest_value["required_case_ids"]),
             "cold_probe_case_ids": list(manifest_value["cold_probe_case_ids"]),
             "first_qualified_case_ids": list(manifest_value["first_qualified_case_ids"]),
             "measured_samples": manifest_value["measured_samples"],
+            "model_dimensions": {
+                case_id: manifest_value["cases"][case_id]["model_dimensions"]
+                for case_id in sorted(manifest_value["required_case_ids"])
+            },
             "optimal_case_ids": list(manifest_value["optimal_case_ids"]),
             "profiles": [manifest_value["profile"]],
             "rebuild_probe_case_ids": list(manifest_value["rebuild_probe_case_ids"]),
@@ -268,6 +297,12 @@ def _validated_run_manifest(manifest: Mapping[str, object]) -> dict[str, object]
     warmups = _nonnegative_integer(value["warmup_samples"], "warmup_samples")
     measured = _positive_integer(value["measured_samples"], "measured_samples")
     approved = _nonnegative_integer(value["approved_case_count"], "approved_case_count")
+    memory_limit = _nonnegative_integer(value["memory_limit_bytes"], "memory_limit_bytes")
+    round_limit = _positive_integer(value["max_constraint_generation_rounds"], "max_constraint_generation_rounds")
+    soft_limit = _positive_integer(value["soft_time_limit_ms"], "soft_time_limit_ms")
+    hard_limit = _positive_integer(value["hard_time_limit_ms"], "hard_time_limit_ms")
+    if hard_limit < soft_limit:
+        raise ValueError("hard_time_limit_ms must be at least soft_time_limit_ms")
     if profile == "full" and (
         required_environments != ("macos", "linux")
         or set(required_solvers) != {"highs", "scip", "cp_sat"}
@@ -286,23 +321,49 @@ def _validated_run_manifest(manifest: Mapping[str, object]) -> dict[str, object]
             raise ValueError("environment availability must be a bool")
         for field in ("build_id", "environment_id", "image_id"):
             _text(evidence[field], f"environments.{environment}.{field}")
+        _git_sha(evidence["git_sha"], f"environments.{environment}.git_sha")
         environments[environment] = evidence
+    cases = _strict_named_objects(value["cases"], "cases", required_case_ids)
+    for case_id, evidence in cases.items():
+        evidence = _strict_object(evidence, f"cases.{case_id}", _CASE_KEYS)
+        for field in ("problem_fingerprint", "request_fingerprint"):
+            _sha(evidence[field], f"cases.{case_id}.{field}")
+        _text(evidence["request_id"], f"cases.{case_id}.request_id")
+        dimensions = _strict_object(evidence["model_dimensions"], f"cases.{case_id}.model_dimensions", _DIMENSION_KEYS)
+        for field in _DIMENSION_KEYS:
+            dimensions[field] = _nonnegative_integer(dimensions[field], f"cases.{case_id}.model_dimensions.{field}")
+        oracle_limits = _strict_object(evidence["oracle_limits"], f"cases.{case_id}.oracle_limits", _ORACLE_LIMIT_KEYS)
+        for field in _ORACLE_LIMIT_KEYS:
+            oracle_limits[field] = _positive_integer(oracle_limits[field], f"cases.{case_id}.oracle_limits.{field}")
+        cases[case_id] = {**evidence, "model_dimensions": dimensions, "oracle_limits": oracle_limits}
     solvers = _strict_named_objects(value["solvers"], "solvers", required_solvers)
     for solver, evidence in solvers.items():
         evidence = _strict_object(evidence, f"solvers.{solver}", _SOLVER_KEYS)
-        for field in ("commercial_key_required", "install_succeeded", "license_evidence_present", "open_source", "reuse_succeeded", "run_succeeded", "source_evidence_present", "whole_claim_certificate_bound"):
+        for field in ("commercial_key_required", "license_evidence_present", "open_source", "source_evidence_present", "whole_claim_certificate_bound"):
             if not isinstance(evidence[field], bool):
                 raise ValueError(f"solvers.{solver}.{field} must be a bool")
-        for field in ("installation_ns", "manual_interventions"):
-            _nonnegative_integer(evidence[field], f"solvers.{solver}.{field}")
+        _nonnegative_integer(evidence["manual_interventions"], f"solvers.{solver}.manual_interventions")
+        solver_environments = _strict_named_objects(evidence["environments"], f"solvers.{solver}.environments", required_environments)
+        for environment, environment_evidence in solver_environments.items():
+            environment_evidence = _strict_object(environment_evidence, f"solvers.{solver}.environments.{environment}", _SOLVER_ENVIRONMENT_KEYS)
+            for field in ("install_succeeded", "reuse_succeeded", "run_succeeded"):
+                if not isinstance(environment_evidence[field], bool):
+                    raise ValueError(f"solvers.{solver}.environments.{environment}.{field} must be a bool")
+            if environment_evidence["build_id"] != environments[environment]["build_id"]:
+                raise ValueError(f"solvers.{solver}.environments.{environment}.build_id does not match environment")
+            _nonnegative_integer(environment_evidence["installation_ns"], f"solvers.{solver}.environments.{environment}.installation_ns")
+            solver_environments[environment] = environment_evidence
         if evidence["whole_claim_certificate_bound"]:
             raise ValueError("current certificate evidence is unbound and cannot gain proof credit")
-        solvers[solver] = evidence
+        solvers[solver] = {**evidence, "environments": solver_environments}
     _sha(value["corpus_manifest_sha256"], "corpus_manifest_sha256")
     _sha(value["license_manifest_sha256"], "license_manifest_sha256")
     return {
         **value,
         "approved_case_count": approved,
+        "cases": cases,
+        "hard_time_limit_ms": hard_limit,
+        "max_constraint_generation_rounds": round_limit,
         "required_environments": required_environments,
         "required_solvers": required_solvers,
         "required_case_ids": required_case_ids,
@@ -314,6 +375,8 @@ def _validated_run_manifest(manifest: Mapping[str, object]) -> dict[str, object]
         "worker_counts": worker_counts,
         "warmup_samples": warmups,
         "measured_samples": measured,
+        "memory_limit_bytes": memory_limit,
+        "soft_time_limit_ms": soft_limit,
         "environments": environments,
         "solvers": solvers,
     }
@@ -330,20 +393,27 @@ def _validated_benchmark_record(record: object, manifest: Mapping[str, object]) 
     case_id = _choice(value["case_id"], "case_id", set(manifest["required_case_ids"]))
     sample_kind = _choice(value["sample_kind"], "sample_kind", _SAMPLE_KINDS)
     run = _validated_solver_run_payload(value["solver_run"])
+    if run["request_id"] != manifest["cases"][case_id]["request_id"]:
+        raise ValueError("solver_run request_id does not match manifest case")
     for field in ("solver_name", "solver_version", "adapter_version", "worker_id"):
         if run[field] != value[field]:
             raise ValueError(f"solver_run {field} does not match record")
     environment_evidence = manifest["environments"][environment]
-    if run["environment_id"] != environment_evidence.get("environment_id"):
+    if run["environment_id"] != environment_evidence["environment_id"]:
         raise ValueError("solver_run environment_id does not match manifest")
-    if value["image_id"] != environment_evidence.get("image_id"):
+    if value["image_id"] != environment_evidence["image_id"]:
         raise ValueError("record image_id does not match manifest")
+    if value["git_sha"] != environment_evidence["git_sha"]:
+        raise ValueError("record git_sha does not match manifest")
+    case_evidence = manifest["cases"][case_id]
+    for field in ("request_fingerprint", "problem_fingerprint"):
+        if value[field] != case_evidence[field]:
+            raise ValueError(f"record {field} does not match manifest")
     if value["corpus_manifest_sha256"] != manifest["corpus_manifest_sha256"] or value["license_manifest_sha256"] != manifest["license_manifest_sha256"]:
         raise ValueError("record manifest fingerprint mismatch")
     for field in ("request_fingerprint", "problem_fingerprint", "corpus_manifest_sha256", "license_manifest_sha256", "semantic_fingerprint"):
         _sha(value[field], field)
-    if not isinstance(value["git_sha"], str) or len(value["git_sha"]) != 40 or any(character not in "0123456789abcdef" for character in value["git_sha"]):
-        raise ValueError("git_sha must be lowercase hexadecimal")
+    _git_sha(value["git_sha"], "git_sha")
     for field in ("truth_method", "cpu", "architecture", "os_version", "container_id", "image_id", "python_version", "corpus_version"):
         _text(value[field], field)
     if value["protocol_version"] != BENCHMARK_PROTOCOL_V1:
@@ -353,6 +423,8 @@ def _validated_benchmark_record(record: object, manifest: Mapping[str, object]) 
     for field in ("worker_count", "completed_requests"):
         _positive_integer(value[field], field)
     _nonnegative_integer(value["memory_limit_bytes"], "memory_limit_bytes")
+    if value["memory_limit_bytes"] != manifest["memory_limit_bytes"]:
+        raise ValueError("record memory_limit_bytes does not match manifest")
     for field in ("cleanup_proven", "check_hard_failure"):
         if not isinstance(value[field], bool):
             raise ValueError(f"{field} must be a bool")
@@ -362,6 +434,10 @@ def _validated_benchmark_record(record: object, manifest: Mapping[str, object]) 
         raise ValueError("check_hard_failure and check_failure_reason must agree")
     if sample_kind == "throughput" and not value["request_wall_ns"]:
         raise ValueError("throughput request_wall_ns must be positive")
+    if sample_kind == "cold" and value["worker_start_count"] < 1:
+        raise ValueError("cold worker_start_count must be at least one")
+    if sample_kind == "rebuild" and value["worker_rebuild_count"] < 1:
+        raise ValueError("rebuild worker_rebuild_count must be at least one")
     if not run["peak_rss_bytes"] <= value["peak_process_group_rss_bytes"] <= value["peak_aggregate_rss_bytes"]:
         raise ValueError("solver/process-group/aggregate RSS must be ordered")
     decoded = {**value, "environment": environment, "solver_name": solver, "case_id": case_id, "sample_kind": sample_kind, "solver_run": run}
@@ -396,6 +472,19 @@ def _validated_solver_run_payload(payload: object) -> dict[str, object]:
         raise ValueError("measurement-only and unknown runs require UNKNOWN proof_status")
     if run["classification"] == BenchmarkClassification.UNKNOWN.value and (run["solve_status"] != "UNKNOWN" or run["business_status"] != "UNKNOWN"):
         raise ValueError("UNKNOWN classification requires UNKNOWN solve/business status")
+    if run["business_status"] == "QUALIFIED_FEASIBLE" and (
+        run["solve_status"] != "FEASIBLE"
+        or run["optimality_status"] != ("OPTIMAL" if run["objective_bounds"]["closed"] else "NOT_PROVEN")
+    ):
+        raise ValueError("qualified run status must match objective closure")
+    if run["business_status"] in {"NO_QUALIFIED_OPPORTUNITY", "NO_ARBITRAGE"} and (
+        run["solve_status"] != "INFEASIBLE" or run["optimality_status"] != "NOT_APPLICABLE"
+    ):
+        raise ValueError("negative run status must be INFEASIBLE and not optimal")
+    if run["business_status"] == "UNKNOWN" and (
+        run["solve_status"] != "UNKNOWN" or run["optimality_status"] != "NOT_APPLICABLE"
+    ):
+        raise ValueError("unknown run status must use UNKNOWN and NOT_APPLICABLE")
     _positive_or_zero(run["peak_rss_bytes"], "peak_rss_bytes")
     timings = _named_nonnegative_pairs(run["phase_timings_ns"], "phase_timings_ns")
     if set(timings) != _PHASE_NAMES:
@@ -405,14 +494,37 @@ def _validated_solver_run_payload(payload: object) -> dict[str, object]:
         raise ValueError("diagnostics must be string pairs")
     if len({item[0] for item in diagnostics}) != len(diagnostics):
         raise ValueError("diagnostics names must be unique")
-    if run["evidence"] is not None:
-        _validated_evidence_payload(run["evidence"])
+    evidence = None if run["evidence"] is None else _validated_evidence_payload(run["evidence"])
     if run["classification"] == BenchmarkClassification.CERTIFICATE_CHECKED.value:
         raise ValueError("current certificate evidence is unbound and cannot be CERTIFICATE_CHECKED")
-    return {**run, "phase_timings_ns": timings}
+    if evidence is not None:
+        if run["objective_bounds"] != evidence["objective_bounds"]:
+            raise ValueError("solver_run objective_bounds must match evidence")
+        qualified = run["business_status"] == "QUALIFIED_FEASIBLE"
+        if qualified != (evidence["candidate"] is not None):
+            raise ValueError("solver_run business_status must match evidence candidate")
+        if evidence["candidate"] is not None:
+            payout = evidence["payout_lower_bound_units"]
+            cost = evidence["cost_upper_bound_units"]
+            profit = evidence["guaranteed_profit_units"]
+            if (
+                any(item is None for item in (payout, cost, profit, evidence["conservative_capital_release_at"], evidence["worst_scenario"]))
+                or evidence["candidate"]["claimed_guaranteed_profit_units"] != profit
+                or evidence["objective_bounds"]["lower_bound_units"] != profit
+                or payout - cost != profit
+                or not evidence["fixed_portfolio_closed"]
+            ):
+                raise ValueError("candidate payout, cost, profit, release, and closure must match evidence")
+        if qualified and evidence["global_search_closed"] != run["objective_bounds"]["closed"]:
+            raise ValueError("qualified global closure must match objective bounds")
+        if run["business_status"] in {"NO_QUALIFIED_OPPORTUNITY", "NO_ARBITRAGE"} and not evidence["global_search_closed"]:
+            raise ValueError("negative status requires closed global search")
+        if run["business_status"] == "UNKNOWN" and evidence["global_search_closed"]:
+            raise ValueError("UNKNOWN status cannot close global search")
+    return {**run, "evidence": evidence, "phase_timings_ns": timings}
 
 
-def _validated_evidence_payload(payload: object) -> None:
+def _validated_evidence_payload(payload: object) -> dict[str, object]:
     value = _strict_object(
         payload,
         "solver evidence",
@@ -475,6 +587,7 @@ def _validated_evidence_payload(payload: object) -> None:
             raise ValueError("completed certificate hash and size must both be present or absent")
         if certificate["checker_succeeded"] and (certificate["checker_exit_code"] != 0 or not certificate["checker_name"].strip() or not certificate["checker_version"].strip()):
             raise ValueError("successful certificate checks require exit code zero and checker identity")
+    return value
 
 
 def _require_sample_matrix(records: tuple[dict[str, object], ...], manifest: Mapping[str, object]) -> None:
@@ -544,7 +657,10 @@ def _hard_gate_failures(
     if any(len(values) != 1 for values in semantic_groups.values()):
         failures.add("SEMANTIC_NONDETERMINISM")
     solver_evidence = manifest["solvers"][solver]
-    if not all(solver_evidence[field] for field in ("install_succeeded", "run_succeeded", "reuse_succeeded")):
+    if any(
+        not all(solver_evidence["environments"][environment][field] for field in ("install_succeeded", "run_succeeded", "reuse_succeeded"))
+        for environment in manifest["required_environments"]
+    ):
         failures.add("ENVIRONMENT_EVIDENCE_FAILED")
     if (
         not all(solver_evidence[field] for field in ("open_source", "license_evidence_present", "source_evidence_present"))
@@ -568,6 +684,16 @@ def _semantic_fingerprint(record: Mapping[str, object]) -> str:
         else {
             "adversary_rounds": evidence["adversary_rounds"],
             "candidate": evidence["candidate"],
+            "certificate": None
+            if evidence["certificate"] is None
+            else {
+                field: evidence["certificate"][field]
+                for field in (
+                    "certificate_sha256", "certificate_size_bytes",
+                    "completed_certificate_sha256", "completed_certificate_size_bytes",
+                    "checker_name", "checker_version", "checker_exit_code", "checker_succeeded",
+                )
+            },
             "conservative_capital_release_at": evidence["conservative_capital_release_at"],
             "cost_upper_bound_units": evidence["cost_upper_bound_units"],
             "cuts": evidence["cuts"],
@@ -629,6 +755,7 @@ def _aggregate_solver_metrics(records: tuple[dict[str, object], ...], manifest: 
                     {
                         "case_id": case_id,
                         "environment": environment,
+                        "peak_aggregate_rss_bytes": _summary(item["peak_aggregate_rss_bytes"] for item in cell),
                         "worker_count": worker_count,
                         "requests_per_second": _throughput_summary(Fraction(item["completed_requests"] * 1_000_000_000, item["request_wall_ns"]) for item in cell),
                     }
@@ -669,17 +796,28 @@ def _benchmark_decision(solvers: Mapping[str, object], manifest: Mapping[str, ob
     active = [solver for solver in sorted(solvers) if not solvers[solver]["hard_gate_failures"]]
     if not active:
         return {"status": "NO_SURVIVOR", "reason": "ALL_CANDIDATES_HARD_ELIMINATED", **empty}
+    if len(active) == 1:
+        return {
+            "status": "SELECTED",
+            "reason": "ONLY_SURVIVOR_AFTER_HARD_GATES",
+            "selected_solver": active[0],
+            "decisive_stage": "HARD_GATE_ELIMINATION",
+            "contributing_cells": [],
+        }
 
     stages = (
         ("FIRST_QUALIFIED_P95", lambda solver: _cell_vector(solvers[solver]["metrics"]["warm"], "first_qualified_ns", "p95", manifest["first_qualified_case_ids"])),
         ("FIRST_QUALIFIED_WORST", lambda solver: _cell_vector(solvers[solver]["metrics"]["warm"], "first_qualified_ns", "worst", manifest["first_qualified_case_ids"])),
-        ("PEAK_RSS_P95", lambda solver: _cell_vector(solvers[solver]["metrics"]["warm"], "peak_aggregate_rss_bytes", "p95")),
-        ("PEAK_RSS_WORST", lambda solver: _cell_vector(solvers[solver]["metrics"]["warm"], "peak_aggregate_rss_bytes", "worst")),
+        ("PEAK_RSS_P95", lambda solver: _cell_vector(solvers[solver]["metrics"]["warm"] + solvers[solver]["metrics"]["throughput"], "peak_aggregate_rss_bytes", "p95")),
+        ("PEAK_RSS_WORST", lambda solver: _cell_vector(solvers[solver]["metrics"]["warm"] + solvers[solver]["metrics"]["throughput"], "peak_aggregate_rss_bytes", "worst")),
         ("THROUGHPUT_WORST", lambda solver: tuple(-value for value in _cell_vector(solvers[solver]["metrics"]["throughput"], "requests_per_second", "worst", descending=False))),
         ("REBUILD_P95", lambda solver: _cell_vector(solvers[solver]["metrics"]["rebuild"], "rebuild_ns", "p95")),
         ("REBUILD_WORST", lambda solver: _cell_vector(solvers[solver]["metrics"]["rebuild"], "rebuild_ns", "worst")),
         ("MANUAL_INTERVENTIONS", lambda solver: (Fraction(manifest["solvers"][solver]["manual_interventions"]),)),
-        ("INSTALLATION_DURATION", lambda solver: (Fraction(manifest["solvers"][solver]["installation_ns"]),)),
+        ("INSTALLATION_DURATION", lambda solver: tuple(sorted(
+            (Fraction(item["installation_ns"]) for item in manifest["solvers"][solver]["environments"].values()),
+            reverse=True,
+        ))),
         ("COLD_START_P95", lambda solver: _cell_vector(solvers[solver]["metrics"]["cold"], "cold_ns", "p95")),
         ("COLD_START_WORST", lambda solver: _cell_vector(solvers[solver]["metrics"]["cold"], "cold_ns", "worst")),
         ("TIME_TO_OPTIMAL_P95", lambda solver: _cell_vector(solvers[solver]["metrics"]["warm"], "optimal_ns", "p95", manifest["optimal_case_ids"])),
@@ -725,7 +863,7 @@ def _cell_vector(
     return tuple(sorted(values, reverse=descending))
 
 
-def _gap_vector(cells: list[dict[str, object]], case_ids: tuple[str, ...]) -> tuple[Fraction, ...]:
+def _gap_vector(cells: list[dict[str, object]], case_ids: tuple[str, ...]) -> tuple[tuple[Fraction, Fraction], ...]:
     values = []
     for cell in cells:
         if cell["case_id"] not in case_ids:
@@ -734,8 +872,9 @@ def _gap_vector(cells: list[dict[str, object]], case_ids: tuple[str, ...]) -> tu
         total = quality["known_gap_samples"] + quality["unknown_gap_samples"]
         rank = 0 if quality["closed_samples"] == total else 1 if quality["known_gap_samples"] else 2
         gap = 0 if quality["gap_units"] is None else _fraction(quality["gap_units"]["worst"])
-        values.extend((Fraction(rank), gap))
-    return tuple(values)
+        values.append((f"{cell['environment']}/{cell['case_id']}", Fraction(rank), gap))
+    values.sort(key=lambda item: (item[1], item[2]), reverse=True)
+    return tuple((rank, gap) for _, rank, gap in values)
 
 
 def _certificate_vector(solver: Mapping[str, object], manifest: Mapping[str, object], phase: str, statistic: str, solver_name: str) -> tuple[Fraction, ...]:
@@ -759,13 +898,15 @@ def _stage_cell_labels(metrics: Mapping[str, object], stage: str, manifest: Mapp
         cells = metrics["rebuild"]
     elif stage.startswith("COLD"):
         cells = metrics["cold"]
+    elif "RSS" in stage:
+        cells = metrics["warm"] + metrics["throughput"]
     else:
-        cells = metrics["warm"] if "RSS" in stage or "CERTIFICATE" in stage else []
+        cells = metrics["warm"] if "CERTIFICATE" in stage else []
     return sorted(f"{cell['environment']}/{cell['case_id']}" + (f"/workers-{cell['worker_count']}" if "worker_count" in cell else "") for cell in cells)
 
 
 def _summary(values: object) -> dict[str, object]:
-    ordered = list(values)
+    ordered = [Fraction(value) for value in values]
     return {
         "p50": _exact_json(statistics.median(ordered)),
         "p95": _exact_json(ordered[0] if len(ordered) == 1 else statistics.quantiles(ordered, n=100, method="inclusive")[94]),
@@ -774,11 +915,11 @@ def _summary(values: object) -> dict[str, object]:
 
 
 def _throughput_summary(values: object) -> dict[str, object]:
-    ordered = list(values)
+    ordered = [Fraction(value) for value in values]
     return {
         "p50": _exact_json(statistics.median(ordered)),
         "p95": _exact_json(ordered[0] if len(ordered) == 1 else statistics.quantiles(ordered, n=100, method="inclusive")[94]),
-        "worst": _exact_json(max(ordered)),
+        "worst": _exact_json(min(ordered)),
     }
 
 
@@ -859,6 +1000,13 @@ def _sha(value: object, name: str) -> str:
     return text
 
 
+def _git_sha(value: object, name: str) -> str:
+    text = _text(value, name)
+    if len(text) != 40 or any(character not in "0123456789abcdef" for character in text):
+        raise ValueError(f"{name} must be lowercase hexadecimal")
+    return text
+
+
 def _unique_strings(value: object, name: str) -> tuple[str, ...]:
     if not isinstance(value, list):
         raise ValueError(f"{name} must be an array")
@@ -898,6 +1046,17 @@ def _objective_bounds_payload(value: object) -> None:
             _integer(bounds[field], field)
     if not isinstance(bounds["closed"], bool):
         raise ValueError("objective_bounds.closed must be a bool")
+    lower = bounds["lower_bound_units"]
+    upper = bounds["upper_bound_units"]
+    gap = bounds["gap_units"]
+    if bounds["closed"]:
+        if lower is None or upper is None or lower != upper or gap != 0:
+            raise ValueError("closed objective_bounds require equal bounds and zero gap")
+    elif lower is not None and upper is not None:
+        if lower >= upper or gap != upper - lower:
+            raise ValueError("open objective_bounds require ordered bounds and their exact gap")
+    elif gap is not None:
+        raise ValueError("objective_bounds gap requires both bounds")
 
 
 def _named_nonnegative_pairs(value: object, name: str) -> dict[str, int]:
