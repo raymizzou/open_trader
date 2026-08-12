@@ -10150,7 +10150,8 @@ console.log(JSON.stringify({html,unavailable}));
     non_trend_start = html.index("非趋势持仓")
     assert non_trend_start < html.index("AMZN") < html.index("decision-detail-row")
     unavailable = rendered["unavailable"]
-    assert "历史趋势持仓归类不可用：历史趋势报告不存在" in unavailable
+    assert "历史买入计划归属暂不可用，未执行分组" in unavailable
+    assert "历史趋势报告不存在" not in unavailable
     assert unavailable.count('class="account-holdings-table"') == 1
     assert "<h3>趋势持仓</h3>" not in unavailable and "<h3>非趋势持仓</h3>" not in unavailable
 
@@ -10174,7 +10175,8 @@ console.log(JSON.stringify({real,simulate,unavailable}));
     assert "trend-holding-included" in real and "trend-holding-excluded" in real
     assert "趋势持仓" not in rendered["simulate"] and "非趋势持仓" not in rendered["simulate"]
     unavailable = rendered["unavailable"]
-    assert "历史趋势持仓归类不可用：历史趋势报告不存在" in unavailable
+    assert "历史买入计划归属暂不可用，未执行分组" in unavailable
+    assert "历史趋势报告不存在" not in unavailable
     assert unavailable.count('class="cn-trend-table"') == 1
     assert "<h3>趋势持仓</h3>" not in unavailable and "<h3>非趋势持仓</h3>" not in unavailable
 

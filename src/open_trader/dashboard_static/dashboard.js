@@ -4546,9 +4546,8 @@ function renderHoldingOriginSection(title, rows, tableHtml) {
   </section>`;
 }
 
-function renderHistoricalTrendHoldingWarning(report) {
-  const reason = report?.historical_buy_plan_membership?.reason || "数据未提供";
-  return `<p class="account-empty missing-text">历史趋势持仓归类不可用：${escapeHtml(formatPlain(reason))}</p>`;
+function renderHistoricalTrendHoldingWarning() {
+  return '<p class="account-empty missing-text">历史买入计划归属暂不可用，未执行分组</p>';
 }
 
 function renderTrendHoldingSource(report) {
@@ -4579,7 +4578,7 @@ function renderTrendHoldingPanel(report, view, items) {
     const rows = Array.isArray(items) ? items : [];
     const split = splitHistoricalTrendHoldings(rows, report);
     if (!split) {
-      return `${renderTrendHoldingSource(report)}${renderHistoricalTrendHoldingWarning(report)}${renderTrendHoldingTable(rows, report)}`;
+      return `${renderTrendHoldingSource(report)}${renderHistoricalTrendHoldingWarning()}${renderTrendHoldingTable(rows, report)}`;
     }
     return `${renderTrendHoldingSource(report)}${renderHoldingOriginSection("趋势持仓", split.trend, renderTrendHoldingTable(split.trend, report))}${renderHoldingOriginSection("非趋势持仓", split.nonTrend, renderTrendHoldingTable(split.nonTrend, report))}`;
   }
@@ -6007,7 +6006,7 @@ function renderAccountViewPanel(group) {
   if (!group.rows.length) return '<p class="account-empty">当前筛选下没有持仓</p>';
   const report = state.dashboard?.trend_reports?.[group.broker];
   const split = splitHistoricalTrendHoldings(group.rows, report);
-  if (!split) return `${renderHistoricalTrendHoldingWarning(report)}${renderAccountTable(group.rows)}`;
+  if (!split) return `${renderHistoricalTrendHoldingWarning()}${renderAccountTable(group.rows)}`;
   return `${renderHoldingOriginSection("趋势持仓", split.trend, renderAccountTable(split.trend))}${renderHoldingOriginSection("非趋势持仓", split.nonTrend, renderAccountTable(split.nonTrend))}`;
 }
 
