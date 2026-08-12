@@ -309,6 +309,53 @@ def test_prediction_route_health_reports_selected_service_status(tmp_path: Path)
     assert payload["prediction_upstream_status"] == "ok"
 
 
+def test_prediction_untrusted_origin_releases_inflight_request(tmp_path: Path) -> None:
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    prediction = _Upstream()
+    route = tmp_path / "prediction-route.json"
+    _write_route(route, "service")
+    with _running(legacy), _running(prediction), _gateway(
+        tmp_path / "static",
+        legacy.server_address[1],
+        prediction_port=prediction.server_address[1],
+        prediction_route_path=route,
+    ) as base:
+        request = urllib.request.Request(
+            base + "/api/prediction-arbitrage/executions",
+            data=b"{}",
+            method="POST",
+            headers={"Origin": "https://attacker.example"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=5)
+        assert error.value.code == HTTPStatus.FORBIDDEN
+        with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
+            health = json.load(response)
+
+    assert health["prediction_inflight_requests"] == 0
+    assert [request["path"] for request in prediction.requests] == ["/healthz"]
+
+
+def test_prediction_health_handles_non_object_json_upstream_body(tmp_path: Path) -> None:
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    prediction = _Upstream()
+    prediction.health_body = b"[]"
+    route = tmp_path / "prediction-route.json"
+    _write_route(route, "service")
+    with _running(legacy), _running(prediction), _gateway(
+        tmp_path / "static",
+        legacy.server_address[1],
+        prediction_port=prediction.server_address[1],
+        prediction_route_path=route,
+    ) as base:
+        with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
+            health = json.load(response)
+
+    assert health["prediction_upstream_status"] == "unavailable"
+
+
 @pytest.mark.parametrize("record", [None, "{", "unknown", "maintenance"])
 def test_prediction_route_maintenance_rejects_before_body_or_upstream(
     tmp_path: Path, record: str | None

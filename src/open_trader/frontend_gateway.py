@@ -233,14 +233,14 @@ def create_frontend_gateway(
                 )
             )
             origin = self.headers.get("Origin", "")
-            if self.command == "POST" and origin and origin != public_origin:
-                self._send_error(
-                    HTTPStatus.FORBIDDEN,
-                    "untrusted_origin",
-                    "Origin is not trusted",
-                )
-                return
             try:
+                if self.command == "POST" and origin and origin != public_origin:
+                    self._send_error(
+                        HTTPStatus.FORBIDDEN,
+                        "untrusted_origin",
+                        "Origin is not trusted",
+                    )
+                    return
                 try:
                     body = self._request_body()
                 except ValueError as error:
@@ -404,7 +404,11 @@ def create_frontend_gateway(
                 )
                 response = connection.getresponse()
                 payload = json.loads(response.read().decode("utf-8"))
-                if response.status == HTTPStatus.OK and payload.get("module") == "prediction_service":
+                if (
+                    response.status == HTTPStatus.OK
+                    and isinstance(payload, dict)
+                    and payload.get("module") == "prediction_service"
+                ):
                     return "ok"
             except (OSError, ValueError, http.client.HTTPException, TimeoutError):
                 pass
