@@ -200,6 +200,7 @@ def _store_keychain_password(
             stdout=slave_fd,
             stderr=slave_fd,
             close_fds=True,
+            start_new_session=True,
         )
         os.close(slave_fd)
         slave_fd = -1
