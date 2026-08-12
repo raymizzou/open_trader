@@ -120,8 +120,11 @@ TREND_HOLDING_EVIDENCE_ALLOWLIST = {
         "US.KO",
         "US.LH",
         "US.NUE",
+        "US.PYPL",
         "US.REGN",
+        "US.XLV",
     }),
+    ("phillips", "HK"): frozenset({"HK.06823"}),
 }
 CURRENT_FINAL_PLAN_TREND_VERSIONS = frozenset({
     ("CN", "v13"),

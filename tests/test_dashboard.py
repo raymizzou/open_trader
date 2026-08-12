@@ -552,28 +552,37 @@ def test_historical_buy_plan_membership_rejects_symlink_loop(tmp_path: Path) -> 
     }
 
 
-def test_historical_buy_plan_membership_adds_tiger_us_evidence_allowlist(
+@pytest.mark.parametrize(
+    ("broker", "market", "expected_symbols"),
+    [
+        (
+            "tiger",
+            "US",
+            [
+                "US.AMZN", "US.CRNX", "US.GRMN", "US.KO", "US.LH",
+                "US.NUE", "US.PYPL", "US.REGN", "US.XLV",
+            ],
+        ),
+        ("phillips", "HK", ["HK.06823"]),
+    ],
+)
+def test_historical_buy_plan_membership_adds_scoped_evidence_allowlist(
     tmp_path: Path,
+    broker: str,
+    market: str,
+    expected_symbols: list[str],
 ) -> None:
     write_buy_plan_history(
-        tmp_path, "reports", "report.json", market="US", actions=[]
+        tmp_path, "reports", "report.json", market=market, actions=[]
     )
 
     membership = dashboard_module._historical_buy_plan_membership(
-        tmp_path / "reports", broker="tiger", market="US"
+        tmp_path / "reports", broker=broker, market=market
     )
 
     assert membership == {
         "available": True,
-        "symbols": [
-            "US.AMZN",
-            "US.CRNX",
-            "US.GRMN",
-            "US.KO",
-            "US.LH",
-            "US.NUE",
-            "US.REGN",
-        ],
+        "symbols": expected_symbols,
         "reason": "",
     }
 
