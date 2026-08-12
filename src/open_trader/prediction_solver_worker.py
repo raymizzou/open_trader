@@ -112,45 +112,32 @@ def _positive_int(value: object, name: str) -> int:
     return value
 
 
-@dataclass(frozen=True, slots=True)
-class WorkerLimits:
-    soft_time_limit_ms: int
-    hard_time_limit_ms: int
-    memory_limit_bytes: int
-    max_constraint_generation_rounds: int
-
-    def __post_init__(self) -> None:
-        for name in (
-            "soft_time_limit_ms",
-            "hard_time_limit_ms",
-            "memory_limit_bytes",
-            "max_constraint_generation_rounds",
-        ):
-            _positive_int(getattr(self, name), name)
-        if self.hard_time_limit_ms < self.soft_time_limit_ms:
-            raise WorkerProtocolError("hard_time_limit_ms must be at least soft_time_limit_ms")
-
-    @classmethod
-    def from_payload(cls, payload: object) -> "WorkerLimits":
-        value = _object(
-            payload,
-            "limits",
-            {"soft_time_limit_ms", "hard_time_limit_ms", "memory_limit_bytes", "max_constraint_generation_rounds"},
-        )
-        return cls(
+def _limits_from_payload(payload: object) -> BenchmarkLimits:
+    value = _object(
+        payload,
+        "limits",
+        {"soft_time_limit_ms", "hard_time_limit_ms", "memory_limit_bytes", "max_constraint_generation_rounds"},
+    )
+    try:
+        return BenchmarkLimits(
             _positive_int(value["soft_time_limit_ms"], "soft_time_limit_ms"),
             _positive_int(value["hard_time_limit_ms"], "hard_time_limit_ms"),
             _positive_int(value["memory_limit_bytes"], "memory_limit_bytes"),
             _positive_int(value["max_constraint_generation_rounds"], "max_constraint_generation_rounds"),
         )
+    except ValueError as exc:
+        raise WorkerProtocolError(str(exc)) from exc
 
-    def to_payload(self) -> dict[str, int]:
-        return {
-            "hard_time_limit_ms": self.hard_time_limit_ms,
-            "max_constraint_generation_rounds": self.max_constraint_generation_rounds,
-            "memory_limit_bytes": self.memory_limit_bytes,
-            "soft_time_limit_ms": self.soft_time_limit_ms,
-        }
+
+def _limits_to_payload(limits: BenchmarkLimits) -> dict[str, int]:
+    if not isinstance(limits, BenchmarkLimits):
+        raise WorkerProtocolError("limits must be BenchmarkLimits")
+    return {
+        "hard_time_limit_ms": limits.hard_time_limit_ms,
+        "max_constraint_generation_rounds": limits.max_constraint_generation_rounds,
+        "memory_limit_bytes": limits.memory_limit_bytes,
+        "soft_time_limit_ms": limits.soft_time_limit_ms,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +145,7 @@ class WorkerRequest:
     request_id: str
     backend: str
     request: OracleRequest
-    limits: WorkerLimits
+    limits: BenchmarkLimits
 
     def __post_init__(self) -> None:
         _string(self.request_id, "request_id")
@@ -166,8 +153,8 @@ class WorkerRequest:
             raise WorkerProtocolError(f"unsupported backend: {self.backend}")
         if not isinstance(self.request, OracleRequest):
             raise WorkerProtocolError("request must be a canonical OracleRequest")
-        if not isinstance(self.limits, WorkerLimits):
-            raise WorkerProtocolError("limits must be WorkerLimits")
+        if not isinstance(self.limits, BenchmarkLimits):
+            raise WorkerProtocolError("limits must be BenchmarkLimits")
 
     @classmethod
     def from_payload(cls, payload: object) -> "WorkerRequest":
@@ -179,7 +166,7 @@ class WorkerRequest:
         if backend not in SUPPORTED_BACKENDS:
             raise WorkerProtocolError(f"unsupported backend: {backend}")
         request_id = _string(value["request_id"], "request_id")
-        limits = WorkerLimits.from_payload(value["limits"])
+        limits = _limits_from_payload(value["limits"])
         try:
             request = request_from_payload(value["request"] if isinstance(value["request"], Mapping) else {})
         except (ModelDecodeError, TypeError, ValueError) as exc:
@@ -189,7 +176,7 @@ class WorkerRequest:
     def to_payload(self) -> dict[str, object]:
         return {
             "backend": self.backend,
-            "limits": self.limits.to_payload(),
+            "limits": _limits_to_payload(self.limits),
             "protocol": BENCHMARK_PROTOCOL_V1,
             "request": canonical_payload(self.request),
             "request_id": self.request_id,
@@ -225,29 +212,6 @@ class WorkerOutcome:
     retried: bool
     cleanup_proven: bool
     response: WorkerResponse | None = None
-
-
-def encode_handshake_line(handshake: WorkerHandshake | Mapping[str, object]) -> bytes:
-    if isinstance(handshake, WorkerHandshake):
-        value: dict[str, object] = {
-            "backend": handshake.backend,
-            "pid": handshake.pid,
-            "protocol": handshake.protocol,
-            "version": handshake.version,
-        }
-    elif isinstance(handshake, Mapping):
-        value = dict(handshake)
-    else:
-        raise WorkerProtocolError("invalid handshake")
-    decoded = decode_handshake_line(_encode_line(value))
-    return _encode_line(
-        {
-            "backend": decoded.backend,
-            "pid": decoded.pid,
-            "protocol": decoded.protocol,
-            "version": decoded.version,
-        }
-    )
 
 
 def decode_handshake_line(raw: bytes | str) -> WorkerHandshake:
@@ -449,6 +413,37 @@ class _PipeReader:
             for key, _ in events:
                 self._read_ready(key)
 
+    def write_stdin(self, payload: bytes, deadline: float) -> None:
+        if self.process.stdin is None:
+            raise WorkerProtocolError("worker stdin is unavailable")
+        descriptor = self.process.stdin.fileno()
+        os.set_blocking(descriptor, False)
+        offset = 0
+        self.selector.register(self.process.stdin, selectors.EVENT_WRITE, "stdin")
+        try:
+            while offset < len(payload):
+                if self.process.poll() is not None:
+                    raise BrokenPipeError("worker exited while request was being written")
+                try:
+                    offset += os.write(descriptor, payload[offset:])
+                    continue
+                except BlockingIOError:
+                    pass
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("worker deadline exceeded while writing request")
+                events = self.selector.select(min(remaining, 0.05))
+                if self.on_read is not None:
+                    self.on_read()
+                for key, _ in events:
+                    if key.data != "stdin":
+                        self._read_ready(key)
+        finally:
+            try:
+                self.selector.unregister(self.process.stdin)
+            except (KeyError, ValueError):
+                pass
+
     def assert_no_trailing_stdout(self) -> None:
         events = self.selector.select(0)
         for key, _ in events:
@@ -483,6 +478,8 @@ class WorkerHarness:
         self.request_count = 0
         self.start_count = 0
         self.rebuild_count = 0
+        self._poisoned = False
+        self._poisoned_evidence: tuple[int | None, int | None, int] | None = None
 
     def __enter__(self) -> "WorkerHarness":
         return self
@@ -490,7 +487,7 @@ class WorkerHarness:
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self.close()
 
-    def _start(self, expected_backend: str) -> "_WorkerProcess":
+    def _start(self, expected_backend: str, deadline: float | None = None) -> "_WorkerProcess":
         if self.start_count:
             self.rebuild_count += 1
         try:
@@ -513,7 +510,10 @@ class WorkerHarness:
         worker = _WorkerProcess(process, max_line_bytes=MAX_LINE_BYTES)
         self.start_count += 1
         try:
-            handshake = worker.reader.read_stdout_line(time.monotonic() + self.startup_timeout_ms / 1000)
+            startup_deadline = time.monotonic() + self.startup_timeout_ms / 1000
+            if deadline is not None:
+                startup_deadline = min(startup_deadline, deadline)
+            handshake = worker.reader.read_stdout_line(startup_deadline)
             decoded = decode_handshake_line(handshake)
             if decoded.backend != expected_backend:
                 raise WorkerProtocolError("handshake backend does not match request")
@@ -522,7 +522,7 @@ class WorkerHarness:
             worker.handshake = decoded
             worker.reader.assert_no_trailing_stdout()
         except Exception:
-            proven = self._terminate(worker)
+            proven = self._terminate_checked(worker)
             raise WorkerStartupError(
                 "worker startup handshake failed",
                 worker_pid=worker.process.pid,
@@ -538,13 +538,27 @@ class WorkerHarness:
             raise WorkerProtocolError("submit requires WorkerRequest")
         if request.request_id in self._request_ids:
             raise WorkerProtocolError(f"duplicate request_id: {request.request_id}")
+        request_line = encode_request_line(request)
+        deadline = time.monotonic() + min(self.request_timeout_ms, request.limits.hard_time_limit_ms) / 1000
         self._request_ids.add(request.request_id)
         self.request_count += 1
+        if self._poisoned:
+            worker_pid, pgid, peak_rss_kib = self._poisoned_evidence or (None, None, 0)
+            return WorkerOutcome(
+                request.request_id,
+                "UNKNOWN",
+                "CLEANUP_UNPROVEN",
+                worker_pid,
+                pgid,
+                peak_rss_kib,
+                False,
+                False,
+            )
         try:
             worker = self._worker
             if worker is not None and worker.memory_limit_bytes != request.limits.memory_limit_bytes:
                 old_worker = worker
-                if not self._terminate(old_worker):
+                if not self._terminate_checked(old_worker):
                     self._worker = None
                     return WorkerOutcome(
                         request.request_id,
@@ -558,7 +572,7 @@ class WorkerHarness:
                     )
                 self._worker = None
                 worker = None
-            worker = worker or self._start(request.backend)
+            worker = worker or self._start(request.backend, deadline)
             worker.memory_limit_bytes = request.limits.memory_limit_bytes
         except WorkerStartupError as exc:
             return WorkerOutcome(
@@ -574,17 +588,14 @@ class WorkerHarness:
         process = worker.process
         pgid = worker.pgid
         try:
-            if process.stdin is None:
-                raise WorkerProtocolError("worker stdin is unavailable")
-            process.stdin.write(encode_request_line(request))
-            process.stdin.flush()
-            deadline = time.monotonic() + min(self.request_timeout_ms, request.limits.hard_time_limit_ms) / 1000
+            worker.begin_request()
+            worker.reader.write_stdin(request_line, deadline)
             response_line = worker.reader.read_stdout_line(deadline)
             response = decode_response_line(response_line, expected_request_id=request.request_id, expected_backend=request.backend)
             worker.sample_rss()
             worker.reader.assert_no_trailing_stdout()
             if response.status != "OK":
-                cleanup_proven = self._terminate(worker)
+                cleanup_proven = self._terminate_checked(worker)
                 self._worker = None
                 return WorkerOutcome(
                     request.request_id,
@@ -600,12 +611,12 @@ class WorkerHarness:
             return WorkerOutcome(request.request_id, "OK", "COMPLETED", process.pid, pgid, worker.peak_rss_kib, False, True, response)
         except TimeoutError:
             termination = "INVALID_OUTPUT" if worker.reader.stdout_buffer else "HARD_TIMEOUT"
-            cleanup_proven = self._terminate(worker)
+            cleanup_proven = self._terminate_checked(worker)
             self._worker = None
             return WorkerOutcome(request.request_id, "UNKNOWN", termination, process.pid, pgid, worker.peak_rss_kib, False, cleanup_proven)
         except (BrokenPipeError, OSError, WorkerProtocolError, WorkerCleanupError, ValueError):
             returncode = process.poll()
-            cleanup_proven = self._terminate(worker)
+            cleanup_proven = self._terminate_checked(worker)
             self._worker = None
             if returncode == 3:
                 termination = "MEMORY_LIMIT"
@@ -616,6 +627,17 @@ class WorkerHarness:
             else:
                 termination = "PROTOCOL_MISMATCH"
             return WorkerOutcome(request.request_id, "UNKNOWN", termination, process.pid, pgid, worker.peak_rss_kib, False, cleanup_proven)
+
+    def _poison_after_cleanup(self, worker: "_WorkerProcess") -> None:
+        if not self._poisoned:
+            self._poisoned = True
+            self._poisoned_evidence = (worker.process.pid, worker.pgid, worker.peak_rss_kib)
+
+    def _terminate_checked(self, worker: "_WorkerProcess") -> bool:
+        proven = self._terminate(worker)
+        if not proven:
+            self._poison_after_cleanup(worker)
+        return proven
 
     def _terminate(self, worker: "_WorkerProcess") -> bool:
         process = worker.process
@@ -675,7 +697,7 @@ class WorkerHarness:
         worker = self._worker
         self._worker = None
         if worker is not None:
-            if not self._terminate(worker):
+            if not self._terminate_checked(worker):
                 raise WorkerCleanupError("worker cleanup could not be proven")
 
 
@@ -687,6 +709,10 @@ class _WorkerProcess:
         self.handshake: WorkerHandshake | None = None
         self.peak_rss_kib = 0
         self.memory_limit_bytes: int | None = None
+
+    def begin_request(self) -> None:
+        self.peak_rss_kib = 0
+        self.sample_rss()
 
     def sample_rss(self) -> None:
         current = process_group_rss_kib(self.pgid)

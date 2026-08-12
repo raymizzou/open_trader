@@ -17,7 +17,6 @@ from open_trader.prediction_solver import BENCHMARK_PROTOCOL_V1
 from open_trader.prediction_solver_worker import (
     MAX_LINE_BYTES,
     WorkerHarness,
-    WorkerLimits,
     WorkerProtocolError,
     decode_handshake_line,
     decode_request_line,
@@ -188,6 +187,27 @@ def test_harness_rejects_handshake_with_a_pid_different_from_the_captured_proces
     assert result.status == "UNKNOWN"
     assert result.termination == "PROTOCOL_MISMATCH"
     assert result.cleanup_proven is True
+
+
+def test_large_request_to_a_worker_that_never_reads_stdin_times_out_boundedly() -> None:
+    code = (
+        "import json,os,time; "
+        "print(json.dumps({'backend':'test','pid':os.getpid(),'protocol':'open_trader.prediction_solver.protocol.v1','version':'1'}), flush=True); "
+        "time.sleep(10)"
+    )
+    payload = _request("blocked", hard_time_limit_ms=100)
+    payload["request"]["problem"]["problem_id"] = "x" * 200_000
+
+    started = time.monotonic()
+    with WorkerHarness([sys.executable, "-c", code], request_timeout_ms=500, cleanup_grace_seconds=0.1) as harness:
+        result = harness.submit(decode_request_line(encode_request_line(payload)))
+    elapsed = time.monotonic() - started
+
+    assert result.status == "UNKNOWN"
+    assert result.termination == "HARD_TIMEOUT"
+    assert result.cleanup_proven is True
+    assert elapsed < 1.0
+    assert process_group_rss_kib(result.pgid) == 0
 
 
 def test_missing_worker_executable_finalizes_current_request_unknown() -> None:
@@ -435,6 +455,79 @@ def test_changed_request_memory_limit_rebuilds_worker_before_dispatch() -> None:
     assert first.worker_pid != second.worker_pid
     assert harness.start_count == 2
     assert harness.rebuild_count == 1
+
+
+def test_cleanup_failure_poisons_harness_and_blocks_later_process_start(monkeypatch) -> None:
+    import open_trader.prediction_solver_worker as worker_module
+
+    popen_calls: list[object] = []
+    original_popen = worker_module.subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        if kwargs.get("start_new_session") is True:
+            popen_calls.append(args[0] if args else kwargs.get("args"))
+        return original_popen(*args, **kwargs)
+
+    monkeypatch.setattr(worker_module.subprocess, "Popen", recording_popen)
+    harness = WorkerHarness(_test_command("ok"))
+    original_terminate = harness._terminate
+    try:
+        first = harness.submit(decode_request_line(encode_request_line(_request("poison-a"))))
+        monkeypatch.setattr(harness, "_terminate", lambda worker: original_terminate(worker) and False)
+        failed = harness.submit(
+            decode_request_line(
+                encode_request_line(_request("poison-b", memory_limit_bytes=2 * 1024 * 1024 * 1024 * 1024))
+            )
+        )
+        blocked = harness.submit(
+            decode_request_line(
+                encode_request_line(_request("poison-c", memory_limit_bytes=3 * 1024 * 1024 * 1024 * 1024))
+            )
+        )
+    finally:
+        harness._terminate = original_terminate
+        harness.close()
+
+    assert first.status == "OK"
+    assert failed.status == "UNKNOWN"
+    assert failed.termination == "PROTOCOL_MISMATCH"
+    assert failed.cleanup_proven is False
+    assert failed.worker_pid == first.worker_pid
+    assert failed.pgid == first.pgid
+    assert failed.peak_rss_kib == first.peak_rss_kib
+    assert blocked.status == "UNKNOWN"
+    assert blocked.termination == "CLEANUP_UNPROVEN"
+    assert blocked.cleanup_proven is False
+    assert blocked.worker_pid == first.worker_pid
+    assert blocked.pgid == first.pgid
+    assert blocked.peak_rss_kib == first.peak_rss_kib
+    assert len(popen_calls) == 1
+
+
+def test_reused_worker_resets_peak_rss_for_each_request(monkeypatch) -> None:
+    request_phases: dict[int, int] = {}
+
+    original_begin_request = sys.modules["open_trader.prediction_solver_worker"]._WorkerProcess.begin_request
+
+    def begin_request(worker) -> None:
+        key = id(worker)
+        request_phases[key] = request_phases.get(key, 0) + 1
+        original_begin_request(worker)
+
+    def deterministic_sample(worker) -> None:
+        current = 100 if request_phases.get(id(worker), 0) == 1 else 10
+        worker.peak_rss_kib = max(worker.peak_rss_kib, current)
+
+    monkeypatch.setattr("open_trader.prediction_solver_worker._WorkerProcess.begin_request", begin_request)
+    monkeypatch.setattr("open_trader.prediction_solver_worker._WorkerProcess.sample_rss", deterministic_sample)
+    with WorkerHarness(_test_command("ok")) as harness:
+        first = harness.submit(decode_request_line(encode_request_line(_request("rss-a"))))
+        second = harness.submit(decode_request_line(encode_request_line(_request("rss-b"))))
+
+    assert first.status == "OK"
+    assert first.peak_rss_kib == 100
+    assert second.status == "OK"
+    assert second.peak_rss_kib == 10
 
 
 def test_line_bound_is_enforced_before_json_decode() -> None:
