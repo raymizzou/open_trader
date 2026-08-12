@@ -276,7 +276,6 @@ install_stack() {
   "$PLUTIL_BIN" -lint "$SINGLE_PLIST" >/dev/null
   ensure_port_owned 8766 "$SINGLE_LABEL" "$GATEWAY_LABEL"
   ensure_port_owned 8767 "$LEGACY_LABEL"
-  wait_http "http://127.0.0.1:8766/"
   gateway_rendered="$(render_template "$GATEWAY_TEMPLATE")"
   legacy_rendered="$(render_template "$LEGACY_TEMPLATE")"
   lint_plist "$gateway_rendered"

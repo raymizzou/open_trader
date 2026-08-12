@@ -318,6 +318,29 @@ def test_prediction_route_health_reports_selected_service_status(tmp_path: Path)
     assert payload["prediction_upstream_status"] == "ok"
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [("legacy", "legacy"), ("maintenance", "maintenance")],
+)
+def test_prediction_route_health_reports_non_service_mode(
+    tmp_path: Path, mode: str, expected: str
+) -> None:
+    legacy = _Upstream()
+    prediction = _Upstream()
+    route = tmp_path / "prediction-route.json"
+    _write_route(route, mode)
+    with _running(legacy), _running(prediction), _gateway(
+        tmp_path / "static",
+        legacy.server_address[1],
+        prediction_port=prediction.server_address[1],
+        prediction_route_path=route,
+    ) as base:
+        with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
+            payload = json.load(response)
+    assert payload["prediction_route_mode"] == mode
+    assert payload["prediction_upstream_status"] == expected
+
+
 def test_prediction_untrusted_origin_releases_inflight_request(tmp_path: Path) -> None:
     _write_static_files(tmp_path / "static")
     legacy = _Upstream()

@@ -6,6 +6,7 @@ import sys
 
 import pytest
 
+import open_trader.cli as cli
 import open_trader.frontend_gateway as frontend_gateway
 from open_trader.frontend_gateway import FrontendGatewayConfig
 
@@ -121,3 +122,37 @@ def test_frontend_gateway_cli_dispatches_explicit_upstream_and_origin(
     assert config.prediction_upstream_port == 18769
     assert config.public_origin == "http://localhost:18766"
     assert config.upstream_timeout_seconds == 2.5
+
+
+def test_cli_frontend_gateway_delegates_to_canonical_entrypoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_main(argv: list[str]) -> int:
+        captured["argv"] = argv
+        return 37
+
+    monkeypatch.setattr(frontend_gateway, "main", fake_main)
+
+    result = cli.main(
+        [
+            "frontend-gateway",
+            "--prediction-route-state",
+            str(tmp_path / "prediction-route.json"),
+            "--account-upstream-host",
+            "localhost",
+            "--account-upstream-port",
+            "18768",
+        ]
+    )
+
+    assert result == 37
+    assert captured["argv"] == [
+        "--prediction-route-state",
+        str(tmp_path / "prediction-route.json"),
+        "--account-upstream-host",
+        "localhost",
+        "--account-upstream-port",
+        "18768",
+    ]

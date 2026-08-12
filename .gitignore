@@ -11,6 +11,12 @@ __pycache__/
 *.py[cod]
 config/daily_premarket.env
 config/prediction_arbitrage.json
+# Issue #45 runtime state (created only when runtime root is this checkout).
+/config/prediction-route.json
+/config/.prediction-cutover.lock
+/config/.prediction-cutover-state.lock
+/prediction-cutover-evidence.json
+/prediction-service-runtime.json
 .superpowers/
 node_modules/
 test-results/

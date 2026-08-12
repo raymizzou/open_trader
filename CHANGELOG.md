@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-12
 
+- #45 final safeguards integrate fail-closed compatibility bootstrap, explicit
+  maintenance rollback, native macOS PID absence proof, route-aware Gateway
+  health, sanitized evidence/public no-submit verification, and runtime artifact
+  ignores. Focused cutover tests are being rerun; live cutover, deployment,
+  restart, 8769 install, and `make acceptance` have not run.
+
 - #45 freezes Prediction Gateway `legacy`, `service`, and `maintenance` route
   modes with in-flight drain, adds Legacy owner-off launchd rendering, and
   records the bounded cutover/rollback script. Tasks 1–4 provide frozen

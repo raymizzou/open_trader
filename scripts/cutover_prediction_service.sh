@@ -15,6 +15,7 @@ LSOF_BIN="${LSOF_BIN:-/usr/sbin/lsof}"
 CURL_BIN="${CURL_BIN:-/usr/bin/curl}"
 PS_BIN="${PS_BIN:-/bin/ps}"
 OWNER_PROBE_BIN="${OWNER_PROBE_BIN:-}"
+GATEWAY_HEALTH=""
 
 usage() {
   echo "usage: $0 --target service|legacy --repo-root PATH --runtime-root PATH --python PATH --expected-sha 40_HEX --prediction-config PATH --launch-agents-dir PATH --wait-seconds POSITIVE_INT" \
@@ -52,6 +53,7 @@ require_executable() {
 
 COMMAND_TIMEOUT_SECONDS=$((WAIT_SECONDS + 5))
 ACTIVE_RUNNER_PID=""
+CAPTURED_OUTPUT=""
 run_bounded() {
   "$PYTHON_BIN" -c '
 import os, signal, subprocess, sys
@@ -94,6 +96,17 @@ except subprocess.TimeoutExpired:
   return "$status"
 }
 
+capture_bounded() {
+  local output_path
+  output_path="$(mktemp "${TMPDIR:-/tmp}/open-trader-cutover-output.XXXXXX")" || return 1
+  if ! run_bounded "$@" >"$output_path"; then
+    rm -f "$output_path"
+    return 1
+  fi
+  CAPTURED_OUTPUT="$(<"$output_path")"
+  rm -f "$output_path"
+}
+
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd -P)" || fail "repo root is unavailable"
 RUNTIME_ROOT="$(cd "$RUNTIME_ROOT" && pwd -P)" || fail "runtime root is unavailable"
 PREDICTION_CONFIG_DIR="${PREDICTION_CONFIG%/*}"
@@ -114,7 +127,7 @@ for executable in "$PYTHON_BIN" "$GIT_BIN" "$LAUNCHCTL_BIN" "$LSOF_BIN" \
 done
 [[ -z "$OWNER_PROBE_BIN" ]] || require_executable "$OWNER_PROBE_BIN"
 [[ -f "$PREDICTION_CONFIG" ]] || fail "prediction config is unavailable"
-[[ -f "$ROUTE_PATH" && ! -L "$ROUTE_PATH" ]] || fail "prediction route path is invalid"
+[[ ! -L "$ROUTE_PATH" ]] || fail "prediction route path is invalid"
 [[ ! -e "$EVIDENCE_PATH" || ( -f "$EVIDENCE_PATH" && ! -L "$EVIDENCE_PATH" ) ]] \
   || fail "prediction evidence path is invalid"
 
@@ -146,9 +159,15 @@ print(json.dumps(payload, separators=(",", ":")))
 PY
 }
 
-INITIAL_ROUTE="$(read_route)" || fail "prediction route record is invalid"
-INITIAL_MODE="$(run_bounded "$PYTHON_BIN" -c 'import json,sys; print(json.loads(sys.argv[1])["mode"])' "$INITIAL_ROUTE")"
-INITIAL_OPERATION_ID="$(run_bounded "$PYTHON_BIN" -c 'import json,sys; print(json.loads(sys.argv[1])["operation_id"])' "$INITIAL_ROUTE")"
+INITIAL_ROUTE=""
+INITIAL_MODE="absent"
+INITIAL_OPERATION_ID="__absent__"
+if [[ -e "$ROUTE_PATH" ]]; then
+  [[ -f "$ROUTE_PATH" ]] || fail "prediction route path is invalid"
+  INITIAL_ROUTE="$(read_route)" || fail "prediction route record is invalid"
+  INITIAL_MODE="$(run_bounded "$PYTHON_BIN" -c 'import json,sys; print(json.loads(sys.argv[1])["mode"])' "$INITIAL_ROUTE")"
+  INITIAL_OPERATION_ID="$(run_bounded "$PYTHON_BIN" -c 'import json,sys; print(json.loads(sys.argv[1])["operation_id"])' "$INITIAL_ROUTE")"
+fi
 
 validate_evidence() {
   run_bounded "$PYTHON_BIN" - "$EVIDENCE_PATH" <<'PY'
@@ -161,6 +180,7 @@ try:
         and set(payload) == {
             "schema_version", "operation_id", "target", "expected_sha", "result",
             "failure_reason", "downtime_started_at", "downtime_ended_at",
+            "before", "after", "route", "owner", "service_runtime", "verification",
         }
         and payload.get("schema_version") == "open_trader.prediction_cutover.evidence.v1"
         and isinstance(payload.get("operation_id"), str) and bool(payload["operation_id"])
@@ -171,6 +191,34 @@ try:
         and isinstance(payload.get("failure_reason"), str)
         and isinstance(payload.get("downtime_started_at"), str)
         and isinstance(payload.get("downtime_ended_at"), str)
+        and isinstance(payload.get("before"), dict)
+        and isinstance(payload.get("after"), dict)
+        and set(payload["before"]) == {"gateway", "legacy", "service"}
+        and set(payload["after"]) == {"gateway", "legacy", "service"}
+        and all(
+            isinstance(payload[side][component], dict)
+            and set(payload[side][component]) == {"pid", "cwd", "git_sha", "listener"}
+            and (payload[side][component]["pid"] is None or type(payload[side][component]["pid"]) is int)
+            and isinstance(payload[side][component]["cwd"], str)
+            and isinstance(payload[side][component]["git_sha"], str)
+            for side in ("before", "after")
+            for component in ("gateway", "legacy", "service")
+        )
+        and isinstance(payload.get("route"), dict)
+        and isinstance(payload.get("owner"), dict)
+        and isinstance(payload.get("service_runtime"), dict)
+        and isinstance(payload.get("verification"), dict)
+        and set(payload["route"]) == {"before_mode", "after_mode", "inflight_before", "inflight_after"}
+        and type(payload["route"]["inflight_before"]) is int
+        and type(payload["route"]["inflight_after"]) is int
+        and set(payload["owner"]) == {"pid", "lock_holders", "available"}
+        and type(payload["owner"]["available"]) is bool
+        and isinstance(payload["owner"]["lock_holders"], list)
+        and set(payload["service_runtime"]) == {"state", "reader_generation", "contract_generation"}
+        and isinstance(payload["service_runtime"]["state"], str)
+        and set(payload["verification"]) == {"direct_backend", "public_state", "public_history", "preview_no_submit"}
+        and payload["verification"]["direct_backend"] in {"verified", "failed"}
+        and all(type(payload["verification"][key]) is bool for key in ("public_state", "public_history", "preview_no_submit"))
         and (
             payload["result"] != "ready"
             or (
@@ -245,17 +293,21 @@ PY
 
 preflight_health() {
   local gateway legacy
-  gateway="$(run_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
-    http://127.0.0.1:8766/healthz)" || return 1
-  legacy="$(run_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
-    http://127.0.0.1:8767/healthz)" || return 1
+  capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+    http://127.0.0.1:8766/healthz || return 1
+  gateway="$CAPTURED_OUTPUT"
+  capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+    http://127.0.0.1:8767/healthz || return 1
+  legacy="$CAPTURED_OUTPUT"
   run_bounded "$PYTHON_BIN" - "$gateway" "$legacy" "$GATEWAY_PID" "$LEGACY_PID" \
     "$REPO_ROOT" "$EXPECTED_SHA" "$INITIAL_ROUTE" <<'PY'
 import json, sys
 try:
     gateway, legacy, route = json.loads(sys.argv[1]), json.loads(sys.argv[2]), json.loads(sys.argv[7])
     expected_gateway_pid, expected_legacy_pid = int(sys.argv[3]), int(sys.argv[4])
-    expected_prediction_status = "ok" if route["mode"] == "service" else "not_selected"
+    expected_prediction_status = {
+        "service": "ok", "legacy": "legacy", "maintenance": "maintenance",
+    }[route["mode"]]
     valid = (
         isinstance(gateway, dict)
         and gateway.get("schema_version") == "open_trader.frontend_gateway.health.v1"
@@ -289,6 +341,7 @@ verify_relevant_label_set() {
   output="$(run_bounded "$LAUNCHCTL_BIN" print "gui/$UID")" || return 1
   expected_service_count=0
   [[ "$INITIAL_MODE" == "service" ]] && expected_service_count=1
+  [[ "${1:-}" == "rollback-maintenance" ]] && expected_service_count="rollback-maintenance"
   run_bounded "$PYTHON_BIN" - "$output" "$expected_service_count" <<'PY'
 import re, sys
 labels = re.findall(
@@ -298,20 +351,34 @@ labels = re.findall(
 expected = {
     "com.open-trader.frontend-gateway": 1,
     "com.open-trader.legacy-dashboard": 1,
-    "com.open-trader.prediction-service": int(sys.argv[2]),
+    "com.open-trader.prediction-service": 0 if sys.argv[2] == "rollback-maintenance" else int(sys.argv[2]),
 }
 relevant = [
     label for label in labels
     if any(term in label for term in ("prediction", "frontend-gateway", "legacy-dashboard"))
 ]
 valid = all(relevant.count(label) == count for label, count in expected.items())
+if sys.argv[2] == "rollback-maintenance":
+    valid = (
+        relevant.count("com.open-trader.frontend-gateway") == 1
+        and relevant.count("com.open-trader.legacy-dashboard") == 1
+        and relevant.count("com.open-trader.prediction-service") in {0, 1}
+    )
 valid = valid and all(label in expected for label in relevant)
 raise SystemExit(0 if valid else 1)
 PY
 }
 
-[[ "$INITIAL_MODE" != "maintenance" ]] || fail "another prediction cutover owns maintenance"
-verify_relevant_label_set || fail "relevant launchd label set is not verified"
+if [[ "$INITIAL_MODE" == "maintenance" && "$TARGET" != "legacy" ]]; then
+  fail "another prediction cutover owns maintenance"
+fi
+[[ "$INITIAL_MODE" != "absent" || "$TARGET" == "service" ]] \
+  || fail "prediction route record is required for legacy rollback"
+if [[ "$INITIAL_MODE" == "maintenance" && "$TARGET" == "legacy" ]]; then
+  verify_relevant_label_set rollback-maintenance || fail "relevant launchd label set is not verified"
+else
+  verify_relevant_label_set || fail "relevant launchd label set is not verified"
+fi
 GATEWAY_PID="$(inspect_label com.open-trader.frontend-gateway 1)" \
   || fail "Frontend Gateway launchd identity is not verified"
 LEGACY_PID="$(inspect_label com.open-trader.legacy-dashboard 1)" \
@@ -335,10 +402,14 @@ else
 fi
 if [[ "$INITIAL_MODE" == "service" ]]; then
   [[ -n "$SERVICE_PID" ]] || fail "service route has no verified Prediction Service"
+elif [[ "$INITIAL_MODE" == "maintenance" && "$TARGET" == "legacy" ]]; then
+  : # An interrupted Service cutover is the explicit rollback input.
 else
   [[ -z "$SERVICE_PID" ]] || fail "non-service route has a loaded Prediction Service"
 fi
-preflight_health || fail "Gateway and Legacy runtime health is not verified"
+if [[ "$INITIAL_MODE" != "absent" ]]; then
+  preflight_health || fail "Gateway and Legacy runtime health is not verified"
+fi
 
 evidence_is_ready_for_target() {
   [[ -f "$EVIDENCE_PATH" ]] || return 1
@@ -353,6 +424,7 @@ try:
         and set(payload) == {
             "schema_version", "operation_id", "target", "expected_sha", "result",
             "failure_reason", "downtime_started_at", "downtime_ended_at",
+            "before", "after", "route", "owner", "service_runtime", "verification",
         }
         and payload.get("schema_version") == "open_trader.prediction_cutover.evidence.v1"
         and payload.get("operation_id") == route.get("operation_id")
@@ -394,6 +466,27 @@ handle_signal() {
   local status="$1"
   trap - INT TERM
   stop_active_runner
+  if [[ -n "${OPERATION_ID:-}" && -n "${DOWNTIME_STARTED_AT:-}" ]] \
+      && declare -F read_route >/dev/null 2>&1 \
+      && declare -F state_transition >/dev/null 2>&1; then
+    local current="" mode="" operation_id="" ended_at=""
+    current="$(read_route 2>/dev/null || true)"
+    if [[ -n "$current" ]]; then
+      mode="$(run_bounded "$PYTHON_BIN" -c \
+        'import json,sys; print(json.loads(sys.argv[1]).get("mode", ""))' \
+        "$current" 2>/dev/null || true)"
+      operation_id="$(run_bounded "$PYTHON_BIN" -c \
+        'import json,sys; print(json.loads(sys.argv[1]).get("operation_id", ""))' \
+        "$current" 2>/dev/null || true)"
+      if [[ "$operation_id" == "$OPERATION_ID" && ( "$mode" == "service" || "$mode" == "legacy" ) ]]; then
+        write_route maintenance "$OPERATION_ID" "$OPERATION_ID" 2>/dev/null || true
+        if route_owned_maintenance 2>/dev/null; then
+          ended_at="$(now 2>/dev/null || true)"
+          write_evidence failed "interrupted" "$ended_at" 2>/dev/null || true
+        fi
+      fi
+    fi
+  fi
   cleanup_lock
   exit "$status"
 }
@@ -430,11 +523,27 @@ def valid_route(payload):
     )
 
 def valid_evidence(payload):
+    def valid_component(value):
+        return (
+            isinstance(value, dict)
+            and set(value) == {"pid", "cwd", "git_sha", "listener"}
+            and (value["pid"] is None or (type(value["pid"]) is int and value["pid"] > 0))
+            and isinstance(value["cwd"], str)
+            and isinstance(value["git_sha"], str)
+            and (value["listener"] is None or isinstance(value["listener"], str))
+        )
+    def valid_snapshot(value):
+        return (
+            isinstance(value, dict)
+            and set(value) == {"gateway", "legacy", "service"}
+            and all(valid_component(value[name]) for name in ("gateway", "legacy", "service"))
+        )
     return (
         isinstance(payload, dict)
         and set(payload) == {
             "schema_version", "operation_id", "target", "expected_sha", "result",
             "failure_reason", "downtime_started_at", "downtime_ended_at",
+            "before", "after", "route", "owner", "service_runtime", "verification",
         }
         and payload.get("schema_version") == "open_trader.prediction_cutover.evidence.v1"
         and isinstance(payload.get("operation_id"), str) and bool(payload["operation_id"])
@@ -445,6 +554,29 @@ def valid_evidence(payload):
         and isinstance(payload.get("failure_reason"), str)
         and isinstance(payload.get("downtime_started_at"), str)
         and isinstance(payload.get("downtime_ended_at"), str)
+        and valid_snapshot(payload.get("before"))
+        and valid_snapshot(payload.get("after"))
+        and isinstance(payload.get("route"), dict)
+        and set(payload["route"]) == {"before_mode", "after_mode", "inflight_before", "inflight_after"}
+        and all(isinstance(payload["route"].get(key), str) for key in ("before_mode", "after_mode"))
+        and all(type(payload["route"].get(key)) is int and payload["route"][key] >= 0 for key in ("inflight_before", "inflight_after"))
+        and isinstance(payload.get("owner"), dict)
+        and set(payload["owner"]) == {"pid", "lock_holders", "available"}
+        and (payload["owner"]["pid"] is None or (type(payload["owner"]["pid"]) is int and payload["owner"]["pid"] > 0))
+        and isinstance(payload["owner"]["lock_holders"], list)
+        and all(type(value) is int and value > 0 for value in payload["owner"]["lock_holders"])
+        and type(payload["owner"]["available"]) is bool
+        and isinstance(payload.get("service_runtime"), dict)
+        and set(payload["service_runtime"]) == {"state", "reader_generation", "contract_generation"}
+        and isinstance(payload["service_runtime"]["state"], str)
+        and (payload["service_runtime"]["reader_generation"] is None or (type(payload["service_runtime"]["reader_generation"]) is int and payload["service_runtime"]["reader_generation"] > 0))
+        and (payload["service_runtime"]["contract_generation"] is None or (type(payload["service_runtime"]["contract_generation"]) is int and payload["service_runtime"]["contract_generation"] > 0))
+        and isinstance(payload.get("verification"), dict)
+        and set(payload["verification"]) == {"direct_backend", "public_state", "public_history", "preview_no_submit"}
+        and payload["verification"]["direct_backend"] in {"verified", "failed"}
+        and type(payload["verification"]["public_state"]) is bool
+        and type(payload["verification"]["public_history"]) is bool
+        and type(payload["verification"]["preview_no_submit"]) is bool
         and (
             payload["result"] != "ready"
             or (
@@ -476,7 +608,20 @@ def atomic_write(path, payload):
             Path(temporary).unlink(missing_ok=True)
 
 operation = sys.argv[1]
-if operation == "route-write":
+if operation == "route-bootstrap":
+    _, path_raw, operation_id, lock_raw = sys.argv[1:]
+    route_path = Path(path_raw)
+    with open(lock_raw, "a+", encoding="utf-8") as state_lock:
+        fcntl.flock(state_lock, fcntl.LOCK_EX)
+        if route_path.exists():
+            raise ValueError("prediction route already exists")
+        atomic_write(route_path, {
+            "schema_version": "open_trader.frontend_gateway.prediction_route.v1",
+            "mode": "maintenance",
+            "operation_id": operation_id,
+            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        })
+elif operation == "route-write":
     _, path_raw, mode, operation_id, expected_operation_id, lock_raw = sys.argv[1:]
     route_path = Path(path_raw)
     with open(lock_raw, "a+", encoding="utf-8") as state_lock:
@@ -488,11 +633,8 @@ if operation == "route-write":
             raise ValueError("stale prediction cutover operation")
         if mode != "maintenance" and current.get("mode") != "maintenance":
             raise ValueError("prediction route is not in maintenance")
-        if (
-            mode == "maintenance"
-            and current.get("mode") == "maintenance"
-            and current.get("operation_id") != operation_id
-        ):
+        if mode == "maintenance" and not expected_operation_id \
+                and current.get("operation_id") != operation_id:
             raise ValueError("another prediction cutover owns maintenance")
         payload = {
             "schema_version": "open_trader.frontend_gateway.prediction_route.v1",
@@ -504,7 +646,7 @@ if operation == "route-write":
 elif operation == "evidence-write":
     (
         _, path_raw, route_raw, initial_evidence_operation_id, operation_id,
-        target, expected_sha, result, reason, started, ended, lock_raw,
+        target, expected_sha, result, reason, started, ended, lock_raw, details_raw,
     ) = sys.argv[1:]
     path = Path(path_raw)
     route_path = Path(route_raw)
@@ -536,6 +678,10 @@ elif operation == "evidence-write":
             "downtime_started_at": started,
             "downtime_ended_at": ended,
         }
+        details = json.loads(details_raw)
+        if not isinstance(details, dict):
+            raise ValueError("invalid prediction evidence details")
+        payload.update(details)
         if not valid_evidence(payload):
             raise ValueError("invalid prediction evidence payload")
         atomic_write(path, payload)
@@ -556,14 +702,16 @@ now() {
 }
 
 gateway_health() {
-  run_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
-    http://127.0.0.1:8766/healthz
+  capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+    http://127.0.0.1:8766/healthz || return 1
+  GATEWAY_HEALTH="$CAPTURED_OUTPUT"
 }
 
 wait_gateway() {
   local mode="$1" require_zero="$2" attempt payload
   for ((attempt = 1; attempt <= WAIT_SECONDS; attempt++)); do
-    if payload="$(gateway_health)" && run_bounded "$PYTHON_BIN" - "$payload" "$mode" "$require_zero" <<'PY'
+    if gateway_health && payload="$GATEWAY_HEALTH" \
+      && run_bounded "$PYTHON_BIN" - "$payload" "$mode" "$require_zero" <<'PY'
 import json, sys
 try:
     payload = json.loads(sys.argv[1])
@@ -575,11 +723,9 @@ try:
         and type(payload.get("prediction_inflight_requests")) is int
         and payload["prediction_inflight_requests"] >= 0
         and (sys.argv[3] != "1" or payload["prediction_inflight_requests"] == 0)
-        and (
-            payload.get("prediction_upstream_status") == "ok"
-            if sys.argv[2] == "service"
-            else payload.get("prediction_upstream_status") == "not_selected"
-        )
+        and payload.get("prediction_upstream_status") == {
+            "service": "ok", "legacy": "legacy", "maintenance": "maintenance",
+        }[sys.argv[2]]
     )
 except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
     valid = False
@@ -608,7 +754,7 @@ PY
 
 pid_absent() {
   local output status
-  if output="$(run_bounded "$PS_BIN" -p "$1" 2>&1)"; then
+  if output="$(run_bounded "$PS_BIN" -p "$1" -o pid= 2>&1)"; then
     return 1
   else
     status=$?
@@ -662,9 +808,9 @@ PY
 
 prove_service_ready() {
   local health
-  health="$(run_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
-    http://127.0.0.1:8769/healthz)" \
-    || return 1
+  capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+    http://127.0.0.1:8769/healthz || return 1
+  health="$CAPTURED_OUTPUT"
   run_bounded "$PYTHON_BIN" - "$RUNTIME_RECORD" "$health" "$REPO_ROOT" "$EXPECTED_SHA" <<'PY'
 import json, sys
 from pathlib import Path
@@ -743,17 +889,164 @@ raise SystemExit(0 if valid else 1)
 PY
 }
 
+validate_history_payload() {
+  run_bounded "$PYTHON_BIN" - "$1" "$2" <<'PY'
+import json, sys
+try:
+    payload = json.loads(sys.argv[1])
+    valid = (
+        isinstance(payload, dict)
+        and payload.get("kind") == sys.argv[2]
+        and isinstance(payload.get("items"), list)
+        and type(payload.get("total")) is int and payload["total"] >= 0
+        and type(payload.get("limit")) is int and payload["limit"] > 0
+        and type(payload.get("offset")) is int and payload["offset"] >= 0
+        and type(payload.get("has_more")) is bool
+    )
+except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+    valid = False
+raise SystemExit(0 if valid else 1)
+PY
+}
+
+validate_direct_health() {
+  run_bounded "$PYTHON_BIN" - "$1" "$TARGET" "$REPO_ROOT" "$EXPECTED_SHA" <<'PY'
+import json, sys
+try:
+    payload = json.loads(sys.argv[1])
+    target = sys.argv[2]
+    valid = isinstance(payload, dict)
+    if target == "service":
+        valid = valid and payload.get("status") in {"running", "healthy"}
+        valid = valid and payload.get("module") == "prediction_service"
+        valid = valid and payload.get("git_sha") == sys.argv[4]
+    else:
+        valid = valid and payload.get("module") == "legacy_dashboard"
+        valid = valid and payload.get("git_sha") == sys.argv[4]
+except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+    valid = False
+raise SystemExit(0 if valid else 1)
+PY
+}
+
 prove_public_contract() {
-  local payload gateway
-  gateway="$(gateway_health)" || return 1
-  payload="$(run_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
-    http://127.0.0.1:8766/api/prediction-arbitrage/state)" || return 1
-  validate_public_payload "$payload" || return 1
+  local payload gateway direct direct_port auth_dir state_before state_after
+  local csrf preview_status preview_payload history_before history_after kind
+  gateway_health || return 1
+  gateway="$GATEWAY_HEALTH"
+  direct_port=8767
+  [[ "$TARGET" == "service" ]] && direct_port=8769
+  capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+    "http://127.0.0.1:${direct_port}/healthz" || return 1
+  direct="$CAPTURED_OUTPUT"
+  validate_direct_health "$direct" || return 1
+  auth_dir="$(mktemp -d "${TMPDIR:-/tmp}/open-trader-cutover-auth.XXXXXX")" || return 1
+  state_before="$auth_dir/state-before.json"
+  state_after="$auth_dir/state-after.json"
+  history_before="$auth_dir/history-before.json"
+  history_after="$auth_dir/history-after.json"
+  if ! run_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+      --cookie-jar "$auth_dir/cookies" --output "$state_before" \
+      "http://127.0.0.1:8766/api/prediction-arbitrage/state"; then
+    rm -rf "$auth_dir"
+    return 1
+  fi
+  payload="$(<"$state_before")"
+  validate_public_payload "$payload" || { rm -rf "$auth_dir"; return 1; }
+  [[ -s "$auth_dir/cookies" ]] || { rm -rf "$auth_dir"; return 1; }
+  for kind in signals executions incidents; do
+    if ! run_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+        --output "$auth_dir/$kind-before.json" \
+        "http://127.0.0.1:8766/api/prediction-arbitrage/history?kind=$kind&limit=100&offset=0"; then
+      rm -rf "$auth_dir"
+      return 1
+    fi
+    validate_history_payload "$(<"$auth_dir/$kind-before.json")" "$kind" \
+      || { rm -rf "$auth_dir"; return 1; }
+  done
+  if ! capture_bounded "$PYTHON_BIN" - "$payload" <<'PY'
+import json, sys
+try:
+    value = json.loads(sys.argv[1]).get("csrf_token")
+    if not isinstance(value, str) or not value:
+        raise ValueError
+    print(value)
+except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+  then
+    rm -rf "$auth_dir"
+    return 1
+  fi
+  csrf="$CAPTURED_OUTPUT"
+  capture_bounded "$CURL_BIN" --silent --show-error --max-time 2 \
+    --cookie "$auth_dir/cookies" --header "Origin: http://127.0.0.1:8766" \
+    --header "Referer: http://127.0.0.1:8766/" \
+    --header "X-CSRF-Token: $csrf" --header "Content-Type: application/json" \
+    --data '{"opportunity_id":"__cutover_nonexistent_opportunity__"}' \
+    --output "$auth_dir/preview.json" --write-out '%{http_code}' \
+    http://127.0.0.1:8766/api/prediction-arbitrage/preview || {
+      rm -rf "$auth_dir"; return 1;
+    }
+  preview_status="$CAPTURED_OUTPUT"
+  preview_status="${preview_status##*$'\n'}"
+  [[ "$preview_status" == "200" ]] || { rm -rf "$auth_dir"; return 1; }
+  preview_payload="$(<"$auth_dir/preview.json")"
+  run_bounded "$PYTHON_BIN" - "$preview_payload" <<'PY' || {
+import json, sys
+try:
+    payload = json.loads(sys.argv[1])
+    valid = (
+        isinstance(payload, dict)
+        and payload.get("state") in {"rejected", "locked", "unavailable"}
+        and "preview_id" not in payload
+        and "execution_id" not in payload
+    )
+except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+    valid = False
+raise SystemExit(0 if valid else 1)
+PY
+    rm -rf "$auth_dir"
+    return 1
+  }
+  if ! run_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+      --output "$state_after" http://127.0.0.1:8766/api/prediction-arbitrage/state; then
+    rm -rf "$auth_dir"
+    return 1
+  fi
+  for kind in signals executions incidents; do
+    if ! run_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+        --output "$auth_dir/$kind-after.json" \
+        "http://127.0.0.1:8766/api/prediction-arbitrage/history?kind=$kind&limit=100&offset=0"; then
+      rm -rf "$auth_dir"
+      return 1
+    fi
+    validate_history_payload "$(<"$auth_dir/$kind-after.json")" "$kind" \
+      || { rm -rf "$auth_dir"; return 1; }
+    history_before="$(<"$auth_dir/$kind-before.json")"
+    history_after="$(<"$auth_dir/$kind-after.json")"
+    run_bounded "$PYTHON_BIN" - "$history_before" "$history_after" <<'PY' || {
+import json, sys
+try:
+    before = json.loads(sys.argv[1])
+    after = json.loads(sys.argv[2])
+except (TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if before == after else 1)
+PY
+      rm -rf "$auth_dir"
+      return 1
+    }
+  done
+  rm -rf "$auth_dir"
+  PUBLIC_VERIFICATION_RESULT=1
   run_bounded "$PYTHON_BIN" - "$gateway" "$TARGET" <<'PY'
 import json, sys
 try:
     gateway = json.loads(sys.argv[1])
-    expected_upstream = "ok" if sys.argv[2] == "service" else "not_selected"
+    expected_upstream = {
+        "service": "ok", "legacy": "legacy", "maintenance": "maintenance",
+    }[sys.argv[2]]
     valid = (
         isinstance(gateway, dict)
         and gateway.get("prediction_route_mode") == sys.argv[2]
@@ -769,10 +1062,12 @@ prove_legacy_ready() {
   local pid health payload
   pid="$(label_pid com.open-trader.legacy-dashboard)" || return 1
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
-  health="$(run_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
-    http://127.0.0.1:8767/healthz)" || return 1
-  payload="$(run_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
-    http://127.0.0.1:8767/api/prediction-arbitrage/state)" || return 1
+  capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+    http://127.0.0.1:8767/healthz || return 1
+  health="$CAPTURED_OUTPUT"
+  capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+    http://127.0.0.1:8767/api/prediction-arbitrage/state || return 1
+  payload="$CAPTURED_OUTPUT"
   validate_public_payload "$payload" || return 1
   run_bounded "$PYTHON_BIN" - "$health" "$pid" "$REPO_ROOT" "$EXPECTED_SHA" <<'PY'
 import json, sys
@@ -843,10 +1138,64 @@ PY
 }
 
 write_evidence() {
-  local result="$1" reason="$2" ended_at="$3"
+  local result="$1" reason="$2" ended_at="$3" details
+  details="$(evidence_details)" || details='{"before":{"gateway":{"pid":null,"cwd":"","git_sha":"","listener":null},"legacy":{"pid":null,"cwd":"","git_sha":"","listener":null},"service":{"pid":null,"cwd":"","git_sha":"","listener":null}},"after":{"gateway":{"pid":null,"cwd":"","git_sha":"","listener":null},"legacy":{"pid":null,"cwd":"","git_sha":"","listener":null},"service":{"pid":null,"cwd":"","git_sha":"","listener":null}},"route":{"before_mode":"unknown","after_mode":"maintenance","inflight_before":0,"inflight_after":0},"owner":{"pid":null,"lock_holders":[],"available":false},"service_runtime":{"state":"unknown","reader_generation":null,"contract_generation":null},"verification":{"direct_backend":"failed","public_state":false,"public_history":false,"preview_no_submit":false}}'
   state_transition evidence-write "$EVIDENCE_PATH" "$ROUTE_PATH" \
     "$INITIAL_EVIDENCE_OPERATION_ID" "$OPERATION_ID" "$TARGET" "$EXPECTED_SHA" \
-    "$result" "$reason" "$DOWNTIME_STARTED_AT" "$ended_at" "$STATE_LOCK_PATH"
+    "$result" "$reason" "$DOWNTIME_STARTED_AT" "$ended_at" "$STATE_LOCK_PATH" "$details"
+}
+
+evidence_details() {
+  local route mode
+  route="$(read_route 2>/dev/null || printf '%s' '{}')"
+  mode="$(run_bounded "$PYTHON_BIN" -c 'import json,sys; print(json.loads(sys.argv[1]).get("mode", "unknown"))' "$route" 2>/dev/null || printf '%s' 'unknown')"
+  run_bounded "$PYTHON_BIN" - "$GATEWAY_PID" "$LEGACY_PID" "$SERVICE_PID" \
+    "$GATEWAY_LISTENER_PID" "$LEGACY_LISTENER_PID" "$SERVICE_LISTENER_PID" \
+    "$REPO_ROOT" "$EXPECTED_SHA" "$INITIAL_MODE" "$mode" \
+    "${PUBLIC_VERIFICATION_RESULT:-0}" "$RUNTIME_RECORD" "$RUNTIME_ROOT/data/prediction_arbitrage/runtime.lock" <<'PY'
+import json, sys
+from pathlib import Path
+
+def value(raw):
+    return int(raw) if isinstance(raw, str) and raw.isdigit() and int(raw) > 0 else None
+
+gateway_pid, legacy_pid, service_pid = (value(item) for item in sys.argv[1:4])
+gateway_listener, legacy_listener, service_listener = (value(item) for item in sys.argv[4:7])
+repo, expected_sha, before_mode, after_mode = sys.argv[7:11]
+verified = sys.argv[11] == "1"
+runtime_path = Path(sys.argv[12])
+runtime = {}
+try:
+    payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        runtime = payload
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    pass
+service_ready = runtime.get("ready") if isinstance(runtime.get("ready"), dict) else {}
+def generation(value):
+    return value if type(value) is int and value > 0 else None
+holders = []
+owner_pid = legacy_pid if after_mode == "legacy" else service_pid
+if owner_pid is not None:
+    holders = [owner_pid]
+payload = {
+    "before": {
+        "gateway": {"pid": gateway_pid, "cwd": repo, "git_sha": expected_sha, "listener": f"127.0.0.1:8766" if gateway_listener else None},
+        "legacy": {"pid": legacy_pid, "cwd": repo, "git_sha": expected_sha, "listener": f"127.0.0.1:8767" if legacy_listener else None},
+        "service": {"pid": service_pid, "cwd": repo, "git_sha": expected_sha, "listener": f"127.0.0.1:8769" if service_listener else None},
+    },
+    "after": {
+        "gateway": {"pid": gateway_pid, "cwd": repo, "git_sha": expected_sha, "listener": f"127.0.0.1:8766" if gateway_listener else None},
+        "legacy": {"pid": legacy_pid, "cwd": repo, "git_sha": expected_sha, "listener": f"127.0.0.1:8767" if legacy_listener else None},
+        "service": {"pid": service_pid, "cwd": repo, "git_sha": expected_sha, "listener": f"127.0.0.1:8769" if service_listener else None},
+    },
+    "route": {"before_mode": before_mode, "after_mode": after_mode, "inflight_before": 0, "inflight_after": 0},
+    "owner": {"pid": owner_pid, "lock_holders": holders, "available": owner_pid is None},
+    "service_runtime": {"state": str(runtime.get("state", "unknown")), "reader_generation": generation(service_ready.get("reader_generation")), "contract_generation": generation(service_ready.get("contract_generation"))},
+    "verification": {"direct_backend": "verified" if verified else "failed", "public_state": verified, "public_history": verified, "preview_no_submit": verified},
+}
+print(json.dumps(payload, separators=(",", ":")))
+PY
 }
 
 retain_maintenance() {
@@ -899,6 +1248,34 @@ fail_in_maintenance() {
   exit 1
 }
 
+account_health_snapshot() {
+  capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+    http://127.0.0.1:8768/healthz || return 1
+  printf '%s\n' "$CAPTURED_OUTPUT"
+}
+
+account_health_unchanged() {
+  run_bounded "$PYTHON_BIN" - "$1" "$2" <<'PY'
+import json, sys
+try:
+    before = json.loads(sys.argv[1])
+    after = json.loads(sys.argv[2])
+    valid = (
+        isinstance(before, dict)
+        and isinstance(after, dict)
+        and before.get("module") == "account_api"
+        and after.get("module") == "account_api"
+        and before.get("status") == after.get("status") == "healthy"
+        and before.get("pid") == after.get("pid")
+        and before.get("api_git_sha") == after.get("api_git_sha")
+        and before.get("worker_git_sha") == after.get("worker_git_sha")
+    )
+except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    valid = False
+raise SystemExit(0 if valid else 1)
+PY
+}
+
 if [[ "$INITIAL_MODE" == "$TARGET" ]]; then
   evidence_is_ready_for_target || fail "completed target evidence is unavailable"
   if [[ "$TARGET" == "service" ]]; then
@@ -914,6 +1291,67 @@ if [[ "$INITIAL_MODE" == "$TARGET" ]]; then
 fi
 
 if [[ "$TARGET" == "service" ]]; then
+  if [[ "$INITIAL_MODE" == "absent" ]]; then
+    OLD_GATEWAY_PID="$GATEWAY_PID"
+    capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+      http://127.0.0.1:8768/healthz \
+      || fail "Account health is not verified before compatibility bootstrap"
+    ACCOUNT_HEALTH_BEFORE="$CAPTURED_OUTPUT"
+    DOWNTIME_STARTED_AT="$(now)" || fail "timestamp_failed"
+    state_transition route-bootstrap "$ROUTE_PATH" "$OPERATION_ID" "$STATE_LOCK_PATH" \
+      || fail "failed to seed maintenance route"
+    route_owned_maintenance || fail "bootstrap route ownership is not verified"
+    INITIAL_MODE="maintenance"
+    INITIAL_OPERATION_ID="$OPERATION_ID"
+    INITIAL_ROUTE="$(read_route)" || fail_in_maintenance bootstrap_route_read_failed
+    run_bounded "$LAUNCHCTL_BIN" bootout \
+      "gui/$UID/com.open-trader.frontend-gateway" \
+      || fail_in_maintenance gateway_bootout_failed
+    for _ in 1 2 3 4 5; do
+      if gateway_probe="$(run_bounded "$LAUNCHCTL_BIN" print \
+          "gui/$UID/com.open-trader.frontend-gateway" 2>&1)"; then
+        fail_in_maintenance gateway_pid_still_loaded
+      elif [[ "$gateway_probe" != *"Could not find service"* ]]; then
+        fail_in_maintenance gateway_label_absence_unproven
+      fi
+      [[ "$_" -lt 5 ]] && run_bounded "$PYTHON_BIN" -c 'import time; time.sleep(1)'
+    done
+    pid_absent "$OLD_GATEWAY_PID" || fail_in_maintenance gateway_pid_absence_unproven
+    [[ -z "$(listener_pid 8766)" ]] || fail_in_maintenance gateway_listener_absence_unproven
+    run_bounded "$INSTALL_DASHBOARD" --mode stack --prediction-owner enabled \
+      --repo-root "$REPO_ROOT" --runtime-root "$RUNTIME_ROOT" --python "$PYTHON_BIN" \
+      --launch-agents-dir "$LAUNCH_AGENTS_DIR" --wait-seconds "$WAIT_SECONDS" \
+      || fail_in_maintenance compatibility_bootstrap_failed
+    route_owned_maintenance || fail_in_maintenance stale_operation
+    GATEWAY_PID="$(inspect_label com.open-trader.frontend-gateway 1)" \
+      || fail_in_maintenance gateway_identity_unproven
+    [[ "$GATEWAY_PID" != "$OLD_GATEWAY_PID" ]] \
+      || fail_in_maintenance gateway_pid_not_replaced
+    GATEWAY_LISTENER_PID="$(listener_pid 8766)" \
+      || fail_in_maintenance gateway_listener_unproven
+    [[ "$GATEWAY_LISTENER_PID" == "$GATEWAY_PID" ]] \
+      || fail_in_maintenance gateway_listener_owner_unproven
+    LEGACY_PID="$(inspect_label com.open-trader.legacy-dashboard 1)" \
+      || fail_in_maintenance legacy_identity_unproven
+    LEGACY_LISTENER_PID="$(listener_pid 8767)" \
+      || fail_in_maintenance legacy_listener_unproven
+    [[ "$LEGACY_LISTENER_PID" == "$LEGACY_PID" ]] \
+      || fail_in_maintenance legacy_listener_owner_unproven
+    preflight_health || fail_in_maintenance compatibility_health_unproven
+    prove_legacy_ready || fail_in_maintenance compatibility_legacy_health_unproven
+    prove_legacy_owner || fail_in_maintenance compatibility_legacy_owner_unproven
+    capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+      http://127.0.0.1:8768/healthz \
+      || fail_in_maintenance account_health_after_bootstrap_unproven
+    ACCOUNT_HEALTH_AFTER="$CAPTURED_OUTPUT"
+    account_health_unchanged "$ACCOUNT_HEALTH_BEFORE" "$ACCOUNT_HEALTH_AFTER" \
+      || fail_in_maintenance account_changed_during_bootstrap
+    SERVICE_PID="$(inspect_label com.open-trader.prediction-service 0)" \
+      || fail_in_maintenance service_identity_unproven
+    [[ -z "$SERVICE_PID" ]] || fail_in_maintenance unexpected_prediction_service
+    [[ -z "$(listener_pid 8769)" ]] || fail_in_maintenance unexpected_prediction_listener
+    INITIAL_EVIDENCE_OPERATION_ID="__absent__"
+  fi
   OLD_LEGACY_PID="$(label_pid com.open-trader.legacy-dashboard)" \
     || fail "failed to inspect Legacy Dashboard PID"
   [[ -n "$OLD_LEGACY_PID" ]] || fail "Legacy Dashboard PID is invalid"
@@ -939,6 +1377,12 @@ if [[ "$TARGET" == "service" ]]; then
     --expected-sha "$EXPECTED_SHA" || fail_in_maintenance service_install_failed
   route_owned_maintenance || fail_in_maintenance stale_operation
   prove_service_ready || fail_in_maintenance service_readiness_unproven
+  SERVICE_PID="$(label_pid com.open-trader.prediction-service)" \
+    || fail_in_maintenance service_pid_unproven
+  SERVICE_LISTENER_PID="$(listener_pid 8769)" \
+    || fail_in_maintenance service_listener_unproven
+  [[ "$SERVICE_LISTENER_PID" == "$SERVICE_PID" ]] \
+    || fail_in_maintenance service_listener_owner_unproven
   route_owned_maintenance || fail_in_maintenance stale_operation
   write_route service "$OPERATION_ID" "$OPERATION_ID" \
     || fail_in_maintenance service_route_write_failed
@@ -971,6 +1415,12 @@ run_bounded "$INSTALL_DASHBOARD" --mode legacy --prediction-owner enabled \
 route_owned_maintenance || fail_in_maintenance stale_operation
 prove_legacy_ready || fail_in_maintenance legacy_readiness_unproven
 prove_legacy_owner || fail_in_maintenance legacy_owner_lock_unproven
+LEGACY_PID="$(label_pid com.open-trader.legacy-dashboard)" \
+  || fail_in_maintenance legacy_pid_unproven
+LEGACY_LISTENER_PID="$(listener_pid 8767)" \
+  || fail_in_maintenance legacy_listener_unproven
+[[ "$LEGACY_LISTENER_PID" == "$LEGACY_PID" ]] \
+  || fail_in_maintenance legacy_listener_owner_unproven
 route_owned_maintenance || fail_in_maintenance stale_operation
 write_route legacy "$OPERATION_ID" "$OPERATION_ID" \
   || fail_in_maintenance legacy_route_write_failed

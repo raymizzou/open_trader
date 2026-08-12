@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ import signal
 import subprocess
 import sys
 import time
+from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
 
 state_path = Path(os.environ["FAKE_STATE"])
@@ -51,7 +53,15 @@ def option(name, default=""):
         return default
 
 def observe_route():
-    route = json.loads(route_path.read_text(encoding="utf-8"))
+    if route_path.exists():
+        route = json.loads(route_path.read_text(encoding="utf-8"))
+    else:
+        route = {
+            "schema_version": "open_trader.frontend_gateway.prediction_route.v1",
+            "mode": "maintenance",
+            "operation_id": "__absent__",
+            "updated_at": "2026-08-12T09:00:00+08:00",
+        }
     mode = route["mode"]
     if state["states"][-1] != mode:
         state["states"].append(mode)
@@ -104,6 +114,9 @@ if command == "python":
     ):
         state["injected_failure_seen"] = True
     save()
+    if tag == "route-write" and mode in {"service", "legacy"}:
+        state["post_route_ready"] = True
+        save()
     child_env = os.environ.copy()
     if state["fail_at"] == "locked_state_race" and tag == "route-write":
         child_env["PYTHONPATH"] = os.pathsep.join(filter(None, [
@@ -145,6 +158,23 @@ if command == "launchctl":
         print("PID\tStatus\tLabel")
         for pid, label in labels:
             print(f"{pid}\t-\t{label}")
+        save()
+        raise SystemExit(0)
+    if sys.argv[1] == "bootout":
+        label = sys.argv[-1].rsplit("/", 1)[-1]
+        item = state["labels"].get(label)
+        if item is None or not item["loaded"]:
+            save()
+            raise SystemExit(0)
+        item["loaded"] = False
+        if label == "com.open-trader.frontend-gateway":
+            state["listeners"]["8766"] = None
+        elif label == "com.open-trader.legacy-dashboard":
+            state["listeners"]["8767"] = None
+        elif label == "com.open-trader.prediction-service":
+            state["listeners"]["8769"] = None
+            state["prediction_service_ready"] = False
+            state["lock_holders"] = []
         save()
         raise SystemExit(0)
     label = sys.argv[-1].rsplit("/", 1)[-1]
@@ -216,6 +246,8 @@ if command == "owner-probe":
 
 if command == "curl":
     url = sys.argv[-1]
+    output_path = option("--output")
+    cookie_jar = option("--cookie-jar")
     route = observe_route()
     if state["fail_at"] == "stale_operation" and route["mode"] == "maintenance" \
             and not state.get("injected_failure_seen"):
@@ -231,6 +263,14 @@ if command == "curl":
         route = {**route, "mode": "maintenance"}
     if state["fail_at"] == "gateway_service" and route["mode"] == "service":
         route = {**route, "mode": "maintenance"}
+    if state["fail_at"] == "post_route_signal" \
+            and state.get("post_route_ready") \
+            and route["mode"] in {"service", "legacy"} \
+            and not state.get("post_route_signal_seen"):
+        Path(os.environ["FAKE_POST_ROUTE_SIGNAL"]).write_text("ready\n", encoding="utf-8")
+        state["post_route_signal_seen"] = True
+        save()
+        time.sleep(30)
     if url.endswith("/healthz") and ":8766" in url:
         gateway = state["labels"]["com.open-trader.frontend-gateway"]
         gateway_health = {
@@ -246,10 +286,11 @@ if command == "curl":
             "prediction_inflight_requests": (
                 1 if state["fail_at"] == "inflight_drain" else state["inflight"]
             ),
-            "prediction_upstream_status": (
-                "ok" if route["mode"] == "service" and state["prediction_service_ready"]
-                else "not_selected"
-            ),
+            "prediction_upstream_status": {
+                "service": "ok" if state["prediction_service_ready"] else "unavailable",
+                "legacy": "legacy",
+                "maintenance": "maintenance",
+            }[route["mode"]],
         }
         if state["fail_at"] == "gateway_service_health" and route["mode"] == "service":
             gateway_health["prediction_upstream_status"] = "unavailable"
@@ -274,6 +315,15 @@ if command == "curl":
         if state["fail_at"] == "health_evidence":
             health["git_sha"] = "wrong"
         print(json.dumps(health))
+    elif url.endswith("/healthz") and ":8768" in url:
+        print(json.dumps({
+            "schema_version": "open_trader.account_api.health.v1",
+            "module": "account_api",
+            "status": "healthy",
+            "pid": state["labels"].get("com.open-trader.account-sync-controller", {}).get("pid", 4001),
+            "api_git_sha": os.environ["FAKE_SHA"],
+            "worker_git_sha": os.environ["FAKE_SHA"],
+        }))
     elif url.endswith("/healthz") and ":8767" in url:
         legacy = state["labels"]["com.open-trader.legacy-dashboard"]
         payload = {
@@ -291,6 +341,11 @@ if command == "curl":
         ):
             payload["git_sha"] = "wrong"
         print(json.dumps(payload))
+    elif "/api/prediction-arbitrage/history" in url:
+        kind = parse_qs(urlsplit(url).query).get("kind", [""])[0]
+        print(json.dumps({"kind": kind, "items": [], "total": 0, "limit": 100, "offset": 0, "has_more": False}))
+    elif url.endswith("/api/prediction-arbitrage/preview"):
+        print(json.dumps({"state": "rejected", "reason": "opportunity_unavailable"}))
     else:
         if state["fail_at"] == "public_contract":
             print("[]")
@@ -306,13 +361,33 @@ if command == "curl":
             "stale": False,
             "events": [],
             "opportunities": [],
+            "csrf_token": "fake-csrf",
         }))
+    body = sys.stdout.getvalue() if hasattr(sys.stdout, "getvalue") else None
+    if output_path:
+        # Reconstruct the just-emitted JSON from the command branch without relying
+        # on the test runner's stdout implementation.
+        if "/api/prediction-arbitrage/history" in url:
+            kind = parse_qs(urlsplit(url).query).get("kind", [""])[0]
+            payload = {"kind": kind, "items": [], "total": 0, "limit": 100, "offset": 0, "has_more": False}
+        elif url.endswith("/api/prediction-arbitrage/preview"):
+            payload = {"state": "rejected", "reason": "opportunity_unavailable"}
+        elif url.endswith("/api/prediction-arbitrage/state"):
+            payload = {"status": state.get("public_status", "healthy"), "health": {"status": state.get("public_health_status", "healthy")}, "readiness": {"status": state.get("public_readiness_status", "ready")}, "stale": False, "events": [], "opportunities": [], "csrf_token": "fake-csrf"}
+        else:
+            payload = {}
+        Path(output_path).write_text(json.dumps(payload), encoding="utf-8")
+    if cookie_jar:
+        Path(cookie_jar).write_text("# Netscape HTTP Cookie File\n127.0.0.1\tFALSE\t/\tFALSE\t0\tot_prediction_session\tfake-session\n", encoding="utf-8")
+    if any(arg in {"--write-out", "-w"} for arg in sys.argv):
+        print("200", end="")
     save()
     raise SystemExit(0)
 
 if command == "install_dashboard_launchd.sh":
+    mode = option("--mode", "legacy")
     expected = [
-        "--mode", "legacy", "--prediction-owner", option("--prediction-owner"),
+        "--mode", mode, "--prediction-owner", option("--prediction-owner"),
         "--repo-root", os.environ["FAKE_REPO_ROOT"],
         "--runtime-root", os.environ["FAKE_RUNTIME_ROOT"],
         "--python", os.environ["FAKE_PYTHON"],
@@ -337,6 +412,10 @@ if command == "install_dashboard_launchd.sh":
     state["legacy_prediction_owner"] = owner
     state["lock_holders"] = [legacy["pid"]] if owner == "enabled" else []
     state["listeners"]["8767"] = {"pid": legacy["pid"]}
+    if mode == "stack":
+        gateway = state["labels"]["com.open-trader.frontend-gateway"]
+        gateway.update(loaded=True, pid=1002, cwd=option("--repo-root"), sha=os.environ["FAKE_SHA"])
+        state["listeners"]["8766"] = {"pid": gateway["pid"]}
     save()
     raise SystemExit(0)
 
@@ -488,6 +567,7 @@ class CutoverHarness:
         self.race_release = root / "race-release"
         self.sleeping_child_pid = root / "sleeping-child-pid"
         self.child_cleanup_started = root / "child-cleanup-started"
+        self.post_route_signal = root / "post-route-signal"
         self.instrumentation = root / "instrumentation"
         for path in (self.repo / "scripts", self.runtime / "config", self.bin, self.launch_agents):
             path.mkdir(parents=True)
@@ -529,6 +609,20 @@ class CutoverHarness:
                 "failure_reason": "newer-operation-active",
                 "downtime_started_at": "2026-08-12T11:00:00+08:00",
                 "downtime_ended_at": "",
+                "before": {
+                    "gateway": {"pid": 1001, "cwd": str(self.repo), "git_sha": SHA, "listener": "127.0.0.1:8766"},
+                    "legacy": {"pid": 2001, "cwd": str(self.repo), "git_sha": SHA, "listener": "127.0.0.1:8767"},
+                    "service": {"pid": None, "cwd": str(self.repo), "git_sha": SHA, "listener": None},
+                },
+                "after": {
+                    "gateway": {"pid": 1001, "cwd": str(self.repo), "git_sha": SHA, "listener": "127.0.0.1:8766"},
+                    "legacy": {"pid": 2001, "cwd": str(self.repo), "git_sha": SHA, "listener": "127.0.0.1:8767"},
+                    "service": {"pid": None, "cwd": str(self.repo), "git_sha": SHA, "listener": None},
+                },
+                "route": {"before_mode": "legacy", "after_mode": "maintenance", "inflight_before": 0, "inflight_after": 0},
+                "owner": {"pid": 2001, "lock_holders": [2001], "available": False},
+                "service_runtime": {"state": "unknown", "reader_generation": None, "contract_generation": None},
+                "verification": {"direct_backend": "failed", "public_state": False, "public_history": False, "preview_no_submit": False},
             },
             "labels": {
                 "com.open-trader.frontend-gateway": {
@@ -548,6 +642,11 @@ class CutoverHarness:
                     "loaded": False, "pid": 0, "cwd": "", "sha": "",
                     "argv": [],
                     "plist": str(self.launch_agents / "com.open-trader.prediction-service.plist"),
+                },
+                "com.open-trader.account-sync-controller": {
+                    "loaded": True, "pid": 4001, "cwd": str(self.repo), "sha": SHA,
+                    "argv": [sys.executable, "-m", "open_trader", "account-sync-controller"],
+                    "plist": str(self.launch_agents / "com.open-trader.account-sync-controller.plist"),
                 },
             },
             "listeners": {
@@ -606,6 +705,8 @@ class CutoverHarness:
             state["labels"]["com.open-trader.legacy-dashboard"]["argv"][-1] = "disabled"
         elif fail_at == "legacy_lock_holder_wrong":
             state["lock_holders"] = [9999]
+        elif fail_at == "post_route_signal":
+            state["post_route_ready"] = False
         self.state_path.write_text(json.dumps(state), encoding="utf-8")
 
     def environment(self) -> dict[str, str]:
@@ -624,6 +725,7 @@ class CutoverHarness:
             "FAKE_RACE_RELEASE": str(self.race_release),
             "FAKE_SLEEPING_CHILD_PID": str(self.sleeping_child_pid),
             "FAKE_CHILD_CLEANUP_STARTED": str(self.child_cleanup_started),
+            "FAKE_POST_ROUTE_SIGNAL": str(self.post_route_signal),
             "FAKE_INSTRUMENTATION": str(self.instrumentation),
             "FAKE_SHA": SHA,
             "FAKE_REAL_PYTHON": sys.executable,
@@ -701,6 +803,24 @@ def test_service_happy_path(harness: CutoverHarness) -> None:
         "--launch-agents-dir", str(harness.launch_agents),
         "--wait-seconds", "2",
     ]
+
+
+def test_service_absent_route_bootstraps_stack_inside_cutover(
+    harness: CutoverHarness,
+) -> None:
+    harness.route.unlink()
+
+    result = harness.run("service")
+
+    assert result.returncode == 0, result.stderr
+    assert harness.state["states"] == ["legacy", "maintenance", "service"]
+    stack_calls = [
+        call for call in harness.state["calls"]
+        if call[0] == "install_dashboard_launchd.sh"
+    ]
+    assert stack_calls[0][1:5] == ["--mode", "stack", "--prediction-owner", "enabled"]
+    assert stack_calls[1][1:5] == ["--mode", "legacy", "--prediction-owner", "disabled"]
+    assert harness.state["max_prediction_owners"] == 1
     assert [
         call for call in harness.state["calls"]
         if call[0] == "install_prediction_service_launchd.sh"
@@ -830,6 +950,23 @@ def test_service_to_legacy_rollback_uses_one_owner(harness: CutoverHarness) -> N
     )
 
 
+def test_failed_service_then_separate_rollback_recovers_maintenance(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("public_contract")
+    failed = harness.run("service")
+    assert failed.returncode == 1
+    assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "maintenance"
+
+    harness.configure("")
+    recovered = harness.run("legacy")
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "legacy"
+    assert harness.evidence["result"] == "ready"
+    assert harness.evidence["target"] == "legacy"
+
+
 def test_repeating_completed_target_preserves_evidence(harness: CutoverHarness) -> None:
     harness.run("service").check_returncode()
     evidence_before = (
@@ -851,7 +988,7 @@ def test_repeating_completed_target_preserves_evidence(harness: CutoverHarness) 
     assert not any(call[:3] == ["python", "-", "route-write"] for call in later_calls)
 
 
-@pytest.mark.parametrize("evidence_state", ["missing", "malformed"])
+@pytest.mark.parametrize("evidence_state", ["missing", "malformed", "boolean", "stale"])
 def test_repeating_completed_target_fails_closed_without_valid_evidence(
     harness: CutoverHarness,
     evidence_state: str,
@@ -860,8 +997,15 @@ def test_repeating_completed_target_fails_closed_without_valid_evidence(
     evidence = harness.runtime / "prediction-cutover-evidence.json"
     if evidence_state == "missing":
         evidence.unlink()
-    else:
+    elif evidence_state == "malformed":
         evidence.write_text("{}", encoding="utf-8")
+    else:
+        payload = harness.evidence
+        if evidence_state == "boolean":
+            payload["route"]["inflight_before"] = True
+        else:
+            payload["operation_id"] = "stale-operation"
+        evidence.write_text(json.dumps(payload), encoding="utf-8")
     route_before = harness.route.read_bytes()
 
     result = harness.run("service")
@@ -1094,6 +1238,36 @@ def test_signal_waits_for_mutating_child_cleanup_before_releasing_lock(
     )
 
 
+@pytest.mark.parametrize("target", ["service", "legacy"])
+def test_signal_after_route_before_evidence_fails_closed(
+    harness: CutoverHarness, target: str
+) -> None:
+    if target == "legacy":
+        harness.run("service").check_returncode()
+    harness.configure("post_route_signal")
+    cutover = subprocess.Popen(
+        harness.command(target),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=harness.environment(),
+    )
+    try:
+        assert wait_for_path(harness.post_route_signal, timeout=20)
+        cutover.send_signal(signal.SIGTERM)
+        stdout, stderr = cutover.communicate(timeout=20)
+    finally:
+        if cutover.poll() is None:
+            cutover.kill()
+            cutover.wait()
+
+    assert cutover.returncode == 143, (stdout, stderr)
+    route = json.loads(harness.route.read_text(encoding="utf-8"))
+    assert route["mode"] == "maintenance"
+    assert harness.evidence["result"] == "failed"
+    assert harness.evidence["failure_reason"] == "interrupted"
+
+
 @pytest.mark.parametrize(
     "failure",
     [
@@ -1243,6 +1417,7 @@ def test_evidence_excludes_config_and_request_secrets(harness: CutoverHarness) -
     assert set(json.loads(evidence_text)) == {
         "schema_version", "operation_id", "target", "expected_sha", "result",
         "failure_reason", "downtime_started_at", "downtime_ended_at",
+        "before", "after", "route", "owner", "service_runtime", "verification",
     }
 
 

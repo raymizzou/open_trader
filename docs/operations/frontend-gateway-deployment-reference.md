@@ -82,7 +82,10 @@ export PYTHONSAFEPATH=1
 export PYTHONPATH="$REPO_ROOT:$REPO_ROOT/src"
 export GATEWAY_PORT=18766
 export LEGACY_PORT=18767
+export PREDICTION_PORT=18769
 export PUBLIC_ORIGIN="http://127.0.0.1:${GATEWAY_PORT}"
+export ROUTE_STATE="$(mktemp "${TMPDIR:-/tmp}/open-trader-prediction-route.XXXXXX")"
+printf '%s\n' '{"schema_version":"open_trader.frontend_gateway.prediction_route.v1","mode":"legacy","operation_id":"manual-check","updated_at":"2026-08-12T00:00:00Z"}' > "$ROUTE_STATE"
 ```
 
 终端 A 启动 Legacy Dashboard：
@@ -111,6 +114,9 @@ cd "$REPO_ROOT"
   --port "$GATEWAY_PORT" \
   --upstream-host 127.0.0.1 \
   --upstream-port "$LEGACY_PORT" \
+  --prediction-route-state "$ROUTE_STATE" \
+  --prediction-upstream-host 127.0.0.1 \
+  --prediction-upstream-port "$PREDICTION_PORT" \
   --public-origin "$PUBLIC_ORIGIN" \
   --static-dir "$REPO_ROOT/src/open_trader/dashboard_static"
 ```

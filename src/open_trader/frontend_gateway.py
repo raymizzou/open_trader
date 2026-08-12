@@ -391,8 +391,8 @@ def create_frontend_gateway(
             return "unavailable"
 
         def _prediction_upstream_status(self, route: _PredictionRoute) -> str:
-            if route.mode != "service":
-                return "not_selected"
+            if route.mode in {"legacy", "maintenance"}:
+                return route.mode
             connection = http.client.HTTPConnection(
                 config.prediction_upstream_host,
                 config.prediction_upstream_port,
