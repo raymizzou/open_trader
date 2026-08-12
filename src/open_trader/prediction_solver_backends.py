@@ -25,6 +25,10 @@ from open_trader.prediction_solver import (
 )
 
 
+DOUBLE_INT_MIN = -(2**53)
+DOUBLE_INT_MAX = 2**53
+
+
 def _highspy() -> Any:
     return importlib.import_module("highspy")
 
@@ -65,6 +69,17 @@ def _native_integer(value: int, name: str) -> float:
 
 
 def _validate_native_precision(model: LinearModel) -> None:
+    variables = {variable.name: variable for variable in model.variables}
+
+    def validate_activity(owner: str, terms: tuple[tuple[str, int], ...]) -> None:
+        minimum = maximum = 0
+        for name, coefficient in terms:
+            variable = variables[name]
+            minimum += coefficient * (variable.lower if coefficient >= 0 else variable.upper)
+            maximum += coefficient * (variable.upper if coefficient >= 0 else variable.lower)
+        if minimum < DOUBLE_INT_MIN or maximum > DOUBLE_INT_MAX:
+            raise UnsafeSolverResult(f"HiGHS possible {owner} activity exceeds exact double integer range")
+
     for variable in model.variables:
         _native_integer(variable.lower, f"{variable.name}.lower")
         _native_integer(variable.upper, f"{variable.name}.upper")
@@ -75,9 +90,11 @@ def _validate_native_precision(model: LinearModel) -> None:
             _native_integer(constraint.lower, f"{constraint.name}.lower")
         if constraint.upper is not None:
             _native_integer(constraint.upper, f"{constraint.name}.upper")
+        validate_activity(f"row {constraint.name}", constraint.coefficients)
     if model.objective is not None:
         for name, coefficient in model.objective.coefficients:
             _native_integer(coefficient, f"objective.{name}")
+        validate_activity("objective", model.objective.coefficients)
 
 
 class HighsBackend:

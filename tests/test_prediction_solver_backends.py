@@ -384,6 +384,24 @@ def test_fake_highs_accepts_the_exact_double_boundary(fake_highspy: SimpleNamesp
 
     assert result.status == NativeSolveStatus.OPTIMAL
     assert result.objective_value == 2**53
+    assert _FakeHighs.instances
+
+
+def test_fake_highs_rejects_unsafe_aggregate_activity_before_native_solve(fake_highspy: SimpleNamespace) -> None:
+    model = LinearModel(
+        variables=tuple(IntVariable(f"x{index}", 0, 1) for index in range(4)),
+        constraints=(
+            LinearConstraint("balance", (("x0", -1), ("x1", 2), ("x2", 1), ("x3", 1)), 1, 1),
+        ),
+        objective=LinearObjective("MAX", (("x0", 2**53), ("x1", 2**53), ("x2", 2**53), ("x3", 2))),
+    )
+    _FakeHighs.model_status = _FakeModelStatus.OPTIMAL
+    _FakeHighs.solution = SimpleNamespace(value_valid=True, col_value=(1.0, 1.0, 0.0, 0.0))
+    _FakeHighs.info = SimpleNamespace(mip_dual_bound=float(2**54))
+
+    with pytest.raises(UnsafeSolverResult, match="activity"):
+        HighsBackend().solve(model, time_limit_ms=1)
+    assert _FakeHighs.instances == []
 
 
 def test_highs_backend_exposes_pinned_solver_identity_without_candidate_imports() -> None:
