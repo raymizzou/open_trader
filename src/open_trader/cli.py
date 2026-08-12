@@ -1086,6 +1086,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Non-secret Polymarket prediction-arbitrage config",
     )
+    dashboard_parser.add_argument(
+        "--prediction-owner", choices=("enabled", "disabled"), default="enabled"
+    )
 
     prediction_parser = subparsers.add_parser(
         "prediction-arb",
@@ -2570,7 +2573,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "dashboard":
-        if args.prediction_config is not None:
+        prediction_config_path = (
+            args.prediction_config.expanduser()
+            if args.prediction_config is not None
+            and args.prediction_owner == "enabled"
+            else None
+        )
+        if prediction_config_path is not None:
             try:
                 prediction_loopback = ipaddress.ip_address(args.host).is_loopback
             except ValueError:
@@ -2628,14 +2637,10 @@ def main(argv: list[str] | None = None) -> int:
             trend_cn_candidate_pool_ids=trend_cn_candidate_pool_ids,
             trend_us_candidate_pool_ids=trend_us_candidate_pool_ids,
             trend_hk_candidate_pool_ids=trend_hk_candidate_pool_ids,
-            prediction_config_path=(
-                args.prediction_config.expanduser()
-                if args.prediction_config is not None
-                else None
-            ),
+            prediction_config_path=prediction_config_path,
         )
         prediction_notifier = None
-        if args.prediction_config is not None:
+        if prediction_config_path is not None:
             try:
                 prediction_notifier = build_notifier(
                     load_env_config(args.config, dry_run=False)
@@ -2649,7 +2654,7 @@ def main(argv: list[str] | None = None) -> int:
             public_url=args.public_url,
             **(
                 {"prediction_notifier": prediction_notifier}
-                if args.prediction_config is not None
+                if prediction_config_path is not None
                 else {}
             ),
         )

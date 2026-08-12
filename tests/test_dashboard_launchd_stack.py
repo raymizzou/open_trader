@@ -38,6 +38,7 @@ def _run_installer(
     tmp_path: Path,
     *,
     mode: str = "stack",
+    prediction_owner: str | None = None,
     **env_overrides: str,
 ) -> tuple[subprocess.CompletedProcess[str], list[str], Path]:
     agents = tmp_path / "LaunchAgents"
@@ -173,14 +174,23 @@ exit 0
         "CURL_BIN": str(curl),
         **env_overrides,
     }
+    owner_args = (
+        ["--prediction-owner", prediction_owner]
+        if prediction_owner is not None
+        else []
+    )
     result = subprocess.run(
-        [str(INSTALLER), "--mode", mode, *common_args[1:]],
+        [str(INSTALLER), "--mode", mode, *owner_args, *common_args[1:]],
         cwd=ROOT,
         env=env,
         capture_output=True,
         text=True,
     )
-    calls = calls_path.read_text(encoding="utf-8").splitlines()
+    calls = (
+        calls_path.read_text(encoding="utf-8").splitlines()
+        if calls_path.exists()
+        else []
+    )
     return result, calls, agents
 
 
@@ -266,6 +276,102 @@ def test_stack_dry_run_prints_two_valid_plists_without_side_effects(
     assert str(runtime / "data") in legacy_args
     assert str(runtime / "config/prediction_arbitrage.json") in legacy_args
     assert not list(agents.iterdir())
+
+
+def test_legacy_only_disables_prediction_owner_without_touching_gateway_or_single(
+    tmp_path: Path,
+) -> None:
+    result, calls, agents = _run_installer(
+        tmp_path, mode="legacy", prediction_owner="disabled"
+    )
+    domain = f"gui/{os.getuid()}"
+    legacy = plistlib.loads((agents / f"{LEGACY_LABEL}.plist").read_bytes())
+    legacy_args = legacy["ProgramArguments"]
+
+    assert result.returncode == 0
+    assert legacy_args[legacy_args.index("--prediction-config") + 2 :][:2] == [
+        "--prediction-owner",
+        "disabled",
+    ]
+    assert [
+        call
+        for call in calls
+        if any(word in call for word in (" bootout ", " bootstrap ", " kickstart"))
+    ] == [
+        f"launchctl bootout {domain}/{LEGACY_LABEL}",
+        f"launchctl bootstrap {domain} {agents / f'{LEGACY_LABEL}.plist'}",
+    ]
+    assert not any(
+        label in call
+        for call in calls
+        for label in (GATEWAY_LABEL, SINGLE_LABEL, "com.open-trader.account-")
+    )
+    assert not any("8766" in call for call in calls)
+
+
+def test_legacy_prediction_owner_defaults_enabled(tmp_path: Path) -> None:
+    result, _, agents = _run_installer(tmp_path, mode="legacy")
+    legacy = plistlib.loads((agents / f"{LEGACY_LABEL}.plist").read_bytes())
+    legacy_args = legacy["ProgramArguments"]
+
+    assert result.returncode == 0
+    assert legacy_args[legacy_args.index("--prediction-owner") + 1] == "enabled"
+
+
+@pytest.mark.parametrize(
+    ("mode", "owner"),
+    (("unknown", "disabled"), ("legacy", "unknown")),
+)
+def test_unknown_mode_or_prediction_owner_fails_without_side_effects(
+    tmp_path: Path, mode: str, owner: str
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "ops/launchd").mkdir(parents=True)
+    (repo / "config").mkdir()
+    for template in (SINGLE_TEMPLATE, GATEWAY_TEMPLATE, LEGACY_TEMPLATE):
+        shutil.copy2(template, repo / "ops/launchd" / template.name)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    calls = tmp_path / "calls"
+    forbidden = tmp_path / "forbidden"
+    _write_executable(forbidden, '#!/bin/sh\nprintf x >> "$FAKE_CALLS"\n')
+
+    result = subprocess.run(
+        [
+            str(INSTALLER),
+            "--mode",
+            mode,
+            "--prediction-owner",
+            owner,
+            "--repo-root",
+            str(repo),
+            "--runtime-root",
+            str(runtime),
+            "--launch-agents-dir",
+            str(agents),
+            "--python",
+            sys.executable,
+        ],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "FAKE_CALLS": str(calls),
+            "LAUNCHCTL_BIN": str(forbidden),
+            "LSOF_BIN": str(forbidden),
+            "CURL_BIN": str(forbidden),
+        },
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert not calls.exists()
+    assert not list(agents.iterdir())
+    assert not list(runtime.iterdir())
+    assert not (repo / "logs").exists()
 
 
 @pytest.mark.parametrize(

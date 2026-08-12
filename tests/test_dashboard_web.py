@@ -5064,6 +5064,73 @@ def test_prediction_arbitrage_cli_rejects_non_loopback_prediction_listener(
     assert error.value.code == 2
 
 
+def test_dashboard_prediction_owner_disabled_omits_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import open_trader.cli as cli
+
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(
+        cli,
+        "serve_dashboard",
+        lambda config, **_: observed.update(
+            prediction_config_path=config.prediction_config_path
+        ),
+    )
+
+    assert (
+        cli.main(
+            [
+                "dashboard",
+                "--prediction-config",
+                str(tmp_path / "prediction.json"),
+                "--prediction-owner",
+                "disabled",
+            ]
+        )
+        == 0
+    )
+    assert observed["prediction_config_path"] is None
+
+
+@pytest.mark.parametrize("owner_args", ([], ["--prediction-owner", "enabled"]))
+def test_dashboard_prediction_owner_enabled_retains_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, owner_args: list[str]
+) -> None:
+    import open_trader.cli as cli
+
+    observed: dict[str, object] = {}
+    prediction_config = tmp_path / "prediction.json"
+    monkeypatch.setattr(
+        cli,
+        "serve_dashboard",
+        lambda config, **_: observed.update(
+            prediction_config_path=config.prediction_config_path
+        ),
+    )
+
+    assert (
+        cli.main(
+            [
+                "dashboard",
+                "--prediction-config",
+                str(prediction_config),
+                *owner_args,
+            ]
+        )
+        == 0
+    )
+    assert observed["prediction_config_path"] == prediction_config
+
+
+def test_dashboard_prediction_owner_rejects_unknown_value() -> None:
+    import open_trader.cli as cli
+
+    with pytest.raises(SystemExit) as error:
+        cli.main(["dashboard", "--prediction-owner", "unknown"])
+    assert error.value.code == 2
+
+
 def test_prediction_arbitrage_localhost_host_and_origin_are_accepted(tmp_path: Path) -> None:
     from open_trader.dashboard_web import create_dashboard_server
 

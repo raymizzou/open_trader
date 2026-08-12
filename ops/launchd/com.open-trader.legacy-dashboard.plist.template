@@ -41,6 +41,8 @@
     <string>http://127.0.0.1:8766/</string>
     <string>--prediction-config</string>
     <string>OPEN_TRADER_PREDICTION_CONFIG</string>
+    <string>--prediction-owner</string>
+    <string>OPEN_TRADER_PREDICTION_OWNER</string>
   </array>
 
   <key>RunAtLoad</key>
