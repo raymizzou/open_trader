@@ -703,6 +703,53 @@ def test_cp_sat_recomputes_exact_objective_and_keeps_near_integer_bound_diagnost
     assert CpSatBackend().solve(_one_variable_model(objective=3), time_limit_ms=1).objective_bound is None
 
 
+def test_cp_sat_feasible_min_keeps_small_bound_for_large_exact_incumbent(
+    fake_cp_sat: SimpleNamespace,
+) -> None:
+    _FakeCpSolver.status = "FEASIBLE"
+    _FakeCpSolver.values = {"x": 2**53 + 1}
+    _FakeCpSolver.objective = 2**53 + 1
+    _FakeCpSolver.best_bound = 0.0
+    model = LinearModel(
+        variables=(IntVariable("x", 2**53 + 1, 2**53 + 1),),
+        constraints=(),
+        objective=LinearObjective("MIN", (("x", 1),)),
+    )
+
+    result = CpSatBackend().solve(model, time_limit_ms=1)
+
+    assert result.status == NativeSolveStatus.FEASIBLE
+    assert result.objective_value == 2**53 + 1
+    assert result.objective_bound == 0
+
+
+@pytest.mark.parametrize(
+    ("native_bound", "expected"),
+    (
+        (float(2**53), None),
+        (float(-(2**53)), None),
+        (float(2**53 - 1), 2**53 - 1),
+        (float(-(2**53 - 1)), -(2**53 - 1)),
+        (0.0, 0),
+        (float("nan"), None),
+        (float("inf"), None),
+        (float("-inf"), None),
+        (0.000002, None),
+    ),
+)
+def test_cp_sat_best_bound_uses_strict_float_integer_boundary(
+    fake_cp_sat: SimpleNamespace, native_bound: float, expected: int | None
+) -> None:
+    _FakeCpSolver.status = "FEASIBLE"
+    _FakeCpSolver.values = {"x": 1}
+    _FakeCpSolver.objective = 1.0
+    _FakeCpSolver.best_bound = native_bound
+
+    result = CpSatBackend().solve(_one_variable_model(), time_limit_ms=1)
+
+    assert result.objective_bound == expected
+
+
 def test_cp_sat_rejects_max_int64_min_before_native_construction(
     fake_cp_sat: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:

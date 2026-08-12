@@ -92,8 +92,8 @@ def _cp_sat_optional_bound(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     if isinstance(value, int):
-        return value if INT64_MIN <= value <= INT64_MAX and abs(value) <= DOUBLE_INT_MAX else None
-    if not math.isfinite(value) or abs(value) > DOUBLE_INT_MAX:
+        return value if INT64_MIN <= value <= INT64_MAX and abs(value) < DOUBLE_INT_MAX else None
+    if not math.isfinite(value) or abs(value) >= DOUBLE_INT_MAX:
         return None
     rounded = round(value)
     if abs(value - rounded) > 1e-6 or not INT64_MIN <= rounded <= INT64_MAX:
@@ -850,11 +850,7 @@ class CpSatBackend:
         if model.objective is not None:
             # Keep the native best bound only as bounded diagnostics; the
             # parent recomputes the exact objective from native integer values.
-            objective_bound = (
-                _cp_sat_optional_bound(solver.best_objective_bound)
-                if objective_value is None or abs(objective_value) <= DOUBLE_INT_MAX
-                else None
-            )
+            objective_bound = _cp_sat_optional_bound(solver.best_objective_bound)
         result = BackendResult(
             NativeSolveStatus.OPTIMAL if native_result == cp_model.OPTIMAL else NativeSolveStatus.FEASIBLE,
             values,
