@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
-from itertools import product
+from itertools import chain, product
 
 from open_trader.prediction_n_leg import (
     ActionPayout,
@@ -272,6 +273,7 @@ def cut_from_scenario(problem: ArbitrageProblem, scenario: SettlementScenario) -
 def _selected_quantities(problem: ArbitrageProblem, quantities: tuple[ActionQuantity, ...]) -> tuple[ActionQuantity, ...]:
     actions_by_id = {action.action_id: action for action in problem.actions}
     selected: dict[str, int] = {}
+    seen_action_ids: set[str] = set()
     for quantity in quantities:
         if not isinstance(quantity, ActionQuantity):
             raise ValueError("quantities must contain ActionQuantity values")
@@ -283,11 +285,12 @@ def _selected_quantities(problem: ArbitrageProblem, quantities: tuple[ActionQuan
             or not 0 <= quantity.quantity_lots <= _INT64_MAX
         ):
             raise ValueError(f"invalid action quantity: {quantity.action_id}")
+        if quantity.action_id in seen_action_ids:
+            raise ValueError(f"duplicate action quantity: {quantity.action_id}")
+        seen_action_ids.add(quantity.action_id)
         action = actions_by_id[quantity.action_id]
         if quantity.quantity_lots and not action.min_quantity_lots <= quantity.quantity_lots <= action.max_quantity_lots:
             raise ValueError(f"action quantity outside selected quantity range: {quantity.action_id}")
-        if quantity.action_id in selected:
-            raise ValueError(f"duplicate action quantity: {quantity.action_id}")
         if quantity.quantity_lots:
             selected[quantity.action_id] = quantity.quantity_lots
     return tuple(ActionQuantity(action_id, selected[action_id]) for action_id in sorted(selected))
@@ -323,6 +326,8 @@ def _qualification_passes(problem: ArbitrageProblem, constraint: QualificationCo
         left = _checked_multiply(evaluation.guaranteed_profit_units, constraint.threshold_denominator)
         right = constraint.threshold_numerator
     elif constraint.metric == QualificationMetric.NET_MARGIN_PPM:
+        if constraint.threshold_numerator > 0 and evaluation.payout_lower_bound_units <= 0:
+            return False
         left = _checked_product(evaluation.guaranteed_profit_units, 1_000_000, constraint.threshold_denominator)
         right = _checked_multiply(constraint.threshold_numerator, evaluation.payout_lower_bound_units)
     elif constraint.metric == QualificationMetric.ANNUALIZED_RETURN_PPM:
@@ -631,14 +636,18 @@ def split_disconnected_solution(
 def quantity_vector_count(problem: ArbitrageProblem) -> int:
     _require_valid(problem)
     total = 1
-    for quantity_range in _quantity_ranges(problem.actions):
-        total = _checked_multiply(total, len(quantity_range))
+    for action in problem.actions:
+        domain_size = _checked_add(
+            _checked_subtract(action.max_quantity_lots, action.min_quantity_lots),
+            2,
+        )
+        total = _checked_multiply(total, domain_size)
     return total
 
 
-def _quantity_ranges(actions: tuple[CandidateAction, ...]) -> tuple[tuple[int, ...], ...]:
+def _quantity_ranges(actions: tuple[CandidateAction, ...]) -> tuple[Iterable[int], ...]:
     return tuple(
-        (0, *range(action.min_quantity_lots, action.max_quantity_lots + 1))
+        chain((0,), range(action.min_quantity_lots, action.max_quantity_lots + 1))
         for action in actions
     )
 

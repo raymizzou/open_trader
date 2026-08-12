@@ -208,6 +208,29 @@ def test_explicit_quantity_bounds_drive_the_oracle_domain() -> None:
     assert oracle.quantity_vector_count(built) == 3
 
 
+def test_large_quantity_domain_is_rejected_before_range_materialization() -> None:
+    key = observation()
+    max_quantity = 2**63 - 2
+    bounded = replace(
+        action("a", "a", key, (ExecutableCostSlice(1, max_quantity, 0),)),
+        max_quantity_lots=max_quantity,
+    )
+    built = problem(
+        (bounded,),
+        (state("a", key, "a", (("yes", TerminalKind.NORMAL_YES, 0),)),),
+    )
+    request = OracleRequest(
+        REQUEST_SCHEMA_V1,
+        SearchMode.ADMISSION,
+        built,
+        OracleBudget(1, 1, 1),
+    )
+
+    result = oracle.find_qualified(request)
+
+    assert result.unknown_reason == UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED
+
+
 @pytest.mark.parametrize(
     ("field", "value", "code"),
     (
@@ -562,6 +585,21 @@ def test_fixed_portfolio_accumulates_integer_costs_and_discards_zero_quantities(
     assert evaluation.guaranteed_profit_units == 10
 
 
+@pytest.mark.parametrize("quantity_lots", ((0, 2), (2, 0)))
+def test_duplicate_action_quantities_are_rejected_independent_of_order(
+    quantity_lots: tuple[int, int],
+) -> None:
+    key = observation()
+    built = problem(
+        (action("a", "a", key, (ExecutableCostSlice(1, 2, 1),)),),
+        (state("a", key, "a", (("yes", TerminalKind.NORMAL_YES, 2),)),),
+    )
+    quantities = tuple(ActionQuantity("a", lots) for lots in quantity_lots)
+
+    with pytest.raises(ValueError, match="duplicate action quantity"):
+        cost_upper_bound(built, quantities)
+
+
 @pytest.mark.parametrize("quantity_lots", (1, 4))
 def test_direct_portfolio_helpers_reject_quantities_outside_selected_range(quantity_lots: int) -> None:
     key = observation()
@@ -666,6 +704,28 @@ def test_net_margin_uses_minimum_payout_as_denominator() -> None:
 
     assert evaluation.guaranteed_profit_units == 40
     assert evaluation.payout_lower_bound_units == 100
+    assert evaluation.failed_qualification_ids == ("margin",)
+
+
+def test_non_positive_payout_cannot_satisfy_positive_net_margin_threshold() -> None:
+    key = observation()
+    built = replace(
+        problem(
+            (action("a", "a", key, (ExecutableCostSlice(1, 1, 0),)),),
+            (state("a", key, "a", (("yes", TerminalKind.NORMAL_YES, 0),)),),
+        ),
+        qualification_constraints=(
+            QualificationConstraint(
+                "margin", "v1", QualificationMetric.NET_MARGIN_PPM,
+                Comparison.GREATER_THAN_OR_EQUAL, 1, 1,
+            ),
+        ),
+    )
+
+    evaluation = evaluate_fixed_portfolio(
+        built, (ActionQuantity("a", 1),), OracleBudget(2, 2, 2),
+    )
+
     assert evaluation.failed_qualification_ids == ("margin",)
 
 
@@ -1688,6 +1748,39 @@ def test_incomplete_terminal_data_returns_one_unknown_reason(missing: str) -> No
         assert canonical_payload(request)["problem"]["terminal_state_sets"][0]["atoms"][0][missing] is None
     result = oracle.find_qualified(request)
     assert result.business_status == BusinessStatus.UNKNOWN
+    assert result.unknown_reason == UnknownReason.UNKNOWN_TERMINAL_DATA
+
+
+@pytest.mark.parametrize("source", ("direct", "wire"))
+def test_blank_terminal_rule_identity_is_unknown_terminal_data(source: str) -> None:
+    key = observation()
+    built = problem(
+        (action("a", "a", key),),
+        (state("a", key, "a", (("yes", TerminalKind.NORMAL_YES, 2),)),),
+    )
+    base = OracleRequest(
+        REQUEST_SCHEMA_V1,
+        SearchMode.ADMISSION,
+        built,
+        OracleBudget(2, 2, 2),
+    )
+    if source == "direct":
+        atom = replace(built.terminal_state_sets[0].atoms[0], rule_version="")
+        request = replace(
+            base,
+            problem=replace(
+                built,
+                terminal_state_sets=(replace(built.terminal_state_sets[0], atoms=(atom,)),),
+            ),
+        )
+    else:
+        payload = canonical_payload(base)
+        payload["problem"]["terminal_state_sets"][0]["atoms"][0]["rule_version"] = ""
+        request = request_from_payload(payload)
+        assert request.problem.terminal_state_sets[0].atoms[0].rule_version == ""
+
+    result = oracle.find_qualified(request)
+
     assert result.unknown_reason == UnknownReason.UNKNOWN_TERMINAL_DATA
 
 

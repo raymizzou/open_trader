@@ -607,6 +607,14 @@ def test_result_from_payload_rejects_non_exhaustive_or_negative_proof_counts(mut
         result_from_payload(payload)
 
 
+def test_result_from_payload_rejects_duplicate_negative_proof_rejection_ids() -> None:
+    payload = negative_result_payload()
+    payload["negative_proof"]["rejection_counts"].append(["qualified-profit", 1])
+
+    with pytest.raises(ModelDecodeError):
+        result_from_payload(payload)
+
+
 def test_validate_problem_reports_mixed_observation_datetimes_without_comparison_error() -> None:
     problem = sample_problem()
     key = replace(problem.actions[0].settlement_observation_key, observation_start=datetime(2026, 8, 11))
@@ -703,7 +711,7 @@ def test_validate_problem_rejects_blank_observation_identity_and_rule_versions()
 
     blank_atom_rule = replace(problem.terminal_state_sets[0].atoms[0], rule_version="")
     blank_atom_state = replace(problem.terminal_state_sets[0], atoms=(blank_atom_rule,))
-    assert any(issue.code == "INVALID_IDENTIFIER" for issue in validate_problem(replace(problem, terminal_state_sets=(blank_atom_state,))))
+    assert any(issue.code == "MISSING_TERMINAL_RULE_IDENTITY" for issue in validate_problem(replace(problem, terminal_state_sets=(blank_atom_state,))))
 
 
 @pytest.mark.parametrize("field", ("schema_version", "oracle_id", "indicator_id", "timezone", "rule_version"))
@@ -762,7 +770,7 @@ def test_blank_terminal_atom_rule_version_is_path_addressed() -> None:
     atom = replace(problem.terminal_state_sets[0].atoms[0], rule_version="")
     malformed = replace(problem, terminal_state_sets=(replace(problem.terminal_state_sets[0], atoms=(atom,)),))
 
-    assert any(issue.code == "INVALID_IDENTIFIER" and issue.path == "terminal_state_sets[0].atoms[0].rule_version" for issue in validate_problem(malformed))
+    assert any(issue.code == "MISSING_TERMINAL_RULE_IDENTITY" and issue.path == "terminal_state_sets[0].atoms[0].rule_version" for issue in validate_problem(malformed))
 
 
 def test_blank_relation_rule_version_is_path_addressed() -> None:

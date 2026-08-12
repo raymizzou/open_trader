@@ -560,7 +560,9 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
             if atom_id is not None:
                 atom_ids.add(atom_id)
             _validate_enum(issues, atom.kind, TerminalKind, "INVALID_TERMINAL_KIND", f"{atom_path}.kind")
-            if atom.rule_version is None:
+            if atom.rule_version is None or (
+                isinstance(atom.rule_version, str) and not atom.rule_version.strip()
+            ):
                 _issue(issues, "MISSING_TERMINAL_RULE_IDENTITY", f"{atom_path}.rule_version", "must identify the terminal rule")
             else:
                 _identifier(issues, atom.rule_version, f"{atom_path}.rule_version")
@@ -770,7 +772,7 @@ def _atom_from_payload(payload: object) -> TerminalAtom:
     return TerminalAtom(
         _string(payload["atom_id"], "atom_id"),
         _enum(TerminalKind, payload["kind"], "kind"),
-        None if rule_version is None else _string(rule_version, "rule_version"),
+        None if rule_version is None else _text(rule_version, "rule_version"),
         tuple(_payout_from_payload(item) for item in _array(payload["payouts"], "payouts")),
         None if capital_release_at is None else _datetime_from_payload(capital_release_at, "capital_release_at"),
     )
@@ -943,14 +945,19 @@ def _payout_proof_from_payload(payload: object) -> PayoutProof:
 
 def _rejection_counts_from_payload(payload: object) -> tuple[tuple[str, int], ...]:
     rejection_counts = []
+    rejection_ids: set[str] = set()
     for item in _array(payload, "rejection_counts"):
         pair = _array(item, "rejection_count")
         if len(pair) != 2:
             raise ModelDecodeError("rejection_count must contain an ID and count")
+        rejection_id = _string(pair[0], "rejection_count.id")
+        if rejection_id in rejection_ids:
+            raise ModelDecodeError("rejection_count IDs must be unique")
+        rejection_ids.add(rejection_id)
         count = _integer(pair[1], "rejection_count.count")
         if count < 0:
             raise ModelDecodeError("rejection_count.count must be non-negative")
-        rejection_counts.append((_string(pair[0], "rejection_count.id"), count))
+        rejection_counts.append((rejection_id, count))
     return tuple(rejection_counts)
 
 
