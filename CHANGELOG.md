@@ -5,6 +5,17 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-12
 
+- 补录 Tiger 美股历史证据缺口 XLV、PYPL 与 Phillips 港股 HK.06823
+  （实时账户名称 HKT-SS）：仅改变 Account 与 Trend Report 两处真实持仓的趋势归类；
+  归类优先使用规范化 Futu 标识，券商别名不覆盖已确认身份；交易、下单、模拟持仓和
+  历史报告内容不变；聚焦归类、fail-closed 与两处 DOM 回归通过。
+
+- Account 与 Trend Report 两处实盘持仓现按历史正式买入计划，在 A 股、港股和美股拆分为
+  “趋势持仓”和“非趋势持仓”；Tiger 美股历史证据缺口 AMZN、CRNX、GRMN、KO、LH、NUE、
+  REGN 通过受源代码控制的 allowlist 补录；验收在 Account 原子发布瞬间遇到可重试
+  503 时交由既有重试边界处理；模拟持仓与交易行为不变；已通过聚焦 Dashboard 回归，
+  最终 `make acceptance` PASS，并按验收同一 SHA 部署。
+
 - #48 冻结 solver-independent、版本化的 N_LEG 模型与有界精确 Oracle 语料：Admission、
   Optimization 与显式 Raw diagnostic 分离，确定性 support proof 和穷尽负证明均有可回放
   的请求/结果指纹；net margin 以最低 payout 计算，annualization 以向上取整的 24 小时天数

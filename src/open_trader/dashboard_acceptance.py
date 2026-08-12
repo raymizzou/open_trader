@@ -997,6 +997,8 @@ def _fetch_account_snapshot(
     except HTTPError as error:
         if error.code == 304:
             return 304, None, error.headers.get("ETag")
+        if error.code == 503:
+            return 503, None, None
         raise
 
 
@@ -3546,10 +3548,41 @@ def _check_trend_holding_tabs(
     status = report.get("real_position_status")
     real_table = real_panel.locator(".cn-trend-table")
     if status == "available":
-        assert real_table.count() == 1, f"{broker} 真实持仓表格缺失"
-        assert real_panel.locator(".cn-trend-table thead th").all_inner_texts() == list(headings), (
-            f"{broker} 真实持仓列定义发生变化"
+        membership = report.get("historical_buy_plan_membership")
+        split = (
+            isinstance(membership, Mapping)
+            and membership.get("available") is True
+            and isinstance(membership.get("symbols"), list)
         )
+        if split:
+            origins = real_panel.locator(".holding-origin-section")
+            assert origins.count() == 2, f"{broker} 真实持仓分组数量不是 2"
+            assert origins.locator(".holding-origin-heading h3").all_inner_texts() == [
+                "趋势持仓", "非趋势持仓",
+            ], f"{broker} 真实持仓分组文案或顺序不正确"
+            for index in range(2):
+                origin = origins.nth(index)
+                rows = origin.locator(".cn-trend-card")
+                table = origin.locator(".cn-trend-table")
+                assert table.count() == int(rows.count() > 0), (
+                    f"{broker} 真实持仓分组表格与行不匹配"
+                )
+                if table.count():
+                    assert table.locator("thead th").all_inner_texts() == list(headings), (
+                        f"{broker} 真实持仓列定义发生变化"
+                    )
+                else:
+                    empty = origin.locator(":scope > .account-empty")
+                    assert empty.count() == 1 and empty.inner_text().strip() == "无", (
+                        f"{broker} 空真实持仓分组缺少中文空状态"
+                    )
+        else:
+            assert real_table.count() == 1, f"{broker} 真实持仓表格缺失"
+            assert real_panel.locator(
+                ".cn-trend-table thead th"
+            ).all_inner_texts() == list(headings), (
+                f"{broker} 真实持仓列定义发生变化"
+            )
         source = report.get("real_position_source")
         if isinstance(source, Mapping) and source:
             source_text = real_panel.inner_text()
@@ -3748,7 +3781,11 @@ def _check_account_holdings(
             assert section.locator(".account-review-action").count() == rows.count(), (
                 f"{broker} 异常账户缺少人工复核动作"
             )
-        empty = section.locator(".account-empty:visible")
+        empty = page.locator(
+            f"#account-{broker}-view-panel > .account-empty:not(.missing-text):visible"
+            if broker in TREND_SIMULATE_MARKETS
+            else f"#account-{broker} > .account-empty:not(.missing-text):visible"
+        )
         if rows.count() == 0:
             assert empty.count() == 1 and empty.inner_text().strip() == "当前筛选下没有持仓", (
                 f"{broker} 无持仓账户缺少中文空状态"
@@ -5026,7 +5063,11 @@ def _check_cn_filter(page: Any, expected_cn: int) -> None:
                 timeout=10_000,
             )
         rows = section.locator(".account-holding-row:visible")
-        empty = section.locator(".account-empty:visible")
+        empty = page.locator(
+            f"#account-{broker}-view-panel > .account-empty:not(.missing-text):visible"
+            if broker in TREND_SIMULATE_MARKETS
+            else f"#account-{broker} > .account-empty:not(.missing-text):visible"
+        )
         count = rows.count()
         total += count
         assert page.locator("#visible-count").inner_text().strip() == f"{_display_number(count)} 条", (
