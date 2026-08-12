@@ -1,0 +1,32 @@
+FROM python:3.12-slim
+
+RUN apt-get update \
+ && apt-get install --no-install-recommends -y build-essential cmake curl ca-certificates \
+    libboost-dev libgmp-dev libmpfr-dev zlib1g-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/src
+RUN curl --fail --location --output scipoptsuite-10.0.2.tgz https://www.scipopt.org/download/release/scipoptsuite-10.0.2.tgz \
+ && echo "eecc29f31e8c8a3089c95ef99dd310d05e1546ba40f4ff36551d75a5f5c47073  scipoptsuite-10.0.2.tgz" | sha256sum -c - \
+ && tar -xzf scipoptsuite-10.0.2.tgz
+RUN cmake -S /opt/src/scipoptsuite-10.0.2 -B /opt/build/scip \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/scip \
+    -DNO_EXTERNAL_CODE=ON -DGCG=off -DUG=off -DBOOST=on -DEXACTSOLVE=on -DLPSEXACT=spx -DGMP=on -DMPFR=on \
+ && cmake --build /opt/build/scip --parallel 2 \
+ && cmake --install /opt/build/scip \
+ && grep -qx '#define SCIP_WITH_EXACTSOLVE' /opt/build/scip/scip/scip/config.h \
+ || { echo "exact solving disabled" >&2; exit 1; }
+
+ENV SCIPOPTDIR=/opt/scip
+ENV LD_LIBRARY_PATH=/opt/scip/lib
+RUN pip install --disable-pip-version-check --no-cache-dir --no-binary pyscipopt pyscipopt==6.2.1 \
+ && python -c 'import pyscipopt; assert pyscipopt.__version__ == "6.2.1"'
+
+RUN curl --fail --location --output vipr.tar.gz https://github.com/scipopt/vipr/archive/30f2951d1e90e47afa821bdd1b12b82246656c42.tar.gz \
+ && echo "bfd905e3378353b5f4e93ad2405c75feed0d477e0a74113496fb2d6e04ca7786  vipr.tar.gz" | sha256sum -c - \
+ && tar -xzf vipr.tar.gz
+RUN cmake -S /opt/src/vipr-30f2951d1e90e47afa821bdd1b12b82246656c42/code -B /opt/build/vipr -DSOPLEX_DIR=/opt/build/scip \
+ && cmake --build /opt/build/vipr --parallel 2 \
+ && install /opt/build/vipr/viprchk /opt/build/vipr/viprcomp /usr/local/bin/ \
+ && command -v viprchk \
+ && command -v viprcomp

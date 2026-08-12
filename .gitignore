@@ -1,4 +1,5 @@
 .venv/
+.benchmark-envs/
 .env
 .tradingagents/
 .worktrees/

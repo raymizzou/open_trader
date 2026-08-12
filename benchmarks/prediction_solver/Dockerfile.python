@@ -1,0 +1,6 @@
+FROM python:3.12-slim
+
+ARG REQUIREMENTS
+RUN case "$REQUIREMENTS" in highs.txt|cp_sat.txt) ;; *) echo "unsupported requirements: $REQUIREMENTS" >&2; exit 2 ;; esac
+COPY requirements/${REQUIREMENTS} /tmp/requirements.txt
+RUN pip install --disable-pip-version-check --no-cache-dir -r /tmp/requirements.txt

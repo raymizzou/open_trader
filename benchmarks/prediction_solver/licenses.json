@@ -1,0 +1,38 @@
+{
+  "highspy": {
+    "version": "1.15.1",
+    "license": "MIT",
+    "project_url": "https://github.com/ERGO-Code/HiGHS",
+    "evidence_path": "LICENSE",
+    "commercial_key_required": false
+  },
+  "pyscipopt": {
+    "version": "6.2.1",
+    "license": "MIT",
+    "project_url": "https://github.com/scipopt/PySCIPOpt",
+    "evidence_path": "LICENSE",
+    "commercial_key_required": false
+  },
+  "scip": {
+    "version": "10.0.2",
+    "license": "Apache-2.0",
+    "project_url": "https://www.scipopt.org/download/release/scipoptsuite-10.0.2.tgz",
+    "evidence_path": "scip/LICENSE",
+    "commercial_key_required": false
+  },
+  "ortools": {
+    "version": "9.15.6755",
+    "license": "Apache-2.0",
+    "project_url": "https://github.com/google/or-tools",
+    "evidence_path": "LICENSE",
+    "commercial_key_required": false
+  },
+  "vipr": {
+    "version": "30f2951d1e90e47afa821bdd1b12b82246656c42",
+    "license": "MIT",
+    "project_url": "https://github.com/scipopt/vipr",
+    "evidence_path": "code/viprchk.cpp",
+    "evidence_sha256": "2baf9c4593f5b8ef42323fbfb7cbfa0e4dfafff65e636cf6a143561b9dca2738",
+    "commercial_key_required": false
+  }
+}
