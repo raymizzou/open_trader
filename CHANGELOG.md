@@ -7,7 +7,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - 补录 Tiger 美股历史证据缺口 XLV、PYPL 与 Phillips 港股 HK.06823
   （实时账户名称 HKT-SS）：仅改变 Account 与 Trend Report 两处真实持仓的趋势归类；
-  交易、下单、模拟持仓和历史报告内容不变；聚焦归类、fail-closed 与两处 DOM 回归通过。
+  归类优先使用规范化 Futu 标识，券商别名不覆盖已确认身份；交易、下单、模拟持仓和
+  历史报告内容不变；聚焦归类、fail-closed 与两处 DOM 回归通过。
 
 - Account 与 Trend Report 两处实盘持仓现按历史正式买入计划，在 A 股、港股和美股拆分为
   “趋势持仓”和“非趋势持仓”；Tiger 美股历史证据缺口 AMZN、CRNX、GRMN、KO、LH、NUE、

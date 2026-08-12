@@ -10153,30 +10153,34 @@ const tiger={market:"US",real_position_status:"available",historical_buy_plan_me
 const phillips={market:"HK",real_position_status:"available",historical_buy_plan_membership:{available:true,symbols:["HK.06823"],reason:""}};
 state.dashboard={trend_reports:{tiger,phillips}};
 state.accountSnapshot={status:"healthy",sources:{account:{brokers:{tiger:{status:"ok"},phillips:{status:"ok"}}}}};
-const tigerRows=["XLV","PYPL"].map((symbol,index)=>({
+const tigerRows=[["XLV","Health ETF"],["PYPL","Payments"]].map(([symbol,name],index)=>({
   key:`tiger:US:${symbol}:${index}`,broker:"tiger",
   holding:{market:"US",symbol,futu_symbol:`US.${symbol}`},
-  display:{market:"US",symbol,name:symbol,market_value_hkd:"10"},index,
+  display:{market:"US",symbol,name,market_value_hkd:"10"},index,
 }));
 const hkRow={key:"phillips:HK:06823:0",broker:"phillips",
-  holding:{market:"HK",symbol:"06823",futu_symbol:"HK.06823",name:"HKT-SS"},
-  display:{market:"HK",symbol:"06823",name:"HKT-SS",market_value_hkd:"10"},index:0};
+  holding:{market:"HK",symbol:"BROKER-HKT",futu_symbol:"HK.06823",name:"HKT-SS"},
+  display:{market:"HK",symbol:"BROKER-HKT",name:"HKT-SS",market_value_hkd:"10"},index:0};
 console.log(JSON.stringify({
   accountTiger:renderAccountViewPanel({broker:"tiger",rows:tigerRows}),
   accountPhillips:renderAccountViewPanel({broker:"phillips",rows:[hkRow]}),
   reportTiger:renderTrendHoldingPanel(tiger,"real",[
-    {market:"US",symbol:"XLV",name:"XLV"},{market:"US",symbol:"PYPL",name:"PYPL"}]),
+    {market:"US",symbol:"XLV",name:"Health ETF"},{market:"US",symbol:"PYPL",name:"Payments"}]),
   reportPhillips:renderTrendHoldingPanel(phillips,"real",[
-    {market:"HK",symbol:"06823",futu_symbol:"HK.06823",name:"HKT-SS"}]),
+    {market:"HK",symbol:"BROKER-HKT",futu_symbol:"HK.06823",name:"HKT-SS"}]),
 }));
 ''')
     rendered = json.loads(output)
-    for surface in ("accountTiger", "reportTiger"):
-        trend_section = rendered[surface].split("非趋势持仓", 1)[0]
-        assert "XLV" in trend_section and "PYPL" in trend_section
-    for surface in ("accountPhillips", "reportPhillips"):
-        trend_section = rendered[surface].split("非趋势持仓", 1)[0]
-        assert "06823" in trend_section and "HKT-SS" in trend_section
+    for surface, identities in (
+        ("accountTiger", ('data-symbol="XLV"', 'data-symbol="PYPL"')),
+        ("reportTiger", ("XLV Health ETF", "PYPL Payments")),
+        ("accountPhillips", ('data-symbol="BROKER-HKT"',)),
+        ("reportPhillips", ("BROKER-HKT HKT-SS",)),
+    ):
+        trend_section, non_trend_section = rendered[surface].split("非趋势持仓", 1)
+        for identity in identities:
+            assert trend_section.count(identity) == 1
+            assert non_trend_section.count(identity) == 0
 
 
 def test_dashboard_splits_real_account_holdings_by_historical_trend_origin() -> None:

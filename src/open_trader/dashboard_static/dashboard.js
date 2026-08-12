@@ -9203,7 +9203,8 @@ function splitHistoricalTrendHoldings(items, report) {
   const nonTrend = [];
   for (const item of items) {
     const position = item?.holding || item;
-    const key = normalizeActionKey(position?.market || report?.market, position?.symbol);
+    const key = normalizeActionKey("", position?.futu_symbol)
+      || normalizeActionKey(position?.market || report?.market, position?.symbol);
     (key && planned.has(key) ? trend : nonTrend).push(item);
   }
   return {trend, nonTrend};

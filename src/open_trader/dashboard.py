@@ -2388,23 +2388,22 @@ def _load_broker_trend_report(
     report_date: str,
     current_candidate_pool_ids: tuple[int, ...] = (),
 ) -> dict[str, Any]:
-    unavailable = {
-        "available": False,
-        "data_status": "unavailable",
-        "broker": broker,
-        "broker_label": broker_label,
-        "market": market,
-        "market_label": market_label,
-        "status_text": "暂时不可用",
-        "historical_buy_plan_membership": _historical_buy_plan_membership(
-            reports_dir, broker=broker, market=market
-        ),
-    }
     selected = _latest_valid_report_payload(
         reports_dir, market=market, broker=broker
     )
     if selected is None:
-        return unavailable
+        return {
+            "available": False,
+            "data_status": "unavailable",
+            "broker": broker,
+            "broker_label": broker_label,
+            "market": market,
+            "market_label": market_label,
+            "status_text": "暂时不可用",
+            "historical_buy_plan_membership": _historical_buy_plan_membership(
+                reports_dir, broker=broker, market=market
+            ),
+        }
     return _project_broker_trend_report(
         selected=selected,
         data_dir=data_dir,
