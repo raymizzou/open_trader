@@ -848,8 +848,8 @@ class CpSatBackend:
         )
         objective_bound = None
         if model.objective is not None:
-            # CP-SAT exposes both values as floats.  Keep only a near-integral
-            # bound as diagnostics; the parent recomputes the exact objective.
+            # Keep the native best bound only as bounded diagnostics; the
+            # parent recomputes the exact objective from native integer values.
             objective_bound = (
                 _cp_sat_optional_bound(solver.best_objective_bound)
                 if objective_value is None or abs(objective_value) <= DOUBLE_INT_MAX
