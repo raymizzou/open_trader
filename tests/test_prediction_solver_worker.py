@@ -569,6 +569,44 @@ def test_cleanup_failure_poisons_harness_and_blocks_later_process_start(monkeypa
     assert len(popen_calls) == 1
 
 
+def test_unproven_hard_timeout_reports_cleanup_unproven_and_poisoned_next_request(monkeypatch) -> None:
+    import open_trader.prediction_solver_worker as worker_module
+
+    popen_calls: list[object] = []
+    original_popen = worker_module.subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        if kwargs.get("start_new_session") is True:
+            popen_calls.append(args[0] if args else kwargs.get("args"))
+        return original_popen(*args, **kwargs)
+
+    monkeypatch.setattr(worker_module.subprocess, "Popen", recording_popen)
+    harness = WorkerHarness(_test_command("hang-child"), request_timeout_ms=100, cleanup_grace_seconds=0.1)
+    original_terminate = harness._terminate
+    try:
+        monkeypatch.setattr(harness, "_terminate", lambda worker: original_terminate(worker) and False)
+        failed = harness.submit(
+            decode_request_line(
+                encode_request_line(_request("unproven-timeout", soft_time_limit_ms=10, hard_time_limit_ms=50))
+            )
+        )
+        blocked = harness.submit(decode_request_line(encode_request_line(_request("after-unproven"))))
+    finally:
+        harness._terminate = original_terminate
+        harness.close()
+
+    assert failed.status == "UNKNOWN"
+    assert failed.termination == "CLEANUP_UNPROVEN"
+    assert failed.cleanup_proven is False
+    assert blocked.status == "UNKNOWN"
+    assert blocked.termination == "CLEANUP_UNPROVEN"
+    assert blocked.cleanup_proven is False
+    assert blocked.worker_pid == failed.worker_pid
+    assert blocked.pgid == failed.pgid
+    assert blocked.peak_rss_kib == failed.peak_rss_kib
+    assert len(popen_calls) == 1
+
+
 def test_reused_worker_resets_peak_rss_for_each_request(monkeypatch) -> None:
     request_phases: dict[int, int] = {}
 

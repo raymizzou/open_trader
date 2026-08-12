@@ -122,6 +122,10 @@ def _positive_int(value: object, name: str) -> int:
     return value
 
 
+def _termination_after_cleanup(termination: str, cleanup_proven: bool) -> str:
+    return termination if cleanup_proven else "CLEANUP_UNPROVEN"
+
+
 def _limits_from_payload(payload: object) -> BenchmarkLimits:
     value = _object(
         payload,
@@ -539,7 +543,10 @@ class WorkerHarness:
             proven = self._terminate_checked(worker)
             raise WorkerStartupError(
                 "worker startup handshake failed",
-                termination="HARD_TIMEOUT" if isinstance(exc, TimeoutError) else "PROTOCOL_MISMATCH",
+                termination=_termination_after_cleanup(
+                    "HARD_TIMEOUT" if isinstance(exc, TimeoutError) else "PROTOCOL_MISMATCH",
+                    proven,
+                ),
                 worker_pid=worker.process.pid,
                 pgid=worker.pgid,
                 peak_rss_kib=worker.peak_rss_kib,
@@ -573,12 +580,13 @@ class WorkerHarness:
             worker = self._worker
             if worker is not None and worker.memory_limit_bytes != request.limits.memory_limit_bytes:
                 old_worker = worker
-                if not self._terminate_checked(old_worker):
+                cleanup_proven = self._terminate_checked(old_worker)
+                if not cleanup_proven:
                     self._worker = None
                     return WorkerOutcome(
                         request.request_id,
                         "UNKNOWN",
-                        "CLEANUP_UNPROVEN",
+                        _termination_after_cleanup("PROTOCOL_MISMATCH", cleanup_proven),
                         old_worker.process.pid,
                         old_worker.pgid,
                         old_worker.peak_rss_kib,
@@ -615,7 +623,10 @@ class WorkerHarness:
                 return WorkerOutcome(
                     request.request_id,
                     "UNKNOWN",
-                    "SOFT_TIMEOUT" if any("timeout" in item for item in response.diagnostics) else "UNKNOWN",
+                    _termination_after_cleanup(
+                        "SOFT_TIMEOUT" if any("timeout" in item for item in response.diagnostics) else "UNKNOWN",
+                        cleanup_proven,
+                    ),
                     process.pid,
                     pgid,
                     worker.peak_rss_kib,
@@ -628,7 +639,16 @@ class WorkerHarness:
             termination = "INVALID_OUTPUT" if worker.reader.stdout_buffer else "HARD_TIMEOUT"
             cleanup_proven = self._terminate_checked(worker)
             self._worker = None
-            return WorkerOutcome(request.request_id, "UNKNOWN", termination, process.pid, pgid, worker.peak_rss_kib, False, cleanup_proven)
+            return WorkerOutcome(
+                request.request_id,
+                "UNKNOWN",
+                _termination_after_cleanup(termination, cleanup_proven),
+                process.pid,
+                pgid,
+                worker.peak_rss_kib,
+                False,
+                cleanup_proven,
+            )
         except (BrokenPipeError, OSError, WorkerProtocolError, WorkerCleanupError, ValueError):
             returncode = process.poll()
             cleanup_proven = self._terminate_checked(worker)
@@ -641,7 +661,16 @@ class WorkerHarness:
                 termination = "INVALID_OUTPUT"
             else:
                 termination = "PROTOCOL_MISMATCH"
-            return WorkerOutcome(request.request_id, "UNKNOWN", termination, process.pid, pgid, worker.peak_rss_kib, False, cleanup_proven)
+            return WorkerOutcome(
+                request.request_id,
+                "UNKNOWN",
+                _termination_after_cleanup(termination, cleanup_proven),
+                process.pid,
+                pgid,
+                worker.peak_rss_kib,
+                False,
+                cleanup_proven,
+            )
 
     def _poison_after_cleanup(self, worker: "_WorkerProcess") -> None:
         if not self._poisoned:
