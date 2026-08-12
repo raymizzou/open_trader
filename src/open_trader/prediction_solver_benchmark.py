@@ -113,12 +113,12 @@ _PHASE_NAMES = {
     "first_qualified", "independent_check", "optimal", "serialization",
 }
 _ENVIRONMENT_KEYS = {"available", "build_id", "environment_id", "git_sha", "image_id"}
-_SOLVER_KEYS = {
-    "commercial_key_required", "environments", "license_evidence_present",
-    "manual_interventions", "open_source", "source_evidence_present",
-    "whole_claim_certificate_bound",
+_SOLVER_KEYS = {"environments", "manual_interventions", "whole_claim_certificate_bound"}
+_SOLVER_ENVIRONMENT_KEYS = {
+    "build_id", "commercial_key_required", "install_succeeded", "installation_ns",
+    "license_evidence_present", "open_source", "reuse_succeeded", "run_succeeded",
+    "source_evidence_present",
 }
-_SOLVER_ENVIRONMENT_KEYS = {"build_id", "install_succeeded", "installation_ns", "reuse_succeeded", "run_succeeded"}
 _CASE_KEYS = {"model_dimensions", "oracle_limits", "problem_fingerprint", "request_fingerprint", "request_id"}
 _DIMENSION_KEYS = {
     "action_count", "contract_count", "cost_slice_count", "joint_state_count",
@@ -339,14 +339,16 @@ def _validated_run_manifest(manifest: Mapping[str, object]) -> dict[str, object]
     solvers = _strict_named_objects(value["solvers"], "solvers", required_solvers)
     for solver, evidence in solvers.items():
         evidence = _strict_object(evidence, f"solvers.{solver}", _SOLVER_KEYS)
-        for field in ("commercial_key_required", "license_evidence_present", "open_source", "source_evidence_present", "whole_claim_certificate_bound"):
-            if not isinstance(evidence[field], bool):
-                raise ValueError(f"solvers.{solver}.{field} must be a bool")
+        if not isinstance(evidence["whole_claim_certificate_bound"], bool):
+            raise ValueError(f"solvers.{solver}.whole_claim_certificate_bound must be a bool")
         _nonnegative_integer(evidence["manual_interventions"], f"solvers.{solver}.manual_interventions")
         solver_environments = _strict_named_objects(evidence["environments"], f"solvers.{solver}.environments", required_environments)
         for environment, environment_evidence in solver_environments.items():
             environment_evidence = _strict_object(environment_evidence, f"solvers.{solver}.environments.{environment}", _SOLVER_ENVIRONMENT_KEYS)
-            for field in ("install_succeeded", "reuse_succeeded", "run_succeeded"):
+            for field in (
+                "commercial_key_required", "install_succeeded", "license_evidence_present",
+                "open_source", "reuse_succeeded", "run_succeeded", "source_evidence_present",
+            ):
                 if not isinstance(environment_evidence[field], bool):
                     raise ValueError(f"solvers.{solver}.environments.{environment}.{field} must be a bool")
             if environment_evidence["build_id"] != environments[environment]["build_id"]:
@@ -662,9 +664,10 @@ def _hard_gate_failures(
         for environment in manifest["required_environments"]
     ):
         failures.add("ENVIRONMENT_EVIDENCE_FAILED")
-    if (
-        not all(solver_evidence[field] for field in ("open_source", "license_evidence_present", "source_evidence_present"))
-        or solver_evidence["commercial_key_required"]
+    if any(
+        not all(solver_evidence["environments"][environment][field] for field in ("open_source", "license_evidence_present", "source_evidence_present"))
+        or solver_evidence["environments"][environment]["commercial_key_required"]
+        for environment in manifest["required_environments"]
     ):
         failures.add("LICENSE_EVIDENCE_FAILED")
     return sorted(failures)

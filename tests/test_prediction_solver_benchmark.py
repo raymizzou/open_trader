@@ -1066,21 +1066,21 @@ def _benchmark_manifest(*, profile: str = "full", solvers: tuple[str, ...] = ("h
         "schema_version": _MANIFEST_SCHEMA_V1,
         "solvers": {
             solver: {
-                "commercial_key_required": False,
                 "environments": {
                     environment: {
                         "build_id": f"{environment}-build-artifact",
+                        "commercial_key_required": False,
                         "install_succeeded": True,
                         "installation_ns": 10,
+                        "license_evidence_present": True,
+                        "open_source": True,
                         "reuse_succeeded": True,
                         "run_succeeded": True,
+                        "source_evidence_present": True,
                     }
                     for environment in environments
                 },
-                "license_evidence_present": True,
                 "manual_interventions": 0,
-                "open_source": True,
-                "source_evidence_present": True,
                 "whole_claim_certificate_bound": False,
             }
             for solver in solvers
@@ -1238,6 +1238,24 @@ def test_hard_gate_requires_install_run_and_reuse_evidence_for_each_environment(
     assert summary["solvers"]["highs"]["operational_evidence"]["environments"]["linux"][field] is False
 
 
+@pytest.mark.parametrize(
+    ("field", "unsafe_value"),
+    (
+        ("license_evidence_present", False),
+        ("source_evidence_present", False),
+        ("commercial_key_required", True),
+    ),
+)
+def test_hard_gate_requires_license_evidence_for_each_environment(field: str, unsafe_value: bool) -> None:
+    manifest = _benchmark_manifest()
+    manifest["solvers"]["highs"]["environments"]["linux"][field] = unsafe_value
+
+    summary = aggregate_benchmark_records(_full_records(), manifest)
+
+    assert summary["solvers"]["highs"]["hard_gate_failures"] == ["LICENSE_EVIDENCE_FAILED"]
+    assert summary["solvers"]["highs"]["operational_evidence"]["environments"]["linux"][field] is unsafe_value
+
+
 @pytest.mark.parametrize("mutation", ("missing", "duplicate"))
 def test_aggregate_rejects_missing_or_duplicate_structural_samples(mutation: str) -> None:
     records = _full_records()
@@ -1276,8 +1294,8 @@ def test_aggregate_rejects_a_full_manifest_that_skips_a_mandatory_phase_or_probe
         (lambda records, manifest: records[0].__setitem__("peak_aggregate_rss_bytes", 10_001), "MEMORY_LIMIT_EXCEEDED"),
         (lambda records, manifest: (manifest.__setitem__("memory_limit_bytes", 0), [record.__setitem__("memory_limit_bytes", 0) for record in records]), "MEMORY_LIMIT_UNBOUNDED"),
         (lambda records, manifest: manifest["solvers"]["highs"]["environments"]["macos"].__setitem__("run_succeeded", False), "ENVIRONMENT_EVIDENCE_FAILED"),
-        (lambda records, manifest: manifest["solvers"]["highs"].__setitem__("open_source", False), "LICENSE_EVIDENCE_FAILED"),
-        (lambda records, manifest: manifest["solvers"]["highs"].__setitem__("commercial_key_required", True), "LICENSE_EVIDENCE_FAILED"),
+        (lambda records, manifest: manifest["solvers"]["highs"]["environments"]["macos"].__setitem__("open_source", False), "LICENSE_EVIDENCE_FAILED"),
+        (lambda records, manifest: manifest["solvers"]["highs"]["environments"]["macos"].__setitem__("commercial_key_required", True), "LICENSE_EVIDENCE_FAILED"),
     ),
 )
 def test_hard_gate_eliminates_each_unsafe_evidence_class(mutate, reason: str) -> None:
