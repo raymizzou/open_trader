@@ -34,6 +34,9 @@ class _Upstream(ThreadingHTTPServer):
         self.response_body: bytes | None = None
         self.response_headers: list[tuple[str, str]] = []
         self.response_delay = 0.0
+        self.block_path: str | None = None
+        self.request_started = threading.Event()
+        self.release_response = threading.Event()
         self.health_body: bytes | None = None
         super().__init__(("127.0.0.1", 0), _UpstreamHandler)
 
@@ -57,6 +60,9 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
                 "body": body,
             }
         )
+        if self.path == self.server.block_path:
+            self.server.request_started.set()
+            assert self.server.release_response.wait(timeout=5)
         response = {"ok": True}
         encoded = (
             self.server.health_body
@@ -165,7 +171,12 @@ def _gateway(
 
 
 @pytest.mark.parametrize("method", ["GET", "POST"])
-def test_prediction_prefix_routes_as_one_unit(tmp_path: Path, method: str) -> None:
+@pytest.mark.parametrize(
+    "path", ["/api/prediction-arbitrage", "/api/prediction-arbitrage/state"]
+)
+def test_prediction_prefix_routes_as_one_unit(
+    tmp_path: Path, method: str, path: str
+) -> None:
     _write_static_files(tmp_path / "static")
     legacy = _Upstream()
     prediction = _Upstream()
@@ -177,12 +188,10 @@ def test_prediction_prefix_routes_as_one_unit(tmp_path: Path, method: str) -> No
         prediction_port=prediction.server_address[1],
         prediction_route_path=route,
     ) as base:
-        _prediction_request(base, method, "/api/prediction-arbitrage/state")
+        _prediction_request(base, method, path)
 
     assert legacy.requests == []
-    assert [item["path"] for item in prediction.requests] == [
-        "/api/prediction-arbitrage/state"
-    ]
+    assert [item["path"] for item in prediction.requests] == [path]
 
 
 @pytest.mark.parametrize("method", ["GET", "POST"])
@@ -392,6 +401,76 @@ def test_prediction_route_maintenance_rejects_before_body_or_upstream(
     }
     assert legacy.requests == []
     assert prediction.requests == []
+
+
+def test_prediction_route_change_drains_selected_request_and_rejects_new_work(
+    tmp_path: Path,
+) -> None:
+    _write_static_files(tmp_path / "static")
+    legacy = _Upstream()
+    prediction = _Upstream()
+    route = tmp_path / "prediction-route.json"
+    _write_route(route, "legacy")
+    legacy.block_path = "/api/prediction-arbitrage/executions"
+
+    with _running(legacy), _running(prediction), _gateway(
+        tmp_path / "static",
+        legacy.server_address[1],
+        prediction_port=prediction.server_address[1],
+        prediction_route_path=route,
+    ) as base:
+        completed: list[int] = []
+
+        def post_selected_request() -> None:
+            connection = http.client.HTTPConnection(
+                base.removeprefix("http://"), timeout=5
+            )
+            connection.request(
+                "POST", "/api/prediction-arbitrage/executions", body=b"{}"
+            )
+            response = connection.getresponse()
+            response.read()
+            completed.append(response.status)
+            connection.close()
+
+        request = threading.Thread(target=post_selected_request)
+        request.start()
+        assert legacy.request_started.wait(timeout=5)
+
+        replacement = route.with_suffix(".tmp")
+        _write_route(replacement, "maintenance")
+        replacement.replace(route)
+
+        with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
+            health_during = json.load(response)
+        maintenance = urllib.request.Request(
+            base + "/api/prediction-arbitrage/executions",
+            data=b"{}",
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(maintenance, timeout=5)
+
+        assert health_during["prediction_route_mode"] == "maintenance"
+        assert health_during["prediction_inflight_requests"] == 1
+        assert error.value.code == HTTPStatus.SERVICE_UNAVAILABLE
+        assert len(
+            [
+                item
+                for item in legacy.requests
+                if item["path"] == "/api/prediction-arbitrage/executions"
+            ]
+        ) == 1
+        assert prediction.requests == []
+
+        legacy.release_response.set()
+        request.join(timeout=5)
+        assert not request.is_alive()
+        with urllib.request.urlopen(base + "/healthz", timeout=5) as response:
+            health_after = json.load(response)
+
+    assert completed == [HTTPStatus.OK]
+    assert health_after["prediction_inflight_requests"] == 0
 
 
 def test_gateway_serves_dashboard_assets_without_contacting_upstream(

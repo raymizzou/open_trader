@@ -266,6 +266,16 @@ def create_prediction_server(
                 {"error": f"{mode} runtime is unavailable"},
             )
 
+        def _send_error(self, status: HTTPStatus, error: Exception) -> None:
+            self._send_json(
+                status,
+                {
+                    "status": "error",
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                },
+            )
+
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path == "/healthz":
@@ -366,7 +376,7 @@ def create_prediction_server(
                 try:
                     self._require_production_auth()
                 except PermissionError as exc:
-                    self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
+                    self._send_error(HTTPStatus.FORBIDDEN, exc)
                     return
                 if not _is_production_available(runtime):
                     self._send_unavailable()
@@ -436,13 +446,13 @@ def create_prediction_server(
                     raise RuntimeError("prediction mutation result is invalid")
                 self._send_json(status, safe_result)
             except PermissionError as exc:
-                self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
+                self._send_error(HTTPStatus.FORBIDDEN, exc)
             except OverflowError as exc:
                 self._send_json(
                     HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": str(exc)}
                 )
             except ValueError as exc:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                self._send_error(HTTPStatus.BAD_REQUEST, exc)
             except (sqlite3.Error, OSError, RuntimeError) as exc:
                 self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
 
