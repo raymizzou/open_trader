@@ -5,6 +5,7 @@ import json
 from copy import deepcopy
 from dataclasses import replace
 from datetime import timedelta
+from fractions import Fraction
 from itertools import combinations
 from pathlib import Path
 
@@ -40,17 +41,22 @@ from open_trader.prediction_n_leg_oracle import (
     solve_optimal,
 )
 from open_trader.prediction_solver import (
+    BENCHMARK_PROTOCOL_V1,
     BenchmarkClassification,
     CertificateEvidence,
     SolverEvidence,
+    TerminationReason,
     solve_with_constraint_generation,
 )
 from open_trader.prediction_solver_benchmark import (
     CheckFailureReason,
+    aggregate_benchmark_records,
     check_solver_claim,
     generate_synthetic_corpus,
+    generate_benchmark_report,
     import_approved_snapshot,
     load_canonical_cases,
+    verify_benchmark_report,
 )
 from test_prediction_solver import BruteForceBackend, benchmark_limits
 
@@ -856,3 +862,625 @@ def _assert_hard_checker_failure(
     assert checked.hard_failure is True
     assert checked.failure_reason == reason
     assert checked.canonical_result is None
+
+
+_RECORD_SCHEMA_V1 = "open_trader.prediction_solver.record.v1"
+_MANIFEST_SCHEMA_V1 = "open_trader.prediction_solver.run_manifest.v1"
+_SHA_A = "sha256:" + "a" * 64
+_SHA_B = "sha256:" + "b" * 64
+_SHA_C = "sha256:" + "c" * 64
+
+
+def _record_semantic_fingerprint(record: dict[str, object]) -> str:
+    run = record["solver_run"]
+    evidence = run["evidence"]
+    payload = {
+        "business_status": run["business_status"],
+        "canonical_result": run["canonical_result"],
+        "check_failure_reason": record["check_failure_reason"],
+        "check_hard_failure": record["check_hard_failure"],
+        "classification": run["classification"],
+        "evidence": None if evidence is None else {
+            field: evidence[field]
+            for field in (
+                "adversary_rounds", "candidate", "conservative_capital_release_at",
+                "cost_upper_bound_units", "cuts", "fixed_portfolio_closed",
+                "global_search_closed", "guaranteed_profit_units", "master_rounds",
+                "native_status", "objective_bounds", "payout_lower_bound_units",
+                "worst_scenario",
+            )
+        },
+        "objective_bounds": run["objective_bounds"],
+        "optimality_status": run["optimality_status"],
+        "proof_status": run["proof_status"],
+        "solve_status": run["solve_status"],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _benchmark_solver_run(*, wall_ns: int, first_ns: int, optimal_ns: int, solver: str = "highs") -> dict[str, object]:
+    return {
+        "adapter_version": "adapter-v1",
+        "business_status": "QUALIFIED_FEASIBLE",
+        "canonical_result": None,
+        "classification": "MEASUREMENT_ONLY",
+        "diagnostics": [],
+        "environment_id": "mac-build",
+        "evidence": {
+            "adversary_rounds": 2,
+            "candidate": {"claimed_guaranteed_profit_units": 7, "quantities": [{"action_id": "a", "quantity_lots": 1}]},
+            "certificate": None,
+            "conservative_capital_release_at": "2026-08-12T00:00:00Z",
+            "cost_upper_bound_units": 3,
+            "cuts": [],
+            "fixed_portfolio_closed": True,
+            "global_search_closed": False,
+            "guaranteed_profit_units": 7,
+            "master_rounds": 3,
+            "native_status": "FEASIBLE",
+            "objective_bounds": {"closed": False, "gap_units": 2, "lower_bound_units": 7, "upper_bound_units": 9},
+            "payout_lower_bound_units": 10,
+            "worst_scenario": {"atoms": [{"atom_id": "yes", "market_contract_id": "a"}]},
+        },
+        "objective_bounds": {"closed": False, "gap_units": 2, "lower_bound_units": 7, "upper_bound_units": 9},
+        "optimality_status": "NOT_PROVEN",
+        "peak_rss_bytes": 600,
+        "phase_timings_ns": [
+            ["backend", max(0, wall_ns - 6)],
+            ["certificate_check", 0],
+            ["certificate_completion", 0],
+            ["certificate_generation", 0],
+            ["first_qualified", max(0, first_ns)],
+            ["independent_check", 1],
+            ["optimal", max(0, optimal_ns)],
+            ["serialization", 2],
+        ],
+        "proof_status": "UNKNOWN",
+        "request_id": "request-1",
+        "schema_version": BENCHMARK_PROTOCOL_V1,
+        "solve_status": "FEASIBLE",
+        "solver_name": solver,
+        "solver_version": "1.0",
+        "termination_reason": TerminationReason.COMPLETED.value,
+        "worker_id": "worker-1",
+    }
+
+
+def _benchmark_record(
+    *,
+    environment: str = "macos",
+    solver: str = "highs",
+    sample_kind: str = "warm",
+    sample_index: int = 0,
+    wall_ns: int = 100,
+    worker_count: int = 1,
+) -> dict[str, object]:
+    run = _benchmark_solver_run(wall_ns=wall_ns, first_ns=wall_ns - 10, optimal_ns=wall_ns - 5, solver=solver)
+    run["environment_id"] = f"{environment}-build"
+    run["worker_id"] = f"worker-{worker_count}"
+    record = {
+        "adapter_version": "adapter-v1",
+        "architecture": "arm64" if environment == "macos" else "x86_64",
+        "case_id": "case-a",
+        "check_failure_reason": None,
+        "check_hard_failure": False,
+        "cleanup_proven": True,
+        "completed_requests": 1,
+        "container_id": "none" if environment == "macos" else "container-1",
+        "corpus_manifest_sha256": _SHA_A,
+        "corpus_version": "corpus-v1",
+        "cpu": "fixture-cpu",
+        "environment": environment,
+        "git_sha": "1" * 40,
+        "image_id": "none" if environment == "macos" else "image-1",
+        "license_manifest_sha256": _SHA_B,
+        "memory_limit_bytes": 10_000,
+        "os_version": "fixture-os",
+        "peak_aggregate_rss_bytes": 700 + worker_count,
+        "peak_process_group_rss_bytes": 600,
+        "problem_fingerprint": _SHA_C,
+        "profile": "full",
+        "protocol_version": BENCHMARK_PROTOCOL_V1,
+        "python_version": "3.12.11",
+        "request_fingerprint": _SHA_A,
+        "request_wall_ns": wall_ns,
+        "sample_index": sample_index,
+        "sample_kind": sample_kind,
+        "schema_version": _RECORD_SCHEMA_V1,
+        "semantic_fingerprint": _SHA_A,
+        "solver_name": solver,
+        "solver_run": run,
+        "solver_version": "1.0",
+        "truth_method": "exact_oracle_v1",
+        "worker_count": worker_count,
+        "worker_id": f"worker-{worker_count}",
+        "worker_rebuild_count": 0,
+        "worker_start_count": 1,
+    }
+    record["semantic_fingerprint"] = _record_semantic_fingerprint(record)
+    return record
+
+
+def _benchmark_manifest(*, profile: str = "full", solvers: tuple[str, ...] = ("highs", "scip", "cp_sat")) -> dict[str, object]:
+    environments = ("macos", "linux") if profile == "full" else ("macos",)
+    probes = ["case-a"] if profile == "full" else []
+    return {
+        "approved_case_count": 1,
+        "cold_probe_case_ids": probes,
+        "corpus_manifest_sha256": _SHA_A,
+        "environments": {
+            environment: {
+                "available": True,
+                "build_id": f"{environment}-build",
+                "environment_id": f"{environment}-build",
+                "image_id": "none" if environment == "macos" else "image-1",
+            }
+            for environment in environments
+        },
+        "first_qualified_case_ids": ["case-a"],
+        "license_manifest_sha256": _SHA_B,
+        "measured_samples": 30 if profile == "full" else 1,
+        "optimal_case_ids": ["case-a"],
+        "profile": profile,
+        "rebuild_probe_case_ids": probes,
+        "required_case_ids": ["case-a"],
+        "required_environments": list(environments),
+        "required_solvers": list(solvers),
+        "schema_version": _MANIFEST_SCHEMA_V1,
+        "solvers": {
+            solver: {
+                "commercial_key_required": False,
+                "install_succeeded": True,
+                "installation_ns": 10,
+                "license_evidence_present": True,
+                "manual_interventions": 0,
+                "open_source": True,
+                "reuse_succeeded": True,
+                "run_succeeded": True,
+                "source_evidence_present": True,
+                "whole_claim_certificate_bound": False,
+            }
+            for solver in solvers
+        },
+        "throughput_probe_case_ids": probes,
+        "warmup_samples": 5 if profile == "full" else 0,
+        "worker_counts": [1, 2, 4] if profile == "full" else [1],
+    }
+
+
+def _quick_records(*, solvers: tuple[str, ...] = ("highs", "scip", "cp_sat")) -> list[dict[str, object]]:
+    return [
+        {
+            **_benchmark_record(environment="macos", solver=solver, sample_index=0, wall_ns=100 + index),
+            "profile": "quick",
+        }
+        for index, solver in enumerate(solvers)
+    ]
+
+
+def _refresh_semantic_fingerprints(records: list[dict[str, object]]) -> None:
+    for record in records:
+        record["semantic_fingerprint"] = _record_semantic_fingerprint(record)
+
+
+def _full_records(*, solvers: tuple[str, ...] = ("highs", "scip", "cp_sat")) -> list[dict[str, object]]:
+    records = [
+        _benchmark_record(
+            environment=environment,
+            solver=solver,
+            sample_kind="warmup" if index < 5 else "warm",
+            sample_index=index if index < 5 else index - 5,
+            wall_ns=(index + 1 if index < 5 else index - 5 + 1) * (100 if environment == "macos" else 200),
+        )
+        for environment in ("macos", "linux")
+        for solver in solvers
+        for index in range(35)
+    ]
+    for environment in ("macos", "linux"):
+        for solver in solvers:
+            for worker_count in (1, 2, 4):
+                records.extend(
+                    _benchmark_record(environment=environment, solver=solver, sample_kind="throughput", sample_index=index, wall_ns=3, worker_count=worker_count)
+                    for index in range(30)
+                )
+            for sample_kind, base in (("cold", 50), ("rebuild", 70)):
+                records.extend(
+                    _benchmark_record(environment=environment, solver=solver, sample_kind=sample_kind, sample_index=index, wall_ns=base + index)
+                    for index in range(30)
+                )
+    return records
+
+
+def test_aggregate_requires_exact_five_warmups_and_thirty_measurements_per_environment() -> None:
+    summary = aggregate_benchmark_records(_full_records(), _benchmark_manifest())
+    cells = summary["solvers"]["highs"]["metrics"]["warm"]
+
+    assert [cell["environment"] for cell in cells] == ["linux", "macos"]
+    assert cells[0]["request_wall_ns"] == {"p50": 3100, "p95": 5710, "worst": 6000}
+    assert cells[1]["request_wall_ns"] == {"p50": 1550, "p95": 2855, "worst": 3000}
+    assert cells[1]["first_qualified_ns"] == {"p50": 1540, "p95": 2845, "worst": 2990}
+    assert cells[1]["optimal_ns"] == {"p50": 1545, "p95": 2850, "worst": 2995}
+    assert cells[1]["phase_timings_ns"]["backend"] == {"p50": 1544, "p95": 2849, "worst": 2994}
+    assert cells[1]["master_rounds"] == {"p50": 3, "p95": 3, "worst": 3}
+    assert cells[1]["adversary_rounds"] == {"p50": 2, "p95": 2, "worst": 2}
+    assert cells[1]["cut_count"] == {"p50": 0, "p95": 0, "worst": 0}
+    assert cells[1]["peak_process_group_rss_bytes"] == {"p50": 600, "p95": 600, "worst": 600}
+    assert cells[1]["peak_aggregate_rss_bytes"] == {"p50": 701, "p95": 701, "worst": 701}
+    assert cells[1]["objective_gap_quality"] == {"closed_samples": 0, "known_gap_samples": 30, "unknown_gap_samples": 0, "gap_units": {"p50": 2, "p95": 2, "worst": 2}}
+    assert all(isinstance(value, int | dict) and not isinstance(value, float) for cell in cells for value in cell["request_wall_ns"].values())
+
+
+def test_aggregate_keeps_exact_rational_throughput_without_pooling_environments() -> None:
+    manifest = _benchmark_manifest()
+    records = _full_records()
+
+    summary = aggregate_benchmark_records(records, manifest)
+    cells = summary["solvers"]["highs"]["metrics"]["throughput"]
+
+    assert {(cell["environment"], cell["worker_count"]) for cell in cells} == {
+        (environment, worker_count) for environment in ("macos", "linux") for worker_count in (1, 2, 4)
+    }
+    assert all(cell["requests_per_second"]["p50"] == {"numerator": 1_000_000_000, "denominator": 3} for cell in cells)
+    assert Fraction(cells[0]["requests_per_second"]["p50"]["numerator"], cells[0]["requests_per_second"]["p50"]["denominator"]) == Fraction(1_000_000_000, 3)
+
+
+@pytest.mark.parametrize("mutation", ("missing", "duplicate"))
+def test_aggregate_rejects_missing_or_duplicate_structural_samples(mutation: str) -> None:
+    records = _full_records()
+    if mutation == "missing":
+        records.pop()
+    else:
+        records.append(deepcopy(records[-1]))
+
+    with pytest.raises(ValueError, match=mutation):
+        aggregate_benchmark_records(records, _benchmark_manifest())
+
+
+@pytest.mark.parametrize(
+    "group",
+    (
+        "first_qualified_case_ids",
+        "optimal_case_ids",
+        "throughput_probe_case_ids",
+        "cold_probe_case_ids",
+        "rebuild_probe_case_ids",
+    ),
+)
+def test_aggregate_rejects_a_full_manifest_that_skips_a_mandatory_phase_or_probe_group(group: str) -> None:
+    manifest = _benchmark_manifest()
+    manifest[group] = []
+
+    with pytest.raises(ValueError, match="non-empty"):
+        aggregate_benchmark_records(_full_records(), manifest)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "reason"),
+    (
+        (lambda records, manifest: records[0].update({"check_hard_failure": True, "check_failure_reason": "FALSE_SAFE"}), "CHECK_HARD_FAILURE"),
+        (lambda records, manifest: records[0].__setitem__("cleanup_proven", False), "CLEANUP_UNPROVEN"),
+        (lambda records, manifest: records[0].__setitem__("peak_aggregate_rss_bytes", 10_001), "MEMORY_LIMIT_EXCEEDED"),
+        (lambda records, manifest: records[0].__setitem__("memory_limit_bytes", 0), "MEMORY_LIMIT_UNBOUNDED"),
+        (lambda records, manifest: manifest["solvers"]["highs"].__setitem__("run_succeeded", False), "ENVIRONMENT_EVIDENCE_FAILED"),
+        (lambda records, manifest: manifest["solvers"]["highs"].__setitem__("open_source", False), "LICENSE_EVIDENCE_FAILED"),
+        (lambda records, manifest: manifest["solvers"]["highs"].__setitem__("commercial_key_required", True), "LICENSE_EVIDENCE_FAILED"),
+    ),
+)
+def test_hard_gate_eliminates_each_unsafe_evidence_class(mutate, reason: str) -> None:
+    manifest = _benchmark_manifest(profile="quick")
+    records = _quick_records()
+    mutate(records, manifest)
+    _refresh_semantic_fingerprints(records)
+
+    summary = aggregate_benchmark_records(records, manifest)
+
+    assert reason in summary["solvers"]["highs"]["hard_gate_failures"]
+
+
+def test_hard_gate_allows_truthful_unknown_failure_but_rejects_unsafe_nonunknown_mapping() -> None:
+    manifest = _benchmark_manifest(profile="quick")
+    truthful = _quick_records()
+    truthful[0]["solver_run"].update(
+        {
+            "business_status": "UNKNOWN",
+            "classification": "UNKNOWN",
+            "solve_status": "UNKNOWN",
+            "termination_reason": "HARD_TIMEOUT",
+        }
+    )
+    unsafe = deepcopy(truthful)
+    unsafe[0]["solver_run"]["classification"] = "MEASUREMENT_ONLY"
+    unsafe[0]["solver_run"]["solve_status"] = "FEASIBLE"
+    unsafe[0]["solver_run"]["business_status"] = "QUALIFIED_FEASIBLE"
+    _refresh_semantic_fingerprints(truthful)
+    _refresh_semantic_fingerprints(unsafe)
+
+    truthful_summary = aggregate_benchmark_records(truthful, manifest)
+    unsafe_summary = aggregate_benchmark_records(unsafe, manifest)
+
+    assert "UNSAFE_FAILURE_MAPPING" not in truthful_summary["solvers"]["highs"]["hard_gate_failures"]
+    assert "UNSAFE_FAILURE_MAPPING" in unsafe_summary["solvers"]["highs"]["hard_gate_failures"]
+
+
+def test_hard_gate_detects_semantic_nondeterminism_for_repeated_case() -> None:
+    records = _full_records()
+    records[5]["solver_run"]["evidence"]["candidate"]["claimed_guaranteed_profit_units"] += 1
+    _refresh_semantic_fingerprints(records)
+
+    summary = aggregate_benchmark_records(records, _benchmark_manifest())
+
+    assert summary["solvers"]["highs"]["hard_gate_failures"] == ["SEMANTIC_NONDETERMINISM"]
+
+
+@pytest.mark.parametrize(
+    ("manifest_change", "expected_status", "expected_reason"),
+    (
+        ({"approved_case_count": 0}, "BLOCKED_REAL_CORPUS_EMPTY", "REAL_CORPUS_EMPTY"),
+        ({}, "BLOCKED_MISSING_ENVIRONMENT", "QUICK_PROFILE_NOT_SELECTION_EVIDENCE"),
+    ),
+)
+def test_recommendation_emits_blocked_decisions_before_comparison(
+    manifest_change: dict[str, object],
+    expected_status: str,
+    expected_reason: str,
+) -> None:
+    manifest = _benchmark_manifest(profile="quick")
+    manifest.update(manifest_change)
+
+    decision = aggregate_benchmark_records(_quick_records(), manifest)["decision"]
+
+    assert decision == {"status": expected_status, "reason": expected_reason, "selected_solver": None}
+
+
+def test_recommendation_uses_worst_cell_first_and_never_solver_name_for_a_tie() -> None:
+    manifest = _benchmark_manifest(profile="quick", solvers=("zeta", "alpha"))
+    tied = _quick_records(solvers=("zeta", "alpha"))
+    tied[1]["request_wall_ns"] = tied[0]["request_wall_ns"]
+    tied[1]["solver_run"]["phase_timings_ns"] = deepcopy(tied[0]["solver_run"]["phase_timings_ns"])
+
+    tie = aggregate_benchmark_records(tied, manifest)["decision"]
+    tied[0]["solver_run"]["phase_timings_ns"] = [
+        [name, value + 10 if name == "first_qualified" else value]
+        for name, value in tied[0]["solver_run"]["phase_timings_ns"]
+    ]
+    selected = aggregate_benchmark_records(tied, manifest)["decision"]
+
+    assert tie["status"] == "BLOCKED_MISSING_ENVIRONMENT"
+    assert tie["selected_solver"] is None
+    assert selected["status"] == "BLOCKED_MISSING_ENVIRONMENT"
+    assert selected["selected_solver"] is None
+
+
+def _set_first_qualified(records: list[dict[str, object]], solver: str, environment: str, value: int) -> None:
+    for record in records:
+        if record["solver_name"] == solver and record["environment"] == environment:
+            record["solver_run"]["phase_timings_ns"] = [
+                [name, value if name == "first_qualified" else timing]
+                for name, timing in record["solver_run"]["phase_timings_ns"]
+            ]
+
+
+def test_recommendation_selects_by_descending_worst_cell_vector_and_records_contributors() -> None:
+    records = _full_records()
+    _set_first_qualified(records, "highs", "macos", 100)
+    _set_first_qualified(records, "highs", "linux", 100)
+    _set_first_qualified(records, "scip", "macos", 90)
+    _set_first_qualified(records, "scip", "linux", 110)
+    next(record for record in records if record["solver_name"] == "cp_sat").update(
+        {"check_hard_failure": True, "check_failure_reason": "FALSE_SAFE"}
+    )
+    _refresh_semantic_fingerprints(records)
+
+    decision = aggregate_benchmark_records(records, _benchmark_manifest())["decision"]
+
+    assert decision["status"] == "SELECTED"
+    assert decision["selected_solver"] == "highs"
+    assert decision["decisive_stage"] == "FIRST_QUALIFIED_P95"
+    assert decision["contributing_cells"] == ["linux/case-a", "macos/case-a"]
+
+
+def test_recommendation_emits_no_survivor_and_no_decisive_winner_without_name_tiebreak() -> None:
+    tied_records = _full_records()
+    for environment in ("macos", "linux"):
+        for solver in ("highs", "scip", "cp_sat"):
+            _set_first_qualified(tied_records, solver, environment, 100)
+    tie = aggregate_benchmark_records(tied_records, _benchmark_manifest())["decision"]
+    eliminated = deepcopy(tied_records)
+    for solver in ("highs", "scip", "cp_sat"):
+        next(record for record in eliminated if record["solver_name"] == solver).update(
+            {"check_hard_failure": True, "check_failure_reason": "FALSE_SAFE"}
+        )
+    _refresh_semantic_fingerprints(eliminated)
+    no_survivor = aggregate_benchmark_records(eliminated, _benchmark_manifest())["decision"]
+
+    assert tie == {"status": "NO_DECISIVE_WINNER", "reason": "COMPLETE_TIE", "selected_solver": None}
+    assert no_survivor == {"status": "NO_SURVIVOR", "reason": "ALL_CANDIDATES_HARD_ELIMINATED", "selected_solver": None}
+
+
+def test_recommendation_blocks_when_a_full_manifest_environment_is_unavailable() -> None:
+    manifest = _benchmark_manifest()
+    manifest["environments"]["linux"]["available"] = False
+    records = [record for record in _full_records() if record["environment"] == "macos"]
+
+    decision = aggregate_benchmark_records(records, manifest)["decision"]
+
+    assert decision == {"status": "BLOCKED_MISSING_ENVIRONMENT", "reason": "MANDATORY_ENVIRONMENT_UNAVAILABLE", "selected_solver": None}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda record: record.__setitem__("semantic_fingerprint", _SHA_C),
+        lambda record: record["solver_run"].update({"classification": "CHECKED", "canonical_result": None}),
+        lambda record: record["solver_run"].update({"classification": "UNKNOWN", "solve_status": "FEASIBLE"}),
+        lambda record: record["solver_run"]["evidence"]["candidate"].__setitem__("extra", 1),
+        lambda record: record["solver_run"]["evidence"].__setitem__("cuts", [{}]),
+        lambda record: record["solver_run"]["evidence"].__setitem__("certificate", {"checker_succeeded": True}),
+    ),
+)
+def test_aggregate_rejects_unbound_or_malformed_canonical_solver_run_payloads(mutation) -> None:
+    record = _quick_records()[0]
+    record["semantic_fingerprint"] = _record_semantic_fingerprint(record)
+    mutation(record)
+
+    with pytest.raises(ValueError):
+        aggregate_benchmark_records([record, *_quick_records()[1:]], _benchmark_manifest(profile="quick"))
+
+
+def test_aggregate_refuses_to_promote_current_unbound_certificate_evidence() -> None:
+    manifest = _benchmark_manifest(profile="quick")
+    manifest["solvers"]["highs"]["whole_claim_certificate_bound"] = True
+
+    with pytest.raises(ValueError, match="unbound"):
+        aggregate_benchmark_records(_quick_records(), manifest)
+
+
+@pytest.mark.parametrize(
+    "violation",
+    (
+        "checked_axes",
+        "measurement_proof",
+        "unknown_business",
+        "missing_phase",
+        "rss_order",
+        "certificate_pair",
+        "certificate_success",
+    ),
+)
+def test_aggregate_validates_all_solver_run_invariants_used_by_the_report(violation: str) -> None:
+    records = _quick_records()
+    record = records[0]
+    run = record["solver_run"]
+    if violation == "checked_axes":
+        result = canonical_payload(load_canonical_cases()[0].expected_result)
+        run["canonical_result"] = result
+        for field in ("solve_status", "proof_status", "business_status", "optimality_status", "objective_bounds"):
+            run[field] = result[field]
+        run["classification"] = "CHECKED"
+        run["business_status"] = "NO_ARBITRAGE"
+    elif violation == "measurement_proof":
+        run["proof_status"] = "PROVEN"
+    elif violation == "unknown_business":
+        run.update({"classification": "UNKNOWN", "solve_status": "UNKNOWN"})
+    elif violation == "missing_phase":
+        run["phase_timings_ns"] = run["phase_timings_ns"][:-1]
+    elif violation == "rss_order":
+        run["peak_rss_bytes"] = record["peak_process_group_rss_bytes"] + 1
+    else:
+        run["evidence"]["certificate"] = {
+            "certificate_sha256": _SHA_A,
+            "certificate_size_bytes": 10,
+            "completed_certificate_sha256": _SHA_B,
+            "completed_certificate_size_bytes": 10 if violation == "certificate_success" else None,
+            "checker_name": "" if violation == "certificate_success" else "checker",
+            "checker_version": "1",
+            "checker_exit_code": 1 if violation == "certificate_success" else 0,
+            "checker_succeeded": violation == "certificate_success",
+            "generation_ns": 1,
+            "completion_ns": 1,
+            "check_ns": 1,
+        }
+    _refresh_semantic_fingerprints(records)
+
+    with pytest.raises(ValueError):
+        aggregate_benchmark_records(records, _benchmark_manifest(profile="quick"))
+
+
+def test_objective_gap_quality_ranks_only_all_closed_samples_as_closed() -> None:
+    cells = [
+        {
+            "case_id": "case-a",
+            "objective_gap_quality": {
+                "closed_samples": 1,
+                "known_gap_samples": 30,
+                "unknown_gap_samples": 0,
+                "gap_units": {"p50": 0, "p95": 0, "worst": 0},
+            },
+        }
+    ]
+
+    assert benchmark._gap_vector(cells, ("case-a",)) == (Fraction(1), Fraction(0))
+
+
+def test_generate_report_is_order_independent_and_verify_detects_changed_or_extra_bytes(tmp_path: Path) -> None:
+    manifest = _benchmark_manifest(profile="quick")
+    records = _quick_records()
+    manifest_path = tmp_path / "manifest.json"
+    left_jsonl = tmp_path / "left.jsonl"
+    left_tail_jsonl = tmp_path / "left-tail.jsonl"
+    right_jsonl = tmp_path / "right.jsonl"
+    right_tail_jsonl = tmp_path / "right-tail.jsonl"
+    left_output = tmp_path / "left"
+    right_output = tmp_path / "right"
+    manifest_path.write_text(json.dumps(manifest))
+    left_jsonl.write_text(json.dumps(records[0]) + "\n")
+    left_tail_jsonl.write_text("".join(json.dumps(record) + "\n" for record in records[1:]))
+    right_jsonl.write_text("".join(json.dumps(record) + "\n" for record in reversed(records[1:])))
+    right_tail_jsonl.write_text(json.dumps(records[0]) + "\n")
+
+    generate_benchmark_report([left_jsonl, left_tail_jsonl], manifest_path, left_output)
+    generate_benchmark_report([right_jsonl, right_tail_jsonl], manifest_path, right_output)
+
+    assert {path.name: path.read_bytes() for path in left_output.iterdir()} == {
+        path.name: path.read_bytes() for path in right_output.iterdir()
+    }
+    assert sorted(path.name for path in left_output.iterdir()) == ["production_envelope.json", "report.md", "summary.json"]
+    assert all(path.read_bytes().endswith(b"\n") and not path.read_bytes().endswith(b"\n\n") for path in left_output.iterdir())
+    envelope = json.loads((left_output / "production_envelope.json").read_bytes())
+    assert envelope["proof_policy"] == {
+        "benchmark_certificate_evidence": "UNBOUND_BENCHMARK_ONLY",
+        "canonical_proof": "EXACT_ORACLE_CHECKING",
+    }
+    assert envelope["selection"] == {
+        "reason": "QUICK_PROFILE_NOT_SELECTION_EVIDENCE",
+        "solver": None,
+        "status": "BLOCKED_MISSING_ENVIRONMENT",
+    }
+    assert envelope["measured_dimensions"] == {
+        "case_ids": ["case-a"],
+        "cold_probe_case_ids": [],
+        "first_qualified_case_ids": ["case-a"],
+        "measured_samples": 1,
+        "optimal_case_ids": ["case-a"],
+        "profiles": ["quick"],
+        "rebuild_probe_case_ids": [],
+        "sample_kinds": ["warm"],
+        "solvers": ["cp_sat", "highs", "scip"],
+        "throughput_probe_case_ids": [],
+        "warmup_samples": 0,
+        "worker_counts": [1],
+    }
+    verify_benchmark_report([left_jsonl, left_tail_jsonl], manifest_path, left_output)
+    (left_output / "summary.json").write_bytes((left_output / "summary.json").read_bytes() + b" ")
+    with pytest.raises(ValueError, match="summary.json"):
+        verify_benchmark_report([left_jsonl, left_tail_jsonl], manifest_path, left_output)
+    generate_benchmark_report([left_jsonl, left_tail_jsonl], manifest_path, left_output)
+    (left_output / "extra.txt").write_text("extra")
+    with pytest.raises(ValueError, match="extra"):
+        verify_benchmark_report([left_jsonl, left_tail_jsonl], manifest_path, left_output)
+    (left_output / "extra.txt").unlink()
+    (left_output / "report.md").unlink()
+    with pytest.raises(ValueError, match="missing"):
+        verify_benchmark_report([left_jsonl, left_tail_jsonl], manifest_path, left_output)
+
+
+@pytest.mark.parametrize("bad_line", ('{"schema_version":1,"schema_version":2}\n', '{"value":NaN}\n'))
+def test_generate_report_rejects_duplicate_json_keys_and_nonstandard_constants(tmp_path: Path, bad_line: str) -> None:
+    manifest_path = tmp_path / "manifest.json"
+    records_path = tmp_path / "records.jsonl"
+    manifest_path.write_text(json.dumps(_benchmark_manifest(profile="quick")))
+    records_path.write_text(bad_line)
+
+    with pytest.raises(ValueError):
+        generate_benchmark_report([records_path], manifest_path, tmp_path / "output")
+
+
+def test_generate_report_rejects_a_jsonl_line_above_the_worker_limit(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.json"
+    records_path = tmp_path / "records.jsonl"
+    manifest_path.write_text(json.dumps(_benchmark_manifest(profile="quick")))
+    records_path.write_bytes(b" " * (1024 * 1024 + 1))
+
+    with pytest.raises(ValueError, match="line limit"):
+        generate_benchmark_report([records_path], manifest_path, tmp_path / "output")
