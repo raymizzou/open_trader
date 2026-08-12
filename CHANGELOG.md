@@ -5,6 +5,15 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-12
 
+- #45 freezes Prediction Gateway `legacy`, `service`, and `maintenance` route
+  modes with in-flight drain, adds Legacy owner-off launchd rendering, and
+  records the bounded cutover/rollback script. Tasks 1–4 provide frozen
+  Legacy/Service parity and durable idempotency proof; the merge-main SHA is
+  `97c2766ce7aaf1f50efe8a2226d3d89209ded3e6`. Shell/plist/diff gates passed
+  and the exact full branch gate passed `5870 passed, 1 warning in 917.38s`.
+  Compatibility bootstrap, live cutover, deployment/restart, 8769 install, and
+  `make acceptance` have not run.
+
 - 补录 Tiger 美股历史证据缺口 XLV、PYPL 与 Phillips 港股 HK.06823
   （实时账户名称 HKT-SS）：仅改变 Account 与 Trend Report 两处真实持仓的趋势归类；
   归类优先使用规范化 Futu 标识，券商别名不覆盖已确认身份；交易、下单、模拟持仓和
