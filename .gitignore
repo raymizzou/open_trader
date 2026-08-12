@@ -1,5 +1,6 @@
 .venv/
 .benchmark-envs/
+benchmarks/prediction_solver/inbox/
 .env
 .tradingagents/
 .worktrees/

@@ -1,0 +1,12 @@
+{
+  "anonymization_salt": "issue49-approved-v1-82f7af716230",
+  "cases": [],
+  "input_gaps": [
+    {
+      "gap_id": "legacy-incomplete-terminal-model",
+      "reason": "approved legacy relations/signals/previews do not contain a complete #48 terminal model",
+      "source_alias": "legacy-approved-prediction-data"
+    }
+  ],
+  "schema_version": "open_trader.prediction_solver.approved_corpus.v1"
+}
