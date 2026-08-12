@@ -700,7 +700,19 @@ def test_dashboard_fails_closed_when_existing_execution_batch_is_invalid(
         report[key] == []
         for key in ("sell_actions", "buy_actions", "hold_actions", "review_actions")
     )
-    assert "REVISION" not in json.dumps(report, ensure_ascii=False)
+    assert report["historical_buy_plan_membership"] == (
+        {
+            "available": False,
+            "symbols": [],
+            "reason": "历史买入计划格式无效",
+        }
+        if corruption == "invalid-report"
+        else {
+            "available": True,
+            "symbols": ["US.REVISION", "US.VIXY"],
+            "reason": "",
+        }
+    )
 
 
 def relative_luminance(color: str) -> float:
