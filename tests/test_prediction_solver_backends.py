@@ -577,44 +577,6 @@ def test_fake_scip_limits_and_unknown_statuses_are_unknown(fake_pyscipopt: Simpl
     assert result.values == ()
 
 
-def test_fake_scip_formal_mode_enables_exact_and_scopes_certificate(
-    fake_pyscipopt: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    certificate = ViprCheckResult(
-        "sha256:" + "a" * 64,
-        7,
-        "sha256:" + "b" * 64,
-        9,
-        "viprchk",
-        "vipr-test",
-        0,
-        True,
-        0,
-        3,
-        5,
-        generation_ns=11,
-    )
-    monkeypatch.setattr(solver_backends, "check_vipr_certificate", lambda *_args, **_kwargs: certificate)
-
-    result = ScipBackend().solve(
-        _one_variable_model(),
-        time_limit_ms=321,
-        formal=True,
-        artifact_dir=tmp_path,
-        certificate_path="request.vipr",
-    )
-
-    instance = _FakeScipModel.instances[-1]
-    assert result.status == NativeSolveStatus.OPTIMAL
-    assert isinstance(result, solver_backends.ScipBackendResult)
-    assert result.certificate is not None and result.certificate.checker_succeeded
-    assert instance.options["exact/enable"] is True
-    assert instance.options["parallel/maxnthreads"] == 1
-    assert instance.options["randomization/randomseedshift"] == 4901
-    assert instance.options["limits/time"] == 0.321
-    assert Path(instance.options["certificate/filename"]).resolve() == (tmp_path / "request.vipr").resolve()
-
-
 def test_scip_exact_replay_does_not_interpolate_controlled_certificate_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -632,35 +594,19 @@ def test_scip_exact_replay_does_not_interpolate_controlled_certificate_path(
         "#!/usr/bin/env python3\nfrom pathlib import Path\nPath.cwd().joinpath('__scip_exact_certificate.vipr').write_bytes(b'cert')\n",
     )
     monkeypatch.setattr(solver_backends, "_scip_cli", lambda: str(cli))
-    monkeypatch.setattr(
-        solver_backends,
-        "check_vipr_certificate",
-        lambda *_args, **_kwargs: ViprCheckResult(
-            "sha256:" + "a" * 64,
-            4,
-            "sha256:" + "b" * 64,
-            4,
-            "viprchk",
-            "vipr-test",
-            0,
-            True,
-            0,
-            1,
-            1,
-        ),
-    )
+    _install_formal_tools(tmp_path, monkeypatch, _one_variable_vipr_prefix(objective=-1))
     escaped = tmp_path / "escaped.mps"
     requested = f"request.vipr\nread {escaped}\nwrite problem {escaped}"
 
     result = ScipBackend().solve(
         _one_variable_model(),
-        time_limit_ms=321,
+        time_limit_ms=5_000,
         formal=True,
         artifact_dir=tmp_path,
         certificate_path=requested,
     )
 
-    assert result.status == NativeSolveStatus.OPTIMAL
+    assert result.status == NativeSolveStatus.OPTIMAL, result
     assert (tmp_path / requested).is_file()
     assert not escaped.exists()
 
@@ -671,12 +617,182 @@ def _write_executable(path: Path, source: str) -> Path:
     return path
 
 
+def _one_variable_min_model(*, objective: int = 1) -> LinearModel:
+    return LinearModel((IntVariable("x", 0, 1),), (), LinearObjective("MIN", (("x", objective),)))
+
+
+def _one_variable_vipr_prefix(*, objective: int = 1, value: int = 1, lower: int | None = None, upper: int | None = None) -> str:
+    transformed = objective
+    if lower is None:
+        lower = transformed
+    if upper is None:
+        upper = transformed
+    return "\n".join(
+        (
+            "VER 1.0",
+            "VAR 1",
+            "t_v0",
+            "INT 1",
+            "0",
+            "OBJ min",
+            f"1 0 {transformed}",
+            "CON 2 2",
+            "B0 G 0 1 0 1",
+            "B1 L 1 1 0 1",
+            f"RTP range {lower} {upper}",
+            "SOL 1",
+            f"best 1 0 {value}",
+            "DER 0",
+            "",
+        )
+    )
+
+
+def _install_formal_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefix: str) -> None:
+    cli = _write_executable(
+        tmp_path / "scip",
+        "#!/usr/bin/env python3\nfrom pathlib import Path\n"
+        f"Path.cwd().joinpath('__scip_exact_certificate.vipr').write_text({prefix!r})\n",
+    )
+    comp = _write_executable(
+        tmp_path / "viprcomp",
+        "#!/usr/bin/env python3\nfrom pathlib import Path\nimport sys\n"
+        "source = Path(sys.argv[-1])\n"
+        "source.with_name(source.stem + '_complete' + source.suffix).write_bytes(source.read_bytes())\n",
+    )
+    chk = _write_executable(tmp_path / "viprchk", "#!/usr/bin/env python3\n")
+    monkeypatch.setattr(solver_backends, "_scip_cli", lambda: str(cli))
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    assert comp.is_file() and chk.is_file()
+
+
+def test_formal_production_path_does_not_optimize_ordinary_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class WriteOnlyModel(_FakeScipModel):
+        def writeProblem(self, filename: str, **kwargs: object) -> None:
+            Path(filename).write_bytes(b"MPS")
+
+        def optimize(self) -> None:
+            raise AssertionError("formal mode must not use ordinary optimize claim")
+
+    monkeypatch.setattr(
+        solver_backends.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(Model=WriteOnlyModel) if name == "pyscipopt" else (_ for _ in ()).throw(AssertionError(name)),
+    )
+    _install_formal_tools(tmp_path, monkeypatch, _one_variable_vipr_prefix(objective=-1))
+
+    result = ScipBackend().solve(
+        _one_variable_model(), time_limit_ms=5_000, formal=True, artifact_dir=tmp_path, certificate_path="request.vipr"
+    )
+
+    assert result.status == NativeSolveStatus.OPTIMAL
+    assert dict(result.values) == {"x": 1}
+
+
+def test_formal_mps_write_failure_is_proof_unclosed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class FailingModel(_FakeScipModel):
+        def writeProblem(self, filename: str, **kwargs: object) -> None:
+            raise OSError("MPS write failed")
+
+    monkeypatch.setattr(
+        solver_backends.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(Model=FailingModel) if name == "pyscipopt" else (_ for _ in ()).throw(AssertionError(name)),
+    )
+
+    result = ScipBackend().solve(
+        _one_variable_model(), time_limit_ms=321, formal=True, artifact_dir=tmp_path, certificate_path="request.vipr"
+    )
+
+    assert result.status == NativeSolveStatus.UNKNOWN
+    assert "PROOF_UNCLOSED" in result.native_status
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    (
+        ("#!/bin/sh\nexit 7\n", "PROOF_UNCLOSED"),
+        ("#!/bin/sh\nsleep 10\n", "PROOF_UNCLOSED"),
+    ),
+)
+def test_formal_exact_cli_nonzero_or_timeout_is_proof_unclosed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str, expected: str
+) -> None:
+    class WriteOnlyModel(_FakeScipModel):
+        def writeProblem(self, filename: str, **kwargs: object) -> None:
+            Path(filename).write_bytes(b"MPS")
+
+    monkeypatch.setattr(
+        solver_backends.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(Model=WriteOnlyModel) if name == "pyscipopt" else (_ for _ in ()).throw(AssertionError(name)),
+    )
+    cli = _write_executable(tmp_path / "scip", source)
+    monkeypatch.setattr(solver_backends, "_scip_cli", lambda: str(cli))
+    limit = 10 if "sleep" in source else 321
+
+    result = ScipBackend().solve(
+        _one_variable_model(), time_limit_ms=limit, formal=True, artifact_dir=tmp_path, certificate_path="request.vipr"
+    )
+
+    assert result.status == NativeSolveStatus.UNKNOWN
+    assert expected in result.native_status
+
+
+def test_formal_rejects_lossy_mps_certificate_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class WriteOnlyModel(_FakeScipModel):
+        def writeProblem(self, filename: str, **kwargs: object) -> None:
+            Path(filename).write_bytes(b"MPS")
+
+    monkeypatch.setattr(
+        solver_backends.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(Model=WriteOnlyModel) if name == "pyscipopt" else (_ for _ in ()).throw(AssertionError(name)),
+    )
+    _install_formal_tools(tmp_path, monkeypatch, _one_variable_vipr_prefix(objective=9007199254740990, value=1))
+
+    result = ScipBackend().solve(
+        _one_variable_model(objective=2**53),
+        time_limit_ms=321,
+        formal=True,
+        artifact_dir=tmp_path,
+        certificate_path="request.vipr",
+    )
+
+    assert result.status == NativeSolveStatus.UNKNOWN
+    assert "PROOF_UNCLOSED" in result.native_status
+
+
+def test_formal_rejects_certificate_claim_value_mismatch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class WriteOnlyModel(_FakeScipModel):
+        def writeProblem(self, filename: str, **kwargs: object) -> None:
+            Path(filename).write_bytes(b"MPS")
+
+    monkeypatch.setattr(
+        solver_backends.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(Model=WriteOnlyModel) if name == "pyscipopt" else (_ for _ in ()).throw(AssertionError(name)),
+    )
+    _install_formal_tools(tmp_path, monkeypatch, _one_variable_vipr_prefix(objective=-1, value=1, lower=0, upper=0))
+
+    result = ScipBackend().solve(
+        _one_variable_model(), time_limit_ms=321, formal=True, artifact_dir=tmp_path, certificate_path="request.vipr"
+    )
+
+    assert result.status == NativeSolveStatus.UNKNOWN
+    assert "PROOF_UNCLOSED" in result.native_status
+
+
 def test_vipr_helper_completes_and_checks_in_separate_single_threaded_processes(tmp_path: Path) -> None:
     original = tmp_path / "original.vipr"
     original.write_bytes(b"original")
     comp = _write_executable(
         tmp_path / "viprcomp",
-        "#!/usr/bin/env python3\nfrom pathlib import Path\nimport sys\nPath(sys.argv[-1]).open('ab').write(b' completed')\n",
+        "#!/usr/bin/env python3\nfrom pathlib import Path\nimport sys\n"
+        "source = Path(sys.argv[-1])\n"
+        "source.with_name(source.stem + '_complete' + source.suffix).write_bytes(source.read_bytes() + b' completed')\n",
     )
     chk = _write_executable(
         tmp_path / "viprchk",
@@ -704,7 +820,7 @@ def test_vipr_helper_missing_or_failed_checker_is_not_proof(tmp_path: Path) -> N
 
     assert result.checker_succeeded is False
     assert result.checker_exit_code == 19
-    assert result.completed_certificate_sha256 is not None
+    assert result.completed_certificate_sha256 is None
 
 
 def test_vipr_helper_maps_missing_certificate_and_checker_timeout_to_failure(tmp_path: Path) -> None:

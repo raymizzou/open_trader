@@ -7,11 +7,14 @@ module therefore imports HiGHS only when an adapter is used.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from fractions import Fraction
 import hashlib
 import importlib
 import json
 import math
 import os
+import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 import shutil
@@ -119,6 +122,7 @@ def _validate_native_precision(model: LinearModel) -> None:
 SCIP_VERSION = "10.0.2"
 PYSCIPOPT_VERSION = "6.2.1"
 VIPR_VERSION = "30f2951d1e90e47afa821bdd1b12b82246656c42"
+VIPR_MAX_CERTIFICATE_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,15 +243,10 @@ def check_vipr_certificate(
     except ValueError as exc:
         return ViprCheckResult(None, None, None, None, "viprchk", VIPR_VERSION, None, False, None, 0, 0, str(exc))
     certificate_sha256, certificate_size = _sha256_file(certificate)
-    completed = _artifact_path(root, f"{certificate.stem}.completed{certificate.suffix or '.vipr'}")
+    completed = _artifact_path(root, certificate.with_name(f"{certificate.stem}_complete{certificate.suffix or '.vipr'}"))
     completed.unlink(missing_ok=True)
-    try:
-        shutil.copyfile(certificate, completed)
-    except OSError as exc:
-        return ViprCheckResult(certificate_sha256, certificate_size, None, None, "viprchk", VIPR_VERSION, None, False, None, 0, 0, str(exc))
-
     completion_exit_code, completion_ns, completion_error = _run_vipr_process(
-        [*completion_command, "--threads=1", str(completed)], cwd=root, timeout_ms=timeout_ms
+        [*completion_command, "--threads=1", str(certificate)], cwd=root, timeout_ms=timeout_ms
     )
     if completion_error is not None or completion_exit_code != 0 or not completed.is_file():
         return ViprCheckResult(
@@ -282,6 +281,220 @@ def check_vipr_certificate(
         check_ns,
         checker_error,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _ViprClaim:
+    status: NativeSolveStatus
+    values: tuple[tuple[str, int], ...]
+    objective_value: int | None
+    objective_bound: int | None
+
+
+def _vipr_fraction(token: str) -> Fraction:
+    if re.fullmatch(r"[+-]?\d+(?:/\d+)?", token) is None:
+        raise ValueError(f"invalid VIPR rational: {token}")
+    try:
+        return Fraction(token)
+    except (ValueError, ZeroDivisionError, TypeError) as exc:
+        raise ValueError(f"invalid VIPR rational: {token}") from exc
+
+
+def _vipr_int(token: str, name: str) -> int:
+    try:
+        value = int(token)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"invalid VIPR {name}: {token}") from exc
+    return value
+
+
+def _vipr_terms(tokens: list[str], position: int, *, variable_count: int) -> tuple[dict[int, Fraction], int]:
+    if position >= len(tokens):
+        raise ValueError("VIPR coefficient list is missing")
+    count_token = tokens[position]
+    position += 1
+    if count_token == "OBJ":
+        raise ValueError("VIPR coefficient list unexpectedly aliases OBJ")
+    count = _vipr_int(count_token, "coefficient count")
+    if count < 0:
+        raise ValueError("VIPR coefficient count must be nonnegative")
+    terms: dict[int, Fraction] = {}
+    for _ in range(count):
+        if position + 1 >= len(tokens):
+            raise ValueError("VIPR coefficient pair is incomplete")
+        index = _vipr_int(tokens[position], "coefficient index")
+        value = _vipr_fraction(tokens[position + 1])
+        position += 2
+        if not 0 <= index < variable_count:
+            raise ValueError("VIPR coefficient index is out of range")
+        if index in terms:
+            raise ValueError("VIPR coefficient index is duplicated")
+        terms[index] = value
+    return terms, position
+
+
+def _vipr_row(sense: str, rhs: Fraction, terms: dict[int, Fraction]) -> tuple[str, Fraction, tuple[tuple[int, Fraction], ...]]:
+    if sense not in {"E", "L", "G"}:
+        raise ValueError(f"invalid VIPR constraint sense: {sense}")
+    return sense, rhs, tuple(sorted(terms.items()))
+
+
+def _model_vipr_rows(model: LinearModel) -> tuple[tuple[str, Fraction, tuple[tuple[int, Fraction], ...]], ...]:
+    indexes = {variable.name: index for index, variable in enumerate(model.variables)}
+    rows: list[tuple[str, Fraction, tuple[tuple[int, Fraction], ...]]] = []
+    for constraint in model.constraints:
+        terms = {indexes[name]: Fraction(coefficient) for name, coefficient in constraint.coefficients if coefficient}
+        if constraint.lower is not None:
+            rows.append(_vipr_row("G", Fraction(constraint.lower), terms))
+        if constraint.upper is not None:
+            rows.append(_vipr_row("L", Fraction(constraint.upper), terms))
+    for index, variable in enumerate(model.variables):
+        rows.append(_vipr_row("G", Fraction(variable.lower), {index: Fraction(1)}))
+        rows.append(_vipr_row("L", Fraction(variable.upper), {index: Fraction(1)}))
+    return tuple(rows)
+
+
+def _parse_vipr_claim(certificate_path: Path, model: LinearModel) -> _ViprClaim:
+    try:
+        if certificate_path.stat().st_size > VIPR_MAX_CERTIFICATE_BYTES:
+            raise ValueError("VIPR certificate exceeds the parser size limit")
+        tokens = certificate_path.read_text(encoding="ascii").split()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"VIPR certificate cannot be read: {exc}") from exc
+    position = 0
+
+    def take(name: str) -> str:
+        nonlocal position
+        if position >= len(tokens):
+            raise ValueError(f"VIPR {name} is missing")
+        token = tokens[position]
+        position += 1
+        return token
+
+    if take("version marker") != "VER" or take("version") not in {"1.0", "1.1"}:
+        raise ValueError("unsupported VIPR certificate version")
+    if take("VAR marker") != "VAR":
+        raise ValueError("VIPR VAR section is missing")
+    variable_count = _vipr_int(take("variable count"), "variable count")
+    if variable_count != len(model.variables) or variable_count < 0:
+        raise ValueError("VIPR variable count does not match the model")
+    names = tuple(take("variable name") for _ in range(variable_count))
+    if names != tuple(f"t_v{index}" for index in range(variable_count)):
+        raise ValueError("VIPR variable names do not match the internal model")
+
+    if take("INT marker") != "INT":
+        raise ValueError("VIPR INT section is missing")
+    integer_count = _vipr_int(take("integer count"), "integer count")
+    integer_indexes = tuple(_vipr_int(take("integer index"), "integer index") for _ in range(integer_count))
+    if integer_count != variable_count or tuple(sorted(integer_indexes)) != tuple(range(variable_count)):
+        raise ValueError("VIPR INT section does not mark every variable exactly once")
+
+    if take("OBJ marker") != "OBJ":
+        raise ValueError("VIPR OBJ section is missing")
+    objective_sense = take("objective sense")
+    if objective_sense != "min":
+        raise ValueError("VIPR objective sense must be min")
+    objective_terms, position = _vipr_terms(tokens, position, variable_count=variable_count)
+
+    if take("CON marker") != "CON":
+        raise ValueError("VIPR CON section is missing")
+    constraint_count = _vipr_int(take("constraint count"), "constraint count")
+    bound_count = _vipr_int(take("bound count"), "bound count")
+    if constraint_count < 0 or bound_count < 0:
+        raise ValueError("VIPR CON counts must be nonnegative")
+    certificate_rows: list[tuple[str, Fraction, tuple[tuple[int, Fraction], ...]]] = []
+    for _ in range(constraint_count):
+        take("constraint label")
+        sense = take("constraint sense")
+        rhs = _vipr_fraction(take("constraint rhs"))
+        terms, position = _vipr_terms(tokens, position, variable_count=variable_count)
+        certificate_rows.append(_vipr_row(sense, rhs, terms))
+
+    if take("RTP marker") != "RTP":
+        raise ValueError("VIPR RTP section is missing")
+    relation = take("RTP relation")
+    lower: Fraction | None = None
+    upper: Fraction | None = None
+    if relation == "infeas":
+        pass
+    elif relation == "range":
+        lower_token = take("RTP lower bound")
+        upper_token = take("RTP upper bound")
+        if lower_token != "-inf":
+            lower = _vipr_fraction(lower_token)
+        if upper_token != "inf":
+            upper = _vipr_fraction(upper_token)
+        if lower is not None and upper is not None and lower > upper:
+            raise ValueError("VIPR RTP bounds are reversed")
+    else:
+        raise ValueError(f"unsupported VIPR RTP relation: {relation}")
+
+    if take("SOL marker") != "SOL":
+        raise ValueError("VIPR SOL section is missing")
+    solution_count = _vipr_int(take("solution count"), "solution count")
+    if solution_count < 0:
+        raise ValueError("VIPR solution count must be nonnegative")
+    solutions: list[tuple[Fraction, ...]] = []
+    for _ in range(solution_count):
+        take("solution label")
+        terms, position = _vipr_terms(tokens, position, variable_count=variable_count)
+        values = [Fraction(0) for _ in range(variable_count)]
+        for index, value in terms.items():
+            if value.denominator != 1:
+                raise ValueError("VIPR solution contains a noninteger value")
+            values[index] = value
+        solutions.append(tuple(values))
+
+    if take("DER marker") != "DER":
+        raise ValueError("VIPR DER section is missing")
+    derivation_count = _vipr_int(take("derivation count"), "derivation count")
+    if derivation_count < 0:
+        raise ValueError("VIPR derivation count must be nonnegative")
+
+    indexes = {variable.name: index for index, variable in enumerate(model.variables)}
+    objective_sign = -1 if model.objective is not None and model.objective.sense == "MAX" else 1
+    expected_objective = {
+        indexes[name]: Fraction(objective_sign * coefficient)
+        for name, coefficient in (model.objective.coefficients if model.objective is not None else ())
+        if coefficient
+    }
+    if objective_terms != expected_objective:
+        raise ValueError("VIPR objective does not match the exact model")
+    expected_rows = _model_vipr_rows(model)
+    if constraint_count != len(expected_rows) or bound_count != 2 * len(model.variables):
+        raise ValueError("VIPR constraint counts do not match the exact model")
+    if Counter(certificate_rows) != Counter(expected_rows):
+        raise ValueError("VIPR constraints do not match the exact model")
+
+    if relation == "infeas":
+        if solutions:
+            raise ValueError("VIPR infeasibility claim unexpectedly includes a solution")
+        return _ViprClaim(NativeSolveStatus.INFEASIBLE, (), None, None)
+    if lower is None or upper is None or lower != upper or lower.denominator != 1:
+        raise ValueError("VIPR optimality claim must have one finite integral RTP value")
+    if not solutions:
+        raise ValueError("VIPR optimality claim has no solution")
+    target = lower
+    for values in solutions:
+        if any(value.denominator != 1 for value in values):
+            continue
+        if any(value < variable.lower or value > variable.upper for value, variable in zip(values, model.variables, strict=True)):
+            continue
+        if any(
+            not (
+                (constraint.lower is None or sum(Fraction(coefficient) * values[indexes[name]] for name, coefficient in constraint.coefficients) >= constraint.lower)
+                and (constraint.upper is None or sum(Fraction(coefficient) * values[indexes[name]] for name, coefficient in constraint.coefficients) <= constraint.upper)
+            )
+            for constraint in model.constraints
+        ):
+            continue
+        if sum(coefficient * values[index] for index, coefficient in objective_terms.items()) != target:
+            continue
+        original_value = int(target) * objective_sign if model.objective is not None else None
+        original_bound = original_value
+        named_values = tuple((variable.name, int(values[index])) for index, variable in enumerate(model.variables))
+        return _ViprClaim(NativeSolveStatus.OPTIMAL, named_values, original_value, original_bound)
+    raise ValueError("VIPR solutions do not satisfy the exact model claim")
 
 
 class HighsBackend:
@@ -410,26 +623,18 @@ class ScipBackend:
         if not isinstance(formal, bool):
             raise ValueError("formal must be a bool")
         self.certificate = None
-        if formal and artifact_dir is None:
-            return self._unknown("PROOF_UNCLOSED", 0)
         if formal:
-            try:
-                artifact_root = Path(artifact_dir).resolve()
-                artifact_root.mkdir(parents=True, exist_ok=True)
-                requested_certificate = certificate_path or f"scip-{time.time_ns()}.vipr"
-                certificate = _artifact_path(artifact_root, requested_certificate)
-                certificate.unlink(missing_ok=True)
-                generated_certificate = artifact_root / "__scip_exact_certificate.vipr"
-                generated_certificate.unlink(missing_ok=True)
-            except (OSError, ValueError) as exc:
-                return self._unknown(f"PROOF_UNCLOSED: {exc}", 0)
-        else:
-            artifact_root = certificate = generated_certificate = None
+            return self._solve_formal(
+                model,
+                time_limit_ms=time_limit_ms,
+                artifact_dir=artifact_dir,
+                certificate_path=certificate_path,
+                checker_timeout_ms=checker_timeout_ms,
+            )
 
         try:
             scip = _pyscipopt()
             solver = scip.Model()
-            formal_direct = formal and not hasattr(solver, "writeProblem")
             hide_output = getattr(solver, "hideOutput", None)
             if hide_output is not None:
                 hide_output()
@@ -438,48 +643,30 @@ class ScipBackend:
             solver.setParam("parallel/maxnthreads", 1)
             solver.setParam("randomization/randomseedshift", 4901)
             solver.setParam("limits/time", time_limit_ms / 1_000)
-            if formal_direct:
-                try:
-                    solver.setParam("exact/enable", True)
-                except Exception:
-                    solver.enableExactSolving(True)
-                solver.setParam("certificate/filename", str(certificate))
-        except Exception as exc:
-            return self._unknown(f"PROOF_UNCLOSED: {exc}" if formal else f"SCIP_UNAVAILABLE: {exc}", 0)
-
-        try:
             variable_indexes: dict[str, Any] = {}
             objective_coefficients = dict(model.objective.coefficients) if model.objective is not None else {}
             for variable in model.variables:
                 variable_indexes[variable.name] = solver.addVar(
                     name=variable.name,
                     vtype="I",
-                    lb=self._native_number(variable.lower, f"{variable.name}.lower", formal=formal),
-                    ub=self._native_number(variable.upper, f"{variable.name}.upper", formal=formal),
-                    obj=self._native_number(objective_coefficients.get(variable.name, 0), f"objective.{variable.name}", formal=formal),
+                    lb=self._native_number(variable.lower, f"{variable.name}.lower", formal=False),
+                    ub=self._native_number(variable.upper, f"{variable.name}.upper", formal=False),
+                    obj=self._native_number(objective_coefficients.get(variable.name, 0), f"objective.{variable.name}", formal=False),
                 )
             for constraint in model.constraints:
                 expression: Any = 0
                 for name, coefficient in constraint.coefficients:
-                    expression += self._native_number(coefficient, f"{constraint.name}.{name}", formal=formal) * variable_indexes[name]
+                    expression += self._native_number(coefficient, f"{constraint.name}.{name}", formal=False) * variable_indexes[name]
                 if constraint.lower is not None:
-                    solver.addCons(expression >= self._native_number(constraint.lower, f"{constraint.name}.lower", formal=formal), name=f"{constraint.name}:lower")
+                    solver.addCons(expression >= self._native_number(constraint.lower, f"{constraint.name}.lower", formal=False), name=f"{constraint.name}:lower")
                 if constraint.upper is not None:
-                    solver.addCons(expression <= self._native_number(constraint.upper, f"{constraint.name}.upper", formal=formal), name=f"{constraint.name}:upper")
+                    solver.addCons(expression <= self._native_number(constraint.upper, f"{constraint.name}.upper", formal=False), name=f"{constraint.name}:upper")
             if model.objective is not None:
-                if model.objective.sense == "MAX":
-                    solver.setMaximize()
-                else:
-                    solver.setMinimize()
-            exact_problem = None
-            if formal and not formal_direct:
-                exact_problem = _artifact_path(artifact_root, "scip-formal.mps")
-                solver.writeProblem(str(exact_problem), verbose=False)
-        except (KeyError, TypeError, ValueError, UnsafeSolverResult) as exc:
-            return self._unknown(f"INVALID_INTEGER: {exc}", 0)
+                solver.setMaximize() if model.objective.sense == "MAX" else solver.setMinimize()
+        except Exception as exc:
+            return self._unknown(f"SCIP_UNAVAILABLE: {exc}", 0)
 
         started_ns = time.perf_counter_ns()
-        generation_started_ns = started_ns if formal else None
         try:
             solver.optimize()
             solve_ns = max(1, time.perf_counter_ns() - started_ns)
@@ -494,7 +681,7 @@ class ScipBackend:
             try:
                 solution = solver.getBestSol()
                 if solution is None:
-                    result = self._unknown("PROOF_UNCLOSED" if formal else native_status, solve_ns)
+                    result = self._unknown(native_status, solve_ns)
                 else:
                     values = tuple(
                         (variable.name, _integer_value(solver.getSolVal(solution, variable_indexes[variable.name]), f"value for {variable.name}"))
@@ -516,88 +703,140 @@ class ScipBackend:
                 result = self._unknown(f"INVALID_INTEGER: {exc}", solve_ns)
         else:
             result = self._unknown(native_status, solve_ns)
+        validate_backend_result(model, result)
+        return result
 
-        if formal and exact_problem is not None:
-            binary = _scip_cli()
-            if binary is None:
-                return self._unknown("PROOF_UNCLOSED: SCIP CLI is unavailable", solve_ns)
-            exact_exit_code, exact_ns, exact_error = _run_vipr_process(
-                [
-                    binary,
-                    "-c",
-                    "set display verblevel 0",
-                    "-c",
-                    "set parallel maxnthreads 1",
-                    "-c",
-                    "set randomization randomseedshift 4901",
-                    "-c",
-                    f"set limits time {time_limit_ms / 1_000}",
-                    "-c",
-                    "set exact enable TRUE",
-                    "-c",
-                    "set certificate filename __scip_exact_certificate.vipr",
-                    "-c",
-                    f"read {exact_problem}",
-                    "-c",
-                    "optimize",
-                    "-c",
-                    "quit",
-                ],
-                cwd=artifact_root,
-                timeout_ms=time_limit_ms,
-            )
-            generation_ns = max(1, exact_ns)
-            if exact_error is not None or exact_exit_code != 0 or not generated_certificate.is_file() or generated_certificate.stat().st_size == 0:
-                return self._unknown("PROOF_UNCLOSED", solve_ns)
-            if generated_certificate != certificate:
-                try:
-                    certificate.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(generated_certificate, certificate)
-                except OSError as exc:
-                    return self._unknown(f"PROOF_UNCLOSED: {exc}", solve_ns)
-        elif formal:
-            generation_ns = max(1, time.perf_counter_ns() - (generation_started_ns or started_ns))
-            certificate_result = (
-                check_vipr_certificate(
-                    certificate,
-                    artifact_root,
-                    timeout_ms=checker_timeout_ms,
+    def _solve_formal(
+        self,
+        model: LinearModel,
+        *,
+        time_limit_ms: int,
+        artifact_dir: str | os.PathLike[str] | None,
+        certificate_path: str | os.PathLike[str] | None,
+        checker_timeout_ms: int,
+    ) -> ScipBackendResult:
+        if artifact_dir is None:
+            return self._unknown("PROOF_UNCLOSED", 0)
+        try:
+            artifact_root = Path(artifact_dir).resolve()
+            artifact_root.mkdir(parents=True, exist_ok=True)
+            requested_certificate = certificate_path or f"scip-{time.time_ns()}.vipr"
+            certificate = _artifact_path(artifact_root, requested_certificate)
+            certificate.unlink(missing_ok=True)
+            generated_certificate = _artifact_path(artifact_root, "__scip_exact_certificate.vipr")
+            generated_certificate.unlink(missing_ok=True)
+            exact_problem = _artifact_path(artifact_root, "scip-formal.mps")
+        except (OSError, TypeError, ValueError) as exc:
+            return self._unknown(f"PROOF_UNCLOSED: {exc}", 0)
+
+        started_ns = time.perf_counter_ns()
+        try:
+            scip = _pyscipopt()
+            solver = scip.Model()
+            hide_output = getattr(solver, "hideOutput", None)
+            if hide_output is not None:
+                hide_output()
+            else:
+                solver.setParam("display/verblevel", 0)
+            solver.setParam("parallel/maxnthreads", 1)
+            solver.setParam("randomization/randomseedshift", 4901)
+            solver.setParam("limits/time", time_limit_ms / 1_000)
+            variable_indexes: dict[str, Any] = {}
+            objective_coefficients = dict(model.objective.coefficients) if model.objective is not None else {}
+            for index, variable in enumerate(model.variables):
+                internal_name = f"v{index}"
+                variable_indexes[variable.name] = solver.addVar(
+                    name=internal_name,
+                    vtype="I",
+                    lb=self._native_number(variable.lower, f"{variable.name}.lower", formal=True),
+                    ub=self._native_number(variable.upper, f"{variable.name}.upper", formal=True),
+                    obj=self._native_number(objective_coefficients.get(variable.name, 0), f"objective.{variable.name}", formal=True),
                 )
-                if result.status in {NativeSolveStatus.OPTIMAL, NativeSolveStatus.INFEASIBLE}
-                else None
-            )
-            if certificate_result is not None:
-                certificate_result = replace(certificate_result, generation_ns=generation_ns)
-            self.certificate = certificate_result
-            if certificate_result is None or not certificate_result.checker_succeeded:
-                result = self._unknown("PROOF_UNCLOSED", solve_ns, certificate=certificate_result)
-            elif isinstance(result, ScipBackendResult):
-                result = ScipBackendResult(
-                    result.status,
-                    result.values,
-                    result.objective_value,
-                    result.objective_bound,
-                    result.native_status,
-                    result.solve_ns,
-                    certificate_result,
-                )
-        if formal and exact_problem is not None:
+            for constraint_index, constraint in enumerate(model.constraints):
+                expression: Any = 0
+                for name, coefficient in constraint.coefficients:
+                    expression += self._native_number(coefficient, f"{constraint.name}.{name}", formal=True) * variable_indexes[name]
+                if constraint.lower is not None:
+                    solver.addCons(expression >= self._native_number(constraint.lower, f"{constraint.name}.lower", formal=True), name=f"c{constraint_index}:lower")
+                if constraint.upper is not None:
+                    solver.addCons(expression <= self._native_number(constraint.upper, f"{constraint.name}.upper", formal=True), name=f"c{constraint_index}:upper")
+            if model.objective is not None:
+                solver.setMaximize() if model.objective.sense == "MAX" else solver.setMinimize()
+            solver.writeProblem(str(exact_problem), verbose=False)
+        except Exception as exc:
+            return self._unknown(f"PROOF_UNCLOSED: {exc}", max(1, time.perf_counter_ns() - started_ns))
+
+        binary = _scip_cli()
+        if binary is None:
+            return self._unknown("PROOF_UNCLOSED: SCIP CLI is unavailable", max(1, time.perf_counter_ns() - started_ns))
+        try:
+            binary = _validate_executable_path(binary, artifact_root)
+        except ValueError as exc:
+            return self._unknown(f"PROOF_UNCLOSED: {exc}", max(1, time.perf_counter_ns() - started_ns))
+        exact_exit_code, exact_ns, exact_error = _run_vipr_process(
+            [
+                binary,
+                "-c",
+                "set display verblevel 0",
+                "-c",
+                "set parallel maxnthreads 1",
+                "-c",
+                "set randomization randomseedshift 4901",
+                "-c",
+                f"set limits time {time_limit_ms / 1_000}",
+                "-c",
+                "set exact enable TRUE",
+                "-c",
+                "set certificate filename __scip_exact_certificate.vipr",
+                "-c",
+                "read scip-formal.mps",
+                "-c",
+                "optimize",
+                "-c",
+                "quit",
+            ],
+            cwd=artifact_root,
+            timeout_ms=time_limit_ms,
+        )
+        generation_ns = max(1, exact_ns)
+        try:
+            generated_certificate_ready = generated_certificate.is_file() and generated_certificate.stat().st_size > 0
+        except OSError as exc:
+            return self._unknown(f"PROOF_UNCLOSED: {exc}", generation_ns)
+        if exact_error is not None or exact_exit_code != 0 or not generated_certificate_ready:
+            return self._unknown("PROOF_UNCLOSED", generation_ns)
+        try:
+            certificate.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(generated_certificate, certificate)
+        except OSError as exc:
+            return self._unknown(f"PROOF_UNCLOSED: {exc}", generation_ns)
+
+        try:
             certificate_result = check_vipr_certificate(certificate, artifact_root, timeout_ms=checker_timeout_ms)
             certificate_result = replace(certificate_result, generation_ns=generation_ns)
-            self.certificate = certificate_result
-            if not certificate_result.checker_succeeded:
-                result = self._unknown("PROOF_UNCLOSED", solve_ns, certificate=certificate_result)
-            else:
-                result = ScipBackendResult(
-                    result.status,
-                    result.values,
-                    result.objective_value,
-                    result.objective_bound,
-                    result.native_status,
-                    result.solve_ns,
-                    certificate_result,
-                )
-        validate_backend_result(model, result)
+        except Exception as exc:
+            return self._unknown(f"PROOF_UNCLOSED: {exc}", generation_ns)
+        self.certificate = certificate_result
+        if not certificate_result.checker_succeeded:
+            return self._unknown("PROOF_UNCLOSED", generation_ns, certificate=certificate_result)
+        completed = _artifact_path(artifact_root, certificate.with_name(f"{certificate.stem}_complete{certificate.suffix or '.vipr'}"))
+        try:
+            claim = _parse_vipr_claim(completed, model)
+        except Exception as exc:
+            return self._unknown(f"PROOF_UNCLOSED: {exc}", generation_ns, certificate=certificate_result)
+        result = ScipBackendResult(
+            claim.status,
+            claim.values,
+            claim.objective_value,
+            claim.objective_bound,
+            f"VIPR_CERTIFICATE:{claim.status.value}",
+            generation_ns,
+            certificate_result,
+        )
+        try:
+            validate_backend_result(model, result)
+        except Exception as exc:
+            return self._unknown(f"PROOF_UNCLOSED: {exc}", generation_ns, certificate=certificate_result)
         return result
 
 
@@ -629,7 +868,7 @@ def _self_check(solver_name: str) -> None:
             result = ScipBackend().solve(model, time_limit_ms=10_000, formal=True, artifact_dir=artifact_dir)
             if result.status != NativeSolveStatus.OPTIMAL or not isinstance(result, ScipBackendResult) or result.certificate is None or not result.certificate.checker_succeeded:
                 raise RuntimeError(f"SCIP exact/VIPR self-check failed: {result}")
-            completed_files = list(Path(artifact_dir).glob("*.completed.vipr"))
+            completed_files = list(Path(artifact_dir).glob("*_complete.vipr"))
             if len(completed_files) != 1:
                 raise RuntimeError(f"SCIP exact/VIPR self-check missing completed certificate: {completed_files}")
             completed_files[0].write_bytes(b"corrupt")
@@ -640,7 +879,11 @@ def _self_check(solver_name: str) -> None:
             )
             if corrupt_exit_code == 0 or corrupt_error is not None:
                 raise RuntimeError(f"SCIP exact/VIPR corrupt-certificate self-check unexpectedly passed: {corrupt_exit_code}, {corrupt_error}")
-        print(json.dumps({"adapter": "ScipBackend", "solver": "SCIP+VIPR", "version": SCIP_VERSION, "status": result.status.value, "certificate_sha256": result.certificate.certificate_sha256, "certificate_size_bytes": result.certificate.certificate_size_bytes, "completed_certificate_sha256": result.certificate.completed_certificate_sha256, "completed_certificate_size_bytes": result.certificate.completed_certificate_size_bytes, "generation_ns": result.certificate.generation_ns, "completion_ns": result.certificate.completion_ns, "check_ns": result.certificate.check_ns, "corrupt_checker_exit_code": corrupt_exit_code, "corrupt_check_ns": corrupt_check_ns}))
+            lossy_model = LinearModel((IntVariable("x", 0, 1),), (), LinearObjective("MAX", (("x", 2**53),)))
+            lossy = ScipBackend().solve(lossy_model, time_limit_ms=10_000, formal=True, artifact_dir=artifact_dir, certificate_path="lossy.vipr")
+            if lossy.status != NativeSolveStatus.UNKNOWN or "PROOF_UNCLOSED" not in lossy.native_status:
+                raise RuntimeError(f"SCIP exact/VIPR lossy-MPS self-check unexpectedly passed: {lossy}")
+        print(json.dumps({"adapter": "ScipBackend", "solver": "SCIP+VIPR", "version": SCIP_VERSION, "status": result.status.value, "certificate_sha256": result.certificate.certificate_sha256, "certificate_size_bytes": result.certificate.certificate_size_bytes, "completed_certificate_sha256": result.certificate.completed_certificate_sha256, "completed_certificate_size_bytes": result.certificate.completed_certificate_size_bytes, "generation_ns": result.certificate.generation_ns, "completion_ns": result.certificate.completion_ns, "check_ns": result.certificate.check_ns, "corrupt_checker_exit_code": corrupt_exit_code, "corrupt_check_ns": corrupt_check_ns, "lossy_status": lossy.status.value, "lossy_native_status": lossy.native_status}))
         return
     if solver_name != "highs":
         raise ValueError(f"unsupported self-check solver: {solver_name}")
