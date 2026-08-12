@@ -3,16 +3,27 @@ from __future__ import annotations
 from contextlib import contextmanager
 import json
 from pathlib import Path
+import sqlite3
 import threading
 from typing import Iterator
 import urllib.error
 import urllib.request
 
+import pytest
+
 from open_trader.dashboard_web import create_dashboard_server
 from open_trader.frontend_gateway import FrontendGatewayConfig, create_frontend_gateway
+from open_trader.prediction_arbitrage_execution import PredictionExecutionService
+from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_service import create_prediction_server
 from tests.test_dashboard import dashboard_config
-from tests.test_prediction_arbitrage_execution import execution_fixture, wait_until_terminal
+from tests.test_prediction_arbitrage_execution import (
+    ChannelNotifier,
+    CompositeTestNotifier,
+    FakeTrading,
+    execution_fixture,
+    wait_until_terminal,
+)
 
 
 class _Store:
@@ -177,6 +188,33 @@ def _serve(server: object) -> Iterator[str]:
         thread.join(timeout=5)
 
 
+def _record_requests(
+    server: object, handler_name: str, requests: list[dict[str, object]]
+) -> None:
+    handler = server.RequestHandlerClass  # type: ignore[attr-defined]
+
+    class RecordingHandler(handler):
+        def _record(self) -> None:
+            requests.append(
+                {
+                    "handler": handler_name,
+                    "method": self.command,
+                    "path": self.path,
+                    "headers": dict(self.headers.items()),
+                }
+            )
+
+        def do_GET(self) -> None:
+            self._record()
+            super().do_GET()
+
+        def do_POST(self) -> None:
+            self._record()
+            super().do_POST()
+
+    server.RequestHandlerClass = RecordingHandler  # type: ignore[attr-defined]
+
+
 @contextmanager
 def _gateway_contract_stack(
     tmp_path: Path,
@@ -184,7 +222,7 @@ def _gateway_contract_stack(
     store: object | None = None,
     monitor: object | None = None,
     execution: object | None = None,
-) -> Iterator[tuple[str, Path]]:
+) -> Iterator[tuple[str, dict[str, object]]]:
     store = store or _Store()
     monitor = monitor or _Monitor()
     execution = execution or _Execution()
@@ -209,6 +247,12 @@ def _gateway_contract_stack(
         csrf_token="csrf-token",
         runtime_metadata={"git_sha": "abc123"},
     )
+    upstream_requests: dict[str, list[dict[str, object]]] = {
+        "legacy": [],
+        "service": [],
+    }
+    _record_requests(legacy, "legacy", upstream_requests["legacy"])
+    _record_requests(service, "service", upstream_requests["service"])
     route = tmp_path / "prediction-route.json"
     route.write_text(
         json.dumps(
@@ -235,7 +279,12 @@ def _gateway_contract_stack(
             port=0,
         )
         with _serve(gateway) as gateway_base:
-            yield gateway_base, route
+            yield gateway_base, {
+                "route": route,
+                "requests": upstream_requests,
+                "origins": {"legacy": legacy_base, "service": service_base},
+                "runtime": runtime,
+            }
 
 
 @contextmanager
@@ -282,15 +331,18 @@ def _post(
     payload: dict[str, object],
     *,
     csrf_token: str = "csrf-token",
+    session_token: str = "session-token",
     origin: str | None = None,
+    referer: str | None = None,
 ) -> urllib.request.Request:
     return urllib.request.Request(
         base + path,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            "Cookie": "ot_prediction_session=session-token",
+            "Cookie": f"ot_prediction_session={session_token}",
             "Origin": origin or base,
+            **({"Referer": referer} if referer is not None else {}),
             "X-CSRF-Token": csrf_token,
         },
         method="POST",
@@ -303,17 +355,80 @@ def _gateway_post(
     payload: dict[str, object],
     *,
     csrf_token: str = "csrf-token",
+    session_token: str = "session-token",
+    origin: str = "http://127.0.0.1:8766",
 ) -> urllib.request.Request:
     return _post(
         base,
         path,
         payload,
         csrf_token=csrf_token,
-        origin="http://127.0.0.1:8766",
+        session_token=session_token,
+        origin=origin,
+        referer=origin + "/prediction",
     )
 
 
-def _contract_observations(base: str) -> dict[str, tuple[int, object]]:
+def _strict_equal(actual: object, expected: object, path: str = "$") -> None:
+    assert type(actual) is type(expected), (path, type(actual), type(expected))
+    if isinstance(expected, dict):
+        assert isinstance(actual, dict)
+        assert set(actual) == set(expected), path
+        for key in expected:
+            _strict_equal(actual[key], expected[key], f"{path}.{key}")
+    elif isinstance(expected, list):
+        assert isinstance(actual, list)
+        assert len(actual) == len(expected), path
+        for index, value in enumerate(expected):
+            _strict_equal(actual[index], value, f"{path}[{index}]")
+    else:
+        assert actual == expected, path
+
+
+def test_strict_contract_comparison_rejects_bool_as_int() -> None:
+    with pytest.raises(AssertionError):
+        _strict_equal({"nested": [True]}, {"nested": [1]})
+
+
+def _durable_snapshot(store: PredictionArbitrageStore) -> dict[str, object]:
+    executions = store.histories("executions")
+    with sqlite3.connect(store.path) as connection:
+        table_counts = {
+            table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            for table in ("executions", "execution_legs", "incidents", "control_events")
+        }
+        mode_transitions = connection.execute(
+            "SELECT count(*) FROM control_events WHERE action='set_validation_mode'"
+        ).fetchone()[0]
+    return {
+        "executions": executions,
+        "table_counts": table_counts,
+        "evidence_count": sum(len(item["evidence"]) for item in executions),
+        "validation_mode": store.get_validation_mode(),
+        "mode_transitions": mode_transitions,
+    }
+
+
+def _response_observation(
+    request: str | urllib.request.Request,
+) -> tuple[int, dict[str, object], object]:
+    try:
+        status, headers, payload = _json_response(request)
+    except urllib.error.HTTPError as error:
+        status = error.code
+        headers = error.headers
+        payload = json.loads(error.read().decode("utf-8"))
+    return (
+        status,
+        {
+            "content-type": headers.get("Content-Type"),
+            "set-cookie": headers.get_all("Set-Cookie", []),
+        },
+        payload,
+    )
+
+
+def _contract_observations(base: str) -> dict[str, tuple[int, dict[str, object], object]]:
     requests: tuple[tuple[str, str | urllib.request.Request], ...] = (
         ("state", base + "/api/prediction-arbitrage/state"),
         (
@@ -347,23 +462,6 @@ def _contract_observations(base: str) -> dict[str, tuple[int, object]]:
             for path, payload, _expected in CONTROL_CASES
         ),
         (
-            "execution_retry",
-            _gateway_post(
-                base,
-                "/api/prediction-arbitrage/executions",
-                {"preview_id": "preview-1", "idempotency_key": "key-1"},
-            ),
-        ),
-        (
-            "security_error",
-            _gateway_post(
-                base,
-                "/api/prediction-arbitrage/preview",
-                {"opportunity_id": "opp-1"},
-                csrf_token="wrong",
-            ),
-        ),
-        (
             "schema_error",
             _gateway_post(
                 base,
@@ -372,22 +470,33 @@ def _contract_observations(base: str) -> dict[str, tuple[int, object]]:
             ),
         ),
     )
-    observed: dict[str, tuple[int, object]] = {}
+    observed: dict[str, tuple[int, dict[str, object], object]] = {}
     for name, request in requests:
-        try:
-            status, _headers, payload = _json_response(request)
-        except urllib.error.HTTPError as error:
-            status = error.code
-            payload = json.loads(error.read().decode("utf-8"))
-        observed[name] = status, payload
+        observed[name] = _response_observation(request)
     return observed
 
 
 def test_gateway_preserves_the_frozen_prediction_contract_across_cutover(
     tmp_path: Path,
 ) -> None:
-    with _gateway_contract_stack(tmp_path) as (base, route):
+    matrix_paths = [
+        "/api/prediction-arbitrage/state",
+        "/api/prediction-arbitrage/history?kind=signals&limit=20&offset=0",
+        "/api/prediction-arbitrage/history?kind=executions&limit=20&offset=0",
+        "/api/prediction-arbitrage/preview",
+        "/api/prediction-arbitrage/executions",
+        *(path for path, _payload, _expected in CONTROL_CASES),
+    ]
+    with _gateway_contract_stack(tmp_path) as (base, stack):
+        route = stack["route"]
+        upstream_requests = stack["requests"]
         legacy = _contract_observations(base)
+        assert upstream_requests["service"] == []
+        legacy_requests = list(upstream_requests["legacy"])
+        assert [request["handler"] for request in legacy_requests] == [
+            "legacy"
+        ] * len(legacy_requests)
+        assert [request["path"] for request in legacy_requests[:9]] == matrix_paths
         route.write_text(
             json.dumps(
                 {
@@ -400,20 +509,93 @@ def test_gateway_preserves_the_frozen_prediction_contract_across_cutover(
             encoding="utf-8",
         )
         service = _contract_observations(base)
+        assert upstream_requests["legacy"] == legacy_requests
+        service_requests = upstream_requests["service"]
+        assert [request["handler"] for request in service_requests] == [
+            "service"
+        ] * len(service_requests)
+        assert [request["path"] for request in service_requests[:9]] == matrix_paths
 
-    assert service == legacy
-    assert {name: status for name, (status, _body) in service.items()} == {
+        for handler_name, requests in (
+            ("legacy", legacy_requests),
+            ("service", service_requests),
+        ):
+            target_origin = stack["origins"][handler_name]
+            for request in requests:
+                if request["method"] != "POST":
+                    continue
+                headers = request["headers"]
+                assert headers["Cookie"] == "ot_prediction_session=session-token"
+                assert headers["X-Csrf-Token"] == "csrf-token"
+                assert headers["Origin"] == target_origin
+                assert headers["Referer"] == target_origin + "/prediction"
+
+        security: dict[str, dict[str, tuple[int, dict[str, object], object]]] = {}
+        for route_mode in ("legacy", "service"):
+            route.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "open_trader.frontend_gateway.prediction_route.v1",
+                        "mode": route_mode,
+                        "operation_id": "security-parity",
+                        "updated_at": "2026-08-12T00:02:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            security[route_mode] = {
+                "wrong_session": _response_observation(
+                    _gateway_post(
+                        base,
+                        "/api/prediction-arbitrage/preview",
+                        {"opportunity_id": "opp-1"},
+                        session_token="wrong",
+                    )
+                ),
+                "wrong_csrf": _response_observation(
+                    _gateway_post(
+                        base,
+                        "/api/prediction-arbitrage/preview",
+                        {"opportunity_id": "opp-1"},
+                        csrf_token="wrong",
+                    )
+                ),
+            }
+        before_wrong_origin = {
+            name: len(requests) for name, requests in upstream_requests.items()
+        }
+        wrong_origin = _response_observation(
+            _gateway_post(
+                base,
+                "/api/prediction-arbitrage/preview",
+                {"opportunity_id": "opp-1"},
+                origin="https://attacker.example",
+            )
+        )
+
+    _strict_equal(service, legacy)
+    assert {name: result[0] for name, result in service.items()} == {
         "state": 200,
         "signal_history": 200,
         "execution_history": 200,
         "preview": 200,
         "execution": 200,
         **{path: 200 for path, _payload, _expected in CONTROL_CASES},
-        "execution_retry": 200,
-        "security_error": 403,
         "schema_error": 400,
     }
-    assert service["signal_history"][1] == {
+    assert all(
+        result[1]["content-type"] == "application/json; charset=utf-8"
+        for result in service.values()
+    )
+    assert service["state"][1]["set-cookie"] == [
+        "ot_prediction_session=session-token; SameSite=Strict; HttpOnly; Path=/"
+    ]
+    assert all(
+        result[1]["set-cookie"] == []
+        for name, result in service.items()
+        if name != "state"
+    )
+    assert service["signal_history"][2] == {
         "kind": "signals",
         "items": [],
         "total": 0,
@@ -421,7 +603,7 @@ def test_gateway_preserves_the_frozen_prediction_contract_across_cutover(
         "offset": 0,
         "has_more": False,
     }
-    assert service["execution_history"][1] == {
+    assert service["execution_history"][2] == {
         "kind": "executions",
         "items": [],
         "total": 0,
@@ -429,11 +611,48 @@ def test_gateway_preserves_the_frozen_prediction_contract_across_cutover(
         "offset": 0,
         "has_more": False,
     }
-    assert service["execution_retry"] == service["execution"]
-    for name in ("security_error", "schema_error"):
-        error_text = json.dumps(service[name][1])
-        assert "session-token" not in error_text
-        assert "Traceback" not in error_text
+    assert service["schema_error"][2] == {
+        "status": "error",
+        "error_type": "ValueError",
+        "message": "prediction request fields are invalid",
+    }
+    assert "api_secret" not in service["preview"][2]
+    _strict_equal(security["service"], security["legacy"])
+    assert security["service"]["wrong_session"] == (
+        403,
+        {"content-type": "application/json; charset=utf-8", "set-cookie": []},
+        {
+            "status": "error",
+            "error_type": "PermissionError",
+            "message": "prediction session is invalid",
+        },
+    )
+    assert security["service"]["wrong_csrf"] == (
+        403,
+        {"content-type": "application/json; charset=utf-8", "set-cookie": []},
+        {
+            "status": "error",
+            "error_type": "PermissionError",
+            "message": "prediction CSRF token is invalid",
+        },
+    )
+    assert wrong_origin == (
+        403,
+        {"content-type": "application/json; charset=utf-8", "set-cookie": []},
+        {
+            "schema_version": "open_trader.frontend_gateway.error.v1",
+            "code": "untrusted_origin",
+            "message": "Origin is not trusted",
+        },
+    )
+    assert {
+        name: len(requests) for name, requests in upstream_requests.items()
+    } == before_wrong_origin
+    for result in (*service.values(), *security["service"].values(), wrong_origin):
+        text = json.dumps(result[2])
+        assert "session-token" not in text
+        assert "must-not-escape" not in text
+        assert "Traceback" not in text
 
 
 def test_gateway_cutover_reuses_one_durable_execution_without_duplicate_audit(
@@ -448,7 +667,8 @@ def test_gateway_cutover_reuses_one_durable_execution_without_duplicate_audit(
         store=store,
         monitor=monitor,
         execution=execution,
-    ) as (base, route):
+    ) as (base, stack):
+        route = stack["route"]
         _status, _headers, preview = _json_response(
             _gateway_post(
                 base,
@@ -460,7 +680,10 @@ def test_gateway_cutover_reuses_one_durable_execution_without_duplicate_audit(
         first_status, _headers, first = _json_response(
             _gateway_post(base, "/api/prediction-arbitrage/executions", request_body)
         )
-        wait_until_terminal(execution, str(first["execution_id"]))
+        terminal = wait_until_terminal(execution, str(first["execution_id"]))
+        assert terminal["state"] == "both_rejected"
+        before_restart = _durable_snapshot(store)
+        assert trading.batch_calls == 1
 
         route.write_text(
             json.dumps(
@@ -484,6 +707,21 @@ def test_gateway_cutover_reuses_one_durable_execution_without_duplicate_audit(
             except urllib.error.HTTPError as error:
                 maintenance_statuses.append(error.code)
 
+        restarted_store = PredictionArbitrageStore(store.data_dir)
+        restarted_trading = FakeTrading(result="both_rejected")
+        restarted_execution = PredictionExecutionService(
+            store=restarted_store,
+            monitor=monitor,
+            trading=restarted_trading,
+            notifier=CompositeTestNotifier(
+                ChannelNotifier("macos"), ChannelNotifier("feishu")
+            ),
+            lock_path=tmp_path / "execution.lock",
+        )
+        assert restarted_execution.reconcile_startup()["state"] == "ready"
+        stack["runtime"].store = restarted_store
+        stack["runtime"].execution = restarted_execution
+
         route.write_text(
             json.dumps(
                 {
@@ -503,7 +741,7 @@ def test_gateway_cutover_reuses_one_durable_execution_without_duplicate_audit(
             + "/api/prediction-arbitrage/history?kind=executions&limit=20&offset=0"
         )
 
-    executions = store.histories("executions")
+    after_restart = _durable_snapshot(restarted_store)
     assert first_status == retry_status == 200
     assert maintenance_statuses == [503, 503]
     assert retry["execution_id"] == first["execution_id"]
@@ -512,10 +750,15 @@ def test_gateway_cutover_reuses_one_durable_execution_without_duplicate_audit(
     assert [item["execution_id"] for item in history["items"]] == [
         first["execution_id"]
     ]
-    assert len(executions) == 1
-    assert executions[0]["idempotency_key"] == "cutover-request"
-    assert trading.batch_calls == 1
-    assert store.get_validation_mode() == "observe_only"
+    assert before_restart == after_restart
+    assert after_restart["table_counts"] == {
+        "executions": 1,
+        "execution_legs": 2,
+        "incidents": 0,
+        "control_events": 0,
+    }
+    assert after_restart["executions"][0]["idempotency_key"] == "cutover-request"
+    assert restarted_trading.batch_calls == 0
 
 
 def test_legacy_prediction_http_surface_matches_contract_v1(tmp_path: Path) -> None:
