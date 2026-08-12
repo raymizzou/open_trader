@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -14,8 +15,10 @@ from open_trader.prediction_solver import (
     LinearModel,
     LinearObjective,
     NativeSolveStatus,
+    UnsafeSolverResult,
     validate_backend_result,
 )
+import open_trader.prediction_solver_backends as solver_backends
 from open_trader.prediction_solver_backends import HighsBackend
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -175,42 +178,212 @@ def test_highs_reports_infeasible_model_without_an_incumbent(highs_backend: High
     validate_backend_result(model, result)
 
 
-def _timed_knapsack(size: int) -> LinearModel:
-    weights = tuple(1 + (index * 37) % 97 for index in range(size))
-    values = tuple(1 + (index * 53) % 101 for index in range(size))
-    return LinearModel(
-        variables=tuple(IntVariable(f"x:{index}", 0, 1) for index in range(size)),
-        constraints=(
-            LinearConstraint(
-                "capacity",
-                tuple((f"x:{index}", weight) for index, weight in enumerate(weights)),
-                None,
-                sum(weights) // 3,
-            ),
-        ),
-        objective=LinearObjective("MAX", tuple((f"x:{index}", value) for index, value in enumerate(values))),
+class _FakeModelStatus:
+    OPTIMAL = "optimal"
+    INFEASIBLE = "infeasible"
+    TIME_LIMIT = "time_limit"
+    OTHER = "other"
+
+
+class _FakeHighs:
+    model_status = _FakeModelStatus.OTHER
+    solution = SimpleNamespace(value_valid=False, col_value=())
+    info = SimpleNamespace(mip_dual_bound=0.0)
+    instances: list["_FakeHighs"] = []
+
+    def __init__(self) -> None:
+        self.options: dict[str, object] = {}
+        self.variables: list[dict[str, object]] = []
+        self.rows: list[tuple[object, ...]] = []
+        self.objective_sense: str | None = None
+        type(self).instances.append(self)
+
+    def setOptionValue(self, name: str, value: object) -> None:
+        self.options[name] = value
+
+    def addVariable(self, **kwargs: object) -> None:
+        self.variables.append(kwargs)
+
+    def addRow(self, *args: object) -> None:
+        self.rows.append(args)
+
+    def setMaximize(self) -> None:
+        self.objective_sense = "MAX"
+
+    def setMinimize(self) -> None:
+        self.objective_sense = "MIN"
+
+    def run(self) -> str:
+        return "ok"
+
+    def getModelStatus(self) -> str:
+        return type(self).model_status
+
+    def modelStatusToString(self, status: str) -> str:
+        return status
+
+    def getSolution(self) -> SimpleNamespace:
+        return type(self).solution
+
+    def getInfo(self) -> SimpleNamespace:
+        return type(self).info
+
+
+@pytest.fixture
+def fake_highspy(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    _FakeHighs.instances.clear()
+    module = SimpleNamespace(
+        Highs=_FakeHighs,
+        HighsVarType=SimpleNamespace(kInteger="integer"),
+        HighsModelStatus=SimpleNamespace(kOptimal=_FakeModelStatus.OPTIMAL, kInfeasible=_FakeModelStatus.INFEASIBLE),
+        kHighsInf=1e100,
     )
+    monkeypatch.setattr(solver_backends.importlib, "import_module", lambda name: module)
+    return module
 
 
-def test_highs_keeps_a_time_limit_incumbent_feasible(highs_backend: HighsBackend) -> None:
-    result = highs_backend.solve(_timed_knapsack(150), time_limit_ms=5)
-
-    assert result.native_status == "Time limit reached"
-    assert result.status == NativeSolveStatus.FEASIBLE
-    assert result.values
-    assert result.status != NativeSolveStatus.OPTIMAL
-    validate_backend_result(_timed_knapsack(150), result)
+def _one_variable_model(*, objective: int = 1) -> LinearModel:
+    return LinearModel((IntVariable("x", 0, 1),), (), LinearObjective("MAX", (("x", objective),)))
 
 
-def test_highs_reports_a_time_limit_without_an_incumbent_as_unknown(highs_backend: HighsBackend) -> None:
-    model = _timed_knapsack(250)
-    result = highs_backend.solve(model, time_limit_ms=5)
+def test_fake_highs_sets_deterministic_options_and_translates_max_model(fake_highspy: SimpleNamespace) -> None:
+    _FakeHighs.model_status = _FakeModelStatus.OPTIMAL
+    model = LinearModel(
+        variables=(IntVariable("x", 0, 10), IntVariable("y", 0, 10)),
+        constraints=(LinearConstraint("capacity", (("x", 1), ("y", 1)), None, 7),),
+        objective=LinearObjective("MAX", (("x", 3), ("y", 1))),
+    )
+    _FakeHighs.solution = SimpleNamespace(value_valid=True, col_value=(7.0, 0.0))
+    _FakeHighs.info = SimpleNamespace(mip_dual_bound=21.0)
 
-    assert result.native_status == "Time limit reached"
-    assert result.status == NativeSolveStatus.UNKNOWN
-    assert result.values == ()
-    assert result.objective_value is None
+    result = HighsBackend().solve(model, time_limit_ms=321)
+
+    instance = _FakeHighs.instances[-1]
+    assert result.status == NativeSolveStatus.OPTIMAL
+    assert dict(result.values) == {"x": 7, "y": 0}
+    assert result.objective_value == 21
+    assert instance.options == {
+        "output_flag": False,
+        "log_to_console": False,
+        "threads": 1,
+        "random_seed": 4901,
+        "time_limit": 0.321,
+    }
+    assert instance.objective_sense == "MAX"
+    assert [variable["type"] for variable in instance.variables] == ["integer", "integer"]
     validate_backend_result(model, result)
+
+
+def test_fake_highs_translates_minimize_objective(fake_highspy: SimpleNamespace) -> None:
+    model = LinearModel(
+        variables=(IntVariable("x", 0, 10), IntVariable("y", 0, 10)),
+        constraints=(LinearConstraint("minimum", (("x", 1), ("y", 1)), 7, None),),
+        objective=LinearObjective("MIN", (("x", 2), ("y", 1))),
+    )
+    _FakeHighs.model_status = _FakeModelStatus.OPTIMAL
+    _FakeHighs.solution = SimpleNamespace(value_valid=True, col_value=(0.0, 7.0))
+    _FakeHighs.info = SimpleNamespace(mip_dual_bound=7.0)
+
+    result = HighsBackend().solve(model, time_limit_ms=1)
+
+    assert result.status == NativeSolveStatus.OPTIMAL
+    assert result.objective_value == 7
+    assert _FakeHighs.instances[-1].objective_sense == "MIN"
+
+
+def test_fake_highs_maps_minimize_and_native_states(fake_highspy: SimpleNamespace) -> None:
+    model = _one_variable_model()
+    cases = (
+        (_FakeModelStatus.OPTIMAL, True, NativeSolveStatus.OPTIMAL),
+        (_FakeModelStatus.INFEASIBLE, False, NativeSolveStatus.INFEASIBLE),
+        (_FakeModelStatus.TIME_LIMIT, True, NativeSolveStatus.FEASIBLE),
+        (_FakeModelStatus.TIME_LIMIT, False, NativeSolveStatus.UNKNOWN),
+        (_FakeModelStatus.OTHER, True, NativeSolveStatus.FEASIBLE),
+        (_FakeModelStatus.OTHER, False, NativeSolveStatus.UNKNOWN),
+    )
+    for native_status, value_valid, expected in cases:
+        _FakeHighs.model_status = native_status
+        _FakeHighs.solution = SimpleNamespace(value_valid=value_valid, col_value=(1.0,) if value_valid else ())
+        _FakeHighs.info = SimpleNamespace(mip_dual_bound=1.0)
+
+        result = HighsBackend().solve(model, time_limit_ms=1)
+
+        assert result.status == expected
+        if expected in {NativeSolveStatus.FEASIBLE, NativeSolveStatus.OPTIMAL}:
+            assert result.values == (("x", 1),)
+        else:
+            assert result.values == ()
+
+
+def test_fake_highs_accepts_only_native_values_within_one_integer(fake_highspy: SimpleNamespace) -> None:
+    model = _one_variable_model()
+    _FakeHighs.model_status = _FakeModelStatus.OTHER
+    _FakeHighs.info = SimpleNamespace(mip_dual_bound=0.0)
+
+    _FakeHighs.solution = SimpleNamespace(value_valid=True, col_value=(1.0000005,))
+    assert HighsBackend().solve(model, time_limit_ms=1).values == (("x", 1),)
+
+    _FakeHighs.solution = SimpleNamespace(value_valid=True, col_value=(1.000002,))
+    with pytest.raises(UnsafeSolverResult, match="non-integral"):
+        HighsBackend().solve(model, time_limit_ms=1)
+
+
+def test_fake_highs_rejects_native_solution_that_breaks_parent_row(fake_highspy: SimpleNamespace) -> None:
+    model = LinearModel(
+        variables=(IntVariable("x", 0, 1),),
+        constraints=(LinearConstraint("cap", (("x", 1),), None, 0),),
+        objective=LinearObjective("MAX", (("x", 1),)),
+    )
+    _FakeHighs.model_status = _FakeModelStatus.TIME_LIMIT
+    _FakeHighs.solution = SimpleNamespace(value_valid=True, col_value=(1.0,))
+    _FakeHighs.info = SimpleNamespace(mip_dual_bound=1.0)
+
+    with pytest.raises(UnsafeSolverResult, match="constraint violated: cap"):
+        HighsBackend().solve(model, time_limit_ms=1)
+
+
+def test_fake_highs_rounds_only_near_integer_objective_bounds(fake_highspy: SimpleNamespace) -> None:
+    model = _one_variable_model()
+    _FakeHighs.model_status = _FakeModelStatus.TIME_LIMIT
+    _FakeHighs.solution = SimpleNamespace(value_valid=False, col_value=())
+
+    _FakeHighs.info = SimpleNamespace(mip_dual_bound=4.0000005)
+    assert HighsBackend().solve(model, time_limit_ms=1).objective_bound == 4
+
+    _FakeHighs.info = SimpleNamespace(mip_dual_bound=4.000002)
+    assert HighsBackend().solve(model, time_limit_ms=1).objective_bound is None
+
+
+@pytest.mark.parametrize(
+    "model",
+    (
+        LinearModel((IntVariable("x", 0, 2**53 + 1),), (), None),
+        LinearModel((IntVariable("x", 0, 1),), (LinearConstraint("row", (("x", 2**53 + 1),), None, None),), None),
+        LinearModel((IntVariable("x", 0, 1),), (LinearConstraint("row", (("x", 1),), 2**53 + 1, None),), None),
+        LinearModel((IntVariable("x", 0, 1),), (LinearConstraint("row", (("x", 1),), None, 2**53 + 1),), None),
+        _one_variable_model(objective=2**53 + 1),
+    ),
+)
+def test_fake_highs_rejects_int64_values_that_double_cannot_represent(
+    fake_highspy: SimpleNamespace, model: LinearModel
+) -> None:
+    _FakeHighs.model_status = _FakeModelStatus.INFEASIBLE
+    _FakeHighs.solution = SimpleNamespace(value_valid=False, col_value=())
+    _FakeHighs.info = SimpleNamespace(mip_dual_bound=0.0)
+    with pytest.raises(UnsafeSolverResult, match="cannot represent"):
+        HighsBackend().solve(model, time_limit_ms=1)
+    assert _FakeHighs.instances == []
+
+
+def test_fake_highs_accepts_the_exact_double_boundary(fake_highspy: SimpleNamespace) -> None:
+    _FakeHighs.model_status = _FakeModelStatus.OPTIMAL
+    _FakeHighs.solution = SimpleNamespace(value_valid=True, col_value=(1.0,))
+    _FakeHighs.info = SimpleNamespace(mip_dual_bound=float(2**53))
+
+    result = HighsBackend().solve(_one_variable_model(objective=2**53), time_limit_ms=1)
+
+    assert result.status == NativeSolveStatus.OPTIMAL
+    assert result.objective_value == 2**53
 
 
 def test_highs_backend_exposes_pinned_solver_identity_without_candidate_imports() -> None:

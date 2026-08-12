@@ -57,6 +57,29 @@ def _optional_integer_value(value: object, name: str) -> int | None:
     return int(rounded)
 
 
+def _native_integer(value: int, name: str) -> float:
+    number = float(value)
+    if number != value:
+        raise UnsafeSolverResult(f"HiGHS cannot represent {name} exactly")
+    return number
+
+
+def _validate_native_precision(model: LinearModel) -> None:
+    for variable in model.variables:
+        _native_integer(variable.lower, f"{variable.name}.lower")
+        _native_integer(variable.upper, f"{variable.name}.upper")
+    for constraint in model.constraints:
+        for name, coefficient in constraint.coefficients:
+            _native_integer(coefficient, f"{constraint.name}.{name}")
+        if constraint.lower is not None:
+            _native_integer(constraint.lower, f"{constraint.name}.lower")
+        if constraint.upper is not None:
+            _native_integer(constraint.upper, f"{constraint.name}.upper")
+    if model.objective is not None:
+        for name, coefficient in model.objective.coefficients:
+            _native_integer(coefficient, f"objective.{name}")
+
+
 class HighsBackend:
     """Thin translation layer from the benchmark integer IR to HiGHS."""
 
@@ -65,6 +88,7 @@ class HighsBackend:
 
     def solve(self, model: LinearModel, *, time_limit_ms: int) -> BackendResult:
         validate_linear_model(model)
+        _validate_native_precision(model)
         if isinstance(time_limit_ms, bool) or not isinstance(time_limit_ms, int) or time_limit_ms <= 0:
             raise ValueError("time_limit_ms must be a positive integer")
 
@@ -80,9 +104,9 @@ class HighsBackend:
         objective_coefficients = dict(model.objective.coefficients) if model.objective is not None else {}
         for index, variable in enumerate(model.variables):
             solver.addVariable(
-                lb=variable.lower,
-                ub=variable.upper,
-                obj=objective_coefficients.get(variable.name, 0),
+                lb=_native_integer(variable.lower, f"{variable.name}.lower"),
+                ub=_native_integer(variable.upper, f"{variable.name}.upper"),
+                obj=_native_integer(objective_coefficients.get(variable.name, 0), f"objective.{variable.name}"),
                 type=highs.HighsVarType.kInteger,
                 name=variable.name,
             )
@@ -91,9 +115,9 @@ class HighsBackend:
         infinity = getattr(highs, "kHighsInf", float("inf"))
         for constraint in model.constraints:
             indices = [variable_indexes[name] for name, _ in constraint.coefficients]
-            coefficients = [coefficient for _, coefficient in constraint.coefficients]
-            lower = -infinity if constraint.lower is None else constraint.lower
-            upper = infinity if constraint.upper is None else constraint.upper
+            coefficients = [_native_integer(coefficient, f"{constraint.name}.{name}") for name, coefficient in constraint.coefficients]
+            lower = -infinity if constraint.lower is None else _native_integer(constraint.lower, f"{constraint.name}.lower")
+            upper = infinity if constraint.upper is None else _native_integer(constraint.upper, f"{constraint.name}.upper")
             solver.addRow(lower, upper, len(indices), indices, coefficients)
 
         if model.objective is not None:
@@ -149,11 +173,14 @@ def _self_check(solver_name: str) -> None:
     from open_trader.prediction_solver import IntVariable, LinearObjective
 
     backend = HighsBackend()
+    native_version = str(_highspy().Highs().version())
+    if native_version != backend.version:
+        raise RuntimeError(f"HiGHS version mismatch: expected {backend.version}, got {native_version}")
     model = LinearModel((IntVariable("x", 0, 1),), (), LinearObjective("MAX", (("x", 1),)))
     result = backend.solve(model, time_limit_ms=1_000)
     if result.status != NativeSolveStatus.OPTIMAL or dict(result.values) != {"x": 1}:
         raise RuntimeError(f"HiGHS self-check failed: {result}")
-    print(json.dumps({"adapter": "HighsBackend", "solver": "highspy", "version": backend.version, "status": result.status.value}))
+    print(json.dumps({"adapter": "HighsBackend", "solver": "highspy", "version": native_version, "status": result.status.value}))
 
 
 def main() -> None:
