@@ -64,6 +64,9 @@ def _run_installer(
         (ACCOUNT_LABEL, 4104),
     ):
         (state_dir / label).write_text(f"{pid}\n", encoding="utf-8")
+    listener_state = tmp_path / "listener-state"
+    listener_state.mkdir()
+    (listener_state / "8768").write_text("4104\n", encoding="utf-8")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
 
@@ -78,12 +81,20 @@ job_pid() {
     com.open-trader.dashboard) echo 4101 ;;
     com.open-trader.frontend-gateway) echo 4102 ;;
     com.open-trader.legacy-dashboard) echo 4103 ;;
-    com.open-trader.account-api) echo 4104 ;;
+    com.open-trader.account-api) echo 5104 ;;
+  esac
+}
+job_port() {
+  case "$1" in
+    com.open-trader.dashboard|com.open-trader.frontend-gateway) echo 8766 ;;
+    com.open-trader.legacy-dashboard) echo 8767 ;;
+    com.open-trader.account-api) echo 8768 ;;
   esac
 }
 if [[ "$1" == "bootout" ]]; then
   if [[ "$label" != "${FAKE_STUCK_LABEL:-}" ]]; then
     rm -f "$FAKE_LAUNCHD_STATE_DIR/$label"
+    rm -f "$FAKE_LISTENER_STATE_DIR/$(job_port "$label")"
   fi
   exit 0
 fi
@@ -92,7 +103,9 @@ if [[ "$1" == "bootstrap" ]]; then
   if [[ "$label" == "com.open-trader.frontend-gateway" && "${FAKE_FAIL_GATEWAY_BOOTSTRAP:-0}" == "1" ]]; then
     exit 5
   fi
-  job_pid "$label" > "$FAKE_LAUNCHD_STATE_DIR/$label"
+  pid="$(job_pid "$label")"
+  printf '%s\n' "$pid" > "$FAKE_LAUNCHD_STATE_DIR/$label"
+  printf '%s\n' "$pid" > "$FAKE_LISTENER_STATE_DIR/$(job_port "$label")"
   exit 0
 fi
 if [[ "$1" == "print" ]]; then
@@ -113,7 +126,7 @@ echo "lsof $*" >> "$FAKE_CALLS"
 case "$*" in
   *tiTCP:8766*) [[ -n "${FAKE_8766_PID:-4101}" ]] && echo "${FAKE_8766_PID:-4101}" ;;
   *tiTCP:8767*) [[ -n "${FAKE_8767_PID:-}" ]] && echo "$FAKE_8767_PID" ;;
-  *tiTCP:8768*) [[ -n "${FAKE_8768_PID:-4104}" ]] && echo "${FAKE_8768_PID:-4104}" ;;
+  *tiTCP:8768*) [[ -f "$FAKE_LISTENER_STATE_DIR/8768" ]] && cat "$FAKE_LISTENER_STATE_DIR/8768" ;;
 esac
 """,
     )
@@ -185,11 +198,13 @@ exit 0
         for label in (SINGLE_LABEL, GATEWAY_LABEL, ACCOUNT_LABEL):
             shutil.copy2(agents / f"{label}.plist", snapshots / f"{label}.plist")
             shutil.copy2(state_dir / label, snapshots / label)
+        shutil.copy2(listener_state / "8768", snapshots / "port-8768")
 
     env = {
         **os.environ,
         "FAKE_CALLS": str(calls_path),
         "FAKE_LAUNCHD_STATE_DIR": str(state_dir),
+        "FAKE_LISTENER_STATE_DIR": str(listener_state),
         "LAUNCHCTL_BIN": str(launchctl),
         "LSOF_BIN": str(lsof),
         "CURL_BIN": str(curl),
@@ -309,6 +324,7 @@ def test_legacy_only_disables_prediction_owner_without_touching_gateway_or_singl
     legacy = plistlib.loads((agents / f"{LEGACY_LABEL}.plist").read_bytes())
     legacy_args = legacy["ProgramArguments"]
     snapshots = tmp_path / "legacy-nonlegacy-snapshots"
+    listener_state = tmp_path / "listener-state"
 
     assert result.returncode == 0
     assert legacy_args[legacy_args.index("--prediction-config") + 2 :][:2] == [
@@ -340,6 +356,10 @@ def test_legacy_only_disables_prediction_owner_without_touching_gateway_or_singl
         assert (tmp_path / "launchd-state" / label).read_bytes() == (
             snapshots / label
         ).read_bytes()
+    assert (listener_state / "8768").read_bytes() == (
+        snapshots / "port-8768"
+    ).read_bytes()
+    assert (listener_state / "8768").read_text(encoding="utf-8") == "4104\n"
 
 
 def test_legacy_prediction_owner_defaults_enabled(tmp_path: Path) -> None:
