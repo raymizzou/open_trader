@@ -310,7 +310,9 @@ def validate_linear_model(model: LinearModel) -> None:
     if model.objective is not None:
         if not isinstance(model.objective, LinearObjective) or model.objective.sense not in {"MAX", "MIN"}:
             raise ValueError("objective must use MAX or MIN")
-        _validate_terms("objective", model.objective.coefficients, variables)
+        terms = _validate_terms("objective", model.objective.coefficients, variables)
+        if not _expression_activity_fits_int64(terms, variables):
+            raise ValueError("possible objective activity exceeds signed int64")
 
 
 def validate_backend_result(model: LinearModel, result: BackendResult) -> None:
@@ -363,14 +365,18 @@ def _validate_row(name: str, coefficients: object, lower: int | None, upper: int
     _optional_int64(upper, f"{name}.upper")
     if lower is not None and upper is not None and lower > upper:
         raise ValueError(f"constraint lower bound exceeds upper bound: {name}")
+    if not _expression_activity_fits_int64(terms, variables):
+        raise ValueError(f"possible row activity exceeds signed int64: {name}")
+
+
+def _expression_activity_fits_int64(terms: tuple[tuple[str, int], ...], variables: dict[str, IntVariable]) -> bool:
     minimum = 0
     maximum = 0
     for variable_name, coefficient in terms:
         variable = variables[variable_name]
         minimum += coefficient * (variable.lower if coefficient >= 0 else variable.upper)
         maximum += coefficient * (variable.upper if coefficient >= 0 else variable.lower)
-    if not INT64_MIN <= minimum <= INT64_MAX or not INT64_MIN <= maximum <= INT64_MAX:
-        raise ValueError(f"possible row activity exceeds signed int64: {name}")
+    return INT64_MIN <= minimum <= INT64_MAX and INT64_MIN <= maximum <= INT64_MAX
 
 
 def _validate_terms(owner: str, coefficients: object, variables: dict[str, IntVariable]) -> tuple[tuple[str, int], ...]:

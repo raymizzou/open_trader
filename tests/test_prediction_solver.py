@@ -80,6 +80,30 @@ def test_linear_model_rejects_unsafe_integer_ir(model: LinearModel, reason: str)
         validate_linear_model(model)
 
 
+def test_linear_model_rejects_possible_objective_activity_outside_int64() -> None:
+    model = LinearModel(
+        variables=(IntVariable("lots", 2, INT64_MAX),),
+        constraints=(),
+        objective=LinearObjective("MAX", (("lots", 2),)),
+    )
+
+    with pytest.raises(ValueError, match="possible objective activity exceeds signed int64"):
+        validate_linear_model(model)
+
+
+def test_linear_model_rejects_duplicate_constraint_names() -> None:
+    model = replace(
+        valid_linear_model(),
+        constraints=(
+            LinearConstraint("budget", (("lots", 1),), None, 4),
+            LinearConstraint("budget", (("reserve", 1),), -2, 3),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="duplicate constraint name"):
+        validate_linear_model(model)
+
+
 def test_linear_model_canonicalizes_coefficient_order_for_fingerprint() -> None:
     model = valid_linear_model()
     shuffled = replace(
