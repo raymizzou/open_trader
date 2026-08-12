@@ -24,6 +24,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
   无关，主要为 legacy fixture 缺失和 sandbox 禁止 localhost socket bind/browser process。
   未改 Prediction runtime、Dashboard、solver dependency 或 order path。
 
+- 将 Open Trader 以 Apache License 2.0 正式开放许可，并在 README 与 Python 包元数据中
+  发布相同的 SPDX 标识；运行代码、交易流程、后台服务与数据均未改变。已核对许可证官方
+  原文、包元数据解析与 Git 差异；本次不涉及行为或 Dashboard acceptance。
+
 - 完成通用 N_LEG Prediction 套利设计与开发 Ticket 契约收敛：热路径接受任一已验证合格
   连通组合而不等待全局最优，组件级负证明仅接受预算内完整 Oracle 或可独立检查证书；
   Entry/Repair 部分成交风险、OBSERVE_ONLY、Episode 重武装、scope Canary 与一次切换边界
