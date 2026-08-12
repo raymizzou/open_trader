@@ -22,7 +22,12 @@ The split appears in both existing real-position surfaces:
 
 ## Membership Rule
 
-A current real position belongs to `趋势持仓` when its normalized market and symbol appeared in a formal `BUY` action in any historical trend-report artifact for that broker. Every other current real position belongs to `非趋势持仓`.
+A current real position belongs to `趋势持仓` when either:
+
+1. its normalized market and symbol appeared in a formal `BUY` action in any historical trend-report artifact for that broker; or
+2. it appears in the source-controlled historical-evidence gap allowlist below.
+
+Every other current real position belongs to `非趋势持仓`.
 
 This rule is deliberately based on historical buy-plan membership, not on:
 
@@ -33,9 +38,19 @@ This rule is deliberately based on historical buy-plan membership, not on:
 
 Membership is permanent historical provenance. A symbol remains a trend symbol after it is sold, and is classified as trend again if it later reappears in the real account. If personal shares are added to the same broker position, the complete aggregated row remains in `趋势持仓`; quantities are never split.
 
+### Historical-evidence gap allowlist
+
+The allowlist is a narrow operator assertion for strategy positions whose original formal `BUY` artifact was not retained. It is keyed by broker and market so it cannot leak across accounts:
+
+```text
+Tiger / US: AMZN, CRNX, GRMN, KO, LH, NUE, REGN
+```
+
+These seven symbols are unioned with Tiger's historical formal-`BUY` membership after the same US symbol normalization. The allowlist is not inferred from current `HOLD` decisions, candidate rows, account holdings, or report presence, and it does not create a Dashboard editing UI or a general override system. Future additions require an explicit source change and regression-test update.
+
 ## Historical Projection
 
-The Dashboard backend scans only the existing report directory selected by `TREND_REPORT_SOURCES`. It reuses the existing formal-action projection and symbol normalization. For each broker it publishes one small read-only contract on the broker's trend-report payload:
+The Dashboard backend scans only the existing report directory selected by `TREND_REPORT_SOURCES`. It reuses the existing formal-action projection and symbol normalization, then unions the broker/market-specific source-controlled allowlist. For each broker it publishes one small read-only contract on the broker's trend-report payload:
 
 ```json
 {
@@ -64,6 +79,8 @@ Classification must fail closed. A broker's membership contract is unavailable w
 
 The contract then contains `available: false`, an empty `symbols` array, and a short `reason`.
 
+The allowlist does not turn an unreadable history into an available history. If historical scanning fails, the existing unavailable contract and single-table fallback remain in force so the UI never silently treats all non-allowlisted positions as non-trend.
+
 When membership is unavailable, neither UI guesses that every row is non-trend. Both surfaces keep their existing single real-holdings table and show `历史买入计划归属暂不可用，未执行分组`. An available history with zero formal buys is distinct: both sections render normally and all current rows appear under `非趋势持仓`.
 
 ## UI Behavior
@@ -90,6 +107,9 @@ Focused backend tests prove:
 - `BUY` membership without requiring a fill;
 - permanent membership after later non-buy reports;
 - unavailable versus valid-empty history.
+- Tiger/US allowlist membership is added without a formal `BUY` artifact;
+- the allowlist does not affect another broker or market;
+- an unavailable historical scan still uses the unavailable contract rather than a partial allowlist result.
 
 Focused Dashboard JavaScript tests prove:
 
@@ -110,4 +130,4 @@ Final review readiness still requires `make acceptance` to return `PASS`. After 
 - Renaming `非趋势持仓` to `被趋势持仓`
 - Changing account totals, statement reconciliation, trading behavior, or order ownership
 - Changing simulated holdings or report history navigation
-- Adding a manual classification override
+- Adding a Dashboard editor or general-purpose manual classification override
