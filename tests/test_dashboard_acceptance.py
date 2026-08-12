@@ -7974,9 +7974,25 @@ def test_acceptance_returns_retryable_account_snapshot_503(
 
     assert dashboard_acceptance._fetch_account_snapshot("http://account.test") == (
         503,
-        payload,
+        None,
         None,
     )
+
+
+def test_acceptance_reraises_non_503_account_snapshot_http_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failed(request: dashboard_acceptance.Request, **_kwargs: object) -> object:
+        raise dashboard_acceptance.HTTPError(
+            request.full_url, 502, "Bad Gateway", {}, None
+        )
+
+    monkeypatch.setattr(dashboard_acceptance, "urlopen", failed)
+
+    with pytest.raises(dashboard_acceptance.HTTPError) as raised:
+        dashboard_acceptance._fetch_account_snapshot("http://account.test")
+
+    assert raised.value.code == 502
 
 
 def test_acceptance_requires_non_account_legacy_payload_and_quotes_404(
