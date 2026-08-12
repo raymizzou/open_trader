@@ -1418,6 +1418,79 @@ def _set_first_qualified(records: list[dict[str, object]], solver: str, environm
             ]
 
 
+def _set_unknown_timeout(record: dict[str, object]) -> None:
+    run = record["solver_run"]
+    run.update(
+        {
+            "business_status": "UNKNOWN",
+            "classification": "UNKNOWN",
+            "evidence": None,
+            "objective_bounds": {
+                "closed": False,
+                "gap_units": None,
+                "lower_bound_units": None,
+                "upper_bound_units": None,
+            },
+            "optimality_status": "NOT_APPLICABLE",
+            "solve_status": "UNKNOWN",
+            "termination_reason": "HARD_TIMEOUT",
+        }
+    )
+    run["phase_timings_ns"] = [[name, 0] for name, _ in run["phase_timings_ns"]]
+
+
+@pytest.mark.parametrize(
+    "unknown_environments",
+    (("macos",), ("macos", "linux")),
+    ids=("mixed-achieved-and-unachieved", "all-unachieved"),
+)
+def test_recommendation_ranks_phase_nonachievement_before_zero_timing(
+    unknown_environments: tuple[str, ...],
+) -> None:
+    records = _full_records()
+    for record in records:
+        if record["solver_name"] == "highs" and record["environment"] in unknown_environments:
+            _set_unknown_timeout(record)
+    _refresh_semantic_fingerprints(records)
+
+    summary = aggregate_benchmark_records(records, _benchmark_manifest())
+
+    assert summary["decision"]["selected_solver"] != "highs"
+    assert summary["solvers"]["highs"]["hard_gate_failures"] == []
+    for cell in summary["solvers"]["highs"]["metrics"]["warm"]:
+        unachieved = 30 if cell["environment"] in unknown_environments else 0
+        quality = cell["first_qualified_quality"]
+        assert quality["achieved_samples"] == 30 - unachieved
+        assert quality["unachieved_samples"] == unachieved
+        if unachieved == 30:
+            assert quality["timing_ns"] is None
+
+
+def test_recommendation_ignores_phase_timing_when_every_solver_is_unachieved() -> None:
+    records = _full_records()
+    raw_phase_values = {"highs": 0, "scip": 10, "cp_sat": 20}
+    for record in records:
+        _set_unknown_timeout(record)
+        record["solver_run"]["phase_timings_ns"] = [
+            [name, raw_phase_values[record["solver_name"]] if name in {"first_qualified", "optimal"} else value]
+            for name, value in record["solver_run"]["phase_timings_ns"]
+        ]
+    _refresh_semantic_fingerprints(records)
+
+    summary = aggregate_benchmark_records(records, _benchmark_manifest())
+
+    assert summary["decision"] == {
+        "status": "NO_DECISIVE_WINNER",
+        "reason": "COMPLETE_TIE",
+        "selected_solver": None,
+    }
+    assert all(
+        cell["first_qualified_quality"]["timing_ns"] is None
+        for solver in summary["solvers"].values()
+        for cell in solver["metrics"]["warm"]
+    )
+
+
 def test_recommendation_selects_by_descending_worst_cell_vector_and_records_contributors() -> None:
     records = _full_records()
     _set_first_qualified(records, "highs", "macos", 100)
@@ -1601,6 +1674,47 @@ def test_aggregate_rejects_contradictory_or_unbound_solver_claim_fields(violatio
     _refresh_semantic_fingerprints(records)
 
     with pytest.raises(ValueError):
+        aggregate_benchmark_records(records, _benchmark_manifest(profile="quick"))
+
+
+def test_aggregate_rejects_coherent_solver_claim_values_outside_signed_int64() -> None:
+    records = _quick_records()
+    run = records[0]["solver_run"]
+    evidence = run["evidence"]
+    huge = 2**100
+    bounds = {
+        "closed": False,
+        "gap_units": 2 * huge,
+        "lower_bound_units": huge,
+        "upper_bound_units": 3 * huge,
+    }
+    run["objective_bounds"] = deepcopy(bounds)
+    evidence.update(
+        {
+            "candidate": {
+                "claimed_guaranteed_profit_units": huge,
+                "quantities": [{"action_id": "a", "quantity_lots": huge}],
+            },
+            "cost_upper_bound_units": huge,
+            "cuts": [
+                {
+                    "cut_id": "cut-1",
+                    "payout_per_lot": [
+                        {"action_id": "a", "payout_lower_bound_per_lot_units": huge}
+                    ],
+                    "scenario": {
+                        "atoms": [{"atom_id": "yes", "market_contract_id": "a"}]
+                    },
+                }
+            ],
+            "guaranteed_profit_units": huge,
+            "objective_bounds": deepcopy(bounds),
+            "payout_lower_bound_units": 2 * huge,
+        }
+    )
+    _refresh_semantic_fingerprints(records)
+
+    with pytest.raises(ValueError, match="signed 64-bit"):
         aggregate_benchmark_records(records, _benchmark_manifest(profile="quick"))
 
 

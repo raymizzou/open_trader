@@ -54,7 +54,14 @@ from open_trader.prediction_n_leg_oracle import (
     solve_optimal,
     split_disconnected_solution,
 )
-from open_trader.prediction_solver import BENCHMARK_PROTOCOL_V1, BenchmarkClassification, SolverEvidence, TerminationReason
+from open_trader.prediction_solver import (
+    BENCHMARK_PROTOCOL_V1,
+    INT64_MAX,
+    INT64_MIN,
+    BenchmarkClassification,
+    SolverEvidence,
+    TerminationReason,
+)
 
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -536,7 +543,7 @@ def _validated_evidence_payload(payload: object) -> dict[str, object]:
     _objective_bounds_payload(value["objective_bounds"])
     for field in ("payout_lower_bound_units", "cost_upper_bound_units", "guaranteed_profit_units"):
         if value[field] is not None:
-            _integer(value[field], field)
+            _signed_int64(value[field], field)
     if value["conservative_capital_release_at"] is not None:
         _utc_z(value["conservative_capital_release_at"], "conservative_capital_release_at")
     for field in ("fixed_portfolio_closed", "global_search_closed"):
@@ -556,16 +563,17 @@ def _validated_evidence_payload(payload: object) -> dict[str, object]:
         for payout in cut_value["payout_per_lot"]:
             payout_value = _strict_object(payout, "cut payout", {"action_id", "payout_lower_bound_per_lot_units"})
             _text(payout_value["action_id"], "action_id")
-            _integer(payout_value["payout_lower_bound_per_lot_units"], "payout_lower_bound_per_lot_units")
+            _signed_int64(payout_value["payout_lower_bound_per_lot_units"], "payout_lower_bound_per_lot_units")
     if value["candidate"] is not None:
         candidate = _strict_object(value["candidate"], "candidate", {"quantities", "claimed_guaranteed_profit_units"})
-        _integer(candidate["claimed_guaranteed_profit_units"], "claimed_guaranteed_profit_units")
+        _signed_int64(candidate["claimed_guaranteed_profit_units"], "claimed_guaranteed_profit_units")
         if not isinstance(candidate["quantities"], list):
             raise ValueError("candidate quantities must be an array")
         for quantity in candidate["quantities"]:
             quantity_value = _strict_object(quantity, "quantity", {"action_id", "quantity_lots"})
             _text(quantity_value["action_id"], "action_id")
-            _nonnegative_integer(quantity_value["quantity_lots"], "quantity_lots")
+            if _signed_int64(quantity_value["quantity_lots"], "quantity_lots") < 0:
+                raise ValueError("quantity_lots must be non-negative")
     if value["worst_scenario"] is not None:
         scenario = _strict_object(value["worst_scenario"], "worst_scenario", {"atoms"})
         _selected_atoms(scenario["atoms"], "worst_scenario.atoms")
@@ -743,8 +751,10 @@ def _aggregate_solver_metrics(records: tuple[dict[str, object], ...], manifest: 
             }
             if case_id in manifest["first_qualified_case_ids"]:
                 result["first_qualified_ns"] = _summary(item["solver_run"]["phase_timings_ns"]["first_qualified"] for item in cell)
+                result["first_qualified_quality"] = _phase_quality(cell, "first_qualified")
             if case_id in manifest["optimal_case_ids"]:
                 result["optimal_ns"] = _summary(item["solver_run"]["phase_timings_ns"]["optimal"] for item in cell)
+                result["optimal_quality"] = _phase_quality(cell, "optimal")
             warm.append(result)
     metrics["warm"] = warm
     throughput = []
@@ -788,6 +798,22 @@ def _gap_quality(records: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def _phase_quality(records: list[dict[str, object]], phase: str) -> dict[str, object]:
+    achieved = [
+        record for record in records
+        if (
+            record["solver_run"]["business_status"] == "QUALIFIED_FEASIBLE"
+            if phase == "first_qualified"
+            else record["solver_run"]["optimality_status"] == "OPTIMAL"
+        )
+    ]
+    return {
+        "achieved_samples": len(achieved),
+        "timing_ns": None if not achieved else _summary(record["solver_run"]["phase_timings_ns"][phase] for record in achieved),
+        "unachieved_samples": len(records) - len(achieved),
+    }
+
+
 def _benchmark_decision(solvers: Mapping[str, object], manifest: Mapping[str, object]) -> dict[str, object]:
     empty = {"selected_solver": None}
     if manifest["approved_case_count"] == 0:
@@ -809,8 +835,8 @@ def _benchmark_decision(solvers: Mapping[str, object], manifest: Mapping[str, ob
         }
 
     stages = (
-        ("FIRST_QUALIFIED_P95", lambda solver: _cell_vector(solvers[solver]["metrics"]["warm"], "first_qualified_ns", "p95", manifest["first_qualified_case_ids"])),
-        ("FIRST_QUALIFIED_WORST", lambda solver: _cell_vector(solvers[solver]["metrics"]["warm"], "first_qualified_ns", "worst", manifest["first_qualified_case_ids"])),
+        ("FIRST_QUALIFIED_P95", lambda solver: _phase_vector(solvers[solver]["metrics"]["warm"], "first_qualified", "p95", manifest["first_qualified_case_ids"])),
+        ("FIRST_QUALIFIED_WORST", lambda solver: _phase_vector(solvers[solver]["metrics"]["warm"], "first_qualified", "worst", manifest["first_qualified_case_ids"])),
         ("PEAK_RSS_P95", lambda solver: _cell_vector(solvers[solver]["metrics"]["warm"] + solvers[solver]["metrics"]["throughput"], "peak_aggregate_rss_bytes", "p95")),
         ("PEAK_RSS_WORST", lambda solver: _cell_vector(solvers[solver]["metrics"]["warm"] + solvers[solver]["metrics"]["throughput"], "peak_aggregate_rss_bytes", "worst")),
         ("THROUGHPUT_WORST", lambda solver: tuple(-value for value in _cell_vector(solvers[solver]["metrics"]["throughput"], "requests_per_second", "worst", descending=False))),
@@ -823,8 +849,8 @@ def _benchmark_decision(solvers: Mapping[str, object], manifest: Mapping[str, ob
         ))),
         ("COLD_START_P95", lambda solver: _cell_vector(solvers[solver]["metrics"]["cold"], "cold_ns", "p95")),
         ("COLD_START_WORST", lambda solver: _cell_vector(solvers[solver]["metrics"]["cold"], "cold_ns", "worst")),
-        ("TIME_TO_OPTIMAL_P95", lambda solver: _cell_vector(solvers[solver]["metrics"]["warm"], "optimal_ns", "p95", manifest["optimal_case_ids"])),
-        ("TIME_TO_OPTIMAL_WORST", lambda solver: _cell_vector(solvers[solver]["metrics"]["warm"], "optimal_ns", "worst", manifest["optimal_case_ids"])),
+        ("TIME_TO_OPTIMAL_P95", lambda solver: _phase_vector(solvers[solver]["metrics"]["warm"], "optimal", "p95", manifest["optimal_case_ids"])),
+        ("TIME_TO_OPTIMAL_WORST", lambda solver: _phase_vector(solvers[solver]["metrics"]["warm"], "optimal", "worst", manifest["optimal_case_ids"])),
         ("OBJECTIVE_GAP_QUALITY", lambda solver: _gap_vector(solvers[solver]["metrics"]["warm"], manifest["optimal_case_ids"])),
         ("BOUND_CERTIFICATE_CAPABILITY", lambda solver: (Fraction(not manifest["solvers"][solver]["whole_claim_certificate_bound"]),)),
         ("CERTIFICATE_GENERATION_P95", lambda solver: _certificate_vector(solvers[solver], manifest, "certificate_generation", "p95", solver)),
@@ -864,6 +890,28 @@ def _cell_vector(
         if metric in cell and (case_ids is None or cell["case_id"] in case_ids)
     ]
     return tuple(sorted(values, reverse=descending))
+
+
+def _phase_vector(
+    cells: list[dict[str, object]],
+    phase: str,
+    statistic: str,
+    case_ids: tuple[str, ...],
+) -> tuple[Fraction, ...]:
+    selected = [cell for cell in cells if cell["case_id"] in case_ids]
+    nonachievement = sorted(
+        (Fraction(cell[f"{phase}_quality"]["unachieved_samples"]) for cell in selected),
+        reverse=True,
+    )
+    timings = sorted(
+        (
+            _fraction(cell[f"{phase}_quality"]["timing_ns"][statistic])
+            for cell in selected
+            if cell[f"{phase}_quality"]["timing_ns"] is not None
+        ),
+        reverse=True,
+    )
+    return tuple(nonachievement + timings)
 
 
 def _gap_vector(cells: list[dict[str, object]], case_ids: tuple[str, ...]) -> tuple[tuple[Fraction, Fraction], ...]:
@@ -978,6 +1026,13 @@ def _integer(value: object, name: str) -> int:
     return value
 
 
+def _signed_int64(value: object, name: str) -> int:
+    number = _integer(value, name)
+    if not INT64_MIN <= number <= INT64_MAX:
+        raise ValueError(f"{name} must be a signed 64-bit integer")
+    return number
+
+
 def _positive_integer(value: object, name: str) -> int:
     number = _integer(value, name)
     if number <= 0:
@@ -1046,7 +1101,7 @@ def _objective_bounds_payload(value: object) -> None:
     bounds = _strict_object(value, "objective_bounds", {"lower_bound_units", "upper_bound_units", "gap_units", "closed"})
     for field in ("lower_bound_units", "upper_bound_units", "gap_units"):
         if bounds[field] is not None:
-            _integer(bounds[field], field)
+            _signed_int64(bounds[field], field)
     if not isinstance(bounds["closed"], bool):
         raise ValueError("objective_bounds.closed must be a bool")
     lower = bounds["lower_bound_units"]
