@@ -2419,15 +2419,15 @@ def _historical_buy_plan_membership(
         }
     symbols: set[str] = set()
     for path in paths:
-        if path.resolve().parent != reports_dir:
-            return {
-                "available": False,
-                "symbols": [],
-                "reason": "历史趋势报告不可读取",
-            }
         try:
+            if path.resolve().parent != reports_dir:
+                return {
+                    "available": False,
+                    "symbols": [],
+                    "reason": "历史趋势报告不可读取",
+                }
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError):
             return {
                 "available": False,
                 "symbols": [],

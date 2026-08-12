@@ -3756,11 +3756,19 @@ class TabbedAccountLocator:
                 or broker in self.page.empty_origin_brokers
             )
         match = re.fullmatch(
-            r"#account-(\w+)(?:-view-panel)? > \.account-empty:visible",
+            r"#account-(\w+)(?:-view-panel)? > \.account-empty"
+            r"(?::not\(\.missing-text\))?:visible",
             self.selector,
         )
         if match and match.group(1) in self.page.tab_order:
-            return int(self.page.visible_rows(f"#account-{match.group(1)}:visible") == 0)
+            broker = match.group(1)
+            return int(
+                self.page.visible_rows(f"#account-{broker}:visible") == 0
+                or (
+                    broker in self.page.membership_warning_brokers
+                    and ":not(.missing-text)" not in self.selector
+                )
+            )
         if re.fullmatch(
             r'\.account-holding-row:visible:has\('
             r'\.account-holding-market:has-text\("US"\)\) '
@@ -4015,11 +4023,18 @@ class TabbedAccountLocator:
                 if self.page.visible_rows(self.selector) == 0
                 else "无"
             )
-        if re.fullmatch(
-            r"#account-(\w+)(?:-view-panel)? > \.account-empty:visible",
+        match = re.fullmatch(
+            r"#account-(\w+)(?:-view-panel)? > \.account-empty"
+            r"(?::not\(\.missing-text\))?:visible",
             self.selector,
-        ):
-            return "当前筛选下没有持仓"
+        )
+        if match:
+            return (
+                "历史买入计划归属暂不可用，未执行分组"
+                if ":not(.missing-text)" not in self.selector
+                and match.group(1) in self.page.membership_warning_brokers
+                else "当前筛选下没有持仓"
+            )
         if self.selector == "#visible-count":
             return f"{self.page.visible_rows():,} 条"
         if re.fullmatch(
@@ -4264,6 +4279,7 @@ class TabbedAccountPage:
         self.all_rows = {"futu": 1, "tiger": 1, "phillips": 1, "eastmoney": 0}
         self.cn_rows = cn_rows or {"futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 5}
         self.empty_origin_brokers: set[str] = set()
+        self.membership_warning_brokers: set[str] = set()
         self.market = "ALL"
         self.selected = "futu"
         self.tab_order = ["futu", "tiger", "phillips", "eastmoney"]
@@ -6202,6 +6218,17 @@ def test_check_account_holdings_ignores_empty_origin_subgroup() -> None:
     assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
 
 
+def test_check_account_holdings_ignores_membership_warning_with_visible_rows() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.all_rows["eastmoney"] = 1
+    page.membership_warning_brokers.add("eastmoney")
+
+    dashboard_acceptance._check_account_holdings(page, payload)
+
+    assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
+
+
 @pytest.mark.parametrize(
     ("broker", "width", "count"),
     [
@@ -6633,6 +6660,17 @@ def test_cn_filter_ignores_empty_origin_subgroup_when_rows_are_visible() -> None
         "futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 1,
     })
     page.empty_origin_brokers.add("eastmoney")
+
+    dashboard_acceptance._check_cn_filter(page, expected_cn=1)
+
+    assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
+
+
+def test_cn_filter_ignores_membership_warning_with_visible_rows() -> None:
+    page = TabbedAccountPage(cn_rows={
+        "futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 1,
+    })
+    page.membership_warning_brokers.add("eastmoney")
 
     dashboard_acceptance._check_cn_filter(page, expected_cn=1)
 

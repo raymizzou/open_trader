@@ -3780,9 +3780,9 @@ def _check_account_holdings(
                 f"{broker} 异常账户缺少人工复核动作"
             )
         empty = page.locator(
-            f"#account-{broker}-view-panel > .account-empty:visible"
+            f"#account-{broker}-view-panel > .account-empty:not(.missing-text):visible"
             if broker in TREND_SIMULATE_MARKETS
-            else f"#account-{broker} > .account-empty:visible"
+            else f"#account-{broker} > .account-empty:not(.missing-text):visible"
         )
         if rows.count() == 0:
             assert empty.count() == 1 and empty.inner_text().strip() == "当前筛选下没有持仓", (
@@ -5062,9 +5062,9 @@ def _check_cn_filter(page: Any, expected_cn: int) -> None:
             )
         rows = section.locator(".account-holding-row:visible")
         empty = page.locator(
-            f"#account-{broker}-view-panel > .account-empty:visible"
+            f"#account-{broker}-view-panel > .account-empty:not(.missing-text):visible"
             if broker in TREND_SIMULATE_MARKETS
-            else f"#account-{broker} > .account-empty:visible"
+            else f"#account-{broker} > .account-empty:not(.missing-text):visible"
         )
         count = rows.count()
         total += count

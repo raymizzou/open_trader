@@ -375,20 +375,23 @@ def write_buy_plan_history(
 @pytest.mark.parametrize(
     (
         "market", "directory", "older_buy", "revision_buy", "non_buy_symbols",
-        "expected_symbols",
+        "review_buy", "review_buy_key", "expected_symbols",
     ),
     [
         (
             "CN", "trend_a_share", "511190", "159915",
-            ("600000", "000001", "601318"), ["CN.159915", "CN.511190"],
+            ("600000", "000001", "601318"), "300750", "CN.300750",
+            ["CN.159915", "CN.511190"],
         ),
         (
             "HK", "trend_hk_phillips", "622", "700",
-            ("1", "2", "3"), ["HK.00622", "HK.00700"],
+            ("1", "2", "3"), "9988", "HK.09988",
+            ["HK.00622", "HK.00700"],
         ),
         (
             "US", "trend_us_tiger", "adp", "msft",
-            ("sell", "hold", "review"), ["US.ADP", "US.MSFT"],
+            ("sell", "hold", "review"), "tsla", "US.TSLA",
+            ["US.ADP", "US.MSFT"],
         ),
     ],
 )
@@ -399,6 +402,8 @@ def test_historical_buy_plan_membership_keeps_every_formal_buy_revision(
     older_buy: str,
     revision_buy: str,
     non_buy_symbols: tuple[str, str, str],
+    review_buy: str,
+    review_buy_key: str,
     expected_symbols: list[str],
 ) -> None:
     write_buy_plan_history(
@@ -411,6 +416,7 @@ def test_historical_buy_plan_membership_keeps_every_formal_buy_revision(
             {"action": "SELL_ALL", "symbol": non_buy_symbols[0]},
             {"action": "HOLD", "symbol": non_buy_symbols[1]},
             {"action": "MANUAL_REVIEW", "symbol": non_buy_symbols[2]},
+            {"action": "BUY", "symbol": review_buy, "reason": "review_required"},
         ],
     )
     write_buy_plan_history(
@@ -427,13 +433,16 @@ def test_historical_buy_plan_membership_keeps_every_formal_buy_revision(
         ],
     )
 
-    assert dashboard_module._historical_buy_plan_membership(
+    membership = dashboard_module._historical_buy_plan_membership(
         tmp_path / directory, market=market
-    ) == {
+    )
+
+    assert membership == {
         "available": True,
         "symbols": expected_symbols,
         "reason": "",
     }
+    assert review_buy_key not in membership["symbols"]
 
 
 def test_historical_buy_plan_membership_distinguishes_unavailable_from_empty(
@@ -512,6 +521,23 @@ def test_historical_buy_plan_membership_rejects_symlink_escape(tmp_path: Path) -
     reports_dir = tmp_path / "reports"
     reports_dir.mkdir()
     (reports_dir / "linked.json").symlink_to(outside / "reports/external.json")
+
+    membership = dashboard_module._historical_buy_plan_membership(
+        reports_dir, market="US"
+    )
+
+    assert membership == {
+        "available": False,
+        "symbols": [],
+        "reason": "历史趋势报告不可读取",
+    }
+
+
+def test_historical_buy_plan_membership_rejects_symlink_loop(tmp_path: Path) -> None:
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    loop = reports_dir / "loop.json"
+    loop.symlink_to(loop)
 
     membership = dashboard_module._historical_buy_plan_membership(
         reports_dir, market="US"
