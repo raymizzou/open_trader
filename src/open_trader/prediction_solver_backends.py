@@ -73,10 +73,19 @@ def _validate_native_precision(model: LinearModel) -> None:
 
     def validate_activity(owner: str, terms: tuple[tuple[str, int], ...]) -> None:
         minimum = maximum = 0
+        absolute_total = 0
         for name, coefficient in terms:
             variable = variables[name]
-            minimum += coefficient * (variable.lower if coefficient >= 0 else variable.upper)
-            maximum += coefficient * (variable.upper if coefficient >= 0 else variable.lower)
+            lower_product = coefficient * variable.lower
+            upper_product = coefficient * variable.upper
+            contribution = max(abs(lower_product), abs(upper_product))
+            if contribution > DOUBLE_INT_MAX:
+                raise UnsafeSolverResult(f"HiGHS possible {owner} activity term contribution exceeds exact double integer range")
+            absolute_total += contribution
+            if absolute_total > DOUBLE_INT_MAX:
+                raise UnsafeSolverResult(f"HiGHS possible {owner} activity term accumulation exceeds exact double integer range")
+            minimum += lower_product if coefficient >= 0 else upper_product
+            maximum += upper_product if coefficient >= 0 else lower_product
         if minimum < DOUBLE_INT_MIN or maximum > DOUBLE_INT_MAX:
             raise UnsafeSolverResult(f"HiGHS possible {owner} activity exceeds exact double integer range")
 

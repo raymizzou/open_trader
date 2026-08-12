@@ -404,6 +404,27 @@ def test_fake_highs_rejects_unsafe_aggregate_activity_before_native_solve(fake_h
     assert _FakeHighs.instances == []
 
 
+def test_fake_highs_rejects_fixed_cancellation_with_an_unsafe_term_product(fake_highspy: SimpleNamespace) -> None:
+    model = LinearModel(
+        variables=(
+            IntVariable("x", 2**52 + 1, 2**52 + 1),
+            IntVariable("y", 2**52, 2**52),
+            IntVariable("z", 0, 1),
+        ),
+        constraints=(
+            LinearConstraint("balance", (("x", 3), ("y", -3), ("z", 1)), 3, 3),
+        ),
+        objective=LinearObjective("MIN", (("z", 1),)),
+    )
+    _FakeHighs.model_status = _FakeModelStatus.OPTIMAL
+    _FakeHighs.solution = SimpleNamespace(value_valid=True, col_value=(float(2**52 + 1), float(2**52), 0.0))
+    _FakeHighs.info = SimpleNamespace(mip_dual_bound=0.0)
+
+    with pytest.raises(UnsafeSolverResult, match="term contribution"):
+        HighsBackend().solve(model, time_limit_ms=1)
+    assert _FakeHighs.instances == []
+
+
 def test_highs_backend_exposes_pinned_solver_identity_without_candidate_imports() -> None:
     assert HighsBackend.name == "highs"
     assert HighsBackend.version == "1.15.1"
