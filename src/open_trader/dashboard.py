@@ -2382,6 +2382,9 @@ def _load_broker_trend_report(
         "market": market,
         "market_label": market_label,
         "status_text": "暂时不可用",
+        "historical_buy_plan_membership": _historical_buy_plan_membership(
+            reports_dir, market=market
+        ),
     }
     selected = _latest_valid_report_payload(
         reports_dir, market=market, broker=broker
@@ -2403,6 +2406,64 @@ def _load_broker_trend_report(
     )
 
 
+def _historical_buy_plan_membership(
+    reports_dir: Path, *, market: str
+) -> dict[str, object]:
+    reports_dir = reports_dir.resolve()
+    paths = sorted(reports_dir.glob("*.json"))
+    if not paths:
+        return {
+            "available": False,
+            "symbols": [],
+            "reason": "历史趋势报告不存在",
+        }
+    symbols: set[str] = set()
+    for path in paths:
+        if path.resolve().parent != reports_dir:
+            return {
+                "available": False,
+                "symbols": [],
+                "reason": "历史趋势报告不可读取",
+            }
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {
+                "available": False,
+                "symbols": [],
+                "reason": "历史趋势报告不可读取",
+            }
+        judgments = (
+            payload.get("strategy_judgments") if isinstance(payload, dict) else None
+        )
+        actions = (
+            judgments.get("formal_actions") if isinstance(judgments, dict) else None
+        )
+        if not isinstance(actions, list) or not all(
+            isinstance(item, dict) for item in actions
+        ):
+            return {
+                "available": False,
+                "symbols": [],
+                "reason": "历史买入计划格式无效",
+            }
+        for item in actions:
+            if item.get("action") != "BUY" or _trend_action_needs_review(item):
+                continue
+            try:
+                symbol = normalize_backtest_symbol(
+                    market, str(item.get("symbol") or "")
+                )
+            except ValueError:
+                return {
+                    "available": False,
+                    "symbols": [],
+                    "reason": "历史买入计划标的无效",
+                }
+            symbols.add(f"{market}.{symbol}")
+    return {"available": True, "symbols": sorted(symbols), "reason": ""}
+
+
 def _project_broker_trend_report(
     *,
     selected: tuple[Path, dict[str, Any], date, date, date, datetime],
@@ -2418,6 +2479,9 @@ def _project_broker_trend_report(
     use_execution_batch: bool = False,
     historical: bool = False,
 ) -> dict[str, Any]:
+    historical_buy_plan_membership = _historical_buy_plan_membership(
+        reports_dir, market=market
+    )
     _, latest_payload, *_ = selected
     latest_report_sha256 = _report_hash(latest_payload)
     execution_batch: dict[str, object] | None = None
@@ -2504,6 +2568,7 @@ def _project_broker_trend_report(
             "market": market,
             "market_label": market_label,
             "status_text": execution_batch_error,
+            "historical_buy_plan_membership": historical_buy_plan_membership,
             "execution_batch": None,
             "execution_batch_blocking": True,
             "execution_batch_error": execution_batch_error,
@@ -2741,6 +2806,7 @@ def _project_broker_trend_report(
             if execution_today
             else f"数据截至 {data_date}；今日未更新"
         ),
+        "historical_buy_plan_membership": historical_buy_plan_membership,
         "option_attention": payload.get("option_attention", []),
         "real_position_actions": real_position_actions,
         "real_position_status": real_status,
