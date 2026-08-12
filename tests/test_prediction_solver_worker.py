@@ -18,6 +18,7 @@ from open_trader.prediction_solver_worker import (
     MAX_LINE_BYTES,
     WorkerHarness,
     WorkerProtocolError,
+    _PipeReader,
     decode_handshake_line,
     decode_request_line,
     decode_response_line,
@@ -210,6 +211,46 @@ def test_large_request_to_a_worker_that_never_reads_stdin_times_out_boundedly() 
     assert process_group_rss_kib(result.pgid) == 0
 
 
+def test_write_stdin_checks_deadline_and_rss_on_successful_partial_writes(monkeypatch) -> None:
+    import open_trader.prediction_solver_worker as worker_module
+
+    stdin_read, stdin_write = os.pipe()
+    stdout_read, stdout_write = os.pipe()
+    stderr_read, stderr_write = os.pipe()
+
+    class Process:
+        stdin = os.fdopen(stdin_write, "wb", buffering=0)
+        stdout = os.fdopen(stdout_read, "rb", buffering=0)
+        stderr = os.fdopen(stderr_read, "rb", buffering=0)
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    process = Process()
+    samples: list[bool] = []
+    reader = _PipeReader(process, MAX_LINE_BYTES, on_read=lambda: samples.append(True))
+    writes: list[bytes] = []
+    monotonic_values = iter((0.0, 0.4, 0.8, 1.1))
+
+    monkeypatch.setattr(worker_module.os, "write", lambda _fd, data: writes.append(bytes(data)) or min(2, len(data)))
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: next(monotonic_values))
+    try:
+        with pytest.raises(TimeoutError, match="writing request"):
+            reader.write_stdin(b"abcdefgh", deadline=1.0)
+    finally:
+        reader.close()
+        process.stdin.close()
+        process.stdout.close()
+        process.stderr.close()
+        os.close(stdin_read)
+        os.close(stdout_write)
+        os.close(stderr_write)
+
+    assert len(writes) == 3
+    assert len(samples) == 3
+
+
 def test_missing_worker_executable_finalizes_current_request_unknown() -> None:
     with WorkerHarness(["/definitely/missing/open-trader-worker"]) as harness:
         result = harness.submit(decode_request_line(encode_request_line(_request("missing"))))
@@ -217,6 +258,30 @@ def test_missing_worker_executable_finalizes_current_request_unknown() -> None:
     assert result.status == "UNKNOWN"
     assert result.termination == "CRASH"
     assert result.worker_pid is None
+    assert result.cleanup_proven is True
+
+
+def test_startup_handshake_timeout_is_reported_as_hard_timeout() -> None:
+    with WorkerHarness(
+        [sys.executable, "-c", "import time; time.sleep(10)"],
+        request_timeout_ms=500,
+        startup_timeout_ms=50,
+        cleanup_grace_seconds=0.1,
+    ) as harness:
+        result = harness.submit(decode_request_line(encode_request_line(_request("startup-timeout"))))
+
+    assert result.status == "UNKNOWN"
+    assert result.termination == "HARD_TIMEOUT"
+    assert result.cleanup_proven is True
+
+
+def test_malformed_startup_handshake_is_reported_as_protocol_mismatch() -> None:
+    code = "import sys,time; sys.stdout.write('{malformed\\n'); sys.stdout.flush(); time.sleep(10)"
+    with WorkerHarness([sys.executable, "-c", code], cleanup_grace_seconds=0.1) as harness:
+        result = harness.submit(decode_request_line(encode_request_line(_request("startup-malformed"))))
+
+    assert result.status == "UNKNOWN"
+    assert result.termination == "PROTOCOL_MISMATCH"
     assert result.cleanup_proven is True
 
 
@@ -490,7 +555,7 @@ def test_cleanup_failure_poisons_harness_and_blocks_later_process_start(monkeypa
 
     assert first.status == "OK"
     assert failed.status == "UNKNOWN"
-    assert failed.termination == "PROTOCOL_MISMATCH"
+    assert failed.termination == "CLEANUP_UNPROVEN"
     assert failed.cleanup_proven is False
     assert failed.worker_pid == first.worker_pid
     assert failed.pgid == first.pgid

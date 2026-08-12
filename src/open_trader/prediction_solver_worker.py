@@ -42,8 +42,18 @@ class WorkerCleanupError(RuntimeError):
 class WorkerStartupError(WorkerProtocolError):
     """The startup handshake failed after the process was isolated."""
 
-    def __init__(self, message: str, *, worker_pid: int | None, pgid: int | None, peak_rss_kib: int, cleanup_proven: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        termination: str,
+        worker_pid: int | None,
+        pgid: int | None,
+        peak_rss_kib: int,
+        cleanup_proven: bool,
+    ) -> None:
         super().__init__(message)
+        self.termination = termination
         self.worker_pid = worker_pid
         self.pgid = pgid
         self.peak_rss_kib = peak_rss_kib
@@ -422,19 +432,22 @@ class _PipeReader:
         self.selector.register(self.process.stdin, selectors.EVENT_WRITE, "stdin")
         try:
             while offset < len(payload):
-                if self.process.poll() is not None:
-                    raise BrokenPipeError("worker exited while request was being written")
-                try:
-                    offset += os.write(descriptor, payload[offset:])
-                    continue
-                except BlockingIOError:
-                    pass
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("worker deadline exceeded while writing request")
-                events = self.selector.select(min(remaining, 0.05))
                 if self.on_read is not None:
                     self.on_read()
+                if self.process.poll() is not None:
+                    raise BrokenPipeError("worker exited while request was being written")
+                try:
+                    written = os.write(descriptor, payload[offset:])
+                    if written <= 0:
+                        raise BrokenPipeError("worker stdin accepted no bytes")
+                    offset += written
+                    continue
+                except BlockingIOError:
+                    pass
+                events = self.selector.select(min(remaining, 0.05))
                 for key, _ in events:
                     if key.data != "stdin":
                         self._read_ready(key)
@@ -502,6 +515,7 @@ class WorkerHarness:
         except OSError as exc:
             raise WorkerStartupError(
                 f"worker process could not start: {exc}",
+                termination="CRASH",
                 worker_pid=None,
                 pgid=None,
                 peak_rss_kib=0,
@@ -521,10 +535,11 @@ class WorkerHarness:
                 raise WorkerProtocolError("handshake pid does not match captured process")
             worker.handshake = decoded
             worker.reader.assert_no_trailing_stdout()
-        except Exception:
+        except Exception as exc:
             proven = self._terminate_checked(worker)
             raise WorkerStartupError(
                 "worker startup handshake failed",
+                termination="HARD_TIMEOUT" if isinstance(exc, TimeoutError) else "PROTOCOL_MISMATCH",
                 worker_pid=worker.process.pid,
                 pgid=worker.pgid,
                 peak_rss_kib=worker.peak_rss_kib,
@@ -563,7 +578,7 @@ class WorkerHarness:
                     return WorkerOutcome(
                         request.request_id,
                         "UNKNOWN",
-                        "PROTOCOL_MISMATCH",
+                        "CLEANUP_UNPROVEN",
                         old_worker.process.pid,
                         old_worker.pgid,
                         old_worker.peak_rss_kib,
@@ -578,7 +593,7 @@ class WorkerHarness:
             return WorkerOutcome(
                 request.request_id,
                 "UNKNOWN",
-                "CRASH" if exc.worker_pid is None else "PROTOCOL_MISMATCH",
+                exc.termination,
                 exc.worker_pid,
                 exc.pgid,
                 exc.peak_rss_kib,
