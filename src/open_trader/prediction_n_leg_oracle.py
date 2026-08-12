@@ -318,19 +318,19 @@ def _qualification_passes(problem: ArbitrageProblem, constraint: QualificationCo
         right = constraint.threshold_numerator
     elif constraint.metric == QualificationMetric.NET_MARGIN_PPM:
         left = _checked_product(evaluation.guaranteed_profit_units, 1_000_000, constraint.threshold_denominator)
-        right = _checked_multiply(constraint.threshold_numerator, evaluation.cost_upper_bound_units)
+        right = _checked_multiply(constraint.threshold_numerator, evaluation.payout_lower_bound_units)
     elif constraint.metric == QualificationMetric.ANNUALIZED_RETURN_PPM:
-        release_delay_seconds = _release_delay_seconds(problem, evaluation)
+        occupied_days = _occupied_days(problem, evaluation)
         left = _checked_product(
             evaluation.guaranteed_profit_units,
-            365 * 24 * 60 * 60,
+            365,
             1_000_000,
             constraint.threshold_denominator,
         )
         right = _checked_product(
             constraint.threshold_numerator,
             evaluation.cost_upper_bound_units,
-            release_delay_seconds,
+            occupied_days,
         )
     elif constraint.metric == QualificationMetric.MAX_CAPITAL_RELEASE_DELAY_SECONDS:
         release_delay_seconds = _release_delay_seconds(problem, evaluation)
@@ -345,6 +345,11 @@ def _release_delay_seconds(problem: ArbitrageProblem, evaluation: PortfolioEvalu
     delay = evaluation.conservative_capital_release_at - problem.as_of
     whole_seconds = _checked_add(_checked_multiply(delay.days, 24 * 60 * 60), delay.seconds)
     return _checked_add(whole_seconds, int(bool(delay.microseconds)))
+
+
+def _occupied_days(problem: ArbitrageProblem, evaluation: PortfolioEvaluation) -> int:
+    seconds = _release_delay_seconds(problem, evaluation)
+    return max(1, _checked_add(seconds, 86_399) // 86_400)
 
 
 def evaluate_fixed_portfolio(

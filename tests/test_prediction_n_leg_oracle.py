@@ -576,6 +576,54 @@ def test_fixed_portfolio_qualifies_only_from_exact_integer_constraints() -> None
     assert rounded_down.failed_qualification_ids == ("profit",)
 
 
+def test_net_margin_uses_minimum_payout_as_denominator() -> None:
+    key = observation()
+    built = problem(
+        (action("a", "a", key, (ExecutableCostSlice(1, 1, 60),)),),
+        (state("a", key, "a", (("yes", TerminalKind.NORMAL_YES, 100),), AS_OF + timedelta(days=1)),),
+    )
+    built = replace(
+        built,
+        qualification_constraints=(
+            QualificationConstraint(
+                "margin", "v1", QualificationMetric.NET_MARGIN_PPM,
+                Comparison.GREATER_THAN_OR_EQUAL, 500_000, 1,
+            ),
+        ),
+    )
+
+    evaluation = evaluate_fixed_portfolio(
+        built, (ActionQuantity("a", 1),), OracleBudget(2, 2, 2),
+    )
+
+    assert evaluation.guaranteed_profit_units == 40
+    assert evaluation.payout_lower_bound_units == 100
+    assert evaluation.failed_qualification_ids == ("margin",)
+
+
+def test_annualized_return_rounds_occupied_time_up_to_at_least_one_day() -> None:
+    key = observation()
+    built = problem(
+        (action("a", "a", key, (ExecutableCostSlice(1, 1, 100),)),),
+        (state("a", key, "a", (("yes", TerminalKind.NORMAL_YES, 101),), AS_OF + timedelta(hours=12)),),
+    )
+    built = replace(
+        built,
+        qualification_constraints=(
+            QualificationConstraint(
+                "annual", "v1", QualificationMetric.ANNUALIZED_RETURN_PPM,
+                Comparison.GREATER_THAN_OR_EQUAL, 5_000_000, 1,
+            ),
+        ),
+    )
+
+    evaluation = evaluate_fixed_portfolio(
+        built, (ActionQuantity("a", 1),), OracleBudget(2, 2, 2),
+    )
+
+    assert evaluation.failed_qualification_ids == ("annual",)
+
+
 def test_subsecond_release_delay_is_conservatively_rounded_up() -> None:
     key = observation()
     built = replace(
