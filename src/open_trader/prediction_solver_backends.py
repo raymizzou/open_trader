@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import signal
 import stat
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -289,19 +290,25 @@ def _run_vipr_process(command: list[str], *, cwd: Path, timeout_ms: int) -> tupl
         returncode = process.wait(timeout=timeout_ms / 1_000)
         return returncode, max(1, time.perf_counter_ns() - started_ns), None
     except subprocess.TimeoutExpired:
+        process_group = process.pid
         try:
-            os.killpg(process.pid, 15)
-            process.wait(timeout=1)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
+            os.killpg(process_group, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
             try:
-                os.killpg(process.pid, 9)
+                os.killpg(process_group, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            try:
-                process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
         return None, max(1, time.perf_counter_ns() - started_ns), "VIPR subprocess timed out"
 
 

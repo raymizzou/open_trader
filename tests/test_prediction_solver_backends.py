@@ -5,6 +5,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -1113,6 +1114,36 @@ def test_vipr_helper_maps_missing_certificate_and_checker_timeout_to_failure(tmp
     assert timed_out.checker_succeeded is False
     assert timed_out.checker_exit_code is None
     assert timed_out.error == "VIPR subprocess timed out"
+
+
+def test_vipr_timeout_reaps_descendant_after_leader_exits_on_sigterm(tmp_path: Path) -> None:
+    marker = tmp_path / "late-marker"
+    pid_file = tmp_path / "descendant.pid"
+    launcher = _write_executable(
+        tmp_path / "launcher",
+        "#!/usr/bin/env python3\n"
+        "import os, signal, subprocess, sys, time\n"
+        f"marker = {str(marker)!r}\n"
+        f"pid_file = {str(pid_file)!r}\n"
+        "descendant = subprocess.Popen([sys.executable, '-c', "
+        "\"import pathlib, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(3.0); pathlib.Path(__import__('sys').argv[1]).write_text('late')\", marker])\n"
+        "pathlib = __import__('pathlib')\n"
+        "pathlib.Path(pid_file).write_text(str(descendant.pid))\n"
+        "def stop(*_):\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "while True: time.sleep(1)\n",
+    )
+
+    exit_code, _, error = solver_backends._run_vipr_process([str(launcher)], cwd=tmp_path, timeout_ms=2_000)
+
+    assert exit_code is None
+    assert error == "VIPR subprocess timed out"
+    time.sleep(3.5)
+    assert not marker.exists()
+    descendant_pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(descendant_pid, 0)
 
 
 def test_vipr_helper_rejects_certificate_outside_request_artifact_dir(tmp_path: Path) -> None:
