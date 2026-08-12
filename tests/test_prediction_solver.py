@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+import json
+from pathlib import Path
 
 import pytest
 
@@ -9,29 +12,641 @@ from open_trader.prediction_solver import (
     BenchmarkClassification,
     BenchmarkLimits,
     CertificateEvidence,
+    CompiledAdversary,
     INT64_MAX,
+    INT64_MIN,
     IntVariable,
     LinearConstraint,
     LinearModel,
     LinearObjective,
     NativeSolveStatus,
+    ReleaseProfile,
     SolverEvidence,
     SolverRun,
     TerminationReason,
     UnsafeSolverResult,
+    compile_adversary,
+    compile_master,
+    compile_terminal_model,
     linear_model_fingerprint,
+    solve_with_constraint_generation,
     validate_backend_result,
     validate_linear_model,
 )
 from open_trader.prediction_n_leg import (
+    ActionPayout,
+    ActionQuantity,
+    ActionSide,
+    ArbitrageProblem,
     BusinessStatus,
+    CandidateAction,
+    Comparison,
+    ConstraintModel,
+    ExecutableCostSlice,
+    ForbiddenAtomCombination,
     ObjectiveBounds,
+    OBSERVATION_SCHEMA_V1,
+    OracleBudget,
+    OracleRequest,
+    PortfolioCandidate,
     OptimalityStatus,
     OracleResult,
+    PROBLEM_SCHEMA_V1,
     ProofStatus,
+    QualificationConstraint,
+    QualificationMetric,
+    REQUEST_SCHEMA_V1,
+    RelationConstraint,
+    RelationKind,
+    SettlementObservationKey,
+    SettlementScenario,
+    SelectedAtom,
+    SearchMode,
     SolveStatus,
+    TerminalAtom,
+    TerminalKind,
+    TerminalStateSet,
     UnknownReason,
+    fingerprint,
+    request_from_payload,
+    result_from_payload,
 )
+from open_trader.prediction_n_leg_oracle import (
+    build_relation_components,
+    cost_upper_bound,
+    cut_from_scenario,
+    derive_selected_support_graph,
+    evaluate_fixed_portfolio,
+    split_disconnected_solution,
+)
+
+
+AS_OF = datetime(2026, 8, 12, tzinfo=UTC)
+CORPUS_PATH = Path(__file__).with_name("fixtures") / "prediction_n_leg_v1.json"
+CORPUS_REPLAYS = tuple(
+    (case["case_id"], replay)
+    for case in json.loads(CORPUS_PATH.read_text(encoding="utf-8"))["cases"]
+    for replay in (case, *case.get("additional_replays", ()))
+)
+
+
+class BruteForceBackend:
+    name = "brute-force-test"
+    version = "1"
+
+    def solve(self, model: LinearModel, *, time_limit_ms: int) -> BackendResult:
+        del time_limit_ms
+        validate_linear_model(model)
+        variables = {variable.name: variable for variable in model.variables}
+        best_values: dict[str, int] | None = None
+        best_objective: int | None = None
+
+        def possible(values: dict[str, int]) -> bool:
+            for constraint in model.constraints:
+                minimum = maximum = 0
+                for name, coefficient in constraint.coefficients:
+                    if name in values:
+                        minimum += coefficient * values[name]
+                        maximum += coefficient * values[name]
+                    else:
+                        variable = variables[name]
+                        minimum += coefficient * (variable.lower if coefficient >= 0 else variable.upper)
+                        maximum += coefficient * (variable.upper if coefficient >= 0 else variable.lower)
+                if constraint.lower is not None and maximum < constraint.lower:
+                    return False
+                if constraint.upper is not None and minimum > constraint.upper:
+                    return False
+            return True
+
+        def forced_value(values: dict[str, int]) -> tuple[str, int] | None:
+            for constraint in model.constraints:
+                if constraint.lower is None or constraint.lower != constraint.upper:
+                    continue
+                missing = tuple((name, coefficient) for name, coefficient in constraint.coefficients if name not in values)
+                if len(missing) != 1:
+                    continue
+                name, coefficient = missing[0]
+                assigned = sum(coefficient_ * values[name_] for name_, coefficient_ in constraint.coefficients if name_ in values)
+                dividend = constraint.lower - assigned
+                if coefficient and dividend % coefficient == 0:
+                    return name, dividend // coefficient
+            return None
+
+        def visit(values: dict[str, int]) -> None:
+            nonlocal best_objective, best_values
+            if not possible(values):
+                return
+            if len(values) == len(variables):
+                objective = 0 if model.objective is None else sum(
+                    coefficient * values[name] for name, coefficient in model.objective.coefficients
+                )
+                if best_values is None or (
+                    model.objective is not None
+                    and (
+                        objective > best_objective
+                        if model.objective.sense == "MAX"
+                        else objective < best_objective
+                    )
+                ):
+                    best_values = dict(values)
+                    best_objective = objective
+                return
+            forced = forced_value(values)
+            if forced is not None:
+                name, value = forced
+                variable = variables[name]
+                if variable.lower <= value <= variable.upper:
+                    values[name] = value
+                    visit(values)
+                    del values[name]
+                return
+            variable = min(
+                (item for item in model.variables if item.name not in values),
+                key=lambda item: (item.upper - item.lower, item.name),
+            )
+            for value in range(variable.lower, variable.upper + 1):
+                values[variable.name] = value
+                visit(values)
+            del values[variable.name]
+
+        visit({})
+        if best_values is None:
+            return BackendResult(NativeSolveStatus.INFEASIBLE, (), None, None, "infeasible", 0)
+        assert best_objective is not None
+        return BackendResult(
+            NativeSolveStatus.OPTIMAL,
+            tuple(sorted(best_values.items())),
+            best_objective if model.objective is not None else None,
+            best_objective if model.objective is not None else None,
+            "optimal",
+            0,
+        )
+
+
+class RecordingBackend(BruteForceBackend):
+    def __init__(self, *, feasible_adversary: bool = False) -> None:
+        self.feasible_adversary = feasible_adversary
+        self.calls: list[tuple[LinearModel, BackendResult]] = []
+
+    def solve(self, model: LinearModel, *, time_limit_ms: int) -> BackendResult:
+        result = super().solve(model, time_limit_ms=time_limit_ms)
+        if (
+            self.feasible_adversary
+            and model.objective is not None
+            and model.objective.sense == "MIN"
+            and all(variable.name.startswith("z:") for variable in model.variables)
+            and result.status == NativeSolveStatus.OPTIMAL
+        ):
+            result = replace(result, status=NativeSolveStatus.FEASIBLE, native_status="time limit")
+        self.calls.append((model, result))
+        return result
+
+
+class UnknownReachabilityBackend(BruteForceBackend):
+    def __init__(self, atom_id: str) -> None:
+        self.atom_id = atom_id
+
+    def solve(self, model: LinearModel, *, time_limit_ms: int) -> BackendResult:
+        if any(constraint.name == f"reachability:{self.atom_id}" for constraint in model.constraints):
+            return BackendResult(NativeSolveStatus.UNKNOWN, (), None, None, "time limit", 0)
+        return super().solve(model, time_limit_ms=time_limit_ms)
+
+
+class UnclosedLexicographicBackend(BruteForceBackend):
+    def __init__(self) -> None:
+        self.master_objective_calls = 0
+
+    def solve(self, model: LinearModel, *, time_limit_ms: int) -> BackendResult:
+        is_master = any(variable.name == "profit" for variable in model.variables) and model.objective is not None
+        if is_master:
+            self.master_objective_calls += 1
+            if self.master_objective_calls == 2:
+                return BackendResult(NativeSolveStatus.INFEASIBLE, (), None, None, "inconsistent re-solve", 0)
+        return super().solve(model, time_limit_ms=time_limit_ms)
+
+
+class UnclosedSupportBackend(BruteForceBackend):
+    def solve(self, model: LinearModel, *, time_limit_ms: int) -> BackendResult:
+        result = super().solve(model, time_limit_ms=time_limit_ms)
+        if (
+            model.objective is not None
+            and model.objective.sense == "MIN"
+            and not any(constraint.name == "relation:redundant" for constraint in model.constraints)
+            and result.status == NativeSolveStatus.OPTIMAL
+        ):
+            return replace(result, status=NativeSolveStatus.FEASIBLE, native_status="time limit")
+        return result
+
+
+def solver_problem(action: CandidateAction) -> ArbitrageProblem:
+    key = action.settlement_observation_key
+    return ArbitrageProblem(
+        PROBLEM_SCHEMA_V1,
+        "solver-test",
+        AS_OF,
+        "usd-cents",
+        (action,),
+        (
+            TerminalStateSet(
+                action.market_contract_id,
+                key,
+                "v1",
+                (
+                    TerminalAtom(
+                        "yes",
+                        TerminalKind.NORMAL_YES,
+                        "v1",
+                        (ActionPayout(action.action_id, 100),),
+                        AS_OF + timedelta(days=1),
+                    ),
+                ),
+            ),
+        ),
+        ConstraintModel((), ()),
+        (),
+    )
+
+
+def piecewise_action() -> CandidateAction:
+    key = SettlementObservationKey(OBSERVATION_SCHEMA_V1, "oracle", "indicator", AS_OF, AS_OF, "UTC", "v1")
+    return CandidateAction(
+        "action-a",
+        "venue",
+        "account",
+        "chain",
+        "contract-a",
+        key,
+        ActionSide.BUY_YES,
+        1,
+        1,
+        2,
+        7,
+        "usd-cents",
+        "usd-cents",
+        "usd-cents-v1",
+        (
+            ExecutableCostSlice(1, 3, 2),
+            ExecutableCostSlice(4, 5, 4),
+            ExecutableCostSlice(6, 7, 9),
+        ),
+    )
+
+
+def piecewise_problem() -> ArbitrageProblem:
+    action = piecewise_action()
+    anchor = replace(
+        action,
+        action_id="anchor",
+        min_quantity_lots=1,
+        max_quantity_lots=1,
+        cost_slices=(ExecutableCostSlice(1, 1, 0),),
+    )
+    return replace(
+        solver_problem(action),
+        actions=(action, anchor),
+        terminal_state_sets=(
+            replace(
+                solver_problem(action).terminal_state_sets[0],
+                atoms=(
+                    replace(
+                        solver_problem(action).terminal_state_sets[0].atoms[0],
+                        payouts=(ActionPayout("action-a", 100), ActionPayout("anchor", 100)),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def qualification_problem(
+    metric: QualificationMetric,
+    comparison: Comparison,
+    threshold: int,
+    *,
+    denominator: int = 1,
+    payout: int = 10,
+) -> ArbitrageProblem:
+    action = replace(
+        piecewise_action(),
+        min_quantity_lots=1,
+        max_quantity_lots=1,
+        cost_slices=(ExecutableCostSlice(1, 1, 2),),
+    )
+    base = solver_problem(action)
+    atom = replace(
+        base.terminal_state_sets[0].atoms[0],
+        payouts=(ActionPayout(action.action_id, payout),),
+        capital_release_at=AS_OF + timedelta(days=2),
+    )
+    return replace(
+        base,
+        terminal_state_sets=(replace(base.terminal_state_sets[0], atoms=(atom,)),),
+        qualification_constraints=(QualificationConstraint("qualification", "v1", metric, comparison, threshold, denominator),),
+    )
+
+
+def constraint_generation_problem() -> ArbitrageProblem:
+    action = replace(
+        piecewise_action(),
+        min_quantity_lots=1,
+        max_quantity_lots=1,
+        cost_slices=(ExecutableCostSlice(1, 1, 1),),
+    )
+    base = solver_problem(action)
+    return replace(
+        base,
+        terminal_state_sets=(
+            replace(
+                base.terminal_state_sets[0],
+                atoms=(
+                    TerminalAtom("a-high", TerminalKind.NORMAL_YES, "v1", (ActionPayout("action-a", 10),), AS_OF + timedelta(days=1)),
+                    TerminalAtom("a-low", TerminalKind.NORMAL_NO, "v1", (ActionPayout("action-a", 2),), AS_OF + timedelta(days=1)),
+                ),
+            ),
+        ),
+        qualification_constraints=(
+            QualificationConstraint(
+                "minimum-profit",
+                "v1",
+                QualificationMetric.GUARANTEED_PROFIT_UNITS,
+                Comparison.GREATER_THAN_OR_EQUAL,
+                1,
+                1,
+            ),
+        ),
+    )
+
+
+def release_reachability_problem() -> ArbitrageProblem:
+    base = constraint_generation_problem()
+    state = base.terminal_state_sets[0]
+    return replace(
+        base,
+        terminal_state_sets=(
+            replace(
+                state,
+                atoms=(
+                    TerminalAtom("early", TerminalKind.NORMAL_YES, "v1", (ActionPayout("action-a", 2),), AS_OF + timedelta(days=1)),
+                    TerminalAtom("late", TerminalKind.NORMAL_NO, "v1", (ActionPayout("action-a", 2),), AS_OF + timedelta(days=10)),
+                ),
+            ),
+        ),
+        constraint_model=ConstraintModel((), (ForbiddenAtomCombination("late-unreachable", ("late",), "v1"),)),
+        qualification_constraints=(
+            QualificationConstraint(
+                "release",
+                "v1",
+                QualificationMetric.MAX_CAPITAL_RELEASE_DELAY_SECONDS,
+                Comparison.LESS_THAN_OR_EQUAL,
+                86_400,
+                1,
+            ),
+        ),
+    )
+
+
+def redundant_connection_problem() -> ArbitrageProblem:
+    base = terminal_problem(
+        ("a", "b"),
+        relations=(RelationConstraint("redundant", RelationKind.IMPLIES, ("a", "b"), "v1"),),
+    )
+    actions = tuple(
+        replace(action, cost_slices=(ExecutableCostSlice(1, 1, 1),))
+        for action in base.actions
+    )
+    states = tuple(
+        replace(
+            state,
+            atoms=(
+                replace(
+                    state.atoms[0],
+                    payouts=(ActionPayout(f"action-{state.market_contract_id}", 2),),
+                ),
+            ),
+        )
+        for state in base.terminal_state_sets
+    )
+    return replace(
+        base,
+        actions=actions,
+        terminal_state_sets=states,
+        qualification_constraints=(
+            QualificationConstraint(
+                "minimum-profit",
+                "v1",
+                QualificationMetric.GUARANTEED_PROFIT_UNITS,
+                Comparison.GREATER_THAN_OR_EQUAL,
+                1,
+                1,
+            ),
+        ),
+    )
+
+
+def lexicographic_tie_problem() -> ArbitrageProblem:
+    action = replace(
+        piecewise_action(),
+        min_quantity_lots=1,
+        max_quantity_lots=1,
+        cost_slices=(ExecutableCostSlice(1, 1, 1),),
+    )
+    action_b = replace(action, action_id="action-b")
+    base = solver_problem(action)
+    state = base.terminal_state_sets[0]
+    return replace(
+        base,
+        actions=(action, action_b),
+        terminal_state_sets=(
+            replace(
+                state,
+                atoms=(
+                    replace(
+                        state.atoms[0],
+                        payouts=(ActionPayout("action-a", 1), ActionPayout("action-b", 1)),
+                    ),
+                ),
+            ),
+        ),
+        qualification_constraints=(
+            QualificationConstraint(
+                "non-negative",
+                "v1",
+                QualificationMetric.GUARANTEED_PROFIT_UNITS,
+                Comparison.GREATER_THAN_OR_EQUAL,
+                0,
+                1,
+            ),
+        ),
+    )
+
+
+def two_component_optimization_problem() -> ArbitrageProblem:
+    base = terminal_problem(("a", "b"))
+    states = tuple(
+        replace(
+            state,
+            atoms=(
+                replace(
+                    state.atoms[0],
+                    payouts=(
+                        ActionPayout(
+                            f"action-{state.market_contract_id}",
+                            2 if state.market_contract_id == "a" else 4,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        for state in base.terminal_state_sets
+    )
+    return replace(
+        base,
+        terminal_state_sets=states,
+        qualification_constraints=(
+            QualificationConstraint(
+                "non-negative",
+                "v1",
+                QualificationMetric.GUARANTEED_PROFIT_UNITS,
+                Comparison.GREATER_THAN_OR_EQUAL,
+                0,
+                1,
+            ),
+        ),
+    )
+
+
+def two_profile_optimization_problem() -> ArbitrageProblem:
+    base = terminal_problem(
+        ("a", "b"),
+        relations=(RelationConstraint("connected", RelationKind.IMPLIES, ("a", "b"), "v1"),),
+    )
+    states = tuple(
+        replace(
+            state,
+            atoms=(
+                TerminalAtom(
+                    f"{state.market_contract_id}-only",
+                    TerminalKind.NORMAL_YES,
+                    "v1",
+                    (
+                        ActionPayout(
+                            f"action-{state.market_contract_id}",
+                            2 if state.market_contract_id == "a" else 4,
+                        ),
+                    ),
+                    AS_OF + timedelta(days=1 if state.market_contract_id == "a" else 2),
+                ),
+            ),
+        )
+        for state in base.terminal_state_sets
+    )
+    return replace(
+        base,
+        terminal_state_sets=states,
+        qualification_constraints=(
+            QualificationConstraint(
+                "non-negative",
+                "v1",
+                QualificationMetric.GUARANTEED_PROFIT_UNITS,
+                Comparison.GREATER_THAN_OR_EQUAL,
+                0,
+                1,
+            ),
+        ),
+    )
+
+
+def benchmark_limits(rounds: int = 20) -> BenchmarkLimits:
+    return BenchmarkLimits(1_000, 2_000, 1_000_000, rounds)
+
+
+def with_fixed_value(model: LinearModel, variable_name: str, value: int) -> LinearModel:
+    return replace(
+        model,
+        constraints=model.constraints + (LinearConstraint(f"test:fix:{variable_name}", ((variable_name, 1),), value, value),),
+    )
+
+
+def terminal_problem(
+    contract_ids: tuple[str, ...],
+    *,
+    relations: tuple[RelationConstraint, ...] = (),
+    forbidden: tuple[ForbiddenAtomCombination, ...] = (),
+) -> ArbitrageProblem:
+    actions = []
+    states = []
+    for contract_id in contract_ids:
+        key = SettlementObservationKey(
+            OBSERVATION_SCHEMA_V1,
+            f"oracle-{contract_id}",
+            f"indicator-{contract_id}",
+            AS_OF,
+            AS_OF,
+            "UTC",
+            "v1",
+        )
+        action_id = f"action-{contract_id}"
+        actions.append(
+            CandidateAction(
+                action_id,
+                "venue",
+                "account",
+                "chain",
+                contract_id,
+                key,
+                ActionSide.BUY_YES,
+                1,
+                1,
+                1,
+                1,
+                "usd-cents",
+                "usd-cents",
+                "usd-cents-v1",
+                (ExecutableCostSlice(1, 1, 1),),
+            )
+        )
+        states.append(
+            TerminalStateSet(
+                contract_id,
+                key,
+                "v1",
+                tuple(
+                    TerminalAtom(
+                        f"{contract_id}-{suffix}",
+                        kind,
+                        "v1",
+                        (ActionPayout(action_id, payout),),
+                        AS_OF + timedelta(days=1),
+                    )
+                    for suffix, kind, payout in (
+                        ("yes", TerminalKind.NORMAL_YES, 100),
+                        ("no", TerminalKind.NORMAL_NO, 0),
+                        ("void", TerminalKind.VOID, 50),
+                    )
+                ),
+            )
+        )
+    return ArbitrageProblem(
+        PROBLEM_SCHEMA_V1,
+        "terminal-test",
+        AS_OF,
+        "usd-cents",
+        tuple(actions),
+        tuple(states),
+        ConstraintModel(relations, forbidden),
+        (),
+    )
+
+
+def with_fixed_atoms(model: LinearModel, atom_values: dict[str, int]) -> LinearModel:
+    return replace(
+        model,
+        constraints=model.constraints
+        + tuple(
+            LinearConstraint(f"test:fix-atom:{atom_id}", ((f"z:{atom_id}", 1),), value, value)
+            for atom_id, value in sorted(atom_values.items())
+        ),
+    )
 
 
 def valid_linear_model() -> LinearModel:
@@ -40,6 +655,508 @@ def valid_linear_model() -> LinearModel:
         constraints=(LinearConstraint("budget", (("lots", 3), ("reserve", -2)), -6, 12),),
         objective=LinearObjective("MAX", (("lots", 5), ("reserve", -1))),
     )
+
+
+@pytest.mark.parametrize(
+    ("quantity", "expected_cost"),
+    ((0, 0), (2, 4), (3, 6), (5, 14), (7, 32)),
+)
+def test_master_piecewise_cost_matches_canonical_quantity_boundaries(quantity: int, expected_cost: int) -> None:
+    problem = piecewise_problem()
+    component = build_relation_components(problem)[0]
+    scenario = SettlementScenario((SelectedAtom("contract-a", "yes"),))
+    compiled = compile_master(
+        problem,
+        component,
+        ReleaseProfile(86_400, 1, AS_OF + timedelta(days=1)),
+        (cut_from_scenario(problem, scenario),),
+        (),
+    )
+    quantity_variable = dict(compiled.quantity_variables)["action-a"]
+    result = BruteForceBackend().solve(with_fixed_value(compiled.model, quantity_variable, quantity), time_limit_ms=1)
+
+    assert cost_upper_bound(problem, (ActionQuantity("action-a", quantity),)) == expected_cost
+    assert result.status == NativeSolveStatus.OPTIMAL
+    assert dict(result.values)[compiled.cost_variable] == expected_cost
+
+
+@pytest.mark.parametrize("quantity", (1, 8))
+def test_master_rejects_quantities_below_minimum_or_above_maximum(quantity: int) -> None:
+    problem = piecewise_problem()
+    component = build_relation_components(problem)[0]
+    scenario = SettlementScenario((SelectedAtom("contract-a", "yes"),))
+    compiled = compile_master(
+        problem,
+        component,
+        ReleaseProfile(86_400, 1, AS_OF + timedelta(days=1)),
+        (cut_from_scenario(problem, scenario),),
+        (),
+    )
+    quantity_variable = dict(compiled.quantity_variables)["action-a"]
+
+    result = BruteForceBackend().solve(with_fixed_value(compiled.model, quantity_variable, quantity), time_limit_ms=1)
+
+    assert result.status == NativeSolveStatus.INFEASIBLE
+
+
+@pytest.mark.parametrize(
+    "atom_values",
+    (
+        {"a-yes": 0, "a-no": 0, "a-void": 0},
+        {"a-yes": 1, "a-no": 1},
+    ),
+)
+def test_terminal_model_selects_exactly_one_atom_per_contract(atom_values: dict[str, int]) -> None:
+    model = compile_terminal_model(terminal_problem(("a",)))
+
+    result = BruteForceBackend().solve(with_fixed_atoms(model, atom_values), time_limit_ms=1)
+
+    assert result.status == NativeSolveStatus.INFEASIBLE
+
+
+@pytest.mark.parametrize(
+    ("relation", "normal_violation", "exceptional_bypass"),
+    (
+        (
+            RelationConstraint("implies", RelationKind.IMPLIES, ("a", "b"), "v1"),
+            ("a-yes", "b-no"),
+            ("a-void", "b-no"),
+        ),
+        (
+            RelationConstraint("exclusive", RelationKind.MUTUALLY_EXCLUSIVE, ("a", "b", "c"), "v1"),
+            ("a-yes", "b-yes", "c-no"),
+            ("a-void", "b-yes", "c-yes"),
+        ),
+        (
+            RelationConstraint("one", RelationKind.EXACTLY_ONE, ("a", "b", "c"), "v1"),
+            ("a-yes", "b-yes", "c-no"),
+            ("a-void", "b-yes", "c-yes"),
+        ),
+    ),
+)
+def test_terminal_relations_apply_only_when_every_selected_atom_is_normal(
+    relation: RelationConstraint,
+    normal_violation: tuple[str, ...],
+    exceptional_bypass: tuple[str, ...],
+) -> None:
+    problem = terminal_problem(tuple(relation.contract_ids), relations=(relation,))
+    model = compile_terminal_model(problem)
+
+    violation = BruteForceBackend().solve(
+        with_fixed_atoms(model, {atom_id: 1 for atom_id in normal_violation}),
+        time_limit_ms=1,
+    )
+    bypass = BruteForceBackend().solve(
+        with_fixed_atoms(model, {atom_id: 1 for atom_id in exceptional_bypass}),
+        time_limit_ms=1,
+    )
+
+    assert violation.status == NativeSolveStatus.INFEASIBLE
+    assert bypass.status == NativeSolveStatus.OPTIMAL
+
+
+def test_terminal_forbidden_atom_combination_is_infeasible_even_with_exceptional_atom() -> None:
+    problem = terminal_problem(
+        ("a", "b"),
+        forbidden=(ForbiddenAtomCombination("forbidden", ("a-void", "b-yes"), "v1"),),
+    )
+    model = compile_terminal_model(problem)
+
+    result = BruteForceBackend().solve(
+        with_fixed_atoms(model, {"a-void": 1, "b-yes": 1}),
+        time_limit_ms=1,
+    )
+
+    assert result.status == NativeSolveStatus.INFEASIBLE
+
+
+def test_adversary_canonicalizes_fixed_quantities_and_respects_active_constraint_ids() -> None:
+    problem = terminal_problem(
+        ("b", "a"),
+        forbidden=(ForbiddenAtomCombination("not-both-no", ("a-no", "b-no"), "v1"),),
+    )
+    quantities = (
+        ActionQuantity("action-b", 1),
+        ActionQuantity("action-a", 1),
+    )
+
+    constrained = compile_adversary(problem, quantities)
+    relaxed = compile_adversary(problem, quantities, active_constraint_ids=frozenset())
+    constrained_result = BruteForceBackend().solve(constrained.model, time_limit_ms=1)
+    relaxed_result = BruteForceBackend().solve(relaxed.model, time_limit_ms=1)
+
+    assert isinstance(constrained, CompiledAdversary)
+    assert constrained.quantities == (
+        ActionQuantity("action-a", 1),
+        ActionQuantity("action-b", 1),
+    )
+    assert constrained_result.status == NativeSolveStatus.OPTIMAL
+    assert constrained_result.objective_value == 50
+    assert relaxed_result.status == NativeSolveStatus.OPTIMAL
+    assert relaxed_result.objective_value == 0
+
+
+@pytest.mark.parametrize(
+    ("metric", "comparison", "denominator", "passing_threshold", "failing_threshold"),
+    (
+        (QualificationMetric.GUARANTEED_PROFIT_UNITS, Comparison.GREATER_THAN_OR_EQUAL, 3, 24, 25),
+        (QualificationMetric.GUARANTEED_PROFIT_UNITS, Comparison.LESS_THAN_OR_EQUAL, 3, 24, 23),
+        (QualificationMetric.NET_MARGIN_PPM, Comparison.GREATER_THAN_OR_EQUAL, 3, 2_400_000, 2_400_001),
+        (QualificationMetric.NET_MARGIN_PPM, Comparison.LESS_THAN_OR_EQUAL, 3, 2_400_000, 2_399_999),
+        (QualificationMetric.ANNUALIZED_RETURN_PPM, Comparison.GREATER_THAN_OR_EQUAL, 2, 1_460_000_000, 1_460_000_001),
+        (QualificationMetric.ANNUALIZED_RETURN_PPM, Comparison.LESS_THAN_OR_EQUAL, 2, 1_460_000_000, 1_459_999_999),
+        (QualificationMetric.MAX_CAPITAL_RELEASE_DELAY_SECONDS, Comparison.GREATER_THAN_OR_EQUAL, 3, 518_400, 518_401),
+        (QualificationMetric.MAX_CAPITAL_RELEASE_DELAY_SECONDS, Comparison.LESS_THAN_OR_EQUAL, 3, 518_400, 518_399),
+    ),
+)
+def test_master_qualification_rows_match_exact_canonical_boundaries(
+    metric: QualificationMetric,
+    comparison: Comparison,
+    denominator: int,
+    passing_threshold: int,
+    failing_threshold: int,
+) -> None:
+    results = []
+    for threshold in (passing_threshold, failing_threshold):
+        problem = qualification_problem(metric, comparison, threshold, denominator=denominator)
+        oracle_evaluation = evaluate_fixed_portfolio(
+            problem,
+            (ActionQuantity("action-a", 1),),
+            OracleBudget(2, 1, 1),
+        )
+        scenario = SettlementScenario((SelectedAtom("contract-a", "yes"),))
+        compiled = compile_master(
+            problem,
+            build_relation_components(problem)[0],
+            ReleaseProfile(172_800, 2, AS_OF + timedelta(days=2)),
+            (cut_from_scenario(problem, scenario),),
+            (),
+        )
+        result = BruteForceBackend().solve(compiled.model, time_limit_ms=1).status
+        results.append(result)
+        assert (result == NativeSolveStatus.OPTIMAL) == (oracle_evaluation.failed_qualification_ids == ())
+
+    assert results == [NativeSolveStatus.OPTIMAL, NativeSolveStatus.INFEASIBLE]
+
+
+@pytest.mark.parametrize(
+    ("comparison", "threshold", "expected_status"),
+    (
+        (Comparison.GREATER_THAN_OR_EQUAL, INT64_MIN, NativeSolveStatus.OPTIMAL),
+        (Comparison.GREATER_THAN_OR_EQUAL, INT64_MAX, NativeSolveStatus.INFEASIBLE),
+        (Comparison.LESS_THAN_OR_EQUAL, INT64_MAX, NativeSolveStatus.OPTIMAL),
+        (Comparison.LESS_THAN_OR_EQUAL, INT64_MIN, NativeSolveStatus.INFEASIBLE),
+    ),
+)
+def test_constant_release_qualification_uses_signed_int64_thresholds_without_rewriting(
+    comparison: Comparison,
+    threshold: int,
+    expected_status: NativeSolveStatus,
+) -> None:
+    problem = qualification_problem(
+        QualificationMetric.MAX_CAPITAL_RELEASE_DELAY_SECONDS,
+        comparison,
+        threshold,
+    )
+    oracle_evaluation = evaluate_fixed_portfolio(
+        problem,
+        (ActionQuantity("action-a", 1),),
+        OracleBudget(2, 1, 1),
+    )
+    scenario = SettlementScenario((SelectedAtom("contract-a", "yes"),))
+    compiled = compile_master(
+        problem,
+        build_relation_components(problem)[0],
+        ReleaseProfile(172_800, 2, AS_OF + timedelta(days=2)),
+        (cut_from_scenario(problem, scenario),),
+        (),
+    )
+
+    result = BruteForceBackend().solve(compiled.model, time_limit_ms=1)
+
+    assert result.status == expected_status
+    assert (result.status == NativeSolveStatus.OPTIMAL) == (oracle_evaluation.failed_qualification_ids == ())
+
+
+@pytest.mark.parametrize("comparison", tuple(Comparison))
+def test_positive_margin_threshold_rejects_non_positive_payout(comparison: Comparison) -> None:
+    problem = qualification_problem(QualificationMetric.NET_MARGIN_PPM, comparison, 1, payout=0)
+    scenario = SettlementScenario((SelectedAtom("contract-a", "yes"),))
+    compiled = compile_master(
+        problem,
+        build_relation_components(problem)[0],
+        ReleaseProfile(172_800, 2, AS_OF + timedelta(days=2)),
+        (cut_from_scenario(problem, scenario),),
+        (),
+    )
+
+    result = BruteForceBackend().solve(compiled.model, time_limit_ms=1)
+
+    assert result.status == NativeSolveStatus.INFEASIBLE
+
+
+def test_constraint_generation_adds_canonical_worse_cut_then_closes_fixed_portfolio() -> None:
+    problem = constraint_generation_problem()
+    request = OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, problem, OracleBudget(2, 2, 2))
+    backend = RecordingBackend()
+
+    evidence = solve_with_constraint_generation(request, backend, benchmark_limits())
+
+    master_results = [
+        result
+        for model, result in backend.calls
+        if model.objective == LinearObjective("MAX", (("profit", 1),))
+    ]
+    adversary_results = [
+        result
+        for model, result in backend.calls
+        if model.objective is not None and model.objective.sense == "MIN" and all(variable.name.startswith("z:") for variable in model.variables)
+    ]
+    low_scenario = SettlementScenario((SelectedAtom("contract-a", "a-low"),))
+
+    assert [dict(result.values)["payout"] for result in master_results] == [10, 2]
+    assert [result.objective_value for result in adversary_results] == [2, 2]
+    assert evidence.candidate == PortfolioCandidate((ActionQuantity("action-a", 1),), 1)
+    assert evidence.fixed_portfolio_closed is True
+    assert evidence.global_search_closed is False
+    assert evidence.payout_lower_bound_units == 2
+    assert evidence.cost_upper_bound_units == 1
+    assert evidence.guaranteed_profit_units == 1
+    assert evidence.worst_scenario == low_scenario
+    assert evidence.cuts[-1].cut_id == f"cut:{fingerprint(low_scenario)}"
+    assert evidence.master_rounds == evidence.adversary_rounds == 2
+
+
+def test_master_rejects_repeated_canonical_cuts() -> None:
+    problem = constraint_generation_problem()
+    scenario = SettlementScenario((SelectedAtom("contract-a", "a-high"),))
+    cut = cut_from_scenario(problem, scenario)
+
+    with pytest.raises(ValueError, match="repeated settlement cut"):
+        compile_master(
+            problem,
+            build_relation_components(problem)[0],
+            ReleaseProfile(86_400, 1, AS_OF + timedelta(days=1)),
+            (cut, cut),
+            (),
+        )
+
+
+def test_master_rejects_a_cut_that_does_not_match_its_canonical_scenario() -> None:
+    problem = constraint_generation_problem()
+    scenario = SettlementScenario((SelectedAtom("contract-a", "a-high"),))
+    cut = cut_from_scenario(problem, scenario)
+    forged_payout = replace(
+        cut,
+        payout_per_lot=(ActionPayout("action-a", cut.payout_per_lot[0].payout_lower_bound_per_lot_units - 1),),
+    )
+
+    for forged_cut in (replace(cut, cut_id="cut:forged"), forged_payout):
+        with pytest.raises(ValueError, match="canonical settlement cut"):
+            compile_master(
+                problem,
+                build_relation_components(problem)[0],
+                ReleaseProfile(86_400, 1, AS_OF + timedelta(days=1)),
+                (forged_cut,),
+                (),
+            )
+
+
+def test_feasible_adversary_result_never_closes_fixed_portfolio_proof() -> None:
+    problem = constraint_generation_problem()
+    request = OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, problem, OracleBudget(2, 2, 2))
+
+    evidence = solve_with_constraint_generation(request, RecordingBackend(feasible_adversary=True), benchmark_limits())
+
+    assert evidence.native_status == TerminationReason.PROOF_UNCLOSED
+    assert evidence.candidate is None
+    assert evidence.fixed_portfolio_closed is False
+    assert evidence.global_search_closed is False
+
+
+def test_contradictory_terminal_constraints_return_unknown_evidence() -> None:
+    base = terminal_problem(
+        ("a", "b"),
+        relations=(RelationConstraint("exclusive", RelationKind.MUTUALLY_EXCLUSIVE, ("a", "b"), "v1"),),
+    )
+    contradictory = replace(
+        base,
+        terminal_state_sets=tuple(replace(state, atoms=(state.atoms[0],)) for state in base.terminal_state_sets),
+    )
+    request = OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, contradictory, OracleBudget(4, 1, 1))
+
+    evidence = solve_with_constraint_generation(request, BruteForceBackend(), benchmark_limits())
+
+    assert evidence.native_status == UnknownReason.CONTRADICTORY_CONSTRAINT_MODEL
+    assert evidence.candidate is None
+    assert evidence.fixed_portfolio_closed is False
+    assert evidence.global_search_closed is False
+
+
+def test_unreachable_late_atom_does_not_delay_release_profile() -> None:
+    problem = release_reachability_problem()
+    request = OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, problem, OracleBudget(2, 2, 2))
+
+    evidence = solve_with_constraint_generation(request, BruteForceBackend(), benchmark_limits())
+
+    assert evidence.candidate == PortfolioCandidate((ActionQuantity("action-a", 1),), 1)
+    assert evidence.conservative_capital_release_at == AS_OF + timedelta(days=1)
+
+
+def test_unknown_late_atom_reachability_that_can_change_release_is_proof_unclosed() -> None:
+    problem = release_reachability_problem()
+    request = OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, problem, OracleBudget(2, 2, 2))
+
+    evidence = solve_with_constraint_generation(request, UnknownReachabilityBackend("late"), benchmark_limits())
+
+    assert evidence.native_status == TerminationReason.PROOF_UNCLOSED
+    assert evidence.candidate is None
+    assert evidence.fixed_portfolio_closed is False
+
+
+def test_disconnected_parent_vector_is_excluded_and_only_a_child_is_admitted() -> None:
+    problem = redundant_connection_problem()
+    request = OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, problem, OracleBudget(4, 1, 4))
+
+    evidence = solve_with_constraint_generation(request, BruteForceBackend(), benchmark_limits())
+
+    assert evidence.candidate is not None
+    assert len(evidence.candidate.quantities) == 1
+    assert evidence.candidate.claimed_guaranteed_profit_units == 1
+    assert evidence.fixed_portfolio_closed is True
+
+
+def test_unclosed_support_recheck_makes_the_request_unknown() -> None:
+    problem = redundant_connection_problem()
+    request = OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, problem, OracleBudget(4, 1, 4))
+
+    evidence = solve_with_constraint_generation(request, UnclosedSupportBackend(), benchmark_limits())
+
+    assert evidence.native_status == TerminationReason.PROOF_UNCLOSED
+    assert evidence.candidate is None
+    assert evidence.fixed_portfolio_closed is False
+
+
+def test_optimization_uses_lexicographically_earliest_selected_action_ids() -> None:
+    problem = lexicographic_tie_problem()
+    request = OracleRequest(REQUEST_SCHEMA_V1, SearchMode.OPTIMIZATION, problem, OracleBudget(4, 1, 1))
+
+    evidence = solve_with_constraint_generation(request, BruteForceBackend(), benchmark_limits())
+
+    assert evidence.candidate == PortfolioCandidate((ActionQuantity("action-a", 1),), 0)
+    assert evidence.objective_bounds == ObjectiveBounds(0, 0, 0, True)
+    assert evidence.global_search_closed is True
+
+
+def test_optimization_continues_until_every_component_search_closes() -> None:
+    problem = two_component_optimization_problem()
+    request = OracleRequest(REQUEST_SCHEMA_V1, SearchMode.OPTIMIZATION, problem, OracleBudget(4, 1, 1))
+
+    evidence = solve_with_constraint_generation(request, BruteForceBackend(), benchmark_limits())
+
+    assert evidence.candidate == PortfolioCandidate((ActionQuantity("action-b", 1),), 3)
+    assert evidence.objective_bounds == ObjectiveBounds(3, 3, 0, True)
+    assert evidence.global_search_closed is True
+
+
+def test_optimization_continues_until_every_release_profile_search_closes() -> None:
+    problem = two_profile_optimization_problem()
+    request = OracleRequest(REQUEST_SCHEMA_V1, SearchMode.OPTIMIZATION, problem, OracleBudget(4, 1, 1))
+
+    evidence = solve_with_constraint_generation(request, BruteForceBackend(), benchmark_limits())
+
+    assert evidence.candidate == PortfolioCandidate((ActionQuantity("action-b", 1),), 3)
+    assert evidence.conservative_capital_release_at == AS_OF + timedelta(days=2)
+    assert evidence.objective_bounds == ObjectiveBounds(3, 3, 0, True)
+    assert evidence.global_search_closed is True
+
+
+def test_unclosed_later_lexicographic_objective_cannot_become_a_negative_result() -> None:
+    problem = lexicographic_tie_problem()
+    request = OracleRequest(REQUEST_SCHEMA_V1, SearchMode.OPTIMIZATION, problem, OracleBudget(4, 1, 1))
+
+    evidence = solve_with_constraint_generation(request, UnclosedLexicographicBackend(), benchmark_limits())
+
+    assert evidence.native_status == TerminationReason.PROOF_UNCLOSED
+    assert evidence.candidate is None
+    assert evidence.global_search_closed is False
+
+
+def test_signed_int64_overflow_in_compiled_profit_is_numeric_unsafe() -> None:
+    base = constraint_generation_problem()
+    action = replace(base.actions[0], cost_slices=(ExecutableCostSlice(1, 1, -1),))
+    state = replace(
+        base.terminal_state_sets[0],
+        atoms=tuple(
+            replace(atom, payouts=(ActionPayout("action-a", INT64_MAX),))
+            for atom in base.terminal_state_sets[0].atoms
+        ),
+    )
+    problem = replace(base, actions=(action,), terminal_state_sets=(state,))
+    request = OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, problem, OracleBudget(2, 2, 2))
+
+    evidence = solve_with_constraint_generation(request, BruteForceBackend(), benchmark_limits())
+
+    assert evidence.native_status == TerminationReason.NUMERIC_UNSAFE
+    assert evidence.candidate is None
+
+
+@pytest.mark.parametrize(("case_id", "replay"), CORPUS_REPLAYS, ids=[f"{case_id}:{replay['request']['mode']}" for case_id, replay in CORPUS_REPLAYS])
+def test_common_engine_matches_frozen_oracle_business_and_proof_safety(case_id: str, replay: dict[str, object]) -> None:
+    del case_id
+    request = request_from_payload(replay["request"])  # type: ignore[arg-type]
+    expected = result_from_payload(replay["expected_result"])  # type: ignore[arg-type]
+
+    evidence = solve_with_constraint_generation(request, BruteForceBackend(), benchmark_limits(100))
+
+    if expected.business_status == BusinessStatus.QUALIFIED_FEASIBLE:
+        assert evidence.candidate is not None
+        assert evidence.fixed_portfolio_closed is True
+        checked_problem = (
+            replace(
+                request.problem,
+                problem_id=f"{request.problem.problem_id}:raw-arbitrage-diagnostic",
+                qualification_constraints=(),
+            )
+            if request.mode == SearchMode.RAW_ARBITRAGE_DIAGNOSTIC
+            else request.problem
+        )
+        evaluation = evaluate_fixed_portfolio(checked_problem, evidence.candidate.quantities, request.budget)
+        support = derive_selected_support_graph(checked_problem, evaluation, request.budget)
+        assert not isinstance(support, UnknownReason)
+        assert evaluation.failed_qualification_ids == ()
+        assert len(split_disconnected_solution(checked_problem, evaluation, support)) == 1
+        assert evidence.payout_lower_bound_units == evaluation.payout_lower_bound_units
+        assert evidence.cost_upper_bound_units == evaluation.cost_upper_bound_units
+        assert evidence.guaranteed_profit_units == evaluation.guaranteed_profit_units
+        assert evidence.conservative_capital_release_at == evaluation.conservative_capital_release_at
+        if request.mode != SearchMode.ADMISSION:
+            assert expected.solution is not None
+            assert evidence.candidate.quantities == expected.solution.quantities
+            assert evidence.objective_bounds == expected.objective_bounds
+    elif expected.business_status == BusinessStatus.NO_QUALIFIED_OPPORTUNITY:
+        assert evidence.native_status == BusinessStatus.NO_QUALIFIED_OPPORTUNITY
+        assert evidence.candidate is None
+        assert evidence.global_search_closed is True
+    elif expected.business_status == BusinessStatus.NO_ARBITRAGE:
+        assert evidence.native_status == BusinessStatus.NO_ARBITRAGE
+        assert evidence.candidate is None
+        assert evidence.global_search_closed is True
+        assert evidence.objective_bounds == expected.objective_bounds
+    else:
+        assert expected.unknown_reason is not None
+        if expected.unknown_reason in {
+            UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED,
+            UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED,
+        }:
+            assert evidence.native_status not in {
+                BusinessStatus.NO_QUALIFIED_OPPORTUNITY,
+                BusinessStatus.NO_ARBITRAGE,
+            }
+        else:
+            assert evidence.candidate is None
+            assert evidence.fixed_portfolio_closed is False
+            assert evidence.native_status == expected.unknown_reason
 
 
 @pytest.mark.parametrize(
