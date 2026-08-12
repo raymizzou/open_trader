@@ -51,23 +51,47 @@ require_executable() {
 }
 
 COMMAND_TIMEOUT_SECONDS=$((WAIT_SECONDS + 5))
+ACTIVE_RUNNER_PID=""
 run_bounded() {
   "$PYTHON_BIN" -c '
 import os, signal, subprocess, sys
 timeout = int(sys.argv[1])
 process = subprocess.Popen(sys.argv[2:], start_new_session=True)
-try:
-    raise SystemExit(process.wait(timeout=timeout))
-except subprocess.TimeoutExpired:
+
+def stop_child():
+    if process.poll() is not None:
+        return
     os.killpg(process.pid, signal.SIGTERM)
     try:
         process.wait(timeout=1)
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
         process.wait()
+
+def interrupted(signum, _frame):
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    stop_child()
+    raise SystemExit(128 + signum)
+
+signal.signal(signal.SIGINT, interrupted)
+signal.signal(signal.SIGTERM, interrupted)
+try:
+    raise SystemExit(process.wait(timeout=timeout))
+except subprocess.TimeoutExpired:
+    stop_child()
     print(f"command timed out after {timeout}s: {sys.argv[2]}", file=sys.stderr)
     raise SystemExit(124)
-' "$COMMAND_TIMEOUT_SECONDS" "$@"
+' "$COMMAND_TIMEOUT_SECONDS" "$@" <&0 &
+  ACTIVE_RUNNER_PID=$!
+  local status
+  if wait "$ACTIVE_RUNNER_PID"; then
+    status=0
+  else
+    status=$?
+  fi
+  ACTIVE_RUNNER_PID=""
+  return "$status"
 }
 
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd -P)" || fail "repo root is unavailable"
@@ -187,9 +211,9 @@ inspect_label() {
   run_bounded "$PYTHON_BIN" - "$output" "$expected_plist" "$REPO_ROOT" <<'PY'
 import re, sys
 text, expected_plist, expected_cwd = sys.argv[1:]
-path = re.search(r"(?m)^path = (.+)$", text)
-cwd = re.search(r"(?m)^working directory = (.+)$", text)
-pid = re.search(r"(?m)^pid = ([1-9][0-9]*)$", text)
+path = re.search(r"(?m)^\s*path = (.+?)\s*$", text)
+cwd = re.search(r"(?m)^\s*working directory = (.+?)\s*$", text)
+pid = re.search(r"(?m)^\s*pid = ([1-9][0-9]*)\s*$", text)
 if not path or not cwd or not pid or path.group(1) != expected_plist or cwd.group(1) != expected_cwd:
     raise SystemExit(1)
 print(pid.group(1))
@@ -268,7 +292,8 @@ verify_relevant_label_set() {
   run_bounded "$PYTHON_BIN" - "$output" "$expected_service_count" <<'PY'
 import re, sys
 labels = re.findall(
-    r'(?m)^\s*[0-9]+\s*=\s*(com\.open-trader\.[^\s]+)\s*$', sys.argv[1]
+    r'(?m)^\s*(?:[1-9][0-9]*|-)\s+(?:[0-9]+|-)\s+'
+    r'(com\.open-trader\.[^\s]+)\s*$', sys.argv[1]
 )
 expected = {
     "com.open-trader.frontend-gateway": 1,
@@ -350,63 +375,179 @@ LOCK_DIR="$RUNTIME_ROOT/config/.prediction-cutover.lock"
 run_bounded "$PYTHON_BIN" -c \
   'from pathlib import Path; import sys; Path(sys.argv[1]).mkdir()' "$LOCK_DIR" 2>/dev/null \
   || fail "another prediction cutover is active"
+OPERATION_LOCK_HELD=1
 cleanup_lock() {
+  [[ "$OPERATION_LOCK_HELD" -eq 1 ]] || return 0
   run_bounded "$PYTHON_BIN" -c \
     'from pathlib import Path; import sys; Path(sys.argv[1]).rmdir()' "$LOCK_DIR" \
     2>/dev/null || true
+  OPERATION_LOCK_HELD=0
+}
+stop_active_runner() {
+  local runner_pid="$ACTIVE_RUNNER_PID"
+  [[ "$runner_pid" =~ ^[1-9][0-9]*$ ]] || return 0
+  kill -TERM "$runner_pid" 2>/dev/null || true
+  wait "$runner_pid" 2>/dev/null || true
+  ACTIVE_RUNNER_PID=""
+}
+handle_signal() {
+  local status="$1"
+  trap - INT TERM
+  stop_active_runner
+  cleanup_lock
+  exit "$status"
 }
 trap cleanup_lock EXIT
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
 
 OPERATION_ID="$(run_bounded "$PYTHON_BIN" -c 'import uuid; print(uuid.uuid4().hex)')"
 DOWNTIME_STARTED_AT=""
+STATE_LOCK_PATH="$RUNTIME_ROOT/config/.prediction-cutover-state.lock"
 
-write_route() {
-  local mode="$1" operation_id="$2" expected_operation_id="${3:-}"
-  run_bounded "$PYTHON_BIN" - route-write "$ROUTE_PATH" "$mode" "$operation_id" \
-    "$expected_operation_id" <<'PY'
+state_transition() {
+  run_bounded "$PYTHON_BIN" - "$@" <<'PY'
 from datetime import datetime
+import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import sys
 from tempfile import NamedTemporaryFile
 
-_, path_raw, mode, operation_id, expected_operation_id = sys.argv[1:]
-path = Path(path_raw)
-current = json.loads(path.read_text(encoding="utf-8"))
-if expected_operation_id and current.get("operation_id") != expected_operation_id:
-    raise ValueError("stale prediction cutover operation")
-if mode != "maintenance" and current.get("mode") != "maintenance":
-    raise ValueError("prediction route is not in maintenance")
-if (
-    mode == "maintenance"
-    and current.get("mode") == "maintenance"
-    and current.get("operation_id") != operation_id
-):
-    raise ValueError("another prediction cutover owns maintenance")
-payload = {
-    "schema_version": "open_trader.frontend_gateway.prediction_route.v1",
-    "mode": mode,
-    "operation_id": operation_id,
-    "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-}
-temporary = ""
-try:
-    with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
-                           prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
-        temporary = handle.name
-        json.dump(payload, handle, separators=(",", ":"))
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
+def read_json(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def valid_route(payload):
+    return (
+        isinstance(payload, dict)
+        and set(payload) == {"schema_version", "mode", "operation_id", "updated_at"}
+        and payload.get("schema_version") == "open_trader.frontend_gateway.prediction_route.v1"
+        and payload.get("mode") in {"legacy", "maintenance", "service"}
+        and isinstance(payload.get("operation_id"), str) and bool(payload["operation_id"])
+        and isinstance(payload.get("updated_at"), str) and bool(payload["updated_at"])
+    )
+
+def valid_evidence(payload):
+    return (
+        isinstance(payload, dict)
+        and set(payload) == {
+            "schema_version", "operation_id", "target", "expected_sha", "result",
+            "failure_reason", "downtime_started_at", "downtime_ended_at",
+        }
+        and payload.get("schema_version") == "open_trader.prediction_cutover.evidence.v1"
+        and isinstance(payload.get("operation_id"), str) and bool(payload["operation_id"])
+        and payload.get("target") in {"service", "legacy"}
+        and isinstance(payload.get("expected_sha"), str)
+        and re.fullmatch(r"[0-9a-fA-F]{40}", payload["expected_sha"])
+        and payload.get("result") in {"ready", "failed"}
+        and isinstance(payload.get("failure_reason"), str)
+        and isinstance(payload.get("downtime_started_at"), str)
+        and isinstance(payload.get("downtime_ended_at"), str)
+        and (
+            payload["result"] != "ready"
+            or (
+                not payload["failure_reason"]
+                and bool(payload["downtime_started_at"])
+                and bool(payload["downtime_ended_at"])
+            )
+        )
+    )
+
+def atomic_write(path, payload):
     temporary = ""
-    if json.loads(path.read_text(encoding="utf-8")) != payload:
-        raise ValueError("prediction route readback mismatch")
-finally:
-    if temporary:
-        Path(temporary).unlink(missing_ok=True)
+    try:
+        with NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = handle.name
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = ""
+        if read_json(path) != payload:
+            raise ValueError("prediction state readback mismatch")
+    finally:
+        if temporary:
+            Path(temporary).unlink(missing_ok=True)
+
+operation = sys.argv[1]
+if operation == "route-write":
+    _, path_raw, mode, operation_id, expected_operation_id, lock_raw = sys.argv[1:]
+    route_path = Path(path_raw)
+    with open(lock_raw, "a+", encoding="utf-8") as state_lock:
+        fcntl.flock(state_lock, fcntl.LOCK_EX)
+        current = read_json(route_path)
+        if not valid_route(current):
+            raise ValueError("invalid prediction route record")
+        if expected_operation_id and current.get("operation_id") != expected_operation_id:
+            raise ValueError("stale prediction cutover operation")
+        if mode != "maintenance" and current.get("mode") != "maintenance":
+            raise ValueError("prediction route is not in maintenance")
+        if (
+            mode == "maintenance"
+            and current.get("mode") == "maintenance"
+            and current.get("operation_id") != operation_id
+        ):
+            raise ValueError("another prediction cutover owns maintenance")
+        payload = {
+            "schema_version": "open_trader.frontend_gateway.prediction_route.v1",
+            "mode": mode,
+            "operation_id": operation_id,
+            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        atomic_write(route_path, payload)
+elif operation == "evidence-write":
+    (
+        _, path_raw, route_raw, initial_evidence_operation_id, operation_id,
+        target, expected_sha, result, reason, started, ended, lock_raw,
+    ) = sys.argv[1:]
+    path = Path(path_raw)
+    route_path = Path(route_raw)
+    with open(lock_raw, "a+", encoding="utf-8") as state_lock:
+        fcntl.flock(state_lock, fcntl.LOCK_EX)
+        route = read_json(route_path)
+        if not valid_route(route):
+            raise ValueError("invalid prediction route record")
+        expected_mode = target if result == "ready" else "maintenance"
+        if route.get("operation_id") != operation_id or route.get("mode") != expected_mode:
+            raise ValueError("prediction route is not owned by evidence writer")
+        if path.exists():
+            current_evidence = read_json(path)
+            if not valid_evidence(current_evidence):
+                raise ValueError("invalid prediction evidence record")
+            if current_evidence.get("operation_id") not in {
+                initial_evidence_operation_id, operation_id,
+            }:
+                raise ValueError("prediction evidence is owned by another operation")
+        elif initial_evidence_operation_id != "__absent__":
+            raise ValueError("prediction evidence disappeared during cutover")
+        payload = {
+            "schema_version": "open_trader.prediction_cutover.evidence.v1",
+            "operation_id": operation_id,
+            "target": target,
+            "expected_sha": expected_sha,
+            "result": result,
+            "failure_reason": reason,
+            "downtime_started_at": started,
+            "downtime_ended_at": ended,
+        }
+        if not valid_evidence(payload):
+            raise ValueError("invalid prediction evidence payload")
+        atomic_write(path, payload)
+else:
+    raise ValueError("unknown prediction state transition")
 PY
+}
+
+write_route() {
+  local mode="$1" operation_id="$2" expected_operation_id="${3:-}"
+  state_transition route-write "$ROUTE_PATH" "$mode" "$operation_id" \
+    "$expected_operation_id" "$STATE_LOCK_PATH"
 }
 
 now() {
@@ -458,7 +599,7 @@ label_pid() {
   output="$(run_bounded "$LAUNCHCTL_BIN" print "gui/$UID/$label")" || return
   run_bounded "$PYTHON_BIN" - "$output" <<'PY'
 import re, sys
-match = re.search(r"(?m)^pid = ([1-9][0-9]*)$", sys.argv[1])
+match = re.search(r"(?m)^\s*pid = ([1-9][0-9]*)\s*$", sys.argv[1])
 if match is None:
     raise SystemExit(1)
 print(match.group(1))
@@ -654,84 +795,58 @@ PY
 }
 
 prove_legacy_owner() {
-  local pid argv holders lock_path
-  pid="$(label_pid com.open-trader.legacy-dashboard)" || return 1
-  argv="$(run_bounded "$PS_BIN" -p "$pid" -ww -o command=)" || return 1
+  local output holders lock_path expected_plist
+  output="$(run_bounded "$LAUNCHCTL_BIN" print \
+    "gui/$UID/com.open-trader.legacy-dashboard")" || return 1
+  expected_plist="$LAUNCH_AGENTS_DIR/com.open-trader.legacy-dashboard.plist"
   lock_path="$RUNTIME_ROOT/data/prediction_arbitrage/runtime.lock"
   holders="$(run_bounded "$LSOF_BIN" -nP -F p -- "$lock_path")" || return 1
-  run_bounded "$PYTHON_BIN" - "$argv" "$holders" "$pid" <<'PY' || return 1
-import re, shlex, sys
-try:
-    argv = shlex.split(sys.argv[1])
-except ValueError:
-    raise SystemExit(1)
+  run_bounded "$PYTHON_BIN" - "$output" "$holders" "$expected_plist" \
+    "$REPO_ROOT" <<'PY' || return 1
+import re, sys
+text, holder_text, expected_plist, expected_cwd = sys.argv[1:]
+path = re.search(r"(?m)^\s*path = (.+?)\s*$", text)
+cwd = re.search(r"(?m)^\s*working directory = (.+?)\s*$", text)
+pid = re.search(r"(?m)^\s*pid = ([1-9][0-9]*)\s*$", text)
+lines = text.splitlines()
+starts = [index for index, line in enumerate(lines) if line.strip() == "arguments = {"]
+argument_block_valid = len(starts) == 1
+argv = []
+if argument_block_valid:
+    end = next(
+        (index for index in range(starts[0] + 1, len(lines))
+         if lines[index].strip() == "}"),
+        None,
+    )
+    argument_block_valid = end is not None
+    if end is not None:
+        argv = [line.strip() for line in lines[starts[0] + 1:end] if line.strip()]
 owner_enabled = any(
     argv[index:index + 2] == ["--prediction-owner", "enabled"]
     for index in range(len(argv) - 1)
 )
-holders = {line[1:] for line in sys.argv[2].splitlines() if re.fullmatch(r"p[1-9][0-9]*", line)}
-raise SystemExit(0 if owner_enabled and holders == {sys.argv[3]} else 1)
+holders = {
+    line[1:] for line in holder_text.splitlines()
+    if re.fullmatch(r"p[1-9][0-9]*", line)
+}
+valid = (
+    path is not None and path.group(1) == expected_plist
+    and cwd is not None and cwd.group(1) == expected_cwd
+    and pid is not None
+    and argument_block_valid
+    and owner_enabled
+    and holders == {pid.group(1)}
+)
+raise SystemExit(0 if valid else 1)
 PY
   owner_held
 }
 
 write_evidence() {
   local result="$1" reason="$2" ended_at="$3"
-  run_bounded "$PYTHON_BIN" - evidence-write "$EVIDENCE_PATH" "$ROUTE_PATH" \
+  state_transition evidence-write "$EVIDENCE_PATH" "$ROUTE_PATH" \
     "$INITIAL_EVIDENCE_OPERATION_ID" "$OPERATION_ID" "$TARGET" "$EXPECTED_SHA" \
-    "$result" "$reason" "$DOWNTIME_STARTED_AT" "$ended_at" <<'PY'
-import json
-import os
-from pathlib import Path
-import sys
-from tempfile import NamedTemporaryFile
-
-(
-    _, path_raw, route_raw, initial_evidence_operation_id, operation_id,
-    target, expected_sha, result, reason, started, ended,
-) = sys.argv[1:]
-path = Path(path_raw)
-route = json.loads(Path(route_raw).read_text(encoding="utf-8"))
-expected_mode = target if result == "ready" else "maintenance"
-if route.get("operation_id") != operation_id or route.get("mode") != expected_mode:
-    raise ValueError("prediction route is not owned by evidence writer")
-if path.exists():
-    current_evidence_operation_id = json.loads(
-        path.read_text(encoding="utf-8")
-    ).get("operation_id")
-    if current_evidence_operation_id not in {
-        initial_evidence_operation_id, operation_id,
-    }:
-        raise ValueError("prediction evidence is owned by another operation")
-elif initial_evidence_operation_id != "__absent__":
-    raise ValueError("prediction evidence disappeared during cutover")
-payload = {
-    "schema_version": "open_trader.prediction_cutover.evidence.v1",
-    "operation_id": operation_id,
-    "target": target,
-    "expected_sha": expected_sha,
-    "result": result,
-    "failure_reason": reason,
-    "downtime_started_at": started,
-    "downtime_ended_at": ended,
-}
-temporary = ""
-try:
-    with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
-                           prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
-        temporary = handle.name
-        json.dump(payload, handle, separators=(",", ":"))
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
-    temporary = ""
-    if json.loads(path.read_text(encoding="utf-8")) != payload:
-        raise ValueError("prediction evidence readback mismatch")
-finally:
-    if temporary:
-        Path(temporary).unlink(missing_ok=True)
-PY
+    "$result" "$reason" "$DOWNTIME_STARTED_AT" "$ended_at" "$STATE_LOCK_PATH"
 }
 
 retain_maintenance() {

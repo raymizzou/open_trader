@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -18,7 +20,7 @@ SHA = "a" * 40
 FAKE_COMMAND = r'''#!/usr/bin/env python3
 import json
 import os
-import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -56,6 +58,12 @@ def observe_route():
     return route
 
 if command == "python":
+    if len(sys.argv) > 2 and sys.argv[1] == "-c" \
+            and "start_new_session=True" in sys.argv[2]:
+        save()
+        os.execv(os.environ["FAKE_REAL_PYTHON"], [
+            os.environ["FAKE_REAL_PYTHON"], *sys.argv[1:]
+        ])
     source = sys.stdin.read() if len(sys.argv) > 1 and sys.argv[1] == "-" else None
     tag = sys.argv[2] if len(sys.argv) > 2 and sys.argv[1] == "-" else ""
     mode = sys.argv[4] if tag == "route-write" else ""
@@ -89,11 +97,23 @@ if command == "python":
             json.dumps(state["newer_evidence"]), encoding="utf-8"
         )
         state["injected_failure_seen"] = True
+    if (
+        state["fail_at"] == "locked_state_race"
+        and tag == "route-write" and mode == "maintenance"
+        and not state.get("injected_failure_seen")
+    ):
+        state["injected_failure_seen"] = True
     save()
+    child_env = os.environ.copy()
+    if state["fail_at"] == "locked_state_race" and tag == "route-write":
+        child_env["PYTHONPATH"] = os.pathsep.join(filter(None, [
+            os.environ["FAKE_INSTRUMENTATION"], child_env.get("PYTHONPATH", "")
+        ]))
     completed = subprocess.run(
         [os.environ["FAKE_REAL_PYTHON"], *sys.argv[1:]],
         input=source,
         text=True,
+        env=child_env,
     )
     if fail and completed.returncode == 0:
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -122,18 +142,21 @@ if command == "launchctl":
             (item["pid"], name)
             for name, item in state["labels"].items() if item["loaded"]
         ] + [(9998, label) for label in state["extra_loaded_labels"]]
-        print("services = {")
+        print("PID\tStatus\tLabel")
         for pid, label in labels:
-            print(f"\t{pid} = {label}")
-        print("}")
+            print(f"{pid}\t-\t{label}")
         save()
         raise SystemExit(0)
     label = sys.argv[-1].rsplit("/", 1)[-1]
     item = state["labels"].get(label)
     if sys.argv[1] == "print" and item and item["loaded"]:
-        print(f"path = {item['plist']}")
-        print(f"working directory = {item['cwd']}")
-        print(f"pid = {item['pid']}")
+        print(f"\tpath = {item['plist']}")
+        print("\targuments = {")
+        for argument in item["argv"]:
+            print(f"\t\t{argument}")
+        print("\t}")
+        print(f"\tworking directory = {item['cwd']}")
+        print(f"\tpid = {item['pid']}")
         save()
         raise SystemExit(0)
     print("Could not find service", file=sys.stderr)
@@ -175,14 +198,6 @@ if command == "ps":
         save()
         raise SystemExit(2)
     pid = option("-p")
-    if "command=" in sys.argv:
-        for item in state["labels"].values():
-            if item["loaded"] and str(item["pid"]) == pid:
-                print(shlex.join(item["argv"]))
-                save()
-                raise SystemExit(0)
-        save()
-        raise SystemExit(1)
     present = any(
         item["loaded"] and str(item["pid"]) == pid
         for item in state["labels"].values()
@@ -340,6 +355,20 @@ if command == "install_prediction_service_launchd.sh":
         raise SystemExit(97)
     if state["fail_at"] == "service_installer_timeout":
         time.sleep(10)
+    if state["fail_at"] == "service_installer_interrupt":
+        Path(os.environ["FAKE_SLEEPING_CHILD_PID"]).write_text(
+            str(os.getpid()), encoding="utf-8"
+        )
+        def finish_signal(signum, _frame):
+            Path(os.environ["FAKE_CHILD_CLEANUP_STARTED"]).write_text(
+                f"{signum}\n", encoding="utf-8"
+            )
+            time.sleep(0.5)
+            raise SystemExit(128 + signum)
+        signal.signal(signal.SIGINT, finish_signal)
+        signal.signal(signal.SIGTERM, finish_signal)
+        save()
+        time.sleep(30)
     if state["fail_at"] in {"service_installer", "service_generation", "service_reconcile"}:
         save()
         raise SystemExit(1)
@@ -415,6 +444,39 @@ raise SystemExit(2)
 '''
 
 
+RACE_INSTRUMENTATION = r'''import json
+import os
+import sys
+import time
+from pathlib import Path
+
+_loads = json.loads
+
+def loads(value, *args, **kwargs):
+    payload = _loads(value, *args, **kwargs)
+    marker = Path(os.environ["FAKE_RACE_READ"])
+    if (
+        len(sys.argv) > 1
+        and sys.argv[1] == "route-write"
+        and isinstance(payload, dict)
+        and payload.get("schema_version") \
+            == "open_trader.frontend_gateway.prediction_route.v1"
+        and payload.get("operation_id") == "bootstrap"
+        and not marker.exists()
+    ):
+        marker.write_text("read\n", encoding="utf-8")
+        deadline = time.monotonic() + 5
+        release = Path(os.environ["FAKE_RACE_RELEASE"])
+        while not release.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("race release was not observed")
+            time.sleep(0.01)
+    return payload
+
+json.loads = loads
+'''
+
+
 class CutoverHarness:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -422,8 +484,17 @@ class CutoverHarness:
         self.runtime = root / "runtime"
         self.bin = root / "bin"
         self.launch_agents = root / "LaunchAgents"
+        self.race_read = root / "race-read"
+        self.race_release = root / "race-release"
+        self.sleeping_child_pid = root / "sleeping-child-pid"
+        self.child_cleanup_started = root / "child-cleanup-started"
+        self.instrumentation = root / "instrumentation"
         for path in (self.repo / "scripts", self.runtime / "config", self.bin, self.launch_agents):
             path.mkdir(parents=True)
+        self.instrumentation.mkdir()
+        (self.instrumentation / "sitecustomize.py").write_text(
+            RACE_INSTRUMENTATION, encoding="utf-8"
+        )
         self.config = self.runtime / "config/prediction.json"
         self.config.write_text("{}\n", encoding="utf-8")
         self.route = self.runtime / "config/prediction-route.json"
@@ -537,10 +608,8 @@ class CutoverHarness:
             state["lock_holders"] = [9999]
         self.state_path.write_text(json.dumps(state), encoding="utf-8")
 
-    def run(
-        self, target: str, *extra: str
-    ) -> subprocess.CompletedProcess[str]:
-        env = {
+    def environment(self) -> dict[str, str]:
+        return {
             **os.environ,
             "FAKE_STATE": str(self.state_path),
             "FAKE_ROUTE": str(self.route),
@@ -551,6 +620,11 @@ class CutoverHarness:
             "FAKE_PYTHON": str(self.bin / "python"),
             "FAKE_LAUNCH_AGENTS": str(self.launch_agents),
             "FAKE_WAIT_SECONDS": "2",
+            "FAKE_RACE_READ": str(self.race_read),
+            "FAKE_RACE_RELEASE": str(self.race_release),
+            "FAKE_SLEEPING_CHILD_PID": str(self.sleeping_child_pid),
+            "FAKE_CHILD_CLEANUP_STARTED": str(self.child_cleanup_started),
+            "FAKE_INSTRUMENTATION": str(self.instrumentation),
             "FAKE_SHA": SHA,
             "FAKE_REAL_PYTHON": sys.executable,
             "GIT_BIN": str(self.bin / "git"),
@@ -560,8 +634,9 @@ class CutoverHarness:
             "PS_BIN": str(self.bin / "ps"),
             "OWNER_PROBE_BIN": str(self.bin / "owner-probe"),
         }
-        return subprocess.run(
-            [
+
+    def command(self, target: str, *extra: str) -> list[str]:
+        return [
                 "bash", str(SCRIPT), "--target", target,
                 "--repo-root", str(self.repo),
                 "--runtime-root", str(self.runtime),
@@ -571,16 +646,31 @@ class CutoverHarness:
                 "--launch-agents-dir", str(self.launch_agents),
                 "--wait-seconds", "2",
                 *extra,
-            ],
+            ]
+
+    def run(
+        self, target: str, *extra: str
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            self.command(target, *extra),
             text=True,
             capture_output=True,
-            env=env,
+            env=self.environment(),
         )
 
 
 @pytest.fixture
 def harness(tmp_path: Path) -> CutoverHarness:
     return CutoverHarness(tmp_path)
+
+
+def wait_for_path(path: Path, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.01)
+    return path.exists()
 
 
 def test_service_happy_path(harness: CutoverHarness) -> None:
@@ -730,7 +820,10 @@ def test_service_to_legacy_rollback_uses_one_owner(harness: CutoverHarness) -> N
         "--launch-agents-dir", str(harness.launch_agents),
         "--wait-seconds", "2",
     ]
-    assert any(call[0] == "ps" and "command=" in call for call in harness.state["calls"])
+    assert not any(
+        call[0] == "ps" and "command=" in call
+        for call in harness.state["calls"]
+    )
     assert any(
         call[0] == "lsof" and call[-1].endswith("runtime.lock")
         for call in harness.state["calls"]
@@ -866,6 +959,139 @@ def test_initial_maintenance_cas_cannot_overwrite_newer_route_or_evidence(
     assert route["mode"] == "maintenance"
     assert route["operation_id"] == "newer-operation"
     assert harness.evidence == expected_evidence
+
+
+def test_state_transition_lock_serializes_route_and_evidence_cas(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("locked_state_race")
+    cutover = subprocess.Popen(
+        harness.command("service"),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=harness.environment(),
+    )
+    competitor: subprocess.Popen[str] | None = None
+    try:
+        assert wait_for_path(harness.race_read), "stale writer did not pause after read"
+        competitor = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                r'''
+import fcntl, json, os, sys
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+
+lock_path, route_raw, evidence_raw, route_json, evidence_json = sys.argv[1:]
+
+def atomic_write(path, payload):
+    temporary = ""
+    try:
+        with NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = handle.name
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = ""
+    finally:
+        if temporary:
+            Path(temporary).unlink(missing_ok=True)
+
+with open(lock_path, "a+", encoding="utf-8") as state_lock:
+    fcntl.flock(state_lock, fcntl.LOCK_EX)
+    atomic_write(Path(route_raw), json.loads(route_json))
+    atomic_write(Path(evidence_raw), json.loads(evidence_json))
+''',
+                str(harness.runtime / "config/.prediction-cutover-state.lock"),
+                str(harness.route),
+                str(harness.runtime / "prediction-cutover-evidence.json"),
+                json.dumps({
+                    "schema_version": "open_trader.frontend_gateway.prediction_route.v1",
+                    "mode": "maintenance",
+                    "operation_id": "newer-operation",
+                    "updated_at": "2026-08-12T11:00:00+08:00",
+                }),
+                json.dumps(harness.state["newer_evidence"]),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        time.sleep(0.2)
+        competitor_was_serialized = competitor.poll() is None
+        harness.race_release.write_text("continue\n", encoding="utf-8")
+        stdout, stderr = cutover.communicate(timeout=20)
+        competitor_stdout, competitor_stderr = competitor.communicate(timeout=5)
+    finally:
+        if cutover.poll() is None:
+            cutover.kill()
+            cutover.wait()
+        if competitor is not None and competitor.poll() is None:
+            competitor.kill()
+            competitor.wait()
+
+    assert competitor_was_serialized, competitor_stderr
+    assert cutover.returncode == 1, (stdout, stderr)
+    route = json.loads(harness.route.read_text(encoding="utf-8"))
+    assert route["operation_id"] == "newer-operation"
+    assert harness.evidence == harness.state["newer_evidence"]
+
+
+@pytest.mark.parametrize("interrupt_signal", [signal.SIGINT, signal.SIGTERM])
+def test_signal_waits_for_mutating_child_cleanup_before_releasing_lock(
+    harness: CutoverHarness,
+    interrupt_signal: signal.Signals,
+) -> None:
+    harness.configure("service_installer_interrupt")
+    cutover = subprocess.Popen(
+        harness.command("service"),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=harness.environment(),
+    )
+    child_pid = 0
+    try:
+        assert wait_for_path(harness.sleeping_child_pid, timeout=20)
+        child_pid = int(harness.sleeping_child_pid.read_text(encoding="utf-8"))
+        operation_lock = harness.runtime / "config/.prediction-cutover.lock"
+        assert operation_lock.is_dir()
+        cutover.send_signal(interrupt_signal)
+        cleanup_started = wait_for_path(harness.child_cleanup_started, timeout=3)
+        lock_during_cleanup = operation_lock.is_dir()
+        stdout, stderr = cutover.communicate(timeout=20)
+    finally:
+        if cutover.poll() is None:
+            cutover.kill()
+            cutover.wait()
+        if child_pid:
+            try:
+                os.killpg(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    assert cleanup_started, (stdout, stderr)
+    assert lock_during_cleanup
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+    route = json.loads(harness.route.read_text(encoding="utf-8"))
+    assert route["mode"] == "maintenance"
+    assert not (harness.runtime / "config/.prediction-cutover.lock").exists()
+    assert not any(
+        call[:3] == ["python", "-", "route-write"] and call[4] == "service"
+        for call in harness.state["calls"]
+    )
+    assert not any(
+        call[:3] == ["python", "-", "evidence-write"] and call[9] == "ready"
+        for call in harness.state["calls"]
+    )
 
 
 @pytest.mark.parametrize(
