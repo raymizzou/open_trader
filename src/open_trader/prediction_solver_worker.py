@@ -21,7 +21,14 @@ import time
 from typing import Callable
 
 from open_trader.prediction_n_leg import ModelDecodeError, OracleRequest, canonical_payload, request_from_payload
-from open_trader.prediction_solver import BENCHMARK_PROTOCOL_V1, BenchmarkLimits, solve_with_constraint_generation
+from open_trader.prediction_solver import (
+    BENCHMARK_PROTOCOL_V1,
+    BackendResult,
+    BenchmarkLimits,
+    LinearModel,
+    SolverBackend,
+    solve_with_constraint_generation,
+)
 
 
 MAX_LINE_BYTES = 1024 * 1024
@@ -29,6 +36,15 @@ MAX_DIAGNOSTIC_BYTES = 64 * 1024
 WORKER_VERSION = "1"
 SUPPORTED_BACKENDS = frozenset({"highs", "scip", "cp_sat", "test"})
 NATIVE_BACKENDS = frozenset({"highs", "scip", "cp_sat"})
+WORKER_PHASE_NAMES = (
+    "backend",
+    "first_qualified",
+    "optimal",
+    "certificate_generation",
+    "certificate_completion",
+    "certificate_check",
+    "serialization",
+)
 
 
 class WorkerProtocolError(ValueError):
@@ -212,6 +228,7 @@ class WorkerResponse:
     request_id: str
     status: str
     evidence: Mapping[str, object] | None
+    phase_timings_ns: Mapping[str, int]
     diagnostics: tuple[str, ...]
 
 
@@ -262,6 +279,7 @@ def encode_response_line(response: WorkerResponse | Mapping[str, object]) -> byt
             "backend": response.backend,
             "diagnostics": list(response.diagnostics),
             "evidence": None if response.evidence is None else dict(response.evidence),
+            "phase_timings_ns": dict(response.phase_timings_ns),
             "protocol": response.protocol,
             "request_id": response.request_id,
             "status": response.status,
@@ -276,6 +294,7 @@ def encode_response_line(response: WorkerResponse | Mapping[str, object]) -> byt
             "backend": decoded.backend,
             "diagnostics": list(decoded.diagnostics),
             "evidence": None if decoded.evidence is None else dict(decoded.evidence),
+            "phase_timings_ns": dict(decoded.phase_timings_ns),
             "protocol": decoded.protocol,
             "request_id": decoded.request_id,
             "status": decoded.status,
@@ -284,7 +303,7 @@ def encode_response_line(response: WorkerResponse | Mapping[str, object]) -> byt
 
 
 def decode_response_line(raw: bytes | str, *, expected_request_id: str | None = None, expected_backend: str | None = None) -> WorkerResponse:
-    value = _object(_decode_json_line(raw), "response", {"backend", "diagnostics", "evidence", "protocol", "request_id", "status"})
+    value = _object(_decode_json_line(raw), "response", {"backend", "diagnostics", "evidence", "phase_timings_ns", "protocol", "request_id", "status"})
     protocol = _string(value["protocol"], "protocol")
     if protocol != BENCHMARK_PROTOCOL_V1:
         raise WorkerProtocolError(f"unsupported protocol: {protocol}")
@@ -305,7 +324,37 @@ def decode_response_line(raw: bytes | str, *, expected_request_id: str | None = 
     evidence = value["evidence"]
     if evidence is not None and not isinstance(evidence, Mapping):
         raise WorkerProtocolError("evidence must be an object or null")
-    return WorkerResponse(protocol, backend, request_id, status, None if evidence is None else dict(evidence), tuple(raw_diagnostics))
+    timings = _phase_timings_from_payload(value["phase_timings_ns"])
+    return WorkerResponse(protocol, backend, request_id, status, None if evidence is None else dict(evidence), timings, tuple(raw_diagnostics))
+
+
+def _phase_timings_from_payload(payload: object) -> dict[str, int]:
+    if not isinstance(payload, Mapping) or set(payload) != set(WORKER_PHASE_NAMES) or not all(isinstance(key, str) for key in payload):
+        raise WorkerProtocolError(f"phase_timings_ns must contain exactly {sorted(WORKER_PHASE_NAMES)}")
+    timings = {}
+    for name in WORKER_PHASE_NAMES:
+        value = payload[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise WorkerProtocolError(f"phase_timings_ns.{name} must be a non-negative integer")
+        timings[name] = value
+    return timings
+
+
+def _zero_phase_timings() -> dict[str, int]:
+    return {name: 0 for name in WORKER_PHASE_NAMES}
+
+
+class _TimingBackend:
+    def __init__(self, backend: SolverBackend) -> None:
+        self.backend = backend
+        self.name = backend.name
+        self.version = backend.version
+        self.solve_ns = 0
+
+    def solve(self, model: LinearModel, *, time_limit_ms: int) -> BackendResult:
+        result = self.backend.solve(model, time_limit_ms=time_limit_ms)
+        self.solve_ns += result.solve_ns
+        return result
 
 
 def _encode_line(value: object) -> bytes:
@@ -775,10 +824,10 @@ class _WorkerProcess:
 
 def _test_response(request: WorkerRequest, mode: str) -> WorkerResponse | None:
     if mode == "ok":
-        return WorkerResponse(BENCHMARK_PROTOCOL_V1, request.backend, request.request_id, "OK", {"request_id": request.request_id, "mode": mode}, ())
+        return WorkerResponse(BENCHMARK_PROTOCOL_V1, request.backend, request.request_id, "OK", {"request_id": request.request_id, "mode": mode}, _zero_phase_timings(), ())
     if mode == "cooperative-timeout":
         time.sleep(request.limits.soft_time_limit_ms / 1000 + 0.02)
-        return WorkerResponse(BENCHMARK_PROTOCOL_V1, request.backend, request.request_id, "UNKNOWN", None, ("cooperative timeout",))
+        return WorkerResponse(BENCHMARK_PROTOCOL_V1, request.backend, request.request_id, "UNKNOWN", None, _zero_phase_timings(), ("cooperative timeout",))
     if mode == "hang-child":
         child = subprocess.Popen(
             [sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"],
@@ -801,7 +850,7 @@ def _test_response(request: WorkerRequest, mode: str) -> WorkerResponse | None:
         chunks = [b"x" * (1024 * 1024) for _ in range(2)]
         raise MemoryError(f"deterministic test growth reached {len(chunks)} MiB")
     if mode in {"absent-certificate", "corrupt-certificate", "checker-failure"}:
-        return WorkerResponse(BENCHMARK_PROTOCOL_V1, request.backend, request.request_id, "UNKNOWN", None, (mode,))
+        return WorkerResponse(BENCHMARK_PROTOCOL_V1, request.backend, request.request_id, "UNKNOWN", None, _zero_phase_timings(), (mode,))
     raise WorkerProtocolError(f"unsupported test mode: {mode}")
 
 
@@ -839,7 +888,16 @@ def _run_worker(args: argparse.Namespace) -> int:
             else:
                 from open_trader.prediction_solver_backends import CpSatBackend, HighsBackend, ScipBackend
 
-                adapter = {"highs": HighsBackend, "scip": ScipBackend, "cp_sat": CpSatBackend}[request.backend]()
+                adapter = _TimingBackend({"highs": HighsBackend, "scip": ScipBackend, "cp_sat": CpSatBackend}[request.backend]())
+                started_ns = time.perf_counter_ns()
+                phase_timings = _zero_phase_timings()
+
+                def observe_phase(name: str) -> None:
+                    if name not in {"first_qualified", "optimal"}:
+                        raise ValueError(f"unsupported observed phase: {name}")
+                    if phase_timings[name] == 0:
+                        phase_timings[name] = time.perf_counter_ns() - started_ns
+
                 evidence = solve_with_constraint_generation(
                     request.request,
                     adapter,
@@ -849,8 +907,17 @@ def _run_worker(args: argparse.Namespace) -> int:
                         request.limits.memory_limit_bytes,
                         request.limits.max_constraint_generation_rounds,
                     ),
+                    phase_observer=observe_phase,
                 )
-                response = WorkerResponse(BENCHMARK_PROTOCOL_V1, backend, request.request_id, "OK", canonical_payload(evidence), ())
+                phase_timings["backend"] = adapter.solve_ns
+                if evidence.certificate is not None:
+                    phase_timings["certificate_generation"] = evidence.certificate.generation_ns
+                    phase_timings["certificate_completion"] = evidence.certificate.completion_ns
+                    phase_timings["certificate_check"] = evidence.certificate.check_ns
+                serialization_started_ns = time.perf_counter_ns()
+                evidence_payload = canonical_payload(evidence)
+                phase_timings["serialization"] = time.perf_counter_ns() - serialization_started_ns
+                response = WorkerResponse(BENCHMARK_PROTOCOL_V1, backend, request.request_id, "OK", evidence_payload, phase_timings, ())
             if response is not None:
                 sys.stdout.buffer.write(encode_response_line(response))
                 sys.stdout.buffer.flush()

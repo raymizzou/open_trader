@@ -1,4 +1,4 @@
-.PHONY: acceptance test
+.PHONY: acceptance test prediction-solver-envs prediction-solver-quick prediction-solver-full-macos prediction-solver-full-linux prediction-solver-report prediction-solver-verify-report
 
 WORKTREE_ROOT := $(CURDIR)
 REPOSITORY_ROOT := $(shell git rev-parse --path-format=absolute --git-common-dir)/..
@@ -16,6 +16,24 @@ ACCEPTANCE_HANDOFF := $(ACCEPTANCE_DIR)/prediction-market-browser-handoff.json
 ACCEPTANCE_NONCE := $(ACCEPTANCE_DIR)/prediction-market-browser-nonce
 test:
 	"$(PYTHON_BIN)" -m pytest -q
+
+prediction-solver-envs:
+	PYTHON_BIN="$(PYTHON_BIN)" ./scripts/build_prediction_solver_envs.sh
+
+prediction-solver-quick:
+	PYTHONSAFEPATH=1 PYTHONPATH="$(WORKTREE_ROOT)/src" "$(PYTHON_BIN)" -m open_trader prediction-solver-benchmark quick
+
+prediction-solver-full-macos:
+	PYTHONSAFEPATH=1 PYTHONPATH="$(WORKTREE_ROOT)/src" "$(PYTHON_BIN)" -m open_trader prediction-solver-benchmark full --environment macos
+
+prediction-solver-full-linux:
+	PYTHONSAFEPATH=1 PYTHONPATH="$(WORKTREE_ROOT)/src" "$(PYTHON_BIN)" -m open_trader prediction-solver-benchmark full --environment linux
+
+prediction-solver-report:
+	PYTHONSAFEPATH=1 PYTHONPATH="$(WORKTREE_ROOT)/src" "$(PYTHON_BIN)" -m open_trader prediction-solver-benchmark report
+
+prediction-solver-verify-report:
+	PYTHONSAFEPATH=1 PYTHONPATH="$(WORKTREE_ROOT)/src" "$(PYTHON_BIN)" -m open_trader prediction-solver-benchmark verify-report
 
 acceptance:
 	cd "$(REPOSITORY_ROOT)" && \

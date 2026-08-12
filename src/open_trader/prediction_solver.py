@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal, Protocol
+from typing import Callable, Literal, Protocol
 
 from open_trader.prediction_n_leg import (
     ActionQuantity,
+    ActionPayout,
     ArbitrageProblem,
     BusinessStatus,
     Comparison,
@@ -69,6 +71,7 @@ class TerminationReason(StrEnum):
     PROTOCOL_MISMATCH = "PROTOCOL_MISMATCH"
     NUMERIC_UNSAFE = "NUMERIC_UNSAFE"
     PROOF_UNCLOSED = "PROOF_UNCLOSED"
+    CLEANUP_UNPROVEN = "CLEANUP_UNPROVEN"
 
 
 _SolveFailure = UnknownReason | TerminationReason
@@ -288,6 +291,225 @@ class SolverEvidence:
             raise ValueError("cuts must be a tuple of WorstStateCut")
         if self.certificate is not None and not isinstance(self.certificate, CertificateEvidence):
             raise ValueError("certificate must be CertificateEvidence or None")
+
+
+def solver_evidence_from_payload(payload: object) -> SolverEvidence:
+    value = _payload_object(
+        payload,
+        "solver evidence",
+        {
+            "native_status", "candidate", "objective_bounds", "worst_scenario",
+            "payout_lower_bound_units", "cost_upper_bound_units", "guaranteed_profit_units",
+            "conservative_capital_release_at", "fixed_portfolio_closed", "global_search_closed",
+            "master_rounds", "adversary_rounds", "cuts", "certificate",
+        },
+    )
+    evidence = SolverEvidence(
+        native_status=_payload_string(value["native_status"], "native_status"),
+        candidate=None if value["candidate"] is None else _candidate_from_payload(value["candidate"]),
+        objective_bounds=_bounds_from_payload(value["objective_bounds"]),
+        worst_scenario=None if value["worst_scenario"] is None else _scenario_from_payload(value["worst_scenario"]),
+        payout_lower_bound_units=_payload_optional_int64(value["payout_lower_bound_units"], "payout_lower_bound_units"),
+        cost_upper_bound_units=_payload_optional_int64(value["cost_upper_bound_units"], "cost_upper_bound_units"),
+        guaranteed_profit_units=_payload_optional_int64(value["guaranteed_profit_units"], "guaranteed_profit_units"),
+        conservative_capital_release_at=None if value["conservative_capital_release_at"] is None else _payload_datetime(value["conservative_capital_release_at"], "conservative_capital_release_at"),
+        fixed_portfolio_closed=_payload_bool(value["fixed_portfolio_closed"], "fixed_portfolio_closed"),
+        global_search_closed=_payload_bool(value["global_search_closed"], "global_search_closed"),
+        master_rounds=_payload_nonnegative_int(value["master_rounds"], "master_rounds"),
+        adversary_rounds=_payload_nonnegative_int(value["adversary_rounds"], "adversary_rounds"),
+        cuts=tuple(_cut_from_payload(item) for item in _payload_array(value["cuts"], "cuts")),
+        certificate=None if value["certificate"] is None else _certificate_from_payload(value["certificate"]),
+    )
+    _validate_evidence_invariants(evidence)
+    return evidence
+
+
+def _candidate_from_payload(payload: object) -> PortfolioCandidate:
+    value = _payload_object(payload, "candidate", {"quantities", "claimed_guaranteed_profit_units"})
+    quantities = tuple(_quantity_from_payload(item) for item in _payload_array(value["quantities"], "quantities"))
+    if not quantities or len({item.action_id for item in quantities}) != len(quantities):
+        raise ValueError("candidate quantities must be nonempty and unique")
+    return PortfolioCandidate(quantities, _payload_int64(value["claimed_guaranteed_profit_units"], "claimed_guaranteed_profit_units"))
+
+
+def _quantity_from_payload(payload: object) -> ActionQuantity:
+    value = _payload_object(payload, "quantity", {"action_id", "quantity_lots"})
+    quantity = _payload_int64(value["quantity_lots"], "quantity_lots")
+    if quantity <= 0:
+        raise ValueError("quantity_lots must be positive")
+    return ActionQuantity(_payload_string(value["action_id"], "action_id"), quantity)
+
+
+def _bounds_from_payload(payload: object) -> ObjectiveBounds:
+    value = _payload_object(payload, "objective_bounds", {"lower_bound_units", "upper_bound_units", "gap_units", "closed"})
+    bounds = ObjectiveBounds(
+        _payload_optional_int64(value["lower_bound_units"], "lower_bound_units"),
+        _payload_optional_int64(value["upper_bound_units"], "upper_bound_units"),
+        _payload_optional_int64(value["gap_units"], "gap_units"),
+        _payload_bool(value["closed"], "closed"),
+    )
+    lower, upper, gap = bounds.lower_bound_units, bounds.upper_bound_units, bounds.gap_units
+    if bounds.closed:
+        if lower is None or upper != lower or gap != 0:
+            raise ValueError("closed objective_bounds require equal bounds and zero gap")
+    elif lower is not None and upper is not None:
+        if lower >= upper or gap != upper - lower:
+            raise ValueError("open objective_bounds require ordered bounds and their exact gap")
+    elif gap is not None:
+        raise ValueError("objective_bounds gap requires both bounds")
+    return bounds
+
+
+def _scenario_from_payload(payload: object) -> SettlementScenario:
+    value = _payload_object(payload, "scenario", {"atoms"})
+    atoms = tuple(_selected_atom_from_payload(item) for item in _payload_array(value["atoms"], "atoms"))
+    if not atoms or len({item.market_contract_id for item in atoms}) != len(atoms):
+        raise ValueError("scenario atoms must be nonempty with unique contracts")
+    return SettlementScenario(atoms)
+
+
+def _selected_atom_from_payload(payload: object) -> SelectedAtom:
+    value = _payload_object(payload, "selected atom", {"market_contract_id", "atom_id"})
+    return SelectedAtom(
+        _payload_string(value["market_contract_id"], "market_contract_id"),
+        _payload_string(value["atom_id"], "atom_id"),
+    )
+
+
+def _cut_from_payload(payload: object) -> WorstStateCut:
+    value = _payload_object(payload, "cut", {"cut_id", "scenario", "payout_per_lot"})
+    payouts = tuple(_payout_from_payload(item) for item in _payload_array(value["payout_per_lot"], "payout_per_lot"))
+    if not payouts or len({item.action_id for item in payouts}) != len(payouts):
+        raise ValueError("cut payouts must be nonempty and unique")
+    return WorstStateCut(
+        _payload_string(value["cut_id"], "cut_id"),
+        _scenario_from_payload(value["scenario"]),
+        payouts,
+    )
+
+
+def _payout_from_payload(payload: object) -> ActionPayout:
+    value = _payload_object(payload, "payout", {"action_id", "payout_lower_bound_per_lot_units"})
+    return ActionPayout(
+        _payload_string(value["action_id"], "action_id"),
+        _payload_int64(value["payout_lower_bound_per_lot_units"], "payout_lower_bound_per_lot_units"),
+    )
+
+
+def _certificate_from_payload(payload: object) -> CertificateEvidence:
+    value = _payload_object(
+        payload,
+        "certificate",
+        {
+            "certificate_sha256", "certificate_size_bytes", "completed_certificate_sha256",
+            "completed_certificate_size_bytes", "checker_name", "checker_version",
+            "checker_exit_code", "checker_succeeded", "generation_ns", "completion_ns", "check_ns",
+        },
+    )
+    return CertificateEvidence(
+        certificate_sha256=_payload_string(value["certificate_sha256"], "certificate_sha256"),
+        certificate_size_bytes=_payload_nonnegative_int(value["certificate_size_bytes"], "certificate_size_bytes"),
+        completed_certificate_sha256=None if value["completed_certificate_sha256"] is None else _payload_string(value["completed_certificate_sha256"], "completed_certificate_sha256"),
+        completed_certificate_size_bytes=None if value["completed_certificate_size_bytes"] is None else _payload_nonnegative_int(value["completed_certificate_size_bytes"], "completed_certificate_size_bytes"),
+        checker_name=_payload_text(value["checker_name"], "checker_name"),
+        checker_version=_payload_text(value["checker_version"], "checker_version"),
+        checker_exit_code=_payload_int64(value["checker_exit_code"], "checker_exit_code"),
+        checker_succeeded=_payload_bool(value["checker_succeeded"], "checker_succeeded"),
+        generation_ns=_payload_nonnegative_int(value["generation_ns"], "generation_ns"),
+        completion_ns=_payload_nonnegative_int(value["completion_ns"], "completion_ns"),
+        check_ns=_payload_nonnegative_int(value["check_ns"], "check_ns"),
+    )
+
+
+def _validate_evidence_invariants(evidence: SolverEvidence) -> None:
+    if len({cut.cut_id for cut in evidence.cuts}) != len(evidence.cuts):
+        raise ValueError("solver evidence cuts must be unique")
+    if evidence.candidate is None:
+        if evidence.fixed_portfolio_closed:
+            raise ValueError("fixed portfolio closure requires a candidate")
+        return
+    if any(
+        item is None
+        for item in (
+            evidence.worst_scenario,
+            evidence.payout_lower_bound_units,
+            evidence.cost_upper_bound_units,
+            evidence.guaranteed_profit_units,
+            evidence.conservative_capital_release_at,
+        )
+    ) or not evidence.fixed_portfolio_closed:
+        raise ValueError("candidate evidence requires complete fixed-portfolio proof")
+    assert evidence.payout_lower_bound_units is not None
+    assert evidence.cost_upper_bound_units is not None
+    assert evidence.guaranteed_profit_units is not None
+    if (
+        evidence.candidate.claimed_guaranteed_profit_units != evidence.guaranteed_profit_units
+        or evidence.payout_lower_bound_units - evidence.cost_upper_bound_units != evidence.guaranteed_profit_units
+        or evidence.objective_bounds.lower_bound_units != evidence.guaranteed_profit_units
+        or evidence.global_search_closed != evidence.objective_bounds.closed
+    ):
+        raise ValueError("candidate evidence is inconsistent")
+
+
+def _payload_object(payload: object, name: str, keys: set[str]) -> Mapping[str, object]:
+    if not isinstance(payload, Mapping) or set(payload) != keys or not all(isinstance(key, str) for key in payload):
+        raise ValueError(f"{name} must contain exactly {sorted(keys)}")
+    return payload
+
+
+def _payload_array(payload: object, name: str) -> list[object]:
+    if not isinstance(payload, list):
+        raise ValueError(f"{name} must be a JSON array")
+    return payload
+
+
+def _payload_string(payload: object, name: str) -> str:
+    if not isinstance(payload, str) or not payload.strip():
+        raise ValueError(f"{name} must be a nonempty string")
+    return payload
+
+
+def _payload_text(payload: object, name: str) -> str:
+    if not isinstance(payload, str):
+        raise ValueError(f"{name} must be text")
+    return payload
+
+
+def _payload_int64(payload: object, name: str) -> int:
+    try:
+        return _int64(payload, name)
+    except (OverflowError, ValueError) as error:
+        raise ValueError(str(error)) from error
+
+
+def _payload_optional_int64(payload: object, name: str) -> int | None:
+    return None if payload is None else _payload_int64(payload, name)
+
+
+def _payload_nonnegative_int(payload: object, name: str) -> int:
+    value = _strict_int(payload, name)
+    if value < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    return value
+
+
+def _payload_bool(payload: object, name: str) -> bool:
+    if not isinstance(payload, bool):
+        raise ValueError(f"{name} must be a bool")
+    return payload
+
+
+def _payload_datetime(payload: object, name: str) -> datetime:
+    value = _payload_string(payload, name)
+    if not value.endswith("Z"):
+        raise ValueError(f"{name} must be a UTC timestamp ending in Z")
+    try:
+        decoded = datetime.fromisoformat(f"{value[:-1]}+00:00")
+    except ValueError as error:
+        raise ValueError(f"{name} must be a UTC timestamp ending in Z") from error
+    if decoded.utcoffset() != UTC.utcoffset(decoded):
+        raise ValueError(f"{name} must be UTC")
+    return decoded.astimezone(UTC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -917,6 +1139,8 @@ def solve_with_constraint_generation(
     request: OracleRequest,
     backend: SolverBackend,
     limits: BenchmarkLimits,
+    *,
+    phase_observer: Callable[[str], None] | None = None,
 ) -> SolverEvidence:
     if (
         not isinstance(request, OracleRequest)
@@ -969,6 +1193,7 @@ def solve_with_constraint_generation(
         best: SolverEvidence | None = None
         master_rounds = adversary_rounds = 0
         all_searches_closed = True
+        first_qualified_observed = False
 
         for component in build_relation_components(problem):
             profiles = _release_profiles(problem, component, releases)
@@ -1060,13 +1285,14 @@ def solve_with_constraint_generation(
                         )
                     support_graph, support_rechecks = support
                     adversary_rounds += support_rechecks
+                    final_cut = cut_from_scenario(problem, scenario)
                     evaluation = PortfolioEvaluation(
                         quantities,
                         payout,
                         cost,
                         profit,
                         scenario,
-                        cut_from_scenario(problem, scenario),
+                        final_cut,
                         profile.release_at,
                         (),
                     )
@@ -1091,9 +1317,16 @@ def solve_with_constraint_generation(
                         global_search_closed=False,
                         master_rounds=master_rounds,
                         adversary_rounds=adversary_rounds,
-                        cuts=tuple(cuts),
+                        cuts=tuple(cuts) if final_cut in cuts else (*cuts, final_cut),
                         certificate=None,
                     )
+                    if (
+                        not first_qualified_observed
+                        and (request.mode != SearchMode.RAW_ARBITRAGE_DIAGNOSTIC or profit > 0)
+                    ):
+                        if phase_observer is not None:
+                            phase_observer("first_qualified")
+                        first_qualified_observed = True
                     if request.mode == SearchMode.ADMISSION:
                         return evidence
                     if best is None or _evidence_key(evidence) < _evidence_key(best):
@@ -1109,7 +1342,10 @@ def solve_with_constraint_generation(
                 cuts=tuple(cuts),
             )
         assert best.guaranteed_profit_units is not None
+        assert best.worst_scenario is not None
         profit = best.guaranteed_profit_units
+        final_cut = cut_from_scenario(problem, best.worst_scenario)
+        completed_cuts = tuple(cuts) if final_cut in cuts else (*cuts, final_cut)
         if not all_searches_closed:
             return replace(
                 best,
@@ -1118,7 +1354,7 @@ def solve_with_constraint_generation(
                 global_search_closed=False,
                 master_rounds=master_rounds,
                 adversary_rounds=adversary_rounds,
-                cuts=tuple(cuts),
+                cuts=completed_cuts,
             )
         if request.mode == SearchMode.RAW_ARBITRAGE_DIAGNOSTIC and profit <= 0:
             return replace(
@@ -1128,14 +1364,17 @@ def solve_with_constraint_generation(
                 fixed_portfolio_closed=False,
                 global_search_closed=True,
             )
-        return replace(
+        closed = replace(
             best,
             objective_bounds=ObjectiveBounds(profit, profit, 0, True),
             global_search_closed=True,
             master_rounds=master_rounds,
             adversary_rounds=adversary_rounds,
-            cuts=tuple(cuts),
+            cuts=completed_cuts,
         )
+        if phase_observer is not None:
+            phase_observer("optimal")
+        return closed
     except UnsafeSolverResult:
         return _empty_evidence(TerminationReason.INVALID_OUTPUT.value)
     except _NumericUnsafeError:

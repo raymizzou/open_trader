@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from copy import deepcopy
 from dataclasses import replace
 from datetime import timedelta
@@ -45,6 +46,7 @@ from open_trader.prediction_solver import (
     BenchmarkClassification,
     CertificateEvidence,
     SolverEvidence,
+    SolverRun,
     TerminationReason,
     solve_with_constraint_generation,
 )
@@ -58,6 +60,7 @@ from open_trader.prediction_solver_benchmark import (
     load_canonical_cases,
     verify_benchmark_report,
 )
+from open_trader.prediction_solver_worker import WorkerOutcome, WorkerResponse
 from test_prediction_solver import BruteForceBackend, benchmark_limits
 
 
@@ -224,6 +227,25 @@ def test_synthetic_scale_cases_are_measurement_only_and_exceed_their_oracle_budg
         assert dense_request.problem.constraint_model.relations[0].kind == RelationKind.EXACTLY_ONE
         assert len(dense_request.problem.constraint_model.relations[0].contract_ids) == size
         assert _constraint_graph_edges(dense_request) > _constraint_graph_edges(sparse_request)
+
+
+def test_quick_cases_are_exactly_canonical_plus_semantic_with_frozen_oracle_budgets() -> None:
+    cases = benchmark._load_quick_cases()
+    canonical = load_canonical_cases()
+    synthetic = {
+        item["case_id"]: request_from_payload(item["request"])
+        for item in json.loads(SYNTHETIC_CORPUS.read_bytes())["cases"]
+        if item["case_id"] in SEMANTIC_CASE_IDS
+    }
+
+    assert len(cases) == 34
+    assert tuple(case.case_id for case in cases[:16]) == tuple(case.case_id for case in canonical)
+    assert tuple(case.case_id for case in cases[16:]) == SEMANTIC_CASE_IDS
+    assert all(case.truth_method == "exact_oracle_v1" for case in cases)
+    assert all(case.budget == case.request.budget for case in cases)
+    assert {case.case_id: case.budget for case in cases[16:]} == {
+        case_id: request.budget for case_id, request in synthetic.items()
+    }
 
 
 def _constraint_graph_edges(request) -> set[tuple[str, str]]:
@@ -724,6 +746,30 @@ def test_checker_rejects_false_infeasibility() -> None:
     _assert_hard_checker_failure(case.request, evidence, CheckFailureReason.FALSE_NEGATIVE)
 
 
+def test_checker_keeps_a_safe_noncanonical_admission_as_measurement_only() -> None:
+    case = next(item for item in load_canonical_cases() if item.case_id == "native-complement-n2")
+    assert case.request.mode == SearchMode.ADMISSION
+    assert case.expected_result is not None and case.expected_result.solution is not None
+    evidence = _evidence_for_quantities(
+        case.request,
+        (ActionQuantity("buy-no-a", 2), ActionQuantity("buy-yes-a", 2)),
+    )
+    assert evidence.candidate is not None
+    assert evidence.candidate.quantities != case.expected_result.solution.quantities
+
+    checked = check_solver_claim(
+        case.request,
+        evidence,
+        claimed_problem_fingerprint=fingerprint(case.request.problem),
+        truth_method="exact_oracle_v1",
+    )
+
+    assert checked.classification == BenchmarkClassification.MEASUREMENT_ONLY
+    assert checked.canonical_result is None
+    assert checked.hard_failure is False
+    assert checked.failure_reason is None
+
+
 def test_checker_rejects_false_optimality() -> None:
     case = next(item for item in load_canonical_cases() if item.case_id == "quantity-selection-n4")
     evidence = _evidence_for_quantities(
@@ -973,6 +1019,7 @@ def _benchmark_record(
     record = {
         "adapter_version": "adapter-v1",
         "architecture": "arm64" if environment == "macos" else "x86_64",
+        "build_id": f"{solver}-{environment}-build-artifact",
         "case_id": "case-a",
         "check_failure_reason": None,
         "check_hard_failure": False,
@@ -984,7 +1031,7 @@ def _benchmark_record(
         "cpu": "fixture-cpu",
         "environment": environment,
         "git_sha": "1" * 40,
-        "image_id": "none" if environment == "macos" else "image-1",
+        "image_id": "none" if environment == "macos" else f"{solver}-image-1",
         "license_manifest_sha256": _SHA_B,
         "memory_limit_bytes": 10_000,
         "os_version": "fixture-os",
@@ -1044,10 +1091,11 @@ def _benchmark_manifest(*, profile: str = "full", solvers: tuple[str, ...] = ("h
         "environments": {
             environment: {
                 "available": True,
-                "build_id": f"{environment}-build-artifact",
+                "architecture": "arm64" if environment == "macos" else "x86_64",
+                "cpu": "fixture-cpu",
                 "environment_id": f"{environment}-build",
                 "git_sha": "1" * 40,
-                "image_id": "none" if environment == "macos" else "image-1",
+                "os_version": "fixture-os",
             }
             for environment in environments
         },
@@ -1068,14 +1116,18 @@ def _benchmark_manifest(*, profile: str = "full", solvers: tuple[str, ...] = ("h
             solver: {
                 "environments": {
                     environment: {
-                        "build_id": f"{environment}-build-artifact",
+                        "adapter_version": "adapter-v1",
+                        "build_id": f"{solver}-{environment}-build-artifact",
                         "commercial_key_required": False,
+                        "image_id": "none" if environment == "macos" else f"{solver}-image-1",
                         "install_succeeded": True,
                         "installation_ns": 10,
                         "license_evidence_present": True,
                         "open_source": True,
+                        "python_version": "3.12.11",
                         "reuse_succeeded": True,
                         "run_succeeded": True,
+                        "solver_version": "1.0",
                         "source_evidence_present": True,
                     }
                     for environment in environments
@@ -1209,13 +1261,42 @@ def test_aggregate_binds_every_environment_and_case_identity(identity: str) -> N
     manifest = _benchmark_manifest(profile="quick")
     records = _quick_records()
     if identity == "build_id":
-        manifest["environments"]["macos"]["build_id"] = "other-build"
+        records[0][identity] = "other-build"
     elif identity == "git_sha":
         records[0][identity] = "2" * 40
     else:
         records[0][identity] = _SHA_D
 
     with pytest.raises(ValueError, match=identity):
+        aggregate_benchmark_records(records, manifest)
+
+
+def test_manifest_keeps_distinct_solver_artifact_identities_inside_one_environment() -> None:
+    manifest = _benchmark_manifest(profile="quick")
+    records = _quick_records()
+
+    summary = aggregate_benchmark_records(records, manifest)
+
+    environments = {
+        solver: evidence["operational_evidence"]["environments"]["macos"]
+        for solver, evidence in summary["solvers"].items()
+    }
+    assert len({evidence["build_id"] for evidence in environments.values()}) == 3
+    assert all(evidence["python_version"] == "3.12.11" for evidence in environments.values())
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("build_id", "image_id", "python_version", "solver_version", "adapter_version", "cpu", "architecture", "os_version"),
+)
+def test_record_metadata_binds_to_its_solver_and_environment_evidence(field: str) -> None:
+    manifest = _benchmark_manifest(profile="quick")
+    records = _quick_records()
+    records[0][field] = "mismatch"
+    if field in {"solver_version", "adapter_version"}:
+        records[0]["solver_run"][field] = "mismatch"
+
+    with pytest.raises(ValueError, match=field):
         aggregate_benchmark_records(records, manifest)
 
 
@@ -1863,3 +1944,246 @@ def test_generate_report_rejects_a_jsonl_line_above_the_worker_limit(tmp_path: P
 
     with pytest.raises(ValueError, match="line limit"):
         generate_benchmark_report([records_path], manifest_path, tmp_path / "output")
+
+
+def _test_quick_environment(tmp_path: Path) -> Path:
+    env_root = tmp_path / "envs"
+    for solver in ("highs", "scip", "cp_sat"):
+        environment = env_root / solver
+        (environment / "bin").mkdir(parents=True)
+        (environment / "bin" / "python").write_text("")
+        (environment / ".build-key").write_text("a" * 64 + "\n")
+    return env_root
+
+
+def test_quick_environment_gate_starts_no_worker_when_any_reusable_venv_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    env_root = _test_quick_environment(tmp_path)
+    (env_root / "scip" / ".build-key").unlink()
+    monkeypatch.setattr(benchmark, "_expected_build_key", lambda solver: "a" * 64)
+    monkeypatch.setattr(benchmark, "WorkerHarness", lambda *args, **kwargs: pytest.fail("worker started"))
+
+    result = benchmark._run_quick_benchmark(tmp_path / "quick", env_root)
+
+    assert result == 2
+    assert capsys.readouterr().out.strip() == "BLOCKED_MISSING_ENVIRONMENT"
+
+
+def test_empty_approved_corpus_gate_starts_no_worker_or_environment_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(benchmark, "_load_approved_corpus", lambda path: {"cases": []})
+    monkeypatch.setattr(benchmark, "_discover_quick_environment", lambda *args: pytest.fail("environment discovered"))
+    monkeypatch.setattr(benchmark, "WorkerHarness", lambda *args, **kwargs: pytest.fail("worker started"))
+
+    result = benchmark._run_full_benchmark("macos")
+
+    assert result == 2
+    assert capsys.readouterr().out.strip() == "BLOCKED_REAL_CORPUS_EMPTY"
+
+
+def test_solver_run_construction_attaches_checked_truth_and_maps_failures_honestly() -> None:
+    case = load_canonical_cases()[0]
+    assert case.expected_result is not None
+    evidence = _evidence_for_result(case.expected_result)
+    phases = {name: 0 for name in benchmark.WORKER_PHASE_NAMES}
+    phases["backend"] = 7
+    response = WorkerResponse(
+        BENCHMARK_PROTOCOL_V1,
+        "highs",
+        case.case_id,
+        "OK",
+        canonical_payload(evidence),
+        phases,
+        (),
+    )
+    checked_outcome = WorkerOutcome(case.case_id, "OK", "COMPLETED", 123, 123, 4, False, True, response)
+    failed_outcome = WorkerOutcome(case.case_id, "UNKNOWN", "CLEANUP_UNPROVEN", 123, 123, 4, False, False)
+
+    checked, check = benchmark._solver_run_from_outcome(
+        case,
+        "highs",
+        checked_outcome,
+        _benchmark_manifest(profile="quick")["environments"]["macos"],
+        _benchmark_manifest(profile="quick")["solvers"]["highs"]["environments"]["macos"],
+    )
+    failed, failed_check = benchmark._solver_run_from_outcome(
+        case,
+        "highs",
+        failed_outcome,
+        _benchmark_manifest(profile="quick")["environments"]["macos"],
+        _benchmark_manifest(profile="quick")["solvers"]["highs"]["environments"]["macos"],
+    )
+
+    assert isinstance(checked, SolverRun)
+    assert checked.classification == BenchmarkClassification.CHECKED
+    assert checked.canonical_result == case.expected_result
+    assert dict(checked.phase_timings_ns) == {**phases, "independent_check": checked.phase_timings_ns[-1][1]}
+    assert check.hard_failure is False
+    assert failed.classification == BenchmarkClassification.UNKNOWN
+    assert failed.solve_status == SolveStatus.UNKNOWN
+    assert failed.business_status == BusinessStatus.UNKNOWN
+    assert failed.termination_reason == TerminationReason.CLEANUP_UNPROVEN
+    assert failed_check.failure_reason is None
+
+
+def test_quick_runner_is_serial_and_replays_only_semantic_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cases = load_canonical_cases()[:2]
+    env_root = _test_quick_environment(tmp_path)
+    monkeypatch.setattr(benchmark, "_expected_build_key", lambda solver: "a" * 64)
+    monkeypatch.setattr(benchmark, "_load_quick_cases", lambda: cases)
+    monkeypatch.setattr(benchmark, "_current_git_sha", lambda root=ROOT: "1" * 40)
+    active = 0
+    maximum_active = 0
+    order: list[tuple[str, str, object]] = []
+
+    class Harness:
+        def __init__(self, command, **kwargs):
+            self.solver = command[-1]
+            self.start_count = 1
+            self.rebuild_count = 0
+
+        def __enter__(self):
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            return self
+
+        def __exit__(self, *args):
+            nonlocal active
+            active -= 1
+
+        def submit(self, request):
+            order.append((self.solver, request.request_id, request.request.budget))
+            case = next(item for item in cases if item.case_id == request.request_id)
+            phases = {name: 0 for name in benchmark.WORKER_PHASE_NAMES}
+            response = WorkerResponse(
+                BENCHMARK_PROTOCOL_V1,
+                self.solver,
+                request.request_id,
+                "OK",
+                canonical_payload(_evidence_for_result(case.expected_result)),
+                phases,
+                (),
+            )
+            return WorkerOutcome(request.request_id, "OK", "COMPLETED", 1, 1, 1, False, True, response)
+
+    monkeypatch.setattr(benchmark, "WorkerHarness", Harness)
+    output = tmp_path / "quick"
+
+    assert benchmark._run_quick_benchmark(output, env_root) == 0
+    first = (output / "records.jsonl").read_bytes()
+    assert benchmark._run_quick_benchmark(output, env_root) == 0
+    second = (output / "records.jsonl").read_bytes()
+
+    expected_order = [
+        (solver, case.case_id, case.budget)
+        for solver in ("highs", "scip", "cp_sat")
+        for case in cases
+    ]
+    assert maximum_active == 1
+    assert order == expected_order * 2
+    assert first != second
+    assert "semantic replay PASS" in capsys.readouterr().out
+    records = [json.loads(line) for line in second.splitlines()]
+    assert all(record["memory_limit_bytes"] == 1 << 40 for record in records)
+    manifest = json.loads((output / "manifest.json").read_bytes())
+    assert (
+        manifest["soft_time_limit_ms"],
+        manifest["hard_time_limit_ms"],
+        manifest["memory_limit_bytes"],
+        manifest["max_constraint_generation_rounds"],
+    ) == (5_000, 20_000, 1 << 40, 64)
+
+    first_line = second.splitlines(keepends=True)[0]
+    (output / "records.jsonl").write_bytes(second + first_line)
+    with pytest.raises(ValueError, match="duplicate structural sample"):
+        benchmark._run_quick_benchmark(output, env_root)
+    (output / "records.jsonl").write_bytes(second)
+
+    monkeypatch.setattr(
+        benchmark,
+        "aggregate_benchmark_records",
+        lambda records, run_manifest: {
+            "solvers": {
+                solver: {"hard_gate_failures": ["CHECK_HARD_FAILURE"]}
+                for solver in ("highs", "scip", "cp_sat")
+            }
+        },
+    )
+    with pytest.raises(RuntimeError, match="quick hard gate failed"):
+        benchmark._run_quick_benchmark(output, env_root)
+
+
+def test_open_trader_dispatches_only_the_prediction_solver_benchmark_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    import open_trader.__main__ as entrypoint
+
+    seen: list[list[str]] = []
+    monkeypatch.setattr(benchmark, "main", lambda args: seen.append(args) or 17)
+
+    assert entrypoint.main(["prediction-solver-benchmark", "quick"]) == 17
+    assert seen == [["quick"]]
+
+
+def test_benchmark_cli_dispatches_every_operator_command_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(benchmark, "_run_quick_benchmark", lambda: calls.append("quick") or 0)
+    monkeypatch.setattr(benchmark, "_run_full_benchmark", lambda environment: calls.append(("full", environment)) or 2)
+    monkeypatch.setattr(benchmark, "import_approved_snapshot", lambda inbox, corpus: calls.append(("import", inbox, corpus)))
+    monkeypatch.setattr(benchmark, "_require_final_inputs", lambda: (_ for _ in ()).throw(ValueError("final Task 10 benchmark inputs are absent")))
+
+    assert benchmark.main(["quick"]) == 0
+    assert benchmark.main(["full", "--environment", "macos"]) == 2
+    assert benchmark.main(["import-approved", str(tmp_path / "approved_component.json"), str(tmp_path / "approved.json")]) == 0
+    assert benchmark.main(["report"]) == 1
+    assert benchmark.main(["verify-report"]) == 1
+    assert calls == [
+        "quick",
+        ("full", "macos"),
+        ("import", str(tmp_path / "approved_component.json"), str(tmp_path / "approved.json")),
+    ]
+    assert capsys.readouterr().err.count("final Task 10 benchmark inputs are absent") == 2
+
+
+def test_make_targets_keep_environment_install_separate_from_quick_full_and_reports() -> None:
+    commands = {
+        target: subprocess.run(
+            ["make", "-n", target],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for target in (
+            "prediction-solver-envs",
+            "prediction-solver-quick",
+            "prediction-solver-full-macos",
+            "prediction-solver-full-linux",
+            "prediction-solver-report",
+            "prediction-solver-verify-report",
+        )
+    }
+
+    assert all(result.returncode == 0 for result in commands.values())
+    assert "build_prediction_solver_envs.sh" in commands["prediction-solver-envs"].stdout
+    for target, subcommand in (
+        ("prediction-solver-quick", "quick"),
+        ("prediction-solver-full-macos", "full --environment macos"),
+        ("prediction-solver-full-linux", "full --environment linux"),
+        ("prediction-solver-report", "report"),
+        ("prediction-solver-verify-report", "verify-report"),
+    ):
+        assert f"prediction-solver-benchmark {subcommand}" in commands[target].stdout
+        assert "build_prediction_solver_envs.sh" not in commands[target].stdout

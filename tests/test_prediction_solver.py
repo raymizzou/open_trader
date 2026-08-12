@@ -29,6 +29,7 @@ from open_trader.prediction_solver import (
     compile_master,
     compile_terminal_model,
     linear_model_fingerprint,
+    solver_evidence_from_payload,
     solve_with_constraint_generation,
     validate_backend_result,
     validate_linear_model,
@@ -67,6 +68,7 @@ from open_trader.prediction_n_leg import (
     TerminalKind,
     TerminalStateSet,
     UnknownReason,
+    canonical_payload,
     fingerprint,
     request_from_payload,
     result_from_payload,
@@ -1047,6 +1049,54 @@ def test_constraint_generation_adds_canonical_worse_cut_then_closes_fixed_portfo
     assert evidence.master_rounds == evidence.adversary_rounds == 2
 
 
+def test_phase_observer_records_only_achieved_qualified_and_optimal_events() -> None:
+    problem = constraint_generation_problem()
+    admission_events: list[str] = []
+    optimal_events: list[str] = []
+    failed_events: list[str] = []
+
+    admission = solve_with_constraint_generation(
+        OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, problem, OracleBudget(2, 2, 2)),
+        BruteForceBackend(),
+        benchmark_limits(),
+        phase_observer=admission_events.append,
+    )
+    optimal = solve_with_constraint_generation(
+        OracleRequest(REQUEST_SCHEMA_V1, SearchMode.OPTIMIZATION, problem, OracleBudget(2, 2, 2)),
+        BruteForceBackend(),
+        benchmark_limits(),
+        phase_observer=optimal_events.append,
+    )
+    failed = solve_with_constraint_generation(
+        OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, problem, OracleBudget(2, 2, 2)),
+        RecordingBackend(feasible_adversary=True),
+        benchmark_limits(),
+        phase_observer=failed_events.append,
+    )
+
+    assert admission.candidate is not None
+    assert admission_events == ["first_qualified"]
+    assert optimal.global_search_closed is True
+    assert optimal_events == ["first_qualified", "optimal"]
+    assert failed.native_status == TerminationReason.PROOF_UNCLOSED
+    assert failed_events == []
+
+
+@pytest.mark.parametrize("mode", (SearchMode.ADMISSION, SearchMode.OPTIMIZATION))
+def test_constraint_generation_retains_the_final_fixed_portfolio_cut(mode: SearchMode) -> None:
+    corpus = json.loads(
+        (Path(__file__).parents[1] / "benchmarks/prediction_solver/corpus/synthetic_v1.json").read_text()
+    )
+    payload = next(case for case in corpus["cases"] if case["case_id"] == "implies_exceptional")
+    request = replace(request_from_payload(payload["request"]), mode=mode)
+
+    evidence = solve_with_constraint_generation(request, BruteForceBackend(), benchmark_limits(100))
+
+    assert evidence.candidate is not None
+    assert evidence.worst_scenario is not None
+    assert cut_from_scenario(request.problem, evidence.worst_scenario) in evidence.cuts
+
+
 def test_partial_seed_cut_cannot_close_a_false_no_qualified_result() -> None:
     base = constraint_generation_problem()
     problem = replace(
@@ -1591,6 +1641,60 @@ def valid_solver_evidence() -> SolverEvidence:
         cuts=(),
         certificate=None,
     )
+
+
+def nested_solver_evidence() -> SolverEvidence:
+    problem = constraint_generation_problem()
+    scenario = SettlementScenario((SelectedAtom("contract-a", "a-low"),))
+    return SolverEvidence(
+        native_status="OPTIMAL",
+        candidate=PortfolioCandidate((ActionQuantity("action-a", 1),), 1),
+        objective_bounds=ObjectiveBounds(1, 1, 0, True),
+        worst_scenario=scenario,
+        payout_lower_bound_units=2,
+        cost_upper_bound_units=1,
+        guaranteed_profit_units=1,
+        conservative_capital_release_at=AS_OF + timedelta(days=1),
+        fixed_portfolio_closed=True,
+        global_search_closed=True,
+        master_rounds=2,
+        adversary_rounds=3,
+        cuts=(cut_from_scenario(problem, scenario),),
+        certificate=valid_certificate(),
+    )
+
+
+def test_solver_evidence_payload_round_trips_every_nested_canonical_field() -> None:
+    evidence = nested_solver_evidence()
+    payload = canonical_payload(evidence)
+
+    decoded = solver_evidence_from_payload(payload)
+
+    assert decoded == evidence
+    assert canonical_payload(decoded) == payload
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (lambda payload: payload.pop("candidate"), "solver evidence"),
+        (lambda payload: payload.__setitem__("extra", 1), "solver evidence"),
+        (lambda payload: payload["candidate"]["quantities"][0].__setitem__("quantity_lots", True), "quantity_lots"),
+        (lambda payload: payload["worst_scenario"].__setitem__("extra", 1), "scenario"),
+        (lambda payload: payload["objective_bounds"].__setitem__("upper_bound_units", 2**63), "upper_bound_units"),
+        (lambda payload: payload.__setitem__("conservative_capital_release_at", "2026-08-13T00:00:00+01:00"), "UTC"),
+        (lambda payload: payload["candidate"].__setitem__("claimed_guaranteed_profit_units", 2), "candidate"),
+    ),
+)
+def test_solver_evidence_payload_rejects_malformed_or_inconsistent_nested_claims(
+    mutation,
+    message: str,
+) -> None:
+    payload = canonical_payload(nested_solver_evidence())
+    mutation(payload)
+
+    with pytest.raises(ValueError, match=message):
+        solver_evidence_from_payload(payload)
 
 
 def valid_solver_run(**changes: object) -> SolverRun:

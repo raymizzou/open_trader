@@ -13,11 +13,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from open_trader.prediction_solver import BENCHMARK_PROTOCOL_V1
+from open_trader.prediction_solver import (
+    BENCHMARK_PROTOCOL_V1,
+    BackendResult,
+    IntVariable,
+    LinearModel,
+    NativeSolveStatus,
+)
 from open_trader.prediction_solver_worker import (
     MAX_LINE_BYTES,
+    WORKER_PHASE_NAMES,
     WorkerHarness,
     WorkerProtocolError,
+    _TimingBackend,
     _PipeReader,
     decode_handshake_line,
     decode_request_line,
@@ -135,6 +143,7 @@ def test_protocol_rejects_wrong_response_id_and_noncanonical_response() -> None:
             "protocol": BENCHMARK_PROTOCOL_V1,
             "request_id": "other",
             "status": "OK",
+            "phase_timings_ns": {name: 0 for name in WORKER_PHASE_NAMES},
         },
         separators=(",", ":"),
     ).encode()
@@ -145,6 +154,59 @@ def test_protocol_rejects_wrong_response_id_and_noncanonical_response() -> None:
     invalid["request"]["problem"]["actions"][0]["min_quantity_lots"] = True
     with pytest.raises(WorkerProtocolError, match="canonical"):
         encode_request_line(invalid)
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    (
+        lambda value: value["phase_timings_ns"].pop("backend"),
+        lambda value: value["phase_timings_ns"].__setitem__("extra", 0),
+        lambda value: value["phase_timings_ns"].__setitem__("backend", -1),
+        lambda value: value["phase_timings_ns"].__setitem__("backend", True),
+    ),
+)
+def test_response_protocol_requires_exact_nonnegative_worker_phase_timings(mutator) -> None:
+    value = {
+        "backend": "test",
+        "diagnostics": [],
+        "evidence": None,
+        "phase_timings_ns": {name: 0 for name in WORKER_PHASE_NAMES},
+        "protocol": BENCHMARK_PROTOCOL_V1,
+        "request_id": "request-1",
+        "status": "OK",
+    }
+    mutator(value)
+
+    with pytest.raises(WorkerProtocolError, match="phase_timings_ns"):
+        decode_response_line(json.dumps(value).encode())
+
+
+def test_test_mode_response_uses_zero_for_every_worker_phase() -> None:
+    with WorkerHarness(_test_command("ok")) as harness:
+        outcome = harness.submit(decode_request_line(encode_request_line(_request("phases"))))
+
+    assert outcome.response is not None
+    assert outcome.response.phase_timings_ns == {name: 0 for name in WORKER_PHASE_NAMES}
+
+
+def test_timing_backend_sums_only_native_backend_solve_durations() -> None:
+    class Backend:
+        name = "test"
+        version = "1"
+        durations = iter((7, 11))
+
+        def solve(self, model, *, time_limit_ms):
+            del model, time_limit_ms
+            duration = next(self.durations)
+            return BackendResult(NativeSolveStatus.OPTIMAL, (("x", 0),), None, None, "optimal", duration)
+
+    backend = _TimingBackend(Backend())
+    model = LinearModel((IntVariable("x", 0, 0),), (), None)
+
+    backend.solve(model, time_limit_ms=1)
+    backend.solve(model, time_limit_ms=1)
+
+    assert backend.solve_ns == 18
 
 
 def test_handshake_is_strict_and_protocol_only() -> None:
@@ -486,7 +548,7 @@ def test_peak_rss_sampling_ticks_during_a_silent_solver_wait(monkeypatch) -> Non
         "import json,sys,time; "
         f"print(json.dumps({{'backend':'test','pid':__import__('os').getpid(),'protocol':'{protocol}','version':'1'}}), flush=True); "
         "request=json.loads(sys.stdin.readline()); time.sleep(.2); "
-        f"print(json.dumps({{'backend':'test','diagnostics':[],'evidence':None,'protocol':'{protocol}','request_id':request['request_id'],'status':'OK'}}), flush=True); "
+        f"print(json.dumps({{'backend':'test','diagnostics':[],'evidence':None,'phase_timings_ns':{{name:0 for name in {sorted(WORKER_PHASE_NAMES)!r}}},'protocol':'{protocol}','request_id':request['request_id'],'status':'OK'}}), flush=True); "
         "time.sleep(10)"
     )
     started = time.monotonic()

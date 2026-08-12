@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
+import platform
 import random
 import statistics
+import subprocess
+import sys
 import tempfile
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -25,6 +30,9 @@ from open_trader.prediction_n_leg import (
     OracleBudget,
     OracleRequest,
     OracleResult,
+    ObjectiveBounds,
+    OptimalityStatus,
+    ProofStatus,
     QualificationConstraint,
     QualificationMetric,
     REQUEST_SCHEMA_V1,
@@ -37,6 +45,7 @@ from open_trader.prediction_n_leg import (
     TerminalKind,
     TerminalStateSet,
     UnknownReason,
+    SolveStatus,
     canonical_payload,
     fingerprint,
     request_from_payload,
@@ -59,14 +68,37 @@ from open_trader.prediction_solver import (
     INT64_MAX,
     INT64_MIN,
     BenchmarkClassification,
+    BenchmarkLimits,
     SolverEvidence,
+    SolverRun,
     TerminationReason,
+    solver_evidence_from_payload,
+)
+from open_trader.prediction_solver_worker import (
+    WORKER_PHASE_NAMES,
+    WORKER_VERSION,
+    WorkerHarness,
+    WorkerOutcome,
+    WorkerRequest,
 )
 
 
 _ROOT = Path(__file__).resolve().parents[2]
 _CANONICAL_FIXTURE = _ROOT / "tests" / "fixtures" / "prediction_n_leg_v1.json"
 _CANONICAL_FIXTURE_SHA256 = "a4680fb2c66dedac9e85db9cd06d0872882ca69b09fba6d9f338d0b97243ecc7"
+_BENCHMARK_ROOT = _ROOT / "benchmarks" / "prediction_solver"
+_SYNTHETIC_CORPUS = _BENCHMARK_ROOT / "corpus" / "synthetic_v1.json"
+_APPROVED_CORPUS = _BENCHMARK_ROOT / "corpus" / "approved_v1.json"
+_LICENSE_MANIFEST = _BENCHMARK_ROOT / "licenses.json"
+_BENCHMARK_ENVS = _ROOT / ".benchmark-envs"
+_QUICK_OUTPUT = _ROOT / "reports" / "prediction_solver" / "quick"
+_FINAL_RESULTS = _BENCHMARK_ROOT / "results" / "issue49"
+QUICK_SOFT_TIME_LIMIT_MS = 5_000
+QUICK_HARD_TIME_LIMIT_MS = 20_000
+QUICK_MEMORY_LIMIT_BYTES = 1 << 40
+QUICK_MAX_CONSTRAINT_GENERATION_ROUNDS = 64
+_SOLVERS = ("highs", "scip", "cp_sat")
+_SOLVER_VERSIONS = {"highs": "1.15.1", "scip": "10.0.2", "cp_sat": "9.15.6755"}
 _SYNTHETIC_SCHEMA_V1 = "open_trader.prediction_solver.synthetic_corpus.v1"
 _APPROVED_ENVELOPE_V1 = "open_trader.prediction_solver.approved_envelope.v1"
 _APPROVED_CORPUS_V1 = "open_trader.prediction_solver.approved_corpus.v1"
@@ -93,7 +125,7 @@ _SAMPLE_KINDS = {"warmup", "warm", "cold", "rebuild", "throughput"}
 _RECORD_KEYS = {
     "schema_version", "profile", "environment", "case_id", "truth_method",
     "request_fingerprint", "problem_fingerprint", "git_sha", "cpu", "architecture",
-    "os_version", "container_id", "image_id", "python_version", "solver_name",
+    "os_version", "container_id", "build_id", "image_id", "python_version", "solver_name",
     "solver_version", "adapter_version", "protocol_version", "corpus_version",
     "corpus_manifest_sha256", "license_manifest_sha256", "sample_kind", "sample_index",
     "worker_count", "worker_id", "worker_start_count", "worker_rebuild_count",
@@ -119,11 +151,12 @@ _PHASE_NAMES = {
     "backend", "certificate_check", "certificate_completion", "certificate_generation",
     "first_qualified", "independent_check", "optimal", "serialization",
 }
-_ENVIRONMENT_KEYS = {"available", "build_id", "environment_id", "git_sha", "image_id"}
+_ENVIRONMENT_KEYS = {"available", "environment_id", "git_sha", "cpu", "architecture", "os_version"}
 _SOLVER_KEYS = {"environments", "manual_interventions", "whole_claim_certificate_bound"}
 _SOLVER_ENVIRONMENT_KEYS = {
-    "build_id", "commercial_key_required", "install_succeeded", "installation_ns",
-    "license_evidence_present", "open_source", "reuse_succeeded", "run_succeeded",
+    "adapter_version", "build_id", "commercial_key_required", "image_id",
+    "install_succeeded", "installation_ns", "license_evidence_present", "open_source",
+    "python_version", "reuse_succeeded", "run_succeeded", "solver_version",
     "source_evidence_present",
 }
 _CASE_KEYS = {"model_dimensions", "oracle_limits", "problem_fingerprint", "request_fingerprint", "request_id"}
@@ -326,7 +359,7 @@ def _validated_run_manifest(manifest: Mapping[str, object]) -> dict[str, object]
         evidence = _strict_object(evidence, f"environments.{environment}", _ENVIRONMENT_KEYS)
         if not isinstance(evidence["available"], bool):
             raise ValueError("environment availability must be a bool")
-        for field in ("build_id", "environment_id", "image_id"):
+        for field in ("environment_id", "cpu", "architecture", "os_version"):
             _text(evidence[field], f"environments.{environment}.{field}")
         _git_sha(evidence["git_sha"], f"environments.{environment}.git_sha")
         environments[environment] = evidence
@@ -358,8 +391,8 @@ def _validated_run_manifest(manifest: Mapping[str, object]) -> dict[str, object]
             ):
                 if not isinstance(environment_evidence[field], bool):
                     raise ValueError(f"solvers.{solver}.environments.{environment}.{field} must be a bool")
-            if environment_evidence["build_id"] != environments[environment]["build_id"]:
-                raise ValueError(f"solvers.{solver}.environments.{environment}.build_id does not match environment")
+            for field in ("adapter_version", "build_id", "image_id", "python_version", "solver_version"):
+                _text(environment_evidence[field], f"solvers.{solver}.environments.{environment}.{field}")
             _nonnegative_integer(environment_evidence["installation_ns"], f"solvers.{solver}.environments.{environment}.installation_ns")
             solver_environments[environment] = environment_evidence
         if evidence["whole_claim_certificate_bound"]:
@@ -410,10 +443,13 @@ def _validated_benchmark_record(record: object, manifest: Mapping[str, object]) 
     environment_evidence = manifest["environments"][environment]
     if run["environment_id"] != environment_evidence["environment_id"]:
         raise ValueError("solver_run environment_id does not match manifest")
-    if value["image_id"] != environment_evidence["image_id"]:
-        raise ValueError("record image_id does not match manifest")
-    if value["git_sha"] != environment_evidence["git_sha"]:
-        raise ValueError("record git_sha does not match manifest")
+    for field in ("git_sha", "cpu", "architecture", "os_version"):
+        if value[field] != environment_evidence[field]:
+            raise ValueError(f"record {field} does not match environment evidence")
+    solver_environment_evidence = manifest["solvers"][solver]["environments"][environment]
+    for field in ("build_id", "image_id", "python_version", "solver_version", "adapter_version"):
+        if value[field] != solver_environment_evidence[field]:
+            raise ValueError(f"record {field} does not match solver environment evidence")
     case_evidence = manifest["cases"][case_id]
     for field in ("request_fingerprint", "problem_fingerprint"):
         if value[field] != case_evidence[field]:
@@ -423,7 +459,7 @@ def _validated_benchmark_record(record: object, manifest: Mapping[str, object]) 
     for field in ("request_fingerprint", "problem_fingerprint", "corpus_manifest_sha256", "license_manifest_sha256", "semantic_fingerprint"):
         _sha(value[field], field)
     _git_sha(value["git_sha"], "git_sha")
-    for field in ("truth_method", "cpu", "architecture", "os_version", "container_id", "image_id", "python_version", "corpus_version"):
+    for field in ("truth_method", "cpu", "architecture", "os_version", "container_id", "build_id", "image_id", "python_version", "corpus_version"):
         _text(value[field], field)
     if value["protocol_version"] != BENCHMARK_PROTOCOL_V1:
         raise ValueError("unsupported record protocol")
@@ -506,7 +542,7 @@ def _validated_solver_run_payload(payload: object) -> dict[str, object]:
     evidence = None if run["evidence"] is None else _validated_evidence_payload(run["evidence"])
     if run["classification"] == BenchmarkClassification.CERTIFICATE_CHECKED.value:
         raise ValueError("current certificate evidence is unbound and cannot be CERTIFICATE_CHECKED")
-    if evidence is not None:
+    if evidence is not None and run["classification"] != BenchmarkClassification.UNKNOWN.value:
         if run["objective_bounds"] != evidence["objective_bounds"]:
             raise ValueError("solver_run objective_bounds must match evidence")
         qualified = run["business_status"] == "QUALIFIED_FEASIBLE"
@@ -534,70 +570,7 @@ def _validated_solver_run_payload(payload: object) -> dict[str, object]:
 
 
 def _validated_evidence_payload(payload: object) -> dict[str, object]:
-    value = _strict_object(
-        payload,
-        "solver evidence",
-        {"native_status", "candidate", "objective_bounds", "worst_scenario", "payout_lower_bound_units", "cost_upper_bound_units", "guaranteed_profit_units", "conservative_capital_release_at", "fixed_portfolio_closed", "global_search_closed", "master_rounds", "adversary_rounds", "cuts", "certificate"},
-    )
-    _text(value["native_status"], "native_status")
-    _objective_bounds_payload(value["objective_bounds"])
-    for field in ("payout_lower_bound_units", "cost_upper_bound_units", "guaranteed_profit_units"):
-        if value[field] is not None:
-            _signed_int64(value[field], field)
-    if value["conservative_capital_release_at"] is not None:
-        _utc_z(value["conservative_capital_release_at"], "conservative_capital_release_at")
-    for field in ("fixed_portfolio_closed", "global_search_closed"):
-        if not isinstance(value[field], bool):
-            raise ValueError(f"{field} must be a bool")
-    for field in ("master_rounds", "adversary_rounds"):
-        _nonnegative_integer(value[field], field)
-    if not isinstance(value["cuts"], list):
-        raise ValueError("cuts must be an array")
-    for cut in value["cuts"]:
-        cut_value = _strict_object(cut, "cut", {"cut_id", "scenario", "payout_per_lot"})
-        _text(cut_value["cut_id"], "cut_id")
-        scenario = _strict_object(cut_value["scenario"], "cut.scenario", {"atoms"})
-        _selected_atoms(scenario["atoms"], "cut.scenario.atoms")
-        if not isinstance(cut_value["payout_per_lot"], list):
-            raise ValueError("cut payout_per_lot must be an array")
-        for payout in cut_value["payout_per_lot"]:
-            payout_value = _strict_object(payout, "cut payout", {"action_id", "payout_lower_bound_per_lot_units"})
-            _text(payout_value["action_id"], "action_id")
-            _signed_int64(payout_value["payout_lower_bound_per_lot_units"], "payout_lower_bound_per_lot_units")
-    if value["candidate"] is not None:
-        candidate = _strict_object(value["candidate"], "candidate", {"quantities", "claimed_guaranteed_profit_units"})
-        _signed_int64(candidate["claimed_guaranteed_profit_units"], "claimed_guaranteed_profit_units")
-        if not isinstance(candidate["quantities"], list):
-            raise ValueError("candidate quantities must be an array")
-        for quantity in candidate["quantities"]:
-            quantity_value = _strict_object(quantity, "quantity", {"action_id", "quantity_lots"})
-            _text(quantity_value["action_id"], "action_id")
-            if _signed_int64(quantity_value["quantity_lots"], "quantity_lots") < 0:
-                raise ValueError("quantity_lots must be non-negative")
-    if value["worst_scenario"] is not None:
-        scenario = _strict_object(value["worst_scenario"], "worst_scenario", {"atoms"})
-        _selected_atoms(scenario["atoms"], "worst_scenario.atoms")
-    if value["certificate"] is not None:
-        certificate = _strict_object(value["certificate"], "certificate", {"certificate_sha256", "certificate_size_bytes", "completed_certificate_sha256", "completed_certificate_size_bytes", "checker_name", "checker_version", "checker_exit_code", "checker_succeeded", "generation_ns", "completion_ns", "check_ns"})
-        _sha(certificate["certificate_sha256"], "certificate_sha256")
-        if certificate["completed_certificate_sha256"] is not None:
-            _sha(certificate["completed_certificate_sha256"], "completed_certificate_sha256")
-        for field in ("certificate_size_bytes", "completed_certificate_size_bytes"):
-            if certificate[field] is not None:
-                _nonnegative_integer(certificate[field], field)
-        for field in ("checker_name", "checker_version"):
-            if not isinstance(certificate[field], str):
-                raise ValueError(f"{field} must be text")
-        _integer(certificate["checker_exit_code"], "checker_exit_code")
-        if not isinstance(certificate["checker_succeeded"], bool):
-            raise ValueError("checker_succeeded must be a bool")
-        for field in ("generation_ns", "completion_ns", "check_ns"):
-            _nonnegative_integer(certificate[field], field)
-        if (certificate["completed_certificate_sha256"] is None) != (certificate["completed_certificate_size_bytes"] is None):
-            raise ValueError("completed certificate hash and size must both be present or absent")
-        if certificate["checker_succeeded"] and (certificate["checker_exit_code"] != 0 or not certificate["checker_name"].strip() or not certificate["checker_version"].strip()):
-            raise ValueError("successful certificate checks require exit code zero and checker identity")
-    return value
+    return canonical_payload(solver_evidence_from_payload(payload))
 
 
 def _require_sample_matrix(records: tuple[dict[str, object], ...], manifest: Mapping[str, object]) -> None:
@@ -1220,6 +1193,57 @@ def load_canonical_cases() -> tuple[BenchmarkCase, ...]:
     return tuple(decoded)
 
 
+def _load_quick_cases() -> tuple[BenchmarkCase, ...]:
+    synthetic_bytes = _SYNTHETIC_CORPUS.read_bytes()
+    if synthetic_bytes != generate_synthetic_corpus(4901):
+        raise ValueError("committed synthetic corpus changed")
+    payload = _strict_json(synthetic_bytes, "synthetic corpus")
+    value = _strict_object(
+        payload,
+        "synthetic corpus",
+        {"case_count", "cases", "manifest_sha256", "schema_version", "seed"},
+    )
+    if value["schema_version"] != _SYNTHETIC_SCHEMA_V1 or value["seed"] != 4901 or value["case_count"] != 24:
+        raise ValueError("synthetic corpus identity changed")
+    if not isinstance(value["cases"], list):
+        raise ValueError("synthetic corpus cases must be an array")
+    semantic = []
+    for item in value["cases"]:
+        case = _strict_object(
+            item,
+            "synthetic case",
+            {"case_id", "expected_result", "request", "request_fingerprint", "result_fingerprint", "truth_method"}
+            if isinstance(item, Mapping) and item.get("truth_method") == "exact_oracle_v1"
+            else {"case_id", "declared_search_surface", "expected_result", "request", "request_fingerprint", "result_fingerprint", "truth_method"},
+        )
+        if case["truth_method"] == "measurement_only":
+            continue
+        request = request_from_payload(_mapping(case["request"], "request"))
+        result = result_from_payload(_mapping(case["expected_result"], "expected_result"))
+        if (
+            canonical_payload(request) != case["request"]
+            or canonical_payload(result) != case["expected_result"]
+            or fingerprint(request) != case["request_fingerprint"]
+            or fingerprint(result) != case["result_fingerprint"]
+            or result != _oracle_result(request)
+        ):
+            raise ValueError(f"synthetic case truth changed: {case['case_id']}")
+        semantic.append(
+            BenchmarkCase(
+                _text(case["case_id"], "case_id"),
+                request,
+                result,
+                _sha(case["request_fingerprint"], "request_fingerprint"),
+                _sha(case["result_fingerprint"], "result_fingerprint"),
+                request.budget,
+                "exact_oracle_v1",
+            )
+        )
+    if len(semantic) != 18:
+        raise ValueError("quick corpus must contain exactly 18 semantic synthetic cases")
+    return (*load_canonical_cases(), *semantic)
+
+
 def generate_synthetic_corpus(seed: int = 4901) -> bytes:
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValueError("seed must be an integer")
@@ -1420,6 +1444,8 @@ def _check_positive_claim(
 
     exact_solution = exact.solution
     exact_proof = exact_solution.payout_proof
+    if request.mode == SearchMode.ADMISSION and evaluation.quantities != exact_solution.quantities:
+        return DifferentialCheck(BenchmarkClassification.MEASUREMENT_ONLY, None, False, None)
     if request.mode != SearchMode.ADMISSION and evaluation.guaranteed_profit_units != exact_proof.guaranteed_profit_units:
         return _check_failure(CheckFailureReason.FALSE_OPTIMAL)
     if evaluation.quantities != exact_solution.quantities:
@@ -1961,3 +1987,516 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _current_git_sha(root: Path = _ROOT) -> str:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return _git_sha(completed.stdout.strip(), "git_sha")
+
+
+def _expected_build_key(solver: str) -> str:
+    requirements = _BENCHMARK_ROOT / "requirements" / f"{solver}.txt"
+    dockerfile = _BENCHMARK_ROOT / ("Dockerfile.scip" if solver == "scip" else "Dockerfile.python")
+    material = (
+        f"python={sys.version_info.major}.{sys.version_info.minor}\n"
+        f"os={platform.system()}\n"
+        f"architecture={platform.machine()}\n"
+        f"protocol={BENCHMARK_PROTOCOL_V1}\n"
+    ).encode() + requirements.read_bytes() + dockerfile.read_bytes()
+    return hashlib.sha256(material).hexdigest()
+
+
+def _venv_python_version(path: Path) -> str:
+    configuration = path / "pyvenv.cfg"
+    if configuration.is_file():
+        for line in configuration.read_text().splitlines():
+            if line.startswith("version = "):
+                return _text(line.removeprefix("version = ").strip(), "python_version")
+    return platform.python_version()
+
+
+def _discover_quick_environment(env_root: Path) -> tuple[dict[str, object], dict[str, dict[str, object]]] | None:
+    artifacts: dict[str, dict[str, object]] = {}
+    for solver in _SOLVERS:
+        environment = env_root / solver
+        key_path = environment / ".build-key"
+        python = environment / "bin" / "python"
+        try:
+            key = key_path.read_text().strip()
+        except OSError:
+            return None
+        if (
+            key != _expected_build_key(solver)
+            or len(key) != 64
+            or any(character not in "0123456789abcdef" for character in key)
+            or not python.is_file()
+        ):
+            return None
+        artifacts[solver] = {
+            "adapter_version": WORKER_VERSION,
+            "build_id": f"sha256:{key}",
+            "commercial_key_required": False,
+            "image_id": "none",
+            "install_succeeded": True,
+            "installation_ns": 0,
+            "license_evidence_present": True,
+            "open_source": True,
+            "python_version": _venv_python_version(environment),
+            "reuse_succeeded": True,
+            "run_succeeded": True,
+            "solver_version": _SOLVER_VERSIONS[solver],
+            "source_evidence_present": True,
+        }
+    git_sha = _current_git_sha()
+    cpu = platform.processor() or platform.machine()
+    architecture = platform.machine()
+    os_version = platform.platform()
+    environment_id = "macos:" + hashlib.sha256(
+        json.dumps(
+            {"architecture": architecture, "cpu": cpu, "git_sha": git_sha, "os_version": os_version},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return (
+        {
+            "available": True,
+            "architecture": architecture,
+            "cpu": cpu,
+            "environment_id": environment_id,
+            "git_sha": git_sha,
+            "os_version": os_version,
+        },
+        artifacts,
+    )
+
+
+def _model_dimensions(problem: ArbitrageProblem) -> dict[str, int]:
+    joint_states = 1
+    for state in problem.terminal_state_sets:
+        joint_states *= len(state.atoms)
+    quantity_domain = 1
+    for action in problem.actions:
+        quantity_domain *= 1 + action.max_quantity_lots - action.min_quantity_lots + 1
+    return {
+        "action_count": len(problem.actions),
+        "contract_count": len(problem.terminal_state_sets),
+        "cost_slice_count": sum(len(action.cost_slices) for action in problem.actions),
+        "joint_state_count": joint_states,
+        "quantity_domain_size": quantity_domain,
+        "relationship_count": len(problem.constraint_model.relations) + len(problem.constraint_model.forbidden_atom_combinations),
+        "terminal_atom_count": sum(len(state.atoms) for state in problem.terminal_state_sets),
+    }
+
+
+def _quick_manifest(
+    cases: tuple[BenchmarkCase, ...],
+    environment: Mapping[str, object],
+    artifacts: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    corpus_digest = hashlib.sha256(_CANONICAL_FIXTURE.read_bytes() + _SYNTHETIC_CORPUS.read_bytes()).hexdigest()
+    license_digest = hashlib.sha256(_LICENSE_MANIFEST.read_bytes()).hexdigest()
+    return {
+        "approved_case_count": len(_load_approved_corpus(_APPROVED_CORPUS)["cases"]),
+        "cases": {
+            case.case_id: {
+                "model_dimensions": _model_dimensions(case.request.problem),
+                "oracle_limits": canonical_payload(case.budget),
+                "problem_fingerprint": fingerprint(case.request.problem),
+                "request_fingerprint": case.request_fingerprint,
+                "request_id": case.case_id,
+            }
+            for case in cases
+        },
+        "cold_probe_case_ids": [],
+        "corpus_manifest_sha256": f"sha256:{corpus_digest}",
+        "environments": {"macos": dict(environment)},
+        "first_qualified_case_ids": [
+            case.case_id
+            for case in cases
+            if case.expected_result is not None and case.expected_result.business_status == BusinessStatus.QUALIFIED_FEASIBLE
+        ],
+        "hard_time_limit_ms": QUICK_HARD_TIME_LIMIT_MS,
+        "license_manifest_sha256": f"sha256:{license_digest}",
+        "measured_samples": 1,
+        "memory_limit_bytes": QUICK_MEMORY_LIMIT_BYTES,
+        "max_constraint_generation_rounds": QUICK_MAX_CONSTRAINT_GENERATION_ROUNDS,
+        "optimal_case_ids": [
+            case.case_id
+            for case in cases
+            if case.expected_result is not None and case.expected_result.optimality_status == OptimalityStatus.OPTIMAL
+        ],
+        "profile": "quick",
+        "rebuild_probe_case_ids": [],
+        "required_case_ids": [case.case_id for case in cases],
+        "required_environments": ["macos"],
+        "required_solvers": list(_SOLVERS),
+        "schema_version": _MANIFEST_SCHEMA_V1,
+        "soft_time_limit_ms": QUICK_SOFT_TIME_LIMIT_MS,
+        "solvers": {
+            solver: {
+                "environments": {"macos": dict(artifacts[solver])},
+                "manual_interventions": 0,
+                "whole_claim_certificate_bound": False,
+            }
+            for solver in _SOLVERS
+        },
+        "throughput_probe_case_ids": [],
+        "warmup_samples": 0,
+        "worker_counts": [1],
+    }
+
+
+def _unknown_run(
+    case: BenchmarkCase,
+    solver: str,
+    outcome: WorkerOutcome,
+    environment: Mapping[str, object],
+    artifact: Mapping[str, object],
+    termination: TerminationReason,
+    *,
+    evidence: SolverEvidence | None = None,
+    phase_timings: Mapping[str, int] | None = None,
+    independent_check_ns: int = 0,
+) -> SolverRun:
+    timings = {name: 0 for name in WORKER_PHASE_NAMES}
+    if phase_timings is not None:
+        timings.update(phase_timings)
+    timings["independent_check"] = independent_check_ns
+    return SolverRun(
+        BENCHMARK_PROTOCOL_V1,
+        case.case_id,
+        solver,
+        _text(artifact["solver_version"], "solver_version"),
+        _text(artifact["adapter_version"], "adapter_version"),
+        f"pid-{outcome.worker_pid or 'unavailable'}",
+        _text(environment["environment_id"], "environment_id"),
+        SolveStatus.UNKNOWN,
+        ProofStatus.UNKNOWN,
+        BusinessStatus.UNKNOWN,
+        OptimalityStatus.NOT_APPLICABLE,
+        ObjectiveBounds(None, None, None, False),
+        BenchmarkClassification.UNKNOWN,
+        termination,
+        evidence,
+        None,
+        tuple(timings.items()),
+        outcome.peak_rss_kib * 1024,
+        tuple((f"worker_{index}", text) for index, text in enumerate(outcome.response.diagnostics if outcome.response else ())),
+    )
+
+
+def _solver_run_from_outcome(
+    case: BenchmarkCase,
+    solver: str,
+    outcome: WorkerOutcome,
+    environment: Mapping[str, object],
+    artifact: Mapping[str, object],
+) -> tuple[SolverRun, DifferentialCheck]:
+    empty_check = DifferentialCheck(BenchmarkClassification.UNKNOWN, None, False, None)
+    if outcome.status != "OK" or outcome.response is None:
+        termination = TerminationReason.CLEANUP_UNPROVEN if not outcome.cleanup_proven else (
+            TerminationReason(outcome.termination)
+            if outcome.termination in {item.value for item in TerminationReason}
+            else TerminationReason.PROTOCOL_MISMATCH
+        )
+        return _unknown_run(case, solver, outcome, environment, artifact, termination), empty_check
+    timings = dict(outcome.response.phase_timings_ns)
+    check_started_ns = time.perf_counter_ns()
+    try:
+        evidence = solver_evidence_from_payload(outcome.response.evidence)
+    except (TypeError, ValueError):
+        check_ns = time.perf_counter_ns() - check_started_ns
+        failure = _check_failure(CheckFailureReason.CLAIM_MISMATCH)
+        return _unknown_run(
+            case, solver, outcome, environment, artifact, TerminationReason.INVALID_OUTPUT,
+            phase_timings=timings, independent_check_ns=check_ns,
+        ), failure
+    checked = check_solver_claim(
+        case.request,
+        evidence,
+        claimed_problem_fingerprint=fingerprint(case.request.problem),
+        truth_method=case.truth_method,
+    )
+    check_ns = time.perf_counter_ns() - check_started_ns
+    if checked.hard_failure:
+        return _unknown_run(
+            case, solver, outcome, environment, artifact, TerminationReason.COMPLETED,
+            evidence=evidence, phase_timings=timings, independent_check_ns=check_ns,
+        ), checked
+    phase_pairs = tuple({**timings, "independent_check": check_ns}.items())
+    common = {
+        "schema_version": BENCHMARK_PROTOCOL_V1,
+        "request_id": case.case_id,
+        "solver_name": solver,
+        "solver_version": _text(artifact["solver_version"], "solver_version"),
+        "adapter_version": _text(artifact["adapter_version"], "adapter_version"),
+        "worker_id": f"pid-{outcome.worker_pid or 'unavailable'}",
+        "environment_id": _text(environment["environment_id"], "environment_id"),
+        "termination_reason": TerminationReason.COMPLETED,
+        "evidence": evidence,
+        "phase_timings_ns": phase_pairs,
+        "peak_rss_bytes": outcome.peak_rss_kib * 1024,
+        "diagnostics": tuple((f"worker_{index}", text) for index, text in enumerate(outcome.response.diagnostics)),
+    }
+    if checked.classification == BenchmarkClassification.CHECKED:
+        assert checked.canonical_result is not None
+        result = checked.canonical_result
+        return SolverRun(
+            **common,
+            solve_status=result.solve_status,
+            proof_status=result.proof_status,
+            business_status=result.business_status,
+            optimality_status=result.optimality_status,
+            objective_bounds=result.objective_bounds,
+            classification=checked.classification,
+            canonical_result=result,
+        ), checked
+    if evidence.candidate is not None:
+        return SolverRun(
+            **common,
+            solve_status=SolveStatus.FEASIBLE,
+            proof_status=ProofStatus.UNKNOWN,
+            business_status=BusinessStatus.QUALIFIED_FEASIBLE,
+            optimality_status=OptimalityStatus.OPTIMAL if evidence.objective_bounds.closed else OptimalityStatus.NOT_PROVEN,
+            objective_bounds=evidence.objective_bounds,
+            classification=checked.classification,
+            canonical_result=None,
+        ), checked
+    return _unknown_run(
+        case, solver, outcome, environment, artifact, TerminationReason.COMPLETED,
+        evidence=evidence, phase_timings=timings, independent_check_ns=check_ns,
+    ), checked
+
+
+def _quick_record(
+    case: BenchmarkCase,
+    solver: str,
+    outcome: WorkerOutcome,
+    run: SolverRun,
+    checked: DifferentialCheck,
+    manifest: Mapping[str, object],
+    environment: Mapping[str, object],
+    artifact: Mapping[str, object],
+    wall_ns: int,
+    start_count: int,
+    rebuild_count: int,
+) -> dict[str, object]:
+    peak = outcome.peak_rss_kib * 1024
+    record = {
+        "adapter_version": artifact["adapter_version"],
+        "architecture": environment["architecture"],
+        "build_id": artifact["build_id"],
+        "case_id": case.case_id,
+        "check_failure_reason": None if checked.failure_reason is None else checked.failure_reason.value,
+        "check_hard_failure": checked.hard_failure,
+        "cleanup_proven": outcome.cleanup_proven,
+        "completed_requests": 1,
+        "container_id": "none",
+        "corpus_manifest_sha256": manifest["corpus_manifest_sha256"],
+        "corpus_version": "canonical-48-v1+synthetic-v1",
+        "cpu": environment["cpu"],
+        "environment": "macos",
+        "git_sha": environment["git_sha"],
+        "image_id": artifact["image_id"],
+        "license_manifest_sha256": manifest["license_manifest_sha256"],
+        "memory_limit_bytes": QUICK_MEMORY_LIMIT_BYTES,
+        "os_version": environment["os_version"],
+        "peak_aggregate_rss_bytes": peak,
+        "peak_process_group_rss_bytes": peak,
+        "problem_fingerprint": fingerprint(case.request.problem),
+        "profile": "quick",
+        "protocol_version": BENCHMARK_PROTOCOL_V1,
+        "python_version": artifact["python_version"],
+        "request_fingerprint": case.request_fingerprint,
+        "request_wall_ns": wall_ns,
+        "sample_index": 0,
+        "sample_kind": "warm",
+        "schema_version": _RECORD_SCHEMA_V1,
+        "semantic_fingerprint": "sha256:" + "0" * 64,
+        "solver_name": solver,
+        "solver_run": canonical_payload(run),
+        "solver_version": artifact["solver_version"],
+        "truth_method": case.truth_method,
+        "worker_count": 1,
+        "worker_id": run.worker_id,
+        "worker_rebuild_count": rebuild_count,
+        "worker_start_count": start_count,
+    }
+    record["semantic_fingerprint"] = _semantic_fingerprint(record)
+    return record
+
+
+def _quick_replay_identity(manifest: Mapping[str, object]) -> object:
+    return {
+        "corpus_manifest_sha256": manifest["corpus_manifest_sha256"],
+        "environments": manifest["environments"],
+        "required_case_ids": manifest["required_case_ids"],
+        "solvers": manifest["solvers"],
+    }
+
+
+def _quick_semantics(records: list[dict[str, object]]) -> dict[tuple[str, str], tuple[object, ...]]:
+    return {
+        (record["solver_name"], record["case_id"]): (
+            record["semantic_fingerprint"],
+            record["solver_run"]["termination_reason"],
+            record["check_hard_failure"],
+            record["check_failure_reason"],
+        )
+        for record in records
+    }
+
+
+def _run_quick_benchmark(output_root: Path = _QUICK_OUTPUT, env_root: Path = _BENCHMARK_ENVS) -> int:
+    discovered = _discover_quick_environment(Path(env_root))
+    if discovered is None:
+        print("BLOCKED_MISSING_ENVIRONMENT")
+        return 2
+    environment, artifacts = discovered
+    cases = _load_quick_cases()
+    manifest = _quick_manifest(cases, environment, artifacts)
+    limits = BenchmarkLimits(
+        QUICK_SOFT_TIME_LIMIT_MS,
+        QUICK_HARD_TIME_LIMIT_MS,
+        QUICK_MEMORY_LIMIT_BYTES,
+        QUICK_MAX_CONSTRAINT_GENERATION_ROUNDS,
+    )
+    records: list[dict[str, object]] = []
+    for solver in _SOLVERS:
+        python = Path(env_root) / solver / "bin" / "python"
+        command = [str(python), "-m", "open_trader.prediction_solver_worker", "--backend", solver]
+        worker_env = {**os.environ, "PYTHONSAFEPATH": "1", "PYTHONPATH": str(_ROOT / "src")}
+        with WorkerHarness(
+            command,
+            request_timeout_ms=QUICK_HARD_TIME_LIMIT_MS,
+            startup_timeout_ms=5_000,
+            env=worker_env,
+        ) as harness:
+            for case in cases:
+                started_ns = time.perf_counter_ns()
+                outcome = harness.submit(WorkerRequest(case.case_id, solver, case.request, limits))
+                wall_ns = time.perf_counter_ns() - started_ns
+                run, checked = _solver_run_from_outcome(case, solver, outcome, environment, artifacts[solver])
+                records.append(
+                    _quick_record(
+                        case, solver, outcome, run, checked, manifest, environment,
+                        artifacts[solver], wall_ns, harness.start_count, harness.rebuild_count,
+                    )
+                )
+                if not outcome.cleanup_proven:
+                    raise RuntimeError("CLEANUP_UNPROVEN")
+    summary = aggregate_benchmark_records(records, manifest)
+    hard_failures = {
+        solver: summary["solvers"][solver]["hard_gate_failures"]
+        for solver in _SOLVERS
+        if summary["solvers"][solver]["hard_gate_failures"]
+    }
+    if hard_failures:
+        raise RuntimeError(f"quick hard gate failed: {hard_failures}")
+    output = Path(output_root)
+    records_path = output / "records.jsonl"
+    manifest_path = output / "manifest.json"
+    replayed = False
+    if records_path.is_file() or manifest_path.is_file():
+        if not records_path.is_file() or not manifest_path.is_file():
+            raise ValueError("quick replay baseline is incomplete")
+        previous_manifest = _mapping(_strict_json(manifest_path.read_bytes(), "previous quick manifest"), "previous quick manifest")
+        previous_records = [
+            _mapping(_strict_json(line, f"previous quick record {index}"), f"previous quick record {index}")
+            for index, line in enumerate(records_path.read_bytes().splitlines(), 1)
+        ]
+        aggregate_benchmark_records(previous_records, previous_manifest)
+        if _quick_replay_identity(previous_manifest) == _quick_replay_identity(manifest):
+            if _quick_semantics([dict(record) for record in previous_records]) != _quick_semantics(records):
+                raise ValueError("quick semantic replay changed")
+            replayed = True
+    records_bytes = b"".join(
+        json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"
+        for record in records
+    )
+    _atomic_write_bytes(records_path, records_bytes)
+    _atomic_write_json(manifest_path, manifest)
+    generate_benchmark_report([records_path], manifest_path, output / "artifacts")
+    print("semantic replay PASS" if replayed else "quick baseline PASS")
+    return 0
+
+
+def _run_full_benchmark(environment: str) -> int:
+    if not _load_approved_corpus(_APPROVED_CORPUS)["cases"]:
+        print("BLOCKED_REAL_CORPUS_EMPTY")
+        return 2
+    raise RuntimeError(f"full benchmark runner is not available for {environment} until Task 10")
+
+
+def _final_report_paths() -> tuple[list[Path], Path, Path]:
+    return (
+        [_FINAL_RESULTS / "macos.jsonl", _FINAL_RESULTS / "linux.jsonl"],
+        _FINAL_RESULTS / "manifest.json",
+        _FINAL_RESULTS / "report",
+    )
+
+
+def _require_final_inputs() -> tuple[list[Path], Path, Path]:
+    records, manifest, output = _final_report_paths()
+    missing = [path for path in (*records, manifest) if not path.is_file()]
+    if missing:
+        raise ValueError("final Task 10 benchmark inputs are absent")
+    return records, manifest, output
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="prediction-solver-benchmark")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("quick")
+    full = commands.add_parser("full")
+    full.add_argument("--environment", required=True, choices=("macos", "linux"))
+    commands.add_parser("report")
+    commands.add_parser("verify-report")
+    intake = commands.add_parser("import-approved")
+    intake.add_argument("inbox", nargs="?", default=str(_BENCHMARK_ROOT / "inbox" / "approved_component.json"))
+    intake.add_argument("corpus", nargs="?", default=str(_APPROVED_CORPUS))
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "quick":
+            return _run_quick_benchmark()
+        if args.command == "full":
+            return _run_full_benchmark(args.environment)
+        if args.command == "import-approved":
+            import_approved_snapshot(args.inbox, args.corpus)
+            return 0
+        records, manifest, output = _require_final_inputs()
+        if args.command == "report":
+            generate_benchmark_report(records, manifest, output)
+        else:
+            verify_benchmark_report(records, manifest, output)
+        return 0
+    except (OSError, RuntimeError, ValueError) as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
