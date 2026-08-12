@@ -319,6 +319,10 @@ def _check_positive_claim(
         return _check_failure(CheckFailureReason.FALSE_SAFE)
     if evaluation.failed_qualification_ids:
         return _check_failure(CheckFailureReason.FALSE_SAFE)
+    if evidence.conservative_capital_release_at != evaluation.conservative_capital_release_at:
+        return _check_failure(CheckFailureReason.WRONG_RELEASE)
+    if not _fixed_claim_matches(problem, evidence, evaluation):
+        return _check_failure(CheckFailureReason.CLAIM_MISMATCH)
     try:
         support = derive_selected_support_graph(problem, evaluation, request.budget)
     except ValueError as error:
@@ -333,10 +337,6 @@ def _check_positive_claim(
         return _check_failure(CheckFailureReason.CLAIM_MISMATCH)
     if len(split_disconnected_solution(problem, evaluation, support)) != 1:
         return _check_failure(CheckFailureReason.DISCONNECTED_SUPPORT)
-    if evidence.conservative_capital_release_at != evaluation.conservative_capital_release_at:
-        return _check_failure(CheckFailureReason.WRONG_RELEASE)
-    if not _fixed_claim_matches(problem, evidence, evaluation):
-        return _check_failure(CheckFailureReason.CLAIM_MISMATCH)
     if search_budget_exhausted:
         return DifferentialCheck(BenchmarkClassification.MEASUREMENT_ONLY, None, False, None)
     if exact.solution is None:

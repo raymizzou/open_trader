@@ -33,6 +33,7 @@ from open_trader.prediction_n_leg import (
 )
 from open_trader.prediction_n_leg_oracle import (
     build_relation_components,
+    derive_selected_support_graph,
     diagnose_raw_arbitrage,
     evaluate_fixed_portfolio,
     find_qualified,
@@ -639,6 +640,47 @@ def test_checker_keeps_large_decision_limited_recheck_within_the_frozen_state_bu
     assert checked.canonical_result is None
     assert checked.hard_failure is False
     assert checked.failure_reason is None
+
+
+@pytest.mark.parametrize(
+    ("tampered_field", "failure_reason"),
+    (
+        ("conservative_capital_release_at", CheckFailureReason.WRONG_RELEASE),
+        ("payout_lower_bound_units", CheckFailureReason.CLAIM_MISMATCH),
+    ),
+)
+def test_checker_rejects_tampered_fixed_claim_before_bounded_support_fallback(
+    tampered_field: str,
+    failure_reason: CheckFailureReason,
+) -> None:
+    case = next(item for item in load_canonical_cases() if item.case_id == "exactly-one-n3")
+    assert case.expected_result is not None and case.expected_result.solution is not None
+    payload = canonical_payload(case.request)
+    payload["budget"] = {"max_quantity_vectors": 1, "max_joint_states": 8, "max_support_rechecks": 1}
+    payload["problem"]["constraint_model"]["forbidden_atom_combinations"] = [
+        {
+            "atom_ids": ["a-yes", "b-yes"],
+            "constraint_id": "redundant-forbidden-pair",
+            "rule_version": "v1",
+        }
+    ]
+    request = request_from_payload(payload)
+    assert find_qualified(request).unknown_reason == UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED
+    evaluation = evaluate_fixed_portfolio(request.problem, case.expected_result.solution.quantities, request.budget)
+    assert derive_selected_support_graph(request.problem, evaluation, request.budget) == UnknownReason.ORACLE_SUPPORT_LIMIT_EXCEEDED
+    evidence = _evidence_for_quantities(request, evaluation.quantities)
+    evidence = replace(
+        evidence,
+        **{
+            tampered_field: (
+                evidence.conservative_capital_release_at + timedelta(seconds=1)
+                if tampered_field == "conservative_capital_release_at"
+                else evidence.payout_lower_bound_units + 1
+            )
+        },
+    )
+
+    _assert_hard_checker_failure(request, evidence, failure_reason)
 
 
 def test_checker_rejects_a_profitable_claim_for_an_actually_lossy_portfolio() -> None:
