@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 
 from open_trader.prediction_solver import (
+    INT64_MAX,
+    INT64_MIN,
     IntVariable,
     LinearConstraint,
     LinearModel,
@@ -21,7 +23,7 @@ from open_trader.prediction_solver import (
     validate_backend_result,
 )
 import open_trader.prediction_solver_backends as solver_backends
-from open_trader.prediction_solver_backends import HighsBackend, ScipBackend, ViprCheckResult, check_vipr_certificate
+from open_trader.prediction_solver_backends import CpSatBackend, HighsBackend, ScipBackend, ViprCheckResult, check_vipr_certificate
 
 ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK = ROOT / "benchmarks" / "prediction_solver"
@@ -445,6 +447,313 @@ def test_highs_backend_exposes_pinned_solver_identity_without_candidate_imports(
         check=True,
     )
     assert result.stdout.strip() == "False False False"
+
+
+class _FakeCpExpr:
+    def __init__(self, terms: tuple[tuple[int, str], ...] = (), constant: int = 0) -> None:
+        self.terms = terms
+        self.constant = constant
+
+    def __add__(self, other: object) -> "_FakeCpExpr":
+        if isinstance(other, _FakeCpExpr):
+            return _FakeCpExpr((*self.terms, *other.terms), self.constant + other.constant)
+        return _FakeCpExpr(self.terms, self.constant + int(other))
+
+    def __radd__(self, other: object) -> "_FakeCpExpr":
+        return self + other
+
+    def __rmul__(self, other: object) -> "_FakeCpExpr":
+        return _FakeCpExpr(tuple((int(other) * coefficient, name) for coefficient, name in self.terms), int(other) * self.constant)
+
+
+class _FakeCpVar(_FakeCpExpr):
+    def __init__(self, name: str, lower: int, upper: int) -> None:
+        super().__init__(((1, name),))
+        self.name = name
+        self.lower = lower
+        self.upper = upper
+
+
+class _FakeCpModel:
+    instances: list["_FakeCpModel"] = []
+
+    def __init__(self) -> None:
+        self.variables: list[_FakeCpVar] = []
+        self.constraints: list[tuple[_FakeCpExpr | int, int, int]] = []
+        self.objective: tuple[str, _FakeCpExpr | int] | None = None
+        type(self).instances.append(self)
+
+    def new_int_var(self, lower: int, upper: int, name: str) -> _FakeCpVar:
+        variable = _FakeCpVar(name, lower, upper)
+        self.variables.append(variable)
+        return variable
+
+    def add_linear_constraint(self, expression: _FakeCpExpr | int, lower: int, upper: int) -> None:
+        self.constraints.append((expression, lower, upper))
+
+    def maximize(self, expression: _FakeCpExpr | int) -> None:
+        self.objective = ("MAX", expression)
+
+    def minimize(self, expression: _FakeCpExpr | int) -> None:
+        self.objective = ("MIN", expression)
+
+
+class _FakeCpSolverParameters:
+    def __init__(self) -> None:
+        self.num_search_workers: int | None = None
+        self.random_seed: int | None = None
+        self.max_time_in_seconds: float | None = None
+        self.log_search_progress: bool | None = None
+        self.log_to_stdout: bool | None = None
+
+
+class _FakeCpSolver:
+    status = "OPTIMAL"
+    values: dict[str, object] = {"x": 1}
+    objective = 1.0
+    best_bound = 1.0
+    instances: list["_FakeCpSolver"] = []
+    status_names = {
+        "OPTIMAL": "OPTIMAL",
+        "FEASIBLE": "FEASIBLE",
+        "INFEASIBLE": "INFEASIBLE",
+        "MODEL_INVALID": "MODEL_INVALID",
+        "UNKNOWN": "UNKNOWN",
+    }
+
+    def __init__(self) -> None:
+        self.parameters = _FakeCpSolverParameters()
+        self.model: _FakeCpModel | None = None
+        type(self).instances.append(self)
+
+    def solve(self, model: _FakeCpModel) -> str:
+        self.model = model
+        return type(self).status
+
+    def value(self, variable: _FakeCpVar) -> object:
+        return type(self).values[variable.name]
+
+    def objective_value(self) -> float:
+        return type(self).objective
+
+    def best_objective_bound(self) -> float:
+        return type(self).best_bound
+
+    def status_name(self, status: str) -> str:
+        return self.status_names[status]
+
+
+@pytest.fixture
+def fake_cp_sat(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    _FakeCpModel.instances.clear()
+    _FakeCpSolver.instances.clear()
+    _FakeCpSolver.status = "OPTIMAL"
+    _FakeCpSolver.values = {"x": 1}
+    _FakeCpSolver.objective = 1.0
+    _FakeCpSolver.best_bound = 1.0
+    module = SimpleNamespace(
+        CpModel=_FakeCpModel,
+        CpSolver=_FakeCpSolver,
+        OPTIMAL="OPTIMAL",
+        FEASIBLE="FEASIBLE",
+        INFEASIBLE="INFEASIBLE",
+        MODEL_INVALID="MODEL_INVALID",
+        UNKNOWN="UNKNOWN",
+    )
+    monkeypatch.setattr(
+        solver_backends.importlib,
+        "import_module",
+        lambda name: module if name == "ortools.sat.python.cp_model" else (_ for _ in ()).throw(AssertionError(name)),
+    )
+    return module
+
+
+def test_cp_sat_translates_max_model_and_sets_deterministic_configuration(fake_cp_sat: SimpleNamespace) -> None:
+    _FakeCpSolver.status = "OPTIMAL"
+    _FakeCpSolver.values = {"x": 7, "y": 0}
+    _FakeCpSolver.objective = 21.0
+    _FakeCpSolver.best_bound = 21.0
+    model = LinearModel(
+        variables=(IntVariable("x", 0, 10), IntVariable("y", 0, 10)),
+        constraints=(LinearConstraint("capacity", (("x", 1), ("y", 1)), None, 7),),
+        objective=LinearObjective("MAX", (("x", 3), ("y", 1))),
+    )
+
+    result = CpSatBackend().solve(model, time_limit_ms=321)
+
+    instance = _FakeCpModel.instances[-1]
+    solver = _FakeCpSolver.instances[-1]
+    assert result.status == NativeSolveStatus.OPTIMAL
+    assert dict(result.values) == {"x": 7, "y": 0}
+    assert result.objective_value == 21
+    assert result.objective_bound == 21
+    assert [(item.name, item.lower, item.upper) for item in instance.variables] == [("x", 0, 10), ("y", 0, 10)]
+    expression, lower, upper = instance.constraints[0]
+    assert (expression.terms, lower, upper) == (((1, "x"), (1, "y")), INT64_MIN, 7)
+    assert instance.objective is not None and instance.objective[0] == "MAX"
+    assert instance.objective[1].terms == ((3, "x"), (1, "y"))
+    assert solver.parameters.num_search_workers == 1
+    assert solver.parameters.random_seed == 4901
+    assert solver.parameters.max_time_in_seconds == 0.321
+    assert solver.parameters.log_search_progress is False
+    assert solver.parameters.log_to_stdout is False
+    validate_backend_result(model, result)
+
+
+def test_cp_sat_translates_minimize_objective(fake_cp_sat: SimpleNamespace) -> None:
+    _FakeCpSolver.values = {"x": 0, "y": 7}
+    _FakeCpSolver.objective = 7.0
+    _FakeCpSolver.best_bound = 7.0
+    model = LinearModel(
+        variables=(IntVariable("x", 0, 10), IntVariable("y", 0, 10)),
+        constraints=(LinearConstraint("minimum", (("x", 1), ("y", 1)), 7, None),),
+        objective=LinearObjective("MIN", (("x", 2), ("y", 1))),
+    )
+
+    result = CpSatBackend().solve(model, time_limit_ms=1)
+
+    assert result.status == NativeSolveStatus.OPTIMAL
+    assert result.objective_value == 7
+    assert _FakeCpModel.instances[-1].objective is not None
+    assert _FakeCpModel.instances[-1].objective[0] == "MIN"
+
+
+@pytest.mark.parametrize(
+    ("native_status", "has_values", "expected"),
+    (
+        ("OPTIMAL", True, NativeSolveStatus.OPTIMAL),
+        ("FEASIBLE", True, NativeSolveStatus.FEASIBLE),
+        ("INFEASIBLE", False, NativeSolveStatus.INFEASIBLE),
+        ("MODEL_INVALID", False, NativeSolveStatus.UNKNOWN),
+        ("UNKNOWN", False, NativeSolveStatus.UNKNOWN),
+    ),
+)
+def test_cp_sat_maps_native_statuses_without_promoting_claims(
+    fake_cp_sat: SimpleNamespace,
+    native_status: str,
+    has_values: bool,
+    expected: NativeSolveStatus,
+) -> None:
+    _FakeCpSolver.status = native_status
+    _FakeCpSolver.values = {"x": 1} if has_values else {}
+
+    result = CpSatBackend().solve(_one_variable_model(), time_limit_ms=1)
+
+    assert result.status == expected
+    assert (result.status == NativeSolveStatus.OPTIMAL) is (native_status == "OPTIMAL")
+    if expected in {NativeSolveStatus.OPTIMAL, NativeSolveStatus.FEASIBLE}:
+        assert result.values == (("x", 1),)
+    else:
+        assert result.values == ()
+
+
+def test_cp_sat_accepts_only_strictly_integer_native_values(fake_cp_sat: SimpleNamespace) -> None:
+    _FakeCpSolver.status = "FEASIBLE"
+    _FakeCpSolver.values = {"x": 1.0000005}
+    assert CpSatBackend().solve(_one_variable_model(), time_limit_ms=1).values == (("x", 1),)
+
+    _FakeCpSolver.values = {"x": 1.000002}
+    with pytest.raises(UnsafeSolverResult, match="non-integral"):
+        CpSatBackend().solve(_one_variable_model(), time_limit_ms=1)
+
+
+def test_cp_sat_parent_validation_rejects_native_row_violation(fake_cp_sat: SimpleNamespace) -> None:
+    _FakeCpSolver.status = "FEASIBLE"
+    _FakeCpSolver.values = {"x": 1}
+    model = LinearModel(
+        variables=(IntVariable("x", 0, 1),),
+        constraints=(LinearConstraint("cap", (("x", 1),), None, 0),),
+        objective=LinearObjective("MAX", (("x", 1),)),
+    )
+
+    with pytest.raises(UnsafeSolverResult, match="constraint violated: cap"):
+        CpSatBackend().solve(model, time_limit_ms=1)
+
+
+def test_cp_sat_recomputes_exact_objective_and_keeps_near_integer_bound_diagnostic(
+    fake_cp_sat: SimpleNamespace,
+) -> None:
+    _FakeCpSolver.status = "OPTIMAL"
+    _FakeCpSolver.values = {"x": 1}
+    _FakeCpSolver.objective = 999.0000004
+    _FakeCpSolver.best_bound = 4.0000005
+
+    result = CpSatBackend().solve(_one_variable_model(objective=3), time_limit_ms=1)
+
+    assert result.objective_value == 3
+    assert result.objective_bound == 4
+
+    _FakeCpSolver.best_bound = 4.000002
+    assert CpSatBackend().solve(_one_variable_model(objective=3), time_limit_ms=1).objective_bound is None
+
+
+@pytest.mark.parametrize(
+    "model",
+    (
+        LinearModel(
+            variables=(IntVariable("x", INT64_MAX, INT64_MAX), IntVariable("y", INT64_MAX, INT64_MAX)),
+            constraints=(LinearConstraint("row", (("x", 2), ("y", -2)), 0, 0),),
+            objective=None,
+        ),
+        LinearModel(
+            variables=(IntVariable("x", INT64_MAX, INT64_MAX), IntVariable("y", INT64_MAX, INT64_MAX)),
+            constraints=(LinearConstraint("row", (("x", 1), ("y", -1)), 0, 0),),
+            objective=None,
+        ),
+        LinearModel(
+            variables=(IntVariable("x", INT64_MAX, INT64_MAX), IntVariable("y", INT64_MAX, INT64_MAX)),
+            constraints=(),
+            objective=LinearObjective("MAX", (("x", 1), ("y", -1))),
+        ),
+    ),
+)
+def test_cp_sat_rejects_unsafe_term_or_cumulative_activity_before_native_construction(
+    fake_cp_sat: SimpleNamespace, model: LinearModel
+) -> None:
+    with pytest.raises(ValueError, match="signed int64"):
+        CpSatBackend().solve(model, time_limit_ms=1)
+    assert _FakeCpModel.instances == []
+    assert _FakeCpSolver.instances == []
+
+
+def test_cp_sat_is_lazy_and_does_not_import_optional_candidates() -> None:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT / "src")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import open_trader.prediction_solver_backends; print('highspy' in sys.modules, 'pyscipopt' in sys.modules, 'ortools' in sys.modules)",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert result.stdout.strip() == "False False False"
+
+
+def test_cp_sat_native_max_min_and_infeasible_models() -> None:
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    backend = CpSatBackend()
+    max_result = backend.solve(_one_variable_model(), time_limit_ms=1_000)
+    assert max_result.status == NativeSolveStatus.OPTIMAL
+    assert dict(max_result.values) == {"x": 1}
+
+    min_result = backend.solve(_one_variable_min_model(), time_limit_ms=1_000)
+    assert min_result.status == NativeSolveStatus.OPTIMAL
+    assert dict(min_result.values) == {"x": 0}
+
+    infeasible = LinearModel(
+        variables=(IntVariable("x", 0, 1),),
+        constraints=(LinearConstraint("impossible", (("x", 1),), 2, None),),
+        objective=None,
+    )
+    infeasible_result = backend.solve(infeasible, time_limit_ms=1_000)
+    assert infeasible_result.status == NativeSolveStatus.INFEASIBLE
+    assert infeasible_result.values == ()
+    assert cp_model.__name__ == "ortools.sat.python.cp_model"
 
 
 class _FakeScipExpr:

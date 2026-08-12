@@ -48,6 +48,10 @@ def _pyscipopt() -> Any:
     return importlib.import_module("pyscipopt")
 
 
+def _cp_model() -> Any:
+    return importlib.import_module("ortools.sat.python.cp_model")
+
+
 def _integer_value(value: object, name: str) -> int:
     try:
         number = float(value)
@@ -720,6 +724,132 @@ class HighsBackend:
         return result
 
 
+def _validate_cp_sat_numeric(model: LinearModel) -> None:
+    """Reject expressions CP-SAT could overflow while building or solving."""
+    validate_linear_model(model)
+    variables = {variable.name: variable for variable in model.variables}
+
+    def validate_activity(owner: str, terms: tuple[tuple[str, int], ...]) -> None:
+        minimum = maximum = 0
+        cumulative = 0
+        for name, coefficient in terms:
+            variable = variables[name]
+            lower_product = coefficient * variable.lower
+            upper_product = coefficient * variable.upper
+            if not INT64_MIN <= lower_product <= INT64_MAX or not INT64_MIN <= upper_product <= INT64_MAX:
+                raise ValueError(f"possible {owner} term product exceeds signed int64: {name}")
+            cumulative += max(abs(lower_product), abs(upper_product))
+            if cumulative > INT64_MAX:
+                raise ValueError(f"possible {owner} cumulative activity exceeds signed int64")
+            if coefficient >= 0:
+                minimum += lower_product
+                maximum += upper_product
+            else:
+                minimum += upper_product
+                maximum += lower_product
+        if not INT64_MIN <= minimum <= INT64_MAX or not INT64_MIN <= maximum <= INT64_MAX:
+            raise ValueError(f"possible {owner} activity exceeds signed int64")
+
+    for constraint in model.constraints:
+        validate_activity(f"row {constraint.name}", constraint.coefficients)
+    if model.objective is not None:
+        validate_activity("objective", model.objective.coefficients)
+
+
+def _cp_solver_call(solver: Any, lower_name: str, upper_name: str, *args: object) -> Any:
+    value = getattr(solver, lower_name, None)
+    if callable(value):
+        return value(*args)
+    if value is not None and not args:
+        return value
+    value = getattr(solver, upper_name)
+    return value(*args)
+
+
+class CpSatBackend:
+    """Thin translation layer from the benchmark integer IR to CP-SAT."""
+
+    name = "cp_sat"
+    version = "9.15.6755"
+
+    def solve(self, model: LinearModel, *, time_limit_ms: int) -> BackendResult:
+        _validate_cp_sat_numeric(model)
+        if isinstance(time_limit_ms, bool) or not isinstance(time_limit_ms, int) or time_limit_ms <= 0:
+            raise ValueError("time_limit_ms must be a positive integer")
+
+        cp_model = _cp_model()
+        native_model = cp_model.CpModel()
+        variables: dict[str, Any] = {
+            variable.name: native_model.new_int_var(variable.lower, variable.upper, variable.name)
+            for variable in model.variables
+        }
+
+        def expression(terms: tuple[tuple[str, int], ...]) -> Any:
+            return sum((coefficient * variables[name] for name, coefficient in terms), 0)
+
+        for constraint in model.constraints:
+            native_model.add_linear_constraint(
+                expression(constraint.coefficients),
+                INT64_MIN if constraint.lower is None else constraint.lower,
+                INT64_MAX if constraint.upper is None else constraint.upper,
+            )
+        if model.objective is not None:
+            objective = expression(model.objective.coefficients)
+            if model.objective.sense == "MAX":
+                native_model.maximize(objective)
+            else:
+                native_model.minimize(objective)
+
+        solver = cp_model.CpSolver()
+        solver.parameters.num_search_workers = 1
+        solver.parameters.random_seed = 4901
+        solver.parameters.max_time_in_seconds = time_limit_ms / 1_000
+        solver.parameters.log_search_progress = False
+        solver.parameters.log_to_stdout = False
+        started_ns = time.perf_counter_ns()
+        native_result = _cp_solver_call(solver, "solve", "Solve", native_model)
+        solve_ns = max(1, time.perf_counter_ns() - started_ns)
+        native_status = str(_cp_solver_call(solver, "status_name", "StatusName", native_result))
+
+        if native_result == cp_model.INFEASIBLE:
+            result = BackendResult(NativeSolveStatus.INFEASIBLE, (), None, None, native_status, solve_ns)
+            validate_backend_result(model, result)
+            return result
+        if native_result not in {cp_model.OPTIMAL, cp_model.FEASIBLE}:
+            result = BackendResult(NativeSolveStatus.UNKNOWN, (), None, None, native_status, solve_ns)
+            validate_backend_result(model, result)
+            return result
+
+        values = tuple(
+            (variable.name, _integer_value(_cp_solver_call(solver, "value", "Value", variables[variable.name]), f"value for {variable.name}"))
+            for variable in model.variables
+        )
+        values_by_name = dict(values)
+        objective_value = (
+            sum(values_by_name[name] * coefficient for name, coefficient in model.objective.coefficients)
+            if model.objective is not None
+            else None
+        )
+        objective_bound = None
+        if model.objective is not None:
+            # CP-SAT exposes both values as floats.  Keep only a near-integral
+            # bound as diagnostics; the parent recomputes the exact objective.
+            _optional_integer_value(_cp_solver_call(solver, "objective_value", "ObjectiveValue"), "objective value")
+            objective_bound = _optional_integer_value(
+                _cp_solver_call(solver, "best_objective_bound", "BestObjectiveBound"), "objective bound"
+            )
+        result = BackendResult(
+            NativeSolveStatus.OPTIMAL if native_result == cp_model.OPTIMAL else NativeSolveStatus.FEASIBLE,
+            values,
+            objective_value,
+            objective_bound,
+            native_status,
+            solve_ns,
+        )
+        validate_backend_result(model, result)
+        return result
+
+
 @dataclass(frozen=True, slots=True)
 class ScipBackendResult(BackendResult):
     certificate: ViprCheckResult | None = None
@@ -1002,6 +1132,41 @@ class ScipBackend:
 
 
 def _self_check(solver_name: str) -> None:
+    if solver_name == "cp_sat":
+        from importlib.metadata import PackageNotFoundError, version as package_version
+        from open_trader.prediction_solver import IntVariable, LinearConstraint, LinearObjective
+
+        try:
+            native_version = package_version("ortools")
+        except PackageNotFoundError as exc:
+            raise RuntimeError("OR-Tools package metadata is unavailable") from exc
+        backend = CpSatBackend()
+        if native_version != backend.version:
+            raise RuntimeError(f"OR-Tools version mismatch: expected {backend.version}, got {native_version}")
+        maximum = backend.solve(
+            LinearModel((IntVariable("x", 0, 1),), (), LinearObjective("MAX", (("x", 1),))),
+            time_limit_ms=1_000,
+        )
+        minimum = backend.solve(
+            LinearModel((IntVariable("x", 0, 1),), (), LinearObjective("MIN", (("x", 1),))),
+            time_limit_ms=1_000,
+        )
+        infeasible = backend.solve(
+            LinearModel(
+                (IntVariable("x", 0, 1),),
+                (LinearConstraint("impossible", (("x", 1),), 2, None),),
+                None,
+            ),
+            time_limit_ms=1_000,
+        )
+        if maximum.status != NativeSolveStatus.OPTIMAL or dict(maximum.values) != {"x": 1}:
+            raise RuntimeError(f"CP-SAT max self-check failed: {maximum}")
+        if minimum.status != NativeSolveStatus.OPTIMAL or dict(minimum.values) != {"x": 0}:
+            raise RuntimeError(f"CP-SAT min self-check failed: {minimum}")
+        if infeasible.status != NativeSolveStatus.INFEASIBLE:
+            raise RuntimeError(f"CP-SAT infeasible self-check failed: {infeasible}")
+        print(json.dumps({"adapter": "CpSatBackend", "solver": "ortools", "version": native_version, "status": maximum.status.value}))
+        return
     if solver_name == "scip":
         from open_trader.prediction_solver import IntVariable, LinearObjective
 
@@ -1090,7 +1255,7 @@ def _self_check(solver_name: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--self-check", choices=("highs", "scip", "scip-exact"))
+    parser.add_argument("--self-check", choices=("highs", "scip", "scip-exact", "cp_sat"))
     args = parser.parse_args()
     if args.self_check is not None:
         _self_check(args.self_check)
