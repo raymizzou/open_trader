@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -19,7 +20,7 @@ from open_trader.prediction_solver import (
     validate_backend_result,
 )
 import open_trader.prediction_solver_backends as solver_backends
-from open_trader.prediction_solver_backends import HighsBackend
+from open_trader.prediction_solver_backends import HighsBackend, ScipBackend, ViprCheckResult, check_vipr_certificate
 
 ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK = ROOT / "benchmarks" / "prediction_solver"
@@ -443,3 +444,286 @@ def test_highs_backend_exposes_pinned_solver_identity_without_candidate_imports(
         check=True,
     )
     assert result.stdout.strip() == "False False False"
+
+
+class _FakeScipExpr:
+    def __init__(self, terms: tuple[tuple[int, str], ...] = (), constant: int = 0) -> None:
+        self.terms = terms
+        self.constant = constant
+
+    def __add__(self, other: object) -> "_FakeScipExpr":
+        if isinstance(other, _FakeScipExpr):
+            return _FakeScipExpr((*self.terms, *other.terms), self.constant + other.constant)
+        return _FakeScipExpr(self.terms, self.constant + int(other))
+
+    def __radd__(self, other: object) -> "_FakeScipExpr":
+        return self + other
+
+    def __mul__(self, other: object) -> "_FakeScipExpr":
+        return _FakeScipExpr(tuple((int(other) * coefficient, name) for coefficient, name in self.terms), int(other) * self.constant)
+
+    def __rmul__(self, other: object) -> "_FakeScipExpr":
+        return self * other
+
+    def __ge__(self, other: object) -> tuple[str, "_FakeScipExpr", int]:
+        return (">=", self, int(other))
+
+    def __le__(self, other: object) -> tuple[str, "_FakeScipExpr", int]:
+        return ("<=", self, int(other))
+
+
+class _FakeScipVar(_FakeScipExpr):
+    def __init__(self, name: str) -> None:
+        super().__init__(((1, name),))
+        self.name = name
+
+
+class _FakeScipModel:
+    status = "optimal"
+    values = {"x": 1}
+    valid_solution = True
+    dual_bound = 1.0
+    instances: list["_FakeScipModel"] = []
+
+    def __init__(self) -> None:
+        self.options: dict[str, object] = {}
+        self.variables: list[_FakeScipVar] = []
+        self.constraints: list[object] = []
+        self.objective_sense: str | None = None
+        self.certificate_path: str | None = None
+        type(self).instances.append(self)
+
+    def hideOutput(self) -> None:
+        self.options["hideOutput"] = True
+
+    def setParam(self, name: str, value: object) -> None:
+        self.options[name] = value
+        if name == "certificate/filename":
+            self.certificate_path = str(value)
+
+    def enableExactSolving(self, enabled: bool) -> None:
+        self.options["exact/enable"] = enabled
+
+    def addVar(self, **kwargs: object) -> _FakeScipVar:
+        variable = _FakeScipVar(str(kwargs["name"]))
+        self.variables.append(variable)
+        return variable
+
+    def addCons(self, constraint: object, **kwargs: object) -> None:
+        self.constraints.append((constraint, kwargs))
+
+    def setMaximize(self) -> None:
+        self.objective_sense = "MAX"
+
+    def setMinimize(self) -> None:
+        self.objective_sense = "MIN"
+
+    def optimize(self) -> None:
+        if self.certificate_path is not None:
+            Path(self.certificate_path).write_bytes(b"vipr original certificate\n")
+
+    def getStatus(self) -> str:
+        return type(self).status
+
+    def getBestSol(self) -> object | None:
+        return object() if type(self).valid_solution else None
+
+    def getSolVal(self, solution: object, variable: _FakeScipVar) -> object:
+        return type(self).values[variable.name]
+
+    def getDualbound(self) -> float:
+        return type(self).dual_bound
+
+
+@pytest.fixture
+def fake_pyscipopt(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    _FakeScipModel.instances.clear()
+    _FakeScipModel.status = "optimal"
+    _FakeScipModel.values = {"x": 1}
+    _FakeScipModel.valid_solution = True
+    _FakeScipModel.dual_bound = 1.0
+    module = SimpleNamespace(Model=_FakeScipModel)
+    monkeypatch.setattr(
+        solver_backends.importlib,
+        "import_module",
+        lambda name: module if name == "pyscipopt" else (_ for _ in ()).throw(AssertionError(name)),
+    )
+    return module
+
+
+def test_fake_scip_maps_optimal_and_infeasible_claims(fake_pyscipopt: SimpleNamespace) -> None:
+    model = _one_variable_model()
+    _FakeScipModel.status = "optimal"
+    _FakeScipModel.values = {"x": 1}
+    optimal = ScipBackend().solve(model, time_limit_ms=321)
+    assert optimal.status == NativeSolveStatus.OPTIMAL
+    assert optimal.values == (("x", 1),)
+    assert optimal.objective_value == 1
+
+    _FakeScipModel.status = "infeasible"
+    _FakeScipModel.valid_solution = False
+    infeasible = ScipBackend().solve(model, time_limit_ms=321)
+    assert infeasible.status == NativeSolveStatus.INFEASIBLE
+    assert infeasible.values == ()
+
+
+@pytest.mark.parametrize("status", ("timelimit", "memlimit", "nodelimit", "gaplimit", "unknown"))
+def test_fake_scip_limits_and_unknown_statuses_are_unknown(fake_pyscipopt: SimpleNamespace, status: str) -> None:
+    _FakeScipModel.status = status
+    _FakeScipModel.valid_solution = True
+    _FakeScipModel.values = {"x": 1}
+    result = ScipBackend().solve(_one_variable_model(), time_limit_ms=1)
+    assert result.status == NativeSolveStatus.UNKNOWN
+    assert result.values == ()
+
+
+def test_fake_scip_formal_mode_enables_exact_and_scopes_certificate(
+    fake_pyscipopt: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    certificate = ViprCheckResult(
+        "sha256:" + "a" * 64,
+        7,
+        "sha256:" + "b" * 64,
+        9,
+        "viprchk",
+        "vipr-test",
+        0,
+        True,
+        0,
+        3,
+        5,
+        generation_ns=11,
+    )
+    monkeypatch.setattr(solver_backends, "check_vipr_certificate", lambda *_args, **_kwargs: certificate)
+
+    result = ScipBackend().solve(
+        _one_variable_model(),
+        time_limit_ms=321,
+        formal=True,
+        artifact_dir=tmp_path,
+        certificate_path="request.vipr",
+    )
+
+    instance = _FakeScipModel.instances[-1]
+    assert result.status == NativeSolveStatus.OPTIMAL
+    assert isinstance(result, solver_backends.ScipBackendResult)
+    assert result.certificate is not None and result.certificate.checker_succeeded
+    assert instance.options["exact/enable"] is True
+    assert instance.options["parallel/maxnthreads"] == 1
+    assert instance.options["randomization/randomseedshift"] == 4901
+    assert instance.options["limits/time"] == 0.321
+    assert Path(instance.options["certificate/filename"]).resolve() == (tmp_path / "request.vipr").resolve()
+
+
+def test_scip_exact_replay_does_not_interpolate_controlled_certificate_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeModelWithProblem(_FakeScipModel):
+        def writeProblem(self, filename: str, **kwargs: object) -> None:
+            Path(filename).write_bytes(b"MPS")
+
+    monkeypatch.setattr(
+        solver_backends.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(Model=FakeModelWithProblem) if name == "pyscipopt" else (_ for _ in ()).throw(AssertionError(name)),
+    )
+    cli = _write_executable(
+        tmp_path / "scip",
+        "#!/usr/bin/env python3\nfrom pathlib import Path\nPath.cwd().joinpath('__scip_exact_certificate.vipr').write_bytes(b'cert')\n",
+    )
+    monkeypatch.setattr(solver_backends, "_scip_cli", lambda: str(cli))
+    monkeypatch.setattr(
+        solver_backends,
+        "check_vipr_certificate",
+        lambda *_args, **_kwargs: ViprCheckResult(
+            "sha256:" + "a" * 64,
+            4,
+            "sha256:" + "b" * 64,
+            4,
+            "viprchk",
+            "vipr-test",
+            0,
+            True,
+            0,
+            1,
+            1,
+        ),
+    )
+    escaped = tmp_path / "escaped.mps"
+    requested = f"request.vipr\nread {escaped}\nwrite problem {escaped}"
+
+    result = ScipBackend().solve(
+        _one_variable_model(),
+        time_limit_ms=321,
+        formal=True,
+        artifact_dir=tmp_path,
+        certificate_path=requested,
+    )
+
+    assert result.status == NativeSolveStatus.OPTIMAL
+    assert (tmp_path / requested).is_file()
+    assert not escaped.exists()
+
+
+def _write_executable(path: Path, source: str) -> Path:
+    path.write_text(source)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+def test_vipr_helper_completes_and_checks_in_separate_single_threaded_processes(tmp_path: Path) -> None:
+    original = tmp_path / "original.vipr"
+    original.write_bytes(b"original")
+    comp = _write_executable(
+        tmp_path / "viprcomp",
+        "#!/usr/bin/env python3\nfrom pathlib import Path\nimport sys\nPath(sys.argv[-1]).open('ab').write(b' completed')\n",
+    )
+    chk = _write_executable(
+        tmp_path / "viprchk",
+        "#!/usr/bin/env python3\nfrom pathlib import Path\nimport sys\nassert Path(sys.argv[-1]).read_bytes().endswith(b' completed')\nassert __import__('os').environ.get('OMP_NUM_THREADS') == '1'\n",
+    )
+
+    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=1_000)
+
+    assert result.checker_succeeded is True
+    assert result.certificate_size_bytes == len(b"original")
+    assert result.completed_certificate_size_bytes == len(b"original completed")
+    assert result.certificate_sha256.startswith("sha256:")
+    assert result.completed_certificate_sha256.startswith("sha256:")
+    assert result.completion_ns > 0
+    assert result.check_ns > 0
+
+
+def test_vipr_helper_missing_or_failed_checker_is_not_proof(tmp_path: Path) -> None:
+    original = tmp_path / "original.vipr"
+    original.write_bytes(b"corrupt")
+    chk = _write_executable(tmp_path / "viprchk", "#!/usr/bin/env python3\nraise SystemExit(17)\n")
+    comp = _write_executable(tmp_path / "viprcomp", "#!/usr/bin/env python3\nraise SystemExit(19)\n")
+
+    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=1_000)
+
+    assert result.checker_succeeded is False
+    assert result.checker_exit_code == 19
+    assert result.completed_certificate_sha256 is not None
+
+
+def test_vipr_helper_maps_missing_certificate_and_checker_timeout_to_failure(tmp_path: Path) -> None:
+    missing = check_vipr_certificate(tmp_path / "missing.vipr", tmp_path, timeout_ms=1_000)
+    assert missing.checker_succeeded is False
+    assert missing.error == "certificate is missing"
+
+    original = tmp_path / "original.vipr"
+    original.write_bytes(b"corrupt")
+    comp = _write_executable(tmp_path / "viprcomp", "#!/usr/bin/env python3\nimport sys\n")
+    chk = _write_executable(tmp_path / "viprchk", "#!/usr/bin/env python3\nimport time\ntime.sleep(10)\n")
+    timed_out = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=10)
+    assert timed_out.checker_succeeded is False
+    assert timed_out.checker_exit_code is None
+    assert timed_out.error == "VIPR subprocess timed out"
+
+
+def test_vipr_helper_rejects_certificate_outside_request_artifact_dir(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside.vipr"
+    outside.write_bytes(b"outside")
+    with pytest.raises(ValueError, match="artifact directory"):
+        check_vipr_certificate(outside, tmp_path, viprcomp="unused", viprchk="unused", timeout_ms=1_000)
