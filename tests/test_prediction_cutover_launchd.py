@@ -18,8 +18,10 @@ SHA = "a" * 40
 FAKE_COMMAND = r'''#!/usr/bin/env python3
 import json
 import os
+import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 state_path = Path(os.environ["FAKE_STATE"])
@@ -57,7 +59,7 @@ if command == "python":
     source = sys.stdin.read() if len(sys.argv) > 1 and sys.argv[1] == "-" else None
     tag = sys.argv[2] if len(sys.argv) > 2 and sys.argv[1] == "-" else ""
     mode = sys.argv[4] if tag == "route-write" else ""
-    result = sys.argv[7] if tag == "evidence-write" else ""
+    result = sys.argv[9] if tag == "evidence-write" else ""
     fail = (
         state["fail_at"] == "route_maintenance_write"
         and tag == "route-write" and mode == "maintenance"
@@ -75,6 +77,18 @@ if command == "python":
         and tag == "evidence-write" and result == "ready"
         and not state.get("injected_failure_seen")
     )
+    if (
+        state["fail_at"] == "initial_stale_operation"
+        and tag == "route-write" and mode == "maintenance"
+        and not state.get("injected_failure_seen")
+    ):
+        newer_route = json.loads(route_path.read_text(encoding="utf-8"))
+        newer_route.update(mode="maintenance", operation_id="newer-operation")
+        route_path.write_text(json.dumps(newer_route), encoding="utf-8")
+        Path(os.environ["FAKE_EVIDENCE"]).write_text(
+            json.dumps(state["newer_evidence"]), encoding="utf-8"
+        )
+        state["injected_failure_seen"] = True
     save()
     completed = subprocess.run(
         [os.environ["FAKE_REAL_PYTHON"], *sys.argv[1:]],
@@ -103,6 +117,17 @@ if command == "launchctl":
         print("launchctl diagnostic", file=sys.stderr)
         save()
         raise SystemExit(2)
+    if len(sys.argv) == 3 and sys.argv[1] == "print" and sys.argv[2].count("/") == 1:
+        labels = [
+            (item["pid"], name)
+            for name, item in state["labels"].items() if item["loaded"]
+        ] + [(9998, label) for label in state["extra_loaded_labels"]]
+        print("services = {")
+        for pid, label in labels:
+            print(f"\t{pid} = {label}")
+        print("}")
+        save()
+        raise SystemExit(0)
     label = sys.argv[-1].rsplit("/", 1)[-1]
     item = state["labels"].get(label)
     if sys.argv[1] == "print" and item and item["loaded"]:
@@ -121,6 +146,11 @@ if command == "lsof":
         save()
         raise SystemExit(2)
     args = " ".join(sys.argv[1:])
+    if args.endswith("runtime.lock"):
+        for pid in state["lock_holders"]:
+            print(f"p{pid}")
+        save()
+        raise SystemExit(0 if state["lock_holders"] else 1)
     if "-d cwd" in args:
         pid = option("-p")
         for item in state["labels"].values():
@@ -145,6 +175,14 @@ if command == "ps":
         save()
         raise SystemExit(2)
     pid = option("-p")
+    if "command=" in sys.argv:
+        for item in state["labels"].values():
+            if item["loaded"] and str(item["pid"]) == pid:
+                print(shlex.join(item["argv"]))
+                save()
+                raise SystemExit(0)
+        save()
+        raise SystemExit(1)
     present = any(
         item["loaded"] and str(item["pid"]) == pid
         for item in state["labels"].values()
@@ -153,7 +191,9 @@ if command == "ps":
     raise SystemExit(0 if present else 1)
 
 if command == "owner-probe":
-    if state["fail_at"] in {"owner_lock", "legacy_owner_lock"}:
+    if state["fail_at"] == "owner_lock" or (
+        state["fail_at"] == "legacy_owner_lock" and owners() > 0
+    ):
         save()
         raise SystemExit(2)
     save()
@@ -166,6 +206,9 @@ if command == "curl":
             and not state.get("injected_failure_seen"):
         route["operation_id"] = "newer-operation"
         route_path.write_text(json.dumps(route), encoding="utf-8")
+        Path(os.environ["FAKE_EVIDENCE"]).write_text(
+            json.dumps(state["newer_evidence"]), encoding="utf-8"
+        )
         state["injected_failure_seen"] = True
     if state["fail_at"] == "gateway_maintenance" and route["mode"] == "maintenance":
         route = {**route, "mode": "legacy"}
@@ -238,10 +281,14 @@ if command == "curl":
             print("[]")
             save()
             raise SystemExit(0)
+        public_status = state.get("public_status", "healthy")
         print(json.dumps({
-            "status": "ready",
-            "health": {"status": "ok"},
-            "readiness": {"status": "ready"},
+            "status": public_status,
+            "health": {"status": state.get("public_health_status", "healthy")},
+            "readiness": {
+                "status": state.get("public_readiness_status", "ready")
+            },
+            "stale": False,
             "events": [],
             "opportunities": [],
         }))
@@ -249,6 +296,17 @@ if command == "curl":
     raise SystemExit(0)
 
 if command == "install_dashboard_launchd.sh":
+    expected = [
+        "--mode", "legacy", "--prediction-owner", option("--prediction-owner"),
+        "--repo-root", os.environ["FAKE_REPO_ROOT"],
+        "--runtime-root", os.environ["FAKE_RUNTIME_ROOT"],
+        "--python", os.environ["FAKE_PYTHON"],
+        "--launch-agents-dir", os.environ["FAKE_LAUNCH_AGENTS"],
+        "--wait-seconds", os.environ["FAKE_WAIT_SECONDS"],
+    ]
+    if sys.argv[1:] != expected:
+        save()
+        raise SystemExit(97)
     owner = option("--prediction-owner")
     if state["fail_at"] == "legacy_restart":
         save()
@@ -257,18 +315,41 @@ if command == "install_dashboard_launchd.sh":
     if state["fail_at"] != "old_legacy_pid":
         legacy["pid"] += 1
     legacy["cwd"] = option("--repo-root")
+    legacy["argv"] = [
+        os.environ["FAKE_PYTHON"], "-m", "open_trader", "dashboard",
+        "--prediction-owner", owner,
+    ]
     state["legacy_prediction_owner"] = owner
+    state["lock_holders"] = [legacy["pid"]] if owner == "enabled" else []
     state["listeners"]["8767"] = {"pid": legacy["pid"]}
     save()
     raise SystemExit(0)
 
 if command == "install_prediction_service_launchd.sh":
+    expected = [
+        "--mode", "production", "--repo-root", os.environ["FAKE_REPO_ROOT"],
+        "--runtime-root", os.environ["FAKE_RUNTIME_ROOT"],
+        "--python", os.environ["FAKE_PYTHON"],
+        "--config", os.environ["FAKE_CONFIG"],
+        "--launch-agents-dir", os.environ["FAKE_LAUNCH_AGENTS"],
+        "--wait-seconds", os.environ["FAKE_WAIT_SECONDS"],
+        "--expected-sha", os.environ["FAKE_SHA"],
+    ]
+    if sys.argv[1:] != expected:
+        save()
+        raise SystemExit(97)
+    if state["fail_at"] == "service_installer_timeout":
+        time.sleep(10)
     if state["fail_at"] in {"service_installer", "service_generation", "service_reconcile"}:
         save()
         raise SystemExit(1)
     service = state["labels"]["com.open-trader.prediction-service"]
-    service.update(loaded=True, pid=3001, cwd=option("--repo-root"), sha=os.environ["FAKE_SHA"])
+    service.update(
+        loaded=True, pid=3001, cwd=option("--repo-root"), sha=os.environ["FAKE_SHA"],
+        argv=[os.environ["FAKE_PYTHON"], "-m", "open_trader", "prediction-service"],
+    )
     state["prediction_service_ready"] = True
+    state["lock_holders"] = [service["pid"]]
     state["listeners"]["8769"] = {"pid": service["pid"]}
     record = {
         "schema_version": "open_trader.prediction_service.runtime.v1",
@@ -310,12 +391,21 @@ if command == "install_prediction_service_launchd.sh":
     raise SystemExit(0)
 
 if command == "uninstall_prediction_service_launchd.sh":
+    expected = [
+        "--mode", "production", "--runtime-root", os.environ["FAKE_RUNTIME_ROOT"],
+        "--python", os.environ["FAKE_PYTHON"],
+        "--launch-agents-dir", os.environ["FAKE_LAUNCH_AGENTS"],
+    ]
+    if sys.argv[1:] != expected:
+        save()
+        raise SystemExit(97)
     if state["fail_at"] == "service_uninstall":
         save()
         raise SystemExit(1)
     service = state["labels"]["com.open-trader.prediction-service"]
     service.update(loaded=False, pid=0, cwd="")
     state["prediction_service_ready"] = False
+    state["lock_holders"] = []
     state["listeners"]["8769"] = None
     save()
     raise SystemExit(0)
@@ -354,17 +444,38 @@ class CutoverHarness:
             "legacy_prediction_owner": "enabled",
             "prediction_service_ready": False,
             "inflight": 0,
+            "extra_loaded_labels": [],
+            "lock_holders": [2001],
+            "public_status": "healthy",
+            "public_health_status": "healthy",
+            "public_readiness_status": "ready",
+            "newer_evidence": {
+                "schema_version": "open_trader.prediction_cutover.evidence.v1",
+                "operation_id": "newer-operation",
+                "target": "service",
+                "expected_sha": SHA,
+                "result": "failed",
+                "failure_reason": "newer-operation-active",
+                "downtime_started_at": "2026-08-12T11:00:00+08:00",
+                "downtime_ended_at": "",
+            },
             "labels": {
                 "com.open-trader.frontend-gateway": {
                     "loaded": True, "pid": 1001, "cwd": str(self.repo), "sha": SHA,
+                    "argv": [sys.executable, "-m", "open_trader", "frontend-gateway"],
                     "plist": str(self.launch_agents / "com.open-trader.frontend-gateway.plist"),
                 },
                 "com.open-trader.legacy-dashboard": {
                     "loaded": True, "pid": 2001, "cwd": str(self.repo), "sha": SHA,
+                    "argv": [
+                        sys.executable, "-m", "open_trader", "dashboard",
+                        "--prediction-owner", "enabled",
+                    ],
                     "plist": str(self.launch_agents / "com.open-trader.legacy-dashboard.plist"),
                 },
                 "com.open-trader.prediction-service": {
                     "loaded": False, "pid": 0, "cwd": "", "sha": "",
+                    "argv": [],
                     "plist": str(self.launch_agents / "com.open-trader.prediction-service.plist"),
                 },
             },
@@ -410,6 +521,20 @@ class CutoverHarness:
             state["listeners"]["8769"] = {"pid": 9999}
         elif fail_at == "loaded_unknown_label":
             state["labels"]["com.open-trader.legacy-dashboard"]["cwd"] = "/unknown"
+        elif fail_at == "unknown_relevant_label":
+            state["extra_loaded_labels"] = ["com.open-trader.prediction-service-copy"]
+        elif fail_at == "duplicate_relevant_label":
+            state["extra_loaded_labels"] = ["com.open-trader.legacy-dashboard"]
+        elif fail_at == "public_unavailable":
+            state["public_status"] = "unavailable"
+        elif fail_at == "public_degraded":
+            state["public_health_status"] = "degraded"
+        elif fail_at == "public_error":
+            state["public_readiness_status"] = "error"
+        elif fail_at == "legacy_argv_wrong":
+            state["labels"]["com.open-trader.legacy-dashboard"]["argv"][-1] = "disabled"
+        elif fail_at == "legacy_lock_holder_wrong":
+            state["lock_holders"] = [9999]
         self.state_path.write_text(json.dumps(state), encoding="utf-8")
 
     def run(
@@ -420,6 +545,12 @@ class CutoverHarness:
             "FAKE_STATE": str(self.state_path),
             "FAKE_ROUTE": str(self.route),
             "FAKE_RUNTIME_ROOT": str(self.runtime),
+            "FAKE_REPO_ROOT": str(self.repo),
+            "FAKE_EVIDENCE": str(self.runtime / "prediction-cutover-evidence.json"),
+            "FAKE_CONFIG": str(self.config),
+            "FAKE_PYTHON": str(self.bin / "python"),
+            "FAKE_LAUNCH_AGENTS": str(self.launch_agents),
+            "FAKE_WAIT_SECONDS": "2",
             "FAKE_SHA": SHA,
             "FAKE_REAL_PYTHON": sys.executable,
             "GIT_BIN": str(self.bin / "git"),
@@ -469,6 +600,28 @@ def test_service_happy_path(harness: CutoverHarness) -> None:
     assert str(
         harness.repo / "scripts/install_prediction_service_launchd.sh"
     ) in harness.state["command_paths"]
+    assert [
+        call for call in harness.state["calls"]
+        if call[0] == "install_dashboard_launchd.sh"
+    ][0][1:] == [
+        "--mode", "legacy", "--prediction-owner", "disabled",
+        "--repo-root", str(harness.repo),
+        "--runtime-root", str(harness.runtime),
+        "--python", str(harness.bin / "python"),
+        "--launch-agents-dir", str(harness.launch_agents),
+        "--wait-seconds", "2",
+    ]
+    assert [
+        call for call in harness.state["calls"]
+        if call[0] == "install_prediction_service_launchd.sh"
+    ][0][1:] == [
+        "--mode", "production", "--repo-root", str(harness.repo),
+        "--runtime-root", str(harness.runtime),
+        "--python", str(harness.bin / "python"),
+        "--config", str(harness.config),
+        "--launch-agents-dir", str(harness.launch_agents),
+        "--wait-seconds", "2", "--expected-sha", SHA,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -528,7 +681,7 @@ def test_service_failure_stays_in_maintenance_without_running_later_commands(
         )
     elif forbidden_later_command == "evidence:ready":
         assert not any(
-            call[:3] == ["python", "-", "evidence-write"] and call[7] == "ready"
+            call[:3] == ["python", "-", "evidence-write"] and call[9] == "ready"
             for call in calls
         )
     elif forbidden_later_command != "none":
@@ -565,6 +718,23 @@ def test_service_to_legacy_rollback_uses_one_owner(harness: CutoverHarness) -> N
         "--python", str(harness.bin / "python"),
         "--launch-agents-dir", str(harness.launch_agents),
     ]
+    legacy_enable = [
+        call for call in harness.state["calls"]
+        if call[0] == "install_dashboard_launchd.sh" and "enabled" in call
+    ]
+    assert legacy_enable[-1][1:] == [
+        "--mode", "legacy", "--prediction-owner", "enabled",
+        "--repo-root", str(harness.repo),
+        "--runtime-root", str(harness.runtime),
+        "--python", str(harness.bin / "python"),
+        "--launch-agents-dir", str(harness.launch_agents),
+        "--wait-seconds", "2",
+    ]
+    assert any(call[0] == "ps" and "command=" in call for call in harness.state["calls"])
+    assert any(
+        call[0] == "lsof" and call[-1].endswith("runtime.lock")
+        for call in harness.state["calls"]
+    )
 
 
 def test_repeating_completed_target_preserves_evidence(harness: CutoverHarness) -> None:
@@ -588,21 +758,114 @@ def test_repeating_completed_target_preserves_evidence(harness: CutoverHarness) 
     assert not any(call[:3] == ["python", "-", "route-write"] for call in later_calls)
 
 
+@pytest.mark.parametrize("evidence_state", ["missing", "malformed"])
+def test_repeating_completed_target_fails_closed_without_valid_evidence(
+    harness: CutoverHarness,
+    evidence_state: str,
+) -> None:
+    harness.run("service").check_returncode()
+    evidence = harness.runtime / "prediction-cutover-evidence.json"
+    if evidence_state == "missing":
+        evidence.unlink()
+    else:
+        evidence.write_text("{}", encoding="utf-8")
+    route_before = harness.route.read_bytes()
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert "already ready" not in result.stdout
+    assert harness.route.read_bytes() == route_before
+
+
+def test_repeating_completed_target_requires_operation_lock(
+    harness: CutoverHarness,
+) -> None:
+    harness.run("service").check_returncode()
+    lock = harness.runtime / "config/.prediction-cutover.lock"
+    lock.mkdir()
+    route_before = harness.route.read_bytes()
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert "another prediction cutover is active" in result.stderr
+    assert "already ready" not in result.stdout
+    assert harness.route.read_bytes() == route_before
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["health_evidence", "public_unavailable", "public_degraded", "public_error"],
+)
+def test_repeating_service_reproves_runtime_and_public_contract(
+    harness: CutoverHarness,
+    failure: str,
+) -> None:
+    harness.run("service").check_returncode()
+    harness.configure(failure)
+    route_before = harness.route.read_bytes()
+    evidence_before = (
+        harness.runtime / "prediction-cutover-evidence.json"
+    ).read_bytes()
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert "already ready" not in result.stdout
+    assert harness.route.read_bytes() == route_before
+    assert (
+        harness.runtime / "prediction-cutover-evidence.json"
+    ).read_bytes() == evidence_before
+
+
+@pytest.mark.parametrize("failure", ["legacy_argv_wrong", "legacy_lock_holder_wrong"])
+def test_repeating_legacy_reproves_pid_argv_and_lock_owner(
+    harness: CutoverHarness,
+    failure: str,
+) -> None:
+    harness.run("service").check_returncode()
+    harness.run("legacy").check_returncode()
+    harness.configure(failure)
+
+    result = harness.run("legacy")
+
+    assert result.returncode == 1
+    assert "already ready" not in result.stdout
+
+
 def test_stale_operation_cannot_overwrite_active_maintenance(
     harness: CutoverHarness,
 ) -> None:
     harness.configure("stale_operation")
 
+    original_evidence = harness.state["newer_evidence"]
     result = harness.run("service")
 
     route = json.loads(harness.route.read_text(encoding="utf-8"))
     assert result.returncode == 1
     assert route["mode"] == "maintenance"
     assert route["operation_id"] == "newer-operation"
+    assert harness.evidence == original_evidence
     assert harness.state["max_prediction_owners"] == 1
     assert not any(
         call[0] == "install_dashboard_launchd.sh" for call in harness.state["calls"]
     )
+
+
+def test_initial_maintenance_cas_cannot_overwrite_newer_route_or_evidence(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("initial_stale_operation")
+    expected_evidence = harness.state["newer_evidence"]
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    route = json.loads(harness.route.read_text(encoding="utf-8"))
+    assert route["mode"] == "maintenance"
+    assert route["operation_id"] == "newer-operation"
+    assert harness.evidence == expected_evidence
 
 
 @pytest.mark.parametrize(
@@ -613,6 +876,8 @@ def test_stale_operation_cannot_overwrite_active_maintenance(
         "wrong_runtime_sha",
         "unknown_listener",
         "loaded_unknown_label",
+        "unknown_relevant_label",
+        "duplicate_relevant_label",
         "listener_inspection_error",
         "label_inspection_error",
     ],
@@ -755,6 +1020,19 @@ def test_evidence_excludes_config_and_request_secrets(harness: CutoverHarness) -
     }
 
 
+def test_service_child_timeout_fails_closed_with_no_later_mutation(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("service_installer_timeout")
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "maintenance"
+    assert harness.state["prediction_service_ready"] is False
+    assert harness.evidence["result"] == "failed"
+
+
 @pytest.mark.parametrize(
     ("failure", "forbidden_later_command"),
     [
@@ -791,6 +1069,20 @@ def test_rollback_failure_stays_in_maintenance_without_auto_service_restart(
             call[0] == "install_dashboard_launchd.sh" and "enabled" in call
             for call in calls
         )
+    elif failure == "legacy_owner_lock":
+        legacy_enable_index = next(
+            index for index, call in enumerate(calls)
+            if call[0] == "install_dashboard_launchd.sh" and "enabled" in call
+        )
+        owner_probe_index = next(
+            index for index, call in enumerate(calls)
+            if call[0] == "owner-probe" and index > legacy_enable_index
+        )
+        assert owner_probe_index > legacy_enable_index
+        assert not any(
+            call[:3] == ["python", "-", "route-write"] and call[4] == "legacy"
+            for call in calls[owner_probe_index + 1:]
+        )
     elif forbidden_later_command == "route:legacy":
         assert not any(
             call[:3] == ["python", "-", "route-write"] and call[4] == "legacy"
@@ -808,6 +1100,6 @@ def test_rollback_failure_stays_in_maintenance_without_auto_service_restart(
         )
     elif forbidden_later_command == "evidence:ready":
         assert not any(
-            call[:3] == ["python", "-", "evidence-write"] and call[7] == "ready"
+            call[:3] == ["python", "-", "evidence-write"] and call[9] == "ready"
             for call in calls
         )

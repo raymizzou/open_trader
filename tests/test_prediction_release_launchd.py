@@ -192,7 +192,14 @@ class ReleaseHarness:
         (path / "scripts").mkdir(parents=True)
         (path / "ops" / "launchd").mkdir(parents=True)
         (path / "src").mkdir(parents=True)
-        shutil.copytree(ROOT / "src" / "open_trader", path / "src" / "open_trader")
+        shutil.copytree(
+            ROOT / "src" / "open_trader",
+            path / "src" / "open_trader",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        (path / ".gitignore").write_text(
+            "__pycache__/\n*.pyc\n", encoding="utf-8"
+        )
         for script in (
             "install_prediction_service_launchd.sh",
             "uninstall_prediction_service_launchd.sh",
