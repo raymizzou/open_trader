@@ -4539,6 +4539,18 @@ function renderTrendHoldingTable(items, report) {
   return `<table class="cn-trend-table"><thead><tr>${headings.map((heading) => `<th scope="col">${escapeHtml(heading)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>${rows.length ? "" : "<p>无</p>"}`;
 }
 
+function renderHoldingOriginSection(title, rows, tableHtml) {
+  return `<section class="holding-origin-section">
+    <div class="holding-origin-heading"><h3>${escapeHtml(title)}</h3><span>${escapeHtml(formatDisplayNumber(rows.length))} 条</span></div>
+    ${rows.length ? tableHtml : '<p class="account-empty">无</p>'}
+  </section>`;
+}
+
+function renderHistoricalTrendHoldingWarning(report) {
+  const reason = report?.historical_buy_plan_membership?.reason || "数据未提供";
+  return `<p class="account-empty missing-text">历史趋势持仓归类不可用：${escapeHtml(formatPlain(reason))}</p>`;
+}
+
 function renderTrendHoldingSource(report) {
   const status = trendRealHoldingStatus(report);
   if (status !== "available") return "";
@@ -4565,7 +4577,11 @@ function renderTrendHoldingPanel(report, view, items) {
       return `<p class="account-empty missing-text">真实持仓数据不可用：${escapeHtml(formatPlain(reason))}</p>`;
     }
     const rows = Array.isArray(items) ? items : [];
-    return `${renderTrendHoldingSource(report)}${renderTrendHoldingTable(rows, report)}`;
+    const split = splitHistoricalTrendHoldings(rows, report);
+    if (!split) {
+      return `${renderTrendHoldingSource(report)}${renderHistoricalTrendHoldingWarning(report)}${renderTrendHoldingTable(rows, report)}`;
+    }
+    return `${renderTrendHoldingSource(report)}${renderHoldingOriginSection("趋势持仓", split.trend, renderTrendHoldingTable(split.trend, report))}${renderHoldingOriginSection("非趋势持仓", split.nonTrend, renderTrendHoldingTable(split.nonTrend, report))}`;
   }
   const rows = Array.isArray(items) ? items : [];
   return renderTrendHoldingTable(rows, report);
@@ -5988,9 +6004,11 @@ function renderAccountViewPanel(group) {
   const view = state.accountViews[group.broker] || "real";
   if (view === "simulate") return renderSimulatedAccountView(group.broker);
   if (view === "report") return renderEmbeddedTrendReport(group.broker);
-  return group.rows.length
-    ? renderAccountTable(group.rows)
-    : '<p class="account-empty">当前筛选下没有持仓</p>';
+  if (!group.rows.length) return '<p class="account-empty">当前筛选下没有持仓</p>';
+  const report = state.dashboard?.trend_reports?.[group.broker];
+  const split = splitHistoricalTrendHoldings(group.rows, report);
+  if (!split) return `${renderHistoricalTrendHoldingWarning(report)}${renderAccountTable(group.rows)}`;
+  return `${renderHoldingOriginSection("趋势持仓", split.trend, renderAccountTable(split.trend))}${renderHoldingOriginSection("非趋势持仓", split.nonTrend, renderAccountTable(split.nonTrend))}`;
 }
 
 function simulatedAccountRows(broker) {
@@ -9176,6 +9194,20 @@ function normalizeActionKey(market, symbol) {
     normalizedSymbol = normalizedSymbol.padStart(5, "0");
   }
   return `${normalizedMarket}.${normalizedSymbol}`;
+}
+
+function splitHistoricalTrendHoldings(items, report) {
+  const membership = report?.historical_buy_plan_membership;
+  if (membership?.available !== true || !Array.isArray(membership.symbols)) return null;
+  const planned = new Set(membership.symbols.map((key) => normalizeActionKey("", key)).filter(Boolean));
+  const trend = [];
+  const nonTrend = [];
+  for (const item of items) {
+    const position = item?.holding || item;
+    const key = normalizeActionKey(position?.market || report?.market, position?.symbol);
+    (key && planned.has(key) ? trend : nonTrend).push(item);
+  }
+  return {trend, nonTrend};
 }
 
 function actionSymbol(action) {
