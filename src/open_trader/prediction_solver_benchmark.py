@@ -303,27 +303,32 @@ def _check_positive_claim(
         if request.mode == SearchMode.RAW_ARBITRAGE_DIAGNOSTIC
         else request.problem
     )
-    fixed_budget = (
-        _fixed_check_budget(problem, request.budget)
-        if exact.unknown_reason
-        in {
-            UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED,
-            UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED,
-        }
-        else request.budget
-    )
+    search_budget_exhausted = exact.unknown_reason in {
+        UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED,
+        UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED,
+    }
     try:
-        evaluation = evaluate_fixed_portfolio(problem, evidence.candidate.quantities, fixed_budget)
-    except (OverflowError, ValueError):
+        evaluation = evaluate_fixed_portfolio(problem, evidence.candidate.quantities, request.budget)
+    except ValueError as error:
+        if search_budget_exhausted and str(error) == UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED.value:
+            return DifferentialCheck(BenchmarkClassification.MEASUREMENT_ONLY, None, False, None)
+        return _check_failure(CheckFailureReason.FALSE_SAFE)
+    except OverflowError:
         return _check_failure(CheckFailureReason.FALSE_SAFE)
     if evidence.candidate.claimed_guaranteed_profit_units > evaluation.guaranteed_profit_units and evaluation.guaranteed_profit_units < 0:
         return _check_failure(CheckFailureReason.FALSE_SAFE)
     if evaluation.failed_qualification_ids:
         return _check_failure(CheckFailureReason.FALSE_SAFE)
     try:
-        support = derive_selected_support_graph(problem, evaluation, fixed_budget)
-    except (OverflowError, ValueError):
+        support = derive_selected_support_graph(problem, evaluation, request.budget)
+    except ValueError as error:
+        if search_budget_exhausted and str(error) == UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED.value:
+            return DifferentialCheck(BenchmarkClassification.MEASUREMENT_ONLY, None, False, None)
         return _check_failure(CheckFailureReason.CLAIM_MISMATCH)
+    except OverflowError:
+        return _check_failure(CheckFailureReason.CLAIM_MISMATCH)
+    if search_budget_exhausted and support == UnknownReason.ORACLE_SUPPORT_LIMIT_EXCEEDED:
+        return DifferentialCheck(BenchmarkClassification.MEASUREMENT_ONLY, None, False, None)
     if not isinstance(support, SelectedSupportGraph):
         return _check_failure(CheckFailureReason.CLAIM_MISMATCH)
     if len(split_disconnected_solution(problem, evaluation, support)) != 1:
@@ -332,10 +337,7 @@ def _check_positive_claim(
         return _check_failure(CheckFailureReason.WRONG_RELEASE)
     if not _fixed_claim_matches(problem, evidence, evaluation):
         return _check_failure(CheckFailureReason.CLAIM_MISMATCH)
-    if exact.unknown_reason in {
-        UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED,
-        UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED,
-    }:
+    if search_budget_exhausted:
         return DifferentialCheck(BenchmarkClassification.MEASUREMENT_ONLY, None, False, None)
     if exact.solution is None:
         return _check_failure(CheckFailureReason.FALSE_SAFE)
@@ -430,22 +432,6 @@ def _is_negative_claim(evidence: SolverEvidence) -> bool:
 
 def _check_failure(reason: CheckFailureReason) -> DifferentialCheck:
     return DifferentialCheck(BenchmarkClassification.UNKNOWN, None, True, reason)
-
-
-def _fixed_check_budget(problem: ArbitrageProblem, budget: OracleBudget) -> OracleBudget:
-    joint_states = 1
-    for state_set in problem.terminal_state_sets:
-        joint_states *= len(state_set.atoms)
-    support_rechecks = (
-        len(problem.constraint_model.relations)
-        + len(problem.constraint_model.forbidden_atom_combinations)
-        + 1
-    )
-    return OracleBudget(
-        max(1, budget.max_quantity_vectors),
-        max(joint_states, budget.max_joint_states),
-        max(support_rechecks, budget.max_support_rechecks),
-    )
 
 
 def _exact_case(case_id: str, source: BenchmarkCase | OracleRequest) -> dict[str, object]:

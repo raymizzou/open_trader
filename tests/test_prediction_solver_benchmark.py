@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import open_trader.prediction_solver_benchmark as benchmark
 from open_trader.prediction_n_leg import (
     BusinessStatus,
     ActionQuantity,
@@ -588,6 +589,52 @@ def test_checker_keeps_a_locally_checked_positive_as_measurement_when_exact_orac
         truth_method="exact_oracle_v1",
     )
 
+    assert checked.classification == BenchmarkClassification.MEASUREMENT_ONLY
+    assert checked.canonical_result is None
+    assert checked.hard_failure is False
+    assert checked.failure_reason is None
+
+
+def test_checker_keeps_large_decision_limited_recheck_within_the_frozen_state_budget(monkeypatch) -> None:
+    payload = next(case for case in _synthetic_payload()["cases"] if case["case_id"] == "scale_32_dense")
+    request = request_from_payload(payload["request"])
+    exact = solve_optimal(request)
+    assert exact.unknown_reason == UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED
+    action = request.problem.actions[0]
+    evidence = SolverEvidence(
+        native_status="FEASIBLE",
+        candidate=PortfolioCandidate((ActionQuantity(action.action_id, 1),), 0),
+        objective_bounds=ObjectiveBounds(None, None, None, False),
+        worst_scenario=None,
+        payout_lower_bound_units=None,
+        cost_upper_bound_units=None,
+        guaranteed_profit_units=None,
+        conservative_capital_release_at=None,
+        fixed_portfolio_closed=False,
+        global_search_closed=False,
+        master_rounds=1,
+        adversary_rounds=1,
+        cuts=(),
+        certificate=None,
+    )
+    real_evaluate = benchmark.evaluate_fixed_portfolio
+    seen_budgets = []
+
+    def evaluate_with_budget_guard(problem, quantities, budget):
+        seen_budgets.append(budget)
+        assert budget == request.budget
+        return real_evaluate(problem, quantities, budget)
+
+    monkeypatch.setattr(benchmark, "evaluate_fixed_portfolio", evaluate_with_budget_guard)
+
+    checked = check_solver_claim(
+        request,
+        evidence,
+        claimed_problem_fingerprint=fingerprint(request.problem),
+        truth_method="exact_oracle_v1",
+    )
+
+    assert seen_budgets == [request.budget]
     assert checked.classification == BenchmarkClassification.MEASUREMENT_ONLY
     assert checked.canonical_result is None
     assert checked.hard_failure is False
