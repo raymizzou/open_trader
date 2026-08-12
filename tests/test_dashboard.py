@@ -491,6 +491,7 @@ def test_historical_buy_plan_membership_distinguishes_unavailable_from_empty(
     assert malformed["available"] is False
     assert invalid_formal_actions["available"] is False
     assert invalid_buy_symbol["available"] is False
+    assert mixed["available"] is False
     assert valid_empty == {"available": True, "symbols": [], "reason": ""}
     for unavailable in (
         missing, malformed, invalid_formal_actions, invalid_buy_symbol, mixed,
