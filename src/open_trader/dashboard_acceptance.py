@@ -997,6 +997,12 @@ def _fetch_account_snapshot(
     except HTTPError as error:
         if error.code == 304:
             return 304, None, error.headers.get("ETag")
+        if error.code == 503:
+            try:
+                payload = json.load(error)
+            except (OSError, json.JSONDecodeError):
+                payload = None
+            return 503, payload if isinstance(payload, dict) else None, None
         raise
 
 

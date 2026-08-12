@@ -7,7 +7,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - Account 与 Trend Report 两处实盘持仓现按历史正式买入计划，在 A 股、港股和美股拆分为
   “趋势持仓”和“非趋势持仓”；Tiger 美股历史证据缺口 AMZN、CRNX、GRMN、KO、LH、NUE、
-  REGN 通过受源代码控制的 allowlist 补录；模拟持仓与交易行为不变。
+  REGN 通过受源代码控制的 allowlist 补录；验收在 Account 原子发布瞬间遇到可重试
+  503 时交由既有重试边界处理；模拟持仓与交易行为不变。
 
 - #48 冻结 solver-independent、版本化的 N_LEG 模型与有界精确 Oracle 语料：Admission、
   Optimization 与显式 Raw diagnostic 分离，确定性 support proof 和穷尽负证明均有可回放

@@ -3,6 +3,7 @@ from decimal import Decimal
 from collections.abc import Mapping
 import copy
 import inspect
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -7948,6 +7949,33 @@ def test_acceptance_reads_snapshot_and_facts_with_production_marker(
     assert all(
         request.get_header("X-open-trader-account-route") == "production"
         for request in requests
+    )
+
+
+def test_acceptance_returns_retryable_account_snapshot_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "status": "unavailable",
+        "errors": [{"code": "account_publication_unstable", "retryable": True}],
+    }
+
+    def unstable(request: dashboard_acceptance.Request, **_kwargs: object) -> object:
+        raise dashboard_acceptance.HTTPError(
+            request.full_url,
+            503,
+            "Service Unavailable",
+            {},
+            BytesIO(json.dumps(payload).encode("utf-8")),
+        )
+
+    monkeypatch.setattr(dashboard_acceptance, "urlopen", unstable)
+
+    assert dashboard_acceptance._fetch_account_snapshot("http://account.test") == (
+        503,
+        payload,
+        None,
     )
 
 
