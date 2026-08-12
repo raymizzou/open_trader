@@ -709,7 +709,17 @@ def test_dashboard_fails_closed_when_existing_execution_batch_is_invalid(
         if corruption == "invalid-report"
         else {
             "available": True,
-            "symbols": ["US.REVISION", "US.VIXY"],
+            "symbols": [
+                "US.AMZN",
+                "US.CRNX",
+                "US.GRMN",
+                "US.KO",
+                "US.LH",
+                "US.NUE",
+                "US.REGN",
+                "US.REVISION",
+                "US.VIXY",
+            ],
             "reason": "",
         }
     )

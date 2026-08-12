@@ -112,6 +112,17 @@ TREND_REPORT_SOURCES = {
     "phillips": ("HK", "港股", "辉立", "trend_hk_phillips", "09:30–10:00"),
     "eastmoney": ("CN", "A股", "东方财富", "trend_a_share", "09:30–10:00"),
 }
+TREND_HOLDING_EVIDENCE_ALLOWLIST = {
+    ("tiger", "US"): frozenset({
+        "US.AMZN",
+        "US.CRNX",
+        "US.GRMN",
+        "US.KO",
+        "US.LH",
+        "US.NUE",
+        "US.REGN",
+    }),
+}
 CURRENT_FINAL_PLAN_TREND_VERSIONS = frozenset({
     ("CN", "v13"),
     ("HK", "v11"),
@@ -2383,7 +2394,7 @@ def _load_broker_trend_report(
         "market_label": market_label,
         "status_text": "暂时不可用",
         "historical_buy_plan_membership": _historical_buy_plan_membership(
-            reports_dir, market=market
+            reports_dir, broker=broker, market=market
         ),
     }
     selected = _latest_valid_report_payload(
@@ -2407,7 +2418,7 @@ def _load_broker_trend_report(
 
 
 def _historical_buy_plan_membership(
-    reports_dir: Path, *, market: str
+    reports_dir: Path, *, broker: str, market: str
 ) -> dict[str, object]:
     reports_dir = reports_dir.resolve()
     paths = sorted(reports_dir.glob("*.json"))
@@ -2461,6 +2472,7 @@ def _historical_buy_plan_membership(
                     "reason": "历史买入计划标的无效",
                 }
             symbols.add(f"{market}.{symbol}")
+    symbols.update(TREND_HOLDING_EVIDENCE_ALLOWLIST.get((broker, market), ()))
     return {"available": True, "symbols": sorted(symbols), "reason": ""}
 
 
@@ -2480,7 +2492,7 @@ def _project_broker_trend_report(
     historical: bool = False,
 ) -> dict[str, Any]:
     historical_buy_plan_membership = _historical_buy_plan_membership(
-        reports_dir, market=market
+        reports_dir, broker=broker, market=market
     )
     _, latest_payload, *_ = selected
     latest_report_sha256 = _report_hash(latest_payload)

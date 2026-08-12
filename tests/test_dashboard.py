@@ -434,7 +434,7 @@ def test_historical_buy_plan_membership_keeps_every_formal_buy_revision(
     )
 
     membership = dashboard_module._historical_buy_plan_membership(
-        tmp_path / directory, market=market
+        tmp_path / directory, broker="test", market=market
     )
 
     assert membership == {
@@ -449,13 +449,13 @@ def test_historical_buy_plan_membership_distinguishes_unavailable_from_empty(
     tmp_path: Path,
 ) -> None:
     missing = dashboard_module._historical_buy_plan_membership(
-        tmp_path / "missing", market="US"
+        tmp_path / "missing", broker="test", market="US"
     )
     malformed_dir = tmp_path / "malformed"
     malformed_dir.mkdir()
     (malformed_dir / "broken.json").write_text("{broken", encoding="utf-8")
     malformed = dashboard_module._historical_buy_plan_membership(
-        malformed_dir, market="US"
+        malformed_dir, broker="test", market="US"
     )
     invalid_actions_dir = tmp_path / "invalid-actions"
     write_buy_plan_history(
@@ -465,7 +465,7 @@ def test_historical_buy_plan_membership_distinguishes_unavailable_from_empty(
         "strategy_judgments": {"formal_actions": "invalid"},
     }), encoding="utf-8")
     invalid_formal_actions = dashboard_module._historical_buy_plan_membership(
-        invalid_actions_dir, market="US"
+        invalid_actions_dir, broker="test", market="US"
     )
     invalid_symbol_dir = tmp_path / "invalid-symbol"
     write_buy_plan_history(
@@ -476,14 +476,14 @@ def test_historical_buy_plan_membership_distinguishes_unavailable_from_empty(
         actions=[{"action": "BUY", "symbol": "AAPL/2026"}],
     )
     invalid_buy_symbol = dashboard_module._historical_buy_plan_membership(
-        invalid_symbol_dir, market="US"
+        invalid_symbol_dir, broker="test", market="US"
     )
     valid_empty_dir = tmp_path / "valid-empty"
     write_buy_plan_history(
         tmp_path, "valid-empty", "report.json", market="US", actions=[]
     )
     valid_empty = dashboard_module._historical_buy_plan_membership(
-        valid_empty_dir, market="US"
+        valid_empty_dir, broker="test", market="US"
     )
     mixed_dir = tmp_path / "mixed"
     write_buy_plan_history(
@@ -494,7 +494,9 @@ def test_historical_buy_plan_membership_distinguishes_unavailable_from_empty(
         actions=[{"action": "BUY", "symbol": "ADP"}],
     )
     (mixed_dir / "broken.json").write_text("{broken", encoding="utf-8")
-    mixed = dashboard_module._historical_buy_plan_membership(mixed_dir, market="US")
+    mixed = dashboard_module._historical_buy_plan_membership(
+        mixed_dir, broker="test", market="US"
+    )
 
     assert missing["available"] is False
     assert malformed["available"] is False
@@ -523,7 +525,7 @@ def test_historical_buy_plan_membership_rejects_symlink_escape(tmp_path: Path) -
     (reports_dir / "linked.json").symlink_to(outside / "reports/external.json")
 
     membership = dashboard_module._historical_buy_plan_membership(
-        reports_dir, market="US"
+        reports_dir, broker="test", market="US"
     )
 
     assert membership == {
@@ -540,13 +542,71 @@ def test_historical_buy_plan_membership_rejects_symlink_loop(tmp_path: Path) -> 
     loop.symlink_to(loop)
 
     membership = dashboard_module._historical_buy_plan_membership(
-        reports_dir, market="US"
+        reports_dir, broker="test", market="US"
     )
 
     assert membership == {
         "available": False,
         "symbols": [],
         "reason": "历史趋势报告不可读取",
+    }
+
+
+def test_historical_buy_plan_membership_adds_tiger_us_evidence_allowlist(
+    tmp_path: Path,
+) -> None:
+    write_buy_plan_history(
+        tmp_path, "reports", "report.json", market="US", actions=[]
+    )
+
+    membership = dashboard_module._historical_buy_plan_membership(
+        tmp_path / "reports", broker="tiger", market="US"
+    )
+
+    assert membership == {
+        "available": True,
+        "symbols": [
+            "US.AMZN",
+            "US.CRNX",
+            "US.GRMN",
+            "US.KO",
+            "US.LH",
+            "US.NUE",
+            "US.REGN",
+        ],
+        "reason": "",
+    }
+
+
+@pytest.mark.parametrize(
+    ("broker", "market"),
+    [("phillips", "US"), ("tiger", "HK")],
+)
+def test_historical_buy_plan_membership_scopes_evidence_allowlist(
+    tmp_path: Path, broker: str, market: str
+) -> None:
+    write_buy_plan_history(
+        tmp_path, "reports", "report.json", market=market, actions=[]
+    )
+
+    membership = dashboard_module._historical_buy_plan_membership(
+        tmp_path / "reports", broker=broker, market=market
+    )
+
+    assert membership == {"available": True, "symbols": [], "reason": ""}
+
+
+def test_historical_buy_plan_membership_does_not_publish_partial_allowlist(
+    tmp_path: Path,
+) -> None:
+    membership = dashboard_module._historical_buy_plan_membership(
+        tmp_path / "missing", broker="tiger", market="US"
+    )
+
+    assert membership == {
+        "available": False,
+        "symbols": [],
+        "reason": "历史趋势报告不存在",
     }
 
 
