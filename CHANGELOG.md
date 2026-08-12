@@ -5,6 +5,25 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-12
 
+- #48 冻结 solver-independent、版本化的 N_LEG 模型与有界精确 Oracle 语料：Admission、
+  Optimization 与显式 Raw diagnostic 分离，确定性 support proof 和穷尽负证明均有可回放
+  的请求/结果指纹；net margin 以最低 payout 计算，annualization 以向上取整的 24 小时天数
+  （至少一天）计算。canonical action 明确携带 venue/account/chain 与 quantity bounds，
+  Oracle enumeration 和 direct portfolio evaluation 均拒绝范围外数量；
+  不完整终局输入和不支持版本均 fail-closed，正/负证据共用版本化 `PayoutProof`，指纹与输入
+  顺序无关。最终修复 identity-only proof 合并、signed-64 派生运算溢出和亚秒 release delay
+  向下取整，并加固五个边界：正 margin 门槛拒绝非正 payout、决策预算在惰性数量枚举前用
+  signed-64 算术计数、含零数量的重复 action ID 按任意顺序拒绝、缺失或空白 terminal rule
+  identity 统一返回 terminal-data `UNKNOWN`、负证明 wire decoder 拒绝重复 rejection ID。
+  已验证 N_LEG 聚焦套件 `172 passed in 0.33s`、Prediction arithmetic 加 N_LEG 回归
+  `223 passed in 2.01s`、Admission/Optimization/两类 diagnostic 直接回放
+  `6 passed, 71 deselected in 0.05s`；16-case 语料未改且 SHA-256 仍为
+  `a4680fb2c66dedac9e85db9cd06d0872882ca69b09fba6d9f338d0b97243ecc7`，并通过
+  `compileall` 与 `git diff --check`。项目 venv 全库实际运行结果为
+  `205 failed, 5482 passed, 3 skipped, 1 warning in 194.53s`，不是 green gate；失败与 #48
+  无关，主要为 legacy fixture 缺失和 sandbox 禁止 localhost socket bind/browser process。
+  未改 Prediction runtime、Dashboard、solver dependency 或 order path。
+
 - 完成通用 N_LEG Prediction 套利设计与开发 Ticket 契约收敛：热路径接受任一已验证合格
   连通组合而不等待全局最优，组件级负证明仅接受预算内完整 Oracle 或可独立检查证书；
   Entry/Repair 部分成交风险、OBSERVE_ONLY、Episode 重武装、scope Canary 与一次切换边界

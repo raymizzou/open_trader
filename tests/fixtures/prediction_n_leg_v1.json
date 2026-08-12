@@ -1,0 +1,3736 @@
+{
+  "cases": [
+    {
+      "case_id": "native-complement-n2",
+      "expected_request_fingerprint": "sha256:cf730fcbf5135740a1bf647bc7eca01429570750cfbf50f43652590a0cd9e0df",
+      "expected_result": {
+        "business_status": "QUALIFIED_FEASIBLE",
+        "negative_proof": null,
+        "objective_bounds": {
+          "closed": false,
+          "gap_units": null,
+          "lower_bound_units": 10,
+          "upper_bound_units": null
+        },
+        "optimality_status": "NOT_PROVEN",
+        "proof_status": "PROVEN",
+        "solution": {
+          "payout_proof": {
+            "conservative_capital_release_at": "2026-08-12T00:00:00Z",
+            "cost_upper_bound_units": 90,
+            "guaranteed_profit_units": 10,
+            "joint_states_per_vector": null,
+            "payout_lower_bound_units": 100,
+            "portfolio_fingerprint": "sha256:45540a856e0fcf1b469eece45b3012ab8b3ffb3ce9d1175a7093b3d4258f6ad4",
+            "problem_fingerprint": "sha256:59460aefdeb4f9d289799748ea3047d0f92200f40fcca7d0779e7ef5f6144037",
+            "proof_method": "BOUNDED_EXACT_ORACLE_V1",
+            "qualification_fingerprint": "sha256:817723e8e895d80947d1c20b369eb281fcaedfea1ddd6d5caa12ae883521ae76",
+            "quantity_vectors_examined": null,
+            "quantity_vectors_total": null,
+            "rejection_counts": [],
+            "request_fingerprint": null,
+            "result_kind": "PORTFOLIO",
+            "schema_version": "open_trader.prediction_n_leg.payout_proof.v1",
+            "selected_support_graph": {
+              "action_ids": [
+                "buy-no-a",
+                "buy-yes-a"
+              ],
+              "constraint_ids": [],
+              "contract_ids": [
+                "a"
+              ],
+              "hyperedges": []
+            },
+            "source_problem_fingerprint": null,
+            "worst_scenario": {
+              "atoms": [
+                {
+                  "atom_id": "a-no",
+                  "market_contract_id": "a"
+                }
+              ]
+            },
+            "worst_state_cut": {
+              "cut_id": "cut:sha256:4e86c5f87fc9b80b8444dbf207eaa19a283349e832e1746484c0c8be1d21b7c0",
+              "payout_per_lot": [
+                {
+                  "action_id": "buy-no-a",
+                  "payout_lower_bound_per_lot_units": 100
+                },
+                {
+                  "action_id": "buy-yes-a",
+                  "payout_lower_bound_per_lot_units": 0
+                }
+              ],
+              "scenario": {
+                "atoms": [
+                  {
+                    "atom_id": "a-no",
+                    "market_contract_id": "a"
+                  }
+                ]
+              }
+            }
+          },
+          "quantities": [
+            {
+              "action_id": "buy-no-a",
+              "quantity_lots": 1
+            },
+            {
+              "action_id": "buy-yes-a",
+              "quantity_lots": 1
+            }
+          ]
+        },
+        "solve_status": "FEASIBLE",
+        "unknown_reason": null
+      },
+      "expected_result_fingerprint": "sha256:ec8243654262a4eab73afccd73df765ddf7d248f00a035e87740a205a576e9df",
+      "request": {
+        "budget": {
+          "max_joint_states": 2,
+          "max_quantity_vectors": 9,
+          "max_support_rechecks": 1
+        },
+        "mode": "ADMISSION",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "buy-no-a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 45,
+                  "last_lot": 2
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 2,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-comp",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-comp",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_NO",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            },
+            {
+              "account_id": "fixture-account",
+              "action_id": "buy-yes-a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 45,
+                  "last_lot": 2
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 2,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-comp",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-comp",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [],
+            "relations": []
+          },
+          "problem_id": "native-complement-n2",
+          "qualification_constraints": [
+            {
+              "comparison": "GREATER_THAN_OR_EQUAL",
+              "constraint_id": "minimum-profit",
+              "metric": "GUARANTEED_PROFIT_UNITS",
+              "rule_version": "v1",
+              "threshold_denominator": 1,
+              "threshold_numerator": 10
+            }
+          ],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "a-no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "buy-no-a",
+                      "payout_lower_bound_per_lot_units": 100
+                    },
+                    {
+                      "action_id": "buy-yes-a",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "a-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "buy-no-a",
+                      "payout_lower_bound_per_lot_units": 0
+                    },
+                    {
+                      "action_id": "buy-yes-a",
+                      "payout_lower_bound_per_lot_units": 100
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-comp",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-comp",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    },
+    {
+      "case_id": "implication-two-contract",
+      "expected_request_fingerprint": "sha256:9da86adcd2fe4e348a6e480563702ec742c2edb8c8e485aa07aec71f1e19837f",
+      "expected_result": {
+        "business_status": "QUALIFIED_FEASIBLE",
+        "negative_proof": null,
+        "objective_bounds": {
+          "closed": false,
+          "gap_units": null,
+          "lower_bound_units": 10,
+          "upper_bound_units": null
+        },
+        "optimality_status": "NOT_PROVEN",
+        "proof_status": "PROVEN",
+        "solution": {
+          "payout_proof": {
+            "conservative_capital_release_at": "2026-08-12T00:00:00Z",
+            "cost_upper_bound_units": 90,
+            "guaranteed_profit_units": 10,
+            "joint_states_per_vector": null,
+            "payout_lower_bound_units": 100,
+            "portfolio_fingerprint": "sha256:88273b4bc3bb6c011cb753d28ce762d1a381cde212f7794125c800058df000de",
+            "problem_fingerprint": "sha256:afa12b262640cf7f5ebc69d9f035de005d3201d2820e3497eb011194ecdcd97b",
+            "proof_method": "BOUNDED_EXACT_ORACLE_V1",
+            "qualification_fingerprint": "sha256:817723e8e895d80947d1c20b369eb281fcaedfea1ddd6d5caa12ae883521ae76",
+            "quantity_vectors_examined": null,
+            "quantity_vectors_total": null,
+            "rejection_counts": [],
+            "request_fingerprint": null,
+            "result_kind": "PORTFOLIO",
+            "schema_version": "open_trader.prediction_n_leg.payout_proof.v1",
+            "selected_support_graph": {
+              "action_ids": [
+                "buy-no-a",
+                "buy-yes-b"
+              ],
+              "constraint_ids": [
+                "a-implies-b"
+              ],
+              "contract_ids": [
+                "a",
+                "b"
+              ],
+              "hyperedges": [
+                [
+                  "a-implies-b",
+                  [
+                    "a",
+                    "b"
+                  ]
+                ]
+              ]
+            },
+            "source_problem_fingerprint": null,
+            "worst_scenario": {
+              "atoms": [
+                {
+                  "atom_id": "a-yes",
+                  "market_contract_id": "a"
+                },
+                {
+                  "atom_id": "b-yes",
+                  "market_contract_id": "b"
+                }
+              ]
+            },
+            "worst_state_cut": {
+              "cut_id": "cut:sha256:27297154cac2c5c1bb314e0e34b54111afc1d984e612dcc7d749b4710014db68",
+              "payout_per_lot": [
+                {
+                  "action_id": "buy-no-a",
+                  "payout_lower_bound_per_lot_units": 0
+                },
+                {
+                  "action_id": "buy-yes-b",
+                  "payout_lower_bound_per_lot_units": 100
+                }
+              ],
+              "scenario": {
+                "atoms": [
+                  {
+                    "atom_id": "a-yes",
+                    "market_contract_id": "a"
+                  },
+                  {
+                    "atom_id": "b-yes",
+                    "market_contract_id": "b"
+                  }
+                ]
+              }
+            }
+          },
+          "quantities": [
+            {
+              "action_id": "buy-no-a",
+              "quantity_lots": 1
+            },
+            {
+              "action_id": "buy-yes-b",
+              "quantity_lots": 1
+            }
+          ]
+        },
+        "solve_status": "FEASIBLE",
+        "unknown_reason": null
+      },
+      "expected_result_fingerprint": "sha256:9da461f4db974ae777c0fe785bda387d735c21a38efb12eab89f3acee72db377",
+      "request": {
+        "budget": {
+          "max_joint_states": 4,
+          "max_quantity_vectors": 4,
+          "max_support_rechecks": 1
+        },
+        "mode": "ADMISSION",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "buy-no-a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 45,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-ia",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-ia",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_NO",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            },
+            {
+              "account_id": "fixture-account",
+              "action_id": "buy-yes-b",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 45,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "b",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-ib",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-ib",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [],
+            "relations": [
+              {
+                "constraint_id": "a-implies-b",
+                "contract_ids": [
+                  "a",
+                  "b"
+                ],
+                "kind": "IMPLIES",
+                "rule_version": "v1"
+              }
+            ]
+          },
+          "problem_id": "implication-two-contract",
+          "qualification_constraints": [
+            {
+              "comparison": "GREATER_THAN_OR_EQUAL",
+              "constraint_id": "minimum-profit",
+              "metric": "GUARANTEED_PROFIT_UNITS",
+              "rule_version": "v1",
+              "threshold_denominator": 1,
+              "threshold_numerator": 10
+            }
+          ],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "a-no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "buy-no-a",
+                      "payout_lower_bound_per_lot_units": 100
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "a-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "buy-no-a",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-ia",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-ia",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "atoms": [
+                {
+                  "atom_id": "b-no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "buy-yes-b",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "b-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "buy-yes-b",
+                      "payout_lower_bound_per_lot_units": 100
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "b",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-ib",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-ib",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    },
+    {
+      "case_id": "exactly-one-n3",
+      "expected_request_fingerprint": "sha256:f3d5e28ffc24add779d771dc343a64af7ab41082591f7458b6f44e9e1e507f72",
+      "expected_result": {
+        "business_status": "QUALIFIED_FEASIBLE",
+        "negative_proof": null,
+        "objective_bounds": {
+          "closed": false,
+          "gap_units": null,
+          "lower_bound_units": 10,
+          "upper_bound_units": null
+        },
+        "optimality_status": "NOT_PROVEN",
+        "proof_status": "PROVEN",
+        "solution": {
+          "payout_proof": {
+            "conservative_capital_release_at": "2026-08-12T00:00:00Z",
+            "cost_upper_bound_units": 90,
+            "guaranteed_profit_units": 10,
+            "joint_states_per_vector": null,
+            "payout_lower_bound_units": 100,
+            "portfolio_fingerprint": "sha256:cad1822d715bea112031d07a09825c2c148212e7e25c22ac1df40c01fec4c608",
+            "problem_fingerprint": "sha256:6a1ca4c944ff0e88662af625de848698df913fa4782a1793c34b1a4b28ee36e3",
+            "proof_method": "BOUNDED_EXACT_ORACLE_V1",
+            "qualification_fingerprint": "sha256:817723e8e895d80947d1c20b369eb281fcaedfea1ddd6d5caa12ae883521ae76",
+            "quantity_vectors_examined": null,
+            "quantity_vectors_total": null,
+            "rejection_counts": [],
+            "request_fingerprint": null,
+            "result_kind": "PORTFOLIO",
+            "schema_version": "open_trader.prediction_n_leg.payout_proof.v1",
+            "selected_support_graph": {
+              "action_ids": [
+                "buy-yes-a",
+                "buy-yes-b",
+                "buy-yes-c"
+              ],
+              "constraint_ids": [
+                "one"
+              ],
+              "contract_ids": [
+                "a",
+                "b",
+                "c"
+              ],
+              "hyperedges": [
+                [
+                  "one",
+                  [
+                    "a",
+                    "b",
+                    "c"
+                  ]
+                ]
+              ]
+            },
+            "source_problem_fingerprint": null,
+            "worst_scenario": {
+              "atoms": [
+                {
+                  "atom_id": "a-yes",
+                  "market_contract_id": "a"
+                },
+                {
+                  "atom_id": "b-no",
+                  "market_contract_id": "b"
+                },
+                {
+                  "atom_id": "c-no",
+                  "market_contract_id": "c"
+                }
+              ]
+            },
+            "worst_state_cut": {
+              "cut_id": "cut:sha256:4b4cf61f2239c7f84d5441059b073655cbdd2d03fe2e2cf2474ef2257740bb47",
+              "payout_per_lot": [
+                {
+                  "action_id": "buy-yes-a",
+                  "payout_lower_bound_per_lot_units": 100
+                },
+                {
+                  "action_id": "buy-yes-b",
+                  "payout_lower_bound_per_lot_units": 0
+                },
+                {
+                  "action_id": "buy-yes-c",
+                  "payout_lower_bound_per_lot_units": 0
+                }
+              ],
+              "scenario": {
+                "atoms": [
+                  {
+                    "atom_id": "a-yes",
+                    "market_contract_id": "a"
+                  },
+                  {
+                    "atom_id": "b-no",
+                    "market_contract_id": "b"
+                  },
+                  {
+                    "atom_id": "c-no",
+                    "market_contract_id": "c"
+                  }
+                ]
+              }
+            }
+          },
+          "quantities": [
+            {
+              "action_id": "buy-yes-a",
+              "quantity_lots": 1
+            },
+            {
+              "action_id": "buy-yes-b",
+              "quantity_lots": 1
+            },
+            {
+              "action_id": "buy-yes-c",
+              "quantity_lots": 1
+            }
+          ]
+        },
+        "solve_status": "FEASIBLE",
+        "unknown_reason": null
+      },
+      "expected_result_fingerprint": "sha256:c1235eefad897e935b984d824d16a405eae2e347ee2ee7455858dd938b6ce025",
+      "request": {
+        "budget": {
+          "max_joint_states": 8,
+          "max_quantity_vectors": 8,
+          "max_support_rechecks": 1
+        },
+        "mode": "ADMISSION",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "buy-yes-a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 30,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-a",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-a",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            },
+            {
+              "account_id": "fixture-account",
+              "action_id": "buy-yes-b",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 30,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "b",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-b",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-b",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            },
+            {
+              "account_id": "fixture-account",
+              "action_id": "buy-yes-c",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 30,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "c",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-c",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-c",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [],
+            "relations": [
+              {
+                "constraint_id": "one",
+                "contract_ids": [
+                  "a",
+                  "b",
+                  "c"
+                ],
+                "kind": "EXACTLY_ONE",
+                "rule_version": "v1"
+              }
+            ]
+          },
+          "problem_id": "exactly-one-n3",
+          "qualification_constraints": [
+            {
+              "comparison": "GREATER_THAN_OR_EQUAL",
+              "constraint_id": "minimum-profit",
+              "metric": "GUARANTEED_PROFIT_UNITS",
+              "rule_version": "v1",
+              "threshold_denominator": 1,
+              "threshold_numerator": 10
+            }
+          ],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "a-no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "buy-yes-a",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "a-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "buy-yes-a",
+                      "payout_lower_bound_per_lot_units": 100
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-a",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-a",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "atoms": [
+                {
+                  "atom_id": "b-no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "buy-yes-b",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "b-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "buy-yes-b",
+                      "payout_lower_bound_per_lot_units": 100
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "b",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-b",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-b",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "atoms": [
+                {
+                  "atom_id": "c-no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "buy-yes-c",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "c-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "buy-yes-c",
+                      "payout_lower_bound_per_lot_units": 100
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "c",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-c",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-c",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    },
+    {
+      "case_id": "quantity-selection-n4",
+      "expected_request_fingerprint": "sha256:621e768985d563486f1252b4764a05e0f09fdd454e7811d20e0b67e5598687d2",
+      "expected_result": {
+        "business_status": "QUALIFIED_FEASIBLE",
+        "negative_proof": null,
+        "objective_bounds": {
+          "closed": true,
+          "gap_units": 0,
+          "lower_bound_units": 6,
+          "upper_bound_units": 6
+        },
+        "optimality_status": "OPTIMAL",
+        "proof_status": "PROVEN",
+        "solution": {
+          "payout_proof": {
+            "conservative_capital_release_at": "2026-08-12T00:00:00Z",
+            "cost_upper_bound_units": 6,
+            "guaranteed_profit_units": 6,
+            "joint_states_per_vector": null,
+            "payout_lower_bound_units": 12,
+            "portfolio_fingerprint": "sha256:80b417ae7fe977bef74c46545617166e500e75db94e7952b13821b30d8413017",
+            "problem_fingerprint": "sha256:4fcafe967be41d7b1d28d9f0687e1dcc5f2855bba40f7c46fe9d2db15f6294a4",
+            "proof_method": "BOUNDED_EXACT_ORACLE_V1",
+            "qualification_fingerprint": "sha256:c54d37d4098f474487ef260290e64e18cd29ad330e420ac2888b4a1fe6865df8",
+            "quantity_vectors_examined": null,
+            "quantity_vectors_total": null,
+            "rejection_counts": [],
+            "request_fingerprint": null,
+            "result_kind": "PORTFOLIO",
+            "schema_version": "open_trader.prediction_n_leg.payout_proof.v1",
+            "selected_support_graph": {
+              "action_ids": [
+                "b",
+                "c",
+                "d"
+              ],
+              "constraint_ids": [
+                "exactly-one-bcd"
+              ],
+              "contract_ids": [
+                "b",
+                "c",
+                "d"
+              ],
+              "hyperedges": [
+                [
+                  "exactly-one-bcd",
+                  [
+                    "b",
+                    "c",
+                    "d"
+                  ]
+                ]
+              ]
+            },
+            "source_problem_fingerprint": null,
+            "worst_scenario": {
+              "atoms": [
+                {
+                  "atom_id": "a-yes",
+                  "market_contract_id": "a"
+                },
+                {
+                  "atom_id": "b-no",
+                  "market_contract_id": "b"
+                },
+                {
+                  "atom_id": "c-yes",
+                  "market_contract_id": "c"
+                },
+                {
+                  "atom_id": "d-no",
+                  "market_contract_id": "d"
+                }
+              ]
+            },
+            "worst_state_cut": {
+              "cut_id": "cut:sha256:05923ae221463ad34fc2d17f13320fcc2e554c88cf6630e8814499085b1afd78",
+              "payout_per_lot": [
+                {
+                  "action_id": "a",
+                  "payout_lower_bound_per_lot_units": 0
+                },
+                {
+                  "action_id": "b",
+                  "payout_lower_bound_per_lot_units": 0
+                },
+                {
+                  "action_id": "c",
+                  "payout_lower_bound_per_lot_units": 6
+                },
+                {
+                  "action_id": "d",
+                  "payout_lower_bound_per_lot_units": 0
+                }
+              ],
+              "scenario": {
+                "atoms": [
+                  {
+                    "atom_id": "a-yes",
+                    "market_contract_id": "a"
+                  },
+                  {
+                    "atom_id": "b-no",
+                    "market_contract_id": "b"
+                  },
+                  {
+                    "atom_id": "c-yes",
+                    "market_contract_id": "c"
+                  },
+                  {
+                    "atom_id": "d-no",
+                    "market_contract_id": "d"
+                  }
+                ]
+              }
+            }
+          },
+          "quantities": [
+            {
+              "action_id": "b",
+              "quantity_lots": 1
+            },
+            {
+              "action_id": "c",
+              "quantity_lots": 2
+            },
+            {
+              "action_id": "d",
+              "quantity_lots": 3
+            }
+          ]
+        },
+        "solve_status": "FEASIBLE",
+        "unknown_reason": null
+      },
+      "expected_result_fingerprint": "sha256:fa185cbe8fa2bf02d2c272b4d7c429257c607c8a2eb0c3135aa29ce4bd7a1fb3",
+      "request": {
+        "budget": {
+          "max_joint_states": 8,
+          "max_quantity_vectors": 48,
+          "max_support_rechecks": 1
+        },
+        "mode": "OPTIMIZATION",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 1,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-shared",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-shared",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            },
+            {
+              "account_id": "fixture-account",
+              "action_id": "b",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 1,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "b",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-shared",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-shared",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            },
+            {
+              "account_id": "fixture-account",
+              "action_id": "c",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 1,
+                  "last_lot": 2
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "c",
+              "max_quantity_lots": 2,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-shared",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-shared",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            },
+            {
+              "account_id": "fixture-account",
+              "action_id": "d",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 1,
+                  "last_lot": 3
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "d",
+              "max_quantity_lots": 3,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-shared",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-shared",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [],
+            "relations": [
+              {
+                "constraint_id": "exactly-one-bcd",
+                "contract_ids": [
+                  "b",
+                  "c",
+                  "d"
+                ],
+                "kind": "EXACTLY_ONE",
+                "rule_version": "v1"
+              }
+            ]
+          },
+          "problem_id": "quantity-selection-n4",
+          "qualification_constraints": [
+            {
+              "comparison": "GREATER_THAN_OR_EQUAL",
+              "constraint_id": "minimum-profit",
+              "metric": "GUARANTEED_PROFIT_UNITS",
+              "rule_version": "v1",
+              "threshold_denominator": 1,
+              "threshold_numerator": 1
+            }
+          ],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "a-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "a",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-shared",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-shared",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "atoms": [
+                {
+                  "atom_id": "b-no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "b",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "b-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "b",
+                      "payout_lower_bound_per_lot_units": 12
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "b",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-shared",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-shared",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "atoms": [
+                {
+                  "atom_id": "c-no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "c",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "c-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "c",
+                      "payout_lower_bound_per_lot_units": 6
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "c",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-shared",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-shared",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "atoms": [
+                {
+                  "atom_id": "d-no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "d",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "d-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "d",
+                      "payout_lower_bound_per_lot_units": 4
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "d",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-shared",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-shared",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    },
+    {
+      "case_id": "void-refund-split",
+      "expected_request_fingerprint": "sha256:2e01b36d231eeaa213c070b85dcd5f401c2f4f5d60964cea5fc5eb243976e4bb",
+      "expected_result": {
+        "business_status": "NO_QUALIFIED_OPPORTUNITY",
+        "negative_proof": {
+          "conservative_capital_release_at": null,
+          "cost_upper_bound_units": null,
+          "guaranteed_profit_units": null,
+          "joint_states_per_vector": 27,
+          "payout_lower_bound_units": null,
+          "portfolio_fingerprint": null,
+          "problem_fingerprint": "sha256:7713dbed1d74cf1407a20b73311ff6abe07cdabf2046e4dae7fdecc0b6891074",
+          "proof_method": "EXHAUSTIVE_ORACLE_V1",
+          "qualification_fingerprint": "sha256:817723e8e895d80947d1c20b369eb281fcaedfea1ddd6d5caa12ae883521ae76",
+          "quantity_vectors_examined": 8,
+          "quantity_vectors_total": 8,
+          "rejection_counts": [
+            [
+              "ALL_ZERO",
+              1
+            ],
+            [
+              "minimum-profit",
+              7
+            ]
+          ],
+          "request_fingerprint": "sha256:2e01b36d231eeaa213c070b85dcd5f401c2f4f5d60964cea5fc5eb243976e4bb",
+          "result_kind": "NO_QUALIFIED_OPPORTUNITY",
+          "schema_version": "open_trader.prediction_n_leg.payout_proof.v1",
+          "selected_support_graph": null,
+          "source_problem_fingerprint": null,
+          "worst_scenario": null,
+          "worst_state_cut": null
+        },
+        "objective_bounds": {
+          "closed": false,
+          "gap_units": null,
+          "lower_bound_units": null,
+          "upper_bound_units": null
+        },
+        "optimality_status": "NOT_APPLICABLE",
+        "proof_status": "PROVEN",
+        "solution": null,
+        "solve_status": "INFEASIBLE",
+        "unknown_reason": null
+      },
+      "expected_result_fingerprint": "sha256:eb06bd9801c1920c5733b88f46de2b9eeb53c8081fa34771c0ea6f27bb89e5a4",
+      "request": {
+        "budget": {
+          "max_joint_states": 27,
+          "max_quantity_vectors": 8,
+          "max_support_rechecks": 1
+        },
+        "mode": "ADMISSION",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "buy-a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 30,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-a",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-a",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            },
+            {
+              "account_id": "fixture-account",
+              "action_id": "buy-b",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 30,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "b",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-b",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-b",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            },
+            {
+              "account_id": "fixture-account",
+              "action_id": "buy-c",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 30,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "c",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-c",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-c",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [],
+            "relations": [
+              {
+                "constraint_id": "one",
+                "contract_ids": [
+                  "a",
+                  "b",
+                  "c"
+                ],
+                "kind": "EXACTLY_ONE",
+                "rule_version": "v1"
+              }
+            ]
+          },
+          "problem_id": "void-refund-split",
+          "qualification_constraints": [
+            {
+              "comparison": "GREATER_THAN_OR_EQUAL",
+              "constraint_id": "minimum-profit",
+              "metric": "GUARANTEED_PROFIT_UNITS",
+              "rule_version": "v1",
+              "threshold_denominator": 1,
+              "threshold_numerator": 10
+            }
+          ],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "a-ex",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "VOID",
+                  "payouts": [
+                    {
+                      "action_id": "buy-a",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "a-no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "buy-a",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "a-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "buy-a",
+                      "payout_lower_bound_per_lot_units": 100
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-a",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-a",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "atoms": [
+                {
+                  "atom_id": "b-ex",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "REFUND",
+                  "payouts": [
+                    {
+                      "action_id": "buy-b",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "b-no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "buy-b",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "b-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "buy-b",
+                      "payout_lower_bound_per_lot_units": 100
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "b",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-b",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-b",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "atoms": [
+                {
+                  "atom_id": "c-ex",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "SPLIT",
+                  "payouts": [
+                    {
+                      "action_id": "buy-c",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "c-no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "buy-c",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "c-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "buy-c",
+                      "payout_lower_bound_per_lot_units": 100
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "c",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-c",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-c",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    },
+    {
+      "case_id": "explicit-exception-link",
+      "expected_request_fingerprint": "sha256:31e9059c13ee31a9a8d1ac7a7b186e9d96cc273a888d5c2be270ae86f09f6b81",
+      "expected_result": {
+        "business_status": "QUALIFIED_FEASIBLE",
+        "negative_proof": null,
+        "objective_bounds": {
+          "closed": false,
+          "gap_units": null,
+          "lower_bound_units": 10,
+          "upper_bound_units": null
+        },
+        "optimality_status": "NOT_PROVEN",
+        "proof_status": "PROVEN",
+        "solution": {
+          "payout_proof": {
+            "conservative_capital_release_at": "2026-08-12T00:00:00Z",
+            "cost_upper_bound_units": 90,
+            "guaranteed_profit_units": 10,
+            "joint_states_per_vector": null,
+            "payout_lower_bound_units": 100,
+            "portfolio_fingerprint": "sha256:dc634d2f4793e6576b3f57d824a9a4d1b5974cf0a0cdeba7d7c81f68b627378b",
+            "problem_fingerprint": "sha256:682422fb31934a08c24ba404ec99d0995b840aea5307aa74e179897e5e7d8cf8",
+            "proof_method": "BOUNDED_EXACT_ORACLE_V1",
+            "qualification_fingerprint": "sha256:817723e8e895d80947d1c20b369eb281fcaedfea1ddd6d5caa12ae883521ae76",
+            "quantity_vectors_examined": null,
+            "quantity_vectors_total": null,
+            "rejection_counts": [],
+            "request_fingerprint": null,
+            "result_kind": "PORTFOLIO",
+            "schema_version": "open_trader.prediction_n_leg.payout_proof.v1",
+            "selected_support_graph": {
+              "action_ids": [
+                "buy-a",
+                "buy-b"
+              ],
+              "constraint_ids": [
+                "no-double-exception"
+              ],
+              "contract_ids": [
+                "a",
+                "b"
+              ],
+              "hyperedges": [
+                [
+                  "no-double-exception",
+                  [
+                    "a",
+                    "b"
+                  ]
+                ]
+              ]
+            },
+            "source_problem_fingerprint": null,
+            "worst_scenario": {
+              "atoms": [
+                {
+                  "atom_id": "a-void",
+                  "market_contract_id": "a"
+                },
+                {
+                  "atom_id": "b-normal",
+                  "market_contract_id": "b"
+                }
+              ]
+            },
+            "worst_state_cut": {
+              "cut_id": "cut:sha256:4121453902a54e515bf9208a57fc3ecbb9494203857910da1b19c43226eb6d29",
+              "payout_per_lot": [
+                {
+                  "action_id": "buy-a",
+                  "payout_lower_bound_per_lot_units": 0
+                },
+                {
+                  "action_id": "buy-b",
+                  "payout_lower_bound_per_lot_units": 100
+                }
+              ],
+              "scenario": {
+                "atoms": [
+                  {
+                    "atom_id": "a-void",
+                    "market_contract_id": "a"
+                  },
+                  {
+                    "atom_id": "b-normal",
+                    "market_contract_id": "b"
+                  }
+                ]
+              }
+            }
+          },
+          "quantities": [
+            {
+              "action_id": "buy-a",
+              "quantity_lots": 1
+            },
+            {
+              "action_id": "buy-b",
+              "quantity_lots": 1
+            }
+          ]
+        },
+        "solve_status": "FEASIBLE",
+        "unknown_reason": null
+      },
+      "expected_result_fingerprint": "sha256:c51f225c637a865983cf92b5bbb0fb197e2cbb943ec9a54d8946b69a57bd404e",
+      "request": {
+        "budget": {
+          "max_joint_states": 4,
+          "max_quantity_vectors": 4,
+          "max_support_rechecks": 1
+        },
+        "mode": "ADMISSION",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "buy-a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 45,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-ea",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-ea",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            },
+            {
+              "account_id": "fixture-account",
+              "action_id": "buy-b",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 45,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "b",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-eb",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-eb",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [
+              {
+                "atom_ids": [
+                  "a-void",
+                  "b-refund"
+                ],
+                "constraint_id": "no-double-exception",
+                "rule_version": "v1"
+              }
+            ],
+            "relations": []
+          },
+          "problem_id": "explicit-exception-link",
+          "qualification_constraints": [
+            {
+              "comparison": "GREATER_THAN_OR_EQUAL",
+              "constraint_id": "minimum-profit",
+              "metric": "GUARANTEED_PROFIT_UNITS",
+              "rule_version": "v1",
+              "threshold_denominator": 1,
+              "threshold_numerator": 10
+            }
+          ],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "a-normal",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "buy-a",
+                      "payout_lower_bound_per_lot_units": 100
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "a-void",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "VOID",
+                  "payouts": [
+                    {
+                      "action_id": "buy-a",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-ea",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-ea",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "atoms": [
+                {
+                  "atom_id": "b-normal",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "buy-b",
+                      "payout_lower_bound_per_lot_units": 100
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "b-refund",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "REFUND",
+                  "payouts": [
+                    {
+                      "action_id": "buy-b",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "b",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-eb",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-eb",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    },
+    {
+      "case_id": "disconnected-double-arbitrage",
+      "expected_request_fingerprint": "sha256:0bae4f4fcd5eb002c33208a66f344bfa6463349b9dc2d44779e447937ae4cae1",
+      "expected_result": {
+        "business_status": "QUALIFIED_FEASIBLE",
+        "negative_proof": null,
+        "objective_bounds": {
+          "closed": false,
+          "gap_units": null,
+          "lower_bound_units": 2,
+          "upper_bound_units": null
+        },
+        "optimality_status": "NOT_PROVEN",
+        "proof_status": "PROVEN",
+        "solution": {
+          "payout_proof": {
+            "conservative_capital_release_at": "2026-08-12T00:00:00Z",
+            "cost_upper_bound_units": 1,
+            "guaranteed_profit_units": 2,
+            "joint_states_per_vector": null,
+            "payout_lower_bound_units": 3,
+            "portfolio_fingerprint": "sha256:0e5fd3898a0845d74575c6164b5f381ed53cfccc27a06acf240f736d245e3202",
+            "problem_fingerprint": "sha256:776b335ca6a2c4066f6182a2f867ae9f226b4844eb643c7eaeaf3ea35d5947de",
+            "proof_method": "BOUNDED_EXACT_ORACLE_V1",
+            "qualification_fingerprint": "sha256:c54d37d4098f474487ef260290e64e18cd29ad330e420ac2888b4a1fe6865df8",
+            "quantity_vectors_examined": null,
+            "quantity_vectors_total": null,
+            "rejection_counts": [],
+            "request_fingerprint": null,
+            "result_kind": "PORTFOLIO",
+            "schema_version": "open_trader.prediction_n_leg.payout_proof.v1",
+            "selected_support_graph": {
+              "action_ids": [
+                "component-z"
+              ],
+              "constraint_ids": [],
+              "contract_ids": [
+                "z"
+              ],
+              "hyperedges": []
+            },
+            "source_problem_fingerprint": null,
+            "worst_scenario": {
+              "atoms": [
+                {
+                  "atom_id": "a",
+                  "market_contract_id": "a"
+                },
+                {
+                  "atom_id": "z",
+                  "market_contract_id": "z"
+                }
+              ]
+            },
+            "worst_state_cut": {
+              "cut_id": "cut:sha256:015dd98a99430e068c940340713f23d4b637f8fe191bb2dbf63db8ef9765e1ee",
+              "payout_per_lot": [
+                {
+                  "action_id": "component-a",
+                  "payout_lower_bound_per_lot_units": 3
+                },
+                {
+                  "action_id": "component-z",
+                  "payout_lower_bound_per_lot_units": 3
+                }
+              ],
+              "scenario": {
+                "atoms": [
+                  {
+                    "atom_id": "a",
+                    "market_contract_id": "a"
+                  },
+                  {
+                    "atom_id": "z",
+                    "market_contract_id": "z"
+                  }
+                ]
+              }
+            }
+          },
+          "quantities": [
+            {
+              "action_id": "component-z",
+              "quantity_lots": 1
+            }
+          ]
+        },
+        "solve_status": "FEASIBLE",
+        "unknown_reason": null
+      },
+      "expected_result_fingerprint": "sha256:79ac7d00e68b07be72f39a50f61ac8a9d8559d91478ae4180dccf3fcf917d5e9",
+      "request": {
+        "budget": {
+          "max_joint_states": 1,
+          "max_quantity_vectors": 4,
+          "max_support_rechecks": 1
+        },
+        "mode": "ADMISSION",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "component-a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 1,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-da",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-da",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            },
+            {
+              "account_id": "fixture-account",
+              "action_id": "component-z",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 1,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "z",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-dz",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-dz",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [],
+            "relations": []
+          },
+          "problem_id": "disconnected-double-arbitrage",
+          "qualification_constraints": [
+            {
+              "comparison": "GREATER_THAN_OR_EQUAL",
+              "constraint_id": "minimum-profit",
+              "metric": "GUARANTEED_PROFIT_UNITS",
+              "rule_version": "v1",
+              "threshold_denominator": 1,
+              "threshold_numerator": 1
+            }
+          ],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "a",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "component-a",
+                      "payout_lower_bound_per_lot_units": 3
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-da",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-da",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "atoms": [
+                {
+                  "atom_id": "z",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "component-z",
+                      "payout_lower_bound_per_lot_units": 3
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "z",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-dz",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-dz",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    },
+    {
+      "case_id": "rounded-false-edge",
+      "expected_request_fingerprint": "sha256:2824a03a01515da6ffd9fe14bc8308e8b3100e5c57e4ca35d378f3fa5d8731d6",
+      "expected_result": {
+        "business_status": "NO_QUALIFIED_OPPORTUNITY",
+        "negative_proof": {
+          "conservative_capital_release_at": null,
+          "cost_upper_bound_units": null,
+          "guaranteed_profit_units": null,
+          "joint_states_per_vector": 1,
+          "payout_lower_bound_units": null,
+          "portfolio_fingerprint": null,
+          "problem_fingerprint": "sha256:7126c91e4306659376e5c793fd88aa61cece3e129817ecb2b9f9a7fca1401498",
+          "proof_method": "EXHAUSTIVE_ORACLE_V1",
+          "qualification_fingerprint": "sha256:54513e14d03925ab68f85acc4a2d902a4b2bfd984dca5aaf07a7718d477bfe61",
+          "quantity_vectors_examined": 2,
+          "quantity_vectors_total": 2,
+          "rejection_counts": [
+            [
+              "ALL_ZERO",
+              1
+            ],
+            [
+              "minimum-profit",
+              1
+            ]
+          ],
+          "request_fingerprint": "sha256:2824a03a01515da6ffd9fe14bc8308e8b3100e5c57e4ca35d378f3fa5d8731d6",
+          "result_kind": "NO_QUALIFIED_OPPORTUNITY",
+          "schema_version": "open_trader.prediction_n_leg.payout_proof.v1",
+          "selected_support_graph": null,
+          "source_problem_fingerprint": null,
+          "worst_scenario": null,
+          "worst_state_cut": null
+        },
+        "objective_bounds": {
+          "closed": false,
+          "gap_units": null,
+          "lower_bound_units": null,
+          "upper_bound_units": null
+        },
+        "optimality_status": "NOT_APPLICABLE",
+        "proof_status": "PROVEN",
+        "solution": null,
+        "solve_status": "INFEASIBLE",
+        "unknown_reason": null
+      },
+      "expected_result_fingerprint": "sha256:de5c9d4c8519fca4470ed9184ff70c0d61341b602544b4022fa15dec84018401",
+      "request": {
+        "budget": {
+          "max_joint_states": 1,
+          "max_quantity_vectors": 2,
+          "max_support_rechecks": 1
+        },
+        "mode": "ADMISSION",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 11,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-round",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-round",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [],
+            "relations": []
+          },
+          "problem_id": "rounded-false-edge",
+          "qualification_constraints": [
+            {
+              "comparison": "GREATER_THAN_OR_EQUAL",
+              "constraint_id": "minimum-profit",
+              "metric": "GUARANTEED_PROFIT_UNITS",
+              "rule_version": "v1",
+              "threshold_denominator": 1,
+              "threshold_numerator": 0
+            }
+          ],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "a",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "a",
+                      "payout_lower_bound_per_lot_units": 10
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-round",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-round",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    },
+    {
+      "additional_replays": [
+        {
+          "expected_request_fingerprint": "sha256:37beb32ba88b7f5b6cb0e8d5ac3592fc2971d7c8565519c56199ea652f35df1e",
+          "expected_result": {
+            "business_status": "QUALIFIED_FEASIBLE",
+            "negative_proof": null,
+            "objective_bounds": {
+              "closed": true,
+              "gap_units": 0,
+              "lower_bound_units": 20,
+              "upper_bound_units": 20
+            },
+            "optimality_status": "OPTIMAL",
+            "proof_status": "PROVEN",
+            "solution": {
+              "payout_proof": {
+                "conservative_capital_release_at": "2026-08-12T00:00:00Z",
+                "cost_upper_bound_units": 2,
+                "guaranteed_profit_units": 20,
+                "joint_states_per_vector": null,
+                "payout_lower_bound_units": 22,
+                "portfolio_fingerprint": "sha256:6ddfb2180d340577ebb595aee9f0f6ab1ba64061bb6e9ebbaa0b25f916b6e24a",
+                "problem_fingerprint": "sha256:783c065f258bb79747088541f151e29e79d77a3ff58d054496a9ffc78b1a4998",
+                "proof_method": "BOUNDED_EXACT_ORACLE_V1",
+                "qualification_fingerprint": "sha256:c54d37d4098f474487ef260290e64e18cd29ad330e420ac2888b4a1fe6865df8",
+                "quantity_vectors_examined": null,
+                "quantity_vectors_total": null,
+                "rejection_counts": [],
+                "request_fingerprint": null,
+                "result_kind": "PORTFOLIO",
+                "schema_version": "open_trader.prediction_n_leg.payout_proof.v1",
+                "selected_support_graph": {
+                  "action_ids": [
+                    "a"
+                  ],
+                  "constraint_ids": [],
+                  "contract_ids": [
+                    "a"
+                  ],
+                  "hyperedges": []
+                },
+                "source_problem_fingerprint": null,
+                "worst_scenario": {
+                  "atoms": [
+                    {
+                      "atom_id": "a",
+                      "market_contract_id": "a"
+                    }
+                  ]
+                },
+                "worst_state_cut": {
+                  "cut_id": "cut:sha256:0da8e2085e4d73cab3a067198b91d7aa4cd2ea45507d535a7d52bead46908965",
+                  "payout_per_lot": [
+                    {
+                      "action_id": "a",
+                      "payout_lower_bound_per_lot_units": 11
+                    }
+                  ],
+                  "scenario": {
+                    "atoms": [
+                      {
+                        "atom_id": "a",
+                        "market_contract_id": "a"
+                      }
+                    ]
+                  }
+                }
+              },
+              "quantities": [
+                {
+                  "action_id": "a",
+                  "quantity_lots": 2
+                }
+              ]
+            },
+            "solve_status": "FEASIBLE",
+            "unknown_reason": null
+          },
+          "expected_result_fingerprint": "sha256:e8f7807338516401965a54619dd8ae80339bf40fce715e22519cad8c1fd2a8f3",
+          "request": {
+            "budget": {
+              "max_joint_states": 1,
+              "max_quantity_vectors": 3,
+              "max_support_rechecks": 1
+            },
+            "mode": "OPTIMIZATION",
+            "problem": {
+              "actions": [
+                {
+                  "account_id": "fixture-account",
+                  "action_id": "a",
+                  "asset_valuation_rule_id": "usd-cents-v1",
+                  "chain_id": "fixture-chain",
+                  "cost_slices": [
+                    {
+                      "first_lot": 1,
+                      "incremental_cost_upper_bound_units": 1,
+                      "last_lot": 2
+                    }
+                  ],
+                  "lot_step_units": 1,
+                  "market_contract_id": "a",
+                  "max_quantity_lots": 2,
+                  "min_quantity_lots": 1,
+                  "quantity_scale": 1,
+                  "settlement_asset_id": "usd-cents",
+                  "settlement_observation_key": {
+                    "indicator_id": "indicator-opt",
+                    "observation_end": "2026-08-12T00:00:00Z",
+                    "observation_start": "2026-08-12T00:00:00Z",
+                    "oracle_id": "oracle-opt",
+                    "rule_version": "v1",
+                    "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                    "timezone": "UTC"
+                  },
+                  "side": "BUY_YES",
+                  "valuation_unit_id": "usd-cents",
+                  "venue_id": "fixture-venue"
+                }
+              ],
+              "as_of": "2026-08-12T00:00:00Z",
+              "constraint_model": {
+                "forbidden_atom_combinations": [],
+                "relations": []
+              },
+              "problem_id": "qualified-not-optimal",
+              "qualification_constraints": [
+                {
+                  "comparison": "GREATER_THAN_OR_EQUAL",
+                  "constraint_id": "minimum-profit",
+                  "metric": "GUARANTEED_PROFIT_UNITS",
+                  "rule_version": "v1",
+                  "threshold_denominator": 1,
+                  "threshold_numerator": 1
+                }
+              ],
+              "schema_version": "open_trader.prediction_n_leg.problem.v1",
+              "terminal_state_sets": [
+                {
+                  "atoms": [
+                    {
+                      "atom_id": "a",
+                      "capital_release_at": "2026-08-12T00:00:00Z",
+                      "kind": "NORMAL_YES",
+                      "payouts": [
+                        {
+                          "action_id": "a",
+                          "payout_lower_bound_per_lot_units": 11
+                        }
+                      ],
+                      "rule_version": "v1"
+                    }
+                  ],
+                  "market_contract_id": "a",
+                  "rule_version": "v1",
+                  "settlement_observation_key": {
+                    "indicator_id": "indicator-opt",
+                    "observation_end": "2026-08-12T00:00:00Z",
+                    "observation_start": "2026-08-12T00:00:00Z",
+                    "oracle_id": "oracle-opt",
+                    "rule_version": "v1",
+                    "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                    "timezone": "UTC"
+                  }
+                }
+              ],
+              "valuation_unit_id": "usd-cents"
+            },
+            "schema_version": "open_trader.prediction_n_leg.request.v1"
+          }
+        }
+      ],
+      "case_id": "qualified-not-optimal",
+      "expected_request_fingerprint": "sha256:2a793416b199982bebdc8fbf45ea5c63ebd16a285468d7cf4e13ba2417249be9",
+      "expected_result": {
+        "business_status": "QUALIFIED_FEASIBLE",
+        "negative_proof": null,
+        "objective_bounds": {
+          "closed": false,
+          "gap_units": null,
+          "lower_bound_units": 10,
+          "upper_bound_units": null
+        },
+        "optimality_status": "NOT_PROVEN",
+        "proof_status": "PROVEN",
+        "solution": {
+          "payout_proof": {
+            "conservative_capital_release_at": "2026-08-12T00:00:00Z",
+            "cost_upper_bound_units": 1,
+            "guaranteed_profit_units": 10,
+            "joint_states_per_vector": null,
+            "payout_lower_bound_units": 11,
+            "portfolio_fingerprint": "sha256:36d36aef1896a0b0ff4ba635f74c434d26a24bc339321eb5b6878a2be23d5aed",
+            "problem_fingerprint": "sha256:783c065f258bb79747088541f151e29e79d77a3ff58d054496a9ffc78b1a4998",
+            "proof_method": "BOUNDED_EXACT_ORACLE_V1",
+            "qualification_fingerprint": "sha256:c54d37d4098f474487ef260290e64e18cd29ad330e420ac2888b4a1fe6865df8",
+            "quantity_vectors_examined": null,
+            "quantity_vectors_total": null,
+            "rejection_counts": [],
+            "request_fingerprint": null,
+            "result_kind": "PORTFOLIO",
+            "schema_version": "open_trader.prediction_n_leg.payout_proof.v1",
+            "selected_support_graph": {
+              "action_ids": [
+                "a"
+              ],
+              "constraint_ids": [],
+              "contract_ids": [
+                "a"
+              ],
+              "hyperedges": []
+            },
+            "source_problem_fingerprint": null,
+            "worst_scenario": {
+              "atoms": [
+                {
+                  "atom_id": "a",
+                  "market_contract_id": "a"
+                }
+              ]
+            },
+            "worst_state_cut": {
+              "cut_id": "cut:sha256:0da8e2085e4d73cab3a067198b91d7aa4cd2ea45507d535a7d52bead46908965",
+              "payout_per_lot": [
+                {
+                  "action_id": "a",
+                  "payout_lower_bound_per_lot_units": 11
+                }
+              ],
+              "scenario": {
+                "atoms": [
+                  {
+                    "atom_id": "a",
+                    "market_contract_id": "a"
+                  }
+                ]
+              }
+            }
+          },
+          "quantities": [
+            {
+              "action_id": "a",
+              "quantity_lots": 1
+            }
+          ]
+        },
+        "solve_status": "FEASIBLE",
+        "unknown_reason": null
+      },
+      "expected_result_fingerprint": "sha256:a979a5d08452f8c9070dfce384651d2fd127bd1843b27a6e37e5eaa4b13ad3a6",
+      "request": {
+        "budget": {
+          "max_joint_states": 1,
+          "max_quantity_vectors": 3,
+          "max_support_rechecks": 1
+        },
+        "mode": "ADMISSION",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 1,
+                  "last_lot": 2
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 2,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-opt",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-opt",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [],
+            "relations": []
+          },
+          "problem_id": "qualified-not-optimal",
+          "qualification_constraints": [
+            {
+              "comparison": "GREATER_THAN_OR_EQUAL",
+              "constraint_id": "minimum-profit",
+              "metric": "GUARANTEED_PROFIT_UNITS",
+              "rule_version": "v1",
+              "threshold_denominator": 1,
+              "threshold_numerator": 1
+            }
+          ],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "a",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "a",
+                      "payout_lower_bound_per_lot_units": 11
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-opt",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-opt",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    },
+    {
+      "additional_replays": [
+        {
+          "expected_request_fingerprint": "sha256:f947fcddfe125bf3be916938c066a3cea40fcac5b6a048185786bf753d8f5535",
+          "expected_result": {
+            "business_status": "QUALIFIED_FEASIBLE",
+            "negative_proof": null,
+            "objective_bounds": {
+              "closed": true,
+              "gap_units": 0,
+              "lower_bound_units": 10,
+              "upper_bound_units": 10
+            },
+            "optimality_status": "OPTIMAL",
+            "proof_status": "PROVEN",
+            "solution": {
+              "payout_proof": {
+                "conservative_capital_release_at": "2026-08-12T00:00:00Z",
+                "cost_upper_bound_units": 1,
+                "guaranteed_profit_units": 10,
+                "joint_states_per_vector": null,
+                "payout_lower_bound_units": 11,
+                "portfolio_fingerprint": "sha256:36d36aef1896a0b0ff4ba635f74c434d26a24bc339321eb5b6878a2be23d5aed",
+                "problem_fingerprint": "sha256:f85ff36e4877c34006c82c2c741a37bd511a2eab951b80d4ffeade1990726ff8",
+                "proof_method": "BOUNDED_EXACT_ORACLE_V1",
+                "qualification_fingerprint": "sha256:741fc66f1ab6fb52a8c03e921f55a9da492998de4145d4fd776b54b796ffdb52",
+                "quantity_vectors_examined": null,
+                "quantity_vectors_total": null,
+                "rejection_counts": [],
+                "request_fingerprint": null,
+                "result_kind": "PORTFOLIO",
+                "schema_version": "open_trader.prediction_n_leg.payout_proof.v1",
+                "selected_support_graph": {
+                  "action_ids": [
+                    "a"
+                  ],
+                  "constraint_ids": [],
+                  "contract_ids": [
+                    "a"
+                  ],
+                  "hyperedges": []
+                },
+                "source_problem_fingerprint": null,
+                "worst_scenario": {
+                  "atoms": [
+                    {
+                      "atom_id": "a",
+                      "market_contract_id": "a"
+                    }
+                  ]
+                },
+                "worst_state_cut": {
+                  "cut_id": "cut:sha256:0da8e2085e4d73cab3a067198b91d7aa4cd2ea45507d535a7d52bead46908965",
+                  "payout_per_lot": [
+                    {
+                      "action_id": "a",
+                      "payout_lower_bound_per_lot_units": 11
+                    }
+                  ],
+                  "scenario": {
+                    "atoms": [
+                      {
+                        "atom_id": "a",
+                        "market_contract_id": "a"
+                      }
+                    ]
+                  }
+                }
+              },
+              "quantities": [
+                {
+                  "action_id": "a",
+                  "quantity_lots": 1
+                }
+              ]
+            },
+            "solve_status": "FEASIBLE",
+            "unknown_reason": null
+          },
+          "expected_result_fingerprint": "sha256:e7217194931058f26153954de32ff8e8f4ed17d83fbcbcbbe42bb8cab78950e5",
+          "request": {
+            "budget": {
+              "max_joint_states": 1,
+              "max_quantity_vectors": 2,
+              "max_support_rechecks": 1
+            },
+            "mode": "RAW_ARBITRAGE_DIAGNOSTIC",
+            "problem": {
+              "actions": [
+                {
+                  "account_id": "fixture-account",
+                  "action_id": "a",
+                  "asset_valuation_rule_id": "usd-cents-v1",
+                  "chain_id": "fixture-chain",
+                  "cost_slices": [
+                    {
+                      "first_lot": 1,
+                      "incremental_cost_upper_bound_units": 1,
+                      "last_lot": 1
+                    }
+                  ],
+                  "lot_step_units": 1,
+                  "market_contract_id": "a",
+                  "max_quantity_lots": 1,
+                  "min_quantity_lots": 1,
+                  "quantity_scale": 1,
+                  "settlement_asset_id": "usd-cents",
+                  "settlement_observation_key": {
+                    "indicator_id": "indicator-raw",
+                    "observation_end": "2026-08-12T00:00:00Z",
+                    "observation_start": "2026-08-12T00:00:00Z",
+                    "oracle_id": "oracle-raw",
+                    "rule_version": "v1",
+                    "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                    "timezone": "UTC"
+                  },
+                  "side": "BUY_YES",
+                  "valuation_unit_id": "usd-cents",
+                  "venue_id": "fixture-venue"
+                }
+              ],
+              "as_of": "2026-08-12T00:00:00Z",
+              "constraint_model": {
+                "forbidden_atom_combinations": [],
+                "relations": []
+              },
+              "problem_id": "no-qualified-positive-raw",
+              "qualification_constraints": [
+                {
+                  "comparison": "GREATER_THAN_OR_EQUAL",
+                  "constraint_id": "minimum-profit",
+                  "metric": "GUARANTEED_PROFIT_UNITS",
+                  "rule_version": "v1",
+                  "threshold_denominator": 1,
+                  "threshold_numerator": 11
+                }
+              ],
+              "schema_version": "open_trader.prediction_n_leg.problem.v1",
+              "terminal_state_sets": [
+                {
+                  "atoms": [
+                    {
+                      "atom_id": "a",
+                      "capital_release_at": "2026-08-12T00:00:00Z",
+                      "kind": "NORMAL_YES",
+                      "payouts": [
+                        {
+                          "action_id": "a",
+                          "payout_lower_bound_per_lot_units": 11
+                        }
+                      ],
+                      "rule_version": "v1"
+                    }
+                  ],
+                  "market_contract_id": "a",
+                  "rule_version": "v1",
+                  "settlement_observation_key": {
+                    "indicator_id": "indicator-raw",
+                    "observation_end": "2026-08-12T00:00:00Z",
+                    "observation_start": "2026-08-12T00:00:00Z",
+                    "oracle_id": "oracle-raw",
+                    "rule_version": "v1",
+                    "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                    "timezone": "UTC"
+                  }
+                }
+              ],
+              "valuation_unit_id": "usd-cents"
+            },
+            "schema_version": "open_trader.prediction_n_leg.request.v1"
+          }
+        }
+      ],
+      "case_id": "no-qualified-positive-raw",
+      "expected_request_fingerprint": "sha256:269f52c85c7b97f1fd0f032da016675564a85fbf704c2a8d32508f76e5f0bb5f",
+      "expected_result": {
+        "business_status": "NO_QUALIFIED_OPPORTUNITY",
+        "negative_proof": {
+          "conservative_capital_release_at": null,
+          "cost_upper_bound_units": null,
+          "guaranteed_profit_units": null,
+          "joint_states_per_vector": 1,
+          "payout_lower_bound_units": null,
+          "portfolio_fingerprint": null,
+          "problem_fingerprint": "sha256:9228823dcfa301e6dbf53041bdf37660366173dd0e62fc911ee347fdd6b9a3b1",
+          "proof_method": "EXHAUSTIVE_ORACLE_V1",
+          "qualification_fingerprint": "sha256:a1e37ccd4c8315ad043fe39f8d23861db994a7a7ac8edc662557715d50c64054",
+          "quantity_vectors_examined": 2,
+          "quantity_vectors_total": 2,
+          "rejection_counts": [
+            [
+              "ALL_ZERO",
+              1
+            ],
+            [
+              "minimum-profit",
+              1
+            ]
+          ],
+          "request_fingerprint": "sha256:269f52c85c7b97f1fd0f032da016675564a85fbf704c2a8d32508f76e5f0bb5f",
+          "result_kind": "NO_QUALIFIED_OPPORTUNITY",
+          "schema_version": "open_trader.prediction_n_leg.payout_proof.v1",
+          "selected_support_graph": null,
+          "source_problem_fingerprint": null,
+          "worst_scenario": null,
+          "worst_state_cut": null
+        },
+        "objective_bounds": {
+          "closed": false,
+          "gap_units": null,
+          "lower_bound_units": null,
+          "upper_bound_units": null
+        },
+        "optimality_status": "NOT_APPLICABLE",
+        "proof_status": "PROVEN",
+        "solution": null,
+        "solve_status": "INFEASIBLE",
+        "unknown_reason": null
+      },
+      "expected_result_fingerprint": "sha256:3008ac20458fb7332e48809dcb13e50b42bd7e374460569ab04e05a3957a3ee7",
+      "request": {
+        "budget": {
+          "max_joint_states": 1,
+          "max_quantity_vectors": 2,
+          "max_support_rechecks": 1
+        },
+        "mode": "ADMISSION",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 1,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-raw",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-raw",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [],
+            "relations": []
+          },
+          "problem_id": "no-qualified-positive-raw",
+          "qualification_constraints": [
+            {
+              "comparison": "GREATER_THAN_OR_EQUAL",
+              "constraint_id": "minimum-profit",
+              "metric": "GUARANTEED_PROFIT_UNITS",
+              "rule_version": "v1",
+              "threshold_denominator": 1,
+              "threshold_numerator": 11
+            }
+          ],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "a",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "a",
+                      "payout_lower_bound_per_lot_units": 11
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-raw",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-raw",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    },
+    {
+      "case_id": "no-arbitrage",
+      "expected_request_fingerprint": "sha256:6c14a8f95b6b8d2db0d8385ea55bdd53127d142d341b6270010573100fb9fdac",
+      "expected_result": {
+        "business_status": "NO_ARBITRAGE",
+        "negative_proof": {
+          "conservative_capital_release_at": null,
+          "cost_upper_bound_units": null,
+          "guaranteed_profit_units": null,
+          "joint_states_per_vector": 1,
+          "payout_lower_bound_units": null,
+          "portfolio_fingerprint": null,
+          "problem_fingerprint": "sha256:6c9cc93050374acc2ed803a9d81b35922be079d9306e0dda578ad51651e7f1a9",
+          "proof_method": "EXHAUSTIVE_ORACLE_V1",
+          "qualification_fingerprint": "sha256:741fc66f1ab6fb52a8c03e921f55a9da492998de4145d4fd776b54b796ffdb52",
+          "quantity_vectors_examined": 2,
+          "quantity_vectors_total": 2,
+          "rejection_counts": [
+            [
+              "ALL_ZERO",
+              1
+            ]
+          ],
+          "request_fingerprint": "sha256:98660fe33d48c7d6aa2b63d3a9e0bd46615fa5ac3ff57df2e034b4608b888827",
+          "result_kind": "NO_ARBITRAGE",
+          "schema_version": "open_trader.prediction_n_leg.payout_proof.v1",
+          "selected_support_graph": null,
+          "source_problem_fingerprint": "sha256:0d7eec1364ce84c91473428153a8a888948d280b4fc2de5a74a6ca3639d7b024",
+          "worst_scenario": null,
+          "worst_state_cut": null
+        },
+        "objective_bounds": {
+          "closed": true,
+          "gap_units": 0,
+          "lower_bound_units": 0,
+          "upper_bound_units": 0
+        },
+        "optimality_status": "NOT_APPLICABLE",
+        "proof_status": "PROVEN",
+        "solution": null,
+        "solve_status": "INFEASIBLE",
+        "unknown_reason": null
+      },
+      "expected_result_fingerprint": "sha256:9caf5108541805e4bb15cff6436ff308cfa9bd2fbbdbce0ad1dca9a23dfa01de",
+      "request": {
+        "budget": {
+          "max_joint_states": 1,
+          "max_quantity_vectors": 2,
+          "max_support_rechecks": 1
+        },
+        "mode": "RAW_ARBITRAGE_DIAGNOSTIC",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 1,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-noarb",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-noarb",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [],
+            "relations": []
+          },
+          "problem_id": "no-arbitrage",
+          "qualification_constraints": [],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "a",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "a",
+                      "payout_lower_bound_per_lot_units": 1
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-noarb",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-noarb",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    },
+    {
+      "case_id": "unknown-state-budget",
+      "expected_request_fingerprint": "sha256:fb654690802fd0a68e3cb2862646831efd0e53ad0b1940c1eb29a205dac660aa",
+      "expected_result": {
+        "business_status": "UNKNOWN",
+        "negative_proof": null,
+        "objective_bounds": {
+          "closed": false,
+          "gap_units": null,
+          "lower_bound_units": null,
+          "upper_bound_units": null
+        },
+        "optimality_status": "NOT_APPLICABLE",
+        "proof_status": "UNKNOWN",
+        "solution": null,
+        "solve_status": "UNKNOWN",
+        "unknown_reason": "ORACLE_STATE_LIMIT_EXCEEDED"
+      },
+      "expected_result_fingerprint": "sha256:17dea7cb2b78a5122beceee4a022e57a3b475e31998aed121456ba061a7f53e2",
+      "request": {
+        "budget": {
+          "max_joint_states": 1,
+          "max_quantity_vectors": 2,
+          "max_support_rechecks": 1
+        },
+        "mode": "ADMISSION",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 1,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-st",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-st",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [],
+            "relations": []
+          },
+          "problem_id": "unknown-state-budget",
+          "qualification_constraints": [],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "no",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_NO",
+                  "payouts": [
+                    {
+                      "action_id": "a",
+                      "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "a",
+                      "payout_lower_bound_per_lot_units": 2
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-st",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-st",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    },
+    {
+      "case_id": "unknown-decision-budget",
+      "expected_request_fingerprint": "sha256:3d4ca58fa98da27320fd00206374d45486891c99c8a2dc65f9156251b94d9523",
+      "expected_result": {
+        "business_status": "UNKNOWN",
+        "negative_proof": null,
+        "objective_bounds": {
+          "closed": false,
+          "gap_units": null,
+          "lower_bound_units": null,
+          "upper_bound_units": null
+        },
+        "optimality_status": "NOT_APPLICABLE",
+        "proof_status": "UNKNOWN",
+        "solution": null,
+        "solve_status": "UNKNOWN",
+        "unknown_reason": "ORACLE_DECISION_LIMIT_EXCEEDED"
+      },
+      "expected_result_fingerprint": "sha256:b0dd66d45a24183cabea511b04521d2474b5ddefa3e8cded0d2595e9e04e4b00",
+      "request": {
+        "budget": {
+          "max_joint_states": 1,
+          "max_quantity_vectors": 2,
+          "max_support_rechecks": 1
+        },
+        "mode": "ADMISSION",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 1,
+                  "last_lot": 2
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 2,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-dec",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-dec",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [],
+            "relations": []
+          },
+          "problem_id": "unknown-decision-budget",
+          "qualification_constraints": [],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "a",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "a",
+                      "payout_lower_bound_per_lot_units": 2
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-dec",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-dec",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    },
+    {
+      "case_id": "unknown-missing-atom-data",
+      "expected_request_fingerprint": "sha256:a7c3795e1f9f5b8babc0136e1cc6cd20b8d8bb12967d01ca8dfe577e2374a44a",
+      "expected_result": {
+        "business_status": "UNKNOWN",
+        "negative_proof": null,
+        "objective_bounds": {
+          "closed": false,
+          "gap_units": null,
+          "lower_bound_units": null,
+          "upper_bound_units": null
+        },
+        "optimality_status": "NOT_APPLICABLE",
+        "proof_status": "UNKNOWN",
+        "solution": null,
+        "solve_status": "UNKNOWN",
+        "unknown_reason": "UNKNOWN_TERMINAL_DATA"
+      },
+      "expected_result_fingerprint": "sha256:724d20528b9ff059386bbb6c66c7ef6ae2f7ad2e1d04b78e60ee101f6b2ff4be",
+      "request": {
+        "budget": {
+          "max_joint_states": 1,
+          "max_quantity_vectors": 2,
+          "max_support_rechecks": 1
+        },
+        "mode": "ADMISSION",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 1,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-miss",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-miss",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [],
+            "relations": []
+          },
+          "problem_id": "unknown-missing-atom-data",
+          "qualification_constraints": [],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "a",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-miss",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-miss",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    },
+    {
+      "case_id": "unknown-cross-asset",
+      "expected_request_fingerprint": "sha256:215f46105c550d8a620488e3b86c33245e78412c1ca805fdea62fa551097d133",
+      "expected_result": {
+        "business_status": "UNKNOWN",
+        "negative_proof": null,
+        "objective_bounds": {
+          "closed": false,
+          "gap_units": null,
+          "lower_bound_units": null,
+          "upper_bound_units": null
+        },
+        "optimality_status": "NOT_APPLICABLE",
+        "proof_status": "UNKNOWN",
+        "solution": null,
+        "solve_status": "UNKNOWN",
+        "unknown_reason": "UNKNOWN_VALUATION"
+      },
+      "expected_result_fingerprint": "sha256:f714dca07782528d5eba5aec499b339ca11b65fb6eab455d16c147ff99b3723e",
+      "request": {
+        "budget": {
+          "max_joint_states": 1,
+          "max_quantity_vectors": 2,
+          "max_support_rechecks": 1
+        },
+        "mode": "ADMISSION",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "a",
+              "asset_valuation_rule_id": "eur-usd-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 1,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "eur",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-xa",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-xa",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [],
+            "relations": []
+          },
+          "problem_id": "unknown-cross-asset",
+          "qualification_constraints": [],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "a",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "a",
+                      "payout_lower_bound_per_lot_units": 2
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-xa",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-xa",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    },
+    {
+      "case_id": "unknown-contradictory-model",
+      "expected_request_fingerprint": "sha256:cc86f0ee70f7d47c99ed4fe46461d1600654f25bc98cb016526a09e3594e2130",
+      "expected_result": {
+        "business_status": "UNKNOWN",
+        "negative_proof": null,
+        "objective_bounds": {
+          "closed": false,
+          "gap_units": null,
+          "lower_bound_units": null,
+          "upper_bound_units": null
+        },
+        "optimality_status": "NOT_APPLICABLE",
+        "proof_status": "UNKNOWN",
+        "solution": null,
+        "solve_status": "UNKNOWN",
+        "unknown_reason": "CONTRADICTORY_CONSTRAINT_MODEL"
+      },
+      "expected_result_fingerprint": "sha256:19da7d6e83df6bbc9b7e7faef8cf4be7c711e512ebdde7cece1ac278aaa1c846",
+      "request": {
+        "budget": {
+          "max_joint_states": 1,
+          "max_quantity_vectors": 4,
+          "max_support_rechecks": 1
+        },
+        "mode": "ADMISSION",
+        "problem": {
+          "actions": [
+            {
+              "account_id": "fixture-account",
+              "action_id": "a",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 1,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-ca",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-ca",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            },
+            {
+              "account_id": "fixture-account",
+              "action_id": "b",
+              "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
+              "cost_slices": [
+                {
+                  "first_lot": 1,
+                  "incremental_cost_upper_bound_units": 1,
+                  "last_lot": 1
+                }
+              ],
+              "lot_step_units": 1,
+              "market_contract_id": "b",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
+              "quantity_scale": 1,
+              "settlement_asset_id": "usd-cents",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-cb",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-cb",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              },
+              "side": "BUY_YES",
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
+            }
+          ],
+          "as_of": "2026-08-12T00:00:00Z",
+          "constraint_model": {
+            "forbidden_atom_combinations": [],
+            "relations": [
+              {
+                "constraint_id": "one",
+                "contract_ids": [
+                  "a",
+                  "b"
+                ],
+                "kind": "EXACTLY_ONE",
+                "rule_version": "v1"
+              }
+            ]
+          },
+          "problem_id": "unknown-contradictory-model",
+          "qualification_constraints": [],
+          "schema_version": "open_trader.prediction_n_leg.problem.v1",
+          "terminal_state_sets": [
+            {
+              "atoms": [
+                {
+                  "atom_id": "a",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "a",
+                      "payout_lower_bound_per_lot_units": 2
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "a",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-ca",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-ca",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "atoms": [
+                {
+                  "atom_id": "b",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "b",
+                      "payout_lower_bound_per_lot_units": 2
+                    }
+                  ],
+                  "rule_version": "v1"
+                }
+              ],
+              "market_contract_id": "b",
+              "rule_version": "v1",
+              "settlement_observation_key": {
+                "indicator_id": "indicator-cb",
+                "observation_end": "2026-08-12T00:00:00Z",
+                "observation_start": "2026-08-12T00:00:00Z",
+                "oracle_id": "oracle-cb",
+                "rule_version": "v1",
+                "schema_version": "open_trader.prediction_n_leg.observation.v1",
+                "timezone": "UTC"
+              }
+            }
+          ],
+          "valuation_unit_id": "usd-cents"
+        },
+        "schema_version": "open_trader.prediction_n_leg.request.v1"
+      }
+    }
+  ],
+  "schema_version": "open_trader.prediction_n_leg.oracle_corpus.v1"
+}
