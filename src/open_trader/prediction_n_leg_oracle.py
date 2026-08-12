@@ -23,6 +23,7 @@ from open_trader.prediction_n_leg import (
     ProofStatus,
     QualificationConstraint,
     QualificationMetric,
+    REQUEST_SCHEMA_V1,
     RelationKind,
     SearchMode,
     SelectedSupportGraph,
@@ -114,7 +115,7 @@ def _input_unknown_reason(problem: ArbitrageProblem) -> UnknownReason | None:
     ):
         return UnknownReason.INVALID_MODEL
     issues = validate_problem(problem)
-    if any(issue.code == "MISSING_ACTION_PAYOUT" for issue in issues):
+    if any(issue.code in {"MISSING_ACTION_PAYOUT", "MISSING_TERMINAL_RULE_IDENTITY", "MISSING_CAPITAL_RELEASE_AT"} for issue in issues):
         return UnknownReason.UNKNOWN_TERMINAL_DATA
     if any(issue.code == "MISSING_ASSET_VALUATION_RULE" for issue in issues) or any(
         action.settlement_asset_id != problem.valuation_unit_id for action in problem.actions
@@ -620,8 +621,11 @@ def quantity_vector_count(problem: ArbitrageProblem) -> int:
     return total
 
 
-def _quantity_ranges(actions: tuple[CandidateAction, ...]) -> tuple[range, ...]:
-    return tuple(range(action.cost_slices[-1].last_lot + 1) for action in actions)
+def _quantity_ranges(actions: tuple[CandidateAction, ...]) -> tuple[tuple[int, ...], ...]:
+    return tuple(
+        (0, *range(action.min_quantity_lots, action.max_quantity_lots + 1))
+        for action in actions
+    )
 
 
 def build_exhaustive_search_proof(
@@ -713,6 +717,7 @@ def _connected_qualified_solutions(
 def _search_request_unknown_reason(request: OracleRequest, mode: SearchMode) -> UnknownReason | None:
     if (
         not isinstance(request, OracleRequest)
+        or request.schema_version != REQUEST_SCHEMA_V1
         or request.mode != mode
         or not isinstance(request.budget, OracleBudget)
         or any(
@@ -846,7 +851,7 @@ def diagnose_raw_arbitrage(problem: ArbitrageProblem, budget: OracleBudget) -> O
         qualification_constraints=(),
     )
     request = OracleRequest(
-        "open_trader.prediction_n_leg.request.v1",
+        REQUEST_SCHEMA_V1,
         SearchMode.RAW_ARBITRAGE_DIAGNOSTIC,
         diagnostic_problem,
         budget,

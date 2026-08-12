@@ -8,6 +8,12 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 
+REQUEST_SCHEMA_V1 = "open_trader.prediction_n_leg.request.v1"
+PROBLEM_SCHEMA_V1 = "open_trader.prediction_n_leg.problem.v1"
+OBSERVATION_SCHEMA_V1 = "open_trader.prediction_n_leg.observation.v1"
+PAYOUT_PROOF_SCHEMA_V1 = "open_trader.prediction_n_leg.payout_proof.v1"
+
+
 class ActionSide(StrEnum):
     BUY_YES = "BUY_YES"
     BUY_NO = "BUY_NO"
@@ -101,11 +107,16 @@ class ExecutableCostSlice:
 @dataclass(frozen=True, slots=True)
 class CandidateAction:
     action_id: str
+    venue_id: str
+    account_id: str
+    chain_id: str
     market_contract_id: str
     settlement_observation_key: SettlementObservationKey
     side: ActionSide
     lot_step_units: int
     quantity_scale: int
+    min_quantity_lots: int
+    max_quantity_lots: int
     settlement_asset_id: str
     valuation_unit_id: str
     asset_valuation_rule_id: str
@@ -122,9 +133,9 @@ class ActionPayout:
 class TerminalAtom:
     atom_id: str
     kind: TerminalKind
-    rule_version: str
+    rule_version: str | None
     payouts: tuple[ActionPayout, ...]
-    capital_release_at: datetime
+    capital_release_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,6 +439,8 @@ def _validate_observation_key(issues: list[ModelIssue], value: object, path: str
         return False
     for field in ("schema_version", "oracle_id", "indicator_id", "timezone", "rule_version"):
         _identifier(issues, getattr(value, field), f"{path}.{field}")
+    if value.schema_version != OBSERVATION_SCHEMA_V1:
+        _issue(issues, "INVALID_SCHEMA_VERSION", f"{path}.schema_version", f"must equal {OBSERVATION_SCHEMA_V1}")
     return True
 
 
@@ -437,6 +450,8 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
         return (ModelIssue("INVALID_PROBLEM", "$", "must be an ArbitrageProblem"),)
     as_of_valid = _validate_datetime(issues, problem.as_of, "as_of")
     _identifier(issues, problem.schema_version, "schema_version")
+    if problem.schema_version != PROBLEM_SCHEMA_V1:
+        _issue(issues, "INVALID_SCHEMA_VERSION", "schema_version", f"must equal {PROBLEM_SCHEMA_V1}")
     _identifier(issues, problem.problem_id, "problem_id")
     valuation_unit_id = _identifier(issues, problem.valuation_unit_id, "valuation_unit_id")
     action_ids: set[str] = set()
@@ -447,6 +462,8 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
             _issue(issues, "INVALID_ACTION", prefix, "must be a CandidateAction")
             continue
         action_id = _identifier(issues, action.action_id, f"{prefix}.action_id")
+        for name in ("venue_id", "account_id", "chain_id"):
+            _identifier(issues, getattr(action, name), f"{prefix}.{name}")
         contract_id = _identifier(issues, action.market_contract_id, f"{prefix}.market_contract_id")
         if action_id is not None and action_id in action_ids:
             _issue(issues, "DUPLICATE_ID", f"{prefix}.action_id", "action_id must be unique")
@@ -460,7 +477,7 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
             _issue(issues, "VALUATION_UNIT_MISMATCH", f"{prefix}.valuation_unit_id", "must equal problem valuation_unit_id")
         _identifier(issues, action.asset_valuation_rule_id, f"{prefix}.asset_valuation_rule_id")
         _validate_enum(issues, action.side, ActionSide, "INVALID_ACTION_SIDE", f"{prefix}.side")
-        for name in ("lot_step_units", "quantity_scale"):
+        for name in ("lot_step_units", "quantity_scale", "min_quantity_lots", "max_quantity_lots"):
             _validate_int(issues, getattr(action, name), f"{prefix}.{name}")
         if isinstance(action.lot_step_units, int) and not isinstance(action.lot_step_units, bool) and action.lot_step_units <= 0:
             _issue(issues, "NON_POSITIVE_LOT_STEP", f"{prefix}.lot_step_units", "must be positive")
@@ -479,6 +496,21 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
         cost_slices = _nodes(issues, action.cost_slices, "INVALID_COST_SLICE_CONTAINER", f"{prefix}.cost_slices")
         if not cost_slices:
             _issue(issues, "MISSING_COST_SLICES", f"{prefix}.cost_slices", "must contain at least one executable cost slice")
+        valid_quantity_bounds = all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in (action.min_quantity_lots, action.max_quantity_lots)
+        )
+        if valid_quantity_bounds and not 0 < action.min_quantity_lots <= action.max_quantity_lots:
+            _issue(issues, "INVALID_QUANTITY_BOUNDS", f"{prefix}.min_quantity_lots", "must satisfy 0 < min_quantity_lots <= max_quantity_lots")
+        if (
+            valid_quantity_bounds
+            and cost_slices
+            and isinstance(cost_slices[-1], ExecutableCostSlice)
+            and isinstance(cost_slices[-1].last_lot, int)
+            and not isinstance(cost_slices[-1].last_lot, bool)
+            and action.max_quantity_lots > cost_slices[-1].last_lot
+        ):
+            _issue(issues, "QUANTITY_BOUNDS_EXCEED_COST_SLICES", f"{prefix}.max_quantity_lots", "must not exceed the final executable cost slice")
         for slice_index, cost_slice in enumerate(cost_slices):
             slice_path = f"{prefix}.cost_slices[{slice_index}]"
             if not isinstance(cost_slice, ExecutableCostSlice):
@@ -526,8 +558,15 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
             if atom_id is not None:
                 atom_ids.add(atom_id)
             _validate_enum(issues, atom.kind, TerminalKind, "INVALID_TERMINAL_KIND", f"{atom_path}.kind")
-            _identifier(issues, atom.rule_version, f"{atom_path}.rule_version")
-            release_at_valid = _validate_datetime(issues, atom.capital_release_at, f"{atom_path}.capital_release_at")
+            if atom.rule_version is None:
+                _issue(issues, "MISSING_TERMINAL_RULE_IDENTITY", f"{atom_path}.rule_version", "must identify the terminal rule")
+            else:
+                _identifier(issues, atom.rule_version, f"{atom_path}.rule_version")
+            if atom.capital_release_at is None:
+                _issue(issues, "MISSING_CAPITAL_RELEASE_AT", f"{atom_path}.capital_release_at", "must identify capital release time")
+                release_at_valid = False
+            else:
+                release_at_valid = _validate_datetime(issues, atom.capital_release_at, f"{atom_path}.capital_release_at")
             if as_of_valid and release_at_valid and atom.capital_release_at < problem.as_of:
                 _issue(issues, "STALE_CAPITAL_RELEASE_AT", f"{atom_path}.capital_release_at", "must be after problem as_of")
             payouts = _nodes(issues, atom.payouts, "INVALID_ACTION_PAYOUT_CONTAINER", f"{atom_path}.payouts")
@@ -684,8 +723,11 @@ def _enum(enum_type: type[StrEnum], payload: object, name: str) -> StrEnum:
 
 def _observation_from_payload(payload: object) -> SettlementObservationKey:
     value = _object(payload, "settlement_observation_key", {"schema_version", "oracle_id", "indicator_id", "observation_start", "observation_end", "timezone", "rule_version"})
+    schema_version = _string(value["schema_version"], "schema_version")
+    if schema_version != OBSERVATION_SCHEMA_V1:
+        raise ModelDecodeError(f"schema_version must equal {OBSERVATION_SCHEMA_V1}")
     return SettlementObservationKey(
-        _string(value["schema_version"], "schema_version"), _string(value["oracle_id"], "oracle_id"),
+        schema_version, _string(value["oracle_id"], "oracle_id"),
         _string(value["indicator_id"], "indicator_id"), _datetime_from_payload(value["observation_start"], "observation_start"),
         _datetime_from_payload(value["observation_end"], "observation_end"), _string(value["timezone"], "timezone"),
         _string(value["rule_version"], "rule_version"),
@@ -698,11 +740,14 @@ def _cost_slice_from_payload(payload: object) -> ExecutableCostSlice:
 
 
 def _action_from_payload(payload: object) -> CandidateAction:
-    value = _object(payload, "action", {"action_id", "market_contract_id", "settlement_observation_key", "side", "lot_step_units", "quantity_scale", "settlement_asset_id", "valuation_unit_id", "asset_valuation_rule_id", "cost_slices"})
+    value = _object(payload, "action", {"action_id", "venue_id", "account_id", "chain_id", "market_contract_id", "settlement_observation_key", "side", "lot_step_units", "quantity_scale", "min_quantity_lots", "max_quantity_lots", "settlement_asset_id", "valuation_unit_id", "asset_valuation_rule_id", "cost_slices"})
     return CandidateAction(
-        _string(value["action_id"], "action_id"), _string(value["market_contract_id"], "market_contract_id"),
+        _string(value["action_id"], "action_id"), _string(value["venue_id"], "venue_id"),
+        _string(value["account_id"], "account_id"), _string(value["chain_id"], "chain_id"),
+        _string(value["market_contract_id"], "market_contract_id"),
         _observation_from_payload(value["settlement_observation_key"]), _enum(ActionSide, value["side"], "side"),
         _integer(value["lot_step_units"], "lot_step_units"), _integer(value["quantity_scale"], "quantity_scale"),
+        _integer(value["min_quantity_lots"], "min_quantity_lots"), _integer(value["max_quantity_lots"], "max_quantity_lots"),
         _string(value["settlement_asset_id"], "settlement_asset_id"), _string(value["valuation_unit_id"], "valuation_unit_id"),
         _text(value["asset_valuation_rule_id"], "asset_valuation_rule_id"), tuple(_cost_slice_from_payload(item) for item in _array(value["cost_slices"], "cost_slices")),
     )
@@ -714,8 +759,19 @@ def _payout_from_payload(payload: object) -> ActionPayout:
 
 
 def _atom_from_payload(payload: object) -> TerminalAtom:
-    value = _object(payload, "terminal_atom", {"atom_id", "kind", "rule_version", "payouts", "capital_release_at"})
-    return TerminalAtom(_string(value["atom_id"], "atom_id"), _enum(TerminalKind, value["kind"], "kind"), _string(value["rule_version"], "rule_version"), tuple(_payout_from_payload(item) for item in _array(value["payouts"], "payouts")), _datetime_from_payload(value["capital_release_at"], "capital_release_at"))
+    required = {"atom_id", "kind", "payouts"}
+    allowed = required | {"rule_version", "capital_release_at"}
+    if not isinstance(payload, Mapping) or not required <= set(payload) <= allowed or not all(isinstance(key, str) for key in payload):
+        raise ModelDecodeError(f"terminal_atom must contain {sorted(required)} and only optional rule_version/capital_release_at")
+    rule_version = payload.get("rule_version")
+    capital_release_at = payload.get("capital_release_at")
+    return TerminalAtom(
+        _string(payload["atom_id"], "atom_id"),
+        _enum(TerminalKind, payload["kind"], "kind"),
+        None if rule_version is None else _string(rule_version, "rule_version"),
+        tuple(_payout_from_payload(item) for item in _array(payload["payouts"], "payouts")),
+        None if capital_release_at is None else _datetime_from_payload(capital_release_at, "capital_release_at"),
+    )
 
 
 def _state_set_from_payload(payload: object) -> TerminalStateSet:
@@ -767,9 +823,12 @@ def _sorted_problem(problem: ArbitrageProblem) -> ArbitrageProblem:
 
 def problem_from_payload(payload: Mapping[str, object], *, allow_unknown_data: bool = False) -> ArbitrageProblem:
     value = _object(payload, "problem", {"schema_version", "problem_id", "as_of", "valuation_unit_id", "actions", "terminal_state_sets", "constraint_model", "qualification_constraints"})
+    schema_version = _string(value["schema_version"], "schema_version")
+    if schema_version != PROBLEM_SCHEMA_V1:
+        raise ModelDecodeError(f"schema_version must equal {PROBLEM_SCHEMA_V1}")
     constraint_model = _object(value["constraint_model"], "constraint_model", {"relations", "forbidden_atom_combinations"})
     problem = ArbitrageProblem(
-        _string(value["schema_version"], "schema_version"), _string(value["problem_id"], "problem_id"), _datetime_from_payload(value["as_of"], "as_of"), _string(value["valuation_unit_id"], "valuation_unit_id"),
+        schema_version, _string(value["problem_id"], "problem_id"), _datetime_from_payload(value["as_of"], "as_of"), _string(value["valuation_unit_id"], "valuation_unit_id"),
         tuple(_action_from_payload(item) for item in _array(value["actions"], "actions")),
         tuple(_state_set_from_payload(item) for item in _array(value["terminal_state_sets"], "terminal_state_sets")),
         ConstraintModel(tuple(_relation_from_payload(item) for item in _array(constraint_model["relations"], "relations")), tuple(_forbidden_from_payload(item) for item in _array(constraint_model["forbidden_atom_combinations"], "forbidden_atom_combinations"))),
@@ -778,7 +837,7 @@ def problem_from_payload(payload: Mapping[str, object], *, allow_unknown_data: b
     issues = validate_problem(problem)
     if issues and not (
         allow_unknown_data
-        and all(issue.code in {"MISSING_ACTION_PAYOUT", "MISSING_ASSET_VALUATION_RULE"} for issue in issues)
+        and all(issue.code in {"MISSING_ACTION_PAYOUT", "MISSING_TERMINAL_RULE_IDENTITY", "MISSING_CAPITAL_RELEASE_AT", "MISSING_ASSET_VALUATION_RULE"} for issue in issues)
     ):
         raise ModelDecodeError("invalid problem: " + "; ".join(f"{issue.path}: {issue.code}" for issue in issues))
     return _sorted_problem(problem)
@@ -794,7 +853,10 @@ def _budget_from_payload(payload: object) -> OracleBudget:
 
 def request_from_payload(payload: Mapping[str, object]) -> OracleRequest:
     value = _object(payload, "request", {"schema_version", "mode", "problem", "budget"})
-    return OracleRequest(_string(value["schema_version"], "schema_version"), _enum(SearchMode, value["mode"], "mode"), problem_from_payload(_object(value["problem"], "problem", {"schema_version", "problem_id", "as_of", "valuation_unit_id", "actions", "terminal_state_sets", "constraint_model", "qualification_constraints"}), allow_unknown_data=True), _budget_from_payload(value["budget"]))
+    schema_version = _string(value["schema_version"], "schema_version")
+    if schema_version != REQUEST_SCHEMA_V1:
+        raise ModelDecodeError(f"schema_version must equal {REQUEST_SCHEMA_V1}")
+    return OracleRequest(schema_version, _enum(SearchMode, value["mode"], "mode"), problem_from_payload(_object(value["problem"], "problem", {"schema_version", "problem_id", "as_of", "valuation_unit_id", "actions", "terminal_state_sets", "constraint_model", "qualification_constraints"}), allow_unknown_data=True), _budget_from_payload(value["budget"]))
 
 
 def _quantity_from_payload(payload: object) -> ActionQuantity:

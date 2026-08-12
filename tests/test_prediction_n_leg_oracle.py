@@ -19,15 +19,19 @@ from open_trader.prediction_n_leg import (
     ConstraintModel,
     ExecutableCostSlice,
     ForbiddenAtomCombination,
+    ModelDecodeError,
+    OBSERVATION_SCHEMA_V1,
     OracleBudget,
     OracleRequest,
     OptimalityStatus,
     ProofStatus,
+    PROBLEM_SCHEMA_V1,
     QualificationConstraint,
     QualificationMetric,
     Comparison,
     RelationConstraint,
     RelationKind,
+    REQUEST_SCHEMA_V1,
     SearchMode,
     SelectedAtom,
     SelectedSupportGraph,
@@ -42,6 +46,7 @@ from open_trader.prediction_n_leg import (
     fingerprint,
     request_from_payload,
     result_from_payload,
+    validate_problem,
 )
 import open_trader.prediction_n_leg_oracle as oracle
 from open_trader.prediction_n_leg_oracle import (
@@ -62,7 +67,7 @@ AS_OF = datetime(2026, 8, 12, tzinfo=UTC)
 
 
 ORACLE_CORPUS_PATH = Path(__file__).with_name("fixtures") / "prediction_n_leg_v1.json"
-ORACLE_CORPUS_SHA256 = "dbac567c50fc3bb33f38ae9346a25f66256a94a893a16b84677fbf6ac6befbe4"
+ORACLE_CORPUS_SHA256 = "8de03c98691ed0af9b64499530582f9d3aa8e1b395f75a7531edbb3c6496ae59"
 
 
 def _run_corpus_case(request: OracleRequest):
@@ -115,7 +120,7 @@ def test_oracle_corpus_direct_replay_cases(case_id: str) -> None:
 
 def observation(suffix: str = "a") -> SettlementObservationKey:
     return SettlementObservationKey(
-        "open_trader.prediction_n_leg.observation.v1",
+        OBSERVATION_SCHEMA_V1,
         f"oracle-{suffix}",
         f"indicator-{suffix}",
         AS_OF,
@@ -132,16 +137,21 @@ def action(
     cost_slices: tuple[ExecutableCostSlice, ...] = (ExecutableCostSlice(1, 1, 1),),
 ) -> CandidateAction:
     return CandidateAction(
-        action_id,
-        contract_id,
-        key,
-        ActionSide.BUY_YES,
-        1,
-        1,
-        "usd-cents",
-        "usd-cents",
-        "usd-cents-v1",
-        cost_slices,
+        action_id=action_id,
+        venue_id="test-venue",
+        account_id="test-account",
+        chain_id="test-chain",
+        market_contract_id=contract_id,
+        settlement_observation_key=key,
+        side=ActionSide.BUY_YES,
+        lot_step_units=1,
+        quantity_scale=1,
+        min_quantity_lots=1,
+        max_quantity_lots=cost_slices[-1].last_lot,
+        settlement_asset_id="usd-cents",
+        valuation_unit_id="usd-cents",
+        asset_valuation_rule_id="usd-cents-v1",
+        cost_slices=cost_slices,
     )
 
 
@@ -170,7 +180,7 @@ def problem(
     forbidden: tuple[ForbiddenAtomCombination, ...] = (),
 ) -> ArbitrageProblem:
     return ArbitrageProblem(
-        "open_trader.prediction_n_leg.problem.v1",
+        PROBLEM_SCHEMA_V1,
         "oracle-test",
         AS_OF,
         "usd-cents",
@@ -179,6 +189,42 @@ def problem(
         ConstraintModel(relations, forbidden),
         (),
     )
+
+
+def test_explicit_quantity_bounds_drive_the_oracle_domain() -> None:
+    key = observation()
+    bounded = replace(
+        action("a", "a", key, (ExecutableCostSlice(1, 5, 1),)),
+        min_quantity_lots=2,
+        max_quantity_lots=3,
+    )
+    built = problem(
+        (bounded,),
+        (state("a", key, "a", (("yes", TerminalKind.NORMAL_YES, 2),)),),
+    )
+
+    assert oracle.quantity_vector_count(built) == 3
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "code"),
+    (
+        ("venue_id", "", "INVALID_IDENTIFIER"),
+        ("account_id", "", "INVALID_IDENTIFIER"),
+        ("chain_id", "", "INVALID_IDENTIFIER"),
+        ("min_quantity_lots", 0, "INVALID_QUANTITY_BOUNDS"),
+        ("max_quantity_lots", 6, "QUANTITY_BOUNDS_EXCEED_COST_SLICES"),
+    ),
+)
+def test_candidate_action_requires_complete_identity_and_bounds(field: str, value: object, code: str) -> None:
+    key = observation()
+    base = problem(
+        (action("a", "a", key, (ExecutableCostSlice(1, 5, 1),)),),
+        (state("a", key, "a", (("yes", TerminalKind.NORMAL_YES, 2),)),),
+    )
+    malformed = replace(base, actions=(replace(base.actions[0], **{field: value}),))
+
+    assert code in {issue.code for issue in validate_problem(malformed)}
 
 
 def test_components_join_actions_on_one_market_contract() -> None:
@@ -559,7 +605,7 @@ def test_fixed_portfolio_qualifies_only_from_exact_integer_constraints() -> None
         built,
         qualification_constraints=(
             QualificationConstraint("profit", "v1", QualificationMetric.GUARANTEED_PROFIT_UNITS, Comparison.GREATER_THAN_OR_EQUAL, 1, 1),
-            QualificationConstraint("margin", "v1", QualificationMetric.NET_MARGIN_PPM, Comparison.GREATER_THAN_OR_EQUAL, 500_000, 1),
+            QualificationConstraint("margin", "v1", QualificationMetric.NET_MARGIN_PPM, Comparison.GREATER_THAN_OR_EQUAL, 333_333, 1),
             QualificationConstraint("annual", "v1", QualificationMetric.ANNUALIZED_RETURN_PPM, Comparison.GREATER_THAN_OR_EQUAL, 500_000, 1),
         ),
     )
@@ -1441,6 +1487,70 @@ def test_oracle_classifies_incomplete_terminal_data_and_cross_asset_valuation_as
 
     assert oracle.find_qualified(_admission_request(terminal_data_missing, OracleBudget(1, 1, 1))).unknown_reason == UnknownReason.UNKNOWN_TERMINAL_DATA
     assert oracle.find_qualified(_admission_request(cross_asset, OracleBudget(1, 1, 1))).unknown_reason == UnknownReason.UNKNOWN_VALUATION
+
+
+@pytest.mark.parametrize("path", ("request", "problem", "observation"))
+def test_unknown_schema_versions_fail_closed(path: str) -> None:
+    key = observation()
+    base = problem(
+        (action("a", "a", key),),
+        (state("a", key, "a", (("yes", TerminalKind.NORMAL_YES, 2),)),),
+    )
+    request = OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, base, OracleBudget(2, 2, 2))
+    payload = canonical_payload(request)
+    if path == "request":
+        payload["schema_version"] = "future.v999"
+        direct = replace(request, schema_version="future.v999")
+    elif path == "problem":
+        payload["problem"]["schema_version"] = "future.v999"
+        direct = replace(request, problem=replace(base, schema_version="future.v999"))
+    else:
+        payload["problem"]["actions"][0]["settlement_observation_key"]["schema_version"] = "future.v999"
+        changed_key = replace(base.actions[0].settlement_observation_key, schema_version="future.v999")
+        changed_action = replace(base.actions[0], settlement_observation_key=changed_key)
+        changed_state = replace(base.terminal_state_sets[0], settlement_observation_key=changed_key)
+        direct = replace(
+            request,
+            problem=replace(base, actions=(changed_action,), terminal_state_sets=(changed_state,)),
+        )
+
+    with pytest.raises(ModelDecodeError):
+        request_from_payload(payload)
+
+    assert oracle.find_qualified(direct).unknown_reason == UnknownReason.INVALID_MODEL
+
+
+@pytest.mark.parametrize("missing", ("payout", "rule_version", "capital_release_at"))
+def test_incomplete_terminal_data_returns_one_unknown_reason(missing: str) -> None:
+    key = observation()
+    built = problem(
+        (action("a", "a", key),),
+        (state("a", key, "a", (("yes", TerminalKind.NORMAL_YES, 2),)),),
+    )
+    base = OracleRequest(
+        REQUEST_SCHEMA_V1,
+        SearchMode.ADMISSION,
+        built,
+        OracleBudget(2, 2, 2),
+    )
+    payload = canonical_payload(base)
+    atom = payload["problem"]["terminal_state_sets"][0]["atoms"][0]
+    if missing == "payout":
+        atom["payouts"] = []
+    else:
+        atom.pop(missing)
+
+    request = request_from_payload(payload)
+    decoded_atom = request.problem.terminal_state_sets[0].atoms[0]
+    if missing == "rule_version":
+        assert decoded_atom.rule_version is None
+    elif missing == "capital_release_at":
+        assert decoded_atom.capital_release_at is None
+    if missing != "payout":
+        assert canonical_payload(request)["problem"]["terminal_state_sets"][0]["atoms"][0][missing] is None
+    result = oracle.find_qualified(request)
+    assert result.business_status == BusinessStatus.UNKNOWN
+    assert result.unknown_reason == UnknownReason.UNKNOWN_TERMINAL_DATA
 
 
 @pytest.mark.parametrize("mode", (SearchMode.ADMISSION, SearchMode.OPTIMIZATION, SearchMode.RAW_ARBITRAGE_DIAGNOSTIC))

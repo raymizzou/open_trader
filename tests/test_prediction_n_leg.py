@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+import open_trader.prediction_n_leg as n_leg
 from open_trader.prediction_n_leg import (
     ActionPayout,
     ActionQuantity,
@@ -77,6 +78,13 @@ REQUIRED_ORACLE_CORPUS_CASE_IDS = {
 }
 
 
+def test_canonical_v1_schema_identifiers_are_exact() -> None:
+    assert n_leg.REQUEST_SCHEMA_V1 == "open_trader.prediction_n_leg.request.v1"
+    assert n_leg.PROBLEM_SCHEMA_V1 == "open_trader.prediction_n_leg.problem.v1"
+    assert n_leg.OBSERVATION_SCHEMA_V1 == "open_trader.prediction_n_leg.observation.v1"
+    assert n_leg.PAYOUT_PROOF_SCHEMA_V1 == "open_trader.prediction_n_leg.payout_proof.v1"
+
+
 def test_oracle_corpus_declares_the_complete_v1_case_set() -> None:
     corpus = json.loads(ORACLE_CORPUS_PATH.read_text(encoding="utf-8"))
 
@@ -96,11 +104,16 @@ def sample_problem() -> ArbitrageProblem:
     )
     action = CandidateAction(
         action_id="buy-no-a",
+        venue_id="test-venue",
+        account_id="test-account",
+        chain_id="test-chain",
         market_contract_id="contract-a",
         settlement_observation_key=observation,
         side=ActionSide.BUY_NO,
         lot_step_units=1,
         quantity_scale=1,
+        min_quantity_lots=1,
+        max_quantity_lots=1,
         settlement_asset_id="usd",
         valuation_unit_id="usd-cents",
         asset_valuation_rule_id="usd-cents-v1",
@@ -305,6 +318,7 @@ def test_canonical_json_sorts_unordered_problem_collections_but_preserves_implie
         (replace(sample_problem(), actions=(replace(sample_problem().actions[0], lot_step_units=0),)), "NON_POSITIVE_LOT_STEP"),
         (replace(sample_problem(), actions=(replace(sample_problem().actions[0], lot_step_units=-1),)), "NON_POSITIVE_LOT_STEP"),
         (replace(sample_problem(), actions=(replace(sample_problem().actions[0], cost_slices=(ExecutableCostSlice(1, 1, 90), ExecutableCostSlice(3, 3, 90))),)), "NON_CONTIGUOUS_COST_SLICES"),
+        (replace(sample_problem(), actions=(replace(sample_problem().actions[0], cost_slices=(ExecutableCostSlice(1, "bad", 90),)),)), "INVALID_INTEGER"),
         (replace(sample_problem(), actions=(sample_problem().actions[0], sample_problem().actions[0])), "DUPLICATE_ID"),
         (replace(sample_problem(), terminal_state_sets=(replace(sample_problem().terminal_state_sets[0], atoms=(replace(sample_problem().terminal_state_sets[0].atoms[0], payouts=()),)),)), "MISSING_ACTION_PAYOUT"),
         (replace(sample_problem(), terminal_state_sets=(replace(sample_problem().terminal_state_sets[0], atoms=(replace(sample_problem().terminal_state_sets[0].atoms[0], capital_release_at=AS_OF - timedelta(seconds=1)),)),)), "STALE_CAPITAL_RELEASE_AT"),

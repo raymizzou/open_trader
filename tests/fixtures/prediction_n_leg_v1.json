@@ -2,7 +2,7 @@
   "cases": [
     {
       "case_id": "native-complement-n2",
-      "expected_request_fingerprint": "sha256:bd3a3db1bd82afe76b09cf082d9fc497cee2880c103e948b82d8b3e7cb1bc16b",
+      "expected_request_fingerprint": "sha256:cf730fcbf5135740a1bf647bc7eca01429570750cfbf50f43652590a0cd9e0df",
       "expected_result": {
         "business_status": "QUALIFIED_FEASIBLE",
         "negative_proof": null,
@@ -21,7 +21,7 @@
             "guaranteed_profit_units": 10,
             "payout_lower_bound_units": 100,
             "portfolio_fingerprint": "sha256:45540a856e0fcf1b469eece45b3012ab8b3ffb3ce9d1175a7093b3d4258f6ad4",
-            "problem_fingerprint": "sha256:eadda9254fc78d380d2b194d4f1a3172ee80a0f267fd081c152723b288fd3bfc",
+            "problem_fingerprint": "sha256:59460aefdeb4f9d289799748ea3047d0f92200f40fcca7d0779e7ef5f6144037",
             "selected_support_graph": {
               "action_ids": [
                 "buy-no-a",
@@ -77,7 +77,7 @@
         "solve_status": "FEASIBLE",
         "unknown_reason": null
       },
-      "expected_result_fingerprint": "sha256:4a08145525dcc5a9172c3b7316158df2079cf85ef256526918854cc865951473",
+      "expected_result_fingerprint": "sha256:b9ab3c7c6f7c60bdb38c523551329051d24e1d10e4b1f2b5c0bf728abfb0f6cc",
       "request": {
         "budget": {
           "max_joint_states": 2,
@@ -88,8 +88,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "buy-no-a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -99,6 +101,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 2,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -111,11 +115,14 @@
                 "timezone": "UTC"
               },
               "side": "BUY_NO",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             },
             {
+              "account_id": "fixture-account",
               "action_id": "buy-yes-a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -125,6 +132,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 2,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -137,7 +146,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
@@ -213,7 +223,7 @@
     },
     {
       "case_id": "implication-two-contract",
-      "expected_request_fingerprint": "sha256:99f4d2c90da1e226a8131ba04da3a0d32885ced32f5abe95ee6e8fd1e6149300",
+      "expected_request_fingerprint": "sha256:9da86adcd2fe4e348a6e480563702ec742c2edb8c8e485aa07aec71f1e19837f",
       "expected_result": {
         "business_status": "QUALIFIED_FEASIBLE",
         "negative_proof": null,
@@ -232,7 +242,7 @@
             "guaranteed_profit_units": 10,
             "payout_lower_bound_units": 100,
             "portfolio_fingerprint": "sha256:88273b4bc3bb6c011cb753d28ce762d1a381cde212f7794125c800058df000de",
-            "problem_fingerprint": "sha256:387227a8808be443b4414a1f568bce593fd21f5c71b951a1194ff8443e112f51",
+            "problem_fingerprint": "sha256:afa12b262640cf7f5ebc69d9f035de005d3201d2820e3497eb011194ecdcd97b",
             "selected_support_graph": {
               "action_ids": [
                 "buy-no-a",
@@ -307,7 +317,7 @@
         "solve_status": "FEASIBLE",
         "unknown_reason": null
       },
-      "expected_result_fingerprint": "sha256:fe770f56995780e2e7bab182b7d504ea840ebf172da26452c62e1e89f116a958",
+      "expected_result_fingerprint": "sha256:dbafb8fb333cd83e7a461fbab8d18d8c8b99f52d5a50c2a35d0da36d4f0842b6",
       "request": {
         "budget": {
           "max_joint_states": 4,
@@ -318,8 +328,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "buy-no-a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -329,6 +341,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -341,11 +355,14 @@
                 "timezone": "UTC"
               },
               "side": "BUY_NO",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             },
             {
+              "account_id": "fixture-account",
               "action_id": "buy-yes-b",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -355,6 +372,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "b",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -367,7 +386,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
@@ -484,7 +504,7 @@
     },
     {
       "case_id": "exactly-one-n3",
-      "expected_request_fingerprint": "sha256:a7838fd585979db30a2ad7fc988a2673b36273e2e676a18c83f039a545aded2e",
+      "expected_request_fingerprint": "sha256:f3d5e28ffc24add779d771dc343a64af7ab41082591f7458b6f44e9e1e507f72",
       "expected_result": {
         "business_status": "QUALIFIED_FEASIBLE",
         "negative_proof": null,
@@ -503,7 +523,7 @@
             "guaranteed_profit_units": 10,
             "payout_lower_bound_units": 100,
             "portfolio_fingerprint": "sha256:cad1822d715bea112031d07a09825c2c148212e7e25c22ac1df40c01fec4c608",
-            "problem_fingerprint": "sha256:92e73b8ec998399f39432f882545b40fca88d23fc8a78598fb2d85837190046d",
+            "problem_fingerprint": "sha256:6a1ca4c944ff0e88662af625de848698df913fa4782a1793c34b1a4b28ee36e3",
             "selected_support_graph": {
               "action_ids": [
                 "buy-yes-a",
@@ -597,7 +617,7 @@
         "solve_status": "FEASIBLE",
         "unknown_reason": null
       },
-      "expected_result_fingerprint": "sha256:b0ffcbba8d4190e7afb7f161ccac9b362d8fe5384d7b8a00e543fb50403a9172",
+      "expected_result_fingerprint": "sha256:416e997d80697e37f1be6a2f3345f424a15281582e97566e69fbbda8215771ab",
       "request": {
         "budget": {
           "max_joint_states": 8,
@@ -608,8 +628,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "buy-yes-a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -619,6 +641,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -631,11 +655,14 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             },
             {
+              "account_id": "fixture-account",
               "action_id": "buy-yes-b",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -645,6 +672,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "b",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -657,11 +686,14 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             },
             {
+              "account_id": "fixture-account",
               "action_id": "buy-yes-c",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -671,6 +703,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "c",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -683,7 +717,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
@@ -840,7 +875,7 @@
     },
     {
       "case_id": "quantity-selection-n4",
-      "expected_request_fingerprint": "sha256:daecd4b7c0a4a57c386675d40dc8bfbabdfed674f055613b51e5cbc4eb346cca",
+      "expected_request_fingerprint": "sha256:621e768985d563486f1252b4764a05e0f09fdd454e7811d20e0b67e5598687d2",
       "expected_result": {
         "business_status": "QUALIFIED_FEASIBLE",
         "negative_proof": null,
@@ -859,7 +894,7 @@
             "guaranteed_profit_units": 6,
             "payout_lower_bound_units": 12,
             "portfolio_fingerprint": "sha256:80b417ae7fe977bef74c46545617166e500e75db94e7952b13821b30d8413017",
-            "problem_fingerprint": "sha256:8c9ea372713ac7907b1d6ea9b42776b7c4cf8f680cf9b9fdb7ac4976dcd38bf0",
+            "problem_fingerprint": "sha256:4fcafe967be41d7b1d28d9f0687e1dcc5f2855bba40f7c46fe9d2db15f6294a4",
             "selected_support_graph": {
               "action_ids": [
                 "b",
@@ -965,7 +1000,7 @@
         "solve_status": "FEASIBLE",
         "unknown_reason": null
       },
-      "expected_result_fingerprint": "sha256:10b1689727843e5a3121f3c75e3254bb252f3c36e2884d8ee5a4d0e3156cbdfa",
+      "expected_result_fingerprint": "sha256:897719bb58e806e770875ad2714631a3ef173f483f4bb0066c69d81927b34d48",
       "request": {
         "budget": {
           "max_joint_states": 8,
@@ -976,8 +1011,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -987,6 +1024,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -999,11 +1038,14 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             },
             {
+              "account_id": "fixture-account",
               "action_id": "b",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -1013,6 +1055,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "b",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -1025,11 +1069,14 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             },
             {
+              "account_id": "fixture-account",
               "action_id": "c",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -1039,6 +1086,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "c",
+              "max_quantity_lots": 2,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -1051,11 +1100,14 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             },
             {
+              "account_id": "fixture-account",
               "action_id": "d",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -1065,6 +1117,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "d",
+              "max_quantity_lots": 3,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -1077,7 +1131,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
@@ -1139,18 +1194,6 @@
             {
               "atoms": [
                 {
-                  "atom_id": "b-yes",
-                  "capital_release_at": "2026-08-12T00:00:00Z",
-                  "kind": "NORMAL_YES",
-                  "payouts": [
-                    {
-                      "action_id": "b",
-                      "payout_lower_bound_per_lot_units": 12
-                    }
-                  ],
-                  "rule_version": "v1"
-                },
-                {
                   "atom_id": "b-no",
                   "capital_release_at": "2026-08-12T00:00:00Z",
                   "kind": "NORMAL_NO",
@@ -1158,6 +1201,18 @@
                     {
                       "action_id": "b",
                       "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "b-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "b",
+                      "payout_lower_bound_per_lot_units": 12
                     }
                   ],
                   "rule_version": "v1"
@@ -1178,18 +1233,6 @@
             {
               "atoms": [
                 {
-                  "atom_id": "c-yes",
-                  "capital_release_at": "2026-08-12T00:00:00Z",
-                  "kind": "NORMAL_YES",
-                  "payouts": [
-                    {
-                      "action_id": "c",
-                      "payout_lower_bound_per_lot_units": 6
-                    }
-                  ],
-                  "rule_version": "v1"
-                },
-                {
                   "atom_id": "c-no",
                   "capital_release_at": "2026-08-12T00:00:00Z",
                   "kind": "NORMAL_NO",
@@ -1197,6 +1240,18 @@
                     {
                       "action_id": "c",
                       "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "c-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "c",
+                      "payout_lower_bound_per_lot_units": 6
                     }
                   ],
                   "rule_version": "v1"
@@ -1217,18 +1272,6 @@
             {
               "atoms": [
                 {
-                  "atom_id": "d-yes",
-                  "capital_release_at": "2026-08-12T00:00:00Z",
-                  "kind": "NORMAL_YES",
-                  "payouts": [
-                    {
-                      "action_id": "d",
-                      "payout_lower_bound_per_lot_units": 4
-                    }
-                  ],
-                  "rule_version": "v1"
-                },
-                {
                   "atom_id": "d-no",
                   "capital_release_at": "2026-08-12T00:00:00Z",
                   "kind": "NORMAL_NO",
@@ -1236,6 +1279,18 @@
                     {
                       "action_id": "d",
                       "payout_lower_bound_per_lot_units": 0
+                    }
+                  ],
+                  "rule_version": "v1"
+                },
+                {
+                  "atom_id": "d-yes",
+                  "capital_release_at": "2026-08-12T00:00:00Z",
+                  "kind": "NORMAL_YES",
+                  "payouts": [
+                    {
+                      "action_id": "d",
+                      "payout_lower_bound_per_lot_units": 4
                     }
                   ],
                   "rule_version": "v1"
@@ -1261,13 +1316,13 @@
     },
     {
       "case_id": "void-refund-split",
-      "expected_request_fingerprint": "sha256:31f895029263dfe7a4784b4187170d664fbaba6c103bdb08b953e5ed2ec5ba94",
+      "expected_request_fingerprint": "sha256:2e01b36d231eeaa213c070b85dcd5f401c2f4f5d60964cea5fc5eb243976e4bb",
       "expected_result": {
         "business_status": "NO_QUALIFIED_OPPORTUNITY",
         "negative_proof": {
           "conclusion": "NO_QUALIFIED_OPPORTUNITY",
           "joint_states_per_vector": 27,
-          "problem_fingerprint": "sha256:f82a577d6c3865aeb2ea03912477f265d435c100d97f320f5d833c684f5b9ad6",
+          "problem_fingerprint": "sha256:7713dbed1d74cf1407a20b73311ff6abe07cdabf2046e4dae7fdecc0b6891074",
           "proof_method": "EXHAUSTIVE_ORACLE_V1",
           "qualification_fingerprint": "sha256:3f780d73d8e35b6eb66f361fb990ba4edf73081626b4bf477e8ee0b768112354",
           "quantity_vectors_examined": 8,
@@ -1282,7 +1337,7 @@
               7
             ]
           ],
-          "request_fingerprint": "sha256:31f895029263dfe7a4784b4187170d664fbaba6c103bdb08b953e5ed2ec5ba94",
+          "request_fingerprint": "sha256:2e01b36d231eeaa213c070b85dcd5f401c2f4f5d60964cea5fc5eb243976e4bb",
           "source_problem_fingerprint": null
         },
         "objective_bounds": {
@@ -1297,7 +1352,7 @@
         "solve_status": "INFEASIBLE",
         "unknown_reason": null
       },
-      "expected_result_fingerprint": "sha256:903eb4048e26dac8cff75c5bf748337bf7f59dc57a18b3c6efc419c564ea5c7e",
+      "expected_result_fingerprint": "sha256:6495671107a05672e1fb48b04b8c1bd9cc3fdfbddaaa48200094f6bf1db2980c",
       "request": {
         "budget": {
           "max_joint_states": 27,
@@ -1308,8 +1363,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "buy-a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -1319,6 +1376,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -1331,11 +1390,14 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             },
             {
+              "account_id": "fixture-account",
               "action_id": "buy-b",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -1345,6 +1407,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "b",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -1357,11 +1421,14 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             },
             {
+              "account_id": "fixture-account",
               "action_id": "buy-c",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -1371,6 +1438,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "c",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -1383,7 +1452,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
@@ -1576,7 +1646,7 @@
     },
     {
       "case_id": "explicit-exception-link",
-      "expected_request_fingerprint": "sha256:c9c0de19d92952eee75276b2baf807d2fe72567a7c779cff171af199d3001046",
+      "expected_request_fingerprint": "sha256:31e9059c13ee31a9a8d1ac7a7b186e9d96cc273a888d5c2be270ae86f09f6b81",
       "expected_result": {
         "business_status": "QUALIFIED_FEASIBLE",
         "negative_proof": null,
@@ -1595,7 +1665,7 @@
             "guaranteed_profit_units": 10,
             "payout_lower_bound_units": 100,
             "portfolio_fingerprint": "sha256:dc634d2f4793e6576b3f57d824a9a4d1b5974cf0a0cdeba7d7c81f68b627378b",
-            "problem_fingerprint": "sha256:01e61ce815ce16935e13619f4e59e49ac4cb49a4224817201f3635c8e6a1a4c9",
+            "problem_fingerprint": "sha256:682422fb31934a08c24ba404ec99d0995b840aea5307aa74e179897e5e7d8cf8",
             "selected_support_graph": {
               "action_ids": [
                 "buy-a",
@@ -1670,7 +1740,7 @@
         "solve_status": "FEASIBLE",
         "unknown_reason": null
       },
-      "expected_result_fingerprint": "sha256:e9199184de8f8948cdcf57ec7810225f8c0b7a995cac24b7a1f3bcf5b2d77266",
+      "expected_result_fingerprint": "sha256:76020fdcb86067efd8a00acc85b87f1bbfe1d98205bc2f216e219f4d5081283e",
       "request": {
         "budget": {
           "max_joint_states": 4,
@@ -1681,8 +1751,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "buy-a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -1692,6 +1764,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -1704,11 +1778,14 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             },
             {
+              "account_id": "fixture-account",
               "action_id": "buy-b",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -1718,6 +1795,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "b",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -1730,7 +1809,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
@@ -1846,7 +1926,7 @@
     },
     {
       "case_id": "disconnected-double-arbitrage",
-      "expected_request_fingerprint": "sha256:b25073473913e0846cc1386274c9fbab1b6ddf7bdb52d0b9915e66cea53b577e",
+      "expected_request_fingerprint": "sha256:0bae4f4fcd5eb002c33208a66f344bfa6463349b9dc2d44779e447937ae4cae1",
       "expected_result": {
         "business_status": "QUALIFIED_FEASIBLE",
         "negative_proof": null,
@@ -1865,7 +1945,7 @@
             "guaranteed_profit_units": 2,
             "payout_lower_bound_units": 3,
             "portfolio_fingerprint": "sha256:0e5fd3898a0845d74575c6164b5f381ed53cfccc27a06acf240f736d245e3202",
-            "problem_fingerprint": "sha256:fc93d33d931de85483d6c7d7da5618bc99ae7cb21cd5534117e2aa1f8c03c741",
+            "problem_fingerprint": "sha256:776b335ca6a2c4066f6182a2f867ae9f226b4844eb643c7eaeaf3ea35d5947de",
             "selected_support_graph": {
               "action_ids": [
                 "component-z"
@@ -1924,7 +2004,7 @@
         "solve_status": "FEASIBLE",
         "unknown_reason": null
       },
-      "expected_result_fingerprint": "sha256:1225095dbaf169b83084c07e00498aa7e1143c50127c851a624764f24d2a37bf",
+      "expected_result_fingerprint": "sha256:b1470a2f0c5a4283ee8f7c4b413d233b1d6c361528ea2f9c138d6c121f9f51ba",
       "request": {
         "budget": {
           "max_joint_states": 1,
@@ -1935,8 +2015,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "component-a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -1946,6 +2028,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -1958,11 +2042,14 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             },
             {
+              "account_id": "fixture-account",
               "action_id": "component-z",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -1972,6 +2059,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "z",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -1984,7 +2073,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
@@ -2067,13 +2157,13 @@
     },
     {
       "case_id": "rounded-false-edge",
-      "expected_request_fingerprint": "sha256:3c984570b22815edc784427efbf2e20b99bb3b144f9e11933f4a1eae91ff9ba6",
+      "expected_request_fingerprint": "sha256:2824a03a01515da6ffd9fe14bc8308e8b3100e5c57e4ca35d378f3fa5d8731d6",
       "expected_result": {
         "business_status": "NO_QUALIFIED_OPPORTUNITY",
         "negative_proof": {
           "conclusion": "NO_QUALIFIED_OPPORTUNITY",
           "joint_states_per_vector": 1,
-          "problem_fingerprint": "sha256:27927cb79841917187272886f4c908ff77209649ecbc8129c1a3c60c5cc2a67a",
+          "problem_fingerprint": "sha256:7126c91e4306659376e5c793fd88aa61cece3e129817ecb2b9f9a7fca1401498",
           "proof_method": "EXHAUSTIVE_ORACLE_V1",
           "qualification_fingerprint": "sha256:5ddab904bb6eb030edce1a3da205a3200daa244f41530a5d0cde0d10c0b262d1",
           "quantity_vectors_examined": 2,
@@ -2088,7 +2178,7 @@
               1
             ]
           ],
-          "request_fingerprint": "sha256:3c984570b22815edc784427efbf2e20b99bb3b144f9e11933f4a1eae91ff9ba6",
+          "request_fingerprint": "sha256:2824a03a01515da6ffd9fe14bc8308e8b3100e5c57e4ca35d378f3fa5d8731d6",
           "source_problem_fingerprint": null
         },
         "objective_bounds": {
@@ -2103,7 +2193,7 @@
         "solve_status": "INFEASIBLE",
         "unknown_reason": null
       },
-      "expected_result_fingerprint": "sha256:8f4a1205699224f0ac6afd96b217e2b5152288e42ff0caaaff67f5b6d7487d57",
+      "expected_result_fingerprint": "sha256:70f484381883cd396bbb3e523da15e3173ebc822a34344e0cc10146e8b06b077",
       "request": {
         "budget": {
           "max_joint_states": 1,
@@ -2114,8 +2204,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -2125,6 +2217,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -2137,7 +2231,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
@@ -2194,7 +2289,7 @@
     {
       "additional_replays": [
         {
-          "expected_request_fingerprint": "sha256:f86c38161fa0655cd716f7192b839ed7fbc4502a10c310f039010d00c498ceec",
+          "expected_request_fingerprint": "sha256:37beb32ba88b7f5b6cb0e8d5ac3592fc2971d7c8565519c56199ea652f35df1e",
           "expected_result": {
             "business_status": "QUALIFIED_FEASIBLE",
             "negative_proof": null,
@@ -2213,7 +2308,7 @@
                 "guaranteed_profit_units": 20,
                 "payout_lower_bound_units": 22,
                 "portfolio_fingerprint": "sha256:6ddfb2180d340577ebb595aee9f0f6ab1ba64061bb6e9ebbaa0b25f916b6e24a",
-                "problem_fingerprint": "sha256:f30bfd74302055b5e141ed14e461af96fe12d0a4c51b6583a983c503d0231b49",
+                "problem_fingerprint": "sha256:783c065f258bb79747088541f151e29e79d77a3ff58d054496a9ffc78b1a4998",
                 "selected_support_graph": {
                   "action_ids": [
                     "a"
@@ -2260,7 +2355,7 @@
             "solve_status": "FEASIBLE",
             "unknown_reason": null
           },
-          "expected_result_fingerprint": "sha256:a6b53792feb4bc088854ea6c63399546ebfff41b882cef179c8612a17aad25da",
+          "expected_result_fingerprint": "sha256:e0ffb1e311ba9547f1085963f6271f6add155f3bb397de7fdd4c6e5c7e6955fe",
           "request": {
             "budget": {
               "max_joint_states": 1,
@@ -2271,8 +2366,10 @@
             "problem": {
               "actions": [
                 {
+                  "account_id": "fixture-account",
                   "action_id": "a",
                   "asset_valuation_rule_id": "usd-cents-v1",
+                  "chain_id": "fixture-chain",
                   "cost_slices": [
                     {
                       "first_lot": 1,
@@ -2282,6 +2379,8 @@
                   ],
                   "lot_step_units": 1,
                   "market_contract_id": "a",
+                  "max_quantity_lots": 2,
+                  "min_quantity_lots": 1,
                   "quantity_scale": 1,
                   "settlement_asset_id": "usd-cents",
                   "settlement_observation_key": {
@@ -2294,7 +2393,8 @@
                     "timezone": "UTC"
                   },
                   "side": "BUY_YES",
-                  "valuation_unit_id": "usd-cents"
+                  "valuation_unit_id": "usd-cents",
+                  "venue_id": "fixture-venue"
                 }
               ],
               "as_of": "2026-08-12T00:00:00Z",
@@ -2350,7 +2450,7 @@
         }
       ],
       "case_id": "qualified-not-optimal",
-      "expected_request_fingerprint": "sha256:b773f881ac3e349da26bb4bfb705b0f016a0919fa99df63cb29a38ce22b6100c",
+      "expected_request_fingerprint": "sha256:2a793416b199982bebdc8fbf45ea5c63ebd16a285468d7cf4e13ba2417249be9",
       "expected_result": {
         "business_status": "QUALIFIED_FEASIBLE",
         "negative_proof": null,
@@ -2369,7 +2469,7 @@
             "guaranteed_profit_units": 10,
             "payout_lower_bound_units": 11,
             "portfolio_fingerprint": "sha256:36d36aef1896a0b0ff4ba635f74c434d26a24bc339321eb5b6878a2be23d5aed",
-            "problem_fingerprint": "sha256:f30bfd74302055b5e141ed14e461af96fe12d0a4c51b6583a983c503d0231b49",
+            "problem_fingerprint": "sha256:783c065f258bb79747088541f151e29e79d77a3ff58d054496a9ffc78b1a4998",
             "selected_support_graph": {
               "action_ids": [
                 "a"
@@ -2416,7 +2516,7 @@
         "solve_status": "FEASIBLE",
         "unknown_reason": null
       },
-      "expected_result_fingerprint": "sha256:53cf7d146915c31322da1cae39cbb0edf309feca8a6c331e83a3a2aef94cadaf",
+      "expected_result_fingerprint": "sha256:09a80bd055acc0af5e7cfa24131fcdd83834c53209c6c6e06e19846971eaf5d3",
       "request": {
         "budget": {
           "max_joint_states": 1,
@@ -2427,8 +2527,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -2438,6 +2540,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 2,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -2450,7 +2554,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
@@ -2507,7 +2612,7 @@
     {
       "additional_replays": [
         {
-          "expected_request_fingerprint": "sha256:723ec21930bf1bb282a35f12e21d9329948b84c4334faba33564f453349c5db3",
+          "expected_request_fingerprint": "sha256:f947fcddfe125bf3be916938c066a3cea40fcac5b6a048185786bf753d8f5535",
           "expected_result": {
             "business_status": "QUALIFIED_FEASIBLE",
             "negative_proof": null,
@@ -2526,7 +2631,7 @@
                 "guaranteed_profit_units": 10,
                 "payout_lower_bound_units": 11,
                 "portfolio_fingerprint": "sha256:36d36aef1896a0b0ff4ba635f74c434d26a24bc339321eb5b6878a2be23d5aed",
-                "problem_fingerprint": "sha256:7a5a9382040f309f28c215889acce9c3dcd0eb189060cc63ce881f9241d90eeb",
+                "problem_fingerprint": "sha256:f85ff36e4877c34006c82c2c741a37bd511a2eab951b80d4ffeade1990726ff8",
                 "selected_support_graph": {
                   "action_ids": [
                     "a"
@@ -2573,7 +2678,7 @@
             "solve_status": "FEASIBLE",
             "unknown_reason": null
           },
-          "expected_result_fingerprint": "sha256:ddc568dfda183ffbd0af77fe556c423d12f97ee446acc9265d30f772c2f49978",
+          "expected_result_fingerprint": "sha256:a7efb4bb6941936363a463e29e25f40c8a1efcc78f0c2bc287be4077f4e24239",
           "request": {
             "budget": {
               "max_joint_states": 1,
@@ -2584,8 +2689,10 @@
             "problem": {
               "actions": [
                 {
+                  "account_id": "fixture-account",
                   "action_id": "a",
                   "asset_valuation_rule_id": "usd-cents-v1",
+                  "chain_id": "fixture-chain",
                   "cost_slices": [
                     {
                       "first_lot": 1,
@@ -2595,6 +2702,8 @@
                   ],
                   "lot_step_units": 1,
                   "market_contract_id": "a",
+                  "max_quantity_lots": 1,
+                  "min_quantity_lots": 1,
                   "quantity_scale": 1,
                   "settlement_asset_id": "usd-cents",
                   "settlement_observation_key": {
@@ -2607,7 +2716,8 @@
                     "timezone": "UTC"
                   },
                   "side": "BUY_YES",
-                  "valuation_unit_id": "usd-cents"
+                  "valuation_unit_id": "usd-cents",
+                  "venue_id": "fixture-venue"
                 }
               ],
               "as_of": "2026-08-12T00:00:00Z",
@@ -2663,13 +2773,13 @@
         }
       ],
       "case_id": "no-qualified-positive-raw",
-      "expected_request_fingerprint": "sha256:1a1e7a4fd0516bf0161d915995243d91b00059ce8f3274f55c89b4503c53ecaa",
+      "expected_request_fingerprint": "sha256:269f52c85c7b97f1fd0f032da016675564a85fbf704c2a8d32508f76e5f0bb5f",
       "expected_result": {
         "business_status": "NO_QUALIFIED_OPPORTUNITY",
         "negative_proof": {
           "conclusion": "NO_QUALIFIED_OPPORTUNITY",
           "joint_states_per_vector": 1,
-          "problem_fingerprint": "sha256:acb85c04faf9eb14630ae798e4b6f9abf2cd4eebe5e80e89ceac2600514d2977",
+          "problem_fingerprint": "sha256:9228823dcfa301e6dbf53041bdf37660366173dd0e62fc911ee347fdd6b9a3b1",
           "proof_method": "EXHAUSTIVE_ORACLE_V1",
           "qualification_fingerprint": "sha256:7aa6c08ba66dc6405cf0cf7e69ac508fdb5c50029008c1fd0ef6bf510a0191ac",
           "quantity_vectors_examined": 2,
@@ -2684,7 +2794,7 @@
               1
             ]
           ],
-          "request_fingerprint": "sha256:1a1e7a4fd0516bf0161d915995243d91b00059ce8f3274f55c89b4503c53ecaa",
+          "request_fingerprint": "sha256:269f52c85c7b97f1fd0f032da016675564a85fbf704c2a8d32508f76e5f0bb5f",
           "source_problem_fingerprint": null
         },
         "objective_bounds": {
@@ -2699,7 +2809,7 @@
         "solve_status": "INFEASIBLE",
         "unknown_reason": null
       },
-      "expected_result_fingerprint": "sha256:23cfce6d3e2e7b3738fb1eecd70a387e93663e2375d62b0213d73b7bfe6e9ecc",
+      "expected_result_fingerprint": "sha256:312d83bcb803e709f84bcf26c35017386d7cde23946ad1b88fd525af004a324c",
       "request": {
         "budget": {
           "max_joint_states": 1,
@@ -2710,8 +2820,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -2721,6 +2833,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -2733,7 +2847,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
@@ -2789,13 +2904,13 @@
     },
     {
       "case_id": "no-arbitrage",
-      "expected_request_fingerprint": "sha256:b2732df40d495417fa8470b22b083261ae728a5ae22e13aaa19aa67c715ff403",
+      "expected_request_fingerprint": "sha256:6c14a8f95b6b8d2db0d8385ea55bdd53127d142d341b6270010573100fb9fdac",
       "expected_result": {
         "business_status": "NO_ARBITRAGE",
         "negative_proof": {
           "conclusion": "NO_ARBITRAGE",
           "joint_states_per_vector": 1,
-          "problem_fingerprint": "sha256:0101d560570106abaa9b2b54e0e249d4cee40492733a8dd2487d19b25589e84d",
+          "problem_fingerprint": "sha256:6c9cc93050374acc2ed803a9d81b35922be079d9306e0dda578ad51651e7f1a9",
           "proof_method": "EXHAUSTIVE_ORACLE_V1",
           "qualification_fingerprint": "sha256:2c6e4be397fcbe5fbae1bea747eb783b6fbd6b88454a827bc6a1249b55187353",
           "quantity_vectors_examined": 2,
@@ -2806,8 +2921,8 @@
               1
             ]
           ],
-          "request_fingerprint": "sha256:c0801b49b66f33b4024eb5872fab056df6562cc080faa99376511a905014020a",
-          "source_problem_fingerprint": "sha256:eb655300c3b9f4947da430f9cc03ca50144c1da8d7e0273bc86bafc4f1196069"
+          "request_fingerprint": "sha256:98660fe33d48c7d6aa2b63d3a9e0bd46615fa5ac3ff57df2e034b4608b888827",
+          "source_problem_fingerprint": "sha256:0d7eec1364ce84c91473428153a8a888948d280b4fc2de5a74a6ca3639d7b024"
         },
         "objective_bounds": {
           "closed": true,
@@ -2821,7 +2936,7 @@
         "solve_status": "INFEASIBLE",
         "unknown_reason": null
       },
-      "expected_result_fingerprint": "sha256:df4ca09582e4610531c991cd96c663f35be0d3a49b556a150bc2a901943163d6",
+      "expected_result_fingerprint": "sha256:bd47e589f951ae246de7b899248084a6e374440d3427be663cd722b8ee8fce53",
       "request": {
         "budget": {
           "max_joint_states": 1,
@@ -2832,8 +2947,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -2843,6 +2960,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -2855,7 +2974,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
@@ -2902,7 +3022,7 @@
     },
     {
       "case_id": "unknown-state-budget",
-      "expected_request_fingerprint": "sha256:3b7ff5aab6f70f29a4057236e3f66ba78c7249593fd4eb84b0ff8ffd803d085e",
+      "expected_request_fingerprint": "sha256:fb654690802fd0a68e3cb2862646831efd0e53ad0b1940c1eb29a205dac660aa",
       "expected_result": {
         "business_status": "UNKNOWN",
         "negative_proof": null,
@@ -2929,8 +3049,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -2940,6 +3062,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -2952,7 +3076,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
@@ -3011,7 +3136,7 @@
     },
     {
       "case_id": "unknown-decision-budget",
-      "expected_request_fingerprint": "sha256:2123ba272c697d04932749611f62c44dc1205020e656f2726316bccc58bf5deb",
+      "expected_request_fingerprint": "sha256:3d4ca58fa98da27320fd00206374d45486891c99c8a2dc65f9156251b94d9523",
       "expected_result": {
         "business_status": "UNKNOWN",
         "negative_proof": null,
@@ -3038,8 +3163,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -3049,6 +3176,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 2,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -3061,7 +3190,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
@@ -3108,7 +3238,7 @@
     },
     {
       "case_id": "unknown-missing-atom-data",
-      "expected_request_fingerprint": "sha256:f3a4dca275fd3442563162bcaed997a8c3136deffb5240b5493f0393d61d3d67",
+      "expected_request_fingerprint": "sha256:a7c3795e1f9f5b8babc0136e1cc6cd20b8d8bb12967d01ca8dfe577e2374a44a",
       "expected_result": {
         "business_status": "UNKNOWN",
         "negative_proof": null,
@@ -3135,8 +3265,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -3146,6 +3278,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -3158,7 +3292,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
@@ -3200,7 +3335,7 @@
     },
     {
       "case_id": "unknown-cross-asset",
-      "expected_request_fingerprint": "sha256:25e2c5042b808fda37201412a14bc581d865ff1f1b60d0e8a2be16529b54b38a",
+      "expected_request_fingerprint": "sha256:215f46105c550d8a620488e3b86c33245e78412c1ca805fdea62fa551097d133",
       "expected_result": {
         "business_status": "UNKNOWN",
         "negative_proof": null,
@@ -3227,8 +3362,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "a",
               "asset_valuation_rule_id": "eur-usd-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -3238,6 +3375,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "eur",
               "settlement_observation_key": {
@@ -3250,7 +3389,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
@@ -3297,7 +3437,7 @@
     },
     {
       "case_id": "unknown-contradictory-model",
-      "expected_request_fingerprint": "sha256:3917c83fdbf443f5400276d01bba0a2e916c271303f25d36cfbd3e59705ef917",
+      "expected_request_fingerprint": "sha256:cc86f0ee70f7d47c99ed4fe46461d1600654f25bc98cb016526a09e3594e2130",
       "expected_result": {
         "business_status": "UNKNOWN",
         "negative_proof": null,
@@ -3324,8 +3464,10 @@
         "problem": {
           "actions": [
             {
+              "account_id": "fixture-account",
               "action_id": "a",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -3335,6 +3477,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "a",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -3347,11 +3491,14 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             },
             {
+              "account_id": "fixture-account",
               "action_id": "b",
               "asset_valuation_rule_id": "usd-cents-v1",
+              "chain_id": "fixture-chain",
               "cost_slices": [
                 {
                   "first_lot": 1,
@@ -3361,6 +3508,8 @@
               ],
               "lot_step_units": 1,
               "market_contract_id": "b",
+              "max_quantity_lots": 1,
+              "min_quantity_lots": 1,
               "quantity_scale": 1,
               "settlement_asset_id": "usd-cents",
               "settlement_observation_key": {
@@ -3373,7 +3522,8 @@
                 "timezone": "UTC"
               },
               "side": "BUY_YES",
-              "valuation_unit_id": "usd-cents"
+              "valuation_unit_id": "usd-cents",
+              "venue_id": "fixture-venue"
             }
           ],
           "as_of": "2026-08-12T00:00:00Z",
