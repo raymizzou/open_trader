@@ -283,6 +283,9 @@ def _selected_quantities(problem: ArbitrageProblem, quantities: tuple[ActionQuan
             or not 0 <= quantity.quantity_lots <= _INT64_MAX
         ):
             raise ValueError(f"invalid action quantity: {quantity.action_id}")
+        action = actions_by_id[quantity.action_id]
+        if quantity.quantity_lots and not action.min_quantity_lots <= quantity.quantity_lots <= action.max_quantity_lots:
+            raise ValueError(f"action quantity outside selected quantity range: {quantity.action_id}")
         if quantity.action_id in selected:
             raise ValueError(f"duplicate action quantity: {quantity.action_id}")
         if quantity.quantity_lots:

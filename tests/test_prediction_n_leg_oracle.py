@@ -562,6 +562,26 @@ def test_fixed_portfolio_accumulates_integer_costs_and_discards_zero_quantities(
     assert evaluation.guaranteed_profit_units == 10
 
 
+@pytest.mark.parametrize("quantity_lots", (1, 4))
+def test_direct_portfolio_helpers_reject_quantities_outside_selected_range(quantity_lots: int) -> None:
+    key = observation()
+    bounded = replace(
+        action("a", "a", key, (ExecutableCostSlice(1, 5, 1),)),
+        min_quantity_lots=2,
+        max_quantity_lots=3,
+    )
+    built = problem(
+        (bounded,),
+        (state("a", key, "a", (("yes", TerminalKind.NORMAL_YES, 2),)),),
+    )
+    quantities = (ActionQuantity("a", quantity_lots),)
+
+    with pytest.raises(ValueError, match="outside selected quantity range"):
+        cost_upper_bound(built, quantities)
+    with pytest.raises(ValueError, match="outside selected quantity range"):
+        evaluate_fixed_portfolio(built, quantities, OracleBudget(1, 1, 1))
+
+
 def test_fixed_portfolio_uses_stable_worst_scenario_and_independent_latest_release() -> None:
     key = observation()
     built = problem(
