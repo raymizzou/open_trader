@@ -80,6 +80,27 @@ def _optional_integer_value(value: object, name: str) -> int | None:
     return int(rounded)
 
 
+def _cp_sat_integer_value(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise UnsafeSolverResult(f"CP-SAT returned a non-integer {name}")
+    if not INT64_MIN <= value <= INT64_MAX:
+        raise UnsafeSolverResult(f"CP-SAT returned an out-of-range {name}")
+    return value
+
+
+def _cp_sat_optional_bound(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, int):
+        return value if INT64_MIN <= value <= INT64_MAX and abs(value) <= DOUBLE_INT_MAX else None
+    if not math.isfinite(value) or abs(value) > DOUBLE_INT_MAX:
+        return None
+    rounded = round(value)
+    if abs(value - rounded) > 1e-6 or not INT64_MIN <= rounded <= INT64_MAX:
+        return None
+    return int(rounded)
+
+
 def _native_integer(value: int, name: str) -> float:
     number = float(value)
     if number != value:
@@ -756,16 +777,6 @@ def _validate_cp_sat_numeric(model: LinearModel) -> None:
         validate_activity("objective", model.objective.coefficients)
 
 
-def _cp_solver_call(solver: Any, lower_name: str, upper_name: str, *args: object) -> Any:
-    value = getattr(solver, lower_name, None)
-    if callable(value):
-        return value(*args)
-    if value is not None and not args:
-        return value
-    value = getattr(solver, upper_name)
-    return value(*args)
-
-
 class CpSatBackend:
     """Thin translation layer from the benchmark integer IR to CP-SAT."""
 
@@ -776,6 +787,11 @@ class CpSatBackend:
         _validate_cp_sat_numeric(model)
         if isinstance(time_limit_ms, bool) or not isinstance(time_limit_ms, int) or time_limit_ms <= 0:
             raise ValueError("time_limit_ms must be a positive integer")
+
+        if model.objective is not None and any(
+            coefficient == INT64_MIN for _, coefficient in model.objective.coefficients
+        ):
+            raise ValueError("CP-SAT objective coefficient INT64_MIN is unsupported")
 
         cp_model = _cp_model()
         native_model = cp_model.CpModel()
@@ -807,9 +823,9 @@ class CpSatBackend:
         solver.parameters.log_search_progress = False
         solver.parameters.log_to_stdout = False
         started_ns = time.perf_counter_ns()
-        native_result = _cp_solver_call(solver, "solve", "Solve", native_model)
+        native_result = solver.solve(native_model)
         solve_ns = max(1, time.perf_counter_ns() - started_ns)
-        native_status = str(_cp_solver_call(solver, "status_name", "StatusName", native_result))
+        native_status = str(solver.status_name(native_result))
 
         if native_result == cp_model.INFEASIBLE:
             result = BackendResult(NativeSolveStatus.INFEASIBLE, (), None, None, native_status, solve_ns)
@@ -821,7 +837,7 @@ class CpSatBackend:
             return result
 
         values = tuple(
-            (variable.name, _integer_value(_cp_solver_call(solver, "value", "Value", variables[variable.name]), f"value for {variable.name}"))
+            (variable.name, _cp_sat_integer_value(solver.value(variables[variable.name]), f"value for {variable.name}"))
             for variable in model.variables
         )
         values_by_name = dict(values)
@@ -834,9 +850,10 @@ class CpSatBackend:
         if model.objective is not None:
             # CP-SAT exposes both values as floats.  Keep only a near-integral
             # bound as diagnostics; the parent recomputes the exact objective.
-            _optional_integer_value(_cp_solver_call(solver, "objective_value", "ObjectiveValue"), "objective value")
-            objective_bound = _optional_integer_value(
-                _cp_solver_call(solver, "best_objective_bound", "BestObjectiveBound"), "objective bound"
+            objective_bound = (
+                _cp_sat_optional_bound(solver.best_objective_bound)
+                if objective_value is None or abs(objective_value) <= DOUBLE_INT_MAX
+                else None
             )
         result = BackendResult(
             NativeSolveStatus.OPTIMAL if native_result == cp_model.OPTIMAL else NativeSolveStatus.FEASIBLE,

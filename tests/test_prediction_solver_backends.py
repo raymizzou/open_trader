@@ -533,9 +533,11 @@ class _FakeCpSolver:
     def value(self, variable: _FakeCpVar) -> object:
         return type(self).values[variable.name]
 
+    @property
     def objective_value(self) -> float:
         return type(self).objective
 
+    @property
     def best_objective_bound(self) -> float:
         return type(self).best_bound
 
@@ -647,14 +649,28 @@ def test_cp_sat_maps_native_statuses_without_promoting_claims(
         assert result.values == ()
 
 
-def test_cp_sat_accepts_only_strictly_integer_native_values(fake_cp_sat: SimpleNamespace) -> None:
+def test_cp_sat_rejects_non_integer_native_values(fake_cp_sat: SimpleNamespace) -> None:
     _FakeCpSolver.status = "FEASIBLE"
-    _FakeCpSolver.values = {"x": 1.0000005}
-    assert CpSatBackend().solve(_one_variable_model(), time_limit_ms=1).values == (("x", 1),)
+    for native_value in (1.0, True):
+        _FakeCpSolver.values = {"x": native_value}
+        with pytest.raises(UnsafeSolverResult, match="non-integer"):
+            CpSatBackend().solve(_one_variable_model(), time_limit_ms=1)
 
-    _FakeCpSolver.values = {"x": 1.000002}
-    with pytest.raises(UnsafeSolverResult, match="non-integral"):
-        CpSatBackend().solve(_one_variable_model(), time_limit_ms=1)
+
+def test_cp_sat_native_preserves_integer_above_float_exact_boundary() -> None:
+    pytest.importorskip("ortools.sat.python.cp_model")
+    model = LinearModel(
+        variables=(IntVariable("x", 0, 2**53 + 1),),
+        constraints=(),
+        objective=LinearObjective("MAX", (("x", 1),)),
+    )
+
+    result = CpSatBackend().solve(model, time_limit_ms=1_000)
+
+    assert result.status == NativeSolveStatus.OPTIMAL
+    assert dict(result.values) == {"x": 2**53 + 1}
+    assert result.objective_value == 2**53 + 1
+    assert result.objective_bound is None
 
 
 def test_cp_sat_parent_validation_rejects_native_row_violation(fake_cp_sat: SimpleNamespace) -> None:
@@ -685,6 +701,52 @@ def test_cp_sat_recomputes_exact_objective_and_keeps_near_integer_bound_diagnost
 
     _FakeCpSolver.best_bound = 4.000002
     assert CpSatBackend().solve(_one_variable_model(objective=3), time_limit_ms=1).objective_bound is None
+
+
+def test_cp_sat_rejects_max_int64_min_before_native_construction(
+    fake_cp_sat: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = LinearModel(
+        variables=(IntVariable("x", 0, 0),),
+        constraints=(),
+        objective=LinearObjective("MAX", (("x", -(2**63)),)),
+    )
+    monkeypatch.setattr(
+        solver_backends,
+        "_cp_model",
+        lambda: pytest.fail("CP-SAT module imported before MAX INT64_MIN preflight"),
+    )
+
+    with pytest.raises(ValueError, match="objective.*INT64_MIN"):
+        CpSatBackend().solve(model, time_limit_ms=1)
+
+    assert _FakeCpModel.instances == []
+    assert _FakeCpSolver.instances == []
+
+
+def test_cp_sat_rejects_min_int64_min_before_native_construction(fake_cp_sat: SimpleNamespace) -> None:
+    model = LinearModel(
+        variables=(IntVariable("x", 0, 0),),
+        constraints=(),
+        objective=LinearObjective("MIN", (("x", -(2**63)),)),
+    )
+
+    with pytest.raises(ValueError, match="objective.*INT64_MIN"):
+        CpSatBackend().solve(model, time_limit_ms=1)
+    assert _FakeCpModel.instances == []
+    assert _FakeCpSolver.instances == []
+
+
+def test_cp_sat_rejects_best_bound_outside_exact_float_integer_range(
+    fake_cp_sat: SimpleNamespace,
+) -> None:
+    _FakeCpSolver.status = "OPTIMAL"
+    _FakeCpSolver.values = {"x": 1}
+    _FakeCpSolver.best_bound = float(2**53 + 2)
+
+    result = CpSatBackend().solve(_one_variable_model(), time_limit_ms=1)
+
+    assert result.objective_bound is None
 
 
 @pytest.mark.parametrize(
