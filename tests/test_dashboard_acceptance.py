@@ -6191,6 +6191,17 @@ def test_check_account_holdings_visits_every_broker_tab(
     assert page.account_views["tiger"] == page.account_views["phillips"] == "real"
 
 
+def test_check_account_holdings_ignores_empty_origin_subgroup() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.all_rows["eastmoney"] = 1
+    page.empty_origin_brokers.add("eastmoney")
+
+    dashboard_acceptance._check_account_holdings(page, payload)
+
+    assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
+
+
 @pytest.mark.parametrize(
     ("broker", "width", "count"),
     [

@@ -3779,7 +3779,11 @@ def _check_account_holdings(
             assert section.locator(".account-review-action").count() == rows.count(), (
                 f"{broker} 异常账户缺少人工复核动作"
             )
-        empty = section.locator(".account-empty:visible")
+        empty = page.locator(
+            f"#account-{broker}-view-panel > .account-empty:visible"
+            if broker in TREND_SIMULATE_MARKETS
+            else f"#account-{broker} > .account-empty:visible"
+        )
         if rows.count() == 0:
             assert empty.count() == 1 and empty.inner_text().strip() == "当前筛选下没有持仓", (
                 f"{broker} 无持仓账户缺少中文空状态"
