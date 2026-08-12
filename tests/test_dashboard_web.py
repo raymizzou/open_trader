@@ -700,7 +700,31 @@ def test_dashboard_fails_closed_when_existing_execution_batch_is_invalid(
         report[key] == []
         for key in ("sell_actions", "buy_actions", "hold_actions", "review_actions")
     )
-    assert "REVISION" not in json.dumps(report, ensure_ascii=False)
+    assert report["historical_buy_plan_membership"] == (
+        {
+            "available": False,
+            "symbols": [],
+            "reason": "历史买入计划格式无效",
+        }
+        if corruption == "invalid-report"
+        else {
+            "available": True,
+            "symbols": [
+                "US.AMZN",
+                "US.CRNX",
+                "US.GRMN",
+                "US.KO",
+                "US.LH",
+                "US.NUE",
+                "US.PYPL",
+                "US.REGN",
+                "US.REVISION",
+                "US.VIXY",
+                "US.XLV",
+            ],
+            "reason": "",
+        }
+    )
 
 
 def relative_luminance(color: str) -> float:
@@ -10167,6 +10191,143 @@ console.log("ok");
     assert "background: #fae8e6;" in css
     assert ".trend-holding-blacklisted td" in css
     assert "background: var(--surface-soft);" in css
+
+
+def test_dashboard_shared_historical_trend_holding_split_preserves_rows_and_normalizes_keys() -> None:
+    account_rows = [
+        {"holding": {"market": "US", "symbol": "ADP"}, "display": {"market": "US", "symbol": "ADP", "market_value_hkd": "10"}},
+        {"holding": {"market": "US", "symbol": "AMZN"}, "display": {"market": "US", "symbol": "AMZN", "market_value_hkd": "20"}},
+        {"holding": {"market": "HK", "symbol": "622"}, "display": {"market": "HK", "symbol": "622", "market_value_hkd": "30"}},
+        {"holding": {"market": "CN", "symbol": "600519"}, "display": {"market": "CN", "symbol": "600519", "market_value_hkd": "40"}},
+    ]
+    report_rows = [
+        {"market": "US", "symbol": "ADP"}, {"market": "US", "symbol": "AMZN"},
+        {"market": "HK", "symbol": "622"}, {"market": "CN", "symbol": "600519"},
+    ]
+    output = run_dashboard_js(r'''
+const report = {
+  market: "US",
+  historical_buy_plan_membership: {
+    available: true,
+    symbols: ["US.ADP", "HK.00622", "CN.600519"],
+    reason: "",
+  },
+};
+const accountRows = [
+  {holding:{market:"US",symbol:"ADP"},display:{market:"US",symbol:"ADP",market_value_hkd:"10"}},
+  {holding:{market:"US",symbol:"AMZN"},display:{market:"US",symbol:"AMZN",market_value_hkd:"20"}},
+  {holding:{market:"HK",symbol:"622"},display:{market:"HK",symbol:"622",market_value_hkd:"30"}},
+  {holding:{market:"CN",symbol:"600519"},display:{market:"CN",symbol:"600519",market_value_hkd:"40"}},
+];
+const reportRows = [
+  {market:"US",symbol:"ADP"}, {market:"US",symbol:"AMZN"},
+  {market:"HK",symbol:"622"}, {market:"CN",symbol:"600519"},
+];
+console.log(JSON.stringify({
+  account: splitHistoricalTrendHoldings(accountRows, report),
+  report: splitHistoricalTrendHoldings(reportRows, report),
+}));
+''')
+    rendered = json.loads(output)
+    for surface, rows in (("account", account_rows), ("report", report_rows)):
+        split = rendered[surface]
+        assert split["trend"] == [rows[0], rows[2], rows[3]]
+        assert split["nonTrend"] == [rows[1]]
+        assert len(split["trend"]) + len(split["nonTrend"]) == 4
+
+
+def test_dashboard_allowlisted_positions_render_as_trend_on_both_real_surfaces() -> None:
+    output = run_dashboard_js(r'''
+const tiger={market:"US",real_position_status:"available",historical_buy_plan_membership:{available:true,symbols:["US.XLV","US.PYPL"],reason:""}};
+const phillips={market:"HK",real_position_status:"available",historical_buy_plan_membership:{available:true,symbols:["HK.06823"],reason:""}};
+state.dashboard={trend_reports:{tiger,phillips}};
+state.accountSnapshot={status:"healthy",sources:{account:{brokers:{tiger:{status:"ok"},phillips:{status:"ok"}}}}};
+const tigerRows=[["XLV","Health ETF"],["PYPL","Payments"]].map(([symbol,name],index)=>({
+  key:`tiger:US:${symbol}:${index}`,broker:"tiger",
+  holding:{market:"US",symbol,futu_symbol:`US.${symbol}`},
+  display:{market:"US",symbol,name,market_value_hkd:"10"},index,
+}));
+const hkRow={key:"phillips:HK:06823:0",broker:"phillips",
+  holding:{market:"HK",symbol:"BROKER-HKT",futu_symbol:"HK.06823",name:"HKT-SS"},
+  display:{market:"HK",symbol:"BROKER-HKT",name:"HKT-SS",market_value_hkd:"10"},index:0};
+console.log(JSON.stringify({
+  accountTiger:renderAccountViewPanel({broker:"tiger",rows:tigerRows}),
+  accountPhillips:renderAccountViewPanel({broker:"phillips",rows:[hkRow]}),
+  reportTiger:renderTrendHoldingPanel(tiger,"real",[
+    {market:"US",symbol:"XLV",name:"Health ETF"},{market:"US",symbol:"PYPL",name:"Payments"}]),
+  reportPhillips:renderTrendHoldingPanel(phillips,"real",[
+    {market:"HK",symbol:"BROKER-HKT",futu_symbol:"HK.06823",name:"HKT-SS"}]),
+}));
+''')
+    rendered = json.loads(output)
+    for surface, identities in (
+        ("accountTiger", ('data-symbol="XLV"', 'data-symbol="PYPL"')),
+        ("reportTiger", ("XLV Health ETF", "PYPL Payments")),
+        ("accountPhillips", ('data-symbol="BROKER-HKT"',)),
+        ("reportPhillips", ("BROKER-HKT HKT-SS",)),
+    ):
+        trend_section, non_trend_section = rendered[surface].split("非趋势持仓", 1)
+        for identity in identities:
+            assert trend_section.count(identity) == 1
+            assert non_trend_section.count(identity) == 0
+
+
+def test_dashboard_splits_real_account_holdings_by_historical_trend_origin() -> None:
+    output = run_dashboard_js(r'''
+const report = {market:"US",historical_buy_plan_membership:{available:true,symbols:["US.ADP"],reason:""}};
+state.dashboard={trend_reports:{tiger:report}};
+state.accountSnapshot={status:"healthy",sources:{account:{brokers:{tiger:{status:"ok"}}}}};
+state.selectedHoldingKey="tiger:US:AMZN:1";
+state.selectedHoldingDetail="t_signal";
+const group={broker:"tiger",rows:[
+  {key:"tiger:US:ADP:0",broker:"tiger",holding:{market:"US",symbol:"ADP"},display:{market:"US",symbol:"ADP",name:"ADP",market_value_hkd:"10"},index:0},
+  {key:"tiger:US:AMZN:1",broker:"tiger",holding:{market:"US",symbol:"AMZN"},display:{market:"US",symbol:"AMZN",name:"AMZN",market_value_hkd:"20"},index:1},
+]};
+const fallback={...report,historical_buy_plan_membership:{available:false,symbols:[],reason:"历史趋势报告不存在"}};
+const html=renderAccountViewPanel(group);
+state.dashboard.trend_reports.tiger=fallback;
+const unavailable=renderAccountViewPanel(group);
+console.log(JSON.stringify({html,unavailable}));
+''')
+    rendered = json.loads(output)
+    html = rendered["html"]
+    assert html.index("趋势持仓") < html.index("非趋势持仓")
+    assert html.count("account-holding-row") == 2
+    assert html.count("<strong>ADP</strong>") == 1
+    assert html.count("<strong>AMZN</strong>") == 1
+    assert "HKD 10" in html and "HKD 20" in html
+    non_trend_start = html.index("非趋势持仓")
+    assert non_trend_start < html.index("AMZN") < html.index("decision-detail-row")
+    unavailable = rendered["unavailable"]
+    assert "历史买入计划归属暂不可用，未执行分组" in unavailable
+    assert "历史趋势报告不存在" not in unavailable
+    assert unavailable.count('class="account-holdings-table"') == 1
+    assert "<h3>趋势持仓</h3>" not in unavailable and "<h3>非趋势持仓</h3>" not in unavailable
+
+
+def test_dashboard_splits_only_real_trend_report_holdings_by_historical_origin() -> None:
+    output = run_dashboard_js(r'''
+const report={market:"US",real_position_status:"available",historical_buy_plan_membership:{available:true,symbols:["US.ADP"],reason:""}};
+const rows=[
+  {market:"US",symbol:"ADP",action:"HOLD",trend_report_state:"included"},
+  {market:"US",symbol:"AMZN",action:"HOLD",trend_report_state:"excluded"},
+];
+const real=renderTrendHoldingPanel(report,"real",rows);
+const simulate=renderTrendHoldingPanel(report,"simulate",rows);
+const unavailable=renderTrendHoldingPanel({...report,historical_buy_plan_membership:{available:false,symbols:[],reason:"历史趋势报告不存在"}},"real",rows);
+console.log(JSON.stringify({real,simulate,unavailable}));
+''')
+    rendered = json.loads(output)
+    real = rendered["real"]
+    assert real.index("趋势持仓") < real.index("非趋势持仓")
+    assert real.count("ADP") == 1 and real.count("AMZN") == 1
+    assert "trend-holding-included" in real and "trend-holding-excluded" in real
+    assert "趋势持仓" not in rendered["simulate"] and "非趋势持仓" not in rendered["simulate"]
+    unavailable = rendered["unavailable"]
+    assert "历史买入计划归属暂不可用，未执行分组" in unavailable
+    assert "历史趋势报告不存在" not in unavailable
+    assert unavailable.count('class="cn-trend-table"') == 1
+    assert "<h3>趋势持仓</h3>" not in unavailable and "<h3>非趋势持仓</h3>" not in unavailable
 
 
 def test_dashboard_trend_option_button_mobile_layout_css() -> None:
