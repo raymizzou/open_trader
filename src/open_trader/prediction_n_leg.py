@@ -934,6 +934,7 @@ def _payout_proof_from_payload(payload: object) -> PayoutProof:
         or proof.quantity_vectors_total != proof.quantity_vectors_examined
         or proof.quantity_vectors_total <= 0
         or proof.joint_states_per_vector <= 0
+        or any(count > proof.quantity_vectors_examined for _, count in proof.rejection_counts)
         or (proof.result_kind == ProofResultKind.NO_QUALIFIED_OPPORTUNITY) != (proof.source_problem_fingerprint is None)
     ):
         raise ModelDecodeError("negative payout proof contains invalid branch fields")

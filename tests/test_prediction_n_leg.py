@@ -596,6 +596,7 @@ def test_result_from_payload_rejects_malformed_no_arbitrage_diagnostics(mutate: 
         lambda proof: proof.update(joint_states_per_vector=-1),
         lambda proof: proof.update(joint_states_per_vector=0),
         lambda proof: proof["rejection_counts"][0].__setitem__(1, -1),
+        lambda proof: proof["rejection_counts"][0].__setitem__(1, proof["quantity_vectors_examined"] + 1),
     ],
 )
 def test_result_from_payload_rejects_non_exhaustive_or_negative_proof_counts(mutate: object) -> None:
