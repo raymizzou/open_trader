@@ -20,7 +20,6 @@ from open_trader.prediction_n_leg import (
     ConstraintModel,
     ExecutableCostSlice,
     ForbiddenAtomCombination,
-    ModelDecodeError,
     OracleBudget,
     OracleRequest,
     OracleResult,
@@ -35,6 +34,7 @@ from open_trader.prediction_n_leg import (
     TerminalAtom,
     TerminalKind,
     TerminalStateSet,
+    UnknownReason,
     canonical_payload,
     fingerprint,
     request_from_payload,
@@ -210,21 +210,15 @@ def import_approved_snapshot(inbox_path: str | os.PathLike[str], corpus_path: st
         raise ValueError("source_alias must be a non-empty string")
     if not isinstance(envelope["problem"], Mapping):
         raise ValueError("problem must be an object")
-    problem_gap_kind: str | None = None
-    try:
-        problem = problem_from_payload(envelope["problem"], allow_unknown_data=True)
-    except ModelDecodeError as error:
-        if not _missing_valuation_identity_only(error):
-            raise
-        problem = None
-        problem_gap_kind = "valuation_identity"
-    if problem is not None:
-        issues = validate_problem(problem)
-        if issues:
-            gap_codes = {_INPUT_GAP_CODES.get(issue.code) for issue in issues}
-            if None in gap_codes:
-                raise ValueError("approved problem is malformed")
-            problem_gap_kind = sorted(gap_codes)[0]
+    problem_payload, missing_valuation_identity = _problem_payload_for_gap_validation(envelope["problem"])
+    problem = problem_from_payload(problem_payload, allow_unknown_data=True)
+    gap_kinds = {"valuation_identity"} if missing_valuation_identity else set()
+    issues = validate_problem(problem)
+    if issues:
+        gap_codes = {_INPUT_GAP_CODES.get(issue.code) for issue in issues}
+        if None in gap_codes:
+            raise ValueError("approved problem is malformed")
+        gap_kinds.update(gap_codes)
 
     if missing:
         _append_input_gap(corpus, corpus_payload, "approval_provenance", source_alias, envelope["problem"])
@@ -237,17 +231,16 @@ def import_approved_snapshot(inbox_path: str | os.PathLike[str], corpus_path: st
             _append_input_gap(corpus, corpus_payload, "approval_provenance", source_alias, envelope["problem"])
             return
         _utc_z(envelope[name], name)
-    if problem_gap_kind is not None:
+    if gap_kinds:
         _append_input_gap(
             corpus,
             corpus_payload,
-            problem_gap_kind,
+            sorted(gap_kinds)[0],
             source_alias,
-            envelope["problem"] if problem is None else canonical_payload(problem),
+            envelope["problem"],
         )
         return
 
-    assert problem is not None
     source_fingerprint = fingerprint(problem)
     salt = corpus_payload["anonymization_salt"]
     anonymized = _anonymize_problem(problem, salt)
@@ -284,8 +277,6 @@ def check_solver_claim(
         return _check_failure(CheckFailureReason.CHANGED_PROBLEM_FINGERPRINT)
     if truth_method == "measurement_only":
         if _is_negative_claim(evidence):
-            if evidence.certificate is not None and evidence.certificate.checker_succeeded:
-                return DifferentialCheck(BenchmarkClassification.CERTIFICATE_CHECKED, None, False, None)
             return _check_failure(CheckFailureReason.UNVERIFIED_NEGATIVE)
         return DifferentialCheck(BenchmarkClassification.MEASUREMENT_ONLY, None, False, None)
     if truth_method != "exact_oracle_v1":
@@ -312,8 +303,17 @@ def _check_positive_claim(
         if request.mode == SearchMode.RAW_ARBITRAGE_DIAGNOSTIC
         else request.problem
     )
+    fixed_budget = (
+        _fixed_check_budget(problem, request.budget)
+        if exact.unknown_reason
+        in {
+            UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED,
+            UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED,
+        }
+        else request.budget
+    )
     try:
-        evaluation = evaluate_fixed_portfolio(problem, evidence.candidate.quantities, request.budget)
+        evaluation = evaluate_fixed_portfolio(problem, evidence.candidate.quantities, fixed_budget)
     except (OverflowError, ValueError):
         return _check_failure(CheckFailureReason.FALSE_SAFE)
     if evidence.candidate.claimed_guaranteed_profit_units > evaluation.guaranteed_profit_units and evaluation.guaranteed_profit_units < 0:
@@ -321,7 +321,7 @@ def _check_positive_claim(
     if evaluation.failed_qualification_ids:
         return _check_failure(CheckFailureReason.FALSE_SAFE)
     try:
-        support = derive_selected_support_graph(problem, evaluation, request.budget)
+        support = derive_selected_support_graph(problem, evaluation, fixed_budget)
     except (OverflowError, ValueError):
         return _check_failure(CheckFailureReason.CLAIM_MISMATCH)
     if not isinstance(support, SelectedSupportGraph):
@@ -332,6 +332,11 @@ def _check_positive_claim(
         return _check_failure(CheckFailureReason.WRONG_RELEASE)
     if not _fixed_claim_matches(problem, evidence, evaluation):
         return _check_failure(CheckFailureReason.CLAIM_MISMATCH)
+    if exact.unknown_reason in {
+        UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED,
+        UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED,
+    }:
+        return DifferentialCheck(BenchmarkClassification.MEASUREMENT_ONLY, None, False, None)
     if exact.solution is None:
         return _check_failure(CheckFailureReason.FALSE_SAFE)
 
@@ -405,13 +410,6 @@ def _check_nonpositive_claim(evidence: SolverEvidence, exact: OracleResult) -> D
         evidence.native_status != expected_native_status
         or evidence.objective_bounds != exact.objective_bounds
         or evidence.global_search_closed != expected_closed
-        or evidence.fixed_portfolio_closed
-        or evidence.worst_scenario is not None
-        or evidence.payout_lower_bound_units is not None
-        or evidence.cost_upper_bound_units is not None
-        or evidence.guaranteed_profit_units is not None
-        or evidence.conservative_capital_release_at is not None
-        or evidence.cuts
     ):
         return _check_failure(CheckFailureReason.CLAIM_MISMATCH)
     return DifferentialCheck(BenchmarkClassification.CHECKED, exact, False, None)
@@ -432,6 +430,22 @@ def _is_negative_claim(evidence: SolverEvidence) -> bool:
 
 def _check_failure(reason: CheckFailureReason) -> DifferentialCheck:
     return DifferentialCheck(BenchmarkClassification.UNKNOWN, None, True, reason)
+
+
+def _fixed_check_budget(problem: ArbitrageProblem, budget: OracleBudget) -> OracleBudget:
+    joint_states = 1
+    for state_set in problem.terminal_state_sets:
+        joint_states *= len(state_set.atoms)
+    support_rechecks = (
+        len(problem.constraint_model.relations)
+        + len(problem.constraint_model.forbidden_atom_combinations)
+        + 1
+    )
+    return OracleBudget(
+        max(1, budget.max_quantity_vectors),
+        max(joint_states, budget.max_joint_states),
+        max(support_rechecks, budget.max_support_rechecks),
+    )
 
 
 def _exact_case(case_id: str, source: BenchmarkCase | OracleRequest) -> dict[str, object]:
@@ -702,13 +716,23 @@ def _approved_inbox_path(value: str | os.PathLike[str]) -> Path:
     return path
 
 
-def _missing_valuation_identity_only(error: ModelDecodeError) -> bool:
-    message = str(error)
-    codes = {
-        part.strip().rsplit(": ", 1)[-1]
-        for part in message.removeprefix("invalid problem: ").split(";")
-    }
-    return codes == {"INVALID_IDENTIFIER", "MISSING_ASSET_VALUATION_RULE"}
+def _problem_payload_for_gap_validation(payload: Mapping[str, object]) -> tuple[Mapping[str, object], bool]:
+    actions = payload.get("actions")
+    if not isinstance(actions, list):
+        return payload, False
+    missing = False
+    validated_actions = []
+    for action in actions:
+        if not isinstance(action, Mapping):
+            validated_actions.append(action)
+            continue
+        identity = action.get("asset_valuation_rule_id")
+        if "asset_valuation_rule_id" not in action or isinstance(identity, str) and not identity.strip():
+            missing = True
+            validated_actions.append({**action, "asset_valuation_rule_id": "missing-valuation-identity"})
+        else:
+            validated_actions.append(action)
+    return ({**payload, "actions": validated_actions} if missing else payload), missing
 
 
 def _load_approved_corpus(path: Path) -> dict[str, object]:
@@ -733,8 +757,11 @@ def _append_input_gap(
     problem_payload: object,
 ) -> None:
     material = json.dumps(problem_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
-    suffix = hashlib.sha256(f"{source_alias}\0{material}".encode()).hexdigest()[:24]
-    gap_id = f"{kind}:{suffix}"
+    gap_id = _anonymous_token(
+        corpus["anonymization_salt"],
+        "input_gap",
+        f"{kind}\0{source_alias}\0{material}",
+    )
     if any(gap.get("gap_id") == gap_id for gap in corpus["input_gaps"]):
         return
     corpus["input_gaps"].append(

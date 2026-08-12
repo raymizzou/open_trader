@@ -22,6 +22,7 @@ from open_trader.prediction_n_leg import (
     SearchMode,
     SolveStatus,
     TerminalKind,
+    UnknownReason,
     canonical_payload,
     fingerprint,
     problem_from_payload,
@@ -36,7 +37,12 @@ from open_trader.prediction_n_leg_oracle import (
     find_qualified,
     solve_optimal,
 )
-from open_trader.prediction_solver import BenchmarkClassification, CertificateEvidence, SolverEvidence
+from open_trader.prediction_solver import (
+    BenchmarkClassification,
+    CertificateEvidence,
+    SolverEvidence,
+    solve_with_constraint_generation,
+)
 from open_trader.prediction_solver_benchmark import (
     CheckFailureReason,
     check_solver_claim,
@@ -44,6 +50,7 @@ from open_trader.prediction_solver_benchmark import (
     import_approved_snapshot,
     load_canonical_cases,
 )
+from test_prediction_solver import BruteForceBackend, benchmark_limits
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -387,6 +394,13 @@ def test_approved_snapshot_does_not_hide_malformed_input_behind_a_provenance_gap
                 envelope["problem"]["actions"][0].__setitem__("asset_valuation_rule_id", ""),
             ),
         ),
+        (
+            "valuation_identity",
+            lambda envelope: (
+                envelope["problem"]["actions"][0].__setitem__("settlement_asset_id", "other-asset"),
+                envelope["problem"]["actions"][0].pop("asset_valuation_rule_id"),
+            ),
+        ),
     ),
 )
 def test_approved_snapshot_records_missing_input_as_one_deduplicated_gap(
@@ -404,8 +418,35 @@ def test_approved_snapshot_records_missing_input_as_one_deduplicated_gap(
 
     payload = json.loads(corpus.read_bytes())
     assert payload["cases"] == []
-    matching = [gap for gap in payload["input_gaps"] if gap["gap_id"].startswith(f"{missing_kind}:")]
-    assert len(matching) == 1
+    generated = [gap for gap in payload["input_gaps"] if gap["gap_id"].startswith("anon:input_gap:")]
+    assert len(generated) == 1
+    assert missing_kind.replace("_", " ").split()[0] in generated[0]["reason"]
+
+
+def test_approved_snapshot_gap_identity_uses_the_corpus_salt_without_emitting_raw_ids(tmp_path: Path) -> None:
+    envelope = deepcopy(_approved_envelope())
+    envelope["problem"]["terminal_state_sets"][0]["atoms"][0].pop("capital_release_at")
+    raw_problem_id = envelope["problem"]["problem_id"]
+    gap_ids = []
+
+    for index, salt in enumerate(("salt-alpha", "salt-beta")):
+        directory = tmp_path / str(index)
+        directory.mkdir()
+        inbox, corpus = _temporary_approved_paths(directory)
+        corpus_payload = json.loads(corpus.read_bytes())
+        corpus_payload["anonymization_salt"] = salt
+        corpus.write_text(json.dumps(corpus_payload))
+        inbox.write_text(json.dumps(envelope))
+
+        import_approved_snapshot(inbox, corpus)
+        import_approved_snapshot(inbox, corpus)
+
+        gaps = [gap for gap in json.loads(corpus.read_bytes())["input_gaps"] if gap["gap_id"].startswith("anon:input_gap:")]
+        assert len(gaps) == 1
+        assert raw_problem_id not in json.dumps(gaps[0])
+        gap_ids.append(gaps[0]["gap_id"])
+
+    assert gap_ids[0] != gap_ids[1]
 
 
 def _certificate() -> CertificateEvidence:
@@ -496,6 +537,61 @@ def test_checker_attaches_only_the_unchanged_exact_oracle_result_for_all_48_case
         assert checked.canonical_result == case.expected_result, case.case_id
         assert checked.hard_failure is False
         assert checked.failure_reason is None
+
+
+@pytest.mark.parametrize("case_id", ("void-refund-split", "no-arbitrage"))
+def test_checker_accepts_honest_common_engine_negative_evidence_with_retained_diagnostics(case_id: str) -> None:
+    case = next(item for item in load_canonical_cases() if item.case_id == case_id)
+    evidence = solve_with_constraint_generation(case.request, BruteForceBackend(), benchmark_limits(100))
+    assert evidence.candidate is None
+    assert evidence.cuts
+    if case_id == "no-arbitrage":
+        assert evidence.worst_scenario is not None
+        assert evidence.payout_lower_bound_units is not None
+        assert evidence.cost_upper_bound_units is not None
+        assert evidence.guaranteed_profit_units is not None
+        assert evidence.conservative_capital_release_at is not None
+
+    checked = check_solver_claim(
+        case.request,
+        evidence,
+        claimed_problem_fingerprint=fingerprint(case.request.problem),
+        truth_method="exact_oracle_v1",
+    )
+
+    assert checked.classification == BenchmarkClassification.CHECKED
+    assert checked.canonical_result == case.expected_result
+    assert checked.hard_failure is False
+    assert checked.failure_reason is None
+
+
+@pytest.mark.parametrize(
+    ("case_id", "unknown_reason"),
+    (
+        ("unknown-state-budget", UnknownReason.ORACLE_STATE_LIMIT_EXCEEDED),
+        ("unknown-decision-budget", UnknownReason.ORACLE_DECISION_LIMIT_EXCEEDED),
+    ),
+)
+def test_checker_keeps_a_locally_checked_positive_as_measurement_when_exact_oracle_budget_is_unclosed(
+    case_id: str,
+    unknown_reason: UnknownReason,
+) -> None:
+    case = next(item for item in load_canonical_cases() if item.case_id == case_id)
+    assert case.expected_result is not None and case.expected_result.unknown_reason == unknown_reason
+    evidence = solve_with_constraint_generation(case.request, BruteForceBackend(), benchmark_limits(100))
+    assert evidence.candidate is not None
+
+    checked = check_solver_claim(
+        case.request,
+        evidence,
+        claimed_problem_fingerprint=fingerprint(case.request.problem),
+        truth_method="exact_oracle_v1",
+    )
+
+    assert checked.classification == BenchmarkClassification.MEASUREMENT_ONLY
+    assert checked.canonical_result is None
+    assert checked.hard_failure is False
+    assert checked.failure_reason is None
 
 
 def test_checker_rejects_a_profitable_claim_for_an_actually_lossy_portfolio() -> None:
@@ -603,7 +699,7 @@ def test_checker_rejects_an_unverified_large_negative() -> None:
     _assert_hard_checker_failure(case.request, evidence, CheckFailureReason.UNVERIFIED_NEGATIVE, truth_method="measurement_only")
 
 
-def test_checker_retains_measurements_and_accepts_only_a_separately_checked_negative_certificate() -> None:
+def test_checker_retains_measurements_but_rejects_an_unbound_successful_negative_certificate() -> None:
     case = load_canonical_cases()[0]
     positive = check_solver_claim(
         case.request,
@@ -643,9 +739,10 @@ def test_checker_retains_measurements_and_accepts_only_a_separately_checked_nega
     assert positive.classification == BenchmarkClassification.MEASUREMENT_ONLY
     assert positive.canonical_result is None
     assert positive.hard_failure is False
-    assert certified.classification == BenchmarkClassification.CERTIFICATE_CHECKED
+    assert certified.classification == BenchmarkClassification.UNKNOWN
     assert certified.canonical_result is None
-    assert certified.hard_failure is False
+    assert certified.hard_failure is True
+    assert certified.failure_reason == CheckFailureReason.UNVERIFIED_NEGATIVE
     assert unknown.classification == BenchmarkClassification.MEASUREMENT_ONLY
     assert unknown.canonical_result is None
     assert unknown.hard_failure is False
