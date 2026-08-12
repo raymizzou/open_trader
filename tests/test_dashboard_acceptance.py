@@ -3750,7 +3750,17 @@ class TabbedAccountLocator:
             r"#account-(\w+):visible \.account-empty:visible", self.selector
         )
         if match and match.group(1) in self.page.tab_order:
-            return int(self.page.visible_rows(self.selector) == 0)
+            broker = match.group(1)
+            return int(
+                self.page.visible_rows(self.selector) == 0
+                or broker in self.page.empty_origin_brokers
+            )
+        match = re.fullmatch(
+            r"#account-(\w+)(?:-view-panel)? > \.account-empty:visible",
+            self.selector,
+        )
+        if match and match.group(1) in self.page.tab_order:
+            return int(self.page.visible_rows(f"#account-{match.group(1)}:visible") == 0)
         if re.fullmatch(
             r'\.account-holding-row:visible:has\('
             r'\.account-holding-market:has-text\("US"\)\) '
@@ -4000,6 +4010,15 @@ class TabbedAccountLocator:
             r"#account-(\w+):visible \.account-empty:visible", self.selector
         )
         if match and match.group(1) in self.page.tab_order:
+            return (
+                "当前筛选下没有持仓"
+                if self.page.visible_rows(self.selector) == 0
+                else "无"
+            )
+        if re.fullmatch(
+            r"#account-(\w+)(?:-view-panel)? > \.account-empty:visible",
+            self.selector,
+        ):
             return "当前筛选下没有持仓"
         if self.selector == "#visible-count":
             return f"{self.page.visible_rows():,} 条"
@@ -4244,6 +4263,7 @@ class TabbedAccountPage:
         }
         self.all_rows = {"futu": 1, "tiger": 1, "phillips": 1, "eastmoney": 0}
         self.cn_rows = cn_rows or {"futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 5}
+        self.empty_origin_brokers: set[str] = set()
         self.market = "ALL"
         self.selected = "futu"
         self.tab_order = ["futu", "tiger", "phillips", "eastmoney"]
@@ -6513,6 +6533,81 @@ def test_check_tiger_tab_selects_tiger_and_shows_only_its_section() -> None:
     assert page.max_visible_account_sections == 1
 
 
+def test_trend_holding_tabs_accept_one_table_per_nonempty_origin_section() -> None:
+    from playwright.sync_api import sync_playwright
+
+    headings = (
+        "标的", "动作", "执行参考价", "温度变化", "节气", "大类内强度",
+        "全局强度", "行业", "当前判断", "活动保护线", "持仓提示",
+    )
+    heading_html = "".join(f"<th>{heading}</th>" for heading in headings)
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel="chrome", headless=True)
+        page = browser.new_page()
+        page.set_content(f"""
+          <section data-trend-holding-section>
+            <button data-trend-holding-view="real" aria-selected="true">真实持仓</button>
+            <button data-trend-holding-view="simulate" aria-selected="false">模拟盘持仓</button>
+            <div data-trend-holding-panel="real">
+              <p>只读</p>
+              <section class="holding-origin-section"><div class="holding-origin-heading"><h3>趋势持仓</h3></div>
+                <table class="cn-trend-table"><thead><tr>{heading_html}</tr></thead>
+                  <tbody><tr class="cn-trend-card"><td>ADP</td><td>Automatic Data Processing</td></tr></tbody>
+                </table>
+              </section>
+              <section class="holding-origin-section"><div class="holding-origin-heading"><h3>非趋势持仓</h3></div>
+                <table class="cn-trend-table"><thead><tr>{heading_html}</tr></thead>
+                  <tbody><tr class="cn-trend-card"><td>AMZN</td><td>Amazon</td></tr></tbody>
+                </table>
+              </section>
+            </div>
+            <div data-trend-holding-panel="simulate" hidden>
+              <table class="cn-trend-table"><thead><tr>{heading_html}</tr></thead>
+                <tbody><tr class="cn-trend-card"><td>MSFT</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+          <script>
+            document.querySelectorAll('[data-trend-holding-view]').forEach(tab => tab.addEventListener('click', () => {{
+              const view = tab.dataset.trendHoldingView;
+              document.querySelectorAll('[data-trend-holding-view]').forEach(item => item.setAttribute('aria-selected', String(item === tab)));
+              document.querySelectorAll('[data-trend-holding-panel]').forEach(panel => panel.hidden = panel.dataset.trendHoldingPanel !== view);
+            }}));
+          </script>
+        """)
+        report = {
+            "real_position_status": "available",
+            "real_position_source": {"kind": "account"},
+            "historical_buy_plan_membership": {
+                "available": True, "symbols": ["US.ADP"], "reason": "",
+            },
+            "real_position_actions": [
+                {"symbol": "ADP", "name": "Automatic Data Processing"},
+                {"symbol": "AMZN", "name": "Amazon"},
+            ],
+            "hold_actions": [{"symbol": "MSFT"}],
+        }
+
+        dashboard_acceptance._check_trend_holding_tabs(
+            page, report, "tiger"
+        )
+        page.locator(
+            '.holding-origin-section:nth-of-type(2) .cn-trend-table thead th'
+        ).first.evaluate("node => node.textContent = '错误列'")
+        with pytest.raises(AssertionError, match="真实持仓列定义发生变化"):
+            dashboard_acceptance._check_trend_holding_tabs(
+                page, report, "tiger"
+            )
+        page.locator(
+            ".holding-origin-section:nth-of-type(2) .cn-trend-table"
+        ).evaluate("table => table.replaceWith(table.tBodies[0].rows[0])")
+        with pytest.raises(AssertionError, match="真实持仓分组表格与行不匹配"):
+            dashboard_acceptance._check_trend_holding_tabs(
+                page, report, "tiger"
+            )
+        browser.close()
+
+
 def test_cn_filter_checks_each_broker_tab_without_all_accounts_view() -> None:
     page = tabbed_cn_page()
 
@@ -6520,6 +6615,17 @@ def test_cn_filter_checks_each_broker_tab_without_all_accounts_view() -> None:
 
     assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
     assert page.max_visible_account_sections == 1
+
+
+def test_cn_filter_ignores_empty_origin_subgroup_when_rows_are_visible() -> None:
+    page = TabbedAccountPage(cn_rows={
+        "futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 1,
+    })
+    page.empty_origin_brokers.add("eastmoney")
+
+    dashboard_acceptance._check_cn_filter(page, expected_cn=1)
+
+    assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
 
 
 def test_cn_filter_restores_real_view_before_counting() -> None:
