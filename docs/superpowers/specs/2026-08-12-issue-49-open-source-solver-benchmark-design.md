@@ -3,7 +3,7 @@
 ## Status
 
 - Date: 2026-08-12
-- State: discussion approved; written review pending
+- State: approved for implementation planning
 - Issue: GitHub #49, `[预测套利 12] 基准验证 HiGHS、SCIP 与 OR-Tools CP-SAT`
 - Depends on: GitHub #48 canonical N-leg model and exact Oracle
 - Hands off to: GitHub #50 production solver/verifier engine and GitHub #52 runtime worker sizing
@@ -92,6 +92,18 @@ canonical problem.
 
 The envelope does not become a second production proof type. Canonical proof
 objects remain the only mathematical payloads.
+
+The #48 `PayoutProof` v1 decoder accepts only its exact-Oracle proof methods.
+Issue #49 therefore does not weaken or expand that production-facing schema:
+
+- an Oracle-checked benchmark case may carry the unchanged canonical
+  `OracleResult` and `PayoutProof`;
+- a solver-only large-case claim or a SCIP/VIPR certificate is retained as
+  benchmark evidence in `solver_run`, never serialized as a #48 proof;
+- without an applicable independent check, the canonical result remains absent
+  and the case is classified as measurement-only or `UNKNOWN`;
+- Issue #50 owns any production proof-schema extension needed for the selected
+  solver and independently checked certificate policy.
 
 ## Worker architecture and protocol
 
