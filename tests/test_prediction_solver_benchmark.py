@@ -99,6 +99,91 @@ SCALE_CASE_IDS = (
 )
 
 
+def _full_environment_fixture() -> tuple[dict[str, dict[str, object]], dict[str, dict[str, dict[str, object]]]]:
+    environments = {
+        environment: {
+            "available": True,
+            "architecture": "arm64" if environment == "macos" else "x86_64",
+            "cpu": "fixture-cpu",
+            "environment_id": f"{environment}-build",
+            "git_sha": "1" * 40,
+            "os_version": "fixture-os",
+        }
+        for environment in ("macos", "linux")
+    }
+    artifacts = {
+        solver: {
+            environment: {
+                "adapter_version": "adapter-v1",
+                "build_id": f"{solver}-{environment}-build-artifact",
+                "commercial_key_required": False,
+                "image_id": "none" if environment == "macos" else f"{solver}-image-1",
+                "install_succeeded": True,
+                "installation_ns": 10,
+                "license_evidence_present": True,
+                "open_source": True,
+                "python_version": "3.12.11",
+                "reuse_succeeded": True,
+                "run_succeeded": True,
+                "solver_version": "1.0",
+                "source_evidence_present": True,
+            }
+            for environment in ("macos", "linux")
+        }
+        for solver in ("highs", "scip", "cp_sat")
+    }
+    assert all(set(evidence) == benchmark._ENVIRONMENT_KEYS for evidence in environments.values())
+    assert all(
+        set(evidence) == benchmark._SOLVER_ENVIRONMENT_KEYS
+        for solver_artifacts in artifacts.values()
+        for evidence in solver_artifacts.values()
+    )
+    return environments, artifacts
+
+
+def test_full_cases_bind_all_three_frozen_layers_and_approved_oracle_truth() -> None:
+    cases = benchmark._load_full_cases()
+
+    assert len(cases) == 41
+    assert [case.case_id for case in cases[:16]] == [case.case_id for case in load_canonical_cases()]
+    assert [case.case_id for case in cases[16:40]] == [*SEMANTIC_CASE_IDS, *SCALE_CASE_IDS]
+    approved = cases[-1]
+    assert approved.case_id == "approved:a1b63df2776a88522c3a00ed"
+    assert approved.request.mode == SearchMode.ADMISSION
+    assert canonical_payload(approved.budget) == {
+        "max_joint_states": 9,
+        "max_quantity_vectors": 289,
+        "max_support_rechecks": 64,
+    }
+    assert approved.expected_result is not None
+    assert approved.expected_result.proof_status == ProofStatus.PROVEN
+    assert approved.expected_result.business_status == BusinessStatus.NO_QUALIFIED_OPPORTUNITY
+    assert fingerprint(approved.request.problem) == "sha256:a1b63df2776a88522c3a00ed535489b777b18be827445b0419bf7d8359f127c4"
+
+
+def test_full_manifest_and_sample_plan_freeze_the_exact_task10_matrix() -> None:
+    cases = benchmark._load_full_cases()
+    environments, artifacts = _full_environment_fixture()
+    manifest = benchmark._full_manifest(cases, environments, artifacts)
+    plan = benchmark._full_sample_plan(cases)
+
+    assert manifest["profile"] == "full"
+    assert manifest["required_environments"] == ["macos", "linux"]
+    assert manifest["required_solvers"] == ["highs", "scip", "cp_sat"]
+    assert manifest["worker_counts"] == [1, 2, 4]
+    assert manifest["warmup_samples"] == 5
+    assert manifest["measured_samples"] == 30
+    assert manifest["throughput_probe_case_ids"] == ["single_contract_complement"]
+    assert manifest["cold_probe_case_ids"] == ["single_contract_complement"]
+    assert manifest["rebuild_probe_case_ids"] == ["single_contract_complement"]
+    assert len(plan) == 1_585
+    assert plan[:2] == (
+        (cases[0].case_id, "warmup", 0, 1),
+        (cases[0].case_id, "warmup", 1, 1),
+    )
+    assert plan[-1] == ("single_contract_complement", "rebuild", 29, 1)
+
+
 def test_canonical_corpus_loads_the_frozen_48_fixture_without_copying_it() -> None:
     fixture_bytes = CANONICAL_FIXTURE.read_bytes()
     cases = load_canonical_cases()

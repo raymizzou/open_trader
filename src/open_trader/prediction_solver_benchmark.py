@@ -1209,7 +1209,7 @@ def load_canonical_cases() -> tuple[BenchmarkCase, ...]:
     return tuple(decoded)
 
 
-def _load_quick_cases() -> tuple[BenchmarkCase, ...]:
+def _load_synthetic_cases(*, include_measurement_only: bool) -> tuple[BenchmarkCase, ...]:
     synthetic_bytes = _SYNTHETIC_CORPUS.read_bytes()
     if synthetic_bytes != generate_synthetic_corpus(4901):
         raise ValueError("committed synthetic corpus changed")
@@ -1223,7 +1223,7 @@ def _load_quick_cases() -> tuple[BenchmarkCase, ...]:
         raise ValueError("synthetic corpus identity changed")
     if not isinstance(value["cases"], list):
         raise ValueError("synthetic corpus cases must be an array")
-    semantic = []
+    decoded = []
     for item in value["cases"]:
         case = _strict_object(
             item,
@@ -1232,32 +1232,97 @@ def _load_quick_cases() -> tuple[BenchmarkCase, ...]:
             if isinstance(item, Mapping) and item.get("truth_method") == "exact_oracle_v1"
             else {"case_id", "declared_search_surface", "expected_result", "request", "request_fingerprint", "result_fingerprint", "truth_method"},
         )
-        if case["truth_method"] == "measurement_only":
+        if case["truth_method"] == "measurement_only" and not include_measurement_only:
             continue
         request = request_from_payload(_mapping(case["request"], "request"))
+        case_id = _text(case["case_id"], "case_id")
+        request_fingerprint = _sha(case["request_fingerprint"], "request_fingerprint")
+        if canonical_payload(request) != case["request"] or fingerprint(request) != request_fingerprint:
+            raise ValueError(f"synthetic case request changed: {case_id}")
+        if case["truth_method"] == "measurement_only":
+            if case["expected_result"] is not None or case["result_fingerprint"] is not None:
+                raise ValueError(f"synthetic measurement-only case truth changed: {case_id}")
+            decoded.append(
+                BenchmarkCase(case_id, request, None, request_fingerprint, None, request.budget, "measurement_only")
+            )
+            continue
+        if case["truth_method"] != "exact_oracle_v1":
+            raise ValueError(f"synthetic case truth method changed: {case_id}")
         result = result_from_payload(_mapping(case["expected_result"], "expected_result"))
+        result_fingerprint = _sha(case["result_fingerprint"], "result_fingerprint")
         if (
-            canonical_payload(request) != case["request"]
-            or canonical_payload(result) != case["expected_result"]
-            or fingerprint(request) != case["request_fingerprint"]
-            or fingerprint(result) != case["result_fingerprint"]
+            canonical_payload(result) != case["expected_result"]
+            or fingerprint(result) != result_fingerprint
             or result != _oracle_result(request)
         ):
-            raise ValueError(f"synthetic case truth changed: {case['case_id']}")
-        semantic.append(
+            raise ValueError(f"synthetic case truth changed: {case_id}")
+        decoded.append(
             BenchmarkCase(
-                _text(case["case_id"], "case_id"),
+                case_id,
                 request,
                 result,
-                _sha(case["request_fingerprint"], "request_fingerprint"),
-                _sha(case["result_fingerprint"], "result_fingerprint"),
+                request_fingerprint,
+                result_fingerprint,
                 request.budget,
                 "exact_oracle_v1",
             )
         )
-    if len(semantic) != 18:
-        raise ValueError("quick corpus must contain exactly 18 semantic synthetic cases")
-    return (*load_canonical_cases(), *semantic)
+    expected_count = 24 if include_measurement_only else 18
+    if len(decoded) != expected_count:
+        raise ValueError(f"synthetic corpus must contain exactly {expected_count} selected cases")
+    return tuple(decoded)
+
+
+def _load_quick_cases() -> tuple[BenchmarkCase, ...]:
+    return (*load_canonical_cases(), *_load_synthetic_cases(include_measurement_only=False))
+
+
+def _load_full_cases() -> tuple[BenchmarkCase, ...]:
+    approved_cases = _load_approved_corpus(_APPROVED_CORPUS)["cases"]
+    if len(approved_cases) != 1:
+        raise ValueError("full corpus must contain exactly one approved case")
+    approved = _strict_object(
+        approved_cases[0],
+        "approved case",
+        {
+            "anonymized_problem_fingerprint", "approval_id", "approved_at", "approver", "captured_at",
+            "case_id", "generation_id", "problem", "source_alias", "source_problem_fingerprint",
+        },
+    )
+    approved_problem = problem_from_payload(_mapping(approved["problem"], "approved problem"))
+    approved_problem_fingerprint = "sha256:a1b63df2776a88522c3a00ed535489b777b18be827445b0419bf7d8359f127c4"
+    approved_case_id = "approved:a1b63df2776a88522c3a00ed"
+    if (
+        fingerprint(approved_problem) != approved_problem_fingerprint
+        or _sha(approved["anonymized_problem_fingerprint"], "anonymized_problem_fingerprint") != approved_problem_fingerprint
+        or _sha(approved["source_problem_fingerprint"], "source_problem_fingerprint")
+        != "sha256:c6c5a2955c6f96b03d6c8f10deccd96b1a54d713cea3ec0391a1590801ced59f"
+        or _text(approved["case_id"], "case_id") != approved_case_id
+    ):
+        raise ValueError("approved corpus identity changed")
+    # ponytail: Task 10 v1 has one approved case; add per-case budget metadata when the approved corpus grows.
+    request = OracleRequest(
+        REQUEST_SCHEMA_V1,
+        SearchMode.ADMISSION,
+        approved_problem,
+        OracleBudget(289, 9, 64),
+    )
+    result = _oracle_result(request)
+    if (
+        result.proof_status != ProofStatus.PROVEN
+        or result.business_status != BusinessStatus.NO_QUALIFIED_OPPORTUNITY
+    ):
+        raise ValueError("approved corpus oracle truth changed")
+    approved_case = BenchmarkCase(
+        approved_case_id,
+        request,
+        result,
+        fingerprint(request),
+        fingerprint(result),
+        request.budget,
+        "exact_oracle_v1",
+    )
+    return (*load_canonical_cases(), *_load_synthetic_cases(include_measurement_only=True), approved_case)
 
 
 def generate_synthetic_corpus(seed: int = 4901) -> bytes:
@@ -2213,6 +2278,86 @@ def _quick_manifest(
         "warmup_samples": 0,
         "worker_counts": [1],
     }
+
+
+def _full_manifest(
+    cases: tuple[BenchmarkCase, ...],
+    environments: Mapping[str, Mapping[str, object]],
+    solver_environments: Mapping[str, Mapping[str, Mapping[str, object]]],
+) -> dict[str, object]:
+    corpus_digest = hashlib.sha256(
+        _CANONICAL_FIXTURE.read_bytes() + _SYNTHETIC_CORPUS.read_bytes() + _APPROVED_CORPUS.read_bytes()
+    ).hexdigest()
+    license_digest = hashlib.sha256(_LICENSE_MANIFEST.read_bytes()).hexdigest()
+    probe_case_id = "single_contract_complement"
+    return {
+        "approved_case_count": 1,
+        "cases": {
+            case.case_id: {
+                "model_dimensions": _model_dimensions(case.request.problem),
+                "oracle_limits": canonical_payload(case.budget),
+                "problem_fingerprint": fingerprint(case.request.problem),
+                "request_fingerprint": case.request_fingerprint,
+                "request_id": case.case_id,
+            }
+            for case in cases
+        },
+        "cold_probe_case_ids": [probe_case_id],
+        "corpus_manifest_sha256": f"sha256:{corpus_digest}",
+        "environments": {environment: dict(environments[environment]) for environment in ("macos", "linux")},
+        "first_qualified_case_ids": [
+            case.case_id
+            for case in cases
+            if case.expected_result is not None and case.expected_result.business_status == BusinessStatus.QUALIFIED_FEASIBLE
+        ],
+        "hard_time_limit_ms": QUICK_HARD_TIME_LIMIT_MS,
+        "license_manifest_sha256": f"sha256:{license_digest}",
+        "measured_samples": 30,
+        "memory_limit_bytes": QUICK_MEMORY_LIMIT_BYTES,
+        "max_constraint_generation_rounds": QUICK_MAX_CONSTRAINT_GENERATION_ROUNDS,
+        "optimal_case_ids": [
+            case.case_id
+            for case in cases
+            if case.expected_result is not None and case.expected_result.optimality_status == OptimalityStatus.OPTIMAL
+        ],
+        "profile": "full",
+        "rebuild_probe_case_ids": [probe_case_id],
+        "required_case_ids": [case.case_id for case in cases],
+        "required_environments": ["macos", "linux"],
+        "required_solvers": list(_SOLVERS),
+        "schema_version": _MANIFEST_SCHEMA_V1,
+        "soft_time_limit_ms": QUICK_SOFT_TIME_LIMIT_MS,
+        "solvers": {
+            solver: {
+                "environments": {
+                    environment: dict(solver_environments[solver][environment])
+                    for environment in ("macos", "linux")
+                },
+                "manual_interventions": 0,
+                "whole_claim_certificate_bound": False,
+            }
+            for solver in _SOLVERS
+        },
+        "throughput_probe_case_ids": [probe_case_id],
+        "warmup_samples": 5,
+        "worker_counts": [1, 2, 4],
+    }
+
+
+def _full_sample_plan(cases: tuple[BenchmarkCase, ...]) -> tuple[tuple[str, str, int, int], ...]:
+    plan = [
+        (case.case_id, kind, index, 1)
+        for case in cases
+        for kind, samples in (("warmup", 5), ("warm", 30))
+        for index in range(samples)
+    ]
+    for worker_count in (1, 2, 4):
+        plan.extend(("single_contract_complement", "throughput", index, worker_count) for index in range(30))
+    for kind in ("cold", "rebuild"):
+        plan.extend(("single_contract_complement", kind, index, 1) for index in range(30))
+    if len(plan) != 1_585 or len(set(plan)) != len(plan):
+        raise ValueError("full sample plan must have exactly 1,585 unique structural keys")
+    return tuple(plan)
 
 
 def _unknown_run(
