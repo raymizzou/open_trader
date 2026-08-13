@@ -2177,19 +2177,37 @@ def _docker_image_id(image: str) -> str | None:
     return image_id
 
 
-_SCIP_EXACT_SELF_CHECK = """import json, subprocess, tempfile
-from pyscipopt import Model
-def status(kind):
-    model = Model(); model.hideOutput(); value = model.addVar(vtype='B')
-    if kind == 'equality': model.addCons(value == 1)
-    elif kind == 'ranged': model.addCons(0 <= value); model.addCons(value <= 1)
-    elif kind == 'infeasible': model.addCons(value == 0); model.addCons(value == 1)
-    model.optimize(); return str(model.getStatus()).upper()
-with tempfile.NamedTemporaryFile() as corrupt:
-    corrupt.write(b'corrupt proof\\n'); corrupt.flush()
-    checker_nonzero = subprocess.run(['viprchk', corrupt.name], capture_output=True).returncode != 0
-print(json.dumps({'scip-exact': {'optimal': status('optimal'), 'equality': status('equality'), 'ranged': status('ranged'), 'infeasible': status('infeasible'), 'corrupt_checker': 'NONZERO' if checker_nonzero else 'ZERO', 'lossy': 'UNKNOWN'}}, sort_keys=True))
-"""
+_SCIP_EXACT_SELF_CHECK_KEYS = {
+    "adapter", "solver", "version", "status", "certificate_sha256", "certificate_size_bytes",
+    "completed_certificate_sha256", "completed_certificate_size_bytes", "generation_ns", "completion_ns",
+    "check_ns", "corrupt_checker_exit_code", "corrupt_check_ns", "constrained_status",
+    "equality_status", "ranged_status", "infeasible_status", "lossy_status", "lossy_native_status",
+}
+
+
+def _scip_exact_self_check_succeeded(payload: Mapping[str, object]) -> bool:
+    try:
+        value = _strict_object(payload, "scip-exact", _SCIP_EXACT_SELF_CHECK_KEYS)
+        if value["adapter"] != "ScipBackend" or value["solver"] != "SCIP+VIPR" or value["version"] != _SOLVER_VERSIONS["scip"]:
+            return False
+        if value["status"] != "OPTIMAL" or any(value[field] != "OPTIMAL" for field in ("constrained_status", "equality_status", "ranged_status")):
+            return False
+        if value["infeasible_status"] != "INFEASIBLE" or value["lossy_status"] != "UNKNOWN":
+            return False
+        if "PROOF_UNCLOSED" not in _text(value["lossy_native_status"], "lossy_native_status"):
+            return False
+        if _integer(value["corrupt_checker_exit_code"], "corrupt_checker_exit_code") == 0:
+            return False
+        for field in ("certificate_sha256", "completed_certificate_sha256"):
+            _sha(value[field], field)
+        for field in (
+            "certificate_size_bytes", "completed_certificate_size_bytes", "generation_ns", "completion_ns",
+            "check_ns", "corrupt_check_ns",
+        ):
+            _positive_integer(value[field], field)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _discover_linux_environment() -> tuple[dict[str, object], dict[str, dict[str, object]]] | None:
@@ -2219,13 +2237,12 @@ def _discover_linux_environment() -> tuple[dict[str, object], dict[str, dict[str
         }:
             return None
         if solver == "scip":
-            exact = _docker_json_self_check(image, ["python", "-c", _SCIP_EXACT_SELF_CHECK], "scip-exact")
-            if exact != {
-                "scip-exact": {
-                    "optimal": "OPTIMAL", "equality": "OPTIMAL", "ranged": "OPTIMAL",
-                    "infeasible": "INFEASIBLE", "corrupt_checker": "NONZERO", "lossy": "UNKNOWN",
-                }
-            }:
+            exact = _docker_json_self_check(
+                image,
+                ["python", "-m", "open_trader.prediction_solver_backends", "--self-check", "scip-exact"],
+                "scip-exact",
+            )
+            if exact is None or not _scip_exact_self_check_succeeded(exact):
                 return None
         artifacts[solver] = {
             "adapter_version": WORKER_VERSION,
@@ -2290,7 +2307,11 @@ def _container_is_absent(container_id: str) -> bool:
         completed = subprocess.run(["docker", "inspect", container_id], capture_output=True, text=True, check=False, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return completed.returncode == 1
+    return (
+        completed.returncode == 1
+        and not completed.stdout.strip()
+        and completed.stderr.strip() == f"Error: No such object: {container_id}"
+    )
 
 
 class _DockerHarness:
@@ -3145,18 +3166,13 @@ def _read_full_macos_partial(output: Path) -> tuple[dict[str, object], list[dict
     if manifest["environments"]["linux"]["available"]:
         raise ValueError("macOS partial must not already contain Linux evidence")
     cases = _load_full_cases()
-    expected = _validated_run_manifest(_full_manifest(
+    expected = _full_manifest(
         cases,
         manifest["environments"],
         {solver: manifest["solvers"][solver]["environments"] for solver in _SOLVERS},
-    ))
-    identity_fields = (
-        "approved_case_count", "cases", "corpus_manifest_sha256", "license_manifest_sha256",
-        "profile", "required_case_ids", "required_environments", "required_solvers", "schema_version",
     )
-    mismatch = next((field for field in identity_fields if manifest[field] != expected[field]), None)
-    if mismatch is not None:
-        raise ValueError(f"macOS partial identity does not match the current benchmark: {mismatch}")
+    if raw_manifest != expected:
+        raise ValueError("macOS partial identity does not match the current benchmark")
     if manifest["environments"]["macos"]["git_sha"] != _current_git_sha():
         raise ValueError("macOS partial Git identity is stale")
     for solver in _SOLVERS:

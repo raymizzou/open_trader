@@ -2481,7 +2481,35 @@ def test_full_environment_runner_reuses_each_throughput_worker_slot(monkeypatch)
     assert len(factory.instances) == 3
 
 
-def _install_fake_docker(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+def _scip_exact_self_check_payload() -> dict[str, object]:
+    return {
+        "adapter": "ScipBackend",
+        "solver": "SCIP+VIPR",
+        "version": "10.0.2",
+        "status": "OPTIMAL",
+        "certificate_sha256": "sha256:" + "b" * 64,
+        "certificate_size_bytes": 1,
+        "completed_certificate_sha256": "sha256:" + "c" * 64,
+        "completed_certificate_size_bytes": 1,
+        "generation_ns": 1,
+        "completion_ns": 1,
+        "check_ns": 1,
+        "corrupt_checker_exit_code": 1,
+        "corrupt_check_ns": 1,
+        "constrained_status": "OPTIMAL",
+        "equality_status": "OPTIMAL",
+        "ranged_status": "OPTIMAL",
+        "infeasible_status": "INFEASIBLE",
+        "lossy_status": "UNKNOWN",
+        "lossy_native_status": "PROOF_UNCLOSED",
+    }
+
+
+def _install_fake_docker(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    scip_exact_payload: dict[str, object] | None = None,
+) -> list[list[str]]:
     calls: list[list[str]] = []
 
     def run(command, **kwargs):
@@ -2493,7 +2521,7 @@ def _install_fake_docker(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
             if "linux-platform-highs" in command[-1]:
                 stdout = json.dumps({"architecture": "x86_64", "cpu": "fake-cpu", "os_version": "Linux", "probe": "linux-platform-highs", "python_version": "3.12.11"}) + "\n"
             elif "scip-exact" in command[-1]:
-                stdout = json.dumps({"scip-exact": {"corrupt_checker": "NONZERO", "equality": "OPTIMAL", "infeasible": "INFEASIBLE", "lossy": "UNKNOWN", "optimal": "OPTIMAL", "ranged": "OPTIMAL"}}) + "\n"
+                stdout = json.dumps(scip_exact_payload or _scip_exact_self_check_payload()) + "\n"
             else:
                 solver = command[-1]
                 stdout = json.dumps({
@@ -2520,6 +2548,26 @@ def test_linux_discovery_requires_pinned_images_and_scip_exact_smoke(monkeypatch
     assert any("scip-exact" in " ".join(call) for call in calls)
     assert all(item["image_id"].startswith("sha256:") for item in artifacts.values())
     assert artifacts["scip"]["run_succeeded"] is True
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    (
+        lambda payload: payload.pop("constrained_status"),
+        lambda payload: payload.__setitem__("equality_status", "UNKNOWN"),
+        lambda payload: payload.__setitem__("ranged_status", "FEASIBLE"),
+        lambda payload: payload.__setitem__("infeasible_status", "OPTIMAL"),
+        lambda payload: payload.__setitem__("corrupt_checker_exit_code", 0),
+        lambda payload: payload.__setitem__("lossy_status", "OPTIMAL"),
+        lambda payload: payload.__setitem__("lossy_native_status", "closed"),
+    ),
+)
+def test_linux_discovery_rejects_missing_or_invalid_scip_exact_evidence(monkeypatch, mutator) -> None:
+    payload = _scip_exact_self_check_payload()
+    mutator(payload)
+    _install_fake_docker(monkeypatch, scip_exact_payload=payload)
+
+    assert benchmark._discover_linux_environment() is None
 
 
 def _install_fake_docker_worker(monkeypatch: pytest.MonkeyPatch, *, container_survives: bool = False) -> list[list[str]]:
@@ -2554,7 +2602,7 @@ def _install_fake_docker_worker(monkeypatch: pytest.MonkeyPatch, *, container_su
             inspections[container_id] = inspections.get(container_id, 0) + 1
             if container_survives and inspections[container_id] == 1:
                 return subprocess.CompletedProcess(command, 0, "{}\n", "")
-            return subprocess.CompletedProcess(command, 1, "", "not found")
+            return subprocess.CompletedProcess(command, 1, "", f"Error: No such object: {container_id}\n")
         if command[:3] == ["docker", "rm", "--force"]:
             commands.append(command)
             return subprocess.CompletedProcess(command, 0, command[-1] + "\n", "")
@@ -2603,6 +2651,55 @@ def test_linux_cleanup_survivor_is_removed_and_the_run_stops(monkeypatch) -> Non
     assert [command for command in commands if command[:3] == ["docker", "rm", "--force"]] == [
         ["docker", "rm", "--force", "a" * 64]
     ]
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "expected"),
+    (
+        (1, "Error: No such object: " + "a" * 64 + "\n", True),
+        (1, "permission denied while trying to connect to the Docker daemon\n", False),
+        (1, "unexpected inspect failure\n", False),
+        (2, "Error: No such object: " + "a" * 64 + "\n", False),
+    ),
+)
+def test_container_absence_requires_the_exact_no_such_object_result(monkeypatch, returncode, stderr, expected) -> None:
+    monkeypatch.setattr(
+        benchmark.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, returncode, "", stderr),
+    )
+
+    assert benchmark._container_is_absent("a" * 64) is expected
+
+
+@pytest.mark.parametrize("field,value", (("soft_time_limit_ms", 4_999), ("hard_time_limit_ms", 20_001), ("max_constraint_generation_rounds", 65)))
+def test_full_linux_rejects_tampered_partial_execution_limits_before_docker(tmp_path, monkeypatch, field, value) -> None:
+    environments, artifacts = _full_environment_fixture()
+    environments["linux"]["available"] = False
+    manifest = benchmark._full_manifest(benchmark._load_full_cases(), environments, artifacts)
+    manifest[field] = value
+    (tmp_path / "environment_manifest.json").write_text(json.dumps(manifest))
+    (tmp_path / "macos.jsonl").write_text("")
+    monkeypatch.setattr(benchmark, "_current_git_sha", lambda: "1" * 40)
+    monkeypatch.setattr(benchmark, "_discover_linux_environment", lambda: pytest.fail("docker discovered"))
+    monkeypatch.setattr(benchmark, "_full_sample_plan", lambda _: ())
+    monkeypatch.setattr(benchmark, "aggregate_benchmark_records", lambda records, current: {})
+
+    with pytest.raises(ValueError, match="identity"):
+        benchmark._run_full_linux(tmp_path)
+
+
+def test_full_linux_rejects_incomplete_partial_manifest_before_docker(tmp_path, monkeypatch) -> None:
+    environments, artifacts = _full_environment_fixture()
+    environments["linux"]["available"] = False
+    manifest = benchmark._full_manifest(benchmark._load_full_cases(), environments, artifacts)
+    del manifest["memory_limit_bytes"]
+    (tmp_path / "environment_manifest.json").write_text(json.dumps(manifest))
+    (tmp_path / "macos.jsonl").write_text("")
+    monkeypatch.setattr(benchmark, "_discover_linux_environment", lambda: pytest.fail("docker discovered"))
+
+    with pytest.raises(ValueError, match="macOS partial is invalid"):
+        benchmark._run_full_linux(tmp_path)
 
 
 def test_full_linux_requires_a_complete_validated_macos_partial_before_docker(tmp_path, monkeypatch) -> None:
