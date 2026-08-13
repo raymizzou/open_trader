@@ -5,12 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-13
 
-- Prediction Dashboard state refreshes now preserve newer independently-polled
-  signal history, so closed signals keep live profit hidden and operations
-  unavailable when a slower state response completes afterward. Deterministic
-  closed-signal browser coverage, focused polling/static checks, and all 35
-  Prediction Market browser cases pass; no live command, deployment, restart,
-  or acceptance run was performed.
+- Prediction Dashboard state refreshes now use a signal-history generation to
+  preserve independently-polled signals only when that history advances during
+  the state request. Closed signals keep live profit hidden and operations
+  unavailable without blocking newer signals from a subsequently started state
+  request. Both deterministic request orderings, focused polling/static checks,
+  and all 35 Prediction Market browser cases pass; no live command, deployment,
+  restart, or acceptance run was performed.
 
 - Completed #45's one-time Prediction owner cutover command, Account proof
   helper, dedicated 115-case cutover suite, and Legacy rollback runbook have

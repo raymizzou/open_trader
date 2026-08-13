@@ -7334,6 +7334,28 @@ console.log(JSON.stringify({endedAt:row.ended_at,html}));
     assert 'data-action="participate"' not in result["html"]
 
 
+def test_prediction_state_started_after_signal_history_accepts_state_signals() -> None:
+    output = run_dashboard_js(r'''
+state.workspaceView = "prediction_market";
+globalThis.fetch = (url) => Promise.resolve(url.includes("/history")
+  ? {ok:true,json:async()=>({items:[{
+      opportunity_id:"old-opportunity", ended_at:"2026-08-01T02:00:10Z",
+      event_title:"Old closed signal", actionable_now:false,
+    }]})}
+  : {ok:true,json:async()=>({status:"healthy",histories:{signals:[{
+      opportunity_id:"new-opportunity", event_title:"New active signal",
+      actionable_now:true,
+    }]}})});
+await loadPredictionHistory("signals", {panelOnly: true});
+await fetchPredictionState();
+const row = state.predictionMarket.payload.histories.signals[0];
+console.log(JSON.stringify({opportunityId:row.opportunity_id,endedAt:row.ended_at}));
+''')
+    assert json.loads(output) == {
+        "opportunityId": "new-opportunity",
+    }
+
+
 def test_dashboard_renders_one_selected_broker_tab_and_cards_switch_it() -> None:
     output = run_dashboard_js(r'''
 const mount = () => ({innerHTML:"", textContent:"", classList:{add(){},remove(){}}});

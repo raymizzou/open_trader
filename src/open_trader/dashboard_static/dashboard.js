@@ -60,6 +60,7 @@ const state = {
     signalLastSuccessAt: "",
     signalError: "",
     signalPollEpoch: 0,
+    signalHistoryGeneration: 0,
     csrfToken: "",
     activeExecutionId: "",
   },
@@ -3322,13 +3323,14 @@ function predictionRequestUrl(path) {
 async function fetchPredictionState() {
   if (state.workspaceView !== "prediction_market" || state.predictionMarket.stateRequestInFlight) return;
   state.predictionMarket.stateRequestInFlight = true;
+  const signalHistoryGeneration = state.predictionMarket.signalHistoryGeneration;
   try {
     const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/state"), {cache: "no-store", credentials: "same-origin"});
     if (!response.ok) throw new Error(`prediction state ${response.status}`);
     const payload = await response.json();
     const previousHistories = state.predictionMarket.payload?.histories || {};
     const histories = {...previousHistories, ...(payload.histories || {})};
-    if (state.predictionMarket.signalLastSuccessAt && Array.isArray(previousHistories.signals)) {
+    if (state.predictionMarket.signalHistoryGeneration !== signalHistoryGeneration && Array.isArray(previousHistories.signals)) {
       histories.signals = previousHistories.signals;
     }
     state.predictionMarket.payload = {...payload, histories};
@@ -3367,6 +3369,7 @@ async function loadPredictionHistory(kind, options = {}) {
     state.predictionMarket.payload = {...payload, histories: {...(payload.histories || {}), [kind]: Array.isArray(result.items) ? result.items : []}};
     if (!panelOnly) state.predictionMarket.error = "";
     if (kind === "signals") {
+      state.predictionMarket.signalHistoryGeneration += 1;
       state.predictionMarket.signalLastSuccessAt = new Date().toISOString();
       state.predictionMarket.signalError = "";
     }
