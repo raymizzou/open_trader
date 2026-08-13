@@ -2555,12 +2555,123 @@ def test_full_macos_failure_leaves_no_final_artifact(tmp_path, monkeypatch) -> N
     assert not (tmp_path / "environment_manifest.json").exists()
 
 
-def test_full_macos_refuses_existing_or_stale_outputs_before_worker_start(tmp_path, monkeypatch) -> None:
-    (tmp_path / "macos.jsonl").write_text("stale\n")
-    monkeypatch.setattr(benchmark, "WorkerHarness", lambda *args, **kwargs: pytest.fail("worker started"))
+def _install_full_macos_publication_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
+    environments, artifacts = _full_environment_fixture()
+    monkeypatch.setattr(
+        benchmark,
+        "_discover_quick_environment",
+        lambda root: (environments["macos"], {solver: artifacts[solver]["macos"] for solver in benchmark._SOLVERS}),
+    )
+    monkeypatch.setattr(benchmark, "aggregate_benchmark_records", lambda records, manifest: {})
+
+
+@pytest.mark.parametrize("kind", ("file", "symlink"))
+def test_full_macos_rejects_unsafe_output_root_before_discovery(tmp_path, monkeypatch, kind: str) -> None:
+    output = tmp_path / "results"
+    if kind == "file":
+        output.write_text("not a directory\n")
+    else:
+        target = tmp_path / "foreign-results"
+        target.mkdir()
+        output.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(benchmark, "_discover_quick_environment", lambda root: pytest.fail("environment discovered"))
+
+    with pytest.raises(ValueError, match="output root"):
+        benchmark._run_full_macos(output, tmp_path / "envs")
+
+
+@pytest.mark.parametrize("name", ("macos.jsonl", "linux.jsonl", "environment_manifest.json"))
+@pytest.mark.parametrize("kind", ("file", "directory", "symlink"))
+def test_full_macos_rejects_every_unsafe_final_path_before_discovery(
+    tmp_path,
+    monkeypatch,
+    name: str,
+    kind: str,
+) -> None:
+    output = tmp_path / "results"
+    output.mkdir()
+    path = output / name
+    if kind == "file":
+        path.write_text("foreign\n")
+    elif kind == "directory":
+        path.mkdir()
+    else:
+        path.symlink_to(tmp_path / "missing-foreign-evidence")
+    monkeypatch.setattr(benchmark, "_discover_quick_environment", lambda root: pytest.fail("environment discovered"))
 
     with pytest.raises(ValueError, match="already exists"):
-        benchmark._run_full_macos(tmp_path, tmp_path / "envs")
+        benchmark._run_full_macos(output, tmp_path / "envs")
+
+
+@pytest.mark.parametrize("name", ("macos.jsonl", "environment_manifest.json"))
+def test_full_macos_never_replaces_foreign_evidence_created_after_preflight(
+    tmp_path,
+    monkeypatch,
+    name: str,
+) -> None:
+    output = tmp_path / "results"
+    foreign = b"foreign evidence\n"
+    _install_full_macos_publication_fakes(monkeypatch)
+
+    def run(*args):
+        del args
+        output.mkdir(exist_ok=True)
+        (output / name).write_bytes(foreign)
+        return [{"record": "ours"}]
+
+    monkeypatch.setattr(benchmark, "_run_full_environment", run)
+
+    with pytest.raises(ValueError, match="already exists"):
+        benchmark._run_full_macos(output, tmp_path / "envs")
+
+    assert (output / name).read_bytes() == foreign
+    assert not any(path.name.startswith(f".{name}.") for path in output.iterdir())
+
+
+def test_full_macos_manifest_failure_leaves_an_invalid_fail_closed_partial_package(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    output = tmp_path / "results"
+    _install_full_macos_publication_fakes(monkeypatch)
+    monkeypatch.setattr(benchmark, "_run_full_environment", lambda *args: [{"record": "ours"}])
+    original_write_json = benchmark._atomic_write_json
+
+    def fail_manifest(path, payload, **kwargs):
+        del path, payload, kwargs
+        raise OSError("injected manifest publication failure")
+
+    monkeypatch.setattr(benchmark, "_atomic_write_json", fail_manifest)
+
+    with pytest.raises(OSError, match="injected manifest publication failure"):
+        benchmark._run_full_macos(output, tmp_path / "envs")
+
+    assert (output / "macos.jsonl").is_file()
+    assert not (output / "environment_manifest.json").exists()
+    assert {path.name for path in output.iterdir()} == {"macos.jsonl"}
+    monkeypatch.setattr(benchmark, "_FINAL_RESULTS", output)
+    with pytest.raises(ValueError, match="absent"):
+        benchmark._require_final_inputs()
+    monkeypatch.setattr(benchmark, "_atomic_write_json", original_write_json)
+    monkeypatch.setattr(benchmark, "_discover_quick_environment", lambda root: pytest.fail("environment discovered"))
+    with pytest.raises(ValueError, match="already exists"):
+        benchmark._run_full_macos(output, tmp_path / "envs")
+
+
+@pytest.mark.parametrize("name", ("macos.jsonl", "linux.jsonl", "environment_manifest.json"))
+def test_final_input_reader_rejects_symlinked_evidence(tmp_path, monkeypatch, name: str) -> None:
+    output = tmp_path / "results"
+    output.mkdir()
+    for final_name in ("macos.jsonl", "linux.jsonl", "environment_manifest.json"):
+        (output / final_name).write_text("{}\n")
+    target = tmp_path / "foreign-evidence"
+    target.write_text("{}\n")
+    (output / name).unlink()
+    (output / name).symlink_to(target)
+    monkeypatch.setattr(benchmark, "_FINAL_RESULTS", output)
+
+    with pytest.raises(ValueError, match="unsafe"):
+        benchmark._require_final_inputs()
 
 
 def test_quick_runner_is_serial_and_replays_only_semantic_fields(

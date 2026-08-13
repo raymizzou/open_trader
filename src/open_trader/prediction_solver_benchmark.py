@@ -2055,11 +2055,15 @@ def _utc_z(value: str, name: str) -> datetime:
     return decoded
 
 
-def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
-    _atomic_write_bytes(path, (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode())
+def _atomic_write_json(path: Path, payload: dict[str, object], *, overwrite: bool = True) -> None:
+    _atomic_write_bytes(
+        path,
+        (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(),
+        overwrite=overwrite,
+    )
 
 
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
+def _atomic_write_bytes(path: Path, data: bytes, *, overwrite: bool = True) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
@@ -2068,8 +2072,16 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
             temporary = Path(handle.name)
-        os.replace(temporary, path)
-        temporary = None
+        if overwrite:
+            os.replace(temporary, path)
+            temporary = None
+        else:
+            try:
+                os.link(temporary, path)
+            except FileExistsError as error:
+                raise ValueError(f"benchmark evidence already exists: {path}") from error
+            temporary.unlink()
+            temporary = None
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -2830,6 +2842,8 @@ def _run_quick_benchmark(output_root: Path = _QUICK_OUTPUT, env_root: Path = _BE
 
 def _run_full_macos(output_root: Path = _FINAL_RESULTS, env_root: Path = _BENCHMARK_ENVS) -> int:
     output = Path(output_root)
+    if output.is_symlink() or output.exists() and not output.is_dir():
+        raise ValueError(f"full macOS output root is unsafe: {output}")
     records_path = output / "macos.jsonl"
     manifest_path = output / "environment_manifest.json"
     stale = [path for path in (records_path, output / "linux.jsonl", manifest_path) if path.exists() or path.is_symlink()]
@@ -2888,8 +2902,8 @@ def _run_full_macos(output_root: Path = _FINAL_RESULTS, env_root: Path = _BENCHM
         json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"
         for record in records
     )
-    _atomic_write_bytes(records_path, records_bytes)
-    _atomic_write_json(manifest_path, manifest)
+    _atomic_write_bytes(records_path, records_bytes, overwrite=False)
+    _atomic_write_json(manifest_path, manifest, overwrite=False)
     return 0
 
 
@@ -2912,6 +2926,8 @@ def _final_report_paths() -> tuple[list[Path], Path, Path]:
 
 def _require_final_inputs() -> tuple[list[Path], Path, Path]:
     records, manifest, output = _final_report_paths()
+    if output.is_symlink() or any(path.is_symlink() for path in (*records, manifest)):
+        raise ValueError("final Task 10 benchmark inputs are unsafe")
     missing = [path for path in (*records, manifest) if not path.is_file()]
     if missing:
         raise ValueError("final Task 10 benchmark inputs are absent")
