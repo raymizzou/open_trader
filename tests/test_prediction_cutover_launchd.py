@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime
 from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
 
@@ -364,11 +365,13 @@ if command == "curl":
         print(json.dumps({
             "schema_version": "open_trader.account_api.health.v1",
             "module": "account_api",
-            "status": "ok",
+            "status": state.get("account_health_status", "ok"),
+            "mode": state.get("account_api_mode", "production"),
             "pid": api["pid"],
-            "api_git_sha": os.environ["FAKE_SHA"],
-            "worker_git_sha": os.environ["FAKE_SHA"],
-            "release_match": True,
+            "api_git_sha": state.get("account_api_sha", os.environ["FAKE_SHA"]),
+            "worker_git_sha": state.get("account_worker_sha", os.environ["FAKE_SHA"]),
+            "release_match": state.get("account_api_sha", os.environ["FAKE_SHA"])
+            == state.get("account_worker_sha", os.environ["FAKE_SHA"]),
         }))
     elif url.endswith("/healthz") and ":8767" in url:
         legacy = state["labels"]["com.open-trader.legacy-dashboard"]
@@ -678,6 +681,12 @@ class CutoverHarness:
             "public_status": "healthy",
             "public_health_status": "healthy",
             "public_readiness_status": "ready",
+            "account_controller_sha": SHA,
+            "account_api_sha": SHA,
+            "account_worker_sha": SHA,
+            "account_status_pid": 4001,
+            "account_status_cwd": str(self.repo),
+            "account_heartbeat_at": "",
             "newer_evidence": {
                 "schema_version": "open_trader.prediction_cutover.evidence.v1",
                 "operation_id": "newer-operation",
@@ -707,12 +716,12 @@ class CutoverHarness:
                 "service_runtime": {"state": "unknown", "reader_generation": None, "contract_generation": None},
                 "account": {
                     "before": {
-                        "controller": {"pid": 4001, "cwd": str(self.repo), "git_sha": SHA},
-                        "api": {"pid": 4101, "cwd": str(self.repo), "git_sha": SHA, "listener": "127.0.0.1:8768", "health_status": "ok", "health_pid": 4101, "api_git_sha": SHA, "worker_git_sha": SHA, "release_match": True},
+                        "controller": {"pid": 4001, "cwd": str(self.repo), "argv": [], "git_sha": SHA, "heartbeat_at": ""},
+                        "api": {"pid": 4101, "cwd": str(self.repo), "argv": [], "git_sha": SHA, "listener": "127.0.0.1:8768", "health_status": "ok", "health_mode": "production", "health_pid": 4101, "api_git_sha": SHA, "worker_git_sha": SHA, "release_match": True},
                     },
                     "after": {
-                        "controller": {"pid": 4001, "cwd": str(self.repo), "git_sha": SHA},
-                        "api": {"pid": 4101, "cwd": str(self.repo), "git_sha": SHA, "listener": "127.0.0.1:8768", "health_status": "ok", "health_pid": 4101, "api_git_sha": SHA, "worker_git_sha": SHA, "release_match": True},
+                        "controller": {"pid": 4001, "cwd": str(self.repo), "argv": [], "git_sha": SHA, "heartbeat_at": ""},
+                        "api": {"pid": 4101, "cwd": str(self.repo), "argv": [], "git_sha": SHA, "listener": "127.0.0.1:8768", "health_status": "ok", "health_mode": "production", "health_pid": 4101, "api_git_sha": SHA, "worker_git_sha": SHA, "release_match": True},
                     },
                 },
                 "verification": {
@@ -760,6 +769,35 @@ class CutoverHarness:
                 "8768": {"pid": 4101}, "8769": None,
             },
         }), encoding="utf-8")
+        state = self.state
+        state["labels"]["com.open-trader.account-sync-controller"]["argv"] = [
+            str(self.bin / "python"), "-m", "open_trader", "account-sync-worker",
+            "--config", str(self.runtime / "config/daily_premarket.env"),
+            "--data-dir", str(self.runtime / "data"),
+            "--reports-dir", str(self.runtime / "reports"),
+            "--portfolio", str(self.runtime / "data/latest/portfolio.csv"),
+            "--tiger-config-dir", "/fake/tiger-config",
+        ]
+        state["labels"]["com.open-trader.account-api"]["argv"] = [
+            str(self.bin / "python"), "-m", "open_trader", "account-api",
+            "--data-dir", str(self.runtime / "data"),
+            "--mode", "production",
+            "--config", str(self.runtime / "config/daily_premarket.env"),
+        ]
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+        status_path = self.runtime / "data/account_sync/controller_status.json"
+        status_path.parent.mkdir(parents=True)
+        heartbeat = datetime.now().astimezone().isoformat()
+        status_path.write_text(json.dumps({
+            "schema_version": "open_trader.account_sync.controller.v1",
+            "pid": 4001,
+            "working_directory": str(self.repo),
+            "git_sha": SHA,
+            "heartbeat_at": heartbeat,
+        }), encoding="utf-8")
+        status = self.state
+        status["account_heartbeat_at"] = heartbeat
+        self.state_path.write_text(json.dumps(status), encoding="utf-8")
         fake = self.bin / "fake-command"
         fake.write_text(FAKE_COMMAND, encoding="utf-8")
         fake.chmod(0o755)
@@ -816,6 +854,21 @@ class CutoverHarness:
             state["labels"]["com.open-trader.account-api"]["cwd"] = "/unknown"
         elif fail_at == "account_api_missing_label":
             state["labels"]["com.open-trader.account-api"]["loaded"] = False
+        elif fail_at == "account_old_release":
+            old_sha = "b" * 40
+            state["account_controller_sha"] = old_sha
+            state["account_api_sha"] = old_sha
+            state["account_worker_sha"] = old_sha
+        elif fail_at == "account_stale_heartbeat":
+            state["account_heartbeat_at"] = "2020-01-01T00:00:00+00:00"
+        elif fail_at == "account_status_wrong_pid":
+            state["account_status_pid"] = 4999
+        elif fail_at == "account_status_wrong_cwd":
+            state["account_status_cwd"] = "/unknown"
+        elif fail_at == "account_controller_argv_wrong":
+            state["labels"]["com.open-trader.account-sync-controller"]["argv"][3] = "account-sync-controller"
+        elif fail_at == "account_api_mode_wrong":
+            state["account_api_mode"] = "shadow"
         elif fail_at in {"legacy_label_disappears", "legacy_label_inspection_error"}:
             pass
         elif fail_at == "public_unavailable":
@@ -835,6 +888,14 @@ class CutoverHarness:
         elif fail_at == "post_route_signal":
             state["post_route_ready"] = False
         self.state_path.write_text(json.dumps(state), encoding="utf-8")
+        status_path = self.runtime / "data/account_sync/controller_status.json"
+        status_path.write_text(json.dumps({
+            "schema_version": "open_trader.account_sync.controller.v1",
+            "pid": state.get("account_status_pid", 4001),
+            "working_directory": state.get("account_status_cwd", str(self.repo)),
+            "git_sha": state.get("account_controller_sha", SHA),
+            "heartbeat_at": state.get("account_heartbeat_at", ""),
+        }), encoding="utf-8")
 
     def environment(self) -> dict[str, str]:
         return {
@@ -948,6 +1009,20 @@ def test_account_evidence_proves_controller_and_api_are_preserved(
     assert account_before["api"]["health_pid"] == 4101
 
 
+def test_account_release_may_precede_prediction_release(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("account_old_release")
+
+    result = harness.run("service")
+
+    assert result.returncode == 0, result.stderr
+    account = harness.evidence["account"]["before"]
+    assert account["controller"]["git_sha"] == "b" * 40
+    assert account["api"]["git_sha"] == "b" * 40
+    assert account["api"]["worker_git_sha"] == "b" * 40
+
+
 def test_stopped_runtime_record_can_rollback_repeat_and_cutover(
     harness: CutoverHarness,
 ) -> None:
@@ -1009,6 +1084,46 @@ def test_public_preview_status_difference_fails_closed(
     assert result.returncode == 1
     assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "maintenance"
     assert harness.evidence["result"] == "failed"
+
+
+def test_failed_evidence_preserves_before_observations_when_after_is_unavailable(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("gateway_service")
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    evidence = harness.evidence
+    assert evidence["result"] == "failed"
+    assert evidence["before"]["gateway"]["pid"] == 1001
+    assert evidence["before"]["legacy"]["pid"] == 2001
+    assert evidence["account"]["before"]["controller"]["pid"] == 4001
+    assert evidence["account"]["before"]["api"]["pid"] == 4101
+    assert evidence["after"]["gateway"]["pid"] is None
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "account_stale_heartbeat",
+        "account_status_wrong_pid",
+        "account_status_wrong_cwd",
+        "account_controller_argv_wrong",
+        "account_api_mode_wrong",
+    ],
+)
+def test_preflight_rejects_unverifiable_account_process_identity(
+    harness: CutoverHarness, failure: str
+) -> None:
+    harness.configure(failure)
+    route_before = harness.route.read_bytes()
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert harness.route.read_bytes() == route_before
+    assert not any(call[:3] == ["python", "-", "route-write"] for call in harness.state["calls"])
 
 
 def test_service_absent_route_bootstraps_stack_inside_cutover(

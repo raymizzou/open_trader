@@ -5,6 +5,19 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-12
 
+- #45 round-5 fixes prove the existing Account release at process level: real
+  controller/API launchd argv, controller status PID/cwd/SHA/fresh heartbeat,
+  API production health and 8768 ownership, with exact before/after identity
+  preservation and no Account restart. Account may remain on an older SHA than
+  the accepted Prediction release. Failed evidence now preserves captured
+  before observations while representing unavailable after observations as
+  null. Focused round-5 checks pass: Account old-release (1), Account identity
+  preflight (10), partial failed evidence (1), happy/evidence (4), key
+  service/rollback selectors (13), and malformed/repeat (4). `bash -n` and
+  `git diff --check` pass; affected/full gates remain pending reviewer
+  recheck. Live cutover, deployment, restart, 8769 install, and `make
+  acceptance` have not run.
+
 - #45 round-4 reviewer fixes add the real split Account topology (sync
   controller plus API/8768 health), preserve `ready`/`failed`/`stopped`
   runtime-record semantics for rollback and repeat, require maintenance
