@@ -19,6 +19,7 @@ import time
 from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, urlparse
 
+from .daily_premarket import build_notifier, load_env_config
 from .prediction_read_model import (
     PREDICTION_HISTORY_KINDS,
     _prediction_safe_value,
@@ -565,6 +566,7 @@ def serve_prediction_service(
     port: int = 8769,
     mode: str = "shadow",
     release_manifest_path: Path | None = None,
+    notifier_config_path: Path | None = None,
 ) -> int:
     _require_loopback_host(host)
     if mode not in {"shadow", "production"}:
@@ -574,6 +576,13 @@ def serve_prediction_service(
         if release_manifest_path is None:
             raise ValueError("production release manifest is required")
         release = load_prediction_release_manifest(release_manifest_path)
+        notifier = (
+            None
+            if notifier_config_path is None
+            else build_notifier(load_env_config(notifier_config_path, dry_run=False))
+        )
+    else:
+        notifier = None
     metadata = _runtime_metadata()
     if release is not None:
         metadata.update(
@@ -588,6 +597,7 @@ def serve_prediction_service(
         prediction_config_path=Path(prediction_config_path),
         dashboard_url=f"http://{host}:{port}",
         mode=mode,
+        notifier=notifier,
         git_sha=str(metadata.get("git_sha", "")),
         reader_generation=None if release is None else release.reader_generation,
     )
@@ -639,6 +649,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8769)
     parser.add_argument("--release-manifest", type=Path)
+    parser.add_argument("--notifier-config", type=Path)
     args = parser.parse_args(argv)
     return serve_prediction_service(
         data_dir=args.data_dir,
@@ -647,4 +658,5 @@ def main(argv: list[str] | None = None) -> int:
         port=args.port,
         mode=args.mode,
         release_manifest_path=args.release_manifest,
+        notifier_config_path=args.notifier_config,
     )

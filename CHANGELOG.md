@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-13
 
+- Prediction Service production launchd now supplies the existing daily
+  notifier configuration to its runtime, matching Legacy notification
+  injection; shadow remains unconfigured/read-only. Focused service and
+  launchd rendering checks pass; no live command, deployment, or acceptance
+  run was performed.
+
 - #45 aligns Gateway public-state readiness proof with the production
   read-model contract (`readiness.ready == true`), rejecting invented
   status-only payloads. Focused readiness, happy cutover, and rollback checks
