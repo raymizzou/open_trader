@@ -230,6 +230,10 @@ if command == "lsof":
     if args.endswith("runtime.lock"):
         for pid in state["lock_holders"]:
             print(f"p{pid}")
+            if state["fail_at"] == "lsof_split_field_output" \
+                    and "-F" in sys.argv and "p" in sys.argv \
+                    and "-Fp" not in sys.argv:
+                print("f3")
         save()
         raise SystemExit(0 if state["lock_holders"] else 1)
     if "-d cwd" in args:
@@ -1540,6 +1544,16 @@ def test_service_to_legacy_rollback_uses_one_owner(harness: CutoverHarness) -> N
         call[0] == "lsof" and call[-1].endswith("runtime.lock")
         for call in harness.state["calls"]
     )
+
+
+def test_runtime_lock_probe_uses_joined_lsof_field_output(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("lsof_split_field_output")
+
+    result = harness.run("service")
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_failed_service_then_separate_rollback_recovers_maintenance(

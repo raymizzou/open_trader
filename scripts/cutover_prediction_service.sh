@@ -524,7 +524,7 @@ PY
 
 capture_owner_holders() {
   local status
-  if capture_bounded "$LSOF_BIN" -nP -F p -- \
+  if capture_bounded "$LSOF_BIN" -nP -Fp -- \
       "$RUNTIME_ROOT/data/prediction_arbitrage/runtime.lock"; then
     return 0
   else
@@ -1760,7 +1760,7 @@ prove_legacy_owner() {
     "gui/$UID/com.open-trader.legacy-dashboard")" || return 1
   expected_plist="$LAUNCH_AGENTS_DIR/com.open-trader.legacy-dashboard.plist"
   lock_path="$RUNTIME_ROOT/data/prediction_arbitrage/runtime.lock"
-  holders="$(run_bounded "$LSOF_BIN" -nP -F p -- "$lock_path")" || return 1
+  holders="$(run_bounded "$LSOF_BIN" -nP -Fp -- "$lock_path")" || return 1
   run_bounded "$PYTHON_BIN" - "$output" "$holders" "$expected_plist" \
     "$REPO_ROOT" <<'PY' || return 1
 import re, sys

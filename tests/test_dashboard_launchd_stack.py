@@ -40,6 +40,7 @@ def _run_installer(
     *,
     mode: str = "stack",
     prediction_owner: str | None = None,
+    wait_seconds: int = 1,
     **env_overrides: str,
 ) -> tuple[subprocess.CompletedProcess[str], list[str], Path]:
     agents = tmp_path / "LaunchAgents"
@@ -95,6 +96,8 @@ if [[ "$1" == "bootout" ]]; then
   if [[ "$label" != "${FAKE_STUCK_LABEL:-}" ]]; then
     rm -f "$FAKE_LAUNCHD_STATE_DIR/$label"
     rm -f "$FAKE_LISTENER_STATE_DIR/$(job_port "$label")"
+  elif [[ -n "${FAKE_DELAYED_STUCK_POLLS_FILE:-}" ]]; then
+    echo 0 > "$FAKE_DELAYED_STUCK_POLLS_FILE"
   fi
   exit 0
 fi
@@ -109,6 +112,14 @@ if [[ "$1" == "bootstrap" ]]; then
   exit 0
 fi
 if [[ "$1" == "print" ]]; then
+  if [[ "$label" == "${FAKE_STUCK_LABEL:-}" && -f "${FAKE_DELAYED_STUCK_POLLS_FILE:-}" ]]; then
+    polls="$(cat "$FAKE_DELAYED_STUCK_POLLS_FILE")"
+    polls=$((polls + 1))
+    echo "$polls" > "$FAKE_DELAYED_STUCK_POLLS_FILE"
+    if [[ "$polls" -gt "${FAKE_DELAYED_STUCK_POLLS:-0}" ]]; then
+      rm -f "$FAKE_LAUNCHD_STATE_DIR/$label"
+    fi
+  fi
   if [[ ! -f "$FAKE_LAUNCHD_STATE_DIR/$label" ]]; then
     echo "Could not find service" >&2
     exit 113
@@ -166,7 +177,7 @@ exit 0
         "--python",
         sys.executable,
         "--wait-seconds",
-        "1",
+        str(wait_seconds),
     ]
     single_dry_run = subprocess.run(
         [str(INSTALLER), "--mode", "single", "--dry-run", *common_args[1:]],
@@ -538,6 +549,26 @@ def test_stack_does_not_bootstrap_while_bootout_remains_loaded(
     assert (
         f"launchctl bootstrap {domain} {agents / f'{LEGACY_LABEL}.plist'}"
         not in calls
+    )
+
+
+def test_stack_waits_past_five_polls_for_delayed_legacy_shutdown(
+    tmp_path: Path,
+) -> None:
+    result, calls, agents = _run_installer(
+        tmp_path,
+        wait_seconds=8,
+        FAKE_STUCK_LABEL=LEGACY_LABEL,
+        FAKE_DELAYED_STUCK_POLLS="6",
+        FAKE_DELAYED_STUCK_POLLS_FILE=str(tmp_path / "delayed-polls"),
+    )
+    domain = f"gui/{os.getuid()}"
+
+    assert result.returncode == 0, result.stderr
+    assert int((tmp_path / "delayed-polls").read_text(encoding="utf-8")) >= 6
+    assert (
+        f"launchctl bootstrap {domain} {agents / f'{LEGACY_LABEL}.plist'}"
+        in calls
     )
 
 

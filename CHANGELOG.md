@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-13
 
+- #45 live-preflight follow-up uses joined `lsof -Fp` runtime-lock probes so
+  macOS file-descriptor records cannot invalidate owner evidence, and the
+  Dashboard stack installer now waits up to its configured bounded timeout for
+  delayed Legacy shutdown. Focused cutover/install checks pass; no live
+  command, deployment, or acceptance run was performed.
+
 - #45 round-7 focused closeouts require strict Account controller/API argv and
   health proof at capture time while validating persisted evidence against the
   canonical stored contract, so later plist edits cannot erase truthful before
