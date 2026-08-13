@@ -2702,6 +2702,68 @@ def test_full_linux_rejects_incomplete_partial_manifest_before_docker(tmp_path, 
         benchmark._run_full_linux(tmp_path)
 
 
+def _current_macos_partial(tmp_path, monkeypatch) -> tuple[dict[str, object], dict[str, dict[str, dict[str, object]]]]:
+    environments, artifacts = _full_environment_fixture()
+    environments["linux"]["available"] = False
+    manifest = benchmark._full_manifest(benchmark._load_full_cases(), environments, artifacts)
+    (tmp_path / "environment_manifest.json").write_text(json.dumps(manifest))
+    (tmp_path / "macos.jsonl").write_text("")
+    monkeypatch.setattr(
+        benchmark,
+        "_discover_quick_environment",
+        lambda root: (environments["macos"], {solver: artifacts[solver]["macos"] for solver in benchmark._SOLVERS}),
+    )
+    monkeypatch.setattr(benchmark, "_current_git_sha", lambda: "1" * 40)
+    monkeypatch.setattr(benchmark, "_full_sample_plan", lambda _: ())
+    monkeypatch.setattr(benchmark, "aggregate_benchmark_records", lambda records, current: {})
+    return manifest, artifacts
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("license_evidence_present", False),
+        ("source_evidence_present", False),
+        ("open_source", False),
+        ("commercial_key_required", True),
+    ),
+)
+def test_full_linux_rejects_stale_macos_license_evidence_before_docker(tmp_path, monkeypatch, field, value) -> None:
+    manifest, _ = _current_macos_partial(tmp_path, monkeypatch)
+    for solver in benchmark._SOLVERS:
+        manifest["solvers"][solver]["environments"]["macos"][field] = value
+    (tmp_path / "environment_manifest.json").write_text(json.dumps(manifest))
+    monkeypatch.setattr(benchmark, "_discover_linux_environment", lambda: pytest.fail("docker discovered"))
+
+    with pytest.raises(ValueError, match="identity"):
+        benchmark._run_full_linux(tmp_path)
+
+
+def test_full_linux_rejects_jointly_tampered_macos_solver_build_and_version_before_docker(tmp_path, monkeypatch) -> None:
+    manifest, _ = _current_macos_partial(tmp_path, monkeypatch)
+    for solver in benchmark._SOLVERS:
+        evidence = manifest["solvers"][solver]["environments"]["macos"]
+        evidence["build_id"] = f"tampered-{solver}-build"
+        evidence["solver_version"] = "tampered-version"
+    (tmp_path / "environment_manifest.json").write_text(json.dumps(manifest))
+    monkeypatch.setattr(benchmark, "_discover_linux_environment", lambda: pytest.fail("docker discovered"))
+
+    with pytest.raises(ValueError, match="identity"):
+        benchmark._run_full_linux(tmp_path)
+
+
+def test_full_linux_rejects_mac_hard_gate_result_before_docker(tmp_path, monkeypatch) -> None:
+    _current_macos_partial(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        benchmark,
+        "aggregate_benchmark_records",
+        lambda records, current: {"solvers": {solver: {"hard_gate_failures": ["CHECK_HARD_FAILURE"]} for solver in benchmark._SOLVERS}},
+    )
+
+    with pytest.raises(ValueError, match="macOS partial hard gates failed"):
+        benchmark._read_full_macos_partial(tmp_path)
+
+
 def test_full_linux_requires_a_complete_validated_macos_partial_before_docker(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(benchmark, "_discover_linux_environment", lambda: pytest.fail("docker discovered"))
 

@@ -3165,24 +3165,39 @@ def _read_full_macos_partial(output: Path) -> tuple[dict[str, object], list[dict
         raise ValueError("macOS partial is invalid") from error
     if manifest["environments"]["linux"]["available"]:
         raise ValueError("macOS partial must not already contain Linux evidence")
+    current = _discover_quick_environment(_BENCHMARK_ENVS)
+    if current is None:
+        raise ValueError("current macOS benchmark environment is unavailable")
+    macos_environment, macos_artifacts = current
     cases = _load_full_cases()
     expected = _full_manifest(
         cases,
-        manifest["environments"],
-        {solver: manifest["solvers"][solver]["environments"] for solver in _SOLVERS},
+        {"macos": macos_environment, "linux": manifest["environments"]["linux"]},
+        {
+            solver: {
+                "macos": macos_artifacts[solver],
+                "linux": manifest["solvers"][solver]["environments"]["linux"],
+            }
+            for solver in _SOLVERS
+        },
     )
     if raw_manifest != expected:
         raise ValueError("macOS partial identity does not match the current benchmark")
-    if manifest["environments"]["macos"]["git_sha"] != _current_git_sha():
-        raise ValueError("macOS partial Git identity is stale")
-    for solver in _SOLVERS:
-        evidence = manifest["solvers"][solver]["environments"]["macos"]
-        if not all(evidence[field] for field in ("install_succeeded", "run_succeeded", "reuse_succeeded")):
-            raise ValueError("macOS partial evidence is incomplete")
     try:
-        aggregate_benchmark_records(records, raw_manifest)
+        summary = aggregate_benchmark_records(records, raw_manifest)
     except ValueError as error:
         raise ValueError("macOS partial records are invalid") from error
+    unexpected_hard_gates = {
+        solver: [
+            failure
+            for failure in summary["solvers"][solver]["hard_gate_failures"]
+            if failure not in {"ENVIRONMENT_EVIDENCE_FAILED", "LICENSE_EVIDENCE_FAILED"}
+        ]
+        for solver in _SOLVERS
+    }
+    unexpected_hard_gates = {solver: failures for solver, failures in unexpected_hard_gates.items() if failures}
+    if unexpected_hard_gates:
+        raise ValueError(f"macOS partial hard gates failed: {unexpected_hard_gates}")
     expected_records = len(_full_sample_plan(cases)) * len(_SOLVERS)
     if len(records) != expected_records:
         raise ValueError("macOS partial does not contain the complete 4,755-record plan")
