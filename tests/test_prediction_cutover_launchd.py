@@ -230,10 +230,10 @@ if command == "lsof":
     if args.endswith("runtime.lock"):
         for pid in state["lock_holders"]:
             print(f"p{pid}")
-            if state["fail_at"] == "lsof_split_field_output" \
-                    and "-F" in sys.argv and "p" in sys.argv \
-                    and "-Fp" not in sys.argv:
+            if state["fail_at"] == "lsof_joined_field_output" and "-Fp" in sys.argv:
                 print("f3")
+            elif state["fail_at"] == "lsof_unknown_field_output" and "-Fp" in sys.argv:
+                print("x9")
         save()
         raise SystemExit(0 if state["lock_holders"] else 1)
     if "-d cwd" in args:
@@ -1165,7 +1165,7 @@ def test_legacy_inspection_failure_after_maintenance_writes_failed_evidence(
 
     assert result.returncode == 1
     assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "maintenance"
-    assert harness.evidence["result"] == "failed"
+    assert not (harness.runtime / "prediction-cutover-evidence.json").exists()
 
 
 def test_public_heartbeat_difference_is_allowed_by_contract_projection(
@@ -1546,14 +1546,28 @@ def test_service_to_legacy_rollback_uses_one_owner(harness: CutoverHarness) -> N
     )
 
 
-def test_runtime_lock_probe_uses_joined_lsof_field_output(
+def test_runtime_lock_probe_accepts_joined_lsof_file_field_output(
     harness: CutoverHarness,
 ) -> None:
-    harness.configure("lsof_split_field_output")
+    harness.configure("lsof_joined_field_output")
 
     result = harness.run("service")
 
     assert result.returncode == 0, result.stderr
+    assert harness.evidence["owner"]["before_lock_holders"] == [2001]
+    assert harness.evidence["owner"]["lock_holders"] == [3001]
+
+
+def test_runtime_lock_probe_rejects_unknown_lsof_field_output(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("lsof_unknown_field_output")
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "maintenance"
+    assert not (harness.runtime / "prediction-cutover-evidence.json").exists()
 
 
 def test_failed_service_then_separate_rollback_recovers_maintenance(

@@ -11,6 +11,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
   delayed Legacy shutdown. Focused cutover/install checks pass; no live
   command, deployment, or acceptance run was performed.
 
+- #45 runtime-lock evidence now accepts only the documented macOS `p<PID>` plus
+  `f<FD>` records from joined `lsof -Fp`, retaining fail-closed rejection of
+  unknown fields. Focused before/after evidence and maintenance-failure checks
+  pass; no live command, deployment, or acceptance run was performed.
+
 - #45 round-7 focused closeouts require strict Account controller/API argv and
   health proof at capture time while validating persisted evidence against the
   canonical stored contract, so later plist edits cannot erase truthful before

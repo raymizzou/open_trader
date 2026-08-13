@@ -1891,9 +1891,13 @@ def holders(raw):
     for line in raw.splitlines():
         if not line:
             continue
+        if re.fullmatch(r"f[0-9]+", line):
+            continue
         if not re.fullmatch(r"p[1-9][0-9]*", line):
             raise ValueError("invalid lock-holder observation")
         values.append(int(line[1:]))
+    if raw and not values:
+        raise ValueError("lock-holder PID observation is missing")
     return sorted(set(values))
 
 def account_snapshot(raw):
