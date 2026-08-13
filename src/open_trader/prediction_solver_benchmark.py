@@ -12,6 +12,8 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -2482,7 +2484,7 @@ def _solver_run_from_outcome(
     ), checked
 
 
-def _quick_record(
+def _benchmark_record(
     case: BenchmarkCase,
     solver: str,
     outcome: WorkerOutcome,
@@ -2494,8 +2496,18 @@ def _quick_record(
     wall_ns: int,
     start_count: int,
     rebuild_count: int,
+    *,
+    profile: str,
+    environment_name: str,
+    corpus_version: str,
+    sample_kind: str,
+    sample_index: int,
+    worker_count: int,
+    completed_requests: int,
+    container_id: str,
+    peak_process_group_rss_bytes: int,
+    peak_aggregate_rss_bytes: int,
 ) -> dict[str, object]:
-    peak = outcome.peak_rss_kib * 1024
     record = {
         "adapter_version": artifact["adapter_version"],
         "architecture": environment["architecture"],
@@ -2504,40 +2516,212 @@ def _quick_record(
         "check_failure_reason": None if checked.failure_reason is None else checked.failure_reason.value,
         "check_hard_failure": checked.hard_failure,
         "cleanup_proven": outcome.cleanup_proven,
-        "completed_requests": 1,
-        "container_id": "none",
+        "completed_requests": completed_requests,
+        "container_id": container_id,
         "corpus_manifest_sha256": manifest["corpus_manifest_sha256"],
-        "corpus_version": "canonical-48-v1+synthetic-v1",
+        "corpus_version": corpus_version,
         "cpu": environment["cpu"],
-        "environment": "macos",
+        "environment": environment_name,
         "git_sha": environment["git_sha"],
         "image_id": artifact["image_id"],
         "license_manifest_sha256": manifest["license_manifest_sha256"],
-        "memory_limit_bytes": QUICK_MEMORY_LIMIT_BYTES,
+        "memory_limit_bytes": manifest["memory_limit_bytes"],
         "os_version": environment["os_version"],
-        "peak_aggregate_rss_bytes": peak,
-        "peak_process_group_rss_bytes": peak,
+        "peak_aggregate_rss_bytes": peak_aggregate_rss_bytes,
+        "peak_process_group_rss_bytes": peak_process_group_rss_bytes,
         "problem_fingerprint": fingerprint(case.request.problem),
-        "profile": "quick",
+        "profile": profile,
         "protocol_version": BENCHMARK_PROTOCOL_V1,
         "python_version": artifact["python_version"],
         "request_fingerprint": case.request_fingerprint,
         "request_wall_ns": wall_ns,
-        "sample_index": 0,
-        "sample_kind": "warm",
+        "sample_index": sample_index,
+        "sample_kind": sample_kind,
         "schema_version": _RECORD_SCHEMA_V1,
         "semantic_fingerprint": "sha256:" + "0" * 64,
         "solver_name": solver,
         "solver_run": canonical_payload(run),
         "solver_version": artifact["solver_version"],
         "truth_method": case.truth_method,
-        "worker_count": 1,
+        "worker_count": worker_count,
         "worker_id": run.worker_id,
         "worker_rebuild_count": rebuild_count,
         "worker_start_count": start_count,
     }
     record["semantic_fingerprint"] = _semantic_fingerprint(record)
     return record
+
+
+@contextmanager
+def _full_harness(harness_factory, solver: str):
+    with harness_factory(solver) as harness:
+        yield harness
+
+
+def _run_full_environment(
+    cases: tuple[BenchmarkCase, ...],
+    manifest: Mapping[str, object],
+    environment_name: str,
+    harness_factory,
+) -> list[dict[str, object]]:
+    cases_by_id = {case.case_id: case for case in cases}
+    if len(cases_by_id) != len(cases):
+        raise ValueError("full benchmark cases must have unique IDs")
+    environment = manifest["environments"][environment_name]
+    limits = BenchmarkLimits(
+        manifest["soft_time_limit_ms"],
+        manifest["hard_time_limit_ms"],
+        manifest["memory_limit_bytes"],
+        manifest["max_constraint_generation_rounds"],
+    )
+    records: list[dict[str, object]] = []
+
+    for solver in _SOLVERS:
+        artifact = manifest["solvers"][solver]["environments"][environment_name]
+        container_id = "none" if environment_name == "macos" else artifact["image_id"]
+
+        def submit(harness, case: BenchmarkCase, sample_kind: str, sample_index: int, worker_count: int, slot: int, request_limits: BenchmarkLimits):
+            request_id = ":".join(
+                ("full", environment_name, solver, sample_kind, str(worker_count), str(sample_index), case.case_id, str(slot))
+            )
+            outcome = harness.submit(WorkerRequest(request_id, solver, case.request, request_limits))
+            run, checked = _solver_run_from_outcome(case, solver, outcome, environment, artifact)
+            if not outcome.cleanup_proven:
+                raise RuntimeError("CLEANUP_UNPROVEN")
+            if checked.hard_failure:
+                raise RuntimeError("CHECK_HARD_FAILURE")
+            return outcome, run, checked
+
+        def record(
+            case: BenchmarkCase,
+            outcome: WorkerOutcome,
+            run: SolverRun,
+            checked: DifferentialCheck,
+            sample_kind: str,
+            sample_index: int,
+            worker_count: int,
+            completed_requests: int,
+            wall_ns: int,
+            start_count: int,
+            rebuild_count: int,
+            process_group_rss_bytes: int,
+            aggregate_rss_bytes: int,
+        ) -> dict[str, object]:
+            return _benchmark_record(
+                case, solver, outcome, run, checked, manifest, environment, artifact,
+                wall_ns, start_count, rebuild_count,
+                profile="full",
+                environment_name=environment_name,
+                corpus_version="canonical-48-v1+synthetic-v1+approved-v1",
+                sample_kind=sample_kind,
+                sample_index=sample_index,
+                worker_count=worker_count,
+                completed_requests=completed_requests,
+                container_id=container_id,
+                peak_process_group_rss_bytes=process_group_rss_bytes,
+                peak_aggregate_rss_bytes=aggregate_rss_bytes,
+            )
+
+        with ExitStack() as stack:
+            warm_harness = stack.enter_context(_full_harness(harness_factory, solver))
+            throughput_harnesses = {}
+            for case_id, sample_kind, sample_index, worker_count in _full_sample_plan(cases):
+                case = cases_by_id[case_id]
+                if sample_kind in {"warmup", "warm"}:
+                    started_ns = time.perf_counter_ns()
+                    outcome, run, checked = submit(
+                        warm_harness, case, sample_kind, sample_index, worker_count, 0, limits
+                    )
+                    wall_ns = time.perf_counter_ns() - started_ns
+                    peak = outcome.peak_rss_kib * 1024
+                    records.append(
+                        record(
+                            case, outcome, run, checked, sample_kind, sample_index, worker_count, 1,
+                            wall_ns, warm_harness.start_count, warm_harness.rebuild_count, peak, peak,
+                        )
+                    )
+                elif sample_kind == "throughput":
+                    harnesses = []
+                    for slot in range(worker_count):
+                        harness = throughput_harnesses.get(slot)
+                        if harness is None:
+                            harness = stack.enter_context(_full_harness(harness_factory, solver))
+                            throughput_harnesses[slot] = harness
+                        harnesses.append(harness)
+                    started_ns = time.perf_counter_ns()
+                    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                        batch = list(
+                            executor.map(
+                                lambda slot: submit(
+                                    harnesses[slot], case, sample_kind, sample_index, worker_count, slot, limits
+                                ),
+                                range(worker_count),
+                            )
+                        )
+                    wall_ns = time.perf_counter_ns() - started_ns
+                    fingerprints = {
+                        _semantic_fingerprint(
+                            {
+                                "solver_run": canonical_payload(run),
+                                "check_hard_failure": checked.hard_failure,
+                                "check_failure_reason": None if checked.failure_reason is None else checked.failure_reason.value,
+                            }
+                        )
+                        for _, run, checked in batch
+                    }
+                    if len(fingerprints) != 1:
+                        raise RuntimeError("SEMANTIC_NONDETERMINISM")
+                    outcome, run, checked = batch[0]
+                    peaks = [item[0].peak_rss_kib * 1024 for item in batch]
+                    records.append(
+                        record(
+                            case, outcome, run, checked, sample_kind, sample_index, worker_count, worker_count,
+                            wall_ns, max(harness.start_count for harness in harnesses),
+                            max(harness.rebuild_count for harness in harnesses), max(peaks), sum(peaks),
+                        )
+                    )
+                elif sample_kind == "cold":
+                    with _full_harness(harness_factory, solver) as harness:
+                        started_ns = time.perf_counter_ns()
+                        outcome, run, checked = submit(
+                            harness, case, sample_kind, sample_index, worker_count, 0, limits
+                        )
+                        wall_ns = time.perf_counter_ns() - started_ns
+                    peak = outcome.peak_rss_kib * 1024
+                    records.append(
+                        record(
+                            case, outcome, run, checked, sample_kind, sample_index, worker_count, 1,
+                            wall_ns, harness.start_count, harness.rebuild_count, peak, peak,
+                        )
+                    )
+                elif sample_kind == "rebuild":
+                    with _full_harness(harness_factory, solver) as harness:
+                        submit(
+                            harness, case, "rebuild-prime", sample_index, worker_count, 0,
+                            BenchmarkLimits(
+                                limits.soft_time_limit_ms,
+                                limits.hard_time_limit_ms,
+                                (1 << 40) - 1,
+                                limits.max_constraint_generation_rounds,
+                            ),
+                        )
+                        started_ns = time.perf_counter_ns()
+                        outcome, run, checked = submit(
+                            harness, case, sample_kind, sample_index, worker_count, 0, limits
+                        )
+                        wall_ns = time.perf_counter_ns() - started_ns
+                    if harness.rebuild_count < 1:
+                        raise RuntimeError("WORKER_REBUILD_UNPROVEN")
+                    peak = outcome.peak_rss_kib * 1024
+                    records.append(
+                        record(
+                            case, outcome, run, checked, sample_kind, sample_index, worker_count, 1,
+                            wall_ns, harness.start_count, harness.rebuild_count, peak, peak,
+                        )
+                    )
+                else:
+                    raise ValueError(f"unsupported full sample kind: {sample_kind}")
+    return records
 
 
 def _quick_replay_identity(manifest: Mapping[str, object]) -> object:
@@ -2591,9 +2775,19 @@ def _run_quick_benchmark(output_root: Path = _QUICK_OUTPUT, env_root: Path = _BE
                 wall_ns = time.perf_counter_ns() - started_ns
                 run, checked = _solver_run_from_outcome(case, solver, outcome, environment, artifacts[solver])
                 records.append(
-                    _quick_record(
+                    _benchmark_record(
                         case, solver, outcome, run, checked, manifest, environment,
                         artifacts[solver], wall_ns, harness.start_count, harness.rebuild_count,
+                        profile="quick",
+                        environment_name="macos",
+                        corpus_version="canonical-48-v1+synthetic-v1",
+                        sample_kind="warm",
+                        sample_index=0,
+                        worker_count=1,
+                        completed_requests=1,
+                        container_id="none",
+                        peak_process_group_rss_bytes=outcome.peak_rss_kib * 1024,
+                        peak_aggregate_rss_bytes=outcome.peak_rss_kib * 1024,
                     )
                 )
                 if not outcome.cleanup_proven:

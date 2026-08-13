@@ -2288,6 +2288,142 @@ def test_solver_run_construction_attaches_checked_truth_and_maps_failures_honest
     assert failed_check.failure_reason is None
 
 
+def _fake_batch_peaks(worker_count: int) -> tuple[int, ...]:
+    return tuple((slot + 1) * 1024 for slot in range(worker_count))
+
+
+def _fake_harness_factory(*, cleanup_proven: bool = True, batch_semantics_differ: bool = False):
+    next_pid = 10_000
+    cases = benchmark._load_full_cases()
+
+    class Harness:
+        instances = []
+
+        def __init__(self, solver: str) -> None:
+            nonlocal next_pid
+            type(self).instances.append(self)
+            self.solver = solver
+            self.worker_pid = next_pid
+            next_pid += 1
+            self.start_count = 0
+            self.rebuild_count = 0
+            self._memory_limit_bytes: int | None = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def submit(self, request):
+            if self._memory_limit_bytes is None:
+                self.start_count += 1
+            elif self._memory_limit_bytes != request.limits.memory_limit_bytes:
+                self.start_count += 1
+                self.rebuild_count += 1
+            self._memory_limit_bytes = request.limits.memory_limit_bytes
+            slot = int(request.request_id.rsplit(":", 1)[1])
+            if not cleanup_proven:
+                return WorkerOutcome(
+                    request.request_id, "UNKNOWN", "CLEANUP_UNPROVEN", self.worker_pid,
+                    self.worker_pid, slot + 1, False, False,
+                )
+            case = next(case for case in cases if case.request == request.request)
+            assert case.expected_result is not None
+            evidence = _evidence_for_result(case.expected_result)
+            if batch_semantics_differ and ":throughput:" in request.request_id and slot == 1:
+                evidence = replace(evidence, master_rounds=2)
+            response = WorkerResponse(
+                BENCHMARK_PROTOCOL_V1,
+                self.solver,
+                request.request_id,
+                "OK",
+                canonical_payload(evidence),
+                {name: 0 for name in benchmark.WORKER_PHASE_NAMES},
+                (),
+            )
+            return WorkerOutcome(
+                request.request_id, "OK", "COMPLETED", self.worker_pid, self.worker_pid,
+                slot + 1, False, True, response,
+            )
+
+    return Harness
+
+
+def _run_tiny_full_plan(harness_factory) -> list[dict[str, object]]:
+    cases = benchmark._load_full_cases()
+    environments, artifacts = _full_environment_fixture()
+    manifest = benchmark._full_manifest(cases, environments, artifacts)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(benchmark, "_SOLVERS", ("highs",))
+        monkeypatch.setattr(
+            benchmark,
+            "_full_sample_plan",
+            lambda _: (
+                (cases[0].case_id, "warmup", 0, 1),
+                ("single_contract_complement", "throughput", 0, 2),
+            ),
+        )
+        return benchmark._run_full_environment(cases, manifest, "macos", harness_factory)
+
+
+def test_full_environment_runner_emits_the_exact_plan_and_record_counters(monkeypatch) -> None:
+    cases = benchmark._load_full_cases()
+    environments, artifacts = _full_environment_fixture()
+    manifest = benchmark._full_manifest(cases, environments, artifacts)
+    monkeypatch.setattr(benchmark, "_SOLVERS", ("highs",))
+    monkeypatch.setattr(
+        benchmark,
+        "_full_sample_plan",
+        lambda _: (
+            (cases[0].case_id, "warmup", 0, 1),
+            (cases[0].case_id, "warm", 0, 1),
+            ("single_contract_complement", "throughput", 0, 2),
+            ("single_contract_complement", "cold", 0, 1),
+            ("single_contract_complement", "rebuild", 0, 1),
+        ),
+    )
+
+    records = benchmark._run_full_environment(cases, manifest, "macos", _fake_harness_factory())
+
+    assert [(row["sample_kind"], row["worker_count"], row["completed_requests"]) for row in records] == [
+        ("warmup", 1, 1),
+        ("warm", 1, 1),
+        ("throughput", 2, 2),
+        ("cold", 1, 1),
+        ("rebuild", 1, 1),
+    ]
+    assert records[-1]["worker_rebuild_count"] >= 1
+    assert records[2]["peak_aggregate_rss_bytes"] == sum(_fake_batch_peaks(2))
+    assert all(row["profile"] == "full" for row in records)
+    assert all(benchmark._validated_benchmark_record(row, manifest) for row in records)
+
+
+def test_full_environment_runner_stops_on_unproven_cleanup_or_semantic_mismatch() -> None:
+    with pytest.raises(RuntimeError, match="CLEANUP_UNPROVEN"):
+        _run_tiny_full_plan(_fake_harness_factory(cleanup_proven=False))
+    with pytest.raises(RuntimeError, match="SEMANTIC_NONDETERMINISM"):
+        _run_tiny_full_plan(_fake_harness_factory(batch_semantics_differ=True))
+
+
+def test_full_environment_runner_reuses_each_throughput_worker_slot(monkeypatch) -> None:
+    cases = benchmark._load_full_cases()
+    environments, artifacts = _full_environment_fixture()
+    manifest = benchmark._full_manifest(cases, environments, artifacts)
+    factory = _fake_harness_factory()
+    monkeypatch.setattr(benchmark, "_SOLVERS", ("highs",))
+    monkeypatch.setattr(
+        benchmark,
+        "_full_sample_plan",
+        lambda _: tuple(("single_contract_complement", "throughput", index, 2) for index in range(30)),
+    )
+
+    records = benchmark._run_full_environment(cases, manifest, "macos", factory)
+
+    assert len(records) == 30
+    assert len(factory.instances) == 3
+
+
 def test_quick_runner_is_serial_and_replays_only_semantic_fields(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
