@@ -471,6 +471,7 @@ def _run_fake_validation(
 
     clock = [0.0]
     monkeypatch.setattr(validation, "_seed_shadow", lambda **_kwargs: {"sha256": "seed", "relation_state_rows": 1, "llm_cache_rows": 1})
+    monkeypatch.setattr(validation, "_label_loaded", lambda **_kwargs: False)
     monkeypatch.setattr(validation, "_install_shadow", lambda **_kwargs: {"pid": 101, "cwd": "repo", "git_sha": "sha"})
     restart = {"active": False, "comparisons": 0}
     def restart_shadow(**_kwargs: object) -> dict[str, object]:

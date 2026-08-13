@@ -11,6 +11,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
   removal is proven. Focused launchd checks pass; no live command, deployment,
   restart, or acceptance run was performed.
 
+- Prediction shadow-validation tests now isolate their launchd-label probe, so
+  a running local Prediction Service cannot change fake acceptance outcomes.
+  The full shadow-validation file and focused notifier launchd checks pass; no
+  production behavior, live service, deployment, or acceptance run changed.
+
 - Prediction dashboard state polling now skips an overlapping slow request and
   reuses the initial signal-history request, preventing one browser tab from
   multiplying service reads during a slow refresh. Focused dashboard checks
