@@ -70,6 +70,11 @@ def observe_route():
         state["states"].append(mode)
     return route
 
+def public_readiness():
+    if state["fail_at"] == "public_readiness_status_only":
+        return {"status": "ready"}
+    return {"ready": state.get("public_readiness_status", "ready") == "ready"}
+
 if command == "python":
     if len(sys.argv) > 2 and sys.argv[1] == "-c" \
             and "start_new_session=True" in sys.argv[2]:
@@ -467,9 +472,7 @@ if command == "curl":
         print(json.dumps({
             "status": "degraded" if state["fail_at"] == "public_semantic_mismatch" and ":8766" in url else public_status,
             "health": {"status": state.get("public_health_status", "healthy")},
-            "readiness": {
-                "status": state.get("public_readiness_status", "ready")
-            },
+            "readiness": public_readiness(),
             "stale": False,
             "events": [],
             "opportunities": [],
@@ -497,7 +500,7 @@ if command == "curl":
                 if state["fail_at"] == "public_heartbeat_variant" and ":8766" in url
                 else "same-heartbeat"
             )
-            payload = {"status": "degraded" if state["fail_at"] == "public_semantic_mismatch" and ":8766" in url else state.get("public_status", "healthy"), "health": {"status": state.get("public_health_status", "healthy")}, "readiness": {"status": state.get("public_readiness_status", "ready")}, "stale": False, "events": [], "opportunities": [], "csrf_token": "public-csrf" if state["fail_at"] == "public_csrf_variant" and ":8766" in url else "fake-csrf", "heartbeat": heartbeat, "heartbeat_at": heartbeat}
+            payload = {"status": "degraded" if state["fail_at"] == "public_semantic_mismatch" and ":8766" in url else state.get("public_status", "healthy"), "health": {"status": state.get("public_health_status", "healthy")}, "readiness": public_readiness(), "stale": False, "events": [], "opportunities": [], "csrf_token": "public-csrf" if state["fail_at"] == "public_csrf_variant" and ":8766" in url else "fake-csrf", "heartbeat": heartbeat, "heartbeat_at": heartbeat}
         else:
             payload = {}
         Path(output_path).write_text(json.dumps(payload), encoding="utf-8")
@@ -1495,6 +1498,18 @@ def test_public_csrf_difference_is_allowed_by_contract_projection(
 
     assert result.returncode == 0, result.stderr
     assert harness.evidence["verification"]["public_preview_no_submit"] is True
+
+
+def test_public_readiness_requires_canonical_ready_boolean(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("public_readiness_status_only")
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "maintenance"
+    assert harness.evidence["result"] == "failed"
 
 
 def test_public_semantic_difference_fails_closed_before_ready_evidence(

@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-13
 
+- #45 aligns Gateway public-state readiness proof with the production
+  read-model contract (`readiness.ready == true`), rejecting invented
+  status-only payloads. Focused readiness, happy cutover, and rollback checks
+  pass; no live command, deployment, or acceptance run was performed.
+
 - #45 marks post-cutover lock-holder evidence unavailable when its capture
   fails, instead of treating an empty holder list as verified availability.
   Focused malformed-after evidence check passes; no live command, deployment,

@@ -1477,7 +1477,8 @@ try:
         and isinstance(payload.get("health"), dict)
         and payload["health"].get("status") == "healthy"
         and isinstance(payload.get("readiness"), dict)
-        and payload["readiness"].get("status") == "ready"
+        and type(payload["readiness"].get("ready")) is bool
+        and payload["readiness"]["ready"] is True
         and payload.get("stale") is False
         and isinstance(payload.get("events"), list)
         and isinstance(payload.get("opportunities"), list)
