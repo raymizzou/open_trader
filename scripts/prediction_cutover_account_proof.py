@@ -310,6 +310,10 @@ def validate_canonical(
     api_plist: str,
     require_fresh: bool,
 ) -> bool:
+    # Persisted evidence is checked against the canonical argv contract only.
+    # The plist paths are intentionally not reread here: snapshot() already
+    # proved the loaded launchd argv and plist at capture time, while a later
+    # plist edit must not invalidate an otherwise truthful before snapshot.
     if not isinstance(value, dict) or set(value) != {"controller", "api"}:
         return False
     controller = value.get("controller")
@@ -331,14 +335,6 @@ def validate_canonical(
                 runtime=runtime,
                 tiger_config_dir=tiger_config_dir,
             )
-            or not _plist_matches(
-                controller_plist,
-                kind="controller",
-                repo=repo,
-                python=python,
-                runtime=runtime,
-                tiger_config_dir=tiger_config_dir,
-            )
             or not isinstance(controller["git_sha"], str)
             or re.fullmatch(r"[0-9a-fA-F]{40}", controller["git_sha"]) is None
             or heartbeat.tzinfo is None
@@ -353,14 +349,6 @@ def validate_canonical(
             or not _validate_argv(
                 "api",
                 api.get("argv"),
-                python=python,
-                runtime=runtime,
-                tiger_config_dir=tiger_config_dir,
-            )
-            or not _plist_matches(
-                api_plist,
-                kind="api",
-                repo=repo,
                 python=python,
                 runtime=runtime,
                 tiger_config_dir=tiger_config_dir,

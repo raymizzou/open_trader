@@ -1010,8 +1010,8 @@ def valid_evidence(payload, *, expected_target=None, expected_sha=None,
     owner = payload["owner"]
     account_before = payload["account"]["before"]
     account_after = payload["account"]["after"]
-    if not valid_account_snapshot(account_before, fresh=True) \
-            or not valid_account_snapshot(account_after, fresh=True):
+    if not valid_account_snapshot(account_before, fresh=False) \
+            or not valid_account_snapshot(account_after, fresh=False):
         return False
     account_api = account_after["api"]
     account_controller = account_after["controller"]

@@ -3,6 +3,17 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-13
+
+- #45 round-7 focused closeouts require strict Account controller/API argv and
+  health proof at capture time while validating persisted evidence against the
+  canonical stored contract, so later plist edits cannot erase truthful before
+  observations. Historical Account heartbeats remain valid for repeat checks;
+  current preflight/after captures stay fresh and unchanged. Focused repeat,
+  plist-drift, and strict Account checks pass; reviewer/affected-full gates and
+  live cutover remain pending. No deployment, restart, 8769 install, or `make
+  acceptance` ran.
+
 ## 2026-08-12
 
 - #45 round-5 fixes prove the existing Account release at process level: real
@@ -1078,11 +1089,3 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - Documented local dashboard deployment on port `8766` and added structured API
   checks for `SOXX` decision facts.
 - 2026-08-08: Trend statistics forced refreshes now retain an fsynced append-only audit trail with fail-closed history validation, preserving one-attempt evidence across retries.
-#45 round-6 focused fixes (2026-08-13): strict Account controller/API proof
-now requires loaded launchd argv == rendered plist == production expected argv,
-exact health/status/listener schema, and preserved observed release. Evidence
-captures components independently on failure, retaining before observations
-and nulling only unavailable after components; no all-empty fallback follows a
-captured before snapshot. Focused checks pass (13 strict Account/happy cases,
-2 partial evidence cases); final review/affected-full gates and live cutover
-remain pending.

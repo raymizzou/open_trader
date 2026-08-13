@@ -23,6 +23,7 @@ SHA = "a" * 40
 FAKE_COMMAND = r'''#!/usr/bin/env python3
 import json
 import os
+import plistlib
 import signal
 import subprocess
 import sys
@@ -394,6 +395,22 @@ if command == "curl":
             and state.get("account_health_calls", 0) >= 3
         ):
             health["pid"] = 4999
+        if (
+            state["fail_at"] == "account_plist_drift_after_capture"
+            and state.get("account_health_calls", 0) >= 3
+            and not state.get("account_plist_drift_seen")
+        ):
+            plist_path = (
+                Path(os.environ["FAKE_LAUNCH_AGENTS"])
+                / "com.open-trader.account-api.plist"
+            )
+            plist = plistlib.loads(plist_path.read_bytes())
+            plist["ProgramArguments"] = [
+                *plist["ProgramArguments"],
+                "--after-capture-drift",
+            ]
+            plist_path.write_bytes(plistlib.dumps(plist))
+            state["account_plist_drift_seen"] = True
         print(json.dumps(health))
     elif url.endswith("/healthz") and ":8767" in url:
         legacy = state["labels"]["com.open-trader.legacy-dashboard"]
@@ -933,6 +950,8 @@ class CutoverHarness:
                 "--unexpected",
             ]
             plist_path.write_bytes(plistlib.dumps(plist))
+        elif fail_at == "account_plist_drift_after_capture":
+            state["account_health_calls"] = 0
         elif fail_at in {"after_gateway_pid_mismatch", "after_account_mismatch"}:
             state["service_gateway_health_calls"] = 0
             state["account_health_calls"] = 0
@@ -1247,6 +1266,22 @@ def test_failed_evidence_keeps_other_after_components_when_account_after_is_inva
     assert evidence["account"]["after"] is None
     assert evidence["after"]["gateway"]["pid"] == 1001
     assert evidence["after"]["legacy"]["pid"] == 2002
+
+
+def test_failed_evidence_keeps_before_snapshot_when_account_plist_drifts_after_capture(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("account_plist_drift_after_capture")
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "maintenance"
+    evidence = harness.evidence
+    assert evidence["result"] == "failed"
+    assert evidence["account"]["before"]["controller"]["pid"] == 4001
+    assert evidence["account"]["before"]["api"]["pid"] == 4101
+    assert evidence["account"]["after"] is None
 
 
 def test_service_absent_route_bootstraps_stack_inside_cutover(
@@ -1580,6 +1615,23 @@ def test_repeating_completed_target_preserves_evidence(harness: CutoverHarness) 
         "uninstall_prediction_service_launchd.sh",
     } for call in later_calls)
     assert not any(call[:3] == ["python", "-", "route-write"] for call in later_calls)
+
+
+def test_repeating_completed_target_accepts_stale_historical_account_heartbeat(
+    harness: CutoverHarness,
+) -> None:
+    harness.run("service").check_returncode()
+    evidence_path = harness.runtime / "prediction-cutover-evidence.json"
+    payload = harness.evidence
+    stale = "2020-01-01T00:00:00+00:00"
+    payload["account"]["before"]["controller"]["heartbeat_at"] = stale
+    payload["account"]["after"]["controller"]["heartbeat_at"] = stale
+    evidence_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = harness.run("service")
+
+    assert result.returncode == 0, result.stderr
+    assert "prediction route already ready: service" in result.stdout
 
 
 @pytest.mark.parametrize("evidence_state", ["missing", "malformed", "boolean", "stale"])
