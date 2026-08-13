@@ -1417,6 +1417,20 @@ def test_hard_gate_allows_truthful_unknown_failure_but_rejects_unsafe_nonunknown
     assert "UNSAFE_FAILURE_MAPPING" in unsafe_summary["solvers"]["highs"]["hard_gate_failures"]
 
 
+def test_hard_gate_requires_a_completed_run_per_available_solver_environment() -> None:
+    records = _quick_records()
+    for record in records:
+        if record["solver_name"] == "highs":
+            _set_unknown_timeout(record)
+            record["solver_run"]["termination_reason"] = "CRASH"
+    _refresh_semantic_fingerprints(records)
+
+    summary = aggregate_benchmark_records(records, _benchmark_manifest(profile="quick"))
+
+    assert summary["solvers"]["highs"]["hard_gate_failures"] == ["NO_COMPLETED_RUN"]
+    assert summary["solvers"]["scip"]["hard_gate_failures"] == []
+
+
 def test_hard_gate_detects_semantic_nondeterminism_for_repeated_case() -> None:
     records = _full_records()
     records[5]["solver_run"]["evidence"]["worst_scenario"]["atoms"][0]["atom_id"] = "no"
@@ -1532,6 +1546,11 @@ def test_recommendation_ranks_phase_nonachievement_before_zero_timing(
     for record in records:
         if record["solver_name"] == "highs" and record["environment"] in unknown_environments:
             _set_unknown_timeout(record)
+    for environment in unknown_environments:
+        next(
+            record for record in records
+            if record["solver_name"] == "highs" and record["environment"] == environment
+        )["solver_run"]["termination_reason"] = "COMPLETED"
     _refresh_semantic_fingerprints(records)
 
     summary = aggregate_benchmark_records(records, _benchmark_manifest())
@@ -1556,6 +1575,12 @@ def test_recommendation_ignores_phase_timing_when_every_solver_is_unachieved() -
             [name, raw_phase_values[record["solver_name"]] if name in {"first_qualified", "optimal"} else value]
             for name, value in record["solver_run"]["phase_timings_ns"]
         ]
+    for solver in ("highs", "scip", "cp_sat"):
+        for environment in ("macos", "linux"):
+            next(
+                record for record in records
+                if record["solver_name"] == solver and record["environment"] == environment
+            )["solver_run"]["termination_reason"] = "COMPLETED"
     _refresh_semantic_fingerprints(records)
 
     summary = aggregate_benchmark_records(records, _benchmark_manifest())
@@ -1925,6 +1950,21 @@ def test_generate_report_is_order_independent_and_verify_detects_changed_or_extr
         verify_benchmark_report([left_jsonl, left_tail_jsonl], manifest_path, left_output)
 
 
+def test_verify_report_allows_the_task10_inputs_beside_root_level_artifacts(tmp_path: Path) -> None:
+    output = tmp_path / "issue49"
+    output.mkdir()
+    manifest = output / "environment_manifest.json"
+    macos = output / "macos.jsonl"
+    linux = output / "linux.jsonl"
+    manifest.write_text(json.dumps(_benchmark_manifest(profile="quick")))
+    macos.write_text("".join(json.dumps(record) + "\n" for record in _quick_records()))
+    linux.write_text("")
+
+    generate_benchmark_report([macos, linux], manifest, output)
+
+    verify_benchmark_report([macos, linux], manifest, output)
+
+
 @pytest.mark.parametrize("bad_line", ('{"schema_version":1,"schema_version":2}\n', '{"value":NaN}\n'))
 def test_generate_report_rejects_duplicate_json_keys_and_nonstandard_constants(tmp_path: Path, bad_line: str) -> None:
     manifest_path = tmp_path / "manifest.json"
@@ -1951,7 +1991,8 @@ def _test_quick_environment(tmp_path: Path) -> Path:
     for solver in ("highs", "scip", "cp_sat"):
         environment = env_root / solver
         (environment / "bin").mkdir(parents=True)
-        (environment / "bin" / "python").write_text("")
+        (environment / "bin" / "python").write_text("#!/bin/sh\n")
+        (environment / "bin" / "python").chmod(0o755)
         (environment / ".build-key").write_text("a" * 64 + "\n")
     return env_root
 
@@ -1969,6 +2010,119 @@ def test_quick_environment_gate_starts_no_worker_when_any_reusable_venv_is_missi
     result = benchmark._run_quick_benchmark(tmp_path / "quick", env_root)
 
     assert result == 2
+    assert capsys.readouterr().out.strip() == "BLOCKED_MISSING_ENVIRONMENT"
+
+
+def test_quick_environment_gate_blocks_a_non_utf8_build_key_before_workers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    env_root = _test_quick_environment(tmp_path)
+    (env_root / "scip" / ".build-key").write_bytes(b"\xff")
+    monkeypatch.setattr(benchmark, "_SOLVERS", ("scip",))
+    monkeypatch.setattr(benchmark, "_expected_build_key", lambda solver: "a" * 64)
+
+    assert benchmark._discover_quick_environment(env_root) is None
+
+
+@pytest.mark.parametrize("invalid_python", ("empty", "non-executable"))
+def test_quick_environment_gate_rejects_an_unusable_venv_python_before_workers(
+    invalid_python: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    env_root = _test_quick_environment(tmp_path)
+    python = env_root / "highs" / "bin" / "python"
+    if invalid_python == "empty":
+        python.write_bytes(b"")
+        python.chmod(0o755)
+    else:
+        python.chmod(0o644)
+    monkeypatch.setattr(benchmark, "_expected_build_key", lambda solver: "a" * 64)
+    monkeypatch.setattr(benchmark, "WorkerHarness", lambda *args, **kwargs: pytest.fail("worker started"))
+
+    result = benchmark._run_quick_benchmark(tmp_path / "quick", env_root)
+
+    assert result == 2
+    assert capsys.readouterr().out.strip() == "BLOCKED_MISSING_ENVIRONMENT"
+
+
+def test_quick_environment_discovery_runs_strict_serial_native_self_checks_with_sanitized_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    env_root = _test_quick_environment(tmp_path)
+    monkeypatch.setattr(benchmark, "_expected_build_key", lambda solver: "a" * 64)
+    monkeypatch.setattr(benchmark.platform, "processor", lambda: "fixture-cpu")
+    monkeypatch.setattr(benchmark.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(benchmark.platform, "platform", lambda: "fixture-macos")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-smoke")
+    calls: list[tuple[str, dict[str, str]]] = []
+    git_environments: list[dict[str, str]] = []
+    payloads = {
+        "highs": {"adapter": "HighsBackend", "solver": "highspy", "version": "1.15.1", "status": "OPTIMAL"},
+        "scip": {"adapter": "ScipBackend", "solver": "pyscipopt", "version": "10.0.2", "status": "OPTIMAL"},
+        "cp_sat": {"adapter": "CpSatBackend", "solver": "ortools", "version": "9.15.6755", "status": "OPTIMAL"},
+    }
+
+    def run(command, **kwargs):
+        if command[:3] == ["git", "rev-parse", "HEAD"]:
+            git_environments.append(kwargs["env"])
+            return subprocess.CompletedProcess(command, 0, "1" * 40 + "\n", "")
+        solver = command[-1]
+        calls.append((solver, kwargs["env"]))
+        return subprocess.CompletedProcess(command, 0, json.dumps(payloads[solver]) + "\n", "")
+
+    monkeypatch.setattr(benchmark.subprocess, "run", run)
+
+    discovered = benchmark._discover_quick_environment(env_root)
+
+    assert discovered is not None
+    assert [solver for solver, _ in calls] == ["highs", "scip", "cp_sat"]
+    assert all(
+        environment == {
+            "PATH": f"{env_root / solver / 'bin'}:/usr/bin:/bin:/usr/sbin:/sbin",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONPATH": str(ROOT / "src"),
+            "PYTHONSAFEPATH": "1",
+        }
+        for solver, environment in calls
+    )
+    assert len(git_environments) == 1
+    assert set(git_environments[0]) == {"PATH", "PYTHONNOUSERSITE", "PYTHONPATH", "PYTHONSAFEPATH"}
+    assert "OPENAI_API_KEY" not in git_environments[0]
+    assert all(discovered[1][solver]["run_succeeded"] is True for solver in payloads)
+
+
+@pytest.mark.parametrize("failure", ("timeout", "nonzero", "empty", "malformed", "mismatch"))
+def test_quick_environment_discovery_blocks_on_any_failed_native_self_check(
+    failure: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    env_root = _test_quick_environment(tmp_path)
+    monkeypatch.setattr(benchmark, "_expected_build_key", lambda solver: "a" * 64)
+
+    def run(command, **kwargs):
+        del kwargs
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(command, 5)
+        if failure == "empty":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if failure == "malformed":
+            return subprocess.CompletedProcess(command, 0, "not-json\n", "")
+        payload = {"adapter": "HighsBackend", "solver": "highspy", "version": "1.15.1", "status": "OPTIMAL"}
+        if failure == "mismatch":
+            payload["status"] = "FEASIBLE"
+        return subprocess.CompletedProcess(command, 1 if failure == "nonzero" else 0, json.dumps(payload) + "\n", "")
+
+    monkeypatch.setattr(benchmark.subprocess, "run", run)
+    monkeypatch.setattr(benchmark, "WorkerHarness", lambda *args, **kwargs: pytest.fail("worker started"))
+
+    assert benchmark._discover_quick_environment(env_root) is None
+    assert benchmark._run_quick_benchmark(tmp_path / "quick", env_root) == 2
     assert capsys.readouterr().out.strip() == "BLOCKED_MISSING_ENVIRONMENT"
 
 
@@ -2038,18 +2192,32 @@ def test_quick_runner_is_serial_and_replays_only_semantic_fields(
 ) -> None:
     cases = load_canonical_cases()[:2]
     env_root = _test_quick_environment(tmp_path)
-    monkeypatch.setattr(benchmark, "_expected_build_key", lambda solver: "a" * 64)
     monkeypatch.setattr(benchmark, "_load_quick_cases", lambda: cases)
-    monkeypatch.setattr(benchmark, "_current_git_sha", lambda root=ROOT: "1" * 40)
+    fixture_manifest = _benchmark_manifest(profile="quick")
+    monkeypatch.setattr(
+        benchmark,
+        "_discover_quick_environment",
+        lambda root: (
+            fixture_manifest["environments"]["macos"],
+            {
+                solver: fixture_manifest["solvers"][solver]["environments"]["macos"]
+                for solver in ("highs", "scip", "cp_sat")
+            },
+        ),
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-worker")
+    monkeypatch.setenv("HTTPS_PROXY", "http://credential-bearing-proxy.invalid")
     active = 0
     maximum_active = 0
     order: list[tuple[str, str, object]] = []
+    worker_environments: list[dict[str, str]] = []
 
     class Harness:
         def __init__(self, command, **kwargs):
             self.solver = command[-1]
             self.start_count = 1
             self.rebuild_count = 0
+            worker_environments.append(kwargs["env"])
 
         def __enter__(self):
             nonlocal active, maximum_active
@@ -2091,6 +2259,16 @@ def test_quick_runner_is_serial_and_replays_only_semantic_fields(
     ]
     assert maximum_active == 1
     assert order == expected_order * 2
+    assert worker_environments
+    assert all(
+        environment == {
+            "PATH": f"{env_root / solver / 'bin'}:/usr/bin:/bin:/usr/sbin:/sbin",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONPATH": str(ROOT / "src"),
+            "PYTHONSAFEPATH": "1",
+        }
+        for environment, solver in zip(worker_environments[:3], ("highs", "scip", "cp_sat"), strict=True)
+    )
     assert first != second
     assert "semantic replay PASS" in capsys.readouterr().out
     records = [json.loads(line) for line in second.splitlines()]
@@ -2155,6 +2333,34 @@ def test_benchmark_cli_dispatches_every_operator_command_fail_closed(
         ("import", str(tmp_path / "approved_component.json"), str(tmp_path / "approved.json")),
     ]
     assert capsys.readouterr().err.count("final Task 10 benchmark inputs are absent") == 2
+
+
+def test_task10_report_cli_uses_the_root_environment_manifest_and_jsonl_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = ROOT / "benchmarks/prediction_solver/results/issue49"
+    records = [output / "macos.jsonl", output / "linux.jsonl"]
+    manifest = output / "environment_manifest.json"
+    calls: list[tuple[str, object, object, object]] = []
+    monkeypatch.setattr(
+        benchmark,
+        "generate_benchmark_report",
+        lambda raw_records, raw_manifest, raw_output: calls.append(("report", raw_records, raw_manifest, raw_output)),
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "verify_benchmark_report",
+        lambda raw_records, raw_manifest, raw_output: calls.append(("verify", raw_records, raw_manifest, raw_output)),
+    )
+    monkeypatch.setattr(benchmark, "_require_final_inputs", benchmark._final_report_paths)
+
+    assert benchmark._final_report_paths() == (records, manifest, output)
+    assert benchmark.main(["report"]) == 0
+    assert benchmark.main(["verify-report"]) == 0
+    assert calls == [
+        ("report", records, manifest, output),
+        ("verify", records, manifest, output),
+    ]
 
 
 def test_make_targets_keep_environment_install_separate_from_quick_full_and_reports() -> None:

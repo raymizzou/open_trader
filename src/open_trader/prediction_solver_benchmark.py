@@ -308,14 +308,20 @@ def verify_benchmark_report(
     output_dir: str | os.PathLike[str],
 ) -> None:
     output = Path(output_dir)
-    expected_names = {"summary.json", "production_envelope.json", "report.md"}
+    artifact_names = {"summary.json", "production_envelope.json", "report.md"}
+    input_paths = jsonl_paths if isinstance(jsonl_paths, list | tuple) else ()
+    expected_names = artifact_names | {
+        path.name
+        for path in (Path(manifest_path), *(Path(item) for item in input_paths))
+        if path.parent == output
+    }
     actual_names = {path.name for path in output.iterdir()} if output.is_dir() else set()
     if actual_names != expected_names:
         raise ValueError(f"generated artifact names changed: missing={sorted(expected_names - actual_names)} extra={sorted(actual_names - expected_names)}")
     with tempfile.TemporaryDirectory() as directory:
         regenerated = Path(directory)
         generate_benchmark_report(jsonl_paths, manifest_path, regenerated)
-        for name in sorted(expected_names):
+        for name in sorted(artifact_names):
             if (output / name).read_bytes() != (regenerated / name).read_bytes():
                 raise ValueError(f"generated artifact changed: {name}")
 
@@ -607,6 +613,16 @@ def _hard_gate_failures(
     solver: str,
 ) -> list[str]:
     failures = set()
+    if any(
+        manifest["environments"][environment]["available"]
+        and not any(
+            record["environment"] == environment
+            and record["solver_run"]["termination_reason"] == TerminationReason.COMPLETED.value
+            for record in records
+        )
+        for environment in manifest["required_environments"]
+    ):
+        failures.add("NO_COMPLETED_RUN")
     if any(record["check_hard_failure"] for record in records):
         failures.add("CHECK_HARD_FAILURE")
     if any(not record["cleanup_proven"] for record in records):
@@ -1973,20 +1989,7 @@ def _utc_z(value: str, name: str) -> datetime:
 
 
 def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
-    data = (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-            temporary = Path(handle.name)
-        os.replace(temporary, path)
-        temporary = None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    _atomic_write_bytes(path, (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode())
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -2012,6 +2015,7 @@ def _current_git_sha(root: Path = _ROOT) -> str:
         capture_output=True,
         text=True,
         check=True,
+        env=_native_subprocess_env(Path(sys.executable)),
     )
     return _git_sha(completed.stdout.strip(), "git_sha")
 
@@ -2037,22 +2041,64 @@ def _venv_python_version(path: Path) -> str:
     return platform.python_version()
 
 
+def _native_subprocess_env(python: Path) -> dict[str, str]:
+    return {
+        "PATH": f"{python.parent}:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": str(_ROOT / "src"),
+        "PYTHONSAFEPATH": "1",
+    }
+
+
 def _discover_quick_environment(env_root: Path) -> tuple[dict[str, object], dict[str, dict[str, object]]] | None:
     artifacts: dict[str, dict[str, object]] = {}
+    self_check_identities = {
+        "highs": ("HighsBackend", "highspy"),
+        "scip": ("ScipBackend", "pyscipopt"),
+        "cp_sat": ("CpSatBackend", "ortools"),
+    }
     for solver in _SOLVERS:
         environment = env_root / solver
         key_path = environment / ".build-key"
         python = environment / "bin" / "python"
         try:
             key = key_path.read_text().strip()
-        except OSError:
+            executable = python.is_file() and python.stat().st_size > 0 and os.access(python, os.X_OK)
+        except (OSError, UnicodeError):
             return None
         if (
             key != _expected_build_key(solver)
             or len(key) != 64
             or any(character not in "0123456789abcdef" for character in key)
-            or not python.is_file()
+            or not executable
         ):
+            return None
+        try:
+            smoke = subprocess.run(
+                [str(python), "-m", "open_trader.prediction_solver_backends", "--self-check", solver],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+                env=_native_subprocess_env(python),
+            )
+            lines = smoke.stdout.splitlines() if isinstance(smoke.stdout, str) else ()
+            if smoke.returncode != 0 or len(lines) != 1:
+                return None
+            payload = _strict_object(
+                _strict_json(lines[0].encode(), f"{solver} self-check"),
+                f"{solver} self-check",
+                {"adapter", "solver", "version", "status"},
+            )
+            adapter, native_solver = self_check_identities[solver]
+            if payload != {
+                "adapter": adapter,
+                "solver": native_solver,
+                "version": _SOLVER_VERSIONS[solver],
+                "status": "OPTIMAL",
+            }:
+                return None
+        except (OSError, subprocess.TimeoutExpired, TypeError, ValueError):
             return None
         artifacts[solver] = {
             "adapter_version": WORKER_VERSION,
@@ -2388,12 +2434,11 @@ def _run_quick_benchmark(output_root: Path = _QUICK_OUTPUT, env_root: Path = _BE
     for solver in _SOLVERS:
         python = Path(env_root) / solver / "bin" / "python"
         command = [str(python), "-m", "open_trader.prediction_solver_worker", "--backend", solver]
-        worker_env = {**os.environ, "PYTHONSAFEPATH": "1", "PYTHONPATH": str(_ROOT / "src")}
         with WorkerHarness(
             command,
             request_timeout_ms=QUICK_HARD_TIME_LIMIT_MS,
             startup_timeout_ms=5_000,
-            env=worker_env,
+            env=_native_subprocess_env(python),
         ) as harness:
             for case in cases:
                 started_ns = time.perf_counter_ns()
@@ -2454,8 +2499,8 @@ def _run_full_benchmark(environment: str) -> int:
 def _final_report_paths() -> tuple[list[Path], Path, Path]:
     return (
         [_FINAL_RESULTS / "macos.jsonl", _FINAL_RESULTS / "linux.jsonl"],
-        _FINAL_RESULTS / "manifest.json",
-        _FINAL_RESULTS / "report",
+        _FINAL_RESULTS / "environment_manifest.json",
+        _FINAL_RESULTS,
     )
 
 
