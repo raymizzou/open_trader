@@ -792,6 +792,17 @@ class CutoverHarness:
                     "argv": [],
                     "plist": str(self.launch_agents / "com.open-trader.prediction-service.plist"),
                 },
+                "com.open-trader.prediction-arbitrage-health": {
+                    "loaded": False, "pid": 769, "cwd": str(self.repo), "sha": SHA,
+                    "argv": [
+                        str(self.bin / "python"), "-m", "open_trader",
+                        "prediction-arb", "health-check", "--url",
+                        "http://127.0.0.1:8766", "--data-dir", str(self.runtime / "data"),
+                        "--config", str(self.runtime / "config/daily_premarket.env"),
+                        "--repo", str(self.repo), "--interval", "7200",
+                    ],
+                    "plist": str(self.launch_agents / "com.open-trader.prediction-arbitrage-health.plist"),
+                },
                 "com.open-trader.account-sync-controller": {
                     "loaded": True, "pid": 4001, "cwd": str(self.repo), "sha": SHA,
                     "argv": [sys.executable, "-m", "open_trader", "account-sync-controller"],
@@ -897,6 +908,8 @@ class CutoverHarness:
             state["labels"]["com.open-trader.legacy-dashboard"]["cwd"] = "/unknown"
         elif fail_at == "unknown_relevant_label":
             state["extra_loaded_labels"] = ["com.open-trader.prediction-service-copy"]
+        elif fail_at == "prediction_health_label":
+            state["labels"]["com.open-trader.prediction-arbitrage-health"]["loaded"] = True
         elif fail_at == "duplicate_relevant_label":
             state["extra_loaded_labels"] = ["com.open-trader.legacy-dashboard"]
         elif fail_at == "account_wrong_cwd":
@@ -1926,6 +1939,16 @@ def test_signal_after_route_before_evidence_fails_closed(
     assert route["mode"] == "maintenance"
     assert harness.evidence["result"] == "failed"
     assert harness.evidence["failure_reason"] == "interrupted"
+
+
+def test_preflight_allows_exact_prediction_health_watcher(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("prediction_health_label")
+
+    result = harness.run("service")
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(

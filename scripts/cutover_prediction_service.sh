@@ -677,34 +677,72 @@ capture_after_snapshot() {
 }
 
 verify_relevant_label_set() {
-  local output expected_service_count
+  local output expected_service_count health_observation
   output="$(run_bounded "$LAUNCHCTL_BIN" print "gui/$UID")" || return 1
+  health_observation="$(inspect_label com.open-trader.prediction-arbitrage-health 0 json)" \
+    || return 1
   expected_service_count=0
   [[ "$INITIAL_MODE" == "service" ]] && expected_service_count=1
   [[ "${1:-}" == "rollback-maintenance" ]] && expected_service_count="rollback-maintenance"
-  run_bounded "$PYTHON_BIN" - "$output" "$expected_service_count" <<'PY'
-import re, sys
-labels = re.findall(
-    r'(?m)^\s*(?:[1-9][0-9]*|-)\s+(?:[0-9]+|-)\s+'
-    r'(com\.open-trader\.[^\s]+)\s*$', sys.argv[1]
-)
+  run_bounded "$PYTHON_BIN" - "$output" "$expected_service_count" \
+    "$health_observation" "$PYTHON_BIN" "$RUNTIME_ROOT" "$REPO_ROOT" \
+    "$LAUNCH_AGENTS_DIR" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+entries = [
+    (int(pid), label)
+    for pid, label in re.findall(
+        r'(?m)^\s*([1-9][0-9]*|-)\s+(?:[0-9]+|-)\s+'
+        r'(com\.open-trader\.[^\s]+)\s*$', sys.argv[1]
+    )
+    if pid != "-"
+]
 expected = {
     "com.open-trader.frontend-gateway": 1,
     "com.open-trader.legacy-dashboard": 1,
     "com.open-trader.prediction-service": 0 if sys.argv[2] == "rollback-maintenance" else int(sys.argv[2]),
 }
-relevant = [
-    label for label in labels
-    if any(term in label for term in ("prediction", "frontend-gateway", "legacy-dashboard"))
+allowed = set(expected) | {"com.open-trader.prediction-arbitrage-health"}
+relevant_entries = [
+    (pid, label) for pid, label in entries
+    if label in allowed or label.startswith("com.open-trader.prediction")
 ]
-valid = all(relevant.count(label) == count for label, count in expected.items())
+relevant = [label for _, label in relevant_entries]
+valid = all(label in allowed for label in relevant)
+valid = valid and all(relevant.count(label) == count for label, count in expected.items())
 if sys.argv[2] == "rollback-maintenance":
     valid = (
-        relevant.count("com.open-trader.frontend-gateway") == 1
+        valid
+        and relevant.count("com.open-trader.frontend-gateway") == 1
         and relevant.count("com.open-trader.legacy-dashboard") == 1
         and relevant.count("com.open-trader.prediction-service") in {0, 1}
     )
-valid = valid and all(label in expected for label in relevant)
+watchers = [pid for pid, label in relevant_entries if label == "com.open-trader.prediction-arbitrage-health"]
+if len(watchers) > 1:
+    valid = False
+elif watchers:
+    try:
+        observation = json.loads(sys.argv[3])
+        expected_argv = [
+            sys.argv[4], "-m", "open_trader", "prediction-arb", "health-check",
+            "--url", "http://127.0.0.1:8766",
+            "--data-dir", str(Path(sys.argv[5]) / "data"),
+            "--config", str(Path(sys.argv[5]) / "config" / "daily_premarket.env"),
+            "--repo", sys.argv[6], "--interval", "7200",
+        ]
+        valid = valid and (
+            isinstance(observation, dict)
+            and set(observation) == {"path", "cwd", "pid", "argv"}
+            and observation["path"] == str(Path(sys.argv[7]) / "com.open-trader.prediction-arbitrage-health.plist")
+            and observation["cwd"] == sys.argv[6]
+            and observation["pid"] == watchers[0]
+            and observation["argv"] == expected_argv
+        )
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        valid = False
 raise SystemExit(0 if valid else 1)
 PY
 }
