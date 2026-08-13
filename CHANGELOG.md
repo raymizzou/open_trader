@@ -5,6 +5,19 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-12
 
+- #45 round-4 reviewer fixes add the real split Account topology (sync
+  controller plus API/8768 health), preserve `ready`/`failed`/`stopped`
+  runtime-record semantics for rollback and repeat, require maintenance
+  failure evidence after post-maintenance Legacy inspection errors, and keep
+  only the documented heartbeat/time fields volatile in direct/public parity.
+  Focused checks on this worktree SHA pass: Account evidence (1), stopped
+  rollback/repeat/cutover (1), maintenance/heartbeat/preview contract (4),
+  Account preflight (5), evidence/repeat/secrets (7), and service/rollback
+  failure matrices (28). Shell syntax and diff checks pass. The historical
+  `a2adf509` affected/full results (671/5,884) remain historical; final gates
+  for this new SHA are pending reviewer recheck. Live cutover, deployment,
+  restart, 8769 install, and `make acceptance` have not run.
+
 - #45 round-3 review fixes continue the fail-closed integrated bootstrap and
   maintenance rollback with one evidence validator, observed pre-#45 runtime
   identity, Account preservation checks, direct/public no-submit parity, and

@@ -40,6 +40,22 @@ ACCOUNT_PID=""
 ACCOUNT_LISTENER_PID=""
 ACCOUNT_HEALTH_BEFORE=""
 ACCOUNT_HEALTH_AFTER=""
+ACCOUNT_CONTROLLER_PID=""
+ACCOUNT_API_PID=""
+ACCOUNT_CONTROLLER_SHA=""
+ACCOUNT_API_SHA=""
+BEFORE_ACCOUNT_CONTROLLER_PID=""
+BEFORE_ACCOUNT_API_PID=""
+BEFORE_ACCOUNT_CONTROLLER_SHA=""
+BEFORE_ACCOUNT_API_SHA=""
+BEFORE_ACCOUNT_API_LISTENER_PID=""
+BEFORE_ACCOUNT_API_HEALTH=""
+AFTER_ACCOUNT_CONTROLLER_PID=""
+AFTER_ACCOUNT_API_PID=""
+AFTER_ACCOUNT_CONTROLLER_SHA=""
+AFTER_ACCOUNT_API_SHA=""
+AFTER_ACCOUNT_API_LISTENER_PID=""
+AFTER_ACCOUNT_API_HEALTH=""
 DIRECT_STATE_VERIFIED=0
 DIRECT_HISTORY_VERIFIED=0
 DIRECT_PREVIEW_VERIFIED=0
@@ -203,7 +219,7 @@ if [[ -e "$RUNTIME_RECORD" ]]; then
 import json, sys
 from pathlib import Path
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-if not isinstance(payload, dict) or payload.get("state") not in {"ready", "failed"}:
+if not isinstance(payload, dict) or payload.get("state") not in {"ready", "failed", "stopped"}:
     raise ValueError("prediction runtime record is not an object")
 print(payload["state"])
 PY
@@ -311,23 +327,15 @@ listener_absent() {
 }
 
 inspect_account_identity() {
-  local output expected_plist
-  output="$(run_bounded "$LAUNCHCTL_BIN" print \
-    "gui/$UID/com.open-trader.account-sync-controller")" || return 1
-  expected_plist="$LAUNCH_AGENTS_DIR/com.open-trader.account-sync-controller.plist"
-  run_bounded "$PYTHON_BIN" - "$output" "$expected_plist" "$REPO_ROOT" "$EXPECTED_SHA" <<'PY'
-import re, sys
-text, expected_plist, expected_cwd, expected_sha = sys.argv[1:]
-path = re.search(r"(?m)^\s*path = (.+?)\s*$", text)
-cwd = re.search(r"(?m)^\s*working directory = (.+?)\s*$", text)
-pid = re.search(r"(?m)^\s*pid = ([1-9][0-9]*)\s*$", text)
-sha = re.search(r"(?m)^\s*(?:git_sha|git sha) = ([0-9a-fA-F]{40})\s*$", text)
-if not path or not cwd or not pid or not sha \
-        or path.group(1) != expected_plist or cwd.group(1) != expected_cwd \
-        or sha.group(1) != expected_sha:
-    raise SystemExit(1)
-print(pid.group(1))
-PY
+  inspect_label com.open-trader.account-sync-controller 1
+}
+
+inspect_account_api_identity() {
+  inspect_label com.open-trader.account-api 1
+}
+
+account_repo_sha() {
+  run_bounded "$GIT_BIN" -C "$REPO_ROOT" rev-parse HEAD
 }
 
 account_health_snapshot() {
@@ -345,11 +353,12 @@ try:
         isinstance(payload, dict)
         and payload.get("schema_version") == "open_trader.account_api.health.v1"
         and payload.get("module") == "account_api"
-        and payload.get("status") == "healthy"
+        and payload.get("status") == "ok"
         and type(payload.get("pid")) is int
         and payload["pid"] == int(sys.argv[2])
         and payload.get("api_git_sha") == sys.argv[3]
         and payload.get("worker_git_sha") == sys.argv[3]
+        and payload.get("release_match") is True
     )
 except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
     valid = False
@@ -358,14 +367,21 @@ PY
 }
 
 account_state_unchanged() {
-  local after_pid after_listener after_health
-  after_pid="$(inspect_account_identity)" || return 1
-  after_listener="$(listener_pid 8768)" || return 1
-  [[ "$after_pid" == "$ACCOUNT_PID" && "$after_listener" == "$ACCOUNT_LISTENER_PID" \
-    && "$after_listener" == "$after_pid" ]] || return 1
-  after_health="$(account_health_snapshot)" || return 1
-  validate_account_health "$after_health" "$after_pid" || return 1
-  account_health_unchanged "$ACCOUNT_HEALTH_BEFORE" "$after_health"
+  local controller_pid api_pid api_listener api_health controller_sha api_sha
+  controller_pid="$(inspect_account_identity)" || return 1
+  api_pid="$(inspect_account_api_identity)" || return 1
+  api_listener="$(listener_pid 8768)" || return 1
+  [[ "$controller_pid" == "$ACCOUNT_CONTROLLER_PID" \
+    && "$api_pid" == "$ACCOUNT_API_PID" \
+    && "$api_listener" == "$ACCOUNT_API_PID" ]] || return 1
+  controller_sha="$(account_repo_sha)" || return 1
+  [[ "$controller_sha" == "$ACCOUNT_CONTROLLER_SHA" ]] || return 1
+  api_health="$(account_health_snapshot)" || return 1
+  validate_account_health "$api_health" "$api_pid" || return 1
+  api_sha="$(run_bounded "$PYTHON_BIN" -c \
+    'import json,sys; print(json.loads(sys.argv[1])["api_git_sha"])' "$api_health")" || return 1
+  [[ "$api_sha" == "$ACCOUNT_API_SHA" ]] || return 1
+  account_health_unchanged "$ACCOUNT_HEALTH_BEFORE" "$api_health"
 }
 
 preflight_health() {
@@ -522,6 +538,27 @@ capture_before_snapshot() {
   BEFORE_ACCOUNT_PID="$ACCOUNT_PID"
   BEFORE_ACCOUNT_LISTENER_PID="$ACCOUNT_LISTENER_PID"
   BEFORE_ACCOUNT_HEALTH="$ACCOUNT_HEALTH_BEFORE"
+  BEFORE_ACCOUNT_CONTROLLER_PID="$ACCOUNT_CONTROLLER_PID"
+  BEFORE_ACCOUNT_API_PID="$ACCOUNT_API_PID"
+  BEFORE_ACCOUNT_CONTROLLER_SHA="$ACCOUNT_CONTROLLER_SHA"
+  BEFORE_ACCOUNT_API_SHA="$ACCOUNT_API_SHA"
+  BEFORE_ACCOUNT_API_LISTENER_PID="$ACCOUNT_LISTENER_PID"
+  BEFORE_ACCOUNT_API_HEALTH="$ACCOUNT_HEALTH_BEFORE"
+}
+
+capture_after_account_snapshot() {
+  AFTER_ACCOUNT_CONTROLLER_PID="$(inspect_account_identity)" || return 1
+  AFTER_ACCOUNT_API_PID="$(inspect_account_api_identity)" || return 1
+  AFTER_ACCOUNT_API_LISTENER_PID="$(listener_pid 8768)" || return 1
+  [[ "$AFTER_ACCOUNT_API_LISTENER_PID" == "$AFTER_ACCOUNT_API_PID" ]] || return 1
+  AFTER_ACCOUNT_CONTROLLER_SHA="$(account_repo_sha)" || return 1
+  [[ "$AFTER_ACCOUNT_CONTROLLER_SHA" == "$EXPECTED_SHA" ]] || return 1
+  AFTER_ACCOUNT_API_HEALTH="$(account_health_snapshot)" || return 1
+  validate_account_health "$AFTER_ACCOUNT_API_HEALTH" "$AFTER_ACCOUNT_API_PID" || return 1
+  AFTER_ACCOUNT_API_SHA="$(run_bounded "$PYTHON_BIN" -c \
+    'import json,sys; print(json.loads(sys.argv[1])["api_git_sha"])' \
+    "$AFTER_ACCOUNT_API_HEALTH")" || return 1
+  [[ "$AFTER_ACCOUNT_API_SHA" == "$EXPECTED_SHA" ]] || return 1
 }
 
 capture_after_snapshot() {
@@ -560,6 +597,7 @@ capture_after_snapshot() {
   fi
   capture_owner_holders || return 1
   AFTER_OWNER_HOLDERS="$CAPTURED_OUTPUT"
+  capture_after_account_snapshot || return 1
 }
 
 verify_relevant_label_set() {
@@ -617,16 +655,29 @@ LEGACY_LISTENER_PID="$(listener_pid 8767)" \
   || fail "Legacy Dashboard listener inspection failed"
 SERVICE_LISTENER_PID="$(listener_pid 8769)" \
   || fail "Prediction Service listener inspection failed"
-ACCOUNT_PID="$(inspect_account_identity)" \
-  || fail "Account launchd identity is not verified"
+ACCOUNT_CONTROLLER_PID="$(inspect_account_identity)" \
+  || fail "Account sync controller launchd identity is not verified"
+ACCOUNT_API_PID="$(inspect_account_api_identity)" \
+  || fail "Account API launchd identity is not verified"
 ACCOUNT_LISTENER_PID="$(listener_pid 8768)" \
-  || fail "Account listener inspection failed"
-[[ "$ACCOUNT_LISTENER_PID" == "$ACCOUNT_PID" ]] \
-  || fail "unknown listener on 8768"
+  || fail "Account API listener inspection failed"
+[[ "$ACCOUNT_LISTENER_PID" == "$ACCOUNT_API_PID" ]] \
+  || fail "unknown listener owner on 8768"
+ACCOUNT_CONTROLLER_SHA="$(account_repo_sha)" \
+  || fail "Account sync controller SHA is not observable"
+[[ "$ACCOUNT_CONTROLLER_SHA" == "$EXPECTED_SHA" ]] \
+  || fail "Account sync controller SHA is not selected checkout"
 ACCOUNT_HEALTH_BEFORE="$(account_health_snapshot)" \
-  || fail "Account health is not verified"
-validate_account_health "$ACCOUNT_HEALTH_BEFORE" "$ACCOUNT_PID" \
-  || fail "Account health identity is not verified"
+  || fail "Account API health is not verified"
+validate_account_health "$ACCOUNT_HEALTH_BEFORE" "$ACCOUNT_API_PID" \
+  || fail "Account API health identity is not verified"
+ACCOUNT_API_SHA="$(run_bounded "$PYTHON_BIN" -c \
+  'import json,sys; print(json.loads(sys.argv[1])["api_git_sha"])' \
+  "$ACCOUNT_HEALTH_BEFORE")" \
+  || fail "Account API SHA is not observable"
+[[ "$ACCOUNT_API_SHA" == "$EXPECTED_SHA" ]] \
+  || fail "Account API SHA is not selected checkout"
+ACCOUNT_PID="$ACCOUNT_API_PID"
 [[ "$GATEWAY_LISTENER_PID" == "$GATEWAY_PID" ]] \
   || fail "unknown listener on 8766"
 [[ "$LEGACY_LISTENER_PID" == "$LEGACY_PID" ]] \
@@ -753,12 +804,45 @@ def valid_evidence(payload, *, expected_target=None, expected_sha=None,
             and set(value) == {"gateway", "legacy", "service"}
             and all(valid_component(value[name]) for name in ("gateway", "legacy", "service"))
         )
+    def valid_account_component(value, api=False):
+        keys = (
+            {"pid", "cwd", "git_sha"}
+            if not api else
+            {"pid", "cwd", "git_sha", "listener", "health_status", "health_pid",
+             "api_git_sha", "worker_git_sha", "release_match"}
+        )
+        if not isinstance(value, dict) or set(value) != keys:
+            return False
+        if value["pid"] is not None and (type(value["pid"]) is not int or value["pid"] <= 0):
+            return False
+        if not isinstance(value["cwd"], str) or not isinstance(value["git_sha"], str):
+            return False
+        if not api:
+            return True
+        return (
+            value["listener"] is None or isinstance(value["listener"], str)
+        ) and (
+            value["health_pid"] is None
+            or (type(value["health_pid"]) is int and value["health_pid"] > 0)
+        ) and isinstance(value["health_status"], str) \
+        and isinstance(value["api_git_sha"], str) \
+        and isinstance(value["worker_git_sha"], str) \
+        and type(value["release_match"]) is bool
+
+    def valid_account_snapshot(value):
+        return (
+            isinstance(value, dict)
+            and set(value) == {"controller", "api"}
+            and valid_account_component(value["controller"])
+            and valid_account_component(value["api"], api=True)
+        )
     if not (
         isinstance(payload, dict)
         and set(payload) == {
             "schema_version", "operation_id", "target", "expected_sha", "result",
             "failure_reason", "downtime_started_at", "downtime_ended_at",
             "before", "after", "route", "owner", "service_runtime", "verification",
+            "account",
         }
         and payload.get("schema_version") == "open_trader.prediction_cutover.evidence.v1"
         and isinstance(payload.get("operation_id"), str) and bool(payload["operation_id"])
@@ -789,6 +873,11 @@ def valid_evidence(payload, *, expected_target=None, expected_sha=None,
         and isinstance(payload["service_runtime"]["state"], str)
         and (payload["service_runtime"]["reader_generation"] is None or (type(payload["service_runtime"]["reader_generation"]) is int and payload["service_runtime"]["reader_generation"] > 0))
         and (payload["service_runtime"]["contract_generation"] is None or (type(payload["service_runtime"]["contract_generation"]) is int and payload["service_runtime"]["contract_generation"] > 0))
+        and isinstance(payload.get("account"), dict)
+        and isinstance(payload["account"].get("before"), dict)
+        and isinstance(payload["account"].get("after"), dict)
+        and valid_account_snapshot(payload["account"]["before"])
+        and valid_account_snapshot(payload["account"]["after"])
         and isinstance(payload.get("verification"), dict)
         and set(payload["verification"]) == {
             "direct_backend", "direct_state", "direct_history", "direct_preview_no_submit",
@@ -844,9 +933,27 @@ def valid_evidence(payload, *, expected_target=None, expected_sha=None,
             return False
     else:
         if payload["after"]["service"]["pid"] is not None \
-                or payload["after"]["service"]["listener"] is not None:
+            or payload["after"]["service"]["listener"] is not None:
             return False
     owner = payload["owner"]
+    account_before = payload["account"]["before"]
+    account_after = payload["account"]["after"]
+    account_api = account_after["api"]
+    account_controller = account_after["controller"]
+    if account_before != account_after \
+            or account_controller["pid"] is None \
+            or account_controller["cwd"] != expected_cwd \
+            or account_controller["git_sha"] != expected_sha \
+            or account_api["pid"] is None \
+            or account_api["cwd"] != expected_cwd \
+            or account_api["git_sha"] != expected_sha \
+            or account_api["listener"] != "127.0.0.1:8768" \
+            or account_api["health_status"] != "ok" \
+            or account_api["health_pid"] != account_api["pid"] \
+            or account_api["api_git_sha"] != expected_sha \
+            or account_api["worker_git_sha"] != expected_sha \
+            or account_api["release_match"] is not True:
+        return False
     return owner["pid"] == selected["pid"] and owner["lock_holders"] == [selected["pid"]] \
         and owner["available"] is False
 
@@ -1315,7 +1422,7 @@ def normalize(value):
             for key, item in value.items()
             if key not in {
                 "csrf_token", "timestamp", "created_at", "updated_at", "sampled_at",
-                "process_id", "pid", "sampling",
+                "process_id", "pid", "sampling", "heartbeat", "heartbeat_at",
             }
         }
     if isinstance(value, list):
@@ -1546,7 +1653,7 @@ write_evidence() {
   local result="$1" reason="$2" ended_at="$3" details
   if ! details="$(evidence_details)"; then
     [[ "$result" == "ready" ]] && return 1
-    details='{"before":{"gateway":{"pid":null,"cwd":"","git_sha":"","listener":null},"legacy":{"pid":null,"cwd":"","git_sha":"","listener":null},"service":{"pid":null,"cwd":"","git_sha":"","listener":null}},"after":{"gateway":{"pid":null,"cwd":"","git_sha":"","listener":null},"legacy":{"pid":null,"cwd":"","git_sha":"","listener":null},"service":{"pid":null,"cwd":"","git_sha":"","listener":null}},"route":{"before_mode":"unknown","after_mode":"maintenance","inflight_before":null,"inflight_after":null},"owner":{"pid":null,"lock_holders":[],"before_lock_holders":[],"available":false},"service_runtime":{"state":"unknown","reader_generation":null,"contract_generation":null},"verification":{"direct_backend":"failed","direct_state":false,"direct_history":false,"direct_preview_no_submit":false,"public_state":false,"public_history":false,"public_preview_no_submit":false}}'
+    details='{"before":{"gateway":{"pid":null,"cwd":"","git_sha":"","listener":null},"legacy":{"pid":null,"cwd":"","git_sha":"","listener":null},"service":{"pid":null,"cwd":"","git_sha":"","listener":null}},"after":{"gateway":{"pid":null,"cwd":"","git_sha":"","listener":null},"legacy":{"pid":null,"cwd":"","git_sha":"","listener":null},"service":{"pid":null,"cwd":"","git_sha":"","listener":null}},"route":{"before_mode":"unknown","after_mode":"maintenance","inflight_before":null,"inflight_after":null},"owner":{"pid":null,"lock_holders":[],"before_lock_holders":[],"available":false},"service_runtime":{"state":"unknown","reader_generation":null,"contract_generation":null},"account":{"before":{"controller":{"pid":null,"cwd":"","git_sha":""},"api":{"pid":null,"cwd":"","git_sha":"","listener":null,"health_status":"","health_pid":null,"api_git_sha":"","worker_git_sha":"","release_match":false}},"after":{"controller":{"pid":null,"cwd":"","git_sha":""},"api":{"pid":null,"cwd":"","git_sha":"","listener":null,"health_status":"","health_pid":null,"api_git_sha":"","worker_git_sha":"","release_match":false}}},"verification":{"direct_backend":"failed","direct_state":false,"direct_history":false,"direct_preview_no_submit":false,"public_state":false,"public_history":false,"public_preview_no_submit":false}}'
   fi
   state_transition evidence-write "$EVIDENCE_PATH" "$ROUTE_PATH" \
     "$INITIAL_EVIDENCE_OPERATION_ID" "$OPERATION_ID" "$TARGET" "$EXPECTED_SHA" \
@@ -1566,6 +1673,12 @@ evidence_details() {
     "$BEFORE_GATEWAY_LISTENER_PID" "$BEFORE_LEGACY_LISTENER_PID" "$BEFORE_SERVICE_LISTENER_PID" \
     "$GATEWAY_LISTENER_PID" "$LEGACY_LISTENER_PID" "$SERVICE_LISTENER_PID" \
     "$REPO_ROOT" "$BEFORE_ROUTE_MODE" "$mode" "$BEFORE_OWNER_HOLDERS" "$AFTER_OWNER_HOLDERS" "$RUNTIME_RECORD" \
+    "$BEFORE_ACCOUNT_CONTROLLER_PID" "$BEFORE_ACCOUNT_API_PID" \
+    "$BEFORE_ACCOUNT_CONTROLLER_SHA" "$BEFORE_ACCOUNT_API_SHA" \
+    "$BEFORE_ACCOUNT_API_LISTENER_PID" "$BEFORE_ACCOUNT_API_HEALTH" \
+    "$AFTER_ACCOUNT_CONTROLLER_PID" "$AFTER_ACCOUNT_API_PID" \
+    "$AFTER_ACCOUNT_CONTROLLER_SHA" "$AFTER_ACCOUNT_API_SHA" \
+    "$AFTER_ACCOUNT_API_LISTENER_PID" "$AFTER_ACCOUNT_API_HEALTH" \
     "$DIRECT_STATE_VERIFIED" "$DIRECT_HISTORY_VERIFIED" "$DIRECT_PREVIEW_VERIFIED" \
     "$PUBLIC_STATE_VERIFIED" "$PUBLIC_HISTORY_VERIFIED" "$PUBLIC_PREVIEW_VERIFIED" <<'PY'
 import json, re, sys
@@ -1579,6 +1692,12 @@ from pathlib import Path
     before_gateway_listener_raw, before_legacy_listener_raw, before_service_listener_raw,
     gateway_listener_raw, legacy_listener_raw, service_listener_raw,
     repo, before_mode, after_mode, before_holders_raw, after_holders_raw, runtime_raw,
+    before_account_controller_pid_raw, before_account_api_pid_raw,
+    before_account_controller_sha, before_account_api_sha,
+    before_account_api_listener_raw, before_account_api_health_raw,
+    after_account_controller_pid_raw, after_account_api_pid_raw,
+    after_account_controller_sha, after_account_api_sha,
+    after_account_api_listener_raw, after_account_api_health_raw,
     direct_state, direct_history, direct_preview,
     public_state, public_history, public_preview,
 ) = sys.argv[1:]
@@ -1626,6 +1745,34 @@ def holders(raw):
         values.append(int(line[1:]))
     return sorted(set(values))
 
+def account_snapshot(controller_pid_raw, api_pid_raw, controller_sha,
+                     api_sha, api_listener_raw, api_health_raw):
+    controller_pid = pid(controller_pid_raw)
+    api_pid = pid(api_pid_raw)
+    listener_pid = pid(api_listener_raw)
+    try:
+        health = json.loads(api_health_raw) if api_health_raw else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        health = {}
+    return {
+        "controller": {
+            "pid": controller_pid,
+            "cwd": repo if controller_pid is not None else "",
+            "git_sha": controller_sha if controller_pid is not None else "",
+        },
+        "api": {
+            "pid": api_pid,
+            "cwd": repo if api_pid is not None else "",
+            "git_sha": api_sha if api_pid is not None else "",
+            "listener": "127.0.0.1:8768" if listener_pid is not None else None,
+            "health_status": health.get("status", "") if isinstance(health, dict) else "",
+            "health_pid": health.get("pid") if isinstance(health, dict) and type(health.get("pid")) is int else None,
+            "api_git_sha": health.get("api_git_sha", "") if isinstance(health, dict) else "",
+            "worker_git_sha": health.get("worker_git_sha", "") if isinstance(health, dict) else "",
+            "release_match": health.get("release_match") is True if isinstance(health, dict) else False,
+        },
+    }
+
 before_gateway = health(before_gateway_raw)
 after_gateway = health(after_gateway_raw)
 if after_gateway is None:
@@ -1639,6 +1786,18 @@ after = {
     "gateway": component(after_gateway_raw, gateway_pid_raw, gateway_listener_raw, 8766),
     "legacy": component(after_legacy_raw, legacy_pid_raw, legacy_listener_raw, 8767),
     "service": component(after_service_raw, service_pid_raw, service_listener_raw, 8769),
+}
+account = {
+    "before": account_snapshot(
+        before_account_controller_pid_raw, before_account_api_pid_raw,
+        before_account_controller_sha, before_account_api_sha,
+        before_account_api_listener_raw, before_account_api_health_raw,
+    ),
+    "after": account_snapshot(
+        after_account_controller_pid_raw, after_account_api_pid_raw,
+        after_account_controller_sha, after_account_api_sha,
+        after_account_api_listener_raw, after_account_api_health_raw,
+    ),
 }
 runtime_path = Path(runtime_raw)
 runtime = json.loads(runtime_path.read_text(encoding="utf-8")) if runtime_path.is_file() else {}
@@ -1672,6 +1831,7 @@ payload = {
         "reader_generation": generation(ready.get("reader_generation")),
         "contract_generation": generation(ready.get("contract_generation")),
     },
+    "account": account,
     "verification": {
         "direct_backend": "verified" if all(value == "1" for value in (direct_state, direct_history, direct_preview)) else "failed",
         "direct_state": direct_state == "1",
@@ -1751,7 +1911,7 @@ try:
         and isinstance(after, dict)
         and before.get("module") == "account_api"
         and after.get("module") == "account_api"
-        and before.get("status") == after.get("status") == "healthy"
+        and before.get("status") == after.get("status") == "ok"
         and before.get("pid") == after.get("pid")
         and before.get("api_git_sha") == after.get("api_git_sha")
         and before.get("worker_git_sha") == after.get("worker_git_sha")
@@ -1798,7 +1958,7 @@ if [[ "$TARGET" == "service" ]]; then
     listener_absent 8766 || fail "gateway_listener_absence_unproven"
     state_transition route-bootstrap "$ROUTE_PATH" "$OPERATION_ID" "$STATE_LOCK_PATH" \
       || fail "failed to seed maintenance route"
-    route_owned_maintenance || fail "bootstrap route ownership is not verified"
+    route_owned_maintenance || fail_in_maintenance bootstrap_route_ownership_unverified
     INITIAL_MODE="maintenance"
     INITIAL_OPERATION_ID="$OPERATION_ID"
     INITIAL_ROUTE="$(read_route)" || fail_in_maintenance bootstrap_route_read_failed
@@ -1832,9 +1992,14 @@ if [[ "$TARGET" == "service" ]]; then
     listener_absent 8769 || fail_in_maintenance unexpected_prediction_listener
     INITIAL_EVIDENCE_OPERATION_ID="__absent__"
   fi
-  OLD_LEGACY_PID="$(label_pid com.open-trader.legacy-dashboard)" \
-    || fail "failed to inspect Legacy Dashboard PID"
-  [[ -n "$OLD_LEGACY_PID" ]] || fail "Legacy Dashboard PID is invalid"
+  if [[ -n "$DOWNTIME_STARTED_AT" ]]; then
+    OLD_LEGACY_PID="$(label_pid com.open-trader.legacy-dashboard)" \
+      || fail_in_maintenance legacy_pid_inspection_failed
+  else
+    OLD_LEGACY_PID="$(label_pid com.open-trader.legacy-dashboard)" \
+      || fail "failed to inspect Legacy Dashboard PID"
+  fi
+  [[ -n "$OLD_LEGACY_PID" ]] || fail_in_maintenance legacy_pid_invalid
   [[ -n "$DOWNTIME_STARTED_AT" ]] || DOWNTIME_STARTED_AT="$(now)" \
     || fail_in_maintenance timestamp_failed
   write_route maintenance "$OPERATION_ID" "$INITIAL_OPERATION_ID" \
@@ -1898,7 +2063,7 @@ if [[ -n "$SERVICE_PID" || -n "$SERVICE_LISTENER_PID" ]]; then
     || fail_in_maintenance service_uninstall_failed
   SERVICE_RUNTIME_PRESENT=0
 elif [[ "$SERVICE_RUNTIME_PRESENT" -eq 1 ]]; then
-  [[ "$SERVICE_RUNTIME_STATE" == "failed" ]] \
+  [[ "$SERVICE_RUNTIME_STATE" == "failed" || "$SERVICE_RUNTIME_STATE" == "stopped" ]] \
     || fail_in_maintenance service_absence_unproven
   run_bounded "$UNINSTALL_SERVICE" --mode production --runtime-root "$RUNTIME_ROOT" \
     --python "$PYTHON_BIN" --launch-agents-dir "$LAUNCH_AGENTS_DIR" \

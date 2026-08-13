@@ -185,6 +185,18 @@ if command == "launchctl":
     label = sys.argv[-1].rsplit("/", 1)[-1]
     item = state["labels"].get(label)
     if sys.argv[1] == "print" and item and item["loaded"]:
+        if (
+            label == "com.open-trader.legacy-dashboard"
+            and state["legacy_prediction_owner"] == "disabled"
+            and state["fail_at"] in {"legacy_label_disappears", "legacy_label_inspection_error"}
+        ):
+            if state["fail_at"] == "legacy_label_inspection_error":
+                print("legacy launchctl diagnostic", file=sys.stderr)
+                save()
+                raise SystemExit(2)
+            print("Could not find service", file=sys.stderr)
+            save()
+            raise SystemExit(113)
         print(f"\tpath = {item['plist']}")
         print("\targuments = {")
         for argument in item["argv"]:
@@ -192,7 +204,6 @@ if command == "launchctl":
         print("\t}")
         print(f"\tworking directory = {item['cwd']}")
         print(f"\tpid = {item['pid']}")
-        print(f"\tgit_sha = {item.get('sha', os.environ['FAKE_SHA'])}")
         save()
         raise SystemExit(0)
     print("Could not find service", file=sys.stderr)
@@ -349,13 +360,15 @@ if command == "curl":
             health["git_sha"] = "wrong"
         print(json.dumps(health))
     elif url.endswith("/healthz") and ":8768" in url:
+        api = state["labels"]["com.open-trader.account-api"]
         print(json.dumps({
             "schema_version": "open_trader.account_api.health.v1",
             "module": "account_api",
-            "status": "healthy",
-            "pid": state["labels"].get("com.open-trader.account-sync-controller", {}).get("pid", 4001),
+            "status": "ok",
+            "pid": api["pid"],
             "api_git_sha": os.environ["FAKE_SHA"],
             "worker_git_sha": os.environ["FAKE_SHA"],
+            "release_match": True,
         }))
     elif url.endswith("/healthz") and ":8767" in url:
         legacy = state["labels"]["com.open-trader.legacy-dashboard"]
@@ -378,13 +391,23 @@ if command == "curl":
         kind = parse_qs(urlsplit(url).query).get("kind", [""])[0]
         print(json.dumps({"kind": kind, "items": [], "total": 0, "limit": 100, "offset": 0, "has_more": False}))
     elif url.endswith("/api/prediction-arbitrage/preview"):
-        print(json.dumps({"state": "rejected", "reason": "opportunity_unavailable"}))
+        preview_state = (
+            "unavailable"
+            if state["fail_at"] == "public_preview_semantic_mismatch" and ":8766" in url
+            else "rejected"
+        )
+        print(json.dumps({"state": preview_state, "reason": "opportunity_unavailable"}))
     else:
         if state["fail_at"] == "public_contract":
             print("[]")
             save()
             raise SystemExit(0)
         public_status = state.get("public_status", "healthy")
+        heartbeat = (
+            "public-heartbeat"
+            if state["fail_at"] == "public_heartbeat_variant" and ":8766" in url
+            else "same-heartbeat"
+        )
         print(json.dumps({
             "status": "degraded" if state["fail_at"] == "public_semantic_mismatch" and ":8766" in url else public_status,
             "health": {"status": state.get("public_health_status", "healthy")},
@@ -395,6 +418,8 @@ if command == "curl":
             "events": [],
             "opportunities": [],
             "csrf_token": "public-csrf" if state["fail_at"] == "public_csrf_variant" and ":8766" in url else "fake-csrf",
+            "heartbeat": heartbeat,
+            "heartbeat_at": heartbeat,
         }))
     body = sys.stdout.getvalue() if hasattr(sys.stdout, "getvalue") else None
     if output_path:
@@ -404,9 +429,19 @@ if command == "curl":
             kind = parse_qs(urlsplit(url).query).get("kind", [""])[0]
             payload = {"kind": kind, "items": [], "total": 0, "limit": 100, "offset": 0, "has_more": False}
         elif url.endswith("/api/prediction-arbitrage/preview"):
-            payload = {"state": "rejected", "reason": "opportunity_unavailable"}
+            payload = {
+                "state": "unavailable"
+                if state["fail_at"] == "public_preview_semantic_mismatch" and ":8766" in url
+                else "rejected",
+                "reason": "opportunity_unavailable",
+            }
         elif url.endswith("/api/prediction-arbitrage/state"):
-            payload = {"status": "degraded" if state["fail_at"] == "public_semantic_mismatch" and ":8766" in url else state.get("public_status", "healthy"), "health": {"status": state.get("public_health_status", "healthy")}, "readiness": {"status": state.get("public_readiness_status", "ready")}, "stale": False, "events": [], "opportunities": [], "csrf_token": "public-csrf" if state["fail_at"] == "public_csrf_variant" and ":8766" in url else "fake-csrf"}
+            heartbeat = (
+                "public-heartbeat"
+                if state["fail_at"] == "public_heartbeat_variant" and ":8766" in url
+                else "same-heartbeat"
+            )
+            payload = {"status": "degraded" if state["fail_at"] == "public_semantic_mismatch" and ":8766" in url else state.get("public_status", "healthy"), "health": {"status": state.get("public_health_status", "healthy")}, "readiness": {"status": state.get("public_readiness_status", "ready")}, "stale": False, "events": [], "opportunities": [], "csrf_token": "public-csrf" if state["fail_at"] == "public_csrf_variant" and ":8766" in url else "fake-csrf", "heartbeat": heartbeat, "heartbeat_at": heartbeat}
         else:
             payload = {}
         Path(output_path).write_text(json.dumps(payload), encoding="utf-8")
@@ -552,7 +587,11 @@ if command == "uninstall_prediction_service_launchd.sh":
         if state["legacy_prediction_owner"] == "enabled" else []
     )
     state["listeners"]["8769"] = None
-    (runtime_root / "prediction-service-runtime.json").unlink(missing_ok=True)
+    runtime_record = runtime_root / "prediction-service-runtime.json"
+    if runtime_record.exists():
+        record = json.loads(runtime_record.read_text(encoding="utf-8"))
+        record.update(state="stopped", failure_reason="")
+        runtime_record.write_text(json.dumps(record), encoding="utf-8")
     save()
     raise SystemExit(0)
 
@@ -666,6 +705,16 @@ class CutoverHarness:
                     "available": False,
                 },
                 "service_runtime": {"state": "unknown", "reader_generation": None, "contract_generation": None},
+                "account": {
+                    "before": {
+                        "controller": {"pid": 4001, "cwd": str(self.repo), "git_sha": SHA},
+                        "api": {"pid": 4101, "cwd": str(self.repo), "git_sha": SHA, "listener": "127.0.0.1:8768", "health_status": "ok", "health_pid": 4101, "api_git_sha": SHA, "worker_git_sha": SHA, "release_match": True},
+                    },
+                    "after": {
+                        "controller": {"pid": 4001, "cwd": str(self.repo), "git_sha": SHA},
+                        "api": {"pid": 4101, "cwd": str(self.repo), "git_sha": SHA, "listener": "127.0.0.1:8768", "health_status": "ok", "health_pid": 4101, "api_git_sha": SHA, "worker_git_sha": SHA, "release_match": True},
+                    },
+                },
                 "verification": {
                     "direct_backend": "failed",
                     "direct_state": False,
@@ -700,10 +749,15 @@ class CutoverHarness:
                     "argv": [sys.executable, "-m", "open_trader", "account-sync-controller"],
                     "plist": str(self.launch_agents / "com.open-trader.account-sync-controller.plist"),
                 },
+                "com.open-trader.account-api": {
+                    "loaded": True, "pid": 4101, "cwd": str(self.repo), "sha": SHA,
+                    "argv": [sys.executable, "-m", "open_trader", "account-api"],
+                    "plist": str(self.launch_agents / "com.open-trader.account-api.plist"),
+                },
             },
             "listeners": {
                 "8766": {"pid": 1001}, "8767": {"pid": 2001},
-                "8768": {"pid": 4001}, "8769": None,
+                "8768": {"pid": 4101}, "8769": None,
             },
         }), encoding="utf-8")
         fake = self.bin / "fake-command"
@@ -758,6 +812,12 @@ class CutoverHarness:
             state["listeners"]["8768"] = {"pid": 9999}
         elif fail_at == "account_missing_label":
             state["labels"]["com.open-trader.account-sync-controller"]["loaded"] = False
+        elif fail_at == "account_api_wrong_cwd":
+            state["labels"]["com.open-trader.account-api"]["cwd"] = "/unknown"
+        elif fail_at == "account_api_missing_label":
+            state["labels"]["com.open-trader.account-api"]["loaded"] = False
+        elif fail_at in {"legacy_label_disappears", "legacy_label_inspection_error"}:
+            pass
         elif fail_at == "public_unavailable":
             state["public_status"] = "unavailable"
         elif fail_at == "public_degraded":
@@ -765,6 +825,8 @@ class CutoverHarness:
         elif fail_at == "public_error":
             state["public_readiness_status"] = "error"
         elif fail_at in {"public_semantic_mismatch", "public_csrf_variant"}:
+            pass
+        elif fail_at in {"public_heartbeat_variant", "public_preview_semantic_mismatch"}:
             pass
         elif fail_at == "legacy_argv_wrong":
             state["labels"]["com.open-trader.legacy-dashboard"]["argv"][-1] = "disabled"
@@ -868,6 +930,85 @@ def test_service_happy_path(harness: CutoverHarness) -> None:
         "--launch-agents-dir", str(harness.launch_agents),
         "--wait-seconds", "2",
     ]
+
+
+def test_account_evidence_proves_controller_and_api_are_preserved(
+    harness: CutoverHarness,
+) -> None:
+    result = harness.run("service")
+
+    assert result.returncode == 0, result.stderr
+    account_before = harness.evidence["account"]["before"]
+    account_after = harness.evidence["account"]["after"]
+    assert account_before == account_after
+    assert account_before["controller"]["pid"] == 4001
+    assert account_before["api"]["pid"] == 4101
+    assert account_before["api"]["listener"] == "127.0.0.1:8768"
+    assert account_before["api"]["health_status"] == "ok"
+    assert account_before["api"]["health_pid"] == 4101
+
+
+def test_stopped_runtime_record_can_rollback_repeat_and_cutover(
+    harness: CutoverHarness,
+) -> None:
+    harness.route.write_text(json.dumps({
+        "schema_version": "open_trader.frontend_gateway.prediction_route.v1",
+        "mode": "maintenance",
+        "operation_id": "stopped-service-operation",
+        "updated_at": "2026-08-12T09:00:00+08:00",
+    }), encoding="utf-8")
+    runtime_record = harness.runtime / "prediction-service-runtime.json"
+    runtime_record.write_text(json.dumps({
+        "schema_version": "open_trader.prediction_service.runtime.v1",
+        "state": "stopped",
+        "failure_reason": "",
+    }), encoding="utf-8")
+
+    rollback = harness.run("legacy")
+    assert rollback.returncode == 0, rollback.stderr
+    assert json.loads(runtime_record.read_text(encoding="utf-8"))["state"] == "stopped"
+
+    repeat = harness.run("legacy")
+    assert repeat.returncode == 0, repeat.stderr
+
+    cutover = harness.run("service")
+    assert cutover.returncode == 0, cutover.stderr
+
+
+@pytest.mark.parametrize("failure", ["legacy_label_disappears", "legacy_label_inspection_error"])
+def test_legacy_inspection_failure_after_maintenance_writes_failed_evidence(
+    harness: CutoverHarness, failure: str
+) -> None:
+    harness.route.unlink()
+    harness.configure(failure)
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "maintenance"
+    assert harness.evidence["result"] == "failed"
+
+
+def test_public_heartbeat_difference_is_allowed_by_contract_projection(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("public_heartbeat_variant")
+
+    result = harness.run("service")
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_public_preview_status_difference_fails_closed(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("public_preview_semantic_mismatch")
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "maintenance"
+    assert harness.evidence["result"] == "failed"
 
 
 def test_service_absent_route_bootstraps_stack_inside_cutover(
@@ -1156,7 +1297,9 @@ def test_failed_runtime_record_without_service_is_uninstalled_on_rollback(
     result = harness.run("legacy")
 
     assert result.returncode == 0, result.stderr
-    assert not (harness.runtime / "prediction-service-runtime.json").exists()
+    assert json.loads(
+        (harness.runtime / "prediction-service-runtime.json").read_text(encoding="utf-8")
+    )["state"] == "stopped"
     assert any(
         call[0] == "uninstall_prediction_service_launchd.sh"
         for call in harness.state["calls"]
@@ -1535,7 +1678,16 @@ def test_preflight_rejects_unverified_runtime_before_maintenance(
     )
 
 
-@pytest.mark.parametrize("failure", ["account_wrong_cwd", "account_wrong_listener", "account_missing_label"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "account_wrong_cwd",
+        "account_wrong_listener",
+        "account_missing_label",
+        "account_api_wrong_cwd",
+        "account_api_missing_label",
+    ],
+)
 def test_preflight_rejects_unverified_account_before_maintenance(
     harness: CutoverHarness, failure: str
 ) -> None:
@@ -1680,7 +1832,8 @@ def test_evidence_excludes_config_and_request_secrets(harness: CutoverHarness) -
     assert set(json.loads(evidence_text)) == {
         "schema_version", "operation_id", "target", "expected_sha", "result",
         "failure_reason", "downtime_started_at", "downtime_ended_at",
-        "before", "after", "route", "owner", "service_runtime", "verification",
+        "before", "after", "route", "owner", "service_runtime", "account",
+        "verification",
     }
     assert evidence["owner"]["before_lock_holders"] == [2001]
 
