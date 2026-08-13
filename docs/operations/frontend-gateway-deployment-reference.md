@@ -49,47 +49,6 @@ scripts/install_dashboard_launchd.sh --mode single
 scripts/install_dashboard_launchd.sh
 ```
 
-上面的通用安装器只负责普通 Gateway + Legacy stack 部署，不是 Prediction Service
-owner 切换命令。#45 的正式流程是一次性执行下面的集成切换；不要先手动运行普通
-stack 安装器或另行 bootstrap。命令会在停止旧 Gateway 并证明 `8766` PID/listener
-消失后写入本次 operation 的 `maintenance` route，在 downtime 中安装和验证 stack，
-再完成 Legacy owner → Service owner 的 CAS 切换；任何失败都保持维护态并写入失败
-证据。Account controller 不在此命令中重启。
-
-```bash
-REPO_ROOT=/path/to/open_trader
-PYTHON="$REPO_ROOT/.venv/bin/python"
-RUNTIME_ROOT="$REPO_ROOT"
-EXPECTED_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-scripts/cutover_prediction_service.sh \
-  --target service \
-  --repo-root "$REPO_ROOT" \
-  --runtime-root "$RUNTIME_ROOT" \
-  --python "$PYTHON" \
-  --expected-sha "$EXPECTED_SHA" \
-  --prediction-config "$REPO_ROOT/config/prediction_arbitrage.json" \
-  --launch-agents-dir "$HOME/Library/LaunchAgents" \
-  --wait-seconds 30
-```
-
-明确回滚并保留全部三份 plist：
-
-```bash
-scripts/cutover_prediction_service.sh \
-  --target legacy \
-  --repo-root "$REPO_ROOT" \
-  --runtime-root "$REPO_ROOT" \
-  --python "$PYTHON" \
-  --expected-sha "$EXPECTED_SHA" \
-  --prediction-config "$REPO_ROOT/config/prediction_arbitrage.json" \
-  --launch-agents-dir "$HOME/Library/LaunchAgents" \
-  --wait-seconds 30
-```
-
-`install_dashboard_launchd.sh --mode single` remains a generic Dashboard
-deployment mode; it is not the Prediction owner rollback and must not be used
-for the #45 operation.
-
 完整卸载三个固定 label（重复运行安全）：
 
 ```bash

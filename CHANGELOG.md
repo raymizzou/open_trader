@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-13
 
+- Completed #45's one-time Prediction owner cutover command, Account proof
+  helper, dedicated 115-case cutover suite, and Legacy rollback runbook have
+  been retired. The production route remains Service-owned and Legacy rollback
+  is unsupported. Retained Prediction Service, Gateway, and live no-submit
+  registry checks pass; final `make acceptance` and exact-SHA deployment remain
+  the closure gate.
+
 - Dashboard launchd reinstall now makes its initial label observation and
   continues through the configured elapsed wait bound before refusing a still
   loaded job, preventing a one-second wait from bootstrapping before delayed
