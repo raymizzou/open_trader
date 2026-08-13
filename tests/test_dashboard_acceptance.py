@@ -8120,13 +8120,17 @@ def test_controlled_account_outage_restores_shared_runtime(
         "_project_data_dir",
         lambda _root: runtime_root / "data",
     )
-    monkeypatch.setattr(
-        dashboard_acceptance.subprocess,
-        "run",
-        lambda command, **_kwargs: (
-            commands.append(command) or SimpleNamespace(returncode=0)
-        ),
-    )
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        commands.append(command)
+        if command[:2] == ["launchctl", "print"]:
+            return SimpleNamespace(
+                returncode=1, stdout="", stderr="Could not find service",
+            )
+        if command[0] == "lsof":
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(dashboard_acceptance.subprocess, "run", run)
     monkeypatch.setattr(
         dashboard_acceptance,
         "_fetch_status_payload",
@@ -8146,6 +8150,73 @@ def test_controlled_account_outage_restores_shared_runtime(
         "--repo-root", str(expected_root),
         "--runtime-root", str(runtime_root),
         "--python", str(runtime_root / ".venv/bin/python"),
+    ]
+
+
+def test_controlled_account_outage_waits_for_label_and_listener_before_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_root = tmp_path / "worktree"
+    runtime_root = tmp_path / "runtime"
+    state = {"label_present": True, "listener_present": True}
+    fetch_calls: list[str] = []
+    sleep_calls = 0
+
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_project_data_dir",
+        lambda _root: runtime_root / "data",
+    )
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        if command[:2] == ["launchctl", "bootout"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command[:2] == ["launchctl", "print"]:
+            return SimpleNamespace(
+                returncode=0 if state["label_present"] else 1,
+                stdout="loaded" if state["label_present"] else "",
+                stderr="" if state["label_present"] else "Could not find service",
+            )
+        if command[0] == "lsof":
+            return SimpleNamespace(
+                returncode=0 if state["listener_present"] else 1,
+                stdout="listener" if state["listener_present"] else "",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def sleep(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        assert fetch_calls == []
+        if sleep_calls == 1:
+            state["label_present"] = False
+        else:
+            state["listener_present"] = False
+
+    monkeypatch.setattr(dashboard_acceptance.subprocess, "run", run)
+    monkeypatch.setattr(dashboard_acceptance.time, "sleep", sleep)
+
+    def fetch(_url: str, path: str) -> tuple[int, object]:
+        fetch_calls.append(path)
+        assert state == {"label_present": False, "listener_present": False}
+        return (
+            (503, {"code": "account_module_unavailable"})
+            if path == dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH
+            else (200, {"holding_enrichment": []})
+        )
+
+    monkeypatch.setattr(dashboard_acceptance, "_fetch_status_payload", fetch)
+
+    assert dashboard_acceptance._controlled_account_outage_errors(
+        "http://gateway.test", expected_root,
+    ) == []
+    assert sleep_calls == 2
+    assert fetch_calls == [
+        dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH,
+        "/api/dashboard",
+        "/api/trend-reports/tiger/history",
+        "/api/prediction-arbitrage/state",
     ]
 
 

@@ -13,6 +13,9 @@ operator-facing: what changed, which workflow is affected, and what was verified
   module/tests were removed, and setup/runbook docs now install and verify the
   sole `8769` owner. Focused health/CLI/source metadata tests pass; no live
   service, launchd, route/data, merge, deploy, or acceptance run was performed.
+  Account outage acceptance now waits boundedly for the launchd label and 8768
+  listener to disappear before its first outage probe; the deterministic
+  regression passes.
 
 ## 2026-08-13
 

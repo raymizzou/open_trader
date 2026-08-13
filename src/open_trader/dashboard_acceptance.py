@@ -109,6 +109,7 @@ DASHBOARD_API_TIMEOUT_SECONDS = 30
 ACCOUNT_SNAPSHOT_PATH = "/api/v1/account/snapshot"
 ACCOUNT_ROUTE_HEADER = "X-Open-Trader-Account-Route"
 PRODUCTION_ROUTE_MARKER = "production"
+ACCOUNT_API_OUTAGE_WAIT_SECONDS = 5
 LEGACY_REMOVED_ACCOUNT_FIELDS = frozenset({
     "account_sync", "broker_positions", "broker_summaries", "cash_details",
     "cash_rows", "holdings", "positions", "quotes", "summary",
@@ -1050,10 +1051,13 @@ def _account_outage_isolation_errors(
     stop_account_api: Any,
     restore_account_api: Any,
     fetch: Any,
+    wait_account_api_absent: Any | None = None,
 ) -> list[str]:
     errors: list[str] = []
     try:
         stop_account_api()
+        if wait_account_api_absent is not None:
+            wait_account_api_absent()
         status, payload = fetch(ACCOUNT_SNAPSHOT_PATH)
         if not (
             status == 503
@@ -1115,11 +1119,49 @@ def _controlled_account_outage_errors(
         if result.returncode != 0:
             raise RuntimeError("Account API restore failed")
 
+    def wait_account_api_absent() -> None:
+        label = f"gui/{os.getuid()}/com.open-trader.account-api"
+        deadline = time.monotonic() + ACCOUNT_API_OUTAGE_WAIT_SECONDS
+        while True:
+            label_result = subprocess.run(
+                ["launchctl", "print", label],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            label_output = "\n".join((
+                str(getattr(label_result, "stdout", "")),
+                str(getattr(label_result, "stderr", "")),
+            ))
+            label_absent = (
+                label_result.returncode != 0
+                and "Could not find service" in label_output
+            )
+            listener_result = subprocess.run(
+                ["lsof", "-nP", "-iTCP:8768", "-sTCP:LISTEN"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            listener_absent = (
+                listener_result.returncode == 1
+                and not getattr(listener_result, "stdout", "")
+                and not getattr(listener_result, "stderr", "")
+            )
+            if label_absent and listener_absent:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Account API launchd label/listener remained after bootout"
+                )
+            time.sleep(0.1)
+
     return _account_outage_isolation_errors(
         gateway_url,
         stop_account_api=stop_account_api,
         restore_account_api=restore_account_api,
         fetch=lambda path: _fetch_status_payload(gateway_url, path),
+        wait_account_api_absent=wait_account_api_absent,
     )
 
 
