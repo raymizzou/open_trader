@@ -2803,22 +2803,45 @@ def test_linux_cleanup_survivor_is_removed_and_the_run_stops(monkeypatch) -> Non
 
 
 @pytest.mark.parametrize(
-    ("returncode", "stderr", "expected"),
+    ("returncode", "stdout", "stderr", "expected"),
     (
-        (1, "Error: No such object: " + "a" * 64 + "\n", True),
-        (1, "permission denied while trying to connect to the Docker daemon\n", False),
-        (1, "unexpected inspect failure\n", False),
-        (2, "Error: No such object: " + "a" * 64 + "\n", False),
+        (1, "", "Error: No such object: " + "a" * 64 + "\n", True),
+        (1, "", "permission denied while trying to connect to the Docker daemon\n", False),
+        (1, "", "unexpected inspect failure\n", False),
+        (2, "", "Error: No such object: " + "a" * 64 + "\n", False),
+        (1, " \n", "Error: No such object: " + "a" * 64 + "\n", False),
+        (1, "", "Error: No such object: " + "a" * 64, False),
+        (1, "[]\n", "Error response from daemon: No such container\n", False),
+        (1, "[]\n", "Error response from daemon: No such container: " + "b" * 64 + "\n", False),
+        (1, "[]\n", "permission denied while trying to connect to the Docker daemon\n", False),
+        (1, "", "Error response from daemon: No such container: " + "a" * 64 + "\n", False),
+        (2, "[]\n", "Error response from daemon: No such container: " + "a" * 64 + "\n", False),
     ),
 )
-def test_container_absence_requires_the_exact_no_such_object_result(monkeypatch, returncode, stderr, expected) -> None:
+def test_container_absence_requires_the_exact_no_such_object_result(monkeypatch, returncode, stdout, stderr, expected) -> None:
     monkeypatch.setattr(
         benchmark.subprocess,
         "run",
-        lambda command, **kwargs: subprocess.CompletedProcess(command, returncode, "", stderr),
+        lambda command, **kwargs: subprocess.CompletedProcess(command, returncode, stdout, stderr),
     )
 
     assert benchmark._container_is_absent("a" * 64) is expected
+
+
+def test_container_absence_accepts_the_exact_docker_24_missing_container_result(monkeypatch) -> None:
+    container_id = "a" * 64
+    monkeypatch.setattr(
+        benchmark.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            1,
+            "[]\n",
+            f"Error response from daemon: No such container: {container_id}\n",
+        ),
+    )
+
+    assert benchmark._container_is_absent(container_id)
 
 
 @pytest.mark.parametrize("field,value", (("soft_time_limit_ms", 4_999), ("hard_time_limit_ms", 20_001), ("max_constraint_generation_rounds", 65)))

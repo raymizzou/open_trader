@@ -2322,8 +2322,10 @@ def _container_state(container_id: str) -> str:
         return "present"
     if (
         completed.returncode == 1
-        and not completed.stdout.strip()
-        and completed.stderr.strip() == f"Error: No such object: {container_id}"
+        and (completed.stdout, completed.stderr) in {
+            ("", f"Error: No such object: {container_id}\n"),
+            ("[]\n", f"Error response from daemon: No such container: {container_id}\n"),
+        }
     ):
         return "absent"
     return "unknown"
