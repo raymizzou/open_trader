@@ -369,6 +369,17 @@ test.describe('YES/NO arbitrage signal workspace', () => {
   });
 
   test('closed signals remove the operation button and show a dash for live profit', async ({ page }) => {
+    let releaseState: () => void = () => {};
+    const historyLoaded = new Promise<void>((resolve) => { releaseState = resolve; });
+    await page.route('**/api/prediction-arbitrage/state**', async (route) => {
+      await historyLoaded;
+      await route.continue();
+    });
+    await page.route('**/api/prediction-arbitrage/history?kind=signals**', async (route) => {
+      const response = await route.fetch();
+      await route.fulfill({ response });
+      releaseState();
+    });
     await openPrediction(page, 'signal-closed');
     const firstRow = page.locator('[data-prediction-history-panel] tbody tr').first();
     await expect(firstRow.locator('[data-label="操作"]')).toContainText('飞书已发');

@@ -7302,6 +7302,38 @@ console.log(JSON.stringify({historyCalls}));
     assert json.loads(output) == {"historyCalls": 1}
 
 
+def test_prediction_state_completion_preserves_newer_signal_history() -> None:
+    output = run_dashboard_js(r'''
+state.workspaceView = "prediction_market";
+const pending = {};
+globalThis.fetch = (url) => new Promise((resolve) => {
+  pending[url.includes("/state") ? "state" : "history"] = resolve;
+});
+const stateLoad = fetchPredictionState();
+const historyLoad = loadPredictionHistory("signals", {panelOnly: true});
+pending.history({ok:true,json:async()=>({items:[{
+  opportunity_id:"closed-opportunity", occurred_at:"2026-08-01T01:59:00Z",
+  ended_at:"2026-08-01T02:00:10Z", event_title:"Closed signal",
+  initial_profit:"0.30", live_profit:null, actionable_now:false,
+  notification_state:"sent",
+}]})});
+await historyLoad;
+pending.state({ok:true,json:async()=>({status:"healthy",histories:{signals:[{
+  opportunity_id:"closed-opportunity", occurred_at:"2026-08-01T01:59:00Z",
+  event_title:"Closed signal", initial_profit:"0.30", live_profit:"0.38",
+  actionable_now:true, notification_state:"sent",
+}]}})});
+await stateLoad;
+const row = state.predictionMarket.payload.histories.signals[0];
+const html = predictionHistoryContent(state.predictionMarket.payload, "signals");
+console.log(JSON.stringify({endedAt:row.ended_at,html}));
+''')
+    result = json.loads(output)
+    assert result.get("endedAt") == "2026-08-01T02:00:10Z"
+    assert "实时 —" in result["html"]
+    assert 'data-action="participate"' not in result["html"]
+
+
 def test_dashboard_renders_one_selected_broker_tab_and_cards_switch_it() -> None:
     output = run_dashboard_js(r'''
 const mount = () => ({innerHTML:"", textContent:"", classList:{add(){},remove(){}}});

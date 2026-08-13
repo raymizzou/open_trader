@@ -3327,7 +3327,11 @@ async function fetchPredictionState() {
     if (!response.ok) throw new Error(`prediction state ${response.status}`);
     const payload = await response.json();
     const previousHistories = state.predictionMarket.payload?.histories || {};
-    state.predictionMarket.payload = {...payload, histories: {...previousHistories, ...(payload.histories || {})}};
+    const histories = {...previousHistories, ...(payload.histories || {})};
+    if (state.predictionMarket.signalLastSuccessAt && Array.isArray(previousHistories.signals)) {
+      histories.signals = previousHistories.signals;
+    }
+    state.predictionMarket.payload = {...payload, histories};
     state.predictionMarket.error = "";
     state.predictionMarket.csrfToken = payload.csrf_token || state.predictionMarket.csrfToken;
     if (!["signals", "executions", "incidents"].includes(state.predictionMarket.historyKind)) {
