@@ -522,6 +522,7 @@ def test_shadow_health_has_the_read_only_identity() -> None:
     assert payload["guard_attempts"] == []
     assert isinstance(payload["pid"], int)
     assert isinstance(payload["started_at"], str)
+    assert payload["source_state"] in {"clean", "dirty"}
     assert "release_schema_version" not in payload
     assert "reader_generation" not in payload
     assert "contract_generation" not in payload

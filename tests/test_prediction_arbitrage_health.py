@@ -9,6 +9,7 @@ from open_trader.prediction_arbitrage_health import (
     report_to_dict,
     run_health_check,
     send_report,
+    validate_frontend_gateway_health,
 )
 
 
@@ -48,9 +49,16 @@ def run_check(
     healthz: bool = True,
     llm: tuple[int, int] = (10, 10),
     process: dict[str, object] | None = {
-        "pid": "42",
-        "git_sha": "abc",
+        "schema_version": "open_trader.prediction_service.health.v1",
+        "module": "prediction_service",
         "status": "running",
+        "mode": "production",
+        "production_owner": True,
+        "mutations": "enabled",
+        "source_state": "clean",
+        "pid": 42,
+        "cwd": "/srv/open_trader",
+        "git_sha": "abc",
     },
     notify_configured: bool = True,
 ):
@@ -140,11 +148,80 @@ def test_process_missing_fails() -> None:
 
 
 def test_service_health_identity_replaces_legacy_process_probe() -> None:
-    report = run_check(process={"status": "running", "pid": 42, "git_sha": "abc"})
+    report = run_check()
     checks = {check.name: check for check in report.checks}
     assert checks["process"].status == "PASS"
     assert report.summary["pid"] == "42"
     assert report.summary["sha"] == "abc"
+
+
+def test_gateway_health_requires_service_route_and_prediction_upstream() -> None:
+    health = {
+        "schema_version": "open_trader.frontend_gateway.health.v1",
+        "module": "frontend_gateway",
+        "upstream_status": "ok",
+        "prediction_route_mode": "service",
+        "prediction_upstream_status": "ok",
+    }
+    assert validate_frontend_gateway_health(health) == (True, "")
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"prediction_route_mode": "legacy"},
+        {"prediction_route_mode": "maintenance"},
+        {"prediction_route_mode": None},
+        {"prediction_upstream_status": "unavailable"},
+        {"prediction_upstream_status": None},
+    ],
+)
+def test_gateway_health_fails_closed_without_service_prediction_route(
+    override: dict[str, object],
+) -> None:
+    health = {
+        "schema_version": "open_trader.frontend_gateway.health.v1",
+        "module": "frontend_gateway",
+        "upstream_status": "ok",
+        "prediction_route_mode": "service",
+        "prediction_upstream_status": "ok",
+    }
+    health.update(override)
+    valid, reason = validate_frontend_gateway_health(health)
+    assert valid is False
+    assert reason
+
+
+@pytest.mark.parametrize(
+    "field_override",
+    [
+        {"mode": "shadow", "production_owner": False, "mutations": "prohibited"},
+        {"production_owner": False},
+        {"mutations": "prohibited"},
+        {"schema_version": "open_trader.legacy_dashboard.health.v1", "module": "legacy_dashboard"},
+        {"source_state": "dirty"},
+        {"cwd": ""},
+        {"git_sha": ""},
+        {"pid": "42"},
+    ],
+)
+def test_service_health_identity_fails_closed(field_override: dict[str, object]) -> None:
+    process = {
+        "schema_version": "open_trader.prediction_service.health.v1",
+        "module": "prediction_service",
+        "status": "running",
+        "mode": "production",
+        "production_owner": True,
+        "mutations": "enabled",
+        "source_state": "clean",
+        "pid": 42,
+        "cwd": "/srv/open_trader",
+        "git_sha": "abc",
+    }
+    process.update(field_override)
+    report = run_check(process=process)
+    assert report.status == "FAIL"
+    assert {check.name: check for check in report.checks}["service"].status == "FAIL"
 
 
 def test_notify_unconfigured_warns() -> None:

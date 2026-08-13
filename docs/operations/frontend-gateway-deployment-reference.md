@@ -32,6 +32,7 @@ Prediction 运行时的当前边界固定如下：
 8766 Frontend Gateway: sole browser ingress
 8767 Legacy Dashboard: non-Prediction APIs only; Prediction prefix returns 404
 8769 Prediction Service: sole Prediction runtime, database owner, read API, and mutation API
+18769 isolated Prediction Service check: temporary Shadow only; never a production owner
 Legacy Prediction rollback: unsupported
 Compatible Prediction Service release rollback: supported until #60 advances minimum_reader_generation
 ```
@@ -79,6 +80,8 @@ launchctl list | rg 'com\.open-trader\.(dashboard|frontend-gateway|legacy-dashbo
 lsof -nP -iTCP:8766 -sTCP:LISTEN
 lsof -nP -iTCP:8767 -sTCP:LISTEN
 lsof -nP -iTCP:8769 -sTCP:LISTEN
+curl -fsS http://127.0.0.1:8769/healthz
+PYTHONPATH=src .venv/bin/python -m open_trader prediction-arb status --url http://127.0.0.1:8769
 tail -n 100 logs/frontend_gateway/launchd.out.log
 tail -n 100 logs/legacy_dashboard/launchd.out.log
 tail -n 100 logs/prediction_service/launchd.out.log
@@ -134,7 +137,7 @@ if health.get("pid") != int(expected_pid):
     raise SystemExit("isolated Prediction Service listener PID mismatch")
 if health.get("cwd") != expected_cwd or health.get("git_sha") != expected_sha:
     raise SystemExit("isolated Prediction Service source identity mismatch")
-if health.get("source_state", "clean") != "clean":
+if health.get("source_state") != "clean":
     raise SystemExit("isolated Prediction Service source state is not clean")
 print("isolated Prediction Service:", health["pid"], health["cwd"], health["git_sha"], "source_state=clean")
 ' "$SERVICE_PID" "$REPO_ROOT" "$SERVICE_SHA"
@@ -193,7 +196,9 @@ Gateway 的响应应包含：
 {
   "schema_version": "open_trader.frontend_gateway.health.v1",
   "module": "frontend_gateway",
-  "upstream_status": "ok"
+  "upstream_status": "ok",
+  "prediction_route_mode": "service",
+  "prediction_upstream_status": "ok"
 }
 ```
 
@@ -218,9 +223,16 @@ Prediction Service 的响应必须证明运行时身份，而不仅是 HTTP 存�
   "mutations": "prohibited",
   "pid": 12345,
   "cwd": "/path/to/open_trader",
-  "git_sha": "<isolated-service-sha>"
+  "git_sha": "<isolated-service-sha>",
+  "source_state": "clean"
 }
 ```
+
+生产 `8769` 必须通过同一套唯一 owner 检查；`prediction-arb status` 只接受
+`prediction_service.health.v1`、`mode=production`、`production_owner=true`、
+`mutations=enabled`、`source_state=clean` 以及健康响应中的 PID、cwd、Git SHA，
+未知或 Shadow/Legacy 身份一律 `BLOCKED`。临时 `18769` 只能使用 Shadow 身份
+（`production_owner=false`、`mutations=prohibited`），不能被当作生产服务。
 
 再验证静态页、直接 API 和转发 API：
 
@@ -313,13 +325,17 @@ kill "$GATEWAY_PID" "$LEGACY_PID"
 
 ## 目标端口参考
 
-双进程最终约定仍是：
+生产最终拓扑是三进程、三监听；`8766` 是唯一浏览器入口，`8767` 只承载
+非 Prediction Legacy，`8769` 是 Prediction 的唯一运行时和数据库 owner：
 
 ```text
-Frontend Gateway   127.0.0.1:8766
-Legacy Dashboard   127.0.0.1:8767
-公开浏览器地址     http://127.0.0.1:8766/
+Frontend Gateway      127.0.0.1:8766  (sole browser ingress)
+Legacy Dashboard      127.0.0.1:8767  (non-Prediction only)
+Prediction Service    127.0.0.1:8769  (sole Prediction owner)
+公开浏览器地址        http://127.0.0.1:8766/
 ```
 
-手工不占用生产端口的双进程验证仍可使用上文的 `18766/18767`；正式安装器使用目标
-`8766/8767`，readiness 失败时返回非零并等待人工选择非 Prediction fallback。
+手工不占用生产端口的 Gateway/Legacy 验证仍可使用上文的 `18766/18767`；如需
+隔离 Shadow 验证，`18769` 仅是临时验证端口，绝不属于最终拓扑、生产 owner 或
+回滚入口。正式安装器使用目标 `8766/8767`，Prediction Service 单独使用 `8769`；
+readiness 失败时返回非零并等待人工选择非 Prediction fallback。

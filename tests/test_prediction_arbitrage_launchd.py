@@ -244,6 +244,129 @@ def test_prediction_status_command_is_registered() -> None:
     assert "masked_wallet" in source
 
 
+def test_obsolete_shadow_validator_command_is_not_exposed() -> None:
+    source = (ROOT / "src" / "open_trader" / "__main__.py").read_text(encoding="utf-8")
+    assert "prediction-shadow-validate" not in source
+    assert not (ROOT / "src" / "open_trader" / "prediction_shadow_validation.py").exists()
+
+
+def _status_state() -> dict[str, object]:
+    return {
+        "status": "healthy",
+        "stale": False,
+        "breaker": {"open": False},
+        "readiness": {"ready": True},
+        "opportunities": [],
+    }
+
+
+def _prediction_service_health() -> dict[str, object]:
+    return {
+        "schema_version": "open_trader.prediction_service.health.v1",
+        "module": "prediction_service",
+        "status": "running",
+        "mode": "production",
+        "production_owner": True,
+        "mutations": "enabled",
+        "source_state": "clean",
+        "pid": 4242,
+        "cwd": "/srv/open_trader",
+        "git_sha": "accepted-sha",
+    }
+
+
+def test_prediction_status_8769_uses_exact_service_health_identity(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fetch(request: object, timeout: float) -> _JsonResponse:
+        url = getattr(request, "full_url", request)
+        if url.endswith("/healthz"):
+            return _JsonResponse(_prediction_service_health())
+        return _JsonResponse(_status_state())
+
+    monkeypatch.setattr(cli, "urlopen", fetch)
+    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: pytest.fail("process scan is obsolete"))
+
+    assert cli.main(["prediction-arb", "status", "--url", "http://127.0.0.1:8769"]) == 0
+    output = capsys.readouterr().out
+    assert "health: healthy" in output
+    assert "pid: 4242" in output
+    assert "result: PASS" in output
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"mode": "shadow", "production_owner": False, "mutations": "prohibited"},
+        {"production_owner": False},
+        {"mutations": "prohibited"},
+        {"schema_version": "malformed"},
+        {"source_state": "dirty"},
+        {"cwd": ""},
+        {"git_sha": ""},
+        {"pid": "4242"},
+    ],
+)
+def test_prediction_status_8769_fails_closed_for_non_service_health(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    override: dict[str, object],
+) -> None:
+    health = _prediction_service_health()
+    health.update(override)
+
+    def fetch(request: object, timeout: float) -> _JsonResponse:
+        url = getattr(request, "full_url", request)
+        return _JsonResponse(health if url.endswith("/healthz") else _status_state())
+
+    monkeypatch.setattr(cli, "urlopen", fetch)
+    assert cli.main(["prediction-arb", "status", "--url", "http://127.0.0.1:8769"]) == 2
+    output = capsys.readouterr().out
+    assert "result: BLOCKED" in output
+
+
+def test_prediction_status_8766_validates_gateway_health_without_fabricating_pid(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    health = {
+        "schema_version": "open_trader.frontend_gateway.health.v1",
+        "module": "frontend_gateway",
+        "upstream_status": "ok",
+        "prediction_route_mode": "service",
+        "prediction_upstream_status": "ok",
+    }
+
+    def fetch(request: object, timeout: float) -> _JsonResponse:
+        url = getattr(request, "full_url", request)
+        return _JsonResponse(health if url.endswith("/healthz") else _status_state())
+
+    monkeypatch.setattr(cli, "urlopen", fetch)
+    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: pytest.fail("process scan is obsolete"))
+
+    assert cli.main(["prediction-arb", "status", "--url", "http://127.0.0.1:8766"]) == 0
+    output = capsys.readouterr().out
+    assert "pid: unknown" in output
+    assert "result: PASS" in output
+
+
+def test_prediction_status_rejects_isolated_shadow_port_before_fetch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "urlopen", lambda *args, **kwargs: pytest.fail("isolated port must not be queried"))
+    assert cli.main(["prediction-arb", "status", "--url", "http://127.0.0.1:18769"]) == 2
+    output = capsys.readouterr().out
+    assert "unsupported status URL" in output
+    assert "result: BLOCKED" in output
+
+
+def test_prediction_status_fails_closed_for_malformed_url(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert cli.main(["prediction-arb", "status", "--url", "http://127.0.0.1:bad"]) == 2
+    output = capsys.readouterr().out
+    assert "result: BLOCKED" in output
+
+
 class _JsonResponse:
     status = 200
 

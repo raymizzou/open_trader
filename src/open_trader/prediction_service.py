@@ -172,12 +172,27 @@ def _runtime_metadata() -> dict[str, object]:
         git_sha = subprocess.check_output(
             ["git", "-C", str(cwd), "rev-parse", "HEAD"], text=True
         ).strip()
+        source_status = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(cwd),
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--",
+                "src/open_trader",
+            ],
+            text=True,
+        ).strip()
     except (OSError, subprocess.CalledProcessError):
         git_sha = ""
+        source_status = "unavailable"
     return {
         "pid": os.getpid(),
         "cwd": str(cwd),
         "git_sha": git_sha,
+        "source_state": "clean" if not source_status else "dirty",
         "started_at": datetime.now().astimezone().isoformat(),
     }
 

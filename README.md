@@ -68,17 +68,21 @@ Keychain only; they are never written to config, SQLite, logs, or browser state)
 ```
 
 The preflight signs an in-memory probe but never submits it or places a canary
-order. After it passes, install the persistent macOS Dashboard stack. The
-default command cuts over to Gateway `8766` plus non-Prediction Legacy Dashboard
-`8767`; Prediction remains owned by the independent Service on `8769`. The
-`--mode single` command is a manual non-Prediction fallback, not a Prediction
-rollback. Prediction rollback is supported only by restoring a compatible 8769
-Prediction Service release until #60 advances `minimum_reader_generation`:
+order. After it passes, install and verify the independent production Prediction
+Service first, then install the persistent macOS Dashboard stack. Gateway `8766`
+is the sole browser ingress, Legacy Dashboard `8767` serves non-Prediction APIs
+only, and the Service on `8769` is the sole Prediction owner. The `--mode single`
+command is a manual non-Prediction fallback, not a Prediction rollback. Prediction
+rollback is supported only by restoring a compatible 8769 Prediction Service
+release until #60 advances `minimum_reader_generation`:
 
 ```bash
+scripts/install_prediction_service_launchd.sh --mode production --runtime-root "$PWD"
+curl -fsS http://127.0.0.1:8769/healthz
+.venv/bin/python -m open_trader prediction-arb status --url http://127.0.0.1:8769
 scripts/install_dashboard_launchd.sh --dry-run
 scripts/install_dashboard_launchd.sh
-.venv/bin/python -m open_trader prediction-arb status --url http://127.0.0.1:8769
+.venv/bin/python -m open_trader prediction-arb status --url http://127.0.0.1:8766
 # Optional manual non-Prediction fallback only:
 # scripts/install_dashboard_launchd.sh --mode single
 scripts/uninstall_dashboard_launchd.sh

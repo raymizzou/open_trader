@@ -3,6 +3,17 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-14
+
+- #46 final corrections make the independent Prediction Service health contract
+  fail closed unless it is the production `prediction_service` owner with clean
+  source/cwd/SHA/PID facts; `prediction-arb status` now validates `/healthz` for
+  production `8769` and Gateway identity for `8766` without a Dashboard process
+  scan. The obsolete Legacy-vs-Shadow validator command and its dedicated
+  module/tests were removed, and setup/runbook docs now install and verify the
+  sole `8769` owner. Focused health/CLI/source metadata tests pass; no live
+  service, launchd, route/data, merge, deploy, or acceptance run was performed.
+
 ## 2026-08-13
 
 - #46 removes retired Prediction owner/config flags from Dashboard launchd

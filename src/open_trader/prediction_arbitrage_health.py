@@ -23,6 +23,8 @@ UNIVERSE_MAX_SECONDS = 300.0
 DEFAULT_INTERVAL_SECONDS = 7200.0
 _STATE_PATH = "api/prediction-arbitrage/state"
 _HEALTHZ_PATH = "healthz"
+PREDICTION_SERVICE_HEALTH_SCHEMA = "open_trader.prediction_service.health.v1"
+FRONTEND_GATEWAY_HEALTH_SCHEMA = "open_trader.frontend_gateway.health.v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +82,53 @@ def _fetch_healthz(url: str, timeout: float) -> Mapping[str, object]:
     return payload
 
 
+def validate_prediction_service_health(payload: object) -> tuple[bool, str]:
+    """Accept only the production Prediction Service health contract."""
+
+    if not isinstance(payload, Mapping):
+        return False, "health payload must be an object"
+    expected = {
+        "schema_version": PREDICTION_SERVICE_HEALTH_SCHEMA,
+        "module": "prediction_service",
+        "status": "running",
+        "mode": "production",
+        "mutations": "enabled",
+        "source_state": "clean",
+    }
+    for field, value in expected.items():
+        if payload.get(field) != value:
+            return False, f"health {field} mismatch"
+    if payload.get("production_owner") is not True:
+        return False, "health production_owner mismatch"
+    pid = payload.get("pid")
+    if type(pid) is not int or pid <= 0:
+        return False, "health pid is invalid"
+    cwd = payload.get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip() or not Path(cwd).is_absolute():
+        return False, "health cwd is invalid"
+    git_sha = payload.get("git_sha")
+    if not isinstance(git_sha, str) or not git_sha.strip():
+        return False, "health git_sha is invalid"
+    return True, ""
+
+
+def validate_frontend_gateway_health(payload: object) -> tuple[bool, str]:
+    """Accept only the Gateway health identity and healthy upstream."""
+
+    if not isinstance(payload, Mapping):
+        return False, "health payload must be an object"
+    for field, value in {
+        "schema_version": FRONTEND_GATEWAY_HEALTH_SCHEMA,
+        "module": "frontend_gateway",
+        "upstream_status": "ok",
+        "prediction_route_mode": "service",
+        "prediction_upstream_status": "ok",
+    }.items():
+        if payload.get(field) != value:
+            return False, f"health {field} mismatch"
+    return True, ""
+
+
 def run_health_check(
     *,
     url: str,
@@ -114,8 +163,13 @@ def run_health_check(
     except Exception:
         healthz_payload = {}
     healthz = _mapping(healthz_payload)
-    healthz_ok = str(healthz.get("status", "")) == "running"
-    add("service", "PASS" if healthz_ok else "FAIL", value=url, reason="" if healthz_ok else "healthz unavailable")
+    healthz_ok, healthz_reason = validate_prediction_service_health(healthz_payload)
+    add(
+        "service",
+        "PASS" if healthz_ok else "FAIL",
+        value=url,
+        reason="" if healthz_ok else healthz_reason,
+    )
 
     health = _mapping(payload.get("health"))
     heartbeat = _seconds(health.get("heartbeat_age_seconds"))
@@ -218,10 +272,11 @@ def run_health_check(
             else:
                 add("llm", "PASS", value=f"{llm_success}/{llm_total}")
 
-    pid = str(healthz.get("pid") or "none")
+    pid_value = healthz.get("pid")
+    pid = str(pid_value) if type(pid_value) is int and pid_value > 0 else "none"
     sha = str(healthz.get("git_sha") or "unknown")
-    if not healthz_ok or pid == "none" or sha == "unknown":
-        add("process", "FAIL", reason="Prediction Service identity unavailable")
+    if not healthz_ok:
+        add("process", "FAIL", reason=healthz_reason or "Prediction Service identity unavailable")
     else:
         add("process", "PASS", value=f"pid={pid} sha={sha}")
 

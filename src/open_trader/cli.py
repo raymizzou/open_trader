@@ -112,6 +112,10 @@ from .polymarket_trading import (
     store_predict_api_key,
 )
 from .polymarket_monitor import monitor_once_diagnostic
+from .prediction_arbitrage_health import (
+    validate_frontend_gateway_health,
+    validate_prediction_service_health,
+)
 from .report_translation import DeepSeekReportTranslator, translate_agent_report_files
 from .tiger_account import load_tiger_account_config
 from .technical_facts import LLMTechnicalFactsExtractor, generate_technical_facts
@@ -1180,6 +1184,18 @@ def _prediction_service_state(url: str, timeout: float = 5.0) -> dict[str, objec
     return payload
 
 
+def _prediction_health(url: str, timeout: float = 5.0) -> dict[str, object]:
+    request = Request(
+        f"{url.rstrip('/')}/healthz",
+        headers={"User-Agent": "OpenTrader/1.0"},
+    )
+    with urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("prediction health payload must be an object")
+    return payload
+
+
 _PREDICTION_CROSS_AUTO_MODES = frozenset(
     {"observe_only", "manual_confirm", "auto_submit"}
 )
@@ -1459,12 +1475,40 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if report.get("result") == "PASS" else 2
 
         if args.prediction_command == "status":
-            endpoint = args.url.rstrip("/") + "/api/prediction-arbitrage/state"
+            target_url = args.url.rstrip("/")
             try:
-                with urlopen(endpoint, timeout=args.timeout) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                if not isinstance(payload, dict):
-                    raise ValueError("Dashboard state must be an object")
+                port = urlparse(target_url).port or 8766
+            except ValueError as exc:
+                print("health: BLOCKED")
+                print("pid: unknown")
+                print(f"result: BLOCKED\nerror: {exc}")
+                return 2
+            if port == 8769:
+                health_validator = validate_prediction_service_health
+                service_target = True
+            elif port == 8766:
+                health_validator = validate_frontend_gateway_health
+                service_target = False
+            else:
+                print("health: BLOCKED")
+                print("pid: unknown")
+                print("result: BLOCKED\nerror: unsupported status URL")
+                return 2
+            try:
+                health_payload = _prediction_health(target_url, args.timeout)
+                health_ok, health_reason = health_validator(health_payload)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                print("health: BLOCKED")
+                print("pid: unknown")
+                print(f"result: BLOCKED\nerror: {exc}")
+                return 2
+            if not health_ok:
+                print("health: BLOCKED")
+                print("pid: unknown")
+                print(f"result: BLOCKED\nerror: {health_reason}")
+                return 2
+            try:
+                payload = _prediction_service_state(target_url, args.timeout)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 print("health: BLOCKED")
                 print("pid: unknown")
@@ -1484,22 +1528,7 @@ def main(argv: list[str] | None = None) -> int:
             opportunities = payload.get("opportunities")
             if isinstance(opportunities, list) and not payload.get("stale") and not breaker.get("open") and not active:
                 actionable = sum(1 for item in opportunities if isinstance(item, dict) and item.get("actionable") is True)
-            port = urlparse(args.url).port or 8766
-            pid = "unknown"
-            try:
-                process_rows = subprocess.run(
-                    ["ps", "-axo", "pid=,command="],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                ).stdout.splitlines()
-                for row in process_rows:
-                    candidate, _, command = row.strip().partition(" ")
-                    if candidate.isdigit() and "open_trader" in command and " dashboard" in command and f"--port {port}" in command:
-                        pid = candidate
-                        break
-            except OSError:
-                pass
+            pid = str(health_payload["pid"]) if service_target else "unknown"
             health = "degraded" if status in {"degraded", "unavailable", "error"} else status
             print(f"health: {health}")
             print(f"pid: {pid}")
