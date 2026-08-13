@@ -69,14 +69,18 @@ Keychain only; they are never written to config, SQLite, logs, or browser state)
 
 The preflight signs an in-memory probe but never submits it or places a canary
 order. After it passes, install the persistent macOS Dashboard stack. The
-default command cuts over to Gateway `8766` plus Legacy Dashboard `8767`; use
-`--mode single` to roll back while preserving all three job configurations:
+default command cuts over to Gateway `8766` plus non-Prediction Legacy Dashboard
+`8767`; Prediction remains owned by the independent Service on `8769`. The
+`--mode single` command is a manual non-Prediction fallback, not a Prediction
+rollback. Prediction rollback is supported only by restoring a compatible 8769
+Prediction Service release until #60 advances `minimum_reader_generation`:
 
 ```bash
 scripts/install_dashboard_launchd.sh --dry-run
 scripts/install_dashboard_launchd.sh
-.venv/bin/python -m open_trader prediction-arb status --url http://127.0.0.1:8766
-scripts/install_dashboard_launchd.sh --mode single
+.venv/bin/python -m open_trader prediction-arb status --url http://127.0.0.1:8769
+# Optional manual non-Prediction fallback only:
+# scripts/install_dashboard_launchd.sh --mode single
 scripts/uninstall_dashboard_launchd.sh
 ```
 
@@ -444,7 +448,9 @@ orders.
 
 ### Deploy the Local Dashboard Stack
 
-The persistent macOS Dashboard runs as one launchd-managed stack:
+The persistent macOS Dashboard browser stack is launchd-managed; it owns only
+Gateway and non-Prediction Legacy. Prediction Service is an independent owner
+on `8769`:
 
 ```text
 Browser → Frontend Gateway → Legacy Dashboard
@@ -452,10 +458,13 @@ Browser → Frontend Gateway → Legacy Dashboard
 ```
 
 `http://127.0.0.1:8766/` is the only user and review URL. The Legacy listener
-on `8767` owns the existing backend behavior and must remain loopback-only.
+on `8767` owns non-Prediction backend behavior only; its Prediction prefix
+returns 404. Prediction runtime, database, read API, and mutation API are
+owned solely by the Service on `8769`, and all listeners must remain loopback-only.
 
-On the first install, create the preserved single-process rollback plist before
-cutting over to the stack. After that bootstrap, stack refreshes use one command:
+On the first install, create the preserved single-process non-Prediction fallback
+plist before cutting over to the stack. After that bootstrap, stack refreshes use
+one command:
 
 ```bash
 scripts/install_dashboard_launchd.sh --dry-run
@@ -471,24 +480,35 @@ fresh startup logs:
 ```bash
 launchctl print gui/$(id -u)/com.open-trader.frontend-gateway
 launchctl print gui/$(id -u)/com.open-trader.legacy-dashboard
+launchctl print gui/$(id -u)/com.open-trader.prediction-service
 lsof -nP -iTCP:8766 -sTCP:LISTEN
 lsof -nP -iTCP:8767 -sTCP:LISTEN
+lsof -nP -iTCP:8769 -sTCP:LISTEN
 curl -fsS http://127.0.0.1:8766/healthz
 curl -fsS http://127.0.0.1:8767/healthz
+curl -fsS http://127.0.0.1:8769/healthz
 curl -fsS -o /dev/null -w '%{http_code}\n' \
   http://127.0.0.1:8766/api/quotes
+curl -fsS -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:8766/api/prediction-arbitrage/state
 tail -n 20 logs/frontend_gateway/launchd.out.log
 tail -n 20 logs/legacy_dashboard/launchd.out.log
+tail -n 20 logs/prediction_service/launchd.out.log
 ```
 
-Restore the preserved single-process layout without deleting the stack plists:
+The 8769 health response must identify the sole Prediction owner with
+`mode=production`, `production_owner=true`, and matching `pid`, `cwd`, and
+`git_sha`; the Gateway Prediction state request above must return HTTP 200.
+
+Restore the preserved single-process non-Prediction layout without deleting the
+stack plists (this does not roll back Prediction):
 
 ```bash
 scripts/install_dashboard_launchd.sh --mode single
 ```
 
 See [Frontend Gateway 双进程部署参考](docs/operations/frontend-gateway-deployment-reference.md)
-for cutover order, automatic failure recovery, temporary-port smoke checks,
+for cutover order, fail-closed/manual recovery, temporary-port smoke checks,
 exact-SHA acceptance, and complete uninstall instructions.
 
 To generate intraday 做T signals for existing HK or US holdings:

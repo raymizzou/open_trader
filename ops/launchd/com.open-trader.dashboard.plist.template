@@ -37,8 +37,6 @@
     <string>OPEN_TRADER_REPORTS_DIR</string>
     <string>--config</string>
     <string>OPEN_TRADER_DAILY_CONFIG</string>
-    <string>--prediction-config</string>
-    <string>OPEN_TRADER_PREDICTION_CONFIG</string>
   </array>
 
   <key>RunAtLoad</key>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import shutil
@@ -8,6 +9,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+import open_trader.cli as cli
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +23,7 @@ ACCOUNT_LABEL = "com.open-trader.account-api"
 SINGLE_TEMPLATE = ROOT / f"ops/launchd/{SINGLE_LABEL}.plist.template"
 GATEWAY_TEMPLATE = ROOT / f"ops/launchd/{GATEWAY_LABEL}.plist.template"
 LEGACY_TEMPLATE = ROOT / f"ops/launchd/{LEGACY_LABEL}.plist.template"
+DASHBOARD_PLIST_TEMPLATES = (SINGLE_TEMPLATE, GATEWAY_TEMPLATE, LEGACY_TEMPLATE)
 
 
 def _dry_run_sections(stdout: str) -> dict[str, dict[str, object]]:
@@ -39,7 +43,6 @@ def _run_installer(
     tmp_path: Path,
     *,
     mode: str = "stack",
-    prediction_owner: str | None = None,
     wait_seconds: int = 1,
     **env_overrides: str,
 ) -> tuple[subprocess.CompletedProcess[str], list[str], Path]:
@@ -50,9 +53,6 @@ def _run_installer(
     (repo / "config").mkdir()
     for template in (SINGLE_TEMPLATE, GATEWAY_TEMPLATE, LEGACY_TEMPLATE):
         shutil.copy2(template, repo / "ops/launchd" / template.name)
-    (repo / "config/prediction_arbitrage.json").write_text(
-        "{}\n", encoding="utf-8"
-    )
     runtime = tmp_path / "runtime"
     runtime.mkdir()
     calls_path = tmp_path / "fake-calls"
@@ -221,13 +221,8 @@ exit 0
         "CURL_BIN": str(curl),
         **env_overrides,
     }
-    owner_args = (
-        ["--prediction-owner", prediction_owner]
-        if prediction_owner is not None
-        else []
-    )
     result = subprocess.run(
-        [str(INSTALLER), "--mode", mode, *owner_args, *common_args[1:]],
+        [str(INSTALLER), "--mode", mode, *common_args[1:]],
         cwd=ROOT,
         env=env,
         capture_output=True,
@@ -280,6 +275,47 @@ def test_stack_templates_define_separate_loopback_jobs() -> None:
     )
 
 
+def test_dashboard_launchd_has_no_prediction_owner_or_config(tmp_path: Path) -> None:
+    parser = cli.build_parser()
+    for path in DASHBOARD_PLIST_TEMPLATES:
+        text = path.read_text(encoding="utf-8")
+        assert "--prediction-owner" not in text
+        assert "--prediction-config" not in text
+
+    installer = INSTALLER.read_text(encoding="utf-8")
+    assert "--prediction-owner" not in installer
+    assert "PREDICTION_OWNER" not in installer
+
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    for mode in ("single", "legacy"):
+        result = subprocess.run(
+            [
+                str(INSTALLER),
+                "--mode",
+                mode,
+                "--dry-run",
+                "--repo-root",
+                str(ROOT),
+                "--runtime-root",
+                str(runtime),
+                "--launch-agents-dir",
+                str(agents),
+                "--python",
+                sys.executable,
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        args = plistlib.loads(result.stdout.encode("utf-8"))["ProgramArguments"]
+        dashboard_args = args[args.index("dashboard") :]
+        assert parser.parse_args(dashboard_args).command == "dashboard"
+
+
 def test_stack_dry_run_prints_two_valid_plists_without_side_effects(
     tmp_path: Path,
 ) -> None:
@@ -321,16 +357,14 @@ def test_stack_dry_run_prints_two_valid_plists_without_side_effects(
     assert str(runtime / "config/prediction-route.json") in gateway_args
     legacy_args = sections[LEGACY_LABEL]["ProgramArguments"]
     assert str(runtime / "data") in legacy_args
-    assert str(runtime / "config/prediction_arbitrage.json") in legacy_args
+    assert "--prediction-config" not in legacy_args
     assert not list(agents.iterdir())
 
 
-def test_legacy_only_disables_prediction_owner_without_touching_gateway_or_single(
+def test_legacy_only_preserves_gateway_and_single_without_prediction_flags(
     tmp_path: Path,
 ) -> None:
-    result, calls, agents = _run_installer(
-        tmp_path, mode="legacy", prediction_owner="disabled"
-    )
+    result, calls, agents = _run_installer(tmp_path, mode="legacy")
     domain = f"gui/{os.getuid()}"
     legacy = plistlib.loads((agents / f"{LEGACY_LABEL}.plist").read_bytes())
     legacy_args = legacy["ProgramArguments"]
@@ -338,10 +372,8 @@ def test_legacy_only_disables_prediction_owner_without_touching_gateway_or_singl
     listener_state = tmp_path / "listener-state"
 
     assert result.returncode == 0
-    assert legacy_args[legacy_args.index("--prediction-config") + 2 :][:2] == [
-        "--prediction-owner",
-        "disabled",
-    ]
+    assert "--prediction-config" not in legacy_args
+    assert "--prediction-owner" not in legacy_args
     assert [
         call
         for call in calls
@@ -373,22 +405,19 @@ def test_legacy_only_disables_prediction_owner_without_touching_gateway_or_singl
     assert (listener_state / "8768").read_text(encoding="utf-8") == "4104\n"
 
 
-def test_legacy_prediction_owner_defaults_enabled(tmp_path: Path) -> None:
-    result, _, agents = _run_installer(tmp_path, mode="legacy")
-    legacy = plistlib.loads((agents / f"{LEGACY_LABEL}.plist").read_bytes())
-    legacy_args = legacy["ProgramArguments"]
+def test_fresh_stack_bootstraps_service_prediction_route(tmp_path: Path) -> None:
+    result, _, _ = _run_installer(tmp_path)
 
     assert result.returncode == 0
-    assert legacy_args[legacy_args.index("--prediction-owner") + 1] == "enabled"
+    route = json.loads(
+        (tmp_path / "runtime/config/prediction-route.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert route["mode"] == "service"
 
 
-@pytest.mark.parametrize(
-    ("mode", "owner"),
-    (("unknown", "disabled"), ("legacy", "unknown")),
-)
-def test_unknown_mode_or_prediction_owner_fails_without_side_effects(
-    tmp_path: Path, mode: str, owner: str
-) -> None:
+def test_unknown_mode_fails_without_side_effects(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     (repo / "ops/launchd").mkdir(parents=True)
     (repo / "config").mkdir()
@@ -406,9 +435,7 @@ def test_unknown_mode_or_prediction_owner_fails_without_side_effects(
         [
             str(INSTALLER),
             "--mode",
-            mode,
-            "--prediction-owner",
-            owner,
+            "unknown",
             "--repo-root",
             str(repo),
             "--runtime-root",
@@ -449,9 +476,6 @@ def test_retired_installer_mode_option_fails_without_side_effects(
     (repo / "config").mkdir()
     for template in (SINGLE_TEMPLATE, GATEWAY_TEMPLATE, LEGACY_TEMPLATE):
         shutil.copy2(template, repo / "ops/launchd" / template.name)
-    (repo / "config/prediction_arbitrage.json").write_text(
-        "{}\n", encoding="utf-8"
-    )
     agents = tmp_path / "LaunchAgents"
     agents.mkdir()
     runtime = tmp_path / "runtime"

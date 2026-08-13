@@ -81,9 +81,8 @@ def test_dashboard_launchd_dry_run_is_valid_and_has_no_side_effect(tmp_path: Pat
     assert args[args.index("--config") + 1] == str(
         runtime_root / "config/daily_premarket.env"
     )
-    assert args[args.index("--prediction-config") + 1] == str(
-        runtime_root / "config/prediction_arbitrage.json"
-    )
+    assert "--prediction-config" not in args
+    assert "--prediction-owner" not in args
     assert not list(agents.iterdir())
     assert "127.0.0.1" in result.stdout
     assert "8766" in result.stdout
@@ -109,9 +108,6 @@ def test_dashboard_installer_waits_across_seconds_boundary_before_bootstrap(
     shutil.copy2(
         TEMPLATE,
         repo / "ops/launchd/com.open-trader.dashboard.plist.template",
-    )
-    (repo / "config/prediction_arbitrage.json").write_text(
-        "{}\n", encoding="utf-8"
     )
     log_dir = repo / "logs/dashboard"
     log_dir.mkdir(parents=True)

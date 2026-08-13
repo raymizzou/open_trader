@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-13
 
+- #46 removes retired Prediction owner/config flags from Dashboard launchd
+  templates and installer. Legacy remains non-Prediction on 8767 while
+  Prediction Service owns 8769; fresh stack bootstrap now seeds the Service
+  route, and active runbooks describe fail-closed/manual non-Prediction
+  recovery. Current-parser, launchd, shell/plist, and diff checks pass. No
+  live launchd, service, route/data, or acceptance run was performed.
+
 - Prediction Dashboard state refreshes now use a signal-history generation to
   preserve independently-polled signals only when that history advances during
   the state request. Closed signals keep live profit hidden and operations
