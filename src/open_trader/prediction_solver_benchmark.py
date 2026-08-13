@@ -2130,25 +2130,36 @@ def _native_subprocess_env(python: Path) -> dict[str, str]:
     }
 
 
-def _docker_run_command(image: str, program: list[str]) -> list[str]:
+def _docker_run_command(image: str, program: list[str], cidfile: Path) -> list[str]:
     return [
         "docker", "run", "--rm", "--interactive", "--network", "none",
+        "--cidfile", str(cidfile),
         "--volume", f"{_ROOT}:/workspace:ro", "--workdir", "/workspace",
         "--env", "PYTHONPATH=/workspace/src", "--env", "PYTHONSAFEPATH=1",
         "--env", "PYTHONNOUSERSITE=1", image, *program,
     ]
 
 
-def _docker_completed(command: list[str]) -> subprocess.CompletedProcess[str] | None:
-    try:
-        completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return completed if completed.returncode == 0 else None
+def _docker_completed(image: str, program: list[str]) -> subprocess.CompletedProcess[str] | None:
+    with tempfile.TemporaryDirectory(prefix="open-trader-discovery-") as directory:
+        cidfile = Path(directory) / "container-id"
+        try:
+            completed = subprocess.run(
+                _docker_run_command(image, program, cidfile),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            completed = None
+        container_id = _validated_container_id(cidfile)
+        _prove_container_cleanup(container_id)
+        return completed if completed is not None and completed.returncode == 0 else None
 
 
 def _docker_json_self_check(image: str, program: list[str], name: str) -> dict[str, object] | None:
-    completed = _docker_completed(_docker_run_command(image, program))
+    completed = _docker_completed(image, program)
     if completed is None:
         return None
     lines = completed.stdout.splitlines() if isinstance(completed.stdout, str) else ()
@@ -2302,16 +2313,45 @@ def _validated_container_id(path: Path) -> str:
     return container_id
 
 
-def _container_is_absent(container_id: str) -> bool:
+def _container_state(container_id: str) -> str:
     try:
         completed = subprocess.run(["docker", "inspect", container_id], capture_output=True, text=True, check=False, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
-        return False
-    return (
+        return "unknown"
+    if completed.returncode == 0:
+        return "present"
+    if (
         completed.returncode == 1
         and not completed.stdout.strip()
         and completed.stderr.strip() == f"Error: No such object: {container_id}"
-    )
+    ):
+        return "absent"
+    return "unknown"
+
+
+def _container_is_absent(container_id: str) -> bool:
+    return _container_state(container_id) == "absent"
+
+
+def _prove_container_cleanup(container_id: str) -> None:
+    state = _container_state(container_id)
+    if state == "absent":
+        return
+    if state != "present":
+        raise RuntimeError("CONTAINER_CLEANUP_UNPROVEN")
+    try:
+        subprocess.run(
+            ["docker", "rm", "--force", container_id],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError("CONTAINER_CLEANUP_UNPROVEN") from error
+    if _container_state(container_id) != "absent":
+        raise RuntimeError("CONTAINER_CLEANUP_UNPROVEN")
+    raise RuntimeError("CONTAINER_CLEANUP_UNPROVEN")
 
 
 class _DockerHarness:
@@ -2343,11 +2383,7 @@ class _DockerHarness:
             try:
                 if self._submitted:
                     self.container_id = _validated_container_id(self._cidfile)
-                    if not _container_is_absent(self.container_id):
-                        subprocess.run(["docker", "rm", "--force", self.container_id], capture_output=True, text=True, check=False, timeout=5)
-                        if not _container_is_absent(self.container_id):
-                            raise RuntimeError("CONTAINER_CLEANUP_UNPROVEN")
-                        raise RuntimeError("CONTAINER_CLEANUP_UNPROVEN")
+                    _prove_container_cleanup(self.container_id)
             finally:
                 self._directory.cleanup()
 
@@ -2811,6 +2847,9 @@ def _run_full_environment(
     manifest: Mapping[str, object],
     environment_name: str,
     harness_factory,
+    *,
+    progress=print,
+    monotonic=time.monotonic,
 ) -> list[dict[str, object]]:
     cases_by_id = {case.case_id: case for case in cases}
     if len(cases_by_id) != len(cases):
@@ -2823,6 +2862,23 @@ def _run_full_environment(
         manifest["max_constraint_generation_rounds"],
     )
     records: list[dict[str, object]] = []
+    total_samples = len(_full_sample_plan(cases)) * len(_SOLVERS)
+    progress_started = monotonic()
+    next_progress = progress_started + 60
+    peak_rss_bytes = 0
+
+    def checkpoint(case_id: str, sample_kind: str, sample_index: int, current_rss_bytes: int) -> None:
+        nonlocal next_progress, peak_rss_bytes
+        peak_rss_bytes = max(peak_rss_bytes, current_rss_bytes)
+        now = monotonic()
+        if now < next_progress:
+            return
+        progress(
+            f"full benchmark progress phase={sample_kind} solver={solver} case={case_id} "
+            f"sample={len(records)}/{total_samples} elapsed_seconds={int(now - progress_started)} "
+            f"current_rss_bytes={current_rss_bytes} peak_rss_bytes={peak_rss_bytes}"
+        )
+        next_progress = now + 60
 
     for solver in _SOLVERS:
         artifact = manifest["solvers"][solver]["environments"][environment_name]
@@ -2838,6 +2894,13 @@ def _run_full_environment(
                 raise RuntimeError("CLEANUP_UNPROVEN")
             if checked.hard_failure:
                 raise RuntimeError("CHECK_HARD_FAILURE")
+            if run.termination_reason in {
+                TerminationReason.MEMORY_LIMIT,
+                TerminationReason.CRASH,
+                TerminationReason.INVALID_OUTPUT,
+                TerminationReason.PROTOCOL_MISMATCH,
+            }:
+                raise RuntimeError(f"FATAL_WORKER_TERMINATION:{run.termination_reason.value}")
             return outcome, run, checked
 
         def record(
@@ -2889,6 +2952,7 @@ def _run_full_environment(
                             wall_ns, warm_harness.start_count, warm_harness.rebuild_count, peak, peak, warm_harness,
                         )
                     )
+                    checkpoint(case.case_id, sample_kind, sample_index, peak)
                 elif sample_kind == "throughput":
                     harnesses = []
                     for slot in range(worker_count):
@@ -2929,6 +2993,7 @@ def _run_full_environment(
                             max(harness.rebuild_count for harness in harnesses), max(peaks), sum(peaks), harnesses[0],
                         )
                     )
+                    checkpoint(case.case_id, sample_kind, sample_index, sum(peaks))
                 elif sample_kind == "cold":
                     with _full_harness(harness_factory, solver) as harness:
                         started_ns = time.perf_counter_ns()
@@ -2943,6 +3008,7 @@ def _run_full_environment(
                             wall_ns, harness.start_count, harness.rebuild_count, peak, peak, harness,
                         )
                     )
+                    checkpoint(case.case_id, sample_kind, sample_index, peak)
                 elif sample_kind == "rebuild":
                     with _full_harness(harness_factory, solver) as harness:
                         submit(
@@ -2968,6 +3034,7 @@ def _run_full_environment(
                             wall_ns, harness.start_count, harness.rebuild_count, peak, peak, harness,
                         )
                     )
+                    checkpoint(case.case_id, sample_kind, sample_index, peak)
                 else:
                     raise ValueError(f"unsupported full sample kind: {sample_kind}")
     return records
@@ -3077,6 +3144,35 @@ def _run_quick_benchmark(output_root: Path = _QUICK_OUTPUT, env_root: Path = _BE
     return 0
 
 
+def _unavailable_linux_environment() -> dict[str, object]:
+    return {
+        "available": False,
+        "architecture": "unavailable",
+        "cpu": "unavailable",
+        "environment_id": "linux:unavailable",
+        "git_sha": "0" * 40,
+        "os_version": "unavailable",
+    }
+
+
+def _unavailable_linux_artifact() -> dict[str, object]:
+    return {
+        "adapter_version": WORKER_VERSION,
+        "build_id": "unavailable",
+        "commercial_key_required": False,
+        "image_id": "none",
+        "install_succeeded": False,
+        "installation_ns": 0,
+        "license_evidence_present": False,
+        "open_source": False,
+        "python_version": "unavailable",
+        "reuse_succeeded": False,
+        "run_succeeded": False,
+        "solver_version": "unavailable",
+        "source_evidence_present": False,
+    }
+
+
 def _run_full_macos(output_root: Path = _FINAL_RESULTS, env_root: Path = _BENCHMARK_ENVS) -> int:
     output = Path(output_root)
     if output.is_symlink() or output.exists() and not output.is_dir():
@@ -3092,29 +3188,8 @@ def _run_full_macos(output_root: Path = _FINAL_RESULTS, env_root: Path = _BENCHM
         return 2
     macos_environment, macos_artifacts = discovered
     cases = _load_full_cases()
-    linux_environment = {
-        "available": False,
-        "architecture": "unavailable",
-        "cpu": "unavailable",
-        "environment_id": "linux:unavailable",
-        "git_sha": "0" * 40,
-        "os_version": "unavailable",
-    }
-    linux_artifact = {
-        "adapter_version": WORKER_VERSION,
-        "build_id": "unavailable",
-        "commercial_key_required": False,
-        "image_id": "none",
-        "install_succeeded": False,
-        "installation_ns": 0,
-        "license_evidence_present": False,
-        "open_source": False,
-        "python_version": "unavailable",
-        "reuse_succeeded": False,
-        "run_succeeded": False,
-        "solver_version": "unavailable",
-        "source_evidence_present": False,
-    }
+    linux_environment = _unavailable_linux_environment()
+    linux_artifact = _unavailable_linux_artifact()
     manifest = _full_manifest(
         cases,
         {"macos": macos_environment, "linux": linux_environment},
@@ -3172,11 +3247,11 @@ def _read_full_macos_partial(output: Path) -> tuple[dict[str, object], list[dict
     cases = _load_full_cases()
     expected = _full_manifest(
         cases,
-        {"macos": macos_environment, "linux": manifest["environments"]["linux"]},
+        {"macos": macos_environment, "linux": _unavailable_linux_environment()},
         {
             solver: {
                 "macos": macos_artifacts[solver],
-                "linux": manifest["solvers"][solver]["environments"]["linux"],
+                "linux": _unavailable_linux_artifact(),
             }
             for solver in _SOLVERS
         },
@@ -3219,7 +3294,7 @@ def _run_full_linux(output_root: Path = _FINAL_RESULTS) -> int:
     _validated_run_manifest(manifest)
 
     def harness_factory(solver: str) -> _DockerHarness:
-        return _docker_harness(_text(manifest["solvers"][solver]["environments"]["linux"]["build_id"], "docker image"), solver)
+        return _docker_harness(_text(manifest["solvers"][solver]["environments"]["linux"]["image_id"], "docker image ID"), solver)
 
     linux_records = _run_full_environment(cases, manifest, "linux", harness_factory)
     all_records = macos_records + linux_records

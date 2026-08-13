@@ -2298,6 +2298,7 @@ def _fake_harness_factory(
     batch_semantics_differ: bool = False,
     hard_check_failure: bool = False,
     raise_on_sample_kind: str | None = None,
+    termination: str | None = None,
 ):
     next_pid = 10_000
     cases = benchmark._load_full_cases()
@@ -2343,6 +2344,11 @@ def _fake_harness_factory(
                 return WorkerOutcome(
                     request.request_id, "UNKNOWN", "CLEANUP_UNPROVEN", self.worker_pid,
                     self.worker_pid, slot + 1, False, False,
+                )
+            if termination is not None:
+                return WorkerOutcome(
+                    request.request_id, "UNKNOWN", termination, self.worker_pid,
+                    self.worker_pid, slot + 1, False, True,
                 )
             case = next(case for case in cases if case.request == request.request)
             if case.expected_result is None:
@@ -2437,6 +2443,30 @@ def test_full_environment_runner_stops_on_hard_check_failure() -> None:
         _run_tiny_full_plan(_fake_harness_factory(hard_check_failure=True))
 
 
+@pytest.mark.parametrize("termination", ("MEMORY_LIMIT", "CRASH", "INVALID_OUTPUT", "PROTOCOL_MISMATCH", "unrecognized-format-failure"))
+def test_full_environment_runner_stops_immediately_on_fatal_worker_termination(termination: str) -> None:
+    factory = _fake_harness_factory(termination=termination)
+
+    with pytest.raises(RuntimeError, match="FATAL_WORKER_TERMINATION"):
+        _run_tiny_full_plan(factory)
+
+    assert sum(len(harness.sample_kinds) for harness in factory.instances) == 1
+
+
+@pytest.mark.parametrize("termination", ("SOFT_TIMEOUT", "HARD_TIMEOUT"))
+def test_full_environment_runner_preserves_modeled_timeouts_as_unknown(termination: str, monkeypatch) -> None:
+    cases = benchmark._load_full_cases()
+    environments, artifacts = _full_environment_fixture()
+    manifest = benchmark._full_manifest(cases, environments, artifacts)
+    monkeypatch.setattr(benchmark, "_SOLVERS", ("highs",))
+    monkeypatch.setattr(benchmark, "_full_sample_plan", lambda _: ((cases[0].case_id, "warmup", 0, 1),))
+
+    records = benchmark._run_full_environment(cases, manifest, "macos", _fake_harness_factory(termination=termination))
+
+    assert records[0]["solver_run"]["termination_reason"] == termination
+    assert records[0]["solver_run"]["business_status"] == "UNKNOWN"
+
+
 @pytest.mark.parametrize("sample_kind", ("warmup", "throughput", "cold", "rebuild"))
 def test_full_environment_runner_exits_each_harness_context_on_exception(
     sample_kind: str,
@@ -2481,6 +2511,35 @@ def test_full_environment_runner_reuses_each_throughput_worker_slot(monkeypatch)
     assert len(factory.instances) == 3
 
 
+def test_full_environment_runner_emits_monotonic_bounded_progress(monkeypatch) -> None:
+    cases = benchmark._load_full_cases()
+    environments, artifacts = _full_environment_fixture()
+    manifest = benchmark._full_manifest(cases, environments, artifacts)
+    messages: list[str] = []
+    clock = iter((0.0, 0.0, 60.0, 60.0, 120.0))
+    monkeypatch.setattr(benchmark, "_SOLVERS", ("highs",))
+    monkeypatch.setattr(
+        benchmark,
+        "_full_sample_plan",
+        lambda _: tuple((cases[0].case_id, "warmup", index, 1) for index in range(4)),
+    )
+
+    benchmark._run_full_environment(
+        cases,
+        manifest,
+        "macos",
+        _fake_harness_factory(),
+        progress=messages.append,
+        monotonic=lambda: next(clock),
+    )
+
+    assert len(messages) == 2
+    assert "phase=warmup solver=highs" in messages[0]
+    assert f"case={cases[0].case_id}" in messages[0]
+    assert "sample=2/4 elapsed_seconds=60 current_rss_bytes=1024 peak_rss_bytes=1024" in messages[0]
+    assert "sample=4/4 elapsed_seconds=120" in messages[1]
+
+
 def _scip_exact_self_check_payload() -> dict[str, object]:
     return {
         "adapter": "ScipBackend",
@@ -2518,6 +2577,7 @@ def _install_fake_docker(
         if command[:3] == ["docker", "image", "inspect"]:
             return subprocess.CompletedProcess(command, 0, "sha256:" + "a" * 64 + "\n", "")
         if command[:3] == ["docker", "run", "--rm"]:
+            Path(command[command.index("--cidfile") + 1]).write_text("e" * 64 + "\n")
             if "linux-platform-highs" in command[-1]:
                 stdout = json.dumps({"architecture": "x86_64", "cpu": "fake-cpu", "os_version": "Linux", "probe": "linux-platform-highs", "python_version": "3.12.11"}) + "\n"
             elif "scip-exact" in command[-1]:
@@ -2531,6 +2591,8 @@ def _install_fake_docker(
                     "version": benchmark._SOLVER_VERSIONS[solver],
                 }) + "\n"
             return subprocess.CompletedProcess(command, 0, stdout, "")
+        if command[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(command, 1, "", f"Error: No such object: {'e' * 64}\n")
         raise AssertionError(command)
 
     monkeypatch.setattr(benchmark.subprocess, "run", run)
@@ -2568,6 +2630,67 @@ def test_linux_discovery_rejects_missing_or_invalid_scip_exact_evidence(monkeypa
     _install_fake_docker(monkeypatch, scip_exact_payload=payload)
 
     assert benchmark._discover_linux_environment() is None
+
+
+def _install_discovery_container_run(monkeypatch, mode: str) -> list[list[str]]:
+    calls: list[list[str]] = []
+    inspections = 0
+
+    def run(command, **kwargs):
+        nonlocal inspections
+        del kwargs
+        calls.append(command)
+        if command[:3] == ["docker", "run", "--rm"]:
+            cidfile = Path(command[command.index("--cidfile") + 1])
+            cidfile.write_text("d" * 64 + "\n")
+            if mode == "timeout":
+                raise subprocess.TimeoutExpired(command, 10)
+            if mode == "oserror":
+                raise OSError("docker startup failed")
+            return subprocess.CompletedProcess(command, 1 if mode == "startup" else 0, '{"status":"OPTIMAL"}\n', "startup failed" if mode == "startup" else "")
+        if command[:2] == ["docker", "inspect"]:
+            inspections += 1
+            if mode == "ambiguous":
+                return subprocess.CompletedProcess(command, 1, "", "permission denied\n")
+            if mode == "survivor" and inspections == 1:
+                return subprocess.CompletedProcess(command, 0, "{}\n", "")
+            return subprocess.CompletedProcess(command, 1, "", f"Error: No such object: {'d' * 64}\n")
+        if command[:3] == ["docker", "rm", "--force"]:
+            return subprocess.CompletedProcess(command, 0, "d" * 64 + "\n", "")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(benchmark.subprocess, "run", run)
+    return calls
+
+
+def test_discovery_container_uses_cidfile_and_proves_exact_absence(monkeypatch) -> None:
+    calls = _install_discovery_container_run(monkeypatch, "success")
+
+    assert benchmark._docker_json_self_check("sha256:" + "a" * 64, ["python", "probe"], "probe") == {"status": "OPTIMAL"}
+
+    run = calls[0]
+    assert "--cidfile" in run
+    assert [call[:2] for call in calls].count(["docker", "inspect"]) == 1
+
+
+@pytest.mark.parametrize("mode", ("startup", "timeout", "oserror"))
+def test_discovery_container_proves_absence_after_run_failure(monkeypatch, mode) -> None:
+    calls = _install_discovery_container_run(monkeypatch, mode)
+
+    assert benchmark._docker_json_self_check("sha256:" + "a" * 64, ["python", "probe"], "probe") is None
+
+    assert any(call[:2] == ["docker", "inspect"] for call in calls)
+
+
+@pytest.mark.parametrize("mode", ("ambiguous", "survivor"))
+def test_discovery_container_stops_on_unproven_or_forced_cleanup(monkeypatch, mode) -> None:
+    calls = _install_discovery_container_run(monkeypatch, mode)
+
+    with pytest.raises(RuntimeError, match="CONTAINER_CLEANUP_UNPROVEN"):
+        benchmark._docker_json_self_check("sha256:" + "a" * 64, ["python", "probe"], "probe")
+
+    if mode == "survivor":
+        assert ["docker", "rm", "--force", "d" * 64] in calls
 
 
 def _install_fake_docker_worker(monkeypatch: pytest.MonkeyPatch, *, container_survives: bool = False) -> list[list[str]]:
@@ -2704,7 +2827,9 @@ def test_full_linux_rejects_incomplete_partial_manifest_before_docker(tmp_path, 
 
 def _current_macos_partial(tmp_path, monkeypatch) -> tuple[dict[str, object], dict[str, dict[str, dict[str, object]]]]:
     environments, artifacts = _full_environment_fixture()
-    environments["linux"]["available"] = False
+    environments["linux"] = benchmark._unavailable_linux_environment()
+    for solver in benchmark._SOLVERS:
+        artifacts[solver]["linux"] = benchmark._unavailable_linux_artifact()
     manifest = benchmark._full_manifest(benchmark._load_full_cases(), environments, artifacts)
     (tmp_path / "environment_manifest.json").write_text(json.dumps(manifest))
     (tmp_path / "macos.jsonl").write_text("")
@@ -2764,6 +2889,35 @@ def test_full_linux_rejects_mac_hard_gate_result_before_docker(tmp_path, monkeyp
         benchmark._read_full_macos_partial(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    (
+        ("environment", "architecture", "tampered-linux"),
+        ("environment", "git_sha", "2" * 40),
+        ("artifact", "build_id", "tampered-build"),
+        ("artifact", "image_id", "sha256:" + "f" * 64),
+        ("artifact", "run_succeeded", True),
+    ),
+)
+def test_full_linux_rejects_tampered_unavailable_linux_placeholder_before_docker(
+    tmp_path,
+    monkeypatch,
+    section,
+    field,
+    value,
+) -> None:
+    manifest, _ = _current_macos_partial(tmp_path, monkeypatch)
+    if section == "environment":
+        manifest["environments"]["linux"][field] = value
+    else:
+        manifest["solvers"]["highs"]["environments"]["linux"][field] = value
+    (tmp_path / "environment_manifest.json").write_text(json.dumps(manifest))
+    monkeypatch.setattr(benchmark, "_discover_linux_environment", lambda: pytest.fail("docker discovered"))
+
+    with pytest.raises(ValueError, match="identity"):
+        benchmark._run_full_linux(tmp_path)
+
+
 def test_full_linux_requires_a_complete_validated_macos_partial_before_docker(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(benchmark, "_discover_linux_environment", lambda: pytest.fail("docker discovered"))
 
@@ -2785,13 +2939,18 @@ def test_full_linux_completes_the_partial_without_rewriting_macos_evidence(tmp_p
     macos_before = (tmp_path / "macos.jsonl").read_bytes()
     environments, artifacts = _full_environment_fixture()
     linux_factory = _fake_harness_factory()
+    worker_images: list[str] = []
     monkeypatch.setattr(benchmark, "_current_git_sha", lambda: "1" * 40)
     monkeypatch.setattr(
         benchmark,
         "_discover_linux_environment",
         lambda: (environments["linux"], {solver: artifacts[solver]["linux"] for solver in benchmark._SOLVERS}),
     )
-    monkeypatch.setattr(benchmark, "_docker_harness", lambda image, solver: linux_factory(solver))
+    monkeypatch.setattr(
+        benchmark,
+        "_docker_harness",
+        lambda image, solver: worker_images.append(image) or linux_factory(solver),
+    )
 
     assert benchmark._run_full_linux(tmp_path) == 0
 
@@ -2800,6 +2959,7 @@ def test_full_linux_completes_the_partial_without_rewriting_macos_evidence(tmp_p
     linux_records = (tmp_path / "linux.jsonl").read_text().splitlines()
     assert macos_records == macos_before
     assert manifest["environments"]["linux"]["available"] is True
+    assert set(worker_images) == {artifacts[solver]["linux"]["image_id"] for solver in benchmark._SOLVERS}
     assert len(linux_records) == 4_755
     assert len(macos_records.splitlines()) + len(linux_records) == 9_510
     benchmark.aggregate_benchmark_records(
@@ -2875,6 +3035,22 @@ def test_full_macos_failure_leaves_no_final_artifact(tmp_path, monkeypatch) -> N
     _install_full_macos_fakes(monkeypatch, fail_after_records=2)
 
     with pytest.raises(RuntimeError, match="CLEANUP_UNPROVEN"):
+        benchmark._run_full_macos(tmp_path, tmp_path / "envs")
+
+    assert not (tmp_path / "macos.jsonl").exists()
+    assert not (tmp_path / "environment_manifest.json").exists()
+
+
+def test_full_macos_fatal_termination_never_reaches_publication(tmp_path, monkeypatch) -> None:
+    _install_full_macos_publication_fakes(monkeypatch)
+
+    def fail_before_publication(*args):
+        del args
+        raise RuntimeError("FATAL_WORKER_TERMINATION:CRASH")
+
+    monkeypatch.setattr(benchmark, "_run_full_environment", fail_before_publication)
+
+    with pytest.raises(RuntimeError, match="FATAL_WORKER_TERMINATION:CRASH"):
         benchmark._run_full_macos(tmp_path, tmp_path / "envs")
 
     assert not (tmp_path / "macos.jsonl").exists()
