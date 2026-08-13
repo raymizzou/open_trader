@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-13
 
+- #45 marks post-cutover lock-holder evidence unavailable when its capture
+  fails, instead of treating an empty holder list as verified availability.
+  Focused malformed-after evidence check passes; no live command, deployment,
+  or acceptance run was performed.
+
 - #45 validates joined macOS runtime-lock output at the capture boundary,
   canonicalizing `p<PID>` holders while accepting only `f<FD>` ancillary
   records. Unknown or PID-less output fails closed before route mutation and

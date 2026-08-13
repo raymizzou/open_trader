@@ -1605,6 +1605,7 @@ def test_runtime_lock_probe_after_snapshot_writes_failed_evidence(
     assert evidence["result"] == "failed"
     assert evidence["owner"]["before_lock_holders"] == [2001]
     assert evidence["owner"]["lock_holders"] == []
+    assert evidence["owner"]["available"] is False
 
 
 def test_failed_service_then_separate_rollback_recovers_maintenance(

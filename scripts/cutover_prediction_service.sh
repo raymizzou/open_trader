@@ -60,6 +60,7 @@ AFTER_ACCOUNT_API_SHA=""
 AFTER_ACCOUNT_API_LISTENER_PID=""
 AFTER_ACCOUNT_API_HEALTH=""
 BEFORE_SNAPSHOT_CAPTURED=0
+AFTER_OWNER_HOLDERS_VALID=0
 DIRECT_STATE_VERIFIED=0
 DIRECT_HISTORY_VERIFIED=0
 DIRECT_PREVIEW_VERIFIED=0
@@ -637,6 +638,7 @@ capture_after_account_snapshot() {
 
 capture_after_snapshot() {
   local status=0
+  AFTER_OWNER_HOLDERS_VALID=0
   GATEWAY_PID="" GATEWAY_LISTENER_PID="" AFTER_GATEWAY_HEALTH=""
   if GATEWAY_PID="$(inspect_label com.open-trader.frontend-gateway 1)" \
       && GATEWAY_LISTENER_PID="$(listener_pid 8766)" \
@@ -693,6 +695,7 @@ capture_after_snapshot() {
 
   if capture_owner_holders; then
     AFTER_OWNER_HOLDERS="$CAPTURED_OUTPUT"
+    AFTER_OWNER_HOLDERS_VALID=1
   else
     AFTER_OWNER_HOLDERS=""
     status=1
@@ -1853,7 +1856,8 @@ evidence_details() {
     "$GATEWAY_PID" "$LEGACY_PID" "$SERVICE_PID" \
     "$BEFORE_GATEWAY_LISTENER_PID" "$BEFORE_LEGACY_LISTENER_PID" "$BEFORE_SERVICE_LISTENER_PID" \
     "$GATEWAY_LISTENER_PID" "$LEGACY_LISTENER_PID" "$SERVICE_LISTENER_PID" \
-    "$REPO_ROOT" "$BEFORE_ROUTE_MODE" "$mode" "$BEFORE_OWNER_HOLDERS" "$AFTER_OWNER_HOLDERS" "$RUNTIME_RECORD" \
+    "$REPO_ROOT" "$BEFORE_ROUTE_MODE" "$mode" "$BEFORE_OWNER_HOLDERS" "$AFTER_OWNER_HOLDERS" \
+    "$AFTER_OWNER_HOLDERS_VALID" "$RUNTIME_RECORD" \
     "$BEFORE_ACCOUNT_SNAPSHOT" "$AFTER_ACCOUNT_SNAPSHOT" \
     "$DIRECT_STATE_VERIFIED" "$DIRECT_HISTORY_VERIFIED" "$DIRECT_PREVIEW_VERIFIED" \
     "$PUBLIC_STATE_VERIFIED" "$PUBLIC_HISTORY_VERIFIED" "$PUBLIC_PREVIEW_VERIFIED" <<'PY'
@@ -1867,7 +1871,8 @@ from pathlib import Path
     gateway_pid_raw, legacy_pid_raw, service_pid_raw,
     before_gateway_listener_raw, before_legacy_listener_raw, before_service_listener_raw,
     gateway_listener_raw, legacy_listener_raw, service_listener_raw,
-    repo, before_mode, after_mode, before_holders_raw, after_holders_raw, runtime_raw,
+    repo, before_mode, after_mode, before_holders_raw, after_holders_raw,
+    after_holders_valid, runtime_raw,
     before_account_raw, after_account_raw,
     direct_state, direct_history, direct_preview,
     public_state, public_history, public_preview,
@@ -1976,7 +1981,7 @@ payload = {
         "pid": owner_pid,
         "lock_holders": lock_holders,
         "before_lock_holders": before_lock_holders,
-        "available": not bool(lock_holders),
+        "available": after_holders_valid == "1" and not bool(lock_holders),
     },
     "service_runtime": {
         "state": str(runtime.get("state", "unknown")),
