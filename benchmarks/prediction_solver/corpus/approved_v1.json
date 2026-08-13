@@ -1,6 +1,273 @@
 {
   "anonymization_salt": "issue49-approved-v1-82f7af716230",
-  "cases": [],
+  "cases": [
+    {
+      "anonymized_problem_fingerprint": "sha256:a1b63df2776a88522c3a00ed535489b777b18be827445b0419bf7d8359f127c4",
+      "approval_id": "anon:approval:a1017460454fe8e2a2d70c0fb2e2454485aa23a35903f896ceaed8d711d3cd0d",
+      "approved_at": "2026-08-13T10:36:37Z",
+      "approver": "anon:approver:8e8b834ac4a479288fe6618d1d0f0fed88c362b6069704760daf49fbef687c25",
+      "captured_at": "2026-08-12T21:55:32.153149Z",
+      "case_id": "approved:a1b63df2776a88522c3a00ed",
+      "generation_id": "anon:generation:6c60b91d9843dbe4a3ef8778c4b3845f896e7c24903db5cb58f04bdc87fd64dc",
+      "problem": {
+        "actions": [
+          {
+            "account_id": "anon:account:164651e5de2bfb1f01580ab11d46548ff152e74ce950d334420723aa522e8011",
+            "action_id": "anon:action:235030c275d8670bd5cd3d46f47d51d40f13966f8bb227d75529a457d8790193",
+            "asset_valuation_rule_id": "anon:valuation_rule:8f702046646b9ec7c31f55cb3a09590e3ea8570cc433abfdd7fa7697c02225f7",
+            "chain_id": "anon:chain:cff72196dfa65706417609e16909b4a4c802e965b2f6dba582525bc3b6c47a13",
+            "cost_slices": [
+              {
+                "first_lot": 1,
+                "incremental_cost_upper_bound_units": 9357,
+                "last_lot": 20
+              }
+            ],
+            "lot_step_units": 1,
+            "market_contract_id": "anon:contract:7a5449c36f073c07429fb3bc400198e9961d95e6466d0032e8857d0dcba37482",
+            "max_quantity_lots": 20,
+            "min_quantity_lots": 5,
+            "quantity_scale": 1,
+            "settlement_asset_id": "anon:asset:239aa2fffe5cbda7b68d353ad05cae9b35bd55741dc2d3e6df26118e637a1df5",
+            "settlement_observation_key": {
+              "indicator_id": "anon:observation_indicator:ab541ee9f0b5bc0bdfb96aca3ebd13f180fa32a027b82b8fc250c8eaffc77c0d",
+              "observation_end": "2026-08-13T20:00:00Z",
+              "observation_start": "2026-08-13T13:30:00Z",
+              "oracle_id": "anon:observation_oracle:3cec99164a568d92bdeba71a45f7547611ffd45ef555112acec33a08d08b35c6",
+              "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3",
+              "schema_version": "open_trader.prediction_n_leg.observation.v1",
+              "timezone": "America/New_York"
+            },
+            "side": "BUY_YES",
+            "valuation_unit_id": "anon:asset:239aa2fffe5cbda7b68d353ad05cae9b35bd55741dc2d3e6df26118e637a1df5",
+            "venue_id": "anon:venue:b659bcacf0c58e26fd821c09bc3c23a166fbefd3ce4b076940b9079d5fed773f"
+          },
+          {
+            "account_id": "anon:account:164651e5de2bfb1f01580ab11d46548ff152e74ce950d334420723aa522e8011",
+            "action_id": "anon:action:89a08c2dcd6f98589937c6cd840b0f90951f11ee46c733a1956328301c4ec0f7",
+            "asset_valuation_rule_id": "anon:valuation_rule:8f702046646b9ec7c31f55cb3a09590e3ea8570cc433abfdd7fa7697c02225f7",
+            "chain_id": "anon:chain:cff72196dfa65706417609e16909b4a4c802e965b2f6dba582525bc3b6c47a13",
+            "cost_slices": [
+              {
+                "first_lot": 1,
+                "incremental_cost_upper_bound_units": 986553,
+                "last_lot": 20
+              }
+            ],
+            "lot_step_units": 1,
+            "market_contract_id": "anon:contract:73f1dfec4d1edf25495937ae5c4d49671e770173c61497eb743f2793e407d47a",
+            "max_quantity_lots": 20,
+            "min_quantity_lots": 5,
+            "quantity_scale": 1,
+            "settlement_asset_id": "anon:asset:239aa2fffe5cbda7b68d353ad05cae9b35bd55741dc2d3e6df26118e637a1df5",
+            "settlement_observation_key": {
+              "indicator_id": "anon:observation_indicator:ab541ee9f0b5bc0bdfb96aca3ebd13f180fa32a027b82b8fc250c8eaffc77c0d",
+              "observation_end": "2026-08-13T20:00:00Z",
+              "observation_start": "2026-08-13T13:30:00Z",
+              "oracle_id": "anon:observation_oracle:3cec99164a568d92bdeba71a45f7547611ffd45ef555112acec33a08d08b35c6",
+              "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3",
+              "schema_version": "open_trader.prediction_n_leg.observation.v1",
+              "timezone": "America/New_York"
+            },
+            "side": "BUY_NO",
+            "valuation_unit_id": "anon:asset:239aa2fffe5cbda7b68d353ad05cae9b35bd55741dc2d3e6df26118e637a1df5",
+            "venue_id": "anon:venue:b659bcacf0c58e26fd821c09bc3c23a166fbefd3ce4b076940b9079d5fed773f"
+          }
+        ],
+        "as_of": "2026-08-12T21:55:32.153149Z",
+        "constraint_model": {
+          "forbidden_atom_combinations": [
+            {
+              "atom_ids": [
+                "anon:atom:46a2b00d1983e8a8a2b7524ae55fac0dff33e68c471fa28faca67fe03c4d22d4",
+                "anon:atom:6ef04172a3c506d6824bb63332b689c053874571dea0f647b0567fc738b0e093"
+              ],
+              "constraint_id": "anon:constraint:05f2bf4259b7add0fc11ac49d6c615632e4f6fe8a74ee20754a9b57c4adff1fa",
+              "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3"
+            },
+            {
+              "atom_ids": [
+                "anon:atom:0b3196b56f79a72dddc006654fe3a66a7b50a6d9d6911dbfbd28caeb838064c4",
+                "anon:atom:dbb8b8114616693a8e9c1c5a2a8361beb5dbd44dd130703bf31897cceb89fe94"
+              ],
+              "constraint_id": "anon:constraint:0c012417f8de26cac7ad47a8d665e1e4f35099a703c05d0df123bdbc552c930a",
+              "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3"
+            },
+            {
+              "atom_ids": [
+                "anon:atom:46a2b00d1983e8a8a2b7524ae55fac0dff33e68c471fa28faca67fe03c4d22d4",
+                "anon:atom:c896b57bc6834de35e29cbf7bafae7bb3f9ae2b2ae341877ed980e054e71fff0"
+              ],
+              "constraint_id": "anon:constraint:1b8ba1641b7b744edf89b234e37ecb05f5e689a36e2ade3ed76ab933af497418",
+              "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3"
+            },
+            {
+              "atom_ids": [
+                "anon:atom:0b3196b56f79a72dddc006654fe3a66a7b50a6d9d6911dbfbd28caeb838064c4",
+                "anon:atom:1c9f73b2a343143a02ff9637c303cc8693bf56d45b4039e330e27500bac366e6"
+              ],
+              "constraint_id": "anon:constraint:f4767a328e25a375229bcc841977321ef316cbda882243b4d2f8016c49ca92c6",
+              "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3"
+            }
+          ],
+          "relations": [
+            {
+              "constraint_id": "anon:constraint:586b0a465e69364394ff6c31d5dfbd75ceb9bd232df773fabd56ab15d6d82163",
+              "contract_ids": [
+                "anon:contract:73f1dfec4d1edf25495937ae5c4d49671e770173c61497eb743f2793e407d47a",
+                "anon:contract:7a5449c36f073c07429fb3bc400198e9961d95e6466d0032e8857d0dcba37482"
+              ],
+              "kind": "IMPLIES",
+              "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3"
+            }
+          ]
+        },
+        "problem_id": "anon:problem:56e4a189a3d5069ed376f4348fe91122d4ba1739679e477a9bf50747ea41e146",
+        "qualification_constraints": [
+          {
+            "comparison": "GREATER_THAN_OR_EQUAL",
+            "constraint_id": "anon:constraint:1a90c0f0b6043dedea5a9802766213e93afdb47674ef40d0e2bfc3b273c9add7",
+            "metric": "GUARANTEED_PROFIT_UNITS",
+            "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3",
+            "threshold_denominator": 1,
+            "threshold_numerator": 1000000
+          },
+          {
+            "comparison": "GREATER_THAN_OR_EQUAL",
+            "constraint_id": "anon:constraint:74665e37929587209a0b22d3e645b6778e507fc6f58ff5f6ddf008754c79dc2d",
+            "metric": "ANNUALIZED_RETURN_PPM",
+            "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3",
+            "threshold_denominator": 1,
+            "threshold_numerator": 150000
+          },
+          {
+            "comparison": "LESS_THAN_OR_EQUAL",
+            "constraint_id": "anon:constraint:ccfe1a0b4fdbcf052d6a46e1dd958bfa247f6bf6bc6b09e60cc587dc219488e9",
+            "metric": "MAX_CAPITAL_RELEASE_DELAY_SECONDS",
+            "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3",
+            "threshold_denominator": 1,
+            "threshold_numerator": 2592000
+          },
+          {
+            "comparison": "GREATER_THAN_OR_EQUAL",
+            "constraint_id": "anon:constraint:ed2407ca8f844b58d5b7f0b5b5f189ac25e8ae3920155f0218b03366fb622f7f",
+            "metric": "NET_MARGIN_PPM",
+            "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3",
+            "threshold_denominator": 1,
+            "threshold_numerator": 10000
+          }
+        ],
+        "schema_version": "open_trader.prediction_n_leg.problem.v1",
+        "terminal_state_sets": [
+          {
+            "atoms": [
+              {
+                "atom_id": "anon:atom:1c9f73b2a343143a02ff9637c303cc8693bf56d45b4039e330e27500bac366e6",
+                "capital_release_at": "2026-08-13T20:00:00Z",
+                "kind": "NORMAL_NO",
+                "payouts": [
+                  {
+                    "action_id": "anon:action:89a08c2dcd6f98589937c6cd840b0f90951f11ee46c733a1956328301c4ec0f7",
+                    "payout_lower_bound_per_lot_units": 1000000
+                  }
+                ],
+                "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3"
+              },
+              {
+                "atom_id": "anon:atom:46a2b00d1983e8a8a2b7524ae55fac0dff33e68c471fa28faca67fe03c4d22d4",
+                "capital_release_at": "2026-08-13T20:00:00Z",
+                "kind": "SPLIT",
+                "payouts": [
+                  {
+                    "action_id": "anon:action:89a08c2dcd6f98589937c6cd840b0f90951f11ee46c733a1956328301c4ec0f7",
+                    "payout_lower_bound_per_lot_units": 500000
+                  }
+                ],
+                "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3"
+              },
+              {
+                "atom_id": "anon:atom:dbb8b8114616693a8e9c1c5a2a8361beb5dbd44dd130703bf31897cceb89fe94",
+                "capital_release_at": "2026-08-13T20:00:00Z",
+                "kind": "NORMAL_YES",
+                "payouts": [
+                  {
+                    "action_id": "anon:action:89a08c2dcd6f98589937c6cd840b0f90951f11ee46c733a1956328301c4ec0f7",
+                    "payout_lower_bound_per_lot_units": 0
+                  }
+                ],
+                "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3"
+              }
+            ],
+            "market_contract_id": "anon:contract:73f1dfec4d1edf25495937ae5c4d49671e770173c61497eb743f2793e407d47a",
+            "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3",
+            "settlement_observation_key": {
+              "indicator_id": "anon:observation_indicator:ab541ee9f0b5bc0bdfb96aca3ebd13f180fa32a027b82b8fc250c8eaffc77c0d",
+              "observation_end": "2026-08-13T20:00:00Z",
+              "observation_start": "2026-08-13T13:30:00Z",
+              "oracle_id": "anon:observation_oracle:3cec99164a568d92bdeba71a45f7547611ffd45ef555112acec33a08d08b35c6",
+              "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3",
+              "schema_version": "open_trader.prediction_n_leg.observation.v1",
+              "timezone": "America/New_York"
+            }
+          },
+          {
+            "atoms": [
+              {
+                "atom_id": "anon:atom:0b3196b56f79a72dddc006654fe3a66a7b50a6d9d6911dbfbd28caeb838064c4",
+                "capital_release_at": "2026-08-13T20:00:00Z",
+                "kind": "SPLIT",
+                "payouts": [
+                  {
+                    "action_id": "anon:action:235030c275d8670bd5cd3d46f47d51d40f13966f8bb227d75529a457d8790193",
+                    "payout_lower_bound_per_lot_units": 500000
+                  }
+                ],
+                "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3"
+              },
+              {
+                "atom_id": "anon:atom:6ef04172a3c506d6824bb63332b689c053874571dea0f647b0567fc738b0e093",
+                "capital_release_at": "2026-08-13T20:00:00Z",
+                "kind": "NORMAL_NO",
+                "payouts": [
+                  {
+                    "action_id": "anon:action:235030c275d8670bd5cd3d46f47d51d40f13966f8bb227d75529a457d8790193",
+                    "payout_lower_bound_per_lot_units": 0
+                  }
+                ],
+                "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3"
+              },
+              {
+                "atom_id": "anon:atom:c896b57bc6834de35e29cbf7bafae7bb3f9ae2b2ae341877ed980e054e71fff0",
+                "capital_release_at": "2026-08-13T20:00:00Z",
+                "kind": "NORMAL_YES",
+                "payouts": [
+                  {
+                    "action_id": "anon:action:235030c275d8670bd5cd3d46f47d51d40f13966f8bb227d75529a457d8790193",
+                    "payout_lower_bound_per_lot_units": 1000000
+                  }
+                ],
+                "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3"
+              }
+            ],
+            "market_contract_id": "anon:contract:7a5449c36f073c07429fb3bc400198e9961d95e6466d0032e8857d0dcba37482",
+            "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3",
+            "settlement_observation_key": {
+              "indicator_id": "anon:observation_indicator:ab541ee9f0b5bc0bdfb96aca3ebd13f180fa32a027b82b8fc250c8eaffc77c0d",
+              "observation_end": "2026-08-13T20:00:00Z",
+              "observation_start": "2026-08-13T13:30:00Z",
+              "oracle_id": "anon:observation_oracle:3cec99164a568d92bdeba71a45f7547611ffd45ef555112acec33a08d08b35c6",
+              "rule_version": "anon:rule:0f2f662326b0a05524056e44e8a35e18c425f611eacf9390c60d7723b0c2c0f3",
+              "schema_version": "open_trader.prediction_n_leg.observation.v1",
+              "timezone": "America/New_York"
+            }
+          }
+        ],
+        "valuation_unit_id": "anon:asset:239aa2fffe5cbda7b68d353ad05cae9b35bd55741dc2d3e6df26118e637a1df5"
+      },
+      "source_alias": "production-threshold-preview",
+      "source_problem_fingerprint": "sha256:c6c5a2955c6f96b03d6c8f10deccd96b1a54d713cea3ec0391a1590801ced59f"
+    }
+  ],
   "input_gaps": [
     {
       "gap_id": "legacy-incomplete-terminal-model",

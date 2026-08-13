@@ -282,16 +282,34 @@ def _approved_envelope() -> dict[str, object]:
 def _temporary_approved_paths(tmp_path: Path) -> tuple[Path, Path]:
     inbox = tmp_path / "approved_component.json"
     corpus = tmp_path / "approved_v1.json"
-    corpus.write_bytes(APPROVED_CORPUS.read_bytes())
+    corpus.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.prediction_solver.approved_corpus.v1",
+                "anonymization_salt": "test-approved-v1",
+                "cases": [],
+                "input_gaps": [
+                    {
+                        "gap_id": "legacy-incomplete-terminal-model",
+                        "reason": "approved legacy relations/signals/previews do not contain a complete #48 terminal model",
+                        "source_alias": "legacy-approved-prediction-data",
+                    }
+                ],
+            }
+        )
+    )
     return inbox, corpus
 
 
-def test_approved_corpus_starts_empty_with_the_known_legacy_gap() -> None:
-    payload = json.loads(APPROVED_CORPUS.read_bytes())
+def test_approved_corpus_contains_one_legal_case_with_the_known_legacy_gap() -> None:
+    payload = benchmark._load_approved_corpus(APPROVED_CORPUS)
 
-    assert payload["schema_version"] == "open_trader.prediction_solver.approved_corpus.v1"
-    assert payload["anonymization_salt"]
-    assert payload["cases"] == []
+    assert len(payload["cases"]) == 1
+    case = payload["cases"][0]
+    problem = problem_from_payload(case["problem"])
+    assert validate_problem(problem) == ()
+    assert case["anonymized_problem_fingerprint"] == fingerprint(problem)
+    assert case["case_id"] == f"approved:{case['anonymized_problem_fingerprint'].removeprefix('sha256:')[:24]}"
     assert payload["input_gaps"] == [
         {
             "gap_id": "legacy-incomplete-terminal-model",
