@@ -192,6 +192,7 @@ if command == "launchctl":
         print("\t}")
         print(f"\tworking directory = {item['cwd']}")
         print(f"\tpid = {item['pid']}")
+        print(f"\tgit_sha = {item.get('sha', os.environ['FAKE_SHA'])}")
         save()
         raise SystemExit(0)
     print("Could not find service", file=sys.stderr)
@@ -322,6 +323,8 @@ if command == "curl":
                 "maintenance": "maintenance",
             }[route["mode"]],
         }
+        if state.get("missing_pre45_inflight") and not state.get("gateway_stopped"):
+            gateway_health.pop("prediction_inflight_requests", None)
         if state["fail_at"] == "gateway_service_health" and route["mode"] == "service":
             gateway_health["prediction_upstream_status"] = "unavailable"
         print(json.dumps(gateway_health))
@@ -383,7 +386,7 @@ if command == "curl":
             raise SystemExit(0)
         public_status = state.get("public_status", "healthy")
         print(json.dumps({
-            "status": public_status,
+            "status": "degraded" if state["fail_at"] == "public_semantic_mismatch" and ":8766" in url else public_status,
             "health": {"status": state.get("public_health_status", "healthy")},
             "readiness": {
                 "status": state.get("public_readiness_status", "ready")
@@ -391,7 +394,7 @@ if command == "curl":
             "stale": False,
             "events": [],
             "opportunities": [],
-            "csrf_token": "fake-csrf",
+            "csrf_token": "public-csrf" if state["fail_at"] == "public_csrf_variant" and ":8766" in url else "fake-csrf",
         }))
     body = sys.stdout.getvalue() if hasattr(sys.stdout, "getvalue") else None
     if output_path:
@@ -403,7 +406,7 @@ if command == "curl":
         elif url.endswith("/api/prediction-arbitrage/preview"):
             payload = {"state": "rejected", "reason": "opportunity_unavailable"}
         elif url.endswith("/api/prediction-arbitrage/state"):
-            payload = {"status": state.get("public_status", "healthy"), "health": {"status": state.get("public_health_status", "healthy")}, "readiness": {"status": state.get("public_readiness_status", "ready")}, "stale": False, "events": [], "opportunities": [], "csrf_token": "fake-csrf"}
+            payload = {"status": "degraded" if state["fail_at"] == "public_semantic_mismatch" and ":8766" in url else state.get("public_status", "healthy"), "health": {"status": state.get("public_health_status", "healthy")}, "readiness": {"status": state.get("public_readiness_status", "ready")}, "stale": False, "events": [], "opportunities": [], "csrf_token": "public-csrf" if state["fail_at"] == "public_csrf_variant" and ":8766" in url else "fake-csrf"}
         else:
             payload = {}
         Path(output_path).write_text(json.dumps(payload), encoding="utf-8")
@@ -446,6 +449,7 @@ if command == "install_dashboard_launchd.sh":
         gateway = state["labels"]["com.open-trader.frontend-gateway"]
         gateway.update(loaded=True, pid=1002, cwd=option("--repo-root"), sha=os.environ["FAKE_SHA"])
         state["listeners"]["8766"] = {"pid": gateway["pid"]}
+        legacy["sha"] = os.environ["FAKE_SHA"]
     save()
     raise SystemExit(0)
 
@@ -543,7 +547,10 @@ if command == "uninstall_prediction_service_launchd.sh":
     service = state["labels"]["com.open-trader.prediction-service"]
     service.update(loaded=False, pid=0, cwd="")
     state["prediction_service_ready"] = False
-    state["lock_holders"] = []
+    state["lock_holders"] = (
+        [state["labels"]["com.open-trader.legacy-dashboard"]["pid"]]
+        if state["legacy_prediction_owner"] == "enabled" else []
+    )
     state["listeners"]["8769"] = None
     (runtime_root / "prediction-service-runtime.json").unlink(missing_ok=True)
     save()
@@ -626,6 +633,7 @@ class CutoverHarness:
             "legacy_prediction_owner": "enabled",
             "prediction_service_ready": False,
             "inflight": 0,
+            "missing_pre45_inflight": False,
             "extra_loaded_labels": [],
             "lock_holders": [2001],
             "public_status": "healthy",
@@ -651,7 +659,12 @@ class CutoverHarness:
                     "service": {"pid": None, "cwd": str(self.repo), "git_sha": SHA, "listener": None},
                 },
                 "route": {"before_mode": "legacy", "after_mode": "maintenance", "inflight_before": 0, "inflight_after": 0},
-                "owner": {"pid": 2001, "lock_holders": [2001], "available": False},
+                "owner": {
+                    "pid": 2001,
+                    "lock_holders": [2001],
+                    "before_lock_holders": [2001],
+                    "available": False,
+                },
                 "service_runtime": {"state": "unknown", "reader_generation": None, "contract_generation": None},
                 "verification": {
                     "direct_backend": "failed",
@@ -690,7 +703,7 @@ class CutoverHarness:
             },
             "listeners": {
                 "8766": {"pid": 1001}, "8767": {"pid": 2001},
-                "8768": None, "8769": None,
+                "8768": {"pid": 4001}, "8769": None,
             },
         }), encoding="utf-8")
         fake = self.bin / "fake-command"
@@ -726,6 +739,11 @@ class CutoverHarness:
             state["git_sha"] = "b" * 40
         elif fail_at == "wrong_runtime_sha":
             state["labels"]["com.open-trader.frontend-gateway"]["sha"] = "b" * 40
+        elif fail_at == "pre45_runtime_sha":
+            state["labels"]["com.open-trader.frontend-gateway"]["sha"] = "b" * 40
+            state["labels"]["com.open-trader.legacy-dashboard"]["sha"] = "b" * 40
+        elif fail_at == "pre45_missing_inflight":
+            state["missing_pre45_inflight"] = True
         elif fail_at == "unknown_listener":
             state["listeners"]["8769"] = {"pid": 9999}
         elif fail_at == "loaded_unknown_label":
@@ -734,12 +752,20 @@ class CutoverHarness:
             state["extra_loaded_labels"] = ["com.open-trader.prediction-service-copy"]
         elif fail_at == "duplicate_relevant_label":
             state["extra_loaded_labels"] = ["com.open-trader.legacy-dashboard"]
+        elif fail_at == "account_wrong_cwd":
+            state["labels"]["com.open-trader.account-sync-controller"]["cwd"] = "/unknown"
+        elif fail_at == "account_wrong_listener":
+            state["listeners"]["8768"] = {"pid": 9999}
+        elif fail_at == "account_missing_label":
+            state["labels"]["com.open-trader.account-sync-controller"]["loaded"] = False
         elif fail_at == "public_unavailable":
             state["public_status"] = "unavailable"
         elif fail_at == "public_degraded":
             state["public_health_status"] = "degraded"
         elif fail_at == "public_error":
             state["public_readiness_status"] = "error"
+        elif fail_at in {"public_semantic_mismatch", "public_csrf_variant"}:
+            pass
         elif fail_at == "legacy_argv_wrong":
             state["labels"]["com.open-trader.legacy-dashboard"]["argv"][-1] = "disabled"
         elif fail_at == "legacy_lock_holder_wrong":
@@ -899,6 +925,32 @@ def test_absent_bootstrap_proves_old_gateway_absent_before_route_write(
     )
 
 
+def test_absent_bootstrap_allows_pre_issue45_runtime_sha(harness: CutoverHarness) -> None:
+    harness.route.unlink()
+    harness.configure("pre45_runtime_sha")
+
+    result = harness.run("service")
+
+    assert result.returncode == 0, result.stderr
+    assert harness.evidence["before"]["gateway"]["git_sha"] == "b" * 40
+    assert harness.evidence["before"]["legacy"]["git_sha"] == "b" * 40
+    assert harness.evidence["after"]["gateway"]["git_sha"] == SHA
+    assert harness.evidence["after"]["legacy"]["git_sha"] == SHA
+
+
+def test_absent_bootstrap_records_missing_pre45_inflight_as_unavailable(
+    harness: CutoverHarness,
+) -> None:
+    harness.route.unlink()
+    harness.configure("pre45_missing_inflight")
+
+    result = harness.run("service")
+
+    assert result.returncode == 0, result.stderr
+    assert harness.evidence["route"]["inflight_before"] is None
+    assert harness.evidence["route"]["inflight_after"] == 0
+
+
 @pytest.mark.parametrize("failure", ["gateway_bootout", "bootstrap_listener_inspection_error"])
 def test_absent_bootstrap_failure_keeps_route_absent(
     harness: CutoverHarness, failure: str
@@ -951,6 +1003,15 @@ def test_service_failure_stays_in_maintenance_without_running_later_commands(
     assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "maintenance"
     assert harness.state["max_prediction_owners"] <= 1
     assert harness.evidence["result"] == "failed"
+    if failure == "evidence_write":
+        assert harness.evidence["verification"]["direct_backend"] == "failed"
+        assert not any(
+            harness.evidence["verification"][key]
+            for key in (
+                "direct_state", "direct_history", "direct_preview_no_submit",
+                "public_state", "public_history", "public_preview_no_submit",
+            )
+        )
     calls = harness.state["calls"]
     if forbidden_later_command == "curl":
         route_write = next(
@@ -982,6 +1043,29 @@ def test_service_failure_stays_in_maintenance_without_running_later_commands(
         and "enabled" in call
         for call in calls
     )
+
+
+def test_public_csrf_difference_is_allowed_by_contract_projection(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("public_csrf_variant")
+
+    result = harness.run("service")
+
+    assert result.returncode == 0, result.stderr
+    assert harness.evidence["verification"]["public_preview_no_submit"] is True
+
+
+def test_public_semantic_difference_fails_closed_before_ready_evidence(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("public_semantic_mismatch")
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "maintenance"
+    assert harness.evidence["result"] == "failed"
 
 
 def test_service_to_legacy_rollback_uses_one_owner(harness: CutoverHarness) -> None:
@@ -1050,6 +1134,34 @@ def test_failed_service_then_separate_rollback_recovers_maintenance(
         call[0] == "uninstall_prediction_service_launchd.sh"
         for call in harness.state["calls"]
     )
+
+
+def test_failed_runtime_record_without_service_is_uninstalled_on_rollback(
+    harness: CutoverHarness,
+) -> None:
+    harness.route.write_text(json.dumps({
+        "schema_version": "open_trader.frontend_gateway.prediction_route.v1",
+        "mode": "maintenance",
+        "operation_id": "failed-service-operation",
+        "updated_at": "2026-08-12T09:00:00+08:00",
+    }), encoding="utf-8")
+    (harness.runtime / "prediction-service-runtime.json").write_text(
+        json.dumps({
+            "schema_version": "open_trader.prediction_service.runtime.v1",
+            "state": "failed",
+            "failure_reason": "legacy_restart_failed",
+        }), encoding="utf-8"
+    )
+
+    result = harness.run("legacy")
+
+    assert result.returncode == 0, result.stderr
+    assert not (harness.runtime / "prediction-service-runtime.json").exists()
+    assert any(
+        call[0] == "uninstall_prediction_service_launchd.sh"
+        for call in harness.state["calls"]
+    )
+    assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "legacy"
 
 
 def test_evidence_snapshots_are_observed_before_and_after_cutover(
@@ -1219,7 +1331,13 @@ def test_state_transition_lock_serializes_route_and_evidence_cas(
     )
     competitor: subprocess.Popen[str] | None = None
     try:
-        assert wait_for_path(harness.race_read), "stale writer did not pause after read"
+        # This harness starts a fresh Python process for every bounded probe;
+        # on a cold runner the first route-write can take longer than the
+        # default five-second observation window.  Keep the race assertion
+        # bounded, but allow that startup latency to settle.
+        assert wait_for_path(harness.race_read, timeout=20.0), (
+            "stale writer did not pause after read"
+        )
         competitor = subprocess.Popen(
             [
                 sys.executable,
@@ -1295,12 +1413,16 @@ def test_signal_waits_for_mutating_child_cleanup_before_releasing_lock(
     interrupt_signal: signal.Signals,
 ) -> None:
     harness.configure("service_installer_interrupt")
+    owned_tmp = harness.root / "owned-tmp"
+    owned_tmp.mkdir()
+    environment = harness.environment()
+    environment["TMPDIR"] = str(owned_tmp)
     cutover = subprocess.Popen(
         harness.command("service"),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env=harness.environment(),
+        env=environment,
     )
     child_pid = 0
     try:
@@ -1336,6 +1458,10 @@ def test_signal_waits_for_mutating_child_cleanup_before_releasing_lock(
     assert not any(
         call[:3] == ["python", "-", "evidence-write"] and call[9] == "ready"
         for call in harness.state["calls"]
+    )
+    assert not any(
+        path.name.startswith(("open-trader-cutover-", "open-trader-cutover-auth-"))
+        for path in owned_tmp.iterdir()
     )
 
 
@@ -1407,6 +1533,20 @@ def test_preflight_rejects_unverified_runtime_before_maintenance(
         call[:3] == ["python", "-", "route-write"]
         for call in harness.state["calls"]
     )
+
+
+@pytest.mark.parametrize("failure", ["account_wrong_cwd", "account_wrong_listener", "account_missing_label"])
+def test_preflight_rejects_unverified_account_before_maintenance(
+    harness: CutoverHarness, failure: str
+) -> None:
+    harness.configure(failure)
+    route_before = harness.route.read_bytes()
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert harness.route.read_bytes() == route_before
+    assert not any(call[:3] == ["python", "-", "route-write"] for call in harness.state["calls"])
 
 
 def test_preflight_rejects_missing_tool_before_maintenance(
@@ -1535,12 +1675,14 @@ def test_evidence_excludes_config_and_request_secrets(harness: CutoverHarness) -
     evidence_text = (
         harness.runtime / "prediction-cutover-evidence.json"
     ).read_text(encoding="utf-8")
+    evidence = json.loads(evidence_text)
     assert secret not in evidence_text
     assert set(json.loads(evidence_text)) == {
         "schema_version", "operation_id", "target", "expected_sha", "result",
         "failure_reason", "downtime_started_at", "downtime_ended_at",
         "before", "after", "route", "owner", "service_runtime", "verification",
     }
+    assert evidence["owner"]["before_lock_holders"] == [2001]
 
 
 def test_service_child_timeout_fails_closed_with_no_later_mutation(

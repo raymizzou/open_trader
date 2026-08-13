@@ -59,7 +59,7 @@ stack 安装器或另行 bootstrap。命令会在停止旧 Gateway 并证明 `87
 ```bash
 REPO_ROOT=/path/to/open_trader
 PYTHON="$REPO_ROOT/.venv/bin/python"
-RUNTIME_ROOT="$REPO_ROOT/runtime"
+RUNTIME_ROOT="$REPO_ROOT"
 EXPECTED_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 scripts/cutover_prediction_service.sh \
   --target service \
@@ -75,8 +75,20 @@ scripts/cutover_prediction_service.sh \
 明确回滚并保留全部三份 plist：
 
 ```bash
-scripts/install_dashboard_launchd.sh --mode single
+scripts/cutover_prediction_service.sh \
+  --target legacy \
+  --repo-root "$REPO_ROOT" \
+  --runtime-root "$REPO_ROOT" \
+  --python "$PYTHON" \
+  --expected-sha "$EXPECTED_SHA" \
+  --prediction-config "$REPO_ROOT/config/prediction_arbitrage.json" \
+  --launch-agents-dir "$HOME/Library/LaunchAgents" \
+  --wait-seconds 30
 ```
+
+`install_dashboard_launchd.sh --mode single` remains a generic Dashboard
+deployment mode; it is not the Prediction owner rollback and must not be used
+for the #45 operation.
 
 完整卸载三个固定 label（重复运行安全）：
 

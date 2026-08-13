@@ -5,13 +5,17 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-12
 
-- #45 final safeguards integrate fail-closed compatibility bootstrap, explicit
-  maintenance rollback, native macOS PID absence proof, route-aware Gateway
-  health, sanitized evidence/public no-submit verification, and runtime artifact
-  ignores. The affected regression gate passed 671 tests with one existing
-  deprecation warning; the full-branch gate passed 5,884 tests with the same
-  warning. Live cutover, deployment, restart, 8769 install, and `make
-  acceptance` have not run.
+- #45 round-3 review fixes continue the fail-closed integrated bootstrap and
+  maintenance rollback with one evidence validator, observed pre-#45 runtime
+  identity, Account preservation checks, direct/public no-submit parity, and
+  private temporary-file cleanup. Focused checks on this SHA pass: 19 service
+  failure cases, 5 malformed/repeat evidence cases, and the CAS race case three
+  times; the full cutover-file attempt reached 46 passes before its cold-start
+  race observation timed out, so no final-file PASS is claimed. The prior
+  implementation SHA `a2adf509` historically passed the affected 671-case and
+  full 5,884-case gates; final affected/full gates for this new SHA remain
+  pending reviewer recheck. Live cutover, deployment, restart, 8769 install,
+  and `make acceptance` have not run.
 
 - #45 freezes Prediction Gateway `legacy`, `service`, and `maintenance` route
   modes with in-flight drain, adds Legacy owner-off launchd rendering, and

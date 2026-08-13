@@ -112,13 +112,13 @@ PY
 
 pid_absent() {
   local output status
-  if output="$("$PS_BIN" -p "$1" 2>&1)"; then
+  if output="$("$PS_BIN" -p "$1" -o pid= 2>&1)"; then
     echo "prediction service PID is still present: $1" >&2
     return 1
   else
     status=$?
   fi
-  [[ "$status" -eq 1 ]] && return 0
+  [[ "$status" -eq 1 && -z "$output" ]] && return 0
   printf '%s\n' "$output" >&2
   return "$status"
 }
