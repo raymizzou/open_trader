@@ -5,16 +5,10 @@ import signal
 import subprocess
 import json
 import sqlite3
-import threading
-from contextlib import contextmanager
-from typing import Iterator
 
 import pytest
 
 from open_trader import prediction_shadow_validation as validation
-from open_trader.dashboard_web import create_dashboard_server
-from tests.test_prediction_service import _Runtime, _response, _server
-from tests.test_dashboard import dashboard_config
 
 
 def _state(*, profit: str = "1.20", completed_at: str = "2026-08-10T00:00:00Z") -> dict[str, object]:
@@ -207,47 +201,6 @@ def test_shared_opportunity_missing_field_is_semantic_not_equal_to_none() -> Non
     differences = validation._compare_live_states(_state(), shadow)
 
     assert any(item["classification"] == "semantic_difference" and item["field"] == "fee" for item in differences)
-
-
-@contextmanager
-def _legacy_endpoint(runtime: _Runtime, tmp_path: Path) -> Iterator[str]:
-    server = create_dashboard_server(
-        config=dashboard_config(tmp_path),
-        host="127.0.0.1",
-        port=0,
-        prediction_store=runtime.store,
-        prediction_monitor=runtime.monitor,
-        prediction_execution_service=runtime.execution,
-        cross_venue_monitor=runtime.cross_venue_monitor,
-        prediction_session_token="legacy-session",
-        prediction_csrf_token="legacy-csrf",
-    )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{server.server_address[1]}"
-    finally:
-        server.shutdown(); server.server_close(); thread.join(timeout=5)
-
-
-def test_frozen_legacy_and_shadow_http_endpoints_match_except_session(tmp_path: Path) -> None:
-    runtime = _Runtime()
-    with _legacy_endpoint(runtime, tmp_path) as legacy_base, _server(runtime) as shadow_base:
-        legacy_state_status, legacy_state = _response(legacy_base + "/api/prediction-arbitrage/state")
-        shadow_state_status, shadow_state = _response(shadow_base + "/api/prediction-arbitrage/state")
-        legacy_history_status, legacy_history = _response(
-            legacy_base + "/api/prediction-arbitrage/history?kind=signals&limit=100&offset=0"
-        )
-        shadow_history_status, shadow_history = _response(
-            shadow_base + "/api/prediction-arbitrage/history?kind=signals&limit=100&offset=0"
-        )
-
-    assert legacy_state_status == shadow_state_status == 200
-    assert legacy_history_status == shadow_history_status == 200
-    assert validation._compare_frozen_payloads(legacy_state, shadow_state) == []
-    assert validation._compare_frozen_payloads(legacy_history, shadow_history) == []
-
-
 def test_install_shadow_passes_remaining_timeout_and_returns_verified_facts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

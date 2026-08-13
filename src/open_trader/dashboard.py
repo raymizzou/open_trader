@@ -207,7 +207,6 @@ class DashboardConfig:
     trend_cn_candidate_pool_ids: tuple[int, ...] = ()
     trend_us_candidate_pool_ids: tuple[int, ...] = ()
     trend_hk_candidate_pool_ids: tuple[int, ...] = ()
-    prediction_config_path: Path | None = None
 
     def trend_candidate_pool_ids(self, market: str) -> tuple[int, ...]:
         return {

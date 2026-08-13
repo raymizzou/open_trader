@@ -1055,16 +1055,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Public dashboard URL used in generated links",
     )
-    dashboard_parser.add_argument(
-        "--prediction-config",
-        type=Path,
-        default=None,
-        help="Non-secret Polymarket prediction-arbitrage config",
-    )
-    dashboard_parser.add_argument(
-        "--prediction-owner", choices=("enabled", "disabled"), default="enabled"
-    )
-
     prediction_parser = subparsers.add_parser(
         "prediction-arb",
         help="Run the guarded prediction-market wallet diagnostics",
@@ -2539,19 +2529,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "dashboard":
-        prediction_config_path = (
-            args.prediction_config.expanduser()
-            if args.prediction_config is not None
-            and args.prediction_owner == "enabled"
-            else None
-        )
-        if prediction_config_path is not None:
-            try:
-                prediction_loopback = ipaddress.ip_address(args.host).is_loopback
-            except ValueError:
-                prediction_loopback = args.host == "localhost"
-            if not prediction_loopback:
-                parser.error("--prediction-config requires a loopback --host")
         config_values = _load_optional_env_values(args.config)
         try:
             trend_a_share_tm_id = _optional_positive_tm_id(
@@ -2603,26 +2580,12 @@ def main(argv: list[str] | None = None) -> int:
             trend_cn_candidate_pool_ids=trend_cn_candidate_pool_ids,
             trend_us_candidate_pool_ids=trend_us_candidate_pool_ids,
             trend_hk_candidate_pool_ids=trend_hk_candidate_pool_ids,
-            prediction_config_path=prediction_config_path,
         )
-        prediction_notifier = None
-        if prediction_config_path is not None:
-            try:
-                prediction_notifier = build_notifier(
-                    load_env_config(args.config, dry_run=False)
-                )
-            except (FileNotFoundError, ValueError):
-                prediction_notifier = NullNotifier()
         serve_dashboard(
             config,
             host=args.host,
             port=args.port,
             public_url=args.public_url,
-            **(
-                {"prediction_notifier": prediction_notifier}
-                if prediction_config_path is not None
-                else {}
-            ),
         )
         return 0
 
