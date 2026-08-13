@@ -267,9 +267,9 @@ test "$REMOTE_SHA" = "$ACCEPTED_SHA"
 
 Expected: local `main`, `origin/main`, and the accepted SHA are identical. The implementation commit already contains the required dated changelog entry.
 
-- [ ] **Restart only Gateway and Prediction Service at the exact accepted SHA**
+- [ ] **Redeploy the retained Gateway/Legacy stack and Prediction Service at the exact accepted SHA**
 
-Record the old steady-state PIDs and restart boundary. Keep Legacy absent, restart the existing Frontend Gateway label in place, and reinstall Prediction Service from integrated `main`:
+Record the old steady-state PIDs, route digest, and restart boundary. Reinstall the retained Dashboard stack with Legacy Prediction ownership disabled, then reinstall Prediction Service from integrated `main`. Do not restart Account or write the route record:
 
 ```bash
 MAIN_ROOT=/Users/ray/projects/open_trader
@@ -278,28 +278,40 @@ PYTHON_BIN=/Users/ray/projects/open_trader/.venv/bin/python
 ACCEPTED_SHA="$(git -C /private/tmp/open_trader-retire-cutover-design rev-parse HEAD)"
 DEPLOY_MARKER=/private/tmp/open-trader-retire-cutover-deploy.marker
 OLD_PID_RECORD=/private/tmp/open-trader-retire-cutover-old-pids
+ROUTE_PATH="$RUNTIME_ROOT/config/prediction-route.json"
 : > "$DEPLOY_MARKER"
 test "$(git -C "$MAIN_ROOT" rev-parse HEAD)" = "$ACCEPTED_SHA"
 test -z "$(git -C "$MAIN_ROOT" status --porcelain)"
 
 DOMAIN="gui/$(id -u)"
 OLD_GATEWAY_PID="$(launchctl print "$DOMAIN/com.open-trader.frontend-gateway" | awk '$1 == "pid" && $2 == "=" {print $3; exit}')"
+OLD_LEGACY_PID="$(launchctl print "$DOMAIN/com.open-trader.legacy-dashboard" | awk '$1 == "pid" && $2 == "=" {print $3; exit}')"
 OLD_SERVICE_PID="$(launchctl print "$DOMAIN/com.open-trader.prediction-service" | awk '$1 == "pid" && $2 == "=" {print $3; exit}')"
+OLD_ACCOUNT_PID="$(launchctl print "$DOMAIN/com.open-trader.account-api" | awk '$1 == "pid" && $2 == "=" {print $3; exit}')"
 test -n "$OLD_GATEWAY_PID"
+test -n "$OLD_LEGACY_PID"
 test -n "$OLD_SERVICE_PID"
-printf '%s %s\n' "$OLD_GATEWAY_PID" "$OLD_SERVICE_PID" > "$OLD_PID_RECORD"
+test -n "$OLD_ACCOUNT_PID"
+ROUTE_SHA_BEFORE="$(shasum -a 256 "$ROUTE_PATH" | awk '{print $1}')"
+"$PYTHON_BIN" - "$ROUTE_PATH" <<'PY'
+import json
+import sys
 
-if LEGACY_OUTPUT="$(launchctl print "$DOMAIN/com.open-trader.legacy-dashboard" 2>&1)"; then
-  echo 'Legacy launchd label is unexpectedly loaded' >&2
-  exit 1
-fi
-case "$LEGACY_OUTPUT" in
-  *'Could not find service'*) ;;
-  *) printf '%s\n' "$LEGACY_OUTPUT" >&2; exit 1 ;;
-esac
-test -z "$(lsof -nP -tiTCP:8767 -sTCP:LISTEN 2>/dev/null)"
+with open(sys.argv[1], encoding="utf-8") as handle:
+    route = json.load(handle)
+assert route["schema_version"] == "open_trader.frontend_gateway.prediction_route.v1"
+assert route["mode"] == "service"
+PY
+printf '%s %s %s %s %s\n' \
+  "$OLD_GATEWAY_PID" "$OLD_LEGACY_PID" "$OLD_SERVICE_PID" \
+  "$OLD_ACCOUNT_PID" "$ROUTE_SHA_BEFORE" > "$OLD_PID_RECORD"
 
-launchctl kickstart -k "$DOMAIN/com.open-trader.frontend-gateway"
+"$MAIN_ROOT/scripts/install_dashboard_launchd.sh" \
+  --mode stack \
+  --prediction-owner disabled \
+  --repo-root "$MAIN_ROOT" \
+  --runtime-root "$RUNTIME_ROOT" \
+  --python "$PYTHON_BIN"
 
 "$MAIN_ROOT/scripts/install_prediction_service_launchd.sh" \
   --mode production \
@@ -312,9 +324,9 @@ launchctl kickstart -k "$DOMAIN/com.open-trader.frontend-gateway"
   --expected-sha "$ACCEPTED_SHA"
 ```
 
-Expected: only Frontend Gateway and Prediction Service restart. No Dashboard stack installer, Legacy start, Account installer, Account restart, route write, cutover, or rollback runs. The existing route remains `service`, Legacy remains absent, Account remains untouched, and this exact-SHA restart does not require another acceptance run.
+Expected: Frontend Gateway, Legacy Dashboard, and Prediction Service restart from the exact accepted checkout; Account keeps its existing PID. The Dashboard installer receives `--prediction-owner disabled`, so Legacy remains available on 8767 for its retained non-Prediction responsibilities without owning Prediction. The route record remains byte-for-byte unchanged in `service` mode. No Account installer, Account restart, route write, cutover, or rollback runs, and this exact-SHA redeploy does not require another acceptance run.
 
-- [ ] **Verify Gateway and Service plus explicit Legacy absence**
+- [ ] **Verify Gateway, Legacy, and Service while Legacy Prediction ownership stays disabled**
 
 Run:
 
@@ -325,17 +337,25 @@ PYTHON_BIN=/Users/ray/projects/open_trader/.venv/bin/python
 ACCEPTED_SHA="$(git -C /private/tmp/open_trader-retire-cutover-design rev-parse HEAD)"
 DEPLOY_MARKER=/private/tmp/open-trader-retire-cutover-deploy.marker
 OLD_PID_RECORD=/private/tmp/open-trader-retire-cutover-old-pids
+ROUTE_PATH="$RUNTIME_ROOT/config/prediction-route.json"
 GATEWAY_LABEL=com.open-trader.frontend-gateway
+LEGACY_LABEL=com.open-trader.legacy-dashboard
 SERVICE_LABEL=com.open-trader.prediction-service
+ACCOUNT_LABEL=com.open-trader.account-api
+LEGACY_PLIST=/Users/ray/Library/LaunchAgents/com.open-trader.legacy-dashboard.plist
 DOMAIN="gui/$(id -u)"
 
-read -r OLD_GATEWAY_PID OLD_SERVICE_PID < "$OLD_PID_RECORD"
+read -r OLD_GATEWAY_PID OLD_LEGACY_PID OLD_SERVICE_PID OLD_ACCOUNT_PID ROUTE_SHA_BEFORE < "$OLD_PID_RECORD"
 GATEWAY_PID="$(launchctl print "$DOMAIN/$GATEWAY_LABEL" | awk '$1 == "pid" && $2 == "=" {print $3; exit}')"
+LEGACY_PID="$(launchctl print "$DOMAIN/$LEGACY_LABEL" | awk '$1 == "pid" && $2 == "=" {print $3; exit}')"
 SERVICE_PID="$(launchctl print "$DOMAIN/$SERVICE_LABEL" | awk '$1 == "pid" && $2 == "=" {print $3; exit}')"
+ACCOUNT_PID="$(launchctl print "$DOMAIN/$ACCOUNT_LABEL" | awk '$1 == "pid" && $2 == "=" {print $3; exit}')"
 test "$GATEWAY_PID" != "$OLD_GATEWAY_PID"
+test "$LEGACY_PID" != "$OLD_LEGACY_PID"
 test "$SERVICE_PID" != "$OLD_SERVICE_PID"
+test "$ACCOUNT_PID" = "$OLD_ACCOUNT_PID"
 
-for item in "$GATEWAY_PID:8766" "$SERVICE_PID:8769"
+for item in "$GATEWAY_PID:8766" "$LEGACY_PID:8767" "$SERVICE_PID:8769"
 do
   pid="${item%%:*}"
   port="${item##*:}"
@@ -344,31 +364,63 @@ do
   test "$(lsof -nP -a -p "$pid" -iTCP:"$port" -sTCP:LISTEN -Fp | sed -n 's/^p//p')" = "$pid"
 done
 
-if LEGACY_OUTPUT="$(launchctl print "$DOMAIN/com.open-trader.legacy-dashboard" 2>&1)"; then
-  echo 'Legacy launchd label is unexpectedly loaded after redeploy' >&2
-  exit 1
-fi
-case "$LEGACY_OUTPUT" in
-  *'Could not find service'*) ;;
-  *) printf '%s\n' "$LEGACY_OUTPUT" >&2; exit 1 ;;
-esac
-test -z "$(lsof -nP -tiTCP:8767 -sTCP:LISTEN 2>/dev/null)"
+test "$(shasum -a 256 "$ROUTE_PATH" | awk '{print $1}')" = "$ROUTE_SHA_BEFORE"
 
 GATEWAY_HEALTH="$(curl -fsS http://127.0.0.1:8766/healthz)"
+LEGACY_HEALTH="$(curl -fsS http://127.0.0.1:8767/healthz)"
+LEGACY_PREDICTION_STATE="$(curl -fsS http://127.0.0.1:8767/api/prediction-arbitrage/state)"
 SERVICE_HEALTH="$(curl -fsS http://127.0.0.1:8769/healthz)"
-"$PYTHON_BIN" - "$ACCEPTED_SHA" "$MAIN_ROOT" "$GATEWAY_HEALTH" "$SERVICE_HEALTH" <<'PY'
+"$PYTHON_BIN" - \
+  "$ACCEPTED_SHA" "$MAIN_ROOT" "$ROUTE_PATH" "$LEGACY_PLIST" \
+  "$GATEWAY_HEALTH" "$LEGACY_HEALTH" "$LEGACY_PREDICTION_STATE" \
+  "$SERVICE_HEALTH" <<'PY'
 import json
+import plistlib
 import sys
 
-expected_sha, expected_cwd, gateway_raw, service_raw = sys.argv[1:]
+(
+    expected_sha,
+    expected_cwd,
+    route_path,
+    legacy_plist_path,
+    gateway_raw,
+    legacy_raw,
+    legacy_state_raw,
+    service_raw,
+) = sys.argv[1:]
 gateway = json.loads(gateway_raw)
+legacy = json.loads(legacy_raw)
+legacy_state = json.loads(legacy_state_raw)
 service = json.loads(service_raw)
+with open(route_path, encoding="utf-8") as handle:
+    route = json.load(handle)
+with open(legacy_plist_path, "rb") as handle:
+    legacy_plist = plistlib.load(handle)
+legacy_args = legacy_plist["ProgramArguments"]
+
+assert route["schema_version"] == "open_trader.frontend_gateway.prediction_route.v1"
+assert route["mode"] == "service"
+assert gateway["schema_version"] == "open_trader.frontend_gateway.health.v1"
 assert gateway["module"] == "frontend_gateway"
 assert gateway["cwd"] == expected_cwd
 assert gateway["git_sha"] == expected_sha
+assert gateway["legacy_upstream_status"] == "ok"
 assert gateway["prediction_route_mode"] == "service"
 assert gateway["prediction_upstream_status"] == "ok"
 assert gateway["account_upstream_status"] == "ok"
+assert legacy["schema_version"] == "open_trader.legacy_dashboard.health.v1"
+assert legacy["module"] == "legacy_dashboard"
+assert legacy["cwd"] == expected_cwd
+assert legacy["git_sha"] == expected_sha
+owner_index = legacy_args.index("--prediction-owner")
+assert legacy_args[owner_index + 1] == "disabled"
+assert legacy_state["status"] == "unavailable"
+assert legacy_state["failure_reason"] == "configuration_unavailable"
+assert legacy_state["readiness"] == {
+    "status": "unavailable",
+    "reason": "configuration_unavailable",
+}
+assert service["schema_version"] == "open_trader.prediction_service.health.v1"
 assert service["module"] == "prediction_service"
 assert service["cwd"] == expected_cwd
 assert service["git_sha"] == expected_sha
@@ -380,6 +432,7 @@ PY
 
 for log in \
   "$RUNTIME_ROOT/logs/frontend_gateway/launchd.out.log" \
+  "$RUNTIME_ROOT/logs/legacy_dashboard/launchd.out.log" \
   "$RUNTIME_ROOT/logs/prediction_service/launchd.out.log"
 do
   test -e "$log"
@@ -388,13 +441,15 @@ done
 
 rg -n 'frontend_gateway_runtime:' \
   "$RUNTIME_ROOT/logs/frontend_gateway/launchd.out.log" | tail -1
+rg -n 'dashboard_runtime:' \
+  "$RUNTIME_ROOT/logs/legacy_dashboard/launchd.out.log" | tail -1
 tail -n 50 \
   "$RUNTIME_ROOT/logs/prediction_service/launchd.out.log" \
   "$RUNTIME_ROOT/logs/prediction_service/launchd.err.log"
 curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8766/
 ```
 
-Expected: new Gateway and Service PIDs own only 8766 and 8769, both cwd values are `/Users/ray/projects/open_trader`, both health payloads report `$ACCEPTED_SHA`, Gateway reports `prediction_route_mode=service` with healthy Prediction and Account upstreams, Legacy `launchctl print` fails with `Could not find service`, no process listens on 8767, only Gateway/Prediction Service logs are inspected and are newer than the deployment boundary, the Python verifier prints `exact accepted runtime verified`, and the final command prints `200`.
+Expected: new Gateway, Legacy Dashboard, and Prediction Service PIDs own 8766, 8767, and 8769 respectively; their cwd and health SHA values are `/Users/ray/projects/open_trader` and `$ACCEPTED_SHA`. Account retains its pre-redeploy PID. The route digest is unchanged and both the route record and Gateway report `service`; Gateway reports healthy Legacy, Prediction, and Account upstreams. Legacy's actual health schema is valid, its installed arguments contain `--prediction-owner disabled`, and its Prediction state is the schema-defined `configuration_unavailable` state, proving it has no Prediction runtime ownership while retaining its non-Prediction role. Gateway, Legacy, and Prediction Service logs are newer than the deployment boundary, the Python verifier prints `exact accepted runtime verified`, and the final command prints `200`.
 
 - [ ] **Close Issue #45 only after publication and runtime proof**
 
