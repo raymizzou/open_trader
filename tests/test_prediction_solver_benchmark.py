@@ -2292,7 +2292,13 @@ def _fake_batch_peaks(worker_count: int) -> tuple[int, ...]:
     return tuple((slot + 1) * 1024 for slot in range(worker_count))
 
 
-def _fake_harness_factory(*, cleanup_proven: bool = True, batch_semantics_differ: bool = False):
+def _fake_harness_factory(
+    *,
+    cleanup_proven: bool = True,
+    batch_semantics_differ: bool = False,
+    hard_check_failure: bool = False,
+    raise_on_sample_kind: str | None = None,
+):
     next_pid = 10_000
     cases = benchmark._load_full_cases()
 
@@ -2308,11 +2314,17 @@ def _fake_harness_factory(*, cleanup_proven: bool = True, batch_semantics_differ
             self.start_count = 0
             self.rebuild_count = 0
             self._memory_limit_bytes: int | None = None
+            self.sample_kinds: list[str] = []
+            self.exited = False
+            self.exit_exception = None
 
         def __enter__(self):
             return self
 
-        def __exit__(self, *args) -> None:
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            del exc, traceback
+            self.exited = True
+            self.exit_exception = exc_type
             return None
 
         def submit(self, request):
@@ -2323,6 +2335,10 @@ def _fake_harness_factory(*, cleanup_proven: bool = True, batch_semantics_differ
                 self.rebuild_count += 1
             self._memory_limit_bytes = request.limits.memory_limit_bytes
             slot = int(request.request_id.rsplit(":", 1)[1])
+            sample_kind = request.request_id.split(":", 4)[3]
+            self.sample_kinds.append(sample_kind)
+            if sample_kind == raise_on_sample_kind:
+                raise RuntimeError("FAKE_SAMPLE_FAILURE")
             if not cleanup_proven:
                 return WorkerOutcome(
                     request.request_id, "UNKNOWN", "CLEANUP_UNPROVEN", self.worker_pid,
@@ -2338,7 +2354,7 @@ def _fake_harness_factory(*, cleanup_proven: bool = True, batch_semantics_differ
                 self.solver,
                 request.request_id,
                 "OK",
-                canonical_payload(evidence),
+                {} if hard_check_failure else canonical_payload(evidence),
                 {name: 0 for name in benchmark.WORKER_PHASE_NAMES},
                 (),
             )
@@ -2384,7 +2400,8 @@ def test_full_environment_runner_emits_the_exact_plan_and_record_counters(monkey
         ),
     )
 
-    records = benchmark._run_full_environment(cases, manifest, "macos", _fake_harness_factory())
+    factory = _fake_harness_factory()
+    records = benchmark._run_full_environment(cases, manifest, "macos", factory)
 
     assert [(row["sample_kind"], row["worker_count"], row["completed_requests"]) for row in records] == [
         ("warmup", 1, 1),
@@ -2397,6 +2414,10 @@ def test_full_environment_runner_emits_the_exact_plan_and_record_counters(monkey
     assert records[2]["peak_aggregate_rss_bytes"] == sum(_fake_batch_peaks(2))
     assert all(row["profile"] == "full" for row in records)
     assert all(benchmark._validated_benchmark_record(row, manifest) for row in records)
+    for sample_kind in ("warmup", "warm", "throughput", "cold", "rebuild"):
+        harnesses = [harness for harness in factory.instances if sample_kind in harness.sample_kinds]
+        assert harnesses
+        assert all(harness.exited and harness.exit_exception is None for harness in harnesses)
 
 
 def test_full_environment_runner_stops_on_unproven_cleanup_or_semantic_mismatch() -> None:
@@ -2404,6 +2425,37 @@ def test_full_environment_runner_stops_on_unproven_cleanup_or_semantic_mismatch(
         _run_tiny_full_plan(_fake_harness_factory(cleanup_proven=False))
     with pytest.raises(RuntimeError, match="SEMANTIC_NONDETERMINISM"):
         _run_tiny_full_plan(_fake_harness_factory(batch_semantics_differ=True))
+
+
+def test_full_environment_runner_stops_on_hard_check_failure() -> None:
+    with pytest.raises(RuntimeError, match="CHECK_HARD_FAILURE"):
+        _run_tiny_full_plan(_fake_harness_factory(hard_check_failure=True))
+
+
+@pytest.mark.parametrize("sample_kind", ("warmup", "throughput", "cold", "rebuild"))
+def test_full_environment_runner_exits_each_harness_context_on_exception(
+    sample_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cases = benchmark._load_full_cases()
+    environments, artifacts = _full_environment_fixture()
+    manifest = benchmark._full_manifest(cases, environments, artifacts)
+    case_id = cases[0].case_id if sample_kind == "warmup" else "single_contract_complement"
+    worker_count = 2 if sample_kind == "throughput" else 1
+    factory = _fake_harness_factory(raise_on_sample_kind=sample_kind)
+    monkeypatch.setattr(benchmark, "_SOLVERS", ("highs",))
+    monkeypatch.setattr(
+        benchmark,
+        "_full_sample_plan",
+        lambda _: ((case_id, sample_kind, 0, worker_count),),
+    )
+
+    with pytest.raises(RuntimeError, match="FAKE_SAMPLE_FAILURE"):
+        benchmark._run_full_environment(cases, manifest, "macos", factory)
+
+    harnesses = [harness for harness in factory.instances if sample_kind in harness.sample_kinds]
+    assert harnesses
+    assert all(harness.exited and harness.exit_exception is RuntimeError for harness in harnesses)
 
 
 def test_full_environment_runner_reuses_each_throughput_worker_slot(monkeypatch) -> None:
