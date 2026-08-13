@@ -5,6 +5,12 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-13
 
+- Dashboard launchd reinstall now makes its initial label observation and
+  continues through the configured elapsed wait bound before refusing a still
+  loaded job, preventing a one-second wait from bootstrapping before delayed
+  removal is proven. Focused launchd checks pass; no live command, deployment,
+  restart, or acceptance run was performed.
+
 - Prediction dashboard state polling now skips an overlapping slow request and
   reuses the initial signal-history request, preventing one browser tab from
   multiplying service reads during a slow refresh. Focused dashboard checks

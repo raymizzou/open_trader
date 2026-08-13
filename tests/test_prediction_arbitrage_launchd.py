@@ -98,7 +98,7 @@ def test_uninstaller_targets_only_dashboard_stack_labels() -> None:
     assert "com.open-trader.premarket" not in source
 
 
-def test_dashboard_installer_waits_for_bootout_before_bootstrap(
+def test_dashboard_installer_waits_across_seconds_boundary_before_bootstrap(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path / "repo"
@@ -127,6 +127,22 @@ def test_dashboard_installer_waits_for_bootout_before_bootstrap(
     bin_dir.mkdir()
     state = tmp_path / "bootstrap-count"
     pending_removal = tmp_path / "pending-removal"
+    sleep_log = tmp_path / "sleep-calls"
+    bash_env = tmp_path / "bash-env"
+    bash_env.write_text(
+        """force_seconds_boundary() {
+  if [[ "${FUNCNAME[1]:-}" == "wait_agent_absent" ]] &&
+    [[ "${label:-}" == "com.open-trader.dashboard" ]] &&
+    [[ "$BASH_COMMAND" == output=* && "${FAKE_BOUNDARY_CROSSED:-0}" -eq 0 ]]; then
+    FAKE_BOUNDARY_CROSSED=1
+    SECONDS=$((SECONDS + WAIT_SECONDS))
+  fi
+}
+set -T
+trap force_seconds_boundary DEBUG
+""",
+        encoding="utf-8",
+    )
     launchctl = bin_dir / "launchctl"
     launchctl.write_text(
         """#!/bin/sh
@@ -166,6 +182,12 @@ exit 0
         encoding="utf-8",
     )
     launchctl.chmod(0o755)
+    sleep = bin_dir / "sleep"
+    sleep.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_SLEEP_LOG\"\n",
+        encoding="utf-8",
+    )
+    sleep.chmod(0o755)
     lsof = bin_dir / "lsof"
     lsof.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     lsof.chmod(0o755)
@@ -200,17 +222,20 @@ exit 0
         env={
             **os.environ,
             "FAKE_BOOTSTRAP_STATE": str(state),
+            "FAKE_SLEEP_LOG": str(sleep_log),
             "FAKE_PENDING_REMOVAL": str(pending_removal),
+            "BASH_ENV": str(bash_env),
             "HOME": str(tmp_path),
             "LAUNCHCTL_BIN": str(launchctl),
             "PATH": f"{bin_dir}:/usr/bin:/bin",
         },
-        check=True,
         capture_output=True,
         text=True,
     )
 
+    assert result.returncode == 0, result.stderr
     assert state.read_text(encoding="utf-8").strip() == "1"
+    assert sleep_log.read_text(encoding="utf-8").splitlines() == ["1"]
     assert result.stderr == ""
     assert stdout_log.read_text(encoding="utf-8") == ""
     assert stderr_log.read_text(encoding="utf-8") == ""

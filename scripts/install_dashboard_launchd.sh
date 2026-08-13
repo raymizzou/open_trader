@@ -214,7 +214,7 @@ bootout_agent() {
 
 wait_agent_absent() {
   local label="$1" attempt output status
-  for ((attempt = 1; attempt <= WAIT_SECONDS; attempt++)); do
+  for ((attempt = 0; attempt <= WAIT_SECONDS; attempt++)); do
     if output="$("$LAUNCHCTL_BIN" print "gui/$UID/$label" 2>&1)"; then
       status=0
     else
@@ -228,7 +228,8 @@ wait_agent_absent() {
       printf '%s\n' "$output" >&2
       return 1
     fi
-    [[ "$attempt" -lt "$WAIT_SECONDS" ]] && sleep 1
+    [[ "$attempt" -eq "$WAIT_SECONDS" ]] && break
+    sleep 1
   done
   echo "launchd job is still loaded: $label" >&2
   return 1
