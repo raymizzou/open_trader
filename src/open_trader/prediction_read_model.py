@@ -1086,6 +1086,7 @@ def prediction_state_payload(
     )
     validation_mode = "observe_only"
     auto_eat_stats: dict[str, object] = {}
+    llm_usage_24h: dict[str, object] = {}
     cross_auto: dict[str, object] = {
         "configured_mode": "observe_only",
         "effective_mode": "observe_only",
@@ -1108,6 +1109,14 @@ def prediction_state_payload(
                 auto_eat_stats = get_stats()
             except Exception:
                 auto_eat_stats = {}
+        get_llm_usage = getattr(store, "llm_usage_24h", None)
+        if callable(get_llm_usage):
+            try:
+                llm_value = _prediction_safe_value(get_llm_usage())
+                if isinstance(llm_value, Mapping):
+                    llm_usage_24h = dict(llm_value)
+            except Exception:
+                llm_usage_24h = {}
     get_cross_auto_status = getattr(execution, "cross_auto_status", None)
     if callable(get_cross_auto_status):
         try:
@@ -1142,6 +1151,7 @@ def prediction_state_payload(
         "signals_24h": signals_24h,
         "validation_mode": validation_mode,
         "auto_eat_stats": auto_eat_stats,
+        "llm_usage_24h": llm_usage_24h,
         "cross_auto": cross_auto,
         "current_execution": current_execution,
         "breaker": {

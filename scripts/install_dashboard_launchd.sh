@@ -21,7 +21,7 @@ usage() {
 for arg in "$@"; do
   case "$arg" in
     --cross-execution-mode|--cross-execution-mode=*)
-      echo "--cross-execution-mode is retired; use prediction-arb cross-auto mode {observe_only,manual_confirm,auto_submit} --data-dir PATH, then prediction-arb cross-auto arm --data-dir PATH --url LOOPBACK --expected-sha SHA" >&2
+      echo "--cross-execution-mode is retired; automatic cross-venue CLI controls are removed for safety; use prediction-arb cross-auto status --url http://127.0.0.1:8769 for read-only state" >&2
       exit 2
       ;;
   esac

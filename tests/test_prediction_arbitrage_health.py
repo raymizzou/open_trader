@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 from open_trader.prediction_arbitrage_health import (
-    _dashboard_git_sha,
     format_report,
     report_to_dict,
     run_health_check,
@@ -37,6 +36,7 @@ def base_state(**overrides: object) -> dict[str, object]:
             "catalog": {"status": "healthy"},
         },
         "readiness": {"ready": True},
+        "llm_usage_24h": {"calls": 10, "successes": 10},
     }
     payload.update(overrides)
     return payload
@@ -49,19 +49,18 @@ def run_check(
     llm: tuple[int, int] = (10, 10),
     process: dict[str, object] | None = {
         "pid": "42",
-        "sha": "abc",
-        "expected_sha": "abc",
+        "git_sha": "abc",
+        "status": "running",
     },
     notify_configured: bool = True,
 ):
+    state = payload if payload is not None else base_state(
+        llm_usage_24h={"calls": llm[0], "successes": llm[1]}
+    )
     return run_health_check(
         url="http://127.0.0.1:8766",
-        data_dir=Path("data"),
-        repo_root=Path("."),
-        fetch_state=lambda *args: payload if payload is not None else base_state(),
-        fetch_healthz=lambda *args: healthz,
-        llm_stats=lambda *args: llm,
-        process_info=lambda *args: process,
+        fetch_state=lambda *args: state,
+        fetch_healthz=lambda *args: process if healthz else (_ for _ in ()).throw(ConnectionError("down")),
         notify_configured=notify_configured,
     )
 
@@ -114,19 +113,18 @@ def test_state_check_severity(payload: dict[str, object], expected: str) -> None
 def test_endpoint_exception_fails() -> None:
     report = run_health_check(
         url="http://127.0.0.1:8766",
-        data_dir=Path("data"),
-        repo_root=Path("."),
         fetch_state=lambda *args: (_ for _ in ()).throw(ConnectionError("down")),
-        fetch_healthz=lambda *args: True,
-        llm_stats=lambda *args: (10, 10),
-        process_info=lambda *args: {"pid": "42", "sha": "abc", "expected_sha": "abc"},
+        fetch_healthz=lambda *args: {"status": "running", "pid": 42, "git_sha": "abc"},
     )
     assert report.status == "FAIL"
     assert any(check.name == "endpoint" and check.status == "FAIL" for check in report.checks)
 
 
-def test_gateway_down_fails() -> None:
-    assert run_check(healthz=False).status == "FAIL"
+def test_service_down_fails() -> None:
+    report = run_check(healthz=False)
+    assert report.status == "FAIL"
+    checks = {check.name: check for check in report.checks}
+    assert checks["service"].status == "FAIL"
 
 
 def test_llm_no_success_fails() -> None:
@@ -141,9 +139,12 @@ def test_process_missing_fails() -> None:
     assert run_check(process=None).status == "FAIL"
 
 
-def test_process_sha_mismatch_warns() -> None:
-    report = run_check(process={"pid": "42", "sha": "old", "expected_sha": "new"})
-    assert report.status == "WARN"
+def test_service_health_identity_replaces_legacy_process_probe() -> None:
+    report = run_check(process={"status": "running", "pid": 42, "git_sha": "abc"})
+    checks = {check.name: check for check in report.checks}
+    assert checks["process"].status == "PASS"
+    assert report.summary["pid"] == "42"
+    assert report.summary["sha"] == "abc"
 
 
 def test_notify_unconfigured_warns() -> None:
@@ -191,22 +192,6 @@ def test_send_report_returns_false_on_failure() -> None:
     assert send_report(BrokenNotifier(), run_check()) is False
 
 
-def test_dashboard_git_sha_reads_startup_log(tmp_path: Path) -> None:
-    log = tmp_path / "logs" / "legacy_dashboard" / "launchd.out.log"
-    log.parent.mkdir(parents=True)
-    log.write_text(
-        'dashboard_runtime: {"pid": 44548, "git_sha": '
-        '"64809e3f45d8c8f1a53cf80d98c497027dc5d590", "source_state": "clean"}\n'
-        'dashboard_runtime: {"pid": 94923, "git_sha": '
-        '"ca308877fec207773786c16e98317fcec77aba70", "source_state": "clean"}'
-    )
-    assert _dashboard_git_sha(tmp_path) == "ca308877fec207773786c16e98317fcec77aba70"
-
-
-def test_dashboard_git_sha_returns_none_without_log(tmp_path: Path) -> None:
-    assert _dashboard_git_sha(tmp_path) is None
-
-
 def test_health_check_reports_auto_eat_stats() -> None:
     report = run_check(payload=base_state(auto_eat_stats={
         "mode": "auto",
@@ -221,3 +206,25 @@ def test_health_check_reports_auto_eat_stats() -> None:
     assert checks["auto_eat"].status == "WARN"
     assert "submitted=0" in checks["auto_eat"].value
     assert report.summary["validation_mode"] == "auto"
+
+
+def test_health_reads_llm_usage_from_service_state() -> None:
+    report = run_check(payload=base_state(llm_usage_24h={"calls": 7, "successes": 4}))
+    checks = {check.name: check for check in report.checks}
+    assert checks["llm"].value == "4/7"
+    assert report.summary["llm_total"] == 7
+    assert report.summary["llm_success"] == 4
+
+
+def test_production_consumers_do_not_open_prediction_sqlite_directly() -> None:
+    forbidden = {
+        "src/open_trader/dashboard.py",
+        "src/open_trader/dashboard_web.py",
+        "src/open_trader/cli.py",
+        "src/open_trader/prediction_arbitrage_health.py",
+    }
+    root = Path(__file__).parents[1]
+    for path in forbidden:
+        text = (root / path).read_text(encoding="utf-8")
+        assert "PredictionArbitrageStore(" not in text
+        assert "prediction_arbitrage.sqlite3" not in text

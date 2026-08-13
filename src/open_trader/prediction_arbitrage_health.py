@@ -5,9 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
-import sqlite3
-import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -74,81 +71,20 @@ def _fetch_state(url: str, timeout: float) -> Mapping[str, object]:
     return payload
 
 
-def _fetch_healthz(url: str, timeout: float) -> bool:
+def _fetch_healthz(url: str, timeout: float) -> Mapping[str, object]:
     request = Request(f"{url.rstrip('/')}/{_HEALTHZ_PATH}", headers={"User-Agent": "OpenTrader/1.0"})
     with urlopen(request, timeout=timeout) as response:
-        return response.status == 200
-
-
-def _llm_stats(data_dir: Path) -> tuple[int, int]:
-    path = data_dir / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
-    cutoff = datetime.now(UTC).isoformat(timespec="seconds")
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
-        row = connection.execute(
-            """
-            SELECT count(*), coalesce(sum(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0)
-            FROM llm_usage
-            WHERE kind = 'call' AND created_at >= ?
-            """,
-            (cutoff,),
-        ).fetchone()
-    return int(row[0]), int(row[1])
-
-
-def _process_info(repo_root: Path) -> dict[str, object] | None:
-    try:
-        output = subprocess.run(
-            ["ps", "-axo", "pid=,command="],
-            check=False,
-            capture_output=True,
-            text=True,
-        ).stdout
-    except OSError:
-        return None
-    pid = None
-    for line in output.splitlines():
-        candidate, _, command = line.strip().partition(" ")
-        if (
-            candidate.isdigit()
-            and "open_trader" in command
-            and " dashboard " in command
-            and "--port 8767" in command
-        ):
-            pid = candidate
-            break
-    if pid is None:
-        return None
-    sha = _dashboard_git_sha(repo_root)
-    expected_sha = subprocess.run(
-        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-        check=False,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    return {"pid": pid, "sha": sha, "expected_sha": expected_sha}
-
-
-def _dashboard_git_sha(repo_root: Path) -> str | None:
-    """Read the git SHA the dashboard process actually loaded from its startup log."""
-
-    log = Path(repo_root) / "logs" / "legacy_dashboard" / "launchd.out.log"
-    try:
-        text = log.read_text(errors="replace")
-    except OSError:
-        return None
-    matches = re.findall(r'"git_sha":\s*"([0-9a-f]{7,40})"', text)
-    return matches[-1] if matches else None
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("health payload must be an object")
+    return payload
 
 
 def run_health_check(
     *,
     url: str,
-    data_dir: Path,
-    repo_root: Path,
     fetch_state: Callable[[str, float], Mapping[str, object]] = _fetch_state,
-    fetch_healthz: Callable[[str, float], bool] = _fetch_healthz,
-    llm_stats: Callable[[Path], tuple[int, int]] = _llm_stats,
-    process_info: Callable[[Path], dict[str, object] | None] = _process_info,
+    fetch_healthz: Callable[[str, float], Mapping[str, object]] = _fetch_healthz,
     timeout: float = 10.0,
     notify_configured: bool = True,
 ) -> HealthReport:
@@ -174,10 +110,12 @@ def run_health_check(
     else:
         add("websocket", "PASS")
     try:
-        healthz_ok = bool(fetch_healthz(url, timeout))
+        healthz_payload = fetch_healthz(url, timeout)
     except Exception:
-        healthz_ok = False
-    add("gateway", "PASS" if healthz_ok else "FAIL", value=url, reason="" if healthz_ok else "healthz unavailable")
+        healthz_payload = {}
+    healthz = _mapping(healthz_payload)
+    healthz_ok = str(healthz.get("status", "")) == "running"
+    add("service", "PASS" if healthz_ok else "FAIL", value=url, reason="" if healthz_ok else "healthz unavailable")
 
     health = _mapping(payload.get("health"))
     heartbeat = _seconds(health.get("heartbeat_age_seconds"))
@@ -261,34 +199,31 @@ def run_health_check(
             value=f"mode={mode} submitted={submitted} rejected={rejected} realized={realized:.4f}",
         )
 
-    try:
-        llm_total, llm_success = llm_stats(data_dir)
-    except Exception as exc:
-        add("llm", "FAIL", reason=f"{type(exc).__name__}: {exc}")
+    llm_usage = _mapping(payload.get("llm_usage_24h"))
+    if not llm_usage:
+        add("llm", "FAIL", reason="Service LLM usage is unavailable")
         llm_total, llm_success = 0, 0
     else:
-        if llm_total == 0:
-            add("llm", "PASS", value="0/0", reason="no validation calls in window")
-        elif llm_success == 0:
-            add("llm", "FAIL", value=f"{llm_success}/{llm_total}", reason="no successful LLM validation in window")
+        try:
+            llm_total = int(llm_usage.get("calls", 0) or 0)
+            llm_success = int(llm_usage.get("successes", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            add("llm", "FAIL", reason=f"invalid Service LLM usage: {exc}")
+            llm_total, llm_success = 0, 0
         else:
-            add("llm", "PASS", value=f"{llm_success}/{llm_total}")
+            if llm_total == 0:
+                add("llm", "PASS", value="0/0", reason="no validation calls in window")
+            elif llm_success == 0:
+                add("llm", "FAIL", value=f"{llm_success}/{llm_total}", reason="no successful LLM validation in window")
+            else:
+                add("llm", "PASS", value=f"{llm_success}/{llm_total}")
 
-    try:
-        process = process_info(repo_root)
-    except Exception:
-        process = None
-    if process is None:
-        add("process", "FAIL", reason="dashboard process not found")
-        pid, sha = "none", "unknown"
+    pid = str(healthz.get("pid") or "none")
+    sha = str(healthz.get("git_sha") or "unknown")
+    if not healthz_ok or pid == "none" or sha == "unknown":
+        add("process", "FAIL", reason="Prediction Service identity unavailable")
     else:
-        pid = str(process.get("pid") or "none")
-        sha = str(process.get("sha") or "unknown")
-        expected_sha = str(process.get("expected_sha") or "")
-        if sha != expected_sha:
-            add("process", "WARN", value=f"pid={pid} sha={sha}", reason="running SHA differs from repo HEAD")
-        else:
-            add("process", "PASS", value=f"pid={pid} sha={sha}")
+        add("process", "PASS", value=f"pid={pid} sha={sha}")
 
     if not notify_configured:
         add("notify", "WARN", reason="Feishu not configured")
@@ -367,8 +302,6 @@ def run_service(
     notifier: object,
     *,
     url: str,
-    data_dir: Path,
-    repo_root: Path,
     interval_seconds: float,
     once: bool = False,
     notify: bool = True,
@@ -384,8 +317,6 @@ def run_service(
     while True:
         report = run_health_check(
             url=url,
-            data_dir=data_dir,
-            repo_root=repo_root,
             notify_configured=notify_configured,
         )
         _log(format_report(report).replace("\n", " | "))
@@ -398,10 +329,8 @@ def run_service(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="open-trader prediction-arb health-check")
-    parser.add_argument("--url", default="http://127.0.0.1:8766")
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--url", default="http://127.0.0.1:8769")
     parser.add_argument("--config", type=Path, default=Path("config/daily_premarket.env"))
-    parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_SECONDS)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--no-notify", action="store_true")
@@ -416,8 +345,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.once:
         report = run_health_check(
             url=args.url,
-            data_dir=args.data_dir,
-            repo_root=args.repo,
             notify_configured=not args.no_notify and not isinstance(notifier, NullNotifier),
         )
         if args.json:
@@ -431,8 +358,6 @@ def main(argv: list[str] | None = None) -> int:
     return run_service(
         notifier,
         url=args.url,
-        data_dir=args.data_dir,
-        repo_root=args.repo,
         interval_seconds=args.interval,
         notify=not args.no_notify,
     )

@@ -495,7 +495,7 @@ def test_retired_installer_mode_option_fails_without_side_effects(
         text=True,
     )
     assert result.returncode == 2
-    assert "cross-auto mode" in result.stderr
+    assert "automatic cross-venue CLI controls are removed" in result.stderr
     assert result.stdout == ""
     assert not calls.exists()
     assert not list(agents.iterdir())

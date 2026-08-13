@@ -3355,7 +3355,7 @@ def test_pause_before_claim_records_cross_auto_paused_without_order(
 
     assert result["reason"] == "cross_auto_paused"
     assert result["facts"]["current"] == "paused"
-    assert "cross-auto arm" in result["facts"]["operator_action"]
+    assert "cross-auto status" in result["facts"]["operator_action"]
     assert store.cross_auto_attempts()[0]["reason_code"] == "cross_auto_paused"
     assert (predict.submit_calls, trading.cross_submit_calls) == (0, 0)
 
@@ -3374,7 +3374,7 @@ def test_nonautomatic_mode_claim_records_complete_configuration_rejection(
 
     assert result["reason"] == "configured_mode_not_auto_submit"
     assert result["facts"]["current"] == configured_mode
-    assert "cross-auto mode auto_submit" in result["facts"]["operator_action"]
+    assert "cross-auto status" in result["facts"]["operator_action"]
     attempt = store.cross_auto_attempts()[0]
     assert attempt["decision"] == "rejected"
     assert attempt["reason_code"] == "configured_mode_not_auto_submit"

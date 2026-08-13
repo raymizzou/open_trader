@@ -12,6 +12,9 @@ from open_trader.prediction_read_model import (
 
 
 class _Store:
+    def llm_usage_24h(self) -> dict[str, int]:
+        return {"calls": 4, "successes": 3, "failures": 1, "cache_hits": 2}
+
     def active_execution(self) -> None:
         return None
 
@@ -201,6 +204,7 @@ def frozen_prediction_state() -> dict[str, object]:
   "failure_reason": null,
   "first_live_order": null,
   "health": {"degraded_reasons": [], "status": "healthy"},
+  "llm_usage_24h": {"cache_hits": 2, "calls": 4, "failures": 1, "successes": 3},
   "heartbeat": "2026-08-10T01:00:00Z",
   "heartbeat_at": "2026-08-10T01:00:00Z",
   "market_count": 1,
