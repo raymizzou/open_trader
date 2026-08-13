@@ -2575,7 +2575,9 @@ def _install_fake_docker(
         del kwargs
         calls.append(command)
         if command[:3] == ["docker", "image", "inspect"]:
-            return subprocess.CompletedProcess(command, 0, "sha256:" + "a" * 64 + "\n", "")
+            solver = next(name for name in benchmark._SOLVERS if f"solver-{name}:" in command[-1])
+            image_id = {"highs": "a", "scip": "b", "cp_sat": "c"}[solver] * 64
+            return subprocess.CompletedProcess(command, 0, "sha256:" + image_id + "\n", "")
         if command[:3] == ["docker", "run", "--rm"]:
             Path(command[command.index("--cidfile") + 1]).write_text("e" * 64 + "\n")
             if "linux-platform-highs" in command[-1]:
@@ -2610,6 +2612,24 @@ def test_linux_discovery_requires_pinned_images_and_scip_exact_smoke(monkeypatch
     assert any("scip-exact" in " ".join(call) for call in calls)
     assert all(item["image_id"].startswith("sha256:") for item in artifacts.values())
     assert artifacts["scip"]["run_succeeded"] is True
+
+
+def test_linux_discovery_runs_every_probe_by_the_resolved_immutable_image_id(monkeypatch) -> None:
+    calls = _install_fake_docker(monkeypatch)
+
+    _, artifacts = benchmark._discover_linux_environment()
+
+    docker_runs = [call for call in calls if call[:3] == ["docker", "run", "--rm"]]
+    image_arguments = [call[call.index("PYTHONNOUSERSITE=1") + 1] for call in docker_runs]
+    assert image_arguments == [
+        "sha256:" + "a" * 64,
+        "sha256:" + "b" * 64,
+        "sha256:" + "b" * 64,
+        "sha256:" + "c" * 64,
+        "sha256:" + "a" * 64,
+    ]
+    assert artifacts["highs"]["build_id"].startswith("open-trader-prediction-solver-highs:")
+    assert artifacts["highs"]["image_id"] == "sha256:" + "a" * 64
 
 
 @pytest.mark.parametrize(
@@ -2758,9 +2778,15 @@ def test_docker_harness_is_networkless_read_only_and_proves_container_cleanup(mo
     records = _run_tiny_linux_plan()
 
     command = commands[0]
-    assert command[:3] == ["docker", "run", "--rm"]
-    assert "--network" in command and command[command.index("--network") + 1] == "none"
-    assert any(item.endswith(":/workspace:ro") for item in command)
+    cidfile = command[command.index("--cidfile") + 1]
+    assert command == [
+        "docker", "run", "--rm", "--interactive", "--network", "none",
+        "--cidfile", cidfile,
+        "--volume", f"{benchmark._ROOT}:/workspace:ro", "--workdir", "/workspace",
+        "--env", "PYTHONPATH=/workspace/src", "--env", "PYTHONSAFEPATH=1",
+        "--env", "PYTHONNOUSERSITE=1", "pinned-image",
+        "python", "-m", "open_trader.prediction_solver_worker", "--backend", "highs",
+    ]
     assert records[0]["container_id"] == "a" * 64
     assert benchmark._fake_docker_inspections["a" * 64] >= 1
 

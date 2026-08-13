@@ -2235,7 +2235,7 @@ def _discover_linux_environment() -> tuple[dict[str, object], dict[str, dict[str
         if image_id is None:
             return None
         payload = _docker_json_self_check(
-            image,
+            image_id,
             ["python", "-m", "open_trader.prediction_solver_backends", "--self-check", solver],
             f"{solver} docker self-check",
         )
@@ -2249,7 +2249,7 @@ def _discover_linux_environment() -> tuple[dict[str, object], dict[str, dict[str
             return None
         if solver == "scip":
             exact = _docker_json_self_check(
-                image,
+                image_id,
                 ["python", "-m", "open_trader.prediction_solver_backends", "--self-check", "scip-exact"],
                 "scip-exact",
             )
@@ -2271,7 +2271,7 @@ def _discover_linux_environment() -> tuple[dict[str, object], dict[str, dict[str
             "source_evidence_present": True,
         }
     probe = _docker_json_self_check(
-        artifacts["highs"]["build_id"],
+        artifacts["highs"]["image_id"],
         ["python", "-c", "import json, platform; print(json.dumps({'python_version': platform.python_version(), 'architecture': platform.machine(), 'cpu': platform.processor() or platform.machine(), 'os_version': platform.platform(), 'probe': 'linux-platform-highs'}, sort_keys=True))"],
         "linux platform probe",
     )
@@ -2359,13 +2359,11 @@ class _DockerHarness:
         self._directory = tempfile.TemporaryDirectory(prefix="open-trader-solver-")
         self._cidfile = Path(self._directory.name) / "container-id"
         self._worker = WorkerHarness(
-            [
-                "docker", "run", "--rm", "--interactive", "--network", "none",
-                "--cidfile", str(self._cidfile), "--volume", f"{_ROOT}:/workspace:ro",
-                "--workdir", "/workspace", "--env", "PYTHONPATH=/workspace/src",
-                "--env", "PYTHONSAFEPATH=1", "--env", "PYTHONNOUSERSITE=1", image,
-                "python", "-m", "open_trader.prediction_solver_worker", "--backend", solver,
-            ],
+            _docker_run_command(
+                image,
+                ["python", "-m", "open_trader.prediction_solver_worker", "--backend", solver],
+                self._cidfile,
+            ),
             request_timeout_ms=20_000,
             startup_timeout_ms=5_000,
         )
