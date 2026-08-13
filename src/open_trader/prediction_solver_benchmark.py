@@ -2828,10 +2828,77 @@ def _run_quick_benchmark(output_root: Path = _QUICK_OUTPUT, env_root: Path = _BE
     return 0
 
 
+def _run_full_macos(output_root: Path = _FINAL_RESULTS, env_root: Path = _BENCHMARK_ENVS) -> int:
+    output = Path(output_root)
+    records_path = output / "macos.jsonl"
+    manifest_path = output / "environment_manifest.json"
+    stale = [path for path in (records_path, output / "linux.jsonl", manifest_path) if path.exists() or path.is_symlink()]
+    if stale:
+        raise ValueError(f"full macOS output already exists: {stale[0]}")
+    discovered = _discover_quick_environment(Path(env_root))
+    if discovered is None:
+        print("BLOCKED_MISSING_ENVIRONMENT")
+        return 2
+    macos_environment, macos_artifacts = discovered
+    cases = _load_full_cases()
+    linux_environment = {
+        "available": False,
+        "architecture": "unavailable",
+        "cpu": "unavailable",
+        "environment_id": "linux:unavailable",
+        "git_sha": "0" * 40,
+        "os_version": "unavailable",
+    }
+    linux_artifact = {
+        "adapter_version": WORKER_VERSION,
+        "build_id": "unavailable",
+        "commercial_key_required": False,
+        "image_id": "none",
+        "install_succeeded": False,
+        "installation_ns": 0,
+        "license_evidence_present": False,
+        "open_source": False,
+        "python_version": "unavailable",
+        "reuse_succeeded": False,
+        "run_succeeded": False,
+        "solver_version": "unavailable",
+        "source_evidence_present": False,
+    }
+    manifest = _full_manifest(
+        cases,
+        {"macos": macos_environment, "linux": linux_environment},
+        {
+            solver: {"macos": macos_artifacts[solver], "linux": linux_artifact}
+            for solver in _SOLVERS
+        },
+    )
+
+    def harness_factory(solver: str) -> WorkerHarness:
+        python = Path(env_root) / solver / "bin" / "python"
+        return WorkerHarness(
+            [str(python), "-m", "open_trader.prediction_solver_worker", "--backend", solver],
+            request_timeout_ms=20_000,
+            startup_timeout_ms=5_000,
+            env=_native_subprocess_env(python),
+        )
+
+    records = _run_full_environment(cases, manifest, "macos", harness_factory)
+    aggregate_benchmark_records(records, manifest)
+    records_bytes = b"".join(
+        json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"
+        for record in records
+    )
+    _atomic_write_bytes(records_path, records_bytes)
+    _atomic_write_json(manifest_path, manifest)
+    return 0
+
+
 def _run_full_benchmark(environment: str) -> int:
     if not _load_approved_corpus(_APPROVED_CORPUS)["cases"]:
         print("BLOCKED_REAL_CORPUS_EMPTY")
         return 2
+    if environment == "macos":
+        return _run_full_macos()
     raise RuntimeError(f"full benchmark runner is not available for {environment} until Task 10")
 
 

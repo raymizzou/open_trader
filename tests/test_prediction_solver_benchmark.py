@@ -2345,6 +2345,11 @@ def _fake_harness_factory(
                     self.worker_pid, slot + 1, False, False,
                 )
             case = next(case for case in cases if case.request == request.request)
+            if case.expected_result is None:
+                return WorkerOutcome(
+                    request.request_id, "UNKNOWN", "HARD_TIMEOUT", self.worker_pid,
+                    self.worker_pid, slot + 1, False, True,
+                )
             assert case.expected_result is not None
             evidence = _evidence_for_result(case.expected_result)
             if batch_semantics_differ and ":throughput:" in request.request_id and slot == 1:
@@ -2474,6 +2479,88 @@ def test_full_environment_runner_reuses_each_throughput_worker_slot(monkeypatch)
 
     assert len(records) == 30
     assert len(factory.instances) == 3
+
+
+def _install_full_macos_fakes(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fail_after_records: int | None = None,
+) -> None:
+    environments, artifacts = _full_environment_fixture()
+    cases = benchmark._load_full_cases()
+    factory = _fake_harness_factory()
+    submitted = 0
+
+    monkeypatch.setattr(
+        benchmark,
+        "_discover_quick_environment",
+        lambda root: (environments["macos"], {solver: artifacts[solver]["macos"] for solver in benchmark._SOLVERS}),
+    )
+
+    class Harness:
+        def __init__(self, command, **kwargs) -> None:
+            assert command == [
+                str(Path(kwargs["env"]["PATH"].split(":", 1)[0]) / "python"),
+                "-m",
+                "open_trader.prediction_solver_worker",
+                "--backend",
+                command[-1],
+            ]
+            assert kwargs["request_timeout_ms"] == 20_000
+            assert kwargs["startup_timeout_ms"] == 5_000
+            self.inner = factory(command[-1])
+
+        def __enter__(self):
+            self.inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.inner.__exit__(*args)
+
+        def submit(self, request):
+            nonlocal submitted
+            submitted += 1
+            if fail_after_records is not None and submitted > fail_after_records:
+                return WorkerOutcome(
+                    request.request_id, "UNKNOWN", "CLEANUP_UNPROVEN", 1, 1, 0, False, False,
+                )
+            return self.inner.submit(request)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    monkeypatch.setattr(benchmark, "WorkerHarness", Harness)
+
+
+def test_full_macos_writes_only_a_complete_atomic_partial_handoff(tmp_path, monkeypatch) -> None:
+    _install_full_macos_fakes(monkeypatch)
+
+    assert benchmark._run_full_macos(tmp_path, tmp_path / "envs") == 0
+
+    manifest = json.loads((tmp_path / "environment_manifest.json").read_text())
+    records = [json.loads(line) for line in (tmp_path / "macos.jsonl").read_text().splitlines()]
+    assert manifest["environments"]["macos"]["available"] is True
+    assert manifest["environments"]["linux"]["available"] is False
+    assert len(records) == len(benchmark._full_sample_plan(benchmark._load_full_cases())) * 3
+    assert not (tmp_path / "linux.jsonl").exists()
+
+
+def test_full_macos_failure_leaves_no_final_artifact(tmp_path, monkeypatch) -> None:
+    _install_full_macos_fakes(monkeypatch, fail_after_records=2)
+
+    with pytest.raises(RuntimeError, match="CLEANUP_UNPROVEN"):
+        benchmark._run_full_macos(tmp_path, tmp_path / "envs")
+
+    assert not (tmp_path / "macos.jsonl").exists()
+    assert not (tmp_path / "environment_manifest.json").exists()
+
+
+def test_full_macos_refuses_existing_or_stale_outputs_before_worker_start(tmp_path, monkeypatch) -> None:
+    (tmp_path / "macos.jsonl").write_text("stale\n")
+    monkeypatch.setattr(benchmark, "WorkerHarness", lambda *args, **kwargs: pytest.fail("worker started"))
+
+    with pytest.raises(ValueError, match="already exists"):
+        benchmark._run_full_macos(tmp_path, tmp_path / "envs")
 
 
 def test_quick_runner_is_serial_and_replays_only_semantic_fields(
@@ -2609,7 +2696,8 @@ def test_benchmark_cli_dispatches_every_operator_command_fail_closed(
 ) -> None:
     calls: list[object] = []
     monkeypatch.setattr(benchmark, "_run_quick_benchmark", lambda: calls.append("quick") or 0)
-    monkeypatch.setattr(benchmark, "_run_full_benchmark", lambda environment: calls.append(("full", environment)) or 2)
+    monkeypatch.setattr(benchmark, "_load_approved_corpus", lambda path: {"cases": [{}]})
+    monkeypatch.setattr(benchmark, "_run_full_macos", lambda: calls.append("full-macos") or 2)
     monkeypatch.setattr(benchmark, "import_approved_snapshot", lambda inbox, corpus: calls.append(("import", inbox, corpus)))
     monkeypatch.setattr(benchmark, "_require_final_inputs", lambda: (_ for _ in ()).throw(ValueError("final Task 10 benchmark inputs are absent")))
 
@@ -2620,7 +2708,7 @@ def test_benchmark_cli_dispatches_every_operator_command_fail_closed(
     assert benchmark.main(["verify-report"]) == 1
     assert calls == [
         "quick",
-        ("full", "macos"),
+        "full-macos",
         ("import", str(tmp_path / "approved_component.json"), str(tmp_path / "approved.json")),
     ]
     assert capsys.readouterr().err.count("final Task 10 benchmark inputs are absent") == 2
