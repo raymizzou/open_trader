@@ -54,6 +54,7 @@ const state = {
     historyKind: "signals",
     error: "",
     pollId: null,
+    stateRequestInFlight: false,
     signalPollId: null,
     signalRequestInFlight: false,
     signalLastSuccessAt: "",
@@ -3319,7 +3320,8 @@ function predictionRequestUrl(path) {
 }
 
 async function fetchPredictionState() {
-  if (state.workspaceView !== "prediction_market") return;
+  if (state.workspaceView !== "prediction_market" || state.predictionMarket.stateRequestInFlight) return;
+  state.predictionMarket.stateRequestInFlight = true;
   try {
     const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/state"), {cache: "no-store", credentials: "same-origin"});
     if (!response.ok) throw new Error(`prediction state ${response.status}`);
@@ -3338,10 +3340,12 @@ async function fetchPredictionState() {
     } else {
       state.predictionMarket.payload = {status: "unavailable", stale: true, readiness: {status: "unavailable"}, events: [], opportunities: [], breaker: {open: true}};
     }
+  } finally {
+    state.predictionMarket.stateRequestInFlight = false;
   }
   renderPredictionMarket();
   const kind = state.predictionMarket.historyKind;
-  if (state.predictionMarket.payload && !Array.isArray(state.predictionMarket.payload.histories?.[kind])) {
+  if (state.predictionMarket.payload && !Array.isArray(state.predictionMarket.payload.histories?.[kind]) && (kind !== "signals" || !state.predictionMarket.signalRequestInFlight)) {
     loadPredictionHistory(kind);
   }
 }

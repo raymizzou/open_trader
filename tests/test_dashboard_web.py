@@ -7257,6 +7257,51 @@ console.log(JSON.stringify({inFlight: state.predictionMarket.signalRequestInFlig
     assert json.loads(output) == {"inFlight": True, "epoch": 1}
 
 
+def test_prediction_state_poll_does_not_overlap_a_slow_request() -> None:
+    output = run_dashboard_js(r'''
+state.workspaceView = "prediction_market";
+const pending = [];
+let calls = 0;
+globalThis.fetch = () => {
+  calls += 1;
+  return new Promise((resolve) => pending.push(resolve));
+};
+const first = fetchPredictionState();
+fetchPredictionState();
+const overlappingCalls = calls;
+for (const resolve of pending) {
+  resolve({ok:true,json:async()=>({status:"healthy",histories:{signals:[]}})});
+}
+await first;
+console.log(JSON.stringify({overlappingCalls,inFlight:state.predictionMarket.stateRequestInFlight}));
+''')
+    assert json.loads(output) == {"overlappingCalls": 1, "inFlight": False}
+
+
+def test_prediction_state_load_does_not_duplicate_the_initial_signal_history_request() -> None:
+    output = run_dashboard_js(r'''
+state.workspaceView = "prediction_market";
+globalThis.window = {setInterval(){return 1;},clearInterval(){}};
+const urls = [];
+const history = [];
+globalThis.fetch = (url) => {
+  urls.push(url);
+  if (url.includes("/state")) return Promise.resolve({ok:true,json:async()=>({status:"healthy",histories:{}})});
+  return new Promise((resolve) => history.push(resolve));
+};
+const stateLoad = fetchPredictionState();
+startPredictionSignalPolling();
+await Promise.resolve();
+await Promise.resolve();
+await Promise.resolve();
+const historyCalls = urls.filter((url) => url.includes("/history")).length;
+for (const resolve of history) resolve({ok:true,json:async()=>({items:[]})});
+await stateLoad;
+console.log(JSON.stringify({historyCalls}));
+''')
+    assert json.loads(output) == {"historyCalls": 1}
+
+
 def test_dashboard_renders_one_selected_broker_tab_and_cards_switch_it() -> None:
     output = run_dashboard_js(r'''
 const mount = () => ({innerHTML:"", textContent:"", classList:{add(){},remove(){}}});

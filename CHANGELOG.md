@@ -5,6 +5,11 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-13
 
+- Prediction dashboard state polling now skips an overlapping slow request and
+  reuses the initial signal-history request, preventing one browser tab from
+  multiplying service reads during a slow refresh. Focused dashboard checks
+  pass; no live command, deployment, restart, or acceptance run was performed.
+
 - Prediction Service production launchd now supplies the existing daily
   notifier configuration to its runtime, matching Legacy notification
   injection; shadow remains unconfigured/read-only. Focused service and
