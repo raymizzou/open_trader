@@ -523,14 +523,39 @@ PY
 }
 
 capture_owner_holders() {
-  local status
+  local status raw canonical
   if capture_bounded "$LSOF_BIN" -nP -Fp -- \
       "$RUNTIME_ROOT/data/prediction_arbitrage/runtime.lock"; then
-    return 0
+    status=0
   else
     status=$?
   fi
-  [[ "$status" -eq 1 && -z "$CAPTURED_OUTPUT" ]]
+  raw="$CAPTURED_OUTPUT"
+  if [[ "$status" -eq 1 && -z "$raw" ]]; then
+    CAPTURED_OUTPUT=""
+    return 0
+  fi
+  [[ "$status" -eq 0 ]] || return 1
+  canonical="$(run_bounded "$PYTHON_BIN" - "$raw" <<'PY'
+import re, sys
+
+values = []
+for line in sys.argv[1].splitlines():
+    if not line:
+        continue
+    if re.fullmatch(r"f[0-9]+", line):
+        continue
+    match = re.fullmatch(r"p[1-9][0-9]*", line)
+    if match is None:
+        raise SystemExit(1)
+    values.append(int(line[1:]))
+if sys.argv[1] and not values:
+    raise SystemExit(1)
+print("\n".join(f"p{pid}" for pid in sorted(set(values))))
+PY
+)" || return 1
+  CAPTURED_OUTPUT="$canonical"
+  return 0
 }
 
 capture_before_snapshot() {
@@ -1755,12 +1780,12 @@ PY
 }
 
 prove_legacy_owner() {
-  local output holders lock_path expected_plist
+  local output holders expected_plist
   output="$(run_bounded "$LAUNCHCTL_BIN" print \
     "gui/$UID/com.open-trader.legacy-dashboard")" || return 1
   expected_plist="$LAUNCH_AGENTS_DIR/com.open-trader.legacy-dashboard.plist"
-  lock_path="$RUNTIME_ROOT/data/prediction_arbitrage/runtime.lock"
-  holders="$(run_bounded "$LSOF_BIN" -nP -Fp -- "$lock_path")" || return 1
+  capture_owner_holders || return 1
+  holders="$CAPTURED_OUTPUT"
   run_bounded "$PYTHON_BIN" - "$output" "$holders" "$expected_plist" \
     "$REPO_ROOT" <<'PY' || return 1
 import re, sys
@@ -1891,13 +1916,9 @@ def holders(raw):
     for line in raw.splitlines():
         if not line:
             continue
-        if re.fullmatch(r"f[0-9]+", line):
-            continue
         if not re.fullmatch(r"p[1-9][0-9]*", line):
             raise ValueError("invalid lock-holder observation")
         values.append(int(line[1:]))
-    if raw and not values:
-        raise ValueError("lock-holder PID observation is missing")
     return sorted(set(values))
 
 def account_snapshot(raw):
@@ -1938,6 +1959,8 @@ before_lock_holders = holders(before_holders_raw)
 lock_holders = holders(after_holders_raw)
 selected_after = after.get("legacy") if after_mode == "legacy" else after.get("service")
 owner_pid = selected_after.get("pid") if isinstance(selected_after, dict) else None
+if after_mode not in {"legacy", "service"}:
+    owner_pid = None
 if owner_pid is not None and lock_holders != [owner_pid]:
     raise ValueError("owner lock holder does not match selected owner")
 payload = {

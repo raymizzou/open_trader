@@ -5,6 +5,13 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-13
 
+- #45 validates joined macOS runtime-lock output at the capture boundary,
+  canonicalizing `p<PID>` holders while accepting only `f<FD>` ancillary
+  records. Unknown or PID-less output fails closed before route mutation and
+  after maintenance writes truthful failed evidence. Focused lock and
+  maintenance-failure checks pass; no live command, deployment, or acceptance
+  run was performed.
+
 - #45 live-preflight follow-up uses joined `lsof -Fp` runtime-lock probes so
   macOS file-descriptor records cannot invalidate owner evidence, and the
   Dashboard stack installer now waits up to its configured bounded timeout for

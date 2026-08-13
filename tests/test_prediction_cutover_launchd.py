@@ -228,12 +228,22 @@ if command == "lsof":
         raise SystemExit(2)
     args = " ".join(sys.argv[1:])
     if args.endswith("runtime.lock"):
-        for pid in state["lock_holders"]:
-            print(f"p{pid}")
-            if state["fail_at"] == "lsof_joined_field_output" and "-Fp" in sys.argv:
-                print("f3")
-            elif state["fail_at"] == "lsof_unknown_field_output" and "-Fp" in sys.argv:
-                print("x9")
+        if state["fail_at"] == "lsof_f_only_output" and "-Fp" in sys.argv:
+            print("f0")
+        else:
+            for pid in state["lock_holders"]:
+                print(f"p{pid}")
+                if state["fail_at"] == "lsof_joined_field_output" and "-Fp" in sys.argv:
+                    print("f3")
+                elif state["fail_at"] == "lsof_unknown_field_output" and "-Fp" in sys.argv:
+                    print("x9")
+                elif state["fail_at"] == "lsof_unknown_field_after_snapshot" \
+                        and "-Fp" in sys.argv:
+                    route_mode = ""
+                    if route_path.exists():
+                        route_mode = json.loads(route_path.read_text(encoding="utf-8"))["mode"]
+                    if route_mode != "legacy":
+                        print("x9")
         save()
         raise SystemExit(0 if state["lock_holders"] else 1)
     if "-d cwd" in args:
@@ -1165,7 +1175,7 @@ def test_legacy_inspection_failure_after_maintenance_writes_failed_evidence(
 
     assert result.returncode == 1
     assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "maintenance"
-    assert not (harness.runtime / "prediction-cutover-evidence.json").exists()
+    assert harness.evidence["result"] == "failed"
 
 
 def test_public_heartbeat_difference_is_allowed_by_contract_projection(
@@ -1566,8 +1576,35 @@ def test_runtime_lock_probe_rejects_unknown_lsof_field_output(
     result = harness.run("service")
 
     assert result.returncode == 1
-    assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "maintenance"
+    assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "legacy"
     assert not (harness.runtime / "prediction-cutover-evidence.json").exists()
+
+
+def test_runtime_lock_probe_rejects_f_only_lsof_output(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("lsof_f_only_output")
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "legacy"
+    assert not (harness.runtime / "prediction-cutover-evidence.json").exists()
+
+
+def test_runtime_lock_probe_after_snapshot_writes_failed_evidence(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("lsof_unknown_field_after_snapshot")
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "maintenance"
+    evidence = harness.evidence
+    assert evidence["result"] == "failed"
+    assert evidence["owner"]["before_lock_holders"] == [2001]
+    assert evidence["owner"]["lock_holders"] == []
 
 
 def test_failed_service_then_separate_rollback_recovers_maintenance(
