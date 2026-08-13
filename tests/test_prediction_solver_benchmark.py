@@ -2481,6 +2481,173 @@ def test_full_environment_runner_reuses_each_throughput_worker_slot(monkeypatch)
     assert len(factory.instances) == 3
 
 
+def _install_fake_docker(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    calls: list[list[str]] = []
+
+    def run(command, **kwargs):
+        del kwargs
+        calls.append(command)
+        if command[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(command, 0, "sha256:" + "a" * 64 + "\n", "")
+        if command[:3] == ["docker", "run", "--rm"]:
+            if "linux-platform-highs" in command[-1]:
+                stdout = json.dumps({"architecture": "x86_64", "cpu": "fake-cpu", "os_version": "Linux", "probe": "linux-platform-highs", "python_version": "3.12.11"}) + "\n"
+            elif "scip-exact" in command[-1]:
+                stdout = json.dumps({"scip-exact": {"corrupt_checker": "NONZERO", "equality": "OPTIMAL", "infeasible": "INFEASIBLE", "lossy": "UNKNOWN", "optimal": "OPTIMAL", "ranged": "OPTIMAL"}}) + "\n"
+            else:
+                solver = command[-1]
+                stdout = json.dumps({
+                    "adapter": {"highs": "HighsBackend", "scip": "ScipBackend", "cp_sat": "CpSatBackend"}[solver],
+                    "solver": {"highs": "highspy", "scip": "pyscipopt", "cp_sat": "ortools"}[solver],
+                    "status": "OPTIMAL",
+                    "version": benchmark._SOLVER_VERSIONS[solver],
+                }) + "\n"
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(benchmark.subprocess, "run", run)
+    monkeypatch.setattr(benchmark, "_current_git_sha", lambda: "1" * 40)
+    return calls
+
+
+def test_linux_discovery_requires_pinned_images_and_scip_exact_smoke(monkeypatch) -> None:
+    calls = _install_fake_docker(monkeypatch)
+
+    environment, artifacts = benchmark._discover_linux_environment()
+
+    assert environment["available"] is True
+    assert set(artifacts) == {"highs", "scip", "cp_sat"}
+    assert any("scip-exact" in " ".join(call) for call in calls)
+    assert all(item["image_id"].startswith("sha256:") for item in artifacts.values())
+    assert artifacts["scip"]["run_succeeded"] is True
+
+
+def _install_fake_docker_worker(monkeypatch: pytest.MonkeyPatch, *, container_survives: bool = False) -> list[list[str]]:
+    commands: list[list[str]] = []
+    inspections: dict[str, int] = {}
+
+    class Harness:
+        def __init__(self, command, **kwargs) -> None:
+            del kwargs
+            commands.append(command)
+            cidfile = Path(command[command.index("--cidfile") + 1])
+            cidfile.write_text("a" * 64 + "\n")
+            self.inner = _fake_harness_factory()(command[-1])
+
+        def __enter__(self):
+            self.inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.inner.__exit__(*args)
+
+        def submit(self, request):
+            return self.inner.submit(request)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    def run(command, **kwargs):
+        del kwargs
+        if command[:2] == ["docker", "inspect"]:
+            container_id = command[-1]
+            inspections[container_id] = inspections.get(container_id, 0) + 1
+            if container_survives and inspections[container_id] == 1:
+                return subprocess.CompletedProcess(command, 0, "{}\n", "")
+            return subprocess.CompletedProcess(command, 1, "", "not found")
+        if command[:3] == ["docker", "rm", "--force"]:
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, command[-1] + "\n", "")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(benchmark, "WorkerHarness", Harness)
+    monkeypatch.setattr(benchmark.subprocess, "run", run)
+    monkeypatch.setattr(benchmark, "_fake_docker_inspections", inspections, raising=False)
+    return commands
+
+
+def _run_tiny_linux_plan() -> list[dict[str, object]]:
+    cases = benchmark._load_full_cases()
+    environments, artifacts = _full_environment_fixture()
+    manifest = benchmark._full_manifest(cases, environments, artifacts)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(benchmark, "_SOLVERS", ("highs",))
+        monkeypatch.setattr(benchmark, "_full_sample_plan", lambda _: ((cases[0].case_id, "warmup", 0, 1),))
+        return benchmark._run_full_environment(
+            cases,
+            manifest,
+            "linux",
+            lambda solver: benchmark._docker_harness("pinned-image", solver),
+        )
+
+
+def test_docker_harness_is_networkless_read_only_and_proves_container_cleanup(monkeypatch) -> None:
+    commands = _install_fake_docker_worker(monkeypatch)
+
+    records = _run_tiny_linux_plan()
+
+    command = commands[0]
+    assert command[:3] == ["docker", "run", "--rm"]
+    assert "--network" in command and command[command.index("--network") + 1] == "none"
+    assert any(item.endswith(":/workspace:ro") for item in command)
+    assert records[0]["container_id"] == "a" * 64
+    assert benchmark._fake_docker_inspections["a" * 64] >= 1
+
+
+def test_linux_cleanup_survivor_is_removed_and_the_run_stops(monkeypatch) -> None:
+    commands = _install_fake_docker_worker(monkeypatch, container_survives=True)
+
+    with pytest.raises(RuntimeError, match="CONTAINER_CLEANUP_UNPROVEN"):
+        _run_tiny_linux_plan()
+
+    assert [command for command in commands if command[:3] == ["docker", "rm", "--force"]] == [
+        ["docker", "rm", "--force", "a" * 64]
+    ]
+
+
+def test_full_linux_requires_a_complete_validated_macos_partial_before_docker(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(benchmark, "_discover_linux_environment", lambda: pytest.fail("docker discovered"))
+
+    with pytest.raises(ValueError, match="macOS partial"):
+        benchmark._run_full_linux(tmp_path)
+
+
+def test_full_linux_refuses_existing_linux_evidence_before_docker(tmp_path, monkeypatch) -> None:
+    (tmp_path / "linux.jsonl").write_text("foreign\n")
+    monkeypatch.setattr(benchmark, "_discover_linux_environment", lambda: pytest.fail("docker discovered"))
+
+    with pytest.raises(ValueError, match="linux benchmark evidence already exists"):
+        benchmark._run_full_linux(tmp_path)
+
+
+def test_full_linux_completes_the_partial_without_rewriting_macos_evidence(tmp_path, monkeypatch) -> None:
+    _install_full_macos_fakes(monkeypatch)
+    assert benchmark._run_full_macos(tmp_path, tmp_path / "envs") == 0
+    macos_before = (tmp_path / "macos.jsonl").read_bytes()
+    environments, artifacts = _full_environment_fixture()
+    linux_factory = _fake_harness_factory()
+    monkeypatch.setattr(benchmark, "_current_git_sha", lambda: "1" * 40)
+    monkeypatch.setattr(
+        benchmark,
+        "_discover_linux_environment",
+        lambda: (environments["linux"], {solver: artifacts[solver]["linux"] for solver in benchmark._SOLVERS}),
+    )
+    monkeypatch.setattr(benchmark, "_docker_harness", lambda image, solver: linux_factory(solver))
+
+    assert benchmark._run_full_linux(tmp_path) == 0
+
+    manifest = json.loads((tmp_path / "environment_manifest.json").read_text())
+    macos_records = (tmp_path / "macos.jsonl").read_bytes()
+    linux_records = (tmp_path / "linux.jsonl").read_text().splitlines()
+    assert macos_records == macos_before
+    assert manifest["environments"]["linux"]["available"] is True
+    assert len(linux_records) == 4_755
+    assert len(macos_records.splitlines()) + len(linux_records) == 9_510
+    benchmark.aggregate_benchmark_records(
+        [json.loads(line) for line in macos_records.splitlines() + linux_records], manifest
+    )
+
+
 def _install_full_macos_fakes(
     monkeypatch: pytest.MonkeyPatch,
     *,
