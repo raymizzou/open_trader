@@ -2324,6 +2324,7 @@ def _container_state(container_id: str) -> str:
         completed.returncode == 1
         and (completed.stdout, completed.stderr) in {
             ("", f"Error: No such object: {container_id}\n"),
+            ("[]\n", f"Error: No such object: {container_id}\n"),
             ("[]\n", f"Error response from daemon: No such container: {container_id}\n"),
         }
     ):

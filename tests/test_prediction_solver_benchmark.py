@@ -2811,8 +2811,11 @@ def test_linux_cleanup_survivor_is_removed_and_the_run_stops(monkeypatch) -> Non
         (2, "", "Error: No such object: " + "a" * 64 + "\n", False),
         (1, " \n", "Error: No such object: " + "a" * 64 + "\n", False),
         (1, "", "Error: No such object: " + "a" * 64, False),
+        (1, "[]\n", "Error: No such object: " + "b" * 64 + "\n", False),
+        (1, "[]\n", "Error: No such object: " + "a" * 64, False),
         (1, "[]\n", "Error response from daemon: No such container\n", False),
         (1, "[]\n", "Error response from daemon: No such container: " + "b" * 64 + "\n", False),
+        (1, "[]\n", "Error response from daemon: No such container: " + "a" * 64 + "\n", True),
         (1, "[]\n", "permission denied while trying to connect to the Docker daemon\n", False),
         (1, "", "Error response from daemon: No such container: " + "a" * 64 + "\n", False),
         (2, "[]\n", "Error response from daemon: No such container: " + "a" * 64 + "\n", False),
@@ -2830,18 +2833,26 @@ def test_container_absence_requires_the_exact_no_such_object_result(monkeypatch,
 
 def test_container_absence_accepts_the_exact_docker_24_missing_container_result(monkeypatch) -> None:
     container_id = "a" * 64
-    monkeypatch.setattr(
-        benchmark.subprocess,
-        "run",
-        lambda command, **kwargs: subprocess.CompletedProcess(
+    commands: list[list[str]] = []
+
+    def run(command, **kwargs):
+        del kwargs
+        commands.append(command)
+        return subprocess.CompletedProcess(
             command,
             1,
             "[]\n",
-            f"Error response from daemon: No such container: {container_id}\n",
-        ),
+            f"Error: No such object: {container_id}\n",
+        )
+
+    monkeypatch.setattr(
+        benchmark.subprocess,
+        "run",
+        run,
     )
 
     assert benchmark._container_is_absent(container_id)
+    assert commands == [["docker", "inspect", container_id]]
 
 
 @pytest.mark.parametrize("field,value", (("soft_time_limit_ms", 4_999), ("hard_time_limit_ms", 20_001), ("max_constraint_generation_rounds", 65)))
