@@ -8092,6 +8092,14 @@ def test_account_outage_isolation_fails_closed_and_restores_account() -> None:
         calls.append(path)
         if path == dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH:
             return 503, {"code": "account_module_unavailable"}
+        if path == "/api/prediction-arbitrage/state":
+            raise TimeoutError("prediction state computation timed out")
+        if path == "/healthz":
+            return 200, {
+                "prediction_route_mode": "service",
+                "prediction_upstream_status": "ok",
+                "legacy_upstream_status": "ok",
+            }
         return 200, {"holding_enrichment": []}
 
     assert dashboard_acceptance._account_outage_isolation_errors(
@@ -8103,7 +8111,7 @@ def test_account_outage_isolation_fails_closed_and_restores_account() -> None:
         dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH,
         "/api/dashboard",
         "/api/trend-reports/tiger/history",
-        "/api/prediction-arbitrage/state",
+        "/healthz",
         "restore",
     ]
 
@@ -8137,6 +8145,15 @@ def test_controlled_account_outage_restores_shared_runtime(
         lambda _url, path: (
             (503, {"code": "account_module_unavailable"})
             if path == dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH
+            else (
+                200,
+                {
+                    "prediction_route_mode": "service",
+                    "prediction_upstream_status": "ok",
+                    "legacy_upstream_status": "ok",
+                },
+            )
+            if path == "/healthz"
             else (200, {"holding_enrichment": []})
         ),
     )
@@ -8203,6 +8220,15 @@ def test_controlled_account_outage_waits_for_label_and_listener_before_probe(
         return (
             (503, {"code": "account_module_unavailable"})
             if path == dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH
+            else (
+                200,
+                {
+                    "prediction_route_mode": "service",
+                    "prediction_upstream_status": "ok",
+                    "legacy_upstream_status": "ok",
+                },
+            )
+            if path == "/healthz"
             else (200, {"holding_enrichment": []})
         )
 
@@ -8216,7 +8242,7 @@ def test_controlled_account_outage_waits_for_label_and_listener_before_probe(
         dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH,
         "/api/dashboard",
         "/api/trend-reports/tiger/history",
-        "/api/prediction-arbitrage/state",
+        "/healthz",
     ]
 
 

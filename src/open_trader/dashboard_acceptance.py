@@ -1068,7 +1068,6 @@ def _account_outage_isolation_errors(
         for path in (
             "/api/dashboard",
             "/api/trend-reports/tiger/history",
-            "/api/prediction-arbitrage/state",
         ):
             status, payload = fetch(path)
             if status != 200:
@@ -1077,6 +1076,15 @@ def _account_outage_isolation_errors(
                 not isinstance(payload, Mapping) or "holding_enrichment" not in payload
             ):
                 errors.append("Account 故障时 Research 所在 Dashboard 数据不可读")
+        status, payload = fetch("/healthz")
+        if (
+            status != 200
+            or not isinstance(payload, Mapping)
+            or payload.get("prediction_route_mode") != "service"
+            or payload.get("prediction_upstream_status") != "ok"
+            or payload.get("legacy_upstream_status") != "ok"
+        ):
+            errors.append("Account 故障时 Gateway health contract 不满足")
     except (OSError, RuntimeError) as exc:
         errors.append(f"Account 故障隔离检查失败：{type(exc).__name__}: {exc}")
     finally:

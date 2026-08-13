@@ -15,7 +15,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   service, launchd, route/data, merge, deploy, or acceptance run was performed.
   Account outage acceptance now waits boundedly for the launchd label and 8768
   listener to disappear before its first outage probe; the deterministic
-  regression passes.
+  regression passes and now validates the cheap Gateway health contract instead
+  of recomputing slow Prediction state during the outage check.
 
 ## 2026-08-13
 
