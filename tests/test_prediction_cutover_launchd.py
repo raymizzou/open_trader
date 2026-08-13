@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import signal
 import shutil
 import subprocess
@@ -316,6 +317,8 @@ if command == "curl":
         raise SystemExit(0)
     if url.endswith("/healthz") and ":8766" in url:
         gateway = state["labels"]["com.open-trader.frontend-gateway"]
+        if route["mode"] == "service":
+            state["service_gateway_health_calls"] = state.get("service_gateway_health_calls", 0) + 1
         gateway_health = {
             "schema_version": "open_trader.frontend_gateway.health.v1",
             "module": "frontend_gateway",
@@ -339,6 +342,12 @@ if command == "curl":
             gateway_health.pop("prediction_inflight_requests", None)
         if state["fail_at"] == "gateway_service_health" and route["mode"] == "service":
             gateway_health["prediction_upstream_status"] = "unavailable"
+        if (
+            state["fail_at"] == "after_gateway_pid_mismatch"
+            and route["mode"] == "service"
+            and state.get("service_gateway_health_calls", 0) >= 2
+        ):
+            gateway_health["pid"] = 9999
         print(json.dumps(gateway_health))
     elif url.endswith("/healthz") and ":8769" in url:
         service = state["labels"]["com.open-trader.prediction-service"]
@@ -362,17 +371,30 @@ if command == "curl":
         print(json.dumps(health))
     elif url.endswith("/healthz") and ":8768" in url:
         api = state["labels"]["com.open-trader.account-api"]
-        print(json.dumps({
+        state["account_health_calls"] = state.get("account_health_calls", 0) + 1
+        health = {
             "schema_version": "open_trader.account_api.health.v1",
             "module": "account_api",
             "status": state.get("account_health_status", "ok"),
             "mode": state.get("account_api_mode", "production"),
             "pid": api["pid"],
+            "started_at": "2026-08-12T10:00:00+08:00",
             "api_git_sha": state.get("account_api_sha", os.environ["FAKE_SHA"]),
             "worker_git_sha": state.get("account_worker_sha", os.environ["FAKE_SHA"]),
             "release_match": state.get("account_api_sha", os.environ["FAKE_SHA"])
             == state.get("account_worker_sha", os.environ["FAKE_SHA"]),
-        }))
+            "source": "account_sync_worker_publication",
+        }
+        if state.get("account_health_missing_schema"):
+            health.pop("schema_version", None)
+        if state.get("account_health_missing_module"):
+            health.pop("module", None)
+        if (
+            state["fail_at"] == "after_account_mismatch"
+            and state.get("account_health_calls", 0) >= 3
+        ):
+            health["pid"] = 4999
+        print(json.dumps(health))
     elif url.endswith("/healthz") and ":8767" in url:
         legacy = state["labels"]["com.open-trader.legacy-dashboard"]
         payload = {
@@ -716,12 +738,12 @@ class CutoverHarness:
                 "service_runtime": {"state": "unknown", "reader_generation": None, "contract_generation": None},
                 "account": {
                     "before": {
-                        "controller": {"pid": 4001, "cwd": str(self.repo), "argv": [], "git_sha": SHA, "heartbeat_at": ""},
-                        "api": {"pid": 4101, "cwd": str(self.repo), "argv": [], "git_sha": SHA, "listener": "127.0.0.1:8768", "health_status": "ok", "health_mode": "production", "health_pid": 4101, "api_git_sha": SHA, "worker_git_sha": SHA, "release_match": True},
+                        "controller": {"pid": 4001, "cwd": str(self.repo), "argv": [str(self.bin / "python"), "-m", "open_trader", "account-sync-worker", "--config", str(self.runtime / "config/daily_premarket.env"), "--data-dir", str(self.runtime / "data"), "--reports-dir", str(self.runtime / "reports"), "--portfolio", str(self.runtime / "data/latest/portfolio.csv"), "--tiger-config-dir", "/fake/tiger-config"], "git_sha": SHA, "heartbeat_at": "2026-08-12T11:00:00+08:00"},
+                        "api": {"pid": 4101, "cwd": str(self.repo), "argv": [str(self.bin / "python"), "-m", "open_trader", "account-api", "--data-dir", str(self.runtime / "data"), "--mode", "production", "--config", str(self.runtime / "config/daily_premarket.env")], "git_sha": SHA, "listener": "127.0.0.1:8768", "health_status": "ok", "health_mode": "production", "health_pid": 4101, "api_git_sha": SHA, "worker_git_sha": SHA, "release_match": True},
                     },
                     "after": {
-                        "controller": {"pid": 4001, "cwd": str(self.repo), "argv": [], "git_sha": SHA, "heartbeat_at": ""},
-                        "api": {"pid": 4101, "cwd": str(self.repo), "argv": [], "git_sha": SHA, "listener": "127.0.0.1:8768", "health_status": "ok", "health_mode": "production", "health_pid": 4101, "api_git_sha": SHA, "worker_git_sha": SHA, "release_match": True},
+                        "controller": {"pid": 4001, "cwd": str(self.repo), "argv": [str(self.bin / "python"), "-m", "open_trader", "account-sync-worker", "--config", str(self.runtime / "config/daily_premarket.env"), "--data-dir", str(self.runtime / "data"), "--reports-dir", str(self.runtime / "reports"), "--portfolio", str(self.runtime / "data/latest/portfolio.csv"), "--tiger-config-dir", "/fake/tiger-config"], "git_sha": SHA, "heartbeat_at": "2026-08-12T11:00:00+08:00"},
+                        "api": {"pid": 4101, "cwd": str(self.repo), "argv": [str(self.bin / "python"), "-m", "open_trader", "account-api", "--data-dir", str(self.runtime / "data"), "--mode", "production", "--config", str(self.runtime / "config/daily_premarket.env")], "git_sha": SHA, "listener": "127.0.0.1:8768", "health_status": "ok", "health_mode": "production", "health_pid": 4101, "api_git_sha": SHA, "worker_git_sha": SHA, "release_match": True},
                     },
                 },
                 "verification": {
@@ -798,6 +820,18 @@ class CutoverHarness:
         status = self.state
         status["account_heartbeat_at"] = heartbeat
         self.state_path.write_text(json.dumps(status), encoding="utf-8")
+        for label in (
+            "com.open-trader.account-sync-controller",
+            "com.open-trader.account-api",
+        ):
+            item = state["labels"][label]
+            (self.launch_agents / f"{label}.plist").write_bytes(
+                plistlib.dumps({
+                    "Label": label,
+                    "WorkingDirectory": str(self.repo),
+                    "ProgramArguments": item["argv"],
+                })
+            )
         fake = self.bin / "fake-command"
         fake.write_text(FAKE_COMMAND, encoding="utf-8")
         fake.chmod(0o755)
@@ -809,6 +843,10 @@ class CutoverHarness:
             "uninstall_prediction_service_launchd.sh",
         ):
             shutil.copy2(fake, self.repo / "scripts" / name)
+        shutil.copy2(
+            ROOT / "scripts/prediction_cutover_account_proof.py",
+            self.repo / "scripts/prediction_cutover_account_proof.py",
+        )
 
     @property
     def state(self) -> dict[str, object]:
@@ -869,6 +907,35 @@ class CutoverHarness:
             state["labels"]["com.open-trader.account-sync-controller"]["argv"][3] = "account-sync-controller"
         elif fail_at == "account_api_mode_wrong":
             state["account_api_mode"] = "shadow"
+        elif fail_at == "account_missing_schema":
+            state["account_health_missing_schema"] = True
+        elif fail_at == "account_missing_module":
+            state["account_health_missing_module"] = True
+        elif fail_at == "account_duplicate_config":
+            argv = state["labels"]["com.open-trader.account-sync-controller"]["argv"]
+            index = argv.index("--config")
+            argv[index:index] = ["--config", "/wrong/final-config"]
+        elif fail_at == "account_api_extra_arg":
+            state["labels"]["com.open-trader.account-api"]["argv"].append(
+                "--unexpected"
+            )
+        elif fail_at == "account_loaded_plist_args_wrong":
+            state["labels"]["com.open-trader.account-api"]["argv"] = [
+                *state["labels"]["com.open-trader.account-api"]["argv"],
+                "--config",
+                "/wrong/loaded-plist-config",
+            ]
+        elif fail_at == "account_plist_args_wrong":
+            plist_path = self.launch_agents / "com.open-trader.account-api.plist"
+            plist = plistlib.loads(plist_path.read_bytes())
+            plist["ProgramArguments"] = [
+                *plist["ProgramArguments"],
+                "--unexpected",
+            ]
+            plist_path.write_bytes(plistlib.dumps(plist))
+        elif fail_at in {"after_gateway_pid_mismatch", "after_account_mismatch"}:
+            state["service_gateway_health_calls"] = 0
+            state["account_health_calls"] = 0
         elif fail_at in {"legacy_label_disappears", "legacy_label_inspection_error"}:
             pass
         elif fail_at == "public_unavailable":
@@ -915,6 +982,7 @@ class CutoverHarness:
             "FAKE_CHILD_CLEANUP_STARTED": str(self.child_cleanup_started),
             "FAKE_POST_ROUTE_SIGNAL": str(self.post_route_signal),
             "FAKE_INSTRUMENTATION": str(self.instrumentation),
+            "OPEN_TRADER_TIGER_CONFIG_DIR": "/fake/tiger-config",
             "FAKE_SHA": SHA,
             "FAKE_REAL_PYTHON": sys.executable,
             "GIT_BIN": str(self.bin / "git"),
@@ -1100,7 +1168,7 @@ def test_failed_evidence_preserves_before_observations_when_after_is_unavailable
     assert evidence["before"]["legacy"]["pid"] == 2001
     assert evidence["account"]["before"]["controller"]["pid"] == 4001
     assert evidence["account"]["before"]["api"]["pid"] == 4101
-    assert evidence["after"]["gateway"]["pid"] is None
+    assert evidence["after"]["gateway"] is None
 
 
 @pytest.mark.parametrize(
@@ -1111,6 +1179,12 @@ def test_failed_evidence_preserves_before_observations_when_after_is_unavailable
         "account_status_wrong_cwd",
         "account_controller_argv_wrong",
         "account_api_mode_wrong",
+        "account_missing_schema",
+        "account_missing_module",
+        "account_duplicate_config",
+        "account_api_extra_arg",
+        "account_loaded_plist_args_wrong",
+        "account_plist_args_wrong",
     ],
 )
 def test_preflight_rejects_unverifiable_account_process_identity(
@@ -1124,6 +1198,55 @@ def test_preflight_rejects_unverifiable_account_process_identity(
     assert result.returncode == 1
     assert harness.route.read_bytes() == route_before
     assert not any(call[:3] == ["python", "-", "route-write"] for call in harness.state["calls"])
+
+
+def test_ready_evidence_rejects_empty_account_argv(
+    harness: CutoverHarness,
+) -> None:
+    harness.run("service").check_returncode()
+    evidence_path = harness.runtime / "prediction-cutover-evidence.json"
+    payload = harness.evidence
+    payload["account"]["before"]["controller"]["argv"] = []
+    evidence_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert "already ready" not in result.stdout
+
+
+def test_failed_evidence_keeps_other_after_components_when_gateway_after_is_invalid(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("after_gateway_pid_mismatch")
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    evidence = harness.evidence
+    assert evidence["result"] == "failed"
+    assert evidence["before"]["gateway"]["pid"] == 1001
+    assert evidence["before"]["legacy"]["pid"] == 2001
+    assert evidence["account"]["before"]["controller"]["pid"] == 4001
+    assert evidence["after"]["gateway"] is None
+    assert evidence["after"]["legacy"]["pid"] == 2002
+    assert evidence["account"]["after"]["controller"]["pid"] == 4001
+
+
+def test_failed_evidence_keeps_other_after_components_when_account_after_is_invalid(
+    harness: CutoverHarness,
+) -> None:
+    harness.configure("after_account_mismatch")
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    evidence = harness.evidence
+    assert evidence["result"] == "failed"
+    assert evidence["account"]["before"]["controller"]["pid"] == 4001
+    assert evidence["account"]["after"] is None
+    assert evidence["after"]["gateway"]["pid"] == 1001
+    assert evidence["after"]["legacy"]["pid"] == 2002
 
 
 def test_service_absent_route_bootstraps_stack_inside_cutover(

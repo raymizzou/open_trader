@@ -59,6 +59,7 @@ AFTER_ACCOUNT_CONTROLLER_SHA=""
 AFTER_ACCOUNT_API_SHA=""
 AFTER_ACCOUNT_API_LISTENER_PID=""
 AFTER_ACCOUNT_API_HEALTH=""
+BEFORE_SNAPSHOT_CAPTURED=0
 DIRECT_STATE_VERIFIED=0
 DIRECT_HISTORY_VERIFIED=0
 DIRECT_PREVIEW_VERIFIED=0
@@ -201,6 +202,9 @@ ROUTE_PATH="$RUNTIME_ROOT/config/prediction-route.json"
 EVIDENCE_PATH="$RUNTIME_ROOT/prediction-cutover-evidence.json"
 RUNTIME_RECORD="$RUNTIME_ROOT/prediction-service-runtime.json"
 ACCOUNT_STATUS_PATH="$RUNTIME_ROOT/data/account_sync/controller_status.json"
+ACCOUNT_DAILY_CONFIG="$RUNTIME_ROOT/config/daily_premarket.env"
+ACCOUNT_TIGER_CONFIG_DIR="${OPEN_TRADER_TIGER_CONFIG_DIR:-${HOME}/.tigeropen}"
+ACCOUNT_PROOF_SCRIPT="$REPO_ROOT/scripts/prediction_cutover_account_proof.py"
 INSTALL_DASHBOARD="$REPO_ROOT/scripts/install_dashboard_launchd.sh"
 INSTALL_SERVICE="$REPO_ROOT/scripts/install_prediction_service_launchd.sh"
 UNINSTALL_SERVICE="$REPO_ROOT/scripts/uninstall_prediction_service_launchd.sh"
@@ -211,6 +215,7 @@ for executable in "$PYTHON_BIN" "$GIT_BIN" "$LAUNCHCTL_BIN" "$LSOF_BIN" \
 done
 [[ -z "$OWNER_PROBE_BIN" ]] || require_executable "$OWNER_PROBE_BIN"
 [[ -f "$PREDICTION_CONFIG" ]] || fail "prediction config is unavailable"
+[[ -f "$ACCOUNT_PROOF_SCRIPT" ]] || fail "Account proof helper is unavailable"
 [[ ! -L "$ROUTE_PATH" ]] || fail "prediction route path is invalid"
 [[ ! -e "$EVIDENCE_PATH" || ( -f "$EVIDENCE_PATH" && ! -L "$EVIDENCE_PATH" ) ]] \
   || fail "prediction evidence path is invalid"
@@ -272,7 +277,7 @@ fi
 INITIAL_EVIDENCE_OPERATION_ID="__absent__"
 
 inspect_label() {
-  local label="$1" required="$2" output status expected_plist
+  local label="$1" required="$2" output status expected_plist format="${3:-pid}"
   if output="$(run_bounded "$LAUNCHCTL_BIN" print "gui/$UID/$label" 2>&1)"; then
     status=0
   else
@@ -284,15 +289,36 @@ inspect_label() {
   fi
   [[ "$status" -eq 0 ]] || { printf '%s\n' "$output" >&2; return 1; }
   expected_plist="$LAUNCH_AGENTS_DIR/$label.plist"
-  run_bounded "$PYTHON_BIN" - "$output" "$expected_plist" "$REPO_ROOT" <<'PY'
+  run_bounded "$PYTHON_BIN" - "$output" "$expected_plist" "$REPO_ROOT" "$format" <<'PY'
+import json
 import re, sys
-text, expected_plist, expected_cwd = sys.argv[1:]
+text, expected_plist, expected_cwd, output_format = sys.argv[1:]
 path = re.search(r"(?m)^\s*path = (.+?)\s*$", text)
 cwd = re.search(r"(?m)^\s*working directory = (.+?)\s*$", text)
 pid = re.search(r"(?m)^\s*pid = ([1-9][0-9]*)\s*$", text)
-if not path or not cwd or not pid or path.group(1) != expected_plist or cwd.group(1) != expected_cwd:
+lines = text.splitlines()
+starts = [index for index, line in enumerate(lines) if line.strip() == "arguments = {"]
+argv = []
+if len(starts) == 1:
+    end = next(
+        (index for index in range(starts[0] + 1, len(lines))
+         if lines[index].strip() == "}"),
+        None,
+    )
+    if end is not None:
+        argv = [line.strip() for line in lines[starts[0] + 1:end] if line.strip()]
+if not path or not cwd or not pid or path.group(1) != expected_plist \
+        or cwd.group(1) != expected_cwd or not argv:
     raise SystemExit(1)
-print(pid.group(1))
+if output_format == "json":
+    print(json.dumps({
+        "path": path.group(1),
+        "cwd": cwd.group(1),
+        "pid": int(pid.group(1)),
+        "argv": argv,
+    }, separators=(",", ":")))
+else:
+    print(pid.group(1))
 PY
 }
 
@@ -330,16 +356,8 @@ listener_absent() {
   [[ "$status" -eq 1 && -z "$CAPTURED_OUTPUT" ]]
 }
 
-inspect_account_identity() {
-  account_launchd_observation controller
-}
-
-inspect_account_api_identity() {
-  account_launchd_observation api
-}
-
 account_launchd_observation() {
-  local kind="$1" label output expected_plist
+  local kind="$1" label expected_plist
   case "$kind" in
     controller)
       label="com.open-trader.account-sync-controller"
@@ -350,128 +368,13 @@ account_launchd_observation() {
     *) return 2 ;;
   esac
   expected_plist="$LAUNCH_AGENTS_DIR/$label.plist"
-  output="$(run_bounded "$LAUNCHCTL_BIN" print "gui/$UID/$label")" || return 1
-  run_bounded "$PYTHON_BIN" - "$output" "$expected_plist" "$REPO_ROOT" \
-    "$PYTHON_BIN" "$kind" <<'PY'
-import json
-import re
-import sys
-
-text, expected_plist, expected_cwd, expected_python, kind = sys.argv[1:]
-path = re.search(r"(?m)^\s*path = (.+?)\s*$", text)
-cwd = re.search(r"(?m)^\s*working directory = (.+?)\s*$", text)
-pid = re.search(r"(?m)^\s*pid = ([1-9][0-9]*)\s*$", text)
-lines = text.splitlines()
-starts = [index for index, line in enumerate(lines) if line.strip() == "arguments = {"]
-argv = []
-if len(starts) == 1:
-    end = next(
-        (index for index in range(starts[0] + 1, len(lines))
-         if lines[index].strip() == "}"),
-        None,
-    )
-    if end is not None:
-        argv = [line.strip() for line in lines[starts[0] + 1:end] if line.strip()]
-def option(name):
-    try:
-        return argv[argv.index(name) + 1]
-    except (ValueError, IndexError):
-        return None
-if not path or not cwd or not pid or path.group(1) != expected_plist \
-        or cwd.group(1) != expected_cwd or not argv or argv[0] != expected_python \
-        or argv[1:3] != ["-m", "open_trader"]:
-    raise SystemExit(1)
-if kind == "controller":
-    valid = (
-        argv[3] == "account-sync-worker"
-        and option("--config")
-        and option("--data-dir")
-        and option("--reports-dir")
-        and option("--portfolio")
-        and option("--tiger-config-dir")
-    )
-else:
-    valid = (
-        argv[3] == "account-api"
-        and option("--data-dir")
-        and option("--mode") == "production"
-        and option("--config")
-    )
-if not valid:
-    raise SystemExit(1)
-print(json.dumps({
-    "pid": int(pid.group(1)),
-    "cwd": cwd.group(1),
-    "argv": argv,
-}, separators=(",", ":")))
-PY
+  inspect_label "$label" 1 json
 }
 
 account_health_snapshot() {
   capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
     http://127.0.0.1:8768/healthz || return 1
   printf '%s\n' "$CAPTURED_OUTPUT"
-}
-
-validate_account_health() {
-  run_bounded "$PYTHON_BIN" - "$1" "$2" <<'PY'
-import json, sys
-try:
-    payload = json.loads(sys.argv[1])
-    valid = (
-        isinstance(payload, dict)
-        and payload.get("schema_version") == "open_trader.account_api.health.v1"
-        and payload.get("module") == "account_api"
-        and payload.get("status") == "ok"
-        and payload.get("mode") == "production"
-        and type(payload.get("pid")) is int
-        and payload["pid"] == int(sys.argv[2])
-        and isinstance(payload.get("api_git_sha"), str)
-        and isinstance(payload.get("worker_git_sha"), str)
-        and payload.get("release_match") is True
-    )
-except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
-    valid = False
-raise SystemExit(0 if valid else 1)
-PY
-}
-
-account_controller_status_snapshot() {
-  run_bounded "$PYTHON_BIN" - "$ACCOUNT_STATUS_PATH" "$1" "$REPO_ROOT" <<'PY'
-from datetime import datetime
-import json
-from pathlib import Path
-import sys
-
-try:
-    status = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-    controller = json.loads(sys.argv[2])
-    heartbeat = datetime.fromisoformat(str(status["heartbeat_at"]))
-    heartbeat_age = abs((datetime.now().astimezone() - heartbeat).total_seconds())
-    valid = (
-        isinstance(status, dict)
-        and status.get("schema_version") == "open_trader.account_sync.controller.v1"
-        and type(status.get("pid")) is int
-        and status["pid"] == controller.get("pid")
-        and status.get("working_directory") == sys.argv[3]
-        and status.get("git_sha")
-        and isinstance(status["git_sha"], str)
-        and len(status["git_sha"]) == 40
-        and heartbeat.tzinfo is not None
-        and heartbeat.utcoffset() is not None
-        and heartbeat_age <= 120
-    )
-except (AttributeError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
-    valid = False
-if not valid:
-    raise SystemExit(1)
-print(json.dumps({
-    "pid": status["pid"],
-    "cwd": status["working_directory"],
-    "git_sha": status["git_sha"],
-    "heartbeat_at": status["heartbeat_at"],
-}, separators=(",", ":")))
-PY
 }
 
 account_identity_snapshot() {
@@ -486,68 +389,12 @@ account_identity_snapshot() {
   [[ "$listener_status" -eq 0 ]] || return 1
   listener_raw="$CAPTURED_OUTPUT"
   health="$(account_health_snapshot)" || return 1
-  status="$(account_controller_status_snapshot "$controller_launchd")" || return 1
-  run_bounded "$PYTHON_BIN" - "$controller_launchd" "$api_launchd" "$listener_raw" \
-    "$health" "$status" "$REPO_ROOT" <<'PY'
-import json
-import re
-import sys
-
-try:
-    controller = json.loads(sys.argv[1])
-    api = json.loads(sys.argv[2])
-    listener_lines = sys.argv[3].splitlines()
-    listener_pids = [line[1:] for line in listener_lines if re.fullmatch(r"p[1-9][0-9]*", line)]
-    listener_addresses = [line[1:] for line in listener_lines if line.startswith("n")]
-    health = json.loads(sys.argv[4])
-    status = json.loads(sys.argv[5])
-    repo = sys.argv[6]
-    api_sha = health.get("api_git_sha")
-    worker_sha = health.get("worker_git_sha")
-    valid = (
-        controller.get("pid") == status.get("pid")
-        and controller.get("cwd") == status.get("cwd") == repo
-        and status.get("git_sha")
-        and re.fullmatch(r"[0-9a-fA-F]{40}", status["git_sha"]) is not None
-        and api.get("cwd") == repo
-        and len(listener_pids) == 1
-        and listener_pids[0] == str(api.get("pid"))
-        and listener_addresses == ["127.0.0.1:8768"]
-        and health.get("status") == "ok"
-        and health.get("mode") == "production"
-        and health.get("pid") == api.get("pid")
-        and isinstance(api_sha, str)
-        and re.fullmatch(r"[0-9a-fA-F]{40}", api_sha) is not None
-        and worker_sha == status.get("git_sha")
-        and health.get("release_match") is True
-    )
-except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-    valid = False
-if not valid:
-    raise SystemExit(1)
-print(json.dumps({
-    "controller": {
-        "pid": controller["pid"],
-        "cwd": controller["cwd"],
-        "argv": controller["argv"],
-        "git_sha": status["git_sha"],
-        "heartbeat_at": status["heartbeat_at"],
-    },
-    "api": {
-        "pid": api["pid"],
-        "cwd": api["cwd"],
-        "argv": api["argv"],
-        "git_sha": api_sha,
-        "listener": listener_addresses[0],
-        "health_status": health["status"],
-        "health_mode": health["mode"],
-        "health_pid": health["pid"],
-        "api_git_sha": api_sha,
-        "worker_git_sha": worker_sha,
-        "release_match": health["release_match"],
-    },
-}, separators=(",", ":")))
-PY
+  run_bounded "$PYTHON_BIN" "$ACCOUNT_PROOF_SCRIPT" snapshot \
+    "$controller_launchd" "$api_launchd" "$listener_raw" "$health" \
+    "$ACCOUNT_STATUS_PATH" \
+    "$LAUNCH_AGENTS_DIR/com.open-trader.account-sync-controller.plist" \
+    "$LAUNCH_AGENTS_DIR/com.open-trader.account-api.plist" \
+    "$REPO_ROOT" "$PYTHON_BIN" "$RUNTIME_ROOT" "$ACCOUNT_TIGER_CONFIG_DIR"
 }
 
 account_identity_equal() {
@@ -735,63 +582,98 @@ capture_before_snapshot() {
   BEFORE_ACCOUNT_API_SHA="$ACCOUNT_API_SHA"
   BEFORE_ACCOUNT_API_LISTENER_PID="$ACCOUNT_LISTENER_PID"
   BEFORE_ACCOUNT_API_HEALTH="$ACCOUNT_HEALTH_BEFORE"
+  BEFORE_SNAPSHOT_CAPTURED=1
 }
 
 capture_after_account_snapshot() {
-  AFTER_ACCOUNT_SNAPSHOT="$(account_identity_snapshot)" || return 1
-  account_identity_equal "$ACCOUNT_SNAPSHOT" "$AFTER_ACCOUNT_SNAPSHOT" || return 1
+  local status=0
+  if AFTER_ACCOUNT_SNAPSHOT="$(account_identity_snapshot)" \
+      && account_identity_equal "$ACCOUNT_SNAPSHOT" "$AFTER_ACCOUNT_SNAPSHOT"; then
+    :
+  else
+    AFTER_ACCOUNT_SNAPSHOT=""
+    status=1
+  fi
   AFTER_ACCOUNT_CONTROLLER_PID="$(run_bounded "$PYTHON_BIN" -c \
     'import json,sys; print(json.loads(sys.argv[1])["controller"]["pid"])' \
-    "$AFTER_ACCOUNT_SNAPSHOT")"
+    "$AFTER_ACCOUNT_SNAPSHOT" 2>/dev/null || true)"
   AFTER_ACCOUNT_API_PID="$(run_bounded "$PYTHON_BIN" -c \
     'import json,sys; print(json.loads(sys.argv[1])["api"]["pid"])' \
-    "$AFTER_ACCOUNT_SNAPSHOT")"
+    "$AFTER_ACCOUNT_SNAPSHOT" 2>/dev/null || true)"
   AFTER_ACCOUNT_CONTROLLER_SHA="$(run_bounded "$PYTHON_BIN" -c \
     'import json,sys; print(json.loads(sys.argv[1])["controller"]["git_sha"])' \
-    "$AFTER_ACCOUNT_SNAPSHOT")"
+    "$AFTER_ACCOUNT_SNAPSHOT" 2>/dev/null || true)"
   AFTER_ACCOUNT_API_SHA="$(run_bounded "$PYTHON_BIN" -c \
     'import json,sys; print(json.loads(sys.argv[1])["api"]["git_sha"])' \
-    "$AFTER_ACCOUNT_SNAPSHOT")"
+    "$AFTER_ACCOUNT_SNAPSHOT" 2>/dev/null || true)"
   AFTER_ACCOUNT_API_LISTENER_PID="$AFTER_ACCOUNT_API_PID"
+  return "$status"
 }
 
 capture_after_snapshot() {
-  GATEWAY_PID="$(inspect_label com.open-trader.frontend-gateway 1)" || return 1
-  GATEWAY_LISTENER_PID="$(listener_pid 8766)" || return 1
-  [[ "$GATEWAY_LISTENER_PID" == "$GATEWAY_PID" ]] || return 1
-  LEGACY_PID="$(inspect_label com.open-trader.legacy-dashboard 1)" || return 1
-  LEGACY_LISTENER_PID="$(listener_pid 8767)" || return 1
-  [[ "$LEGACY_LISTENER_PID" == "$LEGACY_PID" ]] || return 1
-  SERVICE_PID="$(inspect_label com.open-trader.prediction-service 0)" || return 1
-  if [[ -n "$SERVICE_PID" ]]; then
-    SERVICE_LISTENER_PID="$(listener_pid 8769)" || return 1
-    [[ "$SERVICE_LISTENER_PID" == "$SERVICE_PID" ]] || return 1
+  local status=0
+  GATEWAY_PID="" GATEWAY_LISTENER_PID="" AFTER_GATEWAY_HEALTH=""
+  if GATEWAY_PID="$(inspect_label com.open-trader.frontend-gateway 1)" \
+      && GATEWAY_LISTENER_PID="$(listener_pid 8766)" \
+      && [[ "$GATEWAY_LISTENER_PID" == "$GATEWAY_PID" ]] \
+      && capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+        http://127.0.0.1:8766/healthz; then
+    AFTER_GATEWAY_HEALTH="$CAPTURED_OUTPUT"
+    if ! validate_observed_health "$AFTER_GATEWAY_HEALTH" frontend_gateway "$GATEWAY_PID"; then
+      GATEWAY_PID="" GATEWAY_LISTENER_PID=""
+      status=1
+    fi
   else
-    listener_absent 8769 || return 1
-    SERVICE_LISTENER_PID=""
+    GATEWAY_PID="" GATEWAY_LISTENER_PID=""
+    status=1
   fi
-  capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
-    http://127.0.0.1:8766/healthz || return 1
-  AFTER_GATEWAY_HEALTH="$CAPTURED_OUTPUT"
-  validate_observed_health "$AFTER_GATEWAY_HEALTH" frontend_gateway "$GATEWAY_PID" \
-    || return 1
-  capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
-    http://127.0.0.1:8767/healthz || return 1
-  AFTER_LEGACY_HEALTH="$CAPTURED_OUTPUT"
-  validate_observed_health "$AFTER_LEGACY_HEALTH" legacy_dashboard "$LEGACY_PID" \
-    || return 1
-  if [[ -n "$SERVICE_PID" ]]; then
-    capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
-      http://127.0.0.1:8769/healthz || return 1
-    AFTER_SERVICE_HEALTH="$CAPTURED_OUTPUT"
-    validate_observed_health "$AFTER_SERVICE_HEALTH" prediction_service "$SERVICE_PID" \
-      || return 1
+
+  LEGACY_PID="" LEGACY_LISTENER_PID="" AFTER_LEGACY_HEALTH=""
+  if LEGACY_PID="$(inspect_label com.open-trader.legacy-dashboard 1)" \
+      && LEGACY_LISTENER_PID="$(listener_pid 8767)" \
+      && [[ "$LEGACY_LISTENER_PID" == "$LEGACY_PID" ]] \
+      && capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+        http://127.0.0.1:8767/healthz; then
+    AFTER_LEGACY_HEALTH="$CAPTURED_OUTPUT"
+    if ! validate_observed_health "$AFTER_LEGACY_HEALTH" legacy_dashboard "$LEGACY_PID"; then
+      LEGACY_PID="" LEGACY_LISTENER_PID=""
+      status=1
+    fi
   else
-    AFTER_SERVICE_HEALTH=""
+    LEGACY_PID="" LEGACY_LISTENER_PID=""
+    status=1
   fi
-  capture_owner_holders || return 1
-  AFTER_OWNER_HOLDERS="$CAPTURED_OUTPUT"
-  capture_after_account_snapshot || return 1
+
+  SERVICE_PID="" SERVICE_LISTENER_PID="" AFTER_SERVICE_HEALTH=""
+  if SERVICE_PID="$(inspect_label com.open-trader.prediction-service 0)"; then
+    if [[ -n "$SERVICE_PID" ]] \
+        && SERVICE_LISTENER_PID="$(listener_pid 8769)" \
+        && [[ "$SERVICE_LISTENER_PID" == "$SERVICE_PID" ]] \
+        && capture_bounded "$CURL_BIN" --fail --silent --show-error --max-time 2 \
+          http://127.0.0.1:8769/healthz; then
+      AFTER_SERVICE_HEALTH="$CAPTURED_OUTPUT"
+      if ! validate_observed_health "$AFTER_SERVICE_HEALTH" prediction_service "$SERVICE_PID"; then
+        SERVICE_PID="" SERVICE_LISTENER_PID=""
+        status=1
+      fi
+    elif [[ -z "$SERVICE_PID" ]] && listener_absent 8769; then
+      :
+    else
+      SERVICE_PID="" SERVICE_LISTENER_PID=""
+      status=1
+    fi
+  else
+    status=1
+  fi
+
+  if capture_owner_holders; then
+    AFTER_OWNER_HOLDERS="$CAPTURED_OUTPUT"
+  else
+    AFTER_OWNER_HOLDERS=""
+    status=1
+  fi
+  capture_after_account_snapshot || status=1
+  return "$status"
 }
 
 verify_relevant_label_set() {
@@ -889,7 +771,10 @@ capture_before_snapshot || fail "runtime evidence before-snapshot is not verifie
 evidence_is_ready_for_target() {
   [[ -f "$EVIDENCE_PATH" ]] || return 1
   state_transition evidence-validate "$EVIDENCE_PATH" "$TARGET" "$EXPECTED_SHA" \
-    "$REPO_ROOT" "$INITIAL_ROUTE" "1"
+    "$REPO_ROOT" "$INITIAL_ROUTE" "1" "$RUNTIME_ROOT" \
+    "$ACCOUNT_TIGER_CONFIG_DIR" "$PYTHON_BIN" \
+    "$LAUNCH_AGENTS_DIR/com.open-trader.account-sync-controller.plist" \
+    "$LAUNCH_AGENTS_DIR/com.open-trader.account-api.plist"
 }
 
 LOCK_DIR="$RUNTIME_ROOT/config/.prediction-cutover.lock"
@@ -975,8 +860,13 @@ def valid_route(payload):
     )
 
 def valid_evidence(payload, *, expected_target=None, expected_sha=None,
-                   expected_cwd=None, route=None, require_ready=False):
-    def valid_component(value):
+                   expected_cwd=None, route=None, runtime_root=None,
+                   tiger_config_dir=None, account_python=None,
+                   account_controller_plist=None, account_api_plist=None,
+                   require_ready=False):
+    def valid_component(value, *, allow_null=False):
+        if value is None:
+            return allow_null
         return (
             isinstance(value, dict)
             and set(value) == {"pid", "cwd", "git_sha", "listener"}
@@ -985,48 +875,41 @@ def valid_evidence(payload, *, expected_target=None, expected_sha=None,
             and isinstance(value["git_sha"], str)
             and (value["listener"] is None or isinstance(value["listener"], str))
         )
-    def valid_snapshot(value):
+    def valid_snapshot(value, *, allow_null=False):
         return (
             isinstance(value, dict)
             and set(value) == {"gateway", "legacy", "service"}
-            and all(valid_component(value[name]) for name in ("gateway", "legacy", "service"))
+            and all(valid_component(value[name], allow_null=allow_null) for name in ("gateway", "legacy", "service"))
         )
-    def valid_account_component(value, api=False):
-        keys = (
-            {"pid", "cwd", "argv", "git_sha", "heartbeat_at"}
-            if not api else
-            {"pid", "cwd", "argv", "git_sha", "listener", "health_status",
-             "health_mode", "health_pid", "api_git_sha", "worker_git_sha",
-             "release_match"}
-        )
-        if not isinstance(value, dict) or set(value) != keys:
+    def valid_account_snapshot(value, *, allow_null=False, fresh=False):
+        if value is None:
+            return allow_null
+        if not isinstance(expected_cwd, str) or not isinstance(runtime_root, str) \
+                or not isinstance(tiger_config_dir, str) \
+                or not isinstance(account_python, str) \
+                or not isinstance(account_controller_plist, str) \
+                or not isinstance(account_api_plist, str):
             return False
-        if value["pid"] is not None and (type(value["pid"]) is not int or value["pid"] <= 0):
+        try:
+            import importlib.util
+            helper_path = Path(expected_cwd) / "scripts/prediction_cutover_account_proof.py"
+            spec = importlib.util.spec_from_file_location("prediction_cutover_account_proof", helper_path)
+            if spec is None or spec.loader is None:
+                return False
+            helper = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(helper)
+            return helper.validate_canonical(
+                value,
+                repo=expected_cwd,
+                python=account_python,
+                runtime=runtime_root,
+                tiger_config_dir=tiger_config_dir,
+                controller_plist=account_controller_plist,
+                api_plist=account_api_plist,
+                require_fresh=fresh,
+            )
+        except (AttributeError, ImportError, KeyError, OSError, TypeError, ValueError):
             return False
-        if not isinstance(value["cwd"], str) or not isinstance(value["git_sha"], str) \
-                or not isinstance(value["argv"], list) \
-                or not all(isinstance(item, str) and item for item in value["argv"]):
-            return False
-        if not api:
-            return isinstance(value["heartbeat_at"], str)
-        return (
-            value["listener"] is None or isinstance(value["listener"], str)
-        ) and (
-            value["health_pid"] is None
-            or (type(value["health_pid"]) is int and value["health_pid"] > 0)
-        ) and isinstance(value["health_status"], str) \
-        and isinstance(value["health_mode"], str) \
-        and isinstance(value["api_git_sha"], str) \
-        and isinstance(value["worker_git_sha"], str) \
-        and type(value["release_match"]) is bool
-
-    def valid_account_snapshot(value):
-        return (
-            isinstance(value, dict)
-            and set(value) == {"controller", "api"}
-            and valid_account_component(value["controller"])
-            and valid_account_component(value["api"], api=True)
-        )
     if not (
         isinstance(payload, dict)
         and set(payload) == {
@@ -1044,8 +927,8 @@ def valid_evidence(payload, *, expected_target=None, expected_sha=None,
         and isinstance(payload.get("failure_reason"), str)
         and isinstance(payload.get("downtime_started_at"), str)
         and isinstance(payload.get("downtime_ended_at"), str)
-        and valid_snapshot(payload.get("before"))
-        and valid_snapshot(payload.get("after"))
+        and valid_snapshot(payload.get("before"), allow_null=payload.get("result") == "failed")
+        and valid_snapshot(payload.get("after"), allow_null=payload.get("result") == "failed")
         and isinstance(payload.get("route"), dict)
         and set(payload["route"]) == {"before_mode", "after_mode", "inflight_before", "inflight_after"}
         and all(payload["route"].get(key) is None or (type(payload["route"].get(key)) is int and payload["route"][key] >= 0)
@@ -1065,10 +948,8 @@ def valid_evidence(payload, *, expected_target=None, expected_sha=None,
         and (payload["service_runtime"]["reader_generation"] is None or (type(payload["service_runtime"]["reader_generation"]) is int and payload["service_runtime"]["reader_generation"] > 0))
         and (payload["service_runtime"]["contract_generation"] is None or (type(payload["service_runtime"]["contract_generation"]) is int and payload["service_runtime"]["contract_generation"] > 0))
         and isinstance(payload.get("account"), dict)
-        and isinstance(payload["account"].get("before"), dict)
-        and isinstance(payload["account"].get("after"), dict)
-        and valid_account_snapshot(payload["account"]["before"])
-        and valid_account_snapshot(payload["account"]["after"])
+        and valid_account_snapshot(payload["account"].get("before"), allow_null=payload["result"] == "failed", fresh=False)
+        and valid_account_snapshot(payload["account"].get("after"), allow_null=payload["result"] == "failed", fresh=False)
         and isinstance(payload.get("verification"), dict)
         and set(payload["verification"]) == {
             "direct_backend", "direct_state", "direct_history", "direct_preview_no_submit",
@@ -1129,6 +1010,9 @@ def valid_evidence(payload, *, expected_target=None, expected_sha=None,
     owner = payload["owner"]
     account_before = payload["account"]["before"]
     account_after = payload["account"]["after"]
+    if not valid_account_snapshot(account_before, fresh=True) \
+            or not valid_account_snapshot(account_after, fresh=True):
+        return False
     account_api = account_after["api"]
     account_controller = account_after["controller"]
     def account_identity(value):
@@ -1210,7 +1094,11 @@ elif operation == "route-write":
         }
         atomic_write(route_path, payload)
 elif operation == "evidence-validate":
-    _, path_raw, target_raw, sha_raw, cwd_raw, route_raw, ready_raw = sys.argv[1:]
+    (
+        _, path_raw, target_raw, sha_raw, cwd_raw, route_raw, ready_raw,
+        runtime_raw, tiger_config_raw, account_python_raw,
+        account_controller_plist_raw, account_api_plist_raw,
+    ) = sys.argv[1:]
     payload = read_json(Path(path_raw))
     route = json.loads(route_raw) if route_raw else None
     if not valid_evidence(
@@ -1219,13 +1107,20 @@ elif operation == "evidence-validate":
         expected_sha=sha_raw or None,
         expected_cwd=cwd_raw or None,
         route=route,
+        runtime_root=runtime_raw or None,
+        tiger_config_dir=tiger_config_raw or None,
+        account_python=account_python_raw or None,
+        account_controller_plist=account_controller_plist_raw or None,
+        account_api_plist=account_api_plist_raw or None,
         require_ready=ready_raw == "1",
     ):
         raise ValueError("invalid prediction evidence record")
 elif operation == "evidence-write":
     (
         _, path_raw, route_raw, initial_evidence_operation_id, operation_id,
-        target, expected_sha, result, reason, started, ended, lock_raw, cwd_raw, details_raw,
+        target, expected_sha, result, reason, started, ended, lock_raw, cwd_raw,
+        runtime_raw, tiger_config_raw, account_python_raw,
+        account_controller_plist_raw, account_api_plist_raw, details_raw,
     ) = sys.argv[1:]
     path = Path(path_raw)
     route_path = Path(route_raw)
@@ -1239,7 +1134,15 @@ elif operation == "evidence-write":
             raise ValueError("prediction route is not owned by evidence writer")
         if path.exists():
             current_evidence = read_json(path)
-            if not valid_evidence(current_evidence):
+            if not valid_evidence(
+                current_evidence,
+                expected_cwd=cwd_raw,
+                runtime_root=runtime_raw,
+                tiger_config_dir=tiger_config_raw,
+                account_python=account_python_raw,
+                account_controller_plist=account_controller_plist_raw,
+                account_api_plist=account_api_plist_raw,
+            ):
                 raise ValueError("invalid prediction evidence record")
             if current_evidence.get("operation_id") not in {
                 initial_evidence_operation_id, operation_id,
@@ -1274,7 +1177,15 @@ elif operation == "evidence-write":
                 "public_history": False,
                 "public_preview_no_submit": False,
             }
-        if not valid_evidence(payload):
+        if not valid_evidence(
+            payload,
+            expected_cwd=cwd_raw,
+            runtime_root=runtime_raw,
+            tiger_config_dir=tiger_config_raw,
+            account_python=account_python_raw,
+            account_controller_plist=account_controller_plist_raw,
+            account_api_plist=account_api_plist_raw,
+        ):
             raise ValueError("invalid prediction evidence payload")
         if result == "ready" and not valid_evidence(
             payload,
@@ -1282,6 +1193,11 @@ elif operation == "evidence-write":
             expected_sha=expected_sha,
             expected_cwd=cwd_raw,
             route=route,
+            runtime_root=runtime_raw,
+            tiger_config_dir=tiger_config_raw,
+            account_python=account_python_raw,
+            account_controller_plist=account_controller_plist_raw,
+            account_api_plist=account_api_plist_raw,
             require_ready=True,
         ):
             raise ValueError("prediction ready evidence is not semantically verified")
@@ -1292,7 +1208,10 @@ PY
 }
 
 validate_evidence() {
-  state_transition evidence-validate "$1" "" "" "$REPO_ROOT" "" "0"
+  state_transition evidence-validate "$1" "" "" "$REPO_ROOT" "" "0" "$RUNTIME_ROOT" \
+    "$ACCOUNT_TIGER_CONFIG_DIR" "$PYTHON_BIN" \
+    "$LAUNCH_AGENTS_DIR/com.open-trader.account-sync-controller.plist" \
+    "$LAUNCH_AGENTS_DIR/com.open-trader.account-api.plist"
 }
 
 if [[ -f "$EVIDENCE_PATH" ]]; then
@@ -1849,12 +1768,15 @@ write_evidence() {
   local result="$1" reason="$2" ended_at="$3" details
   if ! details="$(evidence_details)"; then
     [[ "$result" == "ready" ]] && return 1
-    details='{"before":{"gateway":{"pid":null,"cwd":"","git_sha":"","listener":null},"legacy":{"pid":null,"cwd":"","git_sha":"","listener":null},"service":{"pid":null,"cwd":"","git_sha":"","listener":null}},"after":{"gateway":{"pid":null,"cwd":"","git_sha":"","listener":null},"legacy":{"pid":null,"cwd":"","git_sha":"","listener":null},"service":{"pid":null,"cwd":"","git_sha":"","listener":null}},"route":{"before_mode":"unknown","after_mode":"maintenance","inflight_before":null,"inflight_after":null},"owner":{"pid":null,"lock_holders":[],"before_lock_holders":[],"available":false},"service_runtime":{"state":"unknown","reader_generation":null,"contract_generation":null},"account":{"before":{"controller":{"pid":null,"cwd":"","argv":[],"git_sha":"","heartbeat_at":""},"api":{"pid":null,"cwd":"","argv":[],"git_sha":"","listener":null,"health_status":"","health_mode":"","health_pid":null,"api_git_sha":"","worker_git_sha":"","release_match":false}},"after":{"controller":{"pid":null,"cwd":"","argv":[],"git_sha":"","heartbeat_at":""},"api":{"pid":null,"cwd":"","argv":[],"git_sha":"","listener":null,"health_status":"","health_mode":"","health_pid":null,"api_git_sha":"","worker_git_sha":"","release_match":false}}},"verification":{"direct_backend":"failed","direct_state":false,"direct_history":false,"direct_preview_no_submit":false,"public_state":false,"public_history":false,"public_preview_no_submit":false}}'
+    [[ "$BEFORE_SNAPSHOT_CAPTURED" -eq 0 ]] || return 1
+    details='{"before":{"gateway":{"pid":null,"cwd":"","git_sha":"","listener":null},"legacy":{"pid":null,"cwd":"","git_sha":"","listener":null},"service":{"pid":null,"cwd":"","git_sha":"","listener":null}},"after":{"gateway":{"pid":null,"cwd":"","git_sha":"","listener":null},"legacy":{"pid":null,"cwd":"","git_sha":"","listener":null},"service":{"pid":null,"cwd":"","git_sha":"","listener":null}},"route":{"before_mode":"unknown","after_mode":"maintenance","inflight_before":null,"inflight_after":null},"owner":{"pid":null,"lock_holders":[],"before_lock_holders":[],"available":false},"service_runtime":{"state":"unknown","reader_generation":null,"contract_generation":null},"account":{"before":null,"after":null},"verification":{"direct_backend":"failed","direct_state":false,"direct_history":false,"direct_preview_no_submit":false,"public_state":false,"public_history":false,"public_preview_no_submit":false}}'
   fi
   state_transition evidence-write "$EVIDENCE_PATH" "$ROUTE_PATH" \
     "$INITIAL_EVIDENCE_OPERATION_ID" "$OPERATION_ID" "$TARGET" "$EXPECTED_SHA" \
     "$result" "$reason" "$DOWNTIME_STARTED_AT" "$ended_at" "$STATE_LOCK_PATH" \
-    "$REPO_ROOT" "$details"
+    "$REPO_ROOT" "$RUNTIME_ROOT" "$ACCOUNT_TIGER_CONFIG_DIR" "$PYTHON_BIN" \
+    "$LAUNCH_AGENTS_DIR/com.open-trader.account-sync-controller.plist" \
+    "$LAUNCH_AGENTS_DIR/com.open-trader.account-api.plist" "$details"
 }
 
 evidence_details() {
@@ -1894,28 +1816,31 @@ def pid(raw):
 def health(raw):
     if not raw:
         return None
-    value = json.loads(raw)
-    if not isinstance(value, dict):
-        raise ValueError("health observation is not an object")
-    return value
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
 
-def component(raw, pid_raw, listener_raw, port):
+def component(raw, pid_raw, listener_raw, port, *, after=False):
     if not raw:
+        if after and (pid_raw or listener_raw):
+            return None
         return {"pid": None, "cwd": "", "git_sha": "", "listener": None}
     process_pid = pid(pid_raw)
     observed = health(raw)
     if process_pid is None:
         if observed is not None:
-            raise ValueError("health exists for an absent process")
+            return None
         return {"pid": None, "cwd": "", "git_sha": "", "listener": None}
     if observed is None or observed.get("pid") != process_pid:
-        raise ValueError("process observation does not match health")
+        return None
     cwd = observed.get("cwd")
     git_sha = observed.get("git_sha")
     if not isinstance(cwd, str) or not cwd or not isinstance(git_sha, str) or not git_sha:
-        raise ValueError("process identity is incomplete")
+        return None
     if pid(listener_raw) is None:
-        raise ValueError("listener observation is missing")
+        return None
     return {
         "pid": process_pid,
         "cwd": cwd,
@@ -1935,19 +1860,13 @@ def holders(raw):
 
 def account_snapshot(raw):
     if not raw:
-        return {
-            "controller": {
-                "pid": None, "cwd": "", "argv": [], "git_sha": "", "heartbeat_at": "",
-            },
-            "api": {
-                "pid": None, "cwd": "", "argv": [], "git_sha": "", "listener": None,
-                "health_status": "", "health_mode": "", "health_pid": None,
-                "api_git_sha": "", "worker_git_sha": "", "release_match": False,
-            },
-        }
-    value = json.loads(raw)
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
     if not isinstance(value, dict) or set(value) != {"controller", "api"}:
-        raise ValueError("invalid account observation")
+        return None
     return value
 
 before_gateway = health(before_gateway_raw) or {}
@@ -1958,9 +1877,9 @@ before = {
     "service": component(before_service_raw, before_service_pid_raw, before_service_listener_raw, 8769),
 }
 after = {
-    "gateway": component(after_gateway_raw, gateway_pid_raw, gateway_listener_raw, 8766),
-    "legacy": component(after_legacy_raw, legacy_pid_raw, legacy_listener_raw, 8767),
-    "service": component(after_service_raw, service_pid_raw, service_listener_raw, 8769),
+    "gateway": component(after_gateway_raw, gateway_pid_raw, gateway_listener_raw, 8766, after=True),
+    "legacy": component(after_legacy_raw, legacy_pid_raw, legacy_listener_raw, 8767, after=True),
+    "service": component(after_service_raw, service_pid_raw, service_listener_raw, 8769, after=True),
 }
 account = {
     "before": account_snapshot(before_account_raw),
@@ -1975,7 +1894,8 @@ def generation(value):
     return value if type(value) is int and value > 0 else None
 before_lock_holders = holders(before_holders_raw)
 lock_holders = holders(after_holders_raw)
-owner_pid = after["legacy"]["pid"] if after_mode == "legacy" else after["service"]["pid"]
+selected_after = after.get("legacy") if after_mode == "legacy" else after.get("service")
+owner_pid = selected_after.get("pid") if isinstance(selected_after, dict) else None
 if owner_pid is not None and lock_holders != [owner_pid]:
     raise ValueError("owner lock holder does not match selected owner")
 payload = {
