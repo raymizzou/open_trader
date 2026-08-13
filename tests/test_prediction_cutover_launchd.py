@@ -162,6 +162,10 @@ if command == "launchctl":
         raise SystemExit(0)
     if sys.argv[1] == "bootout":
         label = sys.argv[-1].rsplit("/", 1)[-1]
+        if label == "com.open-trader.frontend-gateway" and state["fail_at"] == "gateway_bootout":
+            print("bootout diagnostic", file=sys.stderr)
+            save()
+            raise SystemExit(1)
         item = state["labels"].get(label)
         if item is None or not item["loaded"]:
             save()
@@ -169,6 +173,7 @@ if command == "launchctl":
         item["loaded"] = False
         if label == "com.open-trader.frontend-gateway":
             state["listeners"]["8766"] = None
+            state["gateway_stopped"] = True
         elif label == "com.open-trader.legacy-dashboard":
             state["listeners"]["8767"] = None
         elif label == "com.open-trader.prediction-service":
@@ -196,6 +201,14 @@ if command == "launchctl":
 if command == "lsof":
     if state["fail_at"] == "listener_inspection_error":
         print("lsof diagnostic", file=sys.stderr)
+        save()
+        raise SystemExit(2)
+    if (
+        state["fail_at"] == "bootstrap_listener_inspection_error"
+        and state.get("gateway_stopped")
+        and "TCP:8766" in " ".join(sys.argv[1:])
+    ):
+        print("bootstrap lsof diagnostic", file=sys.stderr)
         save()
         raise SystemExit(2)
     args = " ".join(sys.argv[1:])
@@ -232,6 +245,8 @@ if command == "ps":
         item["loaded"] and str(item["pid"]) == pid
         for item in state["labels"].values()
     )
+    if present:
+        print(pid)
     save()
     raise SystemExit(0 if present else 1)
 
@@ -271,6 +286,21 @@ if command == "curl":
         state["post_route_signal_seen"] = True
         save()
         time.sleep(30)
+    if route["mode"] == "maintenance" and ":8766/api/prediction-arbitrage/" in url:
+        payload = {
+            "schema_version": "open_trader.frontend_gateway.error.v1",
+            "code": "prediction_maintenance",
+            "message": "Prediction service is in maintenance",
+            "route_mode": "maintenance",
+        }
+        if output_path:
+            Path(output_path).write_text(json.dumps(payload), encoding="utf-8")
+        if cookie_jar:
+            Path(cookie_jar).write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+        if any(arg in {"--write-out", "-w"} for arg in sys.argv):
+            print("503", end="")
+        save()
+        raise SystemExit(0)
     if url.endswith("/healthz") and ":8766" in url:
         gateway = state["labels"]["com.open-trader.frontend-gateway"]
         gateway_health = {
@@ -515,6 +545,7 @@ if command == "uninstall_prediction_service_launchd.sh":
     state["prediction_service_ready"] = False
     state["lock_holders"] = []
     state["listeners"]["8769"] = None
+    (runtime_root / "prediction-service-runtime.json").unlink(missing_ok=True)
     save()
     raise SystemExit(0)
 
@@ -622,7 +653,15 @@ class CutoverHarness:
                 "route": {"before_mode": "legacy", "after_mode": "maintenance", "inflight_before": 0, "inflight_after": 0},
                 "owner": {"pid": 2001, "lock_holders": [2001], "available": False},
                 "service_runtime": {"state": "unknown", "reader_generation": None, "contract_generation": None},
-                "verification": {"direct_backend": "failed", "public_state": False, "public_history": False, "preview_no_submit": False},
+                "verification": {
+                    "direct_backend": "failed",
+                    "direct_state": False,
+                    "direct_history": False,
+                    "direct_preview_no_submit": False,
+                    "public_state": False,
+                    "public_history": False,
+                    "public_preview_no_submit": False,
+                },
             },
             "labels": {
                 "com.open-trader.frontend-gateway": {
@@ -821,6 +860,7 @@ def test_service_absent_route_bootstraps_stack_inside_cutover(
     assert stack_calls[0][1:5] == ["--mode", "stack", "--prediction-owner", "enabled"]
     assert stack_calls[1][1:5] == ["--mode", "legacy", "--prediction-owner", "disabled"]
     assert harness.state["max_prediction_owners"] == 1
+    assert harness.evidence["route"]["before_mode"] == "absent"
     assert [
         call for call in harness.state["calls"]
         if call[0] == "install_prediction_service_launchd.sh"
@@ -832,6 +872,46 @@ def test_service_absent_route_bootstraps_stack_inside_cutover(
         "--launch-agents-dir", str(harness.launch_agents),
         "--wait-seconds", "2", "--expected-sha", SHA,
     ]
+
+
+def test_absent_bootstrap_proves_old_gateway_absent_before_route_write(
+    harness: CutoverHarness,
+) -> None:
+    harness.route.unlink()
+
+    result = harness.run("service")
+
+    assert result.returncode == 0, result.stderr
+    calls = harness.state["calls"]
+    bootout = next(
+        index for index, call in enumerate(calls)
+        if call[:2] == ["launchctl", "bootout"]
+        and call[-1].endswith("com.open-trader.frontend-gateway")
+    )
+    route_bootstrap = next(
+        index for index, call in enumerate(calls)
+        if call[:3] == ["python", "-", "route-bootstrap"]
+    )
+    assert bootout < route_bootstrap
+    assert not any(
+        call[0] == "curl" and ":8766/api/prediction-arbitrage" in " ".join(call[1:])
+        for call in calls[:route_bootstrap]
+    )
+
+
+@pytest.mark.parametrize("failure", ["gateway_bootout", "bootstrap_listener_inspection_error"])
+def test_absent_bootstrap_failure_keeps_route_absent(
+    harness: CutoverHarness, failure: str
+) -> None:
+    harness.route.unlink()
+    harness.configure(failure)
+
+    result = harness.run("service")
+
+    assert result.returncode == 1
+    assert not harness.route.exists()
+    assert not any(call[:3] == ["python", "-", "route-bootstrap"] for call in harness.state["calls"])
+    assert not any(call[0] == "install_dashboard_launchd.sh" for call in harness.state["calls"])
 
 
 @pytest.mark.parametrize(
@@ -886,6 +966,7 @@ def test_service_failure_stays_in_maintenance_without_running_later_commands(
     elif forbidden_later_command == "public_contract":
         assert not any(
             call[0] == "curl"
+            and ("--cookie-jar" in call or "--cookie" in call)
             and any("/api/prediction-arbitrage/state" in arg for arg in call[1:])
             for call in calls
         )
@@ -953,7 +1034,7 @@ def test_service_to_legacy_rollback_uses_one_owner(harness: CutoverHarness) -> N
 def test_failed_service_then_separate_rollback_recovers_maintenance(
     harness: CutoverHarness,
 ) -> None:
-    harness.configure("public_contract")
+    harness.configure("legacy_restart")
     failed = harness.run("service")
     assert failed.returncode == 1
     assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "maintenance"
@@ -965,6 +1046,26 @@ def test_failed_service_then_separate_rollback_recovers_maintenance(
     assert json.loads(harness.route.read_text(encoding="utf-8"))["mode"] == "legacy"
     assert harness.evidence["result"] == "ready"
     assert harness.evidence["target"] == "legacy"
+    assert not any(
+        call[0] == "uninstall_prediction_service_launchd.sh"
+        for call in harness.state["calls"]
+    )
+
+
+def test_evidence_snapshots_are_observed_before_and_after_cutover(
+    harness: CutoverHarness,
+) -> None:
+    harness.run("service").check_returncode()
+
+    evidence = harness.evidence
+
+    assert evidence["before"] != evidence["after"]
+    assert evidence["before"]["service"]["pid"] is None
+    assert evidence["after"]["service"]["pid"] == 3001
+    assert evidence["before"]["legacy"]["pid"] == 2001
+    assert evidence["after"]["legacy"]["pid"] == 2002
+    assert evidence["route"]["inflight_before"] == 0
+    assert evidence["route"]["inflight_after"] == 0
 
 
 def test_repeating_completed_target_preserves_evidence(harness: CutoverHarness) -> None:
@@ -1402,6 +1503,27 @@ def test_unknown_argument_is_rejected_before_runtime_inspection(
 
     assert result.returncode == 2
     assert harness.state["calls"] == []
+
+
+def test_issue45_runtime_artifacts_are_ignored_by_git() -> None:
+    paths = [
+        "config/prediction-route.json",
+        "config/.prediction-cutover.lock",
+        "config/.prediction-cutover-state.lock",
+        "prediction-cutover-evidence.json",
+        "prediction-service-runtime.json",
+    ]
+    result = subprocess.run(
+        ["git", "check-ignore", "--no-index", "--stdin"],
+        cwd=ROOT,
+        input="\n".join(paths) + "\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.splitlines() == paths
 
 
 def test_evidence_excludes_config_and_request_secrets(harness: CutoverHarness) -> None:
