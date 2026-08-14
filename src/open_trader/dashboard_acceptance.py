@@ -4266,7 +4266,11 @@ def _check_trend_review_geometry(page: Any, broker: str) -> None:
           matrix: rect(matrix),
           winRates: [...matrix.querySelectorAll(".trend-review-win-rate")].map(rect),
           columnGroups: [...matrix.querySelectorAll(".trend-review-column-groups")].map(rect),
-          columnGroupCells: [...matrix.querySelectorAll(".trend-review-column-groups")].map(group => [...group.children].map(rect)),
+          columnGroupCells: [...matrix.querySelectorAll(".trend-review-column-groups")].map(group => [...group.querySelectorAll(".trend-review-column-groups-values > span")].map(rect)),
+          columnGroupStyle: (() => { const style = getComputedStyle(matrix.querySelector(".trend-review-column-groups")); return {gridTemplateColumns:style.gridTemplateColumns, columnGap:style.columnGap}; })(),
+          columnGroupValuesStyle: (() => { const style = getComputedStyle(matrix.querySelector(".trend-review-column-groups-values")); return {gridTemplateColumns:style.gridTemplateColumns, columnGap:style.columnGap}; })(),
+          metricStyle: (() => { const style = getComputedStyle(matrix.querySelector(".trend-review-metric")); return {gridTemplateColumns:style.gridTemplateColumns, columnGap:style.columnGap}; })(),
+          valueStyle: (() => { const style = getComputedStyle(matrix.querySelector(".trend-review-values")); return {gridTemplateColumns:style.gridTemplateColumns, columnGap:style.columnGap}; })(),
           valueLists: [...matrix.querySelectorAll(".trend-review-values")].map(rect),
           firstSeries: [...matrix.querySelector(".trend-review-metric").querySelectorAll(".trend-review-series")].map(rect),
           textGroups: textSelectors.map(selector => ({
@@ -4309,9 +4313,21 @@ def _check_trend_review_geometry(page: Any, broker: str) -> None:
         isinstance(column_group_cells, list)
         and len(column_group_cells) == 1
         and isinstance(column_group_cells[0], list)
-        and len(column_group_cells[0]) == 3
+        and len(column_group_cells[0]) == 2
         and all(isinstance(cell, Mapping) for cell in column_group_cells[0])
     ), f"{broker} 趋势复盘策略与市场分组标题几何不可读"
+    column_group_style = geometry.get("columnGroupStyle")
+    column_group_values_style = geometry.get("columnGroupValuesStyle")
+    metric_style = geometry.get("metricStyle")
+    value_style = geometry.get("valueStyle")
+    assert (
+        isinstance(column_group_style, Mapping)
+        and isinstance(metric_style, Mapping)
+        and column_group_style == metric_style
+        and isinstance(column_group_values_style, Mapping)
+        and isinstance(value_style, Mapping)
+        and column_group_values_style == value_style
+    ), f"{broker} 趋势复盘分组网格轨道未与指标数值共享"
     assert isinstance(value_lists, list) and len(value_lists) == 5, (
         f"{broker} 趋势复盘五项指标缺少直接数值列表"
     )
@@ -4325,7 +4341,7 @@ def _check_trend_review_geometry(page: Any, broker: str) -> None:
             later["x"] >= earlier["x"] + earlier["width"] - 1
             for earlier, later in zip(first_series, first_series[1:])
         ), f"{broker} 趋势复盘 1440px 五系列数值未单行对齐"
-        strategy_group, market_group = column_group_cells[0][1:]
+        strategy_group, market_group = column_group_cells[0]
         assert (
             abs(strategy_group["x"] - first_series[0]["x"]) <= 1
             and abs(
@@ -4338,10 +4354,9 @@ def _check_trend_review_geometry(page: Any, broker: str) -> None:
                 - first_series[4]["x"] - first_series[4]["width"]
             ) <= 1
         ), f"{broker} 趋势复盘 1440px 策略与市场分组标题未对齐"
-    if width <= 840:
-        assert geometry.get("documentWidth") == width, (
-            f"{broker} 趋势复盘 {width}px 横向滚动宽度为 {geometry.get('documentWidth')}"
-        )
+    assert geometry.get("documentWidth") == width, (
+        f"{broker} 趋势复盘 {width}px 横向滚动宽度为 {geometry.get('documentWidth')}"
+    )
     if width != 375:
         return
     side = geometry.get("side")

@@ -4055,7 +4055,7 @@ function renderTrendReviewMatrix(review) {
       ${renderTrendReviewStatisticsMeta(review, "discipline", "纪律模拟")}
       ${renderTrendReviewStatisticsMeta(review, "actual", "实际执行")}
     </div>
-    <div class="trend-review-column-groups"><span></span><span>策略表现</span><span>市场基准</span></div>
+    <div class="trend-review-column-groups"><span></span><div class="trend-review-column-groups-values"><span>策略表现</span><span>市场基准</span></div></div>
     ${TREND_REVIEW_METRICS.map((metric) => renderTrendReviewMetric(review, metric)).join("")}
   </figure>`;
 }

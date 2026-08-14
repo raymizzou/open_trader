@@ -1572,17 +1572,23 @@ table {
   color: var(--muted);
   display: grid;
   font-size: 12px;
-  gap: 12px;
-  grid-template-columns: minmax(150px, .8fr) repeat(5, minmax(120px, 1fr));
+  gap: 8px;
+  grid-template-columns: minmax(0, .8fr) minmax(0, 5fr);
 }
 
-.trend-review-column-groups span:nth-child(2) { grid-column: span 2; }
-.trend-review-column-groups span:nth-child(3) { grid-column: span 3; }
+.trend-review-column-groups-values {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.trend-review-column-groups-values span:first-child { grid-column: span 2; }
+.trend-review-column-groups-values span:last-child { grid-column: span 3; }
 
 .trend-review-metric {
   display: grid;
   gap: 8px;
-  grid-template-columns: minmax(150px, .8fr) minmax(0, 5fr);
+  grid-template-columns: minmax(0, .8fr) minmax(0, 5fr);
 }
 
 .trend-review-metric + .trend-review-metric {

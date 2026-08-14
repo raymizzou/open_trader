@@ -7552,6 +7552,7 @@ if ((html.match(/class="trend-review-matrix"/g)||[]).length!==1) throw new Error
 if ((html.match(/class="trend-review-win-rate/g) || []).length !== 2) throw new Error(html);
 if (!html.includes('<span>完整交易胜率</span><strong>100%</strong><small>31 胜 / 31 闭环</small>') || !html.includes('<span>完整交易胜率</span><strong>100%</strong><small>29 胜 / 29 闭环</small>')) throw new Error(html);
 if ((html.match(/class="trend-review-column-groups"/g) || []).length !== 1) throw new Error(html);
+if (!html.includes('<div class="trend-review-column-groups"><span></span><div class="trend-review-column-groups-values"><span>策略表现</span><span>市场基准</span></div></div>')) throw new Error(html);
 for (const text of ["完整交易胜率", "策略表现", "市场基准", "越高越好", "越低越好"]) {
   if (!html.includes(text)) throw new Error(text + "\n" + html);
 }
@@ -7648,6 +7649,7 @@ console.log("ok");
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
     assert ".trend-review-win-rate.unavailable strong" in css
     assert "@media (max-width: 840px)" in css
+    assert ".trend-review-column-groups-values" in css
 
 
 def test_dashboard_renders_action_first_trend_report_for_every_market() -> None:
