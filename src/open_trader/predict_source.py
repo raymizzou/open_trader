@@ -55,6 +55,8 @@ class PredictBook:
     no_asks: tuple[BookLevel, ...]
     source_timestamp: datetime
     received_at: datetime
+    yes_token_id: str = ""
+    no_token_id: str = ""
 
 
 class PredictSource:

@@ -34,7 +34,6 @@ from open_trader.prediction_solver_verified import (
     VerificationResult,
     VerificationStatus,
     candidate_evidence_from_payload,
-    model_fingerprint,
     quote_fingerprint,
     solve,
     verification_result_from_payload,
@@ -102,10 +101,12 @@ class BookBinding:
     tick_units: int
     haircut_ppm: int
     price_units_per_quote_unit: int
+    market_id: str = ""
 
     def __post_init__(self) -> None:
         if (
             not all(isinstance(value, str) and value for value in (self.action_id, self.venue_id, self.native_id, self.fee_rule_id))
+            or not isinstance(self.market_id, str)
             or self.book_kind not in {"polymarket", "predict.fun"}
             or any(type(value) is not int or value < 0 for value in (self.fee_ppm, self.haircut_ppm))
             or type(self.tick_units) is not int or self.tick_units <= 0
@@ -205,6 +206,9 @@ class AccountSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class MarketSolution:
+    component_problem: ArbitrageProblem
+    component_usd_units_per_dollar: int
+    component_bindings: tuple[BookBinding, ...]
     problem: ArbitrageProblem
     quantities: tuple[ActionQuantity, ...]
     bounded_cost_units: int
@@ -276,7 +280,7 @@ def resolve_component(
             and prior.quotes == quotes
             and prior.execution_legs == _execution_legs(problem, prior.quantities, quotes)
         ):
-            return _fund_fixed_solution(prior_market_solution, account_snapshot, now)
+            return _fund_fixed_solution(prior, account_snapshot, now)
 
     proof_input = ProofInput(
         PROOF_REQUEST_SCHEMA_V1,
@@ -296,7 +300,7 @@ def resolve_component(
         return ResolutionResult(status, verification.status.value)
     proof = verification.solution.payout_proof
     market = _market_solution(
-        problem, verification.solution.quantities, proof, evidence, verification, component.relation_fingerprint, economic_quote,
+        component, problem, verification.solution.quantities, proof, evidence, verification, economic_quote,
         quotes,
     )
     return _fund_fixed_solution(market, account_snapshot, now)
@@ -318,7 +322,7 @@ def _problem_with_visible_asks(
     for action in component.problem.actions:
         book = by_action[action.action_id]
         binding = next(binding for binding in component.book_bindings if binding.action_id == action.action_id)
-        quote = _normalize_quote(action, book, binding, now)
+        quote = _normalize_quote(action, book, binding, component.usd_units_per_dollar, now)
         if quote is None:
             continue
         converted.append(replace(action, max_quantity_lots=quote.levels[-1].last_lot, cost_slices=quote.cost_slices))
@@ -345,7 +349,7 @@ def _problem_with_visible_asks(
     return problem, fingerprint({"quotes": canonical_quotes, "relation": component.relation_fingerprint}), canonical_quotes
 
 
-def _normalize_quote(action: CandidateAction, source: ImmutableBook, binding: BookBinding, now: datetime) -> CanonicalQuoteEvidence | None:
+def _normalize_quote(action: CandidateAction, source: ImmutableBook, binding: BookBinding, common_units_per_dollar: int, now: datetime) -> CanonicalQuoteEvidence | None:
     if (
         not isinstance(source.book, ThresholdOrderBook | PredictBook)
         or source.action_id != action.action_id
@@ -364,8 +368,8 @@ def _normalize_quote(action: CandidateAction, source: ImmutableBook, binding: Bo
         raise ValueError("invalid book")
     if any(type(value) is not int or value < 0 for value in (source.fee_ppm, source.haircut_ppm)) or type(source.tick_units) is not int or source.tick_units <= 0 or type(source.price_units_per_quote_unit) is not int or source.price_units_per_quote_unit <= 0:
         raise ValueError("missing cost facts")
-    timestamps, asks, actual_id = _book_asks(source.book, action)
-    if not isinstance(asks, tuple) or source.native_id != actual_id or any(
+    timestamps, asks, market_id, actual_id = _book_asks(source.book, action)
+    if not isinstance(asks, tuple) or source.native_id != actual_id or (binding.book_kind == "predict.fun" and (not binding.market_id or binding.market_id != market_id)) or any(
         not _utc(timestamp)
         or (now - timestamp).total_seconds() < 0
         or (now - timestamp).total_seconds() > BOOK_FRESHNESS_SECONDS
@@ -382,9 +386,10 @@ def _normalize_quote(action: CandidateAction, source: ImmutableBook, binding: Bo
             continue
         protected = int((level.price * source.price_units_per_quote_unit).to_integral_value(rounding=ROUND_CEILING)) + source.tick_units
         venue_cost = _ceil_div(protected * action.lot_step_units, action.quantity_scale)
-        fee = _ceil_div(venue_cost * source.fee_ppm, _PPM)
-        haircut = _ceil_div((venue_cost + fee) * source.haircut_ppm, _PPM)
-        unit_cost = venue_cost + fee + haircut
+        common_cost = _ceil_div(venue_cost * common_units_per_dollar, source.price_units_per_quote_unit)
+        fee = _ceil_div(common_cost * source.fee_ppm, _PPM)
+        haircut = _ceil_div((common_cost + fee) * source.haircut_ppm, _PPM)
+        unit_cost = common_cost + fee + haircut
         last = min(action.max_quantity_lots, first + lots - 1)
         levels.append(QuoteLevelEvidence(first, last, protected, fee, unit_cost))
         first = last + 1
@@ -400,10 +405,11 @@ def _normalize_quote(action: CandidateAction, source: ImmutableBook, binding: Bo
     )
 
 
-def _book_asks(book: ThresholdOrderBook | PredictBook, action: CandidateAction) -> tuple[tuple[datetime, ...], tuple[BookLevel, ...], str]:
+def _book_asks(book: ThresholdOrderBook | PredictBook, action: CandidateAction) -> tuple[tuple[datetime, ...], tuple[BookLevel, ...], str, str]:
     if isinstance(book, ThresholdOrderBook):
-        return (book.confirmed_at,), book.asks, book.token_id
-    return (book.source_timestamp, book.received_at), book.yes_asks if action.side.value == "BUY_YES" else book.no_asks, book.market_id
+        return (book.confirmed_at,), book.asks, book.token_id, book.token_id
+    outcome = book.yes_token_id if action.side.value == "BUY_YES" else book.no_token_id
+    return (book.source_timestamp, book.received_at), book.yes_asks if action.side.value == "BUY_YES" else book.no_asks, book.market_id, outcome
 
 
 def _qualification_constraints(component: VerifiedComponent, rules: tuple[object, ...]) -> tuple[QualificationConstraint, ...]:
@@ -454,12 +460,12 @@ def _execution_legs(
 
 
 def _market_solution(
+    component: VerifiedComponent,
     problem: ArbitrageProblem,
     quantities: tuple[ActionQuantity, ...],
     proof: object,
     evidence: CandidateEvidence,
     verification: VerificationResult,
-    relation_fingerprint: str,
     economic_quote: str,
     quotes: tuple[CanonicalQuoteEvidence, ...],
 ) -> MarketSolution:
@@ -470,7 +476,10 @@ def _market_solution(
         "guaranteed_profit_units": proof.guaranteed_profit_units,
         "capital_release_at": proof.conservative_capital_release_at,
         "global_search_closed": evidence.solver_evidence.global_search_closed,
-        "relation_fingerprint": relation_fingerprint,
+        "component_problem": component.problem,
+        "component_usd_units_per_dollar": component.usd_units_per_dollar,
+        "component_bindings": component.book_bindings,
+        "relation_fingerprint": component.relation_fingerprint,
         "economic_quote_fingerprint": economic_quote,
         "verification_fingerprint": verification_fingerprint,
         "candidate_evidence": evidence,
@@ -480,9 +489,10 @@ def _market_solution(
         "quantities": quantities,
     }
     return MarketSolution(
+        component.problem, component.usd_units_per_dollar, component.book_bindings,
         problem, quantities, proof.cost_upper_bound_units, proof.payout_lower_bound_units,
         proof.guaranteed_profit_units, proof.conservative_capital_release_at,
-        evidence.solver_evidence.global_search_closed, relation_fingerprint,
+        evidence.solver_evidence.global_search_closed, component.relation_fingerprint,
         economic_quote, verification_fingerprint, evidence, verification, quotes,
         _execution_legs(problem, quantities, quotes), fingerprint(values),
     )
@@ -493,18 +503,23 @@ def market_solution_from_payload(
 ) -> MarketSolution:
     """Decode a MarketSolution only when every retained binding recomputes."""
     value = _exact_object(payload, {
-        "problem", "quantities", "bounded_cost_units", "bounded_payout_units",
+        "component_problem", "component_usd_units_per_dollar", "component_bindings", "problem", "quantities", "bounded_cost_units", "bounded_payout_units",
         "guaranteed_profit_units", "capital_release_at", "global_search_closed",
         "relation_fingerprint", "economic_quote_fingerprint", "verification_fingerprint", "fingerprint",
         "candidate_evidence", "verification_result", "quotes", "execution_legs",
     })
     try:
+        component_problem = problem_from_payload(value["component_problem"])
+        component_usd = _nonnegative_int(value["component_usd_units_per_dollar"])
+        component_bindings = tuple(_binding_from_payload(item) for item in _array(value["component_bindings"]))
+        embedded_component = VerifiedComponent(component_problem, _fingerprint(value["relation_fingerprint"]), component_usd, component_bindings)
         problem = problem_from_payload(value["problem"])
         quantities = tuple(_quantity_from_payload(item) for item in _array(value["quantities"]))
         evidence = candidate_evidence_from_payload(value["candidate_evidence"])
         verification = verification_result_from_payload(value["verification_result"], source=evidence)
         quotes = tuple(_quote_from_payload(item) for item in _array(value["quotes"]))
         solution = MarketSolution(
+            embedded_component.problem, embedded_component.usd_units_per_dollar, embedded_component.book_bindings,
             problem, quantities, _nonnegative_int(value["bounded_cost_units"]),
             _nonnegative_int(value["bounded_payout_units"]), _int(value["guaranteed_profit_units"]),
             _datetime(value["capital_release_at"]), _bool(value["global_search_closed"]),
@@ -522,6 +537,9 @@ def market_solution_from_payload(
         "guaranteed_profit_units": solution.guaranteed_profit_units,
         "capital_release_at": solution.capital_release_at,
         "global_search_closed": solution.global_search_closed,
+        "component_problem": solution.component_problem,
+        "component_usd_units_per_dollar": solution.component_usd_units_per_dollar,
+        "component_bindings": solution.component_bindings,
         "relation_fingerprint": solution.relation_fingerprint,
         "economic_quote_fingerprint": solution.economic_quote_fingerprint,
         "verification_fingerprint": solution.verification_fingerprint,
@@ -662,9 +680,9 @@ def _valid_account_snapshot(snapshot: AccountSnapshot | None, now: datetime) -> 
 
 
 def _economic_book(book: ImmutableBook, action: CandidateAction) -> dict[str, object]:
-    _, asks, actual_id = _book_asks(book.book, action)
+    _, asks, market_id, actual_id = _book_asks(book.book, action)
     return {
-        "action_id": book.action_id, "native_id": actual_id, "fee_ppm": book.fee_ppm,
+        "action_id": book.action_id, "native_id": actual_id, "market_id": market_id, "fee_ppm": book.fee_ppm,
         "venue_id": book.venue_id, "fee_rule_id": book.fee_rule_id,
         "tick_units": book.tick_units, "haircut_ppm": book.haircut_ppm,
         "price_units_per_quote_unit": book.price_units_per_quote_unit,
@@ -678,10 +696,6 @@ def _valid_level(level: object) -> bool:
 
 def _utc(value: object) -> bool:
     return isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() == UTC.utcoffset(value)
-
-
-def _semantic_model_fingerprint(problem: ArbitrageProblem) -> str:
-    return model_fingerprint(replace(problem, as_of=_SEMANTIC_AS_OF))
 
 
 def _exact_object(value: object, keys: set[str]) -> dict[str, object]:
@@ -765,10 +779,10 @@ def _execution_leg_from_payload(value: object) -> ExecutionLegEvidence:
 
 
 def _binding_from_payload(value: object) -> BookBinding:
-    item = _exact_object(value, {"action_id", "venue_id", "native_id", "book_kind", "fee_rule_id", "fee_ppm", "tick_units", "haircut_ppm", "price_units_per_quote_unit"})
+    item = _exact_object(value, {"action_id", "venue_id", "native_id", "book_kind", "fee_rule_id", "fee_ppm", "tick_units", "haircut_ppm", "price_units_per_quote_unit", "market_id"})
     return BookBinding(
         *(_text(item[name]) for name in ("action_id", "venue_id", "native_id", "book_kind", "fee_rule_id")),
-        *(_nonnegative_int(item[name]) for name in ("fee_ppm", "tick_units", "haircut_ppm", "price_units_per_quote_unit")),
+        *(_nonnegative_int(item[name]) for name in ("fee_ppm", "tick_units", "haircut_ppm", "price_units_per_quote_unit")), _text(item["market_id"]) if item["market_id"] else "",
     )
 
 
