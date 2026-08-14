@@ -63,6 +63,7 @@ class OrderReceipt:
     rest_confirmed: bool
     observed_at: str
     venue_timestamp: str
+    rest_observation_version: int | None = None
     schema_version: str = ORDER_RECEIPT_SCHEMA_V1
 
     def __post_init__(self) -> None:
@@ -80,10 +81,14 @@ class OrderReceipt:
             raise ValueError("invalid cumulative order receipt")
         if self.sequence is not None and (type(self.sequence) is not int or self.sequence < 0):
             raise ValueError("sequence must be a non-negative integer or null")
-        if type(self.rest_confirmed) is not bool:
+        if type(self.rest_confirmed) is not bool or (self.rest_observation_version is not None and (type(self.rest_observation_version) is not int or self.rest_observation_version < 0)):
             raise ValueError("rest_confirmed must be boolean")
         if self.sequence is None and not self.rest_confirmed:
             raise ValueError("sequence-less receipt requires REST confirmation")
+        if self.rest_confirmed and self.rest_observation_version is None:
+            raise ValueError("REST receipt requires observation version")
+        if not self.rest_confirmed and self.rest_observation_version is not None:
+            raise ValueError("non-REST receipt cannot carry observation version")
         object.__setattr__(self, "observed_at", _timestamp(self.observed_at, "observed_at"))
         object.__setattr__(self, "venue_timestamp", _timestamp(self.venue_timestamp, "venue_timestamp"))
 
@@ -95,7 +100,7 @@ def order_receipt_from_payload(payload: object) -> OrderReceipt:
     keys = {
         "schema_version", "receipt_id", "execution_batch_id", "client_order_id", "venue_id", "account_id",
         "venue_order_id", "submitted_quantity", "cumulative_filled_quantity", "cumulative_cost_units", "cumulative_fee_units", "state",
-        "sequence", "rest_confirmed", "observed_at", "venue_timestamp",
+        "sequence", "rest_confirmed", "observed_at", "venue_timestamp", "rest_observation_version",
     }
     if not isinstance(payload, dict) or set(payload) != keys:
         raise ValueError("unexpected OrderReceipt fields")
@@ -290,6 +295,43 @@ class SettlementCashFlow:
 
 
 @dataclass(frozen=True, slots=True)
+class ConflictResolutionEvidence:
+    conflict_id: str
+    client_order_id: str
+    venue_order_id: str | None
+    venue_id: str
+    account_id: str
+    asset_id: str
+    settlement_asset_id: str
+    outcome: Literal["TERMINAL", "NOT_FOUND"]
+    terminal_state: str | None
+    cumulative_filled_quantity: int
+    cumulative_cost_units: int
+    cumulative_fee_units: int
+    sequence: int | None
+    rest_confirmed: bool
+    observation_version: int
+    source_timestamp: datetime
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        _text(self.conflict_id, "conflict_id")
+        _text(self.client_order_id, "client_order_id")
+        if self.venue_order_id is not None:
+            _text(self.venue_order_id, "venue_order_id")
+        for name in ("venue_id", "account_id", "asset_id", "settlement_asset_id"):
+            _text(getattr(self, name), name)
+        if self.outcome not in {"TERMINAL", "NOT_FOUND"} or (self.outcome == "TERMINAL" and self.terminal_state not in _TERMINAL) or (self.outcome == "NOT_FOUND" and (self.terminal_state is not None or not self.rest_confirmed)):
+            raise ValueError("conflict resolution outcome is invalid")
+        for name in ("cumulative_filled_quantity", "cumulative_cost_units", "cumulative_fee_units", "observation_version"):
+            _nonnegative(getattr(self, name), name)
+        if self.sequence is not None and (type(self.sequence) is not int or self.sequence < 0):
+            raise ValueError("conflict resolution sequence is invalid")
+        if type(self.rest_confirmed) is not bool or not all(isinstance(value, datetime) and value.tzinfo is not None for value in (self.source_timestamp, self.observed_at)):
+            raise ValueError("conflict resolution observation is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class RepairContext:
     """Typed fresh source. Its fingerprints are derived here, never caller supplied."""
     reservation_version: str
@@ -336,6 +378,7 @@ class ReconciliationContext:
     source_timestamp: datetime
     received_at: datetime
     now: datetime
+    conflict_resolutions: tuple[ConflictResolutionEvidence, ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.reservation_version, "reservation_version")
@@ -351,6 +394,10 @@ class ReconciliationContext:
             raise ValueError("reconciliation cash flows must be per-order")
         if any((self.now - value).total_seconds() < 0 or (self.now - value).total_seconds() > 10 for flow in self.cash_flows for value in (flow.source_timestamp, flow.observed_at)):
             raise ValueError("reconciliation cash flows must be fresh")
+        if not isinstance(self.conflict_resolutions, tuple) or not all(isinstance(item, ConflictResolutionEvidence) for item in self.conflict_resolutions) or len({item.conflict_id for item in self.conflict_resolutions}) != len(self.conflict_resolutions):
+            raise ValueError("reconciliation conflict resolutions must be exact")
+        if any((self.now - value).total_seconds() < 0 or (self.now - value).total_seconds() > 10 for item in self.conflict_resolutions for value in (item.source_timestamp, item.observed_at)):
+            raise ValueError("reconciliation conflict resolutions must be fresh")
 
     @property
     def fingerprint(self) -> str:
@@ -437,6 +484,7 @@ class NLegExecutionService:
             "receipt_conflicts": [],
             "unresolved_conflicts": [],
             "conflict_exposure_by_physical_order": {},
+            "capital_exposure_unknown": False,
             "incident": None,
             "repair_plan": None,
         }
@@ -505,6 +553,7 @@ class NLegExecutionService:
                 raise ValueError("N_LEG_RECONCILIATION_PROOF_REQUIRED")
             if control.get("active_batch_id") != execution_batch_id:
                 raise ValueError("N_LEG_RECONCILIATION_OWNERSHIP_LOST")
+            self._resolve_conflicts_with_evidence(batch, context.conflict_resolutions)
             if batch.get("unresolved_conflicts"):
                 raise ValueError("N_LEG_RECONCILIATION_CONFLICT_UNRESOLVED")
             expected_holding: dict[tuple[str, str, str], int] = {}
@@ -629,6 +678,10 @@ class NLegExecutionService:
             and all(getattr(receipt, field) >= prior.get(field, 0) for field in ("cumulative_filled_quantity", "cumulative_cost_units", "cumulative_fee_units"))
         )
 
+    @staticmethod
+    def _receipt_time(receipt: OrderReceipt, name: str) -> datetime:
+        return datetime.fromisoformat(getattr(receipt, name).replace("Z", "+00:00"))
+
     def _resolve_conflicts(self, batch: dict[str, object], leg: dict[str, object], receipt: OrderReceipt) -> None:
         raw = batch.get("unresolved_conflicts")
         if not isinstance(raw, list):
@@ -636,26 +689,65 @@ class NLegExecutionService:
         prior = leg.get("receipt") if isinstance(leg.get("receipt"), dict) else None
         intended = self._intended_identity(leg, prior)
         physical = self._physical_identity(leg, receipt)
-        kept = []
-        cleared: set[str] = set()
-        for conflict in raw:
-            if not isinstance(conflict, dict) or conflict.get("intended_identity") != list(intended):
-                kept.append(conflict)
-                continue
-            same = conflict.get("kind") == "SAME_PHYSICAL" and type(prior.get("sequence")) is int and type(receipt.sequence) is int and receipt.sequence > prior["sequence"] and physical == intended and self._monotonic_terminal(prior, receipt)
-            rest = conflict.get("kind") != "SAME_PHYSICAL" and receipt.rest_confirmed and physical == intended and self._monotonic_terminal(prior, receipt)
-            if same or rest:
-                key = conflict.get("physical_key")
-                if isinstance(key, str):
-                    cleared.add(key)
-            else:
-                kept.append(conflict)
-        if len(kept) == len(raw):
+        key = self._physical_key(intended)
+        related = [item for item in raw if isinstance(item, dict) and item.get("kind") == "SAME_PHYSICAL" and item.get("physical_key") == key]
+        if physical != intended or receipt.state not in _TERMINAL or not related or not self._monotonic_terminal(prior, receipt):
             return
-        batch["unresolved_conflicts"] = kept
+        max_sequence = max((item.get("max_sequence", -1) for item in related if type(item.get("max_sequence")) is int), default=-1)
+        max_rest_version = max((item.get("max_rest_observation_version", -1) for item in related if type(item.get("max_rest_observation_version")) is int), default=-1)
+        max_cash = max((item.get("max_actual_cash_units", 0) for item in related if type(item.get("max_actual_cash_units")) is int), default=0)
+        max_fill = max((item.get("max_actual_filled_quantity", 0) for item in related if type(item.get("max_actual_filled_quantity")) is int), default=0)
+        dominates = receipt.cumulative_cost_units + receipt.cumulative_fee_units >= max_cash and receipt.cumulative_filled_quantity >= max_fill
+        if type(receipt.sequence) is int:
+            dominates = dominates and receipt.sequence > max_sequence
+        elif receipt.rest_confirmed and type(receipt.rest_observation_version) is int:
+            latest_observed = max((str(item.get("max_observed_at", "")) for item in related), default="")
+            latest_source = max((str(item.get("max_source_timestamp", "")) for item in related), default="")
+            dominates = dominates and receipt.rest_observation_version > max_rest_version and receipt.observed_at > latest_observed and receipt.venue_timestamp > latest_source
+        else:
+            dominates = False
+        if not dominates:
+            return
+        batch["unresolved_conflicts"] = [item for item in raw if item not in related]
         exposures = batch.get("conflict_exposure_by_physical_order")
         if isinstance(exposures, dict):
-            batch["conflict_exposure_by_physical_order"] = {key: value for key, value in exposures.items() if key not in cleared}
+            batch["conflict_exposure_by_physical_order"] = {item_key: value for item_key, value in exposures.items() if item_key != key}
+
+    @staticmethod
+    def _resolution_matches(conflict: Mapping[str, object], evidence: ConflictResolutionEvidence) -> bool:
+        identity = [evidence.client_order_id, evidence.venue_order_id, evidence.venue_id, evidence.account_id, evidence.asset_id, evidence.settlement_asset_id]
+        if conflict.get("physical_identity") != identity:
+            return False
+        max_sequence = conflict.get("max_sequence", -1)
+        max_rest = conflict.get("max_rest_observation_version", -1)
+        max_cash = conflict.get("max_actual_cash_units", 0)
+        max_fill = conflict.get("max_actual_filled_quantity", 0)
+        try:
+            if evidence.source_timestamp < datetime.fromisoformat(str(conflict["max_source_timestamp"]).replace("Z", "+00:00")) or evidence.observed_at < datetime.fromisoformat(str(conflict["max_observed_at"]).replace("Z", "+00:00")):
+                return False
+        except (KeyError, ValueError):
+            return False
+        if evidence.outcome == "TERMINAL":
+            if evidence.terminal_state not in _TERMINAL or evidence.cumulative_cost_units + evidence.cumulative_fee_units < max_cash or evidence.cumulative_filled_quantity < max_fill:
+                return False
+            return (type(evidence.sequence) is int and evidence.sequence > (max_sequence if type(max_sequence) is int else -1)) or (evidence.rest_confirmed and evidence.observation_version > (max_rest if type(max_rest) is int else -1))
+        return evidence.rest_confirmed and evidence.observation_version > (max_rest if type(max_rest) is int else -1)
+
+    def _resolve_conflicts_with_evidence(self, batch: dict[str, object], evidence: tuple[ConflictResolutionEvidence, ...]) -> None:
+        raw = batch.get("unresolved_conflicts")
+        if not isinstance(raw, list) or not raw:
+            return
+        expected = {item.get("conflict_id"): item for item in raw if isinstance(item, dict) and isinstance(item.get("conflict_id"), str)}
+        actual = {item.conflict_id: item for item in evidence}
+        if set(actual) != set(expected) or len(expected) != len(raw):
+            return
+        if not all(self._resolution_matches(conflict, actual[conflict_id]) for conflict_id, conflict in expected.items()):
+            return
+        exposures = batch.get("conflict_exposure_by_physical_order")
+        if isinstance(exposures, dict):
+            batch["conflict_exposure_by_physical_order"] = {key: value for key, value in exposures.items() if key not in {item.get("physical_key") for item in raw if isinstance(item, dict)}}
+        batch["unresolved_conflicts"] = []
+        batch["capital_exposure_unknown"] = False
 
     @classmethod
     def _incident_copy(cls, copy: dict[str, object], legs: list[dict[str, object]], receipts: dict[str, object], receipt: OrderReceipt, reason: str) -> tuple[dict[str, object], str, bool]:
@@ -676,18 +768,28 @@ class NLegExecutionService:
         same_physical = intended is not None and physical == intended
         key = cls._physical_key(physical)
         unresolved = copy.get("unresolved_conflicts")
+        observed_at = receipt.observed_at
+        source_timestamp = receipt.venue_timestamp
         record = {
+            "conflict_id": fingerprint({"reason": reason, "old": old, "new": receipt.to_payload(), "physical_identity": physical}),
             "physical_key": key, "physical_identity": list(physical), "intended_identity": list(intended) if intended is not None else None,
-            "kind": "SAME_PHYSICAL" if same_physical else "DRIFT_OR_UNBOUND", "reason": reason,
+            "kind": "SAME_PHYSICAL" if same_physical else ("DRIFT" if isinstance(matching, dict) else "UNBOUND"), "reason": reason,
+            "observed_physical_identities": [list(physical)], "max_sequence": receipt.sequence,
+            "max_rest_observation_version": receipt.rest_observation_version if receipt.rest_confirmed else None,
+            "max_source_timestamp": source_timestamp, "max_observed_at": observed_at,
+            "max_actual_cash_units": receipt.cumulative_cost_units + receipt.cumulative_fee_units,
+            "max_actual_filled_quantity": receipt.cumulative_filled_quantity,
         }
         copy["unresolved_conflicts"] = [*(unresolved if isinstance(unresolved, list) else []), record]
         exposures = copy.get("conflict_exposure_by_physical_order")
         exposure_by_order = dict(exposures) if isinstance(exposures, dict) else {}
         reported = receipt.cumulative_cost_units + receipt.cumulative_fee_units
-        exposure = max(0, reported - int(matching.get("max_cost_units", 0))) if same_physical and isinstance(matching, dict) else reported
+        exposure = max(0, reported - int(matching.get("max_cost_units", 0))) if same_physical and isinstance(matching, dict) else (int(matching.get("max_cost_units", 0)) if isinstance(matching, dict) else reported)
         prior_exposure = exposure_by_order.get(key, 0)
         exposure_by_order[key] = max(prior_exposure if type(prior_exposure) is int else 0, exposure)
         copy["conflict_exposure_by_physical_order"] = exposure_by_order
+        if not isinstance(matching, dict):
+            copy["capital_exposure_unknown"] = True
         copy["repair_plan"] = None
         return copy, reason, True
 
@@ -798,7 +900,7 @@ class NLegExecutionService:
                 if venue_time.tzinfo is None or observed_time.tzinfo is None or (
                     (flow.venue_id, flow.account_id, flow.settlement_asset_id) != key
                     or flow.venue_order_id != receipt.get("venue_order_id")
-                    or flow.observation_version != receipt.get("sequence")
+                    or flow.observation_version != (receipt.get("rest_observation_version") if receipt.get("rest_confirmed") else receipt.get("sequence"))
                     or flow.rest_confirmed != receipt.get("rest_confirmed")
                     or flow.cumulative_cost_units != receipt.get("cumulative_cost_units")
                     or flow.cumulative_fee_units != receipt.get("cumulative_fee_units")
