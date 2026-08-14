@@ -10,6 +10,7 @@ from open_trader.prediction_executable_cost import (
     AccountBalance,
     AccountSnapshot,
     BookBinding,
+    component_fingerprint,
     execution_solution_from_payload,
     ImmutableBook,
     VerifiedComponent,
@@ -72,7 +73,7 @@ def component(book_kind: str = "polymarket") -> VerifiedComponent:
         ConstraintModel((), ()),
         (QualificationConstraint("profit", "rules-v1", QualificationMetric.GUARANTEED_PROFIT_UNITS, Comparison.GREATER_THAN_OR_EQUAL, 1, 1),),
     )
-    return VerifiedComponent(problem, model_fingerprint(problem), 100, (binding(book_kind),))
+    return VerifiedComponent(problem, component_fingerprint(problem, (binding(book_kind),)), 100, (binding(book_kind),))
 
 
 def binding(book_kind: str = "polymarket") -> BookBinding:
@@ -87,13 +88,22 @@ def two_leg_component() -> VerifiedComponent:
     )) for state in base.terminal_state_sets)
     problem = replace(base, actions=(base.actions[0], action_b), terminal_state_sets=states)
     return VerifiedComponent(
-        problem, model_fingerprint(problem), 100,
+        problem, component_fingerprint(problem, (binding(), BookBinding("action-b", "venue-b", "action-b", "polymarket", "fee-v1", 100_000, 1, 100_000, 100))), 100,
         (binding(), BookBinding("action-b", "venue-b", "action-b", "polymarket", "fee-v1", 100_000, 1, 100_000, 100)),
     )
 
 
 def two_leg_books() -> tuple[ImmutableBook, ImmutableBook]:
     return executable_book(), ImmutableBook("action-b", "action-b", ThresholdOrderBook("action-b", (BookLevel(Decimal("0.40"), Decimal("1")),), (), AS_OF), 100_000, 1, 100_000, 100, "venue-b", "fee-v1")
+
+
+def decode_market(payload):
+    return executable_cost.market_solution_from_payload(payload, component=component(), books=(executable_book(),), now=AS_OF)
+
+
+def decode_execution(payload, market):
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
+    return executable_cost.execution_solution_from_payload(payload, market_solution=market, account_snapshot=account, now=AS_OF)
 
 
 def test_missing_book_fails_closed_before_solving() -> None:
@@ -159,6 +169,18 @@ def test_predict_receipt_refresh_reuses_identical_economic_market_solution(monke
     assert captured["calls"] == 1
 
 
+def test_prior_market_solution_re_solves_when_visible_depth_changes(monkeypatch) -> None:
+    captured = qualified_solver(monkeypatch)
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
+    first = resolve_component(component(), (executable_book(),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
+    changed = replace(executable_book(), book=ThresholdOrderBook("action-a", (BookLevel(Decimal("0.41"), Decimal("1")),), (), AS_OF))
+
+    refreshed = resolve_component(component(), (changed,), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF, prior_market_solution=first.market_solution)
+
+    assert refreshed.status is ResolutionStatus.EXECUTION_SOLUTION
+    assert captured["calls"] == 2
+
+
 def qualified_solver(monkeypatch):
     captured = {"calls": 0}
 
@@ -209,7 +231,7 @@ def test_visible_multilevel_asks_floor_lots_and_ceil_protected_cost(monkeypatch)
         cost_slices=(ExecutableCostSlice(1, 3, 1),),
     )
     component_with_minimum = VerifiedComponent(
-        replace(original, actions=(action,)), model_fingerprint(replace(original, actions=(action,))), 100, (binding(),),
+        replace(original, actions=(action,)), component_fingerprint(replace(original, actions=(action,)), (binding(),)), 100, (binding(),),
     )
     book = ImmutableBook(
         "action-a", "action-a",
@@ -226,8 +248,10 @@ def test_visible_multilevel_asks_floor_lots_and_ceil_protected_cost(monkeypatch)
 
     assert result.status is ResolutionStatus.EXECUTION_SOLUTION
     assert captured["input"].request.problem.actions[0].cost_slices == (
-        ExecutableCostSlice(1, 1, 8), ExecutableCostSlice(2, 2, 9),
+        ExecutableCostSlice(1, 1, 7), ExecutableCostSlice(2, 2, 8),
     )
+    assert result.execution_solution.execution_legs[0].protected_price_units == 52
+    assert result.execution_solution.execution_legs[0].price_units_per_quote_unit == 100
 
 
 def test_shallow_action_is_excluded_while_connected_visible_action_reaches_verifier(monkeypatch) -> None:
@@ -411,10 +435,10 @@ def test_market_solution_decoder_recomputes_its_fingerprint(monkeypatch) -> None
     )
     payload = executable_cost.canonical_payload(result.market_solution)
 
-    assert executable_cost.canonical_payload(market_solution_from_payload(payload)) == payload
+    assert executable_cost.canonical_payload(decode_market(payload)) == payload
     payload["fingerprint"] = "sha256:" + "0" * 64
     with pytest.raises(ValueError, match="fingerprint"):
-        market_solution_from_payload(payload)
+        decode_market(payload)
 
 
 def test_prior_rejects_forged_outer_hash_without_matching_source_proof(monkeypatch) -> None:
@@ -427,12 +451,12 @@ def test_prior_rejects_forged_outer_hash_without_matching_source_proof(monkeypat
         key: payload[key] for key in (
             "bounded_cost_units", "bounded_payout_units", "guaranteed_profit_units", "capital_release_at",
             "global_search_closed", "relation_fingerprint", "economic_quote_fingerprint", "verification_fingerprint",
-            "candidate_evidence", "verification_result", "execution_legs", "quantities",
+            "candidate_evidence", "verification_result", "quotes", "execution_legs", "quantities",
         )
     })
 
     with pytest.raises(ValueError, match="fingerprint"):
-        market_solution_from_payload(payload)
+        decode_market(payload)
 
 
 def test_market_solution_decoder_rejects_rehashed_execution_source_tamper(monkeypatch) -> None:
@@ -445,12 +469,39 @@ def test_market_solution_decoder_rejects_rehashed_execution_source_tamper(monkey
         key: payload[key] for key in (
             "bounded_cost_units", "bounded_payout_units", "guaranteed_profit_units", "capital_release_at",
             "global_search_closed", "relation_fingerprint", "economic_quote_fingerprint", "verification_fingerprint",
-            "candidate_evidence", "verification_result", "execution_legs", "quantities",
+            "candidate_evidence", "verification_result", "quotes", "execution_legs", "quantities",
         )
     })
 
     with pytest.raises(ValueError, match="fingerprint"):
-        market_solution_from_payload(payload)
+        decode_market(payload)
+
+
+@pytest.mark.parametrize(
+    ("target", "field", "value"),
+    (
+        ("leg", "native_id", "other-native"),
+        ("leg", "protected_price_units", 42),
+        ("leg", "max_fee_units", 6),
+        ("quote", "native_id", "other-native"),
+    ),
+)
+def test_market_source_decoder_rejects_rehashed_quote_or_leg_tamper(monkeypatch, target, field, value) -> None:
+    qualified_solver(monkeypatch)
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
+    result = resolve_component(component(), (executable_book(),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
+    payload = executable_cost.canonical_payload(result.market_solution)
+    payload["execution_legs" if target == "leg" else "quotes"][0][field] = value
+    payload["fingerprint"] = executable_cost.fingerprint({
+        key: payload[key] for key in (
+            "bounded_cost_units", "bounded_payout_units", "guaranteed_profit_units", "capital_release_at",
+            "global_search_closed", "relation_fingerprint", "economic_quote_fingerprint", "verification_fingerprint",
+            "candidate_evidence", "verification_result", "quotes", "execution_legs", "quantities",
+        )
+    })
+
+    with pytest.raises(ValueError):
+        decode_market(payload)
 
 
 @pytest.mark.parametrize(
@@ -466,7 +517,7 @@ def test_market_solution_decoder_rejects_all_bound_semantic_mutations(monkeypatc
     payload[field] = value
 
     with pytest.raises(ValueError, match="fingerprint"):
-        market_solution_from_payload(payload)
+        decode_market(payload)
 
 
 def test_execution_solution_decoder_recomputes_its_fingerprint(monkeypatch) -> None:
@@ -482,14 +533,25 @@ def test_execution_solution_decoder_recomputes_its_fingerprint(monkeypatch) -> N
     )
     payload = executable_cost.canonical_payload(result.execution_solution)
 
-    assert executable_cost.canonical_payload(execution_solution_from_payload(payload)) == payload
+    assert executable_cost.canonical_payload(decode_execution(payload, result.market_solution)) == payload
     payload["order_ready"] = True
     with pytest.raises(ValueError, match="partial-fill"):
-        execution_solution_from_payload(payload)
+        decode_execution(payload, result.market_solution)
     payload = executable_cost.canonical_payload(result.execution_solution)
     payload["capital_use_units"] += 1
     with pytest.raises(ValueError, match="fingerprint"):
-        execution_solution_from_payload(payload)
+        decode_execution(payload, result.market_solution)
+
+
+def test_execution_decoder_requires_matching_market_and_account(monkeypatch) -> None:
+    qualified_solver(monkeypatch)
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
+    result = resolve_component(component(), (executable_book(),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
+    payload = executable_cost.canonical_payload(result.execution_solution)
+    changed_account = replace(account, max_per_trade_cost_units=50)
+
+    with pytest.raises(ValueError, match="source mismatch"):
+        executable_cost.execution_solution_from_payload(payload, market_solution=result.market_solution, account_snapshot=changed_account, now=AS_OF)
 
 
 def test_codecs_reject_uppercase_hash_and_out_of_range_int(monkeypatch) -> None:
@@ -499,8 +561,8 @@ def test_codecs_reject_uppercase_hash_and_out_of_range_int(monkeypatch) -> None:
     payload = executable_cost.canonical_payload(result.market_solution)
     payload["fingerprint"] = payload["fingerprint"].upper()
     with pytest.raises(ValueError):
-        market_solution_from_payload(payload)
+        decode_market(payload)
     payload = executable_cost.canonical_payload(result.market_solution)
     payload["bounded_cost_units"] = 2**63
     with pytest.raises(ValueError):
-        market_solution_from_payload(payload)
+        decode_market(payload)
