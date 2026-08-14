@@ -2094,59 +2094,28 @@ class PredictionArbitrageStore:
             )
         return _load_payload(encoded)
 
-    def n_leg_replace_batch(
-        self,
-        payload: Mapping[str, object],
-        *,
-        control: Mapping[str, object],
-        transition_kind: str,
-        idempotency_key: str,
-    ) -> dict[str, object]:
-        """Persist a complete reducer result and its control change together."""
-        encoded = _dump_execution_payload(payload)
-        batch_id = payload.get("execution_batch_id")
-        if not isinstance(batch_id, str) or not batch_id or not isinstance(transition_kind, str) or not transition_kind or not isinstance(idempotency_key, str) or not idempotency_key:
-            raise ValueError("invalid n-leg transition")
-        mode = control.get("mode")
-        total = control.get("total_unsettled_capital_units")
-        if mode not in {"MANUAL", "AUTO"} or type(total) is not int or total < 0:
-            raise ValueError("invalid n-leg control")
-        active = control.get("active_batch_id")
-        breaker = control.get("breaker_open")
-        reason = control.get("breaker_reason")
-        if active is not None and not isinstance(active, str) or type(breaker) is not bool or reason is not None and not isinstance(reason, str):
-            raise ValueError("invalid n-leg control")
-        now = _utc_now()
-        transition = _dump_execution_payload({"payload": dict(payload), "control": dict(control)})
-        with self._transaction() as connection:
-            exists = connection.execute(
-                "SELECT 1 FROM n_leg_batches WHERE execution_batch_id=?", (batch_id,)
-            ).fetchone()
-            if exists is None:
-                raise ValueError("N_LEG_BATCH_NOT_FOUND")
-            connection.execute(
-                "UPDATE n_leg_batches SET state=?, payload=?, updated_at=? WHERE execution_batch_id=?",
-                (str(payload.get("state")), encoded, now, batch_id),
-            )
-            connection.execute(
-                "INSERT INTO n_leg_controls(singleton, mode, breaker_open, breaker_reason, active_batch_id, total_unsettled_capital_units, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET mode=excluded.mode, breaker_open=excluded.breaker_open, breaker_reason=excluded.breaker_reason, active_batch_id=excluded.active_batch_id, total_unsettled_capital_units=excluded.total_unsettled_capital_units, updated_at=excluded.updated_at",
-                (mode, int(breaker), reason, active, total, now),
-            )
-            connection.execute(
-                "INSERT INTO n_leg_transitions(transition_id, execution_batch_id, kind, idempotency_key, payload, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(execution_batch_id, idempotency_key) DO NOTHING",
-                (_new_id(), batch_id, transition_kind, idempotency_key, transition, now),
-            )
-        return _load_payload(encoded)
-
     def n_leg_reduce(
         self,
         execution_batch_id: str,
         *,
+        transition_kind: str,
         idempotency_key: str,
         reducer: Callable[[dict[str, object], dict[str, object]], tuple[dict[str, object], dict[str, object], bool]],
     ) -> dict[str, object]:
         """Read, reduce, transition-log, and write one N-leg receipt atomically."""
+        if not isinstance(transition_kind, str) or not transition_kind:
+            raise ValueError("invalid n-leg transition kind")
         with self._transaction() as connection:
+            prior_transition = connection.execute(
+                "SELECT payload FROM n_leg_transitions WHERE execution_batch_id=? AND idempotency_key=?",
+                (str(execution_batch_id), str(idempotency_key)),
+            ).fetchone()
+            if prior_transition is not None:
+                stored = _load_payload(str(prior_transition["payload"]))
+                prior_payload = stored.get("payload")
+                if not isinstance(prior_payload, dict):
+                    raise ValueError("corrupt n-leg transition")
+                return prior_payload
             row = connection.execute(
                 "SELECT payload FROM n_leg_batches WHERE execution_batch_id=?", (str(execution_batch_id),)
             ).fetchone()
@@ -2170,8 +2139,8 @@ class PredictionArbitrageStore:
                 (next_control["mode"], int(bool(next_control["breaker_open"])), next_control["breaker_reason"], next_control["active_batch_id"], next_control["total_unsettled_capital_units"], now),
             )
             connection.execute(
-                "INSERT INTO n_leg_transitions(transition_id, execution_batch_id, kind, idempotency_key, payload, created_at) VALUES (?, ?, 'ORDER_RECEIPT', ?, ?, ?) ON CONFLICT(execution_batch_id, idempotency_key) DO NOTHING",
-                (_new_id(), str(execution_batch_id), str(idempotency_key), _dump_execution_payload({"payload": next_batch, "control": next_control}), now),
+                "INSERT INTO n_leg_transitions(transition_id, execution_batch_id, kind, idempotency_key, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (_new_id(), str(execution_batch_id), transition_kind, str(idempotency_key), _dump_execution_payload({"payload": next_batch, "control": next_control}), now),
             )
         return _load_payload(encoded)
 

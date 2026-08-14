@@ -11,6 +11,7 @@ from open_trader.prediction_executable_cost import ExecutionLegEvidence, Executi
 from open_trader.prediction_n_leg import ActionQuantity, fingerprint
 from open_trader.prediction_n_leg_execution import (
     ConfirmedHolding,
+    CanonicalBookLevel,
     ExecutionSolutionSource,
     ReconciliationContext,
     RepairQuote,
@@ -116,22 +117,22 @@ def receipt(*, leg: str, filled: int, state: str, sequence: int) -> OrderReceipt
     )
 
 
-def repair_context(*, b_buy: int = 1, b_venue: str = "venue-b") -> RepairContext:
+def repair_context(*, b_buy: int = 1, b_venue: str = "venue-b", occurred_cost: int = 0) -> RepairContext:
     return RepairContext(
         "batch-1:v1",
         (
-            RepairQuote("batch-1:action-a", "venue-a", "account-a", "usd-cents", 1, 2, AS_OF, AS_OF),
-            RepairQuote("batch-1:action-b", b_venue, "account-b", "usd-cents", b_buy, 2, AS_OF, AS_OF),
+            RepairQuote("batch-1:action-a", "venue-a", "account-a", "usd-cents", (CanonicalBookLevel(1, 10, 1, 2),), AS_OF, AS_OF),
+            RepairQuote("batch-1:action-b", b_venue, "account-b", "usd-cents", (CanonicalBookLevel(1, 10, b_buy, 2),), AS_OF, AS_OF),
         ),
-        (ConfirmedHolding("venue-a", "account-a", "action-a", 4), ConfirmedHolding("venue-b", "account-b", "action-b", 0)),
+        (ConfirmedHolding("venue-a", "account-a", "action-a", 4, AS_OF, AS_OF), ConfirmedHolding("venue-b", "account-b", "action-b", 0, AS_OF, AS_OF)),
         source_and_solution()[0].account_snapshot,
-        (SettlementCashFlow("venue-a", "account-a", "usd-cents", 0, 0), SettlementCashFlow("venue-b", "account-b", "usd-cents", 0, 0)),
+        (SettlementCashFlow("venue-a", "account-a", "usd-cents", occurred_cost, 0), SettlementCashFlow("venue-b", "account-b", "usd-cents", 0, 0)),
         AS_OF,
     )
 
 
 def reconciliation_context(batch_id: str = "batch-1", *, full: bool = False) -> ReconciliationContext:
-    holdings = (ConfirmedHolding("venue-a", "account-a", "action-a", 10), ConfirmedHolding("venue-b", "account-b", "action-b", 10)) if full else ()
+    holdings = (ConfirmedHolding("venue-a", "account-a", "action-a", 10, AS_OF, AS_OF), ConfirmedHolding("venue-b", "account-b", "action-b", 10, AS_OF, AS_OF)) if full else ()
     return ReconciliationContext(f"{batch_id}:v1", source_and_solution()[0].account_snapshot, holdings, AS_OF, AS_OF, AS_OF)
 
 
@@ -182,6 +183,10 @@ def test_partial_fill_opens_incident_downgrades_mode_and_fixes_best_manual_plan(
 
     incident = current.apply_receipt(receipt(leg="a", filled=4, state="OPEN", sequence=1))
     assert incident["state"] == "INCIDENT"
+    assert incident["execution_controls"] == [
+        {"client_order_id": "batch-1:action-a", "intent": "CANCEL_REQUIRED"},
+        {"client_order_id": "batch-1:action-b", "intent": "STOPPED_UNSENT"},
+    ]
     assert current.control()["mode"] == "MANUAL"
     assert current.control()["active_batch_id"] == "batch-1"
 
@@ -192,7 +197,7 @@ def test_partial_fill_opens_incident_downgrades_mode_and_fixes_best_manual_plan(
     )
     plan = planned["repair_plan"]
     assert isinstance(plan, dict)
-    assert plan["family"] == "EXIT_CONFIRMED"
+    assert plan["family"] == "COMPLETE_REMAINING"
     assert plan["auto_eligible"] is False
     assert plan["reason"] == "REPAIR_PROOF_REQUIRED"
 
@@ -246,6 +251,13 @@ def test_same_sequence_semantic_duplicate_ignores_receipt_id_and_time(tmp_path) 
     first = current.apply_receipt(receipt(leg="a", filled=0, state="OPEN", sequence=1))
     duplicate = replace(receipt(leg="a", filled=0, state="OPEN", sequence=1), receipt_id="different-id", observed_at="2026-08-15T00:00:01Z", venue_timestamp="2026-08-15T00:00:01Z")
     assert current.apply_receipt(duplicate) == first
+
+
+def test_unknown_receipt_requires_rest_confirmation_intent(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    incident = current.apply_receipt(receipt(leg="a", filled=0, state="UNKNOWN", sequence=1))
+    assert incident["execution_controls"][0] == {"client_order_id": "batch-1:action-a", "intent": "REST_CONFIRMATION_REQUIRED"}
 
 
 def test_venue_order_id_is_stable_after_first_confirmation(tmp_path) -> None:
@@ -354,12 +366,12 @@ def test_over_cap_repair_is_retained_but_breaks_automatic_authority(tmp_path) ->
     execution = solution()
     current.enter(
         opportunity_episode_id="episode-1", episode_lineage_id="lineage-1", execution_batch_id="batch-1",
-        source=source_and_solution()[0], partial_fill_proof=proof(execution, repair_cap=7), mode="AUTO", cap_config_version="caps-v1",
+        source=source_and_solution()[0], partial_fill_proof=proof(execution, repair_cap=0), mode="AUTO", cap_config_version="caps-v1",
     )
     current.apply_receipt(receipt(leg="a", filled=4, state="CANCELLED", sequence=1))
     failed = current.apply_receipt(
         receipt(leg="b", filled=0, state="REJECTED", sequence=1),
-        repair_context=repair_context(),
+        repair_context=repair_context(b_buy=511, occurred_cost=8),
     )
 
     assert failed["repair_plan"] == {

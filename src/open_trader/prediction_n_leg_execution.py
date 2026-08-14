@@ -11,7 +11,8 @@ from open_trader.prediction_executable_cost import (
     AccountSnapshot, ExecutionSolution, ImmutableBook, VerifiedComponent,
     execution_solution_from_payload, market_solution_from_payload,
 )
-from open_trader.prediction_n_leg import canonical_payload, fingerprint
+from open_trader.prediction_n_leg import ActionQuantity, OracleBudget, canonical_payload, fingerprint, problem_from_payload
+from open_trader.prediction_n_leg_oracle import evaluate_fixed_portfolio
 
 
 ORDER_RECEIPT_SCHEMA_V1 = "open_trader.prediction_n_leg.order_receipt.v1"
@@ -195,10 +196,12 @@ class ExecutionSolutionSource:
     account_snapshot: AccountSnapshot
     now: datetime
 
-    def decode(self) -> ExecutionSolution:
-        market = market_solution_from_payload(
+    def decode_market(self):
+        return market_solution_from_payload(
             dict(self.market_solution_payload), component=self.component, books=self.books, now=self.now,
         )
+    def decode(self) -> ExecutionSolution:
+        market = self.decode_market()
         return execution_solution_from_payload(
             dict(self.execution_solution_payload), market_solution=market,
             account_snapshot=self.account_snapshot, now=self.now,
@@ -206,14 +209,27 @@ class ExecutionSolutionSource:
 
 
 @dataclass(frozen=True, slots=True)
+class CanonicalBookLevel:
+    first_lot: int
+    last_lot: int
+    buy_ask_units: int
+    sell_bid_units: int
+
+    def __post_init__(self) -> None:
+        if type(self.first_lot) is not int or type(self.last_lot) is not int or self.first_lot <= 0 or self.last_lot < self.first_lot:
+            raise ValueError("invalid canonical book range")
+        _nonnegative(self.buy_ask_units, "buy_ask_units")
+        _nonnegative(self.sell_bid_units, "sell_bid_units")
+
+
+@dataclass(frozen=True, slots=True)
 class RepairQuote:
-    """Fresh canonical executable prices for one original order identity."""
+    """Fresh canonical book snapshot for one original order identity."""
     client_order_id: str
     venue_id: str
     account_id: str
     settlement_asset_id: str
-    buy_cost_per_lot_units: int
-    sell_proceeds_per_lot_units: int
+    levels: tuple[CanonicalBookLevel, ...]
     source_timestamp: datetime
     received_at: datetime
     fee_ppm: int = 0
@@ -223,12 +239,14 @@ class RepairQuote:
     def __post_init__(self) -> None:
         for name in ("client_order_id", "venue_id", "account_id", "settlement_asset_id"):
             _text(getattr(self, name), name)
-        for name in ("buy_cost_per_lot_units", "sell_proceeds_per_lot_units", "fee_ppm", "slippage_units"):
+        for name in ("fee_ppm", "slippage_units"):
             _nonnegative(getattr(self, name), name)
         if type(self.tick_units) is not int or self.tick_units <= 0:
             raise ValueError("tick_units must be positive")
         if not all(isinstance(value, datetime) and value.tzinfo is not None for value in (self.source_timestamp, self.received_at)):
             raise ValueError("repair quote timestamps must be aware")
+        if not self.levels or any(level.last_lot + 1 != later.first_lot for level, later in zip(self.levels, self.levels[1:])):
+            raise ValueError("canonical book levels must be contiguous")
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,11 +255,15 @@ class ConfirmedHolding:
     account_id: str
     asset_id: str
     quantity: int
+    source_timestamp: datetime
+    received_at: datetime
 
     def __post_init__(self) -> None:
         for name in ("venue_id", "account_id", "asset_id"):
             _text(getattr(self, name), name)
         _nonnegative(self.quantity, "quantity")
+        if not all(isinstance(value, datetime) and value.tzinfo is not None for value in (self.source_timestamp, self.received_at)):
+            raise ValueError("holding timestamps must be aware")
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,8 +295,19 @@ class RepairContext:
         _text(self.reservation_version, "reservation_version")
         if not isinstance(self.account_snapshot, AccountSnapshot) or not isinstance(self.now, datetime) or self.now.tzinfo is None:
             raise ValueError("now must be aware")
+        balances = self.account_snapshot.balances if isinstance(self.account_snapshot, AccountSnapshot) else ()
+        if (
+            not isinstance(balances, tuple)
+            or (self.now - self.account_snapshot.captured_at).total_seconds() < 0
+            or (self.now - self.account_snapshot.captured_at).total_seconds() > 10
+            or len({(item.venue_id, item.account_id, item.asset_id) for item in balances}) != len(balances)
+            or any(type(item.available_units) is not int or type(item.allowance_units) is not int or item.available_units < 0 or item.allowance_units < 0 for item in balances)
+        ):
+            raise ValueError("repair account snapshot must be canonical and fresh")
         if not self.quotes or len({quote.client_order_id for quote in self.quotes}) != len(self.quotes):
             raise ValueError("repair quotes must be complete and unique")
+        if any((self.now - value).total_seconds() < 0 or (self.now - value).total_seconds() > 10 for item in self.holdings for value in (item.source_timestamp, item.received_at)):
+            raise ValueError("repair holdings must be fresh")
         if len({(flow.venue_id, flow.account_id, flow.settlement_asset_id) for flow in self.cash_flows}) != len(self.cash_flows):
             raise ValueError("repair cash flows must be unique per reservation key")
         if any((self.now - quote.received_at).total_seconds() < 0 or (self.now - quote.received_at).total_seconds() > 10 or (self.now - quote.source_timestamp).total_seconds() < 0 or (self.now - quote.source_timestamp).total_seconds() > 10 for quote in self.quotes):
@@ -300,6 +333,10 @@ class ReconciliationContext:
             raise ValueError("invalid reconciliation source")
         if any((self.now - value).total_seconds() < 0 or (self.now - value).total_seconds() > 10 for value in (self.source_timestamp, self.received_at, self.account_snapshot.captured_at)):
             raise ValueError("reconciliation source must be fresh")
+        if len({(item.venue_id, item.account_id, item.asset_id) for item in self.account_snapshot.balances}) != len(self.account_snapshot.balances):
+            raise ValueError("reconciliation account snapshot must be canonical")
+        if any((self.now - value).total_seconds() < 0 or (self.now - value).total_seconds() > 10 for item in self.holdings for value in (item.source_timestamp, item.received_at)):
+            raise ValueError("reconciliation holdings must be fresh")
 
     @property
     def fingerprint(self) -> str:
@@ -328,7 +365,11 @@ class NLegExecutionService:
         if mode not in {"MANUAL", "AUTO"}:
             raise ValueError("new N-leg mode must be MANUAL or AUTO")
         try:
-            execution_solution = source.decode()
+            market_solution = source.decode_market()
+            execution_solution = execution_solution_from_payload(
+                dict(source.execution_solution_payload), market_solution=market_solution,
+                account_snapshot=source.account_snapshot, now=source.now,
+            )
         except (TypeError, ValueError) as exc:
             raise ValueError("EXECUTION_SOLUTION_SOURCE_REQUIRED") from exc
         if not _proof_is_bound(partial_fill_proof, execution_solution) or partial_fill_proof.cap_config_version != _text(cap_config_version, "cap_config_version"):
@@ -360,6 +401,8 @@ class NLegExecutionService:
             "submission_enabled": False,
             "state": "ACTIVE",
             "execution_solution_fingerprint": execution_solution.fingerprint,
+            "frozen_problem": canonical_payload(market_solution.problem),
+            "frozen_budget": canonical_payload(market_solution.candidate_evidence.proof_input.request.budget),
             "model_fingerprint": execution_solution.market_solution_fingerprint,
             "quote_fingerprint": execution_solution_binding(execution_solution)["quote_fingerprint"],
             "account_fingerprint": execution_solution.account_snapshot_fingerprint,
@@ -426,6 +469,7 @@ class NLegExecutionService:
             return next_batch, control, True
         return self._store.n_leg_reduce(
             receipt.execution_batch_id,
+            transition_kind="ORDER_RECEIPT",
             idempotency_key=f"receipt:{receipt.receipt_id}:{fingerprint(self._semantic_receipt(receipt))}",
             reducer=reduce,
         )
@@ -464,7 +508,7 @@ class NLegExecutionService:
                 control["mode"] = "MANUAL"
             return result, control, True
         return self._store.n_leg_reduce(
-            execution_batch_id, idempotency_key=f"reconcile:{execution_batch_id}:{context.fingerprint}", reducer=reduce,
+            execution_batch_id, transition_kind="RECONCILIATION", idempotency_key=f"reconcile:{execution_batch_id}:{context.fingerprint}", reducer=reduce,
         )
 
     def _reduce(self, batch: dict[str, object], receipt: OrderReceipt) -> tuple[dict[str, object], str | None, bool]:
@@ -572,6 +616,7 @@ class NLegExecutionService:
     ) -> tuple[dict[str, object], dict[str, object]]:
         batch["state"] = "INCIDENT"
         batch["incident"] = {"reason": reason, "repair_status": "PENDING_RECONCILIATION"}
+        batch["execution_controls"] = self._execution_controls(batch)
         control = dict(control)
         control["mode"] = "MANUAL"
         control["active_batch_id"] = batch["execution_batch_id"]
@@ -595,6 +640,27 @@ class NLegExecutionService:
         return batch, control
 
     @staticmethod
+    def _execution_controls(batch: Mapping[str, object]) -> list[dict[str, str]]:
+        legs = batch.get("legs")
+        if not isinstance(legs, list):
+            return []
+        controls = []
+        for leg in legs:
+            if not isinstance(leg, dict) or not isinstance(leg.get("client_order_id"), str):
+                continue
+            receipt = leg.get("receipt")
+            if not isinstance(receipt, dict):
+                intent = "STOPPED_UNSENT"
+            elif receipt.get("state") == "UNKNOWN":
+                intent = "REST_CONFIRMATION_REQUIRED"
+            elif receipt.get("state") in _TERMINAL:
+                intent = "TERMINAL"
+            else:
+                intent = "CANCEL_REQUIRED"
+            controls.append({"client_order_id": leg["client_order_id"], "intent": intent})
+        return controls
+
+    @staticmethod
     def _repair_plan(batch: Mapping[str, object], context: RepairContext | None) -> dict[str, object] | None:
         if not isinstance(context, RepairContext) or context.reservation_version != batch.get("reservation_version"):
             return None
@@ -612,12 +678,26 @@ class NLegExecutionService:
             for client, quote in quotes.items() for leg in (by_client[client],)
         ):
             return None
-        balances = {(item.venue_id, item.account_id, item.asset_id) for item in context.account_snapshot.balances}
+        balances = {(item.venue_id, item.account_id, item.asset_id): item for item in context.account_snapshot.balances}
         if any((quote.venue_id, quote.account_id, quote.settlement_asset_id) not in balances for quote in quotes.values()):
+            return None
+        reservation_keys = {
+            (str(row["venue_id"]), str(row["account_id"]), str(row["settlement_asset_id"]))
+            for row in batch.get("reservations", []) if isinstance(row, dict)
+        }
+        flow_keys = {(flow.venue_id, flow.account_id, flow.settlement_asset_id) for flow in context.cash_flows}
+        if flow_keys != reservation_keys:
             return None
         holdings = {(item.venue_id, item.account_id, item.asset_id): item.quantity for item in context.holdings}
         complete = {client: int(leg["submitted_quantity"]) - int(leg["receipt"]["cumulative_filled_quantity"]) for client, leg in by_client.items() if isinstance(leg.get("receipt"), dict) and int(leg["submitted_quantity"]) > int(leg["receipt"]["cumulative_filled_quantity"])}
-        exit_ = {client: int(leg["receipt"]["cumulative_filled_quantity"]) for client, leg in by_client.items() if isinstance(leg.get("receipt"), dict) and int(leg["receipt"]["cumulative_filled_quantity"]) > 0 and holdings.get((str(leg["venue_id"]), str(leg["account_id"]), str(leg["asset_id"])), 0) >= int(leg["receipt"]["cumulative_filled_quantity"])}
+        exit_ = {client: int(leg["receipt"]["cumulative_filled_quantity"]) for client, leg in by_client.items() if isinstance(leg.get("receipt"), dict) and int(leg["receipt"]["cumulative_filled_quantity"]) > 0}
+        sold_by_holding: dict[tuple[str, str, str], int] = {}
+        for client, quantity in exit_.items():
+            leg = by_client[client]
+            key = (str(leg["venue_id"]), str(leg["account_id"]), str(leg["asset_id"]))
+            sold_by_holding[key] = sold_by_holding.get(key, 0) + quantity
+        if any(quantity > holdings.get(key, 0) for key, quantity in sold_by_holding.items()):
+            exit_ = {}
         base = sum(flow.occurred_cost_units + flow.occurred_fee_units for flow in context.cash_flows)
         candidates = []
         if complete:
@@ -625,16 +705,17 @@ class NLegExecutionService:
             for client, quantity in complete.items():
                 quote, leg = quotes[client], by_client[client]
                 key = (quote.venue_id, quote.account_id, quote.settlement_asset_id)
-                cost_by_key[key] = cost_by_key.get(key, 0) + quantity * (quote.buy_cost_per_lot_units + quote.slippage_units)
+                cost_by_key[key] = cost_by_key.get(key, 0) + NLegExecutionService._buy_cost(quote, quantity)
             flows = {(flow.venue_id, flow.account_id, flow.settlement_asset_id): flow.occurred_cost_units + flow.occurred_fee_units for flow in context.cash_flows}
             remaining = {
                 (str(row["venue_id"]), str(row["account_id"]), str(row["settlement_asset_id"])): min(int(row["remaining_units"]), max(0, int(row["original_units"]) - flows.get((str(row["venue_id"]), str(row["account_id"]), str(row["settlement_asset_id"])), 0)))
                 for row in batch.get("reservations", []) if isinstance(row, dict)
             }
-            if all(cost <= remaining.get(key, -1) for key, cost in cost_by_key.items()): candidates.append({"family": "COMPLETE_REMAINING", "legs": complete, "conservative_total_loss_units": base + sum(cost_by_key.values())})
+            if all(cost <= remaining.get(key, -1) and cost <= balances[key].available_units and cost <= balances[key].allowance_units for key, cost in cost_by_key.items()):
+                candidates.append(NLegExecutionService._candidate(batch, context, "COMPLETE_REMAINING", complete, base + sum(cost_by_key.values()), 0))
         if exit_:
-            # Do not subtract expected proceeds: an exit is costed conservatively.
-            candidates.append({"family": "EXIT_CONFIRMED", "legs": exit_, "conservative_total_loss_units": base + sum(quantity * (quotes[client].sell_proceeds_per_lot_units + quotes[client].slippage_units) for client, quantity in exit_.items())})
+            proceeds = sum(NLegExecutionService._sell_proceeds(quotes[client], quantity) for client, quantity in exit_.items())
+            candidates.append(NLegExecutionService._candidate(batch, context, "EXIT_CONFIRMED", exit_, base, proceeds))
         for candidate in candidates: candidate["fingerprint"] = fingerprint({"context": context.fingerprint, "candidate": candidate})
         if not candidates:
             return None
@@ -649,6 +730,53 @@ class NLegExecutionService:
             "auto_eligible": False,
             "reason": "REPAIR_LOSS_CAP_EXCEEDED" if over_cap else "REPAIR_PROOF_REQUIRED",
         }
+
+    @staticmethod
+    def _book_units(quote: RepairQuote, quantity: int, *, buy: bool) -> int:
+        remaining = quantity
+        total = 0
+        for level in quote.levels:
+            lots = min(remaining, level.last_lot - level.first_lot + 1)
+            if lots <= 0:
+                continue
+            total += lots * (level.buy_ask_units if buy else level.sell_bid_units)
+            remaining -= lots
+            if not remaining:
+                return total
+        raise ValueError("fresh book lacks required depth")
+
+    @classmethod
+    def _buy_cost(cls, quote: RepairQuote, quantity: int) -> int:
+        gross = cls._book_units(quote, quantity, buy=True)
+        return gross + (gross * quote.fee_ppm + 999_999) // 1_000_000 + quote.tick_units + quote.slippage_units
+
+    @classmethod
+    def _sell_proceeds(cls, quote: RepairQuote, quantity: int) -> int:
+        gross = cls._book_units(quote, quantity, buy=False)
+        return max(0, gross - (gross * quote.fee_ppm + 999_999) // 1_000_000 - quote.tick_units - quote.slippage_units)
+
+    @staticmethod
+    def _candidate(batch: Mapping[str, object], context: RepairContext, family: str, legs: Mapping[str, int], spend: int, proceeds: int) -> dict[str, object]:
+        try:
+            problem = problem_from_payload(batch["frozen_problem"])
+            budget_raw = batch["frozen_budget"]
+            budget = OracleBudget(**budget_raw) if isinstance(budget_raw, dict) else None
+            if budget is None:
+                raise ValueError("missing frozen budget")
+            filled = {
+                str(leg["action_id"]): int(leg["receipt"]["cumulative_filled_quantity"])
+                for leg in batch["legs"] if isinstance(leg, dict) and isinstance(leg.get("receipt"), dict)
+            }
+            submitted = {str(leg["action_id"]): int(leg["submitted_quantity"]) for leg in batch["legs"] if isinstance(leg, dict)}
+            quantities = tuple(
+                ActionQuantity(action.action_id, submitted[action.action_id] if family == "COMPLETE_REMAINING" else filled.get(action.action_id, 0))
+                for action in problem.actions if (family == "COMPLETE_REMAINING" or filled.get(action.action_id, 0))
+            )
+            payout = 0 if family == "EXIT_CONFIRMED" else evaluate_fixed_portfolio(problem, quantities, budget).payout_lower_bound_units
+        except (TypeError, ValueError):
+            raise ValueError("frozen terminal valuation unavailable")
+        loss = max(0, spend - proceeds - payout)
+        return {"family": family, "legs": dict(legs), "conservative_total_loss_units": loss, "worst_terminal_payout_units": payout, "conservative_sell_proceeds_units": proceeds}
 
     @staticmethod
     def _prior_unsettled(batch: Mapping[str, object]) -> int:
