@@ -8,6 +8,23 @@ async function openPrediction(page: Page, state = 'ready') {
 }
 
 test.describe('YES/NO arbitrage signal workspace', () => {
+  test('reviews system-discovered relations in the existing page drawer', async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 812 });
+    await openPrediction(page);
+    await page.getByRole('button', { name: /关系审核 1/ }).click();
+    const drawer = page.getByRole('dialog', { name: '关系审核' });
+    await expect(drawer).toBeVisible();
+    await expect(drawer).toContainText('待审批');
+    await expect(drawer).toContainText('Polymarket');
+    await expect(drawer).toContainText('到期');
+    await drawer.getByRole('button', { name: /Will Bitcoin trade above \$100,000/ }).click();
+    await expect(drawer).toContainText('condition-a');
+    await expect(drawer).toContainText('市场日期');
+    await expect(drawer).toContainText('到期日');
+    await expect(drawer.getByRole('button', { name: '返回列表' })).toBeVisible();
+    expect(await page.locator('body').evaluate((body) => body.scrollWidth <= window.innerWidth)).toBe(true);
+  });
+
   test('shows approved signal columns without the monitoring-scope panel', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 1100 });
     await openPrediction(page);

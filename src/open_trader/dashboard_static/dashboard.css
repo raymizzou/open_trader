@@ -5928,6 +5928,34 @@ table {
 .prediction-market-workspace { min-width: 0; }
 .dashboard-header.hidden { display: none !important; }
 .pm-page-head { align-items: end; display: flex; gap: 20px; justify-content: space-between; margin: 18px 0 12px; }
+.pm-relation-badge { background: #fff8e8; border: 1px solid #e4c98e; border-radius: 999px; color: #6b4a11; font: inherit; font-size: 12px; font-weight: 800; margin: 0 0 8px auto; min-height: 44px; padding: 6px 10px; }
+.pm-relation-badge strong { background: #6b4a11; border-radius: 999px; color: #fff; display: inline-block; margin-left: 4px; min-width: 20px; padding: 2px 5px; }
+.pm-relation-drawer { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); margin-top: 14px; padding: 14px; }
+.pm-relation-drawer > header, .pm-relation-tabs, .pm-relation-actions { align-items: start; display: flex; gap: 8px; justify-content: space-between; }
+.pm-relation-drawer h2, .pm-relation-drawer h3 { margin: 0; }
+.pm-relation-drawer p { color: var(--muted); margin: 4px 0 0; }
+.pm-relation-close, .pm-relation-back { background: transparent; border: 1px solid var(--line); border-radius: 6px; color: var(--text); min-height: 36px; padding: 6px 10px; }
+.pm-relation-tabs { border-bottom: 1px solid var(--line); justify-content: flex-start; margin: 12px 0; overflow-x: auto; }
+.pm-relation-tabs button { background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--muted); min-height: 40px; padding: 8px 10px; white-space: nowrap; }
+.pm-relation-tabs button[aria-pressed="true"] { border-bottom-color: var(--primary); color: var(--text); font-weight: 800; }
+.pm-relation-list { display: grid; gap: 8px; }
+.pm-relation-row { background: #fffefa; border: 1px solid var(--line); border-radius: 8px; color: var(--text); cursor: pointer; display: grid; gap: 8px; padding: 12px; text-align: left; width: 100%; }
+.pm-relation-row > div, .pm-relation-detail-market { min-width: 0; }
+.pm-relation-row strong, .pm-relation-detail-market > strong { display: block; line-height: 1.45; overflow-wrap: anywhere; }
+.pm-relation-market { margin-top: 8px; }
+.pm-relation-market small, .pm-relation-row > small { color: var(--muted); display: block; line-height: 1.5; margin-top: 3px; overflow-wrap: anywhere; }
+.pm-relation-detail { display: grid; gap: 14px; }
+.pm-relation-detail > p { overflow-wrap: anywhere; }
+.pm-relation-detail-market { background: #f7f5f1; border-radius: 6px; padding: 12px; }
+.pm-relation-detail-market dl { display: grid; gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 10px 0 0; }
+.pm-relation-detail-market dt { color: var(--muted); font-size: 12px; }
+.pm-relation-detail-market dd { margin: 2px 0 0; overflow-wrap: anywhere; }
+.pm-relation-evidence { margin: 6px 0 0; overflow-wrap: anywhere; padding-left: 20px; }
+.pm-relation-reason { display: grid; gap: 6px; font-size: 13px; font-weight: 800; }
+.pm-relation-reason select, .pm-relation-reason textarea { background: #fff; border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; min-height: 38px; padding: 8px; }
+.pm-relation-reason textarea { min-height: 72px; resize: vertical; }
+.pm-relation-actions { align-items: center; justify-content: flex-end; }
+.pm-relation-empty { color: var(--muted); margin: 8px 0; }
 .pm-page-head h1 { font-size: 25px; margin: 0 0 5px; }
 .pm-page-head p { color: var(--muted); margin: 0; }
 .pm-strategy-tabs { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; display: inline-grid; gap: 4px; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 10px; padding: 4px; }
@@ -6202,6 +6230,12 @@ table {
   .pm-signal-operation { white-space: normal; }
   .pm-signal-action { width: 100%; }
   .pm-modal { padding: 16px; }
+  .pm-relation-badge { margin: 0 0 8px; }
+  .pm-relation-drawer > header, .pm-relation-actions { align-items: stretch; display: grid; }
+  .pm-relation-drawer > header { grid-template-columns: 1fr; }
+  .pm-relation-close, .pm-relation-back, .pm-relation-actions .pm-button { min-height: 44px; width: 100%; }
+  .pm-relation-detail-market dl { grid-template-columns: 1fr; }
+  .pm-relation-tabs { gap: 2px; }
   .pm-order-legs, .pm-order-summary { grid-template-columns: 1fr; }
   .pm-modal-actions { background: var(--surface); bottom: -16px; display: grid; padding: 12px 0 16px; position: sticky; }
   .pm-modal-actions .pm-button { width: 100%; }

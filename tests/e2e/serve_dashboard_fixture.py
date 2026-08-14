@@ -525,6 +525,21 @@ def _prediction_history_for_scenario(kind: str, scenario: str) -> list[dict[str,
     return items
 
 
+def _relation_review_fixture() -> dict[str, object]:
+    return {
+        "relation_version_id": "rv-fixture-1", "relation_id": "relation-fixture-1",
+        "approval_status": "PENDING", "activation_status": "PENDING",
+        "discovery_source": "deterministic_rule", "discovered_at": "2026-08-15T02:32:00Z",
+        "semantics": {"statement": "若 ‘Will Bitcoin trade above $100,000 at any time before December 31, 2026?’ 为 YES，则下方市场也必须为 YES。"},
+        "markets": [
+            {"venue": "Polymarket", "contract_id": "condition-a", "title": "Will Bitcoin trade above $100,000 at any time before December 31, 2026?", "market_date": "2026-08-15T00:00:00Z", "expires_at": "2026-12-31T17:00:00Z", "settlement_observation_key": "btc-usd"},
+            {"venue": "Polymarket", "contract_id": "condition-b", "title": "Will Bitcoin trade above $90,000 at any time before December 31, 2026?", "market_date": "2026-08-15T00:00:00Z", "expires_at": "2026-12-31T17:00:00Z", "settlement_observation_key": "btc-usd"},
+        ],
+        "source_evidence_fingerprint": "source-fixture", "relation_semantics_fingerprint": "semantics-fixture", "compiled_model_fingerprint": "model-fixture",
+        "evidence": [{"source_evidence": [{"source": "Polymarket rules", "quote": "resolves YES if..."}]}],
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     prediction_scenario = os.environ.get("PREDICTION_FIXTURE_SCENARIO", "ready")
 
@@ -563,7 +578,16 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         if path == "/api/prediction-arbitrage/state":
-            self._send_json(_prediction_payload(type(self).prediction_scenario))
+            payload = _prediction_payload(type(self).prediction_scenario)
+            payload["relation_review"] = {"pending_count": 1}
+            self._send_json(payload)
+            return
+        if path == "/api/prediction-arbitrage/relations":
+            item = _relation_review_fixture()
+            self._send_json({"view": str(query.get("view", ["pending"])[0]), "pending_count": 1, "items": [item]})
+            return
+        if path.startswith("/api/prediction-arbitrage/relations/"):
+            self._send_json(_relation_review_fixture())
             return
         if path == "/api/prediction-arbitrage/history":
             kind = str(query.get("kind", ["signals"])[0] or "signals")

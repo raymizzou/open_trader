@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-15
+
+- #59 adds the production-owned, versioned relation catalog for system-discovered market relations. The existing Prediction page now exposes a same-page review drawer with complete titles, venue, discovery/market/expiry dates and evidence; approval is version/fingerprint-bound, incomplete models cannot activate, invalidation is local to the affected component, and replacement publishes one atomic generation. No Shadow intake, manual creation, auto-approval, Solver/opportunity, quote, monitoring, order, notification, or new page was added. Focused catalog/Service/Runtime/monitor tests and the Prediction Dashboard browser review flow pass; final acceptance remains the release gate.
+
 ## 2026-08-14
 
 - #51 round-six integration makes the existing Predict REST/WS accepted book retain its validated YES/NO outcome token IDs, so the public executable resolver can bind both Predict market and order token identity. Market tamper coverage now rehashes the full current artifact payload before deep validation. No watcher, cache, persistence, order, or Dashboard behavior was added.

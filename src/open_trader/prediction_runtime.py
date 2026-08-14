@@ -48,6 +48,7 @@ from .prediction_read_only import (
     guard_predict_client,
 )
 from .prediction_title_translation import CodexTitleTranslator
+from .relation_catalog import RelationCatalog
 
 logger = logging.getLogger(__name__)
 _CROSS_VENUE_START_TIMEOUT = 5
@@ -360,6 +361,7 @@ class PredictionRuntime:
         self.monitor: PolymarketMonitor | None = None
         self.cross_venue_monitor: object | None = None
         self.execution: PredictionExecutionService | None = None
+        self.relation_catalog: RelationCatalog | None = None
         self._shadow_guards: ExitStack | None = None
         self._shadow_failure_lock = threading.Lock()
         self._shadow_failure_event = threading.Event()
@@ -449,6 +451,7 @@ class PredictionRuntime:
                         f"is below required {minimum_reader_generation}"
                     )
             self.store = PredictionArbitrageStore(self._data_dir)
+            self.relation_catalog = RelationCatalog(self._data_dir)
             trading_config = load_trading_config(self._prediction_config_path)
             apply_safety_policy = getattr(self.store, "apply_safety_policy", None)
             if callable(apply_safety_policy):
@@ -479,6 +482,7 @@ class PredictionRuntime:
                 relation_discovery=discover_threshold_relation_catalog,
                 relation_validator=relation_validator,
                 title_translator=title_translator,
+                relation_catalog=self.relation_catalog,
             )
             self.execution = PredictionExecutionService(
                 store=self.store,
