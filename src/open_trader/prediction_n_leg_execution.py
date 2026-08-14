@@ -100,8 +100,18 @@ def execution_solution_binding(solution: ExecutionSolution) -> dict[str, str]:
     """The stable facts that #74 must bind in its final proof record."""
     if not isinstance(solution, ExecutionSolution) or solution.order_ready or solution.reason != "PARTIAL_FILL_PROOF_REQUIRED":
         raise ValueError("execution solution is not a no-submit partial-fill handoff")
+    expected = fingerprint({
+        "market": solution.market_solution_fingerprint,
+        "account": solution.account_snapshot_fingerprint,
+        "quantities": solution.quantities,
+        "capital_use_units": solution.capital_use_units,
+        "execution_legs": solution.execution_legs,
+    })
+    if solution.fingerprint != expected:
+        raise ValueError("execution solution fingerprint mismatch")
     return {
         "execution_solution_fingerprint": solution.fingerprint,
+        "execution_solution_payload_fingerprint": fingerprint(canonical_payload(solution)),
         "model_fingerprint": solution.market_solution_fingerprint,
         "quote_fingerprint": fingerprint({"sources": tuple(leg.source_fingerprint for leg in solution.execution_legs)}),
         "cost_fingerprint": fingerprint({"capital_use_units": solution.capital_use_units, "legs": tuple((leg.action_id, leg.max_cost_units, leg.max_fee_units) for leg in solution.execution_legs)}),
@@ -112,6 +122,7 @@ def execution_solution_binding(solution: ExecutionSolution) -> dict[str, str]:
 @dataclass(frozen=True, slots=True)
 class PartialFillProofRecord:
     execution_solution_fingerprint: str
+    execution_solution_payload_fingerprint: str
     model_fingerprint: str
     quote_fingerprint: str
     cost_fingerprint: str
@@ -122,8 +133,10 @@ class PartialFillProofRecord:
     solver_lower_bound: int
     solver_upper_bound: int
     solver_termination: str
+    solver_evidence_fingerprint: str
     verifier_status: str
     verifier_fingerprint: str
+    verifier_evidence_fingerprint: str
     status: str
     fingerprint: str
     schema_version: str = PARTIAL_FILL_PROOF_SCHEMA_V1
@@ -132,9 +145,9 @@ class PartialFillProofRecord:
         if self.schema_version != PARTIAL_FILL_PROOF_SCHEMA_V1:
             raise ValueError("unsupported partial-fill proof schema")
         for name in (
-            "execution_solution_fingerprint", "model_fingerprint", "quote_fingerprint", "cost_fingerprint",
+            "execution_solution_fingerprint", "execution_solution_payload_fingerprint", "model_fingerprint", "quote_fingerprint", "cost_fingerprint",
             "order_semantics_fingerprint", "cap_config_version", "solver_termination", "verifier_status",
-            "verifier_fingerprint", "status", "fingerprint",
+            "solver_evidence_fingerprint", "verifier_fingerprint", "verifier_evidence_fingerprint", "status", "fingerprint",
         ):
             _text(getattr(self, name), name)
         for name in ("max_partial_fill_loss", "max_auto_repair_loss", "solver_lower_bound", "solver_upper_bound"):
@@ -192,7 +205,7 @@ class NLegExecutionService:
             raise ValueError("new N-leg mode must be MANUAL or AUTO")
         if not _proof_is_bound(partial_fill_proof, execution_solution) or partial_fill_proof.cap_config_version != _text(cap_config_version, "cap_config_version"):
             raise ValueError("PARTIAL_FILL_PROOF_REQUIRED")
-        if execution_solution.capital_use_units > partial_fill_proof.max_partial_fill_loss:
+        if partial_fill_proof.solver_upper_bound > partial_fill_proof.max_partial_fill_loss:
             raise ValueError("PARTIAL_FILL_LOSS_CAP_EXCEEDED")
         legs = []
         for leg in execution_solution.execution_legs:
@@ -223,6 +236,7 @@ class NLegExecutionService:
             "legs": legs,
             "receipts": {},
             "confirmed_holdings": [],
+            "receipt_conflicts": [],
             "incident": None,
             "repair_plan": None,
         }
@@ -240,29 +254,59 @@ class NLegExecutionService:
         *,
         repair_context: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
-        batch = self.state(receipt.execution_batch_id)
-        if batch is None:
-            raise ValueError("N_LEG_BATCH_NOT_FOUND")
-        next_batch, incident_reason, changed = self._reduce(batch, receipt)
-        if not changed:
-            return batch
+        def reduce(batch: dict[str, object], control: dict[str, object]) -> tuple[dict[str, object], dict[str, object], bool]:
+            next_batch, incident_reason, changed = self._reduce(batch, receipt)
+            if not changed:
+                return batch, control, False
+            existing_incident = next_batch.get("incident")
+            if incident_reason is not None:
+                next_batch, control = self._open_incident(next_batch, control, incident_reason, repair_context)
+            elif isinstance(existing_incident, dict):
+                if self._all_terminal(next_batch):
+                    if self._all_full(next_batch) or self._all_zero(next_batch):
+                        next_batch["state"] = "AWAITING_RECONCILIATION"
+                        control["mode"] = "MANUAL"
+                        control["active_batch_id"] = next_batch["execution_batch_id"]
+                    else:
+                        next_batch, control = self._open_incident(next_batch, control, str(existing_incident.get("reason", "INCIDENT")), repair_context)
+                else:
+                    control["mode"] = "MANUAL"
+                    control["active_batch_id"] = next_batch["execution_batch_id"]
+            elif self._all_terminal(next_batch):
+                if self._all_full(next_batch) or self._all_zero(next_batch):
+                    next_batch["state"] = "AWAITING_RECONCILIATION"
+                else:
+                    next_batch, control = self._open_incident(next_batch, control, "MIXED_TERMINAL_FILL", repair_context)
+            return next_batch, control, True
+        return self._store.n_leg_reduce(receipt.execution_batch_id, idempotency_key=receipt.receipt_id, reducer=reduce)
+
+    def complete_reconciliation(
+        self, execution_batch_id: str, *, context: Mapping[str, object]
+    ) -> dict[str, object]:
+        batch = self.state(execution_batch_id)
+        if batch is None or not self._all_terminal(batch):
+            raise ValueError("N_LEG_RECONCILIATION_NOT_READY")
+        required = {"fresh", "balance_fingerprint", "holding_fingerprint", "reservation_version"}
+        if (
+            not isinstance(context, Mapping) or set(context) != required or context.get("fresh") is not True
+            or context.get("reservation_version") != batch.get("reservation_version")
+            or any(not isinstance(context.get(key), str) or not context[key] for key in ("balance_fingerprint", "holding_fingerprint"))
+            or not (self._all_full(batch) or self._all_zero(batch))
+        ):
+            raise ValueError("N_LEG_RECONCILIATION_PROOF_REQUIRED")
         control = self.control()
-        existing_incident = next_batch.get("incident")
-        if incident_reason is not None:
-            next_batch, control = self._open_incident(next_batch, control, incident_reason, repair_context)
-        elif isinstance(existing_incident, dict):
-            if self._all_terminal(next_batch):
-                next_batch, control = self._open_incident(
-                    next_batch, control, str(existing_incident.get("reason", "INCIDENT")), repair_context,
-                )
-            else:
-                control["mode"] = "MANUAL"
-                control["active_batch_id"] = next_batch["execution_batch_id"]
-        elif self._all_terminal(next_batch):
-            next_batch["state"] = "RECONCILED_ZERO" if self._all_zero(next_batch) else "RECONCILED_FULL"
-            control = self._reconcile_terminal(next_batch, control)
+        result = dict(batch)
+        had_incident = result.get("incident") is not None
+        result["reconciliation"] = dict(context)
+        result["state"] = "RECONCILED_ZERO" if self._all_zero(batch) else "RECONCILED_FULL"
+        result["incident"] = None
+        control["active_batch_id"] = None
+        if self._all_zero(batch):
+            control["total_unsettled_capital_units"] = max(0, int(control["total_unsettled_capital_units"]) - int(batch["reservation_units"]))
+        if had_incident:
+            control["mode"] = "MANUAL"
         return self._store.n_leg_replace_batch(
-            next_batch, control=control, transition_kind="ORDER_RECEIPT", idempotency_key=receipt.receipt_id,
+            result, control=control, transition_kind="RECONCILIATION", idempotency_key=f"reconcile:{execution_batch_id}:{fingerprint(dict(context))}",
         )
 
     def _reduce(self, batch: dict[str, object], receipt: OrderReceipt) -> tuple[dict[str, object], str | None, bool]:
@@ -321,6 +365,13 @@ class NLegExecutionService:
         receipts[receipt.receipt_id] = receipt.to_payload()
         copy["legs"] = legs
         copy["receipts"] = receipts
+        prior = next(
+            (leg.get("receipt") for leg in legs if leg.get("client_order_id") == receipt.client_order_id and isinstance(leg.get("receipt"), dict)),
+            None,
+        )
+        if isinstance(prior, dict):
+            existing = copy.get("receipt_conflicts")
+            copy["receipt_conflicts"] = [*(existing if isinstance(existing, list) else []), {"reason": reason, "old": prior, "new": receipt.to_payload()}]
         return copy, reason, True
 
     @staticmethod
@@ -332,6 +383,15 @@ class NLegExecutionService:
     def _all_zero(batch: Mapping[str, object]) -> bool:
         legs = batch.get("legs")
         return isinstance(legs, list) and bool(legs) and all(isinstance(leg, dict) and isinstance(leg.get("receipt"), dict) and leg["receipt"].get("cumulative_filled_quantity") == 0 for leg in legs)
+
+    @staticmethod
+    def _all_full(batch: Mapping[str, object]) -> bool:
+        legs = batch.get("legs")
+        return isinstance(legs, list) and bool(legs) and all(
+            isinstance(leg, dict) and isinstance(leg.get("receipt"), dict)
+            and leg["receipt"].get("cumulative_filled_quantity") == leg.get("submitted_quantity")
+            for leg in legs
+        )
 
     def _open_incident(
         self,
@@ -350,6 +410,8 @@ class NLegExecutionService:
             control["breaker_open"] = True
             control["breaker_reason"] = "UNKNOWN_ORDER_STATE"
         if not self._all_terminal(batch):
+            return batch, control
+        if isinstance(batch.get("repair_plan"), dict):
             return batch, control
         plan = self._repair_plan(batch, repair_context)
         batch["repair_plan"] = plan

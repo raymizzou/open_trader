@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -44,7 +45,9 @@ def solution() -> ExecutionSolution:
         ExecutionLegEvidence("a", "venue-a", "account-a", "chain-a", "asset-a", "BUY_YES", 10, 1, 1, 0, 40, "usd", "usd", "quote-a"),
         ExecutionLegEvidence("b", "venue-b", "account-b", "chain-b", "asset-b", "BUY_NO", 10, 1, 1, 0, 60, "usd", "usd", "quote-b"),
     )
-    return ExecutionSolution("market", "account", (ActionQuantity("a", 10), ActionQuantity("b", 10)), 100, legs, False, "PARTIAL_FILL_PROOF_REQUIRED", "solution-v1")
+    quantities = (ActionQuantity("a", 10), ActionQuantity("b", 10))
+    identity = fingerprint({"market": "market", "account": "account", "quantities": quantities, "capital_use_units": 100, "execution_legs": legs})
+    return ExecutionSolution("market", "account", quantities, 100, legs, False, "PARTIAL_FILL_PROOF_REQUIRED", identity)
 
 
 def proof(
@@ -59,8 +62,10 @@ def proof(
         "solver_lower_bound": 0,
         "solver_upper_bound": 100,
         "solver_termination": "CLOSED",
+        "solver_evidence_fingerprint": "solver-evidence-v1",
         "verifier_status": verifier_status,
         "verifier_fingerprint": "verifier-v1",
+        "verifier_evidence_fingerprint": "verifier-evidence-v1",
         "status": status,
         "schema_version": "open_trader.prediction_n_leg.partial_fill_proof.v1",
     }
@@ -100,6 +105,15 @@ def repair_context(*, candidates: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def reconciliation_context() -> dict[str, object]:
+    return {
+        "fresh": True,
+        "balance_fingerprint": "balance-v1",
+        "holding_fingerprint": "holdings-v1",
+        "reservation_version": "batch-1:v1",
+    }
+
+
 def test_entry_claims_one_batch_and_survives_reopen(tmp_path) -> None:
     current = service(tmp_path)
     batch = enter(current)
@@ -116,6 +130,7 @@ def test_entry_claims_one_batch_and_survives_reopen(tmp_path) -> None:
     ) == batch
     restarted.apply_receipt(receipt(leg="a", filled=0, state="REJECTED", sequence=1))
     restarted.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
+    restarted.complete_reconciliation("batch-1", context=reconciliation_context())
     with pytest.raises(ValueError, match="LINEAGE_ALREADY_CLAIMED"):
         restarted.enter(
             opportunity_episode_id="episode-2", episode_lineage_id="lineage-1", execution_batch_id="batch-2",
@@ -186,8 +201,11 @@ def test_all_terminal_zero_fill_releases_active_reservation_without_incident(tmp
     current.apply_receipt(receipt(leg="a", filled=0, state="REJECTED", sequence=1))
     completed = current.apply_receipt(receipt(leg="b", filled=0, state="CANCELLED", sequence=1))
 
-    assert completed["state"] == "RECONCILED_ZERO"
+    assert completed["state"] == "AWAITING_RECONCILIATION"
     assert completed["incident"] is None
+    assert current.control()["active_batch_id"] == "batch-1"
+    reconciled = current.complete_reconciliation("batch-1", context=reconciliation_context())
+    assert reconciled["state"] == "RECONCILED_ZERO"
     assert current.control()["active_batch_id"] is None
     assert current.control()["total_unsettled_capital_units"] == 0
 
@@ -199,8 +217,11 @@ def test_all_terminal_full_fill_reconciles_without_incident_and_retains_unsettle
     current.apply_receipt(receipt(leg="a", filled=10, state="FILLED", sequence=1))
     completed = current.apply_receipt(receipt(leg="b", filled=10, state="FILLED", sequence=1))
 
-    assert completed["state"] == "RECONCILED_FULL"
+    assert completed["state"] == "AWAITING_RECONCILIATION"
     assert completed["incident"] is None
+    assert current.control()["active_batch_id"] == "batch-1"
+    reconciled = current.complete_reconciliation("batch-1", context=reconciliation_context())
+    assert reconciled["state"] == "RECONCILED_FULL"
     assert current.control()["active_batch_id"] is None
     assert current.control()["total_unsettled_capital_units"] == 100
 
@@ -250,3 +271,82 @@ def test_over_cap_repair_is_retained_but_breaks_automatic_authority(tmp_path) ->
         "reason": "REPAIR_LOSS_CAP_EXCEEDED",
     }
     assert current.control()["breaker_reason"] == "REPAIR_LOSS_CAP_EXCEEDED"
+
+
+def test_mixed_terminal_receipts_are_an_incident_not_a_full_reconciliation(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+
+    current.apply_receipt(receipt(leg="a", filled=10, state="FILLED", sequence=1))
+    mixed = current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
+
+    assert mixed["state"] == "INCIDENT"
+    assert mixed["incident"]["reason"] == "MIXED_TERMINAL_FILL"
+    assert current.control()["active_batch_id"] == "batch-1"
+
+
+def test_receipts_do_not_release_batch_without_explicit_reconciliation(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+
+    current.apply_receipt(receipt(leg="a", filled=0, state="REJECTED", sequence=1))
+    terminal = current.apply_receipt(receipt(leg="b", filled=0, state="CANCELLED", sequence=1))
+
+    assert terminal["state"] == "AWAITING_RECONCILIATION"
+    assert current.control()["active_batch_id"] == "batch-1"
+
+
+def test_conflict_keeps_old_and_new_receipt_facts(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    old = receipt(leg="a", filled=0, state="OPEN", sequence=1)
+    current.apply_receipt(old)
+    new = replace(old, receipt_id="a-conflict", cumulative_filled_quantity=1)
+
+    conflict = current.apply_receipt(new)
+
+    assert conflict["receipt_conflicts"] == [{"reason": "SAME_SEQUENCE_CONFLICT", "old": old.to_payload(), "new": new.to_payload()}]
+
+
+def test_partial_fill_gate_uses_proven_upper_loss_bound_not_principal(tmp_path) -> None:
+    current = service(tmp_path)
+    execution = solution()
+    accepted = proof(execution, partial_cap=100)
+    values = accepted.to_payload()
+    values["solver_upper_bound"] = 101
+    values.pop("fingerprint")
+    values["fingerprint"] = fingerprint(values)
+    with pytest.raises(ValueError, match="PARTIAL_FILL_LOSS_CAP_EXCEEDED"):
+        current.enter(
+            opportunity_episode_id="episode-1", episode_lineage_id="lineage-1", execution_batch_id="batch-1",
+            execution_solution=execution, partial_fill_proof=PartialFillProofRecord(**values), mode="MANUAL", cap_config_version="caps-v1",
+        )
+
+
+def test_concurrent_different_leg_receipts_do_not_lose_a_transition(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(pool.map(current.apply_receipt, (
+            receipt(leg="a", filled=10, state="FILLED", sequence=1),
+            receipt(leg="b", filled=10, state="FILLED", sequence=1),
+        )))
+
+    durable = current.state("batch-1")
+    assert durable is not None
+    assert {leg["client_order_id"]: leg["receipt"]["state"] for leg in durable["legs"]} == {"batch-1:a": "FILLED", "batch-1:b": "FILLED"}
+    assert durable["state"] == "AWAITING_RECONCILIATION"
+
+
+def test_partial_incident_can_close_only_after_eventual_full_and_reconciliation(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    current.apply_receipt(receipt(leg="a", filled=4, state="OPEN", sequence=1))
+    current.apply_receipt(receipt(leg="a", filled=10, state="FILLED", sequence=2))
+    awaiting = current.apply_receipt(receipt(leg="b", filled=10, state="FILLED", sequence=1))
+
+    assert awaiting["incident"]["reason"] == "PARTIAL_FILL"
+    closed = current.complete_reconciliation("batch-1", context=reconciliation_context())
+    assert closed["incident"] is None
+    assert closed["state"] == "RECONCILED_FULL"
+    assert current.control()["mode"] == "MANUAL"
