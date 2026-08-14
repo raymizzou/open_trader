@@ -7,7 +7,10 @@ from datetime import UTC, datetime
 from typing import Any, Literal, Mapping
 
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
-from open_trader.prediction_executable_cost import ExecutionSolution
+from open_trader.prediction_executable_cost import (
+    AccountSnapshot, ExecutionSolution, ImmutableBook, VerifiedComponent,
+    execution_solution_from_payload, market_solution_from_payload,
+)
 from open_trader.prediction_n_leg import canonical_payload, fingerprint
 
 
@@ -182,6 +185,26 @@ def _proof_is_bound(proof: PartialFillProofRecord, solution: ExecutionSolution) 
     )
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionSolutionSource:
+    """All public #51 inputs required to independently re-decode an Entry."""
+    execution_solution_payload: Mapping[str, object]
+    market_solution_payload: Mapping[str, object]
+    component: VerifiedComponent
+    books: tuple[ImmutableBook, ...]
+    account_snapshot: AccountSnapshot
+    now: datetime
+
+    def decode(self) -> ExecutionSolution:
+        market = market_solution_from_payload(
+            dict(self.market_solution_payload), component=self.component, books=self.books, now=self.now,
+        )
+        return execution_solution_from_payload(
+            dict(self.execution_solution_payload), market_solution=market,
+            account_snapshot=self.account_snapshot, now=self.now,
+        )
+
+
 class NLegExecutionService:
     """The single public behavior seam for durable no-submit N-leg execution."""
 
@@ -194,7 +217,7 @@ class NLegExecutionService:
         opportunity_episode_id: str,
         episode_lineage_id: str,
         execution_batch_id: str,
-        execution_solution: ExecutionSolution,
+        source: ExecutionSolutionSource,
         partial_fill_proof: PartialFillProofRecord,
         mode: Literal["MANUAL", "AUTO"],
         cap_config_version: str,
@@ -203,6 +226,10 @@ class NLegExecutionService:
             _text(value, name)
         if mode not in {"MANUAL", "AUTO"}:
             raise ValueError("new N-leg mode must be MANUAL or AUTO")
+        try:
+            execution_solution = source.decode()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("EXECUTION_SOLUTION_SOURCE_REQUIRED") from exc
         if not _proof_is_bound(partial_fill_proof, execution_solution) or partial_fill_proof.cap_config_version != _text(cap_config_version, "cap_config_version"):
             raise ValueError("PARTIAL_FILL_PROOF_REQUIRED")
         if partial_fill_proof.solver_upper_bound > partial_fill_proof.max_partial_fill_loss:
