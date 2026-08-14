@@ -224,6 +224,8 @@ def test_handshake_is_strict_and_protocol_only() -> None:
     handshake = decode_handshake_line(handshake_line)
     assert handshake.protocol == BENCHMARK_PROTOCOL_V1
     assert handshake.backend == "test"
+    assert handshake.version == "1"
+    assert handshake.solver_version is None
     assert handshake.pid == process.pid
 
     assert process.stdin is not None
@@ -236,6 +238,33 @@ def test_handshake_is_strict_and_protocol_only() -> None:
     assert process.wait(timeout=2) == 0
     assert process.stderr is not None
     assert process.stderr.read() == b""
+
+
+def test_handshake_v2_carries_solver_version_without_redefining_version() -> None:
+    handshake = decode_handshake_line(json.dumps({
+        "backend": "cp_sat",
+        "pid": 1,
+        "protocol": "open_trader.prediction_solver.handshake.v2",
+        "version": "1",
+        "solver_version": "9.15.6755",
+    }).encode())
+
+    assert handshake.version == "1"
+    assert handshake.solver_version == "9.15.6755"
+
+
+@pytest.mark.parametrize(
+    "handshake",
+    (
+        {"backend": "cp_sat", "pid": 1, "protocol": "open_trader.prediction_solver.protocol.v1", "version": "1", "solver_version": "9.15.6755"},
+        {"backend": "cp_sat", "pid": 1, "protocol": "open_trader.prediction_solver.handshake.v2", "version": "1"},
+        {"backend": "cp_sat", "pid": 1, "protocol": "open_trader.prediction_solver.handshake.v2", "solver_version": "9.15.6755"},
+        {"backend": "cp_sat", "extra": True, "pid": 1, "protocol": "open_trader.prediction_solver.handshake.v2", "version": "1", "solver_version": "9.15.6755"},
+    ),
+)
+def test_handshake_schema_keys_must_match_its_protocol_version(handshake: dict[str, object]) -> None:
+    with pytest.raises(WorkerProtocolError, match="handshake must contain exactly"):
+        decode_handshake_line(json.dumps(handshake).encode())
 
 
 @pytest.mark.parametrize("pid", (0, -1, True, "1"))

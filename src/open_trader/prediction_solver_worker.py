@@ -34,6 +34,7 @@ from open_trader.prediction_solver import (
 MAX_LINE_BYTES = 1024 * 1024
 MAX_DIAGNOSTIC_BYTES = 64 * 1024
 WORKER_VERSION = "1"
+WORKER_HANDSHAKE_PROTOCOL_V2 = "open_trader.prediction_solver.handshake.v2"
 SUPPORTED_BACKENDS = frozenset({"highs", "scip", "cp_sat", "test"})
 NATIVE_BACKENDS = frozenset({"highs", "scip", "cp_sat"})
 WORKER_PHASE_NAMES = (
@@ -219,6 +220,7 @@ class WorkerHandshake:
     backend: str
     version: str
     pid: int
+    solver_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,16 +249,24 @@ class WorkerOutcome:
 
 
 def decode_handshake_line(raw: bytes | str) -> WorkerHandshake:
-    value = _object(_decode_json_line(raw), "handshake", {"backend", "pid", "protocol", "version"})
-    protocol = _string(value["protocol"], "protocol")
-    if protocol != BENCHMARK_PROTOCOL_V1:
+    raw_value = _decode_json_line(raw)
+    if not isinstance(raw_value, dict):
+        raise WorkerProtocolError("handshake must be an object")
+    protocol = _string(raw_value.get("protocol"), "protocol")
+    if protocol == BENCHMARK_PROTOCOL_V1:
+        value = _object(raw_value, "handshake", {"backend", "pid", "protocol", "version"})
+        solver_version = None
+    elif protocol == WORKER_HANDSHAKE_PROTOCOL_V2:
+        value = _object(raw_value, "handshake", {"backend", "pid", "protocol", "version", "solver_version"})
+        solver_version = _string(value["solver_version"], "solver_version")
+    else:
         raise WorkerProtocolError(f"unsupported protocol: {protocol}")
     backend = _string(value["backend"], "backend")
     if backend not in SUPPORTED_BACKENDS:
         raise WorkerProtocolError(f"unsupported backend: {backend}")
     version = _string(value["version"], "version")
     pid = _positive_int(value["pid"], "pid")
-    return WorkerHandshake(protocol, backend, version, pid)
+    return WorkerHandshake(protocol, backend, version, pid, solver_version)
 
 
 def encode_request_line(request: WorkerRequest | Mapping[str, object]) -> bytes:
@@ -684,7 +694,7 @@ class WorkerHarness:
                 )
             return WorkerOutcome(
                 request.request_id, "OK", "COMPLETED", process.pid, pgid, worker.peak_rss_kib,
-                False, True, response, worker.handshake.version if worker.handshake is not None else None,
+                False, True, response, worker.handshake.solver_version if worker.handshake is not None else None,
             )
         except TimeoutError:
             termination = "INVALID_OUTPUT" if worker.reader.stdout_buffer else "HARD_TIMEOUT"
@@ -871,9 +881,14 @@ def _run_worker(args: argparse.Namespace) -> int:
 
         adapter_type = {"highs": HighsBackend, "scip": ScipBackend, "cp_sat": CpSatBackend}[backend]
         solver_version = adapter_type().version
-    handshake_protocol = "unsupported.protocol.v9" if mode == "protocol-mismatch" else BENCHMARK_PROTOCOL_V1
+    handshake_protocol = "unsupported.protocol.v9" if mode == "protocol-mismatch" else (
+        BENCHMARK_PROTOCOL_V1 if mode else WORKER_HANDSHAKE_PROTOCOL_V2
+    )
+    handshake = {"backend": backend, "pid": os.getpid(), "protocol": handshake_protocol, "version": WORKER_VERSION}
+    if not mode:
+        handshake["solver_version"] = solver_version
     sys.stdout.buffer.write(
-        _encode_line({"backend": backend, "pid": os.getpid(), "protocol": handshake_protocol, "version": solver_version})
+        _encode_line(handshake)
     )
     sys.stdout.buffer.flush()
     seen: set[str] = set()

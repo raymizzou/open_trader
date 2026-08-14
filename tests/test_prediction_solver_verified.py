@@ -304,6 +304,28 @@ def test_solve_preserves_returned_worker_solver_version() -> None:
     assert payload["solver_version"] == "9.15.6755"
 
 
+def test_direct_solve_rejects_a_worker_request_id() -> None:
+    with pytest.raises(ValueError, match="request_id"):
+        solve(
+            canonical_payload(proof_input()),
+            backend=type("Backend", (), {"name": "cp_sat", "version": "test"})(),
+            request_id="worker-only",
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"harness": object()},
+        {"harness": object(), "request_id": ""},
+        {"backend": type("Backend", (), {"name": "cp_sat", "version": "test"})(), "harness": object(), "request_id": "worker-id"},
+    ),
+)
+def test_worker_solve_requires_a_nonempty_request_id_and_no_direct_backend(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="worker solve"):
+        solve(canonical_payload(proof_input()), **kwargs)
+
+
 def test_default_cp_sat_import_failure_is_persisted_as_unknown_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
     def unavailable(*args, **kwargs):
         raise ModuleNotFoundError("ortools")

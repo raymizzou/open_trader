@@ -154,6 +154,8 @@ def solve(
         if backend is not None or not isinstance(request_id, str) or not request_id.strip():
             raise ValueError("worker solve requires request_id and no direct backend")
         return _solve_via_worker(payload, harness, request_id=request_id)
+    if request_id is not None:
+        raise ValueError("direct solve does not accept request_id")
     proof_input = proof_input_from_payload(payload)
     if backend is None:
         from open_trader.prediction_solver_backends import CpSatBackend

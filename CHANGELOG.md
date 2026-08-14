@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-14
 
+- #50 worker replay keeps legacy handshake-v1 `version` semantics and adds a strict handshake-v2 `solver_version` field for native proof evidence; old v1 workers remain version-unavailable rather than guessed. Direct solve no longer accepts worker-only request IDs. Host WorkerHarness, benchmark, and isolated CP-SAT bridge checks passed.
+
 - #50 proof replay now has only the public `solve`/`verify` seams: `verify` maps canonical semantic drift to `UNKNOWN` while strict codecs still reject it; structural model identity is separated from executable quote costs, and worker evidence retains the native solver version. Verified with host-visible WorkerHarness and isolated CP-SAT positive/negative paths; no database, network, order, or notification change.
 
 - #50 proof review hardening: terminal atom rule version must match its state-set rule; quote fingerprints are recalculated from canonical executable costs; replay decoding binds model/portfolio/quote/generation to its supplied source evidence. Component `NO_QUALIFIED_OPPORTUNITY` is now emitted only by a completed bounded exact Oracle proof; CP-SAT no-candidate remains `UNKNOWN`. CP-SAT `FEASIBLE` admission evidence no longer claims native `OPTIMAL`.
