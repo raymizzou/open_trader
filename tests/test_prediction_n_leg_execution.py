@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 
@@ -10,13 +10,17 @@ from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_executable_cost import ExecutionLegEvidence, ExecutionSolution
 from open_trader.prediction_n_leg import ActionQuantity, fingerprint
 from open_trader.prediction_n_leg_execution import (
+    ConfirmedHolding,
     ExecutionSolutionSource,
+    ReconciliationContext,
+    RepairQuote,
     RepairContext,
     NLegExecutionService,
     OrderReceipt,
     PartialFillProofRecord,
     execution_solution_binding,
     order_receipt_from_payload,
+    partial_fill_proof_from_payload,
 )
 from test_prediction_executable_cost import AS_OF, two_leg_books, two_leg_component
 from test_prediction_solver import BruteForceBackend
@@ -111,21 +115,20 @@ def receipt(*, leg: str, filled: int, state: str, sequence: int) -> OrderReceipt
     )
 
 
-def repair_context(*, candidates: list[dict[str, object]] = []) -> RepairContext:
-    execution = solution()
-    binding = execution_solution_binding(execution)
-    values = {"reservation_version": "batch-1:v1", "model_fingerprint": execution.market_solution_fingerprint, "quote_fingerprint": binding["quote_fingerprint"], "account_fingerprint": execution.account_snapshot_fingerprint, "occurred_cost_units": 0, "occurred_fee_units": 0, "quotes": (("batch-1:action-a", 1, 2), ("batch-1:action-b", 1, 2)), "holdings": (("batch-1:action-a", 4), ("batch-1:action-b", 0))}
-    values["fingerprint"] = fingerprint(values)
-    return RepairContext(**values)
+def repair_context(*, b_buy: int = 1, b_venue: str = "venue-b") -> RepairContext:
+    return RepairContext(
+        "batch-1:v1",
+        (
+            RepairQuote("batch-1:action-a", "venue-a", "account-a", "usd-cents", 1, 2, AS_OF, AS_OF),
+            RepairQuote("batch-1:action-b", b_venue, "account-b", "usd-cents", b_buy, 2, AS_OF, AS_OF),
+        ),
+        (ConfirmedHolding("venue-a", "account-a", "action-a", 4), ConfirmedHolding("venue-b", "account-b", "action-b", 0)),
+        0, 0, AS_OF,
+    )
 
 
-def reconciliation_context() -> dict[str, object]:
-    return {
-        "fresh": True,
-        "balance_fingerprint": "balance-v1",
-        "holding_fingerprint": "holdings-v1",
-        "reservation_version": "batch-1:v1",
-    }
+def reconciliation_context(batch_id: str = "batch-1") -> ReconciliationContext:
+    return ReconciliationContext(f"{batch_id}:v1", source_and_solution()[0].account_snapshot, (), AS_OF, AS_OF, AS_OF)
 
 
 def test_entry_claims_one_batch_and_survives_reopen(tmp_path) -> None:
@@ -152,6 +155,23 @@ def test_entry_claims_one_batch_and_survives_reopen(tmp_path) -> None:
         )
 
 
+def test_entry_retry_uses_immutable_fingerprint_after_receipt_evolves(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    evolved = current.apply_receipt(receipt(leg="a", filled=0, state="REJECTED", sequence=1))
+    assert current.enter(
+        opportunity_episode_id="episode-1", episode_lineage_id="lineage-1", execution_batch_id="batch-1",
+        source=source_and_solution()[0], partial_fill_proof=proof(solution()), mode="AUTO", cap_config_version="caps-v1",
+    ) == evolved
+
+
+def test_proof_decoder_is_strict_at_public_contract() -> None:
+    accepted = proof(solution())
+    assert partial_fill_proof_from_payload(accepted.to_payload()) == accepted
+    with pytest.raises(ValueError, match="unexpected"):
+        partial_fill_proof_from_payload({**accepted.to_payload(), "extra": True})
+
+
 def test_partial_fill_opens_incident_downgrades_mode_and_fixes_best_manual_plan(tmp_path) -> None:
     current = service(tmp_path)
     enter(current)
@@ -164,10 +184,7 @@ def test_partial_fill_opens_incident_downgrades_mode_and_fixes_best_manual_plan(
     current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
     planned = current.apply_receipt(
         receipt(leg="a", filled=4, state="CANCELLED", sequence=2),
-        repair_context=repair_context(candidates=[
-            {"family": "COMPLETE_REMAINING", "conservative_total_loss_units": 8, "legs": [{"client_order_id": "batch-1:action-a", "quantity": 6}, {"client_order_id": "batch-1:action-b", "quantity": 10}], "additional_capital_units": 0, "uses_expected_proceeds": False},
-            {"family": "EXIT_CONFIRMED", "conservative_total_loss_units": 12, "legs": [{"client_order_id": "batch-1:action-a", "quantity": 4}], "additional_capital_units": 0, "uses_expected_proceeds": False},
-        ]),
+        repair_context=repair_context(),
     )
     plan = planned["repair_plan"]
     assert isinstance(plan, dict)
@@ -176,16 +193,11 @@ def test_partial_fill_opens_incident_downgrades_mode_and_fixes_best_manual_plan(
     assert plan["reason"] == "REPAIR_PROOF_REQUIRED"
 
 
-def test_repair_context_rejects_self_consistent_changed_source_fingerprint(tmp_path) -> None:
+def test_repair_context_rejects_structural_venue_mismatch(tmp_path) -> None:
     current = service(tmp_path)
     enter(current)
     current.apply_receipt(receipt(leg="a", filled=4, state="CANCELLED", sequence=1))
-    context = repair_context()
-    values = asdict(context)
-    values["quote_fingerprint"] = "changed-quote"
-    values.pop("fingerprint")
-    values["fingerprint"] = fingerprint(values)
-    rejected = current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1), repair_context=RepairContext(**values))
+    rejected = current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1), repair_context=repair_context(b_venue="other-venue"))
     assert rejected["repair_plan"] is None
 
 
@@ -203,6 +215,16 @@ def test_reconciliation_replay_cannot_clear_a_later_active_batch(tmp_path) -> No
     assert current.control() == before
 
 
+def test_repair_cannot_use_one_leg_reservation_for_another_leg(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    current.apply_receipt(receipt(leg="a", filled=4, state="CANCELLED", sequence=1))
+    context = repair_context()
+    # Aggregate reservation is ample, but action-b cannot consume action-a's key.
+    rejected = current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1), repair_context=repair_context(b_buy=511))
+    assert rejected["repair_plan"]["family"] == "EXIT_CONFIRMED"
+
+
 def test_same_sequence_conflict_opens_persistent_breaker(tmp_path) -> None:
     current = service(tmp_path)
     enter(current)
@@ -212,6 +234,23 @@ def test_same_sequence_conflict_opens_persistent_breaker(tmp_path) -> None:
 
     assert conflict["incident"] == {"reason": "SAME_SEQUENCE_CONFLICT", "repair_status": "PENDING_RECONCILIATION"}
     assert current.control()["mode"] == "MANUAL"
+
+
+def test_same_sequence_semantic_duplicate_ignores_receipt_id_and_time(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    first = current.apply_receipt(receipt(leg="a", filled=0, state="OPEN", sequence=1))
+    duplicate = replace(receipt(leg="a", filled=0, state="OPEN", sequence=1), receipt_id="different-id", observed_at="2026-08-15T00:00:01Z", venue_timestamp="2026-08-15T00:00:01Z")
+    assert current.apply_receipt(duplicate) == first
+
+
+def test_venue_order_id_is_stable_after_first_confirmation(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    first = replace(receipt(leg="a", filled=0, state="OPEN", sequence=1), venue_order_id="venue-order-1")
+    current.apply_receipt(first)
+    conflict = current.apply_receipt(replace(first, receipt_id="next", venue_order_id="venue-order-2", sequence=2))
+    assert conflict["incident"]["reason"] == "VENUE_ORDER_ID_DRIFT"
 
 
 def test_entry_fails_closed_for_unsafe_or_over_partial_fill_cap(tmp_path) -> None:
@@ -267,6 +306,22 @@ def test_all_terminal_full_fill_reconciles_without_incident_and_retains_unsettle
     assert current.control()["total_unsettled_capital_units"] == 1020
 
 
+def test_prior_unsettled_capital_survives_a_later_zero_fill_batch(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    current.apply_receipt(receipt(leg="a", filled=10, state="FILLED", sequence=1))
+    current.apply_receipt(receipt(leg="b", filled=10, state="FILLED", sequence=1))
+    current.complete_reconciliation("batch-1", context=reconciliation_context())
+    current.enter(
+        opportunity_episode_id="episode-2", episode_lineage_id="lineage-2", execution_batch_id="batch-2",
+        source=source_and_solution()[0], partial_fill_proof=proof(solution()), mode="MANUAL", cap_config_version="caps-v1",
+    )
+    current.apply_receipt(replace(receipt(leg="a", filled=0, state="REJECTED", sequence=1), execution_batch_id="batch-2", client_order_id="batch-2:action-a"))
+    current.apply_receipt(replace(receipt(leg="b", filled=0, state="REJECTED", sequence=1), execution_batch_id="batch-2", client_order_id="batch-2:action-b"))
+    current.complete_reconciliation("batch-2", context=reconciliation_context("batch-2"))
+    assert current.control()["total_unsettled_capital_units"] == 1020
+
+
 def test_unknown_receipt_opens_global_breaker_and_stale_receipt_is_ignored(tmp_path) -> None:
     current = service(tmp_path)
     enter(current)
@@ -300,7 +355,7 @@ def test_over_cap_repair_is_retained_but_breaks_automatic_authority(tmp_path) ->
     current.apply_receipt(receipt(leg="a", filled=4, state="CANCELLED", sequence=1))
     failed = current.apply_receipt(
         receipt(leg="b", filled=0, state="REJECTED", sequence=1),
-        repair_context=repair_context(candidates=[{"family": "EXIT_CONFIRMED", "conservative_total_loss_units": 8, "legs": [{"client_order_id": "batch-1:action-a", "quantity": 4}], "additional_capital_units": 0, "uses_expected_proceeds": False}]),
+        repair_context=repair_context(),
     )
 
     assert failed["repair_plan"] == {
@@ -346,7 +401,10 @@ def test_conflict_keeps_old_and_new_receipt_facts(tmp_path) -> None:
 
     conflict = current.apply_receipt(new)
 
-    assert conflict["receipt_conflicts"] == [{"reason": "SAME_SEQUENCE_CONFLICT", "old": old.to_payload(), "new": new.to_payload()}]
+    assert conflict["receipt_conflicts"][0] == {
+        "transition_id": fingerprint({"reason": "SAME_SEQUENCE_CONFLICT", "old": old.to_payload(), "new": new.to_payload()}),
+        "reason": "SAME_SEQUENCE_CONFLICT", "old": old.to_payload(), "new": new.to_payload(),
+    }
 
 
 def test_partial_fill_gate_uses_proven_upper_loss_bound_not_principal(tmp_path) -> None:

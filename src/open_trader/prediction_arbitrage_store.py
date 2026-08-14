@@ -2061,9 +2061,9 @@ class PredictionArbitrageStore:
             ).fetchone()
             if existing is not None:
                 result = _load_payload(str(existing["payload"]))
-                comparable = dict(result)
-                comparable.pop("prior_unsettled_capital_units", None)
-                if comparable != dict(payload):
+                # Batches evolve after Entry. Retry identity is the immutable
+                # entry fingerprint, not the mutable receipt/reconciliation state.
+                if result.get("entry_fingerprint") != payload.get("entry_fingerprint"):
                     raise ValueError("N_LEG_BATCH_ID_CONFLICT")
                 return result
             control = self._n_leg_control_row(
