@@ -47,6 +47,21 @@ def quote_fingerprint(problem: object) -> str:
     })
 
 
+def model_fingerprint(problem: object) -> str:
+    """Bind structural and settlement semantics while excluding executable quotes."""
+    payload = canonical_payload(problem)
+    actions = payload.get("actions")
+    if not isinstance(actions, list) or not all(isinstance(action, Mapping) and "cost_slices" in action for action in actions):
+        raise ValueError("problem actions must be canonical")
+    return fingerprint({
+        **payload,
+        "actions": tuple(
+            {name: value for name, value in action.items() if name != "cost_slices"}
+            for action in actions
+        ),
+    })
+
+
 @dataclass(frozen=True, slots=True)
 class ProofInput:
     schema_version: str
@@ -97,7 +112,7 @@ class CandidateEvidence:
         _string(self.solver_name, "solver_name")
         _string(self.solver_version, "solver_version")
         _fingerprint(self.model_fingerprint, "model_fingerprint")
-        if self.model_fingerprint != fingerprint(self.proof_input.request.problem):
+        if self.model_fingerprint != model_fingerprint(self.proof_input.request.problem):
             raise ValueError("candidate evidence model fingerprint mismatch")
         candidate = self.solver_evidence.candidate
         if candidate is None:
@@ -127,8 +142,18 @@ def candidate_evidence_from_payload(payload: object) -> CandidateEvidence:
         raise ValueError(f"invalid candidate evidence: {exc}") from exc
 
 
-def solve(payload: object, *, backend: SolverBackend | None = None) -> dict[str, object]:
+def solve(
+    payload: object,
+    *,
+    backend: SolverBackend | None = None,
+    harness: WorkerHarness | None = None,
+    request_id: str | None = None,
+) -> dict[str, object]:
     """Consume only a canonical proof input and persist CP-SAT candidate evidence."""
+    if harness is not None:
+        if backend is not None or not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("worker solve requires request_id and no direct backend")
+        return _solve_via_worker(payload, harness, request_id=request_id)
     proof_input = proof_input_from_payload(payload)
     if backend is None:
         from open_trader.prediction_solver_backends import CpSatBackend
@@ -141,17 +166,20 @@ def solve(payload: object, *, backend: SolverBackend | None = None) -> dict[str,
     return canonical_payload(_candidate_evidence(proof_input, backend.name, backend.version, solver_evidence))
 
 
-def solve_via_worker(payload: object, harness: WorkerHarness, *, request_id: str) -> dict[str, object]:
+def _solve_via_worker(payload: object, harness: WorkerHarness, *, request_id: str) -> dict[str, object]:
     """Run the CP-SAT step through the existing serialized worker harness."""
     proof_input = proof_input_from_payload(payload)
     outcome = harness.submit(WorkerRequest(request_id, "cp_sat", proof_input.request, proof_input.limits))
+    solver_version = getattr(outcome, "solver_version", None)
+    if not isinstance(solver_version, str) or not solver_version.strip():
+        solver_version = "unavailable"
     if outcome.status != "OK" or outcome.response is None or outcome.response.evidence is None:
-        return canonical_payload(_candidate_evidence(proof_input, "cp_sat", "worker", _empty_solver_evidence(outcome.termination)))
+        return canonical_payload(_candidate_evidence(proof_input, "cp_sat", solver_version, _empty_solver_evidence(outcome.termination)))
     try:
         solver_evidence = solver_evidence_from_payload(outcome.response.evidence)
     except ValueError:
         solver_evidence = _empty_solver_evidence("INVALID_WORKER_EVIDENCE")
-    return canonical_payload(_candidate_evidence(proof_input, "cp_sat", "worker", solver_evidence))
+    return canonical_payload(_candidate_evidence(proof_input, "cp_sat", solver_version, solver_evidence))
 
 
 def _candidate_evidence(proof_input: ProofInput, solver_name: str, solver_version: str, solver_evidence: SolverEvidence) -> CandidateEvidence:
@@ -160,7 +188,7 @@ def _candidate_evidence(proof_input: ProofInput, solver_name: str, solver_versio
         proof_input,
         solver_name,
         solver_version,
-        fingerprint(proof_input.request.problem),
+        model_fingerprint(proof_input.request.problem),
         None if solver_evidence.candidate is None else fingerprint({"quantities": solver_evidence.candidate.quantities}),
         solver_evidence,
     )
@@ -207,13 +235,21 @@ class VerificationResult:
             raise ValueError("unknown verification must fail closed")
         if self.solution is not None:
             proof = self.solution.payout_proof
-            if proof.problem_fingerprint != self.model_fingerprint or proof.portfolio_fingerprint != self.portfolio_fingerprint or self.portfolio_fingerprint != fingerprint({"quantities": self.solution.quantities}):
+            if proof.portfolio_fingerprint != self.portfolio_fingerprint or self.portfolio_fingerprint != fingerprint({"quantities": self.solution.quantities}):
                 raise ValueError("verification result solution fingerprint mismatch")
 
 
 def verify(payload: object) -> dict[str, object]:
-    """Rebuild fixed-portfolio payout and qualification facts without solver objects."""
-    evidence = candidate_evidence_from_payload(payload)
+    """Verify candidate evidence or exact component input through one canonical seam."""
+    try:
+        if isinstance(payload, Mapping) and payload.get("schema_version") == PROOF_REQUEST_SCHEMA_V1:
+            return _verify_component(proof_input_from_payload(payload))
+        return _verify_candidate(candidate_evidence_from_payload(payload))
+    except (ModelDecodeError, TypeError, ValueError):
+        return canonical_payload(_invalid_unknown(payload))
+
+
+def _verify_candidate(evidence: CandidateEvidence) -> dict[str, object]:
     candidate = evidence.candidate
     if candidate is None:
         return canonical_payload(_unknown(evidence, "NO_CANDIDATE"))
@@ -246,19 +282,18 @@ def verify(payload: object) -> dict[str, object]:
     ))
 
 
-def verify_component(payload: object) -> dict[str, object]:
+def _verify_component(proof_input: ProofInput) -> dict[str, object]:
     """The sole component-negative path: bounded exact Oracle only."""
-    proof_input = proof_input_from_payload(payload)
     result = find_qualified(proof_input.request)
     if result.negative_proof is not None:
         return canonical_payload(VerificationResult(
             VERIFICATION_RESULT_SCHEMA_V1, VerificationStatus.NO_QUALIFIED_OPPORTUNITY, ProofLevel.NONE,
-            fingerprint(proof_input.request.problem), None, proof_input.quote_fingerprint,
+            model_fingerprint(proof_input.request.problem), None, proof_input.quote_fingerprint,
             proof_input.current_generation, None, result.negative_proof, None,
         ))
     return canonical_payload(VerificationResult(
         VERIFICATION_RESULT_SCHEMA_V1, VerificationStatus.UNKNOWN, ProofLevel.NONE,
-        fingerprint(proof_input.request.problem), None, proof_input.quote_fingerprint,
+        model_fingerprint(proof_input.request.problem), None, proof_input.quote_fingerprint,
         proof_input.current_generation, None, None, result.unknown_reason.value if result.unknown_reason else "QUALIFIED_CANDIDATE_EXISTS",
     ))
 
@@ -268,6 +303,51 @@ def _unknown(evidence: CandidateEvidence, reason: str) -> VerificationResult:
         VERIFICATION_RESULT_SCHEMA_V1, VerificationStatus.UNKNOWN, ProofLevel.NONE,
         evidence.model_fingerprint, evidence.portfolio_fingerprint, evidence.proof_input.quote_fingerprint,
         evidence.proof_input.current_generation, None, None, reason or "UNKNOWN",
+    )
+
+
+def _invalid_unknown(payload: object) -> VerificationResult:
+    """Map externally supplied malformed or semantically incompatible evidence to UNKNOWN."""
+    try:
+        raw = canonical_payload(payload)
+        source = raw.get("proof_input") if raw.get("schema_version") == CANDIDATE_EVIDENCE_SCHEMA_V1 else raw
+        if not isinstance(source, Mapping) or not isinstance(source.get("request"), Mapping):
+            raise ValueError("proof input is unavailable")
+        request = source["request"]
+        problem = request.get("problem")
+        if not isinstance(problem, Mapping):
+            raise ValueError("problem is unavailable")
+        generation = source.get("current_generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise ValueError("generation is unavailable")
+        portfolio = raw.get("portfolio_fingerprint")
+        if portfolio is not None:
+            _fingerprint(portfolio, "portfolio_fingerprint")
+        return VerificationResult(
+            VERIFICATION_RESULT_SCHEMA_V1,
+            VerificationStatus.UNKNOWN,
+            ProofLevel.NONE,
+            model_fingerprint(problem),
+            portfolio,
+            quote_fingerprint(problem),
+            generation,
+            None,
+            None,
+            "INVALID_CANONICAL_SEMANTICS",
+        )
+    except ValueError:
+        raw = {"invalid_payload": type(payload).__name__}
+    return VerificationResult(
+        VERIFICATION_RESULT_SCHEMA_V1,
+        VerificationStatus.UNKNOWN,
+        ProofLevel.NONE,
+        fingerprint({"invalid_model": raw}),
+        None,
+        fingerprint({"invalid_quote": raw}),
+        0,
+        None,
+        None,
+        "INVALID_CANONICAL_SEMANTICS",
     )
 
 
@@ -287,13 +367,28 @@ def verification_result_from_payload(payload: object, *, source: ProofInput | Ca
             None if value["unknown_reason"] is None else _string(value["unknown_reason"], "unknown_reason"),
         )
         proof_input = source.proof_input if isinstance(source, CandidateEvidence) else source
-        if not isinstance(proof_input, ProofInput) or (
-            result.model_fingerprint != fingerprint(proof_input.request.problem)
+        source_type_matches = (
+            result.status in {VerificationStatus.QUALIFIED_VERIFIED, VerificationStatus.NOT_QUALIFIED}
+            and isinstance(source, CandidateEvidence)
+        ) or (
+            result.status == VerificationStatus.NO_QUALIFIED_OPPORTUNITY
+            and isinstance(source, ProofInput)
+        ) or (
+            result.status == VerificationStatus.UNKNOWN
+            and (
+                isinstance(source, CandidateEvidence)
+                or (isinstance(source, ProofInput) and result.portfolio_fingerprint is None and result.unknown_reason != "NO_CANDIDATE")
+            )
+        )
+        if not source_type_matches or not isinstance(proof_input, ProofInput) or (
+            result.model_fingerprint != model_fingerprint(proof_input.request.problem)
             or result.quote_fingerprint != proof_input.quote_fingerprint
             or result.current_generation != proof_input.current_generation
             or isinstance(source, CandidateEvidence) and result.portfolio_fingerprint != source.portfolio_fingerprint
+            or isinstance(source, CandidateEvidence) and source.candidate is None and result.status == VerificationStatus.UNKNOWN and result.unknown_reason != "NO_CANDIDATE"
+            or result.solution is not None and result.solution.payout_proof.problem_fingerprint != fingerprint(proof_input.request.problem)
             or result.negative_proof is not None and (
-                result.negative_proof.problem_fingerprint != result.model_fingerprint
+                result.negative_proof.problem_fingerprint != fingerprint(proof_input.request.problem)
                 or result.negative_proof.request_fingerprint != fingerprint(proof_input.request)
             )
         ):

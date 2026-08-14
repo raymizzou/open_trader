@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-14
 
+- #50 proof replay now has only the public `solve`/`verify` seams: `verify` maps canonical semantic drift to `UNKNOWN` while strict codecs still reject it; structural model identity is separated from executable quote costs, and worker evidence retains the native solver version. Verified with host-visible WorkerHarness and isolated CP-SAT positive/negative paths; no database, network, order, or notification change.
+
 - #50 proof review hardening: terminal atom rule version must match its state-set rule; quote fingerprints are recalculated from canonical executable costs; replay decoding binds model/portfolio/quote/generation to its supplied source evidence. Component `NO_QUALIFIED_OPPORTUNITY` is now emitted only by a completed bounded exact Oracle proof; CP-SAT no-candidate remains `UNKNOWN`. CP-SAT `FEASIBLE` admission evidence no longer claims native `OPTIMAL`.
 
 - #50 新增纯序列化 `SOLVER_VERIFIED` 证明入口：CP-SAT `FEASIBLE` 候选可持久化为带模型、组合、行情和 generation 指纹的 evidence；独立 verifier 仅以该 canonical input 和固定组合，经既有精确 Oracle 重算最坏结算、成本、资本释放与资格。固定候选合格才为 `QUALIFIED_VERIFIED`，不合格仅为候选级 `NOT_QUALIFIED`；组件级 `NO_QUALIFIED_OPPORTUNITY` 仅来自完整 exact Oracle，CP-SAT 无候选或不完整路径为 `UNKNOWN`。复用既有 WorkerHarness serialized I/O；无数据库、网络、订单或通知改动。验证：proof/N_LEG/Oracle/solver 回归通过；本地 `/private/tmp` WorkerHarness 清理证明受限，单独记录为 `CLEANUP_UNPROVEN`。

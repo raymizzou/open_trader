@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,12 +44,11 @@ from open_trader.prediction_solver_verified import (
     CandidateEvidence,
     ProofInput,
     candidate_evidence_from_payload,
+    model_fingerprint,
     proof_input_from_payload,
     quote_fingerprint,
     solve,
-    solve_via_worker,
     verify,
-    verify_component,
     verification_result_from_payload,
 )
 
@@ -112,6 +112,38 @@ def test_quote_fingerprint_rejects_actions_without_embedded_cost_input() -> None
         quote_fingerprint({"actions": [{"action_id": "action-a"}]})
 
 
+def test_quote_only_cost_change_keeps_model_identity_but_changes_quote_identity() -> None:
+    original = proof_input()
+    action = original.request.problem.actions[0]
+    repriced_problem = replace(
+        original.request.problem,
+        actions=(replace(action, cost_slices=(ExecutableCostSlice(1, 1, 3),)),),
+    )
+    repriced = replace(
+        original,
+        request=replace(original.request, problem=repriced_problem),
+        quote_fingerprint=quote_fingerprint(repriced_problem),
+    )
+
+    assert candidate_evidence(original).model_fingerprint == candidate_evidence(repriced).model_fingerprint
+    assert original.quote_fingerprint != repriced.quote_fingerprint
+
+
+def test_structural_change_changes_model_identity() -> None:
+    original = proof_input()
+    changed_problem = replace(
+        original.request.problem,
+        qualification_constraints=(QualificationConstraint("profit", "rules-v1", QualificationMetric.GUARANTEED_PROFIT_UNITS, Comparison.GREATER_THAN_OR_EQUAL, 2, 1),),
+    )
+    changed = replace(
+        original,
+        request=replace(original.request, problem=changed_problem),
+        quote_fingerprint=quote_fingerprint(changed_problem),
+    )
+
+    assert candidate_evidence(original).model_fingerprint != candidate_evidence(changed).model_fingerprint
+
+
 def test_candidate_evidence_codec_persists_canonical_candidate_and_fingerprints() -> None:
     evidence = candidate_evidence(proof_input())
     payload = canonical_payload(evidence)
@@ -145,6 +177,29 @@ def test_verify_independently_recomputes_fixed_candidate_as_solver_verified() ->
     assert verification_result_from_payload(payload, source=candidate_evidence(proof_input())).status.value == "QUALIFIED_VERIFIED"
 
 
+def test_positive_result_cannot_be_decoded_against_only_a_proof_input() -> None:
+    payload = verify(canonical_payload(candidate_evidence(proof_input())))
+
+    with pytest.raises(ValueError, match="source binding"):
+        verification_result_from_payload(payload, source=proof_input())
+
+
+def test_no_candidate_unknown_cannot_be_decoded_against_only_a_proof_input() -> None:
+    original = candidate_evidence(proof_input())
+    evidence = replace(
+        original,
+        portfolio_fingerprint=None,
+        solver_evidence=SolverEvidence(
+            "INFEASIBLE", None, ObjectiveBounds(None, None, None, False), None, None, None, None,
+            None, False, False, 0, 0, (), None,
+        ),
+    )
+    payload = verify(canonical_payload(evidence))
+
+    with pytest.raises(ValueError, match="source binding"):
+        verification_result_from_payload(payload, source=evidence.proof_input)
+
+
 def test_not_qualified_candidate_cannot_become_component_negative_proof() -> None:
     input_ = proof_input()
     not_qualified = replace(
@@ -176,7 +231,7 @@ def test_component_negative_requires_completed_exact_oracle() -> None:
         )),
     )
 
-    payload = verify_component(canonical_payload(no_qualification))
+    payload = verify(canonical_payload(no_qualification))
 
     assert payload["status"] == "NO_QUALIFIED_OPPORTUNITY"
     assert payload["negative_proof"]["proof_method"] == "EXHAUSTIVE_ORACLE_V1"
@@ -191,7 +246,7 @@ def test_component_negative_proof_tampering_fails_source_binding() -> None:
             qualification_constraints=(QualificationConstraint("profit", "rules-v1", QualificationMetric.GUARANTEED_PROFIT_UNITS, Comparison.GREATER_THAN_OR_EQUAL, 4, 1),),
         )),
     )
-    payload = verify_component(canonical_payload(no_qualification))
+    payload = verify(canonical_payload(no_qualification))
     payload["negative_proof"]["problem_fingerprint"] = "sha256:" + "b" * 64
 
     with pytest.raises(ValueError, match="source binding"):
@@ -211,7 +266,7 @@ def test_result_tampering_fails_source_and_solution_binding(field, value) -> Non
         verification_result_from_payload(payload, source=evidence)
 
 
-def test_solve_via_worker_accepts_only_serialized_worker_evidence() -> None:
+def test_solve_accepts_only_serialized_worker_evidence() -> None:
     expected = candidate_evidence(proof_input())
 
     class Harness:
@@ -222,9 +277,31 @@ def test_solve_via_worker_accepts_only_serialized_worker_evidence() -> None:
                 WorkerResponse("open_trader.prediction_solver.protocol.v1", "cp_sat", request.request_id, "OK", canonical_payload(expected.solver_evidence), {name: 0 for name in ("backend", "first_qualified", "optimal", "certificate_generation", "certificate_completion", "certificate_check", "serialization")}, ()),
             )
 
-    payload = solve_via_worker(canonical_payload(proof_input()), Harness(), request_id="proof-1")
+    payload = solve(canonical_payload(proof_input()), harness=Harness(), request_id="proof-1")
 
     assert candidate_evidence_from_payload(payload).candidate == expected.candidate
+
+
+def test_solve_preserves_returned_worker_solver_version() -> None:
+    expected = candidate_evidence(proof_input())
+
+    class Harness:
+        def submit(self, request):
+            return SimpleNamespace(
+                status="OK",
+                termination="COMPLETED",
+                solver_version="9.15.6755",
+                response=WorkerResponse(
+                    "open_trader.prediction_solver.protocol.v1", "cp_sat", request.request_id, "OK",
+                    canonical_payload(expected.solver_evidence),
+                    {name: 0 for name in ("backend", "first_qualified", "optimal", "certificate_generation", "certificate_completion", "certificate_check", "serialization")},
+                    (),
+                ),
+            )
+
+    payload = solve(canonical_payload(proof_input()), harness=Harness(), request_id="proof-version")
+
+    assert payload["solver_version"] == "9.15.6755"
 
 
 def test_default_cp_sat_import_failure_is_persisted_as_unknown_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -259,7 +336,7 @@ def test_incomplete_exact_fixed_adversary_fails_closed_as_unknown() -> None:
     evidence = replace(
         candidate_evidence(expanded),
         proof_input=limited,
-        model_fingerprint=fingerprint(limited.request.problem),
+        model_fingerprint=model_fingerprint(limited.request.problem),
     )
 
     payload = verify(canonical_payload(evidence))
@@ -307,7 +384,7 @@ def test_component_negative_replays_multiple_completed_exact_oracle_cases(case_i
     oracle = find_qualified(input_.request)
     assert oracle.negative_proof is not None
 
-    result = verification_result_from_payload(verify_component(canonical_payload(input_)), source=input_)
+    result = verification_result_from_payload(verify(canonical_payload(input_)), source=input_)
 
     assert result.status.value == "NO_QUALIFIED_OPPORTUNITY"
     assert result.negative_proof == oracle.negative_proof
@@ -319,7 +396,7 @@ def test_component_negative_budget_exhaustion_replays_as_unknown(case_id: str) -
     oracle = find_qualified(input_.request)
     assert oracle.negative_proof is None and oracle.unknown_reason is not None
 
-    result = verification_result_from_payload(verify_component(canonical_payload(input_)), source=input_)
+    result = verification_result_from_payload(verify(canonical_payload(input_)), source=input_)
 
     assert result.status.value == "UNKNOWN"
     assert result.unknown_reason == oracle.unknown_reason.value
@@ -332,12 +409,14 @@ def test_component_negative_budget_exhaustion_replays_as_unknown(case_id: str) -
         lambda payload: payload["proof_input"]["request"]["problem"]["terminal_state_sets"][0]["atoms"][0].__setitem__("rule_version", "rules-v2"),
     ),
 )
-def test_fingerprint_or_terminal_rule_drift_is_rejected_before_verification(mutate) -> None:
+def test_fingerprint_or_terminal_rule_drift_fails_closed_as_unknown(mutate) -> None:
     payload = canonical_payload(candidate_evidence(proof_input()))
     mutate(payload)
 
-    with pytest.raises(ValueError):
-        verify(payload)
+    result = verify(payload)
+
+    assert result["status"] == "UNKNOWN"
+    assert result["unknown_reason"] == "INVALID_CANONICAL_SEMANTICS"
 
 
 def test_terminal_atom_rule_version_mismatch_fails_closed() -> None:
@@ -345,7 +424,20 @@ def test_terminal_atom_rule_version_mismatch_fails_closed() -> None:
     payload["proof_input"]["request"]["problem"]["terminal_state_sets"][0]["atoms"][0]["rule_version"] = "other-rules"
 
     with pytest.raises(ValueError, match="TERMINAL_RULE_VERSION_MISMATCH"):
-        verify(payload)
+        candidate_evidence_from_payload(payload)
+
+
+def test_verify_maps_recomputed_terminal_rule_mismatch_to_canonical_unknown() -> None:
+    payload = canonical_payload(candidate_evidence(proof_input()))
+    problem = payload["proof_input"]["request"]["problem"]
+    problem["terminal_state_sets"][0]["atoms"][0]["rule_version"] = "rules-v2"
+    payload["model_fingerprint"] = model_fingerprint(problem)
+
+    result = verify(payload)
+
+    assert result["status"] == "UNKNOWN"
+    assert result["unknown_reason"] == "INVALID_CANONICAL_SEMANTICS"
+    assert result["model_fingerprint"] == model_fingerprint(problem)
 
 
 def candidate_evidence(input_: ProofInput, quantities: tuple[ActionQuantity, ...] = (ActionQuantity("action-a", 1),)) -> CandidateEvidence:
@@ -358,6 +450,6 @@ def candidate_evidence(input_: ProofInput, quantities: tuple[ActionQuantity, ...
         True, False, 1, 1, (cut_from_scenario(input_.request.problem, evaluation.worst_scenario),), None,
     )
     return CandidateEvidence(
-        CANDIDATE_EVIDENCE_SCHEMA_V1, input_, "cp_sat", "test", fingerprint(input_.request.problem),
+        CANDIDATE_EVIDENCE_SCHEMA_V1, input_, "cp_sat", "test", model_fingerprint(input_.request.problem),
         fingerprint({"quantities": quantities}), solver_evidence,
     )

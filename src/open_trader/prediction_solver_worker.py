@@ -243,6 +243,7 @@ class WorkerOutcome:
     retried: bool
     cleanup_proven: bool
     response: WorkerResponse | None = None
+    solver_version: str | None = None
 
 
 def decode_handshake_line(raw: bytes | str) -> WorkerHandshake:
@@ -681,7 +682,10 @@ class WorkerHarness:
                     cleanup_proven,
                     response,
                 )
-            return WorkerOutcome(request.request_id, "OK", "COMPLETED", process.pid, pgid, worker.peak_rss_kib, False, True, response)
+            return WorkerOutcome(
+                request.request_id, "OK", "COMPLETED", process.pid, pgid, worker.peak_rss_kib,
+                False, True, response, worker.handshake.version if worker.handshake is not None else None,
+            )
         except TimeoutError:
             termination = "INVALID_OUTPUT" if worker.reader.stdout_buffer else "HARD_TIMEOUT"
             cleanup_proven = self._terminate_checked(worker)
@@ -860,9 +864,16 @@ def _run_worker(args: argparse.Namespace) -> int:
         return 2
     if args.memory_limit_bytes is not None:
         _apply_rlimit_as(args.memory_limit_bytes)
+    adapter_type = None
+    solver_version = WORKER_VERSION
+    if not mode:
+        from open_trader.prediction_solver_backends import CpSatBackend, HighsBackend, ScipBackend
+
+        adapter_type = {"highs": HighsBackend, "scip": ScipBackend, "cp_sat": CpSatBackend}[backend]
+        solver_version = adapter_type().version
     handshake_protocol = "unsupported.protocol.v9" if mode == "protocol-mismatch" else BENCHMARK_PROTOCOL_V1
     sys.stdout.buffer.write(
-        _encode_line({"backend": backend, "pid": os.getpid(), "protocol": handshake_protocol, "version": WORKER_VERSION})
+        _encode_line({"backend": backend, "pid": os.getpid(), "protocol": handshake_protocol, "version": solver_version})
     )
     sys.stdout.buffer.flush()
     seen: set[str] = set()
@@ -884,9 +895,8 @@ def _run_worker(args: argparse.Namespace) -> int:
             if mode:
                 response = _test_response(request, mode)
             else:
-                from open_trader.prediction_solver_backends import CpSatBackend, HighsBackend, ScipBackend
-
-                adapter = _TimingBackend({"highs": HighsBackend, "scip": ScipBackend, "cp_sat": CpSatBackend}[request.backend]())
+                assert adapter_type is not None
+                adapter = _TimingBackend(adapter_type())
                 started_ns = time.perf_counter_ns()
                 phase_timings = _zero_phase_timings()
 
