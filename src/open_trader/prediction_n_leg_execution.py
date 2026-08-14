@@ -582,11 +582,11 @@ class NLegExecutionService:
             result["reconciliation"] = canonical_payload(context)
             result["state"] = "RECONCILED_ZERO" if self._all_zero(batch) and not any(int(item["cumulative_filled_quantity"]) or int(item["cumulative_cost_units"]) or int(item["cumulative_fee_units"]) for item in terminal_ledger.values()) else "RECONCILED_FULL"
             result["incident"] = None
-            if self._all_zero(batch):
-                result["total_unsettled_capital_units"] = self._terminal_ledger_cost(batch)
+            current_unsettled = 0 if result["state"] == "RECONCILED_ZERO" else (self._terminal_ledger_cost(batch) if self._all_zero(batch) else self._batch_occupancy(batch))
+            result["total_unsettled_capital_units"] = current_unsettled
             control = dict(control)
             control["active_batch_id"] = None
-            control["total_unsettled_capital_units"] = self._prior_unsettled(batch) + (0 if result["state"] == "RECONCILED_ZERO" else (self._terminal_ledger_cost(batch) if self._all_zero(batch) else self._batch_occupancy(batch)))
+            control["total_unsettled_capital_units"] = self._prior_unsettled(batch) + current_unsettled
             if batch.get("incident") is not None:
                 control["mode"] = "MANUAL"
             return result, control, True
@@ -721,13 +721,13 @@ class NLegExecutionService:
         max_rest_version = max((item.get("max_rest_observation_version", -1) for item in related if type(item.get("max_rest_observation_version")) is int), default=-1)
         max_cash = max((item.get("max_actual_cash_units", 0) for item in related if type(item.get("max_actual_cash_units")) is int), default=0)
         max_fill = max((item.get("max_actual_filled_quantity", 0) for item in related if type(item.get("max_actual_filled_quantity")) is int), default=0)
+        latest_observed = max((str(item.get("max_observed_at", "")) for item in related), default="")
+        latest_source = max((str(item.get("max_source_timestamp", "")) for item in related), default="")
         dominates = receipt.cumulative_cost_units + receipt.cumulative_fee_units >= max_cash and receipt.cumulative_filled_quantity >= max_fill
         if type(receipt.sequence) is int:
-            dominates = dominates and receipt.sequence > max_sequence
+            dominates = dominates and max_rest_version < 0 and receipt.sequence > max_sequence and receipt.observed_at >= latest_observed and receipt.venue_timestamp >= latest_source
         elif receipt.rest_confirmed and type(receipt.rest_observation_version) is int:
-            latest_observed = max((str(item.get("max_observed_at", "")) for item in related), default="")
-            latest_source = max((str(item.get("max_source_timestamp", "")) for item in related), default="")
-            dominates = dominates and receipt.rest_observation_version > max_rest_version and receipt.observed_at > latest_observed and receipt.venue_timestamp > latest_source
+            dominates = dominates and max_sequence < 0 and receipt.rest_observation_version > max_rest_version and receipt.observed_at > latest_observed and receipt.venue_timestamp > latest_source
         else:
             dominates = False
         if not dominates:
@@ -756,7 +756,11 @@ class NLegExecutionService:
                 return False
             if evidence.observation_version <= (max_rest if type(max_rest) is int else -1):
                 return False
-            return (type(evidence.sequence) is int and evidence.sequence > (max_sequence if type(max_sequence) is int else -1)) or evidence.rest_confirmed
+            if type(max_rest) is int and max_rest >= 0:
+                return evidence.rest_confirmed and evidence.sequence is None
+            if type(max_sequence) is int and max_sequence >= 0:
+                return type(evidence.sequence) is int and evidence.sequence > max_sequence and not evidence.rest_confirmed
+            return evidence.rest_confirmed or type(evidence.sequence) is int
         return evidence.rest_confirmed and evidence.observation_version > (max_rest if type(max_rest) is int else -1)
 
     def _resolve_conflicts_with_evidence(self, batch: dict[str, object], evidence: tuple[ConflictResolutionEvidence, ...]) -> None:
@@ -769,20 +773,43 @@ class NLegExecutionService:
             return
         if not all(self._resolution_matches(conflict, actual[conflict_id]) for conflict_id, conflict in expected.items()):
             return
+        groups: dict[str, list[tuple[dict[str, object], ConflictResolutionEvidence]]] = {}
+        for conflict_id, conflict in expected.items():
+            key = conflict.get("physical_key")
+            if not isinstance(key, str):
+                return
+            groups.setdefault(key, []).append((conflict, actual[conflict_id]))
+        selected: dict[str, tuple[dict[str, object], ConflictResolutionEvidence]] = {}
+        for key, items in groups.items():
+            first = items[0][1]
+            facts = {(item.outcome, item.terminal_state, item.cumulative_filled_quantity, item.cumulative_cost_units, item.cumulative_fee_units, item.sequence, item.rest_confirmed, item.observation_version) for _, item in items}
+            if len(facts) != 1:
+                return
+            chosen = max(items, key=lambda pair: (pair[1].source_timestamp, pair[1].observed_at))
+            if not all(self._resolution_matches(conflict, chosen[1]) for conflict, _ in items):
+                return
+            selected[key] = chosen
         exposures = batch.get("conflict_exposure_by_physical_order")
         if isinstance(exposures, dict):
-            batch["conflict_exposure_by_physical_order"] = {key: value for key, value in exposures.items() if key not in {item.get("physical_key") for item in raw if isinstance(item, dict)}}
+            batch["conflict_exposure_by_physical_order"] = {key: value for key, value in exposures.items() if key not in selected}
         ledger = self._terminal_ledger(batch)
-        for conflict_id, conflict in expected.items():
-            item = actual[conflict_id]
+        for key, (conflict, item) in selected.items():
             if item.outcome == "TERMINAL":
-                ledger[str(conflict["physical_key"])] = {
-                    "client_order_id": item.client_order_id, "venue_order_id": item.venue_order_id,
-                    "venue_id": item.venue_id, "account_id": item.account_id, "asset_id": item.asset_id,
-                    "settlement_asset_id": item.settlement_asset_id, "cumulative_filled_quantity": item.cumulative_filled_quantity,
-                    "cumulative_cost_units": item.cumulative_cost_units, "cumulative_fee_units": item.cumulative_fee_units,
-                }
+                if conflict.get("kind") == "SAME_PHYSICAL":
+                    self._merge_canonical_resolution(batch, item)
+                else:
+                    maximum = int(conflict.get("conservative_max_units", 0))
+                    submitted = max(1, int(conflict.get("submitted_quantity", 1)))
+                    protected = (maximum * item.cumulative_filled_quantity + submitted - 1) // submitted
+                    ledger[key] = {
+                        "client_order_id": item.client_order_id, "venue_order_id": item.venue_order_id,
+                        "venue_id": item.venue_id, "account_id": item.account_id, "asset_id": item.asset_id,
+                        "settlement_asset_id": item.settlement_asset_id, "cumulative_filled_quantity": item.cumulative_filled_quantity,
+                        "cumulative_cost_units": item.cumulative_cost_units, "cumulative_fee_units": item.cumulative_fee_units,
+                        "holding_capital_units": max(item.cumulative_cost_units + item.cumulative_fee_units, protected),
+                    }
         batch["conflict_terminal_ledger"] = ledger
+        self._refresh_reservations(batch)
         holdings: dict[tuple[str, str, str], int] = {}
         for leg in batch.get("legs", []):
             if isinstance(leg, dict) and isinstance(leg.get("receipt"), dict):
@@ -796,13 +823,34 @@ class NLegExecutionService:
         batch["capital_exposure_unknown"] = False
 
     @staticmethod
+    def _merge_canonical_resolution(batch: dict[str, object], evidence: ConflictResolutionEvidence) -> None:
+        legs = batch.get("legs")
+        if not isinstance(legs, list):
+            return
+        for leg in legs:
+            receipt = leg.get("receipt") if isinstance(leg, dict) else None
+            if not isinstance(leg, dict) or not isinstance(receipt, dict) or leg.get("client_order_id") != evidence.client_order_id:
+                continue
+            if (leg.get("venue_id"), leg.get("account_id"), leg.get("asset_id"), leg.get("settlement_asset_id")) != (evidence.venue_id, evidence.account_id, evidence.asset_id, evidence.settlement_asset_id):
+                continue
+            receipt.update({
+                "venue_order_id": evidence.venue_order_id, "cumulative_filled_quantity": evidence.cumulative_filled_quantity,
+                "cumulative_cost_units": evidence.cumulative_cost_units, "cumulative_fee_units": evidence.cumulative_fee_units,
+                "state": evidence.terminal_state, "sequence": evidence.sequence, "rest_confirmed": evidence.rest_confirmed,
+                "rest_observation_version": evidence.observation_version if evidence.rest_confirmed else None,
+                "venue_timestamp": evidence.source_timestamp.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                "observed_at": evidence.observed_at.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            })
+            return
+
+    @staticmethod
     def _terminal_ledger(batch: Mapping[str, object]) -> dict[str, dict[str, object]]:
         raw = batch.get("conflict_terminal_ledger")
         return {key: dict(value) for key, value in raw.items() if isinstance(key, str) and isinstance(value, dict)} if isinstance(raw, dict) else {}
 
     @staticmethod
     def _terminal_ledger_cost(batch: Mapping[str, object]) -> int:
-        return sum(int(item["cumulative_cost_units"]) + int(item["cumulative_fee_units"]) for item in NLegExecutionService._terminal_ledger(batch).values())
+        return sum(int(item.get("holding_capital_units", int(item["cumulative_cost_units"]) + int(item["cumulative_fee_units"]))) for item in NLegExecutionService._terminal_ledger(batch).values())
 
     @classmethod
     def _incident_copy(cls, copy: dict[str, object], legs: list[dict[str, object]], receipts: dict[str, object], receipt: OrderReceipt, reason: str) -> tuple[dict[str, object], str, bool]:
@@ -825,6 +873,7 @@ class NLegExecutionService:
         unresolved = copy.get("unresolved_conflicts")
         observed_at = receipt.observed_at
         source_timestamp = receipt.venue_timestamp
+        known_max = int(matching.get("max_cost_units", 0)) if isinstance(matching, dict) else max((int(item.get("max_cost_units", 0)) for item in legs if isinstance(item, dict)), default=0)
         record = {
             "conflict_id": fingerprint({"reason": reason, "old": old, "new": receipt.to_payload(), "physical_identity": physical}),
             "physical_key": key, "physical_identity": list(physical), "intended_identity": list(intended) if intended is not None else None,
@@ -834,12 +883,12 @@ class NLegExecutionService:
             "max_source_timestamp": source_timestamp, "max_observed_at": observed_at,
             "max_actual_cash_units": receipt.cumulative_cost_units + receipt.cumulative_fee_units,
             "max_actual_filled_quantity": receipt.cumulative_filled_quantity,
+            "conservative_max_units": known_max, "submitted_quantity": int(matching.get("submitted_quantity", 1)) if isinstance(matching, dict) else max((int(item.get("submitted_quantity", 1)) for item in legs if isinstance(item, dict)), default=1),
         }
         copy["unresolved_conflicts"] = [*(unresolved if isinstance(unresolved, list) else []), record]
         exposures = copy.get("conflict_exposure_by_physical_order")
         exposure_by_order = dict(exposures) if isinstance(exposures, dict) else {}
         reported = receipt.cumulative_cost_units + receipt.cumulative_fee_units
-        known_max = int(matching.get("max_cost_units", 0)) if isinstance(matching, dict) else max((int(item.get("max_cost_units", 0)) for item in legs if isinstance(item, dict)), default=0)
         exposure = max(0, reported - known_max) if same_physical and isinstance(matching, dict) else max(known_max, reported)
         prior_exposure = exposure_by_order.get(key, 0)
         exposure_by_order[key] = max(prior_exposure if type(prior_exposure) is int else 0, exposure)

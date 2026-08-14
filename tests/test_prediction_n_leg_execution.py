@@ -695,7 +695,7 @@ def test_terminal_conflict_evidence_is_durable_economic_state_not_zero_reconcili
     conflict = current.apply_receipt(replace(original, receipt_id="drift", venue_order_id="venue-order-2", sequence=2))["unresolved_conflicts"][0]
     current.apply_receipt(replace(original, receipt_id="a-final", state="REJECTED", sequence=3))
     current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
-    evidence = replace(resolution_for(conflict), cumulative_filled_quantity=1, cumulative_cost_units=7, sequence=4)
+    evidence = replace(resolution_for(conflict), cumulative_filled_quantity=1, cumulative_cost_units=0, sequence=4)
     with pytest.raises(ValueError, match="CONFLICT_UNRESOLVED"):
         current.complete_reconciliation("batch-1", context=reconciliation_context(a_sequence=3, a_venue_order="venue-order-1", resolutions=(replace(evidence, source_timestamp=AS_OF, observed_at=AS_OF),)))
     assert current.state("batch-1")["unresolved_conflicts"]
@@ -705,8 +705,54 @@ def test_terminal_conflict_evidence_is_durable_economic_state_not_zero_reconcili
     )
     result = current.complete_reconciliation("batch-1", context=context)
     assert result["state"] == "RECONCILED_FULL"
-    assert result["conflict_terminal_ledger"][conflict["physical_key"]]["cumulative_cost_units"] == 7
-    assert current.control()["total_unsettled_capital_units"] == 7
+    assert result["conflict_terminal_ledger"][conflict["physical_key"]]["holding_capital_units"] == 51
+    assert result["total_unsettled_capital_units"] == current.control()["total_unsettled_capital_units"] == 51
+
+
+def test_same_physical_terminal_resolution_merges_one_canonical_holding(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    first = receipt(leg="a", filled=0, state="OPEN", sequence=1)
+    current.apply_receipt(first)
+    conflict = current.apply_receipt(replace(first, cumulative_filled_quantity=1, sequence=100))["unresolved_conflicts"][0]
+    current.apply_receipt(replace(first, receipt_id="a-final", state="REJECTED", sequence=2))
+    current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
+    evidence = replace(resolution_for(conflict), cumulative_filled_quantity=10, sequence=101)
+    context = replace(
+        reconciliation_context(a_sequence=101, resolutions=(evidence,), now=AS_OF + timedelta(seconds=2)),
+        holdings=(ConfirmedHolding("venue-a", "account-a", "action-a", 10, AS_OF, AS_OF),),
+        cash_flows=(SettlementCashFlow("batch-1:action-a", None, "venue-a", "account-a", "usd-cents", 0, 0, AS_OF + timedelta(seconds=1), AS_OF + timedelta(seconds=1), 101, False), SettlementCashFlow("batch-1:action-b", None, "venue-b", "account-b", "usd-cents", 0, 0, AS_OF, AS_OF, 1, False)),
+    )
+    result = current.complete_reconciliation("batch-1", context=context)
+    assert result["conflict_terminal_ledger"] == {}
+    assert result["confirmed_holdings"] == [{"venue_id": "venue-a", "account_id": "account-a", "asset_id": "action-a", "quantity": 10}]
+
+
+def test_cross_domain_and_conflicting_same_physical_evidence_fail_atomically(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    rest = replace(receipt(leg="a", filled=0, state="OPEN", sequence=1), receipt_id="rest", sequence=None, rest_confirmed=True, rest_observation_version=1)
+    current.apply_receipt(rest)
+    conflict = current.apply_receipt(replace(rest, state="UNKNOWN", rest_observation_version=100))["unresolved_conflicts"][0]
+    current.apply_receipt(replace(rest, receipt_id="a-final", state="REJECTED", sequence=2, rest_confirmed=False, rest_observation_version=None, observed_at="2026-08-14T00:00:01Z", venue_timestamp="2026-08-14T00:00:01Z"))
+    current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
+    with pytest.raises(ValueError, match="CONFLICT_UNRESOLVED"):
+        current.complete_reconciliation("batch-1", context=reconciliation_context(a_sequence=3, resolutions=(resolution_for(conflict),), now=AS_OF + timedelta(seconds=2)))
+    assert current.state("batch-1")["unresolved_conflicts"]
+
+    multiple = service(tmp_path / "multiple")
+    enter(multiple)
+    first = receipt(leg="a", filled=0, state="OPEN", sequence=1)
+    multiple.apply_receipt(first)
+    one = multiple.apply_receipt(replace(first, cumulative_cost_units=5, sequence=100))["unresolved_conflicts"][0]
+    two = multiple.apply_receipt(replace(first, receipt_id="a-second", state="UNKNOWN"))["unresolved_conflicts"][1]
+    multiple.apply_receipt(replace(first, receipt_id="a-final", state="REJECTED", sequence=2))
+    multiple.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
+    high = replace(resolution_for(one), cumulative_cost_units=5, sequence=101)
+    low = replace(resolution_for(two), cumulative_cost_units=0, sequence=101)
+    with pytest.raises(ValueError, match="CONFLICT_UNRESOLVED"):
+        multiple.complete_reconciliation("batch-1", context=reconciliation_context(a_sequence=2, resolutions=(high, low), now=AS_OF + timedelta(seconds=2)))
+    assert multiple.state("batch-1")["unresolved_conflicts"]
 
 
 def test_exact_conflict_evidence_reconciles_drift_and_unknown_order(tmp_path) -> None:
