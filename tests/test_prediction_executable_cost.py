@@ -231,6 +231,29 @@ def test_prior_component_policy_changes_are_cache_misses(monkeypatch, change) ->
     assert captured["calls"] == 2
 
 
+@pytest.mark.parametrize("change", ("settlement", "rule_version"))
+def test_terminal_semantic_changes_invalidate_authenticated_prior(monkeypatch, change) -> None:
+    captured = qualified_solver(monkeypatch)
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
+    first = resolve_component(component(), (executable_book(),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
+    base = component().problem
+    old_key = base.actions[0].settlement_observation_key
+    key = replace(old_key, indicator_id="indicator-v2") if change == "settlement" else replace(old_key, rule_version="rules-v2")
+    action = replace(base.actions[0], settlement_observation_key=key)
+    state = base.terminal_state_sets[0]
+    if change == "rule_version":
+        state = replace(state, settlement_observation_key=key, rule_version="rules-v2", atoms=tuple(replace(atom, rule_version="rules-v2") for atom in state.atoms))
+    else:
+        state = replace(state, settlement_observation_key=key)
+    problem = replace(base, actions=(action,), terminal_state_sets=(state,))
+    changed = VerifiedComponent(problem, component_fingerprint(problem, (binding(),), 100), 100, (binding(),))
+
+    refreshed = resolve_component(changed, (executable_book(),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF, prior_market_solution=first.market_solution)
+
+    assert refreshed.status is ResolutionStatus.EXECUTION_SOLUTION
+    assert captured["calls"] == 2
+
+
 def qualified_solver(monkeypatch):
     captured = {"calls": 0}
 
@@ -400,7 +423,7 @@ def _actual_gate_book(price: str) -> ImmutableBook:
         ("annualized-equality", 73_900, 30, "729.99", ResolutionStatus.EXECUTION_SOLUTION),
         ("annualized-one-below", 73_899, 30, "729.99", ResolutionStatus.UNKNOWN),
         ("release-equality", 74_000, 30, "729.99", ResolutionStatus.EXECUTION_SOLUTION),
-        ("release-one-second-below", 74_000, 31, "729.99", ResolutionStatus.UNKNOWN),
+        ("release-one-second-below", 74_000, 30 + 1 / 86_400, "729.99", ResolutionStatus.UNKNOWN),
     ),
 )
 def test_public_real_solver_qualification_gate_boundaries(label, payout, release_days, price, expected) -> None:
