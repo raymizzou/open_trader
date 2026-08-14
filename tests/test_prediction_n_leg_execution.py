@@ -118,18 +118,18 @@ def receipt(*, leg: str, filled: int, state: str, sequence: int) -> OrderReceipt
     )
 
 
-def repair_context(*, b_buy: int = 1, b_venue: str = "venue-b", occurred_cost: int = 0) -> RepairContext:
+def repair_context(*, b_buy: int = 1, b_venue: str = "venue-b", occurred_cost: int = 0, a_sequence: int = 2) -> RepairContext:
     return RepairContext(
         "batch-1:v1",
         (
-            RepairQuote("batch-1:action-a", "venue-a", "account-a", "usd-cents", (CanonicalBookLevel(1, 10, 1, 2),), AS_OF, AS_OF),
-            RepairQuote("batch-1:action-b", b_venue, "account-b", "usd-cents", (CanonicalBookLevel(1, 10, b_buy, 2),), AS_OF, AS_OF),
+            RepairQuote("batch-1:action-a", "action-a", "venue-a", "account-a", "usd-cents", (CanonicalBookLevel(1, 10, 1, 2),), AS_OF, AS_OF),
+            RepairQuote("batch-1:action-b", "action-b", b_venue, "account-b", "usd-cents", (CanonicalBookLevel(1, 10, b_buy, 2),), AS_OF, AS_OF),
         ),
         (ConfirmedHolding("venue-a", "account-a", "action-a", 4, AS_OF, AS_OF), ConfirmedHolding("venue-b", "account-b", "action-b", 0, AS_OF, AS_OF)),
         source_and_solution()[0].account_snapshot,
         (
-            SettlementCashFlow(("batch-1:action-a",), "venue-a", "account-a", "usd-cents", occurred_cost, 0, AS_OF, AS_OF, 1),
-            SettlementCashFlow(("batch-1:action-b",), "venue-b", "account-b", "usd-cents", 0, 0, AS_OF, AS_OF, 1),
+            SettlementCashFlow("batch-1:action-a", None, "venue-a", "account-a", "usd-cents", occurred_cost, 0, AS_OF, AS_OF, a_sequence),
+            SettlementCashFlow("batch-1:action-b", None, "venue-b", "account-b", "usd-cents", 0, 0, AS_OF, AS_OF, 1),
         ),
         AS_OF,
     )
@@ -232,9 +232,9 @@ def test_repair_cannot_use_one_leg_reservation_for_another_leg(tmp_path) -> None
     current = service(tmp_path)
     enter(current)
     current.apply_receipt(receipt(leg="a", filled=4, state="CANCELLED", sequence=1))
-    context = repair_context()
+    context = repair_context(a_sequence=1)
     # Aggregate reservation is ample, but action-b cannot consume action-a's key.
-    rejected = current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1), repair_context=repair_context(b_buy=511))
+    rejected = current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1), repair_context=repair_context(b_buy=511, a_sequence=1))
     assert rejected["repair_plan"]["family"] == "EXIT_CONFIRMED"
 
 
@@ -353,6 +353,16 @@ def test_unknown_receipt_opens_global_breaker_and_stale_receipt_is_ignored(tmp_p
     assert current.control()["breaker_reason"] == "UNKNOWN_ORDER_STATE"
 
 
+@pytest.mark.parametrize("filled,state,cost,reason", ((4, "CANCELLED", 511, "COST_RESERVATION_BREACH"), (10, "FILLED", 511, "COST_RESERVATION_BREACH"), (0, "REJECTED", 1, "ZERO_FILL_CASH_BREACH")))
+def test_receipt_cash_breach_persists_incident_and_breaker(tmp_path, filled, state, cost, reason) -> None:
+    current = service(tmp_path)
+    enter(current)
+    breached = current.apply_receipt(replace(receipt(leg="a", filled=filled, state=state, sequence=1), cumulative_cost_units=cost))
+    assert breached["incident"]["reason"] == reason
+    assert current.control()["mode"] == "MANUAL"
+    assert current.control()["breaker_reason"] == reason
+
+
 def test_unknown_terminal_reconciliation_without_context_persists_breaker_across_restart(tmp_path) -> None:
     current = service(tmp_path)
     enter(current)
@@ -369,7 +379,7 @@ def test_shallow_valid_repair_book_persists_incident_and_breaker(tmp_path) -> No
     current = service(tmp_path)
     enter(current)
     current.apply_receipt(receipt(leg="a", filled=4, state="CANCELLED", sequence=1))
-    source = repair_context()
+    source = repair_context(a_sequence=1)
     shallow = replace(source, quotes=tuple(replace(quote, levels=(CanonicalBookLevel(1, 1, 1, 2),)) for quote in source.quotes))
     result = current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1), repair_context=shallow)
     assert result["incident"] == {"reason": "PARTIAL_FILL", "repair_status": "REPAIR_INSUFFICIENT_DEPTH"}
@@ -388,7 +398,7 @@ def test_over_cap_repair_is_retained_but_breaks_automatic_authority(tmp_path) ->
     current.apply_receipt(replace(receipt(leg="a", filled=4, state="CANCELLED", sequence=1), cumulative_cost_units=8))
     failed = current.apply_receipt(
         receipt(leg="b", filled=0, state="REJECTED", sequence=1),
-        repair_context=repair_context(b_buy=511, occurred_cost=8),
+        repair_context=repair_context(b_buy=511, occurred_cost=8, a_sequence=1),
     )
 
     assert failed["repair_plan"] == {
@@ -400,6 +410,20 @@ def test_over_cap_repair_is_retained_but_breaks_automatic_authority(tmp_path) ->
         "reason": "REPAIR_LOSS_CAP_EXCEEDED",
     }
     assert current.control()["breaker_reason"] == "REPAIR_LOSS_CAP_EXCEEDED"
+
+
+def test_repair_loss_cap_accepts_exact_boundary_and_rejects_one_unit_over(tmp_path) -> None:
+    def plan_for(cap: int):
+        current = service(tmp_path / str(cap))
+        current.enter(opportunity_episode_id=f"episode-{cap}", episode_lineage_id=f"lineage-{cap}", execution_batch_id=f"batch-{cap}", source=source_and_solution()[0], partial_fill_proof=proof(solution(), repair_cap=cap), mode="AUTO", cap_config_version="caps-v1")
+        first = replace(receipt(leg="a", filled=4, state="CANCELLED", sequence=1), execution_batch_id=f"batch-{cap}", client_order_id=f"batch-{cap}:action-a", cumulative_cost_units=5)
+        second = replace(receipt(leg="b", filled=0, state="REJECTED", sequence=1), execution_batch_id=f"batch-{cap}", client_order_id=f"batch-{cap}:action-b")
+        current.apply_receipt(first)
+        context = repair_context(b_buy=511, occurred_cost=5, a_sequence=1)
+        context = replace(context, reservation_version=f"batch-{cap}:v1", quotes=tuple(replace(quote, client_order_id=quote.client_order_id.replace("batch-1", f"batch-{cap}")) for quote in context.quotes), cash_flows=tuple(replace(flow, client_order_id=flow.client_order_id.replace("batch-1", f"batch-{cap}")) for flow in context.cash_flows))
+        return current.apply_receipt(second, repair_context=context)
+    assert plan_for(1)["repair_plan"]["reason"] == "REPAIR_PROOF_REQUIRED"
+    assert plan_for(0)["repair_plan"]["reason"] == "REPAIR_LOSS_CAP_EXCEEDED"
 
 
 def test_mixed_terminal_receipts_are_an_incident_not_a_full_reconciliation(tmp_path) -> None:
