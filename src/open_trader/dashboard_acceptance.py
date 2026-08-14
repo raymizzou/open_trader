@@ -109,6 +109,7 @@ DASHBOARD_API_TIMEOUT_SECONDS = 30
 ACCOUNT_SNAPSHOT_PATH = "/api/v1/account/snapshot"
 ACCOUNT_ROUTE_HEADER = "X-Open-Trader-Account-Route"
 PRODUCTION_ROUTE_MARKER = "production"
+ACCOUNT_API_OUTAGE_WAIT_SECONDS = 5
 LEGACY_REMOVED_ACCOUNT_FIELDS = frozenset({
     "account_sync", "broker_positions", "broker_summaries", "cash_details",
     "cash_rows", "holdings", "positions", "quotes", "summary",
@@ -997,6 +998,8 @@ def _fetch_account_snapshot(
     except HTTPError as error:
         if error.code == 304:
             return 304, None, error.headers.get("ETag")
+        if error.code == 503:
+            return 503, None, None
         raise
 
 
@@ -1048,10 +1051,13 @@ def _account_outage_isolation_errors(
     stop_account_api: Any,
     restore_account_api: Any,
     fetch: Any,
+    wait_account_api_absent: Any | None = None,
 ) -> list[str]:
     errors: list[str] = []
     try:
         stop_account_api()
+        if wait_account_api_absent is not None:
+            wait_account_api_absent()
         status, payload = fetch(ACCOUNT_SNAPSHOT_PATH)
         if not (
             status == 503
@@ -1062,7 +1068,6 @@ def _account_outage_isolation_errors(
         for path in (
             "/api/dashboard",
             "/api/trend-reports/tiger/history",
-            "/api/prediction-arbitrage/state",
         ):
             status, payload = fetch(path)
             if status != 200:
@@ -1071,6 +1076,15 @@ def _account_outage_isolation_errors(
                 not isinstance(payload, Mapping) or "holding_enrichment" not in payload
             ):
                 errors.append("Account 故障时 Research 所在 Dashboard 数据不可读")
+        status, payload = fetch("/healthz")
+        if (
+            status != 200
+            or not isinstance(payload, Mapping)
+            or payload.get("prediction_route_mode") != "service"
+            or payload.get("prediction_upstream_status") != "ok"
+            or payload.get("legacy_upstream_status") != "ok"
+        ):
+            errors.append("Account 故障时 Gateway health contract 不满足")
     except (OSError, RuntimeError) as exc:
         errors.append(f"Account 故障隔离检查失败：{type(exc).__name__}: {exc}")
     finally:
@@ -1113,11 +1127,49 @@ def _controlled_account_outage_errors(
         if result.returncode != 0:
             raise RuntimeError("Account API restore failed")
 
+    def wait_account_api_absent() -> None:
+        label = f"gui/{os.getuid()}/com.open-trader.account-api"
+        deadline = time.monotonic() + ACCOUNT_API_OUTAGE_WAIT_SECONDS
+        while True:
+            label_result = subprocess.run(
+                ["launchctl", "print", label],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            label_output = "\n".join((
+                str(getattr(label_result, "stdout", "")),
+                str(getattr(label_result, "stderr", "")),
+            ))
+            label_absent = (
+                label_result.returncode != 0
+                and "Could not find service" in label_output
+            )
+            listener_result = subprocess.run(
+                ["lsof", "-nP", "-iTCP:8768", "-sTCP:LISTEN"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            listener_absent = (
+                listener_result.returncode == 1
+                and not getattr(listener_result, "stdout", "")
+                and not getattr(listener_result, "stderr", "")
+            )
+            if label_absent and listener_absent:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Account API launchd label/listener remained after bootout"
+                )
+            time.sleep(0.1)
+
     return _account_outage_isolation_errors(
         gateway_url,
         stop_account_api=stop_account_api,
         restore_account_api=restore_account_api,
         fetch=lambda path: _fetch_status_payload(gateway_url, path),
+        wait_account_api_absent=wait_account_api_absent,
     )
 
 
@@ -3546,10 +3598,41 @@ def _check_trend_holding_tabs(
     status = report.get("real_position_status")
     real_table = real_panel.locator(".cn-trend-table")
     if status == "available":
-        assert real_table.count() == 1, f"{broker} 真实持仓表格缺失"
-        assert real_panel.locator(".cn-trend-table thead th").all_inner_texts() == list(headings), (
-            f"{broker} 真实持仓列定义发生变化"
+        membership = report.get("historical_buy_plan_membership")
+        split = (
+            isinstance(membership, Mapping)
+            and membership.get("available") is True
+            and isinstance(membership.get("symbols"), list)
         )
+        if split:
+            origins = real_panel.locator(".holding-origin-section")
+            assert origins.count() == 2, f"{broker} 真实持仓分组数量不是 2"
+            assert origins.locator(".holding-origin-heading h3").all_inner_texts() == [
+                "趋势持仓", "非趋势持仓",
+            ], f"{broker} 真实持仓分组文案或顺序不正确"
+            for index in range(2):
+                origin = origins.nth(index)
+                rows = origin.locator(".cn-trend-card")
+                table = origin.locator(".cn-trend-table")
+                assert table.count() == int(rows.count() > 0), (
+                    f"{broker} 真实持仓分组表格与行不匹配"
+                )
+                if table.count():
+                    assert table.locator("thead th").all_inner_texts() == list(headings), (
+                        f"{broker} 真实持仓列定义发生变化"
+                    )
+                else:
+                    empty = origin.locator(":scope > .account-empty")
+                    assert empty.count() == 1 and empty.inner_text().strip() == "无", (
+                        f"{broker} 空真实持仓分组缺少中文空状态"
+                    )
+        else:
+            assert real_table.count() == 1, f"{broker} 真实持仓表格缺失"
+            assert real_panel.locator(
+                ".cn-trend-table thead th"
+            ).all_inner_texts() == list(headings), (
+                f"{broker} 真实持仓列定义发生变化"
+            )
         source = report.get("real_position_source")
         if isinstance(source, Mapping) and source:
             source_text = real_panel.inner_text()
@@ -3748,7 +3831,11 @@ def _check_account_holdings(
             assert section.locator(".account-review-action").count() == rows.count(), (
                 f"{broker} 异常账户缺少人工复核动作"
             )
-        empty = section.locator(".account-empty:visible")
+        empty = page.locator(
+            f"#account-{broker}-view-panel > .account-empty:not(.missing-text):visible"
+            if broker in TREND_SIMULATE_MARKETS
+            else f"#account-{broker} > .account-empty:not(.missing-text):visible"
+        )
         if rows.count() == 0:
             assert empty.count() == 1 and empty.inner_text().strip() == "当前筛选下没有持仓", (
                 f"{broker} 无持仓账户缺少中文空状态"
@@ -4540,22 +4627,38 @@ def _check_trend_review(
     assert isinstance(details, Mapping), f"{broker} 趋势复盘样本明细无效"
     assert isinstance(sample_cutoffs, Mapping), f"{broker} 趋势复盘样本截止无效"
     assert isinstance(metric_cutoffs, Mapping), f"{broker} 趋势复盘指标截止无效"
-    for series, _label in (("discipline", "纪律模拟"), ("actual", "实际执行")):
+    for series, label in (("discipline", "纪律模拟"), ("actual", "实际执行")):
+        expected_statistics: list[str] = []
         detail = details.get(series)
+        sample_cutoff = sample_cutoffs.get(series)
+        if sample_cutoff:
+            expected_statistics.append(f"统计截至 {_plain(sample_cutoff)}")
+        metric_cutoff = metric_cutoffs.get(series)
+        if metric_cutoff:
+            expected_statistics.append(f"指标截至 {_plain(metric_cutoff)}")
         if isinstance(detail, Mapping) and detail.get("available") is True:
-            statistics_items.extend((
-                f"统计截至 {_plain(sample_cutoffs.get(series))}",
+            expected_statistics.append(
                 "发现 "
                 f"{detail.get('discovered_candidate_count')} · 排除 "
                 f"{detail.get('excluded_candidate_count')} · 未闭环 "
-                f"{detail.get('incomplete_open_candidate_count')}",
-            ))
-            metric_cutoff = metric_cutoffs.get(series)
-            if metric_cutoff is not None:
-                statistics_items.append(f"指标截至 {_plain(metric_cutoff)}")
+                f"{detail.get('incomplete_open_candidate_count')}"
+            )
+            eligible = detail["eligible_sample_count"]
+            if eligible:
+                displayed_rate = _trend_review_display(
+                    {"value": Decimal(str(detail["win_rate"])) * Decimal("100")},
+                    percent=True,
+                )
+                expected_statistics.append(
+                    f"完整交易胜率 {displayed_rate} · "
+                    f"{_display_number(detail['winning_sample_count'])} 胜 / "
+                    f"{_display_number(eligible)} 闭环"
+                )
+            else:
+                expected_statistics.append("完整交易胜率 数据不足 · 0 闭环")
             reasons = detail.get("exclusion_reasons")
             if isinstance(reasons, list) and reasons:
-                statistics_items.append(
+                expected_statistics.append(
                     "排除原因 " + "、".join(
                         f"{TREND_REASON_LABELS.get(str(item.get('reason')), '其他原因')} "
                         f"{item.get('count')}"
@@ -4563,7 +4666,20 @@ def _check_trend_review(
                     )
                 )
         else:
-            statistics_items.append("统计来源不可用")
+            expected_statistics.append("统计来源不可用")
+        statistics_items.extend(expected_statistics)
+        statistics_column = workspace.locator(
+            f'.trend-review-statistics[data-series="{series}"]'
+        )
+        assert statistics_column.count() == 1, (
+            f"{broker} 趋势复盘 {label}统计列数量不是 1"
+        )
+        rendered_statistics = statistics_column.locator(
+            ".trend-entry-details > span"
+        ).all_inner_texts()
+        assert rendered_statistics == expected_statistics, (
+            f"{broker} 趋势复盘 {label}统计列内容或顺序错误"
+        )
     for required in (
         f"{market_label}趋势复盘",
         _plain(review.get("broker_label")),
@@ -5026,7 +5142,11 @@ def _check_cn_filter(page: Any, expected_cn: int) -> None:
                 timeout=10_000,
             )
         rows = section.locator(".account-holding-row:visible")
-        empty = section.locator(".account-empty:visible")
+        empty = page.locator(
+            f"#account-{broker}-view-panel > .account-empty:not(.missing-text):visible"
+            if broker in TREND_SIMULATE_MARKETS
+            else f"#account-{broker} > .account-empty:not(.missing-text):visible"
+        )
         count = rows.count()
         total += count
         assert page.locator("#visible-count").inner_text().strip() == f"{_display_number(count)} 条", (

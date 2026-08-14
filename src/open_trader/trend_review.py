@@ -8559,7 +8559,7 @@ def build_trend_review_projection(
             })
 
     projection = {
-        "schema_version": "open_trader.trend_review.projection.v4",
+        "schema_version": "open_trader.trend_review.projection.v5",
         "available": True,
         "market": market,
         "market_label": {"CN": "A 股", "US": "美股", "HK": "港股"}[market],

@@ -3,6 +3,7 @@ from decimal import Decimal
 from collections.abc import Mapping
 import copy
 import inspect
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -1623,6 +1624,8 @@ def trend_reviews() -> dict[str, dict[str, object]]:
                 "discipline": {
                     "available": True,
                     "eligible_sample_count": 4,
+                    "winning_sample_count": 1,
+                    "win_rate": "0.25",
                     "discovered_candidate_count": 9,
                     "excluded_candidate_count": 4,
                     "incomplete_open_candidate_count": 1,
@@ -1633,6 +1636,8 @@ def trend_reviews() -> dict[str, dict[str, object]]:
                 "actual": {
                     "available": False,
                     "eligible_sample_count": 0,
+                    "winning_sample_count": 0,
+                    "win_rate": None,
                     "discovered_candidate_count": 0,
                     "excluded_candidate_count": 0,
                     "incomplete_open_candidate_count": 0,
@@ -2784,6 +2789,108 @@ def test_acceptance_checks_exact_trend_review_content() -> None:
     assert page.review_geometry_checks == ["tiger"]
 
 
+def test_acceptance_allows_unavailable_statistics_with_metric_cutoff() -> None:
+    payload = valid_payload()
+    review = payload["trend_reviews"]["tiger"]
+    review["metric_cutoffs"]["actual"] = "2026-08-08"
+    page = tabbed_account_page(payload)
+    page.review_statistics_texts["actual"] = [
+        "指标截至 2026-08-08",
+        "统计来源不可用",
+    ]
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    dashboard_acceptance._check_trend_review(page, section, "tiger", review)
+
+
+def test_acceptance_formats_four_digit_trend_review_win_rate_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = valid_payload()
+    review = payload["trend_reviews"]["tiger"]
+    review["sample_counts"]["discipline"] = 2_000
+    review["sample_details"]["discipline"].update({
+        "eligible_sample_count": 2_000,
+        "winning_sample_count": 1_000,
+        "win_rate": "0.5",
+        "discovered_candidate_count": 2_005,
+    })
+    rendered = (
+        trend_review_workspace_text("tiger", review)
+        .replace("纪律模拟 4 / 30，数据不足", "纪律模拟 2000 笔")
+        .replace(
+            "发现 9 · 排除 4 · 未闭环 1",
+            "发现 2005 · 排除 4 · 未闭环 1",
+        )
+        .replace(
+            "完整交易胜率 25% · 1 胜 / 4 闭环",
+            "完整交易胜率 50% · 1,000 胜 / 2,000 闭环",
+        )
+    )
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "trend_review_workspace_text",
+        lambda *_args, **_kwargs: rendered,
+    )
+    page = tabbed_account_page(payload)
+    page.review_header_side_texts = [
+        "返回持仓看板",
+        "纪律模拟 2000 笔",
+        "实际执行 数据不可用",
+        "统计刷新失败；报告继续使用上一个有效快照",
+    ]
+    page.review_statistics_texts["discipline"] = [
+        "统计截至 2026-08-08T15:00:00+08:00",
+        "指标截至 2026-08-08",
+        "发现 2005 · 排除 4 · 未闭环 1",
+        "完整交易胜率 50% · 1,000 胜 / 2,000 闭环",
+        "排除原因 成本不完整 4",
+    ]
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    dashboard_acceptance._check_trend_review(page, section, "tiger", review)
+
+
+def test_acceptance_rejects_missing_trend_review_win_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = valid_payload()
+    review = payload["trend_reviews"]["tiger"]
+    rendered = trend_review_workspace_text("tiger", review)
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "trend_review_workspace_text",
+        lambda *_args, **_kwargs: rendered.replace(
+            "完整交易胜率 25% · 1 胜 / 4 闭环 ", ""
+        ),
+    )
+    page = tabbed_account_page(payload)
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="完整交易胜率 25% · 1 胜 / 4 闭环"):
+        dashboard_acceptance._check_trend_review(page, section, "tiger", review)
+
+
+def test_acceptance_rejects_swapped_trend_review_statistics_columns() -> None:
+    payload = valid_payload()
+    review = payload["trend_reviews"]["tiger"]
+    page = tabbed_account_page(payload)
+    page.review_statistics_texts = {
+        "discipline": ["统计来源不可用"],
+        "actual": [
+            "统计截至 2026-08-08T15:00:00+08:00",
+            "指标截至 2026-08-08",
+            "发现 9 · 排除 4 · 未闭环 1",
+            "完整交易胜率 25% · 1 胜 / 4 闭环",
+            "排除原因 成本不完整 4",
+        ],
+    }
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="纪律模拟统计列内容或顺序错误"):
+        dashboard_acceptance._check_trend_review(page, section, "tiger", review)
+
+
 def test_acceptance_rejects_trend_review_benchmark_drift() -> None:
     payload = valid_payload()
     page = tabbed_account_page(payload)
@@ -3141,7 +3248,8 @@ def trend_review_workspace_text(
         "返回持仓看板 纪律模拟 4 / 30，数据不足 实际执行 数据不可用 "
         f"{status_text} "
         "统计截至 2026-08-08T15:00:00+08:00 指标截至 2026-08-08 "
-        "发现 9 · 排除 4 · 未闭环 1 排除原因 成本不完整 4 统计来源不可用 "
+        "发现 9 · 排除 4 · 未闭环 1 完整交易胜率 25% · 1 胜 / 4 闭环 "
+        "排除原因 成本不完整 4 统计来源不可用 "
         f"策略与市场基准 {refresh_cutoff} {refresh_status} 快照更新 2026-07-18T08:00:00+08:00 "
         "5 年收益 CAGR 期间净收益率 相对市场超额收益 最大回撤 卡玛比率 夏普比率 "
         "纪律模拟 实际执行 同期市场 市场 1 年 市场 5 年 基准自身 实际执行日终净值缺失"
@@ -3643,6 +3751,12 @@ class TabbedAccountLocator:
             return 0
         if self.selector == "#trend-report-workspace:visible .trend-review-matrix":
             return int(self.page.trend_kind == "review")
+        if re.fullmatch(
+            r'#trend-report-workspace:visible \.trend-review-statistics'
+            r'\[data-series="(discipline|actual)"\]',
+            self.selector,
+        ):
+            return int(self.page.trend_kind == "review")
         if self.selector == "#trend-report-workspace:visible .trend-review-metric":
             return 5 if self.page.trend_kind == "review" else 0
         if self.selector == "#trend-report-workspace:visible .trend-review-axis":
@@ -3750,7 +3864,25 @@ class TabbedAccountLocator:
             r"#account-(\w+):visible \.account-empty:visible", self.selector
         )
         if match and match.group(1) in self.page.tab_order:
-            return int(self.page.visible_rows(self.selector) == 0)
+            broker = match.group(1)
+            return int(
+                self.page.visible_rows(self.selector) == 0
+                or broker in self.page.empty_origin_brokers
+            )
+        match = re.fullmatch(
+            r"#account-(\w+)(?:-view-panel)? > \.account-empty"
+            r"(?::not\(\.missing-text\))?:visible",
+            self.selector,
+        )
+        if match and match.group(1) in self.page.tab_order:
+            broker = match.group(1)
+            return int(
+                self.page.visible_rows(f"#account-{broker}:visible") == 0
+                or (
+                    broker in self.page.membership_warning_brokers
+                    and ":not(.missing-text)" not in self.selector
+                )
+            )
         if re.fullmatch(
             r'\.account-holding-row:visible:has\('
             r'\.account-holding-market:has-text\("US"\)\) '
@@ -4000,7 +4132,23 @@ class TabbedAccountLocator:
             r"#account-(\w+):visible \.account-empty:visible", self.selector
         )
         if match and match.group(1) in self.page.tab_order:
-            return "当前筛选下没有持仓"
+            return (
+                "当前筛选下没有持仓"
+                if self.page.visible_rows(self.selector) == 0
+                else "无"
+            )
+        match = re.fullmatch(
+            r"#account-(\w+)(?:-view-panel)? > \.account-empty"
+            r"(?::not\(\.missing-text\))?:visible",
+            self.selector,
+        )
+        if match:
+            return (
+                "历史买入计划归属暂不可用，未执行分组"
+                if ":not(.missing-text)" not in self.selector
+                and match.group(1) in self.page.membership_warning_brokers
+                else "当前筛选下没有持仓"
+            )
         if self.selector == "#visible-count":
             return f"{self.page.visible_rows():,} 条"
         if re.fullmatch(
@@ -4070,6 +4218,8 @@ class TabbedAccountLocator:
                 f"{snapshot['strategy_name']}｜第 1 版",
             ]
         if self.selector == "#trend-report-workspace:visible .trend-review-header-side > *":
+            if self.page.review_header_side_texts is not None:
+                return self.page.review_header_side_texts
             status = self.page.reviews[broker].get("statistics_status")
             return [
                 "返回持仓看板", "纪律模拟 4 / 30，数据不足",
@@ -4080,6 +4230,14 @@ class TabbedAccountLocator:
                     else "统计刷新失败；报告继续使用上一个有效快照"
                 ),
             ]
+        statistics_match = re.fullmatch(
+            r'#trend-report-workspace:visible \.trend-review-statistics'
+            r'\[data-series="(discipline|actual)"\] '
+            r'\.trend-entry-details > span',
+            self.selector,
+        )
+        if statistics_match:
+            return self.page.review_statistics_texts[statistics_match.group(1)]
         if self.selector == "#trend-report-workspace:visible .trend-review-matrix figcaption":
             return ["策略与市场基准"]
         if self.selector == "#trend-report-workspace:visible .trend-review-metric h3":
@@ -4244,6 +4402,8 @@ class TabbedAccountPage:
         }
         self.all_rows = {"futu": 1, "tiger": 1, "phillips": 1, "eastmoney": 0}
         self.cn_rows = cn_rows or {"futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 5}
+        self.empty_origin_brokers: set[str] = set()
+        self.membership_warning_brokers: set[str] = set()
         self.market = "ALL"
         self.selected = "futu"
         self.tab_order = ["futu", "tiger", "phillips", "eastmoney"]
@@ -4284,6 +4444,17 @@ class TabbedAccountPage:
         self.review_text_contrast = 12.0
         self.review_marker_contrasts = [4.0] * 25
         self.review_header_left_texts: list[str] | None = None
+        self.review_header_side_texts: list[str] | None = None
+        self.review_statistics_texts = {
+            "discipline": [
+                "统计截至 2026-08-08T15:00:00+08:00",
+                "指标截至 2026-08-08",
+                "发现 9 · 排除 4 · 未闭环 1",
+                "完整交易胜率 25% · 1 胜 / 4 闭环",
+                "排除原因 成本不完整 4",
+            ],
+            "actual": ["统计来源不可用"],
+        }
         self.review_metric_reason: str | None = None
         self.review_metric_values_override: list[str] | None = None
         self.review_text_layout_override: dict[str, object] = {}
@@ -6171,6 +6342,28 @@ def test_check_account_holdings_visits_every_broker_tab(
     assert page.account_views["tiger"] == page.account_views["phillips"] == "real"
 
 
+def test_check_account_holdings_ignores_empty_origin_subgroup() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.all_rows["eastmoney"] = 1
+    page.empty_origin_brokers.add("eastmoney")
+
+    dashboard_acceptance._check_account_holdings(page, payload)
+
+    assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
+
+
+def test_check_account_holdings_ignores_membership_warning_with_visible_rows() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.all_rows["eastmoney"] = 1
+    page.membership_warning_brokers.add("eastmoney")
+
+    dashboard_acceptance._check_account_holdings(page, payload)
+
+    assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
+
+
 @pytest.mark.parametrize(
     ("broker", "width", "count"),
     [
@@ -6513,6 +6706,81 @@ def test_check_tiger_tab_selects_tiger_and_shows_only_its_section() -> None:
     assert page.max_visible_account_sections == 1
 
 
+def test_trend_holding_tabs_accept_one_table_per_nonempty_origin_section() -> None:
+    from playwright.sync_api import sync_playwright
+
+    headings = (
+        "标的", "动作", "执行参考价", "温度变化", "节气", "大类内强度",
+        "全局强度", "行业", "当前判断", "活动保护线", "持仓提示",
+    )
+    heading_html = "".join(f"<th>{heading}</th>" for heading in headings)
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel="chrome", headless=True)
+        page = browser.new_page()
+        page.set_content(f"""
+          <section data-trend-holding-section>
+            <button data-trend-holding-view="real" aria-selected="true">真实持仓</button>
+            <button data-trend-holding-view="simulate" aria-selected="false">模拟盘持仓</button>
+            <div data-trend-holding-panel="real">
+              <p>只读</p>
+              <section class="holding-origin-section"><div class="holding-origin-heading"><h3>趋势持仓</h3></div>
+                <table class="cn-trend-table"><thead><tr>{heading_html}</tr></thead>
+                  <tbody><tr class="cn-trend-card"><td>ADP</td><td>Automatic Data Processing</td></tr></tbody>
+                </table>
+              </section>
+              <section class="holding-origin-section"><div class="holding-origin-heading"><h3>非趋势持仓</h3></div>
+                <table class="cn-trend-table"><thead><tr>{heading_html}</tr></thead>
+                  <tbody><tr class="cn-trend-card"><td>AMZN</td><td>Amazon</td></tr></tbody>
+                </table>
+              </section>
+            </div>
+            <div data-trend-holding-panel="simulate" hidden>
+              <table class="cn-trend-table"><thead><tr>{heading_html}</tr></thead>
+                <tbody><tr class="cn-trend-card"><td>MSFT</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+          <script>
+            document.querySelectorAll('[data-trend-holding-view]').forEach(tab => tab.addEventListener('click', () => {{
+              const view = tab.dataset.trendHoldingView;
+              document.querySelectorAll('[data-trend-holding-view]').forEach(item => item.setAttribute('aria-selected', String(item === tab)));
+              document.querySelectorAll('[data-trend-holding-panel]').forEach(panel => panel.hidden = panel.dataset.trendHoldingPanel !== view);
+            }}));
+          </script>
+        """)
+        report = {
+            "real_position_status": "available",
+            "real_position_source": {"kind": "account"},
+            "historical_buy_plan_membership": {
+                "available": True, "symbols": ["US.ADP"], "reason": "",
+            },
+            "real_position_actions": [
+                {"symbol": "ADP", "name": "Automatic Data Processing"},
+                {"symbol": "AMZN", "name": "Amazon"},
+            ],
+            "hold_actions": [{"symbol": "MSFT"}],
+        }
+
+        dashboard_acceptance._check_trend_holding_tabs(
+            page, report, "tiger"
+        )
+        page.locator(
+            '.holding-origin-section:nth-of-type(2) .cn-trend-table thead th'
+        ).first.evaluate("node => node.textContent = '错误列'")
+        with pytest.raises(AssertionError, match="真实持仓列定义发生变化"):
+            dashboard_acceptance._check_trend_holding_tabs(
+                page, report, "tiger"
+            )
+        page.locator(
+            ".holding-origin-section:nth-of-type(2) .cn-trend-table"
+        ).evaluate("table => table.replaceWith(table.tBodies[0].rows[0])")
+        with pytest.raises(AssertionError, match="真实持仓分组表格与行不匹配"):
+            dashboard_acceptance._check_trend_holding_tabs(
+                page, report, "tiger"
+            )
+        browser.close()
+
+
 def test_cn_filter_checks_each_broker_tab_without_all_accounts_view() -> None:
     page = tabbed_cn_page()
 
@@ -6520,6 +6788,28 @@ def test_cn_filter_checks_each_broker_tab_without_all_accounts_view() -> None:
 
     assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
     assert page.max_visible_account_sections == 1
+
+
+def test_cn_filter_ignores_empty_origin_subgroup_when_rows_are_visible() -> None:
+    page = TabbedAccountPage(cn_rows={
+        "futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 1,
+    })
+    page.empty_origin_brokers.add("eastmoney")
+
+    dashboard_acceptance._check_cn_filter(page, expected_cn=1)
+
+    assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
+
+
+def test_cn_filter_ignores_membership_warning_with_visible_rows() -> None:
+    page = TabbedAccountPage(cn_rows={
+        "futu": 0, "tiger": 0, "phillips": 0, "eastmoney": 1,
+    })
+    page.membership_warning_brokers.add("eastmoney")
+
+    dashboard_acceptance._check_cn_filter(page, expected_cn=1)
+
+    assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
 
 
 def test_cn_filter_restores_real_view_before_counting() -> None:
@@ -7796,6 +8086,49 @@ def test_acceptance_reads_snapshot_and_facts_with_production_marker(
     )
 
 
+def test_acceptance_returns_retryable_account_snapshot_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "status": "unavailable",
+        "errors": [{"code": "account_publication_unstable", "retryable": True}],
+    }
+
+    def unstable(request: dashboard_acceptance.Request, **_kwargs: object) -> object:
+        raise dashboard_acceptance.HTTPError(
+            request.full_url,
+            503,
+            "Service Unavailable",
+            {},
+            BytesIO(json.dumps(payload).encode("utf-8")),
+        )
+
+    monkeypatch.setattr(dashboard_acceptance, "urlopen", unstable)
+
+    assert dashboard_acceptance._fetch_account_snapshot("http://account.test") == (
+        503,
+        None,
+        None,
+    )
+
+
+def test_acceptance_reraises_non_503_account_snapshot_http_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failed(request: dashboard_acceptance.Request, **_kwargs: object) -> object:
+        raise dashboard_acceptance.HTTPError(
+            request.full_url, 502, "Bad Gateway", {}, None
+        )
+
+    monkeypatch.setattr(dashboard_acceptance, "urlopen", failed)
+
+    with pytest.raises(dashboard_acceptance.HTTPError) as raised:
+        dashboard_acceptance._fetch_account_snapshot("http://account.test")
+
+    assert raised.value.code == 502
+
+
 def test_acceptance_requires_non_account_legacy_payload_and_quotes_404(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7893,6 +8226,14 @@ def test_account_outage_isolation_fails_closed_and_restores_account() -> None:
         calls.append(path)
         if path == dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH:
             return 503, {"code": "account_module_unavailable"}
+        if path == "/api/prediction-arbitrage/state":
+            raise TimeoutError("prediction state computation timed out")
+        if path == "/healthz":
+            return 200, {
+                "prediction_route_mode": "service",
+                "prediction_upstream_status": "ok",
+                "legacy_upstream_status": "ok",
+            }
         return 200, {"holding_enrichment": []}
 
     assert dashboard_acceptance._account_outage_isolation_errors(
@@ -7904,7 +8245,7 @@ def test_account_outage_isolation_fails_closed_and_restores_account() -> None:
         dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH,
         "/api/dashboard",
         "/api/trend-reports/tiger/history",
-        "/api/prediction-arbitrage/state",
+        "/healthz",
         "restore",
     ]
 
@@ -7921,19 +8262,32 @@ def test_controlled_account_outage_restores_shared_runtime(
         "_project_data_dir",
         lambda _root: runtime_root / "data",
     )
-    monkeypatch.setattr(
-        dashboard_acceptance.subprocess,
-        "run",
-        lambda command, **_kwargs: (
-            commands.append(command) or SimpleNamespace(returncode=0)
-        ),
-    )
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        commands.append(command)
+        if command[:2] == ["launchctl", "print"]:
+            return SimpleNamespace(
+                returncode=1, stdout="", stderr="Could not find service",
+            )
+        if command[0] == "lsof":
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(dashboard_acceptance.subprocess, "run", run)
     monkeypatch.setattr(
         dashboard_acceptance,
         "_fetch_status_payload",
         lambda _url, path: (
             (503, {"code": "account_module_unavailable"})
             if path == dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH
+            else (
+                200,
+                {
+                    "prediction_route_mode": "service",
+                    "prediction_upstream_status": "ok",
+                    "legacy_upstream_status": "ok",
+                },
+            )
+            if path == "/healthz"
             else (200, {"holding_enrichment": []})
         ),
     )
@@ -7947,6 +8301,82 @@ def test_controlled_account_outage_restores_shared_runtime(
         "--repo-root", str(expected_root),
         "--runtime-root", str(runtime_root),
         "--python", str(runtime_root / ".venv/bin/python"),
+    ]
+
+
+def test_controlled_account_outage_waits_for_label_and_listener_before_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_root = tmp_path / "worktree"
+    runtime_root = tmp_path / "runtime"
+    state = {"label_present": True, "listener_present": True}
+    fetch_calls: list[str] = []
+    sleep_calls = 0
+
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_project_data_dir",
+        lambda _root: runtime_root / "data",
+    )
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        if command[:2] == ["launchctl", "bootout"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command[:2] == ["launchctl", "print"]:
+            return SimpleNamespace(
+                returncode=0 if state["label_present"] else 1,
+                stdout="loaded" if state["label_present"] else "",
+                stderr="" if state["label_present"] else "Could not find service",
+            )
+        if command[0] == "lsof":
+            return SimpleNamespace(
+                returncode=0 if state["listener_present"] else 1,
+                stdout="listener" if state["listener_present"] else "",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def sleep(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        assert fetch_calls == []
+        if sleep_calls == 1:
+            state["label_present"] = False
+        else:
+            state["listener_present"] = False
+
+    monkeypatch.setattr(dashboard_acceptance.subprocess, "run", run)
+    monkeypatch.setattr(dashboard_acceptance.time, "sleep", sleep)
+
+    def fetch(_url: str, path: str) -> tuple[int, object]:
+        fetch_calls.append(path)
+        assert state == {"label_present": False, "listener_present": False}
+        return (
+            (503, {"code": "account_module_unavailable"})
+            if path == dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH
+            else (
+                200,
+                {
+                    "prediction_route_mode": "service",
+                    "prediction_upstream_status": "ok",
+                    "legacy_upstream_status": "ok",
+                },
+            )
+            if path == "/healthz"
+            else (200, {"holding_enrichment": []})
+        )
+
+    monkeypatch.setattr(dashboard_acceptance, "_fetch_status_payload", fetch)
+
+    assert dashboard_acceptance._controlled_account_outage_errors(
+        "http://gateway.test", expected_root,
+    ) == []
+    assert sleep_calls == 2
+    assert fetch_calls == [
+        dashboard_acceptance.ACCOUNT_SNAPSHOT_PATH,
+        "/api/dashboard",
+        "/api/trend-reports/tiger/history",
+        "/healthz",
     ]
 
 

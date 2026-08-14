@@ -7,7 +7,7 @@ RUNTIME_ROOT=""
 PYTHON_BIN="${OPEN_TRADER_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 LAUNCH_AGENTS_DIR="${HOME}/Library/LaunchAgents"
 LAUNCHCTL_BIN="${LAUNCHCTL_BIN:-/bin/launchctl}"
-HEALTH_URL="${OPEN_TRADER_HEALTH_URL:-http://127.0.0.1:8766}"
+HEALTH_URL="${OPEN_TRADER_HEALTH_URL:-http://127.0.0.1:8769}"
 HEALTH_INTERVAL="${OPEN_TRADER_HEALTH_INTERVAL:-7200}"
 WAIT_SECONDS="${PREDICTION_HEALTH_LAUNCHD_WAIT_SECONDS:-30}"
 LABEL="com.open-trader.prediction-arbitrage-health"
@@ -38,7 +38,6 @@ RUNTIME_ROOT="${RUNTIME_ROOT:-$REPO_ROOT}"
 RUNTIME_ROOT="$(cd "$RUNTIME_ROOT" 2>/dev/null && pwd || printf '%s' "$RUNTIME_ROOT")"
 TEMPLATE="$REPO_ROOT/ops/launchd/$LABEL.plist.template"
 PLIST_PATH="$LAUNCH_AGENTS_DIR/$LABEL.plist"
-DATA_DIR="$RUNTIME_ROOT/data"
 DAILY_CONFIG="$RUNTIME_ROOT/config/daily_premarket.env"
 OUT_LOG="$REPO_ROOT/logs/prediction_arbitrage_health/launchd.out.log"
 ERR_LOG="$REPO_ROOT/logs/prediction_arbitrage_health/launchd.err.log"
@@ -52,7 +51,6 @@ sed_escape() {
 render_plist() {
   sed \
     -e "s|OPEN_TRADER_PYTHON|$(sed_escape "$PYTHON_BIN")|g" \
-    -e "s|OPEN_TRADER_DATA_DIR|$(sed_escape "$DATA_DIR")|g" \
     -e "s|OPEN_TRADER_DAILY_CONFIG|$(sed_escape "$DAILY_CONFIG")|g" \
     -e "s|OPEN_TRADER_REPO|$(sed_escape "$REPO_ROOT")|g" \
     -e "s|OPEN_TRADER_HEALTH_URL|$(sed_escape "$HEALTH_URL")|g" \
@@ -134,7 +132,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-mkdir -p "$LAUNCH_AGENTS_DIR" "$REPO_ROOT/logs/prediction_arbitrage_health" "$DATA_DIR"
+mkdir -p "$LAUNCH_AGENTS_DIR" "$REPO_ROOT/logs/prediction_arbitrage_health"
 printf '%s\n' "$rendered" > "$PLIST_PATH"
 bootout_if_loaded
 wait_agent_absent

@@ -39,8 +39,6 @@
     <string>OPEN_TRADER_DAILY_CONFIG</string>
     <string>--public-url</string>
     <string>http://127.0.0.1:8766/</string>
-    <string>--prediction-config</string>
-    <string>OPEN_TRADER_PREDICTION_CONFIG</string>
   </array>
 
   <key>RunAtLoad</key>

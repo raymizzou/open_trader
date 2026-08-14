@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import shutil
@@ -9,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+import open_trader.cli as cli
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install_dashboard_launchd.sh"
@@ -16,9 +19,11 @@ UNINSTALLER = ROOT / "scripts" / "uninstall_dashboard_launchd.sh"
 SINGLE_LABEL = "com.open-trader.dashboard"
 GATEWAY_LABEL = "com.open-trader.frontend-gateway"
 LEGACY_LABEL = "com.open-trader.legacy-dashboard"
+ACCOUNT_LABEL = "com.open-trader.account-api"
 SINGLE_TEMPLATE = ROOT / f"ops/launchd/{SINGLE_LABEL}.plist.template"
 GATEWAY_TEMPLATE = ROOT / f"ops/launchd/{GATEWAY_LABEL}.plist.template"
 LEGACY_TEMPLATE = ROOT / f"ops/launchd/{LEGACY_LABEL}.plist.template"
+DASHBOARD_PLIST_TEMPLATES = (SINGLE_TEMPLATE, GATEWAY_TEMPLATE, LEGACY_TEMPLATE)
 
 
 def _dry_run_sections(stdout: str) -> dict[str, dict[str, object]]:
@@ -38,6 +43,7 @@ def _run_installer(
     tmp_path: Path,
     *,
     mode: str = "stack",
+    wait_seconds: int = 1,
     **env_overrides: str,
 ) -> tuple[subprocess.CompletedProcess[str], list[str], Path]:
     agents = tmp_path / "LaunchAgents"
@@ -47,16 +53,21 @@ def _run_installer(
     (repo / "config").mkdir()
     for template in (SINGLE_TEMPLATE, GATEWAY_TEMPLATE, LEGACY_TEMPLATE):
         shutil.copy2(template, repo / "ops/launchd" / template.name)
-    (repo / "config/prediction_arbitrage.json").write_text(
-        "{}\n", encoding="utf-8"
-    )
     runtime = tmp_path / "runtime"
     runtime.mkdir()
     calls_path = tmp_path / "fake-calls"
     state_dir = tmp_path / "launchd-state"
     state_dir.mkdir()
-    for label in (SINGLE_LABEL, GATEWAY_LABEL, LEGACY_LABEL):
-        (state_dir / label).touch()
+    for label, pid in (
+        (SINGLE_LABEL, 4101),
+        (GATEWAY_LABEL, 4102),
+        (LEGACY_LABEL, 4103),
+        (ACCOUNT_LABEL, 4104),
+    ):
+        (state_dir / label).write_text(f"{pid}\n", encoding="utf-8")
+    listener_state = tmp_path / "listener-state"
+    listener_state.mkdir()
+    (listener_state / "8768").write_text("4104\n", encoding="utf-8")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
 
@@ -66,9 +77,27 @@ def _run_installer(
         """#!/bin/bash
 echo "launchctl $*" >> "$FAKE_CALLS"
 label="${2##*/}"
+job_pid() {
+  case "$1" in
+    com.open-trader.dashboard) echo 4101 ;;
+    com.open-trader.frontend-gateway) echo 4102 ;;
+    com.open-trader.legacy-dashboard) echo 4103 ;;
+    com.open-trader.account-api) echo 5104 ;;
+  esac
+}
+job_port() {
+  case "$1" in
+    com.open-trader.dashboard|com.open-trader.frontend-gateway) echo 8766 ;;
+    com.open-trader.legacy-dashboard) echo 8767 ;;
+    com.open-trader.account-api) echo 8768 ;;
+  esac
+}
 if [[ "$1" == "bootout" ]]; then
   if [[ "$label" != "${FAKE_STUCK_LABEL:-}" ]]; then
     rm -f "$FAKE_LAUNCHD_STATE_DIR/$label"
+    rm -f "$FAKE_LISTENER_STATE_DIR/$(job_port "$label")"
+  elif [[ -n "${FAKE_DELAYED_STUCK_POLLS_FILE:-}" ]]; then
+    echo 0 > "$FAKE_DELAYED_STUCK_POLLS_FILE"
   fi
   exit 0
 fi
@@ -77,19 +106,25 @@ if [[ "$1" == "bootstrap" ]]; then
   if [[ "$label" == "com.open-trader.frontend-gateway" && "${FAKE_FAIL_GATEWAY_BOOTSTRAP:-0}" == "1" ]]; then
     exit 5
   fi
-  : > "$FAKE_LAUNCHD_STATE_DIR/$label"
+  pid="$(job_pid "$label")"
+  printf '%s\n' "$pid" > "$FAKE_LAUNCHD_STATE_DIR/$label"
+  printf '%s\n' "$pid" > "$FAKE_LISTENER_STATE_DIR/$(job_port "$label")"
   exit 0
 fi
 if [[ "$1" == "print" ]]; then
+  if [[ "$label" == "${FAKE_STUCK_LABEL:-}" && -f "${FAKE_DELAYED_STUCK_POLLS_FILE:-}" ]]; then
+    polls="$(cat "$FAKE_DELAYED_STUCK_POLLS_FILE")"
+    polls=$((polls + 1))
+    echo "$polls" > "$FAKE_DELAYED_STUCK_POLLS_FILE"
+    if [[ "$polls" -gt "${FAKE_DELAYED_STUCK_POLLS:-0}" ]]; then
+      rm -f "$FAKE_LAUNCHD_STATE_DIR/$label"
+    fi
+  fi
   if [[ ! -f "$FAKE_LAUNCHD_STATE_DIR/$label" ]]; then
     echo "Could not find service" >&2
     exit 113
   fi
-  case "$2" in
-    *com.open-trader.dashboard) echo "pid = 4101" ;;
-    *com.open-trader.frontend-gateway) echo "pid = 4102" ;;
-    *com.open-trader.legacy-dashboard) echo "pid = 4103" ;;
-  esac
+  echo "pid = $(cat "$FAKE_LAUNCHD_STATE_DIR/$label")"
 fi
 exit 0
 """,
@@ -102,6 +137,7 @@ echo "lsof $*" >> "$FAKE_CALLS"
 case "$*" in
   *tiTCP:8766*) [[ -n "${FAKE_8766_PID:-4101}" ]] && echo "${FAKE_8766_PID:-4101}" ;;
   *tiTCP:8767*) [[ -n "${FAKE_8767_PID:-}" ]] && echo "$FAKE_8767_PID" ;;
+  *tiTCP:8768*) [[ -f "$FAKE_LISTENER_STATE_DIR/8768" ]] && cat "$FAKE_LISTENER_STATE_DIR/8768" ;;
 esac
 """,
     )
@@ -141,7 +177,7 @@ exit 0
         "--python",
         sys.executable,
         "--wait-seconds",
-        "1",
+        str(wait_seconds),
     ]
     single_dry_run = subprocess.run(
         [str(INSTALLER), "--mode", "single", "--dry-run", *common_args[1:]],
@@ -153,21 +189,33 @@ exit 0
     (agents / f"{SINGLE_LABEL}.plist").write_text(
         single_dry_run.stdout, encoding="utf-8"
     )
-    if mode == "single":
-        stack_dry_run = subprocess.run(
-            [str(INSTALLER), "--dry-run", *common_args[1:]],
-            cwd=ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
+    stack_dry_run = subprocess.run(
+        [str(INSTALLER), "--dry-run", *common_args[1:]],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    for label, payload in _dry_run_sections(stack_dry_run.stdout).items():
+        (agents / f"{label}.plist").write_bytes(plistlib.dumps(payload))
+    if mode == "legacy":
+        (agents / f"{ACCOUNT_LABEL}.plist").write_bytes(
+            plistlib.dumps(
+                {"Label": ACCOUNT_LABEL, "ProgramArguments": ["account-sentinel"]}
+            )
         )
-        for label, payload in _dry_run_sections(stack_dry_run.stdout).items():
-            (agents / f"{label}.plist").write_bytes(plistlib.dumps(payload))
+        snapshots = tmp_path / "legacy-nonlegacy-snapshots"
+        snapshots.mkdir()
+        for label in (SINGLE_LABEL, GATEWAY_LABEL, ACCOUNT_LABEL):
+            shutil.copy2(agents / f"{label}.plist", snapshots / f"{label}.plist")
+            shutil.copy2(state_dir / label, snapshots / label)
+        shutil.copy2(listener_state / "8768", snapshots / "port-8768")
 
     env = {
         **os.environ,
         "FAKE_CALLS": str(calls_path),
         "FAKE_LAUNCHD_STATE_DIR": str(state_dir),
+        "FAKE_LISTENER_STATE_DIR": str(listener_state),
         "LAUNCHCTL_BIN": str(launchctl),
         "LSOF_BIN": str(lsof),
         "CURL_BIN": str(curl),
@@ -180,7 +228,11 @@ exit 0
         capture_output=True,
         text=True,
     )
-    calls = calls_path.read_text(encoding="utf-8").splitlines()
+    calls = (
+        calls_path.read_text(encoding="utf-8").splitlines()
+        if calls_path.exists()
+        else []
+    )
     return result, calls, agents
 
 
@@ -199,6 +251,13 @@ def test_stack_templates_define_separate_loopback_jobs() -> None:
     ]
     assert gateway_args[gateway_args.index("--port") + 1] == "8766"
     assert gateway_args[gateway_args.index("--upstream-port") + 1] == "8767"
+    assert gateway_args[gateway_args.index("--prediction-route-state") + 1] == (
+        "OPEN_TRADER_PREDICTION_ROUTE_STATE"
+    )
+    assert gateway_args[gateway_args.index("--prediction-upstream-host") + 1] == (
+        "127.0.0.1"
+    )
+    assert gateway_args[gateway_args.index("--prediction-upstream-port") + 1] == "8769"
     assert legacy_args[legacy_args.index("-m") : legacy_args.index("-m") + 3] == [
         "-m",
         "open_trader",
@@ -214,6 +273,47 @@ def test_stack_templates_define_separate_loopback_jobs() -> None:
     assert legacy["StandardOutPath"] == (
         "OPEN_TRADER_REPO/logs/legacy_dashboard/launchd.out.log"
     )
+
+
+def test_dashboard_launchd_has_no_prediction_owner_or_config(tmp_path: Path) -> None:
+    parser = cli.build_parser()
+    for path in DASHBOARD_PLIST_TEMPLATES:
+        text = path.read_text(encoding="utf-8")
+        assert "--prediction-owner" not in text
+        assert "--prediction-config" not in text
+
+    installer = INSTALLER.read_text(encoding="utf-8")
+    assert "--prediction-owner" not in installer
+    assert "PREDICTION_OWNER" not in installer
+
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    for mode in ("single", "legacy"):
+        result = subprocess.run(
+            [
+                str(INSTALLER),
+                "--mode",
+                mode,
+                "--dry-run",
+                "--repo-root",
+                str(ROOT),
+                "--runtime-root",
+                str(runtime),
+                "--launch-agents-dir",
+                str(agents),
+                "--python",
+                sys.executable,
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        args = plistlib.loads(result.stdout.encode("utf-8"))["ProgramArguments"]
+        dashboard_args = args[args.index("dashboard") :]
+        assert parser.parse_args(dashboard_args).command == "dashboard"
 
 
 def test_stack_dry_run_prints_two_valid_plists_without_side_effects(
@@ -253,10 +353,116 @@ def test_stack_dry_run_prints_two_valid_plists_without_side_effects(
     sections = _dry_run_sections(result.stdout)
     assert set(sections) == {GATEWAY_LABEL, LEGACY_LABEL}
     assert sections[GATEWAY_LABEL]["WorkingDirectory"] == str(ROOT)
+    gateway_args = sections[GATEWAY_LABEL]["ProgramArguments"]
+    assert str(runtime / "config/prediction-route.json") in gateway_args
     legacy_args = sections[LEGACY_LABEL]["ProgramArguments"]
     assert str(runtime / "data") in legacy_args
-    assert str(runtime / "config/prediction_arbitrage.json") in legacy_args
+    assert "--prediction-config" not in legacy_args
     assert not list(agents.iterdir())
+
+
+def test_legacy_only_preserves_gateway_and_single_without_prediction_flags(
+    tmp_path: Path,
+) -> None:
+    result, calls, agents = _run_installer(tmp_path, mode="legacy")
+    domain = f"gui/{os.getuid()}"
+    legacy = plistlib.loads((agents / f"{LEGACY_LABEL}.plist").read_bytes())
+    legacy_args = legacy["ProgramArguments"]
+    snapshots = tmp_path / "legacy-nonlegacy-snapshots"
+    listener_state = tmp_path / "listener-state"
+
+    assert result.returncode == 0
+    assert "--prediction-config" not in legacy_args
+    assert "--prediction-owner" not in legacy_args
+    assert [
+        call
+        for call in calls
+        if any(word in call for word in (" bootout ", " bootstrap ", " kickstart"))
+    ] == [
+        f"launchctl bootout {domain}/{LEGACY_LABEL}",
+        f"launchctl bootstrap {domain} {agents / f'{LEGACY_LABEL}.plist'}",
+    ]
+    assert not any(
+        label in call
+        for call in calls
+        for label in (GATEWAY_LABEL, SINGLE_LABEL, "com.open-trader.account-")
+    )
+    assert not any("8766" in call for call in calls)
+    assert not any("8768" in call for call in calls)
+    assert [call for call in calls if call.startswith("lsof ")] == [
+        "lsof -nP -tiTCP:8767 -sTCP:LISTEN"
+    ]
+    for label in (SINGLE_LABEL, GATEWAY_LABEL, ACCOUNT_LABEL):
+        assert (agents / f"{label}.plist").read_bytes() == (
+            snapshots / f"{label}.plist"
+        ).read_bytes()
+        assert (tmp_path / "launchd-state" / label).read_bytes() == (
+            snapshots / label
+        ).read_bytes()
+    assert (listener_state / "8768").read_bytes() == (
+        snapshots / "port-8768"
+    ).read_bytes()
+    assert (listener_state / "8768").read_text(encoding="utf-8") == "4104\n"
+
+
+def test_fresh_stack_bootstraps_service_prediction_route(tmp_path: Path) -> None:
+    result, _, _ = _run_installer(tmp_path)
+
+    assert result.returncode == 0
+    route = json.loads(
+        (tmp_path / "runtime/config/prediction-route.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert route["mode"] == "service"
+
+
+def test_unknown_mode_fails_without_side_effects(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "ops/launchd").mkdir(parents=True)
+    (repo / "config").mkdir()
+    for template in (SINGLE_TEMPLATE, GATEWAY_TEMPLATE, LEGACY_TEMPLATE):
+        shutil.copy2(template, repo / "ops/launchd" / template.name)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    calls = tmp_path / "calls"
+    forbidden = tmp_path / "forbidden"
+    _write_executable(forbidden, '#!/bin/sh\nprintf x >> "$FAKE_CALLS"\n')
+
+    result = subprocess.run(
+        [
+            str(INSTALLER),
+            "--mode",
+            "unknown",
+            "--repo-root",
+            str(repo),
+            "--runtime-root",
+            str(runtime),
+            "--launch-agents-dir",
+            str(agents),
+            "--python",
+            sys.executable,
+        ],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "FAKE_CALLS": str(calls),
+            "LAUNCHCTL_BIN": str(forbidden),
+            "LSOF_BIN": str(forbidden),
+            "CURL_BIN": str(forbidden),
+        },
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert not calls.exists()
+    assert not list(agents.iterdir())
+    assert not list(runtime.iterdir())
+    assert not (repo / "logs").exists()
 
 
 @pytest.mark.parametrize(
@@ -270,9 +476,6 @@ def test_retired_installer_mode_option_fails_without_side_effects(
     (repo / "config").mkdir()
     for template in (SINGLE_TEMPLATE, GATEWAY_TEMPLATE, LEGACY_TEMPLATE):
         shutil.copy2(template, repo / "ops/launchd" / template.name)
-    (repo / "config/prediction_arbitrage.json").write_text(
-        "{}\n", encoding="utf-8"
-    )
     agents = tmp_path / "LaunchAgents"
     agents.mkdir()
     runtime = tmp_path / "runtime"
@@ -316,7 +519,7 @@ def test_retired_installer_mode_option_fails_without_side_effects(
         text=True,
     )
     assert result.returncode == 2
-    assert "cross-auto mode" in result.stderr
+    assert "automatic cross-venue CLI controls are removed" in result.stderr
     assert result.stdout == ""
     assert not calls.exists()
     assert not list(agents.iterdir())
@@ -370,6 +573,26 @@ def test_stack_does_not_bootstrap_while_bootout_remains_loaded(
     assert (
         f"launchctl bootstrap {domain} {agents / f'{LEGACY_LABEL}.plist'}"
         not in calls
+    )
+
+
+def test_stack_waits_past_five_polls_for_delayed_legacy_shutdown(
+    tmp_path: Path,
+) -> None:
+    result, calls, agents = _run_installer(
+        tmp_path,
+        wait_seconds=8,
+        FAKE_STUCK_LABEL=LEGACY_LABEL,
+        FAKE_DELAYED_STUCK_POLLS="6",
+        FAKE_DELAYED_STUCK_POLLS_FILE=str(tmp_path / "delayed-polls"),
+    )
+    domain = f"gui/{os.getuid()}"
+
+    assert result.returncode == 0, result.stderr
+    assert int((tmp_path / "delayed-polls").read_text(encoding="utf-8")) >= 6
+    assert (
+        f"launchctl bootstrap {domain} {agents / f'{LEGACY_LABEL}.plist'}"
+        in calls
     )
 
 

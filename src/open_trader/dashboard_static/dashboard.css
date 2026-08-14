@@ -1342,6 +1342,31 @@ table {
   min-width: 0;
 }
 
+.holding-origin-section {
+  padding: 14px 0 0;
+}
+
+.holding-origin-section + .holding-origin-section {
+  border-top: 8px solid var(--surface-soft);
+  margin-top: 14px;
+}
+
+.holding-origin-heading {
+  align-items: baseline;
+  display: flex;
+  justify-content: space-between;
+  padding: 0 12px 8px;
+}
+
+.holding-origin-heading h3 {
+  font-size: 1rem;
+  margin: 0;
+}
+
+.holding-origin-heading span {
+  color: var(--muted);
+}
+
 .account-view-panel > .cn-trend-report,
 .account-view-panel > .trend-review,
 .trend-history-panel {

@@ -20,12 +20,8 @@
     <string>health-check</string>
     <string>--url</string>
     <string>OPEN_TRADER_HEALTH_URL</string>
-    <string>--data-dir</string>
-    <string>OPEN_TRADER_DATA_DIR</string>
     <string>--config</string>
     <string>OPEN_TRADER_DAILY_CONFIG</string>
-    <string>--repo</string>
-    <string>OPEN_TRADER_REPO</string>
     <string>--interval</string>
     <string>OPEN_TRADER_HEALTH_INTERVAL</string>
   </array>

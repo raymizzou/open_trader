@@ -522,6 +522,7 @@ def test_shadow_health_has_the_read_only_identity() -> None:
     assert payload["guard_attempts"] == []
     assert isinstance(payload["pid"], int)
     assert isinstance(payload["started_at"], str)
+    assert payload["source_state"] in {"clean", "dirty"}
     assert "release_schema_version" not in payload
     assert "reader_generation" not in payload
     assert "contract_generation" not in payload
@@ -1455,7 +1456,7 @@ def test_production_service_requires_release_manifest_before_runtime_constructio
         )
 
 
-def test_cli_passes_release_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cli_passes_production_config_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     import open_trader.prediction_service as service
 
     captured: dict[str, object] = {}
@@ -1476,11 +1477,73 @@ def test_cli_passes_release_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
             "/tmp/prediction.json",
             "--release-manifest",
             "/tmp/release.json",
+            "--notifier-config",
+            "/tmp/daily_premarket.env",
         ]
     )
 
     assert result == 7
     assert captured["release_manifest_path"] == Path("/tmp/release.json")
+    assert captured["notifier_config_path"] == Path("/tmp/daily_premarket.env")
+
+
+def test_production_service_injects_notifier_from_notifier_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_service as service
+
+    instances = []
+    notifier = object()
+    notifier_config = tmp_path / "daily_premarket.env"
+    loaded_config = object()
+    loaded_paths: list[tuple[Path, bool]] = []
+
+    class FakeRuntime:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            self.state = "NEW"
+            self.production_owner = False
+            instances.append(self)
+
+        def start(self) -> None:
+            self.state = "RUNNING"
+            self.production_owner = True
+
+        def stop(self) -> None:
+            self.state = "STOPPED"
+
+    monkeypatch.setattr(service, "PredictionRuntime", FakeRuntime)
+    def load_config(path: Path, *, dry_run: bool) -> object:
+        loaded_paths.append((path, dry_run))
+        return loaded_config
+
+    def build_configured_notifier(config: object) -> object:
+        assert config is loaded_config
+        return notifier
+
+    monkeypatch.setattr(service, "load_env_config", load_config, raising=False)
+    monkeypatch.setattr(
+        service, "build_notifier", build_configured_notifier, raising=False
+    )
+    monkeypatch.setattr(
+        service, "create_prediction_server",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("bind failed")),
+    )
+
+    with pytest.raises(OSError, match="bind failed"):
+        service.serve_prediction_service(
+            data_dir=tmp_path,
+            prediction_config_path=tmp_path / "prediction.json",
+            notifier_config_path=notifier_config,
+            port=0,
+            mode="production",
+            release_manifest_path=Path(__file__).resolve().parents[1]
+            / "ops"
+            / "prediction-service-release.json",
+        )
+
+    assert instances[0].kwargs["notifier"] is notifier
+    assert loaded_paths == [(notifier_config, False)]
 
 
 def test_production_bind_failure_stops_runtime_and_uses_one_metadata_snapshot(

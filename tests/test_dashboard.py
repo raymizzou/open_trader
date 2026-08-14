@@ -356,6 +356,269 @@ def write_trend_history_report(
     return payload
 
 
+def write_buy_plan_history(
+    root: Path,
+    directory: str,
+    artifact: str,
+    *,
+    market: str,
+    actions: list[dict[str, object]],
+) -> None:
+    path = root / directory / artifact
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "metadata": {"market": market},
+        "strategy_judgments": {"formal_actions": actions},
+    }), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    (
+        "market", "directory", "older_buy", "revision_buy", "non_buy_symbols",
+        "review_buy", "review_buy_key", "expected_symbols",
+    ),
+    [
+        (
+            "CN", "trend_a_share", "511190", "159915",
+            ("600000", "000001", "601318"), "300750", "CN.300750",
+            ["CN.159915", "CN.511190"],
+        ),
+        (
+            "HK", "trend_hk_phillips", "622", "700",
+            ("1", "2", "3"), "9988", "HK.09988",
+            ["HK.00622", "HK.00700"],
+        ),
+        (
+            "US", "trend_us_tiger", "adp", "msft",
+            ("sell", "hold", "review"), "tsla", "US.TSLA",
+            ["US.ADP", "US.MSFT"],
+        ),
+    ],
+)
+def test_historical_buy_plan_membership_keeps_every_formal_buy_revision(
+    tmp_path: Path,
+    market: str,
+    directory: str,
+    older_buy: str,
+    revision_buy: str,
+    non_buy_symbols: tuple[str, str, str],
+    review_buy: str,
+    review_buy_key: str,
+    expected_symbols: list[str],
+) -> None:
+    write_buy_plan_history(
+        tmp_path,
+        directory,
+        "2026-07-14.json",
+        market=market,
+        actions=[
+            {"action": "BUY", "symbol": older_buy},
+            {"action": "SELL_ALL", "symbol": non_buy_symbols[0]},
+            {"action": "HOLD", "symbol": non_buy_symbols[1]},
+            {"action": "MANUAL_REVIEW", "symbol": non_buy_symbols[2]},
+            {"action": "BUY", "symbol": review_buy, "reason": "review_required"},
+        ],
+    )
+    write_buy_plan_history(
+        tmp_path, directory, "2026-07-15.json", market=market, actions=[]
+    )
+    write_buy_plan_history(
+        tmp_path,
+        directory,
+        "2026-07-14-r1.json",
+        market=market,
+        actions=[
+            {"action": "BUY", "symbol": older_buy},
+            {"action": "BUY", "symbol": revision_buy},
+        ],
+    )
+
+    membership = dashboard_module._historical_buy_plan_membership(
+        tmp_path / directory, broker="test", market=market
+    )
+
+    assert membership == {
+        "available": True,
+        "symbols": expected_symbols,
+        "reason": "",
+    }
+    assert review_buy_key not in membership["symbols"]
+
+
+def test_historical_buy_plan_membership_distinguishes_unavailable_from_empty(
+    tmp_path: Path,
+) -> None:
+    missing = dashboard_module._historical_buy_plan_membership(
+        tmp_path / "missing", broker="test", market="US"
+    )
+    malformed_dir = tmp_path / "malformed"
+    malformed_dir.mkdir()
+    (malformed_dir / "broken.json").write_text("{broken", encoding="utf-8")
+    malformed = dashboard_module._historical_buy_plan_membership(
+        malformed_dir, broker="test", market="US"
+    )
+    invalid_actions_dir = tmp_path / "invalid-actions"
+    write_buy_plan_history(
+        tmp_path, "invalid-actions", "report.json", market="US", actions=[]
+    )
+    (invalid_actions_dir / "report.json").write_text(json.dumps({
+        "strategy_judgments": {"formal_actions": "invalid"},
+    }), encoding="utf-8")
+    invalid_formal_actions = dashboard_module._historical_buy_plan_membership(
+        invalid_actions_dir, broker="test", market="US"
+    )
+    invalid_symbol_dir = tmp_path / "invalid-symbol"
+    write_buy_plan_history(
+        tmp_path,
+        "invalid-symbol",
+        "report.json",
+        market="US",
+        actions=[{"action": "BUY", "symbol": "AAPL/2026"}],
+    )
+    invalid_buy_symbol = dashboard_module._historical_buy_plan_membership(
+        invalid_symbol_dir, broker="test", market="US"
+    )
+    valid_empty_dir = tmp_path / "valid-empty"
+    write_buy_plan_history(
+        tmp_path, "valid-empty", "report.json", market="US", actions=[]
+    )
+    valid_empty = dashboard_module._historical_buy_plan_membership(
+        valid_empty_dir, broker="test", market="US"
+    )
+    mixed_dir = tmp_path / "mixed"
+    write_buy_plan_history(
+        tmp_path,
+        "mixed",
+        "valid.json",
+        market="US",
+        actions=[{"action": "BUY", "symbol": "ADP"}],
+    )
+    (mixed_dir / "broken.json").write_text("{broken", encoding="utf-8")
+    mixed = dashboard_module._historical_buy_plan_membership(
+        mixed_dir, broker="test", market="US"
+    )
+
+    assert missing["available"] is False
+    assert malformed["available"] is False
+    assert invalid_formal_actions["available"] is False
+    assert invalid_buy_symbol["available"] is False
+    assert mixed["available"] is False
+    assert valid_empty == {"available": True, "symbols": [], "reason": ""}
+    for unavailable in (
+        missing, malformed, invalid_formal_actions, invalid_buy_symbol, mixed,
+    ):
+        assert unavailable["symbols"] == []
+        assert unavailable["reason"]
+
+
+def test_historical_buy_plan_membership_rejects_symlink_escape(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    write_buy_plan_history(
+        outside,
+        "reports",
+        "external.json",
+        market="US",
+        actions=[{"action": "BUY", "symbol": "LEAK"}],
+    )
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    (reports_dir / "linked.json").symlink_to(outside / "reports/external.json")
+
+    membership = dashboard_module._historical_buy_plan_membership(
+        reports_dir, broker="test", market="US"
+    )
+
+    assert membership == {
+        "available": False,
+        "symbols": [],
+        "reason": "历史趋势报告不可读取",
+    }
+
+
+def test_historical_buy_plan_membership_rejects_symlink_loop(tmp_path: Path) -> None:
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    loop = reports_dir / "loop.json"
+    loop.symlink_to(loop)
+
+    membership = dashboard_module._historical_buy_plan_membership(
+        reports_dir, broker="test", market="US"
+    )
+
+    assert membership == {
+        "available": False,
+        "symbols": [],
+        "reason": "历史趋势报告不可读取",
+    }
+
+
+@pytest.mark.parametrize(
+    ("broker", "market", "expected_symbols"),
+    [
+        (
+            "tiger",
+            "US",
+            [
+                "US.AMZN", "US.CRNX", "US.GRMN", "US.KO", "US.LH",
+                "US.NUE", "US.PYPL", "US.REGN", "US.XLV",
+            ],
+        ),
+        ("phillips", "HK", ["HK.06823"]),
+    ],
+)
+def test_historical_buy_plan_membership_adds_scoped_evidence_allowlist(
+    tmp_path: Path,
+    broker: str,
+    market: str,
+    expected_symbols: list[str],
+) -> None:
+    write_buy_plan_history(
+        tmp_path, "reports", "report.json", market=market, actions=[]
+    )
+
+    membership = dashboard_module._historical_buy_plan_membership(
+        tmp_path / "reports", broker=broker, market=market
+    )
+
+    assert membership == {
+        "available": True,
+        "symbols": expected_symbols,
+        "reason": "",
+    }
+
+
+@pytest.mark.parametrize(
+    ("broker", "market"),
+    [("phillips", "US"), ("tiger", "HK")],
+)
+def test_historical_buy_plan_membership_scopes_evidence_allowlist(
+    tmp_path: Path, broker: str, market: str
+) -> None:
+    write_buy_plan_history(
+        tmp_path, "reports", "report.json", market=market, actions=[]
+    )
+
+    membership = dashboard_module._historical_buy_plan_membership(
+        tmp_path / "reports", broker=broker, market=market
+    )
+
+    assert membership == {"available": True, "symbols": [], "reason": ""}
+
+
+def test_historical_buy_plan_membership_does_not_publish_partial_allowlist(
+    tmp_path: Path,
+) -> None:
+    membership = dashboard_module._historical_buy_plan_membership(
+        tmp_path / "missing", broker="tiger", market="US"
+    )
+
+    assert membership == {
+        "available": False,
+        "symbols": [],
+        "reason": "历史趋势报告不存在",
+    }
+
+
 def test_trend_report_history_uses_payload_date_and_keeps_revisions(
     tmp_path: Path,
 ) -> None:
@@ -948,11 +1211,13 @@ def trend_review_projection_v3(market: str, broker: str) -> dict[str, object]:
     payload = trend_review_projection_v2(market, broker)
     for key in ("batch", "batch_path", "source_path", "source_artifacts"):
         payload.pop(key)
-    payload["schema_version"] = "open_trader.trend_review.projection.v4"
+    payload["schema_version"] = "open_trader.trend_review.projection.v5"
     payload["sample_details"] = {
         key: {
             "available": True,
             "eligible_sample_count": payload["sample_counts"][key],  # type: ignore[index]
+            "winning_sample_count": payload["sample_counts"][key],  # type: ignore[index]
+            "win_rate": "1" if payload["sample_counts"][key] else None,  # type: ignore[index]
             "discovered_candidate_count": payload["sample_counts"][key],  # type: ignore[index]
             "excluded_candidate_count": 0,
             "incomplete_open_candidate_count": 0,
@@ -1264,7 +1529,7 @@ def test_dashboard_rejects_incomplete_snapshot_without_common_cutoff(
     assert review["available"] is False
 
 
-def test_dashboard_accepts_strict_v4_trend_review_projection(tmp_path: Path) -> None:
+def test_dashboard_accepts_strict_v5_trend_review_projection(tmp_path: Path) -> None:
     path = tmp_path / "data/latest/trend_review_us.json"
     path.parent.mkdir(parents=True)
     path.write_text(
@@ -1332,6 +1597,12 @@ def test_dashboard_accepts_failed_benchmark_refresh_with_prior_snapshot_metadata
     ("mutation", "broker"),
     [
         (lambda payload: payload.update(schema_version="v1"), "tiger"),
+        (
+            lambda payload: payload.update(
+                schema_version="open_trader.trend_review.projection.v4"
+            ),
+            "tiger",
+        ),
         (lambda payload: payload.update(market="HK"), "tiger"),
         (lambda payload: payload["metrics"].pop("sharpe"), "tiger"),
         (
@@ -1358,6 +1629,24 @@ def test_dashboard_accepts_failed_benchmark_refresh_with_prior_snapshot_metadata
         ),
         (
             lambda payload: payload["sample_counts"].update(internal=1),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["sample_details"]["discipline"].update(
+                winning_sample_count=32
+            ),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["sample_details"]["discipline"].update(
+                win_rate="0.5"
+            ),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["sample_details"]["discipline"].pop(
+                "win_rate"
+            ),
             "tiger",
         ),
         (lambda payload: payload.update(common_cutoff="2026/07/17"), "tiger"),

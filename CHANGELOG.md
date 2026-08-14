@@ -6,8 +6,163 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-08-14
 
 - #49 标准化 solver adapters/worker benchmark：先通过稳定性硬门槛，再做正套利输出速度实验；在当前 macOS/current-corpus 边界内选择 OR-Tools CP-SAT。Linux cleanup proof 未完成，不构成正式跨平台全量选择；Issue 已关闭。
+- 趋势复盘“策略与市场基准”现分别显示纪律模拟和实际执行的完整交易胜率：只统计既有归因、成本完整的完整闭环，成本后 `net_pnl > 0` 才计胜，持平仍计入分母；零闭环显示“数据不足”，来源不可用不伪装为 `0%`。投影已升至 v5，Controller 会将 v4 视为旧投影并重建。验证：6 个受影响测试文件 `1539 passed, 1 warning`；只读真实三市场投影为 CN 模拟 `2/11`、HK 模拟 `1/6`、US 模拟 `2/8`，三市场实际执行均 `0/0`。未运行 `make acceptance`、部署、合并或推送。
+
+- #46 final corrections make the independent Prediction Service health contract
+  fail closed unless it is the production `prediction_service` owner with clean
+  source/cwd/SHA/PID facts; `prediction-arb status` now validates `/healthz` for
+  production `8769` and Gateway identity for `8766` without a Dashboard process
+  scan. The obsolete Legacy-vs-Shadow validator command and its dedicated
+  module/tests were removed, and setup/runbook docs now install and verify the
+  sole `8769` owner. Focused health/CLI/source metadata tests pass; no live
+  service, launchd, route/data, merge, deploy, or acceptance run was performed.
+  Account outage acceptance now waits boundedly for the launchd label and 8768
+  listener to disappear before its first outage probe; the deterministic
+  regression passes and now validates the cheap Gateway health contract instead
+  of recomputing slow Prediction state during the outage check.
+
+## 2026-08-13
+
+- #46 removes retired Prediction owner/config flags from Dashboard launchd
+  templates and installer. Legacy remains non-Prediction on 8767 while
+  Prediction Service owns 8769; fresh stack bootstrap now seeds the Service
+  route, and active runbooks describe fail-closed/manual non-Prediction
+  recovery. Current-parser, launchd, shell/plist, and diff checks pass. No
+  live launchd, service, route/data, or acceptance run was performed.
+
+- Prediction Dashboard state refreshes now use a signal-history generation to
+  preserve independently-polled signals only when that history advances during
+  the state request. Closed signals keep live profit hidden and operations
+  unavailable without blocking newer signals from a subsequently started state
+  request. Both deterministic request orderings, focused polling/static checks,
+  and all 35 Prediction Market browser cases pass; no live command, deployment,
+  restart, or acceptance run was performed.
+
+- Completed #45's one-time Prediction owner cutover command, Account proof
+  helper, dedicated 115-case cutover suite, and Legacy rollback runbook have
+  been retired. The production route remains Service-owned and Legacy rollback
+  is unsupported. Retained Prediction Service, Gateway, and live no-submit
+  registry checks pass; final `make acceptance` and exact-SHA deployment remain
+  the closure gate.
+
+- Dashboard launchd reinstall now makes its initial label observation and
+  continues through the configured elapsed wait bound before refusing a still
+  loaded job, preventing a one-second wait from bootstrapping before delayed
+  removal is proven. Focused launchd checks pass; no live command, deployment,
+  restart, or acceptance run was performed.
+
+- Prediction shadow-validation tests now isolate their launchd-label probe, so
+  a running local Prediction Service cannot change fake acceptance outcomes.
+  The full shadow-validation file and focused notifier launchd checks pass; no
+  production behavior, live service, deployment, or acceptance run changed.
+
+- Prediction dashboard state polling now skips an overlapping slow request and
+  reuses the initial signal-history request, preventing one browser tab from
+  multiplying service reads during a slow refresh. Focused dashboard checks
+  pass; no live command, deployment, restart, or acceptance run was performed.
+
+- Prediction Service production launchd now supplies the existing daily
+  notifier configuration to its runtime, matching Legacy notification
+  injection; shadow remains unconfigured/read-only. Focused service and
+  launchd rendering checks pass; no live command, deployment, or acceptance
+  run was performed.
+
+- #45 aligns Gateway public-state readiness proof with the production
+  read-model contract (`readiness.ready == true`), rejecting invented
+  status-only payloads. Focused readiness, happy cutover, and rollback checks
+  pass; no live command, deployment, or acceptance run was performed.
+
+- #45 marks post-cutover lock-holder evidence unavailable when its capture
+  fails, instead of treating an empty holder list as verified availability.
+  Focused malformed-after evidence check passes; no live command, deployment,
+  or acceptance run was performed.
+
+- #45 validates joined macOS runtime-lock output at the capture boundary,
+  canonicalizing `p<PID>` holders while accepting only `f<FD>` ancillary
+  records. Unknown or PID-less output fails closed before route mutation and
+  after maintenance writes truthful failed evidence. Focused lock and
+  maintenance-failure checks pass; no live command, deployment, or acceptance
+  run was performed.
+
+- #45 live-preflight follow-up uses joined `lsof -Fp` runtime-lock probes so
+  macOS file-descriptor records cannot invalidate owner evidence, and the
+  Dashboard stack installer now waits up to its configured bounded timeout for
+  delayed Legacy shutdown. Focused cutover/install checks pass; no live
+  command, deployment, or acceptance run was performed.
+
+- #45 runtime-lock evidence now accepts only the documented macOS `p<PID>` plus
+  `f<FD>` records from joined `lsof -Fp`, retaining fail-closed rejection of
+  unknown fields. Focused before/after evidence and maintenance-failure checks
+  pass; no live command, deployment, or acceptance run was performed.
+
+- #45 round-7 focused closeouts require strict Account controller/API argv and
+  health proof at capture time while validating persisted evidence against the
+  canonical stored contract, so later plist edits cannot erase truthful before
+  observations. Historical Account heartbeats remain valid for repeat checks;
+  current preflight/after captures stay fresh and unchanged. Focused repeat,
+  plist-drift, and strict Account checks pass; reviewer/affected-full gates and
+  live cutover remain pending. No deployment, restart, 8769 install, or `make
+  acceptance` ran.
 
 ## 2026-08-12
+
+- #45 round-5 fixes prove the existing Account release at process level: real
+  controller/API launchd argv, controller status PID/cwd/SHA/fresh heartbeat,
+  API production health and 8768 ownership, with exact before/after identity
+  preservation and no Account restart. Account may remain on an older SHA than
+  the accepted Prediction release. Failed evidence now preserves captured
+  before observations while representing unavailable after observations as
+  null. Focused round-5 checks pass: Account old-release (1), Account identity
+  preflight (10), partial failed evidence (1), happy/evidence (4), key
+  service/rollback selectors (13), and malformed/repeat (4). `bash -n` and
+  `git diff --check` pass; affected/full gates remain pending reviewer
+  recheck. Live cutover, deployment, restart, 8769 install, and `make
+  acceptance` have not run.
+
+- #45 round-4 reviewer fixes add the real split Account topology (sync
+  controller plus API/8768 health), preserve `ready`/`failed`/`stopped`
+  runtime-record semantics for rollback and repeat, require maintenance
+  failure evidence after post-maintenance Legacy inspection errors, and keep
+  only the documented heartbeat/time fields volatile in direct/public parity.
+  Focused checks on this worktree SHA pass: Account evidence (1), stopped
+  rollback/repeat/cutover (1), maintenance/heartbeat/preview contract (4),
+  Account preflight (5), evidence/repeat/secrets (7), and service/rollback
+  failure matrices (28). Shell syntax and diff checks pass. The historical
+  `a2adf509` affected/full results (671/5,884) remain historical; final gates
+  for this new SHA are pending reviewer recheck. Live cutover, deployment,
+  restart, 8769 install, and `make acceptance` have not run.
+
+- #45 round-3 review fixes continue the fail-closed integrated bootstrap and
+  maintenance rollback with one evidence validator, observed pre-#45 runtime
+  identity, Account preservation checks, direct/public no-submit parity, and
+  private temporary-file cleanup. Focused checks on this SHA pass: 19 service
+  failure cases, 5 malformed/repeat evidence cases, and the CAS race case three
+  times; the full cutover-file attempt reached 46 passes before its cold-start
+  race observation timed out, so no final-file PASS is claimed. The prior
+  implementation SHA `a2adf509` historically passed the affected 671-case and
+  full 5,884-case gates; final affected/full gates for this new SHA remain
+  pending reviewer recheck. Live cutover, deployment, restart, 8769 install,
+  and `make acceptance` have not run.
+
+- #45 freezes Prediction Gateway `legacy`, `service`, and `maintenance` route
+  modes with in-flight drain, adds Legacy owner-off launchd rendering, and
+  records the bounded cutover/rollback script. Tasks 1–4 provide frozen
+  Legacy/Service parity and durable idempotency proof; the merge-main SHA is
+  `97c2766ce7aaf1f50efe8a2226d3d89209ded3e6`. Shell/plist/diff gates passed
+  and the exact full branch gate passed `5870 passed, 1 warning in 917.38s`.
+  Compatibility bootstrap, live cutover, deployment/restart, 8769 install, and
+  `make acceptance` have not run.
+
+- 补录 Tiger 美股历史证据缺口 XLV、PYPL 与 Phillips 港股 HK.06823
+  （实时账户名称 HKT-SS）：仅改变 Account 与 Trend Report 两处真实持仓的趋势归类；
+  归类优先使用规范化 Futu 标识，券商别名不覆盖已确认身份；交易、下单、模拟持仓和
+  历史报告内容不变；聚焦归类、fail-closed 与两处 DOM 回归通过。
+
+- Account 与 Trend Report 两处实盘持仓现按历史正式买入计划，在 A 股、港股和美股拆分为
+  “趋势持仓”和“非趋势持仓”；Tiger 美股历史证据缺口 AMZN、CRNX、GRMN、KO、LH、NUE、
+  REGN 通过受源代码控制的 allowlist 补录；验收在 Account 原子发布瞬间遇到可重试
+  503 时交由既有重试边界处理；模拟持仓与交易行为不变；已通过聚焦 Dashboard 回归，
+  最终 `make acceptance` PASS，并按验收同一 SHA 部署。
 
 - #48 冻结 solver-independent、版本化的 N_LEG 模型与有界精确 Oracle 语料：Admission、
   Optimization 与显式 Raw diagnostic 分离，确定性 support proof 和穷尽负证明均有可回放
@@ -27,6 +182,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
   `205 failed, 5482 passed, 3 skipped, 1 warning in 194.53s`，不是 green gate；失败与 #48
   无关，主要为 legacy fixture 缺失和 sandbox 禁止 localhost socket bind/browser process。
   未改 Prediction runtime、Dashboard、solver dependency 或 order path。
+
+- 将 Open Trader 以 Apache License 2.0 正式开放许可，并在 README 与 Python 包元数据中
+  发布相同的 SPDX 标识；运行代码、交易流程、后台服务与数据均未改变。已核对许可证官方
+  原文、包元数据解析与 Git 差异；本次不涉及行为或 Dashboard acceptance。
 
 - 完成通用 N_LEG Prediction 套利设计与开发 Ticket 契约收敛：热路径接受任一已验证合格
   连通组合而不等待全局最优，组件级负证明仅接受预算内完整 Oracle 或可独立检查证书；

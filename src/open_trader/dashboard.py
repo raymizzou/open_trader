@@ -8,7 +8,7 @@ import socket
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Context, Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -112,6 +112,20 @@ TREND_REPORT_SOURCES = {
     "phillips": ("HK", "港股", "辉立", "trend_hk_phillips", "09:30–10:00"),
     "eastmoney": ("CN", "A股", "东方财富", "trend_a_share", "09:30–10:00"),
 }
+TREND_HOLDING_EVIDENCE_ALLOWLIST = {
+    ("tiger", "US"): frozenset({
+        "US.AMZN",
+        "US.CRNX",
+        "US.GRMN",
+        "US.KO",
+        "US.LH",
+        "US.NUE",
+        "US.PYPL",
+        "US.REGN",
+        "US.XLV",
+    }),
+    ("phillips", "HK"): frozenset({"HK.06823"}),
+}
 CURRENT_FINAL_PLAN_TREND_VERSIONS = frozenset({
     ("CN", "v13"),
     ("HK", "v11"),
@@ -193,7 +207,6 @@ class DashboardConfig:
     trend_cn_candidate_pool_ids: tuple[int, ...] = ()
     trend_us_candidate_pool_ids: tuple[int, ...] = ()
     trend_hk_candidate_pool_ids: tuple[int, ...] = ()
-    prediction_config_path: Path | None = None
 
     def trend_candidate_pool_ids(self, market: str) -> tuple[int, ...]:
         return {
@@ -506,6 +519,8 @@ def _valid_trend_review_sample_detail(value: object) -> bool:
     if not isinstance(value, dict) or set(value) != {
         "available",
         "eligible_sample_count",
+        "winning_sample_count",
+        "win_rate",
         "discovered_candidate_count",
         "excluded_candidate_count",
         "incomplete_open_candidate_count",
@@ -523,6 +538,9 @@ def _valid_trend_review_sample_detail(value: object) -> bool:
             "incomplete_open_candidate_count",
         )
     ]
+    eligible = value["eligible_sample_count"]
+    wins = value["winning_sample_count"]
+    raw_rate = value["win_rate"]
     reasons = value["exclusion_reasons"]
     if (
         not isinstance(value["available"], bool)
@@ -542,9 +560,30 @@ def _valid_trend_review_sample_detail(value: object) -> bool:
         or not isinstance(value["reason"], str)
     ):
         return False
+    if type(wins) is not int or wins < 0 or wins > eligible:
+        return False
+    if raw_rate is not None and (
+        not isinstance(raw_rate, str) or not raw_rate.strip()
+    ):
+        return False
+    try:
+        rate = None if raw_rate is None else Decimal(raw_rate)
+        if rate is not None and not rate.is_finite():
+            return False
+        with localcontext(Context(prec=28)):
+            expected_rate = Decimal(wins) / Decimal(eligible) if eligible else None
+    except (InvalidOperation, TypeError, ValueError, ZeroDivisionError):
+        return False
+    if rate != expected_rate:
+        return False
     if value["available"]:
         return _valid_aware_datetime(value["statistics_cutoff_at"]) and not value["reason"]
-    return not value["statistics_cutoff_at"] and bool(value["reason"].strip())
+    return (
+        not value["statistics_cutoff_at"]
+        and bool(value["reason"].strip())
+        and wins == 0
+        and rate is None
+    )
 
 
 def _valid_trend_review_benchmark_metadata(
@@ -660,7 +699,7 @@ def _valid_trend_review_projection(
             "metric_cutoffs", "common_cutoff", "interval", "metrics",
             "benchmark_context", "benchmark_refresh",
         }
-        or schema_version != "open_trader.trend_review.projection.v4"
+        or schema_version != "open_trader.trend_review.projection.v5"
         or payload.get("available") is not True
         or payload.get("broker") != broker
         or payload.get("market") != market
@@ -2374,20 +2413,22 @@ def _load_broker_trend_report(
     report_date: str,
     current_candidate_pool_ids: tuple[int, ...] = (),
 ) -> dict[str, Any]:
-    unavailable = {
-        "available": False,
-        "data_status": "unavailable",
-        "broker": broker,
-        "broker_label": broker_label,
-        "market": market,
-        "market_label": market_label,
-        "status_text": "暂时不可用",
-    }
     selected = _latest_valid_report_payload(
         reports_dir, market=market, broker=broker
     )
     if selected is None:
-        return unavailable
+        return {
+            "available": False,
+            "data_status": "unavailable",
+            "broker": broker,
+            "broker_label": broker_label,
+            "market": market,
+            "market_label": market_label,
+            "status_text": "暂时不可用",
+            "historical_buy_plan_membership": _historical_buy_plan_membership(
+                reports_dir, broker=broker, market=market
+            ),
+        }
     return _project_broker_trend_report(
         selected=selected,
         data_dir=data_dir,
@@ -2401,6 +2442,65 @@ def _load_broker_trend_report(
         current_candidate_pool_ids=current_candidate_pool_ids,
         use_execution_batch=True,
     )
+
+
+def _historical_buy_plan_membership(
+    reports_dir: Path, *, broker: str, market: str
+) -> dict[str, object]:
+    reports_dir = reports_dir.resolve()
+    paths = sorted(reports_dir.glob("*.json"))
+    if not paths:
+        return {
+            "available": False,
+            "symbols": [],
+            "reason": "历史趋势报告不存在",
+        }
+    symbols: set[str] = set()
+    for path in paths:
+        try:
+            if path.resolve().parent != reports_dir:
+                return {
+                    "available": False,
+                    "symbols": [],
+                    "reason": "历史趋势报告不可读取",
+                }
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError):
+            return {
+                "available": False,
+                "symbols": [],
+                "reason": "历史趋势报告不可读取",
+            }
+        judgments = (
+            payload.get("strategy_judgments") if isinstance(payload, dict) else None
+        )
+        actions = (
+            judgments.get("formal_actions") if isinstance(judgments, dict) else None
+        )
+        if not isinstance(actions, list) or not all(
+            isinstance(item, dict) for item in actions
+        ):
+            return {
+                "available": False,
+                "symbols": [],
+                "reason": "历史买入计划格式无效",
+            }
+        for item in actions:
+            if item.get("action") != "BUY" or _trend_action_needs_review(item):
+                continue
+            try:
+                symbol = normalize_backtest_symbol(
+                    market, str(item.get("symbol") or "")
+                )
+            except ValueError:
+                return {
+                    "available": False,
+                    "symbols": [],
+                    "reason": "历史买入计划标的无效",
+                }
+            symbols.add(f"{market}.{symbol}")
+    symbols.update(TREND_HOLDING_EVIDENCE_ALLOWLIST.get((broker, market), ()))
+    return {"available": True, "symbols": sorted(symbols), "reason": ""}
 
 
 def _project_broker_trend_report(
@@ -2418,6 +2518,9 @@ def _project_broker_trend_report(
     use_execution_batch: bool = False,
     historical: bool = False,
 ) -> dict[str, Any]:
+    historical_buy_plan_membership = _historical_buy_plan_membership(
+        reports_dir, broker=broker, market=market
+    )
     _, latest_payload, *_ = selected
     latest_report_sha256 = _report_hash(latest_payload)
     execution_batch: dict[str, object] | None = None
@@ -2504,6 +2607,7 @@ def _project_broker_trend_report(
             "market": market,
             "market_label": market_label,
             "status_text": execution_batch_error,
+            "historical_buy_plan_membership": historical_buy_plan_membership,
             "execution_batch": None,
             "execution_batch_blocking": True,
             "execution_batch_error": execution_batch_error,
@@ -2741,6 +2845,7 @@ def _project_broker_trend_report(
             if execution_today
             else f"数据截至 {data_date}；今日未更新"
         ),
+        "historical_buy_plan_membership": historical_buy_plan_membership,
         "option_attention": payload.get("option_attention", []),
         "real_position_actions": real_position_actions,
         "real_position_status": real_status,

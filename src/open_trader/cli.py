@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import ipaddress
 import json
 from getpass import getpass
 import os
@@ -17,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import urlparse
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from .a_share_trend import (
     _process_version,
@@ -53,7 +52,6 @@ from .decision_plan import load_decision_plans
 from .decision_plan_watch import run_decision_plan_watch
 from .futu_quote import FutuQuoteClient, FutuQuoteError
 from .futu_skill_facts import FutuSkillFactsExtractor, generate_futu_skill_facts
-from .frontend_gateway import FrontendGatewayConfig, serve_frontend_gateway
 from .kelly_paper_order_sync import (
     FakeFutuPaperOrderClient,
     FutuPaperOrderSyncError,
@@ -114,7 +112,10 @@ from .polymarket_trading import (
     store_predict_api_key,
 )
 from .polymarket_monitor import monitor_once_diagnostic
-from .prediction_arbitrage_store import PredictionArbitrageStore
+from .prediction_arbitrage_health import (
+    validate_frontend_gateway_health,
+    validate_prediction_service_health,
+)
 from .report_translation import DeepSeekReportTranslator, translate_agent_report_files
 from .tiger_account import load_tiger_account_config
 from .technical_facts import LLMTechnicalFactsExtractor, generate_technical_facts
@@ -1027,30 +1028,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Backtest execution adapter",
     )
 
-    frontend_gateway_parser = subparsers.add_parser(
-        "frontend-gateway",
-        help="Serve the lightweight frontend gateway",
-    )
-    frontend_gateway_parser.add_argument("--host", default="127.0.0.1")
-    frontend_gateway_parser.add_argument("--port", type=positive_int, default=8766)
-    frontend_gateway_parser.add_argument(
-        "--upstream-host", default="127.0.0.1"
-    )
-    frontend_gateway_parser.add_argument(
-        "--upstream-port", type=positive_int, default=8767
-    )
-    frontend_gateway_parser.add_argument(
-        "--public-origin", default="http://127.0.0.1:8766"
-    )
-    frontend_gateway_parser.add_argument(
-        "--upstream-timeout", type=positive_float, default=30.0
-    )
-    frontend_gateway_parser.add_argument(
-        "--static-dir",
-        type=Path,
-        default=Path(__file__).with_name("dashboard_static"),
-    )
-
     dashboard_parser = subparsers.add_parser(
         "dashboard",
         help="Serve the realtime portfolio dashboard",
@@ -1080,13 +1057,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Public dashboard URL used in generated links",
     )
-    dashboard_parser.add_argument(
-        "--prediction-config",
-        type=Path,
-        default=None,
-        help="Non-secret Polymarket prediction-arbitrage config",
-    )
-
     prediction_parser = subparsers.add_parser(
         "prediction-arb",
         help="Run the guarded prediction-market wallet diagnostics",
@@ -1153,36 +1123,23 @@ def build_parser() -> argparse.ArgumentParser:
     prediction_status.add_argument("--timeout", type=positive_float, default=5.0)
 
     cross_auto_parser = prediction_commands.add_parser(
-        "cross-auto", help="Inspect or locally arm cross-venue automatic execution"
+        "cross-auto", help="Inspect Service-owned cross-venue execution state"
     )
     cross_auto_commands = cross_auto_parser.add_subparsers(
         dest="cross_auto_command", required=True
     )
-    cross_auto_status = cross_auto_commands.add_parser("status", help="Show local arm state")
-    cross_auto_status.add_argument("--data-dir", type=Path, default=Path("data"))
-    cross_auto_mode = cross_auto_commands.add_parser(
-        "mode", help="Set the durable cross-venue execution mode locally"
+    cross_auto_status = cross_auto_commands.add_parser(
+        "status", help="Show Service-owned cross-venue execution state"
     )
-    cross_auto_mode.add_argument(
-        "mode", choices=("observe_only", "manual_confirm", "auto_submit")
-    )
-    cross_auto_mode.add_argument("--data-dir", type=Path, default=Path("data"))
-    cross_auto_arm = cross_auto_commands.add_parser(
-        "arm", help="Arm only after local Dashboard readiness checks"
-    )
-    cross_auto_arm.add_argument("--data-dir", type=Path, default=Path("data"))
-    cross_auto_arm.add_argument("--url", required=True)
-    cross_auto_arm.add_argument("--expected-sha", required=True)
+    cross_auto_status.add_argument("--url", default="http://127.0.0.1:8769")
 
     health_parser = prediction_commands.add_parser(
         "health-check", help="Run or serve the prediction-arbitrage health check"
     )
-    health_parser.add_argument("--url", default="http://127.0.0.1:8766")
-    health_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    health_parser.add_argument("--url", default="http://127.0.0.1:8769")
     health_parser.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
-    health_parser.add_argument("--repo", type=Path, default=Path.cwd())
     health_parser.add_argument(
         "--interval", type=positive_float, default=7200.0
     )
@@ -1215,7 +1172,103 @@ def _account_status_projection(snapshot: dict[str, object]) -> dict[str, object]
     }
 
 
+def _prediction_service_state(url: str, timeout: float = 5.0) -> dict[str, object]:
+    request = Request(
+        f"{url.rstrip('/')}/api/prediction-arbitrage/state",
+        headers={"User-Agent": "OpenTrader/1.0"},
+    )
+    with urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("prediction state payload must be an object")
+    return payload
+
+
+def _prediction_health(url: str, timeout: float = 5.0) -> dict[str, object]:
+    request = Request(
+        f"{url.rstrip('/')}/healthz",
+        headers={"User-Agent": "OpenTrader/1.0"},
+    )
+    with urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("prediction health payload must be an object")
+    return payload
+
+
+_PREDICTION_CROSS_AUTO_MODES = frozenset(
+    {"observe_only", "manual_confirm", "auto_submit"}
+)
+
+
+def _prediction_safe_scalar(value: object) -> bool:
+    return isinstance(value, (str, int, float)) and not isinstance(value, bool)
+
+
+def _prediction_finite_decimal(value: object) -> Decimal | None:
+    if not _prediction_safe_scalar(value):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _prediction_cross_auto_state(state: dict[str, object]) -> dict[str, object]:
+    if "cross_auto" not in state:
+        raise ValueError("cross_auto_state_unavailable")
+    value = state["cross_auto"]
+    if not isinstance(value, dict):
+        raise ValueError("cross_auto_state_schema_invalid")
+    required = {
+        "configured_mode",
+        "effective_mode",
+        "armed",
+        "pause_reason",
+        "daily_principal",
+        "latest_attempt",
+    }
+    if not required.issubset(value):
+        raise ValueError("cross_auto_state_schema_invalid")
+    if (
+        value.get("configured_mode") not in _PREDICTION_CROSS_AUTO_MODES
+        or value.get("effective_mode") not in _PREDICTION_CROSS_AUTO_MODES
+        or not isinstance(value.get("pause_reason"), str)
+        or not isinstance(value.get("armed"), bool)
+    ):
+        raise ValueError("cross_auto_state_schema_invalid")
+    daily = value.get("daily_principal")
+    current = _prediction_finite_decimal(
+        daily.get("current") if isinstance(daily, dict) else None
+    )
+    limit = _prediction_finite_decimal(
+        daily.get("limit") if isinstance(daily, dict) else None
+    )
+    if (
+        not isinstance(daily, dict)
+        or current is None
+        or current < 0
+        or limit is None
+        or limit <= 0
+    ):
+        raise ValueError("cross_auto_state_schema_invalid")
+    latest = value.get("latest_attempt")
+    if latest is not None:
+        if not isinstance(latest, dict) or not all(
+            isinstance(latest.get(field), str) and latest[field].strip()
+            for field in ("decision", "reason", "reason_code")
+        ):
+            raise ValueError("cross_auto_state_schema_invalid")
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
+    selected_argv = sys.argv[1:] if argv is None else argv
+    if selected_argv[:1] == ["frontend-gateway"]:
+        from .frontend_gateway import main as frontend_gateway_main
+
+        return frontend_gateway_main(selected_argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -1259,116 +1312,33 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "prediction-arb":
         if args.prediction_command == "cross-auto":
-            store = PredictionArbitrageStore(args.data_dir.expanduser())
             if args.cross_auto_command == "status":
-                state = store.cross_auto_state()
-                latest = store.cross_auto_attempts(limit=1)
-                configured_mode = str(state.get("configured_mode", "observe_only"))
-                armed = state.get("armed") is True
-                effective_mode = (
-                    "observe_only"
-                    if configured_mode == "auto_submit" and not armed
-                    else configured_mode
-                )
-                print(f"configured_mode: {configured_mode}")
-                print(f"effective_mode: {effective_mode}")
-                print(f"armed: {armed}")
-                print(f"pause_reason: {state.get('reason', 'not_armed')}")
-                print(f"daily_principal: {format(store.cross_auto_daily_principal(), 'f')}/100")
-                if latest:
-                    print(f"latest_attempt: {latest[0].get('decision', 'unknown')}")
-                    print(f"latest_reason: {latest[0].get('reason_code', '')}")
-                print("result: PASS")
-                return 0
-
-            if args.cross_auto_command == "mode":
-                state = store.set_cross_auto_mode(args.mode, "operator_configured")
-                print(f"configured_mode: {state['configured_mode']}")
-                print(f"armed: {state['armed'] is True}")
-                print("result: PASS")
-                return 0
-
-            parsed_url = urlparse(args.url)
-            host = parsed_url.hostname or ""
-            try:
-                loopback_url = parsed_url.scheme == "http" and ipaddress.ip_address(host).is_loopback
-            except ValueError:
-                loopback_url = host == "localhost"
-            if not loopback_url:
-                print(f"armed: {store.cross_auto_state().get('armed') is True}")
-                print("reason: url_not_loopback")
-                print("result: BLOCKED")
-                return 2
-
-            def fetch_json(path: str) -> dict[str, object] | None:
                 try:
-                    with urlopen(args.url.rstrip("/") + path, timeout=10) as response:
-                        if getattr(response, "status", 200) != 200:
-                            return None
-                        payload = json.loads(response.read().decode("utf-8"))
-                except (OSError, ValueError, json.JSONDecodeError):
-                    return None
-                return payload if isinstance(payload, dict) else None
-
-            health = fetch_json("/healthz")
-            reason = ""
-            if health is None:
-                reason = "healthz_unavailable"
-            elif health.get("git_sha") != args.expected_sha:
-                reason = "git_sha_mismatch"
-            elif health.get("source_state") != "clean":
-                reason = "source_dirty"
-            state = fetch_json("/api/prediction-arbitrage/state") if not reason else None
-            if not reason and state is None:
-                reason = "prediction_state_unavailable"
-            if not reason:
-                assert state is not None
-                cross = state.get("cross_venue")
-                cross = cross if isinstance(cross, dict) else {}
-                if cross.get("status") != "ready":
-                    reason = "cross_venue_not_ready"
-                elif isinstance(cross.get("breaker"), dict) and cross["breaker"].get("open"):
-                    reason = "cross_breaker_open"
-                venues = state.get("venues")
-                venue_rows = venues if isinstance(venues, list) else []
-                for venue_name, reason_prefix in (
-                    ("polymarket", "polymarket"),
-                    ("predict.fun", "predict_fun"),
-                ):
-                    venue = next(
-                        (
-                            row
-                            for row in venue_rows
-                            if isinstance(row, dict) and row.get("venue") == venue_name
-                        ),
-                        {},
-                    )
-                    if not reason and venue.get("rest") != "ready":
-                        reason = f"{reason_prefix}_rest_not_ready"
-                    if not reason and venue.get("ws") != "ready":
-                        reason = f"{reason_prefix}_ws_not_ready"
-                breaker = state.get("breaker")
-                if not reason and isinstance(breaker, dict) and breaker.get("open"):
-                    reason = "breaker_open"
-                active = state.get("current_execution")
-                if not reason and isinstance(active, dict) and active:
-                    reason = "active_execution"
-                cross_auto = state.get("cross_auto")
-                cross_auto = cross_auto if isinstance(cross_auto, dict) else {}
-                if not reason and cross_auto.get("configured_mode") != "auto_submit":
-                    reason = "configured_mode_not_auto_submit"
-                if not reason and cross_auto.get("notification_ready") is not True:
-                    reason = "notification_config_unavailable"
-            if reason:
-                print(f"armed: {store.cross_auto_state().get('armed') is True}")
-                print(f"reason: {reason}")
-                print("result: BLOCKED")
-                return 2
-            armed = store.arm_cross_auto()
-            print(f"armed: {armed.get('armed') is True}")
-            print(f"git_sha: {args.expected_sha}")
-            print("result: PASS")
-            return 0
+                    state = _prediction_service_state(args.url)
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    print(f"reason: {type(exc).__name__}: {exc}")
+                    print("result: BLOCKED")
+                    return 2
+                try:
+                    cross_auto = _prediction_cross_auto_state(state)
+                except ValueError as exc:
+                    print(f"reason: {exc}")
+                    print("result: BLOCKED")
+                    return 2
+                configured_mode = str(cross_auto["configured_mode"])
+                print(f"configured_mode: {configured_mode}")
+                print(f"effective_mode: {cross_auto['effective_mode']}")
+                print(f"armed: {cross_auto['armed'] is True}")
+                print(f"pause_reason: {cross_auto['pause_reason']}")
+                daily = cross_auto["daily_principal"]
+                assert isinstance(daily, dict)
+                print(f"daily_principal: {daily['current']}/{daily['limit']}")
+                latest = cross_auto.get("latest_attempt")
+                if isinstance(latest, dict):
+                    print(f"latest_attempt: {latest.get('decision', 'unknown')}")
+                    print(f"latest_reason: {latest.get('reason_code', '')}")
+                print("result: PASS")
+                return 0
 
         if args.prediction_command == "predict" and args.predict_command == "setup":
             config_path = args.config.expanduser()
@@ -1505,12 +1475,40 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if report.get("result") == "PASS" else 2
 
         if args.prediction_command == "status":
-            endpoint = args.url.rstrip("/") + "/api/prediction-arbitrage/state"
+            target_url = args.url.rstrip("/")
             try:
-                with urlopen(endpoint, timeout=args.timeout) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                if not isinstance(payload, dict):
-                    raise ValueError("Dashboard state must be an object")
+                port = urlparse(target_url).port or 8766
+            except ValueError as exc:
+                print("health: BLOCKED")
+                print("pid: unknown")
+                print(f"result: BLOCKED\nerror: {exc}")
+                return 2
+            if port == 8769:
+                health_validator = validate_prediction_service_health
+                service_target = True
+            elif port == 8766:
+                health_validator = validate_frontend_gateway_health
+                service_target = False
+            else:
+                print("health: BLOCKED")
+                print("pid: unknown")
+                print("result: BLOCKED\nerror: unsupported status URL")
+                return 2
+            try:
+                health_payload = _prediction_health(target_url, args.timeout)
+                health_ok, health_reason = health_validator(health_payload)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                print("health: BLOCKED")
+                print("pid: unknown")
+                print(f"result: BLOCKED\nerror: {exc}")
+                return 2
+            if not health_ok:
+                print("health: BLOCKED")
+                print("pid: unknown")
+                print(f"result: BLOCKED\nerror: {health_reason}")
+                return 2
+            try:
+                payload = _prediction_service_state(target_url, args.timeout)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 print("health: BLOCKED")
                 print("pid: unknown")
@@ -1530,22 +1528,7 @@ def main(argv: list[str] | None = None) -> int:
             opportunities = payload.get("opportunities")
             if isinstance(opportunities, list) and not payload.get("stale") and not breaker.get("open") and not active:
                 actionable = sum(1 for item in opportunities if isinstance(item, dict) and item.get("actionable") is True)
-            port = urlparse(args.url).port or 8766
-            pid = "unknown"
-            try:
-                process_rows = subprocess.run(
-                    ["ps", "-axo", "pid=,command="],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                ).stdout.splitlines()
-                for row in process_rows:
-                    candidate, _, command = row.strip().partition(" ")
-                    if candidate.isdigit() and "open_trader" in command and " dashboard" in command and f"--port {port}" in command:
-                        pid = candidate
-                        break
-            except OSError:
-                pass
+            pid = str(health_payload["pid"]) if service_target else "unknown"
             health = "degraded" if status in {"degraded", "unavailable", "error"} else status
             print(f"health: {health}")
             print(f"pid: {pid}")
@@ -1566,12 +1549,8 @@ def main(argv: list[str] | None = None) -> int:
             health_argv = [
                 "--url",
                 args.url,
-                "--data-dir",
-                str(args.data_dir),
                 "--config",
                 str(args.config),
-                "--repo",
-                str(args.repo),
                 "--interval",
                 str(args.interval),
             ]
@@ -2555,28 +2534,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"report: {result.report_path}")
         return 0
 
-    if args.command == "frontend-gateway":
-        serve_frontend_gateway(
-            config=FrontendGatewayConfig(
-                static_dir=args.static_dir,
-                upstream_host=args.upstream_host,
-                upstream_port=args.upstream_port,
-                public_origin=args.public_origin,
-                upstream_timeout_seconds=args.upstream_timeout,
-            ),
-            host=args.host,
-            port=args.port,
-        )
-        return 0
-
     if args.command == "dashboard":
-        if args.prediction_config is not None:
-            try:
-                prediction_loopback = ipaddress.ip_address(args.host).is_loopback
-            except ValueError:
-                prediction_loopback = args.host == "localhost"
-            if not prediction_loopback:
-                parser.error("--prediction-config requires a loopback --host")
         config_values = _load_optional_env_values(args.config)
         try:
             trend_a_share_tm_id = _optional_positive_tm_id(
@@ -2628,30 +2586,12 @@ def main(argv: list[str] | None = None) -> int:
             trend_cn_candidate_pool_ids=trend_cn_candidate_pool_ids,
             trend_us_candidate_pool_ids=trend_us_candidate_pool_ids,
             trend_hk_candidate_pool_ids=trend_hk_candidate_pool_ids,
-            prediction_config_path=(
-                args.prediction_config.expanduser()
-                if args.prediction_config is not None
-                else None
-            ),
         )
-        prediction_notifier = None
-        if args.prediction_config is not None:
-            try:
-                prediction_notifier = build_notifier(
-                    load_env_config(args.config, dry_run=False)
-                )
-            except (FileNotFoundError, ValueError):
-                prediction_notifier = NullNotifier()
         serve_dashboard(
             config,
             host=args.host,
             port=args.port,
             public_url=args.public_url,
-            **(
-                {"prediction_notifier": prediction_notifier}
-                if args.prediction_config is not None
-                else {}
-            ),
         )
         return 0
 

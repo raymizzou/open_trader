@@ -56,9 +56,17 @@ Futu OpenD 检查实时行情并写出报告。趋势动物控制器还可以从
   --config config/prediction_arbitrage.json --no-submit
 ```
 
-预检查不会向交易所提交订单，也不会自动执行首单。通过后安装持续运行的 macOS 服务：
+预检查不会向交易所提交订单，也不会自动执行首单。通过后先独立安装并验证生产
+Prediction Service `8769`，再安装持续运行的 macOS Dashboard stack。Gateway `8766`
+是唯一浏览器入口，Legacy Dashboard `8767` 只提供非 Prediction 接口；Prediction
+运行时、数据库、读 API 和变更 API 只有 `8769` Service 可以持有。`--mode single`
+只用于非 Prediction 回退，不是 Prediction 回滚；Prediction 回滚只能恢复兼容的
+`8769` Service release（直到 #60 推进 `minimum_reader_generation`）：
 
 ```bash
+scripts/install_prediction_service_launchd.sh --mode production --runtime-root "$PWD"
+curl -fsS http://127.0.0.1:8769/healthz
+.venv/bin/python -m open_trader prediction-arb status --url http://127.0.0.1:8769
 scripts/install_dashboard_launchd.sh
 .venv/bin/python -m open_trader prediction-arb status --url http://127.0.0.1:8766
 scripts/uninstall_dashboard_launchd.sh

@@ -7,6 +7,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_ROOT=""
 PYTHON_BIN="${OPEN_TRADER_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 CONFIG=""
+NOTIFIER_CONFIG=""
 RELEASE_MANIFEST=""
 EXPECTED_SHA=""
 LAUNCH_AGENTS_DIR="${HOME}/Library/LaunchAgents"
@@ -18,7 +19,7 @@ WAIT_SECONDS="${PREDICTION_SERVICE_LAUNCHD_WAIT_SECONDS:-90}"
 LABEL="com.open-trader.prediction-service"
 
 usage() {
-  echo "usage: $0 --runtime-root PATH [--dry-run] [--mode shadow|production] [--repo-root PATH] [--python PATH] [--config PATH] [--launch-agents-dir PATH] [--wait-seconds N] [--release-manifest PATH] [--expected-sha SHA]" >&2
+  echo "usage: $0 --runtime-root PATH [--dry-run] [--mode shadow|production] [--repo-root PATH] [--python PATH] [--config PATH] [--notifier-config PATH] [--launch-agents-dir PATH] [--wait-seconds N] [--release-manifest PATH] [--expected-sha SHA]" >&2
 }
 
 fail() {
@@ -34,6 +35,7 @@ while [[ $# -gt 0 ]]; do
     --repo-root) [[ $# -ge 2 ]] || { usage; exit 2; }; REPO_ROOT="$2"; shift 2 ;;
     --python) [[ $# -ge 2 ]] || { usage; exit 2; }; PYTHON_BIN="$2"; shift 2 ;;
     --config) [[ $# -ge 2 ]] || { usage; exit 2; }; CONFIG="$2"; shift 2 ;;
+    --notifier-config) [[ $# -ge 2 ]] || { usage; exit 2; }; NOTIFIER_CONFIG="$2"; shift 2 ;;
     --launch-agents-dir) [[ $# -ge 2 ]] || { usage; exit 2; }; LAUNCH_AGENTS_DIR="$2"; shift 2 ;;
     --wait-seconds) [[ $# -ge 2 ]] || { usage; exit 2; }; WAIT_SECONDS="$2"; shift 2 ;;
     --release-manifest) [[ $# -ge 2 ]] || { usage; exit 2; }; RELEASE_MANIFEST="$2"; shift 2 ;;
@@ -54,6 +56,8 @@ RUNTIME_ROOT="$(resolve_path "$RUNTIME_ROOT")"
 RELEASE_MANIFEST="${RELEASE_MANIFEST:-$REPO_ROOT/ops/prediction-service-release.json}"
 RELEASE_MANIFEST="$(resolve_path "$RELEASE_MANIFEST")"
 CONFIG="${CONFIG:-$RUNTIME_ROOT/config/prediction_arbitrage.json}"
+NOTIFIER_CONFIG="${NOTIFIER_CONFIG:-$RUNTIME_ROOT/config/daily_premarket.env}"
+NOTIFIER_CONFIG="$(resolve_path "$NOTIFIER_CONFIG")"
 TEMPLATE="$REPO_ROOT/ops/launchd/$LABEL.plist.template"
 PLIST_PATH="$LAUNCH_AGENTS_DIR/$LABEL.plist"
 DATA_DIR="$RUNTIME_ROOT/data"
@@ -72,6 +76,7 @@ render_plist() {
     -e "s|OPEN_TRADER_PYTHON|$(sed_escape "$PYTHON_BIN")|g" \
     -e "s|OPEN_TRADER_DATA_DIR|$(sed_escape "$DATA_DIR")|g" \
     -e "s|OPEN_TRADER_PREDICTION_CONFIG|$(sed_escape "$CONFIG")|g" \
+    -e "s|OPEN_TRADER_NOTIFIER_CONFIG|$(sed_escape "$NOTIFIER_CONFIG")|g" \
     -e "s|OPEN_TRADER_PREDICTION_MODE|$(sed_escape "$MODE")|g" \
     -e "s|OPEN_TRADER_RELEASE_MANIFEST|$(sed_escape "$RELEASE_MANIFEST")|g" \
     -e "s|OPEN_TRADER_RUNTIME_ROOT|$(sed_escape "$RUNTIME_ROOT")|g" \

@@ -21,10 +21,6 @@ def main(argv: list[str] | None = None) -> int:
         from .prediction_service import main as prediction_service_main
 
         return prediction_service_main(args[1:])
-    if args[:1] == ["prediction-shadow-validate"]:
-        from .prediction_shadow_validation import main as prediction_shadow_validation_main
-
-        return prediction_shadow_validation_main(args[1:])
     if args[:1] == ["prediction-solver-benchmark"]:
         from .prediction_solver_benchmark import main as prediction_solver_benchmark_main
 

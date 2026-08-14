@@ -54,11 +54,13 @@ const state = {
     historyKind: "signals",
     error: "",
     pollId: null,
+    stateRequestInFlight: false,
     signalPollId: null,
     signalRequestInFlight: false,
     signalLastSuccessAt: "",
     signalError: "",
     signalPollEpoch: 0,
+    signalHistoryGeneration: 0,
     csrfToken: "",
     activeExecutionId: "",
   },
@@ -3319,13 +3321,19 @@ function predictionRequestUrl(path) {
 }
 
 async function fetchPredictionState() {
-  if (state.workspaceView !== "prediction_market") return;
+  if (state.workspaceView !== "prediction_market" || state.predictionMarket.stateRequestInFlight) return;
+  state.predictionMarket.stateRequestInFlight = true;
+  const signalHistoryGeneration = state.predictionMarket.signalHistoryGeneration;
   try {
     const response = await fetch(predictionRequestUrl("/api/prediction-arbitrage/state"), {cache: "no-store", credentials: "same-origin"});
     if (!response.ok) throw new Error(`prediction state ${response.status}`);
     const payload = await response.json();
     const previousHistories = state.predictionMarket.payload?.histories || {};
-    state.predictionMarket.payload = {...payload, histories: {...previousHistories, ...(payload.histories || {})}};
+    const histories = {...previousHistories, ...(payload.histories || {})};
+    if (state.predictionMarket.signalHistoryGeneration !== signalHistoryGeneration && Array.isArray(previousHistories.signals)) {
+      histories.signals = previousHistories.signals;
+    }
+    state.predictionMarket.payload = {...payload, histories};
     state.predictionMarket.error = "";
     state.predictionMarket.csrfToken = payload.csrf_token || state.predictionMarket.csrfToken;
     if (!["signals", "executions", "incidents"].includes(state.predictionMarket.historyKind)) {
@@ -3338,10 +3346,12 @@ async function fetchPredictionState() {
     } else {
       state.predictionMarket.payload = {status: "unavailable", stale: true, readiness: {status: "unavailable"}, events: [], opportunities: [], breaker: {open: true}};
     }
+  } finally {
+    state.predictionMarket.stateRequestInFlight = false;
   }
   renderPredictionMarket();
   const kind = state.predictionMarket.historyKind;
-  if (state.predictionMarket.payload && !Array.isArray(state.predictionMarket.payload.histories?.[kind])) {
+  if (state.predictionMarket.payload && !Array.isArray(state.predictionMarket.payload.histories?.[kind]) && (kind !== "signals" || !state.predictionMarket.signalRequestInFlight)) {
     loadPredictionHistory(kind);
   }
 }
@@ -3359,6 +3369,7 @@ async function loadPredictionHistory(kind, options = {}) {
     state.predictionMarket.payload = {...payload, histories: {...(payload.histories || {}), [kind]: Array.isArray(result.items) ? result.items : []}};
     if (!panelOnly) state.predictionMarket.error = "";
     if (kind === "signals") {
+      state.predictionMarket.signalHistoryGeneration += 1;
       state.predictionMarket.signalLastSuccessAt = new Date().toISOString();
       state.predictionMarket.signalError = "";
     }
@@ -4031,6 +4042,11 @@ function renderTrendReviewStatisticsMeta(review, key, label) {
   const disposition = detail?.available === true
     ? `<span>发现 ${detail.discovered_candidate_count} · 排除 ${detail.excluded_candidate_count} · 未闭环 ${detail.incomplete_open_candidate_count}</span>`
     : "<span>统计来源不可用</span>";
+  const winRate = detail?.available !== true
+    ? ""
+    : detail.eligible_sample_count > 0 && hasValue(detail.win_rate)
+      ? `<span>完整交易胜率 ${escapeHtml(trendRiskPercent(detail.win_rate))} · ${escapeHtml(formatDisplayNumber(detail.winning_sample_count))} 胜 / ${escapeHtml(formatDisplayNumber(detail.eligible_sample_count))} 闭环</span>`
+      : "<span>完整交易胜率 数据不足 · 0 闭环</span>";
   const exclusions = Array.isArray(detail?.exclusion_reasons) && detail.exclusion_reasons.length
     ? `<span>排除原因 ${detail.exclusion_reasons.map((item) => `${TREND_REASON_LABELS[item.reason] || "其他原因"} ${item.count}`).join("、")}</span>`
     : "";
@@ -4038,7 +4054,7 @@ function renderTrendReviewStatisticsMeta(review, key, label) {
     <div class="trend-entry-details">
       ${sampleCutoff ? `<span>统计截至 ${escapeHtml(formatPlain(sampleCutoff))}</span>` : ""}
       ${metricCutoff ? `<span>指标截至 ${escapeHtml(formatPlain(metricCutoff))}</span>` : ""}
-      ${disposition}${exclusions}
+      ${disposition}${winRate}${exclusions}
     </div></div>`;
 }
 
@@ -4539,6 +4555,17 @@ function renderTrendHoldingTable(items, report) {
   return `<table class="cn-trend-table"><thead><tr>${headings.map((heading) => `<th scope="col">${escapeHtml(heading)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>${rows.length ? "" : "<p>无</p>"}`;
 }
 
+function renderHoldingOriginSection(title, rows, tableHtml) {
+  return `<section class="holding-origin-section">
+    <div class="holding-origin-heading"><h3>${escapeHtml(title)}</h3><span>${escapeHtml(formatDisplayNumber(rows.length))} 条</span></div>
+    ${rows.length ? tableHtml : '<p class="account-empty">无</p>'}
+  </section>`;
+}
+
+function renderHistoricalTrendHoldingWarning() {
+  return '<p class="account-empty missing-text">历史买入计划归属暂不可用，未执行分组</p>';
+}
+
 function renderTrendHoldingSource(report) {
   const status = trendRealHoldingStatus(report);
   if (status !== "available") return "";
@@ -4565,7 +4592,11 @@ function renderTrendHoldingPanel(report, view, items) {
       return `<p class="account-empty missing-text">真实持仓数据不可用：${escapeHtml(formatPlain(reason))}</p>`;
     }
     const rows = Array.isArray(items) ? items : [];
-    return `${renderTrendHoldingSource(report)}${renderTrendHoldingTable(rows, report)}`;
+    const split = splitHistoricalTrendHoldings(rows, report);
+    if (!split) {
+      return `${renderTrendHoldingSource(report)}${renderHistoricalTrendHoldingWarning()}${renderTrendHoldingTable(rows, report)}`;
+    }
+    return `${renderTrendHoldingSource(report)}${renderHoldingOriginSection("趋势持仓", split.trend, renderTrendHoldingTable(split.trend, report))}${renderHoldingOriginSection("非趋势持仓", split.nonTrend, renderTrendHoldingTable(split.nonTrend, report))}`;
   }
   const rows = Array.isArray(items) ? items : [];
   return renderTrendHoldingTable(rows, report);
@@ -5988,9 +6019,11 @@ function renderAccountViewPanel(group) {
   const view = state.accountViews[group.broker] || "real";
   if (view === "simulate") return renderSimulatedAccountView(group.broker);
   if (view === "report") return renderEmbeddedTrendReport(group.broker);
-  return group.rows.length
-    ? renderAccountTable(group.rows)
-    : '<p class="account-empty">当前筛选下没有持仓</p>';
+  if (!group.rows.length) return '<p class="account-empty">当前筛选下没有持仓</p>';
+  const report = state.dashboard?.trend_reports?.[group.broker];
+  const split = splitHistoricalTrendHoldings(group.rows, report);
+  if (!split) return `${renderHistoricalTrendHoldingWarning()}${renderAccountTable(group.rows)}`;
+  return `${renderHoldingOriginSection("趋势持仓", split.trend, renderAccountTable(split.trend))}${renderHoldingOriginSection("非趋势持仓", split.nonTrend, renderAccountTable(split.nonTrend))}`;
 }
 
 function simulatedAccountRows(broker) {
@@ -9176,6 +9209,21 @@ function normalizeActionKey(market, symbol) {
     normalizedSymbol = normalizedSymbol.padStart(5, "0");
   }
   return `${normalizedMarket}.${normalizedSymbol}`;
+}
+
+function splitHistoricalTrendHoldings(items, report) {
+  const membership = report?.historical_buy_plan_membership;
+  if (membership?.available !== true || !Array.isArray(membership.symbols)) return null;
+  const planned = new Set(membership.symbols.map((key) => normalizeActionKey("", key)).filter(Boolean));
+  const trend = [];
+  const nonTrend = [];
+  for (const item of items) {
+    const position = item?.holding || item;
+    const key = normalizeActionKey("", position?.futu_symbol)
+      || normalizeActionKey(position?.market || report?.market, position?.symbol);
+    (key && planned.has(key) ? trend : nonTrend).push(item);
+  }
+  return {trend, nonTrend};
 }
 
 function actionSymbol(action) {

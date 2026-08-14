@@ -3355,7 +3355,7 @@ def test_pause_before_claim_records_cross_auto_paused_without_order(
 
     assert result["reason"] == "cross_auto_paused"
     assert result["facts"]["current"] == "paused"
-    assert "cross-auto arm" in result["facts"]["operator_action"]
+    assert "cross-auto status" in result["facts"]["operator_action"]
     assert store.cross_auto_attempts()[0]["reason_code"] == "cross_auto_paused"
     assert (predict.submit_calls, trading.cross_submit_calls) == (0, 0)
 
@@ -3374,7 +3374,7 @@ def test_nonautomatic_mode_claim_records_complete_configuration_rejection(
 
     assert result["reason"] == "configured_mode_not_auto_submit"
     assert result["facts"]["current"] == configured_mode
-    assert "cross-auto mode auto_submit" in result["facts"]["operator_action"]
+    assert "cross-auto status" in result["facts"]["operator_action"]
     attempt = store.cross_auto_attempts()[0]
     assert attempt["decision"] == "rejected"
     assert attempt["reason_code"] == "configured_mode_not_auto_submit"
@@ -3482,7 +3482,12 @@ def test_auto_submit_terminal_feishu_failure_pauses_future_entries(
     accepted = service.notify_ready_opportunity(
         "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
     )
-    final = wait_until_terminal(service, str(accepted["execution_id"]))
+    execution_id = str(accepted["execution_id"])
+    final = wait_until_terminal(service, execution_id)
+    deadline = time.monotonic() + 3
+    while execution_id in service._threads and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert execution_id not in service._threads
 
     assert final["state"] == "holding_to_resolution"
     assert store.cross_auto_state()["reason"] == "notification_delivery_failed"

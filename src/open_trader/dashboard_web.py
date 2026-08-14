@@ -3,18 +3,16 @@ from __future__ import annotations
 import json
 import ipaddress
 import os
-import secrets
 import signal
 import subprocess
 import threading
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from http import HTTPStatus
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from .backtest import run_backtest
 from .backtest_prices import DailyKlineProvider, normalize_backtest_symbol
@@ -29,35 +27,6 @@ from .dashboard import (
     load_trend_report_history,
 )
 from .futu_quote import FutuQuoteClient
-from .daily_premarket import build_notifier
-from .predict_cross_venue import PredictCrossVenueMonitor
-from .prediction_arbitrage import (
-    MAX_CROSS_UNSETTLED_PRINCIPAL,
-    MAX_EMERGENCY_LOSS,
-    MAX_NORMAL_COST,
-    MAX_WALLET_BALANCE,
-    MIN_ESTIMATED_PROFIT,
-    MIN_NET_EDGE,
-    MIN_THRESHOLD_ANNUALIZED_YIELD,
-)
-from .prediction_arbitrage_store import PredictionArbitrageStore
-from .prediction_read_model import (
-    PREDICTION_HISTORY_KINDS,
-    _prediction_history_aliases,
-    _prediction_safe_value,
-    _prediction_sort_key,
-    prediction_history_payload as _prediction_history_payload,
-    prediction_state_payload as _prediction_state_payload,
-)
-from .prediction_runtime import (
-    PredictionRuntime,
-    _CrossVenueRuntime,
-    _UnavailableCrossVenueMonitor,
-    _build_cross_venue_monitor,
-    _cross_venue_gamma_lookup,
-    discover_threshold_relations,
-)
-from .prediction_title_translation import cached_prediction_title_zh
 from .research_chat import ResearchChatError, ResearchChatService
 from .standard_strategies import strategy_catalog
 from .strategy_backtest import (
@@ -85,10 +54,6 @@ class RequestBodyTooLargeError(Exception):
 
 class StandardBacktestExecutionError(RuntimeError):
     pass
-
-
-PREDICTION_HISTORY_DEFAULT_LIMIT = 100
-PREDICTION_HISTORY_MAX_LIMIT = 500
 
 
 def build_standard_backtest_options_payload(config: DashboardConfig) -> dict[str, Any]:
@@ -298,17 +263,9 @@ def create_dashboard_server(
     research_chat_service: ResearchChatService | None = None,
     backtest_price_provider: DailyKlineProvider | None = None,
     trend_simulate_position_service: TrendSimulatePositionService | None = None,
-    prediction_store: PredictionArbitrageStore | None = None,
-    prediction_monitor: object | None = None,
-    cross_venue_monitor: PredictCrossVenueMonitor | None = None,
-    prediction_execution_service: object | None = None,
-    prediction_session_token: str | None = None,
-    prediction_csrf_token: str | None = None,
     runtime_metadata: Mapping[str, object] | None = None,
 ) -> ThreadingHTTPServer:
     chat_service = research_chat_service or ResearchChatService(data_dir=config.data_dir)
-    prediction_session = prediction_session_token or secrets.token_urlsafe(32)
-    prediction_csrf = prediction_csrf_token or secrets.token_urlsafe(32)
     health_runtime = dict(
         runtime_metadata
         if runtime_metadata is not None
@@ -344,29 +301,6 @@ def create_dashboard_server(
                 try:
                     self._send_json(
                         build_dashboard_payload(config)
-                    )
-                except Exception as exc:
-                    self._send_error_json(exc)
-                return
-            if path == "/api/prediction-arbitrage/state":
-                self._send_prediction_state()
-                return
-            if path == "/api/prediction-arbitrage/history":
-                try:
-                    query = parse_qs(parsed.query, keep_blank_values=True)
-                    kind = str(query.get("kind", [""])[0]).strip()
-                    limit = self._prediction_query_int(query, "limit", PREDICTION_HISTORY_DEFAULT_LIMIT)
-                    offset = self._prediction_query_int(query, "offset", 0)
-                    self._send_json(
-                        _prediction_history_payload(
-                            prediction_store,
-                            kind=kind,
-                            limit=limit,
-                            offset=offset,
-                            monitor=prediction_monitor,
-                            execution=prediction_execution_service,
-                            cross_venue_monitor=cross_venue_monitor,
-                        )
                     )
                 except Exception as exc:
                     self._send_error_json(exc)
@@ -430,50 +364,6 @@ def create_dashboard_server(
         def do_POST(self) -> None:
             path = urlparse(self.path).path
             try:
-                if path in {
-                    "/api/prediction-arbitrage/preview",
-                    "/api/prediction-arbitrage/executions",
-                    "/api/prediction-arbitrage/mode",
-                    "/api/prediction-arbitrage/circuit-breaker/reset",
-                    "/api/prediction-arbitrage/predict-allowance/cleanup",
-                    "/api/prediction-arbitrage/cross-auto/pause",
-                }:
-                    self._require_prediction_mutation()
-                    payload = self._read_json_body()
-                    if prediction_execution_service is None:
-                        raise RuntimeError("prediction execution service is unavailable")
-                    if path.endswith("/preview"):
-                        self._require_prediction_schema(payload, {"opportunity_id"})
-                        opportunity_id = self._required_prediction_string(payload, "opportunity_id")
-                        result = prediction_execution_service.preview(opportunity_id)
-                    elif path.endswith("/executions"):
-                        self._require_prediction_schema(payload, {"preview_id", "idempotency_key"})
-                        preview_id = self._required_prediction_string(payload, "preview_id")
-                        idempotency_key = self._required_prediction_string(payload, "idempotency_key")
-                        result = prediction_execution_service.confirm(preview_id, idempotency_key)
-                    elif path.endswith("/mode"):
-                        self._require_prediction_schema(payload, {"mode"})
-                        mode = self._required_prediction_string(payload, "mode")
-                        result = prediction_execution_service.set_validation_mode(mode)
-                    elif path.endswith("/circuit-breaker/reset"):
-                        self._require_prediction_schema(payload, {"incident_id"})
-                        incident_id = self._required_prediction_string(payload, "incident_id")
-                        result = prediction_execution_service.reset_breaker(incident_id)
-                    elif path.endswith("/cross-auto/pause"):
-                        self._require_prediction_schema(payload, {"confirm"})
-                        if payload.get("confirm") is not True:
-                            raise ValueError("confirm must be true")
-                        pause_cross_auto = getattr(prediction_execution_service, "pause_cross_auto", None)
-                        if not callable(pause_cross_auto):
-                            raise RuntimeError("cross auto pause is unavailable")
-                        result = pause_cross_auto()
-                    else:
-                        self._require_prediction_schema(payload, {"confirm"})
-                        if payload.get("confirm") is not True:
-                            raise ValueError("confirm must be true")
-                        result = prediction_execution_service.cleanup_predict_allowance(confirm=True)
-                    self._send_json(_prediction_safe_value(result))
-                    return
                 if path == "/api/research-chat/sessions":
                     payload = self._read_json_body()
                     market = str(payload.get("market") or "")
@@ -524,92 +414,6 @@ def create_dashboard_server(
                 self._send_error_json(exc)
                 return
             self._send_not_found()
-
-        def _send_prediction_state(self) -> None:
-            payload = _prediction_state_payload(
-                store=prediction_store,
-                monitor=prediction_monitor,
-                execution=prediction_execution_service,
-                csrf_token=prediction_csrf,
-                cross_venue_monitor=cross_venue_monitor,
-            )
-            self.send_response(HTTPStatus.OK)
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header(
-                "Set-Cookie",
-                f"ot_prediction_session={prediction_session}; SameSite=Strict; HttpOnly; Path=/",
-            )
-            self.end_headers()
-            try:
-                self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
-                return
-
-        @staticmethod
-        def _prediction_query_int(
-            query: Mapping[str, list[str]], key: str, default: int
-        ) -> int:
-            raw = str(query.get(key, [str(default)])[0] or str(default))
-            try:
-                value = int(raw)
-            except ValueError as exc:
-                raise ValueError(f"{key} must be a non-negative integer") from exc
-            if value < 0 or (key == "limit" and value > PREDICTION_HISTORY_MAX_LIMIT):
-                raise ValueError(f"{key} is outside the allowed range")
-            if key == "limit" and value == 0:
-                raise ValueError("limit must be positive")
-            return value
-
-        @staticmethod
-        def _require_prediction_schema(
-            payload: dict[str, Any], expected: set[str]
-        ) -> None:
-            if set(payload) != expected:
-                raise ValueError("prediction request fields are invalid")
-
-        @staticmethod
-        def _required_prediction_string(payload: dict[str, Any], key: str) -> str:
-            value = payload.get(key)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{key} is required")
-            return value.strip()
-
-        def _prediction_listener_host_header(self) -> str:
-            address = self.server.server_address
-            # Preserve the configured loopback name (notably ``localhost``)
-            # so browser Host/Origin headers match the URL the operator used.
-            bound_host = str(host)
-            bound_port = int(address[1])
-            if ":" in bound_host and not bound_host.startswith("["):
-                bound_host = f"[{bound_host}]"
-            return f"{bound_host}:{bound_port}"
-
-        def _require_prediction_mutation(self) -> None:
-            try:
-                if not _is_loopback_address(str(self.client_address[0])):
-                    raise PermissionError("prediction mutations require loopback")
-            except ValueError as exc:
-                raise PermissionError("prediction mutations require loopback") from exc
-            expected_host = self._prediction_listener_host_header()
-            if self.headers.get("Host", "") != expected_host:
-                raise PermissionError("prediction mutation Host is invalid")
-            if self.headers.get("Origin", "") != f"http://{expected_host}":
-                raise PermissionError("prediction mutation Origin is invalid")
-            cookie = SimpleCookie()
-            try:
-                cookie.load(self.headers.get("Cookie", ""))
-            except Exception as exc:
-                raise PermissionError("prediction session is invalid") from exc
-            provided_session = cookie.get("ot_prediction_session")
-            if provided_session is None or not secrets.compare_digest(
-                provided_session.value, prediction_session
-            ):
-                raise PermissionError("prediction session is invalid")
-            provided_csrf = self.headers.get("X-CSRF-Token", "")
-            if not secrets.compare_digest(provided_csrf, prediction_csrf):
-                raise PermissionError("prediction CSRF token is invalid")
 
         def log_message(self, format: str, *args: Any) -> None:
             return
@@ -758,9 +562,7 @@ def serve_dashboard(
     *,
     host: str,
     port: int,
-    prediction_notifier: object | None = None,
     public_url: str = "",
-    cross_venue_monitor: PredictCrossVenueMonitor | None = None,
 ) -> None:
     if public_url.strip():
         _require_loopback_host(host)
@@ -782,37 +584,6 @@ def serve_dashboard(
         reports_dir=config.reports_dir,
     )
     trend_simulate_position_service.prewarm()
-    prediction_store: PredictionArbitrageStore | None = None
-    prediction_monitor: object | None = None
-    prediction_execution: object | None = None
-    prediction_runtime: PredictionRuntime | None = None
-    if config.prediction_config_path is not None:
-        prediction_runtime = PredictionRuntime(
-            data_dir=config.data_dir,
-            prediction_config_path=config.prediction_config_path.expanduser(),
-            dashboard_url=resolved_public_url,
-            notifier=prediction_notifier,
-            cross_venue_monitor=cross_venue_monitor,
-        )
-        try:
-            prediction_runtime.start()
-        except Exception:
-            # A missing Keychain/config must leave a visible, schema-valid locked
-            # Dashboard rather than aborting the existing portfolio surface.
-            try:
-                prediction_runtime.stop()
-            except Exception:
-                pass
-            prediction_runtime = None
-            prediction_store = None
-            prediction_monitor = None
-            prediction_execution = None
-            cross_venue_monitor = None
-        else:
-            prediction_store = prediction_runtime.store
-            prediction_monitor = prediction_runtime.monitor
-            prediction_execution = prediction_runtime.execution
-            cross_venue_monitor = prediction_runtime.cross_venue_monitor
     server = None
     previous_signal_handlers: dict[int, object] = {}
 
@@ -825,10 +596,6 @@ def serve_dashboard(
             host=host,
             port=port,
             trend_simulate_position_service=trend_simulate_position_service,
-            prediction_store=prediction_store,
-            prediction_monitor=prediction_monitor,
-            cross_venue_monitor=cross_venue_monitor,
-            prediction_execution_service=prediction_execution,
             runtime_metadata=runtime_metadata,
         )
         if threading.current_thread() is threading.main_thread():
@@ -847,10 +614,5 @@ def serve_dashboard(
     finally:
         for signum, handler in previous_signal_handlers.items():
             signal.signal(signum, handler)
-        if prediction_runtime is not None:
-            try:
-                prediction_runtime.stop()
-            except Exception:
-                pass
         if server is not None:
             server.server_close()

@@ -14,13 +14,13 @@ CURL_BIN="${CURL_BIN:-$(command -v curl || true)}"
 WAIT_SECONDS="${DASHBOARD_LAUNCHD_WAIT_SECONDS:-30}"
 
 usage() {
-  echo "usage: $0 [--dry-run] [--mode stack|single] [--repo-root PATH] [--runtime-root PATH] [--python PATH] [--launch-agents-dir PATH] [--wait-seconds N]" >&2
+  echo "usage: $0 [--dry-run] [--mode stack|single|legacy] [--repo-root PATH] [--runtime-root PATH] [--python PATH] [--launch-agents-dir PATH] [--wait-seconds N]" >&2
 }
 
 for arg in "$@"; do
   case "$arg" in
     --cross-execution-mode|--cross-execution-mode=*)
-      echo "--cross-execution-mode is retired; use prediction-arb cross-auto mode {observe_only,manual_confirm,auto_submit} --data-dir PATH, then prediction-arb cross-auto arm --data-dir PATH --url LOOPBACK --expected-sha SHA" >&2
+      echo "--cross-execution-mode is retired; automatic cross-venue CLI controls are removed for safety; use prediction-arb cross-auto status --url http://127.0.0.1:8769 for read-only state" >&2
       exit 2
       ;;
   esac
@@ -39,7 +39,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ "$MODE" == "stack" || "$MODE" == "single" ]] || { usage; exit 2; }
+[[ "$MODE" == "stack" || "$MODE" == "single" || "$MODE" == "legacy" ]] || { usage; exit 2; }
 
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 RUNTIME_ROOT="${RUNTIME_ROOT:-$REPO_ROOT}"
@@ -57,7 +57,7 @@ DATA_DIR="$RUNTIME_ROOT/data"
 REPORTS_DIR="$RUNTIME_ROOT/reports"
 PORTFOLIO="$DATA_DIR/latest/portfolio.csv"
 DAILY_CONFIG="$RUNTIME_ROOT/config/daily_premarket.env"
-PREDICTION_CONFIG="$RUNTIME_ROOT/config/prediction_arbitrage.json"
+PREDICTION_ROUTE_STATE="$RUNTIME_ROOT/config/prediction-route.json"
 OUT_LOG="$REPO_ROOT/logs/dashboard/launchd.out.log"
 ERR_LOG="$REPO_ROOT/logs/dashboard/launchd.err.log"
 GATEWAY_OUT_LOG="$REPO_ROOT/logs/frontend_gateway/launchd.out.log"
@@ -67,6 +67,8 @@ LEGACY_ERR_LOG="$REPO_ROOT/logs/legacy_dashboard/launchd.err.log"
 
 if [[ "$MODE" == "single" ]]; then
   [[ -f "$SINGLE_TEMPLATE" ]] || { echo "missing launchd template: $SINGLE_TEMPLATE" >&2; exit 1; }
+elif [[ "$MODE" == "legacy" ]]; then
+  [[ -f "$LEGACY_TEMPLATE" ]] || { echo "missing launchd template: $LEGACY_TEMPLATE" >&2; exit 1; }
 else
   [[ -f "$GATEWAY_TEMPLATE" ]] || { echo "missing launchd template: $GATEWAY_TEMPLATE" >&2; exit 1; }
   [[ -f "$LEGACY_TEMPLATE" ]] || { echo "missing launchd template: $LEGACY_TEMPLATE" >&2; exit 1; }
@@ -77,23 +79,38 @@ sed_escape() {
 }
 
 render_template() {
-  local template="$1" repo python data reports portfolio daily_config prediction
+  local template="$1" repo python data reports portfolio daily_config prediction_route_state
   repo="$(sed_escape "$REPO_ROOT")"
   python="$(sed_escape "$PYTHON_BIN")"
   data="$(sed_escape "$DATA_DIR")"
   reports="$(sed_escape "$REPORTS_DIR")"
   portfolio="$(sed_escape "$PORTFOLIO")"
   daily_config="$(sed_escape "$DAILY_CONFIG")"
-  prediction="$(sed_escape "$PREDICTION_CONFIG")"
+  prediction_route_state="$(sed_escape "$PREDICTION_ROUTE_STATE")"
   sed \
     -e "s|OPEN_TRADER_PYTHON|$python|g" \
     -e "s|OPEN_TRADER_PORTFOLIO|$portfolio|g" \
     -e "s|OPEN_TRADER_DATA_DIR|$data|g" \
     -e "s|OPEN_TRADER_REPORTS_DIR|$reports|g" \
     -e "s|OPEN_TRADER_DAILY_CONFIG|$daily_config|g" \
-    -e "s|OPEN_TRADER_PREDICTION_CONFIG|$prediction|g" \
+    -e "s|OPEN_TRADER_PREDICTION_ROUTE_STATE|$prediction_route_state|g" \
     -e "s|OPEN_TRADER_REPO|$repo|g" \
     "$template"
+}
+
+seed_prediction_route() {
+  local directory temporary
+  [[ -e "$PREDICTION_ROUTE_STATE" ]] && return
+  directory="$(dirname "$PREDICTION_ROUTE_STATE")"
+  mkdir -p "$directory"
+  temporary="$(mktemp "$directory/.prediction-route.XXXXXX")"
+  printf '%s\n' '{"schema_version":"open_trader.frontend_gateway.prediction_route.v1","mode":"service","operation_id":"bootstrap","updated_at":"1970-01-01T00:00:00Z"}' > "$temporary"
+  if ln "$temporary" "$PREDICTION_ROUTE_STATE" 2>/dev/null; then
+    rm -f "$temporary"
+    return
+  fi
+  rm -f "$temporary"
+  [[ -e "$PREDICTION_ROUTE_STATE" ]] || return 1
 }
 
 lint_plist() {
@@ -189,7 +206,7 @@ bootout_agent() {
 
 wait_agent_absent() {
   local label="$1" attempt output status
-  for attempt in 1 2 3 4 5; do
+  for ((attempt = 0; attempt <= WAIT_SECONDS; attempt++)); do
     if output="$("$LAUNCHCTL_BIN" print "gui/$UID/$label" 2>&1)"; then
       status=0
     else
@@ -203,7 +220,8 @@ wait_agent_absent() {
       printf '%s\n' "$output" >&2
       return 1
     fi
-    [[ "$attempt" -lt 5 ]] && sleep 1
+    [[ "$attempt" -eq "$WAIT_SECONDS" ]] && break
+    sleep 1
   done
   echo "launchd job is still loaded: $label" >&2
   return 1
@@ -251,13 +269,13 @@ install_stack() {
   "$PLUTIL_BIN" -lint "$SINGLE_PLIST" >/dev/null
   ensure_port_owned 8766 "$SINGLE_LABEL" "$GATEWAY_LABEL"
   ensure_port_owned 8767 "$LEGACY_LABEL"
-  wait_http "http://127.0.0.1:8766/"
   gateway_rendered="$(render_template "$GATEWAY_TEMPLATE")"
   legacy_rendered="$(render_template "$LEGACY_TEMPLATE")"
   lint_plist "$gateway_rendered"
   lint_plist "$legacy_rendered"
   mkdir -p "$LAUNCH_AGENTS_DIR" "$REPO_ROOT/logs/frontend_gateway" \
     "$REPO_ROOT/logs/legacy_dashboard" "$DATA_DIR" "$REPORTS_DIR"
+  seed_prediction_route
   printf '%s\n' "$gateway_rendered" > "$GATEWAY_PLIST"
   printf '%s\n' "$legacy_rendered" > "$LEGACY_PLIST"
   : > "$GATEWAY_OUT_LOG"
@@ -283,6 +301,20 @@ install_stack() {
   echo "review URL: http://127.0.0.1:8766/"
 }
 
+install_legacy() {
+  local legacy_rendered
+  legacy_rendered="$(render_template "$LEGACY_TEMPLATE")"
+  lint_plist "$legacy_rendered"
+  ensure_port_owned 8767 "$LEGACY_LABEL"
+  mkdir -p "$LAUNCH_AGENTS_DIR" "$REPO_ROOT/logs/legacy_dashboard" "$DATA_DIR" "$REPORTS_DIR"
+  printf '%s\n' "$legacy_rendered" > "$LEGACY_PLIST"
+  : > "$LEGACY_OUT_LOG"
+  : > "$LEGACY_ERR_LOG"
+  start_agent "$LEGACY_LABEL" "$LEGACY_PLIST"
+  wait_health "http://127.0.0.1:8767/healthz" "legacy_dashboard"
+  echo "installed launchd agent: $LEGACY_LABEL"
+}
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
   if [[ "$MODE" == "stack" ]]; then
     gateway_rendered="$(render_template "$GATEWAY_TEMPLATE")"
@@ -291,6 +323,10 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     lint_plist "$legacy_rendered"
     printf '===== %s =====\n%s\n' "$GATEWAY_LABEL" "$gateway_rendered"
     printf '===== %s =====\n%s\n' "$LEGACY_LABEL" "$legacy_rendered"
+  elif [[ "$MODE" == "legacy" ]]; then
+    legacy_rendered="$(render_template "$LEGACY_TEMPLATE")"
+    lint_plist "$legacy_rendered"
+    printf '%s\n' "$legacy_rendered"
   else
     single_rendered="$(render_template "$SINGLE_TEMPLATE")"
     lint_plist "$single_rendered"
@@ -301,6 +337,8 @@ fi
 
 if [[ "$MODE" == "single" ]]; then
   install_single
+elif [[ "$MODE" == "legacy" ]]; then
+  install_legacy
 else
   install_stack
 fi

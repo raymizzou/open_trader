@@ -1,31 +1,41 @@
-# Persistent cross-venue auto-submit mode design
+# Persistent cross-venue auto-submit mode design (retired)
 
 Date: 2026-08-09
 
-Status: design approved in conversation; implementation not started
+Status: historical design; retired on 2026-08-13 in favor of read-only Service observation
+
+> **Retired operational design.** This document records an earlier proposal and
+> is not a current operator runbook. The local `cross-auto mode` and
+> `cross-auto arm` mutation controls described below are retired and
+> must not be used; no remote arming API is provided. Current operators may
+> only observe Service-owned state with
+> `prediction-arb cross-auto status --url http://127.0.0.1:8769`. There is no
+> replacement write control in this task. The command examples and rollout
+> assertions below are historical design context, not instructions to mutate
+> production state.
 
 ## Goal
 
-Make the Predict.fun/Polymarket cross-venue execution mode durable operator
-state. A normal deployment, restart, or another person's commit must not change
-that state. Only an explicit local operator command may change the configured
-mode or arm automatic submission.
+The original proposal was to make the Predict.fun/Polymarket cross-venue
+execution mode durable operator state. It sought to ensure that a normal
+deployment, restart, or another person's commit could not change that state.
 
 Keep all existing opportunity, sizing, daily-principal, same-pair, readiness,
 notification-breaker, reconciliation, and residual-position rules unchanged.
 
 ## Current problem
 
-The durable store currently records whether cross-venue automatic submission is
-armed, but the configured execution mode comes from
+At the time of this proposal, the durable store recorded whether cross-venue
+automatic submission was armed, but the configured execution mode came from
 `OPEN_TRADER_CROSS_EXECUTION_MODE`. The launchd installer defaults that value to
 `observe_only` and writes it into the service plist. A routine deployment can
 therefore preserve `armed=true` in SQLite while replacing the running mode with
 `observe_only`.
 
-This creates two authorities for one operator decision. The fix is to remove
-the deployment environment from that decision and make the existing SQLite
-cross-auto state the sole authority.
+This created two authorities for one operator decision. The proposed fix was
+to remove the deployment environment from that decision and make the existing
+SQLite cross-auto state the sole authority. The shipped safe variant does not
+add a write path; the Service state is observed read-only instead.
 
 ## Approaches considered
 
@@ -39,6 +49,10 @@ cross-auto state the sole authority.
    deployment responsible for trading authority.
 
 ## Decisions
+
+The following decisions describe the retired proposal and are retained for
+historical context only. They do not grant an operator a write control in the
+current implementation.
 
 ### 1. SQLite is the sole execution-authority source
 
@@ -58,22 +72,14 @@ store. The execution service also reads the store directly when deciding
 whether to claim an automatic attempt; it does not treat a monitor snapshot,
 environment variable, plist, or command-line deployment argument as authority.
 
-### 2. Only explicit local commands may mutate the state
+### 2. Write controls were retired
 
-The local prediction-arbitrage CLI is the only mode/arm write surface.
-
-- `cross-auto arm` performs the existing readiness checks, then atomically
-  persists `configured_mode=auto_submit` and `armed=true`.
-- `cross-auto pause` persists `armed=false` and preserves the configured mode.
-  Pausing an automatic configuration therefore remains visibly
-  `auto_submit`, but its effective mode is `observe_only`.
-- `cross-auto mode observe_only` and `cross-auto mode manual_confirm` are
-  explicit long-term mode changes and also disarm automatic submission.
-- `cross-auto mode auto_submit` records the requested configured mode but does
-  not bypass readiness or arm submission; `cross-auto arm` remains required.
-
-There is no web endpoint for arming or changing the configured mode. The
-Dashboard keeps only its confirmed, CSRF-protected emergency-pause action.
+The former local prediction-arbitrage mode and arm commands are retired. No
+Service or Dashboard endpoint replaces them, and this task does not add a
+remote mutation surface. The current CLI exposes only the read-only status
+observation described in the notice above. The Dashboard keeps its existing
+confirmed, CSRF-protected emergency-pause action; that action is not a mode or
+arm control.
 
 ### 3. Deployment cannot write operator state
 
@@ -82,9 +88,9 @@ the execution mode. The rendered plist no longer contains
 `OPEN_TRADER_CROSS_EXECUTION_MODE`.
 
 The old installer option `--cross-execution-mode` is rejected with a clear
-message directing the operator to the local `cross-auto mode` and
-`cross-auto arm` commands. It is not silently ignored: stale automation must
-fail visibly without changing the database.
+message directing the operator to read-only Service status observation. It is
+not silently ignored: stale automation must fail visibly without changing the
+database, and no replacement write command is supplied.
 
 Application startup accepts no mode override from the environment. Removing or
 changing source defaults, plists, deployment scripts, branches, or worktrees
@@ -130,12 +136,12 @@ code plus Chinese operator facts. At minimum the facts include the current
 value, the limiting rule, relevant venue or pair when applicable, observation
 time, and the required operator action.
 
-Mode-state examples include:
+Mode-state examples from the retired proposal include:
 
-- `configured_mode_not_auto_submit`: current configured mode and the local
-  command required to change it;
+- `configured_mode_not_auto_submit`: current configured mode, observed through
+  the Service status response; no local mode-change command is available;
 - `cross_auto_paused`: configured mode is automatic but `armed=false`, with the
-  local arm command and the current readiness blocker;
+  current readiness blocker; no local arm command is available;
 - existing readiness, daily-limit, same-pair, notification-breaker, sizing,
   minimum-order, and active-execution reasons remain unchanged.
 
@@ -150,19 +156,21 @@ installations migrate fail-closed to `observe_only` and `armed=false`; migration
 does not infer automatic authority from a historical arm bit or environment
 value.
 
-For the current production installation, the user has explicitly authorized
-automatic submission. After the accepted SHA is deployed, the operator runs the
-local readiness-checked `cross-auto arm` command once. That writes the durable
-`auto_submit + armed` state. Future deployments then preserve it without any
-special flag.
+The earlier rollout proposal described an explicit production arming step. That
+step is retired: this task does not arm automatic submission or provide a
+replacement mutation control. Operators may inspect the Service-owned state
+with `prediction-arb cross-auto status --url http://127.0.0.1:8769`; any future
+write control requires a separate, explicitly authorized ticket.
 
 If the database is unavailable or corrupt, startup and execution remain
 observe-only and report the failure. They do not reconstruct authority from a
 plist, environment variable, or previous process.
 
-## Verification
+## Verification (historical proposal)
 
-Implementation is accepted only when tests and direct runtime checks prove:
+The following criteria belonged to the retired implementation proposal. They
+are retained as historical context and are not current operator instructions or
+claims about this safe, read-only task:
 
 1. A pre-seeded `auto_submit + armed` row survives ordinary installation,
    service restart, and redeployment unchanged.

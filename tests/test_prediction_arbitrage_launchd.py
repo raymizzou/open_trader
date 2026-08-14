@@ -10,11 +10,11 @@ from pathlib import Path
 import pytest
 
 import open_trader.cli as cli
-from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install_dashboard_launchd.sh"
+HEALTH_INSTALLER = ROOT / "scripts" / "install_prediction_arbitrage_health_launchd.sh"
 UNINSTALLER = ROOT / "scripts" / "uninstall_dashboard_launchd.sh"
 TEMPLATE = ROOT / "ops" / "launchd" / "com.open-trader.dashboard.plist.template"
 
@@ -81,9 +81,8 @@ def test_dashboard_launchd_dry_run_is_valid_and_has_no_side_effect(tmp_path: Pat
     assert args[args.index("--config") + 1] == str(
         runtime_root / "config/daily_premarket.env"
     )
-    assert args[args.index("--prediction-config") + 1] == str(
-        runtime_root / "config/prediction_arbitrage.json"
-    )
+    assert "--prediction-config" not in args
+    assert "--prediction-owner" not in args
     assert not list(agents.iterdir())
     assert "127.0.0.1" in result.stdout
     assert "8766" in result.stdout
@@ -98,7 +97,7 @@ def test_uninstaller_targets_only_dashboard_stack_labels() -> None:
     assert "com.open-trader.premarket" not in source
 
 
-def test_dashboard_installer_waits_for_bootout_before_bootstrap(
+def test_dashboard_installer_waits_across_seconds_boundary_before_bootstrap(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path / "repo"
@@ -109,9 +108,6 @@ def test_dashboard_installer_waits_for_bootout_before_bootstrap(
     shutil.copy2(
         TEMPLATE,
         repo / "ops/launchd/com.open-trader.dashboard.plist.template",
-    )
-    (repo / "config/prediction_arbitrage.json").write_text(
-        "{}\n", encoding="utf-8"
     )
     log_dir = repo / "logs/dashboard"
     log_dir.mkdir(parents=True)
@@ -127,6 +123,22 @@ def test_dashboard_installer_waits_for_bootout_before_bootstrap(
     bin_dir.mkdir()
     state = tmp_path / "bootstrap-count"
     pending_removal = tmp_path / "pending-removal"
+    sleep_log = tmp_path / "sleep-calls"
+    bash_env = tmp_path / "bash-env"
+    bash_env.write_text(
+        """force_seconds_boundary() {
+  if [[ "${FUNCNAME[1]:-}" == "wait_agent_absent" ]] &&
+    [[ "${label:-}" == "com.open-trader.dashboard" ]] &&
+    [[ "$BASH_COMMAND" == output=* && "${FAKE_BOUNDARY_CROSSED:-0}" -eq 0 ]]; then
+    FAKE_BOUNDARY_CROSSED=1
+    SECONDS=$((SECONDS + WAIT_SECONDS))
+  fi
+}
+set -T
+trap force_seconds_boundary DEBUG
+""",
+        encoding="utf-8",
+    )
     launchctl = bin_dir / "launchctl"
     launchctl.write_text(
         """#!/bin/sh
@@ -166,6 +178,12 @@ exit 0
         encoding="utf-8",
     )
     launchctl.chmod(0o755)
+    sleep = bin_dir / "sleep"
+    sleep.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_SLEEP_LOG\"\n",
+        encoding="utf-8",
+    )
+    sleep.chmod(0o755)
     lsof = bin_dir / "lsof"
     lsof.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     lsof.chmod(0o755)
@@ -200,17 +218,20 @@ exit 0
         env={
             **os.environ,
             "FAKE_BOOTSTRAP_STATE": str(state),
+            "FAKE_SLEEP_LOG": str(sleep_log),
             "FAKE_PENDING_REMOVAL": str(pending_removal),
+            "BASH_ENV": str(bash_env),
             "HOME": str(tmp_path),
             "LAUNCHCTL_BIN": str(launchctl),
             "PATH": f"{bin_dir}:/usr/bin:/bin",
         },
-        check=True,
         capture_output=True,
         text=True,
     )
 
+    assert result.returncode == 0, result.stderr
     assert state.read_text(encoding="utf-8").strip() == "1"
+    assert sleep_log.read_text(encoding="utf-8").splitlines() == ["1"]
     assert result.stderr == ""
     assert stdout_log.read_text(encoding="utf-8") == ""
     assert stderr_log.read_text(encoding="utf-8") == ""
@@ -223,11 +244,137 @@ def test_prediction_status_command_is_registered() -> None:
     assert "masked_wallet" in source
 
 
+def test_obsolete_shadow_validator_command_is_not_exposed() -> None:
+    source = (ROOT / "src" / "open_trader" / "__main__.py").read_text(encoding="utf-8")
+    assert "prediction-shadow-validate" not in source
+    assert not (ROOT / "src" / "open_trader" / "prediction_shadow_validation.py").exists()
+
+
+def _status_state() -> dict[str, object]:
+    return {
+        "status": "healthy",
+        "stale": False,
+        "breaker": {"open": False},
+        "readiness": {"ready": True},
+        "opportunities": [],
+    }
+
+
+def _prediction_service_health() -> dict[str, object]:
+    return {
+        "schema_version": "open_trader.prediction_service.health.v1",
+        "module": "prediction_service",
+        "status": "running",
+        "mode": "production",
+        "production_owner": True,
+        "mutations": "enabled",
+        "source_state": "clean",
+        "pid": 4242,
+        "cwd": "/srv/open_trader",
+        "git_sha": "accepted-sha",
+    }
+
+
+def test_prediction_status_8769_uses_exact_service_health_identity(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fetch(request: object, timeout: float) -> _JsonResponse:
+        url = getattr(request, "full_url", request)
+        if url.endswith("/healthz"):
+            return _JsonResponse(_prediction_service_health())
+        return _JsonResponse(_status_state())
+
+    monkeypatch.setattr(cli, "urlopen", fetch)
+    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: pytest.fail("process scan is obsolete"))
+
+    assert cli.main(["prediction-arb", "status", "--url", "http://127.0.0.1:8769"]) == 0
+    output = capsys.readouterr().out
+    assert "health: healthy" in output
+    assert "pid: 4242" in output
+    assert "result: PASS" in output
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"mode": "shadow", "production_owner": False, "mutations": "prohibited"},
+        {"production_owner": False},
+        {"mutations": "prohibited"},
+        {"schema_version": "malformed"},
+        {"source_state": "dirty"},
+        {"cwd": ""},
+        {"git_sha": ""},
+        {"pid": "4242"},
+    ],
+)
+def test_prediction_status_8769_fails_closed_for_non_service_health(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    override: dict[str, object],
+) -> None:
+    health = _prediction_service_health()
+    health.update(override)
+
+    def fetch(request: object, timeout: float) -> _JsonResponse:
+        url = getattr(request, "full_url", request)
+        return _JsonResponse(health if url.endswith("/healthz") else _status_state())
+
+    monkeypatch.setattr(cli, "urlopen", fetch)
+    assert cli.main(["prediction-arb", "status", "--url", "http://127.0.0.1:8769"]) == 2
+    output = capsys.readouterr().out
+    assert "result: BLOCKED" in output
+
+
+def test_prediction_status_8766_validates_gateway_health_without_fabricating_pid(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    health = {
+        "schema_version": "open_trader.frontend_gateway.health.v1",
+        "module": "frontend_gateway",
+        "upstream_status": "ok",
+        "prediction_route_mode": "service",
+        "prediction_upstream_status": "ok",
+    }
+
+    def fetch(request: object, timeout: float) -> _JsonResponse:
+        url = getattr(request, "full_url", request)
+        return _JsonResponse(health if url.endswith("/healthz") else _status_state())
+
+    monkeypatch.setattr(cli, "urlopen", fetch)
+    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: pytest.fail("process scan is obsolete"))
+
+    assert cli.main(["prediction-arb", "status", "--url", "http://127.0.0.1:8766"]) == 0
+    output = capsys.readouterr().out
+    assert "pid: unknown" in output
+    assert "result: PASS" in output
+
+
+def test_prediction_status_rejects_isolated_shadow_port_before_fetch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "urlopen", lambda *args, **kwargs: pytest.fail("isolated port must not be queried"))
+    assert cli.main(["prediction-arb", "status", "--url", "http://127.0.0.1:18769"]) == 2
+    output = capsys.readouterr().out
+    assert "unsupported status URL" in output
+    assert "result: BLOCKED" in output
+
+
+def test_prediction_status_fails_closed_for_malformed_url(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert cli.main(["prediction-arb", "status", "--url", "http://127.0.0.1:bad"]) == 2
+    output = capsys.readouterr().out
+    assert "result: BLOCKED" in output
+
+
 class _JsonResponse:
     status = 200
 
-    def __init__(self, payload: dict[str, object]) -> None:
+    def __init__(
+        self, payload: dict[str, object], *, headers: dict[str, str] | None = None
+    ) -> None:
         self._payload = payload
+        self.headers = headers or {}
 
     def __enter__(self) -> "_JsonResponse":
         return self
@@ -241,180 +388,172 @@ class _JsonResponse:
         return json.dumps(self._payload).encode("utf-8")
 
 
-def _arm_ready_state() -> dict[str, object]:
-    return {
-        "status": "healthy",
-        "cross_venue": {"status": "ready", "breaker": {"open": False}},
-        "venues": [
-            {"venue": "polymarket", "rest": "ready", "ws": "ready"},
-            {"venue": "predict.fun", "rest": "ready", "ws": "ready"},
-        ],
-        "breaker": {"open": False},
-        "current_execution": None,
+def test_cross_auto_mode_and_arm_commands_are_removed() -> None:
+    for command in ("mode auto_submit", "arm"):
+        with pytest.raises(SystemExit) as error:
+            cli.build_parser().parse_args(
+                ["prediction-arb", "cross-auto", *command.split()]
+            )
+        assert error.value.code == 2
+
+
+def test_cross_auto_status_reads_service_state_over_http(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = {
         "cross_auto": {
-            "configured_mode": "auto_submit",
-            "notification_ready": True,
+            "configured_mode": "manual_confirm",
+            "effective_mode": "manual_confirm",
+            "armed": False,
+            "pause_reason": "not_armed",
+            "daily_principal": {"current": "2", "limit": "100"},
+            "latest_attempt": None,
         },
+        "csrf_token": "ignored-by-status",
     }
+    calls: list[object] = []
 
+    def fetch(request: object, timeout: float) -> _JsonResponse:
+        calls.append(request)
+        assert timeout == 5
+        return _JsonResponse(
+            state,
+            headers={"Set-Cookie": "ot_prediction_session=session; Path=/"},
+        )
 
-def test_cross_auto_mode_command_changes_only_local_state(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+    monkeypatch.setattr(cli, "urlopen", fetch)
     assert cli.main(
-        [
-            "prediction-arb",
-            "cross-auto",
-            "mode",
-            "auto_submit",
-            "--data-dir",
-            str(tmp_path),
-        ]
-    ) == 0
-
-    store = PredictionArbitrageStore(tmp_path)
-    state = store.cross_auto_state()
-    assert state["configured_mode"] == "auto_submit"
-    assert state["armed"] is False
-    assert store.arm_cross_auto()["armed"] is True
-    assert cli.main(
-        [
-            "prediction-arb",
-            "cross-auto",
-            "mode",
-            "auto_submit",
-            "--data-dir",
-            str(tmp_path),
-        ]
-    ) == 0
-    assert store.cross_auto_state()["armed"] is False
-    assert "configured_mode: auto_submit" in capsys.readouterr().out
-
-
-def test_cross_auto_status_keeps_manual_confirm_effective(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    PredictionArbitrageStore(tmp_path).set_cross_auto_mode(
-        "manual_confirm", "operator_configured"
-    )
-
-    assert cli.main(
-        ["prediction-arb", "cross-auto", "status", "--data-dir", str(tmp_path)]
+        ["prediction-arb", "cross-auto", "status"]
     ) == 0
 
     output = capsys.readouterr().out
     assert "configured_mode: manual_confirm" in output
     assert "effective_mode: manual_confirm" in output
+    assert "armed: False" in output
+    assert "result: PASS" in output
+    assert len(calls) == 1
+    request = calls[0]
+    assert getattr(request, "full_url") == (
+        "http://127.0.0.1:8769/api/prediction-arbitrage/state"
+    )
+
+
+def test_cross_auto_status_does_not_accept_data_dir() -> None:
+    with pytest.raises(SystemExit) as error:
+        cli.build_parser().parse_args(
+            ["prediction-arb", "cross-auto", "status", "--data-dir", "data"]
+        )
+    assert error.value.code == 2
 
 
 @pytest.mark.parametrize(
-    ("change", "reason"),
+    ("payload", "reason"),
     (
-        (("health_status", "bad"), "healthz_unavailable"),
-        (("sha", "other-sha"), "git_sha_mismatch"),
-        (("dirty", "dirty"), "source_dirty"),
-        (("cross", "degraded"), "cross_venue_not_ready"),
-        (("poly_rest", "stale"), "polymarket_rest_not_ready"),
-        (("poly_ws", "stale"), "polymarket_ws_not_ready"),
-        (("predict_rest", "stale"), "predict_fun_rest_not_ready"),
-        (("predict_ws", "stale"), "predict_fun_ws_not_ready"),
-        (("breaker", True), "breaker_open"),
-        (("active", {"state": "running"}), "active_execution"),
-        (("mode", "manual_confirm"), "configured_mode_not_auto_submit"),
-        (("notification", False), "notification_config_unavailable"),
+        ({"status": "healthy"}, "cross_auto_state_unavailable"),
+        ({"cross_auto": []}, "cross_auto_state_schema_invalid"),
+        ({"cross_auto": {"configured_mode": "observe_only"}}, "cross_auto_state_schema_invalid"),
     ),
 )
-def test_cross_auto_arm_fails_closed_for_remote_readiness(
-    tmp_path: Path,
+def test_cross_auto_status_fails_closed_for_missing_or_malformed_state(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    change: tuple[str, object],
+    payload: dict[str, object],
     reason: str,
 ) -> None:
-    state = _arm_ready_state()
-    health: dict[str, object] = {"git_sha": "accepted-sha", "source_state": "clean"}
-    field, value = change
-    if field == "health_status":
-        health["status"] = value
-    elif field == "sha":
-        health["git_sha"] = value
-    elif field == "dirty":
-        health["source_state"] = value
-    elif field == "cross":
-        state["cross_venue"] = {"status": value, "breaker": {"open": False}}
-    elif field == "poly_rest":
-        state["venues"][0]["rest"] = value  # type: ignore[index]
-    elif field == "poly_ws":
-        state["venues"][0]["ws"] = value  # type: ignore[index]
-    elif field == "predict_rest":
-        state["venues"][1]["rest"] = value  # type: ignore[index]
-    elif field == "predict_ws":
-        state["venues"][1]["ws"] = value  # type: ignore[index]
-    elif field == "breaker":
-        state["breaker"] = {"open": value}
-    elif field == "active":
-        state["current_execution"] = value
-    elif field == "mode":
-        state["cross_auto"]["configured_mode"] = value  # type: ignore[index]
-    elif field == "notification":
-        state["cross_auto"]["notification_ready"] = value  # type: ignore[index]
+    monkeypatch.setattr(cli, "urlopen", lambda *args, **kwargs: _JsonResponse(payload))
 
-    def fetch(url: str, timeout: float) -> _JsonResponse:
-        assert timeout == 10
-        if url.endswith("/healthz"):
-            response = _JsonResponse(health)
-            response.status = int(health.get("status", 200))
-            return response
-        return _JsonResponse(state)
-
-    monkeypatch.setattr(cli, "urlopen", fetch)
-    assert cli.main(
-        [
-            "prediction-arb", "cross-auto", "arm", "--data-dir", str(tmp_path),
-            "--url", "http://127.0.0.1:8766", "--expected-sha", "accepted-sha",
-        ]
-    ) == 2
-    assert f"reason: {reason}" in capsys.readouterr().out
-    assert PredictionArbitrageStore(tmp_path).cross_auto_state()["armed"] is False
+    assert cli.main(["prediction-arb", "cross-auto", "status"]) == 2
+    output = capsys.readouterr().out
+    assert f"reason: {reason}" in output
+    assert "result: BLOCKED" in output
 
 
-def test_cross_auto_arm_requires_complete_remote_readiness_and_status_is_local(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("configured_mode", "unexpected_mode"),
+        ("effective_mode", "unexpected_mode"),
+        ("daily_principal", {"current": [], "limit": "100"}),
+        ("daily_principal", {"current": "0", "limit": {}}),
+        ("daily_principal", {"current": "not-money", "limit": "100"}),
+        ("daily_principal", {"current": "-1", "limit": "100"}),
+        ("daily_principal", {"current": float("nan"), "limit": "100"}),
+        ("daily_principal", {"current": float("inf"), "limit": "100"}),
+        ("daily_principal", {"current": True, "limit": "100"}),
+        ("daily_principal", {"current": "0", "limit": "0"}),
+        ("daily_principal", {"current": "0", "limit": "-1"}),
+        ("daily_principal", {"current": "0", "limit": float("inf")}),
+        ("daily_principal", {"current": "0", "limit": False}),
+        (
+            "latest_attempt",
+            {"decision": 1, "reason": "cross_auto_paused", "reason_code": "cross_auto_paused"},
+        ),
+        (
+            "latest_attempt",
+            {"decision": "rejected", "reason": "", "reason_code": "cross_auto_paused"},
+        ),
+        (
+            "latest_attempt",
+            {"decision": "rejected", "reason": "cross_auto_paused", "reason_code": ""},
+        ),
+        ("latest_attempt", {"decision": "rejected", "reason": "cross_auto_paused"}),
+    ),
+)
+def test_cross_auto_status_fails_closed_for_semantically_invalid_state(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    field: str,
+    value: object,
 ) -> None:
-    state = _arm_ready_state()
-    health = {"git_sha": "accepted-sha", "source_state": "clean"}
+    cross_auto: dict[str, object] = {
+        "configured_mode": "observe_only",
+        "effective_mode": "observe_only",
+        "armed": False,
+        "pause_reason": "not_armed",
+        "daily_principal": {"current": "0", "limit": "100"},
+        "latest_attempt": None,
+    }
+    cross_auto[field] = value
     monkeypatch.setattr(
         cli,
         "urlopen",
-        lambda url, timeout: _JsonResponse(health if url.endswith("/healthz") else state),
+        lambda *args, **kwargs: _JsonResponse({"cross_auto": cross_auto}),
     )
-    args = [
-        "prediction-arb", "cross-auto", "arm", "--data-dir", str(tmp_path),
-        "--url", "http://127.0.0.1:8766", "--expected-sha", "accepted-sha",
-    ]
-    assert cli.main(args) == 0
-    assert "result: PASS" in capsys.readouterr().out
-    assert PredictionArbitrageStore(tmp_path).cross_auto_state()["armed"] is True
-    assert cli.main(["prediction-arb", "cross-auto", "status", "--data-dir", str(tmp_path)]) == 0
+
+    assert cli.main(["prediction-arb", "cross-auto", "status"]) == 2
     output = capsys.readouterr().out
-    assert "configured_mode: auto_submit" in output
-    assert "effective_mode: auto_submit" in output
-    assert "armed: True" in output
-    assert "result: PASS" in output
+    assert "reason: cross_auto_state_schema_invalid" in output
+    assert "result: BLOCKED" in output
+    assert "result: PASS" not in output
 
 
-def test_cross_auto_arm_never_contacts_a_non_loopback_url(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.setattr(cli, "urlopen", lambda *args, **kwargs: pytest.fail("must not fetch"))
-    assert cli.main(
+def test_prediction_health_installer_defaults_to_service_port(tmp_path: Path) -> None:
+    result = subprocess.run(
         [
-            "prediction-arb", "cross-auto", "arm", "--data-dir", str(tmp_path),
-            "--url", "http://example.com", "--expected-sha", "accepted-sha",
-        ]
-    ) == 2
-    assert "reason: url_not_loopback" in capsys.readouterr().out
+            str(HEALTH_INSTALLER),
+            "--dry-run",
+            "--repo-root",
+            str(ROOT),
+            "--runtime-root",
+            str(tmp_path),
+        ],
+        cwd=ROOT,
+        env={**os.environ, "OPEN_TRADER_HEALTH_URL": ""},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "http://127.0.0.1:8769" in result.stdout
+    assert "http://127.0.0.1:8766" not in result.stdout
+    assert "--data-dir" not in result.stdout
+    assert "--repo" not in result.stdout
+
+
+def test_prediction_health_cli_has_no_dead_storage_flags() -> None:
+    for flag in ("--data-dir", "--repo"):
+        with pytest.raises(SystemExit) as error:
+            cli.build_parser().parse_args(
+                ["prediction-arb", "health-check", flag, "unused"]
+            )
+        assert error.value.code == 2
