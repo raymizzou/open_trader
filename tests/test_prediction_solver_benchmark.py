@@ -3006,16 +3006,10 @@ def test_container_absence_accepts_the_exact_docker_24_missing_container_result(
 
 @pytest.mark.parametrize("field,value", (("soft_time_limit_ms", 4_999), ("hard_time_limit_ms", 20_001), ("max_constraint_generation_rounds", 65)))
 def test_full_linux_rejects_tampered_partial_execution_limits_before_docker(tmp_path, monkeypatch, field, value) -> None:
-    environments, artifacts = _full_environment_fixture()
-    environments["linux"]["available"] = False
-    manifest = benchmark._full_manifest(benchmark._load_full_cases(), environments, artifacts)
+    manifest, _ = _current_macos_partial(tmp_path, monkeypatch)
     manifest[field] = value
     (tmp_path / "environment_manifest.json").write_text(json.dumps(manifest))
-    (tmp_path / "macos.jsonl").write_text("")
-    monkeypatch.setattr(benchmark, "_current_git_sha", lambda: "1" * 40)
     monkeypatch.setattr(benchmark, "_discover_linux_environment", lambda: pytest.fail("docker discovered"))
-    monkeypatch.setattr(benchmark, "_full_sample_plan", lambda _: ())
-    monkeypatch.setattr(benchmark, "aggregate_benchmark_records", lambda records, current: {})
 
     with pytest.raises(ValueError, match="identity"):
         benchmark._run_full_linux(tmp_path)
