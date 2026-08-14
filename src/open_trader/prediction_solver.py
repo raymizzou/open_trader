@@ -214,7 +214,7 @@ class _QualificationFormula:
     right_coefficients: tuple[tuple[Literal["profit", "payout", "cost"], int], ...]
     left_constant: int
     right_constant: int
-    requires_positive_payout: bool = False
+    positive_denominator: Literal["payout", "cost"] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -975,8 +975,11 @@ def compile_master(
             delay_seconds=release_profile.delay_seconds,
             occupied_days=release_profile.occupied_days,
         )
-        if formula.requires_positive_payout:
-            constraints.append(LinearConstraint(f"{name}:positive-payout", ((qualification_payout_name, 1),), 1, None))
+        if formula.positive_denominator is not None:
+            constraints.append(LinearConstraint(
+                f"{name}:positive-{formula.positive_denominator}",
+                ((qualification_variables[formula.positive_denominator], 1),), 1, None,
+            ))
         terms = tuple(
             (qualification_variables[semantic_name], coefficient)
             for semantic_name, coefficient in formula.left_coefficients
@@ -1105,7 +1108,15 @@ def _qualification_formula(
             (("payout", constraint.threshold_numerator),),
             0,
             0,
-            constraint.threshold_numerator > 0,
+            "payout" if constraint.threshold_numerator > 0 else None,
+        )
+    if constraint.metric == QualificationMetric.RETURN_ON_COST_PPM:
+        return _QualificationFormula(
+            (("profit", _product64(1_000_000, constraint.threshold_denominator)),),
+            (("cost", constraint.threshold_numerator),),
+            0,
+            0,
+            "cost" if constraint.threshold_numerator > 0 else None,
         )
     if constraint.metric == QualificationMetric.ANNUALIZED_RETURN_PPM:
         return _QualificationFormula(
@@ -1505,7 +1516,7 @@ def _failed_qualification_ids(
             delay_seconds=delay_seconds,
             occupied_days=occupied_days,
         )
-        if formula.requires_positive_payout and payout <= 0:
+        if formula.positive_denominator is not None and values[formula.positive_denominator] <= 0:
             failures.append(constraint.constraint_id)
             continue
         left = _qualification_activity(formula.left_coefficients, formula.left_constant, values)

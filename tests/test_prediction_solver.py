@@ -933,6 +933,8 @@ def test_adversary_canonicalizes_fixed_quantities_and_respects_active_constraint
         (QualificationMetric.GUARANTEED_PROFIT_UNITS, Comparison.LESS_THAN_OR_EQUAL, 3, 24, 23),
         (QualificationMetric.NET_MARGIN_PPM, Comparison.GREATER_THAN_OR_EQUAL, 3, 2_400_000, 2_400_001),
         (QualificationMetric.NET_MARGIN_PPM, Comparison.LESS_THAN_OR_EQUAL, 3, 2_400_000, 2_399_999),
+        (QualificationMetric.RETURN_ON_COST_PPM, Comparison.GREATER_THAN_OR_EQUAL, 3, 12_000_000, 12_000_001),
+        (QualificationMetric.RETURN_ON_COST_PPM, Comparison.LESS_THAN_OR_EQUAL, 3, 12_000_000, 11_999_999),
         (QualificationMetric.ANNUALIZED_RETURN_PPM, Comparison.GREATER_THAN_OR_EQUAL, 2, 1_460_000_000, 1_460_000_001),
         (QualificationMetric.ANNUALIZED_RETURN_PPM, Comparison.LESS_THAN_OR_EQUAL, 2, 1_460_000_000, 1_459_999_999),
         (QualificationMetric.MAX_CAPITAL_RELEASE_DELAY_SECONDS, Comparison.GREATER_THAN_OR_EQUAL, 3, 518_400, 518_401),

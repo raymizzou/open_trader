@@ -90,6 +90,8 @@ class ImmutableBook:
     tick_units: int
     haircut_ppm: int
     price_units_per_quote_unit: int
+    venue_id: str
+    fee_rule_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +154,7 @@ def resolve_component(
     budget: OracleBudget,
     *,
     now: datetime,
+    prior_market_solution: MarketSolution | None = None,
 ) -> ResolutionResult:
     """Resolve one fixed component; funding never changes the chosen portfolio."""
     try:
@@ -162,6 +165,16 @@ def resolve_component(
         return ResolutionResult(ResolutionStatus.UNKNOWN, "BOOK_STATE_UNKNOWN")
     if problem is None:
         return ResolutionResult(ResolutionStatus.NO_QUALIFIED_OPPORTUNITY, "INSUFFICIENT_VISIBLE_DEPTH")
+    if prior_market_solution is not None:
+        try:
+            prior = market_solution_from_payload(canonical_payload(prior_market_solution))
+        except ValueError:
+            return ResolutionResult(ResolutionStatus.UNKNOWN, "PRIOR_MARKET_SOLUTION_INVALID")
+        if (
+            prior.relation_fingerprint == model_fingerprint(problem)
+            and prior.economic_quote_fingerprint == economic_quote
+        ):
+            return _fund_fixed_solution(prior_market_solution, account_snapshot, now)
 
     proof_input = ProofInput(
         PROOF_REQUEST_SCHEMA_V1,
@@ -180,8 +193,6 @@ def resolve_component(
         status = ResolutionStatus.NO_QUALIFIED_OPPORTUNITY if verification.status == VerificationStatus.NO_QUALIFIED_OPPORTUNITY else ResolutionStatus.UNKNOWN
         return ResolutionResult(status, verification.status.value)
     proof = verification.solution.payout_proof
-    if not _qualification_passes(component, proof.guaranteed_profit_units, proof.cost_upper_bound_units, proof.conservative_capital_release_at, problem.as_of):
-        return ResolutionResult(ResolutionStatus.NO_QUALIFIED_OPPORTUNITY, "QUALIFICATION_FAILED")
     market = _market_solution(problem, verification.solution.quantities, proof, evidence, economic_quote)
     return _fund_fixed_solution(market, account_snapshot, now)
 
@@ -216,12 +227,23 @@ def _problem_with_visible_asks(
 
 
 def _cost_slices(action: CandidateAction, source: ImmutableBook, now: datetime) -> tuple[ExecutableCostSlice, ...] | None:
-    if not isinstance(source.book, ThresholdOrderBook | PredictBook) or source.action_id != action.action_id:
+    if (
+        not isinstance(source.book, ThresholdOrderBook | PredictBook)
+        or source.action_id != action.action_id
+        or source.venue_id != action.venue_id
+        or not isinstance(source.fee_rule_id, str)
+        or not source.fee_rule_id
+    ):
         raise ValueError("invalid book")
-    if any(type(value) is not int or value < 0 for value in (source.fee_ppm, source.tick_units, source.haircut_ppm)) or type(source.price_units_per_quote_unit) is not int or source.price_units_per_quote_unit <= 0:
+    if any(type(value) is not int or value < 0 for value in (source.fee_ppm, source.haircut_ppm)) or type(source.tick_units) is not int or source.tick_units <= 0 or type(source.price_units_per_quote_unit) is not int or source.price_units_per_quote_unit <= 0:
         raise ValueError("missing cost facts")
-    confirmed_at, asks, actual_id = _book_asks(source.book, action)
-    if source.native_id != actual_id or not _utc(confirmed_at) or (now - confirmed_at).total_seconds() < 0 or (now - confirmed_at).total_seconds() > BOOK_FRESHNESS_SECONDS:
+    timestamps, asks, actual_id = _book_asks(source.book, action)
+    if source.native_id != actual_id or any(
+        not _utc(timestamp)
+        or (now - timestamp).total_seconds() < 0
+        or (now - timestamp).total_seconds() > BOOK_FRESHNESS_SECONDS
+        for timestamp in timestamps
+    ):
         raise ValueError("stale or mismatched book")
     slices: list[ExecutableCostSlice] = []
     first = 1
@@ -246,10 +268,10 @@ def _cost_slices(action: CandidateAction, source: ImmutableBook, now: datetime) 
     return tuple(slices)
 
 
-def _book_asks(book: ThresholdOrderBook | PredictBook, action: CandidateAction) -> tuple[datetime, tuple[BookLevel, ...], str]:
+def _book_asks(book: ThresholdOrderBook | PredictBook, action: CandidateAction) -> tuple[tuple[datetime, ...], tuple[BookLevel, ...], str]:
     if isinstance(book, ThresholdOrderBook):
-        return book.confirmed_at, book.asks, book.token_id
-    return book.source_timestamp, book.yes_asks if action.side.value == "BUY_YES" else book.no_asks, book.market_id
+        return (book.confirmed_at,), book.asks, book.token_id
+    return (book.source_timestamp, book.received_at), book.yes_asks if action.side.value == "BUY_YES" else book.no_asks, book.market_id
 
 
 def _qualification_constraints(component: VerifiedComponent, rules: tuple[object, ...]) -> tuple[QualificationConstraint, ...]:
@@ -258,23 +280,9 @@ def _qualification_constraints(component: VerifiedComponent, rules: tuple[object
         raise ValueError("missing verified rule version")
     return (
         QualificationConstraint("minimum-profit-usd", rule_version, QualificationMetric.GUARANTEED_PROFIT_UNITS, Comparison.GREATER_THAN_OR_EQUAL, component.usd_units_per_dollar, 1),
-        QualificationConstraint("minimum-margin", rule_version, QualificationMetric.NET_MARGIN_PPM, Comparison.GREATER_THAN_OR_EQUAL, 10_000, 1),
+        QualificationConstraint("minimum-return-on-cost", rule_version, QualificationMetric.RETURN_ON_COST_PPM, Comparison.GREATER_THAN_OR_EQUAL, 10_000, 1),
         QualificationConstraint("minimum-annualized-return", rule_version, QualificationMetric.ANNUALIZED_RETURN_PPM, Comparison.GREATER_THAN_OR_EQUAL, 150_000, 1),
         QualificationConstraint("maximum-release-delay", rule_version, QualificationMetric.MAX_CAPITAL_RELEASE_DELAY_SECONDS, Comparison.LESS_THAN_OR_EQUAL, 30 * _SECONDS_PER_DAY, 1),
-    )
-
-
-def _qualification_passes(component: VerifiedComponent, profit: int | None, cost: int | None, release_at: datetime | None, as_of: datetime) -> bool:
-    if not all(type(value) is int for value in (profit, cost)) or profit is None or cost is None or cost <= 0 or not _utc(release_at) or not _utc(as_of):
-        return False
-    delay_seconds = int((release_at - as_of).total_seconds())
-    if delay_seconds < 0:
-        return False
-    return (
-        profit >= component.usd_units_per_dollar
-        and profit * 100 >= cost
-        and profit * 365 * 100 >= cost * 15 * max(1, (delay_seconds + _SECONDS_PER_DAY - 1) // _SECONDS_PER_DAY)
-        and delay_seconds <= 30 * _SECONDS_PER_DAY
     )
 
 
@@ -282,6 +290,11 @@ def _market_solution(problem: ArbitrageProblem, quantities: tuple[ActionQuantity
     verification_fingerprint = fingerprint(canonical_payload(proof))
     relation_fingerprint = model_fingerprint(problem)
     values = {
+        "bounded_cost_units": proof.cost_upper_bound_units,
+        "bounded_payout_units": proof.payout_lower_bound_units,
+        "guaranteed_profit_units": proof.guaranteed_profit_units,
+        "capital_release_at": proof.conservative_capital_release_at,
+        "global_search_closed": evidence.solver_evidence.global_search_closed,
         "relation_fingerprint": relation_fingerprint,
         "economic_quote_fingerprint": economic_quote,
         "verification_fingerprint": verification_fingerprint,
@@ -315,6 +328,11 @@ def market_solution_from_payload(payload: object) -> MarketSolution:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"invalid market solution: {exc}") from exc
     expected = fingerprint({
+        "bounded_cost_units": solution.bounded_cost_units,
+        "bounded_payout_units": solution.bounded_payout_units,
+        "guaranteed_profit_units": solution.guaranteed_profit_units,
+        "capital_release_at": solution.capital_release_at,
+        "global_search_closed": solution.global_search_closed,
         "relation_fingerprint": solution.relation_fingerprint,
         "economic_quote_fingerprint": solution.economic_quote_fingerprint,
         "verification_fingerprint": solution.verification_fingerprint,
@@ -350,6 +368,7 @@ def execution_solution_from_payload(payload: object) -> ExecutionSolution:
         "market": solution.market_solution_fingerprint,
         "account": solution.account_snapshot_fingerprint,
         "quantities": solution.quantities,
+        "capital_use_units": solution.capital_use_units,
     })
     if (
         solution.order_ready
@@ -373,8 +392,6 @@ def _fund_fixed_solution(market: MarketSolution, account: AccountSnapshot | None
         if action is None:
             return ResolutionResult(ResolutionStatus.UNKNOWN, "MARKET_SOLUTION_INVALID", market)
         debit = cost_upper_bound(market.problem, (quantity,))
-        if debit > account.max_per_trade_cost_units:
-            return ResolutionResult(ResolutionStatus.PER_TRADE_CAP_EXCEEDED, "PER_TRADE_CAP_EXCEEDED", market)
         key = (action.venue_id, action.account_id, action.settlement_asset_id)
         debits[key] = debits.get(key, 0) + debit
     balances = {(item.venue_id, item.account_id, item.asset_id): item for item in account.balances}
@@ -383,12 +400,17 @@ def _fund_fixed_solution(market: MarketSolution, account: AccountSnapshot | None
     if any(debit > balances[key].available_units or debit > balances[key].allowance_units for key, debit in debits.items()):
         return ResolutionResult(ResolutionStatus.INSUFFICIENT_FUNDS, "INSUFFICIENT_FUNDS", market)
     capital_use = sum(debits.values())
+    if capital_use > account.max_per_trade_cost_units:
+        return ResolutionResult(ResolutionStatus.PER_TRADE_CAP_EXCEEDED, "PER_TRADE_CAP_EXCEEDED", market)
     if account.unsettled_capital_units + capital_use > account.max_total_unsettled_capital_units:
         return ResolutionResult(ResolutionStatus.UNSETTLED_CAP_EXCEEDED, "UNSETTLED_CAP_EXCEEDED", market)
     account_fingerprint = fingerprint(account)
     execution = ExecutionSolution(
         market.fingerprint, account_fingerprint, market.quantities, capital_use, False,
-        "PARTIAL_FILL_PROOF_REQUIRED", fingerprint({"market": market.fingerprint, "account": account_fingerprint, "quantities": market.quantities}),
+        "PARTIAL_FILL_PROOF_REQUIRED", fingerprint({
+            "market": market.fingerprint, "account": account_fingerprint,
+            "quantities": market.quantities, "capital_use_units": capital_use,
+        }),
     )
     return ResolutionResult(ResolutionStatus.EXECUTION_SOLUTION, None, market, execution)
 
@@ -400,20 +422,23 @@ def _valid_account_snapshot(snapshot: AccountSnapshot | None, now: datetime) -> 
         return False
     if any(type(value) is not int or value < 0 for value in (snapshot.max_per_trade_cost_units, snapshot.unsettled_capital_units, snapshot.max_total_unsettled_capital_units)):
         return False
-    keys = {(balance.venue_id, balance.account_id, balance.asset_id) for balance in snapshot.balances}
-    return len(keys) == len(snapshot.balances) and all(
+    if not all(
         isinstance(balance, AccountBalance)
         and all(isinstance(value, str) and value for value in (balance.venue_id, balance.account_id, balance.asset_id))
         and type(balance.available_units) is int and balance.available_units >= 0
         and type(balance.allowance_units) is int and balance.allowance_units >= 0
         for balance in snapshot.balances
-    )
+    ):
+        return False
+    keys = {(balance.venue_id, balance.account_id, balance.asset_id) for balance in snapshot.balances}
+    return len(keys) == len(snapshot.balances)
 
 
 def _economic_book(book: ImmutableBook, action: CandidateAction) -> dict[str, object]:
     _, asks, actual_id = _book_asks(book.book, action)
     return {
         "action_id": book.action_id, "native_id": actual_id, "fee_ppm": book.fee_ppm,
+        "venue_id": book.venue_id, "fee_rule_id": book.fee_rule_id,
         "tick_units": book.tick_units, "haircut_ppm": book.haircut_ppm,
         "price_units_per_quote_unit": book.price_units_per_quote_unit,
         "asks": tuple((str(level.price), str(level.size)) for level in asks),

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from dataclasses import replace
 from decimal import Decimal
 
 import open_trader.prediction_executable_cost as executable_cost
@@ -91,19 +92,20 @@ def qualified_solver(monkeypatch):
     def fake_solve(payload, **_kwargs):
         captured["calls"] += 1
         captured["input"] = proof_input_from_payload(payload)
+        quantities = tuple(ActionQuantity(action.action_id, 1) for action in captured["input"].request.problem.actions)
         evaluation = evaluate_fixed_portfolio(
             captured["input"].request.problem,
-            (ActionQuantity("action-a", 1),),
+            quantities,
             captured["input"].request.budget,
         )
         evidence = CandidateEvidence(
             CANDIDATE_EVIDENCE_SCHEMA_V1,
             captured["input"], "test", "1",
             executable_cost.model_fingerprint(captured["input"].request.problem),
-            executable_cost.fingerprint({"quantities": (ActionQuantity("action-a", 1),)}),
+            executable_cost.fingerprint({"quantities": quantities}),
             SolverEvidence(
-                "FEASIBLE", PortfolioCandidate((ActionQuantity("action-a", 1),), evaluation.guaranteed_profit_units),
-                ObjectiveBounds(evaluation.guaranteed_profit_units, 200, 51, False),
+                "FEASIBLE", PortfolioCandidate(quantities, evaluation.guaranteed_profit_units),
+                ObjectiveBounds(evaluation.guaranteed_profit_units, evaluation.guaranteed_profit_units + 1, 1, False),
                 evaluation.worst_scenario, evaluation.payout_lower_bound_units,
                 evaluation.cost_upper_bound_units, evaluation.guaranteed_profit_units,
                 evaluation.conservative_capital_release_at, True, False, 1, 1,
@@ -121,7 +123,7 @@ def executable_book() -> ImmutableBook:
         "action-a", "action-a",
         ThresholdOrderBook("action-a", (BookLevel(Decimal("0.40"), Decimal("1")),), (), AS_OF),
         fee_ppm=100_000, tick_units=1, haircut_ppm=100_000,
-        price_units_per_quote_unit=100,
+        price_units_per_quote_unit=100, venue_id="venue-a", fee_rule_id="fee-v1",
     )
 
 
@@ -171,6 +173,26 @@ def test_insufficient_fixed_funding_retains_market_solution_without_second_solve
     assert captured["calls"] == 1
 
 
+def test_per_trade_cap_applies_to_total_fixed_plan_not_each_leg(monkeypatch) -> None:
+    qualified_solver(monkeypatch)
+    funded = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
+    market = resolve_component(
+        component(), (executable_book(),), funded,
+        BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF,
+    ).market_solution
+    account = AccountSnapshot(
+        AS_OF,
+        (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),),
+        100, 0, 1_000,
+    )
+
+    result = executable_cost._fund_fixed_solution(replace(market, quantities=(ActionQuantity("action-a", 1), ActionQuantity("action-a", 1))), account, AS_OF)
+
+    assert result.status is ResolutionStatus.PER_TRADE_CAP_EXCEEDED
+    assert result.market_solution is not None
+    assert result.execution_solution is None
+
+
 def test_stale_account_retains_market_solution_as_unknown(monkeypatch) -> None:
     qualified_solver(monkeypatch)
     account = AccountSnapshot(
@@ -187,6 +209,47 @@ def test_stale_account_retains_market_solution_as_unknown(monkeypatch) -> None:
     assert result.status is ResolutionStatus.ACCOUNT_STATE_UNKNOWN
     assert result.market_solution is not None
     assert result.execution_solution is None
+
+
+def test_malformed_account_balance_fails_closed_as_account_unknown(monkeypatch) -> None:
+    qualified_solver(monkeypatch)
+    account = AccountSnapshot(AS_OF, (object(),), 1_000, 0, 1_000)
+
+    result = resolve_component(
+        component(), (executable_book(),), account,
+        BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF,
+    )
+
+    assert result.status is ResolutionStatus.ACCOUNT_STATE_UNKNOWN
+    assert result.market_solution is not None
+
+
+def test_prior_market_solution_rechecks_funding_without_resolving_again(monkeypatch) -> None:
+    captured = qualified_solver(monkeypatch)
+    funded = AccountSnapshot(
+        AS_OF,
+        (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),),
+        1_000, 0, 1_000,
+    )
+    first = resolve_component(
+        component(), (executable_book(),), funded,
+        BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF,
+    )
+    unfunded = AccountSnapshot(
+        AS_OF,
+        (AccountBalance("venue-a", "account-a", "usd-cents", 50, 50),),
+        1_000, 0, 1_000,
+    )
+
+    refreshed = resolve_component(
+        component(), (executable_book(),), unfunded,
+        BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2),
+        now=AS_OF, prior_market_solution=first.market_solution,
+    )
+
+    assert refreshed.status is ResolutionStatus.INSUFFICIENT_FUNDS
+    assert refreshed.market_solution == first.market_solution
+    assert captured["calls"] == 1
 
 
 def test_market_solution_decoder_recomputes_its_fingerprint(monkeypatch) -> None:
@@ -208,6 +271,22 @@ def test_market_solution_decoder_recomputes_its_fingerprint(monkeypatch) -> None
         market_solution_from_payload(payload)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("bounded_cost_units", 52), ("bounded_payout_units", 201),
+     ("guaranteed_profit_units", 148), ("global_search_closed", True)),
+)
+def test_market_solution_decoder_rejects_all_bound_semantic_mutations(monkeypatch, field, value) -> None:
+    qualified_solver(monkeypatch)
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
+    result = resolve_component(component(), (executable_book(),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
+    payload = executable_cost.canonical_payload(result.market_solution)
+    payload[field] = value
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        market_solution_from_payload(payload)
+
+
 def test_execution_solution_decoder_recomputes_its_fingerprint(monkeypatch) -> None:
     qualified_solver(monkeypatch)
     account = AccountSnapshot(
@@ -224,4 +303,8 @@ def test_execution_solution_decoder_recomputes_its_fingerprint(monkeypatch) -> N
     assert executable_cost.canonical_payload(execution_solution_from_payload(payload)) == payload
     payload["order_ready"] = True
     with pytest.raises(ValueError, match="partial-fill"):
+        execution_solution_from_payload(payload)
+    payload = executable_cost.canonical_payload(result.execution_solution)
+    payload["capital_use_units"] += 1
+    with pytest.raises(ValueError, match="fingerprint"):
         execution_solution_from_payload(payload)

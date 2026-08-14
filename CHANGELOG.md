@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-14
 
+- #51 review fixes bind every market/execution quantitative field into its artifact fingerprint, add caller-supplied fixed-market re-funding without an internal cache, enforce the per-trade cap over the total plan, fail malformed accounts closed, and require nonzero tick plus verified fee-rule identity. Canonical #50 now has exact `RETURN_ON_COST_PPM` qualification so the 1% gate divides by conservative cost, not payout. Predict books require both source and receipt freshness. Focused resolver/N-leg/oracle/solver/verified checks pass; no watcher, persistence, order, or Dashboard behavior was added.
+
 - #51 adds a one-shot, immutable N-leg executable-cost resolver. It converts only visible BUY asks from existing Polymarket/Predict book types into protected integer cost slices, sends the complete connected component through existing #50 solve/verify, retains a qualified market proof on funding failure, and emits only a non-order-ready `PARTIAL_FILL_PROOF_REQUIRED` handoff. No watcher, cache, persistence, mode, notification, Dashboard, order, or repair behavior was added. Focused resolver/N-leg/oracle/solver/verified/worker checks pass; native CP-SAT smoke is unavailable in the host venv because OR-Tools is absent.
 
 - #50 worker replay keeps legacy handshake-v1 `version` semantics and adds a strict handshake-v2 `solver_version` field for native proof evidence; old v1 workers remain version-unavailable rather than guessed. Direct solve no longer accepts worker-only request IDs. Host WorkerHarness, benchmark, and isolated CP-SAT bridge checks passed.

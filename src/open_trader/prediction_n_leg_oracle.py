@@ -330,6 +330,11 @@ def _qualification_passes(problem: ArbitrageProblem, constraint: QualificationCo
             return False
         left = _checked_product(evaluation.guaranteed_profit_units, 1_000_000, constraint.threshold_denominator)
         right = _checked_multiply(constraint.threshold_numerator, evaluation.payout_lower_bound_units)
+    elif constraint.metric == QualificationMetric.RETURN_ON_COST_PPM:
+        if constraint.threshold_numerator > 0 and evaluation.cost_upper_bound_units <= 0:
+            return False
+        left = _checked_product(evaluation.guaranteed_profit_units, 1_000_000, constraint.threshold_denominator)
+        right = _checked_multiply(constraint.threshold_numerator, evaluation.cost_upper_bound_units)
     elif constraint.metric == QualificationMetric.ANNUALIZED_RETURN_PPM:
         occupied_days = _occupied_days(problem, evaluation)
         left = _checked_product(
