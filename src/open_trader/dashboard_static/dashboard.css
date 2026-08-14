@@ -1537,13 +1537,58 @@ table {
 .trend-review-statistics {
   border-top: 1px solid var(--line);
   display: grid;
-  gap: 5px;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto;
   padding-top: 10px;
 }
+
+.trend-review-statistics-main { min-width: 0; }
+
+.trend-review-statistics-main > strong { display: block; margin-bottom: 5px; }
+
+.trend-review-win-rate {
+  display: grid;
+  justify-items: end;
+  text-align: right;
+}
+
+.trend-review-win-rate span,
+.trend-review-win-rate small,
+.trend-review-metric header span { color: var(--muted); }
+
+.trend-review-win-rate strong {
+  color: var(--accent);
+  font-size: 36px;
+  line-height: 1;
+}
+
+.trend-review-win-rate.unavailable strong {
+  color: var(--muted);
+  font-size: 20px;
+  font-weight: 400;
+}
+
+.trend-review-column-groups {
+  color: var(--muted);
+  display: grid;
+  font-size: 12px;
+  gap: 8px;
+  grid-template-columns: minmax(0, .8fr) minmax(0, 5fr);
+}
+
+.trend-review-column-groups-values {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.trend-review-column-groups-values span:first-child { grid-column: span 2; }
+.trend-review-column-groups-values span:last-child { grid-column: span 3; }
 
 .trend-review-metric {
   display: grid;
   gap: 8px;
+  grid-template-columns: minmax(0, .8fr) minmax(0, 5fr);
 }
 
 .trend-review-metric + .trend-review-metric {
@@ -1551,39 +1596,14 @@ table {
   padding-top: 12px;
 }
 
+.trend-review-metric header {
+  display: grid;
+  gap: 3px;
+  align-content: start;
+}
+
 .trend-review-metric h3 {
   font-size: 14px;
-}
-
-.trend-review-axis {
-  background: var(--line);
-  height: 2px;
-  margin: 12px 7px 0;
-  position: relative;
-}
-
-.trend-review-axis::after {
-  background: var(--muted);
-  content: "";
-  height: 10px;
-  left: var(--trend-review-zero);
-  position: absolute;
-  top: -4px;
-  width: 1px;
-}
-
-.trend-review-point {
-  left: var(--trend-review-position);
-  position: absolute;
-  top: 50%;
-  transform: translate(-50%, -50%);
-}
-
-.trend-review-domain {
-  color: var(--muted);
-  display: flex;
-  font-size: 11px;
-  justify-content: space-between;
 }
 
 .trend-review-values {
@@ -1614,7 +1634,7 @@ table {
 }
 
 .trend-review-series strong {
-  font-size: 14px;
+  font-size: 23px;
 }
 
 .trend-review-series[data-series="discipline"] > span:first-child,
@@ -1630,8 +1650,7 @@ table {
   overflow-wrap: anywhere;
 }
 
-.trend-review-marker,
-.trend-review-point {
+.trend-review-marker {
   background-color: var(--surface-soft);
   border: 2px solid var(--primary);
   display: inline-block;
@@ -1652,7 +1671,6 @@ table {
 }
 
 .trend-review-shape-diamond { transform: rotate(45deg); }
-.trend-review-point.trend-review-shape-diamond { transform: translate(-50%, -50%) rotate(45deg); }
 .trend-review-shape-square { background: var(--primary); }
 .trend-review-shape-ring {
   border-radius: 50%;
@@ -5226,6 +5244,43 @@ table {
 
 }
 
+@media (max-width: 840px) {
+  .trend-review-statistics-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-review-statistics {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-review-win-rate {
+    justify-items: start;
+    text-align: left;
+  }
+
+  .trend-review-column-groups { display: none; }
+
+  .trend-review-metric { grid-template-columns: minmax(0, 1fr); }
+
+  .trend-review-values {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+
+  .trend-review-series {
+    align-items: start;
+    grid-template-columns: minmax(92px, auto) minmax(0, 1fr) minmax(64px, auto);
+  }
+
+  .trend-review-series[data-series="discipline"],
+  .trend-review-series[data-series="actual"] { grid-column: span 3; }
+
+  .trend-review-series[data-series="same_period_benchmark"],
+  .trend-review-series[data-series="market_1y"],
+  .trend-review-series[data-series="market_5y"] { grid-column: span 6; }
+
+  .trend-review-series strong { font-size: 18px; text-align: right; }
+}
+
 @media (max-width: 760px) {
   .backtest-comparison-grid,
   .backtest-artifacts li,
@@ -5269,22 +5324,8 @@ table {
   }
 
   .trend-review-header,
-  .trend-review-statistics-grid,
   .trend-review-matrix-meta {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  .trend-review-values {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .trend-review-series {
-    align-items: start;
-    grid-template-columns: minmax(92px, auto) minmax(0, 1fr) minmax(64px, auto);
-  }
-
-  .trend-review-series strong {
-    text-align: right;
   }
 
   .trend-review-header-side {

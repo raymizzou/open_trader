@@ -2843,8 +2843,10 @@ def test_acceptance_formats_four_digit_trend_review_win_rate_counts(
         "统计截至 2026-08-08T15:00:00+08:00",
         "指标截至 2026-08-08",
         "发现 2005 · 排除 4 · 未闭环 1",
-        "完整交易胜率 50% · 1,000 胜 / 2,000 闭环",
         "排除原因 成本不完整 4",
+    ]
+    page.review_win_rate_texts["discipline"] = [
+        "完整交易胜率", "50%", "1,000 胜 / 2,000 闭环",
     ]
     section = dashboard_acceptance._select_account_tab(page, "tiger")
 
@@ -2856,18 +2858,11 @@ def test_acceptance_rejects_missing_trend_review_win_rate(
 ) -> None:
     payload = valid_payload()
     review = payload["trend_reviews"]["tiger"]
-    rendered = trend_review_workspace_text("tiger", review)
-    monkeypatch.setattr(
-        sys.modules[__name__],
-        "trend_review_workspace_text",
-        lambda *_args, **_kwargs: rendered.replace(
-            "完整交易胜率 25% · 1 胜 / 4 闭环 ", ""
-        ),
-    )
     page = tabbed_account_page(payload)
+    page.review_win_rate_texts["discipline"] = ["完整交易胜率", "数据不足", "0 闭环"]
     section = dashboard_acceptance._select_account_tab(page, "tiger")
 
-    with pytest.raises(AssertionError, match="完整交易胜率 25% · 1 胜 / 4 闭环"):
+    with pytest.raises(AssertionError, match="纪律模拟完整交易胜率"):
         dashboard_acceptance._check_trend_review(page, section, "tiger", review)
 
 
@@ -2954,6 +2949,40 @@ def test_acceptance_rejects_trend_review_panel_style_drift() -> None:
     section = dashboard_acceptance._select_account_tab(page, "tiger")
 
     with pytest.raises(AssertionError, match="圆角"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_allows_trend_review_unavailable_first_metric_value() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.review_first_metric_unavailable = True
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    dashboard_acceptance._check_trend_review(
+        page, section, "tiger", payload["trend_reviews"]["tiger"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("viewport", "attribute", "value", "message"),
+    (
+        (None, "review_unavailable_win_rate_font_size", "14px", "不可用胜率"),
+        ({"width": 375, "height": 844}, "review_metric_value_font_size", "23px", "指标值"),
+    ),
+)
+def test_acceptance_rejects_trend_review_typography_drift(
+    viewport: dict[str, int] | None, attribute: str, value: str, message: str,
+) -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    if viewport is not None:
+        page.viewport_size = viewport
+    setattr(page, attribute, value)
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match=message):
         dashboard_acceptance._check_trend_review(
             page, section, "tiger", payload["trend_reviews"]["tiger"]
         )
@@ -3052,6 +3081,123 @@ def test_acceptance_rejects_375_trend_review_overflow() -> None:
         )
 
 
+def test_acceptance_checks_375_trend_review_with_responsive_grid_tracks() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.viewport_size = {"width": 375, "height": 844}
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    dashboard_acceptance._check_trend_review(
+        page, section, "tiger", payload["trend_reviews"]["tiger"]
+    )
+
+    assert page.review_geometry_checks == ["tiger"]
+    assert page.document_overflow_checks == ["tiger"]
+
+
+def test_acceptance_rejects_800_trend_review_overflow() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.viewport_size = {"width": 800, "height": 844}
+    page.review_document_width = 801
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="800px"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_rejects_841_trend_review_overflow() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.viewport_size = {"width": 841, "height": 844}
+    page.review_document_width = 842
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="841px"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_rejects_375_trend_review_market_cell_not_full_width() -> None:
+    page = tabbed_account_page(valid_payload())
+    page.viewport_size = {"width": 375, "height": 844}
+    page.review_geometry_override = {"mobileMarketFullWidth": False}
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="市场基准逐行"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", valid_payload()["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_rejects_375_trend_review_first_market_cell_not_full_width() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.viewport_size = {"width": 375, "height": 844}
+    page.review_geometry_override = {"mobileFirstMarketFullWidth": False}
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="市场基准逐行"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_rejects_375_trend_review_strategy_two_four_split() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.viewport_size = {"width": 375, "height": 844}
+    page.review_geometry_override = {"mobileStrategySplit": "2/4"}
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="策略表现未等分"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_rejects_1440_trend_review_misaligned_column_groups() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.review_geometry_override = {"desktopColumnGroupsAligned": False}
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="分组标题"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_rejects_1440_trend_review_group_grid_track_drift() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.review_geometry_override = {"desktopGroupGridTrackDrift": True}
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="分组网格轨道"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_rejects_swapped_trend_review_win_rates() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.review_win_rate_texts = {
+        "discipline": ["完整交易胜率", "数据不足", "0 闭环"],
+        "actual": ["完整交易胜率", "25%", "1 胜 / 4 闭环"],
+    }
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="纪律模拟完整交易胜率"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
 def test_acceptance_rejects_375_trend_review_clipped_long_text() -> None:
     payload = valid_payload()
     page = tabbed_account_page(payload)
@@ -3095,7 +3241,6 @@ def test_trend_review_acceptance_fake_rejects_marker_only_expressions() -> None:
 
     for marker in (
         "trend-review-style-contract", "trend-review-geometry-contract",
-        "trend-review-domain-contract",
     ):
         with pytest.raises(AssertionError):
             page.evaluate(f"() => {{ // {marker}\n }}")
@@ -3118,7 +3263,7 @@ def test_trend_review_acceptance_fake_rejects_broken_selector_or_api() -> None:
     dashboard_acceptance._check_trend_review(
         page, section, "tiger", payload["trend_reviews"]["tiger"]
     )
-    domain_expression, style_expression, geometry_expression = captured
+    style_expression, geometry_expression = captured
 
     with pytest.raises(AssertionError):
         page.evaluate(style_expression.replace(
@@ -3128,8 +3273,6 @@ def test_trend_review_acceptance_fake_rejects_broken_selector_or_api() -> None:
         page.evaluate(geometry_expression.replace(
             "getBoundingClientRect", "getBrokenRect", 1
         ))
-    with pytest.raises(AssertionError):
-        page.evaluate(domain_expression.replace("dataset.value", "dataset.broken", 1))
     page.trend_broker = "tiger"
     with pytest.raises(AssertionError):
         page.evaluate(geometry_expression.replace(
@@ -3760,7 +3903,11 @@ class TabbedAccountLocator:
         if self.selector == "#trend-report-workspace:visible .trend-review-metric":
             return 5 if self.page.trend_kind == "review" else 0
         if self.selector == "#trend-report-workspace:visible .trend-review-axis":
-            return 5 if self.page.trend_kind == "review" else 0
+            return 0
+        if self.selector == "#trend-report-workspace:visible .trend-review-win-rate":
+            return 2 if self.page.trend_kind == "review" else 0
+        if self.selector == "#trend-report-workspace:visible .trend-review-column-groups":
+            return int(self.page.trend_kind == "review")
         if self.selector == "#trend-report-workspace:visible .trend-review-series":
             return 25 if self.page.trend_kind == "review" else 0
         match = re.fullmatch(
@@ -3769,7 +3916,7 @@ class TabbedAccountLocator:
             self.selector,
         )
         if match and self.page.trend_kind == "review":
-            return 1 if match.group(2) == "trend-review-axis" else 5
+            return 0 if match.group(2) == "trend-review-axis" else 5
         match = re.fullmatch(
             r'#trend-report-workspace:visible \.trend-review-series\[data-series="'
             r'(discipline|actual|same_period_benchmark|market_1y|market_5y)' r'"\]',
@@ -4238,6 +4385,14 @@ class TabbedAccountLocator:
         )
         if statistics_match:
             return self.page.review_statistics_texts[statistics_match.group(1)]
+        win_rate_match = re.fullmatch(
+            r'#trend-report-workspace:visible \.trend-review-statistics'
+            r'\[data-series="(discipline|actual)"\] '
+            r'\.trend-review-win-rate > \*',
+            self.selector,
+        )
+        if win_rate_match:
+            return self.page.review_win_rate_texts[win_rate_match.group(1)]
         if self.selector == "#trend-report-workspace:visible .trend-review-matrix figcaption":
             return ["策略与市场基准"]
         if self.selector == "#trend-report-workspace:visible .trend-review-metric h3":
@@ -4443,6 +4598,9 @@ class TabbedAccountPage:
         self.review_header_span_border_width = "0px"
         self.review_text_contrast = 12.0
         self.review_marker_contrasts = [4.0] * 25
+        self.review_unavailable_win_rate_font_size = "20px"
+        self.review_metric_value_font_size: str | None = None
+        self.review_first_metric_unavailable = False
         self.review_header_left_texts: list[str] | None = None
         self.review_header_side_texts: list[str] | None = None
         self.review_statistics_texts = {
@@ -4450,16 +4608,20 @@ class TabbedAccountPage:
                 "统计截至 2026-08-08T15:00:00+08:00",
                 "指标截至 2026-08-08",
                 "发现 9 · 排除 4 · 未闭环 1",
-                "完整交易胜率 25% · 1 胜 / 4 闭环",
                 "排除原因 成本不完整 4",
             ],
             "actual": ["统计来源不可用"],
+        }
+        self.review_win_rate_texts = {
+            "discipline": ["完整交易胜率", "25%", "1 胜 / 4 闭环"],
+            "actual": ["完整交易胜率", "统计来源不可用", "来源不可用"],
         }
         self.review_metric_reason: str | None = None
         self.review_metric_values_override: list[str] | None = None
         self.review_text_layout_override: dict[str, object] = {}
         self.review_long_text_scroll_width = 323
         self.review_document_width: int | None = None
+        self.review_geometry_override: dict[str, object] = {}
         self.workspace_view = "portfolio"
         self.research_open = False
         self.script_evaluations: list[tuple[str, object | None]] = []
@@ -4529,7 +4691,9 @@ class TabbedAccountPage:
                 '.trend-review-header-side button',
                 "backgroundColor", "borderColor", "borderWidth", "color",
                 "borderRadius", "boxShadow", "backgroundImage",
-                "textContrast", "markerContrasts",
+                "textContrast", "markerContrasts", "cloneNode", "classList.add", "classList.remove",
+                "unavailableWinRateFontSize", "metricValueFontSize", "fontSize",
+                ".trend-review-win-rate", ".trend-review-series", "metricValueProbe",
             )
             missing = [fragment for fragment in required if fragment not in expression]
             assert not missing, f"trend review style fake 缺少真实表达式：{missing}"
@@ -4599,6 +4763,14 @@ class TabbedAccountPage:
                 "markers": [panel] * 25,
                 "textContrast": self.review_text_contrast,
                 "markerContrasts": self.review_marker_contrasts,
+                "unavailableWinRateFontSize": self.review_unavailable_win_rate_font_size,
+                "metricValueFontSize": self.review_metric_value_font_size or (
+                    "18px"
+                    if self.viewport_size["width"] <= 840
+                    else "23px"
+                    if "metricValueProbe" in expression or not self.review_first_metric_unavailable
+                    else "12px"
+                ),
             }
         if "trend-review-geometry-contract" in expression:
             required = (
@@ -4608,10 +4780,16 @@ class TabbedAccountPage:
                 ".trend-review-header-side > *",
                 ".trend-review-matrix figcaption",
                 ".trend-review-metric h3",
+                ".trend-review-win-rate > *",
                 ".trend-review-series > span:first-child",
                 ".trend-review-series .trend-review-window",
                 ".trend-review-series strong",
-                ".trend-review-matrix", ".trend-review-axis", ".trend-review-values",
+                ".trend-review-matrix", ".trend-review-win-rate",
+                ".trend-review-column-groups", ".trend-review-values",
+                ".trend-review-column-groups-values", "columnGroupStyle",
+                "columnGroupValuesStyle", "metricStyle", "valueStyle",
+                "gridTemplateColumns", "columnGap",
+                "columnGroupCells",
                 "firstSeries",
                 "querySelectorAll", "querySelector", "getBoundingClientRect",
                 "getComputedStyle", "clientWidth", "scrollWidth",
@@ -4621,13 +4799,70 @@ class TabbedAccountPage:
             missing = [fragment for fragment in required if fragment not in expression]
             assert not missing, f"trend review geometry fake 缺少真实表达式：{missing}"
             self.review_geometry_checks.append(self.trend_broker)
-            narrow = self.viewport_size["width"] <= 760
-            panel_width = self.viewport_size["width"] - 28 if narrow else 1360
+            narrow = self.viewport_size["width"] <= 840
+            panel_width = min(self.viewport_size["width"] - 28, 1360)
+            column_group_style = (
+                {"gridTemplateColumns": "none", "columnGap": "8px"}
+                if narrow
+                else {"gridTemplateColumns": "188px 1242px", "columnGap": "8px"}
+            )
+            metric_style = {
+                "gridTemplateColumns": (
+                    "347px"
+                    if narrow
+                    else (
+                        "188px 1242px"
+                        if self.review_geometry_override.get("desktopGroupGridTrackDrift") is not True
+                        else "190px 1240px"
+                    )
+                ),
+                "columnGap": "8px",
+            }
+            value_style = {
+                "gridTemplateColumns": (
+                    "52px 52px 52px 52px 52px 52px"
+                    if narrow
+                    else "250px 250px 250px 250px 250px"
+                ),
+                "columnGap": "12px",
+            }
+            strategy_series = (
+                ((28, 100), (128, 220))
+                if self.review_geometry_override.get("mobileStrategySplit") == "2/4"
+                else ((28, 160), (188, 160))
+            )
+
+            def review_series(index: int) -> dict[str, int]:
+                if not narrow:
+                    return {
+                        "x": 188 + index * 260,
+                        "y": 580,
+                        "width": 250,
+                        "height": 36,
+                    }
+                if index < 2:
+                    x, width = strategy_series[index]
+                    return {"x": x, "y": 580, "width": width, "height": 36}
+                full_width = (
+                    self.review_geometry_override.get("mobileMarketFullWidth") is not False
+                    and not (
+                        index == 2
+                        and self.review_geometry_override.get("mobileFirstMarketFullWidth") is False
+                    )
+                )
+                return {
+                    "x": 28,
+                    "y": 622 + (index - 2) * 42,
+                    "width": panel_width - 28 if full_width else 160,
+                    "height": 36,
+                }
+
             text_counts = (
                 (".trend-review-header > div:first-child > *", 3),
                 (".trend-review-header-side > *", 4),
                 (".trend-review-matrix figcaption", 1),
                 (".trend-review-metric h3", 5),
+                (".trend-review-win-rate > *", 6),
                 (".trend-review-series > span:first-child", 25),
                 (".trend-review-series .trend-review-window", 25),
                 (".trend-review-series strong", 25),
@@ -4663,43 +4898,34 @@ class TabbedAccountPage:
                 ],
                 "button": {"x": 14, "y": 120, "width": 347, "height": 44},
                 "matrix": {"x": 14, "y": 460, "width": panel_width, "height": 1200},
-                "axes": [
-                    {"x": 28, "y": 560 + index * 180, "width": panel_width - 28, "height": 2}
-                    for index in range(5)
+                "winRates": [
+                    {"x": 28, "y": 510 + index * 68 if narrow else 510, "width": 150, "height": 48}
+                    for index in range(2)
                 ],
+                "columnGroups": [{"x": 28, "y": 570, "width": panel_width - 28, "height": 20}],
+                "columnGroupCells": [
+                    [
+                        {"x": 188, "y": 570, "width": 510, "height": 20},
+                        {
+                            "x": 708 if self.review_geometry_override.get("desktopColumnGroupsAligned") is not False else 728,
+                            "y": 570, "width": 770, "height": 20,
+                        },
+                    ],
+                ],
+                "columnGroupStyle": column_group_style,
+                "columnGroupValuesStyle": {
+                    "gridTemplateColumns": "250px 250px 250px 250px 250px",
+                    "columnGap": "12px",
+                },
+                "metricStyle": metric_style,
+                "valueStyle": value_style,
                 "valueLists": [
                     {"x": 28, "y": 580 + index * 180, "width": panel_width - 28, "height": 130}
                     for index in range(5)
                 ],
-                "firstSeries": [
-                    {
-                        "x": 28 if narrow else 28 + index * 260,
-                        "y": 580 + index * 42 if narrow else 580,
-                        "width": panel_width - 28 if narrow else 250,
-                        "height": 36,
-                    }
-                    for index in range(5)
-                ],
+                "firstSeries": [review_series(index) for index in range(5)],
                 "textGroups": text_groups,
             }
-        if "trend-review-domain-contract" in expression:
-            required = (
-                'document.querySelector("#trend-report-workspace")',
-                '.querySelectorAll(".trend-review-metric")',
-                '.querySelectorAll(".trend-review-axis")',
-                '.querySelectorAll(".trend-review-point")',
-                "dataset.domainMin", "dataset.domainMax", "dataset.value",
-                "--trend-review-position", "getComputedStyle",
-            )
-            missing = [fragment for fragment in required if fragment not in expression]
-            assert not missing, f"trend review domain fake 缺少真实表达式：{missing}"
-            return [
-                {
-                    "minimum": -10.0, "maximum": 20.0, "axisCount": 1,
-                    "points": [{"value": 5.0, "position": 50.0}],
-                }
-                for _index in range(5)
-            ]
         assert expression == "document.documentElement.scrollWidth <= window.innerWidth"
         self.document_overflow_checks.append(self.trend_broker)
         return self.trend_broker != self.document_overflow_broker

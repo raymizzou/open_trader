@@ -5,7 +5,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-14
 
+- 趋势复盘基准现以独立的显著完整交易胜率和统一五项指标计分板呈现，桌面端分列策略表现/市场基准，移动端逐行市场基准；无计算或执行变更。验证：聚焦 `trend_review` 测试 `3 + 36 passed`；完整 Dashboard 三文件套件在本地权限下为 `1006 passed, 1 warning in 48.09s`。未运行 `make acceptance`、部署、合并或推送。
+
 - #49 标准化 solver adapters/worker benchmark：先通过稳定性硬门槛，再做正套利输出速度实验；在当前 macOS/current-corpus 边界内选择 OR-Tools CP-SAT。Linux cleanup proof 未完成，不构成正式跨平台全量选择；Issue 已关闭。
+
 - 趋势复盘“策略与市场基准”现分别显示纪律模拟和实际执行的完整交易胜率：只统计既有归因、成本完整的完整闭环，成本后 `net_pnl > 0` 才计胜，持平仍计入分母；零闭环显示“数据不足”，来源不可用不伪装为 `0%`。投影已升至 v5，Controller 会将 v4 视为旧投影并重建。验证：6 个受影响测试文件 `1539 passed, 1 warning`；只读真实三市场投影为 CN 模拟 `2/11`、HK 模拟 `1/6`、US 模拟 `2/8`，三市场实际执行均 `0/0`。未运行 `make acceptance`、部署、合并或推送。
 
 - #46 final corrections make the independent Prediction Service health contract
