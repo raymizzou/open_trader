@@ -46,12 +46,12 @@ BOOK_FRESHNESS_SECONDS = 10
 ACCOUNT_FRESHNESS_SECONDS = 60
 _PPM = 1_000_000
 _SECONDS_PER_DAY = 24 * 60 * 60
+_SEMANTIC_AS_OF = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 class ResolutionStatus(StrEnum):
     UNKNOWN = "UNKNOWN"
     NO_QUALIFIED_OPPORTUNITY = "NO_QUALIFIED_OPPORTUNITY"
-    MARKET_SOLUTION = "MARKET_SOLUTION"
     EXECUTION_SOLUTION = "EXECUTION_SOLUTION"
     INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS"
     PER_TRADE_CAP_EXCEEDED = "PER_TRADE_CAP_EXCEEDED"
@@ -171,7 +171,7 @@ def resolve_component(
         except ValueError:
             return ResolutionResult(ResolutionStatus.UNKNOWN, "PRIOR_MARKET_SOLUTION_INVALID")
         if (
-            prior.relation_fingerprint == model_fingerprint(problem)
+            prior.relation_fingerprint == _semantic_model_fingerprint(problem)
             and prior.economic_quote_fingerprint == economic_quote
         ):
             return _fund_fixed_solution(prior_market_solution, account_snapshot, now)
@@ -288,7 +288,7 @@ def _qualification_constraints(component: VerifiedComponent, rules: tuple[object
 
 def _market_solution(problem: ArbitrageProblem, quantities: tuple[ActionQuantity, ...], proof: object, evidence: CandidateEvidence, economic_quote: str) -> MarketSolution:
     verification_fingerprint = fingerprint(canonical_payload(proof))
-    relation_fingerprint = model_fingerprint(problem)
+    relation_fingerprint = _semantic_model_fingerprint(problem)
     values = {
         "bounded_cost_units": proof.cost_upper_bound_units,
         "bounded_payout_units": proof.payout_lower_bound_units,
@@ -339,7 +339,7 @@ def market_solution_from_payload(payload: object) -> MarketSolution:
         "quantities": solution.quantities,
     })
     if (
-        solution.relation_fingerprint != model_fingerprint(solution.problem)
+        solution.relation_fingerprint != _semantic_model_fingerprint(solution.problem)
         or solution.fingerprint != expected
         or tuple(sorted(solution.quantities, key=lambda item: item.action_id)) != solution.quantities
         or len({item.action_id for item in solution.quantities}) != len(solution.quantities)
@@ -451,6 +451,10 @@ def _valid_level(level: object) -> bool:
 
 def _utc(value: object) -> bool:
     return isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() == UTC.utcoffset(value)
+
+
+def _semantic_model_fingerprint(problem: ArbitrageProblem) -> str:
+    return model_fingerprint(replace(problem, as_of=_SEMANTIC_AS_OF))
 
 
 def _exact_object(value: object, keys: set[str]) -> dict[str, object]:

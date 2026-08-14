@@ -16,6 +16,7 @@ from open_trader.prediction_executable_cost import (
     resolve_component,
 )
 from open_trader.prediction_arbitrage import BookLevel, ThresholdOrderBook
+from open_trader.predict_source import PredictBook
 from open_trader.prediction_n_leg_oracle import evaluate_fixed_portfolio
 from open_trader.prediction_n_leg import (
     ActionPayout,
@@ -84,6 +85,43 @@ def test_missing_book_fails_closed_before_solving() -> None:
     assert result.status is ResolutionStatus.UNKNOWN
     assert result.failure_reason == "BOOK_STATE_UNKNOWN"
     assert result.market_solution is None
+
+
+def test_predict_book_requires_both_fresh_source_and_receipt_timestamps(monkeypatch) -> None:
+    qualified_solver(monkeypatch)
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
+    fresh = ImmutableBook(
+        "action-a", "action-a", PredictBook("action-a", (BookLevel(Decimal("0.40"), Decimal("1")),), (), AS_OF, AS_OF),
+        100_000, 1, 100_000, 100, "venue-a", "fee-v1",
+    )
+    stale_receipt = replace(fresh, book=replace(fresh.book, received_at=AS_OF - timedelta(seconds=11)))
+
+    assert resolve_component(component(), (fresh,), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF).status is ResolutionStatus.EXECUTION_SOLUTION
+    assert resolve_component(component(), (stale_receipt,), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF).status is ResolutionStatus.UNKNOWN
+
+
+def test_wrong_venue_or_native_book_identity_fails_closed(monkeypatch) -> None:
+    qualified_solver(monkeypatch)
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
+    wrong_venue = replace(executable_book(), venue_id="venue-b")
+    wrong_native = replace(executable_book(), native_id="other")
+
+    for book in (wrong_venue, wrong_native):
+        assert resolve_component(component(), (book,), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF).status is ResolutionStatus.UNKNOWN
+
+
+def test_predict_receipt_refresh_reuses_identical_economic_market_solution(monkeypatch) -> None:
+    captured = qualified_solver(monkeypatch)
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
+    first_book = ImmutableBook("action-a", "action-a", PredictBook("action-a", (BookLevel(Decimal("0.40"), Decimal("1")),), (), AS_OF, AS_OF), 100_000, 1, 100_000, 100, "venue-a", "fee-v1")
+    first = resolve_component(component(), (first_book,), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
+    now = AS_OF + timedelta(seconds=1)
+    refreshed_book = replace(first_book, book=replace(first_book.book, received_at=now))
+
+    refreshed = resolve_component(component(), (refreshed_book,), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=now, prior_market_solution=first.market_solution)
+
+    assert refreshed.market_solution == first.market_solution
+    assert captured["calls"] == 1
 
 
 def qualified_solver(monkeypatch):
