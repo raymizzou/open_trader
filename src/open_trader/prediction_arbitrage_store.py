@@ -2111,11 +2111,12 @@ class PredictionArbitrageStore:
                 (str(execution_batch_id), str(idempotency_key)),
             ).fetchone()
             if prior_transition is not None:
-                stored = _load_payload(str(prior_transition["payload"]))
-                prior_payload = stored.get("payload")
-                if not isinstance(prior_payload, dict):
-                    raise ValueError("corrupt n-leg transition")
-                return prior_payload
+                current = connection.execute(
+                    "SELECT payload FROM n_leg_batches WHERE execution_batch_id=?", (str(execution_batch_id),)
+                ).fetchone()
+                if current is None:
+                    raise ValueError("N_LEG_BATCH_NOT_FOUND")
+                return _load_payload(str(current["payload"]))
             row = connection.execute(
                 "SELECT payload FROM n_leg_batches WHERE execution_batch_id=?", (str(execution_batch_id),)
             ).fetchone()

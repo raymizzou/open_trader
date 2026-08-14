@@ -42,6 +42,7 @@ def test_order_receipt_is_a_strict_cumulative_contract() -> None:
         venue_order_id=None,
         submitted_quantity=10,
         cumulative_filled_quantity=4,
+        cumulative_cost_units=0,
         cumulative_fee_units=2,
         state="OPEN",
         sequence=7,
@@ -111,7 +112,7 @@ def receipt(*, leg: str, filled: int, state: str, sequence: int) -> OrderReceipt
     return OrderReceipt(
         receipt_id=f"{leg}-{sequence}", execution_batch_id="batch-1", client_order_id=f"batch-1:{action}",
         venue_id=f"venue-{leg}", account_id=f"account-{leg}", venue_order_id=None,
-        submitted_quantity=10, cumulative_filled_quantity=filled, cumulative_fee_units=0,
+        submitted_quantity=10, cumulative_filled_quantity=filled, cumulative_cost_units=0, cumulative_fee_units=0,
         state=state, sequence=sequence, rest_confirmed=False,
         observed_at="2026-08-15T00:00:00Z", venue_timestamp="2026-08-15T00:00:00Z",
     )
@@ -126,7 +127,10 @@ def repair_context(*, b_buy: int = 1, b_venue: str = "venue-b", occurred_cost: i
         ),
         (ConfirmedHolding("venue-a", "account-a", "action-a", 4, AS_OF, AS_OF), ConfirmedHolding("venue-b", "account-b", "action-b", 0, AS_OF, AS_OF)),
         source_and_solution()[0].account_snapshot,
-        (SettlementCashFlow("venue-a", "account-a", "usd-cents", occurred_cost, 0), SettlementCashFlow("venue-b", "account-b", "usd-cents", 0, 0)),
+        (
+            SettlementCashFlow(("batch-1:action-a",), "venue-a", "account-a", "usd-cents", occurred_cost, 0, AS_OF, AS_OF, 1),
+            SettlementCashFlow(("batch-1:action-b",), "venue-b", "account-b", "usd-cents", 0, 0, AS_OF, AS_OF, 1),
+        ),
         AS_OF,
     )
 
@@ -205,7 +209,7 @@ def test_partial_fill_opens_incident_downgrades_mode_and_fixes_best_manual_plan(
 def test_repair_context_rejects_structural_venue_mismatch(tmp_path) -> None:
     current = service(tmp_path)
     enter(current)
-    current.apply_receipt(receipt(leg="a", filled=4, state="CANCELLED", sequence=1))
+    current.apply_receipt(replace(receipt(leg="a", filled=4, state="CANCELLED", sequence=1), cumulative_cost_units=8))
     rejected = current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1), repair_context=repair_context(b_venue="other-venue"))
     assert rejected["repair_plan"] is None
 
@@ -361,6 +365,19 @@ def test_unknown_terminal_reconciliation_without_context_persists_breaker_across
     assert service(tmp_path).control()["breaker_open"] is True
 
 
+def test_shallow_valid_repair_book_persists_incident_and_breaker(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    current.apply_receipt(receipt(leg="a", filled=4, state="CANCELLED", sequence=1))
+    source = repair_context()
+    shallow = replace(source, quotes=tuple(replace(quote, levels=(CanonicalBookLevel(1, 1, 1, 2),)) for quote in source.quotes))
+    result = current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1), repair_context=shallow)
+    assert result["incident"] == {"reason": "PARTIAL_FILL", "repair_status": "REPAIR_INSUFFICIENT_DEPTH"}
+    assert result["repair_plan"] is None
+    assert current.control()["mode"] == "MANUAL"
+    assert current.control()["breaker_reason"] == "REPAIR_INSUFFICIENT_DEPTH"
+
+
 def test_over_cap_repair_is_retained_but_breaks_automatic_authority(tmp_path) -> None:
     current = service(tmp_path)
     execution = solution()
@@ -368,7 +385,7 @@ def test_over_cap_repair_is_retained_but_breaks_automatic_authority(tmp_path) ->
         opportunity_episode_id="episode-1", episode_lineage_id="lineage-1", execution_batch_id="batch-1",
         source=source_and_solution()[0], partial_fill_proof=proof(execution, repair_cap=0), mode="AUTO", cap_config_version="caps-v1",
     )
-    current.apply_receipt(receipt(leg="a", filled=4, state="CANCELLED", sequence=1))
+    current.apply_receipt(replace(receipt(leg="a", filled=4, state="CANCELLED", sequence=1), cumulative_cost_units=8))
     failed = current.apply_receipt(
         receipt(leg="b", filled=0, state="REJECTED", sequence=1),
         repair_context=repair_context(b_buy=511, occurred_cost=8),
