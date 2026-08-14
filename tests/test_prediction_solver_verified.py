@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import json
+from pathlib import Path
 
 import pytest
 
@@ -30,6 +32,7 @@ from open_trader.prediction_n_leg import (
     TerminalStateSet,
     canonical_payload,
     fingerprint,
+    request_from_payload,
 )
 from open_trader.prediction_n_leg_oracle import cut_from_scenario, evaluate_fixed_portfolio, find_qualified
 from open_trader.prediction_solver import BenchmarkLimits, SolverEvidence
@@ -41,14 +44,17 @@ from open_trader.prediction_solver_verified import (
     ProofInput,
     candidate_evidence_from_payload,
     proof_input_from_payload,
+    quote_fingerprint,
     solve,
     solve_via_worker,
     verify,
+    verify_component,
     verification_result_from_payload,
 )
 
 
 AS_OF = datetime(2026, 8, 14, tzinfo=UTC)
+ORACLE_CORPUS_PATH = Path(__file__).with_name("fixtures") / "prediction_n_leg_v1.json"
 
 
 def proof_input() -> ProofInput:
@@ -69,10 +75,27 @@ def proof_input() -> ProofInput:
         PROOF_REQUEST_SCHEMA_V1,
         OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, problem, OracleBudget(2, 2, 2)),
         BenchmarkLimits(100, 200, 1_000_000, 4),
-        "sha256:" + "a" * 64,
+        quote_fingerprint(problem),
         7,
         "diagnostic-code-version",
     )
+
+
+def proof_input_for_request(request: OracleRequest) -> ProofInput:
+    return ProofInput(
+        PROOF_REQUEST_SCHEMA_V1,
+        request,
+        BenchmarkLimits(100, 200, 1_000_000, 4),
+        quote_fingerprint(request.problem),
+        7,
+        "diagnostic-code-version",
+    )
+
+
+def corpus_request(case_id: str) -> OracleRequest:
+    corpus = json.loads(ORACLE_CORPUS_PATH.read_text(encoding="utf-8"))
+    case = next(case for case in corpus["cases"] if case["case_id"] == case_id)
+    return request_from_payload(case["request"])
 
 
 def test_proof_input_codec_requires_exact_canonical_shape() -> None:
@@ -82,6 +105,11 @@ def test_proof_input_codec_requires_exact_canonical_shape() -> None:
     payload["extra"] = True
     with pytest.raises(ValueError, match="proof input"):
         proof_input_from_payload(payload)
+
+
+def test_quote_fingerprint_rejects_actions_without_embedded_cost_input() -> None:
+    with pytest.raises(ValueError, match="cost"):
+        quote_fingerprint({"actions": [{"action_id": "action-a"}]})
 
 
 def test_candidate_evidence_codec_persists_canonical_candidate_and_fingerprints() -> None:
@@ -114,7 +142,7 @@ def test_verify_independently_recomputes_fixed_candidate_as_solver_verified() ->
     assert payload["status"] == "QUALIFIED_VERIFIED"
     assert payload["proof_level"] == "SOLVER_VERIFIED"
     assert payload["solution"]["payout_proof"]["guaranteed_profit_units"] == 3
-    assert verification_result_from_payload(payload).status.value == "QUALIFIED_VERIFIED"
+    assert verification_result_from_payload(payload, source=candidate_evidence(proof_input())).status.value == "QUALIFIED_VERIFIED"
 
 
 def test_not_qualified_candidate_cannot_become_component_negative_proof() -> None:
@@ -138,6 +166,51 @@ def test_not_qualified_candidate_cannot_become_component_negative_proof() -> Non
     assert payload["negative_proof"] is None
 
 
+def test_component_negative_requires_completed_exact_oracle() -> None:
+    input_ = proof_input()
+    no_qualification = replace(
+        input_,
+        request=replace(input_.request, problem=replace(
+            input_.request.problem,
+            qualification_constraints=(QualificationConstraint("profit", "rules-v1", QualificationMetric.GUARANTEED_PROFIT_UNITS, Comparison.GREATER_THAN_OR_EQUAL, 4, 1),),
+        )),
+    )
+
+    payload = verify_component(canonical_payload(no_qualification))
+
+    assert payload["status"] == "NO_QUALIFIED_OPPORTUNITY"
+    assert payload["negative_proof"]["proof_method"] == "EXHAUSTIVE_ORACLE_V1"
+
+
+def test_component_negative_proof_tampering_fails_source_binding() -> None:
+    input_ = proof_input()
+    no_qualification = replace(
+        input_,
+        request=replace(input_.request, problem=replace(
+            input_.request.problem,
+            qualification_constraints=(QualificationConstraint("profit", "rules-v1", QualificationMetric.GUARANTEED_PROFIT_UNITS, Comparison.GREATER_THAN_OR_EQUAL, 4, 1),),
+        )),
+    )
+    payload = verify_component(canonical_payload(no_qualification))
+    payload["negative_proof"]["problem_fingerprint"] = "sha256:" + "b" * 64
+
+    with pytest.raises(ValueError, match="source binding"):
+        verification_result_from_payload(payload, source=no_qualification)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (("model_fingerprint", "sha256:" + "b" * 64), ("portfolio_fingerprint", "sha256:" + "b" * 64), ("quote_fingerprint", "sha256:" + "b" * 64), ("current_generation", 8)),
+)
+def test_result_tampering_fails_source_and_solution_binding(field, value) -> None:
+    evidence = candidate_evidence(proof_input())
+    payload = verify(canonical_payload(evidence))
+    payload[field] = value
+
+    with pytest.raises(ValueError):
+        verification_result_from_payload(payload, source=evidence)
+
+
 def test_solve_via_worker_accepts_only_serialized_worker_evidence() -> None:
     expected = candidate_evidence(proof_input())
 
@@ -154,7 +227,11 @@ def test_solve_via_worker_accepts_only_serialized_worker_evidence() -> None:
     assert candidate_evidence_from_payload(payload).candidate == expected.candidate
 
 
-def test_default_cp_sat_import_failure_is_persisted_as_unknown_evidence() -> None:
+def test_default_cp_sat_import_failure_is_persisted_as_unknown_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unavailable(*args, **kwargs):
+        raise ModuleNotFoundError("ortools")
+
+    monkeypatch.setattr("open_trader.prediction_solver_verified.solve_with_constraint_generation", unavailable)
     payload = solve(canonical_payload(proof_input()))
 
     assert candidate_evidence_from_payload(payload).candidate is None
@@ -204,11 +281,48 @@ def test_verify_differential_ignores_solver_claims_and_matches_exact_oracle() ->
     )
     forged = replace(original, solver_evidence=forged_solver_evidence)
 
-    result = verification_result_from_payload(verify(canonical_payload(forged)))
+    result = verification_result_from_payload(verify(canonical_payload(forged)), source=forged)
     oracle = find_qualified(input_.request)
 
     assert result.solution is not None and oracle.solution is not None
     assert result.solution.payout_proof.guaranteed_profit_units == oracle.solution.payout_proof.guaranteed_profit_units == 3
+
+
+@pytest.mark.parametrize("case_id", ("exactly-one-n3", "explicit-exception-link", "disconnected-double-arbitrage"))
+def test_verified_candidate_replays_multiple_exact_oracle_relation_cases(case_id: str) -> None:
+    input_ = proof_input_for_request(corpus_request(case_id))
+    oracle = find_qualified(input_.request)
+    assert oracle.solution is not None
+    evidence = candidate_evidence(input_, oracle.solution.quantities)
+
+    result = verification_result_from_payload(verify(canonical_payload(evidence)), source=evidence)
+
+    assert result.status.value == "QUALIFIED_VERIFIED"
+    assert result.solution == oracle.solution
+
+
+@pytest.mark.parametrize("case_id", ("void-refund-split", "rounded-false-edge", "no-qualified-positive-raw"))
+def test_component_negative_replays_multiple_completed_exact_oracle_cases(case_id: str) -> None:
+    input_ = proof_input_for_request(corpus_request(case_id))
+    oracle = find_qualified(input_.request)
+    assert oracle.negative_proof is not None
+
+    result = verification_result_from_payload(verify_component(canonical_payload(input_)), source=input_)
+
+    assert result.status.value == "NO_QUALIFIED_OPPORTUNITY"
+    assert result.negative_proof == oracle.negative_proof
+
+
+@pytest.mark.parametrize("case_id", ("unknown-state-budget", "unknown-decision-budget"))
+def test_component_negative_budget_exhaustion_replays_as_unknown(case_id: str) -> None:
+    input_ = proof_input_for_request(corpus_request(case_id))
+    oracle = find_qualified(input_.request)
+    assert oracle.negative_proof is None and oracle.unknown_reason is not None
+
+    result = verification_result_from_payload(verify_component(canonical_payload(input_)), source=input_)
+
+    assert result.status.value == "UNKNOWN"
+    assert result.unknown_reason == oracle.unknown_reason.value
 
 
 @pytest.mark.parametrize(
@@ -226,8 +340,15 @@ def test_fingerprint_or_terminal_rule_drift_is_rejected_before_verification(muta
         verify(payload)
 
 
-def candidate_evidence(input_: ProofInput) -> CandidateEvidence:
-    quantities = (ActionQuantity("action-a", 1),)
+def test_terminal_atom_rule_version_mismatch_fails_closed() -> None:
+    payload = canonical_payload(candidate_evidence(proof_input()))
+    payload["proof_input"]["request"]["problem"]["terminal_state_sets"][0]["atoms"][0]["rule_version"] = "other-rules"
+
+    with pytest.raises(ValueError, match="TERMINAL_RULE_VERSION_MISMATCH"):
+        verify(payload)
+
+
+def candidate_evidence(input_: ProofInput, quantities: tuple[ActionQuantity, ...] = (ActionQuantity("action-a", 1),)) -> CandidateEvidence:
     evaluation = evaluate_fixed_portfolio(input_.request.problem, quantities, input_.request.budget)
     solver_evidence = SolverEvidence(
         "FEASIBLE", PortfolioCandidate(quantities, evaluation.guaranteed_profit_units),

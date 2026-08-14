@@ -566,6 +566,8 @@ def validate_problem(problem: ArbitrageProblem) -> tuple[ModelIssue, ...]:
                 _issue(issues, "MISSING_TERMINAL_RULE_IDENTITY", f"{atom_path}.rule_version", "must identify the terminal rule")
             else:
                 _identifier(issues, atom.rule_version, f"{atom_path}.rule_version")
+                if atom.rule_version != state_set.rule_version:
+                    _issue(issues, "TERMINAL_RULE_VERSION_MISMATCH", f"{atom_path}.rule_version", "must equal terminal state-set rule_version")
             if atom.capital_release_at is None:
                 _issue(issues, "MISSING_CAPITAL_RELEASE_AT", f"{atom_path}.capital_release_at", "must identify capital release time")
                 release_at_valid = False

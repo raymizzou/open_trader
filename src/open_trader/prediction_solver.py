@@ -1300,7 +1300,7 @@ def solve_with_constraint_generation(
                         excluded = (*excluded, quantities)
                         continue
                     evidence = SolverEvidence(
-                        native_status=NativeSolveStatus.OPTIMAL.value,
+                        native_status=master_result.status.value,
                         candidate=PortfolioCandidate(quantities, profit),
                         objective_bounds=ObjectiveBounds(
                             profit,

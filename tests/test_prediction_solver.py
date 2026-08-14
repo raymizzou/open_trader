@@ -258,6 +258,14 @@ class FeasibleFirstMasterBackend(BruteForceBackend):
         return result
 
 
+class FeasibleMasterBackend(BruteForceBackend):
+    def solve(self, model: LinearModel, *, time_limit_ms: int) -> BackendResult:
+        result = super().solve(model, time_limit_ms=time_limit_ms)
+        if model.objective == LinearObjective("MAX", (("profit", 1),)) and result.status == NativeSolveStatus.OPTIMAL:
+            return replace(result, status=NativeSolveStatus.FEASIBLE, native_status="time limit")
+        return result
+
+
 class MalformedAssignmentBackend(BruteForceBackend):
     def solve(self, model: LinearModel, *, time_limit_ms: int) -> BackendResult:
         result = super().solve(model, time_limit_ms=time_limit_ms)
@@ -1373,6 +1381,17 @@ def test_unclosed_raw_first_objective_never_becomes_closed_no_arbitrage() -> Non
 
     assert evidence.native_status == TerminationReason.PROOF_UNCLOSED
     assert evidence.global_search_closed is False
+    assert evidence.objective_bounds.closed is False
+
+
+def test_admission_preserves_a_feasible_master_native_status() -> None:
+    problem = constraint_generation_problem()
+    request = OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, problem, OracleBudget(2, 2, 2))
+
+    evidence = solve_with_constraint_generation(request, FeasibleMasterBackend(), benchmark_limits())
+
+    assert evidence.candidate is not None
+    assert evidence.native_status == NativeSolveStatus.FEASIBLE
     assert evidence.objective_bounds.closed is False
 
 

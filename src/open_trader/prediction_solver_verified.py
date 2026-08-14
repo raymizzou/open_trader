@@ -7,7 +7,7 @@ from enum import StrEnum
 from typing import Mapping
 
 from open_trader.prediction_n_leg import ModelDecodeError, ObjectiveBounds, OracleRequest, PayoutProof, PortfolioSolution, UnknownReason, canonical_payload, fingerprint, payout_proof_from_payload, portfolio_solution_from_payload, request_from_payload
-from open_trader.prediction_n_leg_oracle import build_portfolio_solution, derive_selected_support_graph, evaluate_fixed_portfolio
+from open_trader.prediction_n_leg_oracle import build_portfolio_solution, derive_selected_support_graph, evaluate_fixed_portfolio, find_qualified
 from open_trader.prediction_solver import BenchmarkLimits
 from open_trader.prediction_solver import SolverBackend, SolverEvidence, solver_evidence_from_payload, solve_with_constraint_generation
 from open_trader.prediction_solver_worker import WorkerHarness, WorkerRequest
@@ -22,12 +22,29 @@ class VerificationStatus(StrEnum):
     QUALIFIED_VERIFIED = "QUALIFIED_VERIFIED"
     NOT_QUALIFIED = "NOT_QUALIFIED"
     UNKNOWN = "UNKNOWN"
+    NO_QUALIFIED_OPPORTUNITY = "NO_QUALIFIED_OPPORTUNITY"
 
 
 class ProofLevel(StrEnum):
     SOLVER_VERIFIED = "SOLVER_VERIFIED"
     FORMALLY_VERIFIED = "FORMALLY_VERIFIED"
     NONE = "NONE"
+
+
+def quote_fingerprint(problem: object) -> str:
+    """Bind the proof to the canonical executable-cost input, not a caller SHA."""
+    payload = canonical_payload(problem)
+    actions = payload.get("actions")
+    if not isinstance(actions, list):
+        raise ValueError("problem actions must be canonical")
+    if not all(isinstance(action, Mapping) and set(action) >= {"action_id", "cost_slices"} for action in actions):
+        raise ValueError("problem actions must embed canonical cost input")
+    return fingerprint({
+        "actions": tuple(
+            {"action_id": action["action_id"], "cost_slices": action["cost_slices"]}
+            for action in actions
+        )
+    })
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +60,8 @@ class ProofInput:
         if self.schema_version != PROOF_REQUEST_SCHEMA_V1 or not isinstance(self.request, OracleRequest) or not isinstance(self.limits, BenchmarkLimits):
             raise ValueError("invalid proof input")
         _fingerprint(self.quote_fingerprint, "quote_fingerprint")
+        if self.quote_fingerprint != quote_fingerprint(self.request.problem):
+            raise ValueError("proof input quote fingerprint mismatch")
         _nonnegative_int(self.current_generation, "current_generation")
         _string(self.code_version, "code_version")
 
@@ -181,8 +200,15 @@ class VerificationResult:
         elif self.status == VerificationStatus.NOT_QUALIFIED:
             if self.proof_level != ProofLevel.NONE or self.solution is None or self.negative_proof is not None or self.unknown_reason is not None:
                 raise ValueError("not-qualified verification is candidate-scoped")
+        elif self.status == VerificationStatus.NO_QUALIFIED_OPPORTUNITY:
+            if self.proof_level != ProofLevel.NONE or self.solution is not None or self.negative_proof is None or self.unknown_reason is not None:
+                raise ValueError("component negative requires an exact negative proof")
         elif self.proof_level != ProofLevel.NONE or self.solution is not None or self.negative_proof is not None or self.unknown_reason is None:
             raise ValueError("unknown verification must fail closed")
+        if self.solution is not None:
+            proof = self.solution.payout_proof
+            if proof.problem_fingerprint != self.model_fingerprint or proof.portfolio_fingerprint != self.portfolio_fingerprint or self.portfolio_fingerprint != fingerprint({"quantities": self.solution.quantities}):
+                raise ValueError("verification result solution fingerprint mismatch")
 
 
 def verify(payload: object) -> dict[str, object]:
@@ -220,6 +246,23 @@ def verify(payload: object) -> dict[str, object]:
     ))
 
 
+def verify_component(payload: object) -> dict[str, object]:
+    """The sole component-negative path: bounded exact Oracle only."""
+    proof_input = proof_input_from_payload(payload)
+    result = find_qualified(proof_input.request)
+    if result.negative_proof is not None:
+        return canonical_payload(VerificationResult(
+            VERIFICATION_RESULT_SCHEMA_V1, VerificationStatus.NO_QUALIFIED_OPPORTUNITY, ProofLevel.NONE,
+            fingerprint(proof_input.request.problem), None, proof_input.quote_fingerprint,
+            proof_input.current_generation, None, result.negative_proof, None,
+        ))
+    return canonical_payload(VerificationResult(
+        VERIFICATION_RESULT_SCHEMA_V1, VerificationStatus.UNKNOWN, ProofLevel.NONE,
+        fingerprint(proof_input.request.problem), None, proof_input.quote_fingerprint,
+        proof_input.current_generation, None, None, result.unknown_reason.value if result.unknown_reason else "QUALIFIED_CANDIDATE_EXISTS",
+    ))
+
+
 def _unknown(evidence: CandidateEvidence, reason: str) -> VerificationResult:
     return VerificationResult(
         VERIFICATION_RESULT_SCHEMA_V1, VerificationStatus.UNKNOWN, ProofLevel.NONE,
@@ -228,10 +271,10 @@ def _unknown(evidence: CandidateEvidence, reason: str) -> VerificationResult:
     )
 
 
-def verification_result_from_payload(payload: object) -> VerificationResult:
+def verification_result_from_payload(payload: object, *, source: ProofInput | CandidateEvidence) -> VerificationResult:
     value = _object(payload, "verification result", {"schema_version", "status", "proof_level", "model_fingerprint", "portfolio_fingerprint", "quote_fingerprint", "current_generation", "solution", "negative_proof", "unknown_reason"})
     try:
-        return VerificationResult(
+        result = VerificationResult(
             _string(value["schema_version"], "schema_version"),
             VerificationStatus(_string(value["status"], "status")),
             ProofLevel(_string(value["proof_level"], "proof_level")),
@@ -243,6 +286,19 @@ def verification_result_from_payload(payload: object) -> VerificationResult:
             None if value["negative_proof"] is None else payout_proof_from_payload(value["negative_proof"]),
             None if value["unknown_reason"] is None else _string(value["unknown_reason"], "unknown_reason"),
         )
+        proof_input = source.proof_input if isinstance(source, CandidateEvidence) else source
+        if not isinstance(proof_input, ProofInput) or (
+            result.model_fingerprint != fingerprint(proof_input.request.problem)
+            or result.quote_fingerprint != proof_input.quote_fingerprint
+            or result.current_generation != proof_input.current_generation
+            or isinstance(source, CandidateEvidence) and result.portfolio_fingerprint != source.portfolio_fingerprint
+            or result.negative_proof is not None and (
+                result.negative_proof.problem_fingerprint != result.model_fingerprint
+                or result.negative_proof.request_fingerprint != fingerprint(proof_input.request)
+            )
+        ):
+            raise ValueError("verification result source binding mismatch")
+        return result
     except (ModelDecodeError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid verification result: {exc}") from exc
 
