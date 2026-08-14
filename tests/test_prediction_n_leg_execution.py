@@ -123,12 +123,13 @@ def repair_context(*, b_buy: int = 1, b_venue: str = "venue-b") -> RepairContext
             RepairQuote("batch-1:action-b", b_venue, "account-b", "usd-cents", b_buy, 2, AS_OF, AS_OF),
         ),
         (ConfirmedHolding("venue-a", "account-a", "action-a", 4), ConfirmedHolding("venue-b", "account-b", "action-b", 0)),
-        0, 0, AS_OF,
+        source_and_solution()[0].account_snapshot, 0, 0, AS_OF,
     )
 
 
-def reconciliation_context(batch_id: str = "batch-1") -> ReconciliationContext:
-    return ReconciliationContext(f"{batch_id}:v1", source_and_solution()[0].account_snapshot, (), AS_OF, AS_OF, AS_OF)
+def reconciliation_context(batch_id: str = "batch-1", *, full: bool = False) -> ReconciliationContext:
+    holdings = (ConfirmedHolding("venue-a", "account-a", "action-a", 10), ConfirmedHolding("venue-b", "account-b", "action-b", 10)) if full else ()
+    return ReconciliationContext(f"{batch_id}:v1", source_and_solution()[0].account_snapshot, holdings, AS_OF, AS_OF, AS_OF)
 
 
 def test_entry_claims_one_batch_and_survives_reopen(tmp_path) -> None:
@@ -284,7 +285,7 @@ def test_all_terminal_zero_fill_releases_active_reservation_without_incident(tmp
     assert completed["state"] == "AWAITING_RECONCILIATION"
     assert completed["incident"] is None
     assert current.control()["active_batch_id"] == "batch-1"
-    reconciled = current.complete_reconciliation("batch-1", context=reconciliation_context())
+    reconciled = current.complete_reconciliation("batch-1", context=reconciliation_context(full=True))
     assert reconciled["state"] == "RECONCILED_ZERO"
     assert current.control()["active_batch_id"] is None
     assert current.control()["total_unsettled_capital_units"] == 0
@@ -300,7 +301,7 @@ def test_all_terminal_full_fill_reconciles_without_incident_and_retains_unsettle
     assert completed["state"] == "AWAITING_RECONCILIATION"
     assert completed["incident"] is None
     assert current.control()["active_batch_id"] == "batch-1"
-    reconciled = current.complete_reconciliation("batch-1", context=reconciliation_context())
+    reconciled = current.complete_reconciliation("batch-1", context=reconciliation_context(full=True))
     assert reconciled["state"] == "RECONCILED_FULL"
     assert current.control()["active_batch_id"] is None
     assert current.control()["total_unsettled_capital_units"] == 1020
@@ -311,7 +312,7 @@ def test_prior_unsettled_capital_survives_a_later_zero_fill_batch(tmp_path) -> N
     enter(current)
     current.apply_receipt(receipt(leg="a", filled=10, state="FILLED", sequence=1))
     current.apply_receipt(receipt(leg="b", filled=10, state="FILLED", sequence=1))
-    current.complete_reconciliation("batch-1", context=reconciliation_context())
+    current.complete_reconciliation("batch-1", context=reconciliation_context(full=True))
     current.enter(
         opportunity_episode_id="episode-2", episode_lineage_id="lineage-2", execution_batch_id="batch-2",
         source=source_and_solution()[0], partial_fill_proof=proof(solution()), mode="MANUAL", cap_config_version="caps-v1",
@@ -445,7 +446,7 @@ def test_partial_incident_can_close_only_after_eventual_full_and_reconciliation(
     awaiting = current.apply_receipt(receipt(leg="b", filled=10, state="FILLED", sequence=1))
 
     assert awaiting["incident"]["reason"] == "PARTIAL_FILL"
-    closed = current.complete_reconciliation("batch-1", context=reconciliation_context())
+    closed = current.complete_reconciliation("batch-1", context=reconciliation_context(full=True))
     assert closed["incident"] is None
     assert closed["state"] == "RECONCILED_FULL"
     assert current.control()["mode"] == "MANUAL"

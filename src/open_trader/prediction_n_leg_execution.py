@@ -250,6 +250,7 @@ class RepairContext:
     reservation_version: str
     quotes: tuple[RepairQuote, ...]
     holdings: tuple[ConfirmedHolding, ...]
+    account_snapshot: AccountSnapshot
     occurred_cost_units: int
     occurred_fee_units: int
     now: datetime
@@ -258,7 +259,7 @@ class RepairContext:
         _text(self.reservation_version, "reservation_version")
         _nonnegative(self.occurred_cost_units, "occurred_cost_units")
         _nonnegative(self.occurred_fee_units, "occurred_fee_units")
-        if not isinstance(self.now, datetime) or self.now.tzinfo is None:
+        if not isinstance(self.account_snapshot, AccountSnapshot) or not isinstance(self.now, datetime) or self.now.tzinfo is None:
             raise ValueError("now must be aware")
         if not self.quotes or len({quote.client_order_id for quote in self.quotes}) != len(self.quotes):
             raise ValueError("repair quotes must be complete and unique")
@@ -429,6 +430,15 @@ class NLegExecutionService:
                 raise ValueError("N_LEG_RECONCILIATION_PROOF_REQUIRED")
             if control.get("active_batch_id") != execution_batch_id:
                 raise ValueError("N_LEG_RECONCILIATION_OWNERSHIP_LOST")
+            expected_holding = {
+                (str(leg["venue_id"]), str(leg["account_id"]), str(leg["asset_id"])): int(leg["receipt"]["cumulative_filled_quantity"])
+                for leg in batch["legs"] if isinstance(leg, dict) and isinstance(leg.get("receipt"), dict)
+            }
+            actual_holding = {(item.venue_id, item.account_id, item.asset_id): item.quantity for item in context.holdings}
+            balances = {(item.venue_id, item.account_id, item.asset_id) for item in context.account_snapshot.balances}
+            settlement_keys = {(str(leg["venue_id"]), str(leg["account_id"]), str(leg["settlement_asset_id"])) for leg in batch["legs"] if isinstance(leg, dict)}
+            if not settlement_keys.issubset(balances) or any(actual_holding.get(key, 0) < quantity for key, quantity in expected_holding.items()):
+                raise ValueError("N_LEG_RECONCILIATION_PROOF_REQUIRED")
             result = dict(batch)
             result["reconciliation"] = canonical_payload(context)
             result["state"] = "RECONCILED_ZERO" if self._all_zero(batch) else "RECONCILED_FULL"
@@ -587,6 +597,9 @@ class NLegExecutionService:
             or quote.settlement_asset_id != leg.get("settlement_asset_id")
             for client, quote in quotes.items() for leg in (by_client[client],)
         ):
+            return None
+        balances = {(item.venue_id, item.account_id, item.asset_id) for item in context.account_snapshot.balances}
+        if any((quote.venue_id, quote.account_id, quote.settlement_asset_id) not in balances for quote in quotes.values()):
             return None
         holdings = {(item.venue_id, item.account_id, item.asset_id): item.quantity for item in context.holdings}
         complete = {client: int(leg["submitted_quantity"]) - int(leg["receipt"]["cumulative_filled_quantity"]) for client, leg in by_client.items() if isinstance(leg.get("receipt"), dict) and int(leg["submitted_quantity"]) > int(leg["receipt"]["cumulative_filled_quantity"])}
