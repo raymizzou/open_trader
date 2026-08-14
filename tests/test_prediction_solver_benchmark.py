@@ -1474,7 +1474,6 @@ def test_aggregate_rejects_a_full_manifest_that_skips_a_mandatory_phase_or_probe
     ("mutate", "reason"),
     (
         (lambda records, manifest: records[0].update({"check_hard_failure": True, "check_failure_reason": "FALSE_SAFE"}), "CHECK_HARD_FAILURE"),
-        (lambda records, manifest: records[0].__setitem__("cleanup_proven", False), "CLEANUP_UNPROVEN"),
         (lambda records, manifest: records[0].__setitem__("peak_aggregate_rss_bytes", 10_001), "MEMORY_LIMIT_EXCEEDED"),
         (lambda records, manifest: (manifest.__setitem__("memory_limit_bytes", 0), [record.__setitem__("memory_limit_bytes", 0) for record in records]), "MEMORY_LIMIT_UNBOUNDED"),
         (lambda records, manifest: manifest["solvers"]["highs"]["environments"]["macos"].__setitem__("run_succeeded", False), "ENVIRONMENT_EVIDENCE_FAILED"),
@@ -1491,6 +1490,14 @@ def test_hard_gate_eliminates_each_unsafe_evidence_class(mutate, reason: str) ->
     summary = aggregate_benchmark_records(records, manifest)
 
     assert reason in summary["solvers"]["highs"]["hard_gate_failures"]
+
+
+def test_aggregate_rejects_persisted_cleanup_unproven_evidence() -> None:
+    records = _quick_records()
+    records[0]["cleanup_proven"] = False
+
+    with pytest.raises(ValueError, match="CLEANUP_UNPROVEN"):
+        aggregate_benchmark_records(records, _benchmark_manifest(profile="quick"))
 
 
 def test_hard_gate_allows_truthful_unknown_failure_but_rejects_unsafe_nonunknown_mapping() -> None:
@@ -3186,16 +3193,49 @@ def test_full_linux_rejects_jointly_tampered_macos_solver_build_and_version_befo
         benchmark._run_full_linux(tmp_path)
 
 
-def test_full_linux_rejects_mac_hard_gate_result_before_docker(tmp_path, monkeypatch) -> None:
-    _current_macos_partial(tmp_path, monkeypatch)
+def test_full_linux_accepts_a_terminal_macos_prefix_before_docker(tmp_path, monkeypatch) -> None:
+    records, manifest, planned = run_three_solver_tiny_plan(
+        monkeypatch,
+        failing_solver="highs",
+        hard_check_failure=True,
+    )
+    (tmp_path / "environment_manifest.json").write_text(json.dumps(manifest))
+    (tmp_path / "macos.jsonl").write_text("".join(json.dumps(record) + "\n" for record in records))
+    stub_current_discovery_with_same_core_identity(monkeypatch, environment_id="macos-build")
+
+    accepted, accepted_records, cases = benchmark._read_full_macos_partial(tmp_path)
+
+    assert accepted == manifest
+    assert len(accepted_records) == 1 + planned * 2
+    assert len(cases) == 41
+
+
+def test_full_linux_publishes_terminal_prefixes_from_both_environments(tmp_path, monkeypatch) -> None:
+    macos_records, manifest, planned = run_three_solver_tiny_plan(
+        monkeypatch,
+        failing_solver="highs",
+        termination="CRASH",
+    )
+    (tmp_path / "environment_manifest.json").write_text(json.dumps(manifest))
+    (tmp_path / "macos.jsonl").write_text("".join(json.dumps(record) + "\n" for record in macos_records))
+    stub_current_discovery_with_same_core_identity(monkeypatch, environment_id="macos-build")
+    environments, artifacts = _full_environment_fixture()
+    linux_factory = _fake_harness_factory(termination_by_solver={"scip": "CRASH"})
     monkeypatch.setattr(
         benchmark,
-        "aggregate_benchmark_records",
-        lambda records, current: {"solvers": {solver: {"hard_gate_failures": ["CHECK_HARD_FAILURE"]} for solver in benchmark._SOLVERS}},
+        "_discover_linux_environment",
+        lambda: (environments["linux"], {solver: artifacts[solver]["linux"] for solver in benchmark._SOLVERS}),
     )
+    monkeypatch.setattr(benchmark, "_docker_harness", lambda image, solver: linux_factory(solver))
 
-    with pytest.raises(ValueError, match="macOS partial hard gates failed"):
-        benchmark._read_full_macos_partial(tmp_path)
+    assert benchmark._run_full_linux(tmp_path) == 0
+
+    linux_records = [json.loads(line) for line in (tmp_path / "linux.jsonl").read_text().splitlines()]
+    final_manifest = json.loads((tmp_path / "environment_manifest.json").read_text())
+    assert len(linux_records) == planned + 1 + planned
+    summary = aggregate_benchmark_records(macos_records + linux_records, final_manifest)
+    assert summary["decision"]["status"] == "SELECTED"
+    assert summary["decision"]["selected_solver"] == "cp_sat"
 
 
 @pytest.mark.parametrize(

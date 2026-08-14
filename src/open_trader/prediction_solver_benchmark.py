@@ -633,6 +633,8 @@ def _sample_counts(records: tuple[dict[str, object], ...], manifest: Mapping[str
 
 
 def _require_sample_matrix(records: tuple[dict[str, object], ...], manifest: Mapping[str, object]) -> None:
+    if any(not record["cleanup_proven"] for record in records):
+        raise ValueError("CLEANUP_UNPROVEN")
     expected = _ordered_sample_keys(manifest)
     actual_keys = [
         (record["environment"], record["solver_name"], record["case_id"], record["sample_kind"], record["sample_index"], record["worker_count"])
@@ -672,18 +674,17 @@ def _hard_gate_failures(
             for record in records
         )
         and not any(
-            record["environment"] == environment and record["solver_run"]["termination_reason"] in _FATAL_TERMINATIONS
+            record["environment"] == environment and _hard_elimination_record(record)
             for record in records
         )
         for environment in manifest["required_environments"]
     ):
         failures.add("NO_COMPLETED_RUN")
-    if any(record["check_hard_failure"] for record in records):
+    eliminations = tuple(record for record in records if _hard_elimination_record(record))
+    if any(record["check_hard_failure"] for record in eliminations):
         failures.add("CHECK_HARD_FAILURE")
-    if any(record["solver_run"]["termination_reason"] in _FATAL_TERMINATIONS for record in records):
+    if any(record["solver_run"]["termination_reason"] in _FATAL_TERMINATIONS for record in eliminations):
         failures.add("FATAL_WORKER_TERMINATION")
-    if any(not record["cleanup_proven"] for record in records):
-        failures.add("CLEANUP_UNPROVEN")
     if any(
         record["memory_limit_bytes"] == 0
         for record in records
@@ -3013,8 +3014,6 @@ def _run_full_environment(
                         )
                     )
                     checkpoint(case.case_id, sample_kind, sample_index, peak)
-                    if _hard_elimination_record(records[-1]):
-                        break
                 elif sample_kind == "throughput":
                     harnesses = []
                     for slot in range(worker_count):
@@ -3061,8 +3060,6 @@ def _run_full_environment(
                         )
                     )
                     checkpoint(case.case_id, sample_kind, sample_index, sum(peaks))
-                    if _hard_elimination_record(records[-1]):
-                        break
                 elif sample_kind == "cold":
                     with _full_harness(harness_factory, solver) as harness:
                         started_ns = time.perf_counter_ns()
@@ -3078,8 +3075,6 @@ def _run_full_environment(
                         )
                     )
                     checkpoint(case.case_id, sample_kind, sample_index, peak)
-                    if _hard_elimination_record(records[-1]):
-                        break
                 elif sample_kind == "rebuild":
                     with _full_harness(harness_factory, solver) as harness:
                         prime_outcome, prime_run, prime_checked = submit(
@@ -3110,10 +3105,10 @@ def _run_full_environment(
                         )
                     )
                     checkpoint(case.case_id, sample_kind, sample_index, peak)
-                    if _hard_elimination_record(records[-1]):
-                        break
                 else:
                     raise ValueError(f"unsupported full sample kind: {sample_kind}")
+                if _hard_elimination_record(records[-1]):
+                    break
     return records
 
 
@@ -3341,23 +3336,9 @@ def _read_full_macos_partial(output: Path) -> tuple[dict[str, object], list[dict
     if submitted_identity != current_identity:
         raise ValueError("macOS partial identity does not match the current benchmark")
     try:
-        summary = aggregate_benchmark_records(records, raw_manifest)
+        aggregate_benchmark_records(records, raw_manifest)
     except ValueError as error:
         raise ValueError("macOS partial records are invalid") from error
-    unexpected_hard_gates = {
-        solver: [
-            failure
-            for failure in summary["solvers"][solver]["hard_gate_failures"]
-            if failure not in {"ENVIRONMENT_EVIDENCE_FAILED", "LICENSE_EVIDENCE_FAILED"}
-        ]
-        for solver in _SOLVERS
-    }
-    unexpected_hard_gates = {solver: failures for solver, failures in unexpected_hard_gates.items() if failures}
-    if unexpected_hard_gates:
-        raise ValueError(f"macOS partial hard gates failed: {unexpected_hard_gates}")
-    expected_records = len(_full_sample_plan(cases)) * len(_SOLVERS)
-    if len(records) != expected_records:
-        raise ValueError("macOS partial does not contain the complete 4,755-record plan")
     return raw_manifest, records, cases
 
 
@@ -3381,8 +3362,6 @@ def _run_full_linux(output_root: Path = _FINAL_RESULTS) -> int:
     linux_records = _run_full_environment(cases, manifest, "linux", harness_factory)
     all_records = macos_records + linux_records
     aggregate_benchmark_records(all_records, manifest)
-    if len(linux_records) != 4_755 or len(all_records) != 9_510:
-        raise RuntimeError("full Linux benchmark record plan is incomplete")
     records_bytes = b"".join(
         json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"
         for record in linux_records
