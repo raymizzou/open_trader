@@ -130,7 +130,7 @@ def qualified_solver(monkeypatch):
     def fake_solve(payload, **_kwargs):
         captured["calls"] += 1
         captured["input"] = proof_input_from_payload(payload)
-        quantities = tuple(ActionQuantity(action.action_id, 1) for action in captured["input"].request.problem.actions)
+        quantities = tuple(ActionQuantity(action.action_id, action.min_quantity_lots) for action in captured["input"].request.problem.actions)
         evaluation = evaluate_fixed_portfolio(
             captured["input"].request.problem,
             quantities,
@@ -162,6 +162,36 @@ def executable_book() -> ImmutableBook:
         ThresholdOrderBook("action-a", (BookLevel(Decimal("0.40"), Decimal("1")),), (), AS_OF),
         fee_ppm=100_000, tick_units=1, haircut_ppm=100_000,
         price_units_per_quote_unit=100, venue_id="venue-a", fee_rule_id="fee-v1",
+    )
+
+
+def test_visible_multilevel_asks_floor_lots_and_ceil_protected_cost(monkeypatch) -> None:
+    captured = qualified_solver(monkeypatch)
+    original = component().problem
+    action = replace(
+        original.actions[0], lot_step_units=10, quantity_scale=100,
+        min_quantity_lots=2, max_quantity_lots=3,
+        cost_slices=(ExecutableCostSlice(1, 3, 1),),
+    )
+    component_with_minimum = VerifiedComponent(
+        replace(original, actions=(action,)), model_fingerprint(replace(original, actions=(action,))), 100,
+    )
+    book = ImmutableBook(
+        "action-a", "action-a",
+        ThresholdOrderBook("action-a", (
+            BookLevel(Decimal("0.401"), Decimal("0.19")),
+            BookLevel(Decimal("0.501"), Decimal("0.11")),
+            BookLevel(Decimal("0.50"), Decimal("0.01")),
+        ), (), AS_OF),
+        100_000, 1, 100_000, 100, "venue-a", "fee-v1",
+    )
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
+
+    result = resolve_component(component_with_minimum, (book,), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(4, 2, 2), now=AS_OF)
+
+    assert result.status is ResolutionStatus.EXECUTION_SOLUTION
+    assert captured["input"].request.problem.actions[0].cost_slices == (
+        ExecutableCostSlice(1, 1, 8), ExecutableCostSlice(2, 2, 9),
     )
 
 
@@ -209,6 +239,23 @@ def test_insufficient_fixed_funding_retains_market_solution_without_second_solve
     assert result.execution_solution is None
     assert result.market_solution.quantities == (ActionQuantity("action-a", 1),)
     assert captured["calls"] == 1
+
+
+def test_balances_are_not_netted_across_accounts_or_assets(monkeypatch) -> None:
+    qualified_solver(monkeypatch)
+    account = AccountSnapshot(
+        AS_OF,
+        (
+            AccountBalance("venue-a", "account-a", "usd-cents", 50, 50),
+            AccountBalance("venue-a", "account-other", "usd-cents", 10_000, 10_000),
+            AccountBalance("venue-a", "account-a", "other-asset", 10_000, 10_000),
+        ),
+        20_000, 0, 20_000,
+    )
+
+    result = resolve_component(component(), (executable_book(),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
+
+    assert result.status is ResolutionStatus.INSUFFICIENT_FUNDS
 
 
 def test_per_trade_cap_applies_to_total_fixed_plan_not_each_leg(monkeypatch) -> None:
