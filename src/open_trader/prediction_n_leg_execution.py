@@ -343,6 +343,8 @@ class NLegExecutionService:
         batch = self.state(execution_batch_id)
         if batch is None or not self._all_terminal(batch):
             raise ValueError("N_LEG_RECONCILIATION_NOT_READY")
+        if batch.get("state") in {"RECONCILED_ZERO", "RECONCILED_FULL"}:
+            return batch
         required = {"fresh", "balance_fingerprint", "holding_fingerprint", "reservation_version"}
         if (
             not isinstance(context, Mapping) or set(context) != required or context.get("fresh") is not True
@@ -352,6 +354,8 @@ class NLegExecutionService:
         ):
             raise ValueError("N_LEG_RECONCILIATION_PROOF_REQUIRED")
         control = self.control()
+        if control.get("active_batch_id") != execution_batch_id:
+            raise ValueError("N_LEG_RECONCILIATION_OWNERSHIP_LOST")
         result = dict(batch)
         had_incident = result.get("incident") is not None
         result["reconciliation"] = dict(context)

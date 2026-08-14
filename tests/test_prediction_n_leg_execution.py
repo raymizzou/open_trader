@@ -189,6 +189,20 @@ def test_repair_context_rejects_self_consistent_changed_source_fingerprint(tmp_p
     assert rejected["repair_plan"] is None
 
 
+def test_reconciliation_replay_cannot_clear_a_later_active_batch(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    current.apply_receipt(receipt(leg="a", filled=0, state="REJECTED", sequence=1))
+    current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
+    current.complete_reconciliation("batch-1", context=reconciliation_context())
+    # A future batch is deliberately represented by the Store control boundary;
+    # replaying batch-1 must be a no-op rather than clearing this ownership.
+    current._store.n_leg_create_batch({**current.state("batch-1"), "execution_batch_id": "batch-2", "episode_lineage_id": "lineage-2", "opportunity_episode_id": "episode-2", "state": "ACTIVE"})
+    before = current.control()
+    current.complete_reconciliation("batch-1", context=reconciliation_context())
+    assert current.control() == before
+
+
 def test_same_sequence_conflict_opens_persistent_breaker(tmp_path) -> None:
     current = service(tmp_path)
     enter(current)
