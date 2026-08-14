@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 
@@ -112,7 +112,9 @@ def receipt(*, leg: str, filled: int, state: str, sequence: int) -> OrderReceipt
 
 
 def repair_context(*, candidates: list[dict[str, object]] = []) -> RepairContext:
-    values = {"reservation_version": "batch-1:v1", "model_fingerprint": "model-v1", "quote_fingerprint": "quote-v1", "account_fingerprint": "account-v1", "occurred_cost_units": 0, "occurred_fee_units": 0, "quotes": (("batch-1:action-a", 1, 2), ("batch-1:action-b", 1, 2)), "holdings": (("batch-1:action-a", 4), ("batch-1:action-b", 0))}
+    execution = solution()
+    binding = execution_solution_binding(execution)
+    values = {"reservation_version": "batch-1:v1", "model_fingerprint": execution.market_solution_fingerprint, "quote_fingerprint": binding["quote_fingerprint"], "account_fingerprint": execution.account_snapshot_fingerprint, "occurred_cost_units": 0, "occurred_fee_units": 0, "quotes": (("batch-1:action-a", 1, 2), ("batch-1:action-b", 1, 2)), "holdings": (("batch-1:action-a", 4), ("batch-1:action-b", 0))}
     values["fingerprint"] = fingerprint(values)
     return RepairContext(**values)
 
@@ -172,6 +174,19 @@ def test_partial_fill_opens_incident_downgrades_mode_and_fixes_best_manual_plan(
     assert plan["family"] == "EXIT_CONFIRMED"
     assert plan["auto_eligible"] is False
     assert plan["reason"] == "REPAIR_PROOF_REQUIRED"
+
+
+def test_repair_context_rejects_self_consistent_changed_source_fingerprint(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    current.apply_receipt(receipt(leg="a", filled=4, state="CANCELLED", sequence=1))
+    context = repair_context()
+    values = asdict(context)
+    values["quote_fingerprint"] = "changed-quote"
+    values.pop("fingerprint")
+    values["fingerprint"] = fingerprint(values)
+    rejected = current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1), repair_context=RepairContext(**values))
+    assert rejected["repair_plan"] is None
 
 
 def test_same_sequence_conflict_opens_persistent_breaker(tmp_path) -> None:

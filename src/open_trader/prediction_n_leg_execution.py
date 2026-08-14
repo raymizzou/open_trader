@@ -280,6 +280,9 @@ class NLegExecutionService:
             "submission_enabled": False,
             "state": "ACTIVE",
             "execution_solution_fingerprint": execution_solution.fingerprint,
+            "model_fingerprint": execution_solution.market_solution_fingerprint,
+            "quote_fingerprint": execution_solution_binding(execution_solution)["quote_fingerprint"],
+            "account_fingerprint": execution_solution.account_snapshot_fingerprint,
             "partial_fill_proof": partial_fill_proof.to_payload(),
             "max_partial_fill_loss": partial_fill_proof.max_partial_fill_loss,
             "max_auto_repair_loss": partial_fill_proof.max_auto_repair_loss,
@@ -479,7 +482,9 @@ class NLegExecutionService:
 
     @staticmethod
     def _repair_plan(batch: Mapping[str, object], context: RepairContext | None) -> dict[str, object] | None:
-        if not isinstance(context, RepairContext) or context.reservation_version != batch.get("reservation_version"):
+        if not isinstance(context, RepairContext) or context.reservation_version != batch.get("reservation_version") or any(
+            getattr(context, name) != batch.get(name) for name in ("model_fingerprint", "quote_fingerprint", "account_fingerprint")
+        ):
             return None
         raw_legs = batch.get("legs")
         if not isinstance(raw_legs, list):
