@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
@@ -149,9 +150,9 @@ def repair_context(*, b_buy: int = 1, b_venue: str = "venue-b", occurred_cost: i
     )
 
 
-def reconciliation_context(batch_id: str = "batch-1", *, full: bool = False, a_sequence: int = 1, a_venue_order: str | None = None, resolutions: tuple[ConflictResolutionEvidence, ...] = ()) -> ReconciliationContext:
+def reconciliation_context(batch_id: str = "batch-1", *, full: bool = False, a_sequence: int = 1, a_venue_order: str | None = None, resolutions: tuple[ConflictResolutionEvidence, ...] = (), now=AS_OF) -> ReconciliationContext:
     holdings = (ConfirmedHolding("venue-a", "account-a", "action-a", 10, AS_OF, AS_OF), ConfirmedHolding("venue-b", "account-b", "action-b", 10, AS_OF, AS_OF)) if full else ()
-    return ReconciliationContext(f"{batch_id}:v1", source_and_solution()[0].account_snapshot, holdings, (SettlementCashFlow(f"{batch_id}:action-a", a_venue_order, "venue-a", "account-a", "usd-cents", 0, 0, AS_OF, AS_OF, a_sequence, False), SettlementCashFlow(f"{batch_id}:action-b", None, "venue-b", "account-b", "usd-cents", 0, 0, AS_OF, AS_OF, 1, False)), AS_OF, AS_OF, AS_OF, resolutions)
+    return ReconciliationContext(f"{batch_id}:v1", source_and_solution()[0].account_snapshot, holdings, (SettlementCashFlow(f"{batch_id}:action-a", a_venue_order, "venue-a", "account-a", "usd-cents", 0, 0, AS_OF, AS_OF, a_sequence, False), SettlementCashFlow(f"{batch_id}:action-b", None, "venue-b", "account-b", "usd-cents", 0, 0, AS_OF, AS_OF, 1, False)), AS_OF, AS_OF, now, resolutions)
 
 
 def resolution_for(conflict: dict[str, object], *, outcome: str = "TERMINAL", sequence: int = 1_000, observation_version: int = 1) -> ConflictResolutionEvidence:
@@ -160,7 +161,7 @@ def resolution_for(conflict: dict[str, object], *, outcome: str = "TERMINAL", se
         conflict["conflict_id"], client, venue_order, venue, account, asset, settlement,
         outcome, "REJECTED" if outcome == "TERMINAL" else None,
         conflict["max_actual_filled_quantity"], conflict["max_actual_cash_units"], 0,
-        sequence if outcome == "TERMINAL" else None, outcome == "NOT_FOUND", observation_version, AS_OF, AS_OF,
+        sequence if outcome == "TERMINAL" else None, outcome == "NOT_FOUND", observation_version, AS_OF + timedelta(seconds=1), AS_OF + timedelta(seconds=1),
     )
 
 
@@ -651,6 +652,63 @@ def test_sequence_none_rest_conflict_requires_newer_rest_observation_version(tmp
     assert newer["unresolved_conflicts"] == []
 
 
+def test_rest_versions_are_monotonic_across_receipt_ids_and_times(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    first = replace(receipt(leg="a", filled=0, state="OPEN", sequence=1), receipt_id="rest-1", sequence=None, rest_confirmed=True, rest_observation_version=1)
+    accepted = current.apply_receipt(replace(first, receipt_id="rest-2", rest_observation_version=2, observed_at="2026-08-14T00:00:01Z", venue_timestamp="2026-08-14T00:00:01Z"))
+    assert current.apply_receipt(replace(first, receipt_id="rest-old", observed_at="2026-08-13T00:00:00Z", venue_timestamp="2026-08-13T00:00:00Z")) == accepted
+    conflicted = current.apply_receipt(replace(first, receipt_id="rest-same", state="UNKNOWN", rest_observation_version=2, observed_at="2026-08-14T00:00:02Z", venue_timestamp="2026-08-14T00:00:02Z"))
+    assert conflicted["incident"]["reason"] == "REST_OBSERVATION_CONFLICT"
+    timed = current.apply_receipt(replace(first, receipt_id="rest-time", rest_observation_version=3, observed_at="2026-08-14T00:00:00Z", venue_timestamp="2026-08-14T00:00:00Z"))
+    assert timed["incident"]["reason"] == "RECEIPT_TIME_REGRESSION"
+
+    sequenced = service(tmp_path / "sequenced")
+    enter(sequenced)
+    sequenced.apply_receipt(receipt(leg="a", filled=0, state="OPEN", sequence=1))
+    time_regression = sequenced.apply_receipt(replace(receipt(leg="a", filled=0, state="OPEN", sequence=2), observed_at="2026-08-13T00:00:00Z", venue_timestamp="2026-08-13T00:00:00Z"))
+    assert time_regression["incident"]["reason"] == "RECEIPT_TIME_REGRESSION"
+
+
+def test_drift_and_unknown_conflicts_reserve_reported_or_known_exposure(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    original = replace(receipt(leg="a", filled=0, state="OPEN", sequence=1), venue_order_id="venue-order-1")
+    current.apply_receipt(original)
+    first = current.apply_receipt(replace(original, receipt_id="drift-2", venue_order_id="venue-order-2", sequence=2, cumulative_cost_units=700))
+    second = current.apply_receipt(replace(original, receipt_id="drift-3", venue_order_id="venue-order-3", sequence=3, cumulative_cost_units=900))
+    assert sorted(second["conflict_exposure_by_physical_order"].values()) == [700, 900]
+    assert current.control()["total_unsettled_capital_units"] == 2620
+
+    unknown = service(tmp_path / "unknown-exposure")
+    enter(unknown)
+    state = unknown.apply_receipt(replace(receipt(leg="a", filled=0, state="OPEN", sequence=1), client_order_id="unknown", receipt_id="unknown-zero"))
+    assert state["capital_exposure_unknown"] is True
+    assert list(state["conflict_exposure_by_physical_order"].values()) == [510]
+
+
+def test_terminal_conflict_evidence_is_durable_economic_state_not_zero_reconciliation(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    original = replace(receipt(leg="a", filled=0, state="OPEN", sequence=1), venue_order_id="venue-order-1")
+    current.apply_receipt(original)
+    conflict = current.apply_receipt(replace(original, receipt_id="drift", venue_order_id="venue-order-2", sequence=2))["unresolved_conflicts"][0]
+    current.apply_receipt(replace(original, receipt_id="a-final", state="REJECTED", sequence=3))
+    current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
+    evidence = replace(resolution_for(conflict), cumulative_filled_quantity=1, cumulative_cost_units=7, sequence=4)
+    with pytest.raises(ValueError, match="CONFLICT_UNRESOLVED"):
+        current.complete_reconciliation("batch-1", context=reconciliation_context(a_sequence=3, a_venue_order="venue-order-1", resolutions=(replace(evidence, source_timestamp=AS_OF, observed_at=AS_OF),)))
+    assert current.state("batch-1")["unresolved_conflicts"]
+    context = replace(
+        reconciliation_context(a_sequence=3, a_venue_order="venue-order-1", resolutions=(evidence,), now=AS_OF + timedelta(seconds=2)),
+        holdings=(ConfirmedHolding("venue-a", "account-a", "action-a", 1, AS_OF, AS_OF),),
+    )
+    result = current.complete_reconciliation("batch-1", context=context)
+    assert result["state"] == "RECONCILED_FULL"
+    assert result["conflict_terminal_ledger"][conflict["physical_key"]]["cumulative_cost_units"] == 7
+    assert current.control()["total_unsettled_capital_units"] == 7
+
+
 def test_exact_conflict_evidence_reconciles_drift_and_unknown_order(tmp_path) -> None:
     current = service(tmp_path)
     enter(current)
@@ -662,7 +720,7 @@ def test_exact_conflict_evidence_reconciles_drift_and_unknown_order(tmp_path) ->
     current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
     with pytest.raises(ValueError, match="CONFLICT_UNRESOLVED"):
         current.complete_reconciliation("batch-1", context=reconciliation_context(a_sequence=3, a_venue_order="venue-order-1"))
-    assert current.complete_reconciliation("batch-1", context=reconciliation_context(a_sequence=3, a_venue_order="venue-order-1", resolutions=(resolution_for(conflict),)))["state"] == "RECONCILED_ZERO"
+    assert current.complete_reconciliation("batch-1", context=reconciliation_context(a_sequence=3, a_venue_order="venue-order-1", resolutions=(resolution_for(conflict),), now=AS_OF + timedelta(seconds=2)))["state"] == "RECONCILED_ZERO"
 
     unknown = service(tmp_path / "unknown")
     enter(unknown)
@@ -672,7 +730,7 @@ def test_exact_conflict_evidence_reconciles_drift_and_unknown_order(tmp_path) ->
     conflict = unresolved["unresolved_conflicts"][0]
     unknown.apply_receipt(receipt(leg="a", filled=0, state="REJECTED", sequence=1))
     unknown.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
-    assert unknown.complete_reconciliation("batch-1", context=reconciliation_context(resolutions=(resolution_for(conflict, outcome="NOT_FOUND"),)))["state"] == "RECONCILED_ZERO"
+    assert unknown.complete_reconciliation("batch-1", context=reconciliation_context(resolutions=(resolution_for(conflict, outcome="NOT_FOUND"),), now=AS_OF + timedelta(seconds=2)))["state"] == "RECONCILED_ZERO"
 
 
 def test_partial_fill_gate_uses_proven_upper_loss_bound_not_principal(tmp_path) -> None:
