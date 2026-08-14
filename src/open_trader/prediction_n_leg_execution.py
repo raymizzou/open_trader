@@ -184,12 +184,13 @@ class NLegExecutionService:
         execution_solution: ExecutionSolution,
         partial_fill_proof: PartialFillProofRecord,
         mode: Literal["MANUAL", "AUTO"],
+        cap_config_version: str,
     ) -> dict[str, object]:
         for name, value in (("opportunity_episode_id", opportunity_episode_id), ("episode_lineage_id", episode_lineage_id), ("execution_batch_id", execution_batch_id)):
             _text(value, name)
         if mode not in {"MANUAL", "AUTO"}:
             raise ValueError("new N-leg mode must be MANUAL or AUTO")
-        if not _proof_is_bound(partial_fill_proof, execution_solution):
+        if not _proof_is_bound(partial_fill_proof, execution_solution) or partial_fill_proof.cap_config_version != _text(cap_config_version, "cap_config_version"):
             raise ValueError("PARTIAL_FILL_PROOF_REQUIRED")
         if execution_solution.capital_use_units > partial_fill_proof.max_partial_fill_loss:
             raise ValueError("PARTIAL_FILL_LOSS_CAP_EXCEEDED")
@@ -221,6 +222,7 @@ class NLegExecutionService:
             "total_unsettled_capital_units": execution_solution.capital_use_units,
             "legs": legs,
             "receipts": {},
+            "confirmed_holdings": [],
             "incident": None,
             "repair_plan": None,
         }
@@ -302,6 +304,14 @@ class NLegExecutionService:
         receipts[receipt.receipt_id] = encoded
         copy["legs"] = legs
         copy["receipts"] = receipts
+        copy["confirmed_holdings"] = [
+            {
+                "venue_id": leg["venue_id"], "account_id": leg["account_id"],
+                "asset_id": leg["asset_id"], "quantity": leg["receipt"]["cumulative_filled_quantity"],
+            }
+            for leg in legs
+            if isinstance(leg.get("receipt"), dict) and leg["receipt"]["cumulative_filled_quantity"] > 0
+        ]
         if receipt.state == "UNKNOWN" or (0 < receipt.cumulative_filled_quantity < receipt.submitted_quantity):
             return copy, "UNKNOWN_ORDER_STATE" if receipt.state == "UNKNOWN" else "PARTIAL_FILL", True
         return copy, None, True

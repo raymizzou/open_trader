@@ -76,7 +76,7 @@ def enter(service: NLegExecutionService) -> dict[str, object]:
     execution = solution()
     return service.enter(
         opportunity_episode_id="episode-1", episode_lineage_id="lineage-1", execution_batch_id="batch-1",
-        execution_solution=execution, partial_fill_proof=proof(execution), mode="AUTO",
+        execution_solution=execution, partial_fill_proof=proof(execution), mode="AUTO", cap_config_version="caps-v1",
     )
 
 
@@ -112,14 +112,14 @@ def test_entry_claims_one_batch_and_survives_reopen(tmp_path) -> None:
     }
     assert restarted.enter(
         opportunity_episode_id="episode-1", episode_lineage_id="lineage-1", execution_batch_id="batch-1",
-        execution_solution=solution(), partial_fill_proof=proof(solution()), mode="AUTO",
+        execution_solution=solution(), partial_fill_proof=proof(solution()), mode="AUTO", cap_config_version="caps-v1",
     ) == batch
     restarted.apply_receipt(receipt(leg="a", filled=0, state="REJECTED", sequence=1))
     restarted.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
     with pytest.raises(ValueError, match="LINEAGE_ALREADY_CLAIMED"):
         restarted.enter(
             opportunity_episode_id="episode-2", episode_lineage_id="lineage-1", execution_batch_id="batch-2",
-            execution_solution=solution(), partial_fill_proof=proof(solution()), mode="MANUAL",
+            execution_solution=solution(), partial_fill_proof=proof(solution()), mode="MANUAL", cap_config_version="caps-v1",
         )
 
 
@@ -165,12 +165,17 @@ def test_entry_fails_closed_for_unsafe_or_over_partial_fill_cap(tmp_path) -> Non
     with pytest.raises(ValueError, match="PARTIAL_FILL_PROOF_REQUIRED"):
         current.enter(
             opportunity_episode_id="episode-1", episode_lineage_id="lineage-1", execution_batch_id="batch-1",
-            execution_solution=execution, partial_fill_proof=proof(execution, status="UNKNOWN"), mode="MANUAL",
+            execution_solution=execution, partial_fill_proof=proof(execution, status="UNKNOWN"), mode="MANUAL", cap_config_version="caps-v1",
         )
     with pytest.raises(ValueError, match="PARTIAL_FILL_LOSS_CAP_EXCEEDED"):
         current.enter(
             opportunity_episode_id="episode-1", episode_lineage_id="lineage-1", execution_batch_id="batch-1",
-            execution_solution=execution, partial_fill_proof=proof(execution, partial_cap=0), mode="MANUAL",
+            execution_solution=execution, partial_fill_proof=proof(execution, partial_cap=0), mode="MANUAL", cap_config_version="caps-v1",
+        )
+    with pytest.raises(ValueError, match="PARTIAL_FILL_PROOF_REQUIRED"):
+        current.enter(
+            opportunity_episode_id="episode-1", episode_lineage_id="lineage-1", execution_batch_id="batch-1",
+            execution_solution=execution, partial_fill_proof=proof(execution), mode="MANUAL", cap_config_version="caps-v2",
         )
 
 
@@ -228,7 +233,7 @@ def test_over_cap_repair_is_retained_but_breaks_automatic_authority(tmp_path) ->
     execution = solution()
     current.enter(
         opportunity_episode_id="episode-1", episode_lineage_id="lineage-1", execution_batch_id="batch-1",
-        execution_solution=execution, partial_fill_proof=proof(execution, repair_cap=7), mode="AUTO",
+        execution_solution=execution, partial_fill_proof=proof(execution, repair_cap=7), mode="AUTO", cap_config_version="caps-v1",
     )
     current.apply_receipt(receipt(leg="a", filled=4, state="CANCELLED", sequence=1))
     failed = current.apply_receipt(
