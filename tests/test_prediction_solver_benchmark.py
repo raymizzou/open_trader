@@ -1448,7 +1448,7 @@ def test_aggregate_rejects_missing_or_duplicate_structural_samples(mutation: str
     else:
         records.append(deepcopy(records[-1]))
 
-    with pytest.raises(ValueError, match=mutation):
+    with pytest.raises(ValueError, match="terminal solver failure" if mutation == "missing" else mutation):
         aggregate_benchmark_records(records, _benchmark_manifest())
 
 
@@ -1530,7 +1530,7 @@ def test_hard_gate_requires_a_completed_run_per_available_solver_environment() -
 
     summary = aggregate_benchmark_records(records, _benchmark_manifest(profile="quick"))
 
-    assert summary["solvers"]["highs"]["hard_gate_failures"] == ["NO_COMPLETED_RUN"]
+    assert summary["solvers"]["highs"]["hard_gate_failures"] == ["FATAL_WORKER_TERMINATION"]
     assert summary["solvers"]["scip"]["hard_gate_failures"] == []
 
 
@@ -1706,7 +1706,7 @@ def test_recommendation_selects_by_descending_worst_cell_vector_and_records_cont
     _set_first_qualified(records, "highs", "linux", 100)
     _set_first_qualified(records, "scip", "macos", 90)
     _set_first_qualified(records, "scip", "linux", 110)
-    next(record for record in records if record["solver_name"] == "cp_sat").update(
+    next(record for record in reversed(records) if record["solver_name"] == "cp_sat").update(
         {"check_hard_failure": True, "check_failure_reason": "FALSE_SAFE"}
     )
     _refresh_semantic_fingerprints(records)
@@ -1724,7 +1724,7 @@ def test_recommendation_memory_stage_includes_every_throughput_worker_cell() -> 
     for record in records:
         if record["sample_kind"] == "throughput" and record["solver_name"] in {"highs", "scip"}:
             record["peak_aggregate_rss_bytes"] = 800 if record["solver_name"] == "highs" else 900
-    next(record for record in records if record["solver_name"] == "cp_sat").update(
+    next(record for record in reversed(records) if record["solver_name"] == "cp_sat").update(
         {"check_hard_failure": True, "check_failure_reason": "FALSE_SAFE"}
     )
     _refresh_semantic_fingerprints(records)
@@ -1739,7 +1739,7 @@ def test_recommendation_memory_stage_includes_every_throughput_worker_cell() -> 
 def test_recommendation_selects_the_only_hard_gate_survivor_by_elimination() -> None:
     records = _full_records()
     for solver in ("scip", "cp_sat"):
-        next(record for record in records if record["solver_name"] == solver).update(
+        next(record for record in reversed(records) if record["solver_name"] == solver).update(
             {"check_hard_failure": True, "check_failure_reason": "FALSE_SAFE"}
         )
     _refresh_semantic_fingerprints(records)
@@ -1763,7 +1763,7 @@ def test_recommendation_emits_no_survivor_and_no_decisive_winner_without_name_ti
     tie = aggregate_benchmark_records(tied_records, _benchmark_manifest())["decision"]
     eliminated = deepcopy(tied_records)
     for solver in ("highs", "scip", "cp_sat"):
-        next(record for record in eliminated if record["solver_name"] == solver).update(
+        next(record for record in reversed(eliminated) if record["solver_name"] == solver).update(
             {"check_hard_failure": True, "check_failure_reason": "FALSE_SAFE"}
         )
     _refresh_semantic_fingerprints(eliminated)
@@ -2299,6 +2299,10 @@ def _fake_harness_factory(
     hard_check_failure: bool = False,
     raise_on_sample_kind: str | None = None,
     termination: str | None = None,
+    termination_by_solver: dict[str, str] | None = None,
+    hard_check_failure_by_solver: dict[str, bool] | None = None,
+    termination_by_sample_kind: dict[tuple[str, str], str] | None = None,
+    termination_by_slot: dict[tuple[str, str, int], str] | None = None,
 ):
     next_pid = 10_000
     cases = benchmark._load_full_cases()
@@ -2345,9 +2349,16 @@ def _fake_harness_factory(
                     request.request_id, "UNKNOWN", "CLEANUP_UNPROVEN", self.worker_pid,
                     self.worker_pid, slot + 1, False, False,
                 )
-            if termination is not None:
+            selected_termination = (termination_by_slot or {}).get(
+                (self.solver, sample_kind, slot),
+                (termination_by_sample_kind or {}).get(
+                    (self.solver, sample_kind),
+                    (termination_by_solver or {}).get(self.solver, termination),
+                ),
+            )
+            if selected_termination is not None:
                 return WorkerOutcome(
-                    request.request_id, "UNKNOWN", termination, self.worker_pid,
+                    request.request_id, "UNKNOWN", selected_termination, self.worker_pid,
                     self.worker_pid, slot + 1, False, True,
                 )
             case = next(case for case in cases if case.request == request.request)
@@ -2365,7 +2376,7 @@ def _fake_harness_factory(
                 self.solver,
                 request.request_id,
                 "OK",
-                {} if hard_check_failure else canonical_payload(evidence),
+                {} if (hard_check_failure_by_solver or {}).get(self.solver, hard_check_failure) else canonical_payload(evidence),
                 {name: 0 for name in benchmark.WORKER_PHASE_NAMES},
                 (),
             )
@@ -2392,6 +2403,122 @@ def _run_tiny_full_plan(harness_factory) -> list[dict[str, object]]:
             ),
         )
         return benchmark._run_full_environment(cases, manifest, "macos", harness_factory)
+
+
+def run_three_solver_tiny_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    failing_solver: str | None = None,
+    termination: str = "COMPLETED",
+    hard_check_failure: bool = False,
+    cleanup_proven: bool = True,
+) -> tuple[list[dict[str, object]], dict[str, object], int]:
+    """Run the canonical runner with a two-record plan and per-solver fake outcomes."""
+    cases = benchmark._load_full_cases()
+    environments, artifacts = _full_environment_fixture()
+    environments["linux"] = benchmark._unavailable_linux_environment()
+    for solver in benchmark._SOLVERS:
+        artifacts[solver]["linux"] = benchmark._unavailable_linux_artifact()
+    manifest = benchmark._full_manifest(cases, environments, artifacts)
+    monkeypatch.setattr(
+        benchmark,
+        "_full_sample_plan",
+        lambda _: ((cases[0].case_id, "warmup", 0, 1), (cases[0].case_id, "warm", 0, 1)),
+    )
+    factory = _fake_harness_factory(
+        cleanup_proven=cleanup_proven,
+        termination_by_solver={} if failing_solver is None or hard_check_failure else {failing_solver: termination},
+        hard_check_failure_by_solver={} if failing_solver is None or not hard_check_failure else {failing_solver: True},
+    )
+    return benchmark._run_full_environment(cases, manifest, "macos", factory), manifest, 2
+
+
+@pytest.mark.parametrize("termination", ("MEMORY_LIMIT", "CRASH", "INVALID_OUTPUT", "PROTOCOL_MISMATCH"))
+def test_full_runner_records_fatal_sample_stops_that_solver_and_continues_others(monkeypatch, termination) -> None:
+    records, manifest, planned = run_three_solver_tiny_plan(monkeypatch, failing_solver="highs", termination=termination)
+
+    assert [row["solver_name"] for row in records].count("highs") == 1
+    assert records[0]["solver_run"]["termination_reason"] == termination
+    assert sum(row["solver_name"] == "scip" for row in records) == planned
+    assert sum(row["solver_name"] == "cp_sat" for row in records) == planned
+
+
+def test_full_runner_records_checker_failure_and_stops_only_that_solver(monkeypatch) -> None:
+    records, manifest, planned = run_three_solver_tiny_plan(monkeypatch, failing_solver="scip", hard_check_failure=True)
+
+    assert sum(row["solver_name"] == "highs" for row in records) == planned
+    assert sum(row["solver_name"] == "scip" for row in records) == 1
+    assert sum(row["solver_name"] == "cp_sat" for row in records) == planned
+    assert next(row for row in records if row["solver_name"] == "scip")["check_hard_failure"] is True
+
+
+def test_matrix_accepts_only_a_terminal_prefix_for_an_eliminated_solver(monkeypatch) -> None:
+    records, manifest, planned = run_three_solver_tiny_plan(monkeypatch, failing_solver="highs", termination="CRASH")
+
+    summary = aggregate_benchmark_records(records, manifest)
+    assert summary["solvers"]["highs"]["hard_gate_failures"] == ["FATAL_WORKER_TERMINATION"]
+    report = benchmark._markdown_report(summary, {"highs": (planned, 1), "scip": (planned, planned), "cp_sat": (planned, planned)})
+    assert "Samples: 1 observed / 2 planned" in report
+
+
+def test_matrix_rejects_partial_solver_without_terminal_last_record(monkeypatch) -> None:
+    records, manifest, planned = run_three_solver_tiny_plan(monkeypatch)
+    del planned
+    records.pop(0)
+
+    with pytest.raises(ValueError, match="ordered plan prefix|terminal solver failure"):
+        aggregate_benchmark_records(records, manifest)
+
+
+def test_matrix_rejects_records_after_a_terminal_sample_or_a_nonprefix_gap(monkeypatch) -> None:
+    records, manifest, planned = run_three_solver_tiny_plan(monkeypatch, failing_solver="highs", termination="CRASH")
+    del planned
+    late = deepcopy(records[0])
+    late["sample_index"] = 1
+    records.insert(1, late)
+
+    with pytest.raises(ValueError, match="terminal|ordered plan prefix"):
+        aggregate_benchmark_records(records, manifest)
+
+
+def test_cleanup_unproven_still_aborts_the_whole_run(monkeypatch) -> None:
+    with pytest.raises(RuntimeError, match="CLEANUP_UNPROVEN"):
+        run_three_solver_tiny_plan(monkeypatch, failing_solver="highs", cleanup_proven=False)
+
+
+def test_full_runner_retains_a_nonzero_throughput_slot_failure(monkeypatch) -> None:
+    cases = benchmark._load_full_cases()
+    environments, artifacts = _full_environment_fixture()
+    manifest = benchmark._full_manifest(cases, environments, artifacts)
+    monkeypatch.setattr(benchmark, "_SOLVERS", ("highs",))
+    monkeypatch.setattr(benchmark, "_full_sample_plan", lambda _: (("single_contract_complement", "throughput", 0, 2),))
+
+    records = benchmark._run_full_environment(
+        cases,
+        manifest,
+        "macos",
+        _fake_harness_factory(termination_by_slot={("highs", "throughput", 1): "CRASH"}),
+    )
+
+    assert len(records) == 1
+    assert records[0]["solver_run"]["termination_reason"] == "CRASH"
+
+
+def test_full_runner_retains_a_rebuild_prime_failure_under_the_rebuild_key(monkeypatch) -> None:
+    cases = benchmark._load_full_cases()
+    environments, artifacts = _full_environment_fixture()
+    manifest = benchmark._full_manifest(cases, environments, artifacts)
+    monkeypatch.setattr(benchmark, "_SOLVERS", ("highs",))
+    monkeypatch.setattr(benchmark, "_full_sample_plan", lambda _: (("single_contract_complement", "rebuild", 0, 1),))
+
+    records = benchmark._run_full_environment(
+        cases,
+        manifest,
+        "macos",
+        _fake_harness_factory(termination_by_sample_kind={("highs", "rebuild-prime"): "CRASH"}),
+    )
+
+    assert [(record["sample_kind"], record["solver_run"]["termination_reason"]) for record in records] == [("rebuild", "CRASH")]
 
 
 def test_full_environment_runner_emits_the_exact_plan_and_record_counters(monkeypatch) -> None:
@@ -2438,18 +2565,21 @@ def test_full_environment_runner_stops_on_unproven_cleanup_or_semantic_mismatch(
         _run_tiny_full_plan(_fake_harness_factory(batch_semantics_differ=True))
 
 
-def test_full_environment_runner_stops_on_hard_check_failure() -> None:
-    with pytest.raises(RuntimeError, match="CHECK_HARD_FAILURE"):
-        _run_tiny_full_plan(_fake_harness_factory(hard_check_failure=True))
+def test_full_environment_runner_retains_hard_check_failure() -> None:
+    records = _run_tiny_full_plan(_fake_harness_factory(hard_check_failure=True))
+
+    assert len(records) == 1
+    assert records[0]["check_hard_failure"] is True
 
 
 @pytest.mark.parametrize("termination", ("MEMORY_LIMIT", "CRASH", "INVALID_OUTPUT", "PROTOCOL_MISMATCH", "unrecognized-format-failure"))
-def test_full_environment_runner_stops_immediately_on_fatal_worker_termination(termination: str) -> None:
+def test_full_environment_runner_retains_fatal_worker_termination(termination: str) -> None:
     factory = _fake_harness_factory(termination=termination)
 
-    with pytest.raises(RuntimeError, match="FATAL_WORKER_TERMINATION"):
-        _run_tiny_full_plan(factory)
+    records = _run_tiny_full_plan(factory)
 
+    assert len(records) == 1
+    assert records[0]["solver_run"]["termination_reason"] in {termination, "PROTOCOL_MISMATCH"}
     assert sum(len(harness.sample_kinds) for harness in factory.instances) == 1
 
 
@@ -2902,6 +3032,125 @@ def _current_macos_partial(tmp_path, monkeypatch) -> tuple[dict[str, object], di
     monkeypatch.setattr(benchmark, "_full_sample_plan", lambda _: ())
     monkeypatch.setattr(benchmark, "aggregate_benchmark_records", lambda records, current: {})
     return manifest, artifacts
+
+
+def write_complete_macos_partial(
+    output: Path,
+    *,
+    git_sha: str = "1" * 40,
+    environment_id: str = "macos:fixture",
+    core_mutation: str | None = None,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    """Use the full fixture and fake harness to write a consistent macOS handoff."""
+    cached = getattr(write_complete_macos_partial, "_cached", None)
+    if cached is None:
+        environments, artifacts = _full_environment_fixture()
+        environments["linux"] = benchmark._unavailable_linux_environment()
+        for solver in benchmark._SOLVERS:
+            artifacts[solver]["linux"] = benchmark._unavailable_linux_artifact()
+        cases = benchmark._load_full_cases()
+        manifest = benchmark._full_manifest(cases, environments, artifacts)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(benchmark, "_full_sample_plan", lambda _: ((cases[0].case_id, "warmup", 0, 1),))
+            seed_records = benchmark._run_full_environment(cases, manifest, "macos", _fake_harness_factory())
+        cases_by_id = {case.case_id: case for case in cases}
+        records = []
+        for solver in benchmark._SOLVERS:
+            template = next(record for record in seed_records if record["solver_name"] == solver)
+            for case_id, kind, index, worker_count in benchmark._full_sample_plan(cases):
+                case = cases_by_id[case_id]
+                record = deepcopy(template)
+                record.update(
+                    {
+                        "case_id": case_id,
+                        "completed_requests": worker_count if kind == "throughput" else 1,
+                        "problem_fingerprint": fingerprint(case.request.problem),
+                        "request_fingerprint": case.request_fingerprint,
+                        "sample_index": index,
+                        "sample_kind": kind,
+                        "worker_count": worker_count,
+                        "worker_rebuild_count": 1 if kind == "rebuild" else 0,
+                    }
+                )
+                record["solver_run"]["request_id"] = case_id
+                record["semantic_fingerprint"] = benchmark._semantic_fingerprint(record)
+                records.append(record)
+        cached = (manifest, records)
+        write_complete_macos_partial._cached = cached
+    manifest, records = deepcopy(cached)
+    manifest["environments"]["macos"]["git_sha"] = git_sha
+    manifest["environments"]["macos"]["environment_id"] = environment_id
+    for record in records:
+        record["git_sha"] = git_sha
+        record["solver_run"]["environment_id"] = environment_id
+        record["semantic_fingerprint"] = benchmark._semantic_fingerprint(record)
+    if core_mutation == "corpus":
+        manifest["corpus_manifest_sha256"] = "sha256:" + "c" * 64
+        for record in records:
+            record["corpus_manifest_sha256"] = manifest["corpus_manifest_sha256"]
+    elif core_mutation == "limits":
+        manifest["soft_time_limit_ms"] += 1
+    elif core_mutation == "plan":
+        manifest["required_solvers"].reverse()
+    elif core_mutation == "solver_version":
+        manifest["solvers"]["highs"]["environments"]["macos"]["solver_version"] = "2.0"
+        for record in records:
+            if record["solver_name"] == "highs":
+                record["solver_version"] = "2.0"
+                record["solver_run"]["solver_version"] = "2.0"
+                record["semantic_fingerprint"] = benchmark._semantic_fingerprint(record)
+    elif core_mutation == "build_id":
+        manifest["solvers"]["highs"]["environments"]["macos"]["build_id"] = "historical-highs-build"
+        for record in records:
+            if record["solver_name"] == "highs":
+                record["build_id"] = "historical-highs-build"
+    elif core_mutation == "license":
+        manifest["license_manifest_sha256"] = "sha256:" + "d" * 64
+        for record in records:
+            record["license_manifest_sha256"] = manifest["license_manifest_sha256"]
+    elif core_mutation is not None:
+        raise ValueError(f"unknown core mutation: {core_mutation}")
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "environment_manifest.json").write_text(json.dumps(manifest))
+    (output / "macos.jsonl").write_text("".join(json.dumps(record) + "\n" for record in records))
+    return manifest, records
+
+
+def stub_current_discovery_with_same_core_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    git_sha: str = "1" * 40,
+    environment_id: str = "macos:fixture",
+) -> None:
+    """Stub only current macOS discovery, retaining the fixture core identity."""
+    environments, artifacts = _full_environment_fixture()
+    environments["macos"]["git_sha"] = git_sha
+    environments["macos"]["environment_id"] = environment_id
+    monkeypatch.setattr(
+        benchmark,
+        "_discover_quick_environment",
+        lambda root: (environments["macos"], {solver: artifacts[solver]["macos"] for solver in benchmark._SOLVERS}),
+    )
+
+
+def test_full_linux_accepts_a_valid_macos_partial_from_an_earlier_orchestration_sha(tmp_path, monkeypatch) -> None:
+    write_complete_macos_partial(tmp_path, git_sha="2" * 40, environment_id="macos:historical")
+    stub_current_discovery_with_same_core_identity(monkeypatch, git_sha="1" * 40, environment_id="macos:current")
+
+    manifest, records, cases = benchmark._read_full_macos_partial(tmp_path)
+
+    assert len(records) == 4_755
+    assert manifest["environments"]["macos"]["git_sha"] == "2" * 40
+    assert len(cases) == 41
+
+
+@pytest.mark.parametrize("mutation", ("corpus", "limits", "plan", "solver_version", "build_id", "license"))
+def test_full_linux_still_rejects_comparison_identity_drift_before_docker(tmp_path, monkeypatch, mutation) -> None:
+    write_complete_macos_partial(tmp_path, core_mutation=mutation)
+    stub_current_discovery_with_same_core_identity(monkeypatch)
+
+    with pytest.raises(ValueError, match="identity"):
+        benchmark._read_full_macos_partial(tmp_path)
 
 
 @pytest.mark.parametrize(

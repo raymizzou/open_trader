@@ -201,6 +201,18 @@ class DifferentialCheck:
     failure_reason: CheckFailureReason | None
 
 
+_FATAL_TERMINATIONS = {
+    TerminationReason.MEMORY_LIMIT.value,
+    TerminationReason.CRASH.value,
+    TerminationReason.INVALID_OUTPUT.value,
+    TerminationReason.PROTOCOL_MISMATCH.value,
+}
+
+
+def _hard_elimination_record(record: Mapping[str, object]) -> bool:
+    return bool(record["check_hard_failure"]) or record["solver_run"]["termination_reason"] in _FATAL_TERMINATIONS
+
+
 def aggregate_benchmark_records(
     records: object,
     manifest: Mapping[str, object],
@@ -297,7 +309,8 @@ def generate_benchmark_report(
         },
         "solver_evidence": summary["solvers"],
     }
-    report = _markdown_report(summary)
+    sample_counts = _sample_counts(tuple(_validated_benchmark_record(record, manifest_value) for record in records), manifest_value)
+    report = _markdown_report(summary, sample_counts)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     (output / "summary.json").write_bytes(_json_bytes(summary))
@@ -490,7 +503,7 @@ def _validated_benchmark_record(record: object, manifest: Mapping[str, object]) 
         raise ValueError("throughput request_wall_ns must be positive")
     if sample_kind == "cold" and value["worker_start_count"] < 1:
         raise ValueError("cold worker_start_count must be at least one")
-    if sample_kind == "rebuild" and value["worker_rebuild_count"] < 1:
+    if sample_kind == "rebuild" and value["worker_rebuild_count"] < 1 and not _hard_elimination_record(value):
         raise ValueError("rebuild worker_rebuild_count must be at least one")
     if not run["peak_rss_bytes"] <= value["peak_process_group_rss_bytes"] <= value["peak_aggregate_rss_bytes"]:
         raise ValueError("solver/process-group/aggregate RSS must be ordered")
@@ -582,32 +595,67 @@ def _validated_evidence_payload(payload: object) -> dict[str, object]:
     return canonical_payload(solver_evidence_from_payload(payload))
 
 
+def _ordered_sample_keys(manifest: Mapping[str, object]) -> dict[tuple[str, str], tuple[tuple[object, ...], ...]]:
+    canonical_case_ids = tuple(case.case_id for case in _load_full_cases()) if manifest["profile"] == "full" else ()
+    if manifest["profile"] == "full" and tuple(manifest["required_case_ids"]) == canonical_case_ids:
+        plan = _full_sample_plan(_load_full_cases())
+    else:
+        plan = [
+            (case_id, kind, index, 1)
+            for case_id in manifest["required_case_ids"]
+            for kind, samples in (("warmup", manifest["warmup_samples"]), ("warm", manifest["measured_samples"]))
+            for index in range(samples)
+        ]
+        for case_id in manifest["throughput_probe_case_ids"]:
+            for count in manifest["worker_counts"]:
+                plan.extend((case_id, "throughput", index, count) for index in range(manifest["measured_samples"]))
+        for kind, case_ids in (("cold", manifest["cold_probe_case_ids"]), ("rebuild", manifest["rebuild_probe_case_ids"])):
+            for case_id in case_ids:
+                plan.extend((case_id, kind, index, 1) for index in range(manifest["measured_samples"]))
+        plan = tuple(plan)
+    return {
+        (environment, solver): tuple((environment, solver, *key) for key in plan)
+        for environment in sorted(manifest["required_environments"])
+        if manifest["environments"][environment]["available"]
+        for solver in manifest["required_solvers"]
+    }
+
+
+def _sample_counts(records: tuple[dict[str, object], ...], manifest: Mapping[str, object]) -> dict[str, tuple[int, int]]:
+    expected = _ordered_sample_keys(manifest)
+    return {
+        solver: (
+            sum(len(keys) for (environment, name), keys in expected.items() if name == solver),
+            sum(record["solver_name"] == solver for record in records),
+        )
+        for solver in manifest["required_solvers"]
+    }
+
+
 def _require_sample_matrix(records: tuple[dict[str, object], ...], manifest: Mapping[str, object]) -> None:
-    expected: set[tuple[object, ...]] = set()
-    measured = manifest["measured_samples"]
-    warmups = manifest["warmup_samples"]
-    for environment in sorted(manifest["required_environments"]):
-        if not manifest["environments"][environment]["available"]:
-            continue
-        for solver in manifest["required_solvers"]:
-            for case_id in manifest["required_case_ids"]:
-                expected.update((environment, solver, case_id, "warmup", 1, index) for index in range(warmups))
-                expected.update((environment, solver, case_id, "warm", 1, index) for index in range(measured))
-            for case_id in manifest["throughput_probe_case_ids"]:
-                for count in manifest["worker_counts"]:
-                    expected.update((environment, solver, case_id, "throughput", count, index) for index in range(measured))
-            for kind, case_ids in (("cold", manifest["cold_probe_case_ids"]), ("rebuild", manifest["rebuild_probe_case_ids"])):
-                for case_id in case_ids:
-                    expected.update((environment, solver, case_id, kind, 1, index) for index in range(measured))
-    actual = [(record["environment"], record["solver_name"], record["case_id"], record["sample_kind"], record["worker_count"], record["sample_index"]) for record in records]
-    if len(actual) != len(set(actual)):
+    expected = _ordered_sample_keys(manifest)
+    actual_keys = [
+        (record["environment"], record["solver_name"], record["case_id"], record["sample_kind"], record["sample_index"], record["worker_count"])
+        for record in records
+    ]
+    if len(actual_keys) != len(set(actual_keys)):
         raise ValueError("duplicate structural sample")
-    missing = expected - set(actual)
-    extra = set(actual) - expected
-    if missing:
-        raise ValueError(f"missing structural sample: {sorted(missing)[0]}")
-    if extra:
-        raise ValueError(f"unexpected structural sample: {sorted(extra)[0]}")
+    if any((record["environment"], record["solver_name"]) not in expected for record in records):
+        raise ValueError("unexpected structural sample")
+    for pair, plan in expected.items():
+        pair_records = [record for record in records if (record["environment"], record["solver_name"]) == pair]
+        actual = tuple(
+            (record["environment"], record["solver_name"], record["case_id"], record["sample_kind"], record["sample_index"], record["worker_count"])
+            for record in pair_records
+        )
+        if any(_hard_elimination_record(record) for record in pair_records[:-1]):
+            raise ValueError("terminal solver failure must be the last observed record")
+        if actual == plan:
+            continue
+        if actual != plan[:len(actual)]:
+            raise ValueError("structural samples must be an ordered plan prefix")
+        if not actual or not _hard_elimination_record(pair_records[-1]):
+            raise ValueError("partial structural samples require a terminal solver failure")
 
 
 def _hard_gate_failures(
@@ -623,11 +671,17 @@ def _hard_gate_failures(
             and record["solver_run"]["termination_reason"] == TerminationReason.COMPLETED.value
             for record in records
         )
+        and not any(
+            record["environment"] == environment and record["solver_run"]["termination_reason"] in _FATAL_TERMINATIONS
+            for record in records
+        )
         for environment in manifest["required_environments"]
     ):
         failures.add("NO_COMPLETED_RUN")
     if any(record["check_hard_failure"] for record in records):
         failures.add("CHECK_HARD_FAILURE")
+    if any(record["solver_run"]["termination_reason"] in _FATAL_TERMINATIONS for record in records):
+        failures.add("FATAL_WORKER_TERMINATION")
     if any(not record["cleanup_proven"] for record in records):
         failures.add("CLEANUP_UNPROVEN")
     if any(
@@ -660,13 +714,17 @@ def _hard_gate_failures(
         failures.add("SEMANTIC_NONDETERMINISM")
     solver_evidence = manifest["solvers"][solver]
     if any(
-        not all(solver_evidence["environments"][environment][field] for field in ("install_succeeded", "run_succeeded", "reuse_succeeded"))
+        manifest["environments"][environment]["available"]
+        and not all(solver_evidence["environments"][environment][field] for field in ("install_succeeded", "run_succeeded", "reuse_succeeded"))
         for environment in manifest["required_environments"]
     ):
         failures.add("ENVIRONMENT_EVIDENCE_FAILED")
     if any(
-        not all(solver_evidence["environments"][environment][field] for field in ("open_source", "license_evidence_present", "source_evidence_present"))
-        or solver_evidence["environments"][environment]["commercial_key_required"]
+        manifest["environments"][environment]["available"]
+        and (
+            not all(solver_evidence["environments"][environment][field] for field in ("open_source", "license_evidence_present", "source_evidence_present"))
+            or solver_evidence["environments"][environment]["commercial_key_required"]
+        )
         for environment in manifest["required_environments"]
     ):
         failures.add("LICENSE_EVIDENCE_FAILED")
@@ -726,6 +784,8 @@ def _aggregate_solver_metrics(records: tuple[dict[str, object], ...], manifest: 
             continue
         for case_id in manifest["required_case_ids"]:
             cell = [record for record in records if record["solver_name"] == solver and record["environment"] == environment and record["case_id"] == case_id and record["sample_kind"] == "warm"]
+            if not cell:
+                continue
             result = {
                 "adversary_rounds": _summary(item["solver_run"]["evidence"]["adversary_rounds"] if item["solver_run"]["evidence"] is not None else 0 for item in cell),
                 "case_id": case_id,
@@ -756,6 +816,8 @@ def _aggregate_solver_metrics(records: tuple[dict[str, object], ...], manifest: 
         for case_id in manifest["throughput_probe_case_ids"]:
             for worker_count in manifest["worker_counts"]:
                 cell = [record for record in records if record["solver_name"] == solver and record["environment"] == environment and record["case_id"] == case_id and record["sample_kind"] == "throughput" and record["worker_count"] == worker_count]
+                if not cell:
+                    continue
                 throughput.append(
                     {
                         "case_id": case_id,
@@ -774,6 +836,8 @@ def _aggregate_solver_metrics(records: tuple[dict[str, object], ...], manifest: 
                 continue
             for case_id in case_ids:
                 selected = [record for record in records if record["solver_name"] == solver and record["environment"] == environment and record["case_id"] == case_id and record["sample_kind"] == kind]
+                if not selected:
+                    continue
                 cells.append({"case_id": case_id, "environment": environment, f"{kind}_ns": _summary(item["request_wall_ns"] for item in selected)})
         metrics[kind] = cells
     return metrics
@@ -1145,7 +1209,7 @@ def _json_bytes(value: object) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
 
 
-def _markdown_report(summary: Mapping[str, object]) -> str:
+def _markdown_report(summary: Mapping[str, object], sample_counts: Mapping[str, tuple[int, int]] | None = None) -> str:
     decision = summary["decision"]
     lines = [
         "# Solver benchmark report",
@@ -1161,7 +1225,11 @@ def _markdown_report(summary: Mapping[str, object]) -> str:
     ]
     for solver, evidence in sorted(summary["solvers"].items()):
         failures = ", ".join(evidence["hard_gate_failures"]) or "none"
-        lines.extend((f"### {solver}", "", f"Hard-gate failures: {failures}", "", "| metric | cell | p95 | worst |", "| --- | --- | ---: | ---: |"))
+        lines.extend((f"### {solver}", "", f"Hard-gate failures: {failures}"))
+        if sample_counts is not None:
+            planned, observed = sample_counts[solver]
+            lines.append(f"Samples: {observed} observed / {planned} planned")
+        lines.extend(("", "| metric | cell | p95 | worst |", "| --- | --- | ---: | ---: |"))
         for cell in evidence["metrics"]["warm"]:
             label = f"{cell['environment']}/{cell['case_id']}"
             for metric in ("request_wall_ns", "first_qualified_ns", "optimal_ns", "peak_aggregate_rss_bytes"):
@@ -2893,15 +2961,6 @@ def _run_full_environment(
             run, checked = _solver_run_from_outcome(case, solver, outcome, environment, artifact)
             if not outcome.cleanup_proven:
                 raise RuntimeError("CLEANUP_UNPROVEN")
-            if checked.hard_failure:
-                raise RuntimeError("CHECK_HARD_FAILURE")
-            if run.termination_reason in {
-                TerminationReason.MEMORY_LIMIT,
-                TerminationReason.CRASH,
-                TerminationReason.INVALID_OUTPUT,
-                TerminationReason.PROTOCOL_MISMATCH,
-            }:
-                raise RuntimeError(f"FATAL_WORKER_TERMINATION:{run.termination_reason.value}")
             return outcome, run, checked
 
         def record(
@@ -2954,6 +3013,8 @@ def _run_full_environment(
                         )
                     )
                     checkpoint(case.case_id, sample_kind, sample_index, peak)
+                    if _hard_elimination_record(records[-1]):
+                        break
                 elif sample_kind == "throughput":
                     harnesses = []
                     for slot in range(worker_count):
@@ -2971,21 +3032,26 @@ def _run_full_environment(
                                 ),
                                 range(worker_count),
                             )
-                        )
+                    )
                     wall_ns = time.perf_counter_ns() - started_ns
-                    fingerprints = {
-                        _semantic_fingerprint(
-                            {
-                                "solver_run": canonical_payload(run),
-                                "check_hard_failure": checked.hard_failure,
-                                "check_failure_reason": None if checked.failure_reason is None else checked.failure_reason.value,
-                            }
-                        )
-                        for _, run, checked in batch
-                    }
-                    if len(fingerprints) != 1:
-                        raise RuntimeError("SEMANTIC_NONDETERMINISM")
-                    outcome, run, checked = batch[0]
+                    terminal = next(
+                        (item for item in batch if item[2].hard_failure or item[1].termination_reason.value in _FATAL_TERMINATIONS),
+                        None,
+                    )
+                    if terminal is None:
+                        fingerprints = {
+                            _semantic_fingerprint(
+                                {
+                                    "solver_run": canonical_payload(run),
+                                    "check_hard_failure": checked.hard_failure,
+                                    "check_failure_reason": None if checked.failure_reason is None else checked.failure_reason.value,
+                                }
+                            )
+                            for _, run, checked in batch
+                        }
+                        if len(fingerprints) != 1:
+                            raise RuntimeError("SEMANTIC_NONDETERMINISM")
+                    outcome, run, checked = terminal or batch[0]
                     peaks = [item[0].peak_rss_kib * 1024 for item in batch]
                     records.append(
                         record(
@@ -2995,6 +3061,8 @@ def _run_full_environment(
                         )
                     )
                     checkpoint(case.case_id, sample_kind, sample_index, sum(peaks))
+                    if _hard_elimination_record(records[-1]):
+                        break
                 elif sample_kind == "cold":
                     with _full_harness(harness_factory, solver) as harness:
                         started_ns = time.perf_counter_ns()
@@ -3010,9 +3078,11 @@ def _run_full_environment(
                         )
                     )
                     checkpoint(case.case_id, sample_kind, sample_index, peak)
+                    if _hard_elimination_record(records[-1]):
+                        break
                 elif sample_kind == "rebuild":
                     with _full_harness(harness_factory, solver) as harness:
-                        submit(
+                        prime_outcome, prime_run, prime_checked = submit(
                             harness, case, "rebuild-prime", sample_index, worker_count, 0,
                             BenchmarkLimits(
                                 limits.soft_time_limit_ms,
@@ -3021,12 +3091,16 @@ def _run_full_environment(
                                 limits.max_constraint_generation_rounds,
                             ),
                         )
-                        started_ns = time.perf_counter_ns()
-                        outcome, run, checked = submit(
-                            harness, case, sample_kind, sample_index, worker_count, 0, limits
-                        )
-                        wall_ns = time.perf_counter_ns() - started_ns
-                    if harness.rebuild_count < 1:
+                        if prime_checked.hard_failure or prime_run.termination_reason.value in _FATAL_TERMINATIONS:
+                            outcome, run, checked = prime_outcome, prime_run, prime_checked
+                            wall_ns = 0
+                        else:
+                            started_ns = time.perf_counter_ns()
+                            outcome, run, checked = submit(
+                                harness, case, sample_kind, sample_index, worker_count, 0, limits
+                            )
+                            wall_ns = time.perf_counter_ns() - started_ns
+                    if harness.rebuild_count < 1 and not (checked.hard_failure or run.termination_reason.value in _FATAL_TERMINATIONS):
                         raise RuntimeError("WORKER_REBUILD_UNPROVEN")
                     peak = outcome.peak_rss_kib * 1024
                     records.append(
@@ -3036,6 +3110,8 @@ def _run_full_environment(
                         )
                     )
                     checkpoint(case.case_id, sample_kind, sample_index, peak)
+                    if _hard_elimination_record(records[-1]):
+                        break
                 else:
                     raise ValueError(f"unsupported full sample kind: {sample_kind}")
     return records
@@ -3257,7 +3333,12 @@ def _read_full_macos_partial(output: Path) -> tuple[dict[str, object], list[dict
             for solver in _SOLVERS
         },
     )
-    if raw_manifest != expected:
+    submitted_identity = copy.deepcopy(raw_manifest)
+    current_identity = copy.deepcopy(expected)
+    for identity in (submitted_identity, current_identity):
+        identity["environments"]["macos"].pop("git_sha")
+        identity["environments"]["macos"].pop("environment_id")
+    if submitted_identity != current_identity:
         raise ValueError("macOS partial identity does not match the current benchmark")
     try:
         summary = aggregate_benchmark_records(records, raw_manifest)
