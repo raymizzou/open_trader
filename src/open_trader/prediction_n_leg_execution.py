@@ -305,8 +305,10 @@ class RepairContext:
             raise ValueError("now must be aware")
         if not account_snapshot_is_valid(self.account_snapshot, self.now):
             raise ValueError("repair account snapshot must be canonical and fresh")
-        if not self.quotes or len({quote.client_order_id for quote in self.quotes}) != len(self.quotes):
+        if not isinstance(self.quotes, tuple) or not all(isinstance(quote, RepairQuote) for quote in self.quotes) or not self.quotes or len({quote.client_order_id for quote in self.quotes}) != len(self.quotes):
             raise ValueError("repair quotes must be complete and unique")
+        if not isinstance(self.holdings, tuple) or not all(isinstance(item, ConfirmedHolding) for item in self.holdings):
+            raise ValueError("repair holdings must be canonical")
         if any((self.now - value).total_seconds() < 0 or (self.now - value).total_seconds() > 10 for item in self.holdings for value in (item.source_timestamp, item.received_at)):
             raise ValueError("repair holdings must be fresh")
         if len({(item.venue_id, item.account_id, item.asset_id) for item in self.holdings}) != len(self.holdings):
@@ -341,7 +343,7 @@ class ReconciliationContext:
             raise ValueError("reconciliation source must be fresh")
         if any((self.now - value).total_seconds() < 0 or (self.now - value).total_seconds() > 10 for item in self.holdings for value in (item.source_timestamp, item.received_at)):
             raise ValueError("reconciliation holdings must be fresh")
-        if len({(item.venue_id, item.account_id, item.asset_id) for item in self.holdings}) != len(self.holdings):
+        if not isinstance(self.holdings, tuple) or not all(isinstance(item, ConfirmedHolding) for item in self.holdings) or len({(item.venue_id, item.account_id, item.asset_id) for item in self.holdings}) != len(self.holdings):
             raise ValueError("reconciliation holdings must be unique")
         if not isinstance(self.cash_flows, tuple) or not all(isinstance(flow, SettlementCashFlow) for flow in self.cash_flows) or len({flow.client_order_id for flow in self.cash_flows}) != len(self.cash_flows):
             raise ValueError("reconciliation cash flows must be per-order")
