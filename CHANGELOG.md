@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-14
 
+- #51 adds a one-shot, immutable N-leg executable-cost resolver. It converts only visible BUY asks from existing Polymarket/Predict book types into protected integer cost slices, sends the complete connected component through existing #50 solve/verify, retains a qualified market proof on funding failure, and emits only a non-order-ready `PARTIAL_FILL_PROOF_REQUIRED` handoff. No watcher, cache, persistence, mode, notification, Dashboard, order, or repair behavior was added. Focused resolver/N-leg/oracle/solver/verified/worker checks pass; native CP-SAT smoke is unavailable in the host venv because OR-Tools is absent.
+
 - #50 worker replay keeps legacy handshake-v1 `version` semantics and adds a strict handshake-v2 `solver_version` field for native proof evidence; old v1 workers remain version-unavailable rather than guessed. Direct solve no longer accepts worker-only request IDs. Host WorkerHarness, benchmark, and isolated CP-SAT bridge checks passed.
 
 - #50 proof replay now has only the public `solve`/`verify` seams: `verify` maps canonical semantic drift to `UNKNOWN` while strict codecs still reject it; structural model identity is separated from executable quote costs, and worker evidence retains the native solver version. Verified with host-visible WorkerHarness and isolated CP-SAT positive/negative paths; no database, network, order, or notification change.
