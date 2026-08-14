@@ -205,6 +205,33 @@ class ExecutionSolutionSource:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class RepairContext:
+    """Canonical, caller-supplied current quotes and reconciled inventory facts."""
+    reservation_version: str
+    model_fingerprint: str
+    quote_fingerprint: str
+    account_fingerprint: str
+    occurred_cost_units: int
+    occurred_fee_units: int
+    quotes: tuple[tuple[str, int, int], ...]  # client order, BUY max cost, SELL cost
+    holdings: tuple[tuple[str, int], ...]
+    fingerprint: str
+
+    def __post_init__(self) -> None:
+        for name in ("reservation_version", "model_fingerprint", "quote_fingerprint", "account_fingerprint", "fingerprint"):
+            _text(getattr(self, name), name)
+        _nonnegative(self.occurred_cost_units, "occurred_cost_units")
+        _nonnegative(self.occurred_fee_units, "occurred_fee_units")
+        if any(not isinstance(item, tuple) or len(item) != 3 or not isinstance(item[0], str) or type(item[1]) is not int or type(item[2]) is not int or item[1] < 0 or item[2] < 0 for item in self.quotes):
+            raise ValueError("invalid repair quotes")
+        if any(not isinstance(item, tuple) or len(item) != 2 or not isinstance(item[0], str) or type(item[1]) is not int or item[1] < 0 for item in self.holdings):
+            raise ValueError("invalid repair holdings")
+        expected = fingerprint({key: value for key, value in asdict(self).items() if key != "fingerprint"})
+        if self.fingerprint != expected:
+            raise ValueError("repair context fingerprint mismatch")
+
+
 class NLegExecutionService:
     """The single public behavior seam for durable no-submit N-leg execution."""
 
@@ -279,7 +306,7 @@ class NLegExecutionService:
         self,
         receipt: OrderReceipt,
         *,
-        repair_context: Mapping[str, object] | None = None,
+        repair_context: RepairContext | None = None,
     ) -> dict[str, object]:
         def reduce(batch: dict[str, object], control: dict[str, object]) -> tuple[dict[str, object], dict[str, object], bool]:
             next_batch, incident_reason, changed = self._reduce(batch, receipt)
@@ -425,7 +452,7 @@ class NLegExecutionService:
         batch: dict[str, object],
         control: dict[str, object],
         reason: str,
-        repair_context: Mapping[str, object] | None,
+        repair_context: RepairContext | None,
     ) -> tuple[dict[str, object], dict[str, object]]:
         batch["state"] = "INCIDENT"
         batch["incident"] = {"reason": reason, "repair_status": "PENDING_RECONCILIATION"}
@@ -451,56 +478,26 @@ class NLegExecutionService:
         return batch, control
 
     @staticmethod
-    def _repair_plan(batch: Mapping[str, object], context: Mapping[str, object] | None) -> dict[str, object] | None:
-        required = {"fresh", "canonical_order_books_fingerprint", "holding_snapshot_fingerprint", "reservation_version", "candidates"}
-        if (
-            not isinstance(context, Mapping)
-            or set(context) != required
-            or context.get("fresh") is not True
-            or context.get("reservation_version") != batch.get("reservation_version")
-            or not isinstance(context.get("candidates"), list)
-            or any(not isinstance(context.get(key), str) or not context[key] for key in ("canonical_order_books_fingerprint", "holding_snapshot_fingerprint"))
-        ):
+    def _repair_plan(batch: Mapping[str, object], context: RepairContext | None) -> dict[str, object] | None:
+        if not isinstance(context, RepairContext) or context.reservation_version != batch.get("reservation_version"):
             return None
         raw_legs = batch.get("legs")
         if not isinstance(raw_legs, list):
             return None
         by_client = {leg.get("client_order_id"): leg for leg in raw_legs if isinstance(leg, dict) and isinstance(leg.get("client_order_id"), str)}
-        candidates: list[dict[str, object]] = []
-        for value in context["candidates"]:
-            if not isinstance(value, Mapping) or set(value) != {"family", "conservative_total_loss_units", "legs", "additional_capital_units", "uses_expected_proceeds"} or value.get("family") not in {"COMPLETE_REMAINING", "EXIT_CONFIRMED"}:
-                continue
-            loss = value.get("conservative_total_loss_units")
-            plan_legs = value.get("legs")
-            if type(loss) is not int or loss < 0 or type(value.get("additional_capital_units")) is not int or value.get("additional_capital_units") != 0 or value.get("uses_expected_proceeds") is not False or not isinstance(plan_legs, list):
-                continue
-            requested: dict[str, int] = {}
-            valid = True
-            for item in plan_legs:
-                if not isinstance(item, Mapping) or set(item) != {"client_order_id", "quantity"} or not isinstance(item.get("client_order_id"), str) or type(item.get("quantity")) is not int or item["quantity"] <= 0 or item["client_order_id"] in requested:
-                    valid = False
-                    break
-                requested[item["client_order_id"]] = item["quantity"]
-            if not valid or not requested or not set(requested).issubset(by_client):
-                continue
-            if value["family"] == "COMPLETE_REMAINING":
-                expected = {
-                    str(client): int(leg["submitted_quantity"]) - int(leg["receipt"]["cumulative_filled_quantity"])
-                    for client, leg in by_client.items()
-                    if isinstance(leg.get("receipt"), dict) and int(leg["submitted_quantity"]) > int(leg["receipt"]["cumulative_filled_quantity"])
-                }
-                valid = requested == expected
-            else:
-                valid = all(
-                    isinstance(by_client[client].get("receipt"), dict)
-                    and quantity <= int(by_client[client]["receipt"]["cumulative_filled_quantity"])
-                    for client, quantity in requested.items()
-                )
-            if not valid:
-                continue
-            candidate = dict(value)
-            candidate["fingerprint"] = fingerprint(candidate)
-            candidates.append(candidate)
+        quotes = {client: (buy, sell) for client, buy, sell in context.quotes}
+        holds = dict(context.holdings)
+        if set(quotes) != set(by_client) or set(holds) != set(by_client): return None
+        complete = {client: int(leg["submitted_quantity"]) - int(leg["receipt"]["cumulative_filled_quantity"]) for client, leg in by_client.items() if isinstance(leg.get("receipt"), dict) and int(leg["submitted_quantity"]) > int(leg["receipt"]["cumulative_filled_quantity"])}
+        exit_ = {client: int(leg["receipt"]["cumulative_filled_quantity"]) for client, leg in by_client.items() if isinstance(leg.get("receipt"), dict) and int(leg["receipt"]["cumulative_filled_quantity"]) > 0 and holds[client] >= int(leg["receipt"]["cumulative_filled_quantity"])}
+        base = context.occurred_cost_units + context.occurred_fee_units
+        candidates = []
+        if complete:
+            cost = sum(quantity * quotes[client][0] for client, quantity in complete.items())
+            if cost <= int(batch["reservation_units"]): candidates.append({"family": "COMPLETE_REMAINING", "legs": complete, "conservative_total_loss_units": base + cost})
+        if exit_:
+            candidates.append({"family": "EXIT_CONFIRMED", "legs": exit_, "conservative_total_loss_units": base + sum(quantity * quotes[client][1] for client, quantity in exit_.items())})
+        for candidate in candidates: candidate["fingerprint"] = fingerprint({"context": context.fingerprint, "candidate": candidate})
         if not candidates:
             return None
         selected = min(candidates, key=lambda item: (int(item["conservative_total_loss_units"]), str(item["fingerprint"])))

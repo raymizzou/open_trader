@@ -11,6 +11,7 @@ from open_trader.prediction_executable_cost import ExecutionLegEvidence, Executi
 from open_trader.prediction_n_leg import ActionQuantity, fingerprint
 from open_trader.prediction_n_leg_execution import (
     ExecutionSolutionSource,
+    RepairContext,
     NLegExecutionService,
     OrderReceipt,
     PartialFillProofRecord,
@@ -110,14 +111,10 @@ def receipt(*, leg: str, filled: int, state: str, sequence: int) -> OrderReceipt
     )
 
 
-def repair_context(*, candidates: list[dict[str, object]]) -> dict[str, object]:
-    return {
-        "fresh": True,
-        "canonical_order_books_fingerprint": "books-v1",
-        "holding_snapshot_fingerprint": "holdings-v1",
-        "reservation_version": "batch-1:v1",
-        "candidates": candidates,
-    }
+def repair_context(*, candidates: list[dict[str, object]] = []) -> RepairContext:
+    values = {"reservation_version": "batch-1:v1", "model_fingerprint": "model-v1", "quote_fingerprint": "quote-v1", "account_fingerprint": "account-v1", "occurred_cost_units": 0, "occurred_fee_units": 0, "quotes": (("batch-1:action-a", 1, 2), ("batch-1:action-b", 1, 2)), "holdings": (("batch-1:action-a", 4), ("batch-1:action-b", 0))}
+    values["fingerprint"] = fingerprint(values)
+    return RepairContext(**values)
 
 
 def reconciliation_context() -> dict[str, object]:
@@ -172,7 +169,7 @@ def test_partial_fill_opens_incident_downgrades_mode_and_fixes_best_manual_plan(
     )
     plan = planned["repair_plan"]
     assert isinstance(plan, dict)
-    assert plan["family"] == "COMPLETE_REMAINING"
+    assert plan["family"] == "EXIT_CONFIRMED"
     assert plan["auto_eligible"] is False
     assert plan["reason"] == "REPAIR_PROOF_REQUIRED"
 
