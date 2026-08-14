@@ -4637,6 +4637,18 @@ def _check_trend_review(
                 f"{detail.get('excluded_candidate_count')} · 未闭环 "
                 f"{detail.get('incomplete_open_candidate_count')}",
             ))
+            eligible = detail["eligible_sample_count"]
+            if eligible:
+                displayed_rate = _trend_review_display(
+                    {"value": Decimal(str(detail["win_rate"])) * Decimal("100")},
+                    percent=True,
+                )
+                statistics_items.append(
+                    f"完整交易胜率 {displayed_rate} · "
+                    f"{detail['winning_sample_count']} 胜 / {eligible} 闭环"
+                )
+            else:
+                statistics_items.append("完整交易胜率 数据不足 · 0 闭环")
             metric_cutoff = metric_cutoffs.get(series)
             if metric_cutoff is not None:
                 statistics_items.append(f"指标截至 {_plain(metric_cutoff)}")

@@ -7480,8 +7480,8 @@ const review=(broker,brokerLabel,market,marketLabel)=>({
   available:true,broker,broker_label:brokerLabel,market,market_label:marketLabel,
   sample_counts:{discipline:31,actual:29,required:30},common_cutoff:"2026-07-17",
   sample_details:{
-    discipline:{available:true,eligible_sample_count:31,discovered_candidate_count:31,excluded_candidate_count:0,incomplete_open_candidate_count:0,exclusion_reasons:[],statistics_cutoff_at:"2026-07-17T16:00:00+08:00",reason:""},
-    actual:{available:true,eligible_sample_count:29,discovered_candidate_count:29,excluded_candidate_count:0,incomplete_open_candidate_count:0,exclusion_reasons:[],statistics_cutoff_at:"2026-07-17T16:00:00+08:00",reason:""},
+    discipline:{available:true,eligible_sample_count:31,winning_sample_count:31,win_rate:"1",discovered_candidate_count:31,excluded_candidate_count:0,incomplete_open_candidate_count:0,exclusion_reasons:[],statistics_cutoff_at:"2026-07-17T16:00:00+08:00",reason:""},
+    actual:{available:true,eligible_sample_count:29,winning_sample_count:29,win_rate:"1",discovered_candidate_count:29,excluded_candidate_count:0,incomplete_open_candidate_count:0,exclusion_reasons:[],statistics_cutoff_at:"2026-07-17T16:00:00+08:00",reason:""},
   },sample_cutoffs:{discipline:"2026-07-17T16:00:00+08:00",actual:"2026-07-17T16:00:00+08:00"},
   metric_cutoffs:{discipline:"2026-07-17",actual:"2026-07-17"},statistics_status:"completed",
   strategy_snapshot:{strategy_id:`trend/${market}/v1`,strategy_name:`${marketLabel}短线右侧趋势`,
@@ -7533,7 +7533,7 @@ for (const text of ["东方财富｜A股","A股趋势复盘","A股短线右侧�
   "纪律模拟 31 笔","实际执行 29 / 30，数据不足","共同截止日 2026-07-17",
   "策略与市场基准","期间净收益率","相对市场超额收益","最大回撤",
   "卡玛比率","夏普比率","纪律模拟","实际执行","同期市场","市场 1 年","市场 5 年",
-  "市场数据截至 2026-07-17","5 年收益 CAGR","12.6%","18.2%","观察期不足","基准自身","实际执行日终净值缺失"]) {
+  "市场数据截至 2026-07-17","5 年收益 CAGR","完整交易胜率 100% · 31 胜 / 31 闭环","完整交易胜率 100% · 29 胜 / 29 闭环","12.6%","18.2%","观察期不足","基准自身","实际执行日终净值缺失"]) {
   if (!html.includes(text)) throw new Error(text+"\n"+html);
 }
 for (const forbidden of [
@@ -7561,7 +7561,7 @@ for (const shape of ["solid-circle","hollow-circle","diamond","square","ring"]) 
 if (!html.includes('aria-label="纪律模拟，期间净收益率，12.6%')) throw new Error(html);
 const noCutoff=renderTrendReviewWorkspace({...state.dashboard.trend_reviews.eastmoney,common_cutoff:null});
 if (noCutoff.includes("共同截止日")) throw new Error(noCutoff);
-for (const forbidden of ["复盘结论","运行状态","创建回测","导出参数","缺陷入口","Connected","Backtest","Sharpe","Calmar","Alpha","Beta","Sortino","胜率","盈亏比"]) {
+for (const forbidden of ["复盘结论","运行状态","创建回测","导出参数","缺陷入口","Connected","Backtest","Sharpe","Calmar","Alpha","Beta","Sortino","盈亏比"]) {
   if (html.includes(forbidden)) throw new Error(forbidden+"\n"+html);
 }
 console.log("ok");
@@ -7574,8 +7574,8 @@ console.log("ok");
 
 def test_dashboard_trend_review_renders_independent_statistics_status() -> None:
     output = run_dashboard_js(r'''
-const detail=(eligible,discovered,excluded,open,cutoff,reasons=[])=>({
-  available:true,eligible_sample_count:eligible,discovered_candidate_count:discovered,
+const detail=(eligible,wins,winRate,discovered,excluded,open,cutoff,reasons=[])=>({
+  available:true,eligible_sample_count:eligible,winning_sample_count:wins,win_rate:winRate,discovered_candidate_count:discovered,
   excluded_candidate_count:excluded,incomplete_open_candidate_count:open,
   exclusion_reasons:reasons,statistics_cutoff_at:cutoff,reason:"",
 });
@@ -7584,8 +7584,8 @@ const review={
   statistics_status:"failed",statistics_reason:"broker unavailable",statistics_as_of_date:"2026-08-08",
   sample_counts:{discipline:4,actual:null,required:30},
   sample_details:{
-    discipline:detail(4,9,4,1,"2026-08-08T15:00:00+08:00",[{reason:"costs_incomplete",count:4}]),
-    actual:{available:false,eligible_sample_count:0,discovered_candidate_count:0,
+    discipline:detail(4,1,"0.25",9,4,1,"2026-08-08T15:00:00+08:00",[{reason:"costs_incomplete",count:4}]),
+    actual:{available:false,eligible_sample_count:0,winning_sample_count:0,win_rate:null,discovered_candidate_count:0,
       excluded_candidate_count:0,incomplete_open_candidate_count:0,exclusion_reasons:[],
       statistics_cutoff_at:"",reason:"matching_source_audit_absent"},
   },
@@ -7607,9 +7607,18 @@ const html=renderTrendReviewWorkspace(review);
 for (const text of [
   "纪律模拟 4 / 30，数据不足","实际执行 数据不可用","发现 9 · 排除 4 · 未闭环 1",
   "统计截至 2026-08-08T15:00:00+08:00","指标截至 2026-08-08",
-  "排除原因 成本不完整 4","统计来源不可用","实际执行日终净值缺失",
+  "完整交易胜率 25% · 1 胜 / 4 闭环","排除原因 成本不完整 4","统计来源不可用","实际执行日终净值缺失",
   "统计刷新失败；报告继续使用上一个有效快照",
 ]) if (!html.includes(text)) throw new Error(text+"\n"+html);
+const unavailableMeta=renderTrendReviewStatisticsMeta(review,"actual","实际执行");
+if (!unavailableMeta.includes("统计来源不可用") || unavailableMeta.includes("完整交易胜率")) throw new Error(unavailableMeta);
+const zero=renderTrendReviewWorkspace({...review,
+  sample_counts:{...review.sample_counts,actual:0},
+  sample_details:{...review.sample_details,actual:detail(0,0,null,0,0,0,"2026-08-08T15:00:00+08:00")},
+  sample_cutoffs:{...review.sample_cutoffs,actual:"2026-08-08T15:00:00+08:00"},
+  metric_cutoffs:{...review.metric_cutoffs,actual:"2026-08-08"},
+});
+if (!zero.includes("完整交易胜率 数据不足 · 0 闭环") || zero.includes("完整交易胜率 0%")) throw new Error(zero);
 if (html.includes("共同截止日")) throw new Error(html);
 if ((html.match(/class="trend-review-matrix"/g)||[]).length!==1) throw new Error(html);
 for (const value of ["7.8%","8.2%","6.1%"] ) if (!html.includes(value)) throw new Error(html);

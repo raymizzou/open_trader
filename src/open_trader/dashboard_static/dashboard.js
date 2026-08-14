@@ -4042,6 +4042,11 @@ function renderTrendReviewStatisticsMeta(review, key, label) {
   const disposition = detail?.available === true
     ? `<span>发现 ${detail.discovered_candidate_count} · 排除 ${detail.excluded_candidate_count} · 未闭环 ${detail.incomplete_open_candidate_count}</span>`
     : "<span>统计来源不可用</span>";
+  const winRate = detail?.available !== true
+    ? ""
+    : detail.eligible_sample_count > 0 && hasValue(detail.win_rate)
+      ? `<span>完整交易胜率 ${escapeHtml(trendRiskPercent(detail.win_rate))} · ${escapeHtml(formatDisplayNumber(detail.winning_sample_count))} 胜 / ${escapeHtml(formatDisplayNumber(detail.eligible_sample_count))} 闭环</span>`
+      : "<span>完整交易胜率 数据不足 · 0 闭环</span>";
   const exclusions = Array.isArray(detail?.exclusion_reasons) && detail.exclusion_reasons.length
     ? `<span>排除原因 ${detail.exclusion_reasons.map((item) => `${TREND_REASON_LABELS[item.reason] || "其他原因"} ${item.count}`).join("、")}</span>`
     : "";
@@ -4049,7 +4054,7 @@ function renderTrendReviewStatisticsMeta(review, key, label) {
     <div class="trend-entry-details">
       ${sampleCutoff ? `<span>统计截至 ${escapeHtml(formatPlain(sampleCutoff))}</span>` : ""}
       ${metricCutoff ? `<span>指标截至 ${escapeHtml(formatPlain(metricCutoff))}</span>` : ""}
-      ${disposition}${exclusions}
+      ${disposition}${winRate}${exclusions}
     </div></div>`;
 }
 

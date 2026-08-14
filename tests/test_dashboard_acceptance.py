@@ -1624,6 +1624,8 @@ def trend_reviews() -> dict[str, dict[str, object]]:
                 "discipline": {
                     "available": True,
                     "eligible_sample_count": 4,
+                    "winning_sample_count": 1,
+                    "win_rate": "0.25",
                     "discovered_candidate_count": 9,
                     "excluded_candidate_count": 4,
                     "incomplete_open_candidate_count": 1,
@@ -1634,6 +1636,8 @@ def trend_reviews() -> dict[str, dict[str, object]]:
                 "actual": {
                     "available": False,
                     "eligible_sample_count": 0,
+                    "winning_sample_count": 0,
+                    "win_rate": None,
                     "discovered_candidate_count": 0,
                     "excluded_candidate_count": 0,
                     "incomplete_open_candidate_count": 0,
@@ -2785,6 +2789,26 @@ def test_acceptance_checks_exact_trend_review_content() -> None:
     assert page.review_geometry_checks == ["tiger"]
 
 
+def test_acceptance_rejects_missing_trend_review_win_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = valid_payload()
+    review = payload["trend_reviews"]["tiger"]
+    rendered = trend_review_workspace_text("tiger", review)
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "trend_review_workspace_text",
+        lambda *_args, **_kwargs: rendered.replace(
+            "完整交易胜率 25% · 1 胜 / 4 闭环 ", ""
+        ),
+    )
+    page = tabbed_account_page(payload)
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="完整交易胜率 25% · 1 胜 / 4 闭环"):
+        dashboard_acceptance._check_trend_review(page, section, "tiger", review)
+
+
 def test_acceptance_rejects_trend_review_benchmark_drift() -> None:
     payload = valid_payload()
     page = tabbed_account_page(payload)
@@ -3142,7 +3166,8 @@ def trend_review_workspace_text(
         "返回持仓看板 纪律模拟 4 / 30，数据不足 实际执行 数据不可用 "
         f"{status_text} "
         "统计截至 2026-08-08T15:00:00+08:00 指标截至 2026-08-08 "
-        "发现 9 · 排除 4 · 未闭环 1 排除原因 成本不完整 4 统计来源不可用 "
+        "发现 9 · 排除 4 · 未闭环 1 完整交易胜率 25% · 1 胜 / 4 闭环 "
+        "排除原因 成本不完整 4 统计来源不可用 "
         f"策略与市场基准 {refresh_cutoff} {refresh_status} 快照更新 2026-07-18T08:00:00+08:00 "
         "5 年收益 CAGR 期间净收益率 相对市场超额收益 最大回撤 卡玛比率 夏普比率 "
         "纪律模拟 实际执行 同期市场 市场 1 年 市场 5 年 基准自身 实际执行日终净值缺失"
