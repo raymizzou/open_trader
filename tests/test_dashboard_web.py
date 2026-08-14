@@ -7650,6 +7650,12 @@ console.log("ok");
     assert ".trend-review-win-rate.unavailable strong" in css
     assert "@media (max-width: 840px)" in css
     assert ".trend-review-column-groups-values" in css
+    unavailable = css.split(".trend-review-win-rate.unavailable strong", 1)[1].split("}", 1)[0]
+    responsive = css.split("@media (max-width: 840px) {", 1)[1].split(
+        "@media (max-width: 760px) {", 1
+    )[0]
+    assert "font-size: 20px;" in unavailable
+    assert ".trend-review-series strong { font-size: 18px; text-align: right; }" in responsive
 
 
 def test_dashboard_renders_action_first_trend_report_for_every_market() -> None:

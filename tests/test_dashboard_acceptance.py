@@ -2954,6 +2954,29 @@ def test_acceptance_rejects_trend_review_panel_style_drift() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("viewport", "attribute", "value", "message"),
+    (
+        (None, "review_unavailable_win_rate_font_size", "14px", "不可用胜率"),
+        ({"width": 375, "height": 844}, "review_metric_value_font_size", "23px", "指标值"),
+    ),
+)
+def test_acceptance_rejects_trend_review_typography_drift(
+    viewport: dict[str, int] | None, attribute: str, value: str, message: str,
+) -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    if viewport is not None:
+        page.viewport_size = viewport
+    setattr(page, attribute, value)
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match=message):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
 def test_acceptance_rejects_trend_review_label_style_drift() -> None:
     payload = valid_payload()
     page = tabbed_account_page(payload)
@@ -3107,6 +3130,19 @@ def test_acceptance_rejects_375_trend_review_first_market_cell_not_full_width() 
     section = dashboard_acceptance._select_account_tab(page, "tiger")
 
     with pytest.raises(AssertionError, match="市场基准逐行"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_rejects_375_trend_review_strategy_two_four_split() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.viewport_size = {"width": 375, "height": 844}
+    page.review_geometry_override = {"mobileStrategySplit": "2/4"}
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="策略表现未等分"):
         dashboard_acceptance._check_trend_review(
             page, section, "tiger", payload["trend_reviews"]["tiger"]
         )
@@ -4551,6 +4587,8 @@ class TabbedAccountPage:
         self.review_header_span_border_width = "0px"
         self.review_text_contrast = 12.0
         self.review_marker_contrasts = [4.0] * 25
+        self.review_unavailable_win_rate_font_size = "20px"
+        self.review_metric_value_font_size: str | None = None
         self.review_header_left_texts: list[str] | None = None
         self.review_header_side_texts: list[str] | None = None
         self.review_statistics_texts = {
@@ -4641,7 +4679,9 @@ class TabbedAccountPage:
                 '.trend-review-header-side button',
                 "backgroundColor", "borderColor", "borderWidth", "color",
                 "borderRadius", "boxShadow", "backgroundImage",
-                "textContrast", "markerContrasts",
+                "textContrast", "markerContrasts", "cloneNode", "classList.add",
+                "unavailableWinRateFontSize", "metricValueFontSize", "fontSize",
+                ".trend-review-win-rate", ".trend-review-series strong",
             )
             missing = [fragment for fragment in required if fragment not in expression]
             assert not missing, f"trend review style fake 缺少真实表达式：{missing}"
@@ -4711,6 +4751,10 @@ class TabbedAccountPage:
                 "markers": [panel] * 25,
                 "textContrast": self.review_text_contrast,
                 "markerContrasts": self.review_marker_contrasts,
+                "unavailableWinRateFontSize": self.review_unavailable_win_rate_font_size,
+                "metricValueFontSize": self.review_metric_value_font_size or (
+                    "18px" if self.viewport_size["width"] <= 840 else "23px"
+                ),
             }
         if "trend-review-geometry-contract" in expression:
             required = (
@@ -4766,6 +4810,37 @@ class TabbedAccountPage:
                 ),
                 "columnGap": "12px",
             }
+            strategy_series = (
+                ((28, 100), (128, 220))
+                if self.review_geometry_override.get("mobileStrategySplit") == "2/4"
+                else ((28, 160), (188, 160))
+            )
+
+            def review_series(index: int) -> dict[str, int]:
+                if not narrow:
+                    return {
+                        "x": 188 + index * 260,
+                        "y": 580,
+                        "width": 250,
+                        "height": 36,
+                    }
+                if index < 2:
+                    x, width = strategy_series[index]
+                    return {"x": x, "y": 580, "width": width, "height": 36}
+                full_width = (
+                    self.review_geometry_override.get("mobileMarketFullWidth") is not False
+                    and not (
+                        index == 2
+                        and self.review_geometry_override.get("mobileFirstMarketFullWidth") is False
+                    )
+                )
+                return {
+                    "x": 28,
+                    "y": 622 + (index - 2) * 42,
+                    "width": panel_width - 28 if full_width else 160,
+                    "height": 36,
+                }
+
             text_counts = (
                 (".trend-review-header > div:first-child > *", 3),
                 (".trend-review-header-side > *", 4),
@@ -4832,22 +4907,7 @@ class TabbedAccountPage:
                     {"x": 28, "y": 580 + index * 180, "width": panel_width - 28, "height": 130}
                     for index in range(5)
                 ],
-                "firstSeries": [
-                    {
-                        "x": 28 if narrow else 188 + index * 260,
-                        "y": (
-                            580 if index < 2 else 622 + (index - 2) * 42
-                        ) if narrow else 580,
-                        "width": (
-                            panel_width - 28 if index >= 2
-                            and self.review_geometry_override.get("mobileMarketFullWidth") is not False
-                            and not (index == 2 and self.review_geometry_override.get("mobileFirstMarketFullWidth") is False)
-                            else 160
-                        ) if narrow else 250,
-                        "height": 36,
-                    }
-                    for index in range(5)
-                ],
+                "firstSeries": [review_series(index) for index in range(5)],
                 "textGroups": text_groups,
             }
         assert expression == "document.documentElement.scrollWidth <= window.innerWidth"

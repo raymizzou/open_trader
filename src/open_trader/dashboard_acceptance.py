@@ -4133,6 +4133,14 @@ def _check_trend_review_visual_contract(page: Any, broker: str) -> None:
         const headerSpans = [...workspace.querySelectorAll(
           ".trend-review-header-side > span"
         )];
+        const unavailableProbe = workspace.querySelector(".trend-review-win-rate").cloneNode(true);
+        unavailableProbe.classList.add("unavailable");
+        unavailableProbe.hidden = true;
+        workspace.appendChild(unavailableProbe);
+        const unavailableWinRateFontSize = getComputedStyle(
+          unavailableProbe.querySelector("strong")
+        ).fontSize;
+        unavailableProbe.remove();
         return {
           tokens, workspace: read(workspace), matrices: matrices.map(read),
           side: read(workspace.querySelector(".trend-review-header-side")),
@@ -4142,6 +4150,10 @@ def _check_trend_review_visual_contract(page: Any, broker: str) -> None:
           markers: markers.map(read),
           textContrast: contrast(tokens.text, tokens.surfaceSoft),
           markerContrasts: markers.map(element => contrast(getComputedStyle(element).borderColor, tokens.surfaceSoft)),
+          unavailableWinRateFontSize,
+          metricValueFontSize: getComputedStyle(
+            workspace.querySelector(".trend-review-series strong")
+          ).fontSize,
         };
         }"""
     )
@@ -4237,6 +4249,14 @@ def _check_trend_review_visual_contract(page: Any, broker: str) -> None:
     assert isinstance(marker_contrasts, list) and len(marker_contrasts) == 25 and all(
         float(value) >= 3 for value in marker_contrasts
     ), f"{broker} 趋势复盘图形标记对比度低于 3:1"
+    assert styles.get("unavailableWinRateFontSize") == "20px", (
+        f"{broker} 趋势复盘不可用胜率主状态字号错误"
+    )
+    width = (getattr(page, "viewport_size", None) or {}).get("width", 0)
+    expected_metric_value_font_size = "18px" if width <= 840 else "23px"
+    assert styles.get("metricValueFontSize") == expected_metric_value_font_size, (
+        f"{broker} 趋势复盘 {width}px 指标值字号错误"
+    )
 
 
 def _check_trend_review_geometry(page: Any, broker: str) -> None:
@@ -4374,9 +4394,23 @@ def _check_trend_review_geometry(page: Any, broker: str) -> None:
     assert win_rates[1]["y"] >= win_rates[0]["y"] + win_rates[0]["height"] - 1, (
         f"{broker} 趋势复盘 375px 完整交易胜率未纵向排列"
     )
-    assert abs(first_series[0]["y"] - first_series[1]["y"]) <= 1, (
+    discipline_series, actual_series = first_series[:2]
+    assert abs(discipline_series["y"] - actual_series["y"]) <= 1, (
         f"{broker} 趋势复盘 375px 策略表现未同列显示"
     )
+    assert abs(discipline_series["width"] - actual_series["width"]) <= 1, (
+        f"{broker} 趋势复盘 375px 策略表现未等分"
+    )
+    strategy_gap = actual_series["x"] - discipline_series["x"] - discipline_series["width"]
+    assert strategy_gap >= -1, f"{broker} 趋势复盘 375px 策略表现重叠"
+    assert strategy_gap <= 16, f"{broker} 趋势复盘 375px 策略表现不相邻"
+    assert (
+        abs(discipline_series["x"] - value_lists[0]["x"]) <= 1
+        and abs(
+            actual_series["x"] + actual_series["width"]
+            - value_lists[0]["x"] - value_lists[0]["width"]
+        ) <= 1
+    ), f"{broker} 趋势复盘 375px 策略表现未与数值列对齐"
     market_cells = first_series[2:]
     assert all(
         cell["width"] >= value_lists[0]["width"] - 1
