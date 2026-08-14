@@ -44,6 +44,7 @@ from open_trader.prediction_n_leg import (
     TerminalStateSet,
 )
 from open_trader.prediction_solver import BenchmarkLimits, ObjectiveBounds, SolverEvidence
+from test_prediction_solver import BruteForceBackend
 from open_trader.prediction_solver_verified import (
     CANDIDATE_EVIDENCE_SCHEMA_V1,
     CandidateEvidence,
@@ -73,7 +74,7 @@ def component(book_kind: str = "polymarket") -> VerifiedComponent:
         ConstraintModel((), ()),
         (QualificationConstraint("profit", "rules-v1", QualificationMetric.GUARANTEED_PROFIT_UNITS, Comparison.GREATER_THAN_OR_EQUAL, 1, 1),),
     )
-    return VerifiedComponent(problem, component_fingerprint(problem, (binding(book_kind),)), 100, (binding(book_kind),))
+    return VerifiedComponent(problem, component_fingerprint(problem, (binding(book_kind),), 100), 100, (binding(book_kind),))
 
 
 def binding(book_kind: str = "polymarket") -> BookBinding:
@@ -88,7 +89,7 @@ def two_leg_component() -> VerifiedComponent:
     )) for state in base.terminal_state_sets)
     problem = replace(base, actions=(base.actions[0], action_b), terminal_state_sets=states)
     return VerifiedComponent(
-        problem, component_fingerprint(problem, (binding(), BookBinding("action-b", "venue-b", "action-b", "polymarket", "fee-v1", 100_000, 1, 100_000, 100))), 100,
+        problem, component_fingerprint(problem, (binding(), BookBinding("action-b", "venue-b", "action-b", "polymarket", "fee-v1", 100_000, 1, 100_000, 100)), 100), 100,
         (binding(), BookBinding("action-b", "venue-b", "action-b", "polymarket", "fee-v1", 100_000, 1, 100_000, 100)),
     )
 
@@ -155,6 +156,16 @@ def test_component_owned_book_policy_rejects_self_authorized_cost_or_kind(monkey
         assert resolve_component(component(), (book,), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF).status is ResolutionStatus.UNKNOWN
 
 
+def test_malformed_book_ask_containers_fail_closed_before_iteration(monkeypatch) -> None:
+    qualified_solver(monkeypatch)
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
+    threshold = replace(executable_book(), book=ThresholdOrderBook("action-a", [], (), AS_OF))
+    predict = ImmutableBook("action-a", "action-a", PredictBook("action-a", [], (), AS_OF, AS_OF), 100_000, 1, 100_000, 100, "venue-a", "fee-v1")
+
+    assert resolve_component(component(), (threshold,), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF).status is ResolutionStatus.UNKNOWN
+    assert resolve_component(component("predict.fun"), (predict,), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF).status is ResolutionStatus.UNKNOWN
+
+
 def test_predict_receipt_refresh_reuses_identical_economic_market_solution(monkeypatch) -> None:
     captured = qualified_solver(monkeypatch)
     account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
@@ -178,6 +189,36 @@ def test_prior_market_solution_re_solves_when_visible_depth_changes(monkeypatch)
     refreshed = resolve_component(component(), (changed,), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF, prior_market_solution=first.market_solution)
 
     assert refreshed.status is ResolutionStatus.EXECUTION_SOLUTION
+    assert captured["calls"] == 2
+
+
+@pytest.mark.parametrize("change", ("fee", "tick", "haircut", "native", "rule", "usd"))
+def test_prior_component_policy_changes_are_cache_misses(monkeypatch, change) -> None:
+    captured = qualified_solver(monkeypatch)
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 10_000, 10_000),), 10_000, 0, 10_000)
+    first = resolve_component(component(), (executable_book(),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
+    new_binding = binding()
+    new_book = executable_book()
+    usd = 100
+    if change == "fee":
+        new_binding, new_book = replace(new_binding, fee_ppm=50_000), replace(new_book, fee_ppm=50_000)
+    elif change == "tick":
+        new_binding, new_book = replace(new_binding, tick_units=2), replace(new_book, tick_units=2)
+    elif change == "haircut":
+        new_binding, new_book = replace(new_binding, haircut_ppm=50_000), replace(new_book, haircut_ppm=50_000)
+    elif change == "native":
+        new_binding = replace(new_binding, native_id="native-b")
+        new_book = replace(new_book, native_id="native-b", book=ThresholdOrderBook("native-b", new_book.book.asks, (), AS_OF))
+    elif change == "rule":
+        new_binding, new_book = replace(new_binding, fee_rule_id="fee-v2"), replace(new_book, fee_rule_id="fee-v2")
+    else:
+        usd = 200
+    problem = component().problem
+    changed_component = VerifiedComponent(problem, component_fingerprint(problem, (new_binding,), usd), usd, (new_binding,))
+
+    refreshed = resolve_component(changed_component, (new_book,), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF, prior_market_solution=first.market_solution)
+
+    assert refreshed.failure_reason != "PRIOR_MARKET_SOLUTION_INVALID"
     assert captured["calls"] == 2
 
 
@@ -231,7 +272,7 @@ def test_visible_multilevel_asks_floor_lots_and_ceil_protected_cost(monkeypatch)
         cost_slices=(ExecutableCostSlice(1, 3, 1),),
     )
     component_with_minimum = VerifiedComponent(
-        replace(original, actions=(action,)), component_fingerprint(replace(original, actions=(action,)), (binding(),)), 100, (binding(),),
+        replace(original, actions=(action,)), component_fingerprint(replace(original, actions=(action,)), (binding(),), 100), 100, (binding(),),
     )
     book = ImmutableBook(
         "action-a", "action-a",
@@ -298,6 +339,18 @@ def test_qualified_fixed_market_plan_becomes_non_order_ready_execution_solution(
     assert result.execution_solution.execution_legs[0].side == "BUY_YES"
     assert result.execution_solution.execution_legs[0].max_cost_units == 51
     assert result.execution_solution.execution_legs[0].source_fingerprint.startswith("sha256:")
+
+
+def test_public_resolver_runs_real_solve_and_verify_with_bruteforce_backend() -> None:
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
+
+    result = resolve_component(
+        component(), (executable_book(),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(4, 4, 4),
+        now=AS_OF, solver_backend=BruteForceBackend(),
+    )
+
+    assert result.status is ResolutionStatus.EXECUTION_SOLUTION
+    assert result.market_solution.verification_result.status.value == "QUALIFIED_VERIFIED"
 
 
 def test_insufficient_fixed_funding_retains_market_solution_without_second_solve(monkeypatch) -> None:

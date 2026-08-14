@@ -26,7 +26,7 @@ from open_trader.prediction_n_leg import (
     problem_from_payload,
 )
 from open_trader.prediction_n_leg_oracle import build_relation_components, cost_upper_bound
-from open_trader.prediction_solver import BenchmarkLimits
+from open_trader.prediction_solver import BenchmarkLimits, SolverBackend
 from open_trader.prediction_solver_verified import (
     PROOF_REQUEST_SCHEMA_V1,
     CandidateEvidence,
@@ -74,14 +74,16 @@ class VerifiedComponent:
     def __post_init__(self) -> None:
         if not isinstance(self.problem, ArbitrageProblem):
             raise ValueError("component problem must be canonical")
-        if self.relation_fingerprint != component_fingerprint(self.problem, self.book_bindings):
-            raise ValueError("component relation fingerprint mismatch")
         if type(self.usd_units_per_dollar) is not int or self.usd_units_per_dollar <= 0:
             raise ValueError("usd units per dollar must be positive")
+        if self.relation_fingerprint != component_fingerprint(self.problem, self.book_bindings, self.usd_units_per_dollar):
+            raise ValueError("component relation fingerprint mismatch")
         if not isinstance(self.book_bindings, tuple) or {
             binding.action_id for binding in self.book_bindings if isinstance(binding, BookBinding)
         } != {action.action_id for action in self.problem.actions} or len(self.book_bindings) != len(self.problem.actions):
             raise ValueError("component must bind every action to verified book policy")
+        if tuple(binding.action_id for binding in self.book_bindings) != tuple(sorted(binding.action_id for binding in self.book_bindings)):
+            raise ValueError("component bindings must be sorted by action ID")
         components = build_relation_components(self.problem)
         if len(components) != 1 or set(components[0].action_ids) != {action.action_id for action in self.problem.actions}:
             raise ValueError("component must contain exactly one connected support")
@@ -112,11 +114,12 @@ class BookBinding:
             raise ValueError("invalid verified book binding")
 
 
-def component_fingerprint(problem: ArbitrageProblem, bindings: tuple[BookBinding, ...]) -> str:
+def component_fingerprint(problem: ArbitrageProblem, bindings: tuple[BookBinding, ...], usd_units_per_dollar: int) -> str:
     """Stable component identity includes relation and trusted execution policy, never receipt time."""
     return fingerprint({
         "problem": canonical_payload(replace(problem, as_of=_SEMANTIC_AS_OF)),
         "book_bindings": bindings,
+        "usd_units_per_dollar": usd_units_per_dollar,
     })
 
 
@@ -248,6 +251,7 @@ def resolve_component(
     *,
     now: datetime,
     prior_market_solution: MarketSolution | None = None,
+    solver_backend: SolverBackend | None = None,
 ) -> ResolutionResult:
     """Resolve one fixed component; funding never changes the chosen portfolio."""
     try:
@@ -260,10 +264,13 @@ def resolve_component(
         return ResolutionResult(ResolutionStatus.NO_QUALIFIED_OPPORTUNITY, "INSUFFICIENT_VISIBLE_DEPTH")
     if prior_market_solution is not None:
         try:
-            prior = market_solution_from_payload(canonical_payload(prior_market_solution), component=component, books=books, now=now, require_current_source=False)
-        except ValueError:
-            return ResolutionResult(ResolutionStatus.UNKNOWN, "PRIOR_MARKET_SOLUTION_INVALID")
-        if (
+            prior = market_solution_from_payload(canonical_payload(prior_market_solution), component=component, books=books, now=now)
+        except ValueError as exc:
+            if str(exc) == "market solution source mismatch":
+                prior = None
+            else:
+                return ResolutionResult(ResolutionStatus.UNKNOWN, "PRIOR_MARKET_SOLUTION_INVALID")
+        if prior is not None and (
             prior.relation_fingerprint == component.relation_fingerprint
             and prior.economic_quote_fingerprint == economic_quote
             and prior.quotes == quotes
@@ -280,7 +287,7 @@ def resolve_component(
         "issue-51",
     )
     try:
-        evidence = candidate_evidence_from_payload(solve(canonical_payload(proof_input)))
+        evidence = candidate_evidence_from_payload(solve(canonical_payload(proof_input), backend=solver_backend))
         verification = verification_result_from_payload(verify(canonical_payload(evidence)), source=evidence)
     except (ValueError, TypeError):
         return ResolutionResult(ResolutionStatus.UNKNOWN, "SOLVER_OR_VERIFIER_UNKNOWN")
@@ -358,7 +365,7 @@ def _normalize_quote(action: CandidateAction, source: ImmutableBook, binding: Bo
     if any(type(value) is not int or value < 0 for value in (source.fee_ppm, source.haircut_ppm)) or type(source.tick_units) is not int or source.tick_units <= 0 or type(source.price_units_per_quote_unit) is not int or source.price_units_per_quote_unit <= 0:
         raise ValueError("missing cost facts")
     timestamps, asks, actual_id = _book_asks(source.book, action)
-    if source.native_id != actual_id or any(
+    if not isinstance(asks, tuple) or source.native_id != actual_id or any(
         not _utc(timestamp)
         or (now - timestamp).total_seconds() < 0
         or (now - timestamp).total_seconds() > BOOK_FRESHNESS_SECONDS
@@ -482,7 +489,7 @@ def _market_solution(
 
 
 def market_solution_from_payload(
-    payload: object, *, component: VerifiedComponent, books: tuple[ImmutableBook, ...], now: datetime, require_current_source: bool = True,
+    payload: object, *, component: VerifiedComponent, books: tuple[ImmutableBook, ...], now: datetime,
 ) -> MarketSolution:
     """Decode a MarketSolution only when every retained binding recomputes."""
     value = _exact_object(payload, {
@@ -526,7 +533,6 @@ def market_solution_from_payload(
     })
     if (
         solution.fingerprint != expected
-        or solution.relation_fingerprint != component.relation_fingerprint
         or solution.verification_result.status != VerificationStatus.QUALIFIED_VERIFIED
         or solution.verification_result.solution is None
         or solution.candidate_evidence.proof_input.request.problem != solution.problem
@@ -542,8 +548,6 @@ def market_solution_from_payload(
         or not _valid_execution_legs(solution.problem, solution.quantities, solution.quotes, solution.execution_legs)
     ):
         raise ValueError("market solution fingerprint mismatch")
-    if not require_current_source:
-        return solution
     try:
         current_problem, current_economic, current_quotes = _problem_with_visible_asks(component, books, now)
     except (InvalidOperation, ValueError) as exc:
