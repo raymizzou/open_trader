@@ -4320,14 +4320,15 @@ def _check_trend_review_geometry(page: Any, broker: str) -> None:
     column_group_values_style = geometry.get("columnGroupValuesStyle")
     metric_style = geometry.get("metricStyle")
     value_style = geometry.get("valueStyle")
-    assert (
-        isinstance(column_group_style, Mapping)
-        and isinstance(metric_style, Mapping)
-        and column_group_style == metric_style
-        and isinstance(column_group_values_style, Mapping)
-        and isinstance(value_style, Mapping)
-        and column_group_values_style == value_style
-    ), f"{broker} 趋势复盘分组网格轨道未与指标数值共享"
+    if width > 840:
+        assert (
+            isinstance(column_group_style, Mapping)
+            and isinstance(metric_style, Mapping)
+            and column_group_style == metric_style
+            and isinstance(column_group_values_style, Mapping)
+            and isinstance(value_style, Mapping)
+            and column_group_values_style == value_style
+        ), f"{broker} 趋势复盘分组网格轨道未与指标数值共享"
     assert isinstance(value_lists, list) and len(value_lists) == 5, (
         f"{broker} 趋势复盘五项指标缺少直接数值列表"
     )

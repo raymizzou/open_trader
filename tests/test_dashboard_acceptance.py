@@ -3047,6 +3047,20 @@ def test_acceptance_rejects_375_trend_review_overflow() -> None:
         )
 
 
+def test_acceptance_checks_375_trend_review_with_responsive_grid_tracks() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.viewport_size = {"width": 375, "height": 844}
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    dashboard_acceptance._check_trend_review(
+        page, section, "tiger", payload["trend_reviews"]["tiger"]
+    )
+
+    assert page.review_geometry_checks == ["tiger"]
+    assert page.document_overflow_checks == ["tiger"]
+
+
 def test_acceptance_rejects_800_trend_review_overflow() -> None:
     payload = valid_payload()
     page = tabbed_account_page(payload)
@@ -4725,8 +4739,33 @@ class TabbedAccountPage:
             missing = [fragment for fragment in required if fragment not in expression]
             assert not missing, f"trend review geometry fake 缺少真实表达式：{missing}"
             self.review_geometry_checks.append(self.trend_broker)
-            narrow = self.viewport_size["width"] <= 841
-            panel_width = self.viewport_size["width"] - 28 if narrow else 1360
+            narrow = self.viewport_size["width"] <= 840
+            panel_width = min(self.viewport_size["width"] - 28, 1360)
+            column_group_style = (
+                {"gridTemplateColumns": "none", "columnGap": "8px"}
+                if narrow
+                else {"gridTemplateColumns": "188px 1242px", "columnGap": "8px"}
+            )
+            metric_style = {
+                "gridTemplateColumns": (
+                    "347px"
+                    if narrow
+                    else (
+                        "188px 1242px"
+                        if self.review_geometry_override.get("desktopGroupGridTrackDrift") is not True
+                        else "190px 1240px"
+                    )
+                ),
+                "columnGap": "8px",
+            }
+            value_style = {
+                "gridTemplateColumns": (
+                    "52px 52px 52px 52px 52px 52px"
+                    if narrow
+                    else "250px 250px 250px 250px 250px"
+                ),
+                "columnGap": "12px",
+            }
             text_counts = (
                 (".trend-review-header > div:first-child > *", 3),
                 (".trend-review-header-side > *", 4),
@@ -4782,21 +4821,13 @@ class TabbedAccountPage:
                         },
                     ],
                 ],
-                "columnGroupStyle": {
-                    "gridTemplateColumns": "188px 1242px", "columnGap": "8px",
-                },
+                "columnGroupStyle": column_group_style,
                 "columnGroupValuesStyle": {
-                    "gridTemplateColumns": "250px 250px 250px 250px 250px", "columnGap": "12px",
+                    "gridTemplateColumns": "250px 250px 250px 250px 250px",
+                    "columnGap": "12px",
                 },
-                "metricStyle": {
-                    "gridTemplateColumns": (
-                        "188px 1242px" if self.review_geometry_override.get("desktopGroupGridTrackDrift") is not True
-                        else "190px 1240px"
-                    ), "columnGap": "8px",
-                },
-                "valueStyle": {
-                    "gridTemplateColumns": "250px 250px 250px 250px 250px", "columnGap": "12px",
-                },
+                "metricStyle": metric_style,
+                "valueStyle": value_style,
                 "valueLists": [
                     {"x": 28, "y": 580 + index * 180, "width": panel_width - 28, "height": 130}
                     for index in range(5)
