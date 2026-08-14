@@ -8,7 +8,7 @@ import socket
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Context, Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -519,6 +519,8 @@ def _valid_trend_review_sample_detail(value: object) -> bool:
     if not isinstance(value, dict) or set(value) != {
         "available",
         "eligible_sample_count",
+        "winning_sample_count",
+        "win_rate",
         "discovered_candidate_count",
         "excluded_candidate_count",
         "incomplete_open_candidate_count",
@@ -536,6 +538,9 @@ def _valid_trend_review_sample_detail(value: object) -> bool:
             "incomplete_open_candidate_count",
         )
     ]
+    eligible = value["eligible_sample_count"]
+    wins = value["winning_sample_count"]
+    raw_rate = value["win_rate"]
     reasons = value["exclusion_reasons"]
     if (
         not isinstance(value["available"], bool)
@@ -555,9 +560,30 @@ def _valid_trend_review_sample_detail(value: object) -> bool:
         or not isinstance(value["reason"], str)
     ):
         return False
+    if type(wins) is not int or wins < 0 or wins > eligible:
+        return False
+    if raw_rate is not None and (
+        not isinstance(raw_rate, str) or not raw_rate.strip()
+    ):
+        return False
+    try:
+        rate = None if raw_rate is None else Decimal(raw_rate)
+        if rate is not None and not rate.is_finite():
+            return False
+        with localcontext(Context(prec=28)):
+            expected_rate = Decimal(wins) / Decimal(eligible) if eligible else None
+    except (InvalidOperation, TypeError, ValueError, ZeroDivisionError):
+        return False
+    if rate != expected_rate:
+        return False
     if value["available"]:
         return _valid_aware_datetime(value["statistics_cutoff_at"]) and not value["reason"]
-    return not value["statistics_cutoff_at"] and bool(value["reason"].strip())
+    return (
+        not value["statistics_cutoff_at"]
+        and bool(value["reason"].strip())
+        and wins == 0
+        and rate is None
+    )
 
 
 def _valid_trend_review_benchmark_metadata(
@@ -673,7 +699,7 @@ def _valid_trend_review_projection(
             "metric_cutoffs", "common_cutoff", "interval", "metrics",
             "benchmark_context", "benchmark_refresh",
         }
-        or schema_version != "open_trader.trend_review.projection.v4"
+        or schema_version != "open_trader.trend_review.projection.v5"
         or payload.get("available") is not True
         or payload.get("broker") != broker
         or payload.get("market") != market

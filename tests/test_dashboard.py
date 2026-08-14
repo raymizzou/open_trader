@@ -1211,11 +1211,13 @@ def trend_review_projection_v3(market: str, broker: str) -> dict[str, object]:
     payload = trend_review_projection_v2(market, broker)
     for key in ("batch", "batch_path", "source_path", "source_artifacts"):
         payload.pop(key)
-    payload["schema_version"] = "open_trader.trend_review.projection.v4"
+    payload["schema_version"] = "open_trader.trend_review.projection.v5"
     payload["sample_details"] = {
         key: {
             "available": True,
             "eligible_sample_count": payload["sample_counts"][key],  # type: ignore[index]
+            "winning_sample_count": payload["sample_counts"][key],  # type: ignore[index]
+            "win_rate": "1" if payload["sample_counts"][key] else None,  # type: ignore[index]
             "discovered_candidate_count": payload["sample_counts"][key],  # type: ignore[index]
             "excluded_candidate_count": 0,
             "incomplete_open_candidate_count": 0,
@@ -1527,7 +1529,7 @@ def test_dashboard_rejects_incomplete_snapshot_without_common_cutoff(
     assert review["available"] is False
 
 
-def test_dashboard_accepts_strict_v4_trend_review_projection(tmp_path: Path) -> None:
+def test_dashboard_accepts_strict_v5_trend_review_projection(tmp_path: Path) -> None:
     path = tmp_path / "data/latest/trend_review_us.json"
     path.parent.mkdir(parents=True)
     path.write_text(
@@ -1595,6 +1597,12 @@ def test_dashboard_accepts_failed_benchmark_refresh_with_prior_snapshot_metadata
     ("mutation", "broker"),
     [
         (lambda payload: payload.update(schema_version="v1"), "tiger"),
+        (
+            lambda payload: payload.update(
+                schema_version="open_trader.trend_review.projection.v4"
+            ),
+            "tiger",
+        ),
         (lambda payload: payload.update(market="HK"), "tiger"),
         (lambda payload: payload["metrics"].pop("sharpe"), "tiger"),
         (
@@ -1621,6 +1629,24 @@ def test_dashboard_accepts_failed_benchmark_refresh_with_prior_snapshot_metadata
         ),
         (
             lambda payload: payload["sample_counts"].update(internal=1),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["sample_details"]["discipline"].update(
+                winning_sample_count=32
+            ),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["sample_details"]["discipline"].update(
+                win_rate="0.5"
+            ),
+            "tiger",
+        ),
+        (
+            lambda payload: payload["sample_details"]["discipline"].pop(
+                "win_rate"
+            ),
             "tiger",
         ),
         (lambda payload: payload.update(common_cutoff="2026/07/17"), "tiger"),

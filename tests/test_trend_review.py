@@ -7724,7 +7724,7 @@ def test_long_term_benchmark_rejects_unordered_or_short_history(tmp_path: Path) 
     assert state["process_git_sha"] == "invalid"
 
 
-def test_projection_keeps_newer_current_benchmark_facts_alongside_snapshot(
+def test_projection_schema_v5_keeps_newer_current_benchmark_facts_alongside_snapshot(
     tmp_path: Path,
 ) -> None:
     write_rates(tmp_path)
@@ -7754,7 +7754,7 @@ def test_projection_keeps_newer_current_benchmark_facts_alongside_snapshot(
 
     projection = trend_review.build_trend_review_projection(tmp_path, "US")
 
-    assert projection["schema_version"] == "open_trader.trend_review.projection.v4"
+    assert projection["schema_version"] == "open_trader.trend_review.projection.v5"
     assert projection["metrics"]["period_net_return"]["same_period_benchmark"]["value"] == "10.0"
 
 
@@ -7802,7 +7802,7 @@ def test_legacy_benchmark_facts_are_readable_but_cannot_drive_new_metrics(
 
     projection = trend_review.build_trend_review_projection(tmp_path, market)
 
-    assert projection["schema_version"] == "open_trader.trend_review.projection.v4"
+    assert projection["schema_version"] == "open_trader.trend_review.projection.v5"
     assert projection["metrics"]["period_net_return"]["same_period_benchmark"] == {
         "value": None,
         "reason": "长期市场基准缺失",
@@ -10418,6 +10418,10 @@ def test_review_keeps_simulation_count_when_actual_equity_is_missing(
         "required": 30,
     }
     assert result["sample_details"]["discipline"]["eligible_sample_count"] == 4
+    assert result["sample_details"]["discipline"]["winning_sample_count"] == 4
+    assert result["sample_details"]["discipline"]["win_rate"] == "1"
+    assert result["sample_details"]["actual"]["winning_sample_count"] == 1
+    assert result["sample_details"]["actual"]["win_rate"] == "1"
     assert result["metrics"]["period_net_return"]["discipline"]["value"] is not None
     assert result["metrics"]["period_net_return"]["actual"]["value"] is None
     assert result["metrics"]["period_net_return"]["actual"]["reason"] == (
@@ -10545,7 +10549,7 @@ def write_projection_metric_history(
     ("market", "symbol"),
     [("CN", "SH.000905"), ("HK", "HK.800000"), ("US", "US.SPY")],
 )
-def test_projection_v4_uses_one_benchmark_identity_for_all_windows(
+def test_projection_v5_uses_one_benchmark_identity_for_all_windows(
     tmp_path: Path, market: str, symbol: str
 ) -> None:
     write_projection_metric_history(
@@ -10562,7 +10566,7 @@ def test_projection_v4_uses_one_benchmark_identity_for_all_windows(
 
     projection = trend_review.build_trend_review_projection(tmp_path, market)
 
-    assert projection["schema_version"] == "open_trader.trend_review.projection.v4"
+    assert projection["schema_version"] == "open_trader.trend_review.projection.v5"
     assert projection["benchmark_context"]["futu_symbol"] == symbol
     assert set(projection["metrics"]["period_net_return"]) == {
         "discipline",
@@ -10936,6 +10940,10 @@ def test_projection_discipline_sample_count_matches_kelly_qualified_pool(
     )
 
     assert projection["sample_counts"]["discipline"] == kelly.eligible_sample_count
+    assert projection["sample_details"]["discipline"]["winning_sample_count"] == 2
+    assert projection["sample_details"]["discipline"]["win_rate"] == "1"
+    assert projection["sample_details"]["actual"]["winning_sample_count"] == 0
+    assert projection["sample_details"]["actual"]["win_rate"] is None
 
 
 def test_projection_actual_zero_sample_count_is_available_with_exclusions(
@@ -10971,6 +10979,8 @@ def test_projection_actual_zero_sample_count_is_available_with_exclusions(
 
     assert projection["sample_counts"]["actual"] == 0
     assert projection["sample_details"]["actual"]["available"] is True
+    assert projection["sample_details"]["actual"]["winning_sample_count"] == 0
+    assert projection["sample_details"]["actual"]["win_rate"] is None
     assert projection["sample_details"]["actual"]["excluded_candidate_count"] == 1
     assert projection["sample_details"]["actual"]["exclusion_reasons"] == [{
         "reason": "no_matching_opening_strategy_action",
