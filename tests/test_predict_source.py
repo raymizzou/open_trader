@@ -384,6 +384,8 @@ def test_complete_yes_book_derives_no_asks_at_the_market_tick() -> None:
         type(book.yes_asks[0])(price=Decimal("0.50"), size=Decimal("2")),
     )
     assert book.source_timestamp == datetime.fromtimestamp(1788048000, UTC)
+    assert book.yes_token_id == "predict-yes"
+    assert book.no_token_id == "predict-no"
 
 
 def test_older_rest_book_timestamp_is_dropped_and_marks_source_stale() -> None:

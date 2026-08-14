@@ -19,6 +19,8 @@ from open_trader.prediction_executable_cost import (
 )
 from open_trader.prediction_arbitrage import BookLevel, ThresholdOrderBook
 from open_trader.predict_source import PredictBook
+from open_trader.predict_source import PredictMarket, PredictSource
+from open_trader.polymarket_trading import PredictConfig
 from open_trader.prediction_n_leg_oracle import evaluate_fixed_portfolio
 from open_trader.prediction_n_leg import (
     ActionPayout,
@@ -107,6 +109,17 @@ def decode_execution(payload, market):
     return executable_cost.execution_solution_from_payload(payload, market_solution=market, account_snapshot=account, now=AS_OF)
 
 
+def _rehash_market_payload(payload: dict[str, object]) -> None:
+    payload["fingerprint"] = executable_cost.fingerprint({
+        key: payload[key] for key in (
+            "bounded_cost_units", "bounded_payout_units", "guaranteed_profit_units", "capital_release_at", "global_search_closed",
+            "component_problem", "component_usd_units_per_dollar", "component_bindings", "relation_fingerprint",
+            "economic_quote_fingerprint", "verification_fingerprint", "candidate_evidence", "verification_result",
+            "quotes", "execution_legs", "quantities",
+        )
+    })
+
+
 def test_missing_book_fails_closed_before_solving() -> None:
     result = resolve_component(
         component(), (), None,
@@ -139,6 +152,22 @@ def test_predict_requires_bound_market_and_outcome_token_identity(monkeypatch) -
     wrong_token = ImmutableBook("action-a", "other-token", PredictBook("action-a", (BookLevel(Decimal("0.40"), Decimal("1")),), (), AS_OF, AS_OF, "other-token"), 100_000, 1, 100_000, 100, "venue-a", "fee-v1")
 
     assert resolve_component(component("predict.fun"), (wrong_token,), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF).status is ResolutionStatus.UNKNOWN
+
+
+def test_predict_source_accept_book_output_flows_to_public_resolver(monkeypatch) -> None:
+    qualified_solver(monkeypatch)
+    source = PredictSource(PredictConfig("0x1111111111111111111111111111111111111111"), now_fn=lambda: AS_OF)
+    market = PredictMarket("predict-market", "condition", "q", "rules", yes_token_id="action-a", no_token_id="no-token", tick_size=Decimal("0.01"))
+    book = source._accept_book(market, {"marketId": "predict-market", "updateTimestampMs": int(AS_OF.timestamp() * 1_000), "asks": [["0.40", "1"]], "bids": [["0.39", "1"]]}, source="rest")
+    base = component().problem
+    policy = BookBinding("action-a", "venue-a", "action-a", "predict.fun", "fee-v1", 100_000, 1, 100_000, 100, "predict-market")
+    verified = VerifiedComponent(base, component_fingerprint(base, (policy,), 100), 100, (policy,))
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
+
+    result = resolve_component(verified, (ImmutableBook("action-a", "action-a", book, 100_000, 1, 100_000, 100, "venue-a", "fee-v1"),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
+
+    assert book is not None
+    assert result.status is ResolutionStatus.EXECUTION_SOLUTION
 
 
 def test_wrong_venue_or_native_book_identity_fails_closed(monkeypatch) -> None:
@@ -586,13 +615,7 @@ def test_prior_rejects_forged_outer_hash_without_matching_source_proof(monkeypat
     first = resolve_component(component(), (executable_book(),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
     payload = executable_cost.canonical_payload(first.market_solution)
     payload["bounded_cost_units"] += 1
-    payload["fingerprint"] = executable_cost.fingerprint({
-        key: payload[key] for key in (
-            "bounded_cost_units", "bounded_payout_units", "guaranteed_profit_units", "capital_release_at",
-            "global_search_closed", "relation_fingerprint", "economic_quote_fingerprint", "verification_fingerprint",
-            "candidate_evidence", "verification_result", "quotes", "execution_legs", "quantities",
-        )
-    })
+    _rehash_market_payload(payload)
 
     with pytest.raises(ValueError, match="fingerprint"):
         decode_market(payload)
@@ -604,13 +627,7 @@ def test_prior_rejects_rehashed_relation_without_embedded_component_proof(monkey
     result = resolve_component(component(), (executable_book(),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
     payload = executable_cost.canonical_payload(result.market_solution)
     payload["relation_fingerprint"] = "sha256:" + "0" * 64
-    payload["fingerprint"] = executable_cost.fingerprint({
-        key: payload[key] for key in (
-            "bounded_cost_units", "bounded_payout_units", "guaranteed_profit_units", "capital_release_at", "global_search_closed",
-            "component_problem", "component_usd_units_per_dollar", "component_bindings", "relation_fingerprint", "economic_quote_fingerprint",
-            "verification_fingerprint", "candidate_evidence", "verification_result", "quotes", "execution_legs", "quantities",
-        )
-    })
+    _rehash_market_payload(payload)
 
     with pytest.raises(ValueError):
         decode_market(payload)
@@ -622,13 +639,7 @@ def test_market_solution_decoder_rejects_rehashed_execution_source_tamper(monkey
     result = resolve_component(component(), (executable_book(),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
     payload = executable_cost.canonical_payload(result.market_solution)
     payload["execution_legs"][0]["source_fingerprint"] = "sha256:" + "0" * 64
-    payload["fingerprint"] = executable_cost.fingerprint({
-        key: payload[key] for key in (
-            "bounded_cost_units", "bounded_payout_units", "guaranteed_profit_units", "capital_release_at",
-            "global_search_closed", "relation_fingerprint", "economic_quote_fingerprint", "verification_fingerprint",
-            "candidate_evidence", "verification_result", "quotes", "execution_legs", "quantities",
-        )
-    })
+    _rehash_market_payload(payload)
 
     with pytest.raises(ValueError, match="fingerprint"):
         decode_market(payload)
@@ -649,13 +660,7 @@ def test_market_source_decoder_rejects_rehashed_quote_or_leg_tamper(monkeypatch,
     result = resolve_component(component(), (executable_book(),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
     payload = executable_cost.canonical_payload(result.market_solution)
     payload["execution_legs" if target == "leg" else "quotes"][0][field] = value
-    payload["fingerprint"] = executable_cost.fingerprint({
-        key: payload[key] for key in (
-            "bounded_cost_units", "bounded_payout_units", "guaranteed_profit_units", "capital_release_at",
-            "global_search_closed", "relation_fingerprint", "economic_quote_fingerprint", "verification_fingerprint",
-            "candidate_evidence", "verification_result", "quotes", "execution_legs", "quantities",
-        )
-    })
+    _rehash_market_payload(payload)
 
     with pytest.raises(ValueError):
         decode_market(payload)

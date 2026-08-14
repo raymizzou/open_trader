@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-14
 
+- #51 round-six integration makes the existing Predict REST/WS accepted book retain its validated YES/NO outcome token IDs, so the public executable resolver can bind both Predict market and order token identity. Market tamper coverage now rehashes the full current artifact payload before deep validation. No watcher, cache, persistence, order, or Dashboard behavior was added.
+
 - #51 round-five hardening converts venue price units into the component valuation scale before solving while retaining protected venue limits for #74, returns canonical decoded prior artifacts, binds Predict market plus outcome-token identity, and retains original component policy evidence to authenticate old relation identity. Terminal settlement/rule semantic changes now invalidate a prior proof, and the public release gate covers exactly 30 days plus one second. No watcher, cache, persistence, order, or Dashboard behavior was added.
 
 - #51 round-four hardening binds USD qualification scale into sorted component policy identity, distinguishes an authenticated prior cache miss from a forged prior, and rejects mutable/malformed order-book ask containers before conversion. Receipt-only refresh still reuses the fixed market; depth and verified policy changes solve again. Public resolver boundaries now exercise real #50 BruteForce solve/verify at equality and one-unit-below for the four admission gates. No watcher, cache, persistence, order, or Dashboard behavior was added.

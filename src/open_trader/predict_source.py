@@ -363,6 +363,8 @@ class PredictSource:
             no_asks=no_asks,
             source_timestamp=timestamp,
             received_at=self._now_fn(),
+            yes_token_id=market.yes_token_id,
+            no_token_id=market.no_token_id,
         )
         self._versions[source][market.market_id] = sequence
         self._books[source][market.market_id] = book
