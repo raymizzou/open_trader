@@ -5,7 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-14
 
-- #51 round-four hardening binds USD qualification scale into sorted component policy identity, distinguishes an authenticated prior cache miss from a forged prior, and rejects mutable/malformed order-book ask containers before conversion. Receipt-only refresh still reuses the fixed market; depth and verified policy changes solve again. No watcher, cache, persistence, order, or Dashboard behavior was added.
+- #51 round-four hardening binds USD qualification scale into sorted component policy identity, distinguishes an authenticated prior cache miss from a forged prior, and rejects mutable/malformed order-book ask containers before conversion. Receipt-only refresh still reuses the fixed market; depth and verified policy changes solve again. Public resolver boundaries now exercise real #50 BruteForce solve/verify at equality and one-unit-below for the four admission gates. No watcher, cache, persistence, order, or Dashboard behavior was added.
 
 - #51 round-three hardening normalizes every verified book once into immutable quote evidence used by both conservative solver costs and #74 execution legs. Component identity now binds the original relation model and cost policy; Market/Execution payload decoders require their current component/book or market/account sources and recompute all retained evidence. Per-leg protected prices are now venue limit prices with explicit scale, rather than lot costs. Focused resolver/#50 and worker checks cover source tampering, source-free decoder rejection, receipt reuse, depth invalidation, account binding, and non-unit lot conversion. No watcher, cache, persistence, order, or Dashboard behavior was added.
 

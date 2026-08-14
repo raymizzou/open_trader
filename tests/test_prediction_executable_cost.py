@@ -195,7 +195,7 @@ def test_prior_market_solution_re_solves_when_visible_depth_changes(monkeypatch)
 @pytest.mark.parametrize("change", ("fee", "tick", "haircut", "native", "rule", "usd"))
 def test_prior_component_policy_changes_are_cache_misses(monkeypatch, change) -> None:
     captured = qualified_solver(monkeypatch)
-    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 10_000, 10_000),), 10_000, 0, 10_000)
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 100_000, 100_000),), 100_000, 0, 100_000)
     first = resolve_component(component(), (executable_book(),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
     new_binding = binding()
     new_book = executable_book()
@@ -351,6 +351,46 @@ def test_public_resolver_runs_real_solve_and_verify_with_bruteforce_backend() ->
 
     assert result.status is ResolutionStatus.EXECUTION_SOLUTION
     assert result.market_solution.verification_result.status.value == "QUALIFIED_VERIFIED"
+
+
+def _actual_gate_component(*, payout: int, release_days: int) -> VerifiedComponent:
+    base = component().problem
+    states = tuple(replace(state, atoms=tuple(
+        replace(atom, payouts=(ActionPayout("action-a", payout),), capital_release_at=AS_OF + timedelta(days=release_days))
+        for atom in state.atoms
+    )) for state in base.terminal_state_sets)
+    problem = replace(base, terminal_state_sets=states)
+    policy = BookBinding("action-a", "venue-a", "action-a", "polymarket", "zero-fee-v1", 0, 1, 0, 100)
+    return VerifiedComponent(problem, component_fingerprint(problem, (policy,), 100), 100, (policy,))
+
+
+def _actual_gate_book(price: str) -> ImmutableBook:
+    return ImmutableBook("action-a", "action-a", ThresholdOrderBook("action-a", (BookLevel(Decimal(price), Decimal("1")),), (), AS_OF), 0, 1, 0, 100, "venue-a", "zero-fee-v1")
+
+
+@pytest.mark.parametrize(
+    ("label", "payout", "release_days", "price", "expected"),
+    (
+        ("profit-equality", 200, 1, "0.99", ResolutionStatus.EXECUTION_SOLUTION),
+        ("profit-one-below", 199, 1, "0.99", ResolutionStatus.UNKNOWN),
+        ("return-on-cost-equality", 10_100, 1, "99.99", ResolutionStatus.EXECUTION_SOLUTION),
+        ("return-on-cost-one-below", 10_099, 1, "99.99", ResolutionStatus.UNKNOWN),
+        ("annualized-equality", 73_900, 30, "729.99", ResolutionStatus.EXECUTION_SOLUTION),
+        ("annualized-one-below", 73_899, 30, "729.99", ResolutionStatus.UNKNOWN),
+        ("release-equality", 74_000, 30, "729.99", ResolutionStatus.EXECUTION_SOLUTION),
+        ("release-one-second-below", 74_000, 31, "729.99", ResolutionStatus.UNKNOWN),
+    ),
+)
+def test_public_real_solver_qualification_gate_boundaries(label, payout, release_days, price, expected) -> None:
+    del label
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 100_000, 100_000),), 100_000, 0, 100_000)
+
+    result = resolve_component(
+        _actual_gate_component(payout=payout, release_days=release_days), (_actual_gate_book(price),), account,
+        BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(4, 4, 4), now=AS_OF, solver_backend=BruteForceBackend(),
+    )
+
+    assert result.status is expected
 
 
 def test_insufficient_fixed_funding_retains_market_solution_without_second_solve(monkeypatch) -> None:
