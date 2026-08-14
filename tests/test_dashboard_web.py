@@ -7616,7 +7616,7 @@ for (const text of [
 ]) if (!html.includes(text)) throw new Error(text+"\n"+html);
 if (!html.includes('<span>完整交易胜率</span><strong>25%</strong><small>1 胜 / 4 闭环</small>')) throw new Error(html);
 const unavailableMeta=renderTrendReviewStatisticsMeta(review,"actual","实际执行");
-if (!unavailableMeta.includes("统计来源不可用") || !unavailableMeta.includes('<span>完整交易胜率</span><strong>数据不足</strong><small>0 闭环</small>')) throw new Error(unavailableMeta);
+if (!unavailableMeta.includes("统计来源不可用") || !unavailableMeta.includes('class="trend-review-win-rate unavailable"><span>完整交易胜率</span><strong>统计来源不可用</strong><small>来源不可用</small>') || unavailableMeta.includes("0 闭环")) throw new Error(unavailableMeta);
 const zero=renderTrendReviewWorkspace({...review,
   sample_counts:{...review.sample_counts,actual:0},
   sample_details:{...review.sample_details,actual:detail(0,0,null,0,0,0,"2026-08-08T15:00:00+08:00")},
@@ -7645,6 +7645,9 @@ console.log("ok");
 ''')
 
     assert "ok" in output
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    assert ".trend-review-win-rate.unavailable strong" in css
+    assert "@media (max-width: 840px)" in css
 
 
 def test_dashboard_renders_action_first_trend_report_for_every_market() -> None:

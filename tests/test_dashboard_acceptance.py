@@ -3047,6 +3047,19 @@ def test_acceptance_rejects_375_trend_review_overflow() -> None:
         )
 
 
+def test_acceptance_rejects_800_trend_review_overflow() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.viewport_size = {"width": 800, "height": 844}
+    page.review_document_width = 801
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="800px"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
 def test_acceptance_rejects_375_trend_review_market_cell_not_full_width() -> None:
     page = tabbed_account_page(valid_payload())
     page.viewport_size = {"width": 375, "height": 844}
@@ -3056,6 +3069,31 @@ def test_acceptance_rejects_375_trend_review_market_cell_not_full_width() -> Non
     with pytest.raises(AssertionError, match="市场基准逐行"):
         dashboard_acceptance._check_trend_review(
             page, section, "tiger", valid_payload()["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_rejects_375_trend_review_first_market_cell_not_full_width() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.viewport_size = {"width": 375, "height": 844}
+    page.review_geometry_override = {"mobileFirstMarketFullWidth": False}
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="市场基准逐行"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
+        )
+
+
+def test_acceptance_rejects_1440_trend_review_misaligned_column_groups() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.review_geometry_override = {"desktopColumnGroupsAligned": False}
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="分组标题"):
+        dashboard_acceptance._check_trend_review(
+            page, section, "tiger", payload["trend_reviews"]["tiger"]
         )
 
 
@@ -4487,7 +4525,7 @@ class TabbedAccountPage:
         }
         self.review_win_rate_texts = {
             "discipline": ["完整交易胜率", "25%", "1 胜 / 4 闭环"],
-            "actual": ["完整交易胜率", "数据不足", "0 闭环"],
+            "actual": ["完整交易胜率", "统计来源不可用", "来源不可用"],
         }
         self.review_metric_reason: str | None = None
         self.review_metric_values_override: list[str] | None = None
@@ -4649,6 +4687,7 @@ class TabbedAccountPage:
                 ".trend-review-series strong",
                 ".trend-review-matrix", ".trend-review-win-rate",
                 ".trend-review-column-groups", ".trend-review-values",
+                "columnGroupCells",
                 "firstSeries",
                 "querySelectorAll", "querySelector", "getBoundingClientRect",
                 "getComputedStyle", "clientWidth", "scrollWidth",
@@ -4658,7 +4697,7 @@ class TabbedAccountPage:
             missing = [fragment for fragment in required if fragment not in expression]
             assert not missing, f"trend review geometry fake 缺少真实表达式：{missing}"
             self.review_geometry_checks.append(self.trend_broker)
-            narrow = self.viewport_size["width"] <= 760
+            narrow = self.viewport_size["width"] <= 840
             panel_width = self.viewport_size["width"] - 28 if narrow else 1360
             text_counts = (
                 (".trend-review-header > div:first-child > *", 3),
@@ -4706,18 +4745,30 @@ class TabbedAccountPage:
                     for index in range(2)
                 ],
                 "columnGroups": [{"x": 28, "y": 570, "width": panel_width - 28, "height": 20}],
+                "columnGroupCells": [
+                    [
+                        {"x": 28, "y": 570, "width": 160, "height": 20},
+                        {"x": 188, "y": 570, "width": 510, "height": 20},
+                        {
+                            "x": 708 if self.review_geometry_override.get("desktopColumnGroupsAligned") is not False else 728,
+                            "y": 570, "width": 770, "height": 20,
+                        },
+                    ],
+                ],
                 "valueLists": [
                     {"x": 28, "y": 580 + index * 180, "width": panel_width - 28, "height": 130}
                     for index in range(5)
                 ],
                 "firstSeries": [
                     {
-                        "x": 28 if narrow else 28 + index * 260,
+                        "x": 28 if narrow else 188 + index * 260,
                         "y": (
                             580 if index < 2 else 622 + (index - 2) * 42
                         ) if narrow else 580,
                         "width": (
-                            panel_width - 28 if index >= 2 and self.review_geometry_override.get("mobileMarketFullWidth") is not False
+                            panel_width - 28 if index >= 2
+                            and self.review_geometry_override.get("mobileMarketFullWidth") is not False
+                            and not (index == 2 and self.review_geometry_override.get("mobileFirstMarketFullWidth") is False)
                             else 160
                         ) if narrow else 250,
                         "height": 36,

@@ -1562,6 +1562,12 @@ table {
   line-height: 1;
 }
 
+.trend-review-win-rate.unavailable strong {
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 400;
+}
+
 .trend-review-column-groups {
   color: var(--muted);
   display: grid;
@@ -5230,6 +5236,43 @@ table {
     grid-template-columns: 1fr;
   }
 
+}
+
+@media (max-width: 840px) {
+  .trend-review-statistics-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-review-statistics {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-review-win-rate {
+    justify-items: start;
+    text-align: left;
+  }
+
+  .trend-review-column-groups { display: none; }
+
+  .trend-review-metric { grid-template-columns: minmax(0, 1fr); }
+
+  .trend-review-values {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+
+  .trend-review-series {
+    align-items: start;
+    grid-template-columns: minmax(92px, auto) minmax(0, 1fr) minmax(64px, auto);
+  }
+
+  .trend-review-series[data-series="discipline"],
+  .trend-review-series[data-series="actual"] { grid-column: span 3; }
+
+  .trend-review-series[data-series="same_period_benchmark"],
+  .trend-review-series[data-series="market_1y"],
+  .trend-review-series[data-series="market_5y"] { grid-column: span 6; }
+
+  .trend-review-series strong { text-align: right; }
 }
 
 @media (max-width: 760px) {

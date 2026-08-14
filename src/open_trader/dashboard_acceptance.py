@@ -4266,6 +4266,7 @@ def _check_trend_review_geometry(page: Any, broker: str) -> None:
           matrix: rect(matrix),
           winRates: [...matrix.querySelectorAll(".trend-review-win-rate")].map(rect),
           columnGroups: [...matrix.querySelectorAll(".trend-review-column-groups")].map(rect),
+          columnGroupCells: [...matrix.querySelectorAll(".trend-review-column-groups")].map(group => [...group.children].map(rect)),
           valueLists: [...matrix.querySelectorAll(".trend-review-values")].map(rect),
           firstSeries: [...matrix.querySelector(".trend-review-metric").querySelectorAll(".trend-review-series")].map(rect),
           textGroups: textSelectors.map(selector => ({
@@ -4296,6 +4297,7 @@ def _check_trend_review_geometry(page: Any, broker: str) -> None:
     ), f"{broker} 趋势复盘矩阵超出 {width}px 视口"
     win_rates = geometry.get("winRates")
     column_groups = geometry.get("columnGroups")
+    column_group_cells = geometry.get("columnGroupCells")
     value_lists = geometry.get("valueLists")
     assert isinstance(win_rates, list) and len(win_rates) == 2, (
         f"{broker} 趋势复盘完整交易胜率面板数量不正确"
@@ -4303,6 +4305,13 @@ def _check_trend_review_geometry(page: Any, broker: str) -> None:
     assert isinstance(column_groups, list) and len(column_groups) == 1, (
         f"{broker} 趋势复盘策略与市场分组标题数量不正确"
     )
+    assert (
+        isinstance(column_group_cells, list)
+        and len(column_group_cells) == 1
+        and isinstance(column_group_cells[0], list)
+        and len(column_group_cells[0]) == 3
+        and all(isinstance(cell, Mapping) for cell in column_group_cells[0])
+    ), f"{broker} 趋势复盘策略与市场分组标题几何不可读"
     assert isinstance(value_lists, list) and len(value_lists) == 5, (
         f"{broker} 趋势复盘五项指标缺少直接数值列表"
     )
@@ -4316,11 +4325,25 @@ def _check_trend_review_geometry(page: Any, broker: str) -> None:
             later["x"] >= earlier["x"] + earlier["width"] - 1
             for earlier, later in zip(first_series, first_series[1:])
         ), f"{broker} 趋势复盘 1440px 五系列数值未单行对齐"
+        strategy_group, market_group = column_group_cells[0][1:]
+        assert (
+            abs(strategy_group["x"] - first_series[0]["x"]) <= 1
+            and abs(
+                strategy_group["x"] + strategy_group["width"]
+                - first_series[1]["x"] - first_series[1]["width"]
+            ) <= 1
+            and abs(market_group["x"] - first_series[2]["x"]) <= 1
+            and abs(
+                market_group["x"] + market_group["width"]
+                - first_series[4]["x"] - first_series[4]["width"]
+            ) <= 1
+        ), f"{broker} 趋势复盘 1440px 策略与市场分组标题未对齐"
+    if width <= 840:
+        assert geometry.get("documentWidth") == width, (
+            f"{broker} 趋势复盘 {width}px 横向滚动宽度为 {geometry.get('documentWidth')}"
+        )
     if width != 375:
         return
-    assert geometry.get("documentWidth") == 375, (
-        f"{broker} 趋势复盘 375px 横向滚动宽度为 {geometry.get('documentWidth')}"
-    )
     side = geometry.get("side")
     button = geometry.get("button")
     assert isinstance(side, Mapping) and isinstance(button, Mapping)
@@ -4338,10 +4361,13 @@ def _check_trend_review_geometry(page: Any, broker: str) -> None:
     assert abs(first_series[0]["y"] - first_series[1]["y"]) <= 1, (
         f"{broker} 趋势复盘 375px 策略表现未同列显示"
     )
+    market_cells = first_series[2:]
     assert all(
+        cell["width"] >= value_lists[0]["width"] - 1
+        for cell in market_cells
+    ) and all(
         later["y"] >= earlier["y"] + earlier["height"] - 1
-        and abs(later["width"] - value_lists[0]["width"]) <= 1
-        for earlier, later in zip(first_series[2:], first_series[3:])
+        for earlier, later in zip(market_cells, market_cells[1:])
     ), f"{broker} 趋势复盘 375px 市场基准逐行未占满内容宽度"
     expected_text_counts = {
         ".trend-review-header > div:first-child > *": 3,
@@ -4643,7 +4669,7 @@ def _check_trend_review(
                 )
         else:
             expected_statistics.append("统计来源不可用")
-            expected_win_rate = ["完整交易胜率", "数据不足", "0 闭环"]
+            expected_win_rate = ["完整交易胜率", "统计来源不可用", "来源不可用"]
         statistics_items.extend(expected_statistics)
         statistics_column = workspace.locator(
             f'.trend-review-statistics[data-series="{series}"]'

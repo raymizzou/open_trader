@@ -4021,9 +4021,11 @@ function renderTrendReviewStatisticsMeta(review, key, label) {
   const disposition = detail?.available === true
     ? `<span>发现 ${detail.discovered_candidate_count} · 排除 ${detail.excluded_candidate_count} · 未闭环 ${detail.incomplete_open_candidate_count}</span>`
     : "<span>统计来源不可用</span>";
-  const winRate = detail?.available === true && detail.eligible_sample_count > 0 && hasValue(detail.win_rate)
-    ? {value:trendRiskPercent(detail.win_rate), detail:`${formatDisplayNumber(detail.winning_sample_count)} 胜 / ${formatDisplayNumber(detail.eligible_sample_count)} 闭环`}
-    : {value:"数据不足", detail:"0 闭环"};
+  const winRate = detail?.available !== true
+    ? {unavailable:true, value:"统计来源不可用", detail:"来源不可用"}
+    : detail.eligible_sample_count > 0 && hasValue(detail.win_rate)
+      ? {value:trendRiskPercent(detail.win_rate), detail:`${formatDisplayNumber(detail.winning_sample_count)} 胜 / ${formatDisplayNumber(detail.eligible_sample_count)} 闭环`}
+      : {value:"数据不足", detail:"0 闭环"};
   const exclusions = Array.isArray(detail?.exclusion_reasons) && detail.exclusion_reasons.length
     ? `<span>排除原因 ${detail.exclusion_reasons.map((item) => `${TREND_REASON_LABELS[item.reason] || "其他原因"} ${item.count}`).join("、")}</span>`
     : "";
@@ -4032,7 +4034,7 @@ function renderTrendReviewStatisticsMeta(review, key, label) {
       ${sampleCutoff ? `<span>统计截至 ${escapeHtml(formatPlain(sampleCutoff))}</span>` : ""}
       ${metricCutoff ? `<span>指标截至 ${escapeHtml(formatPlain(metricCutoff))}</span>` : ""}
       ${disposition}${exclusions}
-    </div></div><div class="trend-review-win-rate"><span>完整交易胜率</span><strong>${escapeHtml(winRate.value)}</strong><small>${escapeHtml(winRate.detail)}</small></div></div>`;
+    </div></div><div class="trend-review-win-rate${winRate.unavailable ? " unavailable" : ""}"><span>完整交易胜率</span><strong>${escapeHtml(winRate.value)}</strong><small>${escapeHtml(winRate.detail)}</small></div></div>`;
 }
 
 function renderTrendReviewMatrix(review) {
