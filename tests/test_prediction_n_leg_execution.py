@@ -462,6 +462,50 @@ def test_conflict_keeps_old_and_new_receipt_facts(tmp_path) -> None:
         "transition_id": fingerprint({"reason": "SAME_SEQUENCE_CONFLICT", "old": old.to_payload(), "new": new.to_payload()}),
         "reason": "SAME_SEQUENCE_CONFLICT", "old": old.to_payload(), "new": new.to_payload(),
     }
+    assert conflict["conflict_observations"][-1]["client_order_id"] == old.client_order_id
+
+
+def test_reconciliation_rejects_unresolved_receipt_conflict(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    old = receipt(leg="a", filled=10, state="FILLED", sequence=1)
+    current.apply_receipt(old)
+    current.apply_receipt(replace(old, receipt_id="a-conflict", cumulative_cost_units=1))
+    current.apply_receipt(receipt(leg="b", filled=10, state="FILLED", sequence=1))
+
+    with pytest.raises(ValueError, match="N_LEG_RECONCILIATION_CONFLICT_UNRESOLVED"):
+        current.complete_reconciliation("batch-1", context=reconciliation_context(full=True))
+
+
+def test_contexts_reject_malformed_members_before_dereference() -> None:
+    repair = repair_context()
+    with pytest.raises(ValueError, match="repair cash flows"):
+        RepairContext(repair.reservation_version, repair.quotes, repair.holdings, repair.account_snapshot, (object(),), repair.now)  # type: ignore[arg-type]
+    reconciliation = reconciliation_context()
+    with pytest.raises(ValueError, match="reconciliation holdings"):
+        ReconciliationContext(reconciliation.reservation_version, reconciliation.account_snapshot, (object(),), reconciliation.cash_flows, reconciliation.source_timestamp, reconciliation.received_at, reconciliation.now)  # type: ignore[arg-type]
+
+
+def test_repair_context_allows_multiple_orders_for_one_reservation_key() -> None:
+    repair = repair_context()
+    duplicate_key = SettlementCashFlow("another-order", None, "venue-a", "account-a", "usd-cents", 0, 0, AS_OF, AS_OF, 1, False)
+    accepted = RepairContext(repair.reservation_version, repair.quotes, repair.holdings, repair.account_snapshot, (*repair.cash_flows, duplicate_key), repair.now)
+
+    assert len(accepted.cash_flows) == 3
+
+
+def test_conflicts_sum_uncertain_exposure_per_order(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    old_a = receipt(leg="a", filled=10, state="FILLED", sequence=1)
+    old_b = receipt(leg="b", filled=10, state="FILLED", sequence=1)
+    current.apply_receipt(old_a)
+    current.apply_receipt(old_b)
+    current.apply_receipt(replace(old_a, receipt_id="a-cost-conflict", cumulative_cost_units=700))
+    conflicted = current.apply_receipt(replace(old_b, receipt_id="b-cost-conflict", cumulative_cost_units=800))
+
+    assert conflicted["conflict_exposure_by_order"] == {"batch-1:action-a": 190, "batch-1:action-b": 290}
+    assert current.control()["total_unsettled_capital_units"] == 1500
 
 
 def test_partial_fill_gate_uses_proven_upper_loss_bound_not_principal(tmp_path) -> None:
