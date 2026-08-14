@@ -4627,34 +4627,37 @@ def _check_trend_review(
     assert isinstance(details, Mapping), f"{broker} 趋势复盘样本明细无效"
     assert isinstance(sample_cutoffs, Mapping), f"{broker} 趋势复盘样本截止无效"
     assert isinstance(metric_cutoffs, Mapping), f"{broker} 趋势复盘指标截止无效"
-    for series, _label in (("discipline", "纪律模拟"), ("actual", "实际执行")):
+    for series, label in (("discipline", "纪律模拟"), ("actual", "实际执行")):
+        expected_statistics: list[str] = []
         detail = details.get(series)
         if isinstance(detail, Mapping) and detail.get("available") is True:
-            statistics_items.extend((
-                f"统计截至 {_plain(sample_cutoffs.get(series))}",
+            sample_cutoff = sample_cutoffs.get(series)
+            if sample_cutoff:
+                expected_statistics.append(f"统计截至 {_plain(sample_cutoff)}")
+            metric_cutoff = metric_cutoffs.get(series)
+            if metric_cutoff:
+                expected_statistics.append(f"指标截至 {_plain(metric_cutoff)}")
+            expected_statistics.append(
                 "发现 "
                 f"{detail.get('discovered_candidate_count')} · 排除 "
                 f"{detail.get('excluded_candidate_count')} · 未闭环 "
-                f"{detail.get('incomplete_open_candidate_count')}",
-            ))
+                f"{detail.get('incomplete_open_candidate_count')}"
+            )
             eligible = detail["eligible_sample_count"]
             if eligible:
                 displayed_rate = _trend_review_display(
                     {"value": Decimal(str(detail["win_rate"])) * Decimal("100")},
                     percent=True,
                 )
-                statistics_items.append(
+                expected_statistics.append(
                     f"完整交易胜率 {displayed_rate} · "
                     f"{detail['winning_sample_count']} 胜 / {eligible} 闭环"
                 )
             else:
-                statistics_items.append("完整交易胜率 数据不足 · 0 闭环")
-            metric_cutoff = metric_cutoffs.get(series)
-            if metric_cutoff is not None:
-                statistics_items.append(f"指标截至 {_plain(metric_cutoff)}")
+                expected_statistics.append("完整交易胜率 数据不足 · 0 闭环")
             reasons = detail.get("exclusion_reasons")
             if isinstance(reasons, list) and reasons:
-                statistics_items.append(
+                expected_statistics.append(
                     "排除原因 " + "、".join(
                         f"{TREND_REASON_LABELS.get(str(item.get('reason')), '其他原因')} "
                         f"{item.get('count')}"
@@ -4662,7 +4665,20 @@ def _check_trend_review(
                     )
                 )
         else:
-            statistics_items.append("统计来源不可用")
+            expected_statistics.append("统计来源不可用")
+        statistics_items.extend(expected_statistics)
+        statistics_column = workspace.locator(
+            f'.trend-review-statistics[data-series="{series}"]'
+        )
+        assert statistics_column.count() == 1, (
+            f"{broker} 趋势复盘 {label}统计列数量不是 1"
+        )
+        rendered_statistics = statistics_column.locator(
+            ".trend-entry-details > span"
+        ).all_inner_texts()
+        assert rendered_statistics == expected_statistics, (
+            f"{broker} 趋势复盘 {label}统计列内容或顺序错误"
+        )
     for required in (
         f"{market_label}趋势复盘",
         _plain(review.get("broker_label")),

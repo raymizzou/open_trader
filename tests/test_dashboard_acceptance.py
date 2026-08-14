@@ -2809,6 +2809,26 @@ def test_acceptance_rejects_missing_trend_review_win_rate(
         dashboard_acceptance._check_trend_review(page, section, "tiger", review)
 
 
+def test_acceptance_rejects_swapped_trend_review_statistics_columns() -> None:
+    payload = valid_payload()
+    review = payload["trend_reviews"]["tiger"]
+    page = tabbed_account_page(payload)
+    page.review_statistics_texts = {
+        "discipline": ["统计来源不可用"],
+        "actual": [
+            "统计截至 2026-08-08T15:00:00+08:00",
+            "指标截至 2026-08-08",
+            "发现 9 · 排除 4 · 未闭环 1",
+            "完整交易胜率 25% · 1 胜 / 4 闭环",
+            "排除原因 成本不完整 4",
+        ],
+    }
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    with pytest.raises(AssertionError, match="纪律模拟统计列内容或顺序错误"):
+        dashboard_acceptance._check_trend_review(page, section, "tiger", review)
+
+
 def test_acceptance_rejects_trend_review_benchmark_drift() -> None:
     payload = valid_payload()
     page = tabbed_account_page(payload)
@@ -3669,6 +3689,12 @@ class TabbedAccountLocator:
             return 0
         if self.selector == "#trend-report-workspace:visible .trend-review-matrix":
             return int(self.page.trend_kind == "review")
+        if re.fullmatch(
+            r'#trend-report-workspace:visible \.trend-review-statistics'
+            r'\[data-series="(discipline|actual)"\]',
+            self.selector,
+        ):
+            return int(self.page.trend_kind == "review")
         if self.selector == "#trend-report-workspace:visible .trend-review-metric":
             return 5 if self.page.trend_kind == "review" else 0
         if self.selector == "#trend-report-workspace:visible .trend-review-axis":
@@ -4140,6 +4166,14 @@ class TabbedAccountLocator:
                     else "统计刷新失败；报告继续使用上一个有效快照"
                 ),
             ]
+        statistics_match = re.fullmatch(
+            r'#trend-report-workspace:visible \.trend-review-statistics'
+            r'\[data-series="(discipline|actual)"\] '
+            r'\.trend-entry-details > span',
+            self.selector,
+        )
+        if statistics_match:
+            return self.page.review_statistics_texts[statistics_match.group(1)]
         if self.selector == "#trend-report-workspace:visible .trend-review-matrix figcaption":
             return ["策略与市场基准"]
         if self.selector == "#trend-report-workspace:visible .trend-review-metric h3":
@@ -4346,6 +4380,16 @@ class TabbedAccountPage:
         self.review_text_contrast = 12.0
         self.review_marker_contrasts = [4.0] * 25
         self.review_header_left_texts: list[str] | None = None
+        self.review_statistics_texts = {
+            "discipline": [
+                "统计截至 2026-08-08T15:00:00+08:00",
+                "指标截至 2026-08-08",
+                "发现 9 · 排除 4 · 未闭环 1",
+                "完整交易胜率 25% · 1 胜 / 4 闭环",
+                "排除原因 成本不完整 4",
+            ],
+            "actual": ["统计来源不可用"],
+        }
         self.review_metric_reason: str | None = None
         self.review_metric_values_override: list[str] | None = None
         self.review_text_layout_override: dict[str, object] = {}

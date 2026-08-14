@@ -486,7 +486,7 @@ Expected: all selected files PASS with exact pytest summary recorded in the hand
 Run from the feature worktree:
 
 ```bash
-PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -c 'from pathlib import Path; from open_trader.trend_review import build_trend_review_projection; root=Path("/Users/ray/projects/open_trader/data"); [(lambda p: print(market, p["schema_version"], p["sample_details"]["discipline"]["winning_sample_count"], p["sample_details"]["discipline"]["eligible_sample_count"], p["sample_details"]["discipline"]["win_rate"], p["sample_details"]["actual"]["winning_sample_count"], p["sample_details"]["actual"]["eligible_sample_count"], p["sample_details"]["actual"]["win_rate"]))(build_trend_review_projection(root, market)) for market in ("CN", "HK", "US")]'
+PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -c 'from pathlib import Path; import open_trader.trend_review as trend_review; trend_review._write_json_atomic = lambda *_args, **_kwargs: None; root=Path("/Users/ray/projects/open_trader/data"); [(lambda p: print(market, p["schema_version"], p["sample_details"]["discipline"]["winning_sample_count"], p["sample_details"]["discipline"]["eligible_sample_count"], p["sample_details"]["discipline"]["win_rate"], p["sample_details"]["actual"]["winning_sample_count"], p["sample_details"]["actual"]["eligible_sample_count"], p["sample_details"]["actual"]["win_rate"]))(trend_review.build_trend_review_projection(root, market)) for market in ("CN", "HK", "US")]'
 ```
 
 Expected:
