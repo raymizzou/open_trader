@@ -68,6 +68,19 @@ def source_and_solution() -> tuple[ExecutionSolutionSource, ExecutionSolution]:
     return source, result.execution_solution
 
 
+def shared_key_source_and_solution() -> tuple[ExecutionSolutionSource, ExecutionSolution]:
+    original = two_leg_component()
+    actions = tuple(replace(action, venue_id="venue-a", account_id="account-a", min_quantity_lots=10, max_quantity_lots=10, cost_slices=(ExecutableCostSlice(1, 10, 1),)) for action in original.problem.actions)
+    problem = replace(original.problem, actions=actions)
+    bindings = tuple(replace(binding, venue_id="venue-a") for binding in original.book_bindings)
+    component = VerifiedComponent(problem, component_fingerprint(problem, bindings, 100), 100, bindings)
+    books = tuple(replace(book, venue_id="venue-a", book=ThresholdOrderBook(book.native_id, (BookLevel(Decimal("0.40"), Decimal("10")),), (), AS_OF)) for book in two_leg_books())
+    account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 10_000, 10_000),), 10_000, 0, 10_000)
+    result = resolve_component(component, books, account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF, solver_backend=BruteForceBackend())
+    assert result.execution_solution is not None and result.market_solution is not None
+    return ExecutionSolutionSource(canonical_payload(result.execution_solution), canonical_payload(result.market_solution), component, books, account, AS_OF), result.execution_solution
+
+
 def solution() -> ExecutionSolution:
     return source_and_solution()[1]
 
@@ -140,6 +153,31 @@ def reconciliation_context(batch_id: str = "batch-1", *, full: bool = False, a_s
     return ReconciliationContext(f"{batch_id}:v1", source_and_solution()[0].account_snapshot, holdings, (SettlementCashFlow(f"{batch_id}:action-a", None, "venue-a", "account-a", "usd-cents", 0, 0, AS_OF, AS_OF, a_sequence, False), SettlementCashFlow(f"{batch_id}:action-b", None, "venue-b", "account-b", "usd-cents", 0, 0, AS_OF, AS_OF, 1, False)), AS_OF, AS_OF, AS_OF)
 
 
+def shared_key_repair_context() -> RepairContext:
+    source, _ = shared_key_source_and_solution()
+    return RepairContext(
+        "shared:v1",
+        (
+            RepairQuote("shared:action-a", "action-a", "venue-a", "account-a", "usd-cents", (CanonicalBookLevel(1, 10, 1, 2),), AS_OF, AS_OF),
+            RepairQuote("shared:action-b", "action-b", "venue-a", "account-a", "usd-cents", (CanonicalBookLevel(1, 10, 1, 2),), AS_OF, AS_OF),
+        ),
+        (ConfirmedHolding("venue-a", "account-a", "action-a", 4, AS_OF, AS_OF), ConfirmedHolding("venue-a", "account-a", "action-b", 0, AS_OF, AS_OF)),
+        source.account_snapshot,
+        (SettlementCashFlow("shared:action-a", None, "venue-a", "account-a", "usd-cents", 0, 0, AS_OF, AS_OF, 1, False), SettlementCashFlow("shared:action-b", None, "venue-a", "account-a", "usd-cents", 0, 0, AS_OF, AS_OF, 1, False)),
+        AS_OF,
+    )
+
+
+def shared_key_reconciliation_context() -> ReconciliationContext:
+    source, _ = shared_key_source_and_solution()
+    return ReconciliationContext(
+        "shared:v1", source.account_snapshot,
+        (ConfirmedHolding("venue-a", "account-a", "action-a", 10, AS_OF, AS_OF), ConfirmedHolding("venue-a", "account-a", "action-b", 10, AS_OF, AS_OF)),
+        (SettlementCashFlow("shared:action-a", None, "venue-a", "account-a", "usd-cents", 0, 0, AS_OF, AS_OF, 1, False), SettlementCashFlow("shared:action-b", None, "venue-a", "account-a", "usd-cents", 0, 0, AS_OF, AS_OF, 1, False)),
+        AS_OF, AS_OF, AS_OF,
+    )
+
+
 def test_entry_claims_one_batch_and_survives_reopen(tmp_path) -> None:
     current = service(tmp_path)
     batch = enter(current)
@@ -172,6 +210,30 @@ def test_entry_retry_uses_immutable_fingerprint_after_receipt_evolves(tmp_path) 
         opportunity_episode_id="episode-1", episode_lineage_id="lineage-1", execution_batch_id="batch-1",
         source=source_and_solution()[0], partial_fill_proof=proof(solution()), mode="AUTO", cap_config_version="caps-v1",
     ) == evolved
+
+
+def test_shared_reservation_key_entry_aggregates_repair_and_reconciliation(tmp_path) -> None:
+    current = service(tmp_path)
+    source, execution = shared_key_source_and_solution()
+    current.enter(
+        opportunity_episode_id="shared-episode", episode_lineage_id="shared-lineage", execution_batch_id="shared",
+        source=source, partial_fill_proof=proof(execution), mode="AUTO", cap_config_version="caps-v1",
+    )
+    a_partial = replace(receipt(leg="a", filled=4, state="CANCELLED", sequence=1), execution_batch_id="shared", client_order_id="shared:action-a", venue_id="venue-a", account_id="account-a", receipt_id="shared-a")
+    b_rejected = replace(receipt(leg="b", filled=0, state="REJECTED", sequence=1), execution_batch_id="shared", client_order_id="shared:action-b", venue_id="venue-a", account_id="account-a", receipt_id="shared-b")
+    current.apply_receipt(a_partial)
+    planned = current.apply_receipt(b_rejected, repair_context=shared_key_repair_context())
+    assert planned["repair_plan"]["family"] == "COMPLETE_REMAINING"
+
+    fresh = service(tmp_path / "reconciliation")
+    source, execution = shared_key_source_and_solution()
+    fresh.enter(
+        opportunity_episode_id="shared-episode-2", episode_lineage_id="shared-lineage-2", execution_batch_id="shared",
+        source=source, partial_fill_proof=proof(execution), mode="AUTO", cap_config_version="caps-v1",
+    )
+    for leg in ("a", "b"):
+        fresh.apply_receipt(replace(receipt(leg=leg, filled=10, state="FILLED", sequence=1), execution_batch_id="shared", client_order_id=f"shared:action-{leg}", venue_id="venue-a", account_id="account-a", receipt_id=f"shared-{leg}"))
+    assert fresh.complete_reconciliation("shared", context=shared_key_reconciliation_context())["state"] == "RECONCILED_FULL"
 
 
 def test_proof_decoder_is_strict_at_public_contract() -> None:
@@ -245,7 +307,7 @@ def test_same_sequence_conflict_opens_persistent_breaker(tmp_path) -> None:
 
     conflict = current.apply_receipt(replace(receipt(leg="a", filled=1, state="OPEN", sequence=1), receipt_id="a-conflict"))
 
-    assert conflict["incident"] == {"reason": "SAME_SEQUENCE_CONFLICT", "repair_status": "PENDING_RECONCILIATION"}
+    assert conflict["incident"] == {"reason": "SAME_SEQUENCE_CONFLICT", "repair_status": "CONFLICT_UNRESOLVED"}
     assert current.control()["mode"] == "MANUAL"
 
 
@@ -462,7 +524,7 @@ def test_conflict_keeps_old_and_new_receipt_facts(tmp_path) -> None:
         "transition_id": fingerprint({"reason": "SAME_SEQUENCE_CONFLICT", "old": old.to_payload(), "new": new.to_payload()}),
         "reason": "SAME_SEQUENCE_CONFLICT", "old": old.to_payload(), "new": new.to_payload(),
     }
-    assert conflict["conflict_observations"][-1]["client_order_id"] == old.client_order_id
+    assert conflict["unresolved_conflicts"][0]["kind"] == "SAME_PHYSICAL"
 
 
 def test_reconciliation_rejects_unresolved_receipt_conflict(tmp_path) -> None:
@@ -504,8 +566,53 @@ def test_conflicts_sum_uncertain_exposure_per_order(tmp_path) -> None:
     current.apply_receipt(replace(old_a, receipt_id="a-cost-conflict", cumulative_cost_units=700))
     conflicted = current.apply_receipt(replace(old_b, receipt_id="b-cost-conflict", cumulative_cost_units=800))
 
-    assert conflicted["conflict_exposure_by_order"] == {"batch-1:action-a": 190, "batch-1:action-b": 290}
+    assert sorted(conflicted["conflict_exposure_by_physical_order"].values()) == [190, 290]
     assert current.control()["total_unsettled_capital_units"] == 1500
+
+
+def test_same_order_newer_terminal_receipt_resolves_conflict_and_reconciles(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    old = receipt(leg="a", filled=0, state="OPEN", sequence=1)
+    current.apply_receipt(old)
+    conflicted = current.apply_receipt(replace(old, receipt_id="a-conflict", cumulative_cost_units=1))
+    assert conflicted["unresolved_conflicts"]
+
+    resolved = current.apply_receipt(replace(old, receipt_id="a-final", state="REJECTED", sequence=2))
+    assert resolved["unresolved_conflicts"] == []
+    assert resolved["receipt_conflicts"]  # immutable audit remains
+    current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
+
+    assert current.complete_reconciliation("batch-1", context=reconciliation_context(a_sequence=2))["state"] == "RECONCILED_ZERO"
+
+
+def test_drift_requires_terminal_rest_confirmation_to_resolve(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    original = replace(receipt(leg="a", filled=0, state="OPEN", sequence=1), venue_order_id="venue-order-1")
+    current.apply_receipt(original)
+    drift = current.apply_receipt(replace(original, receipt_id="drift", venue_order_id="venue-order-2", sequence=2))
+    assert drift["unresolved_conflicts"]
+
+    untrusted = current.apply_receipt(replace(original, receipt_id="untrusted", state="REJECTED", sequence=3))
+    assert untrusted["unresolved_conflicts"]
+    resolved = current.apply_receipt(replace(original, receipt_id="rest-final", state="REJECTED", sequence=None, rest_confirmed=True))
+
+    assert resolved["unresolved_conflicts"] == []
+    assert resolved["receipt_conflicts"]
+
+
+def test_conflict_invalidates_existing_repair_plan(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    current.apply_receipt(receipt(leg="a", filled=4, state="OPEN", sequence=1))
+    current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
+    planned = current.apply_receipt(receipt(leg="a", filled=4, state="CANCELLED", sequence=2), repair_context=repair_context())
+    assert planned["repair_plan"] is not None
+
+    conflicted = current.apply_receipt(replace(receipt(leg="a", filled=4, state="CANCELLED", sequence=2), receipt_id="a-conflict", cumulative_cost_units=1))
+    assert conflicted["unresolved_conflicts"]
+    assert conflicted["repair_plan"] is None
 
 
 def test_partial_fill_gate_uses_proven_upper_loss_bound_not_principal(tmp_path) -> None:

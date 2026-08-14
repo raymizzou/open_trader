@@ -435,8 +435,8 @@ class NLegExecutionService:
             "receipts": {},
             "confirmed_holdings": [],
             "receipt_conflicts": [],
-            "conflict_observations": [],
-            "conflict_exposure_by_order": {},
+            "unresolved_conflicts": [],
+            "conflict_exposure_by_physical_order": {},
             "incident": None,
             "repair_plan": None,
         }
@@ -505,7 +505,7 @@ class NLegExecutionService:
                 raise ValueError("N_LEG_RECONCILIATION_PROOF_REQUIRED")
             if control.get("active_batch_id") != execution_batch_id:
                 raise ValueError("N_LEG_RECONCILIATION_OWNERSHIP_LOST")
-            if batch.get("receipt_conflicts") or batch.get("conflict_observations"):
+            if batch.get("unresolved_conflicts"):
                 raise ValueError("N_LEG_RECONCILIATION_CONFLICT_UNRESOLVED")
             expected_holding: dict[tuple[str, str, str], int] = {}
             for leg in batch["legs"]:
@@ -558,6 +558,7 @@ class NLegExecutionService:
         leg = matches[0]
         if any(leg.get(name) != getattr(receipt, name) for name in ("venue_id", "account_id")) or leg.get("submitted_quantity") != receipt.submitted_quantity:
             return self._incident_copy(copy, legs, receipts, receipt, "RECEIPT_IDENTITY_DRIFT")
+        self._resolve_conflicts(copy, leg, receipt)
         prior = leg.get("receipt")
         if isinstance(prior, dict):
             if prior.get("venue_order_id") is not None and prior.get("venue_order_id") != receipt.venue_order_id:
@@ -603,7 +604,61 @@ class NLegExecutionService:
         return cls._semantic_payload(receipt.to_payload())
 
     @staticmethod
-    def _incident_copy(copy: dict[str, object], legs: list[dict[str, object]], receipts: dict[str, object], receipt: OrderReceipt, reason: str) -> tuple[dict[str, object], str, bool]:
+    def _physical_identity(leg: Mapping[str, object] | None, receipt: OrderReceipt) -> tuple[str, str | None, str, str, str, str]:
+        return (
+            receipt.client_order_id, receipt.venue_order_id, receipt.venue_id, receipt.account_id,
+            str(leg.get("asset_id")) if isinstance(leg, Mapping) else "UNBOUND",
+            str(leg.get("settlement_asset_id")) if isinstance(leg, Mapping) else "UNBOUND",
+        )
+
+    @classmethod
+    def _intended_identity(cls, leg: Mapping[str, object], prior: Mapping[str, object] | None) -> tuple[str, str | None, str, str, str, str]:
+        return (
+            str(leg["client_order_id"]), prior.get("venue_order_id") if isinstance(prior, Mapping) else None,
+            str(leg["venue_id"]), str(leg["account_id"]), str(leg["asset_id"]), str(leg["settlement_asset_id"]),
+        )
+
+    @staticmethod
+    def _physical_key(identity: tuple[str, str | None, str, str, str, str]) -> str:
+        return fingerprint({"physical_identity": identity})
+
+    @staticmethod
+    def _monotonic_terminal(prior: Mapping[str, object] | None, receipt: OrderReceipt) -> bool:
+        return (
+            isinstance(prior, Mapping) and receipt.state in _TERMINAL
+            and all(getattr(receipt, field) >= prior.get(field, 0) for field in ("cumulative_filled_quantity", "cumulative_cost_units", "cumulative_fee_units"))
+        )
+
+    def _resolve_conflicts(self, batch: dict[str, object], leg: dict[str, object], receipt: OrderReceipt) -> None:
+        raw = batch.get("unresolved_conflicts")
+        if not isinstance(raw, list):
+            return
+        prior = leg.get("receipt") if isinstance(leg.get("receipt"), dict) else None
+        intended = self._intended_identity(leg, prior)
+        physical = self._physical_identity(leg, receipt)
+        kept = []
+        cleared: set[str] = set()
+        for conflict in raw:
+            if not isinstance(conflict, dict) or conflict.get("intended_identity") != list(intended):
+                kept.append(conflict)
+                continue
+            same = conflict.get("kind") == "SAME_PHYSICAL" and type(prior.get("sequence")) is int and type(receipt.sequence) is int and receipt.sequence > prior["sequence"] and physical == intended and self._monotonic_terminal(prior, receipt)
+            rest = conflict.get("kind") != "SAME_PHYSICAL" and receipt.rest_confirmed and physical == intended and self._monotonic_terminal(prior, receipt)
+            if same or rest:
+                key = conflict.get("physical_key")
+                if isinstance(key, str):
+                    cleared.add(key)
+            else:
+                kept.append(conflict)
+        if len(kept) == len(raw):
+            return
+        batch["unresolved_conflicts"] = kept
+        exposures = batch.get("conflict_exposure_by_physical_order")
+        if isinstance(exposures, dict):
+            batch["conflict_exposure_by_physical_order"] = {key: value for key, value in exposures.items() if key not in cleared}
+
+    @classmethod
+    def _incident_copy(cls, copy: dict[str, object], legs: list[dict[str, object]], receipts: dict[str, object], receipt: OrderReceipt, reason: str) -> tuple[dict[str, object], str, bool]:
         receipts[receipt.receipt_id] = receipt.to_payload()
         copy["legs"] = legs
         copy["receipts"] = receipts
@@ -611,20 +666,29 @@ class NLegExecutionService:
             (leg.get("receipt") for leg in legs if leg.get("client_order_id") == receipt.client_order_id and isinstance(leg.get("receipt"), dict)),
             None,
         )
-        if isinstance(prior, dict):
-            existing = copy.get("receipt_conflicts")
-            conflict = {"transition_id": fingerprint({"reason": reason, "old": prior, "new": receipt.to_payload()}), "reason": reason, "old": prior, "new": receipt.to_payload()}
-            copy["receipt_conflicts"] = [*(existing if isinstance(existing, list) else []), conflict]
-        observations = copy.get("conflict_observations")
-        copy["conflict_observations"] = [*(observations if isinstance(observations, list) else []), {"client_order_id": receipt.client_order_id, "receipt": receipt.to_payload()}]
+        existing = copy.get("receipt_conflicts")
+        old = prior if isinstance(prior, dict) else None
+        conflict = {"transition_id": fingerprint({"reason": reason, "old": old, "new": receipt.to_payload()}), "reason": reason, "old": old, "new": receipt.to_payload()}
+        copy["receipt_conflicts"] = [*(existing if isinstance(existing, list) else []), conflict]
         matching = next((leg for leg in legs if leg.get("client_order_id") == receipt.client_order_id), None)
-        exposures = copy.get("conflict_exposure_by_order")
+        intended = cls._intended_identity(matching, prior) if isinstance(matching, dict) else None
+        physical = cls._physical_identity(matching, receipt)
+        same_physical = intended is not None and physical == intended
+        key = cls._physical_key(physical)
+        unresolved = copy.get("unresolved_conflicts")
+        record = {
+            "physical_key": key, "physical_identity": list(physical), "intended_identity": list(intended) if intended is not None else None,
+            "kind": "SAME_PHYSICAL" if same_physical else "DRIFT_OR_UNBOUND", "reason": reason,
+        }
+        copy["unresolved_conflicts"] = [*(unresolved if isinstance(unresolved, list) else []), record]
+        exposures = copy.get("conflict_exposure_by_physical_order")
         exposure_by_order = dict(exposures) if isinstance(exposures, dict) else {}
         reported = receipt.cumulative_cost_units + receipt.cumulative_fee_units
-        exposure = max(0, reported - int(matching.get("max_cost_units", 0))) if isinstance(matching, dict) else reported
-        prior_exposure = exposure_by_order.get(receipt.client_order_id, 0)
-        exposure_by_order[receipt.client_order_id] = max(prior_exposure if type(prior_exposure) is int else 0, exposure)
-        copy["conflict_exposure_by_order"] = exposure_by_order
+        exposure = max(0, reported - int(matching.get("max_cost_units", 0))) if same_physical and isinstance(matching, dict) else reported
+        prior_exposure = exposure_by_order.get(key, 0)
+        exposure_by_order[key] = max(prior_exposure if type(prior_exposure) is int else 0, exposure)
+        copy["conflict_exposure_by_physical_order"] = exposure_by_order
+        copy["repair_plan"] = None
         return copy, reason, True
 
     @staticmethod
@@ -664,6 +728,10 @@ class NLegExecutionService:
         if reason in {"UNKNOWN_ORDER_STATE", "COST_RESERVATION_BREACH", "ZERO_FILL_CASH_BREACH", "RECEIPT_ID_CONFLICT", "RECEIPT_IDENTITY_DRIFT", "VENUE_ORDER_ID_DRIFT", "SAME_SEQUENCE_CONFLICT", "CUMULATIVE_REGRESSION", "TERMINAL_REOPENED"}:
             control["breaker_open"] = True
             control["breaker_reason"] = reason
+        if batch.get("unresolved_conflicts"):
+            batch["repair_plan"] = None
+            batch["incident"] = {"reason": reason, "repair_status": "CONFLICT_UNRESOLVED"}
+            return batch, control
         if not self._all_terminal(batch):
             return batch, control
         if isinstance(batch.get("repair_plan"), dict):
@@ -745,6 +813,8 @@ class NLegExecutionService:
 
     @staticmethod
     def _repair_plan(batch: Mapping[str, object], context: RepairContext | None) -> dict[str, object] | None:
+        if batch.get("unresolved_conflicts"):
+            return None
         if not isinstance(context, RepairContext) or context.reservation_version != batch.get("reservation_version"):
             return None
         raw_legs = batch.get("legs")
@@ -882,7 +952,7 @@ class NLegExecutionService:
     def _batch_occupancy(batch: Mapping[str, object]) -> int:
         rows = batch.get("reservations")
         if isinstance(rows, list):
-            exposures = batch.get("conflict_exposure_by_order")
+            exposures = batch.get("conflict_exposure_by_physical_order")
             conflict_units = sum(value for value in exposures.values() if type(value) is int and value >= 0) if isinstance(exposures, dict) else 0
             return sum(int(row.get("remaining_units", 0)) + int(row.get("holding_units", 0)) for row in rows if isinstance(row, dict)) + conflict_units
         value = batch.get("total_unsettled_capital_units", batch.get("reservation_units", 0))
