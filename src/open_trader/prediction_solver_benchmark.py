@@ -3033,11 +3033,11 @@ def _run_full_environment(
                             )
                     )
                     wall_ns = time.perf_counter_ns() - started_ns
-                    terminal = next(
-                        (item for item in batch if item[2].hard_failure or item[1].termination_reason.value in _FATAL_TERMINATIONS),
+                    terminal_index = next(
+                        (index for index, item in enumerate(batch) if item[2].hard_failure or item[1].termination_reason.value in _FATAL_TERMINATIONS),
                         None,
                     )
-                    if terminal is None:
+                    if terminal_index is None:
                         fingerprints = {
                             _semantic_fingerprint(
                                 {
@@ -3050,13 +3050,14 @@ def _run_full_environment(
                         }
                         if len(fingerprints) != 1:
                             raise RuntimeError("SEMANTIC_NONDETERMINISM")
-                    outcome, run, checked = terminal or batch[0]
+                    selected_index = terminal_index if terminal_index is not None else 0
+                    outcome, run, checked = batch[selected_index]
                     peaks = [item[0].peak_rss_kib * 1024 for item in batch]
                     records.append(
                         record(
                             case, outcome, run, checked, sample_kind, sample_index, worker_count, worker_count,
                             wall_ns, max(harness.start_count for harness in harnesses),
-                            max(harness.rebuild_count for harness in harnesses), max(peaks), sum(peaks), harnesses[0],
+                            max(harness.rebuild_count for harness in harnesses), max(peaks), sum(peaks), harnesses[selected_index],
                         )
                     )
                     checkpoint(case.case_id, sample_kind, sample_index, sum(peaks))

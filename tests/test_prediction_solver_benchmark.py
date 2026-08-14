@@ -2310,6 +2310,7 @@ def _fake_harness_factory(
     hard_check_failure_by_solver: dict[str, bool] | None = None,
     termination_by_sample_kind: dict[tuple[str, str], str] | None = None,
     termination_by_slot: dict[tuple[str, str, int], str] | None = None,
+    distinct_container_ids: bool = False,
 ):
     next_pid = 10_000
     cases = benchmark._load_full_cases()
@@ -2323,6 +2324,8 @@ def _fake_harness_factory(
             self.solver = solver
             self.worker_pid = next_pid
             next_pid += 1
+            if distinct_container_ids:
+                self.container_id = f"container-{self.worker_pid}"
             self.start_count = 0
             self.rebuild_count = 0
             self._memory_limit_bytes: int | None = None
@@ -2500,15 +2503,24 @@ def test_full_runner_retains_a_nonzero_throughput_slot_failure(monkeypatch) -> N
     monkeypatch.setattr(benchmark, "_SOLVERS", ("highs",))
     monkeypatch.setattr(benchmark, "_full_sample_plan", lambda _: (("single_contract_complement", "throughput", 0, 2),))
 
+    factory = _fake_harness_factory(
+        termination_by_slot={("highs", "throughput", 1): "CRASH"},
+        distinct_container_ids=True,
+    )
     records = benchmark._run_full_environment(
         cases,
         manifest,
         "macos",
-        _fake_harness_factory(termination_by_slot={("highs", "throughput", 1): "CRASH"}),
+        factory,
     )
 
     assert len(records) == 1
     assert records[0]["solver_run"]["termination_reason"] == "CRASH"
+    terminal_harness = next(
+        harness for harness in factory.instances
+        if f"pid-{harness.worker_pid}" == records[0]["worker_id"]
+    )
+    assert records[0]["container_id"] == terminal_harness.container_id
 
 
 def test_full_runner_retains_a_rebuild_prime_failure_under_the_rebuild_key(monkeypatch) -> None:
