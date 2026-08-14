@@ -755,6 +755,34 @@ def test_cross_domain_and_conflicting_same_physical_evidence_fail_atomically(tmp
     assert multiple.state("batch-1")["unresolved_conflicts"]
 
 
+def test_distinct_drift_ledger_requires_its_own_settlement_account_balance(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    current.apply_receipt(receipt(leg="a", filled=0, state="OPEN", sequence=1))
+    conflict = current.apply_receipt(replace(receipt(leg="a", filled=0, state="OPEN", sequence=2), receipt_id="foreign", venue_id="venue-c", account_id="account-c"))["unresolved_conflicts"][0]
+    current.apply_receipt(receipt(leg="a", filled=0, state="REJECTED", sequence=3))
+    current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
+    evidence = replace(resolution_for(conflict), cumulative_filled_quantity=1, sequence=4)
+    context = replace(
+        reconciliation_context(a_sequence=3, resolutions=(evidence,), now=AS_OF + timedelta(seconds=2)),
+        holdings=(ConfirmedHolding("venue-c", "account-c", "action-a", 1, AS_OF, AS_OF),),
+    )
+    with pytest.raises(ValueError, match="PROOF_REQUIRED"):
+        current.complete_reconciliation("batch-1", context=context)
+    assert current.state("batch-1")["unresolved_conflicts"]
+
+
+def test_unbound_terminal_evidence_cannot_proxy_known_leg_binding(tmp_path) -> None:
+    current = service(tmp_path)
+    enter(current)
+    conflict = current.apply_receipt(replace(receipt(leg="a", filled=0, state="OPEN", sequence=1), client_order_id="unknown-client", receipt_id="unknown"))["unresolved_conflicts"][0]
+    current.apply_receipt(receipt(leg="a", filled=0, state="REJECTED", sequence=1))
+    current.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
+    with pytest.raises(ValueError, match="CONFLICT_UNRESOLVED"):
+        current.complete_reconciliation("batch-1", context=reconciliation_context(resolutions=(resolution_for(conflict),), now=AS_OF + timedelta(seconds=2)))
+    assert current.state("batch-1")["capital_exposure_unknown"] is True
+
+
 def test_exact_conflict_evidence_reconciles_drift_and_unknown_order(tmp_path) -> None:
     current = service(tmp_path)
     enter(current)

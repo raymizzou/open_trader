@@ -571,6 +571,7 @@ class NLegExecutionService:
             actual_holding = {(item.venue_id, item.account_id, item.asset_id): item.quantity for item in context.holdings}
             balances = {(item.venue_id, item.account_id, item.asset_id) for item in context.account_snapshot.balances}
             settlement_keys = {(str(leg["venue_id"]), str(leg["account_id"]), str(leg["settlement_asset_id"])) for leg in batch["legs"] if isinstance(leg, dict)}
+            settlement_keys |= {(str(item["venue_id"]), str(item["account_id"]), str(item["settlement_asset_id"])) for item in terminal_ledger.values()}
             if not settlement_keys.issubset(balances) or any(actual_holding.get(key, 0) < quantity for key, quantity in expected_holding.items()):
                 raise ValueError("N_LEG_RECONCILIATION_PROOF_REQUIRED")
             flows = self._bound_cash_flows(batch, context.cash_flows, context.now)
@@ -742,6 +743,8 @@ class NLegExecutionService:
         identity = [evidence.client_order_id, evidence.venue_order_id, evidence.venue_id, evidence.account_id, evidence.asset_id, evidence.settlement_asset_id]
         if conflict.get("physical_identity") != identity:
             return False
+        if conflict.get("kind") == "UNBOUND" and evidence.outcome != "NOT_FOUND":
+            return False
         max_sequence = conflict.get("max_sequence", -1)
         max_rest = conflict.get("max_rest_observation_version", -1)
         max_cash = conflict.get("max_actual_cash_units", 0)
@@ -781,7 +784,6 @@ class NLegExecutionService:
             groups.setdefault(key, []).append((conflict, actual[conflict_id]))
         selected: dict[str, tuple[dict[str, object], ConflictResolutionEvidence]] = {}
         for key, items in groups.items():
-            first = items[0][1]
             facts = {(item.outcome, item.terminal_state, item.cumulative_filled_quantity, item.cumulative_cost_units, item.cumulative_fee_units, item.sequence, item.rest_confirmed, item.observation_version) for _, item in items}
             if len(facts) != 1:
                 return
@@ -878,7 +880,7 @@ class NLegExecutionService:
             "conflict_id": fingerprint({"reason": reason, "old": old, "new": receipt.to_payload(), "physical_identity": physical}),
             "physical_key": key, "physical_identity": list(physical), "intended_identity": list(intended) if intended is not None else None,
             "kind": "SAME_PHYSICAL" if same_physical else ("DRIFT" if isinstance(matching, dict) else "UNBOUND"), "reason": reason,
-            "observed_physical_identities": [list(physical)], "max_sequence": receipt.sequence,
+            "max_sequence": receipt.sequence,
             "max_rest_observation_version": receipt.rest_observation_version if receipt.rest_confirmed else None,
             "max_source_timestamp": source_timestamp, "max_observed_at": observed_at,
             "max_actual_cash_units": receipt.cumulative_cost_units + receipt.cumulative_fee_units,
