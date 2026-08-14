@@ -7524,7 +7524,7 @@ for (const [broker,label] of [["tiger","美股复盘"],["phillips","港股复盘
   const report=renderAccountSection(group(broker));
   const disclosure=report.match(/<details class="trend-audit trend-review-disclosure"[\s\S]*?<\/details>/)?.[0]||"";
   if (!report.includes("cn-trend-report") || !disclosure.includes("<summary>趋势复盘") || disclosure.includes(" open")) throw new Error(report);
-  if (!disclosure.includes("纪律模拟 31 笔") || !disclosure.includes("trend-review") || !disclosure.includes(label.replace("复盘","趋势复盘")) || disclosure.includes("<small>")) throw new Error(disclosure);
+  if (!disclosure.includes("纪律模拟 31 笔") || !disclosure.includes("trend-review") || !disclosure.includes(label.replace("复盘","趋势复盘"))) throw new Error(disclosure);
   state.accountViews[broker]="real";
 }
 if (renderAccountSection(group("futu")).includes("复盘")) throw new Error("futu review");
@@ -7533,7 +7533,7 @@ for (const text of ["东方财富｜A股","A股趋势复盘","A股短线右侧�
   "纪律模拟 31 笔","实际执行 29 / 30，数据不足","共同截止日 2026-07-17",
   "策略与市场基准","期间净收益率","相对市场超额收益","最大回撤",
   "卡玛比率","夏普比率","纪律模拟","实际执行","同期市场","市场 1 年","市场 5 年",
-  "市场数据截至 2026-07-17","5 年收益 CAGR","完整交易胜率 100% · 31 胜 / 31 闭环","完整交易胜率 100% · 29 胜 / 29 闭环","12.6%","18.2%","观察期不足","基准自身","实际执行日终净值缺失"]) {
+  "市场数据截至 2026-07-17","5 年收益 CAGR","12.6%","18.2%","观察期不足","基准自身","实际执行日终净值缺失"]) {
   if (!html.includes(text)) throw new Error(text+"\n"+html);
 }
 for (const forbidden of [
@@ -7549,13 +7549,17 @@ const side=html.match(/<div class="trend-review-header-side">([\s\S]*?)<\/div>/)
 const sideOrder=["data-close-trend-report","纪律模拟 31 笔","实际执行 29 / 30，数据不足","共同截止日 2026-07-17"];
 if (sideOrder.some((text,index)=>!side.includes(text)||(index&&side.indexOf(text)<=side.indexOf(sideOrder[index-1])))) throw new Error(side);
 if ((html.match(/class="trend-review-matrix"/g)||[]).length!==1) throw new Error(html);
+if ((html.match(/class="trend-review-win-rate/g) || []).length !== 2) throw new Error(html);
+if (!html.includes('<span>完整交易胜率</span><strong>100%</strong><small>31 胜 / 31 闭环</small>') || !html.includes('<span>完整交易胜率</span><strong>100%</strong><small>29 胜 / 29 闭环</small>')) throw new Error(html);
+if ((html.match(/class="trend-review-column-groups"/g) || []).length !== 1) throw new Error(html);
+for (const text of ["完整交易胜率", "策略表现", "市场基准", "越高越好", "越低越好"]) {
+  if (!html.includes(text)) throw new Error(text + "\n" + html);
+}
+if (html.includes('class="trend-review-axis"')) throw new Error(html);
 if ((html.match(/class="trend-review-metric"/g)||[]).length!==5) throw new Error(html);
-if ((html.match(/class="trend-review-axis"/g)||[]).length!==5) throw new Error(html);
 if ((html.match(/class="trend-review-series/g)||[]).length!==25) throw new Error(html);
 for (const metric of html.match(/<section class="trend-review-metric"[\s\S]*?<\/section>/g)||[]) {
-  if ((metric.match(/class="trend-review-axis"/g)||[]).length!==1) throw new Error(metric);
   if ((metric.match(/class="trend-review-series/g)||[]).length!==5) throw new Error(metric);
-  if (!/data-domain-min="-?[\d.]+" data-domain-max="-?[\d.]+"/.test(metric)) throw new Error(metric);
 }
 for (const shape of ["solid-circle","hollow-circle","diamond","square","ring"]) if (!html.includes(`trend-review-shape-${shape}`)) throw new Error(shape);
 if (!html.includes('aria-label="纪律模拟，期间净收益率，12.6%')) throw new Error(html);
@@ -7607,18 +7611,19 @@ const html=renderTrendReviewWorkspace(review);
 for (const text of [
   "纪律模拟 4 / 30，数据不足","实际执行 数据不可用","发现 9 · 排除 4 · 未闭环 1",
   "统计截至 2026-08-08T15:00:00+08:00","指标截至 2026-08-08",
-  "完整交易胜率 25% · 1 胜 / 4 闭环","排除原因 成本不完整 4","统计来源不可用","实际执行日终净值缺失",
+  "排除原因 成本不完整 4","统计来源不可用","实际执行日终净值缺失",
   "统计刷新失败；报告继续使用上一个有效快照",
 ]) if (!html.includes(text)) throw new Error(text+"\n"+html);
+if (!html.includes('<span>完整交易胜率</span><strong>25%</strong><small>1 胜 / 4 闭环</small>')) throw new Error(html);
 const unavailableMeta=renderTrendReviewStatisticsMeta(review,"actual","实际执行");
-if (!unavailableMeta.includes("统计来源不可用") || unavailableMeta.includes("完整交易胜率")) throw new Error(unavailableMeta);
+if (!unavailableMeta.includes("统计来源不可用") || !unavailableMeta.includes('<span>完整交易胜率</span><strong>数据不足</strong><small>0 闭环</small>')) throw new Error(unavailableMeta);
 const zero=renderTrendReviewWorkspace({...review,
   sample_counts:{...review.sample_counts,actual:0},
   sample_details:{...review.sample_details,actual:detail(0,0,null,0,0,0,"2026-08-08T15:00:00+08:00")},
   sample_cutoffs:{...review.sample_cutoffs,actual:"2026-08-08T15:00:00+08:00"},
   metric_cutoffs:{...review.metric_cutoffs,actual:"2026-08-08"},
 });
-if (!zero.includes("完整交易胜率 数据不足 · 0 闭环") || zero.includes("完整交易胜率 0%")) throw new Error(zero);
+if (!zero.includes('<span>完整交易胜率</span><strong>数据不足</strong><small>0 闭环</small>') || zero.includes("完整交易胜率 0%")) throw new Error(zero);
 if (html.includes("共同截止日")) throw new Error(html);
 if ((html.match(/class="trend-review-matrix"/g)||[]).length!==1) throw new Error(html);
 for (const value of ["7.8%","8.2%","6.1%"] ) if (!html.includes(value)) throw new Error(html);

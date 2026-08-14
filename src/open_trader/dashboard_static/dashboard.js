@@ -3958,11 +3958,11 @@ function renderTrendReportEntry(broker) {
 }
 
 const TREND_REVIEW_METRICS = [
-  {key:"period_net_return", label:"期间净收益率", percent:true},
-  {key:"market_excess_return", label:"相对市场超额收益", percent:true},
-  {key:"max_drawdown", label:"最大回撤", percent:true},
-  {key:"calmar", label:"卡玛比率", percent:false},
-  {key:"sharpe", label:"夏普比率", percent:false},
+  {key:"period_net_return", label:"期间净收益率", percent:true, direction:"越高越好"},
+  {key:"market_excess_return", label:"相对市场超额收益", percent:true, direction:"越高越好"},
+  {key:"max_drawdown", label:"最大回撤", percent:true, direction:"越低越好"},
+  {key:"calmar", label:"卡玛比率", percent:false, direction:"越高越好"},
+  {key:"sharpe", label:"夏普比率", percent:false, direction:"越高越好"},
 ];
 
 const TREND_REVIEW_SERIES = [
@@ -3997,25 +3997,6 @@ function trendReviewWindow(review, series, metric) {
 }
 
 function renderTrendReviewMetric(review, metric) {
-  const values = TREND_REVIEW_SERIES.map((series) => numericValue(review.metrics?.[metric.key]?.[series.key]?.value));
-  const numeric = values.filter((value) => value !== null);
-  let minimum = Math.min(0, ...numeric);
-  let maximum = Math.max(0, ...numeric);
-  if (minimum === maximum) {
-    minimum = -1;
-    maximum = 1;
-  }
-  const range = maximum - minimum;
-  const zeroPosition = Math.round((0 - minimum) / range * 10000) / 100;
-  const points = TREND_REVIEW_SERIES.map((series, index) => {
-    const value = values[index];
-    if (value === null) return "";
-    const cell = review.metrics?.[metric.key]?.[series.key] || {};
-    const display = formatTrendReviewValue(cell, metric.percent);
-    const window = trendReviewWindow(review, series, metric);
-    const position = Math.round((value - minimum) / range * 10000) / 100;
-    return `<i class="trend-review-point trend-review-shape-${series.shape}" data-series="${series.key}" data-value="${value}" style="--trend-review-position:${position}%" aria-label="${escapeHtml(`${series.label}，${metric.label}，${display}，${window}`)}"></i>`;
-  }).join("");
   const rows = TREND_REVIEW_SERIES.map((series) => {
     const cell = review.metrics?.[metric.key]?.[series.key] || {};
     const value = numericValue(cell.value);
@@ -4027,10 +4008,8 @@ function renderTrendReviewMetric(review, metric) {
       <strong>${escapeHtml(display)}</strong>
     </li>`;
   }).join("");
-  return `<section class="trend-review-metric" data-domain-min="${minimum}" data-domain-max="${maximum}" style="--trend-review-zero:${zeroPosition}%">
-    <h3>${escapeHtml(metric.label)}</h3>
-    <div class="trend-review-axis" role="img" aria-label="${escapeHtml(`${metric.label}共享数值标尺`)}">${points}</div>
-    <div class="trend-review-domain" aria-hidden="true"><span>${escapeHtml(formatTrendReviewValue({value:minimum}, metric.percent))}</span><span>${escapeHtml(formatTrendReviewValue({value:maximum}, metric.percent))}</span></div>
+  return `<section class="trend-review-metric">
+    <header><h3>${escapeHtml(metric.label)}</h3><span>${escapeHtml(metric.direction)}</span></header>
     <ul class="trend-review-values">${rows}</ul>
   </section>`;
 }
@@ -4042,20 +4021,18 @@ function renderTrendReviewStatisticsMeta(review, key, label) {
   const disposition = detail?.available === true
     ? `<span>发现 ${detail.discovered_candidate_count} · 排除 ${detail.excluded_candidate_count} · 未闭环 ${detail.incomplete_open_candidate_count}</span>`
     : "<span>统计来源不可用</span>";
-  const winRate = detail?.available !== true
-    ? ""
-    : detail.eligible_sample_count > 0 && hasValue(detail.win_rate)
-      ? `<span>完整交易胜率 ${escapeHtml(trendRiskPercent(detail.win_rate))} · ${escapeHtml(formatDisplayNumber(detail.winning_sample_count))} 胜 / ${escapeHtml(formatDisplayNumber(detail.eligible_sample_count))} 闭环</span>`
-      : "<span>完整交易胜率 数据不足 · 0 闭环</span>";
+  const winRate = detail?.available === true && detail.eligible_sample_count > 0 && hasValue(detail.win_rate)
+    ? {value:trendRiskPercent(detail.win_rate), detail:`${formatDisplayNumber(detail.winning_sample_count)} 胜 / ${formatDisplayNumber(detail.eligible_sample_count)} 闭环`}
+    : {value:"数据不足", detail:"0 闭环"};
   const exclusions = Array.isArray(detail?.exclusion_reasons) && detail.exclusion_reasons.length
     ? `<span>排除原因 ${detail.exclusion_reasons.map((item) => `${TREND_REASON_LABELS[item.reason] || "其他原因"} ${item.count}`).join("、")}</span>`
     : "";
-  return `<div class="trend-review-statistics" data-series="${key}"><strong>${escapeHtml(label)}</strong>
+  return `<div class="trend-review-statistics" data-series="${key}"><div class="trend-review-statistics-main"><strong>${escapeHtml(label)}</strong>
     <div class="trend-entry-details">
       ${sampleCutoff ? `<span>统计截至 ${escapeHtml(formatPlain(sampleCutoff))}</span>` : ""}
       ${metricCutoff ? `<span>指标截至 ${escapeHtml(formatPlain(metricCutoff))}</span>` : ""}
-      ${disposition}${winRate}${exclusions}
-    </div></div>`;
+      ${disposition}${exclusions}
+    </div></div><div class="trend-review-win-rate"><span>完整交易胜率</span><strong>${escapeHtml(winRate.value)}</strong><small>${escapeHtml(winRate.detail)}</small></div></div>`;
 }
 
 function renderTrendReviewMatrix(review) {
@@ -4076,6 +4053,7 @@ function renderTrendReviewMatrix(review) {
       ${renderTrendReviewStatisticsMeta(review, "discipline", "纪律模拟")}
       ${renderTrendReviewStatisticsMeta(review, "actual", "实际执行")}
     </div>
+    <div class="trend-review-column-groups"><span></span><span>策略表现</span><span>市场基准</span></div>
     ${TREND_REVIEW_METRICS.map((metric) => renderTrendReviewMetric(review, metric)).join("")}
   </figure>`;
 }
