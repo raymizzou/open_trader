@@ -679,6 +679,11 @@ def _valid_account_snapshot(snapshot: AccountSnapshot | None, now: datetime) -> 
     return len(keys) == len(snapshot.balances)
 
 
+def account_snapshot_is_valid(snapshot: AccountSnapshot | None, now: datetime) -> bool:
+    """Public #51 validation root for consumers of canonical account facts."""
+    return _valid_account_snapshot(snapshot, now)
+
+
 def _economic_book(book: ImmutableBook, action: CandidateAction) -> dict[str, object]:
     _, asks, market_id, actual_id = _book_asks(book.book, action)
     return {

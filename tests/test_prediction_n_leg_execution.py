@@ -114,7 +114,7 @@ def receipt(*, leg: str, filled: int, state: str, sequence: int) -> OrderReceipt
         venue_id=f"venue-{leg}", account_id=f"account-{leg}", venue_order_id=None,
         submitted_quantity=10, cumulative_filled_quantity=filled, cumulative_cost_units=0, cumulative_fee_units=0,
         state=state, sequence=sequence, rest_confirmed=False,
-        observed_at="2026-08-15T00:00:00Z", venue_timestamp="2026-08-15T00:00:00Z",
+        observed_at="2026-08-14T00:00:00Z", venue_timestamp="2026-08-14T00:00:00Z",
     )
 
 
@@ -128,16 +128,16 @@ def repair_context(*, b_buy: int = 1, b_venue: str = "venue-b", occurred_cost: i
         (ConfirmedHolding("venue-a", "account-a", "action-a", 4, AS_OF, AS_OF), ConfirmedHolding("venue-b", "account-b", "action-b", 0, AS_OF, AS_OF)),
         source_and_solution()[0].account_snapshot,
         (
-            SettlementCashFlow("batch-1:action-a", None, "venue-a", "account-a", "usd-cents", occurred_cost, 0, AS_OF, AS_OF, a_sequence),
-            SettlementCashFlow("batch-1:action-b", None, "venue-b", "account-b", "usd-cents", 0, 0, AS_OF, AS_OF, 1),
+            SettlementCashFlow("batch-1:action-a", None, "venue-a", "account-a", "usd-cents", occurred_cost, 0, AS_OF, AS_OF, a_sequence, False),
+            SettlementCashFlow("batch-1:action-b", None, "venue-b", "account-b", "usd-cents", 0, 0, AS_OF, AS_OF, 1, False),
         ),
         AS_OF,
     )
 
 
-def reconciliation_context(batch_id: str = "batch-1", *, full: bool = False) -> ReconciliationContext:
+def reconciliation_context(batch_id: str = "batch-1", *, full: bool = False, a_sequence: int = 1) -> ReconciliationContext:
     holdings = (ConfirmedHolding("venue-a", "account-a", "action-a", 10, AS_OF, AS_OF), ConfirmedHolding("venue-b", "account-b", "action-b", 10, AS_OF, AS_OF)) if full else ()
-    return ReconciliationContext(f"{batch_id}:v1", source_and_solution()[0].account_snapshot, holdings, AS_OF, AS_OF, AS_OF)
+    return ReconciliationContext(f"{batch_id}:v1", source_and_solution()[0].account_snapshot, holdings, (SettlementCashFlow(f"{batch_id}:action-a", None, "venue-a", "account-a", "usd-cents", 0, 0, AS_OF, AS_OF, a_sequence, False), SettlementCashFlow(f"{batch_id}:action-b", None, "venue-b", "account-b", "usd-cents", 0, 0, AS_OF, AS_OF, 1, False)), AS_OF, AS_OF, AS_OF)
 
 
 def test_entry_claims_one_batch_and_survives_reopen(tmp_path) -> None:
@@ -502,7 +502,7 @@ def test_partial_incident_can_close_only_after_eventual_full_and_reconciliation(
     awaiting = current.apply_receipt(receipt(leg="b", filled=10, state="FILLED", sequence=1))
 
     assert awaiting["incident"]["reason"] == "PARTIAL_FILL"
-    closed = current.complete_reconciliation("batch-1", context=reconciliation_context(full=True))
+    closed = current.complete_reconciliation("batch-1", context=reconciliation_context(full=True, a_sequence=2))
     assert closed["incident"] is None
     assert closed["state"] == "RECONCILED_FULL"
     assert current.control()["mode"] == "MANUAL"

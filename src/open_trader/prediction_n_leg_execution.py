@@ -9,7 +9,7 @@ from typing import Any, Literal, Mapping
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_executable_cost import (
     AccountSnapshot, ExecutionSolution, ImmutableBook, VerifiedComponent,
-    execution_solution_from_payload, market_solution_from_payload,
+    account_snapshot_is_valid, execution_solution_from_payload, market_solution_from_payload,
 )
 from open_trader.prediction_n_leg import ActionQuantity, OracleBudget, canonical_payload, fingerprint, problem_from_payload
 from open_trader.prediction_n_leg_oracle import evaluate_fixed_portfolio
@@ -272,7 +272,8 @@ class SettlementCashFlow:
     cumulative_fee_units: int
     source_timestamp: datetime
     observed_at: datetime
-    sequence: int
+    observation_version: int | None
+    rest_confirmed: bool
 
     def __post_init__(self) -> None:
         _text(self.client_order_id, "client_order_id")
@@ -282,20 +283,10 @@ class SettlementCashFlow:
             _text(getattr(self, name), name)
         _nonnegative(self.cumulative_cost_units, "cumulative_cost_units")
         _nonnegative(self.cumulative_fee_units, "cumulative_fee_units")
-        if type(self.sequence) is not int or self.sequence < 0 or not all(isinstance(value, datetime) and value.tzinfo is not None for value in (self.source_timestamp, self.observed_at)):
+        if self.observation_version is not None and (type(self.observation_version) is not int or self.observation_version < 0):
+            raise ValueError("cash flow observation version is invalid")
+        if type(self.rest_confirmed) is not bool or (self.observation_version is None and not self.rest_confirmed) or not all(isinstance(value, datetime) and value.tzinfo is not None for value in (self.source_timestamp, self.observed_at)):
             raise ValueError("cash flow observation is invalid")
-
-
-def _valid_account_snapshot(snapshot: object, now: datetime) -> bool:
-    if not isinstance(snapshot, AccountSnapshot) or not isinstance(snapshot.captured_at, datetime) or snapshot.captured_at.tzinfo is None:
-        return False
-    if not isinstance(snapshot.balances, tuple) or (now - snapshot.captured_at).total_seconds() < 0 or (now - snapshot.captured_at).total_seconds() > 10:
-        return False
-    if any(type(value) is not int or value < 0 for value in (snapshot.max_per_trade_cost_units, snapshot.unsettled_capital_units, snapshot.max_total_unsettled_capital_units)):
-        return False
-    if any(not hasattr(item, "venue_id") or not all(isinstance(value, str) and value for value in (item.venue_id, item.account_id, item.asset_id)) or type(item.available_units) is not int or type(item.allowance_units) is not int or item.available_units < 0 or item.allowance_units < 0 for item in snapshot.balances):
-        return False
-    return len({(item.venue_id, item.account_id, item.asset_id) for item in snapshot.balances}) == len(snapshot.balances)
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,7 +303,7 @@ class RepairContext:
         _text(self.reservation_version, "reservation_version")
         if not isinstance(self.account_snapshot, AccountSnapshot) or not isinstance(self.now, datetime) or self.now.tzinfo is None or not isinstance(self.account_snapshot.captured_at, datetime) or self.account_snapshot.captured_at.tzinfo is None:
             raise ValueError("now must be aware")
-        if not _valid_account_snapshot(self.account_snapshot, self.now):
+        if not account_snapshot_is_valid(self.account_snapshot, self.now):
             raise ValueError("repair account snapshot must be canonical and fresh")
         if not self.quotes or len({quote.client_order_id for quote in self.quotes}) != len(self.quotes):
             raise ValueError("repair quotes must be complete and unique")
@@ -337,6 +328,7 @@ class ReconciliationContext:
     reservation_version: str
     account_snapshot: AccountSnapshot
     holdings: tuple[ConfirmedHolding, ...]
+    cash_flows: tuple[SettlementCashFlow, ...]
     source_timestamp: datetime
     received_at: datetime
     now: datetime
@@ -345,12 +337,14 @@ class ReconciliationContext:
         _text(self.reservation_version, "reservation_version")
         if not isinstance(self.account_snapshot, AccountSnapshot) or not all(isinstance(value, datetime) and value.tzinfo is not None for value in (self.source_timestamp, self.received_at, self.now)):
             raise ValueError("invalid reconciliation source")
-        if any((self.now - value).total_seconds() < 0 or (self.now - value).total_seconds() > 10 for value in (self.source_timestamp, self.received_at)) or not _valid_account_snapshot(self.account_snapshot, self.now):
+        if any((self.now - value).total_seconds() < 0 or (self.now - value).total_seconds() > 10 for value in (self.source_timestamp, self.received_at)) or not account_snapshot_is_valid(self.account_snapshot, self.now):
             raise ValueError("reconciliation source must be fresh")
         if any((self.now - value).total_seconds() < 0 or (self.now - value).total_seconds() > 10 for item in self.holdings for value in (item.source_timestamp, item.received_at)):
             raise ValueError("reconciliation holdings must be fresh")
         if len({(item.venue_id, item.account_id, item.asset_id) for item in self.holdings}) != len(self.holdings):
             raise ValueError("reconciliation holdings must be unique")
+        if not isinstance(self.cash_flows, tuple) or not all(isinstance(flow, SettlementCashFlow) for flow in self.cash_flows) or len({flow.client_order_id for flow in self.cash_flows}) != len(self.cash_flows):
+            raise ValueError("reconciliation cash flows must be per-order")
 
     @property
     def fingerprint(self) -> str:
@@ -513,6 +507,12 @@ class NLegExecutionService:
             settlement_keys = {(str(leg["venue_id"]), str(leg["account_id"]), str(leg["settlement_asset_id"])) for leg in batch["legs"] if isinstance(leg, dict)}
             if not settlement_keys.issubset(balances) or any(actual_holding.get(key, 0) < quantity for key, quantity in expected_holding.items()):
                 raise ValueError("N_LEG_RECONCILIATION_PROOF_REQUIRED")
+            receipts = {str(leg["client_order_id"]): leg["receipt"] for leg in batch["legs"] if isinstance(leg, dict) and isinstance(leg.get("receipt"), dict)}
+            flows = {flow.client_order_id: flow for flow in context.cash_flows}
+            if set(flows) != set(receipts) or any(flow.cumulative_cost_units != receipt.get("cumulative_cost_units") or flow.cumulative_fee_units != receipt.get("cumulative_fee_units") or flow.observation_version != receipt.get("sequence") or flow.rest_confirmed != receipt.get("rest_confirmed") for client, receipt in receipts.items() for flow in (flows[client],)):
+                raise ValueError("N_LEG_RECONCILIATION_PROOF_REQUIRED")
+            if self._all_zero(batch) and any(flow.cumulative_cost_units or flow.cumulative_fee_units for flow in context.cash_flows):
+                raise ValueError("N_LEG_RECONCILIATION_PROOF_REQUIRED")
             result = dict(batch)
             result["reconciliation"] = canonical_payload(context)
             result["state"] = "RECONCILED_ZERO" if self._all_zero(batch) else "RECONCILED_FULL"
@@ -606,6 +606,10 @@ class NLegExecutionService:
             existing = copy.get("receipt_conflicts")
             conflict = {"transition_id": fingerprint({"reason": reason, "old": prior, "new": receipt.to_payload()}), "reason": reason, "old": prior, "new": receipt.to_payload()}
             copy["receipt_conflicts"] = [*(existing if isinstance(existing, list) else []), conflict]
+        matching = next((leg for leg in legs if leg.get("client_order_id") == receipt.client_order_id), None)
+        if isinstance(matching, dict):
+            excess = max(0, receipt.cumulative_cost_units + receipt.cumulative_fee_units - int(matching.get("max_cost_units", 0)))
+            copy["conflict_extra_units"] = max(int(copy.get("conflict_extra_units", 0)), excess)
         return copy, reason, True
 
     @staticmethod
@@ -642,7 +646,7 @@ class NLegExecutionService:
         control["active_batch_id"] = batch["execution_batch_id"]
         batch["total_unsettled_capital_units"] = self._batch_occupancy(batch)
         control["total_unsettled_capital_units"] = self._prior_unsettled(batch) + self._batch_occupancy(batch)
-        if reason in {"UNKNOWN_ORDER_STATE", "COST_RESERVATION_BREACH", "ZERO_FILL_CASH_BREACH"}:
+        if reason in {"UNKNOWN_ORDER_STATE", "COST_RESERVATION_BREACH", "ZERO_FILL_CASH_BREACH", "RECEIPT_ID_CONFLICT", "RECEIPT_IDENTITY_DRIFT", "VENUE_ORDER_ID_DRIFT", "SAME_SEQUENCE_CONFLICT", "CUMULATIVE_REGRESSION", "TERMINAL_REOPENED"}:
             control["breaker_open"] = True
             control["breaker_reason"] = reason
         if not self._all_terminal(batch):
@@ -734,35 +738,44 @@ class NLegExecutionService:
         if set(actual_flows) != set(expected_flows) or any(
             (flow.venue_id, flow.account_id, flow.settlement_asset_id) != key
             or flow.venue_order_id != receipt.get("venue_order_id")
-            or flow.sequence != receipt.get("sequence")
+            or flow.observation_version != receipt.get("sequence")
+            or flow.rest_confirmed != receipt.get("rest_confirmed")
             or flow.cumulative_cost_units != receipt.get("cumulative_cost_units")
             or flow.cumulative_fee_units != receipt.get("cumulative_fee_units")
+            or flow.source_timestamp < datetime.fromisoformat(str(receipt["venue_timestamp"]).replace("Z", "+00:00"))
+            or flow.observed_at < datetime.fromisoformat(str(receipt["observed_at"]).replace("Z", "+00:00"))
             for client, (key, receipt) in expected_flows.items() for flow in (actual_flows[client],)
         ):
             return None
         base = sum(flow.cumulative_cost_units + flow.cumulative_fee_units for flow in context.cash_flows)
         candidates = []
+        failures: list[ValueError] = []
         if complete:
-            cost_by_key: dict[tuple[str, str, str], int] = {}
-            for client, quantity in complete.items():
-                quote, leg = quotes[client], by_client[client]
-                key = (quote.venue_id, quote.account_id, quote.settlement_asset_id)
-                cost_by_key[key] = cost_by_key.get(key, 0) + NLegExecutionService._buy_cost(quote, quantity)
-            flows: dict[tuple[str, str, str], int] = {}
-            for flow in context.cash_flows:
-                key = (flow.venue_id, flow.account_id, flow.settlement_asset_id)
-                flows[key] = flows.get(key, 0) + flow.cumulative_cost_units + flow.cumulative_fee_units
-            remaining = {
-                (str(row["venue_id"]), str(row["account_id"]), str(row["settlement_asset_id"])): min(int(row["remaining_units"]), max(0, int(row["original_units"]) - flows.get((str(row["venue_id"]), str(row["account_id"]), str(row["settlement_asset_id"])), 0)))
-                for row in batch.get("reservations", []) if isinstance(row, dict)
-            }
-            if all(cost <= remaining.get(key, -1) and cost <= balances[key].available_units and cost <= balances[key].allowance_units for key, cost in cost_by_key.items()):
-                candidates.append(NLegExecutionService._candidate(batch, "COMPLETE_REMAINING", complete, base + sum(cost_by_key.values()), 0))
+            try:
+                cost_by_key: dict[tuple[str, str, str], int] = {}
+                for client, quantity in complete.items():
+                    quote, leg = quotes[client], by_client[client]
+                    key = (quote.venue_id, quote.account_id, quote.settlement_asset_id)
+                    cost_by_key[key] = cost_by_key.get(key, 0) + NLegExecutionService._buy_cost(quote, quantity)
+                flows: dict[tuple[str, str, str], int] = {}
+                for flow in context.cash_flows:
+                    key = (flow.venue_id, flow.account_id, flow.settlement_asset_id)
+                    flows[key] = flows.get(key, 0) + flow.cumulative_cost_units + flow.cumulative_fee_units
+                remaining = {(str(row["venue_id"]), str(row["account_id"]), str(row["settlement_asset_id"])): min(int(row["remaining_units"]), max(0, int(row["original_units"]) - flows.get((str(row["venue_id"]), str(row["account_id"]), str(row["settlement_asset_id"])), 0))) for row in batch.get("reservations", []) if isinstance(row, dict)}
+                if all(cost <= remaining.get(key, -1) and cost <= balances[key].available_units and cost <= balances[key].allowance_units for key, cost in cost_by_key.items()):
+                    candidates.append(NLegExecutionService._candidate(batch, "COMPLETE_REMAINING", complete, base + sum(cost_by_key.values()), 0))
+            except ValueError as exc:
+                failures.append(exc)
         if exit_:
-            proceeds = sum(NLegExecutionService._sell_proceeds(quotes[client], quantity) for client, quantity in exit_.items())
-            candidates.append(NLegExecutionService._candidate(batch, "EXIT_CONFIRMED", exit_, base, proceeds))
+            try:
+                proceeds = sum(NLegExecutionService._sell_proceeds(quotes[client], quantity) for client, quantity in exit_.items())
+                candidates.append(NLegExecutionService._candidate(batch, "EXIT_CONFIRMED", exit_, base, proceeds))
+            except ValueError as exc:
+                failures.append(exc)
         for candidate in candidates: candidate["fingerprint"] = fingerprint({"context": context.fingerprint, "candidate": candidate})
         if not candidates:
+            if failures:
+                raise failures[0]
             return None
         selected = min(candidates, key=lambda item: (int(item["conservative_total_loss_units"]), str(item["fingerprint"])))
         cap = batch.get("max_auto_repair_loss")
@@ -832,7 +845,7 @@ class NLegExecutionService:
     def _batch_occupancy(batch: Mapping[str, object]) -> int:
         rows = batch.get("reservations")
         if isinstance(rows, list):
-            return sum(int(row.get("remaining_units", 0)) + int(row.get("holding_units", 0)) for row in rows if isinstance(row, dict))
+            return sum(int(row.get("remaining_units", 0)) + int(row.get("holding_units", 0)) for row in rows if isinstance(row, dict)) + int(batch.get("conflict_extra_units", 0))
         value = batch.get("total_unsettled_capital_units", batch.get("reservation_units", 0))
         return value if type(value) is int and value >= 0 else 0
 
