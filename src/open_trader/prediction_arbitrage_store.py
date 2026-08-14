@@ -542,6 +542,47 @@ class PredictionArbitrageStore:
 
             CREATE INDEX IF NOT EXISTS control_events_action_target
             ON control_events(action, target, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS n_leg_controls (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                mode TEXT NOT NULL CHECK (mode IN ('MANUAL', 'AUTO')),
+                breaker_open INTEGER NOT NULL CHECK (breaker_open IN (0, 1)),
+                breaker_reason TEXT,
+                active_batch_id TEXT,
+                total_unsettled_capital_units INTEGER NOT NULL CHECK (total_unsettled_capital_units >= 0),
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS n_leg_lineage_claims (
+                episode_lineage_id TEXT PRIMARY KEY,
+                opportunity_episode_id TEXT NOT NULL,
+                execution_batch_id TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS n_leg_batches (
+                execution_batch_id TEXT PRIMARY KEY,
+                opportunity_episode_id TEXT NOT NULL,
+                episode_lineage_id TEXT NOT NULL UNIQUE REFERENCES n_leg_lineage_claims(episode_lineage_id),
+                state TEXT NOT NULL,
+                submission_enabled INTEGER NOT NULL CHECK (submission_enabled IN (0, 1)),
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS n_leg_transitions (
+                transition_id TEXT PRIMARY KEY,
+                execution_batch_id TEXT NOT NULL REFERENCES n_leg_batches(execution_batch_id),
+                kind TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (execution_batch_id, idempotency_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS n_leg_transitions_batch_created
+            ON n_leg_transitions(execution_batch_id, created_at DESC, transition_id DESC);
             """
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -583,6 +624,9 @@ class PredictionArbitrageStore:
             version = 6
         if version < 7:
             connection.execute("PRAGMA user_version=7")
+            version = 7
+        if version < 8:
+            connection.execute("PRAGMA user_version=8")
 
     @staticmethod
     def _execution_fields(row: sqlite3.Row) -> dict[str, object]:
@@ -1961,6 +2005,134 @@ class PredictionArbitrageStore:
                 (preview_id, encoded, _canonical_timestamp(created), _canonical_timestamp(expiry)),
             )
         return preview_id
+
+    # N-leg execution owns separate tables: legacy execution rows deliberately
+    # remain untouched while the future Adapter and this no-submit state machine
+    # share one durable boundary.
+    @staticmethod
+    def _n_leg_control_row(row: sqlite3.Row | None) -> dict[str, object]:
+        if row is None:
+            return {
+                "mode": "MANUAL",
+                "breaker_open": False,
+                "breaker_reason": None,
+                "active_batch_id": None,
+                "total_unsettled_capital_units": 0,
+            }
+        return {
+            "mode": str(row["mode"]),
+            "breaker_open": bool(row["breaker_open"]),
+            "breaker_reason": row["breaker_reason"],
+            "active_batch_id": row["active_batch_id"],
+            "total_unsettled_capital_units": int(row["total_unsettled_capital_units"]),
+        }
+
+    def n_leg_control(self) -> dict[str, object]:
+        with self._read_connection() as connection:
+            row = connection.execute("SELECT * FROM n_leg_controls WHERE singleton=1").fetchone()
+        return self._n_leg_control_row(row)
+
+    def n_leg_batch(self, execution_batch_id: str) -> dict[str, object] | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM n_leg_batches WHERE execution_batch_id=?",
+                (str(execution_batch_id),),
+            ).fetchone()
+        return None if row is None else _load_payload(str(row["payload"]))
+
+    def n_leg_create_batch(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Atomically claim a lineage and the single active N-leg batch."""
+        encoded = _dump_execution_payload(payload)
+        batch_id = payload.get("execution_batch_id")
+        opportunity_id = payload.get("opportunity_episode_id")
+        lineage_id = payload.get("episode_lineage_id")
+        mode = payload.get("mode")
+        reservation = payload.get("total_unsettled_capital_units")
+        if (
+            not all(isinstance(value, str) and value for value in (batch_id, opportunity_id, lineage_id))
+            or mode not in {"MANUAL", "AUTO"}
+            or type(reservation) is not int
+            or reservation < 0
+        ):
+            raise ValueError("invalid n-leg batch")
+        now = _utc_now()
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM n_leg_batches WHERE execution_batch_id=?", (batch_id,)
+            ).fetchone()
+            if existing is not None:
+                result = _load_payload(str(existing["payload"]))
+                if result != _load_payload(encoded):
+                    raise ValueError("N_LEG_BATCH_ID_CONFLICT")
+                return result
+            control = self._n_leg_control_row(
+                connection.execute("SELECT * FROM n_leg_controls WHERE singleton=1").fetchone()
+            )
+            if control["breaker_open"]:
+                raise ValueError("N_LEG_BREAKER_OPEN")
+            if control["active_batch_id"] is not None:
+                raise ValueError("N_LEG_ACTIVE_BATCH_EXISTS")
+            if connection.execute(
+                "SELECT 1 FROM n_leg_lineage_claims WHERE episode_lineage_id=?", (lineage_id,)
+            ).fetchone() is not None:
+                raise ValueError("N_LEG_LINEAGE_ALREADY_CLAIMED")
+            connection.execute(
+                "INSERT INTO n_leg_lineage_claims(episode_lineage_id, opportunity_episode_id, execution_batch_id, created_at) VALUES (?, ?, ?, ?)",
+                (lineage_id, opportunity_id, batch_id, now),
+            )
+            connection.execute(
+                "INSERT INTO n_leg_batches(execution_batch_id, opportunity_episode_id, episode_lineage_id, state, submission_enabled, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (batch_id, opportunity_id, lineage_id, str(payload.get("state")), 0, encoded, now, now),
+            )
+            connection.execute(
+                "INSERT INTO n_leg_controls(singleton, mode, breaker_open, breaker_reason, active_batch_id, total_unsettled_capital_units, updated_at) VALUES (1, ?, 0, NULL, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET mode=excluded.mode, active_batch_id=excluded.active_batch_id, total_unsettled_capital_units=excluded.total_unsettled_capital_units, updated_at=excluded.updated_at",
+                (mode, batch_id, reservation, now),
+            )
+        return _load_payload(encoded)
+
+    def n_leg_replace_batch(
+        self,
+        payload: Mapping[str, object],
+        *,
+        control: Mapping[str, object],
+        transition_kind: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        """Persist a complete reducer result and its control change together."""
+        encoded = _dump_execution_payload(payload)
+        batch_id = payload.get("execution_batch_id")
+        if not isinstance(batch_id, str) or not batch_id or not isinstance(transition_kind, str) or not transition_kind or not isinstance(idempotency_key, str) or not idempotency_key:
+            raise ValueError("invalid n-leg transition")
+        mode = control.get("mode")
+        total = control.get("total_unsettled_capital_units")
+        if mode not in {"MANUAL", "AUTO"} or type(total) is not int or total < 0:
+            raise ValueError("invalid n-leg control")
+        active = control.get("active_batch_id")
+        breaker = control.get("breaker_open")
+        reason = control.get("breaker_reason")
+        if active is not None and not isinstance(active, str) or type(breaker) is not bool or reason is not None and not isinstance(reason, str):
+            raise ValueError("invalid n-leg control")
+        now = _utc_now()
+        transition = _dump_execution_payload({"payload": dict(payload), "control": dict(control)})
+        with self._transaction() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM n_leg_batches WHERE execution_batch_id=?", (batch_id,)
+            ).fetchone()
+            if exists is None:
+                raise ValueError("N_LEG_BATCH_NOT_FOUND")
+            connection.execute(
+                "UPDATE n_leg_batches SET state=?, payload=?, updated_at=? WHERE execution_batch_id=?",
+                (str(payload.get("state")), encoded, now, batch_id),
+            )
+            connection.execute(
+                "INSERT INTO n_leg_controls(singleton, mode, breaker_open, breaker_reason, active_batch_id, total_unsettled_capital_units, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET mode=excluded.mode, breaker_open=excluded.breaker_open, breaker_reason=excluded.breaker_reason, active_batch_id=excluded.active_batch_id, total_unsettled_capital_units=excluded.total_unsettled_capital_units, updated_at=excluded.updated_at",
+                (mode, int(breaker), reason, active, total, now),
+            )
+            connection.execute(
+                "INSERT INTO n_leg_transitions(transition_id, execution_batch_id, kind, idempotency_key, payload, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(execution_batch_id, idempotency_key) DO NOTHING",
+                (_new_id(), batch_id, transition_kind, idempotency_key, transition, now),
+            )
+        return _load_payload(encoded)
 
     @staticmethod
     def _reserved_cross_principal(connection: sqlite3.Connection) -> Decimal:
