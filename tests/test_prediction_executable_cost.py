@@ -1,3 +1,5 @@
+import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from dataclasses import replace
 from decimal import Decimal
@@ -19,7 +21,7 @@ from open_trader.prediction_executable_cost import (
 )
 from open_trader.prediction_arbitrage import BookLevel, ThresholdOrderBook
 from open_trader.predict_source import PredictBook
-from open_trader.predict_source import PredictMarket, PredictSource
+from open_trader.predict_source import PredictSource
 from open_trader.polymarket_trading import PredictConfig
 from open_trader.prediction_n_leg_oracle import evaluate_fixed_portfolio
 from open_trader.prediction_n_leg import (
@@ -156,17 +158,25 @@ def test_predict_requires_bound_market_and_outcome_token_identity(monkeypatch) -
 
 def test_predict_source_accept_book_output_flows_to_public_resolver(monkeypatch) -> None:
     qualified_solver(monkeypatch)
-    source = PredictSource(PredictConfig("0x1111111111111111111111111111111111111111"), now_fn=lambda: AS_OF)
-    market = PredictMarket("predict-market", "condition", "q", "rules", yes_token_id="action-a", no_token_id="no-token", tick_size=Decimal("0.01"))
-    book = source._accept_book(market, {"marketId": "predict-market", "updateTimestampMs": int(AS_OF.timestamp() * 1_000), "asks": [["0.40", "1"]], "bids": [["0.39", "1"]]}, source="rest")
+    responses = iter((
+        {"success": True, "data": {"id": "predict-market", "slug": "predict", "conditionId": "condition", "question": "q", "description": "rules", "categorySlug": "category", "outcomes": [{"name": "YES", "onChainId": "action-a"}, {"name": "NO", "onChainId": "no-token"}], "decimalPrecision": 2, "feeRateBps": "0", "tradingStatus": "OPEN", "status": "REGISTERED", "isVisible": True, "isNegRisk": False, "isYieldBearing": False, "marketVariant": "DEFAULT", "oracleQuestionId": "oracle", "resolverAddress": "0x1111111111111111111111111111111111111111"}},
+        {"success": True, "data": {"slug": "category", "startsAt": "2026-08-01T00:00:00Z", "endsAt": "2026-09-01T00:00:00Z", "resolutionProvider": "PREDICT_DOT_FUN"}},
+        {"success": True, "data": {"marketId": "predict-market", "updateTimestampMs": int(AS_OF.timestamp() * 1_000), "asks": [["0.40", "1"]], "bids": [["0.39", "1"]]}},
+    ))
+    class Response:
+        def __init__(self, payload): self.payload = payload
+        def __enter__(self): return self
+        def __exit__(self, *_): return None
+        def read(self): return json.dumps(self.payload).encode()
+    source = PredictSource(PredictConfig("0x1111111111111111111111111111111111111111"), key_loader=lambda: "key", urlopen_fn=lambda *_args, **_kwargs: Response(next(responses)), now_fn=lambda: AS_OF)
+    book = asyncio.run(source.get_order_book("predict-market"))
     base = component().problem
     policy = BookBinding("action-a", "venue-a", "action-a", "predict.fun", "fee-v1", 100_000, 1, 100_000, 100, "predict-market")
     verified = VerifiedComponent(base, component_fingerprint(base, (policy,), 100), 100, (policy,))
     account = AccountSnapshot(AS_OF, (AccountBalance("venue-a", "account-a", "usd-cents", 1_000, 1_000),), 1_000, 0, 1_000)
 
-    result = resolve_component(verified, (ImmutableBook("action-a", "action-a", book, 100_000, 1, 100_000, 100, "venue-a", "fee-v1"),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
-
     assert book is not None
+    result = resolve_component(verified, (ImmutableBook("action-a", "action-a", book, 100_000, 1, 100_000, 100, "venue-a", "fee-v1"),), account, BenchmarkLimits(100, 200, 1_000_000, 4), OracleBudget(2, 2, 2), now=AS_OF)
     assert result.status is ResolutionStatus.EXECUTION_SOLUTION
 
 
