@@ -31,6 +31,7 @@ from open_trader.prediction_solver_verified import (
     PROOF_REQUEST_SCHEMA_V1,
     CandidateEvidence,
     ProofInput,
+    VerificationResult,
     VerificationStatus,
     candidate_evidence_from_payload,
     model_fingerprint,
@@ -47,6 +48,8 @@ ACCOUNT_FRESHNESS_SECONDS = 60
 _PPM = 1_000_000
 _SECONDS_PER_DAY = 24 * 60 * 60
 _SEMANTIC_AS_OF = datetime(1970, 1, 1, tzinfo=UTC)
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 
 
 class ResolutionStatus(StrEnum):
@@ -66,6 +69,7 @@ class VerifiedComponent:
     problem: ArbitrageProblem
     relation_fingerprint: str
     usd_units_per_dollar: int
+    book_bindings: tuple["BookBinding", ...]
 
     def __post_init__(self) -> None:
         if not isinstance(self.problem, ArbitrageProblem):
@@ -74,9 +78,38 @@ class VerifiedComponent:
             raise ValueError("component relation fingerprint mismatch")
         if type(self.usd_units_per_dollar) is not int or self.usd_units_per_dollar <= 0:
             raise ValueError("usd units per dollar must be positive")
+        if not isinstance(self.book_bindings, tuple) or {
+            binding.action_id for binding in self.book_bindings if isinstance(binding, BookBinding)
+        } != {action.action_id for action in self.problem.actions} or len(self.book_bindings) != len(self.problem.actions):
+            raise ValueError("component must bind every action to verified book policy")
         components = build_relation_components(self.problem)
         if len(components) != 1 or set(components[0].action_ids) != {action.action_id for action in self.problem.actions}:
             raise ValueError("component must contain exactly one connected support")
+
+
+@dataclass(frozen=True, slots=True)
+class BookBinding:
+    """Component-owned venue identity and independently verified cost policy."""
+
+    action_id: str
+    venue_id: str
+    native_id: str
+    book_kind: str
+    fee_rule_id: str
+    fee_ppm: int
+    tick_units: int
+    haircut_ppm: int
+    price_units_per_quote_unit: int
+
+    def __post_init__(self) -> None:
+        if (
+            not all(isinstance(value, str) and value for value in (self.action_id, self.venue_id, self.native_id, self.fee_rule_id))
+            or self.book_kind not in {"polymarket", "predict.fun"}
+            or any(type(value) is not int or value < 0 for value in (self.fee_ppm, self.haircut_ppm))
+            or type(self.tick_units) is not int or self.tick_units <= 0
+            or type(self.price_units_per_quote_unit) is not int or self.price_units_per_quote_unit <= 0
+        ):
+            raise ValueError("invalid verified book binding")
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +125,23 @@ class ImmutableBook:
     price_units_per_quote_unit: int
     venue_id: str
     fee_rule_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionLegEvidence:
+    action_id: str
+    venue_id: str
+    account_id: str
+    chain_id: str
+    native_id: str
+    side: str
+    quantity_lots: int
+    protected_price_units: int
+    max_fee_units: int
+    max_cost_units: int
+    settlement_asset_id: str
+    valuation_unit_id: str
+    source_fingerprint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +174,9 @@ class MarketSolution:
     relation_fingerprint: str
     economic_quote_fingerprint: str
     verification_fingerprint: str
+    candidate_evidence: CandidateEvidence
+    verification_result: VerificationResult
+    execution_legs: tuple[ExecutionLegEvidence, ...]
     fingerprint: str
 
 
@@ -133,6 +186,7 @@ class ExecutionSolution:
     account_snapshot_fingerprint: str
     quantities: tuple[ActionQuantity, ...]
     capital_use_units: int
+    execution_legs: tuple[ExecutionLegEvidence, ...]
     order_ready: bool
     reason: str
     fingerprint: str
@@ -173,6 +227,7 @@ def resolve_component(
         if (
             prior.relation_fingerprint == _semantic_model_fingerprint(problem)
             and prior.economic_quote_fingerprint == economic_quote
+            and prior.execution_legs == _execution_legs(problem, prior.quantities, {book.action_id: book for book in books})
         ):
             return _fund_fixed_solution(prior_market_solution, account_snapshot, now)
 
@@ -193,7 +248,10 @@ def resolve_component(
         status = ResolutionStatus.NO_QUALIFIED_OPPORTUNITY if verification.status == VerificationStatus.NO_QUALIFIED_OPPORTUNITY else ResolutionStatus.UNKNOWN
         return ResolutionResult(status, verification.status.value)
     proof = verification.solution.payout_proof
-    market = _market_solution(problem, verification.solution.quantities, proof, evidence, economic_quote)
+    market = _market_solution(
+        problem, verification.solution.quantities, proof, evidence, verification, economic_quote,
+        {book.action_id: book for book in books},
+    )
     return _fund_fixed_solution(market, account_snapshot, now)
 
 
@@ -208,31 +266,52 @@ def _problem_with_visible_asks(
     if len(by_action) != len(books) or set(by_action) != {action.action_id for action in component.problem.actions}:
         raise ValueError("books must exactly cover component actions")
     converted: list[CandidateAction] = []
+    available_ids: set[str] = set()
     economic_books: list[dict[str, object]] = []
     for action in component.problem.actions:
         book = by_action[action.action_id]
-        slices = _cost_slices(action, book, now)
+        binding = next(binding for binding in component.book_bindings if binding.action_id == action.action_id)
+        slices = _cost_slices(action, book, binding, now)
         if slices is None:
-            return None, ""
+            continue
         converted.append(replace(action, max_quantity_lots=slices[-1].last_lot, cost_slices=slices))
+        available_ids.add(action.action_id)
         economic_books.append(_economic_book(book, action))
+    if not converted:
+        return None, ""
+    terminal_sets = tuple(
+        replace(state_set, atoms=tuple(
+            replace(atom, payouts=tuple(payout for payout in atom.payouts if payout.action_id in available_ids))
+            for atom in state_set.atoms
+        ))
+        for state_set in component.problem.terminal_state_sets
+    )
     rules = component.problem.terminal_state_sets
     problem = replace(
         component.problem,
         as_of=now,
         actions=tuple(converted),
+        terminal_state_sets=terminal_sets,
         qualification_constraints=_qualification_constraints(component, rules),
     )
     return problem, fingerprint({"books": tuple(economic_books), "relation": component.relation_fingerprint})
 
 
-def _cost_slices(action: CandidateAction, source: ImmutableBook, now: datetime) -> tuple[ExecutableCostSlice, ...] | None:
+def _cost_slices(action: CandidateAction, source: ImmutableBook, binding: BookBinding, now: datetime) -> tuple[ExecutableCostSlice, ...] | None:
     if (
         not isinstance(source.book, ThresholdOrderBook | PredictBook)
         or source.action_id != action.action_id
-        or source.venue_id != action.venue_id
-        or not isinstance(source.fee_rule_id, str)
-        or not source.fee_rule_id
+        or binding.action_id != action.action_id
+        or binding.venue_id != action.venue_id
+        or source.venue_id != binding.venue_id
+        or source.native_id != binding.native_id
+        or source.fee_rule_id != binding.fee_rule_id
+        or source.fee_ppm != binding.fee_ppm
+        or source.tick_units != binding.tick_units
+        or source.haircut_ppm != binding.haircut_ppm
+        or source.price_units_per_quote_unit != binding.price_units_per_quote_unit
+        or (binding.book_kind == "polymarket") != isinstance(source.book, ThresholdOrderBook)
+        or (binding.book_kind == "predict.fun") != isinstance(source.book, PredictBook)
     ):
         raise ValueError("invalid book")
     if any(type(value) is not int or value < 0 for value in (source.fee_ppm, source.haircut_ppm)) or type(source.tick_units) is not int or source.tick_units <= 0 or type(source.price_units_per_quote_unit) is not int or source.price_units_per_quote_unit <= 0:
@@ -286,7 +365,53 @@ def _qualification_constraints(component: VerifiedComponent, rules: tuple[object
     )
 
 
-def _market_solution(problem: ArbitrageProblem, quantities: tuple[ActionQuantity, ...], proof: object, evidence: CandidateEvidence, economic_quote: str) -> MarketSolution:
+def _execution_legs(
+    problem: ArbitrageProblem,
+    quantities: tuple[ActionQuantity, ...],
+    books: dict[str, ImmutableBook],
+) -> tuple[ExecutionLegEvidence, ...]:
+    """Freeze the exact #74 handoff facts while the source books are verified."""
+    actions = {action.action_id: action for action in problem.actions}
+    result: list[ExecutionLegEvidence] = []
+    for quantity in quantities:
+        action = actions[quantity.action_id]
+        book = books[quantity.action_id]
+        _, asks, _ = _book_asks(book.book, action)
+        remaining = quantity.quantity_lots
+        protected_price = 0
+        max_fee = 0
+        for level in asks:
+            lots = int((level.size * action.quantity_scale / action.lot_step_units).to_integral_value(rounding=ROUND_FLOOR))
+            take = min(remaining, lots)
+            if take <= 0:
+                continue
+            base = int((level.price * book.price_units_per_quote_unit * action.lot_step_units / action.quantity_scale).to_integral_value(rounding=ROUND_CEILING))
+            protected = base + book.tick_units
+            protected_price = max(protected_price, protected)
+            max_fee += take * _ceil_div(protected * book.fee_ppm, _PPM)
+            remaining -= take
+            if not remaining:
+                break
+        if remaining:
+            raise ValueError("execution evidence exceeds visible asks")
+        result.append(ExecutionLegEvidence(
+            action.action_id, action.venue_id, action.account_id, action.chain_id, book.native_id,
+            action.side.value, quantity.quantity_lots, protected_price, max_fee,
+            cost_upper_bound(problem, (quantity,)), action.settlement_asset_id,
+            action.valuation_unit_id, fingerprint(canonical_payload(action)),
+        ))
+    return tuple(result)
+
+
+def _market_solution(
+    problem: ArbitrageProblem,
+    quantities: tuple[ActionQuantity, ...],
+    proof: object,
+    evidence: CandidateEvidence,
+    verification: VerificationResult,
+    economic_quote: str,
+    books: dict[str, ImmutableBook],
+) -> MarketSolution:
     verification_fingerprint = fingerprint(canonical_payload(proof))
     relation_fingerprint = _semantic_model_fingerprint(problem)
     values = {
@@ -298,13 +423,17 @@ def _market_solution(problem: ArbitrageProblem, quantities: tuple[ActionQuantity
         "relation_fingerprint": relation_fingerprint,
         "economic_quote_fingerprint": economic_quote,
         "verification_fingerprint": verification_fingerprint,
+        "candidate_evidence": evidence,
+        "verification_result": verification,
+        "execution_legs": _execution_legs(problem, quantities, books),
         "quantities": quantities,
     }
     return MarketSolution(
         problem, quantities, proof.cost_upper_bound_units, proof.payout_lower_bound_units,
         proof.guaranteed_profit_units, proof.conservative_capital_release_at,
         evidence.solver_evidence.global_search_closed, relation_fingerprint,
-        economic_quote, verification_fingerprint, fingerprint(values),
+        economic_quote, verification_fingerprint, evidence, verification,
+        _execution_legs(problem, quantities, books), fingerprint(values),
     )
 
 
@@ -314,16 +443,22 @@ def market_solution_from_payload(payload: object) -> MarketSolution:
         "problem", "quantities", "bounded_cost_units", "bounded_payout_units",
         "guaranteed_profit_units", "capital_release_at", "global_search_closed",
         "relation_fingerprint", "economic_quote_fingerprint", "verification_fingerprint", "fingerprint",
+        "candidate_evidence", "verification_result", "execution_legs",
     })
     try:
         problem = problem_from_payload(value["problem"])
         quantities = tuple(_quantity_from_payload(item) for item in _array(value["quantities"]))
+        evidence = candidate_evidence_from_payload(value["candidate_evidence"])
+        verification = verification_result_from_payload(value["verification_result"], source=evidence)
         solution = MarketSolution(
             problem, quantities, _nonnegative_int(value["bounded_cost_units"]),
             _nonnegative_int(value["bounded_payout_units"]), _int(value["guaranteed_profit_units"]),
             _datetime(value["capital_release_at"]), _bool(value["global_search_closed"]),
             _fingerprint(value["relation_fingerprint"]), _fingerprint(value["economic_quote_fingerprint"]),
-            _fingerprint(value["verification_fingerprint"]), _fingerprint(value["fingerprint"]),
+            _fingerprint(value["verification_fingerprint"]),
+            evidence, verification,
+            tuple(_execution_leg_from_payload(item) for item in _array(value["execution_legs"])),
+            _fingerprint(value["fingerprint"]),
         )
     except (TypeError, ValueError) as exc:
         raise ValueError(f"invalid market solution: {exc}") from exc
@@ -336,13 +471,27 @@ def market_solution_from_payload(payload: object) -> MarketSolution:
         "relation_fingerprint": solution.relation_fingerprint,
         "economic_quote_fingerprint": solution.economic_quote_fingerprint,
         "verification_fingerprint": solution.verification_fingerprint,
+        "candidate_evidence": solution.candidate_evidence,
+        "verification_result": solution.verification_result,
+        "execution_legs": solution.execution_legs,
         "quantities": solution.quantities,
     })
     if (
         solution.relation_fingerprint != _semantic_model_fingerprint(solution.problem)
         or solution.fingerprint != expected
+        or solution.verification_result.status != VerificationStatus.QUALIFIED_VERIFIED
+        or solution.verification_result.solution is None
+        or solution.candidate_evidence.proof_input.request.problem != solution.problem
+        or solution.candidate_evidence.solver_evidence.global_search_closed != solution.global_search_closed
+        or solution.verification_result.solution.quantities != solution.quantities
+        or solution.verification_result.solution.payout_proof.cost_upper_bound_units != solution.bounded_cost_units
+        or solution.verification_result.solution.payout_proof.payout_lower_bound_units != solution.bounded_payout_units
+        or solution.verification_result.solution.payout_proof.guaranteed_profit_units != solution.guaranteed_profit_units
+        or solution.verification_result.solution.payout_proof.conservative_capital_release_at != solution.capital_release_at
+        or solution.verification_fingerprint != fingerprint(canonical_payload(solution.verification_result.solution.payout_proof))
         or tuple(sorted(solution.quantities, key=lambda item: item.action_id)) != solution.quantities
         or len({item.action_id for item in solution.quantities}) != len(solution.quantities)
+        or not _valid_execution_legs(solution.problem, solution.quantities, solution.execution_legs)
     ):
         raise ValueError("market solution fingerprint mismatch")
     return solution
@@ -352,14 +501,15 @@ def execution_solution_from_payload(payload: object) -> ExecutionSolution:
     """Decode the #74 handoff only when it remains explicitly non-order-ready."""
     value = _exact_object(payload, {
         "market_solution_fingerprint", "account_snapshot_fingerprint", "quantities",
-        "capital_use_units", "order_ready", "reason", "fingerprint",
+        "capital_use_units", "execution_legs", "order_ready", "reason", "fingerprint",
     })
     try:
         solution = ExecutionSolution(
             _fingerprint(value["market_solution_fingerprint"]),
             _fingerprint(value["account_snapshot_fingerprint"]),
             tuple(_quantity_from_payload(item) for item in _array(value["quantities"])),
-            _nonnegative_int(value["capital_use_units"]), _bool(value["order_ready"]),
+            _nonnegative_int(value["capital_use_units"]),
+            tuple(_execution_leg_from_payload(item) for item in _array(value["execution_legs"])), _bool(value["order_ready"]),
             _text(value["reason"]), _fingerprint(value["fingerprint"]),
         )
     except (TypeError, ValueError) as exc:
@@ -369,6 +519,7 @@ def execution_solution_from_payload(payload: object) -> ExecutionSolution:
         "account": solution.account_snapshot_fingerprint,
         "quantities": solution.quantities,
         "capital_use_units": solution.capital_use_units,
+        "execution_legs": solution.execution_legs,
     })
     if (
         solution.order_ready
@@ -376,6 +527,7 @@ def execution_solution_from_payload(payload: object) -> ExecutionSolution:
         or solution.fingerprint != expected
         or tuple(sorted(solution.quantities, key=lambda item: item.action_id)) != solution.quantities
         or len({item.action_id for item in solution.quantities}) != len(solution.quantities)
+        or tuple(item.action_id for item in solution.execution_legs) != tuple(item.action_id for item in solution.quantities)
     ):
         raise ValueError("execution solution partial-fill or fingerprint mismatch")
     return solution
@@ -406,10 +558,11 @@ def _fund_fixed_solution(market: MarketSolution, account: AccountSnapshot | None
         return ResolutionResult(ResolutionStatus.UNSETTLED_CAP_EXCEEDED, "UNSETTLED_CAP_EXCEEDED", market)
     account_fingerprint = fingerprint(account)
     execution = ExecutionSolution(
-        market.fingerprint, account_fingerprint, market.quantities, capital_use, False,
+        market.fingerprint, account_fingerprint, market.quantities, capital_use, market.execution_legs, False,
         "PARTIAL_FILL_PROOF_REQUIRED", fingerprint({
             "market": market.fingerprint, "account": account_fingerprint,
             "quantities": market.quantities, "capital_use_units": capital_use,
+            "execution_legs": market.execution_legs,
         }),
     )
     return ResolutionResult(ResolutionStatus.EXECUTION_SOLUTION, None, market, execution)
@@ -421,6 +574,8 @@ def _valid_account_snapshot(snapshot: AccountSnapshot | None, now: datetime) -> 
     if (now - snapshot.captured_at).total_seconds() < 0 or (now - snapshot.captured_at).total_seconds() > ACCOUNT_FRESHNESS_SECONDS:
         return False
     if any(type(value) is not int or value < 0 for value in (snapshot.max_per_trade_cost_units, snapshot.unsettled_capital_units, snapshot.max_total_unsettled_capital_units)):
+        return False
+    if not isinstance(snapshot.balances, tuple):
         return False
     if not all(
         isinstance(balance, AccountBalance)
@@ -470,8 +625,8 @@ def _array(value: object) -> list[object]:
 
 
 def _int(value: object) -> int:
-    if type(value) is not int:
-        raise ValueError("must be an integer")
+    if type(value) is not int or not _INT64_MIN <= value <= _INT64_MAX:
+        raise ValueError("must be a signed int64 integer")
     return value
 
 
@@ -506,7 +661,8 @@ def _datetime(value: object) -> datetime:
 def _fingerprint(value: object) -> str:
     if not isinstance(value, str) or len(value) != 71 or not value.startswith("sha256:"):
         raise ValueError("must be a SHA-256 fingerprint")
-    int(value[7:], 16)
+    if any(character not in "0123456789abcdef" for character in value[7:]):
+        raise ValueError("must be a lowercase SHA-256 fingerprint")
     return value
 
 
@@ -516,6 +672,43 @@ def _quantity_from_payload(value: object) -> ActionQuantity:
         raise ValueError("quantity action ID is invalid")
     quantity = _nonnegative_int(item["quantity_lots"])
     return ActionQuantity(item["action_id"], quantity)
+
+
+def _execution_leg_from_payload(value: object) -> ExecutionLegEvidence:
+    item = _exact_object(value, {
+        "action_id", "venue_id", "account_id", "chain_id", "native_id", "side",
+        "quantity_lots", "protected_price_units", "max_fee_units", "max_cost_units",
+        "settlement_asset_id", "valuation_unit_id", "source_fingerprint",
+    })
+    side = _text(item["side"])
+    if side not in {"BUY_YES", "BUY_NO"}:
+        raise ValueError("execution leg must buy a canonical side")
+    return ExecutionLegEvidence(
+        *(_text(item[name]) for name in ("action_id", "venue_id", "account_id", "chain_id", "native_id")),
+        side,
+        *(_nonnegative_int(item[name]) for name in ("quantity_lots", "protected_price_units", "max_fee_units", "max_cost_units")),
+        *(_text(item[name]) for name in ("settlement_asset_id", "valuation_unit_id")),
+        _fingerprint(item["source_fingerprint"]),
+    )
+
+
+def _valid_execution_legs(
+    problem: ArbitrageProblem, quantities: tuple[ActionQuantity, ...], legs: tuple[ExecutionLegEvidence, ...]
+) -> bool:
+    actions = {action.action_id: action for action in problem.actions}
+    if tuple(leg.action_id for leg in legs) != tuple(quantity.action_id for quantity in quantities):
+        return False
+    for leg, quantity in zip(legs, quantities, strict=True):
+        action = actions.get(quantity.action_id)
+        if action is None or (
+            leg.venue_id, leg.account_id, leg.chain_id, leg.side, leg.quantity_lots,
+            leg.settlement_asset_id, leg.valuation_unit_id,
+        ) != (
+            action.venue_id, action.account_id, action.chain_id, action.side.value,
+            quantity.quantity_lots, action.settlement_asset_id, action.valuation_unit_id,
+        ) or leg.max_cost_units != cost_upper_bound(problem, (quantity,)) or leg.source_fingerprint != fingerprint(canonical_payload(action)):
+            return False
+    return True
 
 
 def _ceil_div(value: int, divisor: int) -> int:
