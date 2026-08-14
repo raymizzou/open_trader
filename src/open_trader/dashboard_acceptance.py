@@ -4630,13 +4630,13 @@ def _check_trend_review(
     for series, label in (("discipline", "纪律模拟"), ("actual", "实际执行")):
         expected_statistics: list[str] = []
         detail = details.get(series)
+        sample_cutoff = sample_cutoffs.get(series)
+        if sample_cutoff:
+            expected_statistics.append(f"统计截至 {_plain(sample_cutoff)}")
+        metric_cutoff = metric_cutoffs.get(series)
+        if metric_cutoff:
+            expected_statistics.append(f"指标截至 {_plain(metric_cutoff)}")
         if isinstance(detail, Mapping) and detail.get("available") is True:
-            sample_cutoff = sample_cutoffs.get(series)
-            if sample_cutoff:
-                expected_statistics.append(f"统计截至 {_plain(sample_cutoff)}")
-            metric_cutoff = metric_cutoffs.get(series)
-            if metric_cutoff:
-                expected_statistics.append(f"指标截至 {_plain(metric_cutoff)}")
             expected_statistics.append(
                 "发现 "
                 f"{detail.get('discovered_candidate_count')} · 排除 "
@@ -4651,7 +4651,8 @@ def _check_trend_review(
                 )
                 expected_statistics.append(
                     f"完整交易胜率 {displayed_rate} · "
-                    f"{detail['winning_sample_count']} 胜 / {eligible} 闭环"
+                    f"{_display_number(detail['winning_sample_count'])} 胜 / "
+                    f"{_display_number(eligible)} 闭环"
                 )
             else:
                 expected_statistics.append("完整交易胜率 数据不足 · 0 闭环")

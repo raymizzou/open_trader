@@ -2789,6 +2789,68 @@ def test_acceptance_checks_exact_trend_review_content() -> None:
     assert page.review_geometry_checks == ["tiger"]
 
 
+def test_acceptance_allows_unavailable_statistics_with_metric_cutoff() -> None:
+    payload = valid_payload()
+    review = payload["trend_reviews"]["tiger"]
+    review["metric_cutoffs"]["actual"] = "2026-08-08"
+    page = tabbed_account_page(payload)
+    page.review_statistics_texts["actual"] = [
+        "指标截至 2026-08-08",
+        "统计来源不可用",
+    ]
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    dashboard_acceptance._check_trend_review(page, section, "tiger", review)
+
+
+def test_acceptance_formats_four_digit_trend_review_win_rate_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = valid_payload()
+    review = payload["trend_reviews"]["tiger"]
+    review["sample_counts"]["discipline"] = 2_000
+    review["sample_details"]["discipline"].update({
+        "eligible_sample_count": 2_000,
+        "winning_sample_count": 1_000,
+        "win_rate": "0.5",
+        "discovered_candidate_count": 2_005,
+    })
+    rendered = (
+        trend_review_workspace_text("tiger", review)
+        .replace("纪律模拟 4 / 30，数据不足", "纪律模拟 2000 笔")
+        .replace(
+            "发现 9 · 排除 4 · 未闭环 1",
+            "发现 2005 · 排除 4 · 未闭环 1",
+        )
+        .replace(
+            "完整交易胜率 25% · 1 胜 / 4 闭环",
+            "完整交易胜率 50% · 1,000 胜 / 2,000 闭环",
+        )
+    )
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "trend_review_workspace_text",
+        lambda *_args, **_kwargs: rendered,
+    )
+    page = tabbed_account_page(payload)
+    page.review_header_side_texts = [
+        "返回持仓看板",
+        "纪律模拟 2000 笔",
+        "实际执行 数据不可用",
+        "统计刷新失败；报告继续使用上一个有效快照",
+    ]
+    page.review_statistics_texts["discipline"] = [
+        "统计截至 2026-08-08T15:00:00+08:00",
+        "指标截至 2026-08-08",
+        "发现 2005 · 排除 4 · 未闭环 1",
+        "完整交易胜率 50% · 1,000 胜 / 2,000 闭环",
+        "排除原因 成本不完整 4",
+    ]
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    dashboard_acceptance._check_trend_review(page, section, "tiger", review)
+
+
 def test_acceptance_rejects_missing_trend_review_win_rate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4156,6 +4218,8 @@ class TabbedAccountLocator:
                 f"{snapshot['strategy_name']}｜第 1 版",
             ]
         if self.selector == "#trend-report-workspace:visible .trend-review-header-side > *":
+            if self.page.review_header_side_texts is not None:
+                return self.page.review_header_side_texts
             status = self.page.reviews[broker].get("statistics_status")
             return [
                 "返回持仓看板", "纪律模拟 4 / 30，数据不足",
@@ -4380,6 +4444,7 @@ class TabbedAccountPage:
         self.review_text_contrast = 12.0
         self.review_marker_contrasts = [4.0] * 25
         self.review_header_left_texts: list[str] | None = None
+        self.review_header_side_texts: list[str] | None = None
         self.review_statistics_texts = {
             "discipline": [
                 "统计截至 2026-08-08T15:00:00+08:00",
