@@ -1049,6 +1049,79 @@ def test_statistics_disposition_conserves_every_candidate() -> None:
     assert result["exclusion_reasons"] == [{"reason": "no_matching_opening_strategy_action", "count": 1}]
 
 
+def test_statistics_disposition_reports_win_rate_per_source_and_counts_flat() -> None:
+    def pair(
+        label: str, *, source: str, sell_price: str, day: int,
+    ) -> list[dict[str, object]]:
+        broker, account_id = (
+            ("futu", "101") if source == "simulation" else ("tiger", "U1")
+        )
+        rows = [
+            fill(
+                f"{label}-buy", side="buy", quantity="1", price="10", fee="0",
+                filled_at=f"2026-08-{day:02d}T10:00:00-04:00",
+                source=source, broker=broker, account_id=account_id,
+            ),
+            fill(
+                f"{label}-sell", side="sell", quantity="1", price=sell_price,
+                fee="0", filled_at=f"2026-08-{day + 1:02d}T10:00:00-04:00",
+                source=source, broker=broker, account_id=account_id,
+            ),
+        ]
+        for row in rows:
+            row["symbol"] = label
+        return rows
+
+    payload = build_trend_api_stats_payload(
+        [
+            *pair("SIM-WIN", source="simulation", sell_price="12", day=1),
+            *pair("SIM-FLAT", source="simulation", sell_price="10.01", day=3),
+            *pair("ACTUAL-LOSS", source="actual", sell_price="9", day=5),
+        ],
+        strategy_versions=[],
+        generated_at="2026-08-07T17:00:00-04:00",
+        statistics_cutoff_at="2026-08-07T16:00:00-04:00",
+    )
+    payload["sources"] = [
+        {
+            "source": "simulation", "source_id": "simulation:futu:101",
+            "broker": "futu", "account_id": "101", "market": "US",
+            "orders_seen": 4, "fill_count": 4,
+            "statistics_cutoff_at": "2026-08-07T16:00:00-04:00",
+            "status": "available",
+        },
+        {
+            "source": "actual", "source_id": "actual:tiger:U1",
+            "broker": "tiger", "account_id": "U1", "market": "US",
+            "orders_seen": 2, "fill_count": 2,
+            "statistics_cutoff_at": "2026-08-07T16:00:00-04:00",
+            "status": "available",
+        },
+    ]
+
+    simulation = trend_statistics_disposition(
+        payload, market="US", strategy_id="trend_animals_warm_to_hot/US/v1",
+        opening_strategy_version="v1", source="simulation",
+    )
+    actual = trend_statistics_disposition(
+        payload, market="US", strategy_id="trend_animals_warm_to_hot/US/v1",
+        opening_strategy_version="v1", source="actual",
+    )
+    unavailable = trend_statistics_disposition(
+        payload, market="HK", strategy_id="trend_animals_warm_to_hot/HK/v1",
+        opening_strategy_version="v1", source="actual",
+    )
+
+    assert simulation["eligible_sample_count"] == 2
+    assert simulation["winning_sample_count"] == 1
+    assert simulation["win_rate"] == "0.5"
+    assert actual["eligible_sample_count"] == 1
+    assert actual["winning_sample_count"] == 0
+    assert actual["win_rate"] == "0"
+    assert unavailable["winning_sample_count"] == 0
+    assert unavailable["win_rate"] is None
+
+
 def test_simulation_disposition_count_equals_calculate_trend_kelly_eligible_count() -> None:
     def pair(label: str, version: str, buy_at: str, sell_at: str) -> list[dict[str, object]]:
         entries = [

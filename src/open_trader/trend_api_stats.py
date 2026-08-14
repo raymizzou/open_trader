@@ -1829,6 +1829,8 @@ def trend_statistics_disposition(
         return {
             "available": False,
             "eligible_sample_count": 0,
+            "winning_sample_count": 0,
+            "win_rate": None,
             "discovered_candidate_count": 0,
             "excluded_candidate_count": 0,
             "incomplete_open_candidate_count": 0,
@@ -1844,10 +1846,16 @@ def trend_statistics_disposition(
         validated["fills"], market=target[0], source=source
     )
     eligible, excluded = _partition_round_dispositions(closed, target=target)
+    wins = sum(round_["result"] == "win" for round_ in eligible)
     reasons = Counter(str(item["reason"]) for item in excluded)
     return {
         "available": True,
         "eligible_sample_count": len(eligible),
+        "winning_sample_count": wins,
+        "win_rate": (
+            _decimal_text(_divide(Decimal(wins), Decimal(len(eligible))))
+            if eligible else None
+        ),
         "discovered_candidate_count": len(eligible) + len(excluded) + len(incomplete),
         "excluded_candidate_count": len(excluded),
         "incomplete_open_candidate_count": len(incomplete),
