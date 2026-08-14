@@ -238,18 +238,41 @@ def test_handshake_is_strict_and_protocol_only() -> None:
     assert process.stderr.read() == b""
 
 
-def test_harness_rejects_handshake_with_a_pid_different_from_the_captured_process() -> None:
-    code = (
-        "import json,os,time; "
-        "print(json.dumps({'backend':'test','pid':os.getpid()+1,'protocol':'open_trader.prediction_solver.protocol.v1','version':'1'}), flush=True); "
-        "time.sleep(10)"
-    )
-    with WorkerHarness([sys.executable, "-c", code], request_timeout_ms=100) as harness:
-        result = harness.submit(decode_request_line(encode_request_line(_request("pid-mismatch"))))
+@pytest.mark.parametrize("pid", (0, -1, True, "1"))
+def test_handshake_pid_decoder_rejects_nonpositive_or_noninteger_values(pid: object) -> None:
+    handshake = {
+        "backend": "test",
+        "pid": pid,
+        "protocol": BENCHMARK_PROTOCOL_V1,
+        "version": "1",
+    }
 
-    assert result.status == "UNKNOWN"
-    assert result.termination == "PROTOCOL_MISMATCH"
+    with pytest.raises(WorkerProtocolError, match="pid must be a positive integer"):
+        decode_handshake_line(json.dumps(handshake).encode())
+
+
+def test_harness_accepts_positive_handshake_pid_from_a_wrapper_namespace() -> None:
+    code = (
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "import time\n"
+        "from open_trader.prediction_solver_worker import WORKER_PHASE_NAMES\n"
+        "pid = os.getpid()\n"
+        "print(json.dumps({'backend': 'test', 'pid': pid + 1, 'protocol': 'open_trader.prediction_solver.protocol.v1', 'version': '1'}), flush=True)\n"
+        "request = json.loads(sys.stdin.readline())\n"
+        "print(json.dumps({'backend': request['backend'], 'diagnostics': [], 'evidence': {'direct_pid': pid}, 'phase_timings_ns': {name: 0 for name in WORKER_PHASE_NAMES}, 'protocol': request['protocol'], 'request_id': request['request_id'], 'status': 'OK'}), flush=True)\n"
+        "time.sleep(10)\n"
+    )
+    with WorkerHarness([sys.executable, "-c", code], request_timeout_ms=500) as harness:
+        result = harness.submit(decode_request_line(encode_request_line(_request("wrapped-pid"))))
+
+    assert result.status == "OK"
+    assert result.worker_pid is not None
+    assert result.response is not None
+    assert result.worker_pid == result.response.evidence["direct_pid"]
     assert result.cleanup_proven is True
+    assert process_group_rss_kib(result.pgid) == 0
 
 
 def test_large_request_to_a_worker_that_never_reads_stdin_times_out_boundedly() -> None:

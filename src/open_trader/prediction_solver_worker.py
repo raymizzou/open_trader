@@ -584,8 +584,6 @@ class WorkerHarness:
             decoded = decode_handshake_line(handshake)
             if decoded.backend != expected_backend:
                 raise WorkerProtocolError("handshake backend does not match request")
-            if decoded.pid != process.pid:
-                raise WorkerProtocolError("handshake pid does not match captured process")
             worker.handshake = decoded
             worker.reader.assert_no_trailing_stdout()
         except Exception as exc:
