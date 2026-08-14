@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-14
 
+- #50 新增纯序列化 `SOLVER_VERIFIED` 证明入口：CP-SAT `FEASIBLE` 候选可持久化为带模型、组合、行情和 generation 指纹的 evidence；独立 verifier 仅以该 canonical input 和固定组合，经既有精确 Oracle 重算最坏结算、成本、资本释放与资格。固定候选合格才为 `QUALIFIED_VERIFIED`，不合格仅为候选级 `NOT_QUALIFIED`，无候选/不完整路径为 `UNKNOWN`，不产生组件级负证明。复用既有 WorkerHarness serialized I/O；无数据库、网络、订单或通知改动。验证：proof/N_LEG/Oracle/solver 回归通过；本地 `/private/tmp` WorkerHarness 清理证明受限，单独记录为 `CLEANUP_UNPROVEN`。
+
 - 趋势复盘基准现以独立的显著完整交易胜率和统一五项指标计分板呈现，桌面端分列策略表现/市场基准，移动端逐行市场基准；无计算或执行变更。验证：聚焦 `trend_review` 测试 `3 + 36 passed`；完整 Dashboard 三文件套件在本地权限下为 `1006 passed, 1 warning in 48.09s`。未运行 `make acceptance`、部署、合并或推送。
 
 - #49 标准化 solver adapters/worker benchmark：先通过稳定性硬门槛，再做正套利输出速度实验；在当前 macOS/current-corpus 边界内选择 OR-Tools CP-SAT。Linux cleanup proof 未完成，不构成正式跨平台全量选择；Issue 已关闭。

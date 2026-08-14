@@ -969,6 +969,16 @@ def _solution_from_payload(payload: object) -> PortfolioSolution:
     return PortfolioSolution(tuple(_quantity_from_payload(item) for item in _array(value["quantities"], "quantities")), proof)
 
 
+def portfolio_solution_from_payload(payload: object) -> PortfolioSolution:
+    """Decode one canonical portfolio proof without wrapping it in an Oracle result."""
+    return _solution_from_payload(payload)
+
+
+def payout_proof_from_payload(payload: object) -> PayoutProof:
+    """Decode one canonical payout proof without wrapping it in an Oracle result."""
+    return _payout_proof_from_payload(payload)
+
+
 def _bounds_from_payload(payload: object) -> ObjectiveBounds:
     value = _object(payload, "objective_bounds", {"lower_bound_units", "upper_bound_units", "gap_units", "closed"})
     return ObjectiveBounds(_optional_integer(value["lower_bound_units"], "lower_bound_units"), _optional_integer(value["upper_bound_units"], "upper_bound_units"), _optional_integer(value["gap_units"], "gap_units"), _boolean(value["closed"], "closed"))
