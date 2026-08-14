@@ -245,24 +245,38 @@ class ConfirmedHolding:
 
 
 @dataclass(frozen=True, slots=True)
+class SettlementCashFlow:
+    venue_id: str
+    account_id: str
+    settlement_asset_id: str
+    occurred_cost_units: int
+    occurred_fee_units: int
+
+    def __post_init__(self) -> None:
+        for name in ("venue_id", "account_id", "settlement_asset_id"):
+            _text(getattr(self, name), name)
+        _nonnegative(self.occurred_cost_units, "occurred_cost_units")
+        _nonnegative(self.occurred_fee_units, "occurred_fee_units")
+
+
+@dataclass(frozen=True, slots=True)
 class RepairContext:
     """Typed fresh source. Its fingerprints are derived here, never caller supplied."""
     reservation_version: str
     quotes: tuple[RepairQuote, ...]
     holdings: tuple[ConfirmedHolding, ...]
     account_snapshot: AccountSnapshot
-    occurred_cost_units: int
-    occurred_fee_units: int
+    cash_flows: tuple[SettlementCashFlow, ...]
     now: datetime
 
     def __post_init__(self) -> None:
         _text(self.reservation_version, "reservation_version")
-        _nonnegative(self.occurred_cost_units, "occurred_cost_units")
-        _nonnegative(self.occurred_fee_units, "occurred_fee_units")
         if not isinstance(self.account_snapshot, AccountSnapshot) or not isinstance(self.now, datetime) or self.now.tzinfo is None:
             raise ValueError("now must be aware")
         if not self.quotes or len({quote.client_order_id for quote in self.quotes}) != len(self.quotes):
             raise ValueError("repair quotes must be complete and unique")
+        if len({(flow.venue_id, flow.account_id, flow.settlement_asset_id) for flow in self.cash_flows}) != len(self.cash_flows):
+            raise ValueError("repair cash flows must be unique per reservation key")
         if any((self.now - quote.received_at).total_seconds() < 0 or (self.now - quote.received_at).total_seconds() > 10 or (self.now - quote.source_timestamp).total_seconds() < 0 or (self.now - quote.source_timestamp).total_seconds() > 10 for quote in self.quotes):
             raise ValueError("repair quotes must be fresh")
 
@@ -604,7 +618,7 @@ class NLegExecutionService:
         holdings = {(item.venue_id, item.account_id, item.asset_id): item.quantity for item in context.holdings}
         complete = {client: int(leg["submitted_quantity"]) - int(leg["receipt"]["cumulative_filled_quantity"]) for client, leg in by_client.items() if isinstance(leg.get("receipt"), dict) and int(leg["submitted_quantity"]) > int(leg["receipt"]["cumulative_filled_quantity"])}
         exit_ = {client: int(leg["receipt"]["cumulative_filled_quantity"]) for client, leg in by_client.items() if isinstance(leg.get("receipt"), dict) and int(leg["receipt"]["cumulative_filled_quantity"]) > 0 and holdings.get((str(leg["venue_id"]), str(leg["account_id"]), str(leg["asset_id"])), 0) >= int(leg["receipt"]["cumulative_filled_quantity"])}
-        base = context.occurred_cost_units + context.occurred_fee_units
+        base = sum(flow.occurred_cost_units + flow.occurred_fee_units for flow in context.cash_flows)
         candidates = []
         if complete:
             cost_by_key: dict[tuple[str, str, str], int] = {}
@@ -612,7 +626,11 @@ class NLegExecutionService:
                 quote, leg = quotes[client], by_client[client]
                 key = (quote.venue_id, quote.account_id, quote.settlement_asset_id)
                 cost_by_key[key] = cost_by_key.get(key, 0) + quantity * (quote.buy_cost_per_lot_units + quote.slippage_units)
-            remaining = {(str(row["venue_id"]), str(row["account_id"]), str(row["settlement_asset_id"])): int(row["remaining_units"]) for row in batch.get("reservations", []) if isinstance(row, dict)}
+            flows = {(flow.venue_id, flow.account_id, flow.settlement_asset_id): flow.occurred_cost_units + flow.occurred_fee_units for flow in context.cash_flows}
+            remaining = {
+                (str(row["venue_id"]), str(row["account_id"]), str(row["settlement_asset_id"])): min(int(row["remaining_units"]), max(0, int(row["original_units"]) - flows.get((str(row["venue_id"]), str(row["account_id"]), str(row["settlement_asset_id"])), 0)))
+                for row in batch.get("reservations", []) if isinstance(row, dict)
+            }
             if all(cost <= remaining.get(key, -1) for key, cost in cost_by_key.items()): candidates.append({"family": "COMPLETE_REMAINING", "legs": complete, "conservative_total_loss_units": base + sum(cost_by_key.values())})
         if exit_:
             # Do not subtract expected proceeds: an exit is costed conservatively.

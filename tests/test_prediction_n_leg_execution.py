@@ -15,6 +15,7 @@ from open_trader.prediction_n_leg_execution import (
     ReconciliationContext,
     RepairQuote,
     RepairContext,
+    SettlementCashFlow,
     NLegExecutionService,
     OrderReceipt,
     PartialFillProofRecord,
@@ -123,7 +124,9 @@ def repair_context(*, b_buy: int = 1, b_venue: str = "venue-b") -> RepairContext
             RepairQuote("batch-1:action-b", b_venue, "account-b", "usd-cents", b_buy, 2, AS_OF, AS_OF),
         ),
         (ConfirmedHolding("venue-a", "account-a", "action-a", 4), ConfirmedHolding("venue-b", "account-b", "action-b", 0)),
-        source_and_solution()[0].account_snapshot, 0, 0, AS_OF,
+        source_and_solution()[0].account_snapshot,
+        (SettlementCashFlow("venue-a", "account-a", "usd-cents", 0, 0), SettlementCashFlow("venue-b", "account-b", "usd-cents", 0, 0)),
+        AS_OF,
     )
 
 
