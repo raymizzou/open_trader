@@ -4141,6 +4141,14 @@ def _check_trend_review_visual_contract(page: Any, broker: str) -> None:
           unavailableProbe.querySelector("strong")
         ).fontSize;
         unavailableProbe.remove();
+        const metricValueProbe = workspace.querySelector(".trend-review-series").cloneNode(true);
+        metricValueProbe.classList.remove("unavailable");
+        metricValueProbe.hidden = true;
+        workspace.appendChild(metricValueProbe);
+        const metricValueFontSize = getComputedStyle(
+          metricValueProbe.querySelector("strong")
+        ).fontSize;
+        metricValueProbe.remove();
         return {
           tokens, workspace: read(workspace), matrices: matrices.map(read),
           side: read(workspace.querySelector(".trend-review-header-side")),
@@ -4151,9 +4159,7 @@ def _check_trend_review_visual_contract(page: Any, broker: str) -> None:
           textContrast: contrast(tokens.text, tokens.surfaceSoft),
           markerContrasts: markers.map(element => contrast(getComputedStyle(element).borderColor, tokens.surfaceSoft)),
           unavailableWinRateFontSize,
-          metricValueFontSize: getComputedStyle(
-            workspace.querySelector(".trend-review-series strong")
-          ).fontSize,
+          metricValueFontSize,
         };
         }"""
     )

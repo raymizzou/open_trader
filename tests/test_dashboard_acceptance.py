@@ -2954,6 +2954,17 @@ def test_acceptance_rejects_trend_review_panel_style_drift() -> None:
         )
 
 
+def test_acceptance_allows_trend_review_unavailable_first_metric_value() -> None:
+    payload = valid_payload()
+    page = tabbed_account_page(payload)
+    page.review_first_metric_unavailable = True
+    section = dashboard_acceptance._select_account_tab(page, "tiger")
+
+    dashboard_acceptance._check_trend_review(
+        page, section, "tiger", payload["trend_reviews"]["tiger"]
+    )
+
+
 @pytest.mark.parametrize(
     ("viewport", "attribute", "value", "message"),
     (
@@ -4589,6 +4600,7 @@ class TabbedAccountPage:
         self.review_marker_contrasts = [4.0] * 25
         self.review_unavailable_win_rate_font_size = "20px"
         self.review_metric_value_font_size: str | None = None
+        self.review_first_metric_unavailable = False
         self.review_header_left_texts: list[str] | None = None
         self.review_header_side_texts: list[str] | None = None
         self.review_statistics_texts = {
@@ -4679,9 +4691,9 @@ class TabbedAccountPage:
                 '.trend-review-header-side button',
                 "backgroundColor", "borderColor", "borderWidth", "color",
                 "borderRadius", "boxShadow", "backgroundImage",
-                "textContrast", "markerContrasts", "cloneNode", "classList.add",
+                "textContrast", "markerContrasts", "cloneNode", "classList.add", "classList.remove",
                 "unavailableWinRateFontSize", "metricValueFontSize", "fontSize",
-                ".trend-review-win-rate", ".trend-review-series strong",
+                ".trend-review-win-rate", ".trend-review-series", "metricValueProbe",
             )
             missing = [fragment for fragment in required if fragment not in expression]
             assert not missing, f"trend review style fake 缺少真实表达式：{missing}"
@@ -4753,7 +4765,11 @@ class TabbedAccountPage:
                 "markerContrasts": self.review_marker_contrasts,
                 "unavailableWinRateFontSize": self.review_unavailable_win_rate_font_size,
                 "metricValueFontSize": self.review_metric_value_font_size or (
-                    "18px" if self.viewport_size["width"] <= 840 else "23px"
+                    "18px"
+                    if self.viewport_size["width"] <= 840
+                    else "23px"
+                    if "metricValueProbe" in expression or not self.review_first_metric_unavailable
+                    else "12px"
                 ),
             }
         if "trend-review-geometry-contract" in expression:
