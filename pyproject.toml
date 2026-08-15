@@ -12,6 +12,7 @@ dependencies = [
     "backtrader>=1.9.78",
     "futu-api",
     "openai>=2.0.0",
+    "ortools==9.15.6755",
     "polymarket-client==0.2.0",
     "predict-sdk==0.0.22",
     "pdfplumber>=0.11.9",
