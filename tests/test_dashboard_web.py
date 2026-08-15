@@ -14190,3 +14190,22 @@ console.log(JSON.stringify(html));
     assert "19.90" in rendered
     assert "可观察标的" not in rendered
     assert "pm-llm-layout" not in rendered
+
+
+def test_prediction_shadow_renderer_is_compact_safe_and_opens_only_for_attention() -> None:
+    output = run_dashboard_js(r'''
+const green = predictionNLegShadowHtml({n_leg_shadow:{latest_result:{comparison:"CONSISTENT",decision:"QUALIFIED_VERIFIED",result:{minimum_profit:"1.10"}},current_differences:{}}});
+const amber = predictionNLegShadowHtml({n_leg_shadow:{latest_result:{comparison:"DIFFERENCE",decision:"NOT_QUALIFIED"},current_differences:{minimum_profit:{legacy:"1.20",n_leg:"1.10",absolute:"0.10"}}}});
+const red = predictionNLegShadowHtml({n_leg_shadow:{latest_result:{comparison:"FAILURE",reason:"<script>bad</script>"},current_differences:{}}});
+const overview = predictionNLegOverview({n_leg_shadow:{monitoring:2,legacy_qualified:2,completed:3,differences:1,failures:1,last_completed_at:"2026-08-15T00:01:00Z"}});
+console.log(JSON.stringify({green, amber, red, overview}));
+''')
+    rendered = json.loads(output)
+
+    assert '<details class="pm-n-leg-shadow pm-tone-ok">' in rendered["green"]
+    assert '<details class="pm-n-leg-shadow warning" open>' in rendered["amber"]
+    assert '<details class="pm-n-leg-shadow danger" open>' in rendered["red"]
+    assert "&lt;script&gt;bad&lt;/script&gt;" in rendered["red"]
+    assert "<script>bad</script>" not in rendered["red"]
+    for label in ("监控", "旧系统合格", "N_LEG 完成", "差异", "失败", "最近完成"):
+        assert label in rendered["overview"]

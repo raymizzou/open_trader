@@ -1290,6 +1290,7 @@ class PredictCrossVenueMonitor:
         predict_quote_fn: Callable[[str, str, int], PredictBuyQuote] | None = None,
         store: PredictionArbitrageStore | None = None,
         ready_observer: Callable[[str, str], object] | None = None,
+        shadow_observer: Callable[[Mapping[str, object], str], object] | None = None,
         holding_reconciler: Callable[[], object] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -1300,6 +1301,7 @@ class PredictCrossVenueMonitor:
         self._predict_quote_fn = predict_quote_fn
         self._store = store
         self._ready_observer = ready_observer
+        self._shadow_observer = shadow_observer
         self._holding_reconciler = holding_reconciler
         self._clock = clock
         self._task: asyncio.Task[None] | None = None
@@ -2145,35 +2147,59 @@ class PredictCrossVenueMonitor:
         self._signal_episodes[opportunity_id] = signal_id
         if isinstance(opportunity, dict):
             opportunity["signal_episode_id"] = signal_id
+        legacy_qualified = (
+            opportunity.get("funnel_stage") == 5
+            and opportunity.get("actionable") is True
+            and (
+                (isinstance(approval, Mapping) and approval.get("decision") == "APPROVE")
+                or opportunity.get("manual_only") is True
+            )
+        )
         if (
             self._ready_observer is not None
             and notification_identity is not None
-            and opportunity.get("funnel_stage") == 5
-            and opportunity.get("actionable") is True
-            and isinstance(approval, Mapping)
-            and approval.get("decision") == "APPROVE"
+            and legacy_qualified
             and not (
                 same_notification_identity
                 and previous.get("actionable") is True
             )
         ):
             asyncio.create_task(
-                asyncio.to_thread(self._ready_observer, opportunity_id, signal_id)
+                asyncio.to_thread(
+                    self._notify_ready_then_shadow,
+                    opportunity_id,
+                    signal_id,
+                    dict(opportunity),
+                )
             )
-        if (
-            self._ready_observer is not None
-            and notification_identity is not None
-            and opportunity.get("funnel_stage") == 5
-            and opportunity.get("actionable") is True
-            and opportunity.get("manual_only") is True
-            and not (
-                same_notification_identity
-                and previous.get("actionable") is True
-            )
-        ):
+        elif legacy_qualified and self._shadow_observer is not None:
             asyncio.create_task(
-                asyncio.to_thread(self._ready_observer, opportunity_id, signal_id)
+                asyncio.to_thread(self._notify_shadow, signal_id, dict(opportunity))
             )
+
+    def _notify_ready_then_shadow(
+        self, opportunity_id: str, signal_id: str, opportunity: Mapping[str, object]
+    ) -> object:
+        observer = self._ready_observer
+        if observer is None:
+            return None
+        result = observer(opportunity_id, signal_id)
+        shadow = self._shadow_observer
+        if shadow is not None:
+            try:
+                shadow(dict(opportunity), signal_id)
+            except Exception:
+                pass
+        return result
+
+    def _notify_shadow(self, signal_id: str, opportunity: Mapping[str, object]) -> None:
+        shadow = self._shadow_observer
+        if shadow is None:
+            return
+        try:
+            shadow(dict(opportunity), signal_id)
+        except Exception:
+            return
 
     def _close_opportunity(self, key: tuple[str, Direction]) -> None:
         opportunity = self._opportunities.pop(key, None)

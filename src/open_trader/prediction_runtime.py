@@ -5,6 +5,7 @@ import fcntl
 import inspect
 import logging
 import os
+import sys
 import threading
 from collections.abc import Mapping
 from contextlib import ExitStack
@@ -46,6 +47,12 @@ from .prediction_read_only import (
     PredictReadOnlyGuard,
     guard_polymarket_client,
     guard_predict_client,
+)
+from .prediction_solver_server import SolverServerOwner
+from .prediction_n_leg_shadow import (
+    NLegShadowClient,
+    NLegShadowScheduler,
+    legacy_shadow_snapshot,
 )
 from .prediction_title_translation import CodexTitleTranslator
 from .relation_catalog import RelationCatalog
@@ -265,6 +272,7 @@ def _build_cross_venue_monitor(
     fallback_enabled: bool = True,
     max_codex_calls: int | None = None,
     holding_reconciler: Callable[[], object] | None | object = _DEFAULT_HOLDING_RECONCILER,
+    shadow_observer: Callable[[Mapping[str, object], str], object] | None = None,
 ) -> PredictCrossVenueMonitor | _UnavailableCrossVenueMonitor:
     predict_config = getattr(trading_config, "predict", None)
     if predict_config is None:
@@ -287,6 +295,7 @@ def _build_cross_venue_monitor(
             predict_quote_fn=getattr(predict_trading, "quote_market_buy", None),
             store=store,
             ready_observer=execution.notify_ready_opportunity,
+            shadow_observer=shadow_observer,
             holding_reconciler=holding_reconciler,
         )
     except Exception:
@@ -334,6 +343,7 @@ class PredictionRuntime:
         mode: Literal["production", "shadow"] = "production",
         git_sha: str = "",
         reader_generation: int | None = None,
+        solver_server_factory: Callable[[], SolverServerOwner] | None = None,
     ) -> None:
         if mode not in {"production", "shadow"}:
             raise ValueError("prediction runtime mode must be production or shadow")
@@ -347,6 +357,11 @@ class PredictionRuntime:
         self._mode = mode
         self._git_sha = str(git_sha)
         self._reader_generation = reader_generation
+        self._solver_server_factory = solver_server_factory or (
+            lambda: SolverServerOwner(
+                [sys.executable, "-m", "open_trader.prediction_solver_worker", "--backend", "cp_sat"]
+            )
+        )
         self._owner_thread_id = threading.get_ident()
         self._notifier = NullNotifier() if mode == "shadow" else notifier or NullNotifier()
         self._injected_cross_venue_monitor = cross_venue_monitor
@@ -362,6 +377,8 @@ class PredictionRuntime:
         self.cross_venue_monitor: object | None = None
         self.execution: PredictionExecutionService | None = None
         self.relation_catalog: RelationCatalog | None = None
+        self.solver_server: SolverServerOwner | None = None
+        self.n_leg_shadow: NLegShadowScheduler | None = None
         self._shadow_guards: ExitStack | None = None
         self._shadow_failure_lock = threading.Lock()
         self._shadow_failure_event = threading.Event()
@@ -450,6 +467,7 @@ class PredictionRuntime:
                         f"prediction reader generation {self._reader_generation} "
                         f"is below required {minimum_reader_generation}"
                     )
+            self.solver_server = self._solver_server_factory()
             self.store = PredictionArbitrageStore(self._data_dir)
             self.relation_catalog = RelationCatalog(self._data_dir)
             trading_config = load_trading_config(self._prediction_config_path)
@@ -507,6 +525,7 @@ class PredictionRuntime:
             self.monitor.set_failure_observer(
                 self.execution.notify_monitor_failure
             )
+            shadow_observer = self._configure_n_leg_shadow()
             cross_monitor = self._injected_cross_venue_monitor
             if cross_monitor is None:
                 cross_monitor = _build_cross_venue_monitor(
@@ -519,6 +538,7 @@ class PredictionRuntime:
                     holding_reconciler=getattr(
                         self.execution, "reconcile_cross_holdings_once", None
                     ),
+                    shadow_observer=shadow_observer,
                 )
             if not isinstance(cross_monitor, _UnavailableCrossVenueMonitor):
                 self._cross_runtime = _CrossVenueRuntime(cross_monitor)
@@ -585,6 +605,7 @@ class PredictionRuntime:
     def _start_shadow(self) -> None:
         try:
             self._owner.acquire()
+            self.solver_server = self._solver_server_factory()
             self.store = PredictionArbitrageStore(self._data_dir)
             trading_config = load_trading_config(self._prediction_config_path)
             self._prediction_trading = PolymarketTradingClient.from_keychain(
@@ -622,6 +643,7 @@ class PredictionRuntime:
             self.monitor.set_ready_observer(self.execution.notify_ready_opportunity)
             self.monitor.set_observation_observer(self.execution.notify_observation)
             self.monitor.set_failure_observer(self.execution.notify_monitor_failure)
+            shadow_observer = self._configure_n_leg_shadow()
             cross_monitor = self._injected_cross_venue_monitor
             if cross_monitor is None:
                 cross_monitor = _build_cross_venue_monitor(
@@ -634,6 +656,7 @@ class PredictionRuntime:
                     fallback_enabled=False,
                     max_codex_calls=3,
                     holding_reconciler=None,
+                    shadow_observer=shadow_observer,
                 )
             if not isinstance(cross_monitor, _UnavailableCrossVenueMonitor):
                 self._cross_runtime = _CrossVenueRuntime(cross_monitor)
@@ -675,6 +698,23 @@ class PredictionRuntime:
             self._state = "FAILED"
             self._cleanup_resources()
             raise
+
+    def _configure_n_leg_shadow(self) -> Callable[[Mapping[str, object], str], object]:
+        if self.store is None or self.solver_server is None or self.monitor is None:
+            raise RuntimeError("prediction Shadow requires the owned store, monitor, and solver server")
+        scheduler = NLegShadowScheduler(
+            self.store,
+            submit_snapshot=NLegShadowClient(self.solver_server).submit,
+        )
+        self.n_leg_shadow = scheduler
+
+        def observe(opportunity: Mapping[str, object], signal_id: str) -> str:
+            return scheduler.schedule(signal_id, legacy_shadow_snapshot(opportunity, signal_id))
+
+        set_shadow_observer = getattr(self.monitor, "set_shadow_observer", None)
+        if callable(set_shadow_observer):
+            set_shadow_observer(observe)
+        return observe
 
     def stop(self) -> None:
         if self._state == "STOPPED":
@@ -733,6 +773,8 @@ class PredictionRuntime:
             finally:
                 self._shadow_guards = None
         for resource in (
+            ("n_leg_shadow", self.n_leg_shadow),
+            ("solver_server", self.solver_server),
             ("execution", self.execution),
             ("_prediction_trading", self._prediction_trading),
             ("_predict_trading", self._predict_trading),
