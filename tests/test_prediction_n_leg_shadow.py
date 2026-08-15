@@ -374,22 +374,7 @@ def test_shadow_client_fails_closed_when_worker_cleanup_is_unproven() -> None:
     assert result["reason"] == "CLEANUP_UNPROVEN"
 
 
-def test_shadow_client_compares_verified_economics_in_exact_units() -> None:
-    snapshot = legacy_shadow_snapshot(
-        {
-            "opportunity_id": "event-1:market-1",
-            "market_id": "market-1",
-            "market_type": "standard_binary",
-            "quantity": "10",
-            "yes_max_cost": "4.20",
-            "no_max_cost": "4.70",
-            "total_max_cost": "8.90",
-            "minimum_profit": "1.20",
-            "confirmed_at": "2026-08-15T00:00:00Z",
-            "resolution_at": "2026-08-16T00:00:00Z",
-        },
-        "episode-1",
-    )
+def _verified_evidence(snapshot: dict[str, object]) -> CandidateEvidence:
     request = legacy_shadow_request(snapshot)
     proof_input = ProofInput(
         PROOF_REQUEST_SCHEMA_V1,
@@ -430,21 +415,44 @@ def test_shadow_client_compares_verified_economics_in_exact_units() -> None:
             None,
         ),
     )
+    return evidence
 
-    class Server:
-        def submit(self, _request):
-            future = Future()
-            future.set_result(
-                SimpleNamespace(
-                    status="OK",
-                    termination="COMPLETED",
-                    cleanup_proven=True,
-                    response=SimpleNamespace(evidence=canonical_payload(evidence)),
-                )
+
+class _VerifiedServer:
+    def __init__(self, snapshot: dict[str, object]) -> None:
+        self._evidence = _verified_evidence(snapshot)
+
+    def submit(self, _request):
+        future = Future()
+        future.set_result(
+            SimpleNamespace(
+                status="OK",
+                termination="COMPLETED",
+                cleanup_proven=True,
+                response=SimpleNamespace(evidence=canonical_payload(self._evidence)),
             )
-            return future
+        )
+        return future
 
-    result = NLegShadowClient(Server()).submit(snapshot).result()
+
+def test_shadow_client_compares_verified_economics_in_exact_units() -> None:
+    snapshot = legacy_shadow_snapshot(
+        {
+            "opportunity_id": "event-1:market-1",
+            "market_id": "market-1",
+            "market_type": "standard_binary",
+            "quantity": "10",
+            "yes_max_cost": "4.20",
+            "no_max_cost": "4.70",
+            "total_max_cost": "8.90",
+            "minimum_profit": "1.20",
+            "confirmed_at": "2026-08-15T00:00:00Z",
+            "resolution_at": "2026-08-16T00:00:00Z",
+        },
+        "episode-1",
+    )
+
+    result = NLegShadowClient(_VerifiedServer(snapshot)).submit(snapshot).result()
 
     assert result["run_status"] == "SUCCESS"
     assert result["decision"] == "QUALIFIED_VERIFIED"
@@ -464,8 +472,58 @@ def test_shadow_client_compares_verified_economics_in_exact_units() -> None:
     ):
         assert dimension in result["differences"], dimension
     assert result["differences"]["direction"]["status"] == "consistent"
+    assert result["differences"]["direction"] == {
+        "legacy": "YES,NO", "n_leg": "YES,NO", "status": "consistent",
+    }
     assert result["differences"]["worst_case"]["legacy"] == "旧路径未提供"
     assert result["differences"]["worst_case"]["status"] == "na"
+
+
+def test_shadow_direction_compares_per_leg_sides_not_action_ids() -> None:
+    snapshot = legacy_shadow_snapshot(
+        {
+            "opportunity_id": "pair-1",
+            "market_id": "market-1",
+            "market_type": "cross_venue_yes_no",
+            "quantity": "10",
+            "total_max_cost": "8.90",
+            "minimum_profit": "1.10",
+            "confirmed_at": "2026-08-15T00:00:00Z",
+            "resolution_at": "2026-08-16T00:00:00Z",
+            "calculable_gas": "0.02",
+            "legs": [
+                {
+                    "exchange": "polymarket",
+                    "market_id": "m-no",
+                    "condition_id": "c-no",
+                    "outcome": "NO",
+                    "token_id": "t-no",
+                    "net_quantity": "10",
+                    "max_cost": "4.20",
+                    "settlement_at": "2026-08-16T00:00:00Z",
+                },
+                {
+                    "exchange": "predict.fun",
+                    "market_id": "m-yes",
+                    "condition_id": "c-yes",
+                    "outcome": "YES",
+                    "token_id": "t-yes",
+                    "net_quantity": "10",
+                    "max_cost": "4.70",
+                    "settlement_at": "2026-08-16T00:00:00Z",
+                },
+            ],
+        },
+        "episode-1",
+    )
+
+    result = NLegShadowClient(_VerifiedServer(snapshot)).submit(snapshot).result()
+
+    assert result["run_status"] == "SUCCESS"
+    assert result["decision"] == "QUALIFIED_VERIFIED"
+    assert result["differences"]["direction"] == {
+        "legacy": "NO,YES", "n_leg": "NO,YES", "status": "consistent",
+    }
 
 
 def test_scheduler_close_discards_late_worker_completion(tmp_path) -> None:

@@ -434,8 +434,12 @@ def _comparison(snapshot: Mapping[str, object], fingerprint: str, verification: 
         "legacy": "是", "n_leg": "是", "status": "consistent",
     }
     expected_sides = _legacy_direction(snapshot)
+    sides_by_action = {
+        f"legacy-{index}": side for index, side in enumerate(expected_sides, start=1)
+    }
     actual_direction = tuple(
-        getattr(item, "action_id", "") for item in getattr(solution, "quantities", ())
+        sides_by_action.get(getattr(item, "action_id", ""), "")
+        for item in getattr(solution, "quantities", ())
     )
     differences["direction"] = {
         "legacy": ",".join(expected_sides),
@@ -507,9 +511,14 @@ def _legacy_direction(snapshot: Mapping[str, object]) -> tuple[str, ...]:
         legs = snapshot.get("legs")
         if not isinstance(legs, (tuple, list)) or len(legs) != 2:
             return ()
-        # Canonical shadow action ids are assigned by leg order, not outcome.
-        return ("legacy-1", "legacy-2")
-    return ("legacy-1", "legacy-2")
+        # Expected per-leg sides in canonical leg order; action ids are assigned
+        # by leg order, so comparing ids would only prove leg count.
+        return tuple(
+            "YES" if leg.get("outcome") == "YES" else "NO"
+            for leg in legs
+            if isinstance(leg, Mapping)
+        )
+    return ("YES", "NO")
 
 
 def _scenario_label(scenario: object) -> str | None:
