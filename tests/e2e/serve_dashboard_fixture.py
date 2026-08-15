@@ -527,15 +527,17 @@ def _prediction_history_for_scenario(kind: str, scenario: str) -> list[dict[str,
 
 def _relation_review_fixture() -> dict[str, object]:
     return {
-        "relation_version_id": "rv-fixture-1", "relation_id": "relation-fixture-1",
-        "approval_status": "PENDING", "activation_status": "PENDING",
+        "version_id": "rv-fixture-1", "identity": "relation-fixture-1",
+        "fingerprint": "fixture-fingerprint",
+        "status": "PENDING", "activation": "PENDING",
         "discovery_source": "deterministic_rule", "discovered_at": "2026-08-15T02:32:00Z",
-        "semantics": {"statement": "若 ‘Will Bitcoin trade above $100,000 at any time before December 31, 2026?’ 为 YES，则下方市场也必须为 YES。"},
-        "markets": [
+        "statement": "若 ‘Will Bitcoin trade above $100,000 at any time before December 31, 2026?’ 为 YES，则下方市场也必须为 YES。",
+        "relation_type": "IMPLIES",
+        "endpoints": [
             {"venue": "Polymarket", "contract_id": "condition-a", "title": "Will Bitcoin trade above $100,000 at any time before December 31, 2026?", "market_date": "2026-08-15T00:00:00Z", "expires_at": "2026-12-31T17:00:00Z", "settlement_observation_key": "btc-usd"},
             {"venue": "Polymarket", "contract_id": "condition-b", "title": "Will Bitcoin trade above $90,000 at any time before December 31, 2026?", "market_date": "2026-08-15T00:00:00Z", "expires_at": "2026-12-31T17:00:00Z", "settlement_observation_key": "btc-usd"},
         ],
-        "source_evidence_fingerprint": "source-fixture", "relation_semantics_fingerprint": "semantics-fixture", "compiled_model_fingerprint": "model-fixture",
+        "model": {"terminal_states": [], "payouts": {}, "capital_release": None},
         "evidence": [{"source_evidence": [{"source": "Polymarket rules", "quote": "resolves YES if..."}]}],
     }
 

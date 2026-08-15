@@ -1,15 +1,26 @@
-"""Versioned admission catalog for production-discovered market relations."""
+"""V1-compatible public API surface backed by the v2 relation catalog core.
+
+``RelationCatalog`` keeps the v1 constructor and method signatures consumed by
+the Prediction Service and Dashboard, but stores and reads only the v2
+``catalog_v2_*`` tables through ``RelationCatalogV2``/``SqliteCatalogStore``.
+Identity, the frozen version fingerprint, approval freeze, generation
+snapshots, and the cause ledger are all v2 invariants; v1 state is never read
+or written.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
-from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator, Mapping
-from uuid import uuid4
+from typing import Mapping
+
+from .relation_catalog_v2 import (
+    RelationCatalogV2,
+    SqliteCatalogStore,
+    _canonicalize,
+)
 
 
 _SCHEMA = "open_trader.relation_catalog.v1"
@@ -62,19 +73,6 @@ def _string(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} is required")
     return value.strip()
-
-
-def _fact(value: object) -> object:
-    """Exclude occurrence timestamps from the stable evidence identity."""
-    if isinstance(value, Mapping):
-        return {
-            str(key): _fact(item)
-            for key, item in value.items()
-            if str(key) not in {"observed_at", "discovered_at", "seen_at", "updated_at"}
-        }
-    if isinstance(value, (list, tuple)):
-        return [_fact(item) for item in value]
-    return value
 
 
 def _normalise_discovery(value: Mapping[str, object]) -> dict[str, object]:
@@ -137,7 +135,7 @@ def _normalise_discovery(value: Mapping[str, object]) -> dict[str, object]:
 
 
 class RelationCatalog:
-    """SQLite-backed public domain API; readers consume only `current_generation`."""
+    """V2-backed public domain API; readers consume only ``current_generation``."""
 
     def __init__(self, data_dir: Path, *, component_budget: int = _BUDGET) -> None:
         if type(component_budget) is not int or component_budget < 2:
@@ -145,111 +143,52 @@ class RelationCatalog:
         self.path = Path(data_dir) / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.component_budget = component_budget
-        with self._connection() as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.executescript("""
-                CREATE TABLE IF NOT EXISTS relation_catalog_versions (
-                    relation_version_id TEXT PRIMARY KEY,
-                    relation_id TEXT NOT NULL,
-                    previous_relation_version_id TEXT,
-                    source_fingerprint TEXT NOT NULL,
-                    semantics_fingerprint TEXT NOT NULL,
-                    model_fingerprint TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    approval_status TEXT NOT NULL,
-                    activation_status TEXT NOT NULL,
-                    activation_diagnostic TEXT,
-                    active_generation INTEGER,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS relation_catalog_version_identity
-                ON relation_catalog_versions(relation_id, source_fingerprint, semantics_fingerprint, model_fingerprint);
-                CREATE INDEX IF NOT EXISTS relation_catalog_versions_relation
-                ON relation_catalog_versions(relation_id, created_at DESC);
-                CREATE TABLE IF NOT EXISTS relation_catalog_evidence (
-                    occurrence_id TEXT PRIMARY KEY,
-                    relation_version_id TEXT NOT NULL REFERENCES relation_catalog_versions(relation_version_id),
-                    payload TEXT NOT NULL,
-                    observed_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS relation_catalog_audit (
-                    audit_id TEXT PRIMARY KEY,
-                    relation_version_id TEXT,
-                    action TEXT NOT NULL,
-                    actor TEXT NOT NULL,
-                    git_sha TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS relation_catalog_generations (
-                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                    generation INTEGER NOT NULL,
-                    unknown_components TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                INSERT INTO relation_catalog_generations(singleton, generation, unknown_components, updated_at)
-                VALUES(1, 0, '[]', '') ON CONFLICT(singleton) DO NOTHING;
-                CREATE TABLE IF NOT EXISTS relation_catalog_generation_members (
-                    generation INTEGER NOT NULL,
-                    relation_id TEXT NOT NULL,
-                    relation_version_id TEXT NOT NULL REFERENCES relation_catalog_versions(relation_version_id),
-                    PRIMARY KEY(generation, relation_id)
-                );
-            """)
+        self._store = SqliteCatalogStore(self.path)
+        self._catalog = RelationCatalogV2(store=self._store)
 
-    def _connection(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, isolation_level=None, timeout=5, check_same_thread=False)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=5000")
-        return connection
-
-    @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
-        connection = self._connection()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            yield connection
-            connection.execute("COMMIT")
-        except Exception:
-            connection.execute("ROLLBACK")
-            raise
-        finally:
-            connection.close()
-
-    @staticmethod
-    def _audit(connection: sqlite3.Connection, *, version_id: str | None, action: str, actor: str, git_sha: str, payload: Mapping[str, object]) -> None:
-        connection.execute(
-            "INSERT INTO relation_catalog_audit VALUES(?,?,?,?,?,?,?)",
-            (uuid4().hex, version_id, action, actor, git_sha, _canonical(payload), _now()),
-        )
+    def _converted(self, discovery: Mapping[str, object]) -> dict[str, object]:
+        """Map a v1 discovery payload to the clean v2 canonical payload shape."""
+        payload = _normalise_discovery(discovery)
+        endpoints = [
+            {
+                "venue": str(market["venue"]).casefold(),
+                "contract_id": str(market["contract_id"]),
+                "title": market["title"],
+                "market_date": market["market_date"],
+                "expires_at": market["expires_at"],
+                "settlement_observation_key": market["settlement_observation_key"],
+                "settlement_rules": market["settlement_rules"],
+                "cancellation_rules": market["cancellation_rules"],
+            }
+            for market in payload["markets"]
+        ]
+        direction = str(payload["semantics"].get("direction", ""))
+        if direction in {"B_IMPLIES_A", "B_TO_A"}:
+            endpoints = list(reversed(endpoints))
+        converted: dict[str, object] = {
+            "relation_type": payload["relation_type"],
+            "endpoints": endpoints,
+            "discovery_source": payload["discovery_source"],
+            "discovered_at": payload["discovered_at"],
+            "statement": str(payload["semantics"].get("statement", "")),
+        }
+        model = payload.get("model", {})
+        if isinstance(model, Mapping) and model.get("completeness") == "COMPLETE":
+            converted["terminal_states"] = model.get("terminal_states", [])
+            converted["payouts"] = model.get("payouts", {})
+            converted["capital_release"] = model.get("capital_release")
+        return converted
 
     def ingest(self, discovery: Mapping[str, object], *, git_sha: str = "") -> dict[str, object]:
-        payload = _normalise_discovery(discovery)
-        source_fingerprint = _digest(_fact(payload["source_evidence"]))
-        semantics_fingerprint = _digest({"relation_type": payload["relation_type"], "semantics": payload["semantics"], "markets": [{key: market[key] for key in ("venue", "contract_id", "event_identity_basis", "settlement_observation_key", "settlement_rules", "cancellation_rules")} for market in payload["markets"]]})
-        model_fingerprint = _digest(payload["model"])
-        now = _now()
-        with self._transaction() as connection:
-            row = connection.execute(
-                "SELECT * FROM relation_catalog_versions WHERE relation_id=? AND source_fingerprint=? AND semantics_fingerprint=? AND model_fingerprint=?",
-                (payload["relation_id"], source_fingerprint, semantics_fingerprint, model_fingerprint),
-            ).fetchone()
-            if row is not None:
-                version_id = str(row["relation_version_id"])
-                connection.execute("INSERT INTO relation_catalog_evidence VALUES(?,?,?,?)", (uuid4().hex, version_id, _canonical({"discovered_at": payload["discovered_at"], "source_evidence": payload["source_evidence"]}), now))
-                self._audit(connection, version_id=version_id, action="duplicate_discovery", actor="system", git_sha=git_sha, payload={"suppressed": row["approval_status"] == "REJECTED"})
-                return {"created": False, "suppressed": row["approval_status"] == "REJECTED", "relation_version_id": version_id}
-            previous = connection.execute("SELECT relation_version_id FROM relation_catalog_versions WHERE relation_id=? ORDER BY created_at DESC LIMIT 1", (payload["relation_id"],)).fetchone()
-            version_id = f"rv:{uuid4().hex}"
-            connection.execute(
-                "INSERT INTO relation_catalog_versions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (version_id, payload["relation_id"], None if previous is None else previous[0], source_fingerprint, semantics_fingerprint, model_fingerprint, _canonical(payload), "PENDING", "PENDING", None, None, now, now),
-            )
-            connection.execute("INSERT INTO relation_catalog_evidence VALUES(?,?,?,?)", (uuid4().hex, version_id, _canonical({"discovered_at": payload["discovered_at"], "source_evidence": payload["source_evidence"]}), now))
-            self._audit(connection, version_id=version_id, action="discovered", actor="system", git_sha=git_sha, payload={"relation_id": payload["relation_id"]})
-            return {"created": True, "suppressed": False, "relation_version_id": version_id}
+        payload = self._converted(discovery)
+        result = self._catalog.ingest(payload)
+        return {
+            "created": int(result["occurrence_count"]) == 1,
+            "version_id": str(result["version_id"]),
+            "identity": str(result["identity"]),
+            "status": str(result["status"]),
+            "occurrence_count": int(result["occurrence_count"]),
+        }
 
     def ingest_threshold_relation(self, relation: object, *, git_sha: str = "") -> dict[str, object]:
         """Adapt the existing deterministic Polymarket discovery codec once."""
@@ -265,201 +204,333 @@ class RelationCatalog:
                 "settlement_observation_key": _string(getattr(value, "resolution_source") or getattr(value, "condition_id"), "resolution_source"),
                 "settlement_rules": _string(getattr(value, "rules"), "rules"), "cancellation_rules": "not supplied by threshold discovery",
             }
+        relation_direction = str(getattr(relation, "relation"))
+        endpoints = [market(market_a), market(market_b)]
+        if relation_direction in {"B_IMPLIES_A", "B_TO_A"}:
+            endpoints = list(reversed(endpoints))
         return self.ingest({
             "discovery_source": "deterministic_rule", "discovered_at": discovered_at,
-            "relation_type": "IMPLIES", "semantics": {"statement": str(getattr(relation, "relation")), "direction": str(getattr(relation, "relation"))},
+            "relation_type": "IMPLIES", "semantics": {"statement": relation_direction, "direction": relation_direction},
             "source_evidence": [{"event_id": getattr(relation, "event_id"), "rules_hash_a": getattr(relation, "rules_hash_a"), "rules_hash_b": getattr(relation, "rules_hash_b")}],
-            "model": {"completeness": "INCOMPLETE"}, "markets": [market(market_a), market(market_b)],
+            "model": {"completeness": "INCOMPLETE"}, "markets": endpoints,
         }, git_sha=git_sha)
 
-    @staticmethod
-    def _row(row: sqlite3.Row, occurrences: int = 0) -> dict[str, object]:
-        payload = json.loads(str(row["payload"]))
+    def _versions(self) -> dict[str, dict[str, object]]:
+        return self._store.get("versions", {})
+
+    def _row(self, version_id: str, occurrences: int = 0) -> dict[str, object]:
+        record = self._versions()[version_id]
+        payload = record["payload"]
         return {
-            "relation_version_id": row["relation_version_id"], "relation_id": row["relation_id"],
-            "previous_relation_version_id": row["previous_relation_version_id"],
-            "source_evidence_fingerprint": row["source_fingerprint"],
-            "relation_semantics_fingerprint": row["semantics_fingerprint"],
-            "compiled_model_fingerprint": row["model_fingerprint"],
-            "approval_status": row["approval_status"], "activation_status": row["activation_status"],
-            "activation_diagnostic": row["activation_diagnostic"], "active_generation": row["active_generation"],
-            "created_at": row["created_at"], "updated_at": row["updated_at"], "occurrences": occurrences,
-            "discovery_source": payload["discovery_source"], "discovered_at": payload["discovered_at"],
-            "relation_type": payload["relation_type"], "semantics": payload["semantics"],
-            "model": payload["model"], "markets": payload["markets"],
+            "version_id": version_id,
+            "identity": str(record["identity"]),
+            "fingerprint": str(record["version_fp"]),
+            "status": record.get("status", "PENDING"),
+            "activation": record.get("activation_status", "PENDING"),
+            "occurrence_count": occurrences,
+            "created_at": record.get("created_at", ""),
+            "updated_at": record.get("updated_at", ""),
+            "discovery_source": payload["discovery_source"],
+            "discovered_at": payload["discovered_at"],
+            "relation_type": payload["relation_type"],
+            "endpoints": payload["endpoints"],
+            "statement": payload.get("statement", ""),
+            "model": {
+                "terminal_states": payload.get("terminal_states", []),
+                "payouts": payload.get("payouts", {}),
+                "capital_release": payload.get("capital_release"),
+            },
         }
+
+    def _current_generation(self) -> dict[str, dict[str, str]]:
+        return self._catalog.current_generation()
+
+    def _store_write(self, updates: dict[str, dict[str, object]]) -> None:
+        begin = getattr(self._store, "begin_write", None)
+        if begin is None:
+            self._store.setdefault("versions", {}).update(updates)
+            return
+        begin()
+        try:
+            self._store.setdefault("versions", {}).update(updates)
+            self._store.commit_write()
+        except BaseException:
+            self._store.rollback_write()
+            raise
 
     def list(self, view: str) -> list[dict[str, object]]:
-        filters = {
-            "pending": "approval_status='PENDING'",
-            "approved_active": "approval_status='APPROVED' AND activation_status NOT IN ('ACTIVATION_BLOCKED_INCONSISTENT','UNSUPPORTED_SIZE')",
-            "activation_blocked": "approval_status='APPROVED' AND activation_status IN ('ACTIVATION_BLOCKED_INCONSISTENT','UNSUPPORTED_SIZE')",
-            "history": "approval_status IN ('REJECTED','REVOKED') OR activation_status='SUPERSEDED'",
-        }
-        if view not in filters:
+        if view not in {"pending", "approved_active", "activation_blocked", "history"}:
             raise ValueError("relation catalog view is invalid")
-        with self._connection() as connection:
-            rows = connection.execute(f"SELECT v.*, COUNT(e.occurrence_id) AS occurrences FROM relation_catalog_versions v LEFT JOIN relation_catalog_evidence e USING(relation_version_id) WHERE {filters[view]} GROUP BY v.relation_version_id ORDER BY v.created_at DESC, v.relation_version_id DESC").fetchall()
-        result = [self._row(row, int(row["occurrences"])) for row in rows]
+        generation = self._current_generation()
+        versions = self._versions()
+        result = [
+            self._row(version_id, int(record.get("occurrence_count", 1)))
+            for version_id, record in versions.items()
+            if self._in_view(view, version_id, record, generation)
+        ]
         if view == "pending":
             active_endpoints = {
-                str(market["contract_id"])
-                for relation in self.current_generation()["relations"]
-                for market in relation["markets"]
+                str(endpoint["contract_id"])
+                for identity in generation
+                for endpoint in versions[generation[identity]["version_id"]]["payload"]["endpoints"]
             }
             result.sort(key=lambda item: str(item["discovered_at"]), reverse=True)
-            result.sort(key=lambda item: item["model"].get("completeness") != "COMPLETE")
-            result.sort(key=lambda item: not bool(active_endpoints & {str(market["contract_id"]) for market in item["markets"]}))
+            result.sort(key=lambda item: not bool(item["model"]["terminal_states"]))
+            result.sort(key=lambda item: not bool(active_endpoints & {str(endpoint["contract_id"]) for endpoint in item["endpoints"]}))
         return result
 
+    def _in_view(
+        self,
+        view: str,
+        version_id: str,
+        record: dict[str, object],
+        generation: dict[str, dict[str, str]],
+    ) -> bool:
+        status = str(record.get("status", "PENDING"))
+        activation = str(record.get("activation_status", "PENDING"))
+        active = any(
+            entry["version_id"] == version_id for entry in generation.values()
+        )
+        if view == "pending":
+            return status == "PENDING"
+        if view == "approved_active":
+            return status == "APPROVED" and active
+        if view == "activation_blocked":
+            return status == "APPROVED" and not active and activation in {
+                "ACTIVATION_BLOCKED_INCONSISTENT", "UNSUPPORTED_SIZE", "INCOMPLETE",
+            }
+        return status in {"REJECTED", "REVOKED"} or activation == "SUPERSEDED"
+
     def pending_count(self) -> int:
-        with self._connection() as connection:
-            return int(connection.execute("SELECT COUNT(*) FROM relation_catalog_versions WHERE approval_status='PENDING'").fetchone()[0])
+        return sum(
+            1
+            for record in self._versions().values()
+            if record.get("status") == "PENDING"
+        )
 
     def detail(self, relation_version_id: str) -> dict[str, object]:
-        with self._connection() as connection:
-            row = connection.execute("SELECT * FROM relation_catalog_versions WHERE relation_version_id=?", (relation_version_id,)).fetchone()
-            if row is None:
-                raise ValueError("relation version not found")
-            result = self._row(row, int(connection.execute("SELECT COUNT(*) FROM relation_catalog_evidence WHERE relation_version_id=?", (relation_version_id,)).fetchone()[0]))
-            result["evidence"] = [json.loads(str(item[0])) for item in connection.execute("SELECT payload FROM relation_catalog_evidence WHERE relation_version_id=? ORDER BY observed_at, occurrence_id", (relation_version_id,))]
-            result["audit"] = [json.loads(str(item[0])) | {"action": item[1], "actor": item[2], "git_sha": item[3], "created_at": item[4]} for item in connection.execute("SELECT payload, action, actor, git_sha, created_at FROM relation_catalog_audit WHERE relation_version_id=? ORDER BY created_at, audit_id", (relation_version_id,))]
-            return result
+        versions = self._versions()
+        if relation_version_id not in versions:
+            raise ValueError("relation version not found")
+        record = versions[relation_version_id]
+        result = self._row(
+            relation_version_id, int(record.get("occurrence_count", 1))
+        )
+        result["evidence"] = []
+        result["audit"] = []
+        return result
 
-    def _require_expected(self, row: sqlite3.Row, expected: Mapping[str, object]) -> None:
-        required = {"relation_version_id", "source_evidence_fingerprint", "relation_semantics_fingerprint", "compiled_model_fingerprint"}
-        if set(expected) != required or any(str(expected[key]) != str(row[{"relation_version_id": "relation_version_id", "source_evidence_fingerprint": "source_fingerprint", "relation_semantics_fingerprint": "semantics_fingerprint", "compiled_model_fingerprint": "model_fingerprint"}[key]]) for key in required):
+    def _require_expected(self, version_id: str, expected: Mapping[str, object]) -> None:
+        if set(expected) != {"version_id"} or str(expected["version_id"]) != version_id:
             raise RelationConflictError("relation version changed; refresh before deciding")
 
-    def _members(self, connection: sqlite3.Connection) -> list[sqlite3.Row]:
-        generation = int(connection.execute("SELECT generation FROM relation_catalog_generations WHERE singleton=1").fetchone()[0])
-        return connection.execute("SELECT v.* FROM relation_catalog_generation_members m JOIN relation_catalog_versions v USING(relation_version_id) WHERE m.generation=?", (generation,)).fetchall()
-
-    def _activation_diagnostic(self, connection: sqlite3.Connection, row: sqlite3.Row, *, replacing_relation_id: str | None = None) -> str | None:
-        payload = json.loads(str(row["payload"]))
-        model = payload["model"]
-        if model["completeness"] != "COMPLETE":
-            return "INCOMPLETE_MODEL"
-        members = self._members(connection)
-        if replacing_relation_id is None and any(member["relation_id"] == row["relation_id"] and member["relation_version_id"] != row["relation_version_id"] for member in members):
-            return "ACTIVATION_BLOCKED_INCONSISTENT"
-        endpoints = {str(market["contract_id"]) for market in payload["markets"]}
-        connected = set(endpoints)
-        changed = True
-        while changed:
-            changed = False
-            for member in members:
-                member_payload = json.loads(str(member["payload"]))
-                member_endpoints = {str(market["contract_id"]) for market in member_payload["markets"]}
-                if connected & member_endpoints and not member_endpoints <= connected:
-                    connected.update(member_endpoints)
-                    changed = True
-        if len(connected) > self.component_budget:
-            return "UNSUPPORTED_SIZE"
-        return None
-
-    def _publish(self, connection: sqlite3.Connection, row: sqlite3.Row, *, unknown_components: list[list[str]] | None = None) -> int:
-        old_generation = int(connection.execute("SELECT generation FROM relation_catalog_generations WHERE singleton=1").fetchone()[0])
-        new_generation = old_generation + 1
-        members = self._members(connection)
-        by_relation = {str(member["relation_id"]): str(member["relation_version_id"]) for member in members}
-        old_version = by_relation.get(str(row["relation_id"]))
-        by_relation[str(row["relation_id"])] = str(row["relation_version_id"])
-        for relation_id, version_id in by_relation.items():
-            connection.execute("INSERT INTO relation_catalog_generation_members VALUES(?,?,?)", (new_generation, relation_id, version_id))
-        if old_version and old_version != row["relation_version_id"]:
-            connection.execute("UPDATE relation_catalog_versions SET activation_status='SUPERSEDED', updated_at=? WHERE relation_version_id=? AND approval_status!='REVOKED'", (_now(), old_version))
-        now = _now()
-        connection.execute("UPDATE relation_catalog_versions SET activation_status='ACTIVE', active_generation=?, updated_at=? WHERE relation_version_id=?", (new_generation, now, row["relation_version_id"]))
-        connection.execute("UPDATE relation_catalog_generations SET generation=?, unknown_components=?, updated_at=? WHERE singleton=1", (new_generation, _canonical(unknown_components or []), now))
-        return new_generation
-
     def approve(self, relation_version_id: str, expected: Mapping[str, object], *, actor: str, git_sha: str) -> dict[str, object]:
-        with self._transaction() as connection:
-            row = connection.execute("SELECT * FROM relation_catalog_versions WHERE relation_version_id=?", (relation_version_id,)).fetchone()
-            if row is None:
-                raise ValueError("relation version not found")
-            self._require_expected(row, expected)
-            if row["approval_status"] != "PENDING":
-                raise RelationConflictError("relation version is no longer pending")
-            diagnostic = self._activation_diagnostic(connection, row)
-            activation = "INCOMPLETE" if diagnostic == "INCOMPLETE_MODEL" else diagnostic or "ACTIVE"
-            connection.execute("UPDATE relation_catalog_versions SET approval_status='APPROVED', activation_status=?, activation_diagnostic=?, updated_at=? WHERE relation_version_id=?", (activation, None if diagnostic is None else diagnostic, _now(), relation_version_id))
-            row = connection.execute("SELECT * FROM relation_catalog_versions WHERE relation_version_id=?", (relation_version_id,)).fetchone()
-            assert row is not None
-            generation = None if diagnostic else self._publish(connection, row)
-            self._audit(connection, version_id=relation_version_id, action="approved" if diagnostic is None else "activation_blocked", actor=actor, git_sha=git_sha, payload={"activation_status": activation, "generation": generation})
-            return {"relation_version_id": relation_version_id, "approval_status": "APPROVED", "activation_status": activation, "generation": generation}
+        versions = self._versions()
+        if relation_version_id not in versions:
+            raise ValueError("relation version not found")
+        self._require_expected(relation_version_id, expected)
+        if versions[relation_version_id].get("status") != "PENDING":
+            raise RelationConflictError("relation version is no longer pending")
+        record = versions[relation_version_id]
+        identity = str(record["identity"])
+        latest = self._store.get("latest", {})
+        if latest.get(identity) != relation_version_id:
+            raise RelationConflictError("relation version changed; refresh before deciding")
+        if "terminal_states" not in record["payload"]:
+            self._store_write({
+                relation_version_id: {
+                    **record,
+                    "status": "APPROVED",
+                    "activation_status": "INCOMPLETE",
+                    "activation_diagnostic": "INCOMPLETE_MODEL",
+                }
+            })
+            return {
+                "version_id": relation_version_id,
+                "identity": identity,
+                "status": "APPROVED",
+                "activation": "INCOMPLETE",
+            }
+        if any(
+            gen_identity == identity
+            for gen_identity in self._current_generation()
+        ):
+            self._store_write({
+                relation_version_id: {
+                    **record,
+                    "status": "APPROVED",
+                    "activation_status": "ACTIVATION_BLOCKED_INCONSISTENT",
+                    "activation_diagnostic": "ACTIVATION_BLOCKED_INCONSISTENT",
+                }
+            })
+            return {
+                "version_id": relation_version_id,
+                "identity": identity,
+                "status": "APPROVED",
+                "activation": "ACTIVATION_BLOCKED_INCONSISTENT",
+            }
+        self._catalog.approve(relation_version_id, actor=actor, git_sha=git_sha)
+        activation = self._activate(relation_version_id)
+        return {
+            "version_id": relation_version_id,
+            "identity": identity,
+            "status": "APPROVED",
+            "activation": activation,
+        }
+
+    def _activate(self, relation_version_id: str) -> str:
+        """Publish the v2 generation for one approved version, or record why not."""
+        record = self._versions()[relation_version_id]
+        payload = record["payload"]
+        if "terminal_states" not in payload:
+            return "INCOMPLETE"
+        identity = str(record["identity"])
+        previous_generation = self._current_generation()
+        change_set = self._generation_change_set(relation_version_id)
+        result = self._catalog.replace(change_set, actor="system", git_sha="")
+        activation = "ACTIVE"
+        if result["status"] != "ACTIVE":
+            blocked = {
+                str(item["identity"]): str(item["reason"])
+                for item in result["blocked"]
+            }
+            reason = blocked.get(str(record["identity"]), "ACTIVATION_BLOCKED_INCONSISTENT")
+            activation = "UNSUPPORTED_SIZE" if reason == "UNSUPPORTED_SIZE" else "ACTIVATION_BLOCKED_INCONSISTENT"
+        updated = dict(self._versions()[relation_version_id])
+        updated["activation_status"] = activation
+        if activation != "ACTIVE":
+            updated["activation_diagnostic"] = activation
+        self._store_write({relation_version_id: updated})
+        if activation == "ACTIVE":
+            superseded_id = previous_generation.get(identity, {}).get("version_id")
+            if superseded_id and superseded_id != relation_version_id:
+                old_record = self._versions()[superseded_id]
+                self._store_write({
+                    superseded_id: {
+                        **old_record,
+                        "activation_status": "SUPERSEDED",
+                    }
+                })
+        return activation
+
+    def _generation_change_set(self, include_version_id: str) -> list[dict[str, object]]:
+        """Payloads of the current generation members plus one approved version."""
+        versions = self._versions()
+        generation = self._current_generation()
+        payloads = [
+            versions[entry["version_id"]]["payload"]
+            for entry in generation.values()
+            if entry["version_id"] != include_version_id
+        ]
+        payloads.append(versions[include_version_id]["payload"])
+        return payloads
 
     def reject(self, relation_version_id: str, expected: Mapping[str, object], *, reason: str, note: str = "", actor: str, git_sha: str) -> dict[str, object]:
         if reason not in _REASONS or len(note) > 1000:
             raise ValueError("relation decision reason or note is invalid")
-        with self._transaction() as connection:
-            row = connection.execute("SELECT * FROM relation_catalog_versions WHERE relation_version_id=?", (relation_version_id,)).fetchone()
-            if row is None:
-                raise ValueError("relation version not found")
-            self._require_expected(row, expected)
-            if row["approval_status"] != "PENDING":
-                raise RelationConflictError("relation version is no longer pending")
-            connection.execute("UPDATE relation_catalog_versions SET approval_status='REJECTED', activation_status='REJECTED', updated_at=? WHERE relation_version_id=?", (_now(), relation_version_id))
-            self._audit(connection, version_id=relation_version_id, action="rejected", actor=actor, git_sha=git_sha, payload={"reason": reason, "note": note})
-            return {"relation_version_id": relation_version_id, "approval_status": "REJECTED"}
+        versions = self._versions()
+        if relation_version_id not in versions:
+            raise ValueError("relation version not found")
+        self._require_expected(relation_version_id, expected)
+        if versions[relation_version_id].get("status") != "PENDING":
+            raise RelationConflictError("relation version is no longer pending")
+        identity = str(versions[relation_version_id]["identity"])
+        latest = self._store.get("latest", {})
+        if latest.get(identity) != relation_version_id:
+            raise RelationConflictError("relation version changed; refresh before deciding")
+        self._catalog.reject(
+            relation_version_id,
+            reason=reason,
+            note=note,
+            actor=actor,
+            git_sha=git_sha,
+        )
+        record = versions[relation_version_id]
+        self._store_write({
+            relation_version_id: {
+                **record,
+                "activation_status": "REJECTED",
+            }
+        })
+        return {"version_id": relation_version_id, "identity": identity, "status": "REJECTED"}
 
     def revoke(self, relation_version_id: str, expected: Mapping[str, object], *, reason: str, note: str = "", actor: str, git_sha: str) -> dict[str, object]:
         if reason not in _REASONS or len(note) > 1000:
             raise ValueError("relation decision reason or note is invalid")
-        with self._transaction() as connection:
-            row = connection.execute("SELECT * FROM relation_catalog_versions WHERE relation_version_id=?", (relation_version_id,)).fetchone()
-            if row is None:
-                raise ValueError("relation version not found")
-            self._require_expected(row, expected)
-            if row["activation_status"] != "ACTIVE":
-                raise RelationConflictError("relation version is not active")
-            old_generation = int(connection.execute("SELECT generation FROM relation_catalog_generations WHERE singleton=1").fetchone()[0])
-            new_generation = old_generation + 1
-            members = self._members(connection)
-            for member in members:
-                if member["relation_version_id"] != relation_version_id:
-                    connection.execute("INSERT INTO relation_catalog_generation_members VALUES(?,?,?)", (new_generation, member["relation_id"], member["relation_version_id"]))
-            payload = json.loads(str(row["payload"]))
-            unknown = [sorted(str(market["contract_id"]) for market in payload["markets"])]
-            now = _now()
-            connection.execute("UPDATE relation_catalog_versions SET approval_status='REVOKED', activation_status='REVOKED', updated_at=? WHERE relation_version_id=?", (now, relation_version_id))
-            connection.execute("UPDATE relation_catalog_generations SET generation=?, unknown_components=?, updated_at=? WHERE singleton=1", (new_generation, _canonical(unknown), now))
-            self._audit(connection, version_id=relation_version_id, action="revoked", actor=actor, git_sha=git_sha, payload={"reason": reason, "note": note, "generation": new_generation})
-            return {"relation_version_id": relation_version_id, "approval_status": "REVOKED", "generation": new_generation}
+        versions = self._versions()
+        if relation_version_id not in versions:
+            raise ValueError("relation version not found")
+        self._require_expected(relation_version_id, expected)
+        generation = self._current_generation()
+        identity = str(versions[relation_version_id]["identity"])
+        if generation.get(identity, {}).get("version_id") != relation_version_id:
+            raise RelationConflictError("relation version is not active")
+        self._catalog.revoke(relation_version_id, actor=actor, git_sha=git_sha)
+        record = self._versions()[relation_version_id]
+        self._store_write({
+            relation_version_id: {
+                **record,
+                "status": "REVOKED",
+                "activation_status": "REVOKED",
+            }
+        })
+        return {
+            "version_id": relation_version_id,
+            "identity": str(record["identity"]),
+            "status": "REVOKED",
+        }
 
     def replace(self, active_expected: Mapping[str, object], candidate_expected: Mapping[str, object], *, reason: str, note: str = "", actor: str, git_sha: str) -> dict[str, object]:
         """Atomically revoke one current fact while publishing its replacement."""
         if reason not in _REASONS or len(note) > 1000:
             raise ValueError("relation decision reason or note is invalid")
-        with self._transaction() as connection:
-            active_id = _string(active_expected.get("relation_version_id"), "active relation_version_id")
-            candidate_id = _string(candidate_expected.get("relation_version_id"), "candidate relation_version_id")
-            active = connection.execute("SELECT * FROM relation_catalog_versions WHERE relation_version_id=?", (active_id,)).fetchone()
-            candidate = connection.execute("SELECT * FROM relation_catalog_versions WHERE relation_version_id=?", (candidate_id,)).fetchone()
-            if active is None or candidate is None:
-                raise ValueError("relation version not found")
-            self._require_expected(active, active_expected)
-            self._require_expected(candidate, candidate_expected)
-            if active["activation_status"] != "ACTIVE" or candidate["approval_status"] != "APPROVED":
-                raise RelationConflictError("change set versions are no longer eligible")
-            diagnostic = self._activation_diagnostic(connection, candidate, replacing_relation_id=str(active["relation_id"]))
-            if diagnostic is not None:
-                raise ValueError("replacement candidate is not activatable")
-            now = _now()
-            connection.execute("UPDATE relation_catalog_versions SET approval_status='REVOKED', activation_status='REVOKED', updated_at=? WHERE relation_version_id=?", (now, active_id))
-            connection.execute("UPDATE relation_catalog_versions SET approval_status='APPROVED', activation_status='PENDING', updated_at=? WHERE relation_version_id=?", (now, candidate_id))
-            candidate = connection.execute("SELECT * FROM relation_catalog_versions WHERE relation_version_id=?", (candidate_id,)).fetchone()
-            assert candidate is not None
-            generation = self._publish(connection, candidate)
-            self._audit(connection, version_id=active_id, action="replaced", actor=actor, git_sha=git_sha, payload={"reason": reason, "note": note, "replacement_relation_version_id": candidate_id, "generation": generation})
-            self._audit(connection, version_id=candidate_id, action="replacement_activated", actor=actor, git_sha=git_sha, payload={"replaced_relation_version_id": active_id, "generation": generation})
-            return {"revoked_relation_version_id": active_id, "activated_relation_version_id": candidate_id, "generation": generation}
+        active_id = _string(active_expected.get("version_id"), "active version_id")
+        candidate_id = _string(candidate_expected.get("version_id"), "candidate version_id")
+        versions = self._versions()
+        if active_id not in versions or candidate_id not in versions:
+            raise ValueError("relation version not found")
+        self._require_expected(active_id, active_expected)
+        self._require_expected(candidate_id, candidate_expected)
+        generation = self._current_generation()
+        if (
+            generation.get(str(versions[active_id]["identity"]), {}).get("version_id") != active_id
+            or versions[candidate_id].get("status") != "APPROVED"
+        ):
+            raise RelationConflictError("change set versions are no longer eligible")
+        if "terminal_states" not in versions[candidate_id]["payload"]:
+            raise ValueError("replacement candidate is not activatable")
+        change_set = [
+            versions[entry["version_id"]]["payload"]
+            for ident, entry in generation.items()
+            if ident != versions[active_id]["identity"]
+        ]
+        change_set.append(versions[candidate_id]["payload"])
+        self._catalog.approve(candidate_id, actor=actor, git_sha=git_sha)
+        result = self._catalog.replace(change_set, actor=actor, git_sha=git_sha)
+        if result["status"] != "ACTIVE":
+            raise ValueError("replacement candidate is not activatable")
+        updates: dict[str, dict[str, object]] = {
+            active_id: {
+                **versions[active_id],
+                "status": "REVOKED",
+                "activation_status": "SUPERSEDED",
+            },
+            candidate_id: {
+                **versions[candidate_id],
+                "activation_status": "ACTIVE",
+            },
+        }
+        self._store_write(updates)
+        return {
+            "revoked_version_id": active_id,
+            "activated_version_id": candidate_id,
+        }
 
     def current_generation(self) -> dict[str, object]:
-        with self._connection() as connection:
-            generation = connection.execute("SELECT * FROM relation_catalog_generations WHERE singleton=1").fetchone()
-            assert generation is not None
-            rows = connection.execute("SELECT v.* FROM relation_catalog_generation_members m JOIN relation_catalog_versions v USING(relation_version_id) WHERE m.generation=? ORDER BY m.relation_id", (generation["generation"],)).fetchall()
-            return {"generation": generation["generation"], "unknown_components": json.loads(str(generation["unknown_components"])), "relations": [self._row(row) for row in rows]}
+        generation = self._current_generation()
+        rows: dict[str, object] = {}
+        for identity, entry in generation.items():
+            row = self._row(entry["version_id"])
+            row["activation"] = entry["status"]
+            rows[identity] = row
+        return rows

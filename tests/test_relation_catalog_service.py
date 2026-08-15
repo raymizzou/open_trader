@@ -9,7 +9,36 @@ from urllib.request import Request, urlopen
 
 from open_trader.prediction_service import create_prediction_server
 from open_trader.relation_catalog import RelationCatalog
-from tests.test_relation_catalog import discovery
+
+
+def discovery(*, title: str = "Will Bitcoin trade above $100,000 before December 31, 2026?", complete: bool = True) -> dict[str, object]:
+    return {
+        "discovery_source": "exchange_metadata",
+        "discovered_at": "2026-08-15T02:32:00Z",
+        "relation_type": "IMPLIES",
+        "semantics": {"statement": "A YES implies B YES", "direction": "A_TO_B"},
+        "source_evidence": [{"source": "Polymarket rules", "quote": "resolves YES if..."}],
+        "model": {
+            "completeness": "COMPLETE" if complete else "INCOMPLETE",
+            "terminal_states": ["YES", "NO", "VOID"],
+            "payouts": "YES=1, NO=0, VOID=refund",
+            "capital_release": "resolution",
+        },
+        "markets": [
+            {
+                "venue": "Polymarket", "contract_id": "condition-a", "title": title,
+                "market_date": "2026-08-15T00:00:00Z", "expires_at": "2026-12-31T17:00:00Z",
+                "event_identity_basis": "event-a", "settlement_observation_key": "btc-usd",
+                "settlement_rules": "official index", "cancellation_rules": "void refunds",
+            },
+            {
+                "venue": "Polymarket", "contract_id": "condition-b", "title": "Will Bitcoin trade above $90,000 before December 31, 2026?",
+                "market_date": "2026-08-15T00:00:00Z", "expires_at": "2026-12-31T17:00:00Z",
+                "event_identity_basis": "event-a", "settlement_observation_key": "btc-usd",
+                "settlement_rules": "official index", "cancellation_rules": "void refunds",
+            },
+        ],
+    }
 
 
 class _Runtime:
@@ -62,29 +91,25 @@ def mutation(base: str, path: str, payload: dict[str, object]) -> Request:
 
 def test_production_relation_catalog_http_reads_and_approves_the_opened_version(tmp_path: Path) -> None:
     catalog = RelationCatalog(tmp_path)
-    version_id = catalog.ingest(discovery())["relation_version_id"]
+    version_id = catalog.ingest(discovery())["version_id"]
     with running(catalog) as base:
         status, queue = response(base + "/api/prediction-arbitrage/relations?view=pending")
         assert status == 200
         assert queue["pending_count"] == 1
         status, detail = response(base + f"/api/prediction-arbitrage/relations/{version_id}")
         assert status == 200
-        expected = {key: detail[key] for key in (
-            "relation_version_id", "source_evidence_fingerprint", "relation_semantics_fingerprint", "compiled_model_fingerprint",
-        )}
+        expected = {"version_id": detail["version_id"]}
         status, approved = response(mutation(base, f"/api/prediction-arbitrage/relations/{version_id}/approve", {**expected, "confirm": True}))
 
     assert status == 200
-    assert approved["activation_status"] == "ACTIVE"
+    assert approved["activation"] == "ACTIVE"
 
 
 def test_relation_catalog_mutation_rejects_extra_fields_before_approval(tmp_path: Path) -> None:
     catalog = RelationCatalog(tmp_path)
-    version_id = catalog.ingest(discovery())["relation_version_id"]
+    version_id = catalog.ingest(discovery())["version_id"]
     detail = catalog.detail(version_id)
-    expected = {key: detail[key] for key in (
-        "relation_version_id", "source_evidence_fingerprint", "relation_semantics_fingerprint", "compiled_model_fingerprint",
-    )}
+    expected = {"version_id": detail["version_id"]}
     with running(catalog) as base:
         status, denied = response(mutation(base, f"/api/prediction-arbitrage/relations/{version_id}/approve", {**expected, "confirm": True, "ignored": True}))
         assert status == 400
@@ -92,4 +117,4 @@ def test_relation_catalog_mutation_rejects_extra_fields_before_approval(tmp_path
         status, forbidden = response(mutation(base, f"/api/prediction-arbitrage/relations/{version_id}/approve", {**expected, "confirm": True}))
 
     assert status == 200
-    assert forbidden["activation_status"] == "ACTIVE"
+    assert forbidden["activation"] == "ACTIVE"

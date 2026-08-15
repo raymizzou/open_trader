@@ -464,7 +464,7 @@ def create_prediction_server(
                             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                             return
                         expected = self._relation_expected(payload)
-                        if expected["relation_version_id"] != version_id:
+                        if expected["version_id"] != version_id:
                             raise ValueError("relation version path and body differ")
                         if suffix == "/approve":
                             self._require_schema(payload, set(expected) | {"confirm"})
@@ -634,15 +634,10 @@ def create_prediction_server(
 
         @classmethod
         def _relation_expected(cls, payload: Mapping[str, object]) -> dict[str, object]:
-            fields = {
-                "relation_version_id", "source_evidence_fingerprint",
-                "relation_semantics_fingerprint", "compiled_model_fingerprint",
-            }
-            result = {key: payload.get(key) for key in fields}
-            for key, value in result.items():
-                if not isinstance(value, str) or not value.strip():
-                    raise ValueError(f"{key} is required")
-            return result
+            version_id = payload.get("version_id")
+            if not isinstance(version_id, str) or not version_id.strip():
+                raise ValueError("version_id is required")
+            return {"version_id": version_id}
 
         @classmethod
         def _require_confirm(cls, payload: Mapping[str, object]) -> None:

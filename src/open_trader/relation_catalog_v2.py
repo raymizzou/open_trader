@@ -93,7 +93,10 @@ class SqliteCatalogStore(MutableMapping):
     ``relation_catalog_*`` v1 tables are never read or written.
     """
 
-    _VERSION_COLUMNS = frozenset({"payload", "identity", "version_fp", "status", "occurrence_count"})
+    _VERSION_COLUMNS = frozenset({
+        "payload", "identity", "version_fp", "status", "occurrence_count",
+        "activation_status", "activation_diagnostic",
+    })
 
     def __init__(self, db_path: str | os.PathLike[str]) -> None:
         # Callers are serialized by RelationCatalogV2's lock, so one connection
@@ -116,6 +119,8 @@ class SqliteCatalogStore(MutableMapping):
                 payload TEXT NOT NULL,
                 status TEXT NOT NULL,
                 occurrence_count INTEGER NOT NULL,
+                activation_status TEXT,
+                activation_diagnostic TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 meta TEXT NOT NULL DEFAULT '{}'
@@ -140,8 +145,21 @@ class SqliteCatalogStore(MutableMapping):
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (identity, producer, scope)
             );
+            CREATE TABLE IF NOT EXISTS catalog_v2_latest (
+                identity TEXT PRIMARY KEY,
+                version_id TEXT NOT NULL
+            );
             """
         )
+        # Pre-existing v2 databases created before the facade's activation
+        # metadata columns; keep additive so old data stays readable.
+        for column in ("activation_status TEXT", "activation_diagnostic TEXT"):
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE catalog_v2_versions ADD COLUMN {column}"
+                )
+            except sqlite3.OperationalError:
+                pass
 
     # -- transactions ------------------------------------------------------
 
@@ -206,8 +224,8 @@ class SqliteCatalogStore(MutableMapping):
         ).fetchone()
         generation: dict[str, dict] = json.loads(row[0]) if row else {}
         versions: dict[str, dict] = {}
-        for version_id, identity, version_fp, payload, status, occurrence_count, meta in self._conn.execute(
-            "SELECT version_id, identity, version_fp, payload, status, occurrence_count, meta "
+        for version_id, identity, version_fp, payload, status, occurrence_count, activation_status, activation_diagnostic, meta in self._conn.execute(
+            "SELECT version_id, identity, version_fp, payload, status, occurrence_count, activation_status, activation_diagnostic, meta "
             "FROM catalog_v2_versions"
         ):
             versions[version_id] = {
@@ -218,6 +236,10 @@ class SqliteCatalogStore(MutableMapping):
                 "occurrence_count": occurrence_count,
                 **json.loads(meta),
             }
+            if activation_status is not None:
+                versions[version_id]["activation_status"] = activation_status
+            if activation_diagnostic is not None:
+                versions[version_id]["activation_diagnostic"] = activation_diagnostic
         approved: dict[str, dict] = {}
         for identity, version_id, approved_fingerprint, actor, git_sha in self._conn.execute(
             "SELECT identity, version_id, approved_fingerprint, actor, git_sha FROM catalog_v2_approvals"
@@ -233,23 +255,35 @@ class SqliteCatalogStore(MutableMapping):
             "SELECT identity, producer, scope FROM catalog_v2_causes"
         ):
             causes[(identity, producer, scope)] = True
-        return {"versions": versions, "approved": approved, "generation": generation, "causes": causes}
+        latest: dict[str, str] = {}
+        for identity, version_id in self._conn.execute(
+            "SELECT identity, version_id FROM catalog_v2_latest"
+        ):
+            latest[identity] = version_id
+        return {
+            "versions": versions,
+            "approved": approved,
+            "generation": generation,
+            "causes": causes,
+            "latest": latest,
+        }
 
     def _flush(self, state: dict[str, dict]) -> None:
         now = _now()
-        versions, approved, generation, causes = (
+        versions, approved, generation, causes, latest = (
             state["versions"],
             state["approved"],
             state["generation"],
             state["causes"],
+            state.get("latest", {}),
         )
         self._conn.execute("DELETE FROM catalog_v2_versions")
         for version_id, record in versions.items():
             meta = {k: v for k, v in record.items() if k not in self._VERSION_COLUMNS}
             self._conn.execute(
                 "INSERT INTO catalog_v2_versions "
-                "(version_id, identity, version_fp, payload, status, occurrence_count, created_at, updated_at, meta) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(version_id, identity, version_fp, payload, status, occurrence_count, activation_status, activation_diagnostic, created_at, updated_at, meta) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     version_id,
                     record["identity"],
@@ -257,6 +291,8 @@ class SqliteCatalogStore(MutableMapping):
                     json.dumps(record["payload"], sort_keys=True, default=str),
                     record["status"],
                     record["occurrence_count"],
+                    record.get("activation_status"),
+                    record.get("activation_diagnostic"),
                     now,
                     now,
                     json.dumps(meta, sort_keys=True, default=str),
@@ -282,6 +318,12 @@ class SqliteCatalogStore(MutableMapping):
             self._conn.execute(
                 "INSERT INTO catalog_v2_causes (identity, producer, scope, created_at) VALUES (?, ?, ?, ?)",
                 (identity, producer, scope, now),
+            )
+        self._conn.execute("DELETE FROM catalog_v2_latest")
+        for identity, version_id in latest.items():
+            self._conn.execute(
+                "INSERT INTO catalog_v2_latest (identity, version_id) VALUES (?, ?)",
+                (identity, version_id),
             )
         self._conn.execute(
             "INSERT INTO catalog_v2_generations (members, created_at) VALUES (?, ?)",
@@ -367,6 +409,7 @@ class RelationCatalogV2:
                         "status": "PENDING",
                         "occurrence_count": 1,
                     }
+                    self.store.setdefault("latest", {})[identity] = version_id
                     status = "PENDING"
                 return {
                     "identity": identity,
