@@ -175,6 +175,8 @@ def n_leg_set_mode(
     control = store.n_leg_control()
     if int(control["contract_generation"]) != base_contract_generation:
         raise NLegVersionConflict("n-leg contract generation mismatch")
+    if mode == "AUTO":
+        _require_auto_enable(store, control, incident_id)
     store.n_leg_mode_control_write(
         mode=mode,
         contract_generation=int(control["contract_generation"]),
@@ -195,6 +197,131 @@ def n_leg_set_mode(
         },
     )
     return n_leg_mode_contract(store)
+
+
+def _require_auto_enable(store: object, control: Mapping[str, object], incident_id: object) -> None:
+    if control["breaker_open"]:
+        raise ValueError("N_LEG_BREAKER_OPEN")
+    if control["active_batch_id"] is not None:
+        raise ValueError("N_LEG_ACTIVE_BATCH_EXISTS")
+    if store.unacknowledged_incident() is not None:
+        raise ValueError("N_LEG_INCIDENT_ACTIVE")
+    for item in control["enabled_execution_scope_version"]:
+        scope = store.n_leg_scope(str(item["scope_id"]))
+        if scope is None or int(scope["scope_version"]) != int(item["scope_version"]):
+            raise ValueError("N_LEG_SCOPE_VERSION_DRIFT")
+    incidents = store.histories("incidents")
+    if incidents:
+        if not isinstance(incident_id, str) or not incident_id:
+            raise ValueError("N_LEG_AUTO_REQUIRES_RESOLVED_INCIDENT")
+        resolved = next(
+            (
+                item
+                for item in incidents
+                if item.get("incident_id") == incident_id and item.get("acknowledged") is True
+            ),
+            None,
+        )
+        if resolved is None:
+            raise ValueError("N_LEG_AUTO_REQUIRES_RESOLVED_INCIDENT")
+
+
+def n_leg_set_enabled_scope(
+    store: object,
+    *,
+    scope_id: str,
+    enable: bool,
+    base_contract_generation: int,
+    audit: object = None,
+) -> dict[str, object]:
+    if not isinstance(scope_id, str) or not scope_id:
+        raise ValueError("scope id must be non-empty text")
+    if type(enable) is not bool:
+        raise ValueError("enable must be a boolean")
+    control = store.n_leg_control()
+    if int(control["contract_generation"]) != base_contract_generation:
+        raise NLegVersionConflict("n-leg contract generation mismatch")
+    enabled = list(control["enabled_execution_scope_version"])
+    current = next((item for item in enabled if item["scope_id"] == scope_id), None)
+    if enable:
+        scope = store.n_leg_scope(scope_id)
+        if scope is None:
+            raise ValueError("N_LEG_SCOPE_NOT_REGISTERED")
+        if current is not None and int(current["scope_version"]) == int(scope["scope_version"]):
+            return n_leg_mode_contract(store)
+        enabled = [item for item in enabled if item["scope_id"] != scope_id]
+        enabled.append({"scope_id": scope_id, "scope_version": int(scope["scope_version"])})
+        downgrade = current is None
+    else:
+        enabled = [item for item in enabled if item["scope_id"] != scope_id]
+        downgrade = False
+    next_mode = (
+        "MANUAL"
+        if downgrade and control["mode"] == "AUTO"
+        else str(control["mode"])
+    )
+    store.n_leg_mode_control_write(
+        mode=next_mode,
+        contract_generation=int(control["contract_generation"]),
+        qualification_policy_version=int(control["qualification_policy_version"]),
+        safety_config_version=int(control["safety_config_version"]),
+        enabled_execution_scope_version=enabled,
+    )
+    if downgrade:
+        store.record_control_event(
+            action="n_leg_auto_downgrade",
+            target="n_leg_controls",
+            outcome="failed",
+            payload={
+                "reason": "SCOPE_ENABLED_EXPANSION",
+                "scope_id": scope_id,
+                "mode": "MANUAL",
+                "action_word": "manual_confirm",
+                **_audit_dict(audit),
+            },
+        )
+    store.record_control_event(
+        action="n_leg_set_enabled_scope",
+        target=f"n_leg_execution_scopes/{scope_id}",
+        outcome="succeeded",
+        payload={
+            "scope_id": scope_id,
+            "enable": enable,
+            "action_word": _write_word(store.n_leg_control()["mode"]),
+            **_audit_dict(audit),
+        },
+    )
+    return n_leg_mode_contract(store)
+
+
+def n_leg_enforce_auto_scope_versions(
+    store: object, *, audit: object = None
+) -> dict[str, object]:
+    """AUTO runtime admission: fail closed and drop to MANUAL on scope drift."""
+    control = store.n_leg_control()
+    if control["mode"] != "AUTO":
+        return {"ok": True, "mode": "MANUAL", "downgraded": False}
+    drift = []
+    for item in control["enabled_execution_scope_version"]:
+        scope = store.n_leg_scope(str(item["scope_id"]))
+        if scope is None or int(scope["scope_version"]) != int(item["scope_version"]):
+            drift.append(str(item["scope_id"]))
+    if not drift:
+        return {"ok": True, "mode": "AUTO", "downgraded": False}
+    _downgrade(store, "SCOPE_VERSION_DRIFT", audit)
+    store.record_control_event(
+        action="n_leg_auto_downgrade",
+        target="n_leg_controls",
+        outcome="failed",
+        payload={
+            "reason": "SCOPE_VERSION_DRIFT",
+            "scope_ids": drift,
+            "mode": "MANUAL",
+            "action_word": "manual_confirm",
+            **_audit_dict(audit),
+        },
+    )
+    return {"ok": False, "mode": "MANUAL", "downgraded": True, "scope_ids": drift}
 
 
 def _policy_direction(before: Mapping[str, object], after: Mapping[str, object]) -> str:
