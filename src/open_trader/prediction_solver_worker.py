@@ -564,7 +564,12 @@ class WorkerHarness:
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self.close()
 
-    def _start(self, expected_backend: str, deadline: float | None = None) -> "_WorkerProcess":
+    def start(self) -> None:
+        """Spawn and handshake a worker without consuming a request."""
+
+        self._start(None)
+
+    def _start(self, expected_backend: str | None, deadline: float | None = None) -> "_WorkerProcess":
         if self.start_count:
             self.rebuild_count += 1
         try:
@@ -593,7 +598,7 @@ class WorkerHarness:
                 startup_deadline = min(startup_deadline, deadline)
             handshake = worker.reader.read_stdout_line(startup_deadline)
             decoded = decode_handshake_line(handshake)
-            if decoded.backend != expected_backend:
+            if expected_backend is not None and decoded.backend != expected_backend:
                 raise WorkerProtocolError("handshake backend does not match request")
             worker.handshake = decoded
             worker.reader.assert_no_trailing_stdout()
@@ -636,6 +641,26 @@ class WorkerHarness:
             )
         try:
             worker = self._worker
+            if (
+                worker is not None
+                and worker.handshake is not None
+                and worker.handshake.backend != request.backend
+            ):
+                cleanup_proven = self._terminate_checked(worker)
+                if not cleanup_proven:
+                    self._worker = None
+                    return WorkerOutcome(
+                        request.request_id,
+                        "UNKNOWN",
+                        _termination_after_cleanup("PROTOCOL_MISMATCH", cleanup_proven),
+                        worker.process.pid,
+                        worker.pgid,
+                        worker.peak_rss_kib,
+                        False,
+                        False,
+                    )
+                self._worker = None
+                worker = None
             if worker is not None and worker.memory_limit_bytes != request.limits.memory_limit_bytes:
                 old_worker = worker
                 cleanup_proven = self._terminate_checked(old_worker)

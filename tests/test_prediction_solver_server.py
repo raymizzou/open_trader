@@ -41,8 +41,10 @@ class _Harness:
         self.closed = False
         type(self).instances.append(self)
 
-    def submit(self, request: WorkerRequest) -> WorkerOutcome:
+    def start(self) -> None:
         self.start_count = 1
+
+    def submit(self, request: WorkerRequest) -> WorkerOutcome:
         if type(self).block:
             with type(self).lock:
                 type(self).running.append(request.request_id)
@@ -72,11 +74,22 @@ def test_two_slot_server_reuses_a_worker_and_closes_cleanly() -> None:
     try:
         assert server.submit(_request("one")).result(timeout=2).status == "OK"
         assert server.submit(_request("two")).result(timeout=2).status == "OK"
-        assert sum(server.worker_start_counts) == 1
+        assert server.worker_start_counts == (1, 1)
     finally:
         server.close()
 
     assert server.closed is True
+    assert all(harness.closed for harness in _Harness.instances)
+
+
+def test_two_workers_are_resident_together_and_close_leaves_none_behind() -> None:
+    server = SolverServerOwner(("solver",), harness_factory=_Harness)
+    assert server.worker_start_counts == (1, 1)
+    server.close()
+
+    assert server.closed is True
+    assert len(_Harness.instances) == 2
+    assert all(harness.closed for harness in _Harness.instances)
 
 
 def test_two_slot_server_queues_one_third_task_then_bounds_pending_work() -> None:

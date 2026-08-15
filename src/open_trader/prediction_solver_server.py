@@ -49,6 +49,7 @@ class SolverServerOwner:
         self._harnesses: list[WorkerHarness | None] = [None] * _WORKER_COUNT
         self._closed = False
         self._fatal: BaseException | None = None
+        self._start_locked()
 
     @property
     def closed(self) -> bool:
@@ -99,10 +100,11 @@ class SolverServerOwner:
             self._threads.append(thread)
 
     def _run(self, index: int) -> None:
-        harness = self._harness_factory(self._command)
-        with self._lock:
-            self._harnesses[index] = harness
         try:
+            harness = self._harness_factory(self._command)
+            harness.start()
+            with self._lock:
+                self._harnesses[index] = harness
             while True:
                 item = self._queue.get()
                 if item is None:
@@ -119,11 +121,16 @@ class SolverServerOwner:
                         result.set_exception(exc)
                 finally:
                     self._capacity.release()
+        except BaseException as exc:
+            self._fail_closed(exc)
+            raise
         finally:
-            try:
-                harness.close()
-            except WorkerCleanupError as exc:
-                self._fail_closed(exc)
+            harness = self._harnesses[index]
+            if harness is not None:
+                try:
+                    harness.close()
+                except WorkerCleanupError as exc:
+                    self._fail_closed(exc)
 
     def _cancel_pending_locked(self) -> None:
         sentinels = 0

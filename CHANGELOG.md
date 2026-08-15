@@ -9,13 +9,16 @@ operator-facing: what changed, which workflow is affected, and what was verified
   N_LEG Shadow caller for already-qualified legacy YES/NO opportunities. Legacy
   notification/execution remains first and unchanged; standard and cross-venue
   monitors only enqueue an asynchronous canonical snapshot after their durable
-  signal. Per-Episode latest-wins/dedupe/stale-discard results persist solely in
-  existing `signals.payload`, and the existing Prediction page now shows a
-  read-only compact comparison plus summary/history state. No order, notifier,
-  database table, config, network endpoint, retry framework, or additional
-  worker pool was added. Focused runtime/monitor/store/solver/render checks
-  pass; sandbox HTTP/browser process launch remains unavailable, and final
-  acceptance, deploy, merge, and push have not run.
+  signal. This version intentionally does not depend on #59: the
+  relation-catalog switch-authorization gate is deferred, and the Shadow
+  compares directly against the durable legacy signal. Per-Episode
+  latest-wins/dedupe/stale-discard results persist solely in existing
+  `signals.payload`, and the existing Prediction page now shows a read-only
+  compact comparison plus summary/history state. No order, notifier, database
+  table, config, network endpoint, retry framework, or additional worker pool
+  was added. Focused runtime/monitor/store/solver/render checks pass; sandbox
+  HTTP/browser process launch remains unavailable, and final acceptance,
+  deploy, merge, and push have not run.
 
 - #59 adds the production-owned, versioned relation catalog for system-discovered market relations. The existing Prediction page now exposes a same-page review drawer with complete titles, venue, discovery/market/expiry dates and evidence; approval is version/fingerprint-bound, incomplete models cannot activate, invalidation is local to the affected component, and replacement publishes one atomic generation. No Shadow intake, manual creation, auto-approval, Solver/opportunity, quote, monitoring, order, notification, or new page was added. Focused catalog/Service/Runtime/monitor tests and the Prediction Dashboard browser review flow pass; final acceptance remains the release gate.
 

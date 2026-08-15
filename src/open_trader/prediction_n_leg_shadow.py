@@ -109,6 +109,47 @@ def _snapshot_value(value: object, name: str) -> str | None:
     raise ValueError(f"legacy {name} is not canonical")
 
 
+def _economic_fingerprint(opportunity: Mapping[str, object], signal_id: str) -> str:
+    """Hash only economic inputs so observation timestamps never change identity."""
+
+    economic: dict[str, object] = {
+        "signal_id": signal_id,
+        "market_type": str(opportunity.get("market_type", "standard_binary")),
+    }
+    for field in (
+        "opportunity_id", "market_id", "quantity", "yes_max_cost", "no_max_cost",
+        "total_max_cost", "minimum_profit", "estimated_profit", "calculable_gas",
+        "canonical_cutoff", "resolution_at",
+    ):
+        value = _snapshot_value(opportunity.get(field), field)
+        if value is not None:
+            economic[field] = value
+    if "minimum_profit" not in economic and "estimated_profit" in economic:
+        economic["minimum_profit"] = economic["estimated_profit"]
+    if opportunity.get("market_type") == "cross_venue_yes_no":
+        legs = opportunity.get("legs")
+        if not isinstance(legs, (tuple, list)):
+            raise ValueError("legacy cross-venue legs are required")
+        economic["legs"] = [
+            {
+                field: _snapshot_value(leg.get(field), f"leg[{index}].{field}")
+                for field in (
+                    "exchange", "market_id", "condition_id", "outcome", "token_id",
+                    "net_quantity", "max_cost", "settlement_at",
+                )
+            }
+            for index, leg in enumerate(legs)
+            if isinstance(leg, Mapping)
+        ]
+        rules = opportunity.get("rules_fingerprints")
+        if isinstance(rules, Mapping):
+            economic["rules_fingerprints"] = {
+                str(key): _snapshot_value(value, f"rules_fingerprints.{key}")
+                for key, value in sorted(rules.items())
+            }
+    return fingerprint(canonical_payload(economic))
+
+
 def legacy_shadow_snapshot(
     opportunity: Mapping[str, object], signal_id: str
 ) -> dict[str, object]:
@@ -154,17 +195,51 @@ def legacy_shadow_snapshot(
                 str(key): _snapshot_value(value, f"rules_fingerprints.{key}")
                 for key, value in sorted(rules.items())
             }
-    snapshot["fingerprint"] = fingerprint(canonical_payload(snapshot))
+    snapshot["fingerprint"] = _economic_fingerprint(opportunity, signal_id)
     return snapshot
 
 
-def legacy_shadow_request(snapshot: Mapping[str, object]) -> WorkerRequest:
+def _missing_settlement_diagnostic(
+    snapshot: Mapping[str, object],
+) -> dict[str, object]:
+    fingerprint = snapshot.get("fingerprint")
+    return {
+        "run_status": "SUCCESS",
+        "decision": "UNKNOWN",
+        "comparison": "DIFFERENCE",
+        "fingerprint": str(fingerprint) if fingerprint else "",
+        "result": {"order_ready": False},
+        "differences": {
+            **{
+                name: {"status": "na", "reason": "缺少结算证据"}
+                for name in (
+                    "opportunity_exists", "direction", "worst_case",
+                    "net_margin_1pct", "annualized_15pct", "capital_release_30d",
+                    "order_ready", "rejection_reasons",
+                )
+            },
+            "capital_release_at": {
+                "legacy": "",
+                "n_leg": "",
+                "reason": "缺少结算证据",
+            },
+        },
+    }
+
+
+def legacy_shadow_request(
+    snapshot: Mapping[str, object],
+) -> WorkerRequest | Mapping[str, object]:
     """Adapt a fixed legacy YES/NO proof into the canonical generic worker request."""
 
     fingerprint = snapshot.get("fingerprint")
     market_id = snapshot.get("market_id", snapshot.get("opportunity_id"))
     if not isinstance(fingerprint, str) or not fingerprint or not isinstance(market_id, str) or not market_id:
         raise ValueError("legacy snapshot identity is required")
+    try:
+        _time(snapshot.get("resolution_at"), "resolution_at")
+    except ValueError:
+        return _missing_settlement_diagnostic(snapshot)
     quantity = _decimal(snapshot.get("quantity"), "quantity")
     scale = 10 ** max(0, -quantity.as_tuple().exponent)
     lots = int(quantity * scale)
@@ -247,6 +322,9 @@ class NLegShadowClient:
         fingerprint = str(snapshot.get("fingerprint", ""))
         try:
             request = legacy_shadow_request(snapshot)
+            if isinstance(request, Mapping):
+                result.set_result(dict(request))
+                return result
             worker_future = self._solver_server.submit(request)
         except Exception as exc:
             result.set_result(_failure(fingerprint, "CONVERSION_OR_DISPATCH", exc))
@@ -289,13 +367,28 @@ def _comparison(snapshot: Mapping[str, object], fingerprint: str, verification: 
     status = getattr(verification, "status", None)
     decision = status.value if isinstance(status, VerificationStatus) else "UNKNOWN"
     if status is not VerificationStatus.QUALIFIED_VERIFIED:
+        reason = (
+            "缺少已验证解"
+            if status is None
+            else f"N_LEG 状态 {decision}"
+        )
         return {
             "run_status": "SUCCESS",
             "decision": decision,
             "comparison": "DIFFERENCE",
             "fingerprint": fingerprint,
             "result": {"order_ready": False},
-            "differences": {"decision": ["QUALIFIED_VERIFIED", decision]},
+            "differences": {
+                **{
+                    name: {"status": "na", "reason": reason}
+                    for name in (
+                        "opportunity_exists", "direction", "worst_case",
+                        "net_margin_1pct", "annualized_15pct", "capital_release_30d",
+                        "order_ready", "rejection_reasons",
+                    )
+                },
+                "decision": ["QUALIFIED_VERIFIED", decision],
+            },
         }
     solution = getattr(verification, "solution", None)
     proof = getattr(solution, "payout_proof", None)
@@ -337,10 +430,66 @@ def _comparison(snapshot: Mapping[str, object], fingerprint: str, verification: 
             "legacy": _timestamp(expected_release),
             "n_leg": _timestamp(actual_release) if isinstance(actual_release, datetime) else "",
         }
+    differences["opportunity_exists"] = {
+        "legacy": "是", "n_leg": "是", "status": "consistent",
+    }
+    expected_sides = _legacy_direction(snapshot)
+    actual_direction = tuple(
+        getattr(item, "action_id", "") for item in getattr(solution, "quantities", ())
+    )
+    differences["direction"] = {
+        "legacy": ",".join(expected_sides),
+        "n_leg": ",".join(str(item) for item in actual_direction),
+        "status": (
+            "consistent"
+            if len(actual_direction) == len(expected_sides)
+            and all(actual.endswith(expected) for actual, expected in zip(actual_direction, expected_sides, strict=True))
+            else "difference"
+        ),
+    }
+    worst = _scenario_label(getattr(proof, "worst_scenario", None))
+    differences["worst_case"] = (
+        {"legacy": worst, "n_leg": worst, "status": "consistent"}
+        if worst is not None
+        else {"status": "na", "reason": "缺少最坏状态证据"}
+    )
+    _add_gate_difference(differences, "net_margin_1pct", _net_margin(legacy_profit, legacy_cost), _net_margin(n_leg_profit, n_leg_cost))
+    _add_gate_difference(
+        differences,
+        "annualized_15pct",
+        _annualized_gate(snapshot, legacy_profit, legacy_cost, expected_release),
+        _annualized_gate(snapshot, n_leg_profit, n_leg_cost, actual_release),
+    )
+    _add_gate_difference(
+        differences,
+        "capital_release_30d",
+        _release_within_30d(snapshot, expected_release),
+        _release_within_30d(snapshot, actual_release),
+    )
+    differences["order_ready"] = {"legacy": "是", "n_leg": "是", "status": "consistent"}
+    rejections = getattr(proof, "rejection_counts", ())
+    differences["rejection_reasons"] = (
+        {"legacy": "无", "n_leg": "无", "status": "consistent"}
+        if not rejections
+        else {
+            "legacy": "无",
+            "n_leg": ",".join(f"{count}×{name}" for name, count in rejections),
+            "status": "difference",
+        }
+    )
+    comparison = (
+        "CONSISTENT"
+        if all(
+            not isinstance(value, Mapping)
+            or value.get("status") == "consistent"
+            for value in differences.values()
+        )
+        else "DIFFERENCE"
+    )
     return {
         "run_status": "SUCCESS",
         "decision": decision,
-        "comparison": "DIFFERENCE" if differences else "CONSISTENT",
+        "comparison": comparison,
         "fingerprint": fingerprint,
         "result": {
             "order_ready": True,
@@ -350,6 +499,77 @@ def _comparison(snapshot: Mapping[str, object], fingerprint: str, verification: 
             "capital_release_at": _timestamp(actual_release) if isinstance(actual_release, datetime) else None,
         },
         **({"differences": differences} if differences else {}),
+    }
+
+
+def _legacy_direction(snapshot: Mapping[str, object]) -> tuple[str, ...]:
+    if snapshot.get("market_type") == "cross_venue_yes_no":
+        legs = snapshot.get("legs")
+        if not isinstance(legs, (tuple, list)):
+            return ()
+        return tuple(
+            "legacy-1" if leg.get("outcome") == "YES" else "legacy-2"
+            for leg in legs
+            if isinstance(leg, Mapping)
+        )
+    return ("legacy-1", "legacy-2")
+
+
+def _scenario_label(scenario: object) -> str | None:
+    atoms = getattr(scenario, "atoms", None)
+    if not isinstance(atoms, (tuple, list)) or not atoms:
+        return None
+    return ",".join(str(getattr(atom, "atom_id", "")) for atom in atoms if atom is not None)
+
+
+def _net_margin(profit: Decimal, cost: Decimal) -> bool | None:
+    if cost <= 0:
+        return None
+    return profit / cost >= Decimal("0.01")
+
+
+def _annualized_gate(
+    snapshot: Mapping[str, object],
+    profit: Decimal,
+    cost: Decimal,
+    release_at: object,
+) -> bool | None:
+    try:
+        start = _time(snapshot.get("confirmed_at"), "confirmed_at")
+        release = _time(release_at, "release_at")
+    except ValueError:
+        return None
+    seconds = (release.astimezone(UTC) - start.astimezone(UTC)).total_seconds()
+    if cost <= 0 or seconds <= 0:
+        return None
+    return profit / cost * Decimal(365) * Decimal(86400) / Decimal(seconds) >= Decimal("0.15")
+
+
+def _release_within_30d(snapshot: Mapping[str, object], release_at: object) -> bool | None:
+    try:
+        start = _time(snapshot.get("confirmed_at"), "confirmed_at")
+        release = _time(release_at, "release_at")
+    except ValueError:
+        return None
+    return (release.astimezone(UTC) - start.astimezone(UTC)).total_seconds() <= 30 * 86400
+
+
+def _add_gate_difference(
+    differences: dict[str, object],
+    name: str,
+    legacy: bool | None,
+    n_leg: bool | None,
+) -> None:
+    if legacy is None or n_leg is None:
+        differences[name] = {
+            "status": "na",
+            "reason": "缺少结算证据" if legacy is None and n_leg is None else "无法计算",
+        }
+        return
+    differences[name] = {
+        "legacy": "达标" if legacy else "未达标",
+        "n_leg": "达标" if n_leg else "未达标",
+        "status": "consistent" if legacy == n_leg else "difference",
     }
 
 

@@ -114,20 +114,24 @@ def test_legacy_yes_no_adapter_builds_a_canonical_worker_request() -> None:
     assert tuple(action.max_quantity_lots for action in request.request.problem.actions) == (10, 10)
 
 
-def test_legacy_adapter_rejects_missing_real_timestamp_input() -> None:
-    with pytest.raises(ValueError, match="resolution_at"):
-        legacy_shadow_request(
-            {
-                "market_id": "market-1",
-                "market_type": "standard_binary",
-                "quantity": "10",
-                "yes_max_cost": "4.20",
-                "no_max_cost": "4.70",
-                "minimum_profit": "1.10",
-                "confirmed_at": "2026-08-15T00:00:00Z",
-                "fingerprint": "shadow-1",
-            }
-        )
+def test_legacy_adapter_missing_settlement_evidence_returns_diagnostic() -> None:
+    result = legacy_shadow_request(
+        {
+            "market_id": "market-1",
+            "market_type": "standard_binary",
+            "quantity": "10",
+            "yes_max_cost": "4.20",
+            "no_max_cost": "4.70",
+            "minimum_profit": "1.10",
+            "confirmed_at": "2026-08-15T00:00:00Z",
+            "fingerprint": "shadow-1",
+        }
+    )
+
+    assert result["run_status"] == "SUCCESS"
+    assert result["decision"] == "UNKNOWN"
+    assert result["comparison"] == "DIFFERENCE"
+    assert result["differences"]["capital_release_at"]["reason"] == "缺少结算证据"
 
 
 def test_legacy_snapshot_is_canonical_and_changes_with_real_economics() -> None:
@@ -150,6 +154,100 @@ def test_legacy_snapshot_is_canonical_and_changes_with_real_economics() -> None:
     assert snapshot["signal_id"] == "episode-1"
     assert snapshot["total_max_cost"] == "8.90"
     assert snapshot["fingerprint"] != changed["fingerprint"]
+
+
+def test_legacy_snapshot_fingerprint_ignores_observation_timestamps() -> None:
+    source = {
+        "opportunity_id": "event-1:market-1",
+        "market_id": "market-1",
+        "market_type": "standard_binary",
+        "quantity": "10",
+        "yes_max_cost": "4.20",
+        "no_max_cost": "4.70",
+        "total_max_cost": "8.90",
+        "minimum_profit": "1.10",
+        "confirmed_at": "2026-08-15T00:00:00Z",
+        "resolution_at": "2026-08-16T00:00:00Z",
+    }
+
+    snapshot = legacy_shadow_snapshot(source, "episode-1")
+    relived = legacy_shadow_snapshot(
+        {
+            **source,
+            "confirmed_at": "2026-08-15T00:00:01Z",
+        },
+        "episode-1",
+    )
+
+    assert snapshot["confirmed_at"] != relived["confirmed_at"]
+    assert snapshot["fingerprint"] == relived["fingerprint"]
+
+
+def test_shadow_scheduler_dedupes_identical_economics_with_different_timestamps(
+    tmp_path,
+) -> None:
+    store = PredictionArbitrageStore(tmp_path / "data")
+    signal_id = _signal(store)
+    pending: list[Future[dict[str, object]]] = []
+    scheduler = NLegShadowScheduler(
+        store,
+        submit_snapshot=lambda _snapshot: (
+            pending.append(Future()) or pending[-1]
+        ),
+    )
+    source = {
+        "opportunity_id": "event-1:market-1",
+        "market_id": "market-1",
+        "market_type": "standard_binary",
+        "quantity": "10",
+        "yes_max_cost": "4.20",
+        "no_max_cost": "4.70",
+        "total_max_cost": "8.90",
+        "minimum_profit": "1.10",
+        "confirmed_at": "2026-08-15T00:00:00Z",
+        "resolution_at": "2026-08-16T00:00:00Z",
+    }
+    try:
+        assert scheduler.schedule(
+            signal_id, legacy_shadow_snapshot(source, "episode-1")
+        ) == "scheduled"
+        assert scheduler.schedule(
+            signal_id,
+            legacy_shadow_snapshot(
+                {**source, "confirmed_at": "2026-08-15T00:05:00Z"},
+                "episode-1",
+            ),
+        ) == "deduped"
+        assert len(pending) == 1
+    finally:
+        scheduler.close()
+
+
+def test_shadow_client_missing_settlement_evidence_is_a_diagnostic_not_failure() -> None:
+    class Server:
+        def submit(self, _request):
+            raise AssertionError("no worker request may be dispatched")
+
+    result = NLegShadowClient(Server()).submit(
+        {
+            "opportunity_id": "event-1:market-1",
+            "market_id": "market-1",
+            "market_type": "standard_binary",
+            "quantity": "10",
+            "yes_max_cost": "4.20",
+            "no_max_cost": "4.70",
+            "total_max_cost": "8.90",
+            "minimum_profit": "1.10",
+            "confirmed_at": "2026-08-15T00:00:00Z",
+            "signal_id": "episode-1",
+            "fingerprint": "shadow-1",
+        }
+    ).result()
+
+    assert result["run_status"] == "SUCCESS"
+    assert result["decision"] == "UNKNOWN"
+    assert result["comparison"] == "DIFFERENCE"
+    assert result["differences"]["capital_release_at"]["reason"] == "缺少结算证据"
 
 
 def test_shadow_summary_replaces_queued_snapshot_and_keeps_normal_unknown_nonfatal(
@@ -306,6 +404,17 @@ def test_shadow_client_compares_verified_economics_in_exact_units() -> None:
     assert result["differences"]["minimum_profit"] == {
         "legacy": "1.20", "n_leg": "1.1", "absolute": "0.10"
     }
+    for dimension in (
+        "opportunity_exists",
+        "direction",
+        "worst_case",
+        "net_margin_1pct",
+        "annualized_15pct",
+        "capital_release_30d",
+        "order_ready",
+        "rejection_reasons",
+    ):
+        assert dimension in result["differences"], dimension
 
 
 def test_scheduler_close_discards_late_worker_completion(tmp_path) -> None:
