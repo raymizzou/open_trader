@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-16
+
+- #78 adds the v2 relation-catalog core module (`relation_catalog_v2.py`) as a standalone, not-yet-wired building block: venue-qualified relation identity, frozen approval fingerprints, a single cause ledger plus atomic generation snapshot, per-component consistency/budget, and a SQLite persistence seam. No runtime, service, Dashboard, monitor, or production behavior is changed; the existing v1 catalog remains the active catalog. Focused catalog and SQLite tests pass.
+
 ## 2026-08-15
 
 - #54 adds a production-owned, two-server generic solver owner and a no-submit
