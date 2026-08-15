@@ -195,3 +195,282 @@ def n_leg_set_mode(
         },
     )
     return n_leg_mode_contract(store)
+
+
+def _policy_direction(before: Mapping[str, object], after: Mapping[str, object]) -> str:
+    """Loosen when any threshold admits riskier economics."""
+    if (
+        _money(after["min_profit_usd"], "min_profit_usd")
+        < _money(before["min_profit_usd"], "min_profit_usd")
+        or _money(after["min_net_margin"], "min_net_margin")
+        < _money(before["min_net_margin"], "min_net_margin")
+        or _money(after["min_annualized_return"], "min_annualized_return")
+        < _money(before["min_annualized_return"], "min_annualized_return")
+        or after["max_capital_release_days"] > before["max_capital_release_days"]
+    ):
+        return "loosen"
+    if before == after:
+        return "same"
+    return "tighten"
+
+
+def _safety_direction(before: Mapping[str, object], after: Mapping[str, object]) -> str:
+    """Loosen when a cap grows or the rearm gap shrinks."""
+    if (
+        after["episode_rearm_gap_seconds"] < before["episode_rearm_gap_seconds"]
+        or after["max_total_unsettled_capital_units"]
+        > before["max_total_unsettled_capital_units"]
+        or after["max_partial_fill_loss_units"]
+        > before["max_partial_fill_loss_units"]
+        or after["max_auto_repair_loss_units"]
+        > before["max_auto_repair_loss_units"]
+    ):
+        return "loosen"
+    if before == after:
+        return "same"
+    return "tighten"
+
+
+def _downgrade(
+    store: object,
+    reason: str,
+    audit: object,
+    *,
+    qualification_policy_version: int | None = None,
+    safety_config_version: int | None = None,
+) -> None:
+    control = store.n_leg_control()
+    store.n_leg_mode_control_write(
+        mode="MANUAL",
+        contract_generation=int(control["contract_generation"]),
+        qualification_policy_version=(
+            int(control["qualification_policy_version"])
+            if qualification_policy_version is None
+            else qualification_policy_version
+        ),
+        safety_config_version=(
+            int(control["safety_config_version"])
+            if safety_config_version is None
+            else safety_config_version
+        ),
+        enabled_execution_scope_version=list(
+            control["enabled_execution_scope_version"]
+        ),
+    )
+    store.record_control_event(
+        action="n_leg_auto_downgrade",
+        target="n_leg_controls",
+        outcome="failed",
+        payload={
+            "reason": reason,
+            "mode": "MANUAL",
+            "action_word": "manual_confirm",
+            **_audit_dict(audit),
+        },
+    )
+
+
+def n_leg_update_qualification_policy(
+    store: object,
+    *,
+    policy: object,
+    base_version: int,
+    audit: object = None,
+) -> dict[str, object]:
+    validated = _validated_policy(policy)
+    current = _current_policy(store)
+    if current["version"] != base_version:
+        raise NLegVersionConflict("qualification policy version mismatch")
+    direction = _policy_direction(current["policy"], validated)
+    next_version = current["version"] + 1
+    store.n_leg_qualification_policy_write(next_version, validated)
+    control = store.n_leg_control()
+    if direction == "loosen" and control["mode"] == "AUTO":
+        _downgrade(
+            store,
+            "QUALIFICATION_POLICY_LOOSENED",
+            audit,
+            qualification_policy_version=next_version,
+        )
+    else:
+        store.n_leg_mode_control_write(
+            qualification_policy_version=next_version,
+            contract_generation=int(control["contract_generation"]),
+            safety_config_version=int(control["safety_config_version"]),
+            enabled_execution_scope_version=list(
+                control["enabled_execution_scope_version"]
+            ),
+        )
+    store.record_control_event(
+        action="n_leg_update_qualification_policy",
+        target="n_leg_controls",
+        outcome="succeeded",
+        payload={
+            "qualification_policy_version": next_version,
+            "direction": direction,
+            "action_word": _write_word(store.n_leg_control()["mode"]),
+            **_audit_dict(audit),
+        },
+    )
+    return n_leg_mode_contract(store)
+
+
+def n_leg_update_safety_config(
+    store: object,
+    *,
+    config: object,
+    base_version: int,
+    audit: object = None,
+) -> dict[str, object]:
+    validated = _validated_safety_config(config)
+    current = _current_safety_config(store)
+    if current["version"] != base_version:
+        raise NLegVersionConflict("safety config version mismatch")
+    direction = _safety_direction(current["config"], validated)
+    next_version = current["version"] + 1
+    store.n_leg_safety_config_write(next_version, validated)
+    control = store.n_leg_control()
+    if direction == "loosen" and control["mode"] == "AUTO":
+        _downgrade(
+            store,
+            "SAFETY_CONFIG_LOOSENED",
+            audit,
+            safety_config_version=next_version,
+        )
+    else:
+        store.n_leg_mode_control_write(
+            safety_config_version=next_version,
+            contract_generation=int(control["contract_generation"]),
+            qualification_policy_version=int(control["qualification_policy_version"]),
+            enabled_execution_scope_version=list(
+                control["enabled_execution_scope_version"]
+            ),
+        )
+    store.record_control_event(
+        action="n_leg_update_safety_config",
+        target="n_leg_controls",
+        outcome="succeeded",
+        payload={
+            "safety_config_version": next_version,
+            "direction": direction,
+            "action_word": _write_word(store.n_leg_control()["mode"]),
+            **_audit_dict(audit),
+        },
+    )
+    return n_leg_mode_contract(store)
+
+
+def n_leg_upsert_scope(
+    store: object,
+    *,
+    scope_id: str,
+    capability: str,
+    members: object,
+    base_scope_version: int | None = None,
+    audit: object = None,
+) -> dict[str, object]:
+    if not isinstance(scope_id, str) or not scope_id:
+        raise ValueError("scope id must be non-empty text")
+    if capability not in CAPABILITIES:
+        raise ValueError("scope capability is invalid")
+    validated_members = _validated_members(members)
+    existing = store.n_leg_scope(scope_id)
+    if existing is None:
+        if capability != "OBSERVE_ONLY":
+            raise ValueError("N_LEG_SCOPE_STARTS_OBSERVE_ONLY")
+        scope_version = 1
+        direction = "added"
+    else:
+        if int(existing["scope_version"]) != base_scope_version:
+            raise NLegVersionConflict("scope version mismatch")
+        scope_version = int(existing["scope_version"]) + 1
+        if capability != existing["capability"]:
+            direction = "loosen" if capability > existing["capability"] else "tighten"
+        elif validated_members != existing["members"]:
+            direction = "changed"
+        else:
+            direction = "same"
+    store.n_leg_scope_write(
+        scope_id, capability=capability, scope_version=scope_version, members=validated_members
+    )
+    control = store.n_leg_control()
+    if direction in {"loosen", "changed", "added"} and control["mode"] == "AUTO":
+        reason = {
+            "loosen": "SCOPE_CAPABILITY_RAISED",
+            "changed": "SCOPE_MEMBERS_CHANGED",
+            "added": "SCOPE_ADDED",
+        }[direction]
+        _downgrade(store, reason, audit)
+    store.record_control_event(
+        action="n_leg_upsert_scope",
+        target=f"n_leg_execution_scopes/{scope_id}",
+        outcome="succeeded",
+        payload={
+            "scope_id": scope_id,
+            "capability": capability,
+            "scope_version": scope_version,
+            "direction": direction,
+            "action_word": _write_word(store.n_leg_control()["mode"]),
+            **_audit_dict(audit),
+        },
+    )
+    return n_leg_mode_contract(store)
+
+
+def n_leg_order_readiness(
+    store: object | None = None, *, contract: Mapping[str, object] | None = None
+) -> dict[str, object]:
+    """would-submit envelope: per-scope readiness without touching orders."""
+    current = (
+        n_leg_mode_contract(store)
+        if contract is None
+        else dict(contract)
+    )
+    mode = str(current["mode"])
+    gates = dict(current["execution_gates"])
+    enabled = {
+        str(item["scope_id"]): int(item["scope_version"])
+        for item in current["enabled_execution_scope_version"]
+    }
+    scopes: dict[str, dict[str, object]] = {}
+    for scope_id, scope in current["execution_scopes"].items():
+        capability = str(scope["capability"])
+        if capability == "OBSERVE_ONLY":
+            ready, reason, action = False, "SCOPE_OBSERVE_ONLY", None
+        elif capability == "MANUAL_CANARY":
+            if mode == "MANUAL":
+                ready, reason, action = True, "MANUAL_CANARY", "manual_confirm"
+            else:
+                ready, reason, action = False, "MANUAL_CANARY_REQUIRES_MANUAL", None
+        else:
+            if mode == "AUTO" and scope_id in enabled and enabled[scope_id] == int(scope["scope_version"]):
+                ready, reason, action = True, "AUTO_ELIGIBLE", "auto_submit"
+            elif mode == "MANUAL":
+                ready, reason, action = True, "MANUAL_CONFIRM_ALLOWED", "manual_confirm"
+            else:
+                ready, reason, action = False, "SCOPE_NOT_ENABLED", None
+        scopes[scope_id] = {
+            "scope_id": scope_id,
+            "order_ready": ready,
+            "reason": reason,
+            "action": action,
+        }
+    gate_reason = (
+        "GLOBAL_BREAKER_OPEN"
+        if gates["breaker_open"]
+        else "EXECUTION_INCIDENT_ACTIVE"
+        if gates["incident_active"]
+        else "EXECUTION_BATCH_ACTIVE"
+        if gates["batch_active"]
+        else None
+    )
+    if gate_reason is not None:
+        for entry in scopes.values():
+            entry["order_ready"] = False
+            entry["reason"] = gate_reason
+            entry["action"] = None
+    return {
+        "order_ready": any(entry["order_ready"] for entry in scopes.values()),
+        "gates": gates,
+        "scopes": scopes,
+    }

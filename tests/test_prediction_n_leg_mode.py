@@ -11,7 +11,11 @@ from open_trader.prediction_n_leg_mode import (
     DEFAULT_SAFETY_CONFIG,
     NLegVersionConflict,
     n_leg_mode_contract,
+    n_leg_order_readiness,
     n_leg_set_mode,
+    n_leg_update_qualification_policy,
+    n_leg_update_safety_config,
+    n_leg_upsert_scope,
 )
 
 
@@ -26,6 +30,18 @@ def _db_path(tmp_path: Path) -> Path:
         / "prediction_arbitrage"
         / "prediction_arbitrage.sqlite3"
     )
+
+
+def _scope_members(extra: object = None) -> dict[str, object]:
+    members = {
+        "relation_type": "complement",
+        "same_event": True,
+        "same_venue": False,
+        "venues": ["predict", "polymarket"],
+    }
+    if extra is not None:
+        members.update(extra)
+    return members
 
 
 def test_fresh_contract_defaults_to_manual_and_never_inherits_legacy_mode(
@@ -87,3 +103,164 @@ def test_malformed_stored_enabled_list_reads_fail_closed(tmp_path: Path) -> None
         )
 
     assert n_leg_mode_contract(store)["enabled_execution_scope_version"] == []
+
+
+def test_upsert_scope_starts_observe_only_and_bumps_version(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with pytest.raises(ValueError, match="OBSERVE_ONLY"):
+        n_leg_upsert_scope(
+            store,
+            scope_id="s1",
+            capability="MANUAL_CANARY",
+            members=_scope_members(),
+        )
+
+    contract = n_leg_upsert_scope(
+        store, scope_id="s1", capability="OBSERVE_ONLY", members=_scope_members()
+    )
+    assert contract["execution_scopes"]["s1"]["scope_version"] == 1
+
+    contract = n_leg_upsert_scope(
+        store,
+        scope_id="s1",
+        capability="MANUAL_CANARY",
+        members=_scope_members(),
+        base_scope_version=1,
+    )
+    assert contract["execution_scopes"]["s1"]["capability"] == "MANUAL_CANARY"
+    assert contract["execution_scopes"]["s1"]["scope_version"] == 2
+
+    with pytest.raises(NLegVersionConflict, match="scope version mismatch"):
+        n_leg_upsert_scope(
+            store,
+            scope_id="s1",
+            capability="OBSERVE_ONLY",
+            members=_scope_members(),
+            base_scope_version=1,
+        )
+
+
+def test_scope_members_change_downgrades_auto_to_manual(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    n_leg_upsert_scope(
+        store, scope_id="s1", capability="OBSERVE_ONLY", members=_scope_members()
+    )
+    n_leg_set_mode(store, mode="AUTO", base_contract_generation=1)
+
+    contract = n_leg_upsert_scope(
+        store,
+        scope_id="s1",
+        capability="OBSERVE_ONLY",
+        members=_scope_members({"venues": ["predict"]}),
+        base_scope_version=1,
+    )
+
+    assert contract["mode"] == "MANUAL"
+    assert contract["execution_scopes"]["s1"]["scope_version"] == 2
+    assert (
+        store.latest_control_event("n_leg_auto_downgrade", "n_leg_controls")["payload"][
+            "reason"
+        ]
+        == "SCOPE_MEMBERS_CHANGED"
+    )
+
+
+def test_policy_tighten_keeps_auto_and_loosen_downgrades(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    n_leg_set_mode(store, mode="AUTO", base_contract_generation=1)
+    tightened = dict(DEFAULT_QUALIFICATION_POLICY)
+    tightened["min_profit_usd"] = "5.00"
+
+    contract = n_leg_update_qualification_policy(
+        store, policy=tightened, base_version=1
+    )
+
+    assert contract["mode"] == "AUTO"
+    assert contract["qualification_policy_version"] == 2
+
+    loosened = dict(DEFAULT_QUALIFICATION_POLICY)
+    loosened["min_net_margin"] = "0.001"
+    contract = n_leg_update_qualification_policy(
+        store, policy=loosened, base_version=2
+    )
+
+    assert contract["mode"] == "MANUAL"
+    assert contract["qualification_policy_version"] == 3
+    assert (
+        store.latest_control_event("n_leg_auto_downgrade", "n_leg_controls")["payload"][
+            "reason"
+        ]
+        == "QUALIFICATION_POLICY_LOOSENED"
+    )
+
+
+def test_policy_version_mismatch_rejects_without_change(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    changed = dict(DEFAULT_QUALIFICATION_POLICY)
+    changed["min_profit_usd"] = "2.00"
+
+    with pytest.raises(NLegVersionConflict, match="policy version mismatch"):
+        n_leg_update_qualification_policy(store, policy=changed, base_version=99)
+
+    assert n_leg_mode_contract(store)["qualification_policy_version"] == 1
+
+
+def test_safety_config_direction_downgrades_on_loosen_only(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    n_leg_set_mode(store, mode="AUTO", base_contract_generation=1)
+    tightened = dict(DEFAULT_SAFETY_CONFIG)
+    tightened["episode_rearm_gap_seconds"] = 600
+
+    contract = n_leg_update_safety_config(store, config=tightened, base_version=1)
+    assert contract["mode"] == "AUTO"
+    assert contract["safety_config_version"] == 2
+
+    loosened = dict(DEFAULT_SAFETY_CONFIG)
+    loosened["max_total_unsettled_capital_units"] = 1000
+    contract = n_leg_update_safety_config(store, config=loosened, base_version=2)
+    assert contract["mode"] == "MANUAL"
+    assert contract["safety_config_version"] == 3
+
+
+def test_readiness_reflects_capability_and_mode(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    n_leg_upsert_scope(
+        store, scope_id="observe", capability="OBSERVE_ONLY", members=_scope_members()
+    )
+    n_leg_upsert_scope(
+        store, scope_id="canary", capability="OBSERVE_ONLY", members=_scope_members()
+    )
+    n_leg_upsert_scope(
+        store,
+        scope_id="canary",
+        capability="MANUAL_CANARY",
+        members=_scope_members(),
+        base_scope_version=1,
+    )
+    n_leg_upsert_scope(
+        store, scope_id="auto", capability="OBSERVE_ONLY", members=_scope_members()
+    )
+    n_leg_upsert_scope(
+        store,
+        scope_id="auto",
+        capability="AUTO_ELIGIBLE",
+        members=_scope_members(),
+        base_scope_version=1,
+    )
+
+    readiness = n_leg_order_readiness(store)
+    assert readiness["scopes"]["observe"] == {
+        "scope_id": "observe",
+        "order_ready": False,
+        "reason": "SCOPE_OBSERVE_ONLY",
+        "action": None,
+    }
+    assert readiness["scopes"]["canary"]["action"] == "manual_confirm"
+    assert readiness["scopes"]["auto"]["order_ready"] is True
+    assert readiness["scopes"]["auto"]["reason"] == "MANUAL_CONFIRM_ALLOWED"
+    assert readiness["scopes"]["auto"]["action"] == "manual_confirm"
+
+    n_leg_set_mode(store, mode="AUTO", base_contract_generation=1)
+    readiness = n_leg_order_readiness(store)
+    assert readiness["order_ready"] is False
+    assert readiness["scopes"]["auto"]["reason"] == "SCOPE_NOT_ENABLED"
