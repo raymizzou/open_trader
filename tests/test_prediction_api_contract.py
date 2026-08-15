@@ -15,6 +15,7 @@ from open_trader.dashboard_web import create_dashboard_server
 from open_trader.frontend_gateway import FrontendGatewayConfig, create_frontend_gateway
 from open_trader.prediction_arbitrage_execution import PredictionExecutionService
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+from open_trader.prediction_n_leg_mode import NLegVersionConflict
 from open_trader.prediction_service import create_prediction_server
 from tests.test_dashboard import dashboard_config
 from tests.test_prediction_arbitrage_execution import (
@@ -123,6 +124,88 @@ class _Execution:
             "effective_mode": "manual_confirm",
             "armed": False,
         }
+
+    def n_leg_mode_contract(self) -> dict[str, object]:
+        return {
+            "schema_version": "open_trader.prediction_n_leg.mode_contract.v1",
+            "contract_generation": 1,
+            "mode": "MANUAL",
+            "qualification_policy_version": 1,
+            "qualification_policy": {
+                "min_profit_usd": "1.00",
+                "min_net_margin": "0.01",
+                "min_annualized_return": "0.15",
+                "max_capital_release_days": 30,
+            },
+            "safety_config_version": 1,
+            "safety_config": {
+                "episode_rearm_gap_seconds": 300,
+                "max_total_unsettled_capital_units": 0,
+                "max_partial_fill_loss_units": 0,
+                "max_auto_repair_loss_units": 0,
+            },
+            "execution_scopes": {},
+            "enabled_execution_scope_version": [],
+            "execution_gates": {
+                "breaker_open": False,
+                "incident_active": False,
+                "batch_active": False,
+            },
+        }
+
+    def n_leg_set_mode(
+        self,
+        mode: str,
+        *,
+        base_contract_generation: int,
+        incident_id: object = None,
+        audit: object | None = None,
+    ) -> dict[str, object]:
+        return {"state": "ok", "mode": mode}
+
+    def n_leg_update_qualification_policy(
+        self,
+        policy: object,
+        *,
+        base_version: int,
+        audit: object | None = None,
+    ) -> dict[str, object]:
+        return {"state": "ok", "qualification_policy_version": base_version + 1}
+
+    def n_leg_update_safety_config(
+        self,
+        config: object,
+        *,
+        base_version: int,
+        audit: object | None = None,
+    ) -> dict[str, object]:
+        return {"state": "ok", "safety_config_version": base_version + 1}
+
+    def n_leg_upsert_scope(
+        self,
+        scope_id: str,
+        *,
+        capability: str,
+        members: object,
+        base_scope_version: int | None = None,
+        audit: object | None = None,
+    ) -> dict[str, object]:
+        return {
+            "state": "ok",
+            "scope_id": scope_id,
+            "capability": capability,
+            "scope_version": (base_scope_version or 0) + 1,
+        }
+
+    def n_leg_set_enabled_scope(
+        self,
+        scope_id: str,
+        *,
+        enable: bool,
+        base_contract_generation: int,
+        audit: object | None = None,
+    ) -> dict[str, object]:
+        return {"state": "ok", "scope_id": scope_id, "enable": enable}
 
 
 CONTROL_CASES = (
@@ -673,3 +756,105 @@ def test_production_prediction_mutations_match_frozen_legacy_contract() -> None:
             "preview_id": "preview-1",
             "idempotency_key": "key-1",
         }
+
+
+def test_n_leg_contract_read_and_versioned_mutations() -> None:
+    with _prediction_server() as base:
+        status, _headers, contract = _json_response(
+            base + "/api/prediction-arbitrage/n-leg/mode"
+        )
+        assert status == 200
+        assert contract["mode"] == "MANUAL"
+        assert contract["contract_generation"] == 1
+
+        status, _headers, body = _json_response(
+            _post(
+                base,
+                "/api/prediction-arbitrage/n-leg/mode",
+                {
+                    "mode": "AUTO",
+                    "base_contract_generation": 1,
+                    "incident_id": None,
+                },
+            )
+        )
+        assert status == 200
+        assert body == {"state": "ok", "mode": "AUTO"}
+
+        status, _headers, body = _json_response(
+            _post(
+                base,
+                "/api/prediction-arbitrage/n-leg/config",
+                {
+                    "qualification_policy": {
+                        "min_profit_usd": "2.00",
+                        "min_net_margin": "0.01",
+                        "min_annualized_return": "0.15",
+                        "max_capital_release_days": 30,
+                    },
+                    "base_qualification_policy_version": 1,
+                },
+            )
+        )
+        assert status == 200
+        assert body == {"state": "ok", "qualification_policy_version": 2}
+
+        status, _headers, body = _json_response(
+            _post(
+                base,
+                "/api/prediction-arbitrage/n-leg/scope",
+                {
+                    "scope_id": "s1",
+                    "capability": "OBSERVE_ONLY",
+                    "members": {"relation_type": "complement"},
+                    "base_scope_version": None,
+                },
+            )
+        )
+        assert status == 200
+        assert body == {
+            "state": "ok",
+            "scope_id": "s1",
+            "capability": "OBSERVE_ONLY",
+            "scope_version": 1,
+        }
+
+
+def test_n_leg_version_conflict_returns_409() -> None:
+    class _ConflictingExecution(_Execution):
+        def n_leg_set_mode(
+            self,
+            mode: str,
+            *,
+            base_contract_generation: int,
+            incident_id: object = None,
+            audit: object | None = None,
+        ) -> dict[str, object]:
+            raise NLegVersionConflict("n-leg contract generation mismatch")
+
+    runtime = _ProductionRuntime()
+    runtime.execution = _ConflictingExecution()
+    server = create_prediction_server(
+        runtime=runtime,  # type: ignore[arg-type]
+        port=0,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    )
+    with _serve(server) as base:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(
+                _post(
+                    base,
+                    "/api/prediction-arbitrage/n-leg/mode",
+                    {
+                        "mode": "AUTO",
+                        "base_contract_generation": 99,
+                        "incident_id": None,
+                    },
+                ),
+                timeout=5,
+            )
+        assert error.value.code == 409
+        body = json.loads(error.value.read().decode("utf-8"))
+        assert body["error"] == "n-leg contract generation mismatch"
