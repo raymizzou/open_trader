@@ -132,6 +132,52 @@ class _Execution:
     _cross_breaker_open = False
 
 
+def test_prediction_state_projects_persisted_n_leg_shadow_summary() -> None:
+    class Store(_Store):
+        def signal(self, signal_id: str) -> dict[str, object] | None:
+            if signal_id != "episode-1":
+                return None
+            return {
+                "signal_id": signal_id,
+                "n_leg_shadow": {
+                    "latest_fingerprint": "sha256:shadow",
+                    "latest_result": {
+                        "run_status": "SUCCESS",
+                        "decision": "NOT_QUALIFIED",
+                        "comparison": "DIFFERENCE",
+                    },
+                    "first_run_at": "2026-08-15T00:00:00Z",
+                    "last_run_at": "2026-08-15T00:01:00Z",
+                    "run_count": 2,
+                    "qualified_count": 1,
+                    "difference_count": 1,
+                    "failure_count": 0,
+                    "current_differences": {"minimum_profit": {"absolute": "0.10"}},
+                    "max_differences": {"minimum_profit": {"absolute": "0.10"}},
+                },
+            }
+
+    class Monitor(_Monitor):
+        def snapshot(self) -> dict[str, object]:
+            snapshot = super().snapshot()
+            snapshot["opportunities"][0]["signal_episode_id"] = "episode-1"
+            return snapshot
+
+    payload = prediction_state_payload(
+        store=Store(), monitor=Monitor(), execution=_Execution(), csrf_token="csrf"
+    )
+
+    assert payload["opportunities"][0]["n_leg_shadow"]["latest_result"]["comparison"] == "DIFFERENCE"
+    assert payload["n_leg_shadow"] == {
+        "monitoring": 1,
+        "legacy_qualified": 1,
+        "completed": 2,
+        "differences": 1,
+        "failures": 0,
+        "last_completed_at": "2026-08-15T00:01:00Z",
+    }
+
+
 @pytest.fixture
 def frozen_prediction_inputs() -> dict[str, object]:
     return {

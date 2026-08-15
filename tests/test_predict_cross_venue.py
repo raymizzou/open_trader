@@ -2574,6 +2574,46 @@ def test_monitor_fingerprint_rotation_isolates_in_flight_notification_lease(
     asyncio.run(exercise())
 
 
+def test_cross_venue_qualified_signal_schedules_ready_before_shadow(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        store = PredictionArbitrageStore(tmp_path / "data")
+        events: list[str] = []
+        shadow: list[tuple[str, str]] = []
+        monitor = PredictCrossVenueMonitor(
+            predict_source=FakeCrossVenuePredict(()),
+            polymarket_monitor=FakeCrossVenuePolymarket(),
+            validator=FakeCrossVenueValidator(),
+            gamma_lookup=monitor_gamma,
+            store=store,
+            ready_observer=lambda _opportunity_id, _signal_id: events.append("ready"),
+            shadow_observer=lambda opportunity, signal_id: (
+                events.append("shadow"),
+                shadow.append((str(opportunity["opportunity_id"]), signal_id)),
+            ),
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        monitor._persist_observation(
+            {
+                "opportunity_id": "cross:pair:PREDICT_YES_POLYMARKET_NO",
+                "pair_id": "pair",
+                "direction": "PREDICT_YES_POLYMARKET_NO",
+                "market_type": "cross_venue_yes_no",
+                "funnel_stage": 5,
+                "actionable": True,
+                "clear_signal": True,
+                "total_max_cost": Decimal("8.00"),
+                "minimum_profit": Decimal("1.00"),
+                "rules_fingerprints": {"predict.fun": "predict", "polymarket": "poly"},
+                "codex_approval": {"decision": "APPROVE"},
+            }
+        )
+        await asyncio.sleep(0)
+        assert events == ["ready", "shadow"]
+        assert shadow[0][0] == "cross:pair:PREDICT_YES_POLYMARKET_NO"
+
+    asyncio.run(exercise())
+
+
 def test_monitor_uses_existing_discovery_cycle_for_holding_reconciliation() -> None:
     async def exercise() -> None:
         calls: list[str] = []

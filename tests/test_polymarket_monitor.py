@@ -46,12 +46,14 @@ def market(
     accepting_orders: bool = True,
     enable_order_book: bool = True,
     ended: bool = False,
+    end_date: str | None = None,
 ) -> SimpleNamespace:
     return ns(
         id=market_id,
         slug=f"slug-{market_id}",
         question=f"Question {market_id}",
         condition_id=f"condition-{market_id}",
+        end_date=end_date,
         state=ns(
             active=active,
             closed=not active,
@@ -1895,6 +1897,41 @@ def test_upsert_signal_persists_yes_no_action_identity_and_initial_profit(
     assert row["initial_profit"] == "0.11"
 
 
+def test_qualified_yes_no_schedules_ready_before_nonblocking_shadow(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> tuple[list[str], list[tuple[str, str]], str]:
+        monitor = make_monitor(tmp_path)
+        events: list[str] = []
+        shadow_calls: list[tuple[str, str]] = []
+        monitor.set_ready_observer(lambda _opportunity_id, _signal_id: events.append("ready"))
+        monitor.set_shadow_observer(
+            lambda opportunity, signal_id: (
+                events.append("shadow"),
+                shadow_calls.append((str(opportunity["opportunity_id"]), signal_id)),
+            )
+        )
+        signal_id = monitor._upsert_signal(
+            {
+                "opportunity_id": "event-1:market-1",
+                "event_id": "event-1",
+                "market_id": "market-1",
+                "question": "Will the event happen?",
+                "market_type": "standard_binary",
+                "actionable": True,
+                "estimated_profit": Decimal("0.11"),
+            }
+        )
+        await asyncio.sleep(0.01)
+        monitor._reap_notification_task()
+        assert signal_id
+        return events, shadow_calls, signal_id
+
+    events, shadow_calls, signal_id = asyncio.run(exercise())
+    assert events == ["ready", "shadow"]
+    assert shadow_calls == [("event-1:market-1", signal_id)]
+
+
 def test_first_positive_refetches_exact_event_and_verifies_rules(
     tmp_path: Path,
 ) -> None:
@@ -3675,6 +3712,18 @@ def test_readiness_is_refreshed_without_mutation_and_candidate_is_fresh(tmp_path
     monitor.refresh_once()
     assert monitor.opportunity("e:m") is None
     assert monitor.snapshot()["health"]["actionable"] is False
+
+
+def test_standard_binary_opportunity_carries_market_end_date_as_resolution_at(
+    tmp_path: Path,
+) -> None:
+    setup_public([event("e", markets=(market("m", end_date="2026-12-31T17:00:00Z"),))])
+    monitor = make_monitor(tmp_path)
+    monitor.refresh_once()
+
+    opportunity = monitor.opportunity("e:m")
+    assert opportunity is not None
+    assert opportunity["resolution_at"] == datetime(2026, 12, 31, 17, 0, tzinfo=UTC)
 
 
 def test_successful_paired_book_read_uses_local_receipt_freshness(

@@ -19,6 +19,7 @@ from open_trader.prediction_runtime import (
     PredictionRuntime,
     PredictionRuntimeOwnershipError,
     _CrossVenueRuntime,
+    _UnavailableCrossVenueMonitor,
     _RuntimeOwnershipLock,
 )
 from open_trader.predict_cross_venue import (
@@ -688,6 +689,121 @@ def test_failed_runtime_is_terminal_and_stop_does_not_repeat_cleanup(
     runtime.stop()
     runtime.stop()
     assert closed == ["store"]
+
+
+def test_runtime_owns_one_shared_solver_server_for_its_start_stop_lifetime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    events: list[str] = []
+
+    class FakeStore:
+        def __init__(self, _path: Path) -> None:
+            pass
+
+        def apply_safety_policy(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def close(self) -> None:
+            events.append("store.close")
+
+    class FakeTrading:
+        def close(self) -> None:
+            events.append("trading.close")
+
+    monitors: list[object] = []
+
+    class FakeMonitor:
+        def __init__(self, **_kwargs: object) -> None:
+            self.shadow_observer = None
+            monitors.append(self)
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
+        def set_auto_eat_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+        def set_shadow_observer(self, observer: object) -> None:
+            self.shadow_observer = observer
+
+        def start(self) -> None:
+            events.append("monitor.start")
+
+        def stop(self) -> None:
+            events.append("monitor.stop")
+
+    class FakeExecution:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def reconcile_startup(self) -> dict[str, object]:
+            return {"state": "ready"}
+
+        def notify_ready_opportunity(self, *_args: object) -> dict[str, object]:
+            return {}
+
+        def notify_observation(self, *_args: object) -> dict[str, object]:
+            return {}
+
+        def auto_eat_threshold(self, *_args: object) -> dict[str, object]:
+            return {}
+
+        def notify_monitor_failure(self, *_args: object) -> dict[str, object]:
+            return {}
+
+        def set_cross_venue_monitor(self, _monitor: object) -> None:
+            pass
+
+        def close(self) -> None:
+            events.append("execution.close")
+
+    class FakeSolverServer:
+        def close(self) -> None:
+            events.append("solver.close")
+
+    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore)
+    monkeypatch.setattr(runtime_module, "RelationCatalog", lambda _path: object())
+    monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
+    monkeypatch.setattr(runtime_module, "PolymarketTradingClient", SimpleNamespace(from_keychain=lambda _config: FakeTrading()))
+    monkeypatch.setattr(runtime_module, "PredictTradingClient", SimpleNamespace(from_keychain=lambda _config: None))
+    monkeypatch.setattr(runtime_module, "CodexRelationValidator", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(runtime_module, "CodexTitleTranslator", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
+    monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
+    cross_observers: list[object] = []
+    monkeypatch.setattr(
+        runtime_module,
+        "_build_cross_venue_monitor",
+        lambda **kwargs: (
+            cross_observers.append(kwargs["shadow_observer"])
+            or _UnavailableCrossVenueMonitor("test")
+        ),
+    )
+    servers: list[FakeSolverServer] = []
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        solver_server_factory=lambda: servers.append(FakeSolverServer()) or servers[-1],
+    )
+    runtime.start()
+    assert runtime.n_leg_shadow is not None
+    assert callable(getattr(monitors[0], "shadow_observer", None))
+    assert cross_observers == [monitors[0].shadow_observer]
+    runtime.stop()
+
+    assert len(servers) == 1
+    assert events.index("monitor.stop") < events.index("solver.close")
+    assert events.index("solver.close") < events.index("execution.close")
 
 
 def test_reconcile_failure_keeps_runtime_locked_and_does_not_start_monitors(

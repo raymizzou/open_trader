@@ -328,6 +328,7 @@ class PolymarketMonitor:
         self._title_translator = title_translator
         self._relation_catalog = relation_catalog
         self._ready_observer: Callable[[str, str], Mapping[str, object]] | None = None
+        self._shadow_observer: Callable[[Mapping[str, object], str], object] | None = None
         self._auto_eat_observer: Callable[[str, str], object] | None = None
         self._auto_eat_task: asyncio.Task[object] | None = None
         self._observation_observer: (
@@ -459,6 +460,11 @@ class PolymarketMonitor:
         self, observer: Callable[[str, str], Mapping[str, object]]
     ) -> None:
         self._ready_observer = observer
+
+    def set_shadow_observer(
+        self, observer: Callable[[Mapping[str, object], str], object]
+    ) -> None:
+        self._shadow_observer = observer
 
     def set_observation_observer(
         self,
@@ -3271,6 +3277,7 @@ class PolymarketMonitor:
             "condition_id": condition_id,
             "slug": slug,
             "question": question,
+            "end_date": _value(value, "end_date", default=None),
             "volume_24h": event_row["volume_24h"],
             "yes_token_id": outcomes["yes"],
             "no_token_id": outcomes["no"],
@@ -3457,6 +3464,7 @@ class PolymarketMonitor:
             "book_timestamp_b": no_timestamp,
             "book_received_at_a": now,
             "book_received_at_b": now,
+            "resolution_at": _timestamp_or_none(market_row.get("end_date")),
             "profit": intent.minimum_profit,
             "estimated_profit": intent.minimum_profit,
             "minimum_profit": intent.minimum_profit,
@@ -3882,14 +3890,44 @@ class PolymarketMonitor:
                     "book_received_at_b": opportunity.get("book_received_at_b"),
                 }
             )
+            if isinstance(opportunity, dict):
+                opportunity["signal_episode_id"] = signal_id
             self._schedule_observation_notification(signal_id, opportunity)
-            self._schedule_ready_notification(signal_id, opportunity)
+            ready_scheduled = self._schedule_ready_notification(signal_id, opportunity)
+            if not ready_scheduled:
+                self._schedule_shadow(signal_id, opportunity)
             self._schedule_auto_eat(signal_id, opportunity)
             return signal_id
         except Exception as exc:
             self._store_failed = True
             self._record_error(exc, "store")
             return None
+
+    def _notify_shadow(
+        self, signal_id: str | None, opportunity: Mapping[str, object]
+    ) -> None:
+        """Submit an eligible legacy snapshot after its old ready observer returns."""
+
+        observer = self._shadow_observer
+        if (
+            observer is None
+            or signal_id is None
+            or opportunity.get("market_type") != "standard_binary"
+            or opportunity.get("actionable") is not True
+        ):
+            return
+        try:
+            observer(dict(opportunity), signal_id)
+        except Exception:
+            # Shadow is diagnostic only; production notification/execution wins.
+            return
+
+    def _schedule_shadow(
+        self, signal_id: str | None, opportunity: Mapping[str, object]
+    ) -> None:
+        if self._shadow_observer is None:
+            return
+        asyncio.create_task(asyncio.to_thread(self._notify_shadow, signal_id, dict(opportunity)))
 
     def _schedule_observation_notification(
         self, signal_id: str | None, opportunity: Mapping[str, object]
@@ -3960,18 +3998,18 @@ class PolymarketMonitor:
 
     def _schedule_ready_notification(
         self, signal_id: str | None, opportunity: Mapping[str, object]
-    ) -> None:
+    ) -> bool:
         observer = self._ready_observer
         if observer is None or signal_id is None:
-            return
+            return False
         market_type = opportunity.get("market_type")
         if market_type not in {"standard_binary", "threshold_hedge"}:
-            return
+            return False
         if opportunity.get("actionable") is not True:
-            return
+            return False
         if market_type == "threshold_hedge":
             if opportunity.get("rules_verified_at") in (None, ""):
-                return
+                return False
             validation = opportunity.get("relation_validation")
             codex_status = (
                 validation.get("status")
@@ -3979,26 +4017,32 @@ class PolymarketMonitor:
                 else opportunity.get("llm_status")
             )
             if str(codex_status).strip().lower() != "approved":
-                return
+                return False
         self._reap_notification_task()
         task = self._notification_task
         if task is not None and not task.done():
-            return
+            return False
         signal = self._store.signal(str(signal_id))
         if signal is None or signal.get("ended_at") is not None:
-            return
+            return False
         if signal.get("notification_state") in {"sent", "suppressed"}:
-            return
+            return False
         lease_expires = _timestamp_or_none(signal.get("notification_lease_expires_at"))
         if lease_expires is not None and lease_expires > self._now():
-            return
+            return False
         attempts = _decimal(signal.get("notification_attempts")) or Decimal("0")
         if attempts >= 3:
-            return
+            return False
         self._notification_signal_id = str(signal_id)
-        self._notification_task = asyncio.create_task(
-            asyncio.to_thread(observer, str(opportunity.get("opportunity_id", "")), str(signal_id))
-        )
+        opportunity_id = str(opportunity.get("opportunity_id", ""))
+
+        def ready_then_shadow() -> object:
+            result = observer(opportunity_id, str(signal_id))
+            self._notify_shadow(signal_id, opportunity)
+            return result
+
+        self._notification_task = asyncio.create_task(asyncio.to_thread(ready_then_shadow))
+        return True
 
     def _reap_notification_task(self) -> None:
         task = self._notification_task

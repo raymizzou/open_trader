@@ -332,6 +332,57 @@ def _prediction_attach_cached_title(
     return result
 
 
+def _prediction_attach_n_leg_shadow(
+    store: PredictionArbitrageStore | None, value: object
+) -> object:
+    """Project the durable Episode summary without letting it change card economics."""
+
+    if store is None or not isinstance(value, Mapping):
+        return value
+    signal_id = value.get("signal_episode_id")
+    read_signal = getattr(store, "signal", None)
+    if not isinstance(signal_id, str) or not signal_id or not callable(read_signal):
+        return value
+    try:
+        signal = read_signal(signal_id)
+    except Exception:
+        return value
+    shadow = signal.get("n_leg_shadow") if isinstance(signal, Mapping) else None
+    safe_shadow = _prediction_safe_value(shadow)
+    if not isinstance(safe_shadow, Mapping):
+        return value
+    result = dict(value)
+    result["n_leg_shadow"] = dict(safe_shadow)
+    return result
+
+
+def _prediction_n_leg_shadow_summary(rows: list[Mapping[str, object]]) -> dict[str, object]:
+    monitoring = completed = differences = failures = 0
+    last_completed_at: str | None = None
+    seen: set[str] = set()
+    for row in rows:
+        signal_id = row.get("signal_episode_id")
+        shadow = row.get("n_leg_shadow")
+        if not isinstance(signal_id, str) or signal_id in seen or not isinstance(shadow, Mapping):
+            continue
+        seen.add(signal_id)
+        monitoring += 1
+        completed += int(shadow.get("run_count") or 0)
+        differences += int(shadow.get("difference_count") or 0)
+        failures += int(shadow.get("failure_count") or 0)
+        completed_at = shadow.get("last_run_at")
+        if isinstance(completed_at, str) and (last_completed_at is None or completed_at > last_completed_at):
+            last_completed_at = completed_at
+    return {
+        "monitoring": monitoring,
+        "legacy_qualified": monitoring,
+        "completed": completed,
+        "differences": differences,
+        "failures": failures,
+        "last_completed_at": last_completed_at,
+    }
+
+
 def _prediction_evidence_value(row: Mapping[str, object], *keys: str) -> object | None:
     evidence = row.get("evidence")
     if isinstance(evidence, Mapping):
@@ -946,7 +997,9 @@ def prediction_state_payload(
         for row in event_rows
     ]
     opportunity_rows = [
-        _prediction_opportunity_aliases(row)
+        _prediction_attach_n_leg_shadow(
+            store, _prediction_opportunity_aliases(row)
+        )
         for row in opportunity_rows
     ]
     event_rows.extend(
@@ -954,7 +1007,12 @@ def prediction_state_payload(
         for row in cross_venue["events"]
     )
     opportunity_rows.extend(
-        _prediction_attach_cached_title(store, _prediction_opportunity_aliases(row))
+        _prediction_attach_cached_title(
+            store,
+            _prediction_attach_n_leg_shadow(
+                store, _prediction_opportunity_aliases(row)
+            ),
+        )
         for row in cross_venue["opportunities"]
     )
     opportunity_rows = [
@@ -1126,6 +1184,7 @@ def prediction_state_payload(
                 cross_auto = dict(status_value)
         except Exception:
             pass
+    shadow_summary = _prediction_n_leg_shadow_summary(opportunity_rows)
     result = {
         "status": status,
         "health": health,
@@ -1162,6 +1221,8 @@ def prediction_state_payload(
         },
         "csrf_token": csrf_token,
     }
+    if shadow_summary["monitoring"]:
+        result["n_leg_shadow"] = shadow_summary
     pending_count = getattr(relation_catalog, "pending_count", None)
     if callable(pending_count):
         try:
