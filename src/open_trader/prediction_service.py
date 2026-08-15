@@ -28,6 +28,7 @@ from .prediction_read_model import (
 )
 from .prediction_release import load_prediction_release_manifest
 from .prediction_runtime import PredictionRuntime
+from .relation_catalog import RelationConflictError
 
 
 _HISTORY_DEFAULT_LIMIT = 100
@@ -231,6 +232,13 @@ def _query_int(query: Mapping[str, list[str]], key: str, default: int) -> int:
     return value
 
 
+def _object_value(payload: Mapping[str, object], key: str) -> Mapping[str, object]:
+    value = payload.get(key)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{key} must be an object")
+    return value
+
+
 def create_prediction_server(
     *,
     runtime: PredictionRuntime,
@@ -321,6 +329,38 @@ def create_prediction_server(
                     },
                 )
                 return
+            relation_prefix = "/api/prediction-arbitrage/relations"
+            if parsed.path == relation_prefix or parsed.path.startswith(relation_prefix + "/"):
+                if (
+                    mode == "shadow"
+                    and not _is_available(runtime)
+                    or mode == "production"
+                    and not _is_production_available(runtime)
+                ):
+                    self._send_unavailable()
+                    return
+                catalog = getattr(runtime, "relation_catalog", None)
+                if catalog is None:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "relation catalog is unavailable"})
+                    return
+                try:
+                    if parsed.path == relation_prefix:
+                        query = parse_qs(parsed.query, keep_blank_values=True)
+                        if set(query) - {"view"}:
+                            raise ValueError("relation catalog query is invalid")
+                        view = str(query.get("view", ["pending"])[0] or "pending")
+                        rows = catalog.list(view)
+                        self._send_json(HTTPStatus.OK, {"view": view, "pending_count": catalog.pending_count(), "items": rows})
+                    else:
+                        version_id = parsed.path.removeprefix(relation_prefix + "/")
+                        if not version_id or "/" in version_id:
+                            raise ValueError("relation version path is invalid")
+                        self._send_json(HTTPStatus.OK, catalog.detail(version_id))
+                except ValueError as exc:
+                    self._send_error(HTTPStatus.BAD_REQUEST, exc)
+                except (sqlite3.Error, OSError, RuntimeError) as exc:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+                return
             if parsed.path not in {
                 "/api/prediction-arbitrage/state",
                 "/api/prediction-arbitrage/history",
@@ -344,6 +384,7 @@ def create_prediction_server(
                         execution=getattr(runtime, "execution", None),
                         csrf_token="" if mode == "shadow" else prediction_csrf,
                         cross_venue_monitor=getattr(runtime, "cross_venue_monitor", None),
+                        relation_catalog=getattr(runtime, "relation_catalog", None),
                     ),
                     set_session=mode == "production",
                 )
@@ -397,6 +438,55 @@ def create_prediction_server(
                 if not _is_production_available(runtime):
                     self._send_unavailable()
                     return
+            relation_prefix = "/api/prediction-arbitrage/relations"
+            relation_mutation = path.startswith(relation_prefix + "/") or path == relation_prefix + "/change-set"
+            if relation_mutation:
+                try:
+                    payload = self._read_json_body()
+                    catalog = getattr(runtime, "relation_catalog", None)
+                    if catalog is None:
+                        raise RuntimeError("relation catalog is unavailable")
+                    audit = self._audit_context()
+                    actor = str(audit["actor"])
+                    git_sha = str(audit["git_sha"])
+                    if path == relation_prefix + "/change-set":
+                        self._require_schema(payload, {"active", "candidate", "reason", "note", "confirm"})
+                        if payload.get("confirm") is not True:
+                            raise ValueError("confirm must be true")
+                        active = self._relation_expected(_object_value(payload, "active"))
+                        candidate = self._relation_expected(_object_value(payload, "candidate"))
+                        result = catalog.replace(active, candidate, reason=self._required_string(payload, "reason"), note=self._optional_string(payload, "note"), actor=actor, git_sha=git_sha)
+                    else:
+                        suffixes = {"/approve", "/reject", "/revoke"}
+                        suffix = next((item for item in suffixes if path.endswith(item)), "")
+                        version_id = path[len(relation_prefix) + 1 : -len(suffix)] if suffix else ""
+                        if not suffix or not version_id or "/" in version_id:
+                            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                            return
+                        expected = self._relation_expected(payload)
+                        if expected["relation_version_id"] != version_id:
+                            raise ValueError("relation version path and body differ")
+                        if suffix == "/approve":
+                            self._require_schema(payload, set(expected) | {"confirm"})
+                            if payload.get("confirm") is not True:
+                                raise ValueError("confirm must be true")
+                            result = catalog.approve(version_id, expected, actor=actor, git_sha=git_sha)
+                        else:
+                            self._require_schema(payload, set(expected) | {"reason", "note", "confirm"})
+                            if payload.get("confirm") is not True:
+                                raise ValueError("confirm must be true")
+                            operation = catalog.reject if suffix == "/reject" else catalog.revoke
+                            result = operation(version_id, expected, reason=self._required_string(payload, "reason"), note=self._optional_string(payload, "note"), actor=actor, git_sha=git_sha)
+                    self._send_json(HTTPStatus.OK, result)
+                except RelationConflictError as exc:
+                    self._send_error(HTTPStatus.CONFLICT, exc)
+                except OverflowError as exc:
+                    self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": str(exc)})
+                except ValueError as exc:
+                    self._send_error(HTTPStatus.BAD_REQUEST, exc)
+                except (sqlite3.Error, OSError, RuntimeError) as exc:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+                return
             execution_mutation = path in {
                 "/api/prediction-arbitrage/preview",
                 "/api/prediction-arbitrage/executions",
@@ -534,6 +624,25 @@ def create_prediction_server(
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{key} is required")
             return value.strip()
+
+        @classmethod
+        def _optional_string(cls, payload: Mapping[str, object], key: str) -> str:
+            value = payload.get(key, "")
+            if not isinstance(value, str):
+                raise ValueError(f"{key} must be a string")
+            return value.strip()
+
+        @classmethod
+        def _relation_expected(cls, payload: Mapping[str, object]) -> dict[str, object]:
+            fields = {
+                "relation_version_id", "source_evidence_fingerprint",
+                "relation_semantics_fingerprint", "compiled_model_fingerprint",
+            }
+            result = {key: payload.get(key) for key in fields}
+            for key, value in result.items():
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"{key} is required")
+            return result
 
         @classmethod
         def _require_confirm(cls, payload: Mapping[str, object]) -> None:

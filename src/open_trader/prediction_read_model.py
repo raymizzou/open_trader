@@ -876,6 +876,7 @@ def prediction_state_payload(
     execution: object | None,
     csrf_token: str,
     cross_venue_monitor: PredictCrossVenueMonitor | None = None,
+    relation_catalog: object | None = None,
 ) -> dict[str, object]:
     if monitor is None and store is None and execution is None:
         return _prediction_unavailable_state(csrf_token)
@@ -1125,7 +1126,7 @@ def prediction_state_payload(
                 cross_auto = dict(status_value)
         except Exception:
             pass
-    return {
+    result = {
         "status": status,
         "health": health,
         "failure_reason": failure_reason,
@@ -1161,6 +1162,13 @@ def prediction_state_payload(
         },
         "csrf_token": csrf_token,
     }
+    pending_count = getattr(relation_catalog, "pending_count", None)
+    if callable(pending_count):
+        try:
+            result["relation_review"] = {"pending_count": int(pending_count())}
+        except Exception:
+            result["relation_review"] = {"pending_count": 0}
+    return result
 
 
 def prediction_history_payload(

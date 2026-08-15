@@ -63,6 +63,7 @@ const state = {
     signalHistoryGeneration: 0,
     csrfToken: "",
     activeExecutionId: "",
+    relationReview: {open: false, view: "pending", items: [], detail: null, loading: false},
   },
 };
 
@@ -2424,7 +2425,8 @@ function predictionPageHeader(payload) {
     ? ""
     : `<div class="pm-failure-reason">原因：${escapeHtml(predictionFailureReasonLabel(payload))}</div>`;
   const heartbeat = payload?.heartbeat_at || payload?.heartbeat;
-  return `<header class="pm-page-head"><div><h1>预测市场套利</h1><p>先看监控范围和实盘状态，再决定是否参与套利信号。</p></div><div class="pm-updated"><span class="pm-status-line"><i class="pm-status-dot ${tone === "danger" ? "danger" : ""}"></i>${health}</span><br>${predictionClock("Watcher 数据时间", heartbeat)} · Polymarket${failure}</div></header>`;
+  const pending = Number(state.predictionMarket.relationReview.pendingCount || 0);
+  return `<header class="pm-page-head"><div><h1>预测市场套利</h1><p>先看监控范围和实盘状态，再决定是否参与套利信号。</p></div><div class="pm-updated"><button class="pm-relation-badge" type="button" data-action="open-relation-review">关系审核 <strong>${Number.isFinite(pending) ? pending : 0}</strong></button><span class="pm-status-line"><i class="pm-status-dot ${tone === "danger" ? "danger" : ""}"></i>${health}</span><br>${predictionClock("Watcher 数据时间", heartbeat)} · Polymarket${failure}</div></header>`;
 }
 
 function predictionStrategyTabs(strategy) {
@@ -3281,7 +3283,7 @@ function renderPredictionMarket() {
   const workspace = strategy === "llm_hedge"
     ? predictionLlmHedgeWorkspace(viewPayload, expandedRelationKeys)
     : predictionYesNoWorkspace(viewPayload);
-  root.innerHTML = `${predictionPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionReadinessStrip(viewPayload, strategy)}${predictionSafeguardsHtml(viewPayload)}${predictionStrategyTabs(strategy)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload, strategy)}${workspace}`;
+  root.innerHTML = `${predictionPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionReadinessStrip(viewPayload, strategy)}${predictionSafeguardsHtml(viewPayload)}${predictionStrategyTabs(strategy)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload, strategy)}${workspace}${relationReviewDrawer()}`;
 }
 
 function startPredictionPolling() {
@@ -3334,6 +3336,7 @@ async function fetchPredictionState() {
       histories.signals = previousHistories.signals;
     }
     state.predictionMarket.payload = {...payload, histories};
+    state.predictionMarket.relationReview.pendingCount = Number(payload?.relation_review?.pending_count || 0);
     state.predictionMarket.error = "";
     state.predictionMarket.csrfToken = payload.csrf_token || state.predictionMarket.csrfToken;
     if (!["signals", "executions", "incidents"].includes(state.predictionMarket.historyKind)) {
@@ -3656,7 +3659,70 @@ function setPredictionModalBusy(busy) {
   });
 }
 
+function relationExpected(detail) {
+  return {relation_version_id: String(detail?.relation_version_id || ""), source_evidence_fingerprint: String(detail?.source_evidence_fingerprint || ""), relation_semantics_fingerprint: String(detail?.relation_semantics_fingerprint || ""), compiled_model_fingerprint: String(detail?.compiled_model_fingerprint || "")};
+}
+
+function relationCatalogItem(item) {
+  const markets = Array.isArray(item?.markets) ? item.markets : [];
+  const marketLines = markets.map((market) => `<div class="pm-relation-market"><strong>${escapeHtml(predictionValue(market?.title, "标题未返回"))}</strong><small>${escapeHtml(predictionValue(market?.venue, "交易所未返回"))} · 发现 ${escapeHtml(predictionHktTimestamp(item?.discovered_at))} · 市场日期 ${escapeHtml(predictionHktTimestamp(market?.market_date))} · 到期 ${escapeHtml(predictionHktTimestamp(market?.expires_at))}</small></div>`).join("");
+  const status = item?.activation_status === "ACTIVE" ? "已生效" : item?.activation_status === "INCOMPLETE" ? "模型不完整" : item?.activation_status === "UNSUPPORTED_SIZE" ? "激活受阻 · 超出组件预算" : "待审批";
+  return `<button type="button" class="pm-relation-row" data-relation-version-id="${escapeHtml(predictionValue(item?.relation_version_id, ""))}"><span class="pm-pill">${escapeHtml(status)}</span><div><strong>${escapeHtml(predictionValue(item?.semantics?.statement, "关系表述未返回"))}</strong>${marketLines}</div><small>来源 ${escapeHtml(predictionValue(item?.discovery_source, "-"))} · 版本 ${escapeHtml(predictionValue(item?.relation_version_id, "-"))}</small></button>`;
+}
+
+function relationReviewDrawer() {
+  const review = state.predictionMarket.relationReview;
+  if (!review.open) return "";
+  const tabs = [["pending", "待审批"], ["approved_active", "已批准/生效"], ["activation_blocked", "激活受阻"], ["history", "历史"]];
+  const detail = review.detail;
+  const list = review.loading ? `<p class="pm-relation-empty">正在加载关系目录…</p>` : review.items.length ? review.items.map(relationCatalogItem).join("") : `<p class="pm-relation-empty">此视图暂无关系。</p>`;
+  const markets = Array.isArray(detail?.markets) ? detail.markets : [];
+  const detailMarkets = markets.map((market) => `<article class="pm-relation-detail-market"><strong>${escapeHtml(predictionValue(market?.title, "标题未返回"))}</strong><dl><div><dt>交易所</dt><dd>${escapeHtml(predictionValue(market?.venue, "-"))}</dd></div><div><dt>Native ID</dt><dd>${escapeHtml(predictionValue(market?.contract_id, "-"))}</dd></div><div><dt>市场日期</dt><dd>${escapeHtml(predictionHktTimestamp(market?.market_date))}</dd></div><div><dt>到期日</dt><dd>${escapeHtml(predictionHktTimestamp(market?.expires_at))}</dd></div><div><dt>结算依据</dt><dd>${escapeHtml(predictionValue(market?.settlement_observation_key, "-"))}</dd></div></dl></article>`).join("");
+  const evidence = Array.isArray(detail?.evidence) ? detail.evidence.map((item) => `<li>${escapeHtml(JSON.stringify(item?.source_evidence || item))}</li>`).join("") : "";
+  const expected = detail ? relationExpected(detail) : null;
+  const actions = detail?.approval_status === "PENDING" && expected ? `<div class="pm-relation-actions"><button class="pm-button" type="button" data-action="reject-relation" data-relation-version-id="${escapeHtml(expected.relation_version_id)}">拒绝</button><button class="pm-button primary" type="button" data-action="approve-relation" data-relation-version-id="${escapeHtml(expected.relation_version_id)}">确认并尝试激活</button></div>` : detail?.activation_status === "ACTIVE" && expected ? `<div class="pm-relation-actions"><button class="pm-button danger" type="button" data-action="revoke-relation" data-relation-version-id="${escapeHtml(expected.relation_version_id)}">撤销当前关系</button></div>` : "";
+  const decision = detail ? `<label class="pm-relation-reason">决定原因<select data-relation-reason><option value="source_evidence_insufficient">来源证据不足</option><option value="relation_semantics_wrong">关系语义错误</option><option value="model_incomplete_or_wrong">模型不完整或错误</option><option value="identity_mismatch">身份不匹配</option><option value="rules_changed">规则已变化</option><option value="other">其他</option></select><textarea data-relation-note maxlength="1000" placeholder="备注（可选）"></textarea></label>` : "";
+  const detailHtml = detail ? `<section class="pm-relation-detail"><button type="button" class="pm-relation-back" data-action="relation-back">返回列表</button><h2>${escapeHtml(predictionValue(detail?.semantics?.statement, "关系表述未返回"))}</h2><p>版本 ${escapeHtml(predictionValue(detail?.relation_version_id, "-"))} · 发现 ${escapeHtml(predictionHktTimestamp(detail?.discovered_at))} · 来源 ${escapeHtml(predictionValue(detail?.discovery_source, "-"))}</p>${detailMarkets}<section><h3>来源证据</h3><ul class="pm-relation-evidence">${evidence}</ul></section>${decision}${actions}</section>` : "";
+  return `<aside class="pm-relation-drawer" aria-label="关系审核" role="dialog" aria-modal="true"><header><div><h2>关系审核</h2><p>只审核系统发现的关系事实；不展示价格、利润或机会排序。</p></div><button type="button" class="pm-relation-close" data-action="close-relation-review" aria-label="关闭关系审核">关闭</button></header><nav class="pm-relation-tabs" aria-label="关系审核视图">${tabs.map(([key, label]) => `<button type="button" data-relation-view="${key}" aria-pressed="${review.view === key}">${label}</button>`).join("")}</nav><div class="pm-relation-drawer-body"><section class="pm-relation-list" ${detail ? "hidden" : ""}>${list}</section>${detailHtml}</div></aside>`;
+}
+
+async function loadRelationReview(view = state.predictionMarket.relationReview.view) {
+  const review = state.predictionMarket.relationReview;
+  review.loading = true; review.view = view; review.detail = null; renderPredictionMarket();
+  try {
+    const response = await fetch(predictionRequestUrl(`/api/prediction-arbitrage/relations?view=${encodeURIComponent(view)}`), {cache: "no-store", credentials: "same-origin"});
+    if (!response.ok) throw new Error(`关系目录 ${response.status}`);
+    const result = await response.json(); review.items = Array.isArray(result.items) ? result.items : []; review.pendingCount = Number(result.pending_count || 0);
+  } catch (error) { state.predictionMarket.error = error instanceof Error ? error.message : String(error); review.items = []; }
+  finally { review.loading = false; renderPredictionMarket(); }
+}
+
+async function loadRelationDetail(relationVersionId) {
+  try {
+    const response = await fetch(predictionRequestUrl(`/api/prediction-arbitrage/relations/${encodeURIComponent(relationVersionId)}`), {cache: "no-store", credentials: "same-origin"});
+    if (!response.ok) throw new Error(`关系详情 ${response.status}`);
+    state.predictionMarket.relationReview.detail = await response.json();
+  } catch (error) { state.predictionMarket.error = error instanceof Error ? error.message : String(error); }
+  renderPredictionMarket();
+}
+
+async function mutateRelation(action, relationVersionId) {
+  const expected = relationExpected(state.predictionMarket.relationReview.detail);
+  const body = action === "approve" ? {...expected, confirm: true} : {...expected, reason: document.querySelector("[data-relation-reason]")?.value || "other", note: document.querySelector("[data-relation-note]")?.value || "", confirm: true};
+  try { await predictionPost(`/api/prediction-arbitrage/relations/${encodeURIComponent(relationVersionId)}/${action}`, body); await loadRelationReview(state.predictionMarket.relationReview.view); }
+  catch (error) { state.predictionMarket.error = error instanceof Error ? error.message : String(error); renderPredictionMarket(); }
+}
+
 async function handlePredictionMarketClick(event) {
+  if (event.target.closest("[data-action='open-relation-review']")) { state.predictionMarket.relationReview.open = true; await loadRelationReview(); return; }
+  if (event.target.closest("[data-action='close-relation-review']")) { state.predictionMarket.relationReview.open = false; state.predictionMarket.relationReview.detail = null; renderPredictionMarket(); return; }
+  const relationView = event.target.closest("[data-relation-view]");
+  if (relationView) { await loadRelationReview(relationView.dataset.relationView || "pending"); return; }
+  if (event.target.closest("[data-action='relation-back']")) { state.predictionMarket.relationReview.detail = null; renderPredictionMarket(); return; }
+  const relationAction = event.target.closest("[data-action='approve-relation'], [data-action='reject-relation'], [data-action='revoke-relation']");
+  if (relationAction) { await mutateRelation(relationAction.dataset.action.replace("-relation", ""), relationAction.dataset.relationVersionId || ""); return; }
+  const relationRow = event.target.closest("[data-relation-version-id]");
+  if (relationRow) { await loadRelationDetail(relationRow.dataset.relationVersionId || ""); return; }
   const strategy = event.target.closest("[data-prediction-strategy]");
   if (strategy) {
     state.predictionMarket.strategy = strategy.dataset.predictionStrategy === "llm_hedge"

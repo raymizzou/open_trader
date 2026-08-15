@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+import json
+import threading
+from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+from open_trader.prediction_service import create_prediction_server
+from open_trader.relation_catalog import RelationCatalog
+from tests.test_relation_catalog import discovery
+
+
+class _Runtime:
+    state = "RUNNING"
+    mode = "production"
+    production_owner = True
+    store = None
+    monitor = None
+    execution = None
+    cross_venue_monitor = None
+
+    def __init__(self, catalog: RelationCatalog) -> None:
+        self.relation_catalog = catalog
+
+
+@contextmanager
+def running(catalog: RelationCatalog):
+    server = create_prediction_server(
+        runtime=_Runtime(catalog),  # type: ignore[arg-type]
+        port=0,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def response(request: str | Request) -> tuple[int, dict[str, object]]:
+    try:
+        with urlopen(request, timeout=5) as result:
+            return result.status, json.loads(result.read().decode())
+    except HTTPError as error:
+        return error.code, json.loads(error.read().decode())
+
+
+def mutation(base: str, path: str, payload: dict[str, object]) -> Request:
+    return Request(base + path, data=json.dumps(payload).encode(), method="POST", headers={
+        "Content-Type": "application/json", "Cookie": "ot_prediction_session=session-token",
+        "Origin": base, "X-CSRF-Token": "csrf-token",
+    })
+
+
+def test_production_relation_catalog_http_reads_and_approves_the_opened_version(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    version_id = catalog.ingest(discovery())["relation_version_id"]
+    with running(catalog) as base:
+        status, queue = response(base + "/api/prediction-arbitrage/relations?view=pending")
+        assert status == 200
+        assert queue["pending_count"] == 1
+        status, detail = response(base + f"/api/prediction-arbitrage/relations/{version_id}")
+        assert status == 200
+        expected = {key: detail[key] for key in (
+            "relation_version_id", "source_evidence_fingerprint", "relation_semantics_fingerprint", "compiled_model_fingerprint",
+        )}
+        status, approved = response(mutation(base, f"/api/prediction-arbitrage/relations/{version_id}/approve", {**expected, "confirm": True}))
+
+    assert status == 200
+    assert approved["activation_status"] == "ACTIVE"
+
+
+def test_relation_catalog_mutation_rejects_extra_fields_before_approval(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    version_id = catalog.ingest(discovery())["relation_version_id"]
+    detail = catalog.detail(version_id)
+    expected = {key: detail[key] for key in (
+        "relation_version_id", "source_evidence_fingerprint", "relation_semantics_fingerprint", "compiled_model_fingerprint",
+    )}
+    with running(catalog) as base:
+        status, denied = response(mutation(base, f"/api/prediction-arbitrage/relations/{version_id}/approve", {**expected, "confirm": True, "ignored": True}))
+        assert status == 400
+        assert "fields are invalid" in denied["message"]
+        status, forbidden = response(mutation(base, f"/api/prediction-arbitrage/relations/{version_id}/approve", {**expected, "confirm": True}))
+
+    assert status == 200
+    assert forbidden["activation_status"] == "ACTIVE"

@@ -316,6 +316,7 @@ class PolymarketMonitor:
         relation_discovery: Callable[[Sequence[object]], object] | object | None = None,
         relation_validator: object | None = None,
         title_translator: object | None = None,
+        relation_catalog: object | None = None,
     ) -> None:
         self._store = store
         self._trading = trading
@@ -325,6 +326,7 @@ class PolymarketMonitor:
         self._relation_discovery = relation_discovery
         self._relation_validator = relation_validator
         self._title_translator = title_translator
+        self._relation_catalog = relation_catalog
         self._ready_observer: Callable[[str, str], Mapping[str, object]] | None = None
         self._auto_eat_observer: Callable[[str, str], object] | None = None
         self._auto_eat_task: asyncio.Task[object] | None = None
@@ -1725,6 +1727,10 @@ class PolymarketMonitor:
                 payload,
                 full_scanned_at=completed.isoformat(),
             )
+            ingest = getattr(self._relation_catalog, "ingest_threshold_relation", None)
+            if callable(ingest):
+                for relation in relations:
+                    ingest(relation)
             self._set_relation_state(relations, events, scanned_at=completed)
             self._invalidate_rule_cache()
             # A completed catalog scan is a fresh episode boundary.  Even an
