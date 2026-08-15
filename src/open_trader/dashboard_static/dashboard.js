@@ -2692,8 +2692,9 @@ function predictionNLegShadowHtml(value) {
   const comparison = String(latest.comparison || "").toUpperCase();
   const failure = comparison === "FAILURE";
   const different = comparison === "DIFFERENCE";
-  const tone = failure ? "danger" : different ? "warning" : "pm-tone-ok";
-  const label = failure ? "N_LEG 运行失败" : different ? "N_LEG 与旧系统有差异" : "N_LEG 与旧系统一致";
+  const notEvaluated = comparison === "NOT_EVALUATED";
+  const tone = failure ? "danger" : different ? "warning" : notEvaluated ? "" : "pm-tone-ok";
+  const label = failure ? "N_LEG 运行失败" : different ? "N_LEG 与旧系统有差异" : notEvaluated ? "N_LEG 未评估（缺少结算证据）" : "N_LEG 与旧系统一致";
   const differences = shadow.current_differences && typeof shadow.current_differences === "object"
     ? Object.entries(shadow.current_differences)
     : [];

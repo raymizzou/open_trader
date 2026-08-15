@@ -11,6 +11,7 @@ import pytest
 
 from open_trader.prediction_n_leg import (
     ActionQuantity,
+    ActionSide,
     PortfolioCandidate,
     canonical_payload,
     fingerprint,
@@ -130,7 +131,7 @@ def test_legacy_adapter_missing_settlement_evidence_returns_diagnostic() -> None
 
     assert result["run_status"] == "SUCCESS"
     assert result["decision"] == "UNKNOWN"
-    assert result["comparison"] == "DIFFERENCE"
+    assert result["comparison"] == "NOT_EVALUATED"
     assert result["differences"]["capital_release_at"]["reason"] == "缺少结算证据"
 
 
@@ -246,8 +247,55 @@ def test_shadow_client_missing_settlement_evidence_is_a_diagnostic_not_failure()
 
     assert result["run_status"] == "SUCCESS"
     assert result["decision"] == "UNKNOWN"
-    assert result["comparison"] == "DIFFERENCE"
+    assert result["comparison"] == "NOT_EVALUATED"
     assert result["differences"]["capital_release_at"]["reason"] == "缺少结算证据"
+
+
+def test_legacy_cross_venue_shadow_conversion_maps_sides_costs_and_gas() -> None:
+    source = {
+        "opportunity_id": "pair-1",
+        "market_id": "market-1",
+        "market_type": "cross_venue_yes_no",
+        "quantity": "10",
+        "total_max_cost": "8.90",
+        "minimum_profit": "1.10",
+        "confirmed_at": "2026-08-15T00:00:00Z",
+        "resolution_at": "2026-08-16T00:00:00Z",
+        "calculable_gas": "0.02",
+        "signal_id": "episode-1",
+        "legs": [
+            {
+                "exchange": "polymarket",
+                "market_id": "m-yes",
+                "condition_id": "c-yes",
+                "outcome": "YES",
+                "token_id": "t-yes",
+                "net_quantity": "10",
+                "max_cost": "4.20",
+                "settlement_at": "2026-08-16T00:00:00Z",
+            },
+            {
+                "exchange": "predict.fun",
+                "market_id": "m-no",
+                "condition_id": "c-no",
+                "outcome": "NO",
+                "token_id": "t-no",
+                "net_quantity": "10",
+                "max_cost": "4.70",
+                "settlement_at": "2026-08-16T00:00:00Z",
+            },
+        ],
+    }
+
+    snapshot = legacy_shadow_snapshot(source, "episode-1")
+    request = legacy_shadow_request(snapshot)
+
+    assert snapshot["market_type"] == "cross_venue_yes_no"
+    assert tuple(leg["outcome"] for leg in snapshot["legs"]) == ("YES", "NO")
+    assert request.backend == "cp_sat"
+    actions = request.request.problem.actions
+    assert tuple(action.side for action in actions) == (ActionSide.BUY_YES, ActionSide.BUY_NO)
+    assert tuple(action.max_quantity_lots for action in actions) == (10, 10)
 
 
 def test_shadow_summary_replaces_queued_snapshot_and_keeps_normal_unknown_nonfatal(
@@ -415,6 +463,9 @@ def test_shadow_client_compares_verified_economics_in_exact_units() -> None:
         "rejection_reasons",
     ):
         assert dimension in result["differences"], dimension
+    assert result["differences"]["direction"]["status"] == "consistent"
+    assert result["differences"]["worst_case"]["legacy"] == "旧路径未提供"
+    assert result["differences"]["worst_case"]["status"] == "na"
 
 
 def test_scheduler_close_discards_late_worker_completion(tmp_path) -> None:

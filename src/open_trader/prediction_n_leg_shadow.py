@@ -206,7 +206,7 @@ def _missing_settlement_diagnostic(
     return {
         "run_status": "SUCCESS",
         "decision": "UNKNOWN",
-        "comparison": "DIFFERENCE",
+        "comparison": "NOT_EVALUATED",
         "fingerprint": str(fingerprint) if fingerprint else "",
         "result": {"order_ready": False},
         "differences": {
@@ -443,13 +443,13 @@ def _comparison(snapshot: Mapping[str, object], fingerprint: str, verification: 
         "status": (
             "consistent"
             if len(actual_direction) == len(expected_sides)
-            and all(actual.endswith(expected) for actual, expected in zip(actual_direction, expected_sides, strict=True))
+            and all(actual == expected for actual, expected in zip(actual_direction, expected_sides, strict=True))
             else "difference"
         ),
     }
     worst = _scenario_label(getattr(proof, "worst_scenario", None))
     differences["worst_case"] = (
-        {"legacy": worst, "n_leg": worst, "status": "consistent"}
+        {"legacy": "旧路径未提供", "n_leg": worst, "status": "na"}
         if worst is not None
         else {"status": "na", "reason": "缺少最坏状态证据"}
     )
@@ -481,7 +481,7 @@ def _comparison(snapshot: Mapping[str, object], fingerprint: str, verification: 
         "CONSISTENT"
         if all(
             not isinstance(value, Mapping)
-            or value.get("status") == "consistent"
+            or value.get("status") in ("consistent", "na")
             for value in differences.values()
         )
         else "DIFFERENCE"
@@ -505,13 +505,10 @@ def _comparison(snapshot: Mapping[str, object], fingerprint: str, verification: 
 def _legacy_direction(snapshot: Mapping[str, object]) -> tuple[str, ...]:
     if snapshot.get("market_type") == "cross_venue_yes_no":
         legs = snapshot.get("legs")
-        if not isinstance(legs, (tuple, list)):
+        if not isinstance(legs, (tuple, list)) or len(legs) != 2:
             return ()
-        return tuple(
-            "legacy-1" if leg.get("outcome") == "YES" else "legacy-2"
-            for leg in legs
-            if isinstance(leg, Mapping)
-        )
+        # Canonical shadow action ids are assigned by leg order, not outcome.
+        return ("legacy-1", "legacy-2")
     return ("legacy-1", "legacy-2")
 
 

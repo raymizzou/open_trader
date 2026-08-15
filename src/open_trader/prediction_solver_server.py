@@ -116,6 +116,8 @@ class SolverServerOwner:
                         self._fail_closed(WorkerCleanupError("worker cleanup was not proven"))
                     if not result.done():
                         result.set_result(outcome)
+                    if not outcome.cleanup_proven:
+                        return
                 except BaseException as exc:
                     if not result.done():
                         result.set_exception(exc)
@@ -146,7 +148,7 @@ class SolverServerOwner:
             if not result.done():
                 result.set_exception(SolverServerUnavailable("solver server is closing"))
             self._capacity.release()
-        for _ in range(sentinels):
+        for _ in range(max(_WORKER_COUNT, sentinels)):
             self._queue.put(None)
 
     def _fail_closed(self, error: BaseException) -> None:

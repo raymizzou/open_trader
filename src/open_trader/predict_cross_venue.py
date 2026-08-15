@@ -2172,7 +2172,11 @@ class PredictCrossVenueMonitor:
                     dict(opportunity),
                 )
             )
-        elif legacy_qualified and self._shadow_observer is not None:
+        elif (
+            legacy_qualified
+            and self._shadow_observer is not None
+            and notification_identity is not None
+        ):
             asyncio.create_task(
                 asyncio.to_thread(self._notify_shadow, signal_id, dict(opportunity))
             )

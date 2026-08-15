@@ -14197,14 +14197,17 @@ def test_prediction_shadow_renderer_is_compact_safe_and_opens_only_for_attention
 const green = predictionNLegShadowHtml({n_leg_shadow:{latest_result:{comparison:"CONSISTENT",decision:"QUALIFIED_VERIFIED",result:{minimum_profit:"1.10"}},current_differences:{}}});
 const amber = predictionNLegShadowHtml({n_leg_shadow:{latest_result:{comparison:"DIFFERENCE",decision:"NOT_QUALIFIED"},current_differences:{minimum_profit:{legacy:"1.20",n_leg:"1.10",absolute:"0.10"}}}});
 const red = predictionNLegShadowHtml({n_leg_shadow:{latest_result:{comparison:"FAILURE",reason:"<script>bad</script>"},current_differences:{}}});
+const neutral = predictionNLegShadowHtml({n_leg_shadow:{latest_result:{comparison:"NOT_EVALUATED",decision:"UNKNOWN"},current_differences:{capital_release_at:{reason:"缺少结算证据"}}}});
 const overview = predictionNLegOverview({n_leg_shadow:{monitoring:2,legacy_qualified:2,completed:3,differences:1,failures:1,last_completed_at:"2026-08-15T00:01:00Z"}});
-console.log(JSON.stringify({green, amber, red, overview}));
+console.log(JSON.stringify({green, amber, red, neutral, overview}));
 ''')
     rendered = json.loads(output)
 
     assert '<details class="pm-n-leg-shadow pm-tone-ok">' in rendered["green"]
     assert '<details class="pm-n-leg-shadow warning" open>' in rendered["amber"]
     assert '<details class="pm-n-leg-shadow danger" open>' in rendered["red"]
+    assert "N_LEG 未评估" in rendered["neutral"]
+    assert "有差异" not in rendered["neutral"]
     assert "&lt;script&gt;bad&lt;/script&gt;" in rendered["red"]
     assert "<script>bad</script>" not in rendered["red"]
     for label in ("监控", "旧系统合格", "N_LEG 完成", "差异", "失败", "最近完成"):

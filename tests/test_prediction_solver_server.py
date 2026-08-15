@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import time
 from threading import Event, Lock
 
 import pytest
@@ -35,6 +36,7 @@ class _Harness:
     release = Event()
     block = False
     fail_close = False
+    unproven = False
 
     def __init__(self, _command: object) -> None:
         self.start_count = 0
@@ -51,7 +53,10 @@ class _Harness:
                 if len(type(self).running) == 2:
                     type(self).started.set()
             assert type(self).release.wait(2)
-        return WorkerOutcome(request.request_id, "OK", "COMPLETED", None, None, 0, False, True)
+        return WorkerOutcome(
+            request.request_id, "OK", "COMPLETED", None, None, 0, False,
+            not type(self).unproven,
+        )
 
     def close(self) -> None:
         self.closed = True
@@ -67,6 +72,7 @@ def _reset_harness() -> None:
     _Harness.release = Event()
     _Harness.block = False
     _Harness.fail_close = False
+    _Harness.unproven = False
 
 
 def test_two_slot_server_reuses_a_worker_and_closes_cleanly() -> None:
@@ -118,3 +124,17 @@ def test_cleanup_failure_closes_the_server_fail_closed() -> None:
         server.close()
     with pytest.raises(SolverServerUnavailable):
         server.submit(_request("two"))
+
+
+def test_cleanup_unproven_fail_closed_terminates_both_worker_threads() -> None:
+    _Harness.unproven = True
+    server = SolverServerOwner(("solver",), harness_factory=_Harness)
+    outcome = server.submit(_request("one")).result(timeout=2)
+    assert outcome.cleanup_proven is False
+    with pytest.raises(SolverServerUnavailable):
+        server.submit(_request("two"))
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and any(thread.is_alive() for thread in server._threads):
+        time.sleep(0.01)
+    assert all(not thread.is_alive() for thread in server._threads)
+    assert all(harness.closed for harness in _Harness.instances)
