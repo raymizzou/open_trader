@@ -3258,6 +3258,7 @@ def test_threshold_discovery_full_scan_and_only_calls_codex_for_positive_relatio
     assert row["actionable"] is True
     assert row["llm_status"] == "approved"
     assert row["annualized_yield"] is not None
+    assert row["minimum_profit"] == row["estimated_profit"]
     assert row["resolution_at"] == "2026-12-31T17:00:00Z"
     assert row["remaining_days"] == Decimal(
         "157.2083333333333333333333333"

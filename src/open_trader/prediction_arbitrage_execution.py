@@ -58,6 +58,26 @@ from .validation_eat_policy import should_eat as _validation_should_eat
 
 
 PREVIEW_TTL = timedelta(seconds=10)
+
+_THRESHOLD_ERROR_HINTS = {
+    "auth": "签名或钱包身份校验未通过",
+    "geoblock_blocked": "当前网络被地区限制拦截",
+    "preflight_required": "提交前预检未通过",
+    "preflight_failed": "提交前预检未通过",
+    "rejected": "订单被交易场所拒绝",
+    "opportunity_unavailable": "机会已失效或不可用",
+    "rule_hash_changed": "规则指纹已变化，机会不再一致",
+    "cache_fingerprint_changed": "市场快照指纹已变化",
+    "threshold_preflight_unavailable": "预检通道不可用",
+    "threshold_submission_unavailable": "提交通道不可用",
+}
+
+
+def _threshold_error_hint(code: str) -> str:
+    hint = _THRESHOLD_ERROR_HINTS.get(str(code).strip())
+    return hint if hint is not None else "详见执行日志"
+
+
 BOOK_FRESHNESS_SECONDS = Decimal("10")
 MAX_RECONCILIATION_SECONDS = 30
 TERMINAL_STATES = {
@@ -716,7 +736,6 @@ class PredictionExecutionService:
                 decision="submitted", preview_id=preview_id,
                 execution_id=execution_id, total_cost=intent.total_max_cost,
             )
-            self._notify_auto_eat_success(opportunity, intent, preview_result)
             return confirm_result
         reason = str(confirm_result.get("reason") or "confirm_failed")
         self._store.record_auto_eat_attempt(
@@ -725,19 +744,61 @@ class PredictionExecutionService:
         )
         return confirm_result
 
-    def _notify_auto_eat_success(
-        self,
-        opportunity: Mapping[str, object],
-        intent: ThresholdHedgeIntent,
-        preview_result: Mapping[str, object],
+    def _notify_threshold_submitted(
+        self, leg: ThresholdHedgeLeg, result: ThresholdLegResult
     ) -> None:
         try:
-            title = "预测套利验证单已吃"
+            title = "预测套利单已提交"
             message = (
-                f"{opportunity.get('question') or opportunity.get('question_a') or ''}\n"
-                f"数量 {intent.quantity} · 成本 ${intent.total_max_cost:.4f} · "
-                f"预计利润 ${intent.minimum_profit:.4f}"
+                f"{leg.label}｜{leg.outcome}\n"
+                f"限价：${leg.max_price:.4f}\n"
+                f"数量：{format(leg.quantity, 'f')}\n"
+                f"订单号：{result.order_id}"
             )
+            self._deliver_feishu_notification(title, message)
+        except Exception:
+            return
+
+    def _notify_threshold_filled(
+        self, leg: ThresholdHedgeLeg, order_id: str, quantity: Decimal
+    ) -> None:
+        try:
+            title = "预测套利单已吃"
+            message = (
+                f"{leg.label}｜{leg.outcome}\n"
+                f"成交数量：{format(quantity, 'f')}\n"
+                f"订单号：{order_id}"
+            )
+            self._deliver_feishu_notification(title, message)
+        except Exception:
+            return
+
+    def _notify_threshold_rejected(
+        self, leg: ThresholdHedgeLeg, result: ThresholdLegResult
+    ) -> None:
+        try:
+            title = "预测套利单提交失败"
+            message = (
+                f"{leg.label}｜{leg.outcome}\n"
+                f"失败原因：{result.error_code}\n"
+                f"{_threshold_error_hint(result.error_code)}"
+            )
+            self._deliver_feishu_notification(title, message)
+        except Exception:
+            return
+
+    def _notify_threshold_order_failed(
+        self, execution_id: str, reason: str
+    ) -> None:
+        payload = self._store.execution_payload(execution_id)
+        if not isinstance(payload, Mapping) or not isinstance(
+            self._intent_from_payload(payload.get("intent")),
+            ThresholdHedgeIntent,
+        ):
+            return
+        try:
+            title = "预测套利单提交失败"
+            message = f"原因：{reason}\n{_threshold_error_hint(reason)}"
             self._deliver_feishu_notification(title, message)
         except Exception:
             return
@@ -749,15 +810,12 @@ class PredictionExecutionService:
         quantity: Decimal,
         proof: Mapping[str, object],
     ) -> None:
-        payload = self._store.execution_payload(execution_id)
-        if not isinstance(payload, Mapping) or payload.get("auto_eat") is not True:
-            return
         expected = intent.minimum_profit
         actual = quantity - (
             intent.total_max_cost / intent.quantity * quantity
         )
         try:
-            title = "预测套利验证单结算"
+            title = "预测套利单结算"
             message = (
                 f"关系 {intent.relation_id}\n"
                 f"成交数量 {quantity}\n"
@@ -3664,6 +3722,11 @@ class PredictionExecutionService:
         leg_a, leg_b = self._threshold_submission_legs(submission, intent)
         self._store.record_leg(execution_id, self._threshold_leg_payload(leg_a))
         self._store.record_leg(execution_id, self._threshold_leg_payload(leg_b))
+        for leg, result in ((intent.leg_a, leg_a), (intent.leg_b, leg_b)):
+            if result.accepted:
+                self._notify_threshold_submitted(leg, result)
+            elif not self._threshold_ambiguous(result):
+                self._notify_threshold_rejected(leg, result)
         self._transition(
             execution_id,
             "reconciling",
@@ -3683,6 +3746,10 @@ class PredictionExecutionService:
             self._finish_incident(execution_id, "reconciliation_timeout")
             return
         quantity_a, quantity_b, proof = known
+        if quantity_a > 0:
+            self._notify_threshold_filled(intent.leg_a, leg_a.order_id, quantity_a)
+        if quantity_b > 0:
+            self._notify_threshold_filled(intent.leg_b, leg_b.order_id, quantity_b)
         if quantity_a > 0 and quantity_b <= 0:
             self._handle_threshold_one_leg(
                 execution_id, intent, "A", quantity_a, leg_a, leg_b, proof, submitted_at, account
@@ -5860,6 +5927,7 @@ class PredictionExecutionService:
         return isinstance(proof, Mapping) and proof.get("verified") is True
 
     def _finish_rejected(self, execution_id: str, reason: str) -> None:
+        self._notify_threshold_order_failed(execution_id, reason)
         self._transition(execution_id, "both_rejected", {"phase": "validation_rejected", "reason": reason})
 
     def _finish_cross_rejected(

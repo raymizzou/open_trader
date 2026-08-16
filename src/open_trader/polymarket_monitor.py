@@ -3170,6 +3170,7 @@ class PolymarketMonitor:
             "remaining_days": remaining_days,
             "profit": candidate.minimum_profit,
             "estimated_profit": candidate.minimum_profit,
+            "minimum_profit": candidate.minimum_profit,
             "net_edge": candidate.net_edge,
             "quantity": candidate.quantity,
             "maximum_fee": candidate.maximum_fee,
