@@ -18,6 +18,7 @@ from open_trader.prediction_n_leg import (
 )
 from open_trader.prediction_n_leg_oracle import (
     cut_from_scenario,
+    enumerate_allowed_scenarios,
     evaluate_fixed_portfolio,
 )
 
@@ -259,6 +260,93 @@ def test_cross_venue_snapshot_freezes_per_leg_identity_and_outcome_mapping() -> 
     assert rotated["fingerprint"] != snapshot["fingerprint"]
 
 
+def test_cross_venue_shadow_uses_per_venue_identity_and_common_usd_valuation() -> None:
+    snapshot = legacy_shadow_snapshot(_cross_venue_source(), "episode-1")
+    request = legacy_shadow_request(snapshot)
+
+    assert request.backend == "cp_sat"
+    actions = request.request.problem.actions
+    assert tuple(action.venue_id for action in actions) == ("polymarket", "predict.fun")
+    assert tuple(action.account_id for action in actions) == ("poly-wallet", "predict-wallet")
+    assert tuple(action.chain_id for action in actions) == ("137", "8453")
+    assert tuple(action.market_contract_id for action in actions) == ("c-yes", "c-no")
+    assert tuple(action.settlement_asset_id for action in actions) == ("USD", "USD")
+    assert tuple(action.valuation_unit_id for action in actions) == ("USD", "USD")
+    assert tuple(action.asset_valuation_rule_id for action in actions) == ("usd-1:1-v1", "usd-1:1-v1")
+    observations = tuple(action.settlement_observation_key for action in actions)
+    assert tuple(observation.oracle_id for observation in observations) == ("poly-source", "predict-source")
+    assert tuple(observation.indicator_id for observation in observations) == ("c-yes", "c-no")
+    assert tuple(observation.rule_version for observation in observations) == ("poly-fp", "predict-fp")
+    assert tuple(
+        state.market_contract_id for state in request.request.problem.terminal_state_sets
+    ) == ("c-yes", "c-no")
+
+
+def test_cross_venue_missing_identity_evidence_is_not_evaluated() -> None:
+    source = _cross_venue_source()
+    del source["legs"][0]["account_id"]
+    snapshot = legacy_shadow_snapshot(source, "episode-1")
+    result = legacy_shadow_request(snapshot)
+
+    assert result["run_status"] == "SUCCESS"
+    assert result["decision"] == "UNKNOWN"
+    assert result["comparison"] == "NOT_EVALUATED"
+
+
+def test_cross_venue_missing_capital_release_is_not_evaluated() -> None:
+    source = _cross_venue_source()
+    del source["legs"][0]["capital_release_at"]
+    snapshot = legacy_shadow_snapshot(source, "episode-1")
+    result = legacy_shadow_request(snapshot)
+
+    assert result["comparison"] == "NOT_EVALUATED"
+
+
+def test_cross_venue_non_identity_outcome_mapping_is_not_evaluated() -> None:
+    source = _cross_venue_source()
+    source["codex_approval"] = {
+        "direct_outcome_mapping": {
+            "predict_yes": "NO",
+            "predict_no": "YES",
+            "polymarket_yes": "YES",
+            "polymarket_no": "NO",
+        }
+    }
+    snapshot = legacy_shadow_snapshot(source, "episode-1")
+    result = legacy_shadow_request(snapshot)
+
+    assert result["comparison"] == "NOT_EVALUATED"
+
+
+def test_cross_venue_normal_problem_guarantees_complement_payout() -> None:
+    snapshot = legacy_shadow_snapshot(_cross_venue_source(), "episode-1")
+    request = legacy_shadow_request(snapshot)
+    problem = request.request.problem
+    quantities = tuple(
+        ActionQuantity(action.action_id, action.max_quantity_lots)
+        for action in problem.actions
+    )
+
+    evaluation = evaluate_fixed_portfolio(problem, quantities, request.request.budget)
+    assert evaluation.payout_lower_bound_units == 10 * 100_000_000
+    scenarios = enumerate_allowed_scenarios(problem, request.request.budget).scenarios
+    assert scenarios is not None
+    atoms_by_contract = {
+        state.market_contract_id: {atom.atom_id: atom.kind for atom in state.atoms}
+        for state in problem.terminal_state_sets
+    }
+    scenario_kinds = []
+    for scenario in scenarios:
+        scenario_kinds.append(tuple(
+            atoms_by_contract[selected.market_contract_id][selected.atom_id]
+            for selected in scenario.atoms
+        ))
+    assert sorted(scenario_kinds) == [
+        ("NORMAL_NO", "NORMAL_NO"),
+        ("NORMAL_YES", "NORMAL_YES"),
+    ]
+
+
 def test_shadow_scheduler_dedupes_identical_economics_with_different_timestamps(
     tmp_path,
 ) -> None:
@@ -336,6 +424,10 @@ def test_legacy_cross_venue_shadow_conversion_maps_sides_costs_and_gas() -> None
     actions = request.request.problem.actions
     assert tuple(action.side for action in actions) == (ActionSide.BUY_YES, ActionSide.BUY_NO)
     assert tuple(action.max_quantity_lots for action in actions) == (10, 10)
+    poly = next(action for action in actions if action.venue_id == "polymarket")
+    predict = next(action for action in actions if action.venue_id == "predict.fun")
+    assert poly.cost_slices[-1].incremental_cost_upper_bound_units == 42_200_000
+    assert predict.cost_slices[-1].incremental_cost_upper_bound_units == 47_000_000
 
 
 def test_shadow_summary_replaces_queued_snapshot_and_keeps_normal_unknown_nonfatal(
