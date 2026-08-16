@@ -338,7 +338,7 @@ class RelationCatalog:
             end_date = _string(getattr(value, "end_date"), "threshold end_date")
             return {
                 "venue": "Polymarket", "contract_id": _string(getattr(value, "condition_id"), "condition_id"),
-                "title": _string(getattr(value, "question"), "question"), "market_date": discovered_at,
+                "title": _string(getattr(value, "question"), "question"), "market_date": end_date,
                 "expires_at": end_date, "event_identity_basis": _string(getattr(value, "event_id"), "event_id"),
                 "settlement_observation_key": _string(getattr(value, "resolution_source") or getattr(value, "condition_id"), "resolution_source"),
                 "settlement_rules": _string(getattr(value, "rules"), "rules"), "cancellation_rules": "not supplied by threshold discovery",

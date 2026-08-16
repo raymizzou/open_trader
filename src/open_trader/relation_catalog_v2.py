@@ -64,10 +64,7 @@ def _canonicalize(payload: object) -> tuple[str, dict]:
     version_fields = {
         key: value for key, value in payload.items() if key not in _EXCLUDED_FIELDS
     }
-    version_fields["endpoints"] = [
-        {key: value for key, value in endpoint.items() if key != "market_date"}
-        for endpoint in (by_sig[sig] for sig in ordered)
-    ]
+    version_fields["endpoints"] = [by_sig[sig] for sig in ordered]
     return identity, version_fields
 
 
