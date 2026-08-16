@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from .predict_cross_venue import PredictCrossVenueMonitor
 from .prediction_arbitrage import (
@@ -15,6 +15,8 @@ from .prediction_arbitrage import (
     MIN_THRESHOLD_ANNUALIZED_YIELD,
 )
 from .prediction_arbitrage_store import PredictionArbitrageStore
+from .prediction_n_leg_mode import n_leg_order_readiness
+from .prediction_n_leg_read_model import project_n_leg_solution
 from .prediction_title_translation import cached_prediction_title_zh
 
 
@@ -810,6 +812,69 @@ def _prediction_capital_usage(
     }
 
 
+def _prediction_n_leg_solution_projection(
+    solutions: Sequence[Mapping[str, object]],
+    *,
+    n_leg: Mapping[str, object] | None,
+    total_unsettled_capital_units: object,
+) -> list[dict[str, object]]:
+    """Project serialized #84 solutions into dashboard n_leg_solutions."""
+    if not solutions:
+        return []
+    n_leg = dict(n_leg) if isinstance(n_leg, Mapping) else {}
+    try:
+        readiness = n_leg_order_readiness(contract=n_leg)
+    except Exception:
+        readiness = {"scopes": {}}
+    scope_rows = readiness.get("scopes")
+    if not isinstance(scope_rows, Mapping):
+        scope_rows = {}
+    contract_scopes = n_leg.get("execution_scopes")
+    if not isinstance(contract_scopes, Mapping):
+        contract_scopes = {}
+    try:
+        max_units = int(
+            (n_leg.get("safety_config") or {}).get("max_total_unsettled_capital_units") or 0
+        )
+    except (TypeError, ValueError):
+        max_units = 0
+    try:
+        current = Decimal(str(total_unsettled_capital_units))
+    except Exception:
+        current = Decimal("0")
+    current_units = int((current * _NLEG_UNITS_PER_DOLLAR).to_integral_value()) if current.is_finite() else 0
+    projected: list[dict[str, object]] = []
+    for entry in solutions:
+        if not isinstance(entry, Mapping):
+            continue
+        scope_id = str(entry.get("scope_id") or "")
+        scope = dict(contract_scopes.get(scope_id)) if scope_id in contract_scopes else {}
+        scope_ready = scope_rows.get(scope_id)
+        if isinstance(scope_ready, Mapping):
+            scope.update(
+                {
+                    "order_ready": scope_ready.get("order_ready"),
+                    "reason": scope_ready.get("reason"),
+                    "action": scope_ready.get("action"),
+                }
+            )
+        try:
+            item = project_n_leg_solution(
+                market=entry.get("market"),
+                execution=entry.get("execution"),
+                scope=scope,
+                component_id=str(entry.get("component_id") or ""),
+                max_total_unsettled_capital_units=max_units,
+                total_unsettled_capital_units=current_units,
+                legs=entry.get("legs"),
+            )
+        except Exception:
+            item = None
+        if item is not None:
+            projected.append(item)
+    return projected
+
+
 def _prediction_nleg_labels(row: Mapping[str, object]) -> dict[str, object]:
     """Forward-project legacy current opportunities onto N_LEG taxonomy labels."""
 
@@ -1355,6 +1420,8 @@ def prediction_state_payload(
     csrf_token: str,
     cross_venue_monitor: PredictCrossVenueMonitor | None = None,
     relation_catalog: object | None = None,
+    n_leg_solutions: Sequence[Mapping[str, object]] = (),
+    n_leg_metrics: object = None,
 ) -> dict[str, object]:
     if monitor is None and store is None and execution is None:
         return _prediction_unavailable_state(csrf_token)
@@ -1669,6 +1736,22 @@ def prediction_state_payload(
             pass
     shadow_summary = _prediction_n_leg_shadow_summary(opportunity_rows)
     n_leg = _prediction_n_leg_contract(execution)
+    n_leg_projections = _prediction_n_leg_solution_projection(
+        n_leg_solutions,
+        n_leg=n_leg,
+        total_unsettled_capital_units=cross_unsettled_current,
+    )
+    if n_leg_projections:
+        by_component = {
+            str(item.get("component_id") or ""): item
+            for item in n_leg_projections
+            if item.get("component_id")
+        }
+        if by_component:
+            for row in opportunity_rows:
+                component_id = str(row.get("component_id") or "")
+                if component_id in by_component:
+                    row["n_leg_solution"] = by_component[component_id]
     capital_usage = _prediction_capital_usage(
         cross_unsettled=cross_unsettled,
         current_execution=current_execution,
@@ -1714,6 +1797,12 @@ def prediction_state_payload(
         },
         "csrf_token": csrf_token,
     }
+    if n_leg_projections:
+        result["n_leg_solutions"] = n_leg_projections
+    if isinstance(n_leg_metrics, Mapping):
+        safe_metrics = _prediction_safe_value(n_leg_metrics)
+        if isinstance(safe_metrics, Mapping):
+            result["n_leg_metrics"] = dict(safe_metrics)
     if shadow_summary["monitoring"]:
         result["n_leg_shadow"] = shadow_summary
     result["relation_review"] = _prediction_relation_review(relation_catalog)

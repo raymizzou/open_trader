@@ -3430,6 +3430,79 @@ console.log(JSON.stringify({html, filtered: predictionUnifiedOpportunityList(pay
     assert "当前无更多合格机会" in rendered["filtered"]
 
 
+def test_prediction_unified_page_renders_n_leg_execution_plan_and_metrics() -> None:
+    output = run_dashboard_js(r'''
+const payload = {
+  status: "healthy",
+  health: {status: "healthy", degraded_reasons: []},
+  readiness: {status: "ready", wallet_address: "0x1111111111111111111111111111111111111111", p_usd_balance: "60.40"},
+  breaker: {open: false},
+  validation_mode: "MANUAL",
+  heartbeat_at: "2026-08-16T18:05:00Z",
+  n_leg: {mode: "MANUAL", contract_generation: 1, enabled_execution_scope_version: [{scope_id: "s1", scope_version: 1}]},
+  n_leg_metrics: {
+    compile: {samples: 2, p50: 12, p95: 20, worst: 41},
+    solve: {samples: 2, p50: 380, p95: 610, worst: 910},
+    end_to_end: {samples: 2, p50: 430, p95: 690, worst: 1020},
+    opportunity_survival: {samples: 2, p50: 5.0, p95: 8.2, worst: 9.0},
+    queue_merge_drop: 12,
+    timeout: 0,
+    stale_reject: 3,
+  },
+  qualified_opportunities: [{
+    opportunity_id: "nleg-1",
+    title: "Bitcoin 在 8 月 31 日前高于 $120,000？",
+    market_type: "cross_venue_yes_no",
+    strategy_type: "yes_no",
+    relation_type: "NATIVE_COMPLEMENT",
+    discovery_source: "VENUE_METADATA",
+    leg_count: 2,
+    scope_label: "同所 · 同事件",
+    profit: "8.40",
+    annualized_yield: "0.284",
+    remaining_days: "12",
+    legs: [],
+    qualification: {status: "QUALIFIED_VERIFIED", order_ready: false, checks: []},
+    n_leg_solution: {
+      component_id: "nleg-1",
+      market: {minimum_profit: "8.40", maximum_cost: "31.20", capital_release_at: "2026-08-30T00:00:00Z", legs: []},
+      execution: {
+        would_submit: true,
+        order_ready: true,
+        reason: "MANUAL_CANARY",
+        execution_solution_fingerprint: "sha256:4c1234567890abcdef",
+        projected_total_units: 31200000,
+        total_unsettled_capital_units: 0,
+        max_total_unsettled_capital_units: 60000000,
+        legs: [
+          {action_id: "a-yes", venue: "polymarket", outcome: "YES", quantity_lots: 20, max_price: "0.42", max_cost: "16.80", settlement_asset: "pUSD"},
+          {action_id: "a-no", venue: "polymarket", outcome: "NO", quantity_lots: 20, max_price: "0.36", max_cost: "14.40", settlement_asset: "pUSD"},
+        ],
+      },
+    },
+  }],
+};
+const html = predictionUnifiedPage(payload, {kind: "all", legs: null, scope: null});
+console.log(JSON.stringify(html));
+''')
+    rendered = json.loads(output)
+
+    assert "下单计划 · would-submit" in rendered
+    assert "第 1 腿 · Polymarket · BUY YES" in rendered
+    assert "20 份 · 最高 $0.420" in rendered
+    assert "最大成本 $16.80" in rendered
+    assert "手动模式 · 可人工确认下单" in rendered
+    assert "方案指纹" in rendered
+    assert "sha256:4c…" in rendered
+    assert "$31.20 / $60.00" in rendered
+    assert "人工确认下单" in rendered
+    assert "编译 p50/p95/worst" in rendered
+    assert "12 / 20 / 41 ms" in rendered
+    assert "超时 / 陈旧拒绝" in rendered
+    assert "机会存活时间" in rendered
+    assert "p95 8.2s" in rendered
+
+
 def test_prediction_relation_review_renders_six_states_and_blocked_conflicts() -> None:
     output = run_dashboard_js(r'''
 const payload = {relation_review: {
