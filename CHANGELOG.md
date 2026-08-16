@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-16
 
+- 修复预测市场「观察提醒」在阈值套利市场（如 SPY）反复出现/消失时每 ~1 分钟重复发送飞书的问题：观察通知现在按 `market_id` 做 30 分钟成功送达冷却，同一市场 30 分钟内不再重复发送，发送失败仍按原逻辑重试，不影响 YES/NO 下单路径的既有 30 分钟冷却。聚焦 store/execution/monitor 回归通过（349 + 128）。
+
 - Relax timing-sensitive test timeouts for the Prediction Service HTTP concurrency limit and the VIPR certificate subprocess checks so they no longer fail deterministically on a slower local machine. This is a test-only change; no runtime, service, or Dashboard behavior changed.
 
 - #78 adds the v2 relation-catalog core module (`relation_catalog_v2.py`) as a standalone, not-yet-wired building block: venue-qualified relation identity, frozen approval fingerprints, a single cause ledger plus atomic generation snapshot, per-component consistency/budget, and a SQLite persistence seam. No runtime, service, Dashboard, monitor, or production behavior is changed; the existing v1 catalog remains the active catalog. Focused catalog and SQLite tests pass.
