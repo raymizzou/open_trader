@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 import json
 import threading
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from open_trader.prediction_n_leg import problem_from_payload, validate_problem
+from open_trader.prediction_n_leg_oracle import build_relation_components
 from open_trader.prediction_service import create_prediction_server
 from open_trader.relation_catalog import RelationCatalog
+from test_prediction_arbitrage import threshold_relation
 
 
 def discovery(*, title: str = "Will Bitcoin trade above $100,000 before December 31, 2026?", complete: bool = True) -> dict[str, object]:
@@ -133,3 +138,69 @@ def test_relation_catalog_review_rows_expose_every_version_without_views(tmp_pat
     assert by_id[active_id]["status"] == "APPROVED"
     assert by_id[active_id]["activation"] == "ACTIVE"
     assert by_id[pending_id]["model"]["terminal_states"] == []
+
+
+def test_threshold_relation_enrichment_ingests_one_complete_pending_version(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    result = catalog.ingest_threshold_relation(threshold_relation())
+    assert result["status"] == "PENDING"
+
+    rows = catalog.review_rows()
+    assert len(rows) == 1  # enrich success ingests COMPLETE only, no INCOMPLETE twin
+    row = rows[0]
+    assert row["model"]["terminal_states"] == ["NORMAL_YES", "NORMAL_NO", "VOID"]
+    assert row["model"]["payouts"] == {
+        "condition-a": {"NORMAL_YES": 1, "NORMAL_NO": 0, "VOID": 0},
+        "condition-b": {"NORMAL_YES": 0, "NORMAL_NO": 1, "VOID": 0},
+    }
+    problem = problem_from_payload(row["model"]["problem"])
+    assert validate_problem(problem) == ()
+    assert len(build_relation_components(problem)) == 1
+
+    assert catalog.current_generation() == {}  # no auto-approval/activation
+    approved = catalog.approve(
+        result["version_id"], {"version_id": result["version_id"]},
+        actor="operator", git_sha="sha",
+    )
+    assert approved["activation"] == "ACTIVE"
+    active = catalog.current_generation()
+    assert list(active) == [row["identity"]]
+    assert active[row["identity"]]["model"]["problem"] == row["model"]["problem"]
+
+
+def test_threshold_relation_without_resolution_source_stays_incomplete(tmp_path: Path) -> None:
+    base = threshold_relation()
+    relation = replace(base, market_a=replace(base.market_a, resolution_source=""))
+    catalog = RelationCatalog(tmp_path)
+    result = catalog.ingest_threshold_relation(relation)
+
+    row = catalog.review_rows()[0]
+    assert row["model"]["terminal_states"] == []
+    assert row["model"]["problem"] is None
+    approved = catalog.approve(
+        result["version_id"], {"version_id": result["version_id"]},
+        actor="operator", git_sha="sha",
+    )
+    assert approved["activation"] == "INCOMPLETE"
+
+
+def test_threshold_relation_capital_release_is_max_end_date(tmp_path: Path) -> None:
+    base = threshold_relation()
+    later = replace(base, market_b=replace(base.market_b, end_date="2027-03-01T00:00:00Z"))
+    catalog = RelationCatalog(tmp_path)
+    catalog.ingest_threshold_relation(later)
+
+    assert catalog.review_rows()[0]["model"]["capital_release"] == "2027-03-01T00:00:00.000000Z"
+
+
+def test_threshold_relation_fingerprint_is_stable_across_discovery_times(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    with patch(
+        "open_trader.relation_catalog._now",
+        side_effect=["2026-08-15T02:32:00Z", "2026-08-16T09:00:00Z"],
+    ):
+        first = catalog.ingest_threshold_relation(threshold_relation())
+        second = catalog.ingest_threshold_relation(threshold_relation())
+    assert first["version_id"] == second["version_id"]
+    assert second["occurrence_count"] == 2
+    assert [row["version_id"] for row in catalog.review_rows()] == [first["version_id"]]
