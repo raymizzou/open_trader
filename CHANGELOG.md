@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-16
 
+- Relax timing-sensitive test timeouts for the Prediction Service HTTP concurrency limit and the VIPR certificate subprocess checks so they no longer fail deterministically on a slower local machine. This is a test-only change; no runtime, service, or Dashboard behavior changed.
+
 - #78 adds the v2 relation-catalog core module (`relation_catalog_v2.py`) as a standalone, not-yet-wired building block: venue-qualified relation identity, frozen approval fingerprints, a single cause ledger plus atomic generation snapshot, per-component consistency/budget, and a SQLite persistence seam. No runtime, service, Dashboard, monitor, or production behavior is changed; the existing v1 catalog remains the active catalog. Focused catalog and SQLite tests pass.
 
 - Declare `ortools==9.15.6755` as a production dependency so the #54 Shadow CP-SAT solver is installed from `pyproject.toml`/`uv.lock` on future deploys instead of requiring a manual pip install; the lock now pins `protobuf==6.33.6` to satisfy or-tools.

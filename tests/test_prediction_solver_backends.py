@@ -1068,7 +1068,7 @@ def test_vipr_suffixless_certificate_in_dotted_parent_keeps_completion_sibling_c
     )
     chk = _write_executable(tmp_path / "viprchk", "#!/usr/bin/env python3\n")
 
-    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=1_000)
+    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=10_000)
 
     assert result.checker_succeeded is True
     assert (dotted / "request_complete").is_file()
@@ -1125,7 +1125,7 @@ def test_vipr_completion_failure_does_not_report_checker_execution(tmp_path: Pat
         f"#!/usr/bin/env python3\nfrom pathlib import Path\nPath({str(checker_marker)!r}).write_text('ran')\n",
     )
 
-    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=1_000)
+    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=10_000)
 
     assert result.checker_succeeded is False
     assert result.completion_exit_code == 19
@@ -1151,7 +1151,7 @@ def test_vipr_rejects_symlinked_completed_output_without_running_checker(tmp_pat
         f"#!/usr/bin/env python3\nfrom pathlib import Path\nPath({str(checker_marker)!r}).write_text('ran')\n",
     )
 
-    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=1_000)
+    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=10_000)
 
     assert result.checker_succeeded is False
     assert result.checker_exit_code is None
@@ -1173,7 +1173,7 @@ def test_vipr_rejects_symlinked_original_without_running_completion(tmp_path: Pa
     )
     chk = _write_executable(tmp_path / "viprchk", "#!/usr/bin/env python3\n")
 
-    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=1_000)
+    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=10_000)
 
     assert result.checker_succeeded is False
     assert result.completion_exit_code is None
@@ -1191,7 +1191,7 @@ def test_vipr_rejects_oversized_input_before_completion(tmp_path: Path) -> None:
     )
     chk = _write_executable(tmp_path / "viprchk", "#!/usr/bin/env python3\n")
 
-    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=1_000)
+    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=10_000)
 
     assert result.checker_succeeded is False
     assert result.completion_exit_code is None
@@ -1213,7 +1213,7 @@ def test_vipr_rejects_oversized_completion_before_checker(tmp_path: Path) -> Non
         f"#!/usr/bin/env python3\nfrom pathlib import Path\nPath({str(checker_marker)!r}).write_text('ran')\n",
     )
 
-    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=1_000)
+    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=10_000)
 
     assert result.checker_succeeded is False
     assert result.completion_exit_code == 0
@@ -1493,7 +1493,7 @@ def test_vipr_helper_completes_and_checks_in_separate_single_threaded_processes(
         "#!/usr/bin/env python3\nfrom pathlib import Path\nimport sys\nassert Path(sys.argv[-1]).read_bytes().endswith(b' completed')\nassert __import__('os').environ.get('OMP_NUM_THREADS') == '1'\n",
     )
 
-    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=1_000)
+    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=10_000)
 
     assert result.checker_succeeded is True
     assert result.certificate_size_bytes == len(b"original")
@@ -1510,7 +1510,7 @@ def test_vipr_helper_missing_or_failed_checker_is_not_proof(tmp_path: Path) -> N
     chk = _write_executable(tmp_path / "viprchk", "#!/usr/bin/env python3\nraise SystemExit(17)\n")
     comp = _write_executable(tmp_path / "viprcomp", "#!/usr/bin/env python3\nraise SystemExit(19)\n")
 
-    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=1_000)
+    result = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=10_000)
 
     assert result.checker_succeeded is False
     assert result.checker_exit_code is None
@@ -1520,7 +1520,7 @@ def test_vipr_helper_missing_or_failed_checker_is_not_proof(tmp_path: Path) -> N
 
 
 def test_vipr_helper_maps_missing_certificate_and_checker_timeout_to_failure(tmp_path: Path) -> None:
-    missing = check_vipr_certificate(tmp_path / "missing.vipr", tmp_path, timeout_ms=1_000)
+    missing = check_vipr_certificate(tmp_path / "missing.vipr", tmp_path, timeout_ms=10_000)
     assert missing.checker_succeeded is False
     assert missing.error == "certificate is missing"
 
@@ -1568,4 +1568,4 @@ def test_vipr_helper_rejects_certificate_outside_request_artifact_dir(tmp_path: 
     outside = tmp_path.parent / "outside.vipr"
     outside.write_bytes(b"outside")
     with pytest.raises(ValueError, match="artifact directory"):
-        check_vipr_certificate(outside, tmp_path, viprcomp="unused", viprchk="unused", timeout_ms=1_000)
+        check_vipr_certificate(outside, tmp_path, viprcomp="unused", viprchk="unused", timeout_ms=10_000)

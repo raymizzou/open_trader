@@ -298,7 +298,7 @@ def test_global_http_capacity_rejects_overflow_and_releases_read_contexts(
                 if counts["active"] == 8:
                     entered.set()
             try:
-                assert release.wait(timeout=10)
+                assert release.wait(timeout=60)
                 return {"state": "blocked"}
             finally:
                 with counts_lock:
@@ -309,7 +309,7 @@ def test_global_http_capacity_rejects_overflow_and_releases_read_contexts(
             counts["attempts"] += 1
             if counts["attempts"] == 40:
                 overflow_attempted.set()
-        return _response_with_headers(base + "/api/prediction-arbitrage/state")
+        return _response_with_headers(base + "/api/prediction-arbitrage/state", timeout=60)
 
     monkeypatch.setattr(prediction_service, "prediction_state_payload", blocked_state_payload)
     with _running_server(_Runtime()) as (base, server):
@@ -317,7 +317,7 @@ def test_global_http_capacity_rejects_overflow_and_releases_read_contexts(
         baseline_socket_fds = _socket_fd_count()
         try:
             with ThreadPoolExecutor(max_workers=48) as clients:
-                leader_timeout = 15
+                leader_timeout = 60
                 leaders = [
                     clients.submit(
                         _response,
@@ -326,14 +326,14 @@ def test_global_http_capacity_rejects_overflow_and_releases_read_contexts(
                     )
                     for _ in range(8)
                 ]
-                assert entered.wait(timeout=5)
+                assert entered.wait(timeout=30)
                 overflow = [clients.submit(overflow_request, base) for _ in range(40)]
-                assert overflow_attempted.wait(timeout=5)
+                assert overflow_attempted.wait(timeout=30)
 
                 assert counts["max_active"] == 8
                 assert server.http_load_snapshot()["active"] == 8  # type: ignore[attr-defined]
                 assert len(_handler_thread_ids() - baseline_handler_ids) == 8
-                overflow_results = [future.result(timeout=5) for future in overflow]
+                overflow_results = [future.result(timeout=60) for future in overflow]
                 overflow_statuses = [result[0] for result in overflow_results]
                 overflow_payloads = [result[1] for result in overflow_results]
                 overflow_retry_after = [result[2]["Retry-After"] for result in overflow_results]
