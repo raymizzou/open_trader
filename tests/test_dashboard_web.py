@@ -3266,7 +3266,7 @@ const payload = {status:"healthy",health:{status:"healthy"},breaker:{open:false}
 }};
 const preview = {...opportunity, preview_id:"preview-1", wallet_address:"0x1111111111111111111111111111111111111111", available_balance:"20", policy_limits:{max_wallet_balance:"65",max_normal_cost:"20",max_emergency_loss:"2",min_estimated_profit:"1"}};
 console.log(JSON.stringify({
-  tabs:predictionStrategyTabs("yes_no"),
+  filter:predictionOpportunityFilter({}, {}),
   candidate:predictionThresholdCandidateHtml(opportunity, payload, new Set()),
   logs:predictionRelationDiscoveryPanel(payload),
   modal:predictionModalHtml("order", preview),
@@ -3274,10 +3274,12 @@ console.log(JSON.stringify({
 ''')
     rendered = json.loads(output)
 
-    assert "YES/NO套利" in rendered["tabs"]
-    assert "LLM对冲套利" in rendered["tabs"]
-    assert 'data-prediction-strategy="yes_no"' in rendered["tabs"]
-    assert 'aria-pressed="true"' in rendered["tabs"]
+    for label in ("全部", "YES/NO", "LLM", "原生", "机械", "语义", "腿数 ▾", "范围 ▾"):
+        assert label in rendered["filter"]
+    assert "YES/NO套利" not in rendered["filter"]
+    assert "LLM对冲套利" not in rendered["filter"]
+    assert 'data-prediction-filter-kind="yes_no"' in rendered["filter"]
+    assert 'aria-pressed="true"' in rendered["filter"]
     assert rendered["candidate"].startswith("<details")
     assert " open" not in rendered["candidate"].split(">", 1)[0]
     assert "BTC above 90k?" in rendered["candidate"]
@@ -3301,6 +3303,131 @@ console.log(JSON.stringify({
     assert "两个 condition 必须分别成交和核对" in rendered["modal"]
     assert "不会 merge" in rendered["modal"]
     assert "最多按 $2.00" in rendered["modal"]
+
+
+def test_prediction_unified_opportunity_cards_render_metrics_tags_and_manual_confirm() -> None:
+    output = run_dashboard_js(r'''
+const qualified = {
+  opportunity_id: "cross-verified-1",
+  title: "Bitcoin 在 8 月 31 日前高于 $120,000？",
+  market_type: "cross_venue_yes_no",
+  strategy_type: "yes_no",
+  relation_type: "NATIVE_COMPLEMENT",
+  discovery_source: "VENUE_METADATA",
+  leg_count: 2,
+  scope_label: "跨所 · 同事件",
+  quantity: "20",
+  total_max_cost: "31.20",
+  minimum_payout: "39.60",
+  profit: "8.40",
+  annualized_yield: "0.284",
+  remaining_days: "12",
+  extreme_loss: "-0.80",
+  legs: [
+    {exchange: "predict.fun", outcome: "YES", net_quantity: "20", max_price: "0.42", max_cost: "16.80", settlement_asset: "USDT"},
+    {exchange: "polymarket", outcome: "NO", net_quantity: "20", max_price: "0.36", max_cost: "14.40", settlement_asset: "pUSD"},
+  ],
+  qualification: {
+    status: "QUALIFIED_VERIFIED",
+    order_ready: true,
+    order_ready_reason: "",
+    checks: [
+      {key: "net_edge", value: "0.2454", passed: true},
+      {key: "min_profit", value: "8.40", passed: true},
+      {key: "annualized", value: "0.284", passed: true},
+      {key: "tenor", value: "12", passed: true},
+    ],
+  },
+};
+const notReady = {
+  ...qualified,
+  opportunity_id: "cross-blocked-1",
+  title: "Hurupay FDV above $50M / $100M",
+  market_type: "threshold_hedge",
+  strategy_type: "llm_hedge",
+  relation_type: "IMPLIES",
+  discovery_source: "LLM",
+  scope_label: "同所 · 同事件",
+  qualification: {...qualified.qualification, status: "QUALIFIED_FEASIBLE", order_ready: false, order_ready_reason: "余额不足"},
+};
+console.log(JSON.stringify({
+  ready: predictionUnifiedOpportunityCard(qualified, "MANUAL"),
+  blocked: predictionUnifiedOpportunityCard(notReady, "MANUAL"),
+  empty: predictionUnifiedOpportunityList({qualified_opportunities: []}, {}),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert "QUALIFIED_VERIFIED" in rendered["ready"]
+    assert "NATIVE_COMPLEMENT" in rendered["ready"]
+    assert "VENUE_METADATA" in rendered["ready"]
+    assert "2 腿" in rendered["ready"]
+    assert "跨所 · 同事件" in rendered["ready"]
+    for label in ("保证最低利润", "1% 净边际", "15% 年化", "30 天资本释放", "极端风险", "order_ready"):
+        assert label in rendered["ready"]
+    assert "+$8.40" in rendered["ready"]
+    assert "24.5%" in rendered["ready"]
+    assert "28.4%" in rendered["ready"]
+    assert "12 天" in rendered["ready"]
+    assert "−$0.80" in rendered["ready"] or "-$0.80" in rendered["ready"]
+    assert "人工确认下单" in rendered["ready"]
+    assert 'data-action="participate"' in rendered["ready"]
+    assert "第 1 腿 · Predict.fun · BUY YES" in rendered["ready"]
+    assert "第 2 腿 · Polymarket · BUY NO" in rendered["ready"]
+    assert "人工确认下单" not in rendered["blocked"]
+    assert "余额不足" in rendered["blocked"]
+    assert "当前无更多合格机会" in rendered["empty"]
+
+
+def test_prediction_unified_page_renders_mock_blocks_and_filter_state() -> None:
+    output = run_dashboard_js(r'''
+const payload = {
+  status: "healthy",
+  health: {status: "healthy", degraded_reasons: []},
+  readiness: {status: "ready", wallet_address: "0x1111111111111111111111111111111111111111", p_usd_balance: "60.40"},
+  breaker: {open: false},
+  validation_mode: "observe_only",
+  heartbeat_at: "2026-08-16T15:54:51Z",
+  venues: [
+    {venue: "polymarket", rest: "ready", ws: "ready", wallet: "0x1AF9…0562", mode: "可以交易", balance: {asset: "pUSD", value: "60.40"}},
+    {venue: "predict.fun", rest: "stale", ws: "ready", wallet: "0xcE23…f435", mode: "只读", balance: {asset: "USDT", value: null}, reason: "rest stale"},
+  ],
+  qualified_opportunities: [{
+    opportunity_id: "cross-verified-1",
+    title: "Bitcoin 在 8 月 31 日前高于 $120,000？",
+    market_type: "cross_venue_yes_no",
+    strategy_type: "yes_no",
+    relation_type: "NATIVE_COMPLEMENT",
+    discovery_source: "VENUE_METADATA",
+    leg_count: 2,
+    scope_label: "跨所 · 同事件",
+    quantity: "20",
+    total_max_cost: "31.20",
+    minimum_payout: "39.60",
+    profit: "8.40",
+    annualized_yield: "0.284",
+    remaining_days: "12",
+    extreme_loss: "-0.80",
+    legs: [
+      {exchange: "predict.fun", outcome: "YES", net_quantity: "20", max_price: "0.42", max_cost: "16.80", settlement_asset: "USDT"},
+      {exchange: "polymarket", outcome: "NO", net_quantity: "20", max_price: "0.36", max_cost: "14.40", settlement_asset: "pUSD"},
+    ],
+    qualification: {status: "QUALIFIED_VERIFIED", order_ready: true, order_ready_reason: "", checks: [{key: "net_edge", value: "0.2454", passed: true}]},
+  }],
+};
+const html = predictionUnifiedPage(payload, {kind: "all", legs: null, scope: null});
+console.log(JSON.stringify({html, filtered: predictionUnifiedOpportunityList(payload, {kind: "llm_hedge", legs: null, scope: null})}));
+''')
+    rendered = json.loads(output)
+
+    assert "预测套利 · 机会" in rendered["html"]
+    assert "MANUAL" in rendered["html"]
+    assert "AUTO" in rendered["html"]
+    assert "交易所连接与账户状态" in rendered["html"]
+    assert "Polymarket" in rendered["html"]
+    assert "Predict.fun" in rendered["html"]
+    assert "人工确认下单" in rendered["html"]
+    assert "当前无更多合格机会" in rendered["filtered"]
 
 
 def test_prediction_state_projects_relation_funnel_without_secrets() -> None:
