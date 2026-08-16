@@ -94,14 +94,14 @@ def _server(runtime: object, **kwargs: object) -> Iterator[str]:
 
 
 def _response(
-    request: str | Request, *, timeout: float = 5
+    request: str | Request, *, timeout: float = 15
 ) -> tuple[int, dict[str, object]]:
     status, payload, _headers = _response_with_headers(request, timeout=timeout)
     return status, payload
 
 
 def _response_with_headers(
-    request: str | Request, *, timeout: float = 5
+    request: str | Request, *, timeout: float = 15
 ) -> tuple[int, dict[str, object], Mapping[str, str]]:
     try:
         with urlopen(request, timeout=timeout) as response:
