@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-17
+
+- 测试稳定性：修复 prediction service HTTP 并发压力用例在全量测试下的提交顺序竞态，改为先确认 4 个 state 请求都已进入 handler 再提交 4 个 preview 请求，避免 preview 请求抢满并发槽导致 `state_entered` 偶发不触发。仅测试改动，无运行时代码变化。
+
 ## 2026-08-16
 
 - #85 adds the N_LEG read-model projection and bounded metrics for the dashboard: serialized #84 MarketSolution/ExecutionSolution payloads are projected into per-opportunity market fields (minimum profit, maximum cost, capital release, structure/quote/verification fingerprints, per-leg quantity/price/cost) and execution fields (would-submit, ORDER_READY, machine-code reason, execution-solution fingerprint, projected and unsettled capital, per-leg plan). ORDER_READY binds to the execution-solution fingerprint and the n_leg scope capability: observe-only scope, missing/changed fingerprint, non-executable reason, or over-cap projected total fail closed without losing the market qualification; MANUAL + MANUAL_CANARY is order-ready. The dashboard renders the "下单计划 · would-submit" block and the bounded compile/solve/end-to-end/queue/timeout/stale/survival metric overview with Chinese labels; `prediction_state_payload` accepts optional `n_leg_solutions`/`n_leg_metrics` without changing existing calls. No scheduling/solver wiring, real orders, notifications, or mode changes were added. Focused read-model/metrics/dashboard render tests pass.

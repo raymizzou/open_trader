@@ -428,6 +428,8 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
                     clients.submit(_response, base + "/api/prediction-arbitrage/state")
                     for _ in range(4)
                 ]
+                assert state_entered.wait(timeout=15)
+
                 preview_calls = [
                     clients.submit(
                         _response,
@@ -439,7 +441,6 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
                     )
                     for _ in range(4)
                 ]
-                assert state_entered.wait(timeout=15)
                 assert preview_entered.wait(timeout=15)
 
                 overflow_get = clients.submit(
