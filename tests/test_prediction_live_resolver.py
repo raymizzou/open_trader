@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import Future
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+
+import pytest
 
 from open_trader.prediction_arbitrage import BookLevel, ThresholdOrderBook
 from open_trader.prediction_live_resolver import (
@@ -343,7 +346,7 @@ def test_tick_dispatches_solve_request_through_tracking_wrapper(tmp_path: Path) 
         request.request.problem.actions[0].cost_slices[0].incremental_cost_upper_bound_units
         == 490_000
     )
-    assert instance._request_components[request.request_id] == component_id
+    assert instance._request_components[request.request_id][0] == component_id
 
 
 def worker_evidence(problem: ArbitrageProblem) -> dict[str, object]:
@@ -458,6 +461,109 @@ def test_reconcile_prunes_stale_selection_and_skips_discovery(tmp_path: Path) ->
     assert set(kept) == {valid.component_id}
     assert instance._selection == {valid.component_id: valid}
     assert server.requests == []
+
+
+def test_stale_inflight_outcome_is_dropped_after_generation_prunes_component(
+    tmp_path: Path,
+) -> None:
+    rows = {"r:a": row("r:a", raw_problem())}
+    instance, server, catalog = resolver(
+        tmp_path,
+        rows=rows,
+        monitor=FakeMonitor({"contract-a": live_book("contract-a")}),
+        execution=FakeExecution(AccountView(1_000_000, 1_000_000, 0)),
+    )
+    valid = valid_selected(rows)
+    instance._selection_store.save({valid.component_id: valid})
+    instance._tick()
+    assert len(server.requests) == 1
+    request = server.requests[0]
+    assert instance._request_components[request.request_id][0] == valid.component_id
+
+    catalog.rows = {}
+    catalog.generation = 2
+    instance._tick()
+    assert valid.component_id not in instance._selection
+    assert request.request_id not in instance._request_components
+
+    server.futures[0].set_result(
+        worker_outcome(request, worker_evidence(request.request.problem))
+    )
+    instance._tick()
+    assert instance.solutions() == []
+
+
+def test_exceptional_worker_future_does_not_leak_request_components(
+    tmp_path: Path,
+) -> None:
+    rows = {"r:a": row("r:a", raw_problem())}
+    instance, server, _ = resolver(
+        tmp_path,
+        rows=rows,
+        monitor=FakeMonitor({"contract-a": live_book("contract-a")}),
+    )
+    valid = valid_selected(rows)
+    instance._selection_store.save({valid.component_id: valid})
+    instance._tick()
+    assert len(server.futures) == 1
+    request = server.requests[0]
+    server.futures[0].set_exception(RuntimeError("worker startup failed"))
+    instance._tick()
+    assert instance._request_components == {}
+    assert instance.solutions() == []
+
+
+def test_account_view_cache_covers_unavailable_case(tmp_path: Path) -> None:
+    class CountingExecution(FakeExecution):
+        def __init__(self, view=None) -> None:
+            super().__init__(view)
+            self.calls = 0
+
+        def n_leg_account_view(self):
+            self.calls += 1
+            return self.view
+
+    execution = CountingExecution(None)
+    instance, _, _ = resolver(tmp_path, execution=execution)
+
+    assert instance._account_view() is None
+    assert execution.calls == 1
+    assert instance._account_view() is None
+    assert execution.calls == 1
+
+    execution.view = AccountView(2_000_000, 2_000_000, 0)
+    assert instance._account_view() is None
+    assert execution.calls == 1
+
+    instance._account_view_cached_at = datetime.now(UTC) - timedelta(seconds=61)
+    refreshed = instance._account_view()
+    assert refreshed == AccountView(2_000_000, 2_000_000, 0)
+    assert execution.calls == 2
+
+
+def test_normalize_problem_fails_closed_on_unknown_payout_scale() -> None:
+    problem = raw_problem()
+    states = tuple(
+        replace(
+            state,
+            atoms=tuple(
+                replace(
+                    atom,
+                    payouts=tuple(
+                        ActionPayout(payout.action_id, 2)
+                        if payout.action_id == "a-yes"
+                        else payout
+                        for payout in atom.payouts
+                    ),
+                )
+                for atom in state.atoms
+            ),
+        )
+        for state in problem.terminal_state_sets
+    )
+    scaled_dollar = replace(problem, terminal_state_sets=states)
+    with pytest.raises(ValueError, match="unsupported payout scale"):
+        normalize_problem(scaled_dollar)
 
 
 def test_start_stop_idempotent_and_per_tick_exception_isolation(

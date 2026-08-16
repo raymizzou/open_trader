@@ -109,22 +109,21 @@ def normalize_problem(problem: ArbitrageProblem) -> ArbitrageProblem:
 
 
 def _normalize_atom(atom: TerminalAtom) -> TerminalAtom:
-    payouts = tuple(
-        ActionPayout(
-            payout.action_id,
-            (
-                0
-                if payout.payout_lower_bound_per_lot_units == 0
-                else (
-                    USD_UNITS_PER_DOLLAR
-                    if payout.payout_lower_bound_per_lot_units == 1
-                    else payout.payout_lower_bound_per_lot_units
-                )
-            ),
-        )
-        for payout in atom.payouts
-    )
-    return replace(atom, payouts=payouts)
+    payouts: list[ActionPayout] = []
+    for payout in atom.payouts:
+        value = payout.payout_lower_bound_per_lot_units
+        if value == 0:
+            scaled = 0
+        elif value == 1:
+            scaled = USD_UNITS_PER_DOLLAR
+        elif value > 0 and value % (USD_UNITS_PER_DOLLAR // 2) == 0:
+            # Supported micro-USDC scales: 0, 500_000 (half dollar), and any
+            # whole-dollar multiple. Anything else is an unknown payout scale.
+            scaled = value
+        else:
+            raise ValueError(f"unsupported payout scale: {value}")
+        payouts.append(ActionPayout(payout.action_id, scaled))
+    return replace(atom, payouts=tuple(payouts))
 
 
 class _OutcomeTrackingServer:
@@ -134,7 +133,7 @@ class _OutcomeTrackingServer:
         self._server = solver_server
         self._lock = threading.Lock()
         self._pending: dict[str, tuple[WorkerRequest, Future[WorkerOutcome]]] = {}
-        self._ready: list[tuple[WorkerRequest, WorkerOutcome]] = []
+        self._ready: list[tuple[WorkerRequest, WorkerOutcome | None]] = []
         self._closed = False
 
     def submit(self, request: WorkerRequest) -> Future[WorkerOutcome]:
@@ -167,8 +166,7 @@ class _OutcomeTrackingServer:
             outcome = None
         with self._lock:
             self._pending.pop(request.request_id, None)
-            if outcome is not None:
-                self._ready.append((request, outcome))
+            self._ready.append((request, outcome))
 
 
 class PredictionLiveResolver:
@@ -225,7 +223,7 @@ class PredictionLiveResolver:
         self._solutions: dict[
             str, tuple[MarketSolution, ExecutionSolution | None]
         ] = {}
-        self._request_components: dict[str, str] = {}
+        self._request_components: dict[str, tuple[str, str]] = {}
         self._applied_generation: tuple[int, str] | None = None
         self._account_view_cache: AccountView | None = None
         self._account_view_cached_at: datetime | None = None
@@ -339,6 +337,11 @@ class PredictionLiveResolver:
                 for component_id, solution in self._solutions.items()
                 if component_id in kept
             }
+            self._request_components = {
+                request_id: entry
+                for request_id, entry in self._request_components.items()
+                if entry[0] in kept
+            }
         if set(kept) != set(persisted):
             self._selection_store.save(kept)
 
@@ -388,22 +391,36 @@ class PredictionLiveResolver:
             price_units_per_quote_unit=USD_UNITS_PER_DOLLAR,
         )
         with self._lock:
-            self._request_components[request.request_id] = selected.component_id
+            self._request_components[request.request_id] = (
+                selected.component_id,
+                model_fingerprint(problem),
+            )
         return request
 
     def _handle_outcome(
-        self, request: WorkerRequest, outcome: WorkerOutcome
+        self, request: WorkerRequest, outcome: WorkerOutcome | None
     ) -> None:
-        component_id = self._request_components.pop(request.request_id, None)
-        if component_id is None:
+        entry = self._request_components.pop(request.request_id, None)
+        if entry is None:
             return
+        component_id, dispatched_fingerprint = entry
         problem = request.request.problem
         if (
-            outcome.status != "OK"
+            outcome is None
+            or outcome.status != "OK"
             or not outcome.cleanup_proven
             or outcome.response is None
             or outcome.response.evidence is None
         ):
+            self._drop_solution(component_id)
+            return
+        with self._lock:
+            current_problem = self._problem_map.get(component_id)
+            selected = component_id in self._selection
+        if not selected or current_problem is None:
+            self._drop_solution(component_id)
+            return
+        if dispatched_fingerprint != model_fingerprint(current_problem):
             self._drop_solution(component_id)
             return
         try:
@@ -473,8 +490,7 @@ class PredictionLiveResolver:
             cached = self._account_view_cache
             cached_at = self._account_view_cached_at
             if (
-                cached is not None
-                and cached_at is not None
+                cached_at is not None
                 and now - cached_at <= self._account_freshness
             ):
                 return cached

@@ -811,6 +811,7 @@ def test_runtime_owns_one_shared_solver_server_for_its_start_stop_lifetime(
     runtime.stop()
 
     assert len(servers) == 1
+    assert events.index("resolver.stop") < events.index("solver.close")
     assert events.index("monitor.stop") < events.index("solver.close")
     assert events.index("solver.close") < events.index("execution.close")
 
