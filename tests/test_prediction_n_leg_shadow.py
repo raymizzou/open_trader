@@ -361,6 +361,19 @@ def test_cross_venue_extreme_loss_includes_void_refund_worst_case() -> None:
     }
 
 
+def test_cross_venue_shadow_reports_per_leg_capital_release_max() -> None:
+    snapshot = legacy_shadow_snapshot(_cross_venue_source(), "episode-1")
+
+    result = NLegShadowClient(_VerifiedServer(snapshot)).submit(snapshot).result()
+
+    assert result["run_status"] == "SUCCESS"
+    assert result["result"]["capital_release_at"] == "2026-08-16T01:00:00Z"
+    assert result["differences"]["capital_release_at"] == {
+        "legacy": "2026-08-16T00:00:00Z",
+        "n_leg": "2026-08-16T01:00:00Z",
+    }
+
+
 def test_shadow_scheduler_dedupes_identical_economics_with_different_timestamps(
     tmp_path,
 ) -> None:
