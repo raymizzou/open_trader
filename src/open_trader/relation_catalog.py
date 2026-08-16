@@ -161,9 +161,15 @@ def _threshold_complete_model(relation: object) -> dict[str, object] | None:
     legs = (getattr(relation, "buy_leg_a"), getattr(relation, "buy_leg_b"))
     rules_hashes = (getattr(relation, "rules_hash_a"), getattr(relation, "rules_hash_b"))
     direction = str(getattr(relation, "relation"))
+    if direction not in {"A_IMPLIES_B", "B_IMPLIES_A", "A_TO_B", "B_TO_A"}:
+        return None
     sources = [str(getattr(market, "resolution_source") or "").strip() for market in markets]
     end_dates = [str(getattr(market, "end_date") or "").strip() for market in markets]
-    if not all(sources) or not all(end_dates):
+    if not all(sources) or not all(end_dates) or not all(str(item or "").strip() for item in rules_hashes):
+        return None
+    try:
+        release_dates = [_utc(value) for value in end_dates]
+    except (TypeError, ValueError):
         return None
     order = (1, 0) if direction in {"B_IMPLIES_A", "B_TO_A"} else (0, 1)
     contracts: list[str] = []
@@ -179,7 +185,7 @@ def _threshold_complete_model(relation: object) -> dict[str, object] | None:
             side = ActionSide.BUY_NO
         else:
             return None
-        observation_window = _utc(end_dates[index])
+        observation_window = release_dates[index]
         key = SettlementObservationKey(
             OBSERVATION_SCHEMA_V1,
             sources[index],
@@ -215,7 +221,7 @@ def _threshold_complete_model(relation: object) -> dict[str, object] | None:
             "NORMAL_NO": no_payout,
             "VOID": 0,
         }
-        release_at = _utc(end_dates[index])
+        release_at = release_dates[index]
         states.append(TerminalStateSet(
             condition_id,
             key,
@@ -243,7 +249,7 @@ def _threshold_complete_model(relation: object) -> dict[str, object] | None:
     problem = ArbitrageProblem(
         PROBLEM_SCHEMA_V1,
         f"threshold:{rule_digest}",
-        min(_utc(end_dates[0]), _utc(end_dates[1])),
+        min(release_dates),
         "USD",
         tuple(actions),
         tuple(states),
@@ -260,7 +266,7 @@ def _threshold_complete_model(relation: object) -> dict[str, object] | None:
         ),
         (),
     )
-    capital_release = max(_utc(end_dates[index]) for index in order)
+    capital_release = max(release_dates)
     return {
         "completeness": "COMPLETE",
         "terminal_states": ["NORMAL_YES", "NORMAL_NO", "VOID"],
