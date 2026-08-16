@@ -213,3 +213,75 @@ def resolve_background_candidate(
         optimality,
         verification.solution,
     )
+
+
+def _problem_for_component(
+    problem: ArbitrageProblem, component: RelationComponent
+) -> ArbitrageProblem:
+    """Restrict one merged problem to a single canonical relation component."""
+    action_ids = set(component.action_ids)
+    contract_ids = set(component.contract_ids)
+    constraint_ids = set(component.constraint_ids)
+    actions = tuple(
+        action for action in problem.actions if action.action_id in action_ids
+    )
+    states = tuple(
+        state
+        for state in problem.terminal_state_sets
+        if state.market_contract_id in contract_ids
+    )
+    relations = tuple(
+        relation
+        for relation in problem.constraint_model.relations
+        if relation.constraint_id in constraint_ids
+    )
+    forbidden = tuple(
+        combination
+        for combination in problem.constraint_model.forbidden_atom_combinations
+        if combination.constraint_id in constraint_ids
+    )
+    return ArbitrageProblem(
+        problem.schema_version,
+        problem.problem_id,
+        problem.as_of,
+        problem.valuation_unit_id,
+        actions,
+        states,
+        ConstraintModel(relations, forbidden),
+        problem.qualification_constraints,
+    )
+
+
+def run_discovery(
+    problem: ArbitrageProblem,
+    components: tuple[RelationComponent, ...],
+    *,
+    budget: OracleBudget,
+    limits: BenchmarkLimits,
+    backend: SolverBackend | None = None,
+    generation: int = 0,
+    code_version: str = "issue-77",
+    max_components: int | None = None,
+) -> tuple[BackgroundResolution, ...]:
+    """Resolve candidates one at a time within the background budget.
+
+    Returns the empty tuple when the background path is not idle. Components are
+    processed in order; ``max_components`` bounds the pass and each component is
+    resolved at most once.
+    """
+    if not idle_capacity():
+        return ()
+    selected = components if max_components is None else components[:max_components]
+    results: list[BackgroundResolution] = []
+    for component in selected:
+        resolution = resolve_background_candidate(
+            _problem_for_component(problem, component),
+            budget=budget,
+            limits=limits,
+            backend=backend,
+            generation=generation,
+            code_version=code_version,
+        )
+        if resolution is not None:
+            results.append(resolution)
+    return tuple(results)

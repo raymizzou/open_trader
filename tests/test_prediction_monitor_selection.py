@@ -11,6 +11,7 @@ from open_trader.prediction_monitor_selection import (
     idle_capacity,
     relation_generation_components,
     resolve_background_candidate,
+    run_discovery,
 )
 from open_trader.prediction_n_leg import (
     OBSERVATION_SCHEMA_V1,
@@ -38,6 +39,7 @@ from open_trader.prediction_n_leg import (
 )
 from open_trader.prediction_n_leg_oracle import (
     RelationComponent,
+    build_relation_components,
     cut_from_scenario,
     evaluate_fixed_portfolio,
 )
@@ -442,3 +444,71 @@ def test_not_qualified_candidate_records_no_verified_profit(
     assert result.status == VerificationStatus.NOT_QUALIFIED
     assert result.initial_verified_profit is None
     assert result.optimality == OptimalityStatus.NOT_APPLICABLE
+
+
+def test_run_discovery_resolves_each_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    problem = qualified_problem()
+    budget = OracleBudget(2, 2, 2)
+    expected = solver_evidence(problem, budget)
+    monkeypatch.setattr(
+        "open_trader.prediction_solver_verified.solve_with_constraint_generation",
+        lambda request, backend, limits: expected,
+    )
+    backend = type("Backend", (), {"name": "cp_sat", "version": "test"})()
+    components = build_relation_components(problem)
+
+    results = run_discovery(
+        problem,
+        components,
+        budget=budget,
+        limits=BenchmarkLimits(100, 200, 1_000_000, 4),
+        backend=backend,
+    )
+
+    assert len(results) == 1
+    assert results[0].status == VerificationStatus.QUALIFIED_VERIFIED
+    assert results[0].initial_verified_profit == 3
+
+
+def test_run_discovery_honors_max_components(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    problem = qualified_problem()
+    budget = OracleBudget(2, 2, 2)
+    expected = solver_evidence(problem, budget)
+    monkeypatch.setattr(
+        "open_trader.prediction_solver_verified.solve_with_constraint_generation",
+        lambda request, backend, limits: expected,
+    )
+    backend = type("Backend", (), {"name": "cp_sat", "version": "test"})()
+    components = build_relation_components(problem)
+
+    results = run_discovery(
+        problem,
+        components * 2,
+        budget=budget,
+        limits=BenchmarkLimits(100, 200, 1_000_000, 4),
+        backend=backend,
+        max_components=1,
+    )
+
+    assert len(results) == 1
+
+
+def test_run_discovery_skips_when_not_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "open_trader.prediction_monitor_selection.idle_capacity", lambda: False
+    )
+    problem = qualified_problem()
+    components = build_relation_components(problem)
+
+    results = run_discovery(
+        problem,
+        components,
+        budget=OracleBudget(2, 2, 2),
+        limits=BenchmarkLimits(100, 200, 1_000_000, 4),
+    )
+
+    assert results == ()
