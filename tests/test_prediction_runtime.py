@@ -778,6 +778,15 @@ def test_runtime_owns_one_shared_solver_server_for_its_start_stop_lifetime(
     monkeypatch.setattr(runtime_module, "CodexTitleTranslator", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
     monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictionLiveResolver",
+        lambda **_kwargs: SimpleNamespace(
+            start=lambda: events.append("resolver.start"),
+            stop=lambda: events.append("resolver.stop"),
+            solutions=lambda: [],
+        ),
+    )
     cross_observers: list[object] = []
     monkeypatch.setattr(
         runtime_module,
@@ -802,6 +811,7 @@ def test_runtime_owns_one_shared_solver_server_for_its_start_stop_lifetime(
     runtime.stop()
 
     assert len(servers) == 1
+    assert events.index("resolver.stop") < events.index("solver.close")
     assert events.index("monitor.stop") < events.index("solver.close")
     assert events.index("solver.close") < events.index("execution.close")
 

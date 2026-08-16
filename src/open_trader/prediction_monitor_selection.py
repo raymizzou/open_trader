@@ -78,12 +78,20 @@ from open_trader.prediction_solver_verified import (
 def relation_generation_components(
     generation: Mapping[str, Mapping[str, object]],
 ) -> tuple[RelationComponent, ...]:
-    """Build the canonical N-leg components of the current relation generation.
+    """Build the canonical N-leg components of the current relation generation."""
+    return relation_generation_problem(generation)[1]
+
+
+def relation_generation_problem(
+    generation: Mapping[str, Mapping[str, object]],
+) -> tuple[ArbitrageProblem | None, tuple[RelationComponent, ...]]:
+    """Compile one merged problem plus its canonical components (#52 seam).
 
     ``generation`` is the ``RelationCatalog.current_generation()`` mapping of
-    identity -> row. Returns the empty tuple while no ACTIVE, model-complete row
+    identity -> row. Returns ``(None, ())`` while no ACTIVE, model-complete row
     exists; COMPLETE rows without a compiled problem fail closed instead of
-    being silently admitted.
+    being silently admitted. This is the shared compile seam for #77 selection
+    and the #52 live resolver.
     """
     rows = tuple(
         row
@@ -91,8 +99,9 @@ def relation_generation_components(
         if row.get("activation") == "ACTIVE" and _model_complete(row)
     )
     if not rows:
-        return ()
-    return build_relation_components(_compile(rows))
+        return None, ()
+    problem = _compile(rows)
+    return problem, build_relation_components(problem)
 
 
 def _model_complete(row: Mapping[str, object]) -> bool:
@@ -229,7 +238,7 @@ def resolve_background_candidate(
     )
 
 
-def _problem_for_component(
+def problem_for_component(
     problem: ArbitrageProblem, component: RelationComponent
 ) -> ArbitrageProblem:
     """Restrict one merged problem to a single canonical relation component."""
@@ -289,7 +298,7 @@ def run_discovery(
     results: list[BackgroundResolution] = []
     for component in selected:
         resolution = resolve_background_candidate(
-            _problem_for_component(problem, component),
+            problem_for_component(problem, component),
             budget=budget,
             limits=limits,
             backend=backend,
@@ -364,7 +373,7 @@ def _selected_component(
     resolution: BackgroundResolution,
     problem: ArbitrageProblem,
 ) -> SelectedComponent:
-    sub = _problem_for_component(problem, component)
+    sub = problem_for_component(problem, component)
     solution = resolution.solution
     assert solution is not None
     return SelectedComponent(
