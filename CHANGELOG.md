@@ -6,6 +6,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-08-16
 
 - Declare `ortools==9.15.6755` as a production dependency so the #54 Shadow CP-SAT solver is installed from `pyproject.toml`/`uv.lock` on future deploys instead of requiring a manual pip install; the lock now pins `protobuf==6.33.6` to satisfy or-tools.
+
+- #58 adds the versioned N_LEG `MANUAL/AUTO` backend contract: component-wise contract/policy/scope/safety versions, execution scope capabilities starting at `OBSERVE_ONLY`, unified four-gate qualification policy references, safety gates (global breaker, incident/batch) with loosen-to-MANUAL downgrades, and version-checked `/n-leg/{mode,config,scope}` mutations (409 on mismatch). It initializes `MANUAL`, reads legacy `observe_only` as `MANUAL`, leaves the old `/mode` and `/cross-auto/*` endpoints and `cross_auto_state` untouched, and does not take production control before #60. Focused mode/api-contract/store/shadow/read-model tests pass; no page and no #59 wiring.
 ## 2026-08-15
 
 - #54 adds a production-owned, two-server generic solver owner and a no-submit
