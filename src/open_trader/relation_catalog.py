@@ -686,3 +686,18 @@ class RelationCatalog:
             row["activation"] = entry["status"]
             rows[identity] = row
         return rows
+
+    def generation_meta(self) -> dict[str, object]:
+        """Monotonic catalog generation number and whole-generation fingerprint."""
+        generation_number = int(self._store.get("generation_number", 0))
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                sorted(
+                    (str(identity), str(entry["version_id"]))
+                    for identity, entry in self._current_generation().items()
+                ),
+                sort_keys=True,
+                default=str,
+            ).encode()
+        ).hexdigest()
+        return {"generation": generation_number, "fingerprint": fingerprint}
