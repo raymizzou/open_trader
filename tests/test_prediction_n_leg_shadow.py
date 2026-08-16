@@ -382,16 +382,16 @@ def test_cross_venue_normal_problem_guarantees_complement_payout() -> None:
     ]
 
 
-def test_cross_venue_extreme_loss_includes_void_refund_worst_case() -> None:
+def test_cross_venue_extreme_loss_uses_single_leg_void_to_zero() -> None:
     snapshot = legacy_shadow_snapshot(_cross_venue_source(), "episode-1")
 
     result = NLegShadowClient(_VerifiedServer(snapshot)).submit(snapshot).result()
 
     assert result["run_status"] == "SUCCESS"
-    assert result["result"]["extreme_loss"] == "-3.92"
+    assert result["result"]["extreme_loss"] == "-8.92"
     assert result["differences"]["extreme_loss"] == {
         "legacy": "未建模",
-        "n_leg": "-3.92",
+        "n_leg": "-8.92",
         "status": "na",
     }
 

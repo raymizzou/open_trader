@@ -393,11 +393,7 @@ def _cross_venue_extreme_atoms(
         *_cross_venue_normal_atoms(action, release_at),
         TerminalAtom(
             f"{action.market_contract_id}-void", TerminalKind.VOID, rule_version,
-            (ActionPayout(action.action_id, 50_000_000),), release_at,
-        ),
-        TerminalAtom(
-            f"{action.market_contract_id}-refund", TerminalKind.REFUND, rule_version,
-            (ActionPayout(action.action_id, 100_000_000),), release_at,
+            (ActionPayout(action.action_id, 0),), release_at,
         ),
     )
 
@@ -563,7 +559,7 @@ def _failure(fingerprint: str, reason: str, error: BaseException | None) -> dict
 def _cross_venue_extreme_loss(
     snapshot: Mapping[str, object], scale: int
 ) -> Decimal | None:
-    """Worst payout minus cost over NORMAL+VOID+REFUND combos, display-only."""
+    """Worst payout minus cost over NORMAL plus at least one leg voided to $0 at platform discretion, display-only."""
 
     try:
         quantity = _decimal(snapshot.get("quantity"), "quantity")
