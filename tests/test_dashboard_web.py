@@ -3458,6 +3458,75 @@ console.log(JSON.stringify({html, blockedOnly}));
     assert "不显示预计收益" in rendered["html"]
 
 
+def test_prediction_mode_bar_and_capital_usage_render_read_only_preview() -> None:
+    output = run_dashboard_js(r'''
+const payload = {
+  status: "healthy",
+  health: {status: "healthy", degraded_reasons: []},
+  readiness: {status: "ready"},
+  breaker: {open: false},
+  validation_mode: "auto",
+  n_leg: {
+    mode: "AUTO",
+    contract_generation: "1",
+    execution_gates: {breaker_open: true, incident_active: false, batch_active: false},
+    enabled_execution_scope_version: [],
+  },
+  capital_usage: {
+    max_total_unsettled_capital: "60.00",
+    max_total_unsettled_capital_set: true,
+    current_conservative: "3.25",
+    active_batch_reserved: "0.00",
+    remaining: "56.75",
+  },
+};
+const unset = {capital_usage: {max_total_unsettled_capital: "0.00", max_total_unsettled_capital_set: false, current_conservative: "0.00", active_batch_reserved: "0.00", remaining: null}};
+console.log(JSON.stringify({
+  mode: predictionModeBar(payload),
+  capital: predictionCapitalUsage(payload),
+  unset: predictionCapitalUsage(unset),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert "#60 前只读预览" in rendered["mode"]
+    assert "全局熔断开启" in rendered["mode"]
+    assert "enabled scope 空" in rendered["mode"]
+    assert "AUTO" in rendered["mode"]
+    for label in ("max_total_unsettled_capital", "当前保守占用", "剩余额度"):
+        assert label in rendered["capital"]
+    assert "$60.00" in rendered["capital"]
+    assert "$3.25" in rendered["capital"]
+    assert "$56.75" in rendered["capital"]
+    assert "首次 Canary 前需显式设置" in rendered["unset"]
+    assert "active batch 预留" in rendered["capital"]
+
+
+def test_prediction_unified_page_preserves_mock_block_order() -> None:
+    output = run_dashboard_js(r'''
+const payload = {
+  status: "healthy",
+  health: {status: "healthy", degraded_reasons: []},
+  readiness: {status: "ready", wallet_address: "0x1111111111111111111111111111111111111111", p_usd_balance: "60.40"},
+  breaker: {open: false},
+  validation_mode: "observe_only",
+  venues: [
+    {venue: "polymarket", rest: "ready", ws: "ready", wallet: "0x1AF9…0562", mode: "可以交易", balance: {asset: "pUSD", value: "60.40"}},
+    {venue: "predict.fun", rest: "stale", ws: "ready", wallet: "0xcE23…f435", mode: "只读", balance: {asset: "USDT", value: null}, reason: "rest stale"},
+  ],
+  capital_usage: {max_total_unsettled_capital: "0.00", max_total_unsettled_capital_set: false, current_conservative: "0.00", active_batch_reserved: "0.00", remaining: null},
+  qualified_opportunities: [],
+  relation_review: {pending_count: 0, items: []},
+};
+const html = predictionUnifiedPage(payload, {kind: "all", legs: null, scope: null});
+const marks = ["pm-page-head", "pm-mode-bar", "pm-venue-readiness", "资金占用", "机会列表", "关系审核"].map((label) => html.indexOf(label)).filter((index) => index >= 0);
+console.log(JSON.stringify({html, ordered: marks.every((index, i) => i === 0 || marks[i - 1] < index)}));
+''')
+    rendered = json.loads(output)
+    assert rendered["ordered"] is True
+    assert "数据时间" in rendered["html"]
+
+
 def test_prediction_state_projects_relation_funnel_without_secrets() -> None:
     from open_trader.prediction_read_model import prediction_state_payload as _prediction_state_payload
 

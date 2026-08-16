@@ -194,6 +194,13 @@ def frozen_prediction_state() -> dict[str, object]:
   "auto_eat_stats": {},
   "balances": {"allowance": null, "p_usd": "12.50"},
   "breaker": {"incident": null, "open": false, "status": "ready"},
+  "capital_usage": {
+    "max_total_unsettled_capital": "0",
+    "max_total_unsettled_capital_set": false,
+    "current_conservative": "3.25",
+    "active_batch_reserved": "0",
+    "remaining": null
+  },
   "cross_auto": {
     "armed": false,
     "configured_mode": "observe_only",
@@ -717,6 +724,68 @@ def test_relation_review_projects_six_states_without_profit_or_preview() -> None
 def test_relation_review_empty_when_catalog_missing() -> None:
     state = _nleg_state([])
     assert state["relation_review"] == {"pending_count": 0, "items": []}
+
+
+class _NlegContractExecution(_NlegExecution):
+    def n_leg_mode_contract(self) -> dict[str, object]:
+        return {
+            "schema_version": "open_trader.prediction_n_leg.mode_contract.v1",
+            "contract_generation": 1,
+            "mode": "MANUAL",
+            "qualification_policy_version": 1,
+            "qualification_policy": {
+                "min_profit_usd": "1.00",
+                "min_net_margin": "0.01",
+                "min_annualized_return": "0.15",
+                "max_capital_release_days": 30,
+            },
+            "safety_config_version": 1,
+            "safety_config": {"max_total_unsettled_capital_units": 60000000},
+            "execution_scopes": {},
+            "enabled_execution_scope_version": [],
+            "execution_gates": {
+                "breaker_open": False,
+                "incident_active": False,
+                "batch_active": False,
+            },
+        }
+
+
+def test_nleg_contract_and_capital_usage_are_projected_read_only() -> None:
+    state = prediction_state_payload(
+        store=_Store(),
+        monitor=_NlegMonitor([]),
+        execution=_NlegContractExecution(),
+        csrf_token="csrf",
+    )
+
+    n_leg = state["n_leg"]
+    assert n_leg["mode"] == "MANUAL"
+    assert n_leg["contract_generation"] == 1
+    assert n_leg["qualification_policy_version"] == 1
+    assert n_leg["execution_gates"] == {
+        "breaker_open": False,
+        "incident_active": False,
+        "batch_active": False,
+    }
+    assert state["capital_usage"] == {
+        "max_total_unsettled_capital": "60",
+        "max_total_unsettled_capital_set": True,
+        "current_conservative": "3.25",
+        "active_batch_reserved": "0",
+        "remaining": "56.75",
+    }
+
+
+def test_capital_usage_defaults_to_unset_without_remaining() -> None:
+    state = _nleg_state([])
+    assert state["capital_usage"] == {
+        "max_total_unsettled_capital": "0",
+        "max_total_unsettled_capital_set": False,
+        "current_conservative": "3.25",
+        "active_batch_reserved": "0",
+        "remaining": None,
+    }
 
 
 @pytest.mark.parametrize(("kind", "expected"), (

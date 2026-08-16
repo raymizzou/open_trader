@@ -2589,8 +2589,9 @@ function predictionRelationReview(payload, view) {
 function predictionUnifiedPageHeader(payload) {
   const [health, tone] = predictionStatusLabel(payload);
   const heartbeat = payload?.heartbeat_at || payload?.heartbeat;
-  const contract = payload?.contract_generation
-    ? ` · contract generation ${escapeHtml(payload.contract_generation)}`
+  const contractGeneration = payload?.n_leg?.contract_generation ?? payload?.contract_generation;
+  const contract = contractGeneration
+    ? ` · contract generation ${escapeHtml(contractGeneration)}`
     : "";
   return `<header class="pm-page-head"><div><h1>预测套利 · 机会</h1><p>单一 N_LEG 机会 read model；历史 YES_NO / LLM_RELATION 只读保留。</p></div><div class="pm-updated"><span class="pm-status-line"><i class="pm-status-dot ${tone === "danger" ? "danger" : ""}"></i>${health}</span><br>${predictionClock("数据时间", heartbeat)}${contract}</div></header>`;
 }
@@ -3442,13 +3443,19 @@ function predictionLlmHedgeWorkspace(payload, expandedRelationKeys) {
 }
 
 function predictionModeBar(payload) {
-  const effective = String(payload.validation_mode || "observe_only");
-  const active = effective === "auto" ? "AUTO" : "MANUAL";
-  const breaker = payload?.breaker?.open === true ? "全局熔断开启" : "全局熔断关闭";
+  const nleg = payload?.n_leg && typeof payload.n_leg === "object" ? payload.n_leg : {};
+  const gates = nleg.execution_gates && typeof nleg.execution_gates === "object" ? nleg.execution_gates : {};
+  const contractMode = String(nleg.mode || "");
+  const effective = contractMode || payload.validation_mode || "observe_only";
+  const active = effective === "AUTO" || effective === "auto" ? "AUTO" : "MANUAL";
+  const breakerOpen = gates.breaker_open === true || payload?.breaker?.open === true;
+  const breaker = breakerOpen ? "全局熔断开启" : "全局熔断关闭";
+  const scopeCount = Array.isArray(nleg.enabled_execution_scope_version) ? nleg.enabled_execution_scope_version.length : 0;
+  const scopeText = scopeCount > 0 ? `enabled scope ${scopeCount} 个` : "enabled scope 空";
   const buttons = [["manual", "MANUAL"], ["auto", "AUTO"]].map(([value, label]) =>
     `<button type="button" class="pm-mode-button${active === label ? " active" : ""}" data-action="set-mode" data-mode="${value}">${label}</button>`
   ).join("");
-  return `<div class="pm-mode-bar" aria-label="执行模式">${buttons}<span class="pm-mode-stats">#60 前只读预览 · ${breaker} · enabled scope 空</span></div>`;
+  return `<div class="pm-mode-bar" aria-label="执行模式">${buttons}<span class="pm-mode-stats">#60 前只读预览 · ${breaker} · ${scopeText}</span></div>`;
 }
 
 function predictionCrossAutoStatus(payload) {

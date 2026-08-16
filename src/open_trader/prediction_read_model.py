@@ -751,6 +751,7 @@ _NLEG_SCOPE_LABELS = {
     ("cross_venue", "same_event"): "跨所 · 同事件",
     ("cross_venue", "cross_event"): "跨所 · 跨事件",
 }
+_NLEG_UNITS_PER_DOLLAR = Decimal("1000000")
 
 
 def _prediction_strategy_type(row: Mapping[str, object]) -> str | None:
@@ -758,6 +759,55 @@ def _prediction_strategy_type(row: Mapping[str, object]) -> str | None:
     if strategy in _NLEG_RELATION_BY_STRATEGY:
         return str(strategy)
     return _NLEG_STRATEGY_BY_MARKET.get(str(row.get("market_type") or ""))
+
+
+def _prediction_n_leg_contract(execution: object | None) -> dict[str, object] | None:
+    method = getattr(execution, "n_leg_mode_contract", None)
+    if not callable(method):
+        return None
+    try:
+        value = method()
+    except Exception:
+        return None
+    safe = _prediction_safe_value(value)
+    return dict(safe) if isinstance(safe, Mapping) else None
+
+
+def _prediction_capital_usage(
+    *,
+    cross_unsettled: Mapping[str, object],
+    current_execution: Mapping[str, object] | None,
+    n_leg: Mapping[str, object] | None,
+) -> dict[str, object]:
+    safety = n_leg.get("safety_config") if isinstance(n_leg, Mapping) else None
+    units = safety.get("max_total_unsettled_capital_units") if isinstance(safety, Mapping) else 0
+    try:
+        units = int(units or 0)
+    except (TypeError, ValueError):
+        units = 0
+    max_usd = Decimal(units) / _NLEG_UNITS_PER_DOLLAR if units > 0 else Decimal("0")
+    set_flag = units > 0
+    current_raw = cross_unsettled.get("current")
+    current = (
+        _prediction_decimal(current_raw)
+        if current_raw not in (None, "")
+        else None
+    )
+    reserved = Decimal("0")
+    if isinstance(current_execution, Mapping):
+        reserved_value = _prediction_decimal_sort(
+            current_execution.get("total_max_cost", current_execution.get("max_cost"))
+        )
+        if reserved_value.is_finite() and reserved_value > 0:
+            reserved = reserved_value
+    remaining = (max_usd - current - reserved) if set_flag and current is not None else None
+    return {
+        "max_total_unsettled_capital": format(max_usd, "f"),
+        "max_total_unsettled_capital_set": set_flag,
+        "current_conservative": format(current, "f") if current is not None else None,
+        "active_batch_reserved": format(reserved, "f"),
+        "remaining": format(remaining, "f") if remaining is not None else None,
+    }
 
 
 def _prediction_nleg_labels(row: Mapping[str, object]) -> dict[str, object]:
@@ -1618,6 +1668,12 @@ def prediction_state_payload(
         except Exception:
             pass
     shadow_summary = _prediction_n_leg_shadow_summary(opportunity_rows)
+    n_leg = _prediction_n_leg_contract(execution)
+    capital_usage = _prediction_capital_usage(
+        cross_unsettled=cross_unsettled,
+        current_execution=current_execution,
+        n_leg=n_leg,
+    )
     result = {
         "status": status,
         "health": health,
@@ -1635,8 +1691,10 @@ def prediction_state_payload(
         "opportunities": opportunity_rows,
         "qualified_opportunities": qualified_opportunities,
         "opportunity_qualification": opportunity_qualification,
+        "capital_usage": capital_usage,
         "venues": venues,
         "cross_venue": cross_venue,
+        **({"n_leg": n_leg} if n_leg is not None else {}),
         "relation_discovery": _prediction_relation_safe_value(
             safe_snapshot.get("relation_discovery", {})
         ),
