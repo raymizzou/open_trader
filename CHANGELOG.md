@@ -6,6 +6,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-08-16
 
 - #80 将跨所 YES/NO N_LEG 影子模型的 `extreme_loss` 最坏口径从伪精确的 VOID=$0.50 / REFUND=$1.00 改为「至少一条腿可被平台酌情作废到 $0」（NORMAL + 至少一腿作废）的最坏情况；该值仍只读展示，不进入任何资格/门槛逻辑。原因是 Polymarket/Predict.fun 没有可靠的确定性 void/refund 公式，平台酌情作废属尾部风险。聚焦 shadow 测试 22 passed，真实 oracle smoke 返回 extreme_loss=-8.92。
+- #77 selects and persists at most 10 non-overlapping N_LEG monitor components from the active, model-complete relation generation. Background discovery resolves one candidate component at a time only on idle capacity; `initial_verified_profit` comes from the verifier's worst-payout-minus-cost proof (solver OPTIMAL/NOT_PROVEN recorded separately), components rank by verified profit with a stable id tie-break, and the store keeps component identity, fixed admission score, selected portfolio and relation/terminal/portfolio fingerprints without in-flight solves, pending snapshots or quote freshness. No latest-snapshot-wins scheduling, real-time cost recompute, dedupe, Manual/AUTO change, preflight, funding reservation or order mutation was added; the output is the versioned selected-monitor set consumed by #52.
 
 - 修复预测套利阈值对冲订单的飞书通知语义：去掉 confirm 阶段提前发出的假「已吃」；改为按腿发「预测套利单已提交」（订单号+限价+数量）和「预测套利单已吃」（成交数量+订单号），REST 对账证明到位后发整单「预测套利单结算」，提交前整单失败与提交后按腿被拒分别发「预测套利单提交失败」并带失败原因；同时修复「观察提醒」保底净利润显示 +$0.00 的问题（threshold_hedge 快照补 `minimum_profit`）。auto-eat 与手动两条路径统一发通知。聚焦 execution/monitor/notifications 回归通过（250 + 50）。
 

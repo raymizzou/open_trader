@@ -33,7 +33,7 @@ import pytest
 from open_trader.relation_catalog_v2 import RelationCatalogV2  # noqa: F401 - RED: module does not exist yet
 
 # #49 full-matrix oracle budget reused by decision 6 (per-component size ceiling).
-COMPONENT_BUDGET = 7  # ponytail: matches #49 scale_16 oracle limits; confirm exact ceiling at implementation
+GROUP_BUDGET = 7  # ponytail: matches #49 scale_16 oracle limits; confirm exact ceiling at implementation
 
 
 def _endpoint(
@@ -273,7 +273,7 @@ def test_replacement_switches_generation_atomically(store) -> None:
 
 # Decision 5: single cause ledger; component UNKNOWN iff an unresolved cause exists.
 
-def test_component_unknown_propagates_to_whole_component(store) -> None:
+def test_relation_group_unknown_propagates_to_whole_group(store) -> None:
     catalog = _catalog(store)
     ab = _approve(
         catalog,
@@ -349,14 +349,14 @@ def test_unsatisfiable_component_blocked_from_activation(store) -> None:
     assert result["status"] == "ACTIVATION_BLOCKED_INCONSISTENT"
 
 
-def test_component_over_budget_blocked_other_components_unaffected(store) -> None:
+def test_group_over_budget_blocked_other_groups_unaffected(store) -> None:
     catalog = _catalog(store)
     oversized = [
         _payload(
             relation_type="IMPLIES",
             endpoints=[_endpoint("polymarket", f"c{i}"), _endpoint("polymarket", f"c{i + 1}")],
         )
-        for i in range(COMPONENT_BUDGET)
+        for i in range(GROUP_BUDGET)
     ]
     small = _payload(
         relation_type="EXACTLY_ONE", endpoints=[_endpoint("polymarket", "cZ"), _endpoint("predict.fun", "cW")]

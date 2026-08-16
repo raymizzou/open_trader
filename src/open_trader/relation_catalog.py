@@ -31,7 +31,7 @@ _REASONS = frozenset({
 _COMPLETENESS = frozenset({"COMPLETE", "INCOMPLETE"})
 _RELATION_TYPES = frozenset({"IMPLIES", "MUTUALLY_EXCLUSIVE", "EXACTLY_ONE"})
 _ACTIVATION_BLOCKED = frozenset({"ACTIVATION_BLOCKED_INCONSISTENT", "UNSUPPORTED_SIZE"})
-_BUDGET = 10
+_GROUP_BUDGET = 10
 
 
 class RelationConflictError(ValueError):
@@ -137,12 +137,12 @@ def _normalise_discovery(value: Mapping[str, object]) -> dict[str, object]:
 class RelationCatalog:
     """V2-backed public domain API; readers consume only ``current_generation``."""
 
-    def __init__(self, data_dir: Path, *, component_budget: int = _BUDGET) -> None:
-        if type(component_budget) is not int or component_budget < 2:
-            raise ValueError("component_budget must be at least two")
+    def __init__(self, data_dir: Path, *, group_budget: int = _GROUP_BUDGET) -> None:
+        if type(group_budget) is not int or group_budget < 2:
+            raise ValueError("group_budget must be at least two")
         self.path = Path(data_dir) / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.component_budget = component_budget
+        self.group_budget = group_budget
         self._store = SqliteCatalogStore(self.path)
         self._catalog = RelationCatalogV2(store=self._store)
 

@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 
 ALLOWED_VENUES = frozenset({"polymarket", "predict.fun"})
 RELATION_TYPES = frozenset({"IMPLIES", "MUTUALLY_EXCLUSIVE", "EXACTLY_ONE"})
-COMPONENT_BUDGET = 7  # ponytail: #49 scale_16 per-component endpoint ceiling
+GROUP_BUDGET = 7  # ponytail: #49 scale_16 per-group endpoint ceiling
 
 
 def _fp(obj: object) -> str:
@@ -490,13 +490,13 @@ class RelationCatalogV2:
                 new_generation: dict[str, dict] = {}
                 blocked: list[dict[str, str]] = []
                 inconsistent = False
-                for component in _components(entries):
+                for component in _relation_groups(entries):
                     contracts = {
                         contract
                         for entry in component
                         for contract in _entry_contracts(entry)
                     }
-                    if len(contracts) > COMPONENT_BUDGET:
+                    if len(contracts) > GROUP_BUDGET:
                         blocked.extend(
                             {"identity": identity, "reason": "UNSUPPORTED_SIZE"}
                             for identity, _, _ in component
@@ -584,7 +584,7 @@ class RelationCatalogV2:
                 stored_identity, version_fields = _canonicalize(version["payload"])
                 if stored_identity != identity or _fingerprints(version_fields) != frozen["approved_fingerprints"]:
                     raise ValueError(f"tampered payload for {identity}")
-                status = "UNKNOWN" if _component_unknown(identity, generation, versions, causes) else "ACTIVE"
+                status = "UNKNOWN" if _relation_group_unknown(identity, generation, versions, causes) else "ACTIVE"
                 result[identity] = {"version_id": version_id, "status": status}
             return result
 
@@ -593,7 +593,7 @@ def _entry_contracts(entry: tuple[str, str, dict]) -> set[str]:
     return {_canonical_endpoint(endpoint) for endpoint in entry[2]["endpoints"]}
 
 
-def _components(entries: list[tuple[str, str, dict]]) -> list[list[tuple[str, str, dict]]]:
+def _relation_groups(entries: list[tuple[str, str, dict]]) -> list[list[tuple[str, str, dict]]]:
     remaining = list(entries)
     components: list[list[tuple[str, str, dict]]] = []
     while remaining:
@@ -641,7 +641,7 @@ def _relation_holds(entry: tuple[str, str, dict], mask: int, index: dict[str, in
     return sum(values) == 1  # EXACTLY_ONE
 
 
-def _component_unknown(
+def _relation_group_unknown(
     identity: str,
     generation: dict[str, dict],
     versions: MutableMapping,
@@ -649,11 +649,11 @@ def _component_unknown(
 ) -> bool:
     if not causes:
         return False
-    component_ids = _component_ids(identity, generation, versions)
+    component_ids = _relation_group_ids(identity, generation, versions)
     return any(cause_identity in component_ids for (cause_identity, *_) in causes)
 
 
-def _component_ids(
+def _relation_group_ids(
     identity: str, generation: dict[str, dict], versions: MutableMapping
 ) -> set[str]:
     id_contracts: dict[str, set[str]] = {}
