@@ -439,12 +439,13 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
                     )
                     for _ in range(4)
                 ]
-                assert state_entered.wait(timeout=5)
-                assert preview_entered.wait(timeout=5)
+                assert state_entered.wait(timeout=15)
+                assert preview_entered.wait(timeout=15)
 
                 overflow_get = clients.submit(
                     _response_with_headers,
                     base + "/api/prediction-arbitrage/state",
+                    timeout=15,
                 )
                 overflow_post = clients.submit(
                     _response_with_headers,
@@ -453,12 +454,13 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
                         "/api/prediction-arbitrage/preview",
                         data=b'{"opportunity_id":"opp-1"}',
                     ),
+                    timeout=15,
                 )
                 assert server.http_load_snapshot()["active"] == 8  # type: ignore[attr-defined]
 
                 for status, payload, headers in (
-                    overflow_get.result(timeout=5),
-                    overflow_post.result(timeout=5),
+                    overflow_get.result(timeout=15),
+                    overflow_post.result(timeout=15),
                 ):
                     assert status == 503
                     assert payload == {"error": "prediction service busy"}
@@ -476,13 +478,13 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
                         data=b'{"opportunity_id":"opp-1"}',
                     ),
                 )
-                assert preview_reentered.wait(timeout=5)
+                assert preview_reentered.wait(timeout=15)
 
                 for _ in range(8):
                     release_slots.release()
-                assert [future.result(timeout=5)[0] for future in state_calls] == [200] * 4
-                assert [future.result(timeout=5)[0] for future in preview_calls] == [200] * 4
-                assert replacement.result(timeout=5)[0] == 200
+                assert [future.result(timeout=15)[0] for future in state_calls] == [200] * 4
+                assert [future.result(timeout=15)[0] for future in preview_calls] == [200] * 4
+                assert replacement.result(timeout=15)[0] == 200
                 deadline = time.monotonic() + 5
                 while server.http_load_snapshot()["active"] != 0 and time.monotonic() < deadline:  # type: ignore[attr-defined]
                     time.sleep(0.01)

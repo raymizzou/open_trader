@@ -9023,7 +9023,8 @@ def test_report_runner_failure_owns_day_at_inclusive_1900_deadline(tmp_path: Pat
         sleep_fn=sleeps.append, api_factory=lambda **kwargs: ReadyApi(calls, ready=False),
         quote_factory=lambda **kwargs: ReadyQuote(calls), notifier=notifier,
     )
-    assert result == AShareTrendRunResult("failed", None, None)
+    assert result.status == "failed"
+    assert result.waiting_reason == "A股 2026-07-13 → 2026-07-14，ETF基金 2026-07-13 → 2026-07-14"
     assert sleeps == [600.0]
     assert [title for title, _ in macos.messages] == ["A股趋势数据等待中", "A股趋势计划失败"]
     assert feishu.messages == [

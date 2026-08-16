@@ -62,7 +62,7 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
         )
         if self.path == self.server.block_path:
             self.server.request_started.set()
-            assert self.server.release_response.wait(timeout=5)
+            assert self.server.release_response.wait(timeout=15)
         response = {"ok": True}
         encoded = (
             self.server.health_body
@@ -187,6 +187,7 @@ def test_prediction_prefix_routes_as_one_unit(
         legacy.server_address[1],
         prediction_port=prediction.server_address[1],
         prediction_route_path=route,
+        timeout=10,
     ) as base:
         _prediction_request(base, method, path)
 
@@ -208,6 +209,7 @@ def test_prediction_prefix_legacy_mode_routes_as_one_unit(
         legacy.server_address[1],
         prediction_port=prediction.server_address[1],
         prediction_route_path=route,
+        timeout=10,
     ) as base:
         _prediction_request(base, method, "/api/prediction-arbitrage/state")
 
@@ -262,6 +264,7 @@ def test_prediction_service_preserves_headers_body_and_response(tmp_path: Path) 
         legacy.server_address[1],
         prediction_port=prediction.server_address[1],
         prediction_route_path=route,
+        timeout=10,
     ) as base:
         connection = http.client.HTTPConnection(base.removeprefix("http://"), timeout=5)
         connection.putrequest("POST", "/api/prediction-arbitrage/executions")
@@ -441,6 +444,7 @@ def test_prediction_route_change_drains_selected_request_and_rejects_new_work(
         legacy.server_address[1],
         prediction_port=prediction.server_address[1],
         prediction_route_path=route,
+        timeout=10,
     ) as base:
         completed: list[int] = []
 

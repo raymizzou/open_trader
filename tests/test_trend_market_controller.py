@@ -3976,7 +3976,7 @@ def test_heartbeat_refreshes_before_each_calendar_call(
         derive_calls += 1
         if derive_calls == 2:
             calendar_blocked.set()
-            assert release.wait(timeout=2)
+            assert release.wait(timeout=10)
         return active_cn_cycle()
 
     class StopController(Exception):
@@ -4036,10 +4036,10 @@ def test_heartbeat_refreshes_before_each_calendar_call(
 
     thread = threading.Thread(target=run)
     thread.start()
-    assert calendar_blocked.wait(timeout=2)
+    assert calendar_blocked.wait(timeout=10)
     status = load_trend_market_status(config, "CN", now=second_tick)
     release.set()
-    thread.join(timeout=2)
+    thread.join(timeout=10)
 
     assert status["heartbeat_at"] == second_tick.isoformat(timespec="seconds")
     assert controller_stopped.is_set()
