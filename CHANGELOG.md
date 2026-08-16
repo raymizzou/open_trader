@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-16
 
+- #82 adds the catalog-layer runtime relation graph with deterministic Episode lineage: ACTIVE model-complete relations are partitioned into venue-qualified relation groups, changes are classified (PURE_UPDATE / SPLIT / MERGE / EXTEND / NEW / REMOVE), lineage ids are deterministic, and the mapping plus audit persist atomically with restart recovery. The relation catalog now exposes a monotonic generation number and whole-generation fingerprint via `generation_meta()`. No order-book reading, solving, LLM, opportunity, or order behavior was added.
+
 - #80 将跨所 YES/NO N_LEG 影子模型的 `extreme_loss` 最坏口径从伪精确的 VOID=$0.50 / REFUND=$1.00 改为「至少一条腿可被平台酌情作废到 $0」（NORMAL + 至少一腿作废）的最坏情况；该值仍只读展示，不进入任何资格/门槛逻辑。原因是 Polymarket/Predict.fun 没有可靠的确定性 void/refund 公式，平台酌情作废属尾部风险。聚焦 shadow 测试 22 passed，真实 oracle smoke 返回 extreme_loss=-8.92。
 - #77 selects and persists at most 10 non-overlapping N_LEG monitor components from the active, model-complete relation generation. Background discovery resolves one candidate component at a time only on idle capacity; `initial_verified_profit` comes from the verifier's worst-payout-minus-cost proof (solver OPTIMAL/NOT_PROVEN recorded separately), components rank by verified profit with a stable id tie-break, and the store keeps component identity, fixed admission score, selected portfolio and relation/terminal/portfolio fingerprints without in-flight solves, pending snapshots or quote freshness. No latest-snapshot-wins scheduling, real-time cost recompute, dedupe, Manual/AUTO change, preflight, funding reservation or order mutation was added; the output is the versioned selected-monitor set consumed by #52.
 

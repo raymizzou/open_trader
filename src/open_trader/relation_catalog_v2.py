@@ -149,6 +149,10 @@ class SqliteCatalogStore(MutableMapping):
                 identity TEXT PRIMARY KEY,
                 version_id TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS catalog_v2_meta (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                generation_number INTEGER NOT NULL
+            );
             """
         )
         # Pre-existing v2 databases created before the facade's activation
@@ -260,22 +264,28 @@ class SqliteCatalogStore(MutableMapping):
             "SELECT identity, version_id FROM catalog_v2_latest"
         ):
             latest[identity] = version_id
+        meta_row = self._conn.execute(
+            "SELECT generation_number FROM catalog_v2_meta WHERE singleton=1"
+        ).fetchone()
+        generation_number = int(meta_row[0]) if meta_row else 0
         return {
             "versions": versions,
             "approved": approved,
             "generation": generation,
             "causes": causes,
             "latest": latest,
+            "generation_number": generation_number,
         }
 
     def _flush(self, state: dict[str, dict]) -> None:
         now = _now()
-        versions, approved, generation, causes, latest = (
+        versions, approved, generation, causes, latest, generation_number = (
             state["versions"],
             state["approved"],
             state["generation"],
             state["causes"],
             state.get("latest", {}),
+            int(state.get("generation_number", 0)),
         )
         self._conn.execute("DELETE FROM catalog_v2_versions")
         for version_id, record in versions.items():
@@ -329,6 +339,11 @@ class SqliteCatalogStore(MutableMapping):
             "INSERT INTO catalog_v2_generations (members, created_at) VALUES (?, ?)",
             (json.dumps(generation, sort_keys=True), now),
         )
+        self._conn.execute(
+            "INSERT INTO catalog_v2_meta (singleton, generation_number) VALUES (1, ?) "
+            "ON CONFLICT(singleton) DO UPDATE SET generation_number=excluded.generation_number",
+            (generation_number,),
+        )
 
     # -- MutableMapping ----------------------------------------------------
 
@@ -368,14 +383,20 @@ class RelationCatalogV2:
         begin = getattr(self.store, "begin_write", None)
         if begin is None:
             yield
+            self._bump_generation()
             return
         begin()
         try:
             yield
+            self._bump_generation()
             self.store.commit_write()
         except BaseException:
             self.store.rollback_write()
             raise
+
+    def _bump_generation(self) -> None:
+        current = self.store.get("generation_number", 0)
+        self.store["generation_number"] = int(current) + 1
 
     @contextmanager
     def _read(self) -> Iterator[None]:
