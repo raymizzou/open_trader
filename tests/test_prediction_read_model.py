@@ -264,7 +264,29 @@ def frozen_prediction_state() -> dict[str, object]:
       "opportunity_id": "same-venue-1",
       "profit": "1.00",
       "question": "Same venue question",
-      "title": "Same venue question"
+      "title": "Same venue question",
+      "strategy_type": "yes_no",
+      "engine_owner": "yes_no",
+      "relation_type": "NATIVE_COMPLEMENT",
+      "discovery_source": "VENUE_METADATA",
+      "leg_count": 2,
+      "scope": {"event": "same_event", "venue": "same_venue"},
+      "scope_label": "同所 · 同事件",
+      "qualification_policy_version": "v1",
+      "qualification": {
+        "status": "UNKNOWN",
+        "checks": [
+          {"key": "approved", "label": "已批准", "passed": null, "value": null, "threshold": "APPROVE"},
+          {"key": "proof", "label": "证明完整", "passed": null, "value": null, "threshold": true},
+          {"key": "min_profit", "label": "最低利润 $1", "passed": true, "value": "1.00", "threshold": "1.00"},
+          {"key": "net_edge", "label": "1% 净边际", "passed": null, "value": null, "threshold": "0.01"},
+          {"key": "annualized", "label": "15% 年化", "passed": null, "value": null, "threshold": "0.15"},
+          {"key": "tenor", "label": "30 天资本释放", "passed": null, "value": null, "threshold": "30"},
+          {"key": "not_expired", "label": "未过期", "passed": null, "value": null, "threshold": ">0"}
+        ],
+        "order_ready": false,
+        "order_ready_reason": "资格数据未知"
+      }
     },
     {
       "annualized_yield": "0.20",
@@ -282,9 +304,40 @@ def frozen_prediction_state() -> dict[str, object]:
       "title": "Cross venue question",
       "total_max_cost": "4.50",
       "unsettled": {"after": "7.75", "current": "3.25", "limit": "100"},
-      "wallet": "0x2222…2222"
+      "wallet": "0x2222…2222",
+      "strategy_type": "yes_no",
+      "engine_owner": "yes_no",
+      "relation_type": "NATIVE_COMPLEMENT",
+      "discovery_source": "VENUE_METADATA",
+      "leg_count": 2,
+      "scope": {"event": "same_event", "venue": "cross_venue"},
+      "scope_label": "跨所 · 同事件",
+      "qualification_policy_version": "v1",
+      "qualification": {
+        "status": "UNKNOWN",
+        "checks": [
+          {"key": "approved", "label": "已批准", "passed": null, "value": null, "threshold": "APPROVE"},
+          {"key": "proof", "label": "证明完整", "passed": null, "value": null, "threshold": true},
+          {"key": "min_profit", "label": "最低利润 $1", "passed": false, "value": "0.50", "threshold": "1.00"},
+          {"key": "net_edge", "label": "1% 净边际", "passed": null, "value": null, "threshold": "0.01"},
+          {"key": "annualized", "label": "15% 年化", "passed": true, "value": "0.20", "threshold": "0.15"},
+          {"key": "tenor", "label": "30 天资本释放", "passed": false, "value": null, "threshold": "30"},
+          {"key": "not_expired", "label": "未过期", "passed": true, "value": null, "threshold": ">0"}
+        ],
+        "order_ready": false,
+        "order_ready_reason": "资格数据未知"
+      }
     }
   ],
+  "opportunity_qualification": {
+    "status": "NO_QUALIFIED_OPPORTUNITY",
+    "no_arbitrage": false,
+    "qualified_count": 0,
+    "total_count": 2,
+    "verified_count": 0,
+    "feasible_count": 0,
+    "unknown_count": 2
+  },
   "policy_limits": {
     "max_cross_unsettled_principal": "100",
     "max_emergency_loss": "2.00",
@@ -293,6 +346,7 @@ def frozen_prediction_state() -> dict[str, object]:
     "min_estimated_profit": "1.00",
     "min_net_edge": "0.01"
   },
+  "qualified_opportunities": [],
   "readiness": {
     "geoblock": "allowed",
     "p_usd_balance": "12.50",
@@ -346,6 +400,218 @@ def test_shared_prediction_read_model_matches_frozen_payload(
     assert "0x2222222222222222222222222222222222222222" not in json.dumps(payload)
     assert payload["masked_wallet"] == "0x1111…1111"
     assert payload["venues"][1]["wallet"] == "0x2222…2222"
+
+
+def _nleg_cross_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "opportunity_id": "cross-verified-1",
+        "market_type": "cross_venue_yes_no",
+        "question": "Bitcoin above $120k before September?",
+        "quantity": "20",
+        "total_max_cost": "31.20",
+        "minimum_payout": "39.60",
+        "minimum_profit": "8.40",
+        "annualized_yield": "0.284",
+        "remaining_days": "12",
+        "resolution_at": "2026-09-01T00:00:00Z",
+        "actionable": True,
+        "codex_approval": {"decision": "APPROVE", "summary": "deterministic match"},
+        "legs": [
+            {
+                "exchange": "predict.fun",
+                "outcome": "YES",
+                "net_quantity": "20",
+                "max_price": "0.42",
+                "max_cost": "16.80",
+                "settlement_asset": "USDT",
+            },
+            {
+                "exchange": "polymarket",
+                "outcome": "NO",
+                "net_quantity": "20",
+                "max_price": "0.36",
+                "max_cost": "14.40",
+                "settlement_asset": "pUSD",
+            },
+        ],
+        "extreme_loss": "-0.80",
+        "contract_generation": "1",
+    }
+    row.update(overrides)
+    return row
+
+
+def _nleg_threshold_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "opportunity_id": "threshold-feasible-1",
+        "market_type": "threshold_hedge",
+        "question_a": "Hurupay FDV above $50M?",
+        "question_b": "Hurupay FDV above $100M?",
+        "relation": "B_IMPLIES_A",
+        "condition_id_a": "cond-a",
+        "condition_id_b": "cond-b",
+        "quantity": "20",
+        "total_max_cost": "19.00",
+        "minimum_payout": "25.18",
+        "minimum_profit": "6.18",
+        "annualized_yield": "0.189",
+        "remaining_days": "20",
+        "resolution_at": "2026-09-05T00:00:00Z",
+        "actionable": False,
+        "llm_status": "approved",
+        "extreme_loss": "-1.05",
+    }
+    row.update(overrides)
+    return row
+
+
+class _NlegExecution:
+    _breaker_open = False
+    _cross_breaker_open = False
+
+    _fresh_predict_account_snapshot = lambda self: {
+        "wallet_address": "0x2222222222222222222222222222222222222222",
+        "available_usdt": "40.00",
+        "open_orders": [],
+        "positions": [],
+        "checked_at": "2026-08-16T01:00:00Z",
+        "allowance_ready": True,
+    }
+
+
+class _NlegMonitor:
+    def __init__(self, rows: list[dict[str, object]], *, stale: bool = False):
+        self._rows = rows
+        self._stale = stale
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "status": "unavailable" if self._stale else "healthy",
+            "health": {
+                "status": "unavailable" if self._stale else "healthy",
+                "degraded_reasons": ["stale"] if self._stale else [],
+            },
+            "stale": self._stale,
+            "readiness": {
+                "status": "ready",
+                "wallet_address": "0x1111111111111111111111111111111111111111",
+                "p_usd_balance": "60.40",
+            },
+            "events": [],
+            "opportunities": self._rows,
+        }
+
+
+def _nleg_state(rows: list[dict[str, object]], *, stale: bool = False) -> dict[str, object]:
+    return prediction_state_payload(
+        store=_Store(),
+        monitor=_NlegMonitor(rows, stale=stale),
+        execution=_NlegExecution(),
+        csrf_token="csrf",
+    )
+
+
+def test_nleg_forward_projection_labels_current_opportunities() -> None:
+    state = _nleg_state([_nleg_cross_row(), _nleg_threshold_row()])
+
+    cross = state["opportunities"][0]
+    threshold = state["opportunities"][1]
+    assert cross["strategy_type"] == "yes_no"
+    assert cross["engine_owner"] == "yes_no"
+    assert cross["relation_type"] == "NATIVE_COMPLEMENT"
+    assert cross["discovery_source"] == "VENUE_METADATA"
+    assert cross["leg_count"] == 2
+    assert cross["scope"] == {"event": "same_event", "venue": "cross_venue"}
+    assert cross["scope_label"] == "跨所 · 同事件"
+    assert cross["qualification_policy_version"] == "v1"
+    assert cross["contract_generation"] == "1"
+    assert threshold["strategy_type"] == "llm_hedge"
+    assert threshold["engine_owner"] == "llm_hedge"
+    assert threshold["relation_type"] == "IMPLIES"
+    assert threshold["discovery_source"] == "LLM"
+    assert threshold["scope"] == {"event": "same_event", "venue": "same_venue"}
+    assert threshold["scope_label"] == "同所 · 同事件"
+
+
+def test_qualified_verified_cross_opportunity_is_order_ready() -> None:
+    state = _nleg_state([_nleg_cross_row()])
+    row = state["opportunities"][0]
+    qualification = row["qualification"]
+
+    assert qualification["status"] == "QUALIFIED_VERIFIED"
+    assert qualification["order_ready"] is True
+    assert qualification["order_ready_reason"] == ""
+    checks = {item["key"]: item for item in qualification["checks"]}
+    assert checks["approved"]["passed"] is True
+    assert checks["proof"]["passed"] is True
+    assert checks["min_profit"]["passed"] is True
+    assert checks["net_edge"]["passed"] is True
+    assert checks["annualized"]["passed"] is True
+    assert checks["tenor"]["passed"] is True
+    assert checks["not_expired"]["passed"] is True
+    assert row["extreme_loss"] == "-0.80"
+    assert state["opportunity_qualification"]["status"] == "QUALIFIED"
+    assert state["qualified_opportunities"][0]["opportunity_id"] == "cross-verified-1"
+
+
+def test_llm_threshold_stays_feasible_and_insufficient_balance_is_not_no_arbitrage() -> None:
+    row = _nleg_threshold_row(total_max_cost="70.00")
+    state = _nleg_state([row])
+    qualification = state["opportunities"][0]["qualification"]
+
+    assert qualification["status"] == "QUALIFIED_FEASIBLE"
+    assert qualification["order_ready"] is False
+    assert "余额不足" in qualification["order_ready_reason"]
+    assert state["opportunity_qualification"]["status"] == "QUALIFIED"
+    assert state["opportunity_qualification"]["no_arbitrage"] is False
+    assert "NO_ARBITRAGE" not in state["opportunity_qualification"]["status"]
+
+
+def test_qualification_not_qualified_and_unknown_are_distinguished() -> None:
+    low_profit = _nleg_threshold_row(minimum_profit="0.50")
+    missing_proof = _nleg_cross_row(codex_approval={})
+    state = _nleg_state([low_profit, missing_proof])
+    by_id = {
+        str(row["opportunity_id"]): row["qualification"]["status"]
+        for row in state["opportunities"]
+    }
+
+    assert by_id["threshold-feasible-1"] == "NOT_QUALIFIED"
+    assert by_id["cross-verified-1"] == "UNKNOWN"
+    assert state["qualified_opportunities"] == []
+    assert state["opportunity_qualification"]["status"] == "NO_QUALIFIED_OPPORTUNITY"
+
+
+def test_opportunity_qualification_summary_is_unknown_when_stale() -> None:
+    state = _nleg_state([_nleg_cross_row()], stale=True)
+    assert state["opportunity_qualification"]["status"] == "UNKNOWN"
+
+
+def test_nleg_history_keeps_strategy_type_without_forward_writeback() -> None:
+    class Store(_Store):
+        def signal_history(self, _window: str) -> list[dict[str, object]]:
+            return [{
+                "signal_id": "signal-legacy",
+                "opportunity_id": "same-venue-1",
+                "started_at": "2026-08-10T01:02:03Z",
+                "question": "Legacy question",
+                "strategy_type": "yes_no",
+            }]
+
+    payload = prediction_history_payload(
+        Store(),
+        kind="signals",
+        limit=100,
+        offset=0,
+        monitor=_NlegMonitor([]),
+        execution=_NlegExecution(),
+        cross_venue_monitor=None,
+    )
+    item = payload["items"][0]
+    assert item["strategy_type"] == "yes_no"
+    assert "relation_type" not in item
+    assert "engine_owner" not in item
+    assert "qualification" not in item
 
 
 @pytest.mark.parametrize(("kind", "expected"), (
