@@ -6,6 +6,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-08-17
 
 - 测试稳定性：修复 prediction service HTTP 并发压力用例在全量测试下的提交顺序竞态（先确认 4 个 state 请求进入 handler 再提交 4 个 preview，并提高 client timeout），以及跨所 auto_submit 残差事件用例在全量测试下的 reconcile 结果消费竞态（提供两份相同残差结果）。仅测试改动，无运行时代码变化。
+- #52 把 #82/#83/#84 接进生产 PredictionRuntime，形成第一条真正运行的实时 N_LEG 求解链路：`PredictionLiveResolver` 以 250ms daemon 线程推进目录 generation 并裁剪 #77 selected set；Polymarket 最新盘口归一化为 micro-USDC 成本切片后经 #54 的两个常驻 worker 求解，复用同一次 worker evidence 做 #50 verify 产出 `MarketSolution`，再用只读账户 seam 做最小资金检查产出 `ExecutionSolution`；结果只保存在内存，由 state API 透传给 #85 read model。selected set 的 discovery/refresh 单列为 #87；Predict、指标、ORDER_READY 和订单行为仍不在本 scope。聚焦 live-resolver/scheduler/market-solution/monitor-selection/runtime-graph 回归 66 passed；完整 runtime 套件仍保留基线已有的 5 个 sandbox 相关失败。未部署、未推送。
 
 ## 2026-08-16
 
