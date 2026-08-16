@@ -199,6 +199,10 @@ def test_entry_claims_one_batch_and_survives_reopen(tmp_path) -> None:
     assert restarted.control() == {
         "mode": "AUTO", "breaker_open": False, "breaker_reason": None,
         "active_batch_id": "batch-1", "total_unsettled_capital_units": 1020,
+        "contract_generation": 1,
+        "qualification_policy_version": 1,
+        "safety_config_version": 1,
+        "enabled_execution_scope_version": [],
     }
     assert restarted.enter(
         opportunity_episode_id="episode-1", episode_lineage_id="lineage-1", execution_batch_id="batch-1",
