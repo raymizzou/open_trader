@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-16
 
+- #57 replaces the two YES/NO and LLM strategy tabs with a single unified N_LEG opportunity page: a one-row filter (discovery source / relation type / leg count / scope), venue-qualified opportunity cards with qualification status, order_ready reason and extreme risk, a MANUAL confirm action, a read-only capital-usage strip, and a six-state relation review list projected from the versioned relation catalog. The read model forward-projects current opportunities into N_LEG labels while keeping legacy `strategy_type` for history, and the page only exposes `MANUAL`/`AUTO` (OBSERVE_ONLY stays inside MANUAL). No production notification, mode, or order owner changed; the page only projects server facts. Focused read-model/dashboard/relation tests and Playwright block-order/mock-parity checks pass.
+
 - 修复预测市场「观察提醒」在阈值套利市场（如 SPY）反复出现/消失时每 ~1 分钟重复发送飞书的问题：观察通知现在按 `market_id` 做 30 分钟成功送达冷却，同一市场 30 分钟内不再重复发送，发送失败仍按原逻辑重试，不影响 YES/NO 下单路径的既有 30 分钟冷却。聚焦 store/execution/monitor 回归通过（349 + 128）。
 
 - Relax timing-sensitive test timeouts for the Prediction Service HTTP concurrency limit and the VIPR certificate subprocess checks so they no longer fail deterministically on a slower local machine. This is a test-only change; no runtime, service, or Dashboard behavior changed.
