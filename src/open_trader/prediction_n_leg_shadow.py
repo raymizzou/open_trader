@@ -11,6 +11,7 @@ from threading import Condition, RLock
 
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_n_leg import (
+    ActionQuantity,
     ActionPayout,
     ActionSide,
     ArbitrageProblem,
@@ -21,6 +22,8 @@ from open_trader.prediction_n_leg import (
     OracleBudget,
     OracleRequest,
     PROBLEM_SCHEMA_V1,
+    RelationConstraint,
+    RelationKind,
     REQUEST_SCHEMA_V1,
     QualificationConstraint,
     QualificationMetric,
@@ -33,6 +36,7 @@ from open_trader.prediction_n_leg import (
     canonical_payload,
     fingerprint,
 )
+from open_trader.prediction_n_leg_oracle import evaluate_fixed_portfolio
 from open_trader.prediction_solver import BenchmarkLimits
 from open_trader.prediction_solver_server import SolverServerOwner
 from open_trader.prediction_solver_worker import WorkerRequest
@@ -49,6 +53,17 @@ ShadowSubmission = Callable[[dict[str, object]], Future[Mapping[str, object]]]
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+CROSS_VENUE_VALUATION_UNIT = "USD"
+CROSS_VENUE_ASSET_VALUATION_RULE_ID = "usd-1:1-v1"
+CROSS_VENUE_RELATION_RULE = "cross-venue-equivalence-v1"
+_CROSS_VENUE_DIRECT_MAPPING = {
+    "predict_yes": "YES",
+    "predict_no": "NO",
+    "polymarket_yes": "YES",
+    "polymarket_no": "NO",
+}
 
 
 def _decimal(value: object, name: str) -> Decimal:
@@ -135,7 +150,8 @@ def _economic_fingerprint(opportunity: Mapping[str, object], signal_id: str) -> 
                 field: _snapshot_value(leg.get(field), f"leg[{index}].{field}")
                 for field in (
                     "exchange", "market_id", "condition_id", "outcome", "token_id",
-                    "net_quantity", "max_cost", "settlement_at",
+                    "net_quantity", "max_cost", "settlement_at", "account_id", "chain_id",
+                    "resolution_source", "settlement_asset", "capital_release_at",
                 )
             }
             for index, leg in enumerate(legs)
@@ -146,6 +162,12 @@ def _economic_fingerprint(opportunity: Mapping[str, object], signal_id: str) -> 
             economic["rules_fingerprints"] = {
                 str(key): _snapshot_value(value, f"rules_fingerprints.{key}")
                 for key, value in sorted(rules.items())
+            }
+        approval = opportunity.get("codex_approval")
+        if isinstance(approval, Mapping) and isinstance(approval.get("direct_outcome_mapping"), Mapping):
+            economic["direct_outcome_mapping"] = {
+                str(key): str(value)
+                for key, value in sorted(approval["direct_outcome_mapping"].items())
             }
     return fingerprint(canonical_payload(economic))
 
@@ -186,6 +208,8 @@ def legacy_shadow_snapshot(
                 for field in (
                     "exchange", "market_id", "condition_id", "outcome", "token_id",
                     "net_quantity", "max_cost", "book_timestamp", "settlement_at",
+                    "account_id", "chain_id", "resolution_source", "settlement_asset",
+                    "capital_release_at",
                 )
             })
         snapshot["legs"] = canonical_legs
@@ -195,12 +219,20 @@ def legacy_shadow_snapshot(
                 str(key): _snapshot_value(value, f"rules_fingerprints.{key}")
                 for key, value in sorted(rules.items())
             }
+        approval = opportunity.get("codex_approval")
+        if isinstance(approval, Mapping) and isinstance(approval.get("direct_outcome_mapping"), Mapping):
+            snapshot["direct_outcome_mapping"] = {
+                str(key): str(value)
+                for key, value in sorted(approval["direct_outcome_mapping"].items())
+            }
     snapshot["fingerprint"] = _economic_fingerprint(opportunity, signal_id)
     return snapshot
 
 
 def _missing_settlement_diagnostic(
     snapshot: Mapping[str, object],
+    *,
+    reason: str = "缺少结算证据",
 ) -> dict[str, object]:
     fingerprint = snapshot.get("fingerprint")
     return {
@@ -221,7 +253,7 @@ def _missing_settlement_diagnostic(
             "capital_release_at": {
                 "legacy": "",
                 "n_leg": "",
-                "reason": "缺少结算证据",
+                "reason": reason,
             },
         },
     }
@@ -247,13 +279,9 @@ def legacy_shadow_request(
         raise ValueError("legacy quantity is too small")
     units_per_dollar = 100_000_000 * scale
     if snapshot.get("market_type") == "cross_venue_yes_no":
-        legs = snapshot.get("legs")
-        if not isinstance(legs, (list, tuple)) or len(legs) != 2 or not all(isinstance(leg, Mapping) for leg in legs):
-            raise ValueError("legacy cross-venue legs are required")
-        costs = tuple(_decimal(leg.get("max_cost"), "leg max_cost") for leg in legs)
-        gas = _nonnegative_decimal(snapshot.get("calculable_gas", "0"), "calculable_gas")
-        costs = (costs[0], costs[1] + gas)
-        sides = tuple(ActionSide.BUY_YES if leg.get("outcome") == "YES" else ActionSide.BUY_NO for leg in legs)
+        return _cross_venue_request(
+            snapshot, fingerprint, market_id, quantity, scale, lots, units_per_dollar,
+        )
     else:
         costs = (
             _decimal(snapshot.get("yes_max_cost"), "yes_max_cost"),
@@ -269,7 +297,7 @@ def legacy_shadow_request(
     actions = tuple(
         CandidateAction(
             f"legacy-{index}", "legacy", "legacy", "legacy", str(market_id), observation,
-            side, 1, scale, lots, lots, "USD", f"legacy-usd-{units_per_dollar}",
+            side, 1, scale, lots, lots, f"legacy-usd-{units_per_dollar}", f"legacy-usd-{units_per_dollar}",
             "legacy-yes-no-v1", _cost_slices(cost, units_per_dollar, lots),
         )
         for index, (side, cost) in enumerate(zip(sides, costs, strict=True), start=1)
@@ -304,6 +332,175 @@ def legacy_shadow_request(
             ),
         ),
     )
+    return WorkerRequest(
+        f"shadow:{snapshot.get('signal_id', 'episode')}:{fingerprint}", "cp_sat",
+        OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, problem, OracleBudget(4, 4, 4)),
+        BenchmarkLimits(500, 1_000, 256 * 1024 * 1024, 4),
+    )
+
+
+def _cross_venue_identity_mapping(
+    snapshot: Mapping[str, object],
+) -> Mapping[str, str] | None:
+    """Return the frozen direct outcome mapping, defaulting to direct polarity."""
+
+    mapping = snapshot.get("direct_outcome_mapping")
+    if not isinstance(mapping, Mapping):
+        return _CROSS_VENUE_DIRECT_MAPPING
+    normalized = {str(key): str(value) for key, value in mapping.items()}
+    return normalized if normalized == _CROSS_VENUE_DIRECT_MAPPING else None
+
+
+def _cross_venue_normal_atoms(
+    action: CandidateAction, release_at: datetime
+) -> tuple[TerminalAtom, ...]:
+    rule_version = action.settlement_observation_key.rule_version
+    yes_payout = 100_000_000 if action.side is ActionSide.BUY_YES else 0
+    no_payout = 100_000_000 if action.side is ActionSide.BUY_NO else 0
+    return (
+        TerminalAtom(
+            f"{action.market_contract_id}-yes", TerminalKind.NORMAL_YES, rule_version,
+            (ActionPayout(action.action_id, yes_payout),), release_at,
+        ),
+        TerminalAtom(
+            f"{action.market_contract_id}-no", TerminalKind.NORMAL_NO, rule_version,
+            (ActionPayout(action.action_id, no_payout),), release_at,
+        ),
+    )
+
+
+def _cross_venue_equivalence_relations(
+    contract_ids: tuple[str, str],
+) -> tuple[RelationConstraint, ...]:
+    first, second = contract_ids
+    return (
+        RelationConstraint(
+            f"cross-{first}-implies-{second}", RelationKind.IMPLIES,
+            (first, second), CROSS_VENUE_RELATION_RULE,
+        ),
+        RelationConstraint(
+            f"cross-{second}-implies-{first}", RelationKind.IMPLIES,
+            (second, first), CROSS_VENUE_RELATION_RULE,
+        ),
+    )
+
+
+def _cross_venue_extreme_atoms(
+    action: CandidateAction, release_at: datetime
+) -> tuple[TerminalAtom, ...]:
+    rule_version = action.settlement_observation_key.rule_version
+    return (
+        *_cross_venue_normal_atoms(action, release_at),
+        TerminalAtom(
+            f"{action.market_contract_id}-void", TerminalKind.VOID, rule_version,
+            (ActionPayout(action.action_id, 50_000_000),), release_at,
+        ),
+        TerminalAtom(
+            f"{action.market_contract_id}-refund", TerminalKind.REFUND, rule_version,
+            (ActionPayout(action.action_id, 100_000_000),), release_at,
+        ),
+    )
+
+
+def _cross_venue_problem(
+    snapshot: Mapping[str, object],
+    fingerprint: str,
+    market_id: str,
+    quantity: Decimal,
+    scale: int,
+    lots: int,
+    units_per_dollar: int,
+    *,
+    extreme: bool,
+) -> ArbitrageProblem | Mapping[str, object]:
+    """Model one approved cross-venue pair as two venue-qualified contracts."""
+
+    legs = snapshot.get("legs")
+    if not isinstance(legs, (list, tuple)) or len(legs) != 2 or not all(isinstance(leg, Mapping) for leg in legs):
+        raise ValueError("legacy cross-venue legs are required")
+    rules = snapshot.get("rules_fingerprints")
+    if not isinstance(rules, Mapping):
+        return _missing_settlement_diagnostic(snapshot, reason="身份证据缺失")
+    if _cross_venue_identity_mapping(snapshot) is None:
+        return _missing_settlement_diagnostic(snapshot, reason="outcome mapping 与影子模型不兼容")
+    as_of = _time(snapshot.get("confirmed_at"), "confirmed_at")
+    gas = _nonnegative_decimal(snapshot.get("calculable_gas", "0"), "calculable_gas")
+    actions: list[CandidateAction] = []
+    state_sets: list[TerminalStateSet] = []
+    for index, leg in enumerate(legs):
+        exchange = str(leg.get("exchange") or "")
+        condition_id = str(leg.get("condition_id") or "")
+        rule_version = str(rules.get(exchange) or "")
+        resolution_source = str(leg.get("resolution_source") or "")
+        account_id = str(leg.get("account_id") or "")
+        chain_id = str(leg.get("chain_id") or "")
+        try:
+            release_at = _time(leg.get("capital_release_at"), "leg capital_release_at")
+        except ValueError:
+            return _missing_settlement_diagnostic(snapshot)
+        if release_at <= as_of:
+            return _missing_settlement_diagnostic(snapshot)
+        if not all((condition_id, rule_version, resolution_source, account_id, chain_id)):
+            return _missing_settlement_diagnostic(snapshot, reason="身份证据缺失")
+        cost = _decimal(leg.get("max_cost"), "leg max_cost")
+        if exchange == "polymarket":
+            cost = cost + gas
+        side = ActionSide.BUY_YES if leg.get("outcome") == "YES" else ActionSide.BUY_NO
+        observation = SettlementObservationKey(
+            OBSERVATION_SCHEMA_V1, resolution_source, condition_id, as_of,
+            release_at, "UTC", rule_version,
+        )
+        action = CandidateAction(
+            f"cross-{index + 1}", exchange, account_id, chain_id, condition_id,
+            observation, side, 1, scale, lots, lots,
+            CROSS_VENUE_VALUATION_UNIT, CROSS_VENUE_VALUATION_UNIT,
+            CROSS_VENUE_ASSET_VALUATION_RULE_ID,
+            _cost_slices(cost, units_per_dollar, lots),
+        )
+        actions.append(action)
+        atoms = (
+            _cross_venue_extreme_atoms(action, release_at)
+            if extreme
+            else _cross_venue_normal_atoms(action, release_at)
+        )
+        state_sets.append(
+            TerminalStateSet(condition_id, observation, rule_version, atoms)
+        )
+    ordered_actions = tuple(actions)
+    contract_ids = tuple(state.market_contract_id for state in state_sets)
+    qualifications: tuple[QualificationConstraint, ...] = (
+        ()
+        if extreme
+        else (
+            QualificationConstraint(
+                "legacy-positive-profit", "legacy-v1", QualificationMetric.GUARANTEED_PROFIT_UNITS,
+                Comparison.GREATER_THAN_OR_EQUAL, 1, 1,
+            ),
+        )
+    )
+    return ArbitrageProblem(
+        PROBLEM_SCHEMA_V1, f"legacy:{market_id}:{fingerprint}", as_of,
+        CROSS_VENUE_VALUATION_UNIT, ordered_actions, tuple(state_sets),
+        ConstraintModel(_cross_venue_equivalence_relations(contract_ids), ()),
+        qualifications,
+    )
+
+
+def _cross_venue_request(
+    snapshot: Mapping[str, object],
+    fingerprint: str,
+    market_id: str,
+    quantity: Decimal,
+    scale: int,
+    lots: int,
+    units_per_dollar: int,
+) -> WorkerRequest | Mapping[str, object]:
+    problem = _cross_venue_problem(
+        snapshot, fingerprint, market_id, quantity, scale, lots, units_per_dollar,
+        extreme=False,
+    )
+    if isinstance(problem, Mapping):
+        return problem
     return WorkerRequest(
         f"shadow:{snapshot.get('signal_id', 'episode')}:{fingerprint}", "cp_sat",
         OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, problem, OracleBudget(4, 4, 4)),
@@ -361,6 +558,33 @@ def _failure(fingerprint: str, reason: str, error: BaseException | None) -> dict
         "fingerprint": fingerprint,
         "reason": reason if error is None else f"{reason}: {type(error).__name__}",
     }
+
+
+def _cross_venue_extreme_loss(
+    snapshot: Mapping[str, object], scale: int
+) -> Decimal | None:
+    """Worst payout minus cost over NORMAL+VOID+REFUND combos, display-only."""
+
+    try:
+        quantity = _decimal(snapshot.get("quantity"), "quantity")
+        lots = int(quantity * scale)
+        units_per_dollar = 100_000_000 * scale
+        problem = _cross_venue_problem(
+            snapshot, str(snapshot.get("fingerprint", "")), "extreme",
+            quantity, scale, lots, units_per_dollar, extreme=True,
+        )
+        if isinstance(problem, Mapping):
+            return None
+        quantities = tuple(
+            ActionQuantity(action.action_id, action.max_quantity_lots)
+            for action in problem.actions
+        )
+        evaluation = evaluate_fixed_portfolio(
+            problem, quantities, OracleBudget(32, 32, 32)
+        )
+        return Decimal(evaluation.guaranteed_profit_units) / Decimal(units_per_dollar)
+    except Exception:
+        return None
 
 
 def _comparison(snapshot: Mapping[str, object], fingerprint: str, verification: object) -> dict[str, object]:
@@ -434,8 +658,9 @@ def _comparison(snapshot: Mapping[str, object], fingerprint: str, verification: 
         "legacy": "是", "n_leg": "是", "status": "consistent",
     }
     expected_sides = _legacy_direction(snapshot)
+    action_prefix = "cross" if snapshot.get("market_type") == "cross_venue_yes_no" else "legacy"
     sides_by_action = {
-        f"legacy-{index}": side for index, side in enumerate(expected_sides, start=1)
+        f"{action_prefix}-{index}": side for index, side in enumerate(expected_sides, start=1)
     }
     actual_direction = tuple(
         sides_by_action.get(getattr(item, "action_id", ""), "")
@@ -481,6 +706,15 @@ def _comparison(snapshot: Mapping[str, object], fingerprint: str, verification: 
             "status": "difference",
         }
     )
+    extreme_loss: Decimal | None = None
+    if snapshot.get("market_type") == "cross_venue_yes_no":
+        extreme_loss = _cross_venue_extreme_loss(snapshot, scale)
+        if extreme_loss is not None:
+            differences["extreme_loss"] = {
+                "legacy": "未建模",
+                "n_leg": format(extreme_loss, "f"),
+                "status": "na",
+            }
     comparison = (
         "CONSISTENT"
         if all(
@@ -501,6 +735,7 @@ def _comparison(snapshot: Mapping[str, object], fingerprint: str, verification: 
             "maximum_cost": format(n_leg_cost, "f"),
             "minimum_profit": format(n_leg_profit, "f"),
             "capital_release_at": _timestamp(actual_release) if isinstance(actual_release, datetime) else None,
+            **({"extreme_loss": format(extreme_loss, "f")} if extreme_loss is not None else {}),
         },
         **({"differences": differences} if differences else {}),
     }

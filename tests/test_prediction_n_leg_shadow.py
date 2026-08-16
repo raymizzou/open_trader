@@ -13,11 +13,13 @@ from open_trader.prediction_n_leg import (
     ActionQuantity,
     ActionSide,
     PortfolioCandidate,
+    UnknownReason,
     canonical_payload,
     fingerprint,
 )
 from open_trader.prediction_n_leg_oracle import (
     cut_from_scenario,
+    enumerate_allowed_scenarios,
     evaluate_fixed_portfolio,
 )
 
@@ -27,7 +29,12 @@ from open_trader.prediction_n_leg_shadow import (
     legacy_shadow_snapshot,
     legacy_shadow_request,
 )
-from open_trader.prediction_solver import ObjectiveBounds, SolverEvidence
+from open_trader.prediction_solver import (
+    ObjectiveBounds,
+    SolverEvidence,
+    solve_with_constraint_generation,
+)
+from open_trader.prediction_solver_backends import CpSatBackend
 from open_trader.prediction_solver_verified import (
     CANDIDATE_EVIDENCE_SCHEMA_V1,
     PROOF_REQUEST_SCHEMA_V1,
@@ -115,6 +122,35 @@ def test_legacy_yes_no_adapter_builds_a_canonical_worker_request() -> None:
     assert tuple(action.max_quantity_lots for action in request.request.problem.actions) == (10, 10)
 
 
+def test_legacy_standard_binary_valuation_identity_reaches_cp_sat() -> None:
+    request = legacy_shadow_request(
+        {
+            "opportunity_id": "event-1:market-1",
+            "market_id": "market-1",
+            "market_type": "standard_binary",
+            "quantity": "10",
+            "yes_max_cost": "4.20",
+            "no_max_cost": "4.70",
+            "total_max_cost": "8.90",
+            "minimum_profit": "1.10",
+            "confirmed_at": "2026-08-15T00:00:00Z",
+            "resolution_at": "2026-08-16T00:00:00Z",
+            "signal_id": "episode-1",
+            "fingerprint": "shadow-1",
+        }
+    )
+
+    problem = request.request.problem
+    assert all(
+        action.settlement_asset_id == action.valuation_unit_id == problem.valuation_unit_id
+        for action in problem.actions
+    )
+    evidence = solve_with_constraint_generation(request.request, CpSatBackend(), request.limits)
+    assert evidence.native_status != UnknownReason.UNKNOWN_VALUATION.value
+    assert evidence.candidate is not None
+    assert evidence.guaranteed_profit_units is not None and evidence.guaranteed_profit_units > 0
+
+
 def test_legacy_adapter_missing_settlement_evidence_returns_diagnostic() -> None:
     result = legacy_shadow_request(
         {
@@ -182,6 +218,195 @@ def test_legacy_snapshot_fingerprint_ignores_observation_timestamps() -> None:
 
     assert snapshot["confirmed_at"] != relived["confirmed_at"]
     assert snapshot["fingerprint"] == relived["fingerprint"]
+
+
+def _cross_venue_source() -> dict[str, object]:
+    return {
+        "opportunity_id": "pair-1",
+        "market_id": "market-1",
+        "market_type": "cross_venue_yes_no",
+        "quantity": "10",
+        "total_max_cost": "8.90",
+        "minimum_profit": "1.10",
+        "confirmed_at": "2026-08-15T00:00:00Z",
+        "resolution_at": "2026-08-16T00:00:00Z",
+        "calculable_gas": "0.02",
+        "codex_approval": {
+            "direct_outcome_mapping": {
+                "predict_yes": "YES",
+                "predict_no": "NO",
+                "polymarket_yes": "YES",
+                "polymarket_no": "NO",
+            }
+        },
+        "rules_fingerprints": {"predict.fun": "predict-fp", "polymarket": "poly-fp"},
+        "signal_id": "episode-1",
+        "legs": [
+            {
+                "exchange": "polymarket",
+                "market_id": "m-yes",
+                "condition_id": "c-yes",
+                "outcome": "YES",
+                "token_id": "t-yes",
+                "net_quantity": "10",
+                "max_cost": "4.20",
+                "settlement_at": "2026-08-16T00:00:00Z",
+                "account_id": "poly-wallet",
+                "chain_id": "137",
+                "resolution_source": "poly-source",
+                "settlement_asset": "USDC",
+                "capital_release_at": "2026-08-16T00:00:00Z",
+            },
+            {
+                "exchange": "predict.fun",
+                "market_id": "m-no",
+                "condition_id": "c-no",
+                "outcome": "NO",
+                "token_id": "t-no",
+                "net_quantity": "10",
+                "max_cost": "4.70",
+                "settlement_at": "2026-08-16T00:00:00Z",
+                "account_id": "predict-wallet",
+                "chain_id": "8453",
+                "resolution_source": "predict-source",
+                "settlement_asset": "USDT",
+                "capital_release_at": "2026-08-16T01:00:00Z",
+            },
+        ],
+    }
+
+
+def test_cross_venue_snapshot_freezes_per_leg_identity_and_outcome_mapping() -> None:
+    snapshot = legacy_shadow_snapshot(_cross_venue_source(), "episode-1")
+
+    legs = snapshot["legs"]
+    assert legs[0]["account_id"] == "poly-wallet"
+    assert legs[0]["chain_id"] == "137"
+    assert legs[0]["resolution_source"] == "poly-source"
+    assert legs[0]["settlement_asset"] == "USDC"
+    assert legs[0]["capital_release_at"] == "2026-08-16T00:00:00Z"
+    assert legs[1]["account_id"] == "predict-wallet"
+    assert legs[1]["chain_id"] == "8453"
+    assert snapshot["direct_outcome_mapping"]["predict_yes"] == "YES"
+
+    source = _cross_venue_source()
+    source["legs"][0] = {**source["legs"][0], "account_id": "other-wallet"}
+    rotated = legacy_shadow_snapshot(source, "episode-1")
+    assert rotated["fingerprint"] != snapshot["fingerprint"]
+
+
+def test_cross_venue_shadow_uses_per_venue_identity_and_common_usd_valuation() -> None:
+    snapshot = legacy_shadow_snapshot(_cross_venue_source(), "episode-1")
+    request = legacy_shadow_request(snapshot)
+
+    assert request.backend == "cp_sat"
+    actions = request.request.problem.actions
+    assert tuple(action.venue_id for action in actions) == ("polymarket", "predict.fun")
+    assert tuple(action.account_id for action in actions) == ("poly-wallet", "predict-wallet")
+    assert tuple(action.chain_id for action in actions) == ("137", "8453")
+    assert tuple(action.market_contract_id for action in actions) == ("c-yes", "c-no")
+    assert tuple(action.settlement_asset_id for action in actions) == ("USD", "USD")
+    assert tuple(action.valuation_unit_id for action in actions) == ("USD", "USD")
+    assert tuple(action.asset_valuation_rule_id for action in actions) == ("usd-1:1-v1", "usd-1:1-v1")
+    observations = tuple(action.settlement_observation_key for action in actions)
+    assert tuple(observation.oracle_id for observation in observations) == ("poly-source", "predict-source")
+    assert tuple(observation.indicator_id for observation in observations) == ("c-yes", "c-no")
+    assert tuple(observation.rule_version for observation in observations) == ("poly-fp", "predict-fp")
+    assert tuple(
+        state.market_contract_id for state in request.request.problem.terminal_state_sets
+    ) == ("c-yes", "c-no")
+
+
+def test_cross_venue_missing_identity_evidence_is_not_evaluated() -> None:
+    source = _cross_venue_source()
+    del source["legs"][0]["account_id"]
+    snapshot = legacy_shadow_snapshot(source, "episode-1")
+    result = legacy_shadow_request(snapshot)
+
+    assert result["run_status"] == "SUCCESS"
+    assert result["decision"] == "UNKNOWN"
+    assert result["comparison"] == "NOT_EVALUATED"
+
+
+def test_cross_venue_missing_capital_release_is_not_evaluated() -> None:
+    source = _cross_venue_source()
+    del source["legs"][0]["capital_release_at"]
+    snapshot = legacy_shadow_snapshot(source, "episode-1")
+    result = legacy_shadow_request(snapshot)
+
+    assert result["comparison"] == "NOT_EVALUATED"
+
+
+def test_cross_venue_non_identity_outcome_mapping_is_not_evaluated() -> None:
+    source = _cross_venue_source()
+    source["codex_approval"] = {
+        "direct_outcome_mapping": {
+            "predict_yes": "NO",
+            "predict_no": "YES",
+            "polymarket_yes": "YES",
+            "polymarket_no": "NO",
+        }
+    }
+    snapshot = legacy_shadow_snapshot(source, "episode-1")
+    result = legacy_shadow_request(snapshot)
+
+    assert result["comparison"] == "NOT_EVALUATED"
+
+
+def test_cross_venue_normal_problem_guarantees_complement_payout() -> None:
+    snapshot = legacy_shadow_snapshot(_cross_venue_source(), "episode-1")
+    request = legacy_shadow_request(snapshot)
+    problem = request.request.problem
+    quantities = tuple(
+        ActionQuantity(action.action_id, action.max_quantity_lots)
+        for action in problem.actions
+    )
+
+    evaluation = evaluate_fixed_portfolio(problem, quantities, request.request.budget)
+    assert evaluation.payout_lower_bound_units == 10 * 100_000_000
+    scenarios = enumerate_allowed_scenarios(problem, request.request.budget).scenarios
+    assert scenarios is not None
+    atoms_by_contract = {
+        state.market_contract_id: {atom.atom_id: atom.kind for atom in state.atoms}
+        for state in problem.terminal_state_sets
+    }
+    scenario_kinds = []
+    for scenario in scenarios:
+        scenario_kinds.append(tuple(
+            atoms_by_contract[selected.market_contract_id][selected.atom_id]
+            for selected in scenario.atoms
+        ))
+    assert sorted(scenario_kinds) == [
+        ("NORMAL_NO", "NORMAL_NO"),
+        ("NORMAL_YES", "NORMAL_YES"),
+    ]
+
+
+def test_cross_venue_extreme_loss_includes_void_refund_worst_case() -> None:
+    snapshot = legacy_shadow_snapshot(_cross_venue_source(), "episode-1")
+
+    result = NLegShadowClient(_VerifiedServer(snapshot)).submit(snapshot).result()
+
+    assert result["run_status"] == "SUCCESS"
+    assert result["result"]["extreme_loss"] == "-3.92"
+    assert result["differences"]["extreme_loss"] == {
+        "legacy": "未建模",
+        "n_leg": "-3.92",
+        "status": "na",
+    }
+
+
+def test_cross_venue_shadow_reports_per_leg_capital_release_max() -> None:
+    snapshot = legacy_shadow_snapshot(_cross_venue_source(), "episode-1")
+
+    result = NLegShadowClient(_VerifiedServer(snapshot)).submit(snapshot).result()
+
+    assert result["run_status"] == "SUCCESS"
+    assert result["result"]["capital_release_at"] == "2026-08-16T01:00:00Z"
+    assert result["differences"]["capital_release_at"] == {
+        "legacy": "2026-08-16T00:00:00Z",
+        "n_leg": "2026-08-16T01:00:00Z",
+    }
 
 
 def test_shadow_scheduler_dedupes_identical_economics_with_different_timestamps(
@@ -252,42 +477,7 @@ def test_shadow_client_missing_settlement_evidence_is_a_diagnostic_not_failure()
 
 
 def test_legacy_cross_venue_shadow_conversion_maps_sides_costs_and_gas() -> None:
-    source = {
-        "opportunity_id": "pair-1",
-        "market_id": "market-1",
-        "market_type": "cross_venue_yes_no",
-        "quantity": "10",
-        "total_max_cost": "8.90",
-        "minimum_profit": "1.10",
-        "confirmed_at": "2026-08-15T00:00:00Z",
-        "resolution_at": "2026-08-16T00:00:00Z",
-        "calculable_gas": "0.02",
-        "signal_id": "episode-1",
-        "legs": [
-            {
-                "exchange": "polymarket",
-                "market_id": "m-yes",
-                "condition_id": "c-yes",
-                "outcome": "YES",
-                "token_id": "t-yes",
-                "net_quantity": "10",
-                "max_cost": "4.20",
-                "settlement_at": "2026-08-16T00:00:00Z",
-            },
-            {
-                "exchange": "predict.fun",
-                "market_id": "m-no",
-                "condition_id": "c-no",
-                "outcome": "NO",
-                "token_id": "t-no",
-                "net_quantity": "10",
-                "max_cost": "4.70",
-                "settlement_at": "2026-08-16T00:00:00Z",
-            },
-        ],
-    }
-
-    snapshot = legacy_shadow_snapshot(source, "episode-1")
+    snapshot = legacy_shadow_snapshot(_cross_venue_source(), "episode-1")
     request = legacy_shadow_request(snapshot)
 
     assert snapshot["market_type"] == "cross_venue_yes_no"
@@ -296,6 +486,10 @@ def test_legacy_cross_venue_shadow_conversion_maps_sides_costs_and_gas() -> None
     actions = request.request.problem.actions
     assert tuple(action.side for action in actions) == (ActionSide.BUY_YES, ActionSide.BUY_NO)
     assert tuple(action.max_quantity_lots for action in actions) == (10, 10)
+    poly = next(action for action in actions if action.venue_id == "polymarket")
+    predict = next(action for action in actions if action.venue_id == "predict.fun")
+    assert poly.cost_slices[-1].incremental_cost_upper_bound_units == 42_200_000
+    assert predict.cost_slices[-1].incremental_cost_upper_bound_units == 47_000_000
 
 
 def test_shadow_summary_replaces_queued_snapshot_and_keeps_normal_unknown_nonfatal(
@@ -491,6 +685,15 @@ def test_shadow_direction_compares_per_leg_sides_not_action_ids() -> None:
             "confirmed_at": "2026-08-15T00:00:00Z",
             "resolution_at": "2026-08-16T00:00:00Z",
             "calculable_gas": "0.02",
+            "codex_approval": {
+                "direct_outcome_mapping": {
+                    "predict_yes": "YES",
+                    "predict_no": "NO",
+                    "polymarket_yes": "YES",
+                    "polymarket_no": "NO",
+                }
+            },
+            "rules_fingerprints": {"predict.fun": "predict-fp", "polymarket": "poly-fp"},
             "legs": [
                 {
                     "exchange": "polymarket",
@@ -501,6 +704,11 @@ def test_shadow_direction_compares_per_leg_sides_not_action_ids() -> None:
                     "net_quantity": "10",
                     "max_cost": "4.20",
                     "settlement_at": "2026-08-16T00:00:00Z",
+                    "account_id": "poly-wallet",
+                    "chain_id": "137",
+                    "resolution_source": "poly-source",
+                    "settlement_asset": "USDC",
+                    "capital_release_at": "2026-08-16T00:00:00Z",
                 },
                 {
                     "exchange": "predict.fun",
@@ -511,6 +719,11 @@ def test_shadow_direction_compares_per_leg_sides_not_action_ids() -> None:
                     "net_quantity": "10",
                     "max_cost": "4.70",
                     "settlement_at": "2026-08-16T00:00:00Z",
+                    "account_id": "predict-wallet",
+                    "chain_id": "8453",
+                    "resolution_source": "predict-source",
+                    "settlement_asset": "USDT",
+                    "capital_release_at": "2026-08-16T01:00:00Z",
                 },
             ],
         },

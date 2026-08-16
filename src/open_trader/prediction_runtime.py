@@ -21,6 +21,8 @@ from .polymarket_relation_discovery import (
 from .polymarket_trading import PolymarketTradingClient, load_trading_config
 from .predict_cross_venue import (
     CodexCrossVenueEquivalenceValidator,
+    POLYMARKET_CHAIN_ID,
+    PREDICT_CHAIN_ID,
     PredictCrossVenueMonitor,
 )
 from .predict_source import PredictSource
@@ -281,6 +283,17 @@ def _build_cross_venue_monitor(
         return _UnavailableCrossVenueMonitor("predict_construction_failed")
     if holding_reconciler is _DEFAULT_HOLDING_RECONCILER:
         holding_reconciler = getattr(execution, "reconcile_cross_holdings_once", None)
+    account_identities: dict[str, dict[str, str]] = {}
+    if getattr(trading_config, "wallet_address", ""):
+        account_identities["polymarket"] = {
+            "account_id": str(trading_config.wallet_address),
+            "chain_id": POLYMARKET_CHAIN_ID,
+        }
+    if predict_config is not None and getattr(predict_config, "wallet_address", ""):
+        account_identities["predict.fun"] = {
+            "account_id": str(predict_config.wallet_address),
+            "chain_id": PREDICT_CHAIN_ID,
+        }
     try:
         return PredictCrossVenueMonitor(
             predict_source=PredictSource(predict_config),
@@ -297,6 +310,7 @@ def _build_cross_venue_monitor(
             ready_observer=execution.notify_ready_opportunity,
             shadow_observer=shadow_observer,
             holding_reconciler=holding_reconciler,
+            account_identities=account_identities,
         )
     except Exception:
         return _UnavailableCrossVenueMonitor("predict_construction_failed")

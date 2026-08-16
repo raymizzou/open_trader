@@ -60,6 +60,10 @@ def validate_cross_execution_mode(value: object) -> str:
 CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION = (
     "cross-exchange-yes-no-equivalence-v4"
 )
+# EIP-155 chain ids frozen into each leg's durable identity. The trading
+# config carries wallet addresses only, so each venue's chain is pinned here.
+PREDICT_CHAIN_ID = "8453"
+POLYMARKET_CHAIN_ID = "137"
 CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT = """You are a semantic auditor for one explicit Predict.fun and Polymarket binary-market pair.
 
 Determine only whether the supplied complete rules guarantee that both markets
@@ -251,6 +255,8 @@ class CrossVenueLeg:
     book_timestamp: datetime
     settlement_at: datetime | None
     minimum_order_size: Decimal = Decimal("0")
+    resolution_source: str = ""
+    capital_release_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,6 +443,8 @@ def _build_cross_venue_intents(
                     maximum_fee=predict_fee, fee_asset=pair.predict.settlement_asset,
                     book_timestamp=predict_book.source_timestamp, settlement_at=None,
                     minimum_order_size=pair.predict.minimum_order_size,
+                    resolution_source=pair.predict.resolution_source,
+                    capital_release_at=pair.predict.event_end_at,
                 ),
                 CrossVenueLeg(
                     exchange="polymarket", market_id=pair.polymarket.market_id,
@@ -448,6 +456,8 @@ def _build_cross_venue_intents(
                     book_timestamp=polymarket_book.confirmed_at,
                     settlement_at=pair.polymarket.settlement_at,
                     minimum_order_size=pair.polymarket.minimum_order_size,
+                    resolution_source=pair.polymarket.resolution_source,
+                    capital_release_at=pair.polymarket.settlement_at,
                 ),
             )
             annualized = (
@@ -1292,6 +1302,7 @@ class PredictCrossVenueMonitor:
         ready_observer: Callable[[str, str], object] | None = None,
         shadow_observer: Callable[[Mapping[str, object], str], object] | None = None,
         holding_reconciler: Callable[[], object] | None = None,
+        account_identities: Mapping[str, Mapping[str, str]] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._predict = predict_source
@@ -1303,6 +1314,10 @@ class PredictCrossVenueMonitor:
         self._ready_observer = ready_observer
         self._shadow_observer = shadow_observer
         self._holding_reconciler = holding_reconciler
+        self._account_identities = {
+            str(exchange): dict(identity)
+            for exchange, identity in (account_identities or {}).items()
+        }
         self._clock = clock
         self._task: asyncio.Task[None] | None = None
         self._hot_restart = asyncio.Event()
@@ -1810,7 +1825,10 @@ class PredictCrossVenueMonitor:
             "confirmed_at": confirmed_at,
             "confirmed_age_seconds": confirmed_age_seconds,
             "intent": self._intent_payload(intent),
-            "legs": [asdict(leg) for leg in intent.legs],
+            "legs": [
+                {**asdict(leg), **self._account_identity(leg.exchange)}
+                for leg in intent.legs
+            ],
             "quantity": intent.quantity,
             "calculable_gas": intent.calculable_gas,
             "total_max_cost": intent.total_max_cost,
@@ -1858,6 +1876,9 @@ class PredictCrossVenueMonitor:
             },
         }
 
+    def _account_identity(self, exchange: str) -> dict[str, str]:
+        return dict(self._account_identities.get(exchange, {}))
+
     @staticmethod
     def _candidate_identity(market: VenueMarket) -> dict[str, str]:
         result = {
@@ -1893,6 +1914,8 @@ class PredictCrossVenueMonitor:
             payload["book_timestamp"] = leg.book_timestamp.isoformat()
             if leg.settlement_at is not None:
                 payload["settlement_at"] = leg.settlement_at.isoformat()
+            if leg.capital_release_at is not None:
+                payload["capital_release_at"] = leg.capital_release_at.isoformat()
             legs.append(payload)
         return {
             "intent_type": "cross_venue",
