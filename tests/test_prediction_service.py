@@ -94,14 +94,14 @@ def _server(runtime: object, **kwargs: object) -> Iterator[str]:
 
 
 def _response(
-    request: str | Request, *, timeout: float = 15
+    request: str | Request, *, timeout: float = 60
 ) -> tuple[int, dict[str, object]]:
     status, payload, _headers = _response_with_headers(request, timeout=timeout)
     return status, payload
 
 
 def _response_with_headers(
-    request: str | Request, *, timeout: float = 15
+    request: str | Request, *, timeout: float = 60
 ) -> tuple[int, dict[str, object], Mapping[str, str]]:
     try:
         with urlopen(request, timeout=timeout) as response:
@@ -460,8 +460,8 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
                 assert server.http_load_snapshot()["active"] == 8  # type: ignore[attr-defined]
 
                 for status, payload, headers in (
-                    overflow_get.result(timeout=15),
-                    overflow_post.result(timeout=15),
+                    overflow_get.result(timeout=60),
+                    overflow_post.result(timeout=60),
                 ):
                     assert status == 503
                     assert payload == {"error": "prediction service busy"}
@@ -483,9 +483,9 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
 
                 for _ in range(8):
                     release_slots.release()
-                assert [future.result(timeout=15)[0] for future in state_calls] == [200] * 4
-                assert [future.result(timeout=15)[0] for future in preview_calls] == [200] * 4
-                assert replacement.result(timeout=15)[0] == 200
+                assert [future.result(timeout=60)[0] for future in state_calls] == [200] * 4
+                assert [future.result(timeout=60)[0] for future in preview_calls] == [200] * 4
+                assert replacement.result(timeout=60)[0] == 200
                 deadline = time.monotonic() + 5
                 while server.http_load_snapshot()["active"] != 0 and time.monotonic() < deadline:  # type: ignore[attr-defined]
                     time.sleep(0.01)

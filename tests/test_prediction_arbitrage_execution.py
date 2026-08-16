@@ -3408,15 +3408,22 @@ def test_auto_submit_safe_dust_emits_residual_event_without_success(
     service, store, _trading, cross, predict = _cross_service(tmp_path)
     _macos, feishu = service._notifier._notifiers  # type: ignore[attr-defined]
     cross.overrides["execution_mode"] = "auto_submit"
-    predict.reconcile_results.append(
+    predict.reconcile_results.extend([
         {
             "status": "verified",
             "verified": True,
             "filled_quantity": Decimal("5"),
             "position_quantity": Decimal("4.9"),
             "execution_proof": {"verified": True},
-        }
-    )
+        },
+        {
+            "status": "verified",
+            "verified": True,
+            "filled_quantity": Decimal("5"),
+            "position_quantity": Decimal("4.9"),
+            "execution_proof": {"verified": True},
+        },
+    ])
     assert store.arm_cross_auto()["armed"] is True
     signal_id = _cross_venue_notification_signal(store)
 

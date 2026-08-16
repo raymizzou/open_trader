@@ -5,7 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-17
 
-- 测试稳定性：修复 prediction service HTTP 并发压力用例在全量测试下的提交顺序竞态，改为先确认 4 个 state 请求都已进入 handler 再提交 4 个 preview 请求，避免 preview 请求抢满并发槽导致 `state_entered` 偶发不触发。仅测试改动，无运行时代码变化。
+- 测试稳定性：修复 prediction service HTTP 并发压力用例在全量测试下的提交顺序竞态（先确认 4 个 state 请求进入 handler 再提交 4 个 preview，并提高 client timeout），以及跨所 auto_submit 残差事件用例在全量测试下的 reconcile 结果消费竞态（提供两份相同残差结果）。仅测试改动，无运行时代码变化。
 
 ## 2026-08-16
 
