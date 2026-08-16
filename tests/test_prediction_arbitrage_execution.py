@@ -4277,6 +4277,97 @@ def test_threshold_execution_notifies_rejected_leg(tmp_path: Path) -> None:
     )
 
 
+class BothRejectedThresholdTrading(ThresholdTrading):
+    """Venue that rejects both threshold legs with distinct error codes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def submit_threshold_hedge_once(
+        self, intent: ThresholdHedgeIntent
+    ) -> ThresholdHedgeSubmission:
+        self.threshold_submit_calls += 1
+        results = []
+        for leg, error_code in (
+            (intent.leg_a, "insufficient_allowance"),
+            (intent.leg_b, "geoblock_blocked"),
+        ):
+            results.append(
+                ThresholdLegResult(
+                    leg.label, leg.outcome, leg.condition_id, leg.token_id,
+                    False, "rejected", "", Decimal("0"), (),
+                    error_code,
+                )
+            )
+        return ThresholdHedgeSubmission(leg_a=results[0], leg_b=results[1])
+
+
+def test_threshold_execution_notifies_both_legs_rejected(tmp_path: Path) -> None:
+    store = PredictionArbitrageStore(tmp_path / "data")
+    trading = BothRejectedThresholdTrading()
+    monitor = ThresholdMonitor(_threshold_intent())
+    macos = ChannelNotifier("macos")
+    feishu = ChannelNotifier("feishu")
+    service = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=trading,
+        notifier=CompositeTestNotifier(macos, feishu),
+        lock_path=tmp_path / "execution.lock",
+    )
+    assert service.reconcile_startup()["state"] == "ready"
+    store.set_validation_mode("auto")
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+
+    assert result["state"] == "validating" or result.get("execution_id")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and len(
+        [title for title, _ in feishu.messages if title == "预测套利单提交失败"]
+    ) < 2:
+        time.sleep(0.05)
+    failed = [
+        message for title, message in feishu.messages
+        if title == "预测套利单提交失败"
+    ]
+    assert len(failed) == 2
+    assert any(
+        "A｜YES" in message and "insufficient_allowance" in message
+        for message in failed
+    )
+    assert any(
+        "B｜NO" in message and "geoblock_blocked" in message
+        for message in failed
+    )
+    assert not any(
+        title in {"预测套利单已提交", "预测套利单已吃"}
+        for title, _ in feishu.messages
+    )
+    assert trading.threshold_submit_calls == 1
+
+
+def test_threshold_manual_confirm_notifies_submitted_filled_settled(
+    tmp_path: Path,
+) -> None:
+    service, trading, store, _ = threshold_execution_fixture(tmp_path)
+    _macos, feishu = service.test_notifiers  # type: ignore[attr-defined]
+
+    preview = service.preview("threshold-opp-1")
+    execution = service.confirm(str(preview["id"]), "threshold-manual-1")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "holding_to_resolution"
+    assert trading.threshold_preflight_calls == 1
+    assert trading.threshold_submit_calls == 1
+    titles = [title for title, _ in feishu.messages]
+    assert titles.count("预测套利单已提交") == 2
+    assert titles.count("预测套利单已吃") == 2
+    assert titles.count("预测套利单结算") == 1
+    assert not any("验证单" in title for title in titles)
+    assert store.auto_eat_stats()["today_submitted"] == 0
+
+
 def test_notify_observation_sends_immediately_dedupes_and_survives_close(
     tmp_path: Path,
 ) -> None:
