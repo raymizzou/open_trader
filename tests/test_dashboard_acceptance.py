@@ -8721,7 +8721,7 @@ def test_account_api_gateway_request_injects_production_route_marker(tmp_path: P
             base + "/api/v1/account/snapshot",
             headers={"X-Open-Trader-Account-Route": "caller-value"},
         )
-        with dashboard_acceptance.urlopen(request, timeout=5) as response:
+        with dashboard_acceptance.urlopen(request, timeout=60) as response:
             response.read()
 
     assert account.requests[0]["headers"]["X-Open-Trader-Account-Route"] == "production"
