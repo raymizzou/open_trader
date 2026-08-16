@@ -387,6 +387,9 @@ def create_prediction_server(
                         csrf_token="" if mode == "shadow" else prediction_csrf,
                         cross_venue_monitor=getattr(runtime, "cross_venue_monitor", None),
                         relation_catalog=getattr(runtime, "relation_catalog", None),
+                        n_leg_solutions=getattr(
+                            runtime, "n_leg_solutions", lambda: []
+                        )(),
                     ),
                     set_session=mode == "production",
                 )

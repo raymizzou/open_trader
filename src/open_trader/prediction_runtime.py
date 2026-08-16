@@ -44,6 +44,8 @@ from .prediction_arbitrage_store import (
     PredictionArbitrageStore,
     read_minimum_reader_generation,
 )
+from .prediction_live_resolver import PredictionLiveResolver
+from .prediction_monitor_selection import MonitorSelectionStore
 from .prediction_read_only import (
     PolymarketReadOnlyGuard,
     PredictReadOnlyGuard,
@@ -392,6 +394,7 @@ class PredictionRuntime:
         self.execution: PredictionExecutionService | None = None
         self.relation_catalog: RelationCatalog | None = None
         self.solver_server: SolverServerOwner | None = None
+        self.live_resolver: PredictionLiveResolver | None = None
         self.n_leg_shadow: NLegShadowScheduler | None = None
         self._shadow_guards: ExitStack | None = None
         self._shadow_failure_lock = threading.Lock()
@@ -605,6 +608,16 @@ class PredictionRuntime:
                     )
                     if callable(set_cross_venue_monitor):
                         set_cross_venue_monitor(self.cross_venue_monitor)
+            self.live_resolver = PredictionLiveResolver(
+                data_dir=self._data_dir,
+                relation_catalog=self.relation_catalog,
+                monitor=self.monitor,
+                solver_server=self.solver_server,
+                selection_store=MonitorSelectionStore(self._data_dir),
+                store=self.store,
+                execution=self.execution,
+            )
+            self.live_resolver.start()
             self._state = "RUNNING"
             logger.info(
                 "prediction_runtime_state state=RUNNING pid=%s data_dir=%s",
@@ -754,9 +767,20 @@ class PredictionRuntime:
             ) from errors[0]
         self._state = "STOPPED"
 
+    def n_leg_solutions(self) -> list[dict[str, object]]:
+        resolver = self.live_resolver
+        return [] if resolver is None else resolver.solutions()
+
     def _cleanup_resources(self) -> list[BaseException]:
         errors: list[BaseException] = []
         uncertain_thread = False
+        if self.live_resolver is not None:
+            try:
+                self.live_resolver.stop()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                self.live_resolver = None
         if self._cross_runtime is not None:
             try:
                 self._cross_runtime.stop()
