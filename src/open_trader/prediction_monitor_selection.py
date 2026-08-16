@@ -1,4 +1,4 @@
-"""Issue #77 step 2: relation generation -> canonical N-leg components.
+"""Issue #77: relation generation -> canonical components -> background resolution.
 
 Only ACTIVE and model-complete generation rows may enter monitoring selection
 (#77 acceptance 1); UNKNOWN, candidate, unapproved or model-incomplete rows are
@@ -12,18 +12,32 @@ row must carry a compiled canonical problem payload under ``model["problem"]``
 (``open_trader.prediction_n_leg.problem.v1``). Until enrichment produces such
 rows, no row is admitted and this bridge returns the empty set, which is the
 current production state.
+
+Background resolution (#77 acceptance 4-6) consumes one compiled component and
+fixes its ``initial_verified_profit`` to the #50 verifier's worst-payout-minus-
+cost proof; the #51 fee/tick/slippage and safety margin are already baked into
+each action's ``cost_slices``. ``OPTIMAL``/``NOT_PROVEN`` is recorded separately
+from the verified profit, and the whole pass is gated by ``idle_capacity()`` so
+it never competes with the #52 real-time window.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 from open_trader.prediction_n_leg import (
     PROBLEM_SCHEMA_V1,
+    REQUEST_SCHEMA_V1,
     CandidateAction,
     ForbiddenAtomCombination,
+    OptimalityStatus,
+    OracleBudget,
+    OracleRequest,
+    PortfolioSolution,
     QualificationConstraint,
     RelationConstraint,
+    SearchMode,
     TerminalStateSet,
     ArbitrageProblem,
     ConstraintModel,
@@ -33,6 +47,17 @@ from open_trader.prediction_n_leg import (
 from open_trader.prediction_n_leg_oracle import (
     RelationComponent,
     build_relation_components,
+)
+from open_trader.prediction_solver import BenchmarkLimits, SolverBackend
+from open_trader.prediction_solver_verified import (
+    PROOF_REQUEST_SCHEMA_V1,
+    ProofInput,
+    VerificationStatus,
+    candidate_evidence_from_payload,
+    quote_fingerprint,
+    solve,
+    verification_result_from_payload,
+    verify,
 )
 
 
@@ -123,3 +148,68 @@ def _merge_one(
     if existing is not None and canonical_payload(existing) != canonical_payload(value):
         raise ValueError(f"{label} {key!r} conflicts across compiled relations")
     index.setdefault(key, value)
+
+
+@dataclass(frozen=True, slots=True)
+class BackgroundResolution:
+    """The fixed first-resolution outcome of one candidate component."""
+
+    status: VerificationStatus
+    initial_verified_profit: int | None
+    optimality: OptimalityStatus
+    solution: PortfolioSolution | None
+
+
+def idle_capacity() -> bool:
+    """Return True when the #52 real-time worker has no pending snapshot.
+
+    Default seam: background discovery may only consume idle capacity so it never
+    competes with the real-time window. The #52 integration injects the live check.
+    """
+    return True
+
+
+def resolve_background_candidate(
+    problem: ArbitrageProblem,
+    *,
+    budget: OracleBudget,
+    limits: BenchmarkLimits,
+    backend: SolverBackend | None = None,
+    generation: int = 0,
+    code_version: str = "issue-77",
+) -> BackgroundResolution | None:
+    """Resolve one compiled component once within a fixed background budget.
+
+    Returns ``None`` while the background path is not idle. Otherwise runs the
+    #50 solve + verify seam on the compiled problem and fixes
+    ``initial_verified_profit`` to the verifier's worst-payout-minus-cost proof,
+    never the unverified solver objective or bound.
+    """
+    if not idle_capacity():
+        return None
+    proof_input = ProofInput(
+        PROOF_REQUEST_SCHEMA_V1,
+        OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, problem, budget),
+        limits,
+        quote_fingerprint(problem),
+        generation,
+        code_version,
+    )
+    try:
+        evidence = candidate_evidence_from_payload(solve(canonical_payload(proof_input), backend=backend))
+        verification = verification_result_from_payload(verify(canonical_payload(evidence)), source=evidence)
+    except (TypeError, ValueError):
+        return BackgroundResolution(VerificationStatus.UNKNOWN, None, OptimalityStatus.NOT_APPLICABLE, None)
+    if verification.status != VerificationStatus.QUALIFIED_VERIFIED or verification.solution is None:
+        return BackgroundResolution(verification.status, None, OptimalityStatus.NOT_APPLICABLE, None)
+    optimality = (
+        OptimalityStatus.OPTIMAL
+        if evidence.solver_evidence.global_search_closed
+        else OptimalityStatus.NOT_PROVEN
+    )
+    return BackgroundResolution(
+        VerificationStatus.QUALIFIED_VERIFIED,
+        verification.solution.payout_proof.guaranteed_profit_units,
+        optimality,
+        verification.solution,
+    )

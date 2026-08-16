@@ -1,4 +1,4 @@
-"""Issue #77 step 2: relation generation -> canonical N-leg components."""
+"""Issue #77: relation generation -> components -> background resolution."""
 
 from __future__ import annotations
 
@@ -6,16 +6,28 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from open_trader.prediction_monitor_selection import relation_generation_components
+from open_trader.prediction_monitor_selection import (
+    BackgroundResolution,
+    idle_capacity,
+    relation_generation_components,
+    resolve_background_candidate,
+)
 from open_trader.prediction_n_leg import (
     OBSERVATION_SCHEMA_V1,
     PROBLEM_SCHEMA_V1,
     ActionPayout,
+    ActionQuantity,
     ActionSide,
     ArbitrageProblem,
     CandidateAction,
+    Comparison,
     ConstraintModel,
     ExecutableCostSlice,
+    ObjectiveBounds,
+    OptimalityStatus,
+    OracleBudget,
+    QualificationConstraint,
+    QualificationMetric,
     RelationConstraint,
     RelationKind,
     SettlementObservationKey,
@@ -24,7 +36,13 @@ from open_trader.prediction_n_leg import (
     TerminalStateSet,
     canonical_payload,
 )
-from open_trader.prediction_n_leg_oracle import RelationComponent
+from open_trader.prediction_n_leg_oracle import (
+    RelationComponent,
+    cut_from_scenario,
+    evaluate_fixed_portfolio,
+)
+from open_trader.prediction_solver import BenchmarkLimits, PortfolioCandidate, SolverEvidence
+from open_trader.prediction_solver_verified import VerificationStatus
 
 
 AS_OF = datetime(2026, 8, 16, tzinfo=UTC)
@@ -255,3 +273,172 @@ def replace_payout(
         built.constraint_model,
         built.qualification_constraints,
     )
+
+
+def qualified_problem(*, min_profit: int = 3) -> ArbitrageProblem:
+    key = observation()
+    action = CandidateAction(
+        action_id="contract-a",
+        venue_id="polymarket",
+        account_id="test-account",
+        chain_id="test-chain",
+        market_contract_id="contract-a",
+        settlement_observation_key=key,
+        side=ActionSide.BUY_YES,
+        lot_step_units=1,
+        quantity_scale=1,
+        min_quantity_lots=1,
+        max_quantity_lots=1,
+        settlement_asset_id="usd-cents",
+        valuation_unit_id="usd-cents",
+        asset_valuation_rule_id="usd-cents-v1",
+        cost_slices=(ExecutableCostSlice(1, 1, 2),),
+    )
+    states = (
+        TerminalStateSet(
+            "contract-a",
+            key,
+            "v1",
+            (
+                TerminalAtom(
+                    "contract-a:yes",
+                    TerminalKind.NORMAL_YES,
+                    "v1",
+                    (ActionPayout("contract-a", 5),),
+                    AS_OF,
+                ),
+            ),
+        ),
+    )
+    return ArbitrageProblem(
+        PROBLEM_SCHEMA_V1,
+        "background",
+        AS_OF,
+        "usd-cents",
+        (action,),
+        states,
+        ConstraintModel((), ()),
+        (
+            QualificationConstraint(
+                "profit",
+                "v1",
+                QualificationMetric.GUARANTEED_PROFIT_UNITS,
+                Comparison.GREATER_THAN_OR_EQUAL,
+                min_profit,
+                1,
+            ),
+        ),
+    )
+
+
+def solver_evidence(
+    problem: ArbitrageProblem, budget: OracleBudget, *, closed: bool = False
+) -> SolverEvidence:
+    quantities = (ActionQuantity("contract-a", 1),)
+    evaluation = evaluate_fixed_portfolio(problem, quantities, budget)
+    return SolverEvidence(
+        "FEASIBLE",
+        PortfolioCandidate(quantities, evaluation.guaranteed_profit_units),
+        ObjectiveBounds(
+            evaluation.guaranteed_profit_units,
+            evaluation.guaranteed_profit_units if closed else None,
+            0 if closed else None,
+            closed,
+        ),
+        evaluation.worst_scenario,
+        evaluation.payout_lower_bound_units,
+        evaluation.cost_upper_bound_units,
+        evaluation.guaranteed_profit_units,
+        evaluation.conservative_capital_release_at,
+        True,
+        closed,
+        1,
+        1,
+        (cut_from_scenario(problem, evaluation.worst_scenario),),
+        None,
+    )
+
+
+def test_idle_capacity_defaults_true() -> None:
+    assert idle_capacity() is True
+
+
+def test_background_resolution_skips_when_not_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "open_trader.prediction_monitor_selection.idle_capacity", lambda: False
+    )
+    assert (
+        resolve_background_candidate(
+            qualified_problem(),
+            budget=OracleBudget(2, 2, 2),
+            limits=BenchmarkLimits(100, 200, 1_000_000, 4),
+        )
+        is None
+    )
+
+
+def test_qualified_candidate_fixes_initial_verified_profit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    problem = qualified_problem()
+    budget = OracleBudget(2, 2, 2)
+    expected = solver_evidence(problem, budget)
+    monkeypatch.setattr(
+        "open_trader.prediction_solver_verified.solve_with_constraint_generation",
+        lambda request, backend, limits: expected,
+    )
+    backend = type("Backend", (), {"name": "cp_sat", "version": "test"})()
+
+    result = resolve_background_candidate(
+        problem, budget=budget, limits=BenchmarkLimits(100, 200, 1_000_000, 4), backend=backend
+    )
+
+    assert isinstance(result, BackgroundResolution)
+    assert result.status == VerificationStatus.QUALIFIED_VERIFIED
+    assert result.initial_verified_profit == 3
+    assert result.optimality == OptimalityStatus.NOT_PROVEN
+    assert result.solution is not None
+    assert result.solution.payout_proof.guaranteed_profit_units == 3
+
+
+def test_optimal_global_search_is_recorded_separately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    problem = qualified_problem()
+    budget = OracleBudget(2, 2, 2)
+    expected = solver_evidence(problem, budget, closed=True)
+    monkeypatch.setattr(
+        "open_trader.prediction_solver_verified.solve_with_constraint_generation",
+        lambda request, backend, limits: expected,
+    )
+    backend = type("Backend", (), {"name": "cp_sat", "version": "test"})()
+
+    result = resolve_background_candidate(
+        problem, budget=budget, limits=BenchmarkLimits(100, 200, 1_000_000, 4), backend=backend
+    )
+
+    assert result is not None
+    assert result.optimality == OptimalityStatus.OPTIMAL
+    assert result.initial_verified_profit == 3
+
+
+def test_not_qualified_candidate_records_no_verified_profit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    problem = qualified_problem(min_profit=4)
+    budget = OracleBudget(2, 2, 2)
+    expected = solver_evidence(problem, budget)
+    monkeypatch.setattr(
+        "open_trader.prediction_solver_verified.solve_with_constraint_generation",
+        lambda request, backend, limits: expected,
+    )
+    backend = type("Backend", (), {"name": "cp_sat", "version": "test"})()
+
+    result = resolve_background_candidate(
+        problem, budget=budget, limits=BenchmarkLimits(100, 200, 1_000_000, 4), backend=backend
+    )
+
+    assert result is not None
+    assert result.status == VerificationStatus.NOT_QUALIFIED
+    assert result.initial_verified_profit is None
+    assert result.optimality == OptimalityStatus.NOT_APPLICABLE
