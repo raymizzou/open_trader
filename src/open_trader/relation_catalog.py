@@ -155,7 +155,7 @@ def _normalise_discovery(value: Mapping[str, object]) -> dict[str, object]:
     }
 
 
-def _threshold_complete_model(relation: object, *, discovered_at: str) -> dict[str, object] | None:
+def _threshold_complete_model(relation: object) -> dict[str, object] | None:
     """Deterministically compile a COMPLETE threshold model, or None when facts are missing."""
     markets = (getattr(relation, "market_a"), getattr(relation, "market_b"))
     legs = (getattr(relation, "buy_leg_a"), getattr(relation, "buy_leg_b"))
@@ -165,7 +165,6 @@ def _threshold_complete_model(relation: object, *, discovered_at: str) -> dict[s
     end_dates = [str(getattr(market, "end_date") or "").strip() for market in markets]
     if not all(sources) or not all(end_dates):
         return None
-    observed_at = _utc(discovered_at)
     order = (1, 0) if direction in {"B_IMPLIES_A", "B_TO_A"} else (0, 1)
     contracts: list[str] = []
     actions: list[CandidateAction] = []
@@ -180,12 +179,13 @@ def _threshold_complete_model(relation: object, *, discovered_at: str) -> dict[s
             side = ActionSide.BUY_NO
         else:
             return None
+        observation_window = _utc(end_dates[index])
         key = SettlementObservationKey(
             OBSERVATION_SCHEMA_V1,
             sources[index],
             condition_id,
-            observed_at,
-            _utc(end_dates[index]),
+            observation_window,
+            observation_window,
             "UTC",
             rules_hash,
         )
@@ -243,7 +243,7 @@ def _threshold_complete_model(relation: object, *, discovered_at: str) -> dict[s
     problem = ArbitrageProblem(
         PROBLEM_SCHEMA_V1,
         f"threshold:{rule_digest}",
-        observed_at,
+        min(_utc(end_dates[0]), _utc(end_dates[1])),
         "USD",
         tuple(actions),
         tuple(states),
@@ -348,7 +348,7 @@ class RelationCatalog:
         if relation_direction in {"B_IMPLIES_A", "B_TO_A"}:
             endpoints = list(reversed(endpoints))
         model: dict[str, object] = {"completeness": "INCOMPLETE"}
-        enriched = _threshold_complete_model(relation, discovered_at=discovered_at)
+        enriched = _threshold_complete_model(relation)
         if enriched is not None:
             model = enriched
         return self.ingest({

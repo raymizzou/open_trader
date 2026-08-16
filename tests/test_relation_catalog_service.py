@@ -5,6 +5,7 @@ from dataclasses import replace
 import json
 import threading
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -190,3 +191,16 @@ def test_threshold_relation_capital_release_is_max_end_date(tmp_path: Path) -> N
     catalog.ingest_threshold_relation(later)
 
     assert catalog.review_rows()[0]["model"]["capital_release"] == "2027-03-01T00:00:00.000000Z"
+
+
+def test_threshold_relation_fingerprint_is_stable_across_discovery_times(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    with patch(
+        "open_trader.relation_catalog._now",
+        side_effect=["2026-08-15T02:32:00Z", "2026-08-16T09:00:00Z"],
+    ):
+        first = catalog.ingest_threshold_relation(threshold_relation())
+        second = catalog.ingest_threshold_relation(threshold_relation())
+    assert first["version_id"] == second["version_id"]
+    assert second["occurrence_count"] == 2
+    assert [row["version_id"] for row in catalog.review_rows()] == [first["version_id"]]
