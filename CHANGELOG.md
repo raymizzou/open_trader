@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-16
 
+- #81 把 Polymarket threshold 关系从 INCOMPLETE 确定性 enrich 成 COMPLETE v2 目录版本：仅当 resolution_source 与 end_date 都可确定时才产出 COMPLETE（否则保持 INCOMPLETE，不 fallback），同一 identity 的新 fingerprint 版本保持 PENDING、需重新人工批准/激活，旧 INCOMPLETE 历史版本不迁移不动；terminal_states 固定 NORMAL_YES/NORMAL_NO/VOID，VOID 赔付按 #80 保守口径为 $0，capital_release 取两个市场 end_date 的最大值，并把编译后的 N_LEG 结构问题（占位成本、真实账户/chain/成本留给 #52）以 model.problem 存入 catalog 供 #77 relation_generation_components 消费。不调 LLM、不读订单簿、不产生订单/通知/模式变化。聚焦 catalog/monitor-selection 测试通过。
+
 - #80 将跨所 YES/NO N_LEG 影子模型的 `extreme_loss` 最坏口径从伪精确的 VOID=$0.50 / REFUND=$1.00 改为「至少一条腿可被平台酌情作废到 $0」（NORMAL + 至少一腿作废）的最坏情况；该值仍只读展示，不进入任何资格/门槛逻辑。原因是 Polymarket/Predict.fun 没有可靠的确定性 void/refund 公式，平台酌情作废属尾部风险。聚焦 shadow 测试 22 passed，真实 oracle smoke 返回 extreme_loss=-8.92。
 - #77 selects and persists at most 10 non-overlapping N_LEG monitor components from the active, model-complete relation generation. Background discovery resolves one candidate component at a time only on idle capacity; `initial_verified_profit` comes from the verifier's worst-payout-minus-cost proof (solver OPTIMAL/NOT_PROVEN recorded separately), components rank by verified profit with a stable id tie-break, and the store keeps component identity, fixed admission score, selected portfolio and relation/terminal/portfolio fingerprints without in-flight solves, pending snapshots or quote freshness. No latest-snapshot-wins scheduling, real-time cost recompute, dedupe, Manual/AUTO change, preflight, funding reservation or order mutation was added; the output is the versioned selected-monitor set consumed by #52.
 

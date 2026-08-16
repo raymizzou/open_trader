@@ -21,6 +21,23 @@ from .relation_catalog_v2 import (
     SqliteCatalogStore,
     _canonicalize,
 )
+from .prediction_n_leg import (
+    OBSERVATION_SCHEMA_V1,
+    PROBLEM_SCHEMA_V1,
+    ActionPayout,
+    ActionSide,
+    ArbitrageProblem,
+    CandidateAction,
+    ConstraintModel,
+    ExecutableCostSlice,
+    RelationConstraint,
+    RelationKind,
+    SettlementObservationKey,
+    TerminalAtom,
+    TerminalKind,
+    TerminalStateSet,
+    canonical_payload,
+)
 
 
 _SCHEMA = "open_trader.relation_catalog.v1"
@@ -40,6 +57,10 @@ class RelationConflictError(ValueError):
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _utc(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
 
 
 def _canonical(value: object) -> str:
@@ -134,6 +155,121 @@ def _normalise_discovery(value: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _threshold_complete_model(relation: object, *, discovered_at: str) -> dict[str, object] | None:
+    """Deterministically compile a COMPLETE threshold model, or None when facts are missing."""
+    markets = (getattr(relation, "market_a"), getattr(relation, "market_b"))
+    legs = (getattr(relation, "buy_leg_a"), getattr(relation, "buy_leg_b"))
+    rules_hashes = (getattr(relation, "rules_hash_a"), getattr(relation, "rules_hash_b"))
+    direction = str(getattr(relation, "relation"))
+    sources = [str(getattr(market, "resolution_source") or "").strip() for market in markets]
+    end_dates = [str(getattr(market, "end_date") or "").strip() for market in markets]
+    if not all(sources) or not all(end_dates):
+        return None
+    observed_at = _utc(discovered_at)
+    order = (1, 0) if direction in {"B_IMPLIES_A", "B_TO_A"} else (0, 1)
+    contracts: list[str] = []
+    actions: list[CandidateAction] = []
+    states: list[TerminalStateSet] = []
+    payouts: dict[str, dict[str, int]] = {}
+    for index in order:
+        market, leg, rules_hash = markets[index], legs[index], rules_hashes[index]
+        condition_id = str(getattr(market, "condition_id"))
+        if str(getattr(leg, "outcome")) == "YES":
+            side = ActionSide.BUY_YES
+        elif str(getattr(leg, "outcome")) == "NO":
+            side = ActionSide.BUY_NO
+        else:
+            return None
+        key = SettlementObservationKey(
+            OBSERVATION_SCHEMA_V1,
+            sources[index],
+            condition_id,
+            observed_at,
+            _utc(end_dates[index]),
+            "UTC",
+            rules_hash,
+        )
+        action_id = f"polymarket:{condition_id}"
+        contracts.append(condition_id)
+        actions.append(CandidateAction(
+            action_id,
+            venue_id="polymarket",
+            account_id="catalog-v2",
+            chain_id="polymarket",
+            market_contract_id=condition_id,
+            settlement_observation_key=key,
+            side=side,
+            lot_step_units=1,
+            quantity_scale=1,
+            min_quantity_lots=1,
+            max_quantity_lots=1,
+            settlement_asset_id="USD",
+            valuation_unit_id="USD",
+            asset_valuation_rule_id="usd-1:1-v1",
+            cost_slices=(ExecutableCostSlice(1, 1, 0),),
+        ))
+        yes_payout = 1 if side == ActionSide.BUY_YES else 0
+        no_payout = 0 if side == ActionSide.BUY_YES else 1
+        payouts[condition_id] = {
+            "NORMAL_YES": yes_payout,
+            "NORMAL_NO": no_payout,
+            "VOID": 0,
+        }
+        release_at = _utc(end_dates[index])
+        states.append(TerminalStateSet(
+            condition_id,
+            key,
+            rules_hash,
+            (
+                TerminalAtom(
+                    f"{condition_id}:NORMAL_YES", TerminalKind.NORMAL_YES, rules_hash,
+                    (ActionPayout(action_id, yes_payout),), release_at,
+                ),
+                TerminalAtom(
+                    f"{condition_id}:NORMAL_NO", TerminalKind.NORMAL_NO, rules_hash,
+                    (ActionPayout(action_id, no_payout),), release_at,
+                ),
+                TerminalAtom(
+                    f"{condition_id}:VOID", TerminalKind.VOID, rules_hash,
+                    (ActionPayout(action_id, 0),), release_at,
+                ),
+            ),
+        ))
+    rule_digest = _digest({
+        "direction": direction,
+        "rules_hash_a": rules_hashes[0],
+        "rules_hash_b": rules_hashes[1],
+    })
+    problem = ArbitrageProblem(
+        PROBLEM_SCHEMA_V1,
+        f"threshold:{rule_digest}",
+        observed_at,
+        "USD",
+        tuple(actions),
+        tuple(states),
+        ConstraintModel(
+            (
+                RelationConstraint(
+                    f"imply:{contracts[0]}->{contracts[1]}",
+                    RelationKind.IMPLIES,
+                    tuple(contracts),
+                    rule_digest,
+                ),
+            ),
+            (),
+        ),
+        (),
+    )
+    capital_release = max(_utc(end_dates[index]) for index in order)
+    return {
+        "completeness": "COMPLETE",
+        "terminal_states": ["NORMAL_YES", "NORMAL_NO", "VOID"],
+        "payouts": payouts,
+        "capital_release": capital_release.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+        "problem": canonical_payload(problem),
+    }
+
+
 class RelationCatalog:
     """V2-backed public domain API; readers consume only ``current_generation``."""
 
@@ -177,7 +313,10 @@ class RelationCatalog:
             converted["terminal_states"] = model.get("terminal_states", [])
             converted["payouts"] = model.get("payouts", {})
             converted["capital_release"] = model.get("capital_release")
+            if model.get("problem") is not None:
+                converted["problem"] = model["problem"]
         return converted
+
 
     def ingest(self, discovery: Mapping[str, object], *, git_sha: str = "") -> dict[str, object]:
         payload = self._converted(discovery)
@@ -208,11 +347,15 @@ class RelationCatalog:
         endpoints = [market(market_a), market(market_b)]
         if relation_direction in {"B_IMPLIES_A", "B_TO_A"}:
             endpoints = list(reversed(endpoints))
+        model: dict[str, object] = {"completeness": "INCOMPLETE"}
+        enriched = _threshold_complete_model(relation, discovered_at=discovered_at)
+        if enriched is not None:
+            model = enriched
         return self.ingest({
             "discovery_source": "deterministic_rule", "discovered_at": discovered_at,
             "relation_type": "IMPLIES", "semantics": {"statement": relation_direction, "direction": relation_direction},
             "source_evidence": [{"event_id": getattr(relation, "event_id"), "rules_hash_a": getattr(relation, "rules_hash_a"), "rules_hash_b": getattr(relation, "rules_hash_b")}],
-            "model": {"completeness": "INCOMPLETE"}, "markets": endpoints,
+            "model": model, "markets": endpoints,
         }, git_sha=git_sha)
 
     def _versions(self) -> dict[str, dict[str, object]]:
@@ -239,6 +382,7 @@ class RelationCatalog:
                 "terminal_states": payload.get("terminal_states", []),
                 "payouts": payload.get("payouts", {}),
                 "capital_release": payload.get("capital_release"),
+                "problem": payload.get("problem"),
             },
         }
 
