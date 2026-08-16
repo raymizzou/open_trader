@@ -13,6 +13,7 @@ from open_trader.prediction_n_leg import (
     ActionQuantity,
     ActionSide,
     PortfolioCandidate,
+    UnknownReason,
     canonical_payload,
     fingerprint,
 )
@@ -28,7 +29,12 @@ from open_trader.prediction_n_leg_shadow import (
     legacy_shadow_snapshot,
     legacy_shadow_request,
 )
-from open_trader.prediction_solver import ObjectiveBounds, SolverEvidence
+from open_trader.prediction_solver import (
+    ObjectiveBounds,
+    SolverEvidence,
+    solve_with_constraint_generation,
+)
+from open_trader.prediction_solver_backends import CpSatBackend
 from open_trader.prediction_solver_verified import (
     CANDIDATE_EVIDENCE_SCHEMA_V1,
     PROOF_REQUEST_SCHEMA_V1,
@@ -114,6 +120,35 @@ def test_legacy_yes_no_adapter_builds_a_canonical_worker_request() -> None:
     assert request.request_id == "shadow:episode-1:shadow-1"
     assert tuple(action.quantity_scale for action in request.request.problem.actions) == (1, 1)
     assert tuple(action.max_quantity_lots for action in request.request.problem.actions) == (10, 10)
+
+
+def test_legacy_standard_binary_valuation_identity_reaches_cp_sat() -> None:
+    request = legacy_shadow_request(
+        {
+            "opportunity_id": "event-1:market-1",
+            "market_id": "market-1",
+            "market_type": "standard_binary",
+            "quantity": "10",
+            "yes_max_cost": "4.20",
+            "no_max_cost": "4.70",
+            "total_max_cost": "8.90",
+            "minimum_profit": "1.10",
+            "confirmed_at": "2026-08-15T00:00:00Z",
+            "resolution_at": "2026-08-16T00:00:00Z",
+            "signal_id": "episode-1",
+            "fingerprint": "shadow-1",
+        }
+    )
+
+    problem = request.request.problem
+    assert all(
+        action.settlement_asset_id == action.valuation_unit_id == problem.valuation_unit_id
+        for action in problem.actions
+    )
+    evidence = solve_with_constraint_generation(request.request, CpSatBackend(), request.limits)
+    assert evidence.native_status != UnknownReason.UNKNOWN_VALUATION.value
+    assert evidence.candidate is not None
+    assert evidence.guaranteed_profit_units is not None and evidence.guaranteed_profit_units > 0
 
 
 def test_legacy_adapter_missing_settlement_evidence_returns_diagnostic() -> None:

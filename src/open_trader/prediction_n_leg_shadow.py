@@ -297,7 +297,7 @@ def legacy_shadow_request(
     actions = tuple(
         CandidateAction(
             f"legacy-{index}", "legacy", "legacy", "legacy", str(market_id), observation,
-            side, 1, scale, lots, lots, "USD", f"legacy-usd-{units_per_dollar}",
+            side, 1, scale, lots, lots, f"legacy-usd-{units_per_dollar}", f"legacy-usd-{units_per_dollar}",
             "legacy-yes-no-v1", _cost_slices(cost, units_per_dollar, lots),
         )
         for index, (side, cost) in enumerate(zip(sides, costs, strict=True), start=1)
