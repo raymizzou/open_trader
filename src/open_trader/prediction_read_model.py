@@ -732,6 +732,433 @@ def _prediction_cross_opportunity_runtime(
     return result
 
 
+_NLEG_STRATEGY_BY_MARKET = {
+    "standard_binary": "yes_no",
+    "cross_venue_yes_no": "yes_no",
+    "threshold_hedge": "llm_hedge",
+}
+_NLEG_RELATION_BY_STRATEGY = {
+    "yes_no": "NATIVE_COMPLEMENT",
+    "llm_hedge": "IMPLIES",
+}
+_NLEG_SOURCE_BY_STRATEGY = {
+    "yes_no": "VENUE_METADATA",
+    "llm_hedge": "LLM",
+}
+_NLEG_SCOPE_LABELS = {
+    ("same_venue", "same_event"): "同所 · 同事件",
+    ("same_venue", "cross_event"): "同所 · 跨事件",
+    ("cross_venue", "same_event"): "跨所 · 同事件",
+    ("cross_venue", "cross_event"): "跨所 · 跨事件",
+}
+_NLEG_UNITS_PER_DOLLAR = Decimal("1000000")
+
+
+def _prediction_strategy_type(row: Mapping[str, object]) -> str | None:
+    strategy = row.get("strategy_type")
+    if strategy in _NLEG_RELATION_BY_STRATEGY:
+        return str(strategy)
+    return _NLEG_STRATEGY_BY_MARKET.get(str(row.get("market_type") or ""))
+
+
+def _prediction_n_leg_contract(execution: object | None) -> dict[str, object] | None:
+    method = getattr(execution, "n_leg_mode_contract", None)
+    if not callable(method):
+        return None
+    try:
+        value = method()
+    except Exception:
+        return None
+    safe = _prediction_safe_value(value)
+    return dict(safe) if isinstance(safe, Mapping) else None
+
+
+def _prediction_capital_usage(
+    *,
+    cross_unsettled: Mapping[str, object],
+    current_execution: Mapping[str, object] | None,
+    n_leg: Mapping[str, object] | None,
+) -> dict[str, object]:
+    safety = n_leg.get("safety_config") if isinstance(n_leg, Mapping) else None
+    units = safety.get("max_total_unsettled_capital_units") if isinstance(safety, Mapping) else 0
+    try:
+        units = int(units or 0)
+    except (TypeError, ValueError):
+        units = 0
+    max_usd = Decimal(units) / _NLEG_UNITS_PER_DOLLAR if units > 0 else Decimal("0")
+    set_flag = units > 0
+    current_raw = cross_unsettled.get("current")
+    current = (
+        _prediction_decimal(current_raw)
+        if current_raw not in (None, "")
+        else None
+    )
+    reserved = Decimal("0")
+    if isinstance(current_execution, Mapping):
+        reserved_value = _prediction_decimal_sort(
+            current_execution.get("total_max_cost", current_execution.get("max_cost"))
+        )
+        if reserved_value.is_finite() and reserved_value > 0:
+            reserved = reserved_value
+    remaining = (max_usd - current - reserved) if set_flag and current is not None else None
+    return {
+        "max_total_unsettled_capital": format(max_usd, "f"),
+        "max_total_unsettled_capital_set": set_flag,
+        "current_conservative": format(current, "f") if current is not None else None,
+        "active_batch_reserved": format(reserved, "f"),
+        "remaining": format(remaining, "f") if remaining is not None else None,
+    }
+
+
+def _prediction_nleg_labels(row: Mapping[str, object]) -> dict[str, object]:
+    """Forward-project legacy current opportunities onto N_LEG taxonomy labels."""
+
+    strategy = _prediction_strategy_type(row)
+    legs = row.get("legs")
+    buy_legs = row.get("buy_legs")
+    leg_rows = legs if isinstance(legs, (list, tuple)) else buy_legs
+    leg_count = len(leg_rows) if isinstance(leg_rows, (list, tuple)) and len(leg_rows) >= 2 else None
+    if leg_count is None and strategy is not None:
+        leg_count = 2
+    exchanges = {
+        str(item.get("exchange") or "").casefold()
+        for item in leg_rows
+        if isinstance(item, Mapping)
+    } if isinstance(leg_rows, (list, tuple)) else set()
+    cross_venue = (
+        str(row.get("market_type") or "") == "cross_venue_yes_no"
+        or ({"predict.fun", "polymarket"} <= exchanges)
+    )
+    event_id_a = row.get("event_id_a")
+    event_id_b = row.get("event_id_b")
+    cross_event = (
+        event_id_a not in (None, "")
+        and event_id_b not in (None, "")
+        and str(event_id_a) != str(event_id_b)
+    )
+    venue_scope = "cross_venue" if cross_venue else "same_venue"
+    event_scope = "cross_event" if cross_event else "same_event"
+    labels: dict[str, object] = {
+        "strategy_type": strategy,
+        "engine_owner": strategy,
+        "relation_type": (
+            _NLEG_RELATION_BY_STRATEGY.get(str(strategy))
+            if strategy is not None
+            else None
+        ),
+        "discovery_source": (
+            _NLEG_SOURCE_BY_STRATEGY.get(str(strategy))
+            if strategy is not None
+            else None
+        ),
+        "leg_count": leg_count,
+        "scope": {"event": event_scope, "venue": venue_scope},
+        "scope_label": _NLEG_SCOPE_LABELS[(venue_scope, event_scope)],
+        "qualification_policy_version": str(
+            row.get("qualification_policy_version") or "v1"
+        ),
+    }
+    for field in ("contract_generation", "contract_version"):
+        if row.get(field) not in (None, ""):
+            labels[field] = row.get(field)
+    return labels
+
+
+def _prediction_approved(row: Mapping[str, object]) -> tuple[bool | None, bool]:
+    codex = row.get("codex_approval")
+    if isinstance(codex, Mapping):
+        decision = str(codex.get("decision") or "").upper()
+        return (decision == "APPROVE", decision != "")
+    llm_status = row.get("llm_status")
+    if llm_status not in (None, ""):
+        return (str(llm_status) == "approved", True)
+    approval = row.get("approved", row.get("approval"))
+    if isinstance(approval, bool):
+        return (approval, True)
+    if isinstance(approval, str) and approval:
+        return (str(approval).casefold() in {"true", "approved", "approve"}, True)
+    return (None, False)
+
+
+def _prediction_proof_complete(row: Mapping[str, object]) -> tuple[bool | None, bool]:
+    if str(row.get("market_type") or "") == "threshold_hedge":
+        return (False, True)
+    codex = row.get("codex_approval")
+    if isinstance(codex, Mapping):
+        decision = str(codex.get("decision") or "").upper()
+        return (decision == "APPROVE", decision != "")
+    proof = row.get("proof_status", row.get("proof"))
+    if isinstance(proof, bool):
+        return (proof, True)
+    if isinstance(proof, str) and proof:
+        return (str(proof).casefold() in {"true", "complete", "verified", "approved"}, True)
+    return (None, False)
+
+
+def _prediction_net_edge(row: Mapping[str, object]) -> Decimal | None:
+    profit = _prediction_decimal_sort(row.get("profit", row.get("minimum_profit")))
+    payout = _prediction_decimal_sort(row.get("minimum_payout"))
+    if not profit.is_finite() or not payout.is_finite() or payout <= 0:
+        return None
+    return profit / payout
+
+
+def _prediction_remaining_days_known(row: Mapping[str, object]) -> Decimal | None:
+    value = _prediction_decimal_sort(row.get("remaining_days"))
+    if value.is_finite():
+        return value
+    cutoff = row.get("resolution_at") or row.get("canonical_cutoff")
+    if not isinstance(cutoff, str):
+        return None
+    try:
+        end = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    days = Decimal(str((end.astimezone(UTC) - datetime.now(UTC).astimezone(UTC)).total_seconds())) / Decimal("86400")
+    return days if days.is_finite() else None
+
+
+def _prediction_balance_shortfall(
+    row: Mapping[str, object], balances: Mapping[str, Decimal | None]
+) -> bool:
+    max_cost = _prediction_decimal_sort(row.get("max_cost", row.get("total_max_cost")))
+    if not max_cost.is_finite() or max_cost < 0:
+        return True
+    legs = row.get("legs")
+    if isinstance(legs, (list, tuple)) and str(row.get("market_type") or "") == "cross_venue_yes_no":
+        required_predict = Decimal("0")
+        required_poly = Decimal("0")
+        for leg in legs:
+            if not isinstance(leg, Mapping):
+                continue
+            cost = _prediction_decimal_sort(leg.get("max_cost"))
+            if not cost.is_finite():
+                continue
+            if str(leg.get("exchange") or "").casefold() == "predict.fun":
+                required_predict += cost
+            else:
+                required_poly += cost
+        if required_predict > 0 or required_poly > 0:
+            return (
+                balances.get("predict_usdt") is None
+                or balances.get("predict_usdt") < required_predict
+                or balances.get("p_usd") is None
+                or balances.get("p_usd") < required_poly
+            )
+    if str(row.get("market_type") or "") == "cross_venue_yes_no":
+        return (
+            balances.get("p_usd") is None
+            or balances.get("p_usd") < max_cost
+            or balances.get("predict_usdt") is None
+            or balances.get("predict_usdt") < max_cost
+        )
+    return balances.get("p_usd") is None or balances.get("p_usd") < max_cost
+
+
+def _prediction_relation_review_item(
+    row: Mapping[str, object],
+) -> dict[str, object] | None:
+    """Map one v2 catalog row onto the six-state review vocabulary (no profit/preview)."""
+
+    status = str(row.get("status") or "")
+    activation = str(row.get("activation") or "")
+    model = row.get("model")
+    terminal_states = model.get("terminal_states") if isinstance(model, Mapping) else None
+    compiled = bool(terminal_states)
+    if status == "PENDING":
+        key = "PENDING_APPROVAL"
+    elif status == "APPROVED":
+        if activation == "ACTIVE":
+            key = "ACTIVATED"
+        elif activation in {"ACTIVATION_BLOCKED_INCONSISTENT", "UNSUPPORTED_SIZE"}:
+            key = "ACTIVATION_BLOCKED"
+        elif activation == "SUPERSEDED":
+            key = "SOURCE_CHANGED_REAPPROVAL"
+        elif compiled:
+            key = "COMPILED_PENDING_ACTIVATION"
+        else:
+            key = "APPROVED_MODEL_INCOMPLETE"
+    else:
+        return None
+    item: dict[str, object] = {
+        "version_id": row.get("version_id"),
+        "title": row.get("statement") or row.get("title"),
+        "relation_type": row.get("relation_type"),
+        "discovery_source": row.get("discovery_source"),
+        "status": key,
+        "reason": "",
+        "conflict_candidates": 0,
+    }
+    if key == "ACTIVATION_BLOCKED" and activation == "ACTIVATION_BLOCKED_INCONSISTENT":
+        item["reason"] = "ACTIVATION_BLOCKED_INCONSISTENT"
+        try:
+            item["conflict_candidates"] = int(row.get("conflict_candidates") or 0)
+        except (TypeError, ValueError):
+            item["conflict_candidates"] = 0
+    elif activation in {"ACTIVATION_BLOCKED_INCONSISTENT", "UNSUPPORTED_SIZE"}:
+        item["reason"] = activation
+    elif key == "SOURCE_CHANGED_REAPPROVAL":
+        item["reason"] = "rules fingerprint 变化 · 保留批准不等于可交易"
+    return item
+
+
+def _prediction_relation_review(relation_catalog: object | None) -> dict[str, object]:
+    review: dict[str, object] = {"pending_count": 0, "items": []}
+    if relation_catalog is None:
+        return review
+    pending = getattr(relation_catalog, "pending_count", None)
+    if callable(pending):
+        try:
+            review["pending_count"] = int(pending())
+        except Exception:
+            review["pending_count"] = 0
+    rows = getattr(relation_catalog, "review_rows", None)
+    if not callable(rows):
+        return review
+    try:
+        raw_rows = rows()
+    except Exception:
+        return review
+    items: list[dict[str, object]] = []
+    for row in raw_rows:
+        if not isinstance(row, Mapping):
+            continue
+        item = _prediction_relation_review_item(row)
+        if item is not None:
+            items.append(item)
+    review["items"] = items
+    return review
+
+
+def _prediction_qualification(
+    row: Mapping[str, object],
+    *,
+    balances: Mapping[str, Decimal | None],
+    breaker_open: bool,
+    cross_breaker_open: bool,
+) -> dict[str, object]:
+    approved, approved_known = _prediction_approved(row)
+    proof, proof_known = _prediction_proof_complete(row)
+    profit = _prediction_decimal_sort(row.get("profit", row.get("minimum_profit")))
+    payout = _prediction_decimal_sort(row.get("minimum_payout"))
+    annualized = _prediction_decimal_sort(row.get("annualized_yield"))
+    remaining = _prediction_remaining_days_known(row)
+    edge = _prediction_net_edge(row)
+    profit_known = profit.is_finite()
+    payout_known = payout.is_finite() and payout > 0
+    annualized_known = annualized.is_finite()
+    remaining_known = remaining is not None and remaining.is_finite()
+    remaining_present = row.get("remaining_days") not in (None, "")
+    tenor_value = format(remaining, "f") if remaining_known and remaining_present else None
+    checks: list[dict[str, object]] = [
+        {
+            "key": "approved",
+            "label": "已批准",
+            "passed": approved,
+            "value": (
+                str((row.get("codex_approval") or {}).get("decision") or row.get("llm_status"))
+                if isinstance(row.get("codex_approval"), Mapping) or row.get("llm_status")
+                else row.get("approved", row.get("approval"))
+            ),
+            "threshold": "APPROVE",
+        },
+        {
+            "key": "proof",
+            "label": "证明完整",
+            "passed": proof,
+            "value": proof,
+            "threshold": True,
+        },
+        {
+            "key": "min_profit",
+            "label": "最低利润 $1",
+            "passed": (
+                profit >= MIN_ESTIMATED_PROFIT
+                if profit_known
+                else None
+            ),
+            "value": format(profit, "f") if profit_known else None,
+            "threshold": format(MIN_ESTIMATED_PROFIT, "f"),
+        },
+        {
+            "key": "net_edge",
+            "label": "1% 净边际",
+            "passed": (
+                edge >= MIN_NET_EDGE
+                if edge is not None
+                else None
+            ),
+            "value": format(edge, "f") if edge is not None else None,
+            "threshold": format(MIN_NET_EDGE, "f"),
+        },
+        {
+            "key": "annualized",
+            "label": "15% 年化",
+            "passed": (
+                annualized >= MIN_THRESHOLD_ANNUALIZED_YIELD
+                if annualized_known
+                else None
+            ),
+            "value": format(annualized, "f") if annualized_known else None,
+            "threshold": format(MIN_THRESHOLD_ANNUALIZED_YIELD, "f"),
+        },
+        {
+            "key": "tenor",
+            "label": "30 天资本释放",
+            "passed": (
+                Decimal("0") < remaining <= Decimal("30")
+                if remaining_known
+                else None
+            ),
+            "value": tenor_value,
+            "threshold": "30",
+        },
+        {
+            "key": "not_expired",
+            "label": "未过期",
+            "passed": (
+                remaining > Decimal("0")
+                if remaining_known
+                else None
+            ),
+            "value": tenor_value,
+            "threshold": ">0",
+        },
+    ]
+    gate_checks = [
+        item for item in checks if item["key"] not in {"approved", "proof"}
+    ]
+    gate_passed = all(item["passed"] is True for item in gate_checks)
+    known = approved_known and proof_known and profit_known and payout_known and annualized_known and remaining_known
+    if not known:
+        status = "UNKNOWN"
+    elif approved is True and proof is True and gate_passed:
+        status = "QUALIFIED_VERIFIED"
+    elif approved is True and gate_passed:
+        status = "QUALIFIED_FEASIBLE"
+    else:
+        status = "NOT_QUALIFIED"
+    order_ready = status in {"QUALIFIED_VERIFIED", "QUALIFIED_FEASIBLE"}
+    reason = ""
+    if not order_ready:
+        reason = "资格数据未知" if status == "UNKNOWN" else "未通过资格门槛"
+    elif (remaining_known and remaining <= Decimal("0")) or not gate_passed:
+        order_ready = False
+        reason = "已过期" if remaining_known and remaining <= Decimal("0") else "未通过资格门槛"
+    elif breaker_open or cross_breaker_open:
+        order_ready = False
+        reason = "熔断中"
+    elif _prediction_balance_shortfall(row, balances):
+        order_ready = False
+        reason = "余额不足"
+    return {
+        "status": status,
+        "checks": checks,
+        "order_ready": order_ready,
+        "order_ready_reason": reason,
+    }
+
+
 def _prediction_predict_account_snapshot(execution: object | None) -> Mapping[str, object]:
     fresh = getattr(execution, "_fresh_predict_account_snapshot", None)
     method = fresh if callable(fresh) else getattr(
@@ -1039,6 +1466,62 @@ def prediction_state_payload(
     opportunity_rows = sorted(
         (row for row in opportunity_rows if isinstance(row, Mapping)), key=_prediction_sort_key
     )
+    predict_snapshot = _prediction_predict_account_snapshot(execution)
+    balances: dict[str, Decimal | None] = {
+        "p_usd": _prediction_decimal_sort(
+            readiness.get("p_usd_balance", readiness.get("balance"))
+        ) if readiness.get("p_usd_balance", readiness.get("balance")) not in (None, "") else None,
+        "predict_usdt": _prediction_decimal_sort(
+            predict_snapshot.get("available_usdt")
+        ) if predict_snapshot.get("available_usdt") not in (None, "") else None,
+    }
+    projected_opportunities: list[dict[str, object]] = []
+    for row in opportunity_rows:
+        projected = dict(row)
+        projected.update(_prediction_nleg_labels(projected))
+        projected["qualification"] = _prediction_qualification(
+            projected,
+            balances=balances,
+            breaker_open=breaker_open,
+            cross_breaker_open=cross_breaker_open,
+        )
+        projected_opportunities.append(projected)
+    opportunity_rows = projected_opportunities
+    qualified_opportunities = [
+        row
+        for row in opportunity_rows
+        if row["qualification"]["status"] in {"QUALIFIED_VERIFIED", "QUALIFIED_FEASIBLE"}
+    ]
+    snapshot_status = str(safe_snapshot.get("status") or "unavailable")
+    snapshot_stale = bool(safe_snapshot.get("stale")) or snapshot_status in {
+        "degraded",
+        "unavailable",
+        "error",
+    }
+    opportunity_qualification: dict[str, object] = {
+        "status": (
+            "UNKNOWN"
+            if snapshot_stale
+            else "QUALIFIED"
+            if qualified_opportunities
+            else "NO_QUALIFIED_OPPORTUNITY"
+        ),
+        "no_arbitrage": False,
+        "qualified_count": len(qualified_opportunities),
+        "total_count": len(opportunity_rows),
+        "verified_count": sum(
+            row["qualification"]["status"] == "QUALIFIED_VERIFIED"
+            for row in opportunity_rows
+        ),
+        "feasible_count": sum(
+            row["qualification"]["status"] == "QUALIFIED_FEASIBLE"
+            for row in opportunity_rows
+        ),
+        "unknown_count": sum(
+            row["qualification"]["status"] == "UNKNOWN"
+            for row in opportunity_rows
+        ),
+    }
     event_count = len(event_rows)
     market_count = 0
     token_ids: set[str] = set()
@@ -1185,6 +1668,12 @@ def prediction_state_payload(
         except Exception:
             pass
     shadow_summary = _prediction_n_leg_shadow_summary(opportunity_rows)
+    n_leg = _prediction_n_leg_contract(execution)
+    capital_usage = _prediction_capital_usage(
+        cross_unsettled=cross_unsettled,
+        current_execution=current_execution,
+        n_leg=n_leg,
+    )
     result = {
         "status": status,
         "health": health,
@@ -1200,8 +1689,12 @@ def prediction_state_payload(
         "stale": stale,
         "events": event_rows,
         "opportunities": opportunity_rows,
+        "qualified_opportunities": qualified_opportunities,
+        "opportunity_qualification": opportunity_qualification,
+        "capital_usage": capital_usage,
         "venues": venues,
         "cross_venue": cross_venue,
+        **({"n_leg": n_leg} if n_leg is not None else {}),
         "relation_discovery": _prediction_relation_safe_value(
             safe_snapshot.get("relation_discovery", {})
         ),
@@ -1223,12 +1716,7 @@ def prediction_state_payload(
     }
     if shadow_summary["monitoring"]:
         result["n_leg_shadow"] = shadow_summary
-    pending_count = getattr(relation_catalog, "pending_count", None)
-    if callable(pending_count):
-        try:
-            result["relation_review"] = {"pending_count": int(pending_count())}
-        except Exception:
-            result["relation_review"] = {"pending_count": 0}
+    result["relation_review"] = _prediction_relation_review(relation_catalog)
     return result
 
 

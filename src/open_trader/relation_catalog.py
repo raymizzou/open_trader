@@ -279,6 +279,14 @@ class RelationCatalog:
             result.sort(key=lambda item: not bool(active_endpoints & {str(endpoint["contract_id"]) for endpoint in item["endpoints"]}))
         return result
 
+    def review_rows(self) -> list[dict[str, object]]:
+        """All catalog versions as raw rows for the read model six-state projection."""
+
+        return [
+            self._row(version_id, int(record.get("occurrence_count", 1)))
+            for version_id, record in self._versions().items()
+        ]
+
     def _in_view(
         self,
         view: str,

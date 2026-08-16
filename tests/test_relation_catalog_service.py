@@ -118,3 +118,18 @@ def test_relation_catalog_mutation_rejects_extra_fields_before_approval(tmp_path
 
     assert status == 200
     assert forbidden["activation"] == "ACTIVE"
+
+
+def test_relation_catalog_review_rows_expose_every_version_without_views(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    pending_id = catalog.ingest(discovery(complete=False))["version_id"]
+    active_id = catalog.ingest(discovery(title="Active relation"))["version_id"]
+    catalog.approve(active_id, {"version_id": active_id}, actor="operator", git_sha="sha")
+
+    rows = catalog.review_rows()
+    by_id = {row["version_id"]: row for row in rows}
+    assert set(by_id) == {pending_id, active_id}
+    assert by_id[pending_id]["status"] == "PENDING"
+    assert by_id[active_id]["status"] == "APPROVED"
+    assert by_id[active_id]["activation"] == "ACTIVE"
+    assert by_id[pending_id]["model"]["terminal_states"] == []

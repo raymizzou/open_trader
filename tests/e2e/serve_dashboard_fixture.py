@@ -195,6 +195,96 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
         "breaker": {"open": scenario == "incident", "status": "locked" if scenario == "incident" else "ready"},
         "csrf_token": "fixture-csrf",
     }
+    mock_qualified_opportunity: dict[str, object] = {
+        "opportunity_id": "cross-opportunity-actionable-fixture",
+        "title": "Bitcoin 在 8 月 31 日前高于 $120,000？",
+        "market_type": "cross_venue_yes_no",
+        "strategy_type": "yes_no",
+        "engine_owner": "yes_no",
+        "relation_type": "NATIVE_COMPLEMENT",
+        "discovery_source": "VENUE_METADATA",
+        "leg_count": 2,
+        "scope": {"event": "same_event", "venue": "cross_venue"},
+        "scope_label": "跨所 · 同事件",
+        "quantity": "20",
+        "net_quantity": "20",
+        "total_max_cost": "31.20",
+        "minimum_payout": "39.60",
+        "minimum_profit": "8.40",
+        "profit": "8.40",
+        "annualized_yield": "0.284",
+        "remaining_days": "12",
+        "resolution_at": "2026-08-31T23:59:00Z",
+        "canonical_cutoff": "2026-08-31T23:59:00Z",
+        "extreme_loss": "-0.80",
+        "legs": [
+            {"exchange": "predict.fun", "outcome": "YES", "net_quantity": "20", "max_price": "0.42", "max_cost": "16.80", "settlement_asset": "USDT"},
+            {"exchange": "polymarket", "outcome": "NO", "net_quantity": "20", "max_price": "0.36", "max_cost": "14.40", "settlement_asset": "pUSD"},
+        ],
+        "qualification": {
+            "status": "QUALIFIED_VERIFIED",
+            "order_ready": True,
+            "order_ready_reason": "",
+            "checks": [
+                {"key": "approved", "label": "已批准", "passed": True, "value": "APPROVE", "threshold": "APPROVE"},
+                {"key": "proof", "label": "证明完整", "passed": True, "value": True, "threshold": True},
+                {"key": "min_profit", "label": "最低利润 $1", "passed": True, "value": "8.40", "threshold": "1.00"},
+                {"key": "net_edge", "label": "1% 净边际", "passed": True, "value": "0.2454", "threshold": "0.01"},
+                {"key": "annualized", "label": "15% 年化", "passed": True, "value": "0.284", "threshold": "0.15"},
+                {"key": "tenor", "label": "30 天资本释放", "passed": True, "value": "12", "threshold": "30"},
+                {"key": "not_expired", "label": "未过期", "passed": True, "value": "12", "threshold": ">0"},
+            ],
+        },
+        "actionable": True,
+    }
+    payload["qualified_opportunities"] = [mock_qualified_opportunity]
+    payload["capital_usage"] = {
+        "max_total_unsettled_capital": "60",
+        "max_total_unsettled_capital_set": True,
+        "current_conservative": "35.20",
+        "active_batch_reserved": "0",
+        "remaining": "24.80",
+    }
+    payload["relation_review"] = {
+        "pending_count": 2,
+        "items": [
+            {
+                "version_id": "v-btc-complement",
+                "title": "BTC $120k 互补关系",
+                "relation_type": "NATIVE_COMPLEMENT",
+                "discovery_source": "VENUE_METADATA",
+                "status": "ACTIVATED",
+            },
+            {
+                "version_id": "v-hurupay-threshold",
+                "title": "Hurupay 阈值关系",
+                "relation_type": "IMPLIES",
+                "discovery_source": "LLM",
+                "status": "APPROVED_MODEL_INCOMPLETE",
+            },
+            {
+                "version_id": "v-spy-monotonic",
+                "title": "SPY 单调关系",
+                "relation_type": "IMPLIES",
+                "discovery_source": "MANUAL",
+                "status": "ACTIVATION_BLOCKED",
+                "reason": "ACTIVATION_BLOCKED_INCONSISTENT",
+                "conflict_candidates": 2,
+            },
+        ],
+    }
+    payload["n_leg"] = {
+        "mode": "MANUAL",
+        "contract_generation": 1,
+        "qualification_policy_version": 1,
+        "safety_config": {"max_total_unsettled_capital_units": 60000000},
+        "enabled_execution_scope_version": [],
+        "execution_gates": {
+            "breaker_open": scenario == "incident",
+            "incident_active": scenario == "incident",
+            "batch_active": False,
+        },
+    }
     if scenario == "ready-zero-allowance":
         payload["venues"][1] = {**payload["venues"][1], "allowance": {"asset": "USDT", "value": "0", "spender": "0xSpender…C0DE"}, "mode": "可以交易"}
     if scenario in {"signer-bnb-low", "cross-signal-bnb-low"}:
@@ -581,7 +671,6 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/prediction-arbitrage/state":
             payload = _prediction_payload(type(self).prediction_scenario)
-            payload["relation_review"] = {"pending_count": 1}
             self._send_json(payload)
             return
         if path == "/api/prediction-arbitrage/relations":

@@ -63,6 +63,8 @@ const state = {
     signalHistoryGeneration: 0,
     csrfToken: "",
     activeExecutionId: "",
+    filter: {kind: "all", legs: null, scope: null},
+    relationView: "all",
     relationReview: {open: false, view: "pending", items: [], detail: null, loading: false},
   },
 };
@@ -2429,9 +2431,175 @@ function predictionPageHeader(payload) {
   return `<header class="pm-page-head"><div><h1>预测套利 · 机会</h1><p>先看监控范围和实盘状态，再决定是否参与套利信号。</p></div><div class="pm-updated"><button class="pm-relation-badge" type="button" data-action="open-relation-review">关系审核 <strong>${Number.isFinite(pending) ? pending : 0}</strong></button><span class="pm-status-line"><i class="pm-status-dot ${tone === "danger" ? "danger" : ""}"></i>${health}</span><br>${predictionClock("Watcher 数据时间", heartbeat)} · Polymarket${failure}</div></header>`;
 }
 
-function predictionStrategyTabs(strategy) {
-  const selected = strategy === "llm_hedge" ? "llm_hedge" : "yes_no";
-  return `<nav class="pm-strategy-tabs" aria-label="套利策略"><button type="button" data-prediction-strategy="yes_no" aria-pressed="${selected === "yes_no"}">YES/NO套利</button><button type="button" data-prediction-strategy="llm_hedge" aria-pressed="${selected === "llm_hedge"}">LLM对冲套利</button></nav>`;
+function predictionOpportunityFilter(payload, filter) {
+  const active = filter || {};
+  const kind = active.kind || "all";
+  const kinds = [
+    ["all", "全部"], ["yes_no", "YES/NO"], ["llm_hedge", "LLM"],
+    ["native", "原生"], ["mechanical", "机械"], ["semantic", "语义"],
+  ];
+  const kindButtons = kinds.map(([key, label]) =>
+    `<button type="button" data-prediction-filter-kind="${key}" aria-pressed="${kind === key}">${label}</button>`
+  ).join("");
+  const legsLabel = active.legs !== null && active.legs !== undefined ? `${active.legs} 腿 ▾` : "腿数 ▾";
+  const scopeLabel = active.scope === "cross_venue" ? "跨所 ▾" : active.scope === "same_venue" ? "同所 ▾" : "范围 ▾";
+  return `<nav class="pm-strategy-tabs" aria-label="机会筛选">${kindButtons}<button type="button" data-prediction-filter-legs aria-pressed="${active.legs !== null && active.legs !== undefined}">${legsLabel}</button><button type="button" data-prediction-filter-scope aria-pressed="${active.scope !== null && active.scope !== undefined}">${scopeLabel}</button></nav>`;
+}
+
+function predictionUnifiedFilteredRows(payload, filter) {
+  const active = filter || {};
+  const rows = (Array.isArray(payload?.qualified_opportunities) ? payload.qualified_opportunities : [])
+    .filter((item) => (
+      item && typeof item === "object"
+      && ["QUALIFIED_VERIFIED", "QUALIFIED_FEASIBLE"].includes(item?.qualification?.status)
+    ));
+  return rows.filter((item) => {
+    const strategy = String(item.strategy_type || "");
+    const relation = String(item.relation_type || "");
+    const kind = active.kind || "all";
+    if (kind !== "all") {
+      if (kind === "yes_no" && strategy !== "yes_no") return false;
+      if (kind === "llm_hedge" && strategy !== "llm_hedge") return false;
+      if (kind === "native" && relation !== "NATIVE_COMPLEMENT") return false;
+      if (kind === "mechanical" && relation !== "MECHANICAL") return false;
+      if (kind === "semantic" && !["IMPLIES", "MUTUALLY_EXCLUSIVE", "EXACTLY_ONE"].includes(relation)) return false;
+    }
+    if (active.legs !== null && active.legs !== undefined && Number(item.leg_count) !== Number(active.legs)) return false;
+    if (active.scope && item?.scope?.venue !== active.scope) return false;
+    return true;
+  });
+}
+
+function predictionUnifiedLegRows(row) {
+  const opportunity = predictionOpportunityDisplay(row);
+  if (predictionIsCrossVenue(opportunity)) {
+    const legs = Array.isArray(opportunity.legs) ? opportunity.legs : [];
+    return legs.map((leg, index) => {
+      const venue = String(leg.exchange || "").toLowerCase() === "predict.fun" ? "Predict.fun" : "Polymarket";
+      return `<div class="pm-order-leg"><span>第 ${index + 1} 腿 · ${escapeHtml(venue)} · BUY ${escapeHtml(leg.outcome || "")}</span><strong>${escapeHtml(predictionValue(leg.net_quantity, "-"))} 份 · 最高 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(leg.max_cost))} · ${escapeHtml(predictionValue(leg.settlement_asset, "-"))}</small></div>`;
+    }).join("");
+  }
+  if (String(opportunity.market_type || "") === "threshold_hedge") {
+    const legs = Array.isArray(opportunity.buy_legs) ? opportunity.buy_legs : [];
+    return legs.map((leg, index) => `<div class="pm-order-leg"><span>第 ${index + 1} 腿 · Polymarket · BUY ${escapeHtml(leg.outcome || "")}</span><strong>${escapeHtml(predictionValue(leg.quantity, "-"))} 份 · 最高 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(leg.max_cost))} · pUSD</small></div>`).join("");
+  }
+  const yes = `<div class="pm-order-leg"><span>第 1 腿 · Polymarket · BUY YES</span><strong>${escapeHtml(predictionValue(opportunity.quantity, "-"))} 份 · 最高 ${escapeHtml(predictionPrice(opportunity.yes_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(opportunity.yes_cost))} · pUSD</small></div>`;
+  const no = `<div class="pm-order-leg"><span>第 2 腿 · Polymarket · BUY NO</span><strong>${escapeHtml(predictionValue(opportunity.quantity, "-"))} 份 · 最高 ${escapeHtml(predictionPrice(opportunity.no_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(opportunity.no_cost))} · pUSD</small></div>`;
+  return `${yes}${no}`;
+}
+
+function predictionUnifiedMetric(label, value, className = "", extra = "") {
+  return `<div class="pm-metric"><span>${escapeHtml(label)}</span><strong class="${className}">${value}</strong>${extra}</div>`;
+}
+
+function predictionUnifiedOpportunityCard(row, mode) {
+  const opportunity = predictionOpportunityDisplay(row);
+  const qualification = opportunity.qualification && typeof opportunity.qualification === "object" ? opportunity.qualification : {};
+  const checks = Array.isArray(qualification.checks) ? qualification.checks : [];
+  const checkValue = (key) => {
+    const item = checks.find((entry) => entry && entry.key === key);
+    return item ? item.value : undefined;
+  };
+  const statusClass = qualification.status === "QUALIFIED_VERIFIED" ? "ok" : "warn";
+  const status = predictionValue(qualification.status, "UNKNOWN");
+  const edge = Number(checkValue("net_edge"));
+  const edgePercent = Number.isFinite(edge) ? `${(Math.trunc(edge * 100 * 10) / 10).toFixed(1)}%` : "-";
+  const remaining = Number(opportunity.remaining_days);
+  const tenor = Number.isFinite(remaining) && remaining > 0
+    ? `${Number.isInteger(remaining) ? remaining : remaining.toFixed(1)} 天`
+    : "不可计算";
+  const legs = Array.isArray(opportunity.legs) ? opportunity.legs : [];
+  const exchanges = new Set(legs.map((leg) => String(leg?.exchange || "").toLowerCase()).filter(Boolean));
+  const venueLabel = exchanges.has("predict.fun") && exchanges.has("polymarket")
+    ? "Predict.fun × Polymarket"
+    : String(opportunity.venue || "Polymarket");
+  const subtitle = `${escapeHtml(venueLabel)} · ${escapeHtml(predictionValue(opportunity.scope_label, ""))}`;
+  const tags = [
+    opportunity.relation_type,
+    opportunity.discovery_source,
+    opportunity.leg_count ? `${opportunity.leg_count} 腿` : "",
+  ].filter(Boolean).map((tag, index) => `<span class="pm-pill${index === 0 ? " blue" : ""}">${escapeHtml(String(tag))}</span>`).join("");
+  const metrics = [
+    predictionUnifiedMetric("保证最低利润", escapeHtml(predictionSignedMoney(opportunity.profit)), "pm-positive"),
+    predictionUnifiedMetric("1% 净边际", escapeHtml(edgePercent)),
+    predictionUnifiedMetric("15% 年化", escapeHtml(predictionAnnualizedPercent(opportunity.annualized_yield, 1))),
+    predictionUnifiedMetric("30 天资本释放", escapeHtml(tenor)),
+    predictionUnifiedMetric("极端风险", escapeHtml(predictionSignedMoney(opportunity.extreme_loss)), "pm-negative"),
+    predictionUnifiedMetric(
+      "order_ready",
+      qualification.order_ready === true ? "是" : "否",
+      "",
+      `<small style="color:var(--muted)">${escapeHtml(predictionValue(qualification.order_ready_reason, qualification.order_ready === true ? "MANUAL 模式 · 可人工确认" : ""))}</small>`,
+    ),
+  ].join("");
+  const action = qualification.order_ready === true && mode === "MANUAL"
+    ? `<div class="pm-opportunity-action"><p>确认时重新读取两所 REST、盘口、余额与未结算额度。</p><button type="button" class="pm-button primary" data-action="participate" data-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id, ""))}">人工确认下单</button></div>`
+    : `<div class="pm-opportunity-action"><p>order_ready=false · ${escapeHtml(predictionValue(qualification.order_ready_reason, "不可下单"))} · 不可下单。</p></div>`;
+  return `<article class="pm-opportunity"><div class="pm-opportunity-title"><div><h3>${escapeHtml(predictionValue(opportunity.title || opportunity.question, "数据未返回"))}</h3><p>${subtitle}</p></div><span class="pm-pill ${statusClass}">${escapeHtml(status)}</span></div><div class="pm-tags">${tags}</div>${legs.length ? `<div class="pm-order-legs">${predictionUnifiedLegRows(opportunity)}</div>` : ""}<div class="pm-metrics">${metrics}</div>${action}</article>`;
+}
+
+function predictionUnifiedOpportunityList(payload, filter) {
+  const rows = predictionUnifiedFilteredRows(payload, filter);
+  const cards = rows.map((row) => predictionUnifiedOpportunityCard(row, "MANUAL")).join("");
+  const empty = rows.length ? "" : `<div class="pm-empty"><strong>当前无更多合格机会</strong><p style="margin:4px 0 0">低于门槛的正收益、未经批准、证明未完成、UNKNOWN 和陈旧结果只进漏斗/历史。</p></div>`;
+  return `<section class="pm-panel" aria-label="机会列表"><div class="pm-panel-heading"><div><h2>机会列表</h2><p>只读投影 · 前端不重算利润/年化/期限/安全状态。</p></div></div><div style="padding:0 14px">${predictionOpportunityFilter(payload, filter)}</div>${cards}${empty}</section>`;
+}
+
+function predictionCapitalUsage(payload) {
+  const usage = payload?.capital_usage && typeof payload.capital_usage === "object" ? payload.capital_usage : {};
+  const set = usage.max_total_unsettled_capital_set === true && predictionHasValue(usage.max_total_unsettled_capital);
+  return `<section class="pm-readiness" aria-label="资金占用"><div class="pm-readiness-item"><span>max_total_unsettled_capital</span><strong>${escapeHtml(predictionMoney(set ? usage.max_total_unsettled_capital : "0.00"))}</strong><small>${set ? "显式设置" : "首次 Canary 前需显式设置"}</small></div><div class="pm-readiness-item"><span>当前保守占用</span><strong>${escapeHtml(predictionMoney(usage.current_conservative))}</strong><small>active batch 预留 ${escapeHtml(predictionMoney(usage.active_batch_reserved))}</small></div><div class="pm-readiness-item"><span>剩余额度</span><strong>${escapeHtml(predictionMoney(usage.remaining))}</strong><small>只投影服务端账本</small></div></section>`;
+}
+
+const PREDICTION_RELATION_REVIEW_STATES = {
+  PENDING_APPROVAL: {label: "待批准", tone: ""},
+  APPROVED_MODEL_INCOMPLETE: {label: "已批准 · 模型不完整", tone: ""},
+  COMPILED_PENDING_ACTIVATION: {label: "编译补全待激活", tone: ""},
+  ACTIVATION_BLOCKED: {label: "激活阻断", tone: "block"},
+  ACTIVATED: {label: "已激活", tone: "ok"},
+  SOURCE_CHANGED_REAPPROVAL: {label: "来源变化需重批", tone: ""},
+};
+
+function predictionRelationReview(payload, view) {
+  const review = payload?.relation_review && typeof payload.relation_review === "object" ? payload.relation_review : {};
+  const items = Array.isArray(review.items) ? review.items : [];
+  const activeView = view || "all";
+  const filtered = activeView === "all"
+    ? items
+    : items.filter((item) => item && item.status === activeView);
+  const pending = Number(review.pending_count || 0);
+  const rows = filtered.map((item) => {
+    const state = PREDICTION_RELATION_REVIEW_STATES[item.status] || {label: predictionValue(item.status, "未知状态"), tone: ""};
+    const conflicts = Number(item.conflict_candidates || 0);
+    const reason = [
+      item.reason,
+      conflicts > 0 ? `冲突候选 ${conflicts}` : "",
+    ].filter(Boolean).join(" · ");
+    return `<div class="pm-relation-row"><div style="display:flex;justify-content:space-between;align-items:center"><strong>${escapeHtml(predictionValue(item.title || item.statement, "关系表述未返回"))}</strong><span class="pm-relation-badge${state.tone ? ` ${state.tone}` : ""}">${escapeHtml(state.label)}</span></div><small>${escapeHtml(predictionValue(item.relation_type, ""))}${escapeHtml(item.discovery_source ? ` · ${item.discovery_source}` : "")}${reason ? ` · ${escapeHtml(reason)}` : ""}</small></div>`;
+  }).join("");
+  const empty = filtered.length ? "" : `<div class="pm-empty">暂无关系审核项。</div>`;
+  const tabs = [
+    ["all", "全部"], ["PENDING_APPROVAL", "待批准"], ["APPROVED_MODEL_INCOMPLETE", "已批准 · 模型不完整"],
+    ["COMPILED_PENDING_ACTIVATION", "编译补全待激活"], ["ACTIVATION_BLOCKED", "激活阻断"],
+    ["ACTIVATED", "已激活"], ["SOURCE_CHANGED_REAPPROVAL", "来源变化需重批"],
+  ].map(([key, label]) => `<button type="button" data-relation-review-view="${key}" aria-pressed="${activeView === key}">${label}</button>`).join("");
+  return `<section class="pm-relation-drawer" aria-label="关系审核"><header style="display:flex;justify-content:space-between;align-items:start"><div><h2>关系审核</h2><p>只投影关系事实、证据与审批状态；首版不显示预计收益。</p></div><span class="pm-relation-badge">待批准 <strong>${pending}</strong></span></header><nav class="pm-relation-tabs">${tabs}</nav><div class="pm-relation-list">${rows}${empty}</div></section>`;
+}
+
+function predictionUnifiedPageHeader(payload) {
+  const [health, tone] = predictionStatusLabel(payload);
+  const heartbeat = payload?.heartbeat_at || payload?.heartbeat;
+  const contractGeneration = payload?.n_leg?.contract_generation ?? payload?.contract_generation;
+  const contract = contractGeneration
+    ? ` · contract generation ${escapeHtml(contractGeneration)}`
+    : "";
+  return `<header class="pm-page-head"><div><h1>预测套利 · 机会</h1><p>单一 N_LEG 机会 read model；历史 YES_NO / LLM_RELATION 只读保留。</p></div><div class="pm-updated"><span class="pm-status-line"><i class="pm-status-dot ${tone === "danger" ? "danger" : ""}"></i>${health}</span><br>${predictionClock("数据时间", heartbeat)}${contract}</div></header>`;
+}
+
+function predictionUnifiedPage(payload, filter) {
+  const viewPayload = payload || {status: "loading", events: [], opportunities: []};
+  const filterState = state.predictionMarket.filter || {kind: "all", legs: null, scope: null};
+  return `${predictionUnifiedPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionReadinessStrip(viewPayload)}${predictionCapitalUsage(viewPayload)}${predictionUnifiedOpportunityList(viewPayload, filterState)}${predictionRelationReview(viewPayload, state.predictionMarket.relationView)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload)}`;
 }
 
 function predictionAnnualizedPercent(value, digits = 1) {
@@ -2449,12 +2617,15 @@ function predictionReadinessStrip(payload, strategy = "yes_no") {
     const cards = venues.map((venue) => {
       const balance = venue.balance && typeof venue.balance === "object" ? venue.balance : {};
       const isPredict = String(venue.venue || "").toLowerCase() === "predict.fun";
-      const venueName = isPredict ? "Predict Account" : "Polymarket";
+      const venueName = isPredict ? "Predict.fun" : "Polymarket";
       const wallet = predictionMaskedWallet(venue.wallet);
       const rest = predictionValue(venue.rest, "unavailable");
       const ws = predictionValue(venue.ws, "unavailable");
       const asset = predictionValue(balance.asset, "-");
       const amount = predictionHasValue(balance.value) ? predictionMoney(balance.value) : "-";
+      const balanceReason = isPredict && !predictionHasValue(balance.value) && venue.reason
+        ? ` · 原因：${escapeHtml(predictionFailureReasonLabel({failure_reason: venue.reason}))}`
+        : "";
       const allowance = venue.allowance && typeof venue.allowance === "object" ? venue.allowance : {};
       const allowanceLine = isPredict && predictionHasValue(allowance.value)
         ? `<small>授权 ${escapeHtml(predictionMoney(allowance.value))} ${escapeHtml(predictionValue(allowance.asset, "USDT"))}${allowance.spender ? ` · spender ${escapeHtml(predictionMaskedWallet(allowance.spender))}` : ""}</small>`
@@ -2463,7 +2634,7 @@ function predictionReadinessStrip(payload, strategy = "yes_no") {
       const detail = venue.reason
         ? `<small>原因：${escapeHtml(predictionFailureReasonLabel({failure_reason: venue.reason}))}</small>`
         : venue.last_success ? `<small>最近成功 ${escapeHtml(predictionValue(venue.last_success))}</small>` : "";
-      return `<article class="pm-readiness-item pm-venue-card"><div class="pm-venue-card-title"><strong>${venueName}</strong><span class="pm-pill ${predictionTone(venue.mode)}">${escapeHtml(predictionValue(venue.mode, "只读"))}</span></div>${isPredict ? "<small>Predict.fun</small>" : ""}<div class="pm-venue-states"><span>REST：${escapeHtml(healthLabel(rest))}</span><span>WebSocket：${escapeHtml(healthLabel(ws))}</span></div><small>钱包 ${escapeHtml(wallet)}</small><small>可用余额 ${escapeHtml(amount)} ${escapeHtml(asset)}</small>${allowanceLine}${detail}</article>`;
+      return `<article class="pm-readiness-item pm-venue-card"><div class="pm-venue-card-title"><strong>${venueName}</strong><span class="pm-pill ${predictionTone(venue.mode)}">${escapeHtml(predictionValue(venue.mode, "只读"))}</span></div><div class="pm-venue-states"><span>REST：${escapeHtml(healthLabel(rest))}</span><span>WebSocket：${escapeHtml(healthLabel(ws))}</span></div><small>钱包 ${escapeHtml(wallet)}</small><small>可用余额 ${escapeHtml(amount)} ${escapeHtml(asset)}${balanceReason}</small>${allowanceLine}${isPredict && balanceReason ? "" : detail}</article>`;
     });
     const signer = payload?.privy_signer || payload?.signer;
     if (signer && typeof signer === "object") {
@@ -3272,18 +3443,19 @@ function predictionLlmHedgeWorkspace(payload, expandedRelationKeys) {
 }
 
 function predictionModeBar(payload) {
-  const mode = payload.validation_mode || "observe_only";
-  const stats = payload.auto_eat_stats || {};
-  const modes = [
-    ["observe_only", "观察"],
-    ["manual", "手动"],
-    ["auto", "auto"],
-  ];
-  const buttons = modes.map(([value, label]) =>
-    `<button type="button" class="pm-mode-button${mode === value ? " active" : ""}" data-action="set-mode" data-mode="${value}">${label}</button>`
+  const nleg = payload?.n_leg && typeof payload.n_leg === "object" ? payload.n_leg : {};
+  const gates = nleg.execution_gates && typeof nleg.execution_gates === "object" ? nleg.execution_gates : {};
+  const contractMode = String(nleg.mode || "");
+  const effective = contractMode || payload.validation_mode || "observe_only";
+  const active = effective === "AUTO" || effective === "auto" ? "AUTO" : "MANUAL";
+  const breakerOpen = gates.breaker_open === true || payload?.breaker?.open === true;
+  const breaker = breakerOpen ? "全局熔断开启" : "全局熔断关闭";
+  const scopeCount = Array.isArray(nleg.enabled_execution_scope_version) ? nleg.enabled_execution_scope_version.length : 0;
+  const scopeText = scopeCount > 0 ? `enabled scope ${scopeCount} 个` : "enabled scope 空";
+  const buttons = [["manual", "MANUAL"], ["auto", "AUTO"]].map(([value, label]) =>
+    `<button type="button" class="pm-mode-button${active === label ? " active" : ""}" data-action="set-mode" data-mode="${value}">${label}</button>`
   ).join("");
-  const crossAuto = predictionCrossAutoStatus(payload);
-  return `<div class="pm-mode-bar" aria-label="验证期吃单模式">${buttons}<span class="pm-mode-stats">今日 ${stats.today_submitted || 0} 单 / $${Number(stats.today_cost || 0).toFixed(2)}</span>${crossAuto}</div>`;
+  return `<div class="pm-mode-bar" aria-label="执行模式">${buttons}<span class="pm-mode-stats">#60 前只读预览 · ${breaker} · ${scopeText}</span></div>`;
 }
 
 function predictionCrossAutoStatus(payload) {
@@ -3310,17 +3482,9 @@ function predictionCrossAutoStatus(payload) {
 function renderPredictionMarket() {
   const root = elements["prediction-market-root"];
   if (!root) return;
-  const expandedRelationKeys = new Set(
-    Array.from(root.querySelectorAll(".pm-threshold-candidate[open][data-relation-key]"))
-      .map((candidate) => candidate.dataset.relationKey)
-  );
   const payload = state.predictionMarket.payload;
   const viewPayload = payload || {status: "loading", events: [], opportunities: []};
-  const strategy = state.predictionMarket.strategy === "llm_hedge" ? "llm_hedge" : "yes_no";
-  const workspace = strategy === "llm_hedge"
-    ? predictionLlmHedgeWorkspace(viewPayload, expandedRelationKeys)
-    : predictionYesNoWorkspace(viewPayload);
-  root.innerHTML = `${predictionPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionReadinessStrip(viewPayload, strategy)}${predictionSafeguardsHtml(viewPayload)}${predictionStrategyTabs(strategy)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload, strategy)}${workspace}${relationReviewDrawer()}`;
+  root.innerHTML = predictionUnifiedPage(viewPayload);
 }
 
 function startPredictionPolling() {
@@ -3760,16 +3924,27 @@ async function handlePredictionMarketClick(event) {
   if (relationAction) { await mutateRelation(relationAction.dataset.action.replace("-relation", ""), relationAction.dataset.relationVersionId || ""); return; }
   const relationRow = event.target.closest("[data-relation-version-id]");
   if (relationRow) { await loadRelationDetail(relationRow.dataset.relationVersionId || ""); return; }
-  const strategy = event.target.closest("[data-prediction-strategy]");
-  if (strategy) {
-    state.predictionMarket.strategy = strategy.dataset.predictionStrategy === "llm_hedge"
-      ? "llm_hedge"
-      : "yes_no";
-    if (state.predictionMarket.strategy === "yes_no") {
-      startPredictionSignalPolling();
-    } else {
-      stopPredictionSignalPolling();
-    }
+  const filterKind = event.target.closest("[data-prediction-filter-kind]");
+  if (filterKind) {
+    state.predictionMarket.filter.kind = filterKind.dataset.predictionFilterKind || "all";
+    renderPredictionMarket();
+    return;
+  }
+  if (event.target.closest("[data-prediction-filter-legs]")) {
+    const current = state.predictionMarket.filter.legs;
+    state.predictionMarket.filter.legs = current === null || current === undefined ? "2" : null;
+    renderPredictionMarket();
+    return;
+  }
+  if (event.target.closest("[data-prediction-filter-scope]")) {
+    const current = state.predictionMarket.filter.scope;
+    state.predictionMarket.filter.scope = current === "cross_venue" ? "same_venue" : current === "same_venue" ? null : "cross_venue";
+    renderPredictionMarket();
+    return;
+  }
+  const relationReviewView = event.target.closest("[data-relation-review-view]");
+  if (relationReviewView) {
+    state.predictionMarket.relationView = relationReviewView.dataset.relationReviewView || "all";
     renderPredictionMarket();
     return;
   }
