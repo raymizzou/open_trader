@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from open_trader.prediction_monitor_selection import (
     BackgroundResolution,
+    MonitorSelectionStore,
+    SelectedComponent,
     idle_capacity,
     relation_generation_components,
     resolve_background_candidate,
     run_discovery,
+    select_monitor_components,
 )
 from open_trader.prediction_n_leg import (
     OBSERVATION_SCHEMA_V1,
@@ -31,6 +35,7 @@ from open_trader.prediction_n_leg import (
     QualificationMetric,
     RelationConstraint,
     RelationKind,
+    SelectedSupportGraph,
     SettlementObservationKey,
     TerminalAtom,
     TerminalKind,
@@ -39,8 +44,10 @@ from open_trader.prediction_n_leg import (
 )
 from open_trader.prediction_n_leg_oracle import (
     RelationComponent,
+    build_portfolio_solution,
     build_relation_components,
     cut_from_scenario,
+    derive_selected_support_graph,
     evaluate_fixed_portfolio,
 )
 from open_trader.prediction_solver import BenchmarkLimits, PortfolioCandidate, SolverEvidence
@@ -512,3 +519,204 @@ def test_run_discovery_skips_when_not_idle(monkeypatch: pytest.MonkeyPatch) -> N
     )
 
     assert results == ()
+
+
+# -- step 4: top-10 selection + persistence ---------------------------------
+
+
+def multi_relation_problem(
+    edges: tuple[tuple[str, str], ...],
+    keys: tuple[SettlementObservationKey, ...],
+) -> ArbitrageProblem:
+    actions = tuple(
+        action(contract_id, keys[index])
+        for index, edge in enumerate(edges)
+        for contract_id in edge
+    )
+    states = tuple(
+        state(contract_id, keys[index])
+        for index, edge in enumerate(edges)
+        for contract_id in edge
+    )
+    relations = tuple(
+        RelationConstraint(
+            f"r:{antecedent}->{consequent}",
+            RelationKind.IMPLIES,
+            (antecedent, consequent),
+            "v1",
+        )
+        for antecedent, consequent in edges
+    )
+    return problem(actions, states, relations)
+
+
+def edge_resolutions(
+    edges: tuple[tuple[str, str], ...],
+    keys: tuple[SettlementObservationKey, ...],
+    scores: tuple[int, ...],
+) -> dict[str, BackgroundResolution]:
+    """Resolve one single-edge sub-problem per component with a fixed score."""
+    budget = OracleBudget(8, 8, 4)
+    resolutions: dict[str, BackgroundResolution] = {}
+    for (antecedent, consequent), key, score in zip(edges, keys, scores):
+        sub = relation_problem(antecedent, consequent, key)
+        quantities = (ActionQuantity(antecedent, 1),)
+        evaluation = evaluate_fixed_portfolio(sub, quantities, budget)
+        support = derive_selected_support_graph(sub, evaluation, budget)
+        assert isinstance(support, SelectedSupportGraph)
+        solution = build_portfolio_solution(sub, evaluation, support)
+        component_id = f"component:{':'.join(sorted((antecedent, consequent)))}"
+        resolutions[component_id] = BackgroundResolution(
+            VerificationStatus.QUALIFIED_VERIFIED,
+            score,
+            OptimalityStatus.NOT_PROVEN,
+            solution,
+        )
+    return resolutions
+
+
+def test_selection_ranks_by_profit_then_component_id() -> None:
+    edges = (("contract-a", "contract-b"), ("contract-c", "contract-d"))
+    keys = (observation("a"), observation("b"))
+    merged = multi_relation_problem(edges, keys)
+    by_id = {
+        component.component_id: component
+        for component in build_relation_components(merged)
+    }
+
+    ranked = select_monitor_components(
+        edge_resolutions(edges, keys, (10, 20)),
+        {},
+        problem=merged,
+        components=by_id,
+    )
+    assert list(ranked) == ["component:contract-c:contract-d", "component:contract-a:contract-b"]
+    assert ranked["component:contract-c:contract-d"].admission_score == 20
+    assert ranked["component:contract-a:contract-b"].admission_score == 10
+
+    tied = select_monitor_components(
+        edge_resolutions(edges, keys, (10, 10)),
+        {},
+        problem=merged,
+        components=by_id,
+    )
+    assert list(tied) == ["component:contract-a:contract-b", "component:contract-c:contract-d"]
+
+
+def test_selection_caps_at_max_slots() -> None:
+    edges = tuple((f"contract-{index}-a", f"contract-{index}-b") for index in range(12))
+    keys = tuple(observation(str(index)) for index in range(12))
+    merged = multi_relation_problem(edges, keys)
+    by_id = {
+        component.component_id: component
+        for component in build_relation_components(merged)
+    }
+
+    ranked = select_monitor_components(
+        edge_resolutions(edges, keys, tuple(range(1, 13))),
+        {},
+        problem=merged,
+        components=by_id,
+        max_slots=10,
+    )
+    assert len(ranked) == 10
+    scores = [item.admission_score for item in ranked.values()]
+    assert scores == sorted(scores, reverse=True)
+    assert "component:contract-0-a:contract-0-b" not in ranked
+    assert "component:contract-1-a:contract-1-b" not in ranked
+
+
+def test_selection_excludes_unqualified_and_nonpositive() -> None:
+    edges = (("contract-a", "contract-b"), ("contract-c", "contract-d"))
+    keys = (observation("a"), observation("b"))
+    merged = multi_relation_problem(edges, keys)
+    by_id = {
+        component.component_id: component
+        for component in build_relation_components(merged)
+    }
+    good = edge_resolutions(edges, keys, (5, 0))["component:contract-a:contract-b"]
+    candidates: dict[str, BackgroundResolution] = {
+        "component:contract-a:contract-b": good,
+        "component:contract-c:contract-d": BackgroundResolution(
+            VerificationStatus.UNKNOWN,
+            None,
+            OptimalityStatus.NOT_APPLICABLE,
+            None,
+        ),
+        "component:unknown": BackgroundResolution(
+            VerificationStatus.QUALIFIED_VERIFIED,
+            0,
+            OptimalityStatus.NOT_PROVEN,
+            good.solution,
+        ),
+        "component:missing": BackgroundResolution(
+            VerificationStatus.QUALIFIED_VERIFIED,
+            None,
+            OptimalityStatus.NOT_PROVEN,
+            None,
+        ),
+    }
+
+    ranked = select_monitor_components(
+        candidates, {}, problem=merged, components=by_id
+    )
+    assert list(ranked) == ["component:contract-a:contract-b"]
+
+
+def test_selection_merges_current_and_replaces_same_id() -> None:
+    edges = (
+        ("contract-a", "contract-b"),
+        ("contract-c", "contract-d"),
+        ("contract-e", "contract-f"),
+    )
+    keys = (observation("a"), observation("b"), observation("c"))
+    merged = multi_relation_problem(edges, keys)
+    by_id = {
+        component.component_id: component
+        for component in build_relation_components(merged)
+    }
+    initial = edge_resolutions(edges, keys, (10, 0, 30))
+    current = select_monitor_components(
+        initial, {}, problem=merged, components=by_id
+    )
+
+    replaced = select_monitor_components(
+        edge_resolutions(edges, keys, (5, 20, 30)),
+        current,
+        problem=merged,
+        components=by_id,
+    )
+    assert list(replaced) == [
+        "component:contract-e:contract-f",
+        "component:contract-c:contract-d",
+        "component:contract-a:contract-b",
+    ]
+    assert replaced["component:contract-a:contract-b"].admission_score == 5
+    assert replaced["component:contract-c:contract-d"].admission_score == 20
+    assert replaced["component:contract-e:contract-f"].admission_score == 30
+
+
+def test_monitor_selection_store_round_trip(tmp_path: Path) -> None:
+    edges = (("contract-a", "contract-b"), ("contract-c", "contract-d"))
+    keys = (observation("a"), observation("b"))
+    merged = multi_relation_problem(edges, keys)
+    by_id = {
+        component.component_id: component
+        for component in build_relation_components(merged)
+    }
+    selection = select_monitor_components(
+        edge_resolutions(edges, keys, (10, 20)),
+        {},
+        problem=merged,
+        components=by_id,
+    )
+    store = MonitorSelectionStore(tmp_path)
+    assert store.path == tmp_path / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    assert store.load() == ("", {})
+
+    fingerprint_value = store.save(selection)
+    assert fingerprint_value.startswith("sha256:")
+    loaded_fingerprint, loaded = store.load()
+
+    assert loaded_fingerprint == fingerprint_value
+    assert loaded == selection

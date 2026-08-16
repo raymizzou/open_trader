@@ -19,16 +19,29 @@ cost proof; the #51 fee/tick/slippage and safety margin are already baked into
 each action's ``cost_slices``. ``OPTIMAL``/``NOT_PROVEN`` is recorded separately
 from the verified profit, and the whole pass is gated by ``idle_capacity()`` so
 it never competes with the #52 real-time window.
+
+Selection and persistence (#77 acceptance 7-10): the ranked selected-monitor set
+keeps at most 10 non-overlapping components (disjoint by construction, since
+components are connected components of one merged problem) ordered by fixed
+``initial_verified_profit``. Component identity, the fixed admission score, the
+verified portfolio and its fingerprints are persisted in the shared prediction
+SQLite; in-flight solves, pending snapshots and quote freshness are never
+persisted here.
 """
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 
 from open_trader.prediction_n_leg import (
     PROBLEM_SCHEMA_V1,
     REQUEST_SCHEMA_V1,
+    ActionQuantity,
     CandidateAction,
     ForbiddenAtomCombination,
     OptimalityStatus,
@@ -42,6 +55,7 @@ from open_trader.prediction_n_leg import (
     ArbitrageProblem,
     ConstraintModel,
     canonical_payload,
+    fingerprint,
     problem_from_payload,
 )
 from open_trader.prediction_n_leg_oracle import (
@@ -285,3 +299,236 @@ def run_discovery(
         if resolution is not None:
             results.append(resolution)
     return tuple(results)
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedComponent:
+    """One persisted monitor slot: component identity plus fixed admission facts."""
+
+    component_id: str
+    contract_ids: tuple[str, ...]
+    constraint_ids: tuple[str, ...]
+    action_ids: tuple[str, ...]
+    admission_score: int
+    portfolio: tuple[ActionQuantity, ...]
+    relation_fingerprint: str
+    terminal_fingerprint: str
+    portfolio_fingerprint: str
+    status: str
+
+
+def select_monitor_components(
+    candidates: Mapping[str, BackgroundResolution],
+    current: Mapping[str, SelectedComponent],
+    *,
+    problem: ArbitrageProblem,
+    components: Mapping[str, RelationComponent],
+    max_slots: int = 10,
+) -> dict[str, SelectedComponent]:
+    """Select at most ``max_slots`` monitor components by fixed admission score.
+
+    Only ``QUALIFIED_VERIFIED`` candidates with ``initial_verified_profit > 0``
+    enter; ``current`` entries persist unless replaced by a same-id candidate.
+    The result is ranked by admission score descending, ties by component id.
+    Components of one generation are connected components of one merged problem,
+    so they are disjoint by construction and need no runtime overlap check.
+    Structural invalidation is the caller's job: pass a ``current`` that already
+    excludes invalidated components.
+    """
+    if max_slots < 0:
+        raise ValueError("max_slots must be non-negative")
+    selected: dict[str, SelectedComponent] = dict(current)
+    for component_id, resolution in candidates.items():
+        if resolution.status != VerificationStatus.QUALIFIED_VERIFIED:
+            continue
+        profit = resolution.initial_verified_profit
+        if resolution.solution is None or profit is None or profit <= 0:
+            continue
+        component = components.get(component_id)
+        if component is None or component.component_id != component_id:
+            raise ValueError(
+                f"candidate {component_id!r} has no matching component structure"
+            )
+        selected[component_id] = _selected_component(
+            component_id, component, resolution, problem
+        )
+    ranked = sorted(
+        selected.values(), key=lambda item: (-item.admission_score, item.component_id)
+    )
+    return {item.component_id: item for item in ranked[:max_slots]}
+
+
+def _selected_component(
+    component_id: str,
+    component: RelationComponent,
+    resolution: BackgroundResolution,
+    problem: ArbitrageProblem,
+) -> SelectedComponent:
+    sub = _problem_for_component(problem, component)
+    solution = resolution.solution
+    assert solution is not None
+    return SelectedComponent(
+        component_id=component_id,
+        contract_ids=component.contract_ids,
+        constraint_ids=component.constraint_ids,
+        action_ids=component.action_ids,
+        admission_score=resolution.initial_verified_profit or 0,
+        portfolio=solution.quantities,
+        relation_fingerprint=fingerprint({"constraint_model": sub.constraint_model}),
+        terminal_fingerprint=fingerprint({"terminal_state_sets": sub.terminal_state_sets}),
+        portfolio_fingerprint=fingerprint({"quantities": solution.quantities}),
+        status="ACTIVE",
+    )
+
+
+def selection_fingerprint(selection: Mapping[str, SelectedComponent]) -> str:
+    """Canonical sha256 of the whole selection ordered by component id."""
+    ordered = [selection[component_id] for component_id in sorted(selection)]
+    return fingerprint({"selection": ordered})
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+_MONITOR_SELECTION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS monitor_selection_meta (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    selection_fingerprint TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS monitor_selection_components (
+    component_id TEXT PRIMARY KEY,
+    contract_ids TEXT NOT NULL,
+    constraint_ids TEXT NOT NULL,
+    action_ids TEXT NOT NULL,
+    admission_score INTEGER NOT NULL,
+    portfolio TEXT NOT NULL,
+    relation_fingerprint TEXT NOT NULL,
+    terminal_fingerprint TEXT NOT NULL,
+    portfolio_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+
+def _encode_portfolio(quantities: tuple[ActionQuantity, ...]) -> str:
+    return json.dumps(
+        [
+            {"action_id": quantity.action_id, "quantity_lots": quantity.quantity_lots}
+            for quantity in quantities
+        ],
+        sort_keys=True,
+    )
+
+
+def _decode_portfolio(raw: str) -> tuple[ActionQuantity, ...]:
+    return tuple(
+        ActionQuantity(str(item["action_id"]), int(item["quantity_lots"]))
+        for item in json.loads(raw)
+    )
+
+
+def _decode_ids(raw: str) -> tuple[str, ...]:
+    return tuple(str(item) for item in json.loads(raw))
+
+
+class MonitorSelectionStore:
+    """Persist the selected-monitor set in the shared prediction SQLite (WAL).
+
+    The selection is rewritten atomically as one transaction; in-flight solves,
+    pending snapshots and quote freshness are never stored here.
+    """
+
+    def __init__(self, data_dir: str | Path) -> None:
+        self.path = (
+            Path(data_dir)
+            / "prediction_arbitrage"
+            / "prediction_arbitrage.sqlite3"
+        )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.executescript(_MONITOR_SELECTION_SCHEMA)
+
+    def save(self, selection: Mapping[str, SelectedComponent]) -> str:
+        fingerprint_value = selection_fingerprint(selection)
+        now = _utc_now()
+        rows = [
+            (
+                item.component_id,
+                json.dumps(list(item.contract_ids)),
+                json.dumps(list(item.constraint_ids)),
+                json.dumps(list(item.action_ids)),
+                item.admission_score,
+                _encode_portfolio(item.portfolio),
+                item.relation_fingerprint,
+                item.terminal_fingerprint,
+                item.portfolio_fingerprint,
+                item.status,
+                now,
+                now,
+            )
+            for item in sorted(selection.values(), key=lambda item: item.component_id)
+        ]
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("DELETE FROM monitor_selection_components")
+            connection.execute(
+                """
+                INSERT INTO monitor_selection_meta(
+                    singleton, selection_fingerprint, updated_at
+                ) VALUES (1, ?, ?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    selection_fingerprint=excluded.selection_fingerprint,
+                    updated_at=excluded.updated_at
+                """,
+                (fingerprint_value, now),
+            )
+            connection.executemany(
+                """
+                INSERT INTO monitor_selection_components(
+                    component_id, contract_ids, constraint_ids, action_ids,
+                    admission_score, portfolio, relation_fingerprint,
+                    terminal_fingerprint, portfolio_fingerprint, status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        return fingerprint_value
+
+    def load(self) -> tuple[str, dict[str, SelectedComponent]]:
+        with sqlite3.connect(self.path) as connection:
+            row = connection.execute(
+                "SELECT selection_fingerprint FROM monitor_selection_meta"
+                " WHERE singleton=1"
+            ).fetchone()
+            if row is None:
+                return "", {}
+            rows = connection.execute(
+                """
+                SELECT component_id, contract_ids, constraint_ids, action_ids,
+                       admission_score, portfolio, relation_fingerprint,
+                       terminal_fingerprint, portfolio_fingerprint, status
+                FROM monitor_selection_components
+                """
+            ).fetchall()
+        return str(row[0]), {
+            str(component_id): SelectedComponent(
+                component_id=str(component_id),
+                contract_ids=_decode_ids(contract_ids),
+                constraint_ids=_decode_ids(constraint_ids),
+                action_ids=_decode_ids(action_ids),
+                admission_score=int(admission_score),
+                portfolio=_decode_portfolio(portfolio),
+                relation_fingerprint=str(relation_fingerprint),
+                terminal_fingerprint=str(terminal_fingerprint),
+                portfolio_fingerprint=str(portfolio_fingerprint),
+                status=str(status),
+            )
+            for component_id, contract_ids, constraint_ids, action_ids,
+                admission_score, portfolio, relation_fingerprint,
+                terminal_fingerprint, portfolio_fingerprint, status in rows
+        }
