@@ -4202,6 +4202,43 @@ def test_notify_observation_sends_immediately_dedupes_and_survives_close(
     assert feishu.calls == 1
 
 
+def test_notify_observation_suppresses_same_market_within_cooldown(
+    tmp_path: Path,
+) -> None:
+    service, trading, store, monitor = threshold_execution_fixture(tmp_path)
+    macos, feishu = service.test_notifiers
+    signal_id = _notification_signal(store)
+    opportunity = monitor.opportunity("threshold-opp-1")
+    reserved = store.reserve_notification_attempt(
+        signal_id, kind="observation", lease_seconds=0
+    )
+    assert service.notify_observation(
+        opportunity, signal_id, str(reserved["lease_id"])
+    ) == {"state": "sent", "signal_id": signal_id}
+    assert feishu.calls == 1
+
+    store.close_signal(
+        "relation-1",
+        ended_at=datetime.now(UTC).isoformat(),
+        reason="data_unavailable",
+    )
+    second_signal = _notification_signal(store)
+    second_reserved = store.reserve_notification_attempt(
+        second_signal, kind="observation", lease_seconds=0
+    )
+
+    result = service.notify_observation(
+        opportunity, second_signal, str(second_reserved["lease_id"])
+    )
+
+    assert result == {"state": "ignored", "reason": "market_cooldown"}
+    assert feishu.calls == 1
+    current = store.signal(second_signal)
+    assert current is not None
+    assert current["observation_state"] == "suppressed"
+    assert current["observation_suppressed_reason"] == "market_cooldown"
+
+
 def test_two_service_instances_reserve_one_notification_attempt(tmp_path: Path) -> None:
     service, _, store, _ = threshold_execution_fixture(tmp_path)
     signal_id = _notification_signal(store)

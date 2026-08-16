@@ -1877,9 +1877,14 @@ class PredictionArbitrageStore:
         self,
         market_id: str,
         since: datetime,
+        *,
+        kind: str = "order_ready",
     ) -> bool:
         """Return whether this market has a successful delivery at or after since."""
 
+        fields = _NOTIFICATION_KINDS.get(kind)
+        if fields is None:
+            raise ValueError(f"unknown notification kind: {kind}")
         cutoff = _parse_timestamp(since)
         # ponytail: scan per-market episode payloads; add a notification_sent_at
         # index only if measured history makes this check material.
@@ -1890,7 +1895,7 @@ class PredictionArbitrageStore:
             ).fetchall()
         for row in rows:
             payload = _load_payload(str(row["payload"]))
-            sent_at = payload.get("notification_sent_at")
+            sent_at = payload.get(fields["sent_at"])
             if sent_at in (None, ""):
                 continue
             try:

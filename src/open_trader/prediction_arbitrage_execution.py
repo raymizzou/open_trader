@@ -785,6 +785,18 @@ class PredictionExecutionService:
         attempts = _decimal(signal.get("observation_attempts")) or Decimal("0")
         if attempts >= 3:
             return {"state": "ignored", "reason": "notification_attempts_exhausted"}
+        market_id = str(signal.get("market_id", "")).strip()
+        if self._store.notification_sent_since(
+            market_id, _utc_now() - timedelta(minutes=30), kind="observation"
+        ):
+            self._store.update_signal(
+                signal_id,
+                {
+                    "observation_state": "suppressed",
+                    "observation_suppressed_reason": "market_cooldown",
+                },
+            )
+            return {"state": "ignored", "reason": "market_cooldown"}
         try:
             title, message = render_prediction_opportunity_notification(
                 opportunity,
