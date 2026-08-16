@@ -905,6 +905,81 @@ def _prediction_balance_shortfall(
     return balances.get("p_usd") is None or balances.get("p_usd") < max_cost
 
 
+def _prediction_relation_review_item(
+    row: Mapping[str, object],
+) -> dict[str, object] | None:
+    """Map one v2 catalog row onto the six-state review vocabulary (no profit/preview)."""
+
+    status = str(row.get("status") or "")
+    activation = str(row.get("activation") or "")
+    model = row.get("model")
+    terminal_states = model.get("terminal_states") if isinstance(model, Mapping) else None
+    compiled = bool(terminal_states)
+    if status == "PENDING":
+        key = "PENDING_APPROVAL"
+    elif status == "APPROVED":
+        if activation == "ACTIVE":
+            key = "ACTIVATED"
+        elif activation in {"ACTIVATION_BLOCKED_INCONSISTENT", "UNSUPPORTED_SIZE"}:
+            key = "ACTIVATION_BLOCKED"
+        elif activation == "SUPERSEDED":
+            key = "SOURCE_CHANGED_REAPPROVAL"
+        elif compiled:
+            key = "COMPILED_PENDING_ACTIVATION"
+        else:
+            key = "APPROVED_MODEL_INCOMPLETE"
+    else:
+        return None
+    item: dict[str, object] = {
+        "version_id": row.get("version_id"),
+        "title": row.get("statement") or row.get("title"),
+        "relation_type": row.get("relation_type"),
+        "discovery_source": row.get("discovery_source"),
+        "status": key,
+        "reason": "",
+        "conflict_candidates": 0,
+    }
+    if key == "ACTIVATION_BLOCKED" and activation == "ACTIVATION_BLOCKED_INCONSISTENT":
+        item["reason"] = "ACTIVATION_BLOCKED_INCONSISTENT"
+        try:
+            item["conflict_candidates"] = int(row.get("conflict_candidates") or 0)
+        except (TypeError, ValueError):
+            item["conflict_candidates"] = 0
+    elif activation in {"ACTIVATION_BLOCKED_INCONSISTENT", "UNSUPPORTED_SIZE"}:
+        item["reason"] = activation
+    elif key == "SOURCE_CHANGED_REAPPROVAL":
+        item["reason"] = "rules fingerprint 变化 · 保留批准不等于可交易"
+    return item
+
+
+def _prediction_relation_review(relation_catalog: object | None) -> dict[str, object]:
+    review: dict[str, object] = {"pending_count": 0, "items": []}
+    if relation_catalog is None:
+        return review
+    pending = getattr(relation_catalog, "pending_count", None)
+    if callable(pending):
+        try:
+            review["pending_count"] = int(pending())
+        except Exception:
+            review["pending_count"] = 0
+    rows = getattr(relation_catalog, "review_rows", None)
+    if not callable(rows):
+        return review
+    try:
+        raw_rows = rows()
+    except Exception:
+        return review
+    items: list[dict[str, object]] = []
+    for row in raw_rows:
+        if not isinstance(row, Mapping):
+            continue
+        item = _prediction_relation_review_item(row)
+        if item is not None:
+            items.append(item)
+    review["items"] = items
+    return review
+
+
 def _prediction_qualification(
     row: Mapping[str, object],
     *,
@@ -1583,12 +1658,7 @@ def prediction_state_payload(
     }
     if shadow_summary["monitoring"]:
         result["n_leg_shadow"] = shadow_summary
-    pending_count = getattr(relation_catalog, "pending_count", None)
-    if callable(pending_count):
-        try:
-            result["relation_review"] = {"pending_count": int(pending_count())}
-        except Exception:
-            result["relation_review"] = {"pending_count": 0}
+    result["relation_review"] = _prediction_relation_review(relation_catalog)
     return result
 
 

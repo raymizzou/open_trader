@@ -3430,6 +3430,34 @@ console.log(JSON.stringify({html, filtered: predictionUnifiedOpportunityList(pay
     assert "当前无更多合格机会" in rendered["filtered"]
 
 
+def test_prediction_relation_review_renders_six_states_and_blocked_conflicts() -> None:
+    output = run_dashboard_js(r'''
+const payload = {relation_review: {
+  pending_count: 2,
+  items: [
+    {version_id: "v-pending", title: "BTC $120k 互补关系", relation_type: "NATIVE_COMPLEMENT", discovery_source: "VENUE_METADATA", status: "PENDING_APPROVAL"},
+    {version_id: "v-incomplete", title: "Hurupay 阈值关系", relation_type: "IMPLIES", discovery_source: "LLM", status: "APPROVED_MODEL_INCOMPLETE"},
+    {version_id: "v-compiled", title: "编译补全关系", relation_type: "IMPLIES", discovery_source: "RULE", status: "COMPILED_PENDING_ACTIVATION"},
+    {version_id: "v-blocked", title: "SPY 单调关系", relation_type: "IMPLIES", discovery_source: "MANUAL", status: "ACTIVATION_BLOCKED", reason: "ACTIVATION_BLOCKED_INCONSISTENT", conflict_candidates: 2},
+    {version_id: "v-active", title: "已激活关系", relation_type: "MUTUALLY_EXCLUSIVE", discovery_source: "RULE", status: "ACTIVATED"},
+    {version_id: "v-superseded", title: "旧版本关系", relation_type: "EXACTLY_ONE", discovery_source: "LLM", status: "SOURCE_CHANGED_REAPPROVAL", reason: "rules fingerprint 变化 · 保留批准不等于可交易"},
+  ],
+}};
+const html = predictionRelationReview(payload, "all");
+const blockedOnly = predictionRelationReview(payload, "ACTIVATION_BLOCKED");
+console.log(JSON.stringify({html, blockedOnly}));
+''')
+    rendered = json.loads(output)
+
+    for label in ("待批准", "已批准 · 模型不完整", "编译补全待激活", "激活阻断", "已激活", "来源变化需重批"):
+        assert label in rendered["html"]
+    assert "ACTIVATION_BLOCKED_INCONSISTENT · 冲突候选 2" in rendered["html"]
+    assert "rules fingerprint 变化 · 保留批准不等于可交易" in rendered["html"]
+    assert "SPY 单调关系" in rendered["blockedOnly"]
+    assert "已激活关系" not in rendered["blockedOnly"]
+    assert "不显示预计收益" in rendered["html"]
+
+
 def test_prediction_state_projects_relation_funnel_without_secrets() -> None:
     from open_trader.prediction_read_model import prediction_state_payload as _prediction_state_payload
 

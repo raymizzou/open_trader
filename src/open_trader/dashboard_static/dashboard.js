@@ -2571,9 +2571,10 @@ function predictionRelationReview(payload, view) {
   const rows = filtered.map((item) => {
     const state = PREDICTION_RELATION_REVIEW_STATES[item.status] || {label: predictionValue(item.status, "未知状态"), tone: ""};
     const conflicts = Number(item.conflict_candidates || 0);
-    const reason = item.reason || (item.status === "ACTIVATION_BLOCKED" && conflicts > 0
-      ? `ACTIVATION_BLOCKED_INCONSISTENT · 冲突候选 ${conflicts}`
-      : "");
+    const reason = [
+      item.reason,
+      conflicts > 0 ? `冲突候选 ${conflicts}` : "",
+    ].filter(Boolean).join(" · ");
     return `<div class="pm-relation-row"><div style="display:flex;justify-content:space-between;align-items:center"><strong>${escapeHtml(predictionValue(item.title || item.statement, "关系表述未返回"))}</strong><span class="pm-relation-badge${state.tone ? ` ${state.tone}` : ""}">${escapeHtml(state.label)}</span></div><small>${escapeHtml(predictionValue(item.relation_type, ""))}${escapeHtml(item.discovery_source ? ` · ${item.discovery_source}` : "")}${reason ? ` · ${escapeHtml(reason)}` : ""}</small></div>`;
   }).join("");
   const empty = filtered.length ? "" : `<div class="pm-empty">暂无关系审核项。</div>`;

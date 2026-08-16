@@ -354,6 +354,7 @@ def frozen_prediction_state() -> dict[str, object]:
     "status": "ready",
     "wallet_address": "0x1111…1111"
   },
+  "relation_review": {"pending_count": 0, "items": []},
   "relation_discovery": {},
   "signals_24h": 1,
   "stale": false,
@@ -612,6 +613,110 @@ def test_nleg_history_keeps_strategy_type_without_forward_writeback() -> None:
     assert "relation_type" not in item
     assert "engine_owner" not in item
     assert "qualification" not in item
+
+
+class _RelationCatalog:
+    def pending_count(self) -> int:
+        return 2
+
+    def review_rows(self) -> list[dict[str, object]]:
+        return [
+            {
+                "version_id": "v-pending",
+                "statement": "BTC $120k 互补关系",
+                "relation_type": "NATIVE_COMPLEMENT",
+                "discovery_source": "VENUE_METADATA",
+                "status": "PENDING",
+                "activation": "PENDING",
+                "model": {"terminal_states": []},
+            },
+            {
+                "version_id": "v-incomplete",
+                "statement": "Hurupay 阈值关系",
+                "relation_type": "IMPLIES",
+                "discovery_source": "LLM",
+                "status": "APPROVED",
+                "activation": "INCOMPLETE",
+                "model": {"terminal_states": []},
+            },
+            {
+                "version_id": "v-compiled",
+                "statement": "编译补全关系",
+                "relation_type": "IMPLIES",
+                "discovery_source": "RULE",
+                "status": "APPROVED",
+                "activation": "PENDING",
+                "model": {"terminal_states": ["NORMAL_YES", "NORMAL_NO"]},
+            },
+            {
+                "version_id": "v-blocked",
+                "statement": "SPY 单调关系",
+                "relation_type": "IMPLIES",
+                "discovery_source": "MANUAL",
+                "status": "APPROVED",
+                "activation": "ACTIVATION_BLOCKED_INCONSISTENT",
+                "conflict_candidates": 2,
+                "model": {"terminal_states": ["NORMAL_YES", "NORMAL_NO"]},
+            },
+            {
+                "version_id": "v-active",
+                "statement": "已激活关系",
+                "relation_type": "MUTUALLY_EXCLUSIVE",
+                "discovery_source": "RULE",
+                "status": "APPROVED",
+                "activation": "ACTIVE",
+                "model": {"terminal_states": ["NORMAL_YES", "NORMAL_NO"]},
+            },
+            {
+                "version_id": "v-superseded",
+                "statement": "旧版本关系",
+                "relation_type": "EXACTLY_ONE",
+                "discovery_source": "LLM",
+                "status": "APPROVED",
+                "activation": "SUPERSEDED",
+                "model": {"terminal_states": ["NORMAL_YES", "NORMAL_NO"]},
+            },
+            {
+                "version_id": "v-rejected",
+                "statement": "被拒绝关系",
+                "relation_type": "IMPLIES",
+                "discovery_source": "LLM",
+                "status": "REJECTED",
+                "activation": "PENDING",
+                "model": {"terminal_states": []},
+            },
+        ]
+
+
+def test_relation_review_projects_six_states_without_profit_or_preview() -> None:
+    state = prediction_state_payload(
+        store=_Store(),
+        monitor=_NlegMonitor([]),
+        execution=_NlegExecution(),
+        csrf_token="csrf",
+        relation_catalog=_RelationCatalog(),
+    )
+    review = state["relation_review"]
+
+    assert review["pending_count"] == 2
+    assert [item["version_id"] for item in review["items"]] == [
+        "v-pending", "v-incomplete", "v-compiled", "v-blocked", "v-active", "v-superseded",
+    ]
+    assert [item["status"] for item in review["items"]] == [
+        "PENDING_APPROVAL", "APPROVED_MODEL_INCOMPLETE", "COMPILED_PENDING_ACTIVATION",
+        "ACTIVATION_BLOCKED", "ACTIVATED", "SOURCE_CHANGED_REAPPROVAL",
+    ]
+    blocked = review["items"][3]
+    assert blocked["conflict_candidates"] == 2
+    assert blocked["reason"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+    serialized = json.dumps(review)
+    for secret in ("terminal_states", "payouts", "capital_release", "payout", "preview"):
+        assert secret not in serialized
+
+
+def test_relation_review_empty_when_catalog_missing() -> None:
+    state = _nleg_state([])
+    assert state["relation_review"] == {"pending_count": 0, "items": []}
 
 
 @pytest.mark.parametrize(("kind", "expected"), (
