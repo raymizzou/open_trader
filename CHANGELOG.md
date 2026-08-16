@@ -5,7 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-16
 
-- #80 将跨所 YES/NO N_LEG 影子模型的 `extreme_loss` 最坏口径从伪精确的 VOID=$0.50 / REFUND=$1.00 改为「每腿可被平台酌情作废到 $0」（NORMAL + 单腿作废）的最坏情况；该值仍只读展示，不进入任何资格/门槛逻辑。原因是 Polymarket/Predict.fun 没有可靠的确定性 void/refund 公式，平台酌情作废属尾部风险。聚焦 shadow 测试 22 passed，真实 oracle smoke 返回 extreme_loss=-8.92。
+- #80 将跨所 YES/NO N_LEG 影子模型的 `extreme_loss` 最坏口径从伪精确的 VOID=$0.50 / REFUND=$1.00 改为「至少一条腿可被平台酌情作废到 $0」（NORMAL + 至少一腿作废）的最坏情况；该值仍只读展示，不进入任何资格/门槛逻辑。原因是 Polymarket/Predict.fun 没有可靠的确定性 void/refund 公式，平台酌情作废属尾部风险。聚焦 shadow 测试 22 passed，真实 oracle smoke 返回 extreme_loss=-8.92。
 
 - 修复预测套利阈值对冲订单的飞书通知语义：去掉 confirm 阶段提前发出的假「已吃」；改为按腿发「预测套利单已提交」（订单号+限价+数量）和「预测套利单已吃」（成交数量+订单号），REST 对账证明到位后发整单「预测套利单结算」，提交前整单失败与提交后按腿被拒分别发「预测套利单提交失败」并带失败原因；同时修复「观察提醒」保底净利润显示 +$0.00 的问题（threshold_hedge 快照补 `minimum_profit`）。auto-eat 与手动两条路径统一发通知。聚焦 execution/monitor/notifications 回归通过（250 + 50）。
 
@@ -19,7 +19,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 - Declare `ortools==9.15.6755` as a production dependency so the #54 Shadow CP-SAT solver is installed from `pyproject.toml`/`uv.lock` on future deploys instead of requiring a manual pip install; the lock now pins `protobuf==6.33.6` to satisfy or-tools.
 
-- #56 upgrades the cross-venue YES/NO N_LEG Shadow adapter to model two venue-qualified contracts: per-venue account/chain/settlement identity frozen into the durable snapshot, per-leg capital release (Predict event_end_at / Polymarket settlement_at, latest-wins), 1:1 USDT:pUSD valuation, and a read-only `extreme_loss` over VOID/REFUND terminal states while the normal guarantee keeps the legacy same-basis qualification gates. No production notification, mode, or order owner changed, and no new tables or workers were added; real VOID/REFUND/SPLIT trigger extraction is deferred to #80. Focused shadow/cross-venue/solver tests and a real CP-SAT smoke pass; also aligns the standard-binary shadow settlement asset with its valuation unit.
+- #56 upgrades the cross-venue YES/NO N_LEG Shadow adapter to model two venue-qualified contracts: per-venue account/chain/settlement identity frozen into the durable snapshot, per-leg capital release (Predict event_end_at / Polymarket settlement_at, latest-wins), 1:1 USDT:pUSD valuation, and a read-only `extreme_loss` over VOID/REFUND terminal states while the normal guarantee keeps the legacy same-basis qualification gates. No production notification, mode, or order owner changed, and no new tables or workers were added; deterministic VOID/REFUND/SPLIT trigger extraction was re-scoped in #80 to a display-only at-least-one-leg-void-to-$0 tail-risk warning. Focused shadow/cross-venue/solver tests and a real CP-SAT smoke pass; also aligns the standard-binary shadow settlement asset with its valuation unit.
 
 - #79 replaces the v1 relation catalog with the v2 core as the active catalog. Relation identity is venue-qualified, approval freezes a single fingerprint, mutations use version_id-only conflict detection, UNKNOWN derives from a single cause ledger, consistency/budget is per connected component, and current_generation returns full relation facts. The Prediction Service and Dashboard now read the v2 projection, the v1 catalog module is removed, and no Manual/AUTO, order, Solver, or notification behavior changed. Focused catalog, monitor, service, and Dashboard tests pass.
 

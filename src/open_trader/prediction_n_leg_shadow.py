@@ -559,7 +559,7 @@ def _failure(fingerprint: str, reason: str, error: BaseException | None) -> dict
 def _cross_venue_extreme_loss(
     snapshot: Mapping[str, object], scale: int
 ) -> Decimal | None:
-    """Worst payout minus cost over NORMAL plus a single leg voided to $0 at platform discretion, display-only."""
+    """Worst payout minus cost over NORMAL plus at least one leg voided to $0 at platform discretion, display-only."""
 
     try:
         quantity = _decimal(snapshot.get("quantity"), "quantity")
