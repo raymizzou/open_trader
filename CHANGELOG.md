@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-16
 
+- #80 将跨所 YES/NO N_LEG 影子模型的 `extreme_loss` 最坏口径从伪精确的 VOID=$0.50 / REFUND=$1.00 改为「每腿可被平台酌情作废到 $0」（NORMAL + 单腿作废）的最坏情况；该值仍只读展示，不进入任何资格/门槛逻辑。原因是 Polymarket/Predict.fun 没有可靠的确定性 void/refund 公式，平台酌情作废属尾部风险。聚焦 shadow 测试 22 passed，真实 oracle smoke 返回 extreme_loss=-8.92。
+
 - 修复预测套利阈值对冲订单的飞书通知语义：去掉 confirm 阶段提前发出的假「已吃」；改为按腿发「预测套利单已提交」（订单号+限价+数量）和「预测套利单已吃」（成交数量+订单号），REST 对账证明到位后发整单「预测套利单结算」，提交前整单失败与提交后按腿被拒分别发「预测套利单提交失败」并带失败原因；同时修复「观察提醒」保底净利润显示 +$0.00 的问题（threshold_hedge 快照补 `minimum_profit`）。auto-eat 与手动两条路径统一发通知。聚焦 execution/monitor/notifications 回归通过（250 + 50）。
 
 - #57 replaces the two YES/NO and LLM strategy tabs with a single unified N_LEG opportunity page: a one-row filter (discovery source / relation type / leg count / scope), venue-qualified opportunity cards with qualification status, order_ready reason and extreme risk, a MANUAL confirm action, a read-only capital-usage strip, and a six-state relation review list projected from the versioned relation catalog. The read model forward-projects current opportunities into N_LEG labels while keeping legacy `strategy_type` for history, and the page only exposes `MANUAL`/`AUTO` (OBSERVE_ONLY stays inside MANUAL). No production notification, mode, or order owner changed; the page only projects server facts. Focused read-model/dashboard/relation tests and Playwright block-order/mock-parity checks pass.
