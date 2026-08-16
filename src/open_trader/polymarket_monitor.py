@@ -529,6 +529,24 @@ class PolymarketMonitor:
                 and 0 <= (now - book.confirmed_at).total_seconds() <= BOOK_FRESHNESS_SECONDS
             }
 
+    def cross_venue_book_meta(self, token_id: str) -> dict[str, object]:
+        """Read-only timing metadata for one cached cross-venue book (#52 seam)."""
+        with self._lock:
+            book = self._cross_venue_books.get(str(token_id))
+            exchange_time = self._cross_venue_book_timestamps.get(str(token_id))
+        if book is None:
+            return {"received_at": None, "exchange_time": None, "sequence": None}
+        sequence = (
+            int(exchange_time.timestamp() * 1000)
+            if exchange_time is not None
+            else None
+        )
+        return {
+            "received_at": book.confirmed_at,
+            "exchange_time": exchange_time,
+            "sequence": sequence,
+        }
+
     def set_failure_observer(
         self,
         observer: Callable[[Mapping[str, object]], Mapping[str, object] | object],

@@ -4340,6 +4340,32 @@ class PredictionExecutionService:
             return None
         return snapshot
 
+    def n_leg_account_view(self) -> object | None:
+        """Read-only #52 account seam in integer micro-USDC; None fails closed."""
+        from open_trader.prediction_market_solution import AccountView
+
+        snapshot = self._fresh_account_snapshot()
+        if snapshot is None:
+            return None
+        try:
+            balance = _decimal(snapshot.get("p_usd_balance"))
+            allowance = _decimal(snapshot.get("p_usd_allowance"))
+        except InvalidOperation:
+            return None
+        if (
+            balance is None
+            or allowance is None
+            or balance < 0
+            or allowance < 0
+            or not balance.is_finite()
+            or not allowance.is_finite()
+        ):
+            return None
+        return AccountView(
+            available_units=int(balance * 1_000_000),
+            allowance_units=int(allowance * 1_000_000),
+        )
+
     @staticmethod
     def _snapshot_collections_valid(snapshot: Mapping[str, object]) -> bool:
         open_order_ids = snapshot.get("open_order_ids")
