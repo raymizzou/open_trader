@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
 
+from open_trader.prediction_market_solution import MarketSolution
+from open_trader.prediction_n_leg import ActionQuantity, canonical_payload, fingerprint
 from open_trader.prediction_read_model import (
     prediction_history_payload,
     prediction_state_payload,
@@ -539,6 +542,97 @@ def test_nleg_forward_projection_labels_current_opportunities() -> None:
     assert threshold["discovery_source"] == "LLM"
     assert threshold["scope"] == {"event": "same_event", "venue": "same_venue"}
     assert threshold["scope_label"] == "同所 · 同事件"
+
+
+def test_nleg_solution_projection_is_exposed_and_attached_to_opportunities() -> None:
+    class ContractExecution(_NlegExecution):
+        def n_leg_mode_contract(self) -> dict[str, object]:
+            return {
+                "schema_version": "open_trader.prediction_n_leg.mode_contract.v1",
+                "contract_generation": 1,
+                "mode": "MANUAL",
+                "qualification_policy_version": 1,
+                "qualification_policy": {},
+                "safety_config_version": 1,
+                "safety_config": {
+                    "episode_rearm_gap_seconds": 300,
+                    "max_total_unsettled_capital_units": 60_000_000,
+                    "max_partial_fill_loss_units": 0,
+                    "max_auto_repair_loss_units": 0,
+                },
+                "execution_scopes": {
+                    "s1": {"scope_id": "s1", "capability": "MANUAL_CANARY", "scope_version": 1},
+                },
+                "enabled_execution_scope_version": [{"scope_id": "s1", "scope_version": 1}],
+                "execution_gates": {
+                    "breaker_open": False,
+                    "incident_active": False,
+                    "batch_active": False,
+                },
+            }
+
+    market = canonical_payload(
+        MarketSolution(
+            component_id="c1",
+            structure_fingerprint="sha256:struct",
+            quote_fingerprint="sha256:quote",
+            quantities=(ActionQuantity("a-yes", 20), ActionQuantity("a-no", 20)),
+            guaranteed_profit_units=8_400_000,
+            bounded_cost_units=31_200_000,
+            bounded_payout_units=39_600_000,
+            capital_release_at=datetime(2026, 8, 30, tzinfo=UTC),
+            global_search_closed=False,
+            verification_fingerprint="sha256:verify",
+        )
+    )
+    execution_payload = {
+        "market_solution_fingerprint": fingerprint(canonical_payload(market)),
+        "quantities": market["quantities"],
+        "capital_use_units": 31_200_000,
+        "reason": "EXECUTABLE",
+        "order_ready": False,
+        "partial_fill_proof": "UNKNOWN",
+    }
+    state = prediction_state_payload(
+        store=_Store(),
+        monitor=_NlegMonitor([_nleg_cross_row(component_id="c1")]),
+        execution=ContractExecution(),
+        csrf_token="csrf",
+        n_leg_solutions=[
+            {
+                "component_id": "c1",
+                "scope_id": "s1",
+                "market": market,
+                "execution": execution_payload,
+            }
+        ],
+    )
+
+    assert state["n_leg_solutions"][0]["component_id"] == "c1"
+    assert state["n_leg_solutions"][0]["execution"]["order_ready"] is True
+    assert state["n_leg_solutions"][0]["execution"]["reason"] == "MANUAL_CANARY"
+    assert state["opportunities"][0]["n_leg_solution"]["execution"]["order_ready"] is True
+
+
+def test_nleg_metrics_is_exposed_when_provided() -> None:
+    state = prediction_state_payload(
+        store=_Store(),
+        monitor=_NlegMonitor([_nleg_cross_row()]),
+        execution=_NlegExecution(),
+        csrf_token="csrf",
+        n_leg_metrics={
+            "compile": {"samples": 2, "p50": 12.0, "p95": 20.0, "worst": 41.0},
+            "solve": {"samples": 2, "p50": 380.0, "p95": 610.0, "worst": 910.0},
+            "end_to_end": {"samples": 2, "p50": 430.0, "p95": 690.0, "worst": 1020.0},
+            "opportunity_survival": {"samples": 2, "p50": 5.0, "p95": 8.2, "worst": 9.0},
+            "queue_merge_drop": 12,
+            "timeout": 0,
+            "stale_reject": 3,
+        },
+    )
+
+    assert state["n_leg_metrics"]["queue_merge_drop"] == 12
+    assert state["n_leg_metrics"]["stale_reject"] == 3
 
 
 def test_qualified_verified_cross_opportunity_is_order_ready() -> None:

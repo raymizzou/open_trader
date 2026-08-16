@@ -2035,6 +2035,11 @@ function predictionMoney(value, fallback = "-") {
   return Number.isFinite(number) ? `$${number.toFixed(2)}` : (String(value || fallback));
 }
 
+function predictionNLegUnitsMoney(value, fallback = "-") {
+  const number = Number(value);
+  return Number.isFinite(number) ? `$${(number / 1000000).toFixed(2)}` : (String(value || fallback));
+}
+
 function predictionPrice(value, fallback = "-") {
   const number = Number(value);
   return Number.isFinite(number) ? `$${number.toFixed(3)}` : (String(value || fallback));
@@ -2063,6 +2068,7 @@ function predictionTone(value) {
 function predictionReasonLabel(value) {
   const raw = String(value || "").trim();
   if (!raw) return "暂不可参与";
+  const key = raw.toLowerCase();
   const labels = {
     neg_risk: "已订阅 · Negative Risk 暂不可参与",
     fee_unverified_or_enabled: "已订阅 · 收费市场不可参与",
@@ -2082,8 +2088,15 @@ function predictionReasonLabel(value) {
     operator_paused: "操作员已暂停自动下单",
     notification_delivery_failed: "通知发送失败，已暂停自动下单",
     not_armed: "自动下单未启用",
+    scope_observe_only: "当前范围只读 · 不可下单",
+    partial_fill_proof_required: "缺少成交证明 · 不可下单",
+    execution_fingerprint_mismatch: "方案指纹已变化 · 资格失效",
+    unsettled_cap_exceeded: "超出未结算资金上限",
+    manual_canary: "手动模式 · 可人工确认下单",
+    manual_canary_requires_manual: "手动模式 · 当前范围不可下单",
+    insufficient_depth: "盘口深度不足",
   };
-  return labels[raw] || raw.replaceAll("_", " ");
+  return labels[key] || raw.replaceAll("_", " ");
 }
 
 function predictionIncidentReasonLabel(value) {
@@ -2492,9 +2505,32 @@ function predictionUnifiedMetric(label, value, className = "", extra = "") {
   return `<div class="pm-metric"><span>${escapeHtml(label)}</span><strong class="${className}">${value}</strong>${extra}</div>`;
 }
 
+function predictionNLegExecutionPlan(opportunity) {
+  const solution = opportunity?.n_leg_solution && typeof opportunity.n_leg_solution === "object" ? opportunity.n_leg_solution : null;
+  if (!solution) return "";
+  const market = solution.market && typeof solution.market === "object" ? solution.market : {};
+  const execution = solution.execution && typeof solution.execution === "object" ? solution.execution : {};
+  const legs = Array.isArray(execution.legs) && execution.legs.length
+    ? execution.legs
+    : Array.isArray(market.legs) ? market.legs : [];
+  const legRows = legs.map((leg, index) => {
+    const venueRaw = String(leg.venue || "").toLowerCase();
+    const venue = venueRaw === "predict.fun" ? "Predict.fun" : venueRaw === "polymarket" ? "Polymarket" : (leg.venue || "Polymarket");
+    return `<div class="pm-order-leg"><span>第 ${index + 1} 腿 · ${escapeHtml(venue)} · BUY ${escapeHtml(predictionValue(leg.outcome, ""))}</span><strong>${escapeHtml(predictionValue(leg.quantity_lots, "-"))} 份 · 最高 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(leg.max_cost))} · ${escapeHtml(predictionValue(leg.settlement_asset, "pUSD"))}</small></div>`;
+  }).join("");
+  const ready = execution.order_ready === true;
+  const fingerprint = String(execution.execution_solution_fingerprint || "");
+  const shortFingerprint = fingerprint.startsWith("sha256:") ? `sha256:${fingerprint.slice(7, 9)}…` : predictionValue(fingerprint, "-");
+  return `<div class="pm-execution-plan"><h4>下单计划 · would-submit</h4>${legRows ? `<div class="pm-order-legs">${legRows}</div>` : ""}<dl><dt>可下单</dt><dd>${ready ? "是" : "否"}</dd><dt>原因</dt><dd>${escapeHtml(predictionReasonLabel(execution.reason))}</dd><dt>方案指纹</dt><dd>${escapeHtml(shortFingerprint)}</dd><dt>预计占用</dt><dd>${escapeHtml(predictionNLegUnitsMoney(execution.projected_total_units))} / ${escapeHtml(predictionNLegUnitsMoney(execution.max_total_unsettled_capital_units))}</dd></dl></div>`;
+}
+
 function predictionUnifiedOpportunityCard(row, mode) {
   const opportunity = predictionOpportunityDisplay(row);
   const qualification = opportunity.qualification && typeof opportunity.qualification === "object" ? opportunity.qualification : {};
+  const nLegSolution = opportunity.n_leg_solution && typeof opportunity.n_leg_solution === "object" ? opportunity.n_leg_solution : null;
+  const nLegExecution = nLegSolution?.execution && typeof nLegSolution.execution === "object" ? nLegSolution.execution : null;
+  const nLegReady = nLegExecution?.order_ready === true;
+  const orderReady = nLegExecution ? nLegReady : qualification.order_ready === true;
   const checks = Array.isArray(qualification.checks) ? qualification.checks : [];
   const checkValue = (key) => {
     const item = checks.find((entry) => entry && entry.key === key);
@@ -2532,10 +2568,10 @@ function predictionUnifiedOpportunityCard(row, mode) {
       `<small style="color:var(--muted)">${escapeHtml(predictionValue(qualification.order_ready_reason, qualification.order_ready === true ? "MANUAL 模式 · 可人工确认" : ""))}</small>`,
     ),
   ].join("");
-  const action = qualification.order_ready === true && mode === "MANUAL"
+  const action = orderReady && mode === "MANUAL"
     ? `<div class="pm-opportunity-action"><p>确认时重新读取两所 REST、盘口、余额与未结算额度。</p><button type="button" class="pm-button primary" data-action="participate" data-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id, ""))}">人工确认下单</button></div>`
-    : `<div class="pm-opportunity-action"><p>order_ready=false · ${escapeHtml(predictionValue(qualification.order_ready_reason, "不可下单"))} · 不可下单。</p></div>`;
-  return `<article class="pm-opportunity"><div class="pm-opportunity-title"><div><h3>${escapeHtml(predictionValue(opportunity.title || opportunity.question, "数据未返回"))}</h3><p>${subtitle}</p></div><span class="pm-pill ${statusClass}">${escapeHtml(status)}</span></div><div class="pm-tags">${tags}</div>${legs.length ? `<div class="pm-order-legs">${predictionUnifiedLegRows(opportunity)}</div>` : ""}<div class="pm-metrics">${metrics}</div>${action}</article>`;
+    : `<div class="pm-opportunity-action"><p>order_ready=false · ${escapeHtml(predictionValue(nLegExecution?.reason ? predictionReasonLabel(nLegExecution.reason) : qualification.order_ready_reason, "不可下单"))} · 不可下单。</p></div>`;
+  return `<article class="pm-opportunity"><div class="pm-opportunity-title"><div><h3>${escapeHtml(predictionValue(opportunity.title || opportunity.question, "数据未返回"))}</h3><p>${subtitle}</p></div><span class="pm-pill ${statusClass}">${escapeHtml(status)}</span></div><div class="pm-tags">${tags}</div>${legs.length ? `<div class="pm-order-legs">${predictionUnifiedLegRows(opportunity)}</div>` : ""}<div class="pm-metrics">${metrics}</div>${predictionNLegExecutionPlan(opportunity)}${action}</article>`;
 }
 
 function predictionUnifiedOpportunityList(payload, filter) {
@@ -2549,6 +2585,32 @@ function predictionCapitalUsage(payload) {
   const usage = payload?.capital_usage && typeof payload.capital_usage === "object" ? payload.capital_usage : {};
   const set = usage.max_total_unsettled_capital_set === true && predictionHasValue(usage.max_total_unsettled_capital);
   return `<section class="pm-readiness" aria-label="资金占用"><div class="pm-readiness-item"><span>max_total_unsettled_capital</span><strong>${escapeHtml(predictionMoney(set ? usage.max_total_unsettled_capital : "0.00"))}</strong><small>${set ? "显式设置" : "首次 Canary 前需显式设置"}</small></div><div class="pm-readiness-item"><span>当前保守占用</span><strong>${escapeHtml(predictionMoney(usage.current_conservative))}</strong><small>active batch 预留 ${escapeHtml(predictionMoney(usage.active_batch_reserved))}</small></div><div class="pm-readiness-item"><span>剩余额度</span><strong>${escapeHtml(predictionMoney(usage.remaining))}</strong><small>只投影服务端账本</small></div></section>`;
+}
+
+function predictionNLegMetrics(payload) {
+  const metrics = payload?.n_leg_metrics && typeof payload.n_leg_metrics === "object" ? payload.n_leg_metrics : {};
+  const windowSummary = (name, unit = "ms") => {
+    const item = metrics[name] && typeof metrics[name] === "object" ? metrics[name] : {};
+    const p50 = predictionHasValue(item.p50) ? `${Number(item.p50).toFixed(0)}` : "-";
+    const p95 = predictionHasValue(item.p95) ? `${Number(item.p95).toFixed(0)}` : "-";
+    const worst = predictionHasValue(item.worst) ? `${Number(item.worst).toFixed(0)}` : "-";
+    return `${p50} / ${p95} / ${worst} ${unit}`;
+  };
+  const counters = ["queue_merge_drop", "timeout", "stale_reject"];
+  const hasWindow = ["compile", "solve", "end_to_end", "opportunity_survival"].some((name) => metrics[name] && typeof metrics[name] === "object");
+  const hasCounter = counters.some((name) => predictionHasValue(metrics[name]));
+  if (!hasWindow && !hasCounter) return "";
+  const survival = metrics.opportunity_survival && typeof metrics.opportunity_survival === "object" ? metrics.opportunity_survival : {};
+  const survivalP95 = predictionHasValue(survival.p95) ? `${Number(survival.p95).toFixed(1)}s` : "-";
+  const cards = [
+    predictionUnifiedMetric("编译 p50/p95/worst", escapeHtml(windowSummary("compile"))),
+    predictionUnifiedMetric("求解 p50/p95/worst", escapeHtml(windowSummary("solve"))),
+    predictionUnifiedMetric("端到端 p50/p95/worst", escapeHtml(windowSummary("end_to_end"))),
+    predictionUnifiedMetric("队列合并 / 丢弃", escapeHtml(predictionValue(metrics.queue_merge_drop, "0")), "", "<small>latest-snapshot-wins</small>"),
+    predictionUnifiedMetric("超时 / 陈旧拒绝", escapeHtml(`${predictionValue(metrics.timeout, "0")} / ${predictionValue(metrics.stale_reject, "0")}`)),
+    predictionUnifiedMetric("机会存活时间", escapeHtml(`p95 ${survivalP95}`), "", "<small>内存 / 线程 / 队列有界</small>"),
+  ].join("");
+  return `<section class="pm-metrics pm-n-leg-overview" aria-label="N_LEG 性能指标">${cards}</section>`;
 }
 
 const PREDICTION_RELATION_REVIEW_STATES = {
@@ -2599,7 +2661,7 @@ function predictionUnifiedPageHeader(payload) {
 function predictionUnifiedPage(payload, filter) {
   const viewPayload = payload || {status: "loading", events: [], opportunities: []};
   const filterState = state.predictionMarket.filter || {kind: "all", legs: null, scope: null};
-  return `${predictionUnifiedPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionReadinessStrip(viewPayload)}${predictionCapitalUsage(viewPayload)}${predictionUnifiedOpportunityList(viewPayload, filterState)}${predictionRelationReview(viewPayload, state.predictionMarket.relationView)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload)}`;
+  return `${predictionUnifiedPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionNLegMetrics(viewPayload)}${predictionReadinessStrip(viewPayload)}${predictionCapitalUsage(viewPayload)}${predictionUnifiedOpportunityList(viewPayload, filterState)}${predictionRelationReview(viewPayload, state.predictionMarket.relationView)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload)}`;
 }
 
 function predictionAnnualizedPercent(value, digits = 1) {

@@ -5191,6 +5191,7 @@ tbody tr.active-row,
 .trend-discipline-card,
 .trend-industry-context-card,
 .trend-discipline-category,
+.pm-execution-plan,
 .account-sync-alert.status-muted,
 .trend-discipline-workspace > summary small,
 .trend-controller-status > summary small,
@@ -6203,6 +6204,11 @@ table {
 .pm-order-leg strong { display: block; font-size: 17px; }
 .pm-order-leg small { color: var(--muted); display: block; margin-top: 5px; }
 .pm-order-leg a { color: inherit; overflow-wrap: anywhere; }
+.pm-execution-plan { background: var(--surface-soft); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 12px; padding: 12px; }
+.pm-execution-plan h4 { font-size: 13px; margin: 0 0 8px; }
+.pm-execution-plan dl { display: grid; gap: 6px; grid-template-columns: 1fr 1fr; margin: 12px 0 0; }
+.pm-execution-plan dt { color: var(--muted); font-size: 11px; }
+.pm-execution-plan dd { font-size: 13px; margin: 0; overflow-wrap: anywhere; }
 .pm-order-summary { display: grid; gap: 8px; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 12px; }
 .pm-order-summary div { background: #f2eee7; border-radius: 7px; padding: 11px; }
 .pm-order-summary span { color: var(--muted); display: block; font-size: 11px; margin-bottom: 5px; }
@@ -6276,7 +6282,7 @@ table {
   .pm-relation-close, .pm-relation-back, .pm-relation-actions .pm-button { min-height: 44px; width: 100%; }
   .pm-relation-detail-market dl { grid-template-columns: 1fr; }
   .pm-relation-tabs { gap: 2px; }
-  .pm-order-legs, .pm-order-summary { grid-template-columns: 1fr; }
+  .pm-order-legs, .pm-order-summary, .pm-execution-plan dl { grid-template-columns: 1fr; }
   .pm-modal-actions { background: var(--surface); bottom: -16px; display: grid; padding: 12px 0 16px; position: sticky; }
   .pm-modal-actions .pm-button { width: 100%; }
 }
