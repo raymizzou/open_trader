@@ -135,7 +135,8 @@ def _economic_fingerprint(opportunity: Mapping[str, object], signal_id: str) -> 
                 field: _snapshot_value(leg.get(field), f"leg[{index}].{field}")
                 for field in (
                     "exchange", "market_id", "condition_id", "outcome", "token_id",
-                    "net_quantity", "max_cost", "settlement_at",
+                    "net_quantity", "max_cost", "settlement_at", "account_id", "chain_id",
+                    "resolution_source", "settlement_asset", "capital_release_at",
                 )
             }
             for index, leg in enumerate(legs)
@@ -146,6 +147,12 @@ def _economic_fingerprint(opportunity: Mapping[str, object], signal_id: str) -> 
             economic["rules_fingerprints"] = {
                 str(key): _snapshot_value(value, f"rules_fingerprints.{key}")
                 for key, value in sorted(rules.items())
+            }
+        approval = opportunity.get("codex_approval")
+        if isinstance(approval, Mapping) and isinstance(approval.get("direct_outcome_mapping"), Mapping):
+            economic["direct_outcome_mapping"] = {
+                str(key): str(value)
+                for key, value in sorted(approval["direct_outcome_mapping"].items())
             }
     return fingerprint(canonical_payload(economic))
 
@@ -186,6 +193,8 @@ def legacy_shadow_snapshot(
                 for field in (
                     "exchange", "market_id", "condition_id", "outcome", "token_id",
                     "net_quantity", "max_cost", "book_timestamp", "settlement_at",
+                    "account_id", "chain_id", "resolution_source", "settlement_asset",
+                    "capital_release_at",
                 )
             })
         snapshot["legs"] = canonical_legs
@@ -194,6 +203,12 @@ def legacy_shadow_snapshot(
             snapshot["rules_fingerprints"] = {
                 str(key): _snapshot_value(value, f"rules_fingerprints.{key}")
                 for key, value in sorted(rules.items())
+            }
+        approval = opportunity.get("codex_approval")
+        if isinstance(approval, Mapping) and isinstance(approval.get("direct_outcome_mapping"), Mapping):
+            snapshot["direct_outcome_mapping"] = {
+                str(key): str(value)
+                for key, value in sorted(approval["direct_outcome_mapping"].items())
             }
     snapshot["fingerprint"] = _economic_fingerprint(opportunity, signal_id)
     return snapshot

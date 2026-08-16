@@ -827,10 +827,11 @@ def test_cross_venue_intent_uses_decimal_depth_fees_later_settlement_and_venue_i
         Decimal("5"), Decimal("5"),
     ]
     assert set(asdict(intent.legs[0])) == {
-        "exchange", "market_id", "condition_id", "outcome", "token_id",
-        "settlement_asset", "requested_quantity", "net_quantity", "max_price", "max_cost", "maximum_fee", "fee_asset",
-        "book_timestamp", "settlement_at", "minimum_order_size",
-    }
+            "exchange", "market_id", "condition_id", "outcome", "token_id",
+            "settlement_asset", "requested_quantity", "net_quantity", "max_price", "max_cost", "maximum_fee", "fee_asset",
+            "book_timestamp", "settlement_at", "minimum_order_size",
+            "resolution_source", "capital_release_at",
+        }
 
 
 def test_cross_venue_intent_calculates_only_the_polymarket_yes_predict_no_direction() -> None:
@@ -2089,6 +2090,46 @@ def test_official_market_url_ignores_generic_polymarket_slug() -> None:
         "https://predict.fun/market/btc-year-end"
     )
     assert "market_url" not in opportunity["approved_candidates"]["polymarket"]
+
+
+def test_cross_venue_opportunity_legs_carry_frozen_account_identities() -> None:
+    base_pair = resolve_explicit_market_pairs(
+        (monitor_predict_market(external_ids=("poly-condition",)),),
+        gamma_lookup=lambda condition_ids, **kwargs: [
+            {
+                **polymarket_row("poly-condition"),
+                "eventSlug": "btc-above-100k",
+            }
+        ],
+    ).pairs[0]
+    pair = ExplicitMarketPair(
+        pair_id="public-pair",
+        predict=base_pair.predict,
+        polymarket=base_pair.polymarket,
+    )
+    monitor = PredictCrossVenueMonitor(
+        predict_source=FakeCrossVenuePredict(()),
+        polymarket_monitor=FakeCrossVenuePolymarket(),
+        validator=FakeCrossVenueValidator(),
+        gamma_lookup=monitor_gamma,
+        predict_quote_fn=predict_quote(),
+        account_identities={
+            "predict.fun": {"account_id": "predict-wallet", "chain_id": "8453"},
+            "polymarket": {"account_id": "poly-wallet", "chain_id": "137"},
+        },
+    )
+
+    opportunity = monitor._opportunity_payload(
+        pair,
+        _build_stage_four_intent(pair),
+        FakeCrossVenueValidator().validate(pair),
+    )
+
+    by_exchange = {leg["exchange"]: leg for leg in opportunity["legs"]}
+    assert by_exchange["predict.fun"]["account_id"] == "predict-wallet"
+    assert by_exchange["predict.fun"]["chain_id"] == "8453"
+    assert by_exchange["polymarket"]["account_id"] == "poly-wallet"
+    assert by_exchange["polymarket"]["chain_id"] == "137"
 
 
 def _build_stage_four_intent(pair: ExplicitMarketPair) -> CrossVenueIntent:

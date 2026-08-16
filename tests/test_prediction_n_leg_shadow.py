@@ -184,6 +184,81 @@ def test_legacy_snapshot_fingerprint_ignores_observation_timestamps() -> None:
     assert snapshot["fingerprint"] == relived["fingerprint"]
 
 
+def _cross_venue_source() -> dict[str, object]:
+    return {
+        "opportunity_id": "pair-1",
+        "market_id": "market-1",
+        "market_type": "cross_venue_yes_no",
+        "quantity": "10",
+        "total_max_cost": "8.90",
+        "minimum_profit": "1.10",
+        "confirmed_at": "2026-08-15T00:00:00Z",
+        "resolution_at": "2026-08-16T00:00:00Z",
+        "calculable_gas": "0.02",
+        "codex_approval": {
+            "direct_outcome_mapping": {
+                "predict_yes": "YES",
+                "predict_no": "NO",
+                "polymarket_yes": "YES",
+                "polymarket_no": "NO",
+            }
+        },
+        "rules_fingerprints": {"predict.fun": "predict-fp", "polymarket": "poly-fp"},
+        "signal_id": "episode-1",
+        "legs": [
+            {
+                "exchange": "polymarket",
+                "market_id": "m-yes",
+                "condition_id": "c-yes",
+                "outcome": "YES",
+                "token_id": "t-yes",
+                "net_quantity": "10",
+                "max_cost": "4.20",
+                "settlement_at": "2026-08-16T00:00:00Z",
+                "account_id": "poly-wallet",
+                "chain_id": "137",
+                "resolution_source": "poly-source",
+                "settlement_asset": "USDC",
+                "capital_release_at": "2026-08-16T00:00:00Z",
+            },
+            {
+                "exchange": "predict.fun",
+                "market_id": "m-no",
+                "condition_id": "c-no",
+                "outcome": "NO",
+                "token_id": "t-no",
+                "net_quantity": "10",
+                "max_cost": "4.70",
+                "settlement_at": "2026-08-16T00:00:00Z",
+                "account_id": "predict-wallet",
+                "chain_id": "8453",
+                "resolution_source": "predict-source",
+                "settlement_asset": "USDT",
+                "capital_release_at": "2026-08-16T01:00:00Z",
+            },
+        ],
+    }
+
+
+def test_cross_venue_snapshot_freezes_per_leg_identity_and_outcome_mapping() -> None:
+    snapshot = legacy_shadow_snapshot(_cross_venue_source(), "episode-1")
+
+    legs = snapshot["legs"]
+    assert legs[0]["account_id"] == "poly-wallet"
+    assert legs[0]["chain_id"] == "137"
+    assert legs[0]["resolution_source"] == "poly-source"
+    assert legs[0]["settlement_asset"] == "USDC"
+    assert legs[0]["capital_release_at"] == "2026-08-16T00:00:00Z"
+    assert legs[1]["account_id"] == "predict-wallet"
+    assert legs[1]["chain_id"] == "8453"
+    assert snapshot["direct_outcome_mapping"]["predict_yes"] == "YES"
+
+    source = _cross_venue_source()
+    source["legs"][0] = {**source["legs"][0], "account_id": "other-wallet"}
+    rotated = legacy_shadow_snapshot(source, "episode-1")
+    assert rotated["fingerprint"] != snapshot["fingerprint"]
+
+
 def test_shadow_scheduler_dedupes_identical_economics_with_different_timestamps(
     tmp_path,
 ) -> None:
@@ -252,42 +327,7 @@ def test_shadow_client_missing_settlement_evidence_is_a_diagnostic_not_failure()
 
 
 def test_legacy_cross_venue_shadow_conversion_maps_sides_costs_and_gas() -> None:
-    source = {
-        "opportunity_id": "pair-1",
-        "market_id": "market-1",
-        "market_type": "cross_venue_yes_no",
-        "quantity": "10",
-        "total_max_cost": "8.90",
-        "minimum_profit": "1.10",
-        "confirmed_at": "2026-08-15T00:00:00Z",
-        "resolution_at": "2026-08-16T00:00:00Z",
-        "calculable_gas": "0.02",
-        "signal_id": "episode-1",
-        "legs": [
-            {
-                "exchange": "polymarket",
-                "market_id": "m-yes",
-                "condition_id": "c-yes",
-                "outcome": "YES",
-                "token_id": "t-yes",
-                "net_quantity": "10",
-                "max_cost": "4.20",
-                "settlement_at": "2026-08-16T00:00:00Z",
-            },
-            {
-                "exchange": "predict.fun",
-                "market_id": "m-no",
-                "condition_id": "c-no",
-                "outcome": "NO",
-                "token_id": "t-no",
-                "net_quantity": "10",
-                "max_cost": "4.70",
-                "settlement_at": "2026-08-16T00:00:00Z",
-            },
-        ],
-    }
-
-    snapshot = legacy_shadow_snapshot(source, "episode-1")
+    snapshot = legacy_shadow_snapshot(_cross_venue_source(), "episode-1")
     request = legacy_shadow_request(snapshot)
 
     assert snapshot["market_type"] == "cross_venue_yes_no"
@@ -491,6 +531,15 @@ def test_shadow_direction_compares_per_leg_sides_not_action_ids() -> None:
             "confirmed_at": "2026-08-15T00:00:00Z",
             "resolution_at": "2026-08-16T00:00:00Z",
             "calculable_gas": "0.02",
+            "codex_approval": {
+                "direct_outcome_mapping": {
+                    "predict_yes": "YES",
+                    "predict_no": "NO",
+                    "polymarket_yes": "YES",
+                    "polymarket_no": "NO",
+                }
+            },
+            "rules_fingerprints": {"predict.fun": "predict-fp", "polymarket": "poly-fp"},
             "legs": [
                 {
                     "exchange": "polymarket",
@@ -501,6 +550,11 @@ def test_shadow_direction_compares_per_leg_sides_not_action_ids() -> None:
                     "net_quantity": "10",
                     "max_cost": "4.20",
                     "settlement_at": "2026-08-16T00:00:00Z",
+                    "account_id": "poly-wallet",
+                    "chain_id": "137",
+                    "resolution_source": "poly-source",
+                    "settlement_asset": "USDC",
+                    "capital_release_at": "2026-08-16T00:00:00Z",
                 },
                 {
                     "exchange": "predict.fun",
@@ -511,6 +565,11 @@ def test_shadow_direction_compares_per_leg_sides_not_action_ids() -> None:
                     "net_quantity": "10",
                     "max_cost": "4.70",
                     "settlement_at": "2026-08-16T00:00:00Z",
+                    "account_id": "predict-wallet",
+                    "chain_id": "8453",
+                    "resolution_source": "predict-source",
+                    "settlement_asset": "USDT",
+                    "capital_release_at": "2026-08-16T01:00:00Z",
                 },
             ],
         },
