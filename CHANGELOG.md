@@ -5,6 +5,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-16
 
+- 趋势报告就绪状态：控制器 `status.json` 新增 `waiting` 字段，报告未产出时说明缺什么（如「下一执行日 2026-08-17 报告未产出，正在补产：香港ETF 2026-08-13 → 2026-08-14」）；看板趋势报告头部新增全宽就绪横幅——就绪显示绿色「最新报告 · 可用于下一交易日 X」，未就绪显示琥珀色「报告未就绪」+ 缺口原因；后端报告投影新增 `ready_for_next_trading_day` 字段（执行日未过期即视为可给下一交易日使用）。不改变报告生成、执行、订单或通知行为。聚焦趋势报告/控制器/看板接受测试通过。
+
 - #83 adds the latest-snapshot-wins real-time scheduler for the selected N_LEG monitor components: one in-flight solve plus one latest pending snapshot per component, an economic snapshot fingerprint (price/depth/fee/availability only) that skips re-solving unchanged books, stale-result dropping, and fail-closed UNKNOWN on timeout/crash/busy with no immediate retry. The solve dispatch reuses the two resident #54 solver harnesses and a `build_solve_request` seam; snapshot timing (local received, exchange time, book sequence) gates ORDER_READY fail-closed. No MarketSolution qualification, proof, account/risk, or order behavior was added.
 
 - #82 adds the catalog-layer runtime relation graph with deterministic Episode lineage: ACTIVE model-complete relations are partitioned into venue-qualified relation groups, changes are classified (PURE_UPDATE / SPLIT / MERGE / EXTEND / NEW / REMOVE), lineage ids are deterministic, and the mapping plus audit persist atomically with restart recovery. The relation catalog now exposes a monotonic generation number and whole-generation fingerprint via `generation_meta()`. No order-book reading, solving, LLM, opportunity, or order behavior was added.

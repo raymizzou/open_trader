@@ -202,15 +202,29 @@ def _status_date(row: Mapping[str, object]) -> str:
 def updates_ready(
     rows: Sequence[Mapping[str, object]], *, market: str, as_of_date: str
 ) -> bool:
+    return update_status_gap(rows, market=market, as_of_date=as_of_date) is None
+
+
+def update_status_gap(
+    rows: Sequence[Mapping[str, object]], *, market: str, as_of_date: str
+) -> str | None:
     required = MARKET_UPDATE_ASSETS[_market(market)]
-    dates = {asset: [] for asset in required}
-    for row in rows:
-        if not isinstance(row, Mapping):
-            return False
-        asset = row.get("asset")
-        if asset in dates:
-            dates[asset].append(_status_date(row))
-    return all(dates[asset] == [as_of_date] for asset in required)
+    invalid = any(not isinstance(row, Mapping) for row in rows)
+    gaps: list[str] = []
+    for asset in required:
+        dates = [
+            _status_date(row)
+            for row in rows
+            if isinstance(row, Mapping) and row.get("asset") == asset
+        ]
+        if invalid or dates != [as_of_date]:
+            current = max((day for day in dates if day), default="")
+            gaps.append(
+                f"{asset} {current} → {as_of_date}"
+                if current
+                else f"{asset} 数据缺失 → {as_of_date}"
+            )
+    return "，".join(gaps) if gaps else None
 
 
 def _candidate_pool_components(
@@ -616,7 +630,12 @@ def _attempt_market_report(
         )
         update_rows = api.get_update_status()
         if not updates_ready(update_rows, market=market, as_of_date=as_of_date):
-            return AShareTrendRunResult("waiting", None, None)
+            return AShareTrendRunResult(
+                "waiting", None, None,
+                waiting_reason=update_status_gap(
+                    update_rows, market=market, as_of_date=as_of_date
+                ),
+            )
 
         prior_state = rebuild_overheat_trim_projection(
             config.data_dir, market=market, state_path=paths.state
@@ -1440,6 +1459,7 @@ def _run_market_trend_retry(
         tzinfo=SHANGHAI,
     )
     last_error = "Trend Animals update status is not ready"
+    waiting_gap: str | None = None
     _write_log(paths.log, {"event": "start", "market": market, "run_date": run_date})
     while True:
         try:
@@ -1458,6 +1478,8 @@ def _run_market_trend_retry(
                     "run_date": run_date,
                 })
                 return result
+            if result.status == "waiting" and result.waiting_reason:
+                waiting_gap = result.waiting_reason
         except Exception as exc:
             last_error = _redact_api_key(exc, config.trend_animals_api_key)
         now = now_fn().astimezone(SHANGHAI)
@@ -1496,5 +1518,8 @@ def _run_market_trend_retry(
                 f"{last_error}；本轮重试窗口已结束。",
                 channels={"macos"},
             )
-            return AShareTrendRunResult("failed", None, None)
+            return AShareTrendRunResult(
+                "failed", None, None,
+                waiting_reason=waiting_gap or last_error,
+            )
         sleep_fn(min(600.0, max(1.0, (deadline - now).total_seconds())))

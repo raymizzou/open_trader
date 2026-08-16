@@ -1903,6 +1903,7 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     assert reports["tiger"]["report_date"] == "2026-07-15"
     assert reports["tiger"]["data_date"] == "2026-07-14"
     assert reports["tiger"]["data_status"] == "current"
+    assert reports["tiger"]["ready_for_next_trading_day"] is True
     assert reports["tiger"]["generated_at"] == "2026-07-15T11:30:36+08:00"
     assert reports["tiger"]["sell_actions"][0]["symbol"] == "AAPL"
     assert reports["tiger"]["buy_actions"][0]["execution"] == {
@@ -2361,6 +2362,7 @@ def test_dashboard_trend_report_falls_back_to_latest_valid_stale_report(
 
     assert report["available"] is True
     assert report["data_status"] == "stale"
+    assert report["ready_for_next_trading_day"] is False
     assert report["status_text"] == "数据截至 2026-07-14；今日未更新"
     assert report["option_attention"] == stale_attention
     assert report["sell_actions"][0]["symbol"] == "STALE-SELL"

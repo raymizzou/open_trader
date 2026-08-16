@@ -1772,6 +1772,7 @@ class AShareTrendRunResult:
     status: str
     report_path: Path | None
     json_path: Path | None
+    waiting_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -8136,12 +8137,27 @@ def _status_date(row: Mapping[str, object]) -> str:
 
 
 def _updates_ready(rows: Sequence[Mapping[str, object]], run_date: str) -> bool:
+    return _updates_gap(rows, run_date) is None
+
+
+def _updates_gap(
+    rows: Sequence[Mapping[str, object]], run_date: str
+) -> str | None:
     dates = {
         row.get("asset"): _status_date(row)
         for row in rows
         if row.get("asset") in {"A股", "ETF基金"}
     }
-    return dates == {"A股": run_date, "ETF基金": run_date}
+    gaps = [
+        (
+            f"{asset} {dates[asset]} → {run_date}"
+            if dates.get(asset)
+            else f"{asset} 数据缺失 → {run_date}"
+        )
+        for asset in ("A股", "ETF基金")
+        if dates.get(asset) != run_date
+    ]
+    return "，".join(gaps) if gaps else None
 
 
 def _row_tm_id(row: Mapping[str, object]) -> int:
@@ -8548,7 +8564,10 @@ def _attempt_report(
         )
         update_rows = api.get_update_status()
         if not _updates_ready(update_rows, run_date):
-            return AShareTrendRunResult("waiting", None, None)
+            return AShareTrendRunResult(
+                "waiting", None, None,
+                waiting_reason=_updates_gap(update_rows, run_date),
+            )
 
         balance_before = _balance(api.get_account_balance())
         candidate_pool_ids = (
@@ -9301,6 +9320,7 @@ def run_a_share_trend_report(
         deadline = datetime.combine(run_day, time(19, 0), tzinfo=SHANGHAI)
         notified_waiting = False
         last_error = "Trend Animals update status is not ready"
+        waiting_gap: str | None = None
         _write_run_log(
             log_path,
             {"event": "start", "process_version": version, "run_date": run_date},
@@ -9328,6 +9348,8 @@ def run_a_share_trend_report(
                 )
                 if attempt.status in {"generated", "existing", "holiday"}:
                     return attempt
+                if attempt.status == "waiting" and attempt.waiting_reason:
+                    waiting_gap = attempt.waiting_reason
                 last_error = "Trend Animals update status is not ready"
             except (TrendAnimalsError, FutuQuoteError, ValueError, RuntimeError) as exc:
                 last_error = _redact_api_key(exc, config.trend_animals_api_key)
@@ -9362,7 +9384,10 @@ def run_a_share_trend_report(
                     message=message,
                 )
                 _notify_status(notifier, "A股趋势计划失败", last_error)
-                return AShareTrendRunResult("failed", None, None)
+                return AShareTrendRunResult(
+                    "failed", None, None,
+                    waiting_reason=waiting_gap or last_error,
+                )
             if not notified_waiting:
                 _notify_status(notifier, "A股趋势数据等待中", last_error)
                 notified_waiting = True

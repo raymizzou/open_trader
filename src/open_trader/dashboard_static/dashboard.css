@@ -1800,6 +1800,37 @@ table {
   color: var(--muted);
 }
 
+.trend-readiness-banner {
+  align-items: flex-start;
+  border: 1px solid;
+  border-left-width: 4px;
+  border-radius: 8px;
+  display: flex;
+  gap: 10px;
+  margin: 0 0 14px;
+  padding: 12px 14px;
+}
+
+.trend-readiness-banner strong {
+  flex: 0 0 auto;
+}
+
+.trend-readiness-banner span {
+  line-height: 1.5;
+}
+
+.trend-readiness-banner.ready {
+  background: #e7f4ec;
+  border-color: #b8dac6;
+  color: #1f5c3d;
+}
+
+.trend-readiness-banner.waiting {
+  background: #fff1dc;
+  border-color: #efc47e;
+  color: #7a4a12;
+}
+
 .trend-report-header dl {
   display: grid;
   gap: 10px;

@@ -2420,6 +2420,7 @@ def _load_broker_trend_report(
         return {
             "available": False,
             "data_status": "unavailable",
+            "ready_for_next_trading_day": False,
             "broker": broker,
             "broker_label": broker_label,
             "market": market,
@@ -2602,6 +2603,7 @@ def _project_broker_trend_report(
         return {
             "available": False,
             "data_status": "unavailable",
+            "ready_for_next_trading_day": False,
             "broker": broker,
             "broker_label": broker_label,
             "market": market,
@@ -2831,6 +2833,8 @@ def _project_broker_trend_report(
         ),
         "current_strategy_parameter_rows": current_parameter_rows,
         "data_status": "current" if current else "stale",
+        "ready_for_next_trading_day": execution_date
+        >= date.fromisoformat(report_date),
         "broker": broker,
         "broker_label": broker_label,
         "market": market,

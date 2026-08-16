@@ -122,6 +122,14 @@ class ReportTask:
     allocation_reference: Mapping[str, object] | None = None
 
 
+class ReportGenerationError(RuntimeError):
+    def __init__(
+        self, message: str, waiting_reason: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.waiting_reason = waiting_reason
+
+
 def _market(value: str) -> str:
     market = value.strip().upper()
     if market not in BUY_WINDOWS:
@@ -238,6 +246,7 @@ def _status_payload(
     blocker: object,
     next_check_at: datetime,
     fixed_process_version: str | None = None,
+    waiting: object = None,
 ) -> dict[str, object]:
     mode = trend_execution_mode(config, hostname_fn=socket.gethostname)
     return {
@@ -256,6 +265,7 @@ def _status_payload(
         "heartbeat_at": now.isoformat(timespec="seconds"),
         "last_success": last_success,
         "blocker": blocker,
+        "waiting": waiting,
         "next_check_at": next_check_at.isoformat(timespec="seconds"),
     }
 
@@ -270,6 +280,7 @@ def _record_status(
     blocker: object,
     next_check_at: datetime,
     fixed_process_version: str,
+    waiting: object = None,
 ) -> dict[str, object]:
     payload = _status_payload(
         config,
@@ -280,6 +291,7 @@ def _record_status(
         blocker=blocker,
         next_check_at=next_check_at,
         fixed_process_version=fixed_process_version,
+        waiting=waiting,
     )
     _write_status(config, market, payload)
     return payload
@@ -729,7 +741,31 @@ def _generate_report(
         )
     )
     if result.status not in {"generated", "existing", "holiday"}:
-        raise RuntimeError(f"{market} trend report generation returned {result.status}")
+        raise ReportGenerationError(
+            f"{market} trend report generation returned {result.status}"
+            + (f": {result.waiting_reason}" if result.waiting_reason else ""),
+            waiting_reason=result.waiting_reason,
+        )
+
+
+def _trend_waiting_reason(
+    *,
+    phase: str,
+    execution_date: str,
+    latest: object,
+    report_waiting: str | None,
+    blocker: object,
+) -> object:
+    if phase == "holiday":
+        return (
+            f"下一执行日 {execution_date} 报告已产出，今日休市无需重跑"
+        )
+    if phase == "recovering_report" and latest is None:
+        waiting = f"下一执行日 {execution_date} 报告未产出，正在补产"
+        if report_waiting:
+            waiting = f"{waiting}：{report_waiting}"
+        return waiting
+    return blocker
 
 
 def _run_cycle_statistics(
@@ -3065,6 +3101,7 @@ def run_trend_market_controller(
     report_failures = 0
     report_retry_after: datetime | None = None
     report_blocker: str | None = None
+    report_waiting: str | None = None
     review_failures = 0
     review_retry_after: datetime | None = None
     operation_failures = 0
@@ -3499,10 +3536,12 @@ def run_trend_market_controller(
                         future.result(timeout=1 if once else None)
                     except TimeoutError:
                         phase = "recovering_report"
+                        report_waiting = None
                     except Exception as exc:
                         report_failures += 1
                         report_retry_after = _retry_at(now, report_failures)
                         report_blocker = f"report generation failed: {exc}"
+                        report_waiting = getattr(exc, "waiting_reason", None)
                         blocker = report_blocker
                         phase = "recovering_report"
                         future = None
@@ -3511,6 +3550,7 @@ def run_trend_market_controller(
                         report_failures = 0
                         report_retry_after = None
                         report_blocker = None
+                        report_waiting = None
                         if report_target and report_target.completes_revision_request:
                             assert request is not None
                             latest = _pending_revision_report(
@@ -3835,6 +3875,13 @@ def run_trend_market_controller(
                 phase=phase,
                 last_success=last_success,
                 blocker=blocker,
+                waiting=_trend_waiting_reason(
+                    phase=phase,
+                    execution_date=work_cycle.execution_date,
+                    latest=latest,
+                    report_waiting=report_waiting,
+                    blocker=blocker,
+                ),
                 next_check_at=next_check,
                 fixed_process_version=process_version,
             )

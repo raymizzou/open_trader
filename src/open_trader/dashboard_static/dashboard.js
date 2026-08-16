@@ -5701,6 +5701,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const riskSummary = renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.report_date);
   const allocation = renderTrendAllocation(report);
   const rotations = renderTrendRotations(report);
+  const readinessBanner = renderTrendReadinessBanner(report);
   return `<${root} class="cn-trend-report"${identity}>
     <header class="trend-report-header">
       <div><p>${escapeHtml(`${formatPlain(report.broker_label)}｜${formatPlain(report.market_label)}`)}</p><h1>当天趋势报告</h1>${strategyVersion}</div>
@@ -5726,6 +5727,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
         <span class="trend-report-cost">${escapeHtml(trendReportCostLabel(report))}</span>
       </div>
     </header>
+    ${readinessBanner}
     ${allocation}
     ${batchError}
     ${revisionAnomaly}
@@ -5745,6 +5747,18 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
 
 function trendSellActionLabel(item) {
   return item?.action === "SELL_PARTIAL" ? "止盈减仓 30%" : "全部卖出";
+}
+
+function renderTrendReadinessBanner(report) {
+  const controller = state.dashboard?.trend_controllers?.[report.broker] || {};
+  if (report.ready_for_next_trading_day) {
+    return `<div class="trend-readiness-banner ready" role="status"><strong>最新报告</strong><span>可用于下一交易日 ${escapeHtml(formatPlain(report.report_date))}。</span></div>`;
+  }
+  const waiting = controller.waiting;
+  if (waiting) {
+    return `<div class="trend-readiness-banner waiting" role="status"><strong>报告未就绪</strong><span>${escapeHtml(formatPlain(waiting))}</span></div>`;
+  }
+  return "";
 }
 
 function renderTrendControllerStatus(broker) {

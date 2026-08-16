@@ -8048,6 +8048,42 @@ def test_a_share_report_pins_one_account_snapshot_through_internal_retries(
     assert all(item is snapshot for item in seen)
 
 
+def test_a_share_updates_gap_reports_stale_assets() -> None:
+    stale = [
+        {"asset": "A股", "asOfDate": "2026-07-13"},
+        {"asset": "ETF基金", "asOfDate": "2026-07-14"},
+    ]
+    assert trend_module._updates_gap(stale, "2026-07-14") == (
+        "A股 2026-07-13 → 2026-07-14"
+    )
+    assert trend_module._updates_ready(stale, "2026-07-14") is False
+    ready = [
+        {"asset": "A股", "asOfDate": "2026-07-14"},
+        {"asset": "ETF基金", "asOfDate": "2026-07-14"},
+    ]
+    assert trend_module._updates_gap(ready, "2026-07-14") is None
+    assert trend_module._updates_ready(ready, "2026-07-14") is True
+
+
+def test_a_share_report_failure_carries_waiting_gap_at_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(trend_module, "_attempt_report", lambda **kwargs: (
+        AShareTrendRunResult(
+            "waiting", None, None,
+            waiting_reason="A股 2026-07-13 → 2026-07-14",
+        )
+    ))
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path),
+        run_date="2026-07-14",
+        now_fn=lambda: datetime(2026, 7, 14, 19, tzinfo=SHANGHAI),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert result.status == "failed"
+    assert result.waiting_reason == "A股 2026-07-13 → 2026-07-14"
+
+
 def test_report_runner_includes_simulated_holding_only_industry(
     tmp_path: Path,
 ) -> None:

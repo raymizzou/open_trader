@@ -3185,6 +3185,82 @@ def test_report_failure_remains_visible_while_close_waits_for_report(
         )
 
 
+def test_trend_waiting_reason_holiday() -> None:
+    assert controller._trend_waiting_reason(
+        phase="holiday",
+        execution_date="2026-07-20",
+        latest=None,
+        report_waiting=None,
+        blocker="old blocker",
+    ) == "下一执行日 2026-07-20 报告已产出，今日休市无需重跑"
+
+
+def test_trend_waiting_reason_recovering_report_with_gap() -> None:
+    gap = "香港ETF 2026-07-16 → 2026-07-17"
+    assert controller._trend_waiting_reason(
+        phase="recovering_report",
+        execution_date="2026-07-20",
+        latest=None,
+        report_waiting=gap,
+        blocker=None,
+    ) == "下一执行日 2026-07-20 报告未产出，正在补产：" + gap
+    assert controller._trend_waiting_reason(
+        phase="recovering_report",
+        execution_date="2026-07-20",
+        latest=("report.md", {"report": "x"}),
+        report_waiting=gap,
+        blocker="report generation failed: x",
+    ) == "report generation failed: x"
+
+
+def test_controller_waiting_reports_missing_report_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = replace(active_cn_cycle(), session="closed", market_open=False)
+    patch_cycle(monkeypatch, cycle)
+    monkeypatch.setattr(
+        controller,
+        "_cycle_to_reconcile",
+        lambda _config, _cycle, _now, **_kwargs: cycle,
+    )
+    monkeypatch.setattr(controller, "_load_cycle_report", lambda *_args: None)
+    monkeypatch.setattr(
+        controller,
+        "_generate_report",
+        lambda *_args: (_ for _ in ()).throw(
+            controller.ReportGenerationError(
+                "CN trend report generation returned waiting: "
+                "港股 2026-07-16 → 2026-07-17",
+                waiting_reason="港股 2026-07-16 → 2026-07-17",
+            )
+        ),
+    )
+    monkeypatch.setattr(controller, "_capture_close", pytest.fail)
+    statuses: list[dict[str, object]] = []
+
+    class _StopController(Exception):
+        pass
+
+    def stop_after_first_status(_seconds: float) -> None:
+        statuses.append(load_trend_market_status(config, "CN", now=NOW))
+        raise _StopController
+
+    with pytest.raises(_StopController):
+        run_trend_market_controller(
+            config,
+            "CN",
+            now_fn=lambda: NOW,
+            sleep_fn=stop_after_first_status,
+        )
+
+    assert statuses[-1]["waiting"] == (
+        "下一执行日 2026-07-20 报告未产出，正在补产："
+        "港股 2026-07-16 → 2026-07-17"
+    )
+    assert str(statuses[-1]["blocker"]).startswith("report generation failed:")
+
+
 def test_report_blocker_remains_visible_when_close_capture_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

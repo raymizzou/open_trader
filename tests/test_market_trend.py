@@ -27,6 +27,7 @@ from open_trader.market_trend import (
     resolve_market_dates,
     run_market_trend_report,
     updates_ready,
+    update_status_gap,
 )
 from open_trader.trend_animals import (
     TrendAnimalsError,
@@ -508,6 +509,32 @@ def test_updates_ready_rejects_duplicate_or_malformed_required_statuses(
     assert updates_ready(rows, market=market, as_of_date="2026-07-24") is False
 
 
+def test_update_status_gap_reports_stale_assets_for_both_markets() -> None:
+    us_stale = [
+        {"asset": "美股", "asOfDate": "2026-07-23"},
+        {"asset": "美国ETF", "asOfDate": "2026-07-24"},
+    ]
+    assert update_status_gap(
+        us_stale, market="US", as_of_date="2026-07-24"
+    ) == "美股 2026-07-23 → 2026-07-24"
+    assert updates_ready(us_stale, market="US", as_of_date="2026-07-24") is False
+
+    hk_stale = [
+        {"asset": "港股", "asOfDate": "2026-07-23"},
+        {"asset": "香港ETF", "asOfDate": "2026-07-22"},
+    ]
+    assert update_status_gap(
+        hk_stale, market="HK", as_of_date="2026-07-24"
+    ) == "港股 2026-07-23 → 2026-07-24，香港ETF 2026-07-22 → 2026-07-24"
+
+    ready = [
+        {"asset": "港股", "asOfDate": "2026-07-24"},
+        {"asset": "香港ETF", "asOfDate": "2026-07-24"},
+    ]
+    assert update_status_gap(ready, market="HK", as_of_date="2026-07-24") is None
+    assert updates_ready(ready, market="HK", as_of_date="2026-07-24") is True
+
+
 def test_hk_etf_root_missing_warm_to_hot_is_empty() -> None:
     class Api:
         def get_components(
@@ -779,6 +806,27 @@ def test_market_report_failure_owns_day_at_19_shanghai_deadline(tmp_path: Path) 
     ]
     ledger = cfg.data_dir / "trend_us_tiger/daily_delivery/2026-07-15.json"
     assert __import__("json").loads(ledger.read_text(encoding="utf-8"))["status"] == "sent"
+
+
+def test_market_report_failure_carries_waiting_gap_at_deadline(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 15, 19, 0, tzinfo=SHANGHAI)
+    result = run_market_trend_report(
+        config=config(tmp_path),
+        market="US",
+        run_date="2026-07-15",
+        notifier=NullNotifier(),
+        attempt_fn=lambda **kwargs: AShareTrendRunResult(
+            "waiting", None, None,
+            waiting_reason="美股 2026-07-14 → 2026-07-15",
+        ),
+        now_fn=lambda: now,
+        sleep_fn=lambda seconds: None,
+    )
+
+    assert result.status == "failed"
+    assert result.waiting_reason == "美股 2026-07-14 → 2026-07-15"
 
 
 def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
