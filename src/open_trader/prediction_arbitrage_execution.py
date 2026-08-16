@@ -548,6 +548,105 @@ class PredictionExecutionService:
             return {"state": "rejected", "reason": str(exc)}
         return {"state": "ok", "mode": value}
 
+    def n_leg_mode_contract(self) -> dict[str, object]:
+        from .prediction_n_leg_mode import n_leg_mode_contract
+
+        return n_leg_mode_contract(self._store)
+
+    def n_leg_set_mode(
+        self,
+        mode: str,
+        *,
+        base_contract_generation: int,
+        incident_id: object = None,
+        audit: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        from .prediction_n_leg_mode import n_leg_set_mode
+
+        return n_leg_set_mode(
+            self._store,
+            mode=mode,
+            base_contract_generation=base_contract_generation,
+            incident_id=incident_id,
+            audit=audit,
+        )
+
+    def n_leg_update_qualification_policy(
+        self,
+        policy: object,
+        *,
+        base_version: int,
+        audit: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        from .prediction_n_leg_mode import n_leg_update_qualification_policy
+
+        return n_leg_update_qualification_policy(
+            self._store, policy=policy, base_version=base_version, audit=audit
+        )
+
+    def n_leg_update_safety_config(
+        self,
+        config: object,
+        *,
+        base_version: int,
+        audit: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        from .prediction_n_leg_mode import n_leg_update_safety_config
+
+        return n_leg_update_safety_config(
+            self._store, config=config, base_version=base_version, audit=audit
+        )
+
+    def n_leg_upsert_scope(
+        self,
+        scope_id: str,
+        *,
+        capability: str,
+        members: object,
+        base_scope_version: int | None = None,
+        audit: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        from .prediction_n_leg_mode import n_leg_upsert_scope
+
+        return n_leg_upsert_scope(
+            self._store,
+            scope_id=scope_id,
+            capability=capability,
+            members=members,
+            base_scope_version=base_scope_version,
+            audit=audit,
+        )
+
+    def n_leg_set_enabled_scope(
+        self,
+        scope_id: str,
+        *,
+        enable: bool,
+        base_contract_generation: int,
+        audit: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        from .prediction_n_leg_mode import n_leg_set_enabled_scope
+
+        return n_leg_set_enabled_scope(
+            self._store,
+            scope_id=scope_id,
+            enable=enable,
+            base_contract_generation=base_contract_generation,
+            audit=audit,
+        )
+
+    def n_leg_order_readiness(self) -> dict[str, object]:
+        from .prediction_n_leg_mode import n_leg_order_readiness
+
+        return n_leg_order_readiness(self._store)
+
+    def n_leg_enforce_auto_scope_versions(
+        self, *, audit: Mapping[str, object] | None = None
+    ) -> dict[str, object]:
+        from .prediction_n_leg_mode import n_leg_enforce_auto_scope_versions
+
+        return n_leg_enforce_auto_scope_versions(self._store, audit=audit)
+
     def auto_eat_threshold(
         self, opportunity_id: str, signal_id: str
     ) -> dict[str, object]:

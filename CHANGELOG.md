@@ -8,8 +8,10 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - #78 adds the v2 relation-catalog core module (`relation_catalog_v2.py`) as a standalone, not-yet-wired building block: venue-qualified relation identity, frozen approval fingerprints, a single cause ledger plus atomic generation snapshot, per-component consistency/budget, and a SQLite persistence seam. No runtime, service, Dashboard, monitor, or production behavior is changed; the existing v1 catalog remains the active catalog. Focused catalog and SQLite tests pass.
 
 - Declare `ortools==9.15.6755` as a production dependency so the #54 Shadow CP-SAT solver is installed from `pyproject.toml`/`uv.lock` on future deploys instead of requiring a manual pip install; the lock now pins `protobuf==6.33.6` to satisfy or-tools.
+
 - #79 replaces the v1 relation catalog with the v2 core as the active catalog. Relation identity is venue-qualified, approval freezes a single fingerprint, mutations use version_id-only conflict detection, UNKNOWN derives from a single cause ledger, consistency/budget is per connected component, and current_generation returns full relation facts. The Prediction Service and Dashboard now read the v2 projection, the v1 catalog module is removed, and no Manual/AUTO, order, Solver, or notification behavior changed. Focused catalog, monitor, service, and Dashboard tests pass.
 
+- #58 adds the versioned N_LEG `MANUAL/AUTO` backend contract: component-wise contract/policy/scope/safety versions, execution scope capabilities starting at `OBSERVE_ONLY`, unified four-gate qualification policy references, safety gates (global breaker, incident/batch) with loosen-to-MANUAL downgrades, and version-checked `/n-leg/{mode,config,scope}` mutations (409 on mismatch). It initializes `MANUAL`, reads legacy `observe_only` as `MANUAL`, leaves the old `/mode` and `/cross-auto/*` endpoints and `cross_auto_state` untouched, and does not take production control before #60. Focused mode/api-contract/store/shadow/read-model tests pass; no page and no #59 wiring.
 ## 2026-08-15
 
 - #54 adds a production-owned, two-server generic solver owner and a no-submit

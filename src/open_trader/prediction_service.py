@@ -26,6 +26,7 @@ from .prediction_read_model import (
     prediction_history_payload,
     prediction_state_payload,
 )
+from .prediction_n_leg_mode import NLegVersionConflict
 from .prediction_release import load_prediction_release_manifest
 from .prediction_runtime import PredictionRuntime
 from .relation_catalog import RelationConflictError
@@ -364,6 +365,7 @@ def create_prediction_server(
             if parsed.path not in {
                 "/api/prediction-arbitrage/state",
                 "/api/prediction-arbitrage/history",
+                "/api/prediction-arbitrage/n-leg/mode",
             }:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
@@ -388,6 +390,17 @@ def create_prediction_server(
                     ),
                     set_session=mode == "production",
                 )
+                return
+            if parsed.path == "/api/prediction-arbitrage/n-leg/mode":
+                try:
+                    execution = getattr(runtime, "execution", None)
+                    if execution is None or getattr(execution, "n_leg_mode_contract", None) is None:
+                        raise RuntimeError("n-leg mode contract is unavailable")
+                    self._send_json(HTTPStatus.OK, execution.n_leg_mode_contract())
+                except ValueError as exc:
+                    self._send_error(HTTPStatus.BAD_REQUEST, exc)
+                except (sqlite3.Error, OSError, RuntimeError) as exc:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                 return
             try:
                 query = parse_qs(parsed.query, keep_blank_values=True)
@@ -498,6 +511,9 @@ def create_prediction_server(
                 "/api/prediction-arbitrage/circuit-breaker/reset",
                 "/api/prediction-arbitrage/predict-allowance/cleanup",
                 "/api/prediction-arbitrage/cross-auto/pause",
+                "/api/prediction-arbitrage/n-leg/mode",
+                "/api/prediction-arbitrage/n-leg/config",
+                "/api/prediction-arbitrage/n-leg/scope",
             }:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
@@ -522,6 +538,84 @@ def create_prediction_server(
                         self._required_string(payload, "preview_id"),
                         self._required_string(payload, "idempotency_key"),
                     )
+                elif path == "/api/prediction-arbitrage/n-leg/mode":
+                    self._require_schema(payload, {"mode", "base_contract_generation", "incident_id"})
+                    incident_id = payload.get("incident_id")
+                    if incident_id is not None and not isinstance(incident_id, str):
+                        raise ValueError("incident_id must be a string or null")
+                    result = execution.n_leg_set_mode(
+                        self._required_string(payload, "mode"),
+                        base_contract_generation=self._required_int(
+                            payload, "base_contract_generation"
+                        ),
+                        incident_id=incident_id,
+                        audit=audit,
+                    )
+                elif path == "/api/prediction-arbitrage/n-leg/config":
+                    has_policy = "qualification_policy" in payload
+                    has_safety = "safety_config" in payload
+                    if has_policy == has_safety:
+                        raise ValueError(
+                            "config requires exactly one of qualification_policy or safety_config"
+                        )
+                    if has_policy:
+                        self._require_schema(
+                            payload,
+                            {"qualification_policy", "base_qualification_policy_version"},
+                        )
+                        result = execution.n_leg_update_qualification_policy(
+                            payload["qualification_policy"],
+                            base_version=self._required_int(
+                                payload, "base_qualification_policy_version"
+                            ),
+                            audit=audit,
+                        )
+                    else:
+                        self._require_schema(
+                            payload, {"safety_config", "base_safety_config_version"}
+                        )
+                        result = execution.n_leg_update_safety_config(
+                            payload["safety_config"],
+                            base_version=self._required_int(
+                                payload, "base_safety_config_version"
+                            ),
+                            audit=audit,
+                        )
+                elif path == "/api/prediction-arbitrage/n-leg/scope":
+                    scope_id = self._required_string(payload, "scope_id")
+                    if "enable" in payload:
+                        self._require_schema(
+                            payload, {"scope_id", "enable", "base_contract_generation"}
+                        )
+                        enable = payload.get("enable")
+                        if type(enable) is not bool:
+                            raise ValueError("enable must be a boolean")
+                        result = execution.n_leg_set_enabled_scope(
+                            scope_id,
+                            enable=enable,
+                            base_contract_generation=self._required_int(
+                                payload, "base_contract_generation"
+                            ),
+                            audit=audit,
+                        )
+                    else:
+                        self._require_schema(
+                            payload, {"scope_id", "capability", "members", "base_scope_version"}
+                        )
+                        base_scope_version = payload.get("base_scope_version")
+                        if base_scope_version is not None and (
+                            type(base_scope_version) is not int or base_scope_version < 1
+                        ):
+                            raise ValueError(
+                                "base_scope_version must be a positive integer or null"
+                            )
+                        result = execution.n_leg_upsert_scope(
+                            scope_id,
+                            capability=self._required_string(payload, "capability"),
+                            members=payload["members"],
+                            base_scope_version=base_scope_version,
+                            audit=audit,
+                        )
                 elif path.endswith("/mode"):
                     self._require_schema(payload, {"mode"})
                     result = execution.set_validation_mode(
@@ -553,6 +647,8 @@ def create_prediction_server(
                 self._send_json(status, safe_result)
             except PermissionError as exc:
                 self._send_error(HTTPStatus.FORBIDDEN, exc)
+            except NLegVersionConflict as exc:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
             except OverflowError as exc:
                 self._send_json(
                     HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": str(exc)}
@@ -624,6 +720,13 @@ def create_prediction_server(
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{key} is required")
             return value.strip()
+
+        @staticmethod
+        def _required_int(payload: Mapping[str, object], key: str) -> int:
+            value = payload.get(key)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{key} must be a positive integer")
+            return value
 
         @classmethod
         def _optional_string(cls, payload: Mapping[str, object], key: str) -> str:

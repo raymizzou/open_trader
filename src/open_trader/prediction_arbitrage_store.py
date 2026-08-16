@@ -264,6 +264,30 @@ def _row_payload(row: sqlite3.Row, *, fields: Mapping[str, object]) -> dict[str,
     return result
 
 
+def _n_leg_enabled_scopes(raw: object) -> list[dict[str, object]]:
+    """Decode the enabled-execution list, failing closed on malformed storage."""
+    if raw is None:
+        return []
+    try:
+        value = json.loads(str(raw))
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(value, list):
+        return []
+    enabled = []
+    for item in value:
+        if not isinstance(item, dict):
+            return []
+        scope_id = item.get("scope_id")
+        scope_version = item.get("scope_version")
+        if not isinstance(scope_id, str) or not scope_id:
+            return []
+        if type(scope_version) is not int or scope_version < 1:
+            return []
+        enabled.append({"scope_id": scope_id, "scope_version": scope_version})
+    return enabled
+
+
 def read_minimum_reader_generation(data_dir: Path) -> int:
     path = Path(data_dir) / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
     if not path.exists():
@@ -550,6 +574,34 @@ class PredictionArbitrageStore:
                 breaker_reason TEXT,
                 active_batch_id TEXT,
                 total_unsettled_capital_units INTEGER NOT NULL CHECK (total_unsettled_capital_units >= 0),
+                contract_generation INTEGER NOT NULL DEFAULT 1
+                    CHECK (contract_generation >= 1),
+                qualification_policy_version INTEGER NOT NULL DEFAULT 1
+                    CHECK (qualification_policy_version >= 1),
+                safety_config_version INTEGER NOT NULL DEFAULT 1
+                    CHECK (safety_config_version >= 1),
+                enabled_execution_scope_version TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS n_leg_qualification_policy (
+                version INTEGER PRIMARY KEY CHECK (version >= 1),
+                policy TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS n_leg_safety_config (
+                version INTEGER PRIMARY KEY CHECK (version >= 1),
+                config TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS n_leg_execution_scopes (
+                scope_id TEXT PRIMARY KEY,
+                capability TEXT NOT NULL
+                    CHECK (capability IN ('OBSERVE_ONLY', 'MANUAL_CANARY', 'AUTO_ELIGIBLE')),
+                scope_version INTEGER NOT NULL CHECK (scope_version >= 1),
+                members TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
 
@@ -627,6 +679,35 @@ class PredictionArbitrageStore:
             version = 7
         if version < 8:
             connection.execute("PRAGMA user_version=8")
+            version = 8
+        if version < 9:
+            columns = {
+                str(column[1])
+                for column in connection.execute("PRAGMA table_info(n_leg_controls)")
+            }
+            for name, definition in (
+                (
+                    "contract_generation",
+                    "INTEGER NOT NULL DEFAULT 1 CHECK (contract_generation >= 1)",
+                ),
+                (
+                    "qualification_policy_version",
+                    "INTEGER NOT NULL DEFAULT 1 CHECK (qualification_policy_version >= 1)",
+                ),
+                (
+                    "safety_config_version",
+                    "INTEGER NOT NULL DEFAULT 1 CHECK (safety_config_version >= 1)",
+                ),
+                (
+                    "enabled_execution_scope_version",
+                    "TEXT NOT NULL DEFAULT '[]'",
+                ),
+            ):
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE n_leg_controls ADD COLUMN {name} {definition}"
+                    )
+            connection.execute("PRAGMA user_version=9")
 
     @staticmethod
     def _execution_fields(row: sqlite3.Row) -> dict[str, object]:
@@ -2018,6 +2099,10 @@ class PredictionArbitrageStore:
                 "breaker_reason": None,
                 "active_batch_id": None,
                 "total_unsettled_capital_units": 0,
+                "contract_generation": 1,
+                "qualification_policy_version": 1,
+                "safety_config_version": 1,
+                "enabled_execution_scope_version": [],
             }
         return {
             "mode": str(row["mode"]),
@@ -2025,12 +2110,193 @@ class PredictionArbitrageStore:
             "breaker_reason": row["breaker_reason"],
             "active_batch_id": row["active_batch_id"],
             "total_unsettled_capital_units": int(row["total_unsettled_capital_units"]),
+            "contract_generation": int(row["contract_generation"]),
+            "qualification_policy_version": int(row["qualification_policy_version"]),
+            "safety_config_version": int(row["safety_config_version"]),
+            "enabled_execution_scope_version": _n_leg_enabled_scopes(
+                row["enabled_execution_scope_version"]
+            ),
         }
 
     def n_leg_control(self) -> dict[str, object]:
         with self._read_connection() as connection:
             row = connection.execute("SELECT * FROM n_leg_controls WHERE singleton=1").fetchone()
         return self._n_leg_control_row(row)
+
+    def n_leg_qualification_policy_latest(self) -> dict[str, object] | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT version, policy FROM n_leg_qualification_policy ORDER BY version DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "version": int(row["version"]),
+            "policy": _load_payload(str(row["policy"])),
+        }
+
+    def n_leg_qualification_policy_write(
+        self, version: int, policy: Mapping[str, object]
+    ) -> None:
+        if type(version) is not int or version < 1:
+            raise ValueError("qualification policy version must be a positive integer")
+        now = _utc_now()
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT INTO n_leg_qualification_policy(version, policy, updated_at) VALUES (?, ?, ?) ON CONFLICT(version) DO UPDATE SET policy=excluded.policy, updated_at=excluded.updated_at",
+                (version, _dump_payload(policy), now),
+            )
+
+    def n_leg_safety_config_latest(self) -> dict[str, object] | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT version, config FROM n_leg_safety_config ORDER BY version DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "version": int(row["version"]),
+            "config": _load_payload(str(row["config"])),
+        }
+
+    def n_leg_safety_config_write(self, version: int, config: Mapping[str, object]) -> None:
+        if type(version) is not int or version < 1:
+            raise ValueError("safety config version must be a positive integer")
+        now = _utc_now()
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT INTO n_leg_safety_config(version, config, updated_at) VALUES (?, ?, ?) ON CONFLICT(version) DO UPDATE SET config=excluded.config, updated_at=excluded.updated_at",
+                (version, _dump_payload(config), now),
+            )
+
+    def n_leg_scopes(self) -> dict[str, dict[str, object]]:
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                "SELECT scope_id, capability, scope_version, members FROM n_leg_execution_scopes ORDER BY scope_id"
+            ).fetchall()
+        return {
+            str(row["scope_id"]): {
+                "scope_id": str(row["scope_id"]),
+                "capability": str(row["capability"]),
+                "scope_version": int(row["scope_version"]),
+                "members": _load_payload(str(row["members"])),
+            }
+            for row in rows
+        }
+
+    def n_leg_scope(self, scope_id: str) -> dict[str, object] | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT scope_id, capability, scope_version, members FROM n_leg_execution_scopes WHERE scope_id=?",
+                (str(scope_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "scope_id": str(row["scope_id"]),
+            "capability": str(row["capability"]),
+            "scope_version": int(row["scope_version"]),
+            "members": _load_payload(str(row["members"])),
+        }
+
+    def n_leg_scope_write(
+        self,
+        scope_id: str,
+        *,
+        capability: str,
+        scope_version: int,
+        members: Mapping[str, object],
+    ) -> None:
+        if not isinstance(scope_id, str) or not scope_id:
+            raise ValueError("scope id must be non-empty text")
+        if capability not in {"OBSERVE_ONLY", "MANUAL_CANARY", "AUTO_ELIGIBLE"}:
+            raise ValueError("scope capability is invalid")
+        if type(scope_version) is not int or scope_version < 1:
+            raise ValueError("scope version must be a positive integer")
+        now = _utc_now()
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT INTO n_leg_execution_scopes(scope_id, capability, scope_version, members, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(scope_id) DO UPDATE SET capability=excluded.capability, scope_version=excluded.scope_version, members=excluded.members, updated_at=excluded.updated_at",
+                (scope_id, capability, scope_version, _dump_payload(members), now),
+            )
+
+    def n_leg_mode_control_write(
+        self,
+        *,
+        mode: str | None = None,
+        contract_generation: int | None = None,
+        qualification_policy_version: int | None = None,
+        safety_config_version: int | None = None,
+        enabled_execution_scope_version: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        """Atomically update the versioned N-leg mode contract fields."""
+        if mode is not None and mode not in {"MANUAL", "AUTO"}:
+            raise ValueError("n-leg mode must be MANUAL or AUTO")
+        for name, value in (
+            ("contract_generation", contract_generation),
+            ("qualification_policy_version", qualification_policy_version),
+            ("safety_config_version", safety_config_version),
+        ):
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError(f"{name} must be a positive integer")
+        now = _utc_now()
+        with self._transaction() as connection:
+            current = self._n_leg_control_row(
+                connection.execute("SELECT * FROM n_leg_controls WHERE singleton=1").fetchone()
+            )
+            next_control = dict(current)
+            if mode is not None:
+                next_control["mode"] = mode
+            if contract_generation is not None:
+                next_control["contract_generation"] = contract_generation
+            if qualification_policy_version is not None:
+                next_control["qualification_policy_version"] = qualification_policy_version
+            if safety_config_version is not None:
+                next_control["safety_config_version"] = safety_config_version
+            if enabled_execution_scope_version is not None:
+                if not isinstance(enabled_execution_scope_version, list):
+                    raise ValueError("enabled execution scope version must be a list")
+                if any(
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("scope_id"), str)
+                    or not item["scope_id"]
+                    or type(item.get("scope_version")) is not int
+                    or item["scope_version"] < 1
+                    for item in enabled_execution_scope_version
+                ):
+                    raise ValueError("enabled execution scope version entries are invalid")
+                next_control["enabled_execution_scope_version"] = enabled_execution_scope_version
+            connection.execute(
+                "INSERT INTO n_leg_controls(singleton, mode, breaker_open, breaker_reason, active_batch_id, total_unsettled_capital_units, contract_generation, qualification_policy_version, safety_config_version, enabled_execution_scope_version, updated_at) VALUES (1, ?, 0, NULL, NULL, 0, ?, ?, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET mode=excluded.mode, contract_generation=excluded.contract_generation, qualification_policy_version=excluded.qualification_policy_version, safety_config_version=excluded.safety_config_version, enabled_execution_scope_version=excluded.enabled_execution_scope_version, updated_at=excluded.updated_at",
+                (
+                    str(next_control["mode"]),
+                    int(next_control["contract_generation"]),
+                    int(next_control["qualification_policy_version"]),
+                    int(next_control["safety_config_version"]),
+                    json.dumps(next_control["enabled_execution_scope_version"]),
+                    now,
+                ),
+            )
+        return self.n_leg_control()
+
+    def record_control_event(
+        self,
+        *,
+        action: str,
+        target: str,
+        outcome: str,
+        payload: Mapping[str, object],
+    ) -> str:
+        if outcome not in {"succeeded", "rejected", "failed"}:
+            raise ValueError("invalid terminal control outcome")
+        with self._transaction() as connection:
+            return self._insert_control_event(
+                connection,
+                action=action,
+                target=target,
+                outcome=outcome,
+                payload=payload,
+            )
 
     def n_leg_batch(self, execution_batch_id: str) -> dict[str, object] | None:
         with self._read_connection() as connection:
@@ -2089,8 +2355,17 @@ class PredictionArbitrageStore:
                 (batch_id, opportunity_id, lineage_id, str(payload.get("state")), 0, encoded, now, now),
             )
             connection.execute(
-                "INSERT INTO n_leg_controls(singleton, mode, breaker_open, breaker_reason, active_batch_id, total_unsettled_capital_units, updated_at) VALUES (1, ?, 0, NULL, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET mode=excluded.mode, active_batch_id=excluded.active_batch_id, total_unsettled_capital_units=excluded.total_unsettled_capital_units, updated_at=excluded.updated_at",
-                (mode, batch_id, int(control["total_unsettled_capital_units"]) + reservation, now),
+                "INSERT INTO n_leg_controls(singleton, mode, breaker_open, breaker_reason, active_batch_id, total_unsettled_capital_units, contract_generation, qualification_policy_version, safety_config_version, enabled_execution_scope_version, updated_at) VALUES (1, ?, 0, NULL, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET mode=excluded.mode, active_batch_id=excluded.active_batch_id, total_unsettled_capital_units=excluded.total_unsettled_capital_units, contract_generation=excluded.contract_generation, qualification_policy_version=excluded.qualification_policy_version, safety_config_version=excluded.safety_config_version, enabled_execution_scope_version=excluded.enabled_execution_scope_version, updated_at=excluded.updated_at",
+                (
+                    mode,
+                    batch_id,
+                    int(control["total_unsettled_capital_units"]) + reservation,
+                    int(control["contract_generation"]),
+                    int(control["qualification_policy_version"]),
+                    int(control["safety_config_version"]),
+                    json.dumps(control["enabled_execution_scope_version"]),
+                    now,
+                ),
             )
         return _load_payload(encoded)
 
@@ -2136,8 +2411,19 @@ class PredictionArbitrageStore:
                 (str(next_batch.get("state")), encoded, now, str(execution_batch_id)),
             )
             connection.execute(
-                "INSERT INTO n_leg_controls(singleton, mode, breaker_open, breaker_reason, active_batch_id, total_unsettled_capital_units, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET mode=excluded.mode, breaker_open=excluded.breaker_open, breaker_reason=excluded.breaker_reason, active_batch_id=excluded.active_batch_id, total_unsettled_capital_units=excluded.total_unsettled_capital_units, updated_at=excluded.updated_at",
-                (next_control["mode"], int(bool(next_control["breaker_open"])), next_control["breaker_reason"], next_control["active_batch_id"], next_control["total_unsettled_capital_units"], now),
+                "INSERT INTO n_leg_controls(singleton, mode, breaker_open, breaker_reason, active_batch_id, total_unsettled_capital_units, contract_generation, qualification_policy_version, safety_config_version, enabled_execution_scope_version, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET mode=excluded.mode, breaker_open=excluded.breaker_open, breaker_reason=excluded.breaker_reason, active_batch_id=excluded.active_batch_id, total_unsettled_capital_units=excluded.total_unsettled_capital_units, contract_generation=excluded.contract_generation, qualification_policy_version=excluded.qualification_policy_version, safety_config_version=excluded.safety_config_version, enabled_execution_scope_version=excluded.enabled_execution_scope_version, updated_at=excluded.updated_at",
+                (
+                    next_control["mode"],
+                    int(bool(next_control["breaker_open"])),
+                    next_control["breaker_reason"],
+                    next_control["active_batch_id"],
+                    next_control["total_unsettled_capital_units"],
+                    int(next_control.get("contract_generation", 1)),
+                    int(next_control.get("qualification_policy_version", 1)),
+                    int(next_control.get("safety_config_version", 1)),
+                    json.dumps(next_control.get("enabled_execution_scope_version", [])),
+                    now,
+                ),
             )
             connection.execute(
                 "INSERT INTO n_leg_transitions(transition_id, execution_batch_id, kind, idempotency_key, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
