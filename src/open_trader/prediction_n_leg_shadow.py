@@ -11,6 +11,7 @@ from threading import Condition, RLock
 
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_n_leg import (
+    ActionQuantity,
     ActionPayout,
     ActionSide,
     ArbitrageProblem,
@@ -35,6 +36,7 @@ from open_trader.prediction_n_leg import (
     canonical_payload,
     fingerprint,
 )
+from open_trader.prediction_n_leg_oracle import evaluate_fixed_portfolio
 from open_trader.prediction_solver import BenchmarkLimits
 from open_trader.prediction_solver_server import SolverServerOwner
 from open_trader.prediction_solver_worker import WorkerRequest
@@ -383,7 +385,24 @@ def _cross_venue_equivalence_relations(
     )
 
 
-def _cross_venue_request(
+def _cross_venue_extreme_atoms(
+    action: CandidateAction, release_at: datetime
+) -> tuple[TerminalAtom, ...]:
+    rule_version = action.settlement_observation_key.rule_version
+    return (
+        *_cross_venue_normal_atoms(action, release_at),
+        TerminalAtom(
+            f"{action.market_contract_id}-void", TerminalKind.VOID, rule_version,
+            (ActionPayout(action.action_id, 50_000_000),), release_at,
+        ),
+        TerminalAtom(
+            f"{action.market_contract_id}-refund", TerminalKind.REFUND, rule_version,
+            (ActionPayout(action.action_id, 100_000_000),), release_at,
+        ),
+    )
+
+
+def _cross_venue_problem(
     snapshot: Mapping[str, object],
     fingerprint: str,
     market_id: str,
@@ -391,7 +410,9 @@ def _cross_venue_request(
     scale: int,
     lots: int,
     units_per_dollar: int,
-) -> WorkerRequest | Mapping[str, object]:
+    *,
+    extreme: bool,
+) -> ArbitrageProblem | Mapping[str, object]:
     """Model one approved cross-venue pair as two venue-qualified contracts."""
 
     legs = snapshot.get("legs")
@@ -437,25 +458,49 @@ def _cross_venue_request(
             _cost_slices(cost, units_per_dollar, lots),
         )
         actions.append(action)
+        atoms = (
+            _cross_venue_extreme_atoms(action, release_at)
+            if extreme
+            else _cross_venue_normal_atoms(action, release_at)
+        )
         state_sets.append(
-            TerminalStateSet(
-                condition_id, observation, rule_version,
-                _cross_venue_normal_atoms(action, release_at),
-            )
+            TerminalStateSet(condition_id, observation, rule_version, atoms)
         )
     ordered_actions = tuple(actions)
     contract_ids = tuple(state.market_contract_id for state in state_sets)
-    problem = ArbitrageProblem(
-        PROBLEM_SCHEMA_V1, f"legacy:{market_id}:{fingerprint}", as_of,
-        CROSS_VENUE_VALUATION_UNIT, ordered_actions, tuple(state_sets),
-        ConstraintModel(_cross_venue_equivalence_relations(contract_ids), ()),
-        (
+    qualifications: tuple[QualificationConstraint, ...] = (
+        ()
+        if extreme
+        else (
             QualificationConstraint(
                 "legacy-positive-profit", "legacy-v1", QualificationMetric.GUARANTEED_PROFIT_UNITS,
                 Comparison.GREATER_THAN_OR_EQUAL, 1, 1,
             ),
-        ),
+        )
     )
+    return ArbitrageProblem(
+        PROBLEM_SCHEMA_V1, f"legacy:{market_id}:{fingerprint}", as_of,
+        CROSS_VENUE_VALUATION_UNIT, ordered_actions, tuple(state_sets),
+        ConstraintModel(_cross_venue_equivalence_relations(contract_ids), ()),
+        qualifications,
+    )
+
+
+def _cross_venue_request(
+    snapshot: Mapping[str, object],
+    fingerprint: str,
+    market_id: str,
+    quantity: Decimal,
+    scale: int,
+    lots: int,
+    units_per_dollar: int,
+) -> WorkerRequest | Mapping[str, object]:
+    problem = _cross_venue_problem(
+        snapshot, fingerprint, market_id, quantity, scale, lots, units_per_dollar,
+        extreme=False,
+    )
+    if isinstance(problem, Mapping):
+        return problem
     return WorkerRequest(
         f"shadow:{snapshot.get('signal_id', 'episode')}:{fingerprint}", "cp_sat",
         OracleRequest(REQUEST_SCHEMA_V1, SearchMode.ADMISSION, problem, OracleBudget(4, 4, 4)),
@@ -513,6 +558,33 @@ def _failure(fingerprint: str, reason: str, error: BaseException | None) -> dict
         "fingerprint": fingerprint,
         "reason": reason if error is None else f"{reason}: {type(error).__name__}",
     }
+
+
+def _cross_venue_extreme_loss(
+    snapshot: Mapping[str, object], scale: int
+) -> Decimal | None:
+    """Worst payout minus cost over NORMAL+VOID+REFUND combos, display-only."""
+
+    try:
+        quantity = _decimal(snapshot.get("quantity"), "quantity")
+        lots = int(quantity * scale)
+        units_per_dollar = 100_000_000 * scale
+        problem = _cross_venue_problem(
+            snapshot, str(snapshot.get("fingerprint", "")), "extreme",
+            quantity, scale, lots, units_per_dollar, extreme=True,
+        )
+        if isinstance(problem, Mapping):
+            return None
+        quantities = tuple(
+            ActionQuantity(action.action_id, action.max_quantity_lots)
+            for action in problem.actions
+        )
+        evaluation = evaluate_fixed_portfolio(
+            problem, quantities, OracleBudget(32, 32, 32)
+        )
+        return Decimal(evaluation.guaranteed_profit_units) / Decimal(units_per_dollar)
+    except Exception:
+        return None
 
 
 def _comparison(snapshot: Mapping[str, object], fingerprint: str, verification: object) -> dict[str, object]:
@@ -634,6 +706,15 @@ def _comparison(snapshot: Mapping[str, object], fingerprint: str, verification: 
             "status": "difference",
         }
     )
+    extreme_loss: Decimal | None = None
+    if snapshot.get("market_type") == "cross_venue_yes_no":
+        extreme_loss = _cross_venue_extreme_loss(snapshot, scale)
+        if extreme_loss is not None:
+            differences["extreme_loss"] = {
+                "legacy": "未建模",
+                "n_leg": format(extreme_loss, "f"),
+                "status": "na",
+            }
     comparison = (
         "CONSISTENT"
         if all(
@@ -654,6 +735,7 @@ def _comparison(snapshot: Mapping[str, object], fingerprint: str, verification: 
             "maximum_cost": format(n_leg_cost, "f"),
             "minimum_profit": format(n_leg_profit, "f"),
             "capital_release_at": _timestamp(actual_release) if isinstance(actual_release, datetime) else None,
+            **({"extreme_loss": format(extreme_loss, "f")} if extreme_loss is not None else {}),
         },
         **({"differences": differences} if differences else {}),
     }
