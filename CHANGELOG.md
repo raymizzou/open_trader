@@ -18,6 +18,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - 修复 `RelationCatalogV2` 在 `COMMIT` 失败时未回滚、留下悬挂事务并污染共享连接的问题：`begin_read` / `_state` / `commit_write` 的 COMMIT 失败现在都会 ROLLBACK 并重抛。聚焦 relation-catalog/v2/sqlite/monitor-selection/live-resolver 回归 87 passed；未部署、未推送。
 - 为 #91 临时恢复 PredictionService/UI：`PredictionRuntime` 增加 `enable_n_leg_background`，`OPEN_TRADER_DISABLE_NLEG_BACKGROUND=1` 时跳过 `PredictionLiveResolver` 和 selection driver 启动；运行时仍可达 RUNNING。这是等待 #91 彻底修复的临时缓解，不改变求解/执行语义。聚焦 runtime/live-resolver/monitor-selection 回归 60 passed；未部署、未推送。
 - #91 根因修复：`RelationCatalogV2` 不再共享一个跨线程 SQLite connection，改为 `threading.local()` 每线程连接与事务状态；移除 Python lock，写冲突交给 `BEGIN IMMEDIATE` + `busy_timeout`。并发读写测试通过，聚焦 catalog/v2/sqlite/monitor-selection/live-resolver 回归 90 passed；未部署、未推送。
+- #91 追加修复：`SqliteCatalogStore._state()` 现在缓存当前线程加载的目录状态，写事务/失败后失效；避免 relation review 列表每行都全量重读 SQLite 的 O(N²) 问题。聚焦 catalog/v2/sqlite/monitor-selection/live-resolver 回归 91 passed；未部署、未推送。
 
 ## 2026-08-16
 

@@ -202,6 +202,7 @@ class SqliteCatalogStore(MutableMapping):
             raise
         finally:
             self._local.overlay = None
+            self._local.cache = None
 
     def rollback_write(self) -> None:
         if getattr(self._local, "overlay", None) is None:
@@ -244,8 +245,10 @@ class SqliteCatalogStore(MutableMapping):
             state = self._load_state(conn)
             conn.execute("COMMIT")
         except BaseException:
+            self._local.cache = None
             conn.execute("ROLLBACK")
             raise
+        self._local.cache = state
         return state
 
     def _load_state(self, conn: sqlite3.Connection) -> dict[str, dict]:
