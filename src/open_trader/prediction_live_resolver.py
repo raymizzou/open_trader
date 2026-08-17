@@ -151,6 +151,10 @@ class _OutcomeTrackingServer:
             self._ready = []
             return ready
 
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
     def close(self) -> None:
         with self._lock:
             self._closed = True
@@ -250,6 +254,9 @@ class PredictionLiveResolver:
             self._thread = None
             self._scheduler.close()
             self._tracking.close()
+
+    def is_idle(self) -> bool:
+        return self._tracking.pending_count() == 0
 
     def solutions(self) -> list[dict[str, object]]:
         with self._lock:

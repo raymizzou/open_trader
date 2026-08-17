@@ -784,7 +784,21 @@ def test_runtime_owns_one_shared_solver_server_for_its_start_stop_lifetime(
         lambda **_kwargs: SimpleNamespace(
             start=lambda: events.append("resolver.start"),
             stop=lambda: events.append("resolver.stop"),
+            is_idle=lambda: True,
             solutions=lambda: [],
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictionMonitorSelectionDriver",
+        lambda **_kwargs: SimpleNamespace(
+            start=lambda: events.append("selection.start"),
+            stop=lambda: events.append("selection.stop"),
+            status=lambda: {
+                "selection_pending": 0,
+                "selection_failures_consecutive": 0,
+                "selection_applied_generation": None,
+            },
         ),
     )
     cross_observers: list[object] = []
@@ -811,6 +825,7 @@ def test_runtime_owns_one_shared_solver_server_for_its_start_stop_lifetime(
     runtime.stop()
 
     assert len(servers) == 1
+    assert events.index("selection.stop") < events.index("resolver.stop")
     assert events.index("resolver.stop") < events.index("solver.close")
     assert events.index("monitor.stop") < events.index("solver.close")
     assert events.index("solver.close") < events.index("execution.close")

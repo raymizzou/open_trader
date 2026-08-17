@@ -46,6 +46,7 @@ from .prediction_arbitrage_store import (
 )
 from .prediction_live_resolver import PredictionLiveResolver
 from .prediction_monitor_selection import MonitorSelectionStore
+from .prediction_monitor_selection_driver import PredictionMonitorSelectionDriver
 from .prediction_read_only import (
     PolymarketReadOnlyGuard,
     PredictReadOnlyGuard,
@@ -395,6 +396,7 @@ class PredictionRuntime:
         self.relation_catalog: RelationCatalog | None = None
         self.solver_server: SolverServerOwner | None = None
         self.live_resolver: PredictionLiveResolver | None = None
+        self.monitor_selection_driver: PredictionMonitorSelectionDriver | None = None
         self.n_leg_shadow: NLegShadowScheduler | None = None
         self._shadow_guards: ExitStack | None = None
         self._shadow_failure_lock = threading.Lock()
@@ -608,16 +610,23 @@ class PredictionRuntime:
                     )
                     if callable(set_cross_venue_monitor):
                         set_cross_venue_monitor(self.cross_venue_monitor)
+            selection_store = MonitorSelectionStore(self._data_dir)
             self.live_resolver = PredictionLiveResolver(
                 data_dir=self._data_dir,
                 relation_catalog=self.relation_catalog,
                 monitor=self.monitor,
                 solver_server=self.solver_server,
-                selection_store=MonitorSelectionStore(self._data_dir),
+                selection_store=selection_store,
                 store=self.store,
                 execution=self.execution,
             )
             self.live_resolver.start()
+            self.monitor_selection_driver = PredictionMonitorSelectionDriver(
+                relation_catalog=self.relation_catalog,
+                selection_store=selection_store,
+                idle_check=self.live_resolver.is_idle,
+            )
+            self.monitor_selection_driver.start()
             self._state = "RUNNING"
             logger.info(
                 "prediction_runtime_state state=RUNNING pid=%s data_dir=%s",
@@ -771,9 +780,31 @@ class PredictionRuntime:
         resolver = self.live_resolver
         return [] if resolver is None else resolver.solutions()
 
+    def n_leg_metrics(self) -> dict[str, object]:
+        driver = self.monitor_selection_driver
+        if driver is None:
+            return {
+                "selection_pending": 0,
+                "selection_failures_consecutive": 0,
+            }
+        status = driver.status()
+        return {
+            "selection_pending": int(status.get("selection_pending", 0)),
+            "selection_failures_consecutive": int(
+                status.get("selection_failures_consecutive", 0)
+            ),
+        }
+
     def _cleanup_resources(self) -> list[BaseException]:
         errors: list[BaseException] = []
         uncertain_thread = False
+        if self.monitor_selection_driver is not None:
+            try:
+                self.monitor_selection_driver.stop()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                self.monitor_selection_driver = None
         if self.live_resolver is not None:
             try:
                 self.live_resolver.stop()
