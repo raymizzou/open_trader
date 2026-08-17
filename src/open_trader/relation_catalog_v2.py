@@ -511,6 +511,28 @@ class RelationCatalogV2:
             versions[version_id]["reject_note"] = note
             return {"version_id": version_id, "status": "REJECTED"}
 
+    def reject_many(
+        self,
+        version_ids: list[str],
+        *,
+        reason: str,
+        actor: str,
+        git_sha: str,
+        note: str = "",
+    ) -> dict:
+        """Reject many versions in one write transaction (one flush)."""
+        with self._write():
+            versions = self.store.setdefault("versions", {})
+            for version_id in version_ids:
+                if version_id not in versions:
+                    raise ValueError(f"unknown version: {version_id}")
+                versions[version_id]["status"] = "REJECTED"
+                versions[version_id]["reject_reason"] = reason
+                versions[version_id]["reject_note"] = note
+                versions[version_id]["reject_actor"] = actor
+                versions[version_id]["reject_git_sha"] = git_sha
+            return {"rejected": len(version_ids)}
+
     def revoke(self, version_id: str, *, actor: str, git_sha: str) -> dict:
         with self._write():
             versions = self.store.setdefault("versions", {})

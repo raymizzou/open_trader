@@ -566,6 +566,83 @@ class RelationCatalog:
             })
         return {"applied": len(rejected), "rejected": rejected}
 
+    def dedup_complete_pending(
+        self,
+        *,
+        actor: str,
+        git_sha: str,
+        dry_run: bool = True,
+        limit: int = 200,
+    ):
+        """Reject duplicate COMPLETE PENDING versions, keeping the latest per identity.
+
+        Version rows are never deleted; rejected duplicates stay in history.
+        Apply is bounded by ``limit`` rejected versions per run and can be
+        rerun until the dry-run report is empty.
+        """
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        pending_by_identity: dict[str, list[str]] = {}
+        for version_id, record in self._versions().items():
+            if record.get("status") != "PENDING":
+                continue
+            if not _stored_payload_complete(record["payload"]):
+                continue
+            pending_by_identity.setdefault(str(record["identity"]), []).append(version_id)
+        latest = self._store.get("latest", {})
+        matches: list[dict[str, object]] = []
+        for identity in sorted(pending_by_identity):
+            version_ids = pending_by_identity[identity]
+            if len(version_ids) < 2:
+                continue
+            keep = latest.get(identity)
+            if keep not in version_ids:
+                keep = sorted(version_ids)[-1]
+            matches.append({
+                "identity": identity,
+                "kept_version_id": keep,
+                "reject_version_ids": sorted(
+                    version_id for version_id in version_ids if version_id != keep
+                ),
+            })
+        if dry_run:
+            return matches
+        targets = [
+            (str(match["identity"]), version_id, str(match["kept_version_id"]))
+            for match in matches
+            for version_id in match["reject_version_ids"]  # type: ignore[union-attr]
+        ][:limit]
+        if not targets:
+            return {"applied": 0, "rejected": [], "remaining": 0}
+        self._catalog.reject_many(
+            [version_id for _, version_id, _ in targets],
+            reason="other",
+            note="issue-92 duplicate complete pending dedup",
+            actor=actor,
+            git_sha=git_sha,
+        )
+        updates: dict[str, dict[str, object]] = {}
+        for _, version_id, kept_id in targets:
+            record = self._versions()[version_id]
+            updates[version_id] = {
+                **record,
+                "activation_status": "REJECTED",
+                "activation_diagnostic": "DUPLICATE_COMPLETE_PENDING",
+                "reject_note": f"issue-92 duplicate complete pending dedup; kept {kept_id}",
+                "dedup_actor": actor,
+                "dedup_git_sha": git_sha,
+            }
+        self._store_write(updates)
+        remaining = sum(len(match["reject_version_ids"]) for match in matches) - len(targets)  # type: ignore[arg-type]
+        return {
+            "applied": len(targets),
+            "rejected": [
+                {"version_id": version_id, "identity": identity, "status": "REJECTED"}
+                for identity, version_id, _ in targets
+            ],
+            "remaining": remaining,
+        }
+
     def detail(self, relation_version_id: str) -> dict[str, object]:
         versions = self._versions()
         if relation_version_id not in versions:
