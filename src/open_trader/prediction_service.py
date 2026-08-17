@@ -34,6 +34,7 @@ from .relation_catalog import RelationConflictError
 
 _HISTORY_DEFAULT_LIMIT = 100
 _HISTORY_MAX_LIMIT = 500
+_RELATIONS_DEFAULT_LIMIT = 500
 _MAX_JSON_BODY_BYTES = 1024 * 1024
 _MAX_CONCURRENT_HTTP_REQUESTS = 8
 _HISTORY_CACHE_SECONDS = 1.0
@@ -347,11 +348,21 @@ def create_prediction_server(
                 try:
                     if parsed.path == relation_prefix:
                         query = parse_qs(parsed.query, keep_blank_values=True)
-                        if set(query) - {"view"}:
+                        if set(query) - {"view", "limit", "offset"}:
                             raise ValueError("relation catalog query is invalid")
                         view = str(query.get("view", ["pending"])[0] or "pending")
+                        limit = _query_int(query, "limit", _RELATIONS_DEFAULT_LIMIT)
+                        offset = _query_int(query, "offset", 0)
                         rows = catalog.list(view)
-                        self._send_json(HTTPStatus.OK, {"view": view, "pending_count": catalog.pending_count(), "items": rows})
+                        self._send_json(
+                            HTTPStatus.OK,
+                            {
+                                "view": view,
+                                "pending_count": catalog.pending_count(),
+                                "total": len(rows),
+                                "items": rows[offset : offset + limit],
+                            },
+                        )
                     else:
                         version_id = parsed.path.removeprefix(relation_prefix + "/")
                         if not version_id or "/" in version_id:

@@ -286,6 +286,31 @@ def _threshold_complete_model(relation: object) -> dict[str, object] | None:
     }
 
 
+def _threshold_discovery_payload(
+    relation: object, model: dict[str, object]
+) -> dict[str, object]:
+    """One deterministic Polymarket threshold relation as a v1 discovery payload."""
+    def market(value: object) -> dict[str, object]:
+        end_date = _string(getattr(value, "end_date"), "threshold end_date")
+        return {
+            "venue": "Polymarket", "contract_id": _string(getattr(value, "condition_id"), "condition_id"),
+            "title": _string(getattr(value, "question"), "question"), "market_date": end_date,
+            "expires_at": end_date, "event_identity_basis": _string(getattr(value, "event_id"), "event_id"),
+            "settlement_observation_key": _string(getattr(value, "resolution_source") or getattr(value, "condition_id"), "resolution_source"),
+            "settlement_rules": _string(getattr(value, "rules"), "rules"), "cancellation_rules": "not supplied by threshold discovery",
+        }
+    relation_direction = str(getattr(relation, "relation"))
+    endpoints = [market(getattr(relation, "market_a")), market(getattr(relation, "market_b"))]
+    if relation_direction in {"B_IMPLIES_A", "B_TO_A"}:
+        endpoints = list(reversed(endpoints))
+    return {
+        "discovery_source": "deterministic_rule", "discovered_at": _now(),
+        "relation_type": "IMPLIES", "semantics": {"statement": relation_direction, "direction": relation_direction},
+        "source_evidence": [{"event_id": getattr(relation, "event_id"), "rules_hash_a": getattr(relation, "rules_hash_a"), "rules_hash_b": getattr(relation, "rules_hash_b")}],
+        "model": model, "markets": endpoints,
+    }
+
+
 class RelationCatalog:
     """V2-backed public domain API; readers consume only ``current_generation``."""
 
@@ -373,39 +398,47 @@ class RelationCatalog:
 
     def ingest_threshold_relation(self, relation: object, *, git_sha: str = "") -> dict[str, object]:
         """Adapt the existing deterministic Polymarket discovery codec once."""
-        market_a = getattr(relation, "market_a")
-        market_b = getattr(relation, "market_b")
-        discovered_at = _now()
-        def market(value: object) -> dict[str, object]:
-            end_date = _string(getattr(value, "end_date"), "threshold end_date")
-            return {
-                "venue": "Polymarket", "contract_id": _string(getattr(value, "condition_id"), "condition_id"),
-                "title": _string(getattr(value, "question"), "question"), "market_date": end_date,
-                "expires_at": end_date, "event_identity_basis": _string(getattr(value, "event_id"), "event_id"),
-                "settlement_observation_key": _string(getattr(value, "resolution_source") or getattr(value, "condition_id"), "resolution_source"),
-                "settlement_rules": _string(getattr(value, "rules"), "rules"), "cancellation_rules": "not supplied by threshold discovery",
-            }
-        relation_direction = str(getattr(relation, "relation"))
-        endpoints = [market(market_a), market(market_b)]
-        if relation_direction in {"B_IMPLIES_A", "B_TO_A"}:
-            endpoints = list(reversed(endpoints))
-        model: dict[str, object] = {"completeness": "INCOMPLETE"}
         enriched = _threshold_complete_model(relation)
-        if enriched is not None:
-            model = enriched
-        return self.ingest({
-            "discovery_source": "deterministic_rule", "discovered_at": discovered_at,
-            "relation_type": "IMPLIES", "semantics": {"statement": relation_direction, "direction": relation_direction},
-            "source_evidence": [{"event_id": getattr(relation, "event_id"), "rules_hash_a": getattr(relation, "rules_hash_a"), "rules_hash_b": getattr(relation, "rules_hash_b")}],
-            "model": model, "markets": endpoints,
-        }, git_sha=git_sha)
+        model: dict[str, object] = (
+            enriched if enriched is not None else {"completeness": "INCOMPLETE"}
+        )
+        return self.ingest(
+            _threshold_discovery_payload(relation, model), git_sha=git_sha
+        )
+
+    def threshold_relation_identity(self, relation: object) -> str:
+        """Catalog identity for one threshold relation, via the ingest codec path."""
+        payload = _threshold_discovery_payload(
+            relation, {"completeness": "INCOMPLETE"}
+        )
+        return str(_canonicalize(self._converted(payload))[0])
+
+    def prepared_relation_identities(self) -> set[str]:
+        """Identities that already hold PENDING or APPROVED versions."""
+        prepared = getattr(self._store, "prepared_identities", None)
+        if callable(prepared):
+            return set(prepared())
+        return {
+            str(record["identity"])
+            for record in self._versions().values()
+            if record.get("status") in {"PENDING", "APPROVED"}
+        }
 
     def _versions(self) -> dict[str, dict[str, object]]:
         return self._store.get("versions", {})
 
-    def _row(self, version_id: str, occurrences: int = 0) -> dict[str, object]:
+    def _row(
+        self, version_id: str, occurrences: int = 0, *, include_problem: bool = True
+    ) -> dict[str, object]:
         record = self._versions()[version_id]
         payload = record["payload"]
+        model: dict[str, object] = {
+            "terminal_states": payload.get("terminal_states", []),
+            "payouts": payload.get("payouts", {}),
+            "capital_release": payload.get("capital_release"),
+        }
+        if include_problem:
+            model["problem"] = payload.get("problem")
         return {
             "version_id": version_id,
             "identity": str(record["identity"]),
@@ -420,12 +453,7 @@ class RelationCatalog:
             "relation_type": payload["relation_type"],
             "endpoints": payload["endpoints"],
             "statement": payload.get("statement", ""),
-            "model": {
-                "terminal_states": payload.get("terminal_states", []),
-                "payouts": payload.get("payouts", {}),
-                "capital_release": payload.get("capital_release"),
-                "problem": payload.get("problem"),
-            },
+            "model": model,
         }
 
     def _current_generation(self) -> dict[str, dict[str, str]]:
@@ -450,7 +478,7 @@ class RelationCatalog:
         generation = self._current_generation()
         versions = self._versions()
         result = [
-            self._row(version_id, int(record.get("occurrence_count", 1)))
+            self._row(version_id, int(record.get("occurrence_count", 1)), include_problem=False)
             for version_id, record in versions.items()
             if self._in_view(view, version_id, record, generation)
         ]
@@ -541,6 +569,83 @@ class RelationCatalog:
                 "status": "REJECTED",
             })
         return {"applied": len(rejected), "rejected": rejected}
+
+    def dedup_complete_pending(
+        self,
+        *,
+        actor: str,
+        git_sha: str,
+        dry_run: bool = True,
+        limit: int = 200,
+    ):
+        """Reject duplicate COMPLETE PENDING versions, keeping the latest per identity.
+
+        Version rows are never deleted; rejected duplicates stay in history.
+        Apply is bounded by ``limit`` rejected versions per run and can be
+        rerun until the dry-run report is empty.
+        """
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        pending_by_identity: dict[str, list[str]] = {}
+        for version_id, record in self._versions().items():
+            if record.get("status") != "PENDING":
+                continue
+            if not _stored_payload_complete(record["payload"]):
+                continue
+            pending_by_identity.setdefault(str(record["identity"]), []).append(version_id)
+        latest = self._store.get("latest", {})
+        matches: list[dict[str, object]] = []
+        for identity in sorted(pending_by_identity):
+            version_ids = pending_by_identity[identity]
+            if len(version_ids) < 2:
+                continue
+            keep = latest.get(identity)
+            if keep not in version_ids:
+                keep = sorted(version_ids)[-1]
+            matches.append({
+                "identity": identity,
+                "kept_version_id": keep,
+                "reject_version_ids": sorted(
+                    version_id for version_id in version_ids if version_id != keep
+                ),
+            })
+        if dry_run:
+            return matches
+        targets = [
+            (str(match["identity"]), version_id, str(match["kept_version_id"]))
+            for match in matches
+            for version_id in match["reject_version_ids"]  # type: ignore[union-attr]
+        ][:limit]
+        if not targets:
+            return {"applied": 0, "rejected": [], "remaining": 0}
+        self._catalog.reject_many(
+            [version_id for _, version_id, _ in targets],
+            reason="other",
+            note="issue-92 duplicate complete pending dedup",
+            actor=actor,
+            git_sha=git_sha,
+        )
+        updates: dict[str, dict[str, object]] = {}
+        for _, version_id, kept_id in targets:
+            record = self._versions()[version_id]
+            updates[version_id] = {
+                **record,
+                "activation_status": "REJECTED",
+                "activation_diagnostic": "DUPLICATE_COMPLETE_PENDING",
+                "reject_note": f"issue-92 duplicate complete pending dedup; kept {kept_id}",
+                "dedup_actor": actor,
+                "dedup_git_sha": git_sha,
+            }
+        self._store_write(updates)
+        remaining = sum(len(match["reject_version_ids"]) for match in matches) - len(targets)  # type: ignore[arg-type]
+        return {
+            "applied": len(targets),
+            "rejected": [
+                {"version_id": version_id, "identity": identity, "status": "REJECTED"}
+                for identity, version_id, _ in targets
+            ],
+            "remaining": remaining,
+        }
 
     def detail(self, relation_version_id: str) -> dict[str, object]:
         versions = self._versions()

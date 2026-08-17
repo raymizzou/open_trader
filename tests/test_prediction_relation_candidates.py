@@ -127,21 +127,39 @@ def test_prepare_ingests_only_complete_selected_relations(tmp_path: Path) -> Non
     assert catalog.pending_count() == 2
 
 
-def test_unchanged_fingerprint_does_not_reingest(tmp_path: Path) -> None:
+def test_restarted_catalog_skips_already_prepared_component(tmp_path: Path) -> None:
     catalog = RelationCatalog(tmp_path)
     relations = [relation("e", "a", "b"), relation("e", "b", "c")]
     first = prepare_relation_candidates(catalog, relations)
     assert first["status"] == "PREPARED"
     assert catalog.pending_count() == 2
 
-    fingerprint = first["fingerprint"]
-    assert isinstance(fingerprint, str)
-    second = prepare_relation_candidates(
-        catalog, relations, prepared_fingerprints={fingerprint}
-    )
+    restarted = RelationCatalog(tmp_path)
+    second = prepare_relation_candidates(restarted, relations)
     assert second["status"] == "SKIPPED"
     assert second["prepared"] == 0
-    assert catalog.pending_count() == 2
+    assert restarted.pending_count() == 2
+
+
+def test_source_drift_after_prepare_does_not_add_pending_version(
+    tmp_path: Path,
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+    relations = [relation("e", "a", "b"), relation("e", "b", "c")]
+    assert prepare_relation_candidates(catalog, relations)["status"] == "PREPARED"
+
+    def drifted(rel: ThresholdRelation) -> ThresholdRelation:
+        return replace(
+            rel,
+            market_a=replace(rel.market_a, question=f"{rel.market_a.question} (edited)"),
+            market_b=replace(rel.market_b, question=f"{rel.market_b.question} (edited)"),
+        )
+
+    restarted = RelationCatalog(tmp_path)
+    report = prepare_relation_candidates(restarted, [drifted(rel) for rel in relations])
+    assert report["status"] == "SKIPPED"
+    assert report["prepared"] == 0
+    assert restarted.pending_count() == 2
 
 
 def test_two_complete_components_prepare_each_once_and_do_not_cycle(
@@ -154,30 +172,21 @@ def test_two_complete_components_prepare_each_once_and_do_not_cycle(
         relation("e2", "d", "e"),
         relation("e2", "e", "f"),
     ]
-    prepared_fingerprints: set[str] = set()
 
-    first = prepare_relation_candidates(
-        catalog, relations, prepared_fingerprints=prepared_fingerprints
-    )
+    first = prepare_relation_candidates(catalog, relations)
     assert first["status"] == "PREPARED"
     assert first["prepared"] == 1
     assert isinstance(first["fingerprint"], str)
-    prepared_fingerprints.add(first["fingerprint"])
     assert catalog.pending_count() == 2
 
-    second = prepare_relation_candidates(
-        catalog, relations, prepared_fingerprints=prepared_fingerprints
-    )
+    second = prepare_relation_candidates(catalog, relations)
     assert second["status"] == "PREPARED"
     assert second["prepared"] == 1
     assert isinstance(second["fingerprint"], str)
     assert second["fingerprint"] != first["fingerprint"]
-    prepared_fingerprints.add(second["fingerprint"])
     assert catalog.pending_count() == 4
 
-    third = prepare_relation_candidates(
-        catalog, relations, prepared_fingerprints=prepared_fingerprints
-    )
+    third = prepare_relation_candidates(catalog, relations)
     assert third["status"] == "SKIPPED"
     assert third["prepared"] == 0
     assert catalog.pending_count() == 4
@@ -246,21 +255,29 @@ class FakeClient:
 
 
 def test_monitor_full_scan_auto_prepares_at_most_one_candidate(tmp_path: Path) -> None:
-    monitor = PolymarketMonitor(
-        store=PredictionArbitrageStore(tmp_path / "data"),
-        trading=SimpleNamespace(),
-        public_client_factory=FakeClient,
-        relation_discovery=discover_threshold_relations,
-        relation_catalog=RelationCatalog(tmp_path / "data"),
-    )
-    client = FakeClient([threshold_event()])
+    data_dir = tmp_path / "data"
 
-    asyncio.run(monitor._run_full_relation_scan(client))
-    assert monitor._prepared_candidate_fps
+    def make_monitor() -> PolymarketMonitor:
+        return PolymarketMonitor(
+            store=PredictionArbitrageStore(data_dir),
+            trading=SimpleNamespace(),
+            public_client_factory=FakeClient,
+            relation_discovery=discover_threshold_relations,
+            relation_catalog=RelationCatalog(data_dir),
+        )
+
+    monitor = make_monitor()
+    asyncio.run(monitor._run_full_relation_scan(FakeClient([threshold_event()])))
     assert monitor._relation_catalog.pending_count() == 3
 
     asyncio.run(monitor._run_full_relation_scan(FakeClient([threshold_event()])))
     assert monitor._relation_catalog.pending_count() == 3
+
+    # A restarted service builds a fresh monitor and catalog over the same
+    # data dir; its next full scan must not add new PENDING versions.
+    restarted = make_monitor()
+    asyncio.run(restarted._run_full_relation_scan(FakeClient([threshold_event()])))
+    assert restarted._relation_catalog.pending_count() == 3
 
 
 def test_cli_relation_candidates_dry_run_and_apply(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

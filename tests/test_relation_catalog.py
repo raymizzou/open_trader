@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -119,6 +120,76 @@ def test_ingest_controlled_rejects_invalid_payloads(
     with pytest.raises(ValueError):
         catalog.ingest_controlled(discovery(**kwargs))
     assert catalog.review_rows() == []
+
+
+def drifted_question(relation: object) -> object:
+    return replace(
+        relation,
+        market_a=replace(relation.market_a, question=f"{relation.market_a.question} (edited)"),
+        market_b=replace(relation.market_b, question=f"{relation.market_b.question} (edited)"),
+    )
+
+
+def test_dedup_complete_pending_keeps_latest_and_rejects_duplicates(
+    tmp_path: Path,
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+    base = threshold_relation()
+    first_id = catalog.ingest_threshold_relation(base)["version_id"]
+    second_id = catalog.ingest_threshold_relation(drifted_question(base))["version_id"]
+    assert catalog.pending_count() == 2
+
+    matches = catalog.dedup_complete_pending(actor="cli", git_sha="", dry_run=True)
+    assert catalog.pending_count() == 2
+    assert len(matches) == 1
+    assert matches[0]["kept_version_id"] == second_id
+    assert matches[0]["reject_version_ids"] == [first_id]
+
+    result = catalog.dedup_complete_pending(actor="cli", git_sha="", dry_run=False)
+    assert result["applied"] == 1
+    assert catalog.pending_count() == 1
+    assert [row["version_id"] for row in catalog.list("pending")] == [second_id]
+    assert {row["version_id"] for row in catalog.list("history")} == {first_id}
+    assert len(catalog.review_rows()) == 2
+
+    approved = catalog.approve(
+        second_id, {"version_id": second_id}, actor="operator", git_sha="sha"
+    )
+    assert approved["status"] == "APPROVED"
+    assert approved["activation"] == "ACTIVE"
+
+
+def test_dedup_complete_pending_apply_is_bounded_and_rerunnable(
+    tmp_path: Path,
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+
+    def duplicate_pair(tag: str) -> tuple[object, object]:
+        base = threshold_relation()
+        retagged = replace(
+            base,
+            market_a=replace(base.market_a, condition_id=f"condition-{tag}-a"),
+            market_b=replace(base.market_b, condition_id=f"condition-{tag}-b"),
+        )
+        return retagged, drifted_question(retagged)
+
+    for pair in (duplicate_pair("x"), duplicate_pair("y")):
+        catalog.ingest_threshold_relation(pair[0])
+        catalog.ingest_threshold_relation(pair[1])
+    assert catalog.pending_count() == 4
+
+    bounded = catalog.dedup_complete_pending(
+        actor="cli", git_sha="", dry_run=False, limit=1
+    )
+    assert bounded["applied"] == 1
+    assert catalog.pending_count() == 3
+
+    finished = catalog.dedup_complete_pending(actor="cli", git_sha="", dry_run=False)
+    assert finished["applied"] == 1
+    assert catalog.pending_count() == 2
+    assert catalog.dedup_complete_pending(actor="cli", git_sha="", dry_run=True) == []
+
+
 def test_cleanup_dry_run_lists_only_model_less_pending_rows(tmp_path: Path) -> None:
     catalog = RelationCatalog(tmp_path)
     incomplete_id = catalog.ingest(discovery(completeness="INCOMPLETE"))["version_id"]
@@ -215,6 +286,48 @@ def test_cli_relation_ingest_validation_failure(
     ])
     assert code == 2
     assert "error:" in capsys.readouterr().err
+
+
+def test_cli_catalog_dedup_dry_run_and_apply(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    catalog = RelationCatalog(tmp_path / "data")
+    base = threshold_relation()
+    first_id = catalog.ingest_threshold_relation(base)["version_id"]
+    second_id = catalog.ingest_threshold_relation(drifted_question(base))["version_id"]
+
+    code = cli.main([
+        "prediction-arb",
+        "catalog-dedup",
+        "--dry-run",
+        "--data-dir",
+        str(tmp_path / "data"),
+    ])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "duplicates: 1" in out
+    assert first_id in out
+    assert second_id in out
+    assert catalog.pending_count() == 2  # dry-run leaves rows untouched
+
+    code = cli.main([
+        "prediction-arb",
+        "catalog-dedup",
+        "--apply",
+        "--data-dir",
+        str(tmp_path / "data"),
+    ])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "applied: 1" in out
+
+    # An externally-run CLI write is visible to a freshly opened catalog; the
+    # pre-existing handle keeps its thread-local read cache by design (#91).
+    reopened = RelationCatalog(tmp_path / "data")
+    assert reopened.pending_count() == 1
+    rows = {row["version_id"]: row for row in reopened.review_rows()}
+    assert rows[first_id]["status"] == "REJECTED"
+    assert rows[second_id]["status"] == "PENDING"
 
 
 def test_cli_catalog_cleanup_dry_run(

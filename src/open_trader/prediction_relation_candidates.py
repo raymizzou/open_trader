@@ -148,9 +148,17 @@ def prepare_relation_candidates(
     relations: Sequence[object],
     *,
     max_components: int = 1,
-    prepared_fingerprints: set[str] | None = None,
 ) -> dict[str, object]:
-    """Ingest at most ``max_components`` complete components as PENDING versions."""
+    """Ingest at most ``max_components`` complete components as PENDING versions.
+
+    A component whose member identities all already hold PENDING/APPROVED
+    catalog versions is skipped, so restarting the process never re-ingests an
+    already-prepared component; the catalog itself is the prepared-set source.
+    """
+    prepared_identities: set[str] | None = None
+    derive = getattr(catalog, "prepared_relation_identities", None)
+    if catalog is not None and callable(derive):
+        prepared_identities = set(derive())
     prepared: list[dict[str, object]] = []
     incomplete: list[dict[str, object]] = []
     skipped = 0
@@ -167,7 +175,10 @@ def prepare_relation_candidates(
                 }
             )
             continue
-        if prepared_fingerprints is not None and component.fingerprint in prepared_fingerprints:
+        if prepared_identities is not None and {
+            str(catalog.threshold_relation_identity(relation))
+            for relation in component.relations
+        } <= prepared_identities:
             skipped += 1
             continue
         if len(prepared) >= max_components:
