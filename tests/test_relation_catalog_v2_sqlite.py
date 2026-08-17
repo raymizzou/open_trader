@@ -119,3 +119,25 @@ def test_sqlite_concurrent_writer_reader_see_complete_generations(tmp_path) -> N
     assert not errors
     assert snapshots
     assert all(snapshot in (g1_ids, g2_ids, g1_ids | g2_ids) for snapshot in snapshots)
+
+
+def test_sqlite_read_rolls_back_when_commit_raises(tmp_path) -> None:
+    db_path = str(tmp_path / "catalog.db")
+    catalog = _catalog(db_path)
+    store = catalog.store
+    real_conn = store._conn
+
+    class ExplodingConnection:
+        def execute(self, sql, *args, **kwargs):
+            if isinstance(sql, str) and sql.strip().upper() == "COMMIT":
+                raise sqlite3.OperationalError("cannot commit")
+            return real_conn.execute(sql, *args, **kwargs)
+
+    store._conn = ExplodingConnection()
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            catalog.current_generation()
+    finally:
+        store._conn = real_conn
+
+    assert catalog.current_generation() == {}
