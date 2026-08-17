@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-17
 
+- 修复预测套利预检失败只报笼统 `preflight_failed`、吞掉真实原因的问题：阈值/标准 pair 预检失败现在把底层 `error_code`（如 `order_amount_mismatch`）作为失败原因透传到飞书通知和执行记录，取不到时回退 `preflight_failed`，并补充常见错误码中文提示。仅改变失败原因展示，不改变下单、风控或经济逻辑。聚焦 execution 回归 252 passed；未部署、未推送。
 - 测试稳定性：修复 prediction service HTTP 并发压力用例在全量测试下的提交顺序竞态（先确认 4 个 state 请求进入 handler 再提交 4 个 preview，并提高 client timeout）、跨所 auto_submit 残差事件用例在全量测试下的 reconcile 结果消费竞态（提供两份相同残差结果），以及 dashboard acceptance 中 account gateway 标记用例的 client timeout。仅测试改动，无运行时代码变化。
 - #52 把 #82/#83/#84 接进生产 PredictionRuntime，形成第一条真正运行的实时 N_LEG 求解链路：`PredictionLiveResolver` 以 250ms daemon 线程推进目录 generation 并裁剪 #77 selected set；Polymarket 最新盘口归一化为 micro-USDC 成本切片后经 #54 的两个常驻 worker 求解，复用同一次 worker evidence 做 #50 verify 产出 `MarketSolution`，再用只读账户 seam 做最小资金检查产出 `ExecutionSolution`；结果只保存在内存，由 state API 透传给 #85 read model。selected set 的 discovery/refresh 单列为 #87；Predict、指标、ORDER_READY 和订单行为仍不在本 scope。聚焦 live-resolver/scheduler/market-solution/monitor-selection/runtime-graph 回归 66 passed；完整 runtime 套件仍保留基线已有的 5 个 sandbox 相关失败。未部署、未推送。
 
