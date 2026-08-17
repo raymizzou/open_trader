@@ -16,6 +16,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - 修复 `relation-candidates --dry-run` 对生产只读 SQLite 仍走写连接、导致 `readonly database` 的问题：dry-run 改用 `mode=ro` 只读读取 `relation_state`，apply 保持原写路径。聚焦 candidate/relation-catalog/monitor 回归 153 passed；未部署、未推送。
 - 修复 `RelationCatalogV2` 读路径并发竞态：`PredictionLiveResolver` 与 selection driver 同时读共享 SQLite connection 时可能触发 `cannot start a transaction within a transaction`。改为 store 级 `RLock` 串行化 `_state`/`_read`，保持写语义和 schema 不变。聚焦 relation-catalog/monitor-selection/live-resolver/validation 回归 58 passed；未部署、未推送。
 - 修复 `RelationCatalogV2` 在 `COMMIT` 失败时未回滚、留下悬挂事务并污染共享连接的问题：`begin_read` / `_state` / `commit_write` 的 COMMIT 失败现在都会 ROLLBACK 并重抛。聚焦 relation-catalog/v2/sqlite/monitor-selection/live-resolver 回归 87 passed；未部署、未推送。
+- 为 #91 临时恢复 PredictionService/UI：`PredictionRuntime` 增加 `enable_n_leg_background`，`OPEN_TRADER_DISABLE_NLEG_BACKGROUND=1` 时跳过 `PredictionLiveResolver` 和 selection driver 启动；运行时仍可达 RUNNING。这是等待 #91 彻底修复的临时缓解，不改变求解/执行语义。聚焦 runtime/live-resolver/monitor-selection 回归 60 passed；未部署、未推送。
 
 ## 2026-08-16
 
