@@ -1645,13 +1645,19 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.prediction_command == "relation-candidates":
-            from .prediction_arbitrage_store import PredictionArbitrageStore
+            from .prediction_arbitrage_store import (
+                PredictionArbitrageStore,
+                load_relation_state_readonly,
+            )
             from .polymarket_relation_discovery import threshold_relation_from_payload
             from .prediction_relation_candidates import prepare_relation_candidates
             from .relation_catalog import RelationCatalog
 
             try:
-                state = PredictionArbitrageStore(args.data_dir).load_relation_state()
+                if args.dry_run:
+                    state = load_relation_state_readonly(args.data_dir)
+                else:
+                    state = PredictionArbitrageStore(args.data_dir).load_relation_state()
                 payloads = [] if state is None else state.get("relations") or []
                 relations = [
                     threshold_relation_from_payload(payload) for payload in payloads

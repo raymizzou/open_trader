@@ -312,6 +312,18 @@ def read_minimum_reader_generation(data_dir: Path) -> int:
         connection.close()
 
 
+def load_relation_state_readonly(data_dir: Path) -> dict[str, object] | None:
+    path = Path(data_dir) / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        row = connection.execute(
+            "SELECT payload FROM relation_state WHERE singleton=1"
+        ).fetchone()
+    finally:
+        connection.close()
+    return None if row is None else _load_payload(str(row[0]))
+
+
 class PredictionArbitrageStore:
     """Direct sqlite3 persistence with one short-lived connection per action."""
 
