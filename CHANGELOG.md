@@ -15,6 +15,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - #90 新增自动候选准备：full relation scan 后，把 `relation_state` 里的同事件 pairwise IMPLIES 按 contract 连通分量分组，筛选 3..10 contracts 且全部可编译 COMPLETE 的组件，每轮最多自动 ingest 1 个为 PENDING candidate；成功 fingerprint 进入集合避免重复写入，候选准备失败不影响 scan 健康。新增 `relation-candidates --dry-run/--apply` 诊断/执行。不自动 approve/activate。聚焦 candidate/relation-catalog/monitor/selection 回归 172 passed；未部署、未推送。
 - 修复 `relation-candidates --dry-run` 对生产只读 SQLite 仍走写连接、导致 `readonly database` 的问题：dry-run 改用 `mode=ro` 只读读取 `relation_state`，apply 保持原写路径。聚焦 candidate/relation-catalog/monitor 回归 153 passed；未部署、未推送。
 - 修复 `RelationCatalogV2` 读路径并发竞态：`PredictionLiveResolver` 与 selection driver 同时读共享 SQLite connection 时可能触发 `cannot start a transaction within a transaction`。改为 store 级 `RLock` 串行化 `_state`/`_read`，保持写语义和 schema 不变。聚焦 relation-catalog/monitor-selection/live-resolver/validation 回归 58 passed；未部署、未推送。
+- 修复 `RelationCatalogV2` 在 `COMMIT` 失败时未回滚、留下悬挂事务并污染共享连接的问题：`begin_read` / `_state` / `commit_write` 的 COMMIT 失败现在都会 ROLLBACK 并重抛。聚焦 relation-catalog/v2/sqlite/monitor-selection/live-resolver 回归 87 passed；未部署、未推送。
 
 ## 2026-08-16
 

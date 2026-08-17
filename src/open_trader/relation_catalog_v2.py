@@ -182,9 +182,14 @@ class SqliteCatalogStore(MutableMapping):
     def commit_write(self) -> None:
         if self._overlay is None:
             raise RuntimeError("no active write transaction")
-        self._flush(self._overlay)
-        self._conn.execute("COMMIT")
-        self._overlay = None
+        try:
+            self._flush(self._overlay)
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        finally:
+            self._overlay = None
 
     def rollback_write(self) -> None:
         if self._overlay is None:
@@ -199,10 +204,11 @@ class SqliteCatalogStore(MutableMapping):
         self._conn.execute("BEGIN")
         try:
             self._cache = self._load_state()
+            self._conn.execute("COMMIT")
         except BaseException:
+            self._cache = None
             self._conn.execute("ROLLBACK")
             raise
-        self._conn.execute("COMMIT")
 
     def end_read(self) -> None:
         self._cache = None
@@ -218,10 +224,10 @@ class SqliteCatalogStore(MutableMapping):
             self._conn.execute("BEGIN")
             try:
                 state = self._load_state()
+                self._conn.execute("COMMIT")
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
-            self._conn.execute("COMMIT")
             return state
 
     def _load_state(self) -> dict[str, dict]:
