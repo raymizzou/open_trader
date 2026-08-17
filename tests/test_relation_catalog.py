@@ -9,6 +9,7 @@ import pytest
 
 import open_trader.cli as cli
 from open_trader.relation_catalog import RelationCatalog, _threshold_complete_model
+from open_trader.relation_catalog_v2 import SqliteCatalogStore
 from test_prediction_arbitrage import threshold_relation
 
 
@@ -72,6 +73,32 @@ def test_ingest_controlled_accepts_complete_n3_payload_and_stays_pending(
     rows = catalog.review_rows()
     assert len(rows) == 1
     assert rows[0]["model"]["problem"] == PROBLEM
+
+
+def test_list_pending_does_not_reload_catalog_per_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+    for index in range(50):
+        payload = discovery(completeness="INCOMPLETE", n=2)
+        payload["markets"][0]["contract_id"] = f"condition-a-{index}"
+        payload["markets"][1]["contract_id"] = f"condition-b-{index}"
+        catalog.ingest(payload)
+
+    store = catalog._store
+    original_load_state = SqliteCatalogStore._load_state
+    calls: list[object] = []
+
+    def counting_load_state(self: SqliteCatalogStore, conn: object) -> dict:
+        calls.append(conn)
+        return original_load_state(self, conn)
+
+    monkeypatch.setattr(SqliteCatalogStore, "_load_state", counting_load_state)
+
+    rows = catalog.list("pending")
+
+    assert len(rows) == 50
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize(
