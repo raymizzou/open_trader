@@ -2588,7 +2588,8 @@ function predictionCapitalUsage(payload) {
 }
 
 function predictionNLegMetrics(payload) {
-  const metrics = payload?.n_leg_metrics && typeof payload.n_leg_metrics === "object" ? payload.n_leg_metrics : {};
+  const metrics = payload?.n_leg_metrics && typeof payload.n_leg_metrics === "object" ? payload.n_leg_metrics : null;
+  if (!metrics) return "";
   const windowSummary = (name, unit = "ms") => {
     const item = metrics[name] && typeof metrics[name] === "object" ? metrics[name] : {};
     const p50 = predictionHasValue(item.p50) ? `${Number(item.p50).toFixed(0)}` : "-";
@@ -2596,21 +2597,39 @@ function predictionNLegMetrics(payload) {
     const worst = predictionHasValue(item.worst) ? `${Number(item.worst).toFixed(0)}` : "-";
     return `${p50} / ${p95} / ${worst} ${unit}`;
   };
-  const counters = ["queue_merge_drop", "timeout", "stale_reject"];
-  const hasWindow = ["compile", "solve", "end_to_end", "opportunity_survival"].some((name) => metrics[name] && typeof metrics[name] === "object");
-  const hasCounter = counters.some((name) => predictionHasValue(metrics[name]));
-  if (!hasWindow && !hasCounter) return "";
   const survival = metrics.opportunity_survival && typeof metrics.opportunity_survival === "object" ? metrics.opportunity_survival : {};
   const survivalP95 = predictionHasValue(survival.p95) ? `${Number(survival.p95).toFixed(1)}s` : "-";
+  const selectionPending = metrics.selection_pending;
+  const selectionFailures = metrics.selection_failures_consecutive;
+  const hasSelection = predictionHasValue(selectionPending) && predictionHasValue(selectionFailures);
+  const pending = hasSelection ? Number(selectionPending) : 0;
+  const failures = hasSelection ? Number(selectionFailures) : 0;
+  let selectionValue = "- / -";
+  let selectionTone = "";
+  let selectionNote = "数据未返回";
+  if (hasSelection) {
+    selectionValue = `${pending} / ${failures}`;
+    if (failures > 0) {
+      selectionTone = "pm-tone-danger";
+      selectionNote = `连续失败 ${failures} 次`;
+    } else if (pending > 0) {
+      selectionTone = "pm-tone-warning";
+      selectionNote = `${pending} 版待处理`;
+    } else {
+      selectionTone = "pm-tone-ok";
+      selectionNote = "已追上最新 generation";
+    }
+  }
   const cards = [
+    predictionUnifiedMetric("Selection 积压 / 连续失败", escapeHtml(selectionValue), selectionTone, `<small>${escapeHtml(selectionNote)}</small>`),
     predictionUnifiedMetric("编译 p50/p95/worst", escapeHtml(windowSummary("compile"))),
     predictionUnifiedMetric("求解 p50/p95/worst", escapeHtml(windowSummary("solve"))),
     predictionUnifiedMetric("端到端 p50/p95/worst", escapeHtml(windowSummary("end_to_end"))),
-    predictionUnifiedMetric("队列合并 / 丢弃", escapeHtml(predictionValue(metrics.queue_merge_drop, "0")), "", "<small>latest-snapshot-wins</small>"),
-    predictionUnifiedMetric("超时 / 陈旧拒绝", escapeHtml(`${predictionValue(metrics.timeout, "0")} / ${predictionValue(metrics.stale_reject, "0")}`)),
+    predictionUnifiedMetric("队列合并 / 丢弃", escapeHtml(predictionValue(metrics.queue_merge_drop, "-")), "", "<small>latest-snapshot-wins</small>"),
+    predictionUnifiedMetric("超时 / 陈旧拒绝", escapeHtml(`${predictionValue(metrics.timeout, "-")} / ${predictionValue(metrics.stale_reject, "-")}`)),
     predictionUnifiedMetric("机会存活时间", escapeHtml(`p95 ${survivalP95}`), "", "<small>内存 / 线程 / 队列有界</small>"),
   ].join("");
-  return `<section class="pm-metrics pm-n-leg-overview" aria-label="N_LEG 性能指标">${cards}</section>`;
+  return `<section class="pm-metrics pm-n-leg-metrics-overview" aria-label="N_LEG 性能指标">${cards}</section>`;
 }
 
 const PREDICTION_RELATION_REVIEW_STATES = {

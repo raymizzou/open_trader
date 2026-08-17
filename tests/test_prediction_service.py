@@ -539,6 +539,7 @@ def test_shadow_state_and_history_use_the_shared_read_model() -> None:
         execution=runtime.execution,
         csrf_token="",
         cross_venue_monitor=runtime.cross_venue_monitor,
+        n_leg_metrics={},
     )
     expected_history = prediction_history_payload(
         runtime.store,

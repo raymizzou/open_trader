@@ -390,6 +390,9 @@ def create_prediction_server(
                         n_leg_solutions=getattr(
                             runtime, "n_leg_solutions", lambda: []
                         )(),
+                        n_leg_metrics=getattr(
+                            runtime, "n_leg_metrics", lambda: {}
+                        )(),
                     ),
                     set_session=mode == "production",
                 )

@@ -6057,6 +6057,7 @@ table {
 .pm-opportunity { border-left: 4px solid var(--success); display: grid; gap: 12px; }
 .pm-opportunity.disabled { border-left-color: var(--line); }
 .pm-n-leg-overview { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.pm-n-leg-metrics-overview { grid-template-columns: repeat(7, minmax(0, 1fr)); }
 .pm-n-leg-shadow { background: #f2eee7; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); padding: 0 10px; }
 .pm-n-leg-shadow.warning { background: #fff4db; border-color: #d7a037; }
 .pm-n-leg-shadow.danger { background: #fff0ec; border-color: #bf5a48; }

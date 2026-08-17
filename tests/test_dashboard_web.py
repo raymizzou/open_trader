@@ -3503,6 +3503,31 @@ console.log(JSON.stringify(html));
     assert "p95 8.2s" in rendered
 
 
+def test_prediction_n_leg_metrics_selection_card_states() -> None:
+    output = run_dashboard_js(r'''
+const cases = {
+  ok: predictionNLegMetrics({n_leg_metrics: {selection_pending: 0, selection_failures_consecutive: 0}}),
+  warning: predictionNLegMetrics({n_leg_metrics: {selection_pending: 3, selection_failures_consecutive: 0}}),
+  danger: predictionNLegMetrics({n_leg_metrics: {selection_pending: 3, selection_failures_consecutive: 2}}),
+  missing: predictionNLegMetrics({n_leg_metrics: {}}),
+};
+console.log(JSON.stringify(cases));
+''')
+    rendered = json.loads(output)
+
+    assert "0 / 0" in rendered["ok"]
+    assert "pm-tone-ok" in rendered["ok"]
+    assert "已追上最新 generation" in rendered["ok"]
+    assert "3 / 0" in rendered["warning"]
+    assert "pm-tone-warning" in rendered["warning"]
+    assert "3 版待处理" in rendered["warning"]
+    assert "3 / 2" in rendered["danger"]
+    assert "pm-tone-danger" in rendered["danger"]
+    assert "连续失败 2 次" in rendered["danger"]
+    assert "- / -" in rendered["missing"]
+    assert "数据未返回" in rendered["missing"]
+
+
 def test_prediction_relation_review_renders_six_states_and_blocked_conflicts() -> None:
     output = run_dashboard_js(r'''
 const payload = {relation_review: {
