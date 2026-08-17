@@ -65,6 +65,15 @@ _THRESHOLD_ERROR_HINTS = {
     "preflight_required": "提交前预检未通过",
     "preflight_failed": "提交前预检未通过",
     "rejected": "订单被交易场所拒绝",
+    "order_amount_mismatch": "下单数量与预期不一致",
+    "order_shape_mismatch": "签名订单结构与预期不一致",
+    "account_insufficient": "账户余额或授权额度不足",
+    "invalid": "订单参数校验失败",
+    "network": "网络请求失败",
+    "timeout": "请求超时",
+    "unavailable": "服务不可用",
+    "sdk_error": "SDK 调用失败",
+    "signing": "订单签名失败",
     "opportunity_unavailable": "机会已失效或不可用",
     "rule_hash_changed": "规则指纹已变化，机会不再一致",
     "cache_fingerprint_changed": "市场快照指纹已变化",
@@ -470,7 +479,11 @@ class PredictionExecutionService:
         except Exception:
             preflight_result = None
         if not self._preflight_passed(preflight_result):
-            return {"state": "failed", "reason": "preflight_failed"}
+            return {
+                "state": "failed",
+                "reason": self._preflight_error_code(preflight_result)
+                or "preflight_failed",
+            }
 
         final = self._fresh_opportunity(str(opportunity_id))
         final_intent = self._intent_from_opportunity(final)
@@ -2360,7 +2373,10 @@ class PredictionExecutionService:
             if callable(preflight):
                 result = _call(preflight, intent, tick_size=tick_size)
                 if not self._preflight_passed(result):
-                    self._finish_rejected(execution_id, "preflight_failed")
+                    self._finish_rejected(
+                        execution_id,
+                        self._preflight_error_code(result) or "preflight_failed",
+                    )
                     return
             submit = getattr(self._trading, "submit_pair_once", None)
             try:
@@ -3709,7 +3725,10 @@ class PredictionExecutionService:
         except Exception:
             result = None
         if not self._preflight_passed(result):
-            self._finish_rejected(execution_id, "preflight_failed")
+            self._finish_rejected(
+                execution_id,
+                self._preflight_error_code(result) or "preflight_failed",
+            )
             return
         submit = getattr(self._trading, "submit_threshold_hedge_once", None)
         if not callable(submit):
@@ -5734,6 +5753,15 @@ class PredictionExecutionService:
         if not isinstance(value, Mapping):
             return value is True or getattr(value, "accepted", False) is True
         return value.get("result") in ("PASS", "pass", True)
+
+    @staticmethod
+    def _preflight_error_code(value: object) -> str:
+        code = (
+            value.get("error_code")
+            if isinstance(value, Mapping)
+            else getattr(value, "error_code", "")
+        )
+        return str(code).strip() if code else ""
 
     @staticmethod
     def _result_status(value: object) -> str:

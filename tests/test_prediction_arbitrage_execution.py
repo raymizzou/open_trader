@@ -4192,8 +4192,32 @@ def test_threshold_execution_notifies_whole_order_failure(tmp_path: Path) -> Non
     service, trading, store, _ = threshold_execution_fixture(tmp_path)
     store.set_validation_mode("auto")
     trading.threshold_preflight_result = {
-        "result": "BLOCKED", "error_code": "preflight_failed",
+        "result": "BLOCKED", "error_code": "order_amount_mismatch",
     }
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+
+    assert result["state"] == "validating" or result.get("execution_id")
+    assert trading.threshold_submit_calls == 0
+    _macos, feishu = service.test_notifiers  # type: ignore[attr-defined]
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not any(
+        title == "预测套利单提交失败" for title, _ in feishu.messages
+    ):
+        time.sleep(0.05)
+    assert any(
+        title == "预测套利单提交失败"
+        and "order_amount_mismatch" in message
+        and "下单数量与预期不一致" in message
+        for title, message in feishu.messages
+    )
+
+
+def test_threshold_preflight_failure_falls_back_to_generic_reason(tmp_path: Path) -> None:
+    service, trading, store, _ = threshold_execution_fixture(tmp_path)
+    store.set_validation_mode("auto")
+    trading.threshold_preflight_result = {"result": "BLOCKED"}
     signal_id = _notification_signal(store)
 
     result = service.auto_eat_threshold("threshold-opp-1", signal_id)
@@ -4209,6 +4233,23 @@ def test_threshold_execution_notifies_whole_order_failure(tmp_path: Path) -> Non
     assert any(
         title == "预测套利单提交失败" and "preflight_failed" in message
         for title, message in feishu.messages
+    )
+
+
+def test_preflight_error_code_extracts_from_mapping_object_and_missing() -> None:
+    assert PredictionExecutionService._preflight_error_code(None) == ""
+    assert (
+        PredictionExecutionService._preflight_error_code({"error_code": "network"})
+        == "network"
+    )
+    assert (
+        PredictionExecutionService._preflight_error_code(
+            SimpleNamespace(error_code="timeout")
+        )
+        == "timeout"
+    )
+    assert (
+        PredictionExecutionService._preflight_error_code({"result": "BLOCKED"}) == ""
     )
 
 
