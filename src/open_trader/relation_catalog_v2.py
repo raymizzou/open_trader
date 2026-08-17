@@ -99,19 +99,28 @@ class SqliteCatalogStore(MutableMapping):
     })
 
     def __init__(self, db_path: str | os.PathLike[str]) -> None:
-        # Callers are serialized by RelationCatalogV2's lock, so one connection
-        # may be shared across threads (pooled readers/writers in tests).
-        self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        self._conn.isolation_level = None  # manual transactions
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        self._create_tables()
-        self._overlay: dict[str, dict] | None = None
-        self._cache: dict[str, dict] | None = None
+        self._path = str(db_path)
+        self._local = threading.local()
+        conn = sqlite3.connect(self._path, check_same_thread=False)
+        try:
+            conn.isolation_level = None  # manual transactions
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            self._create_tables(conn)
+        finally:
+            conn.close()
 
-    def _create_tables(self) -> None:
-        self._conn.executescript(
+    def _connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "connection", None)
+        if conn is None:
+            conn = sqlite3.connect(self._path, check_same_thread=False)
+            conn.isolation_level = None  # manual transactions
+            conn.execute("PRAGMA busy_timeout=5000")
+            self._local.connection = conn
+        return conn
+
+    def _create_tables(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS catalog_v2_versions (
                 version_id TEXT PRIMARY KEY,
@@ -160,7 +169,7 @@ class SqliteCatalogStore(MutableMapping):
         # metadata columns; keep additive so old data stays readable.
         for column in ("activation_status TEXT", "activation_diagnostic TEXT"):
             try:
-                self._conn.execute(
+                conn.execute(
                     f"ALTER TABLE catalog_v2_versions ADD COLUMN {column}"
                 )
             except sqlite3.OperationalError:
@@ -169,74 +178,83 @@ class SqliteCatalogStore(MutableMapping):
     # -- transactions ------------------------------------------------------
 
     def begin_write(self) -> None:
-        if self._overlay is not None:
+        if getattr(self._local, "overlay", None) is not None:
             raise RuntimeError("nested write transaction")
-        self._conn.execute("BEGIN IMMEDIATE")
+        conn = self._connection()
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            self._overlay = self._load_state()
+            self._local.overlay = self._load_state(conn)
         except BaseException:
-            self._conn.execute("ROLLBACK")
+            conn.execute("ROLLBACK")
             raise
-        self._cache = None
+        self._local.cache = None
 
     def commit_write(self) -> None:
-        if self._overlay is None:
+        overlay = getattr(self._local, "overlay", None)
+        if overlay is None:
             raise RuntimeError("no active write transaction")
+        conn = self._connection()
         try:
-            self._flush(self._overlay)
-            self._conn.execute("COMMIT")
+            self._flush(overlay, conn)
+            conn.execute("COMMIT")
         except BaseException:
-            self._conn.execute("ROLLBACK")
+            conn.execute("ROLLBACK")
             raise
         finally:
-            self._overlay = None
+            self._local.overlay = None
 
     def rollback_write(self) -> None:
-        if self._overlay is None:
+        if getattr(self._local, "overlay", None) is None:
             return
-        self._conn.execute("ROLLBACK")
-        self._overlay = None
-        self._cache = None
+        self._connection().execute("ROLLBACK")
+        self._local.overlay = None
+        self._local.cache = None
 
     def begin_read(self) -> None:
-        if self._overlay is not None or self._cache is not None:
+        if (
+            getattr(self._local, "overlay", None) is not None
+            or getattr(self._local, "cache", None) is not None
+        ):
             return
-        self._conn.execute("BEGIN")
+        conn = self._connection()
+        conn.execute("BEGIN")
         try:
-            self._cache = self._load_state()
-            self._conn.execute("COMMIT")
+            self._local.cache = self._load_state(conn)
+            conn.execute("COMMIT")
         except BaseException:
-            self._cache = None
-            self._conn.execute("ROLLBACK")
+            self._local.cache = None
+            conn.execute("ROLLBACK")
             raise
 
     def end_read(self) -> None:
-        self._cache = None
+        self._local.cache = None
 
     # -- state materialization --------------------------------------------
 
     def _state(self) -> dict[str, dict]:
-        with self._lock:
-            if self._overlay is not None:
-                return self._overlay
-            if self._cache is not None:
-                return self._cache
-            self._conn.execute("BEGIN")
-            try:
-                state = self._load_state()
-                self._conn.execute("COMMIT")
-            except BaseException:
-                self._conn.execute("ROLLBACK")
-                raise
-            return state
+        overlay = getattr(self._local, "overlay", None)
+        if overlay is not None:
+            return overlay
+        cache = getattr(self._local, "cache", None)
+        if cache is not None:
+            return cache
+        conn = self._connection()
+        conn.execute("BEGIN")
+        try:
+            state = self._load_state(conn)
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        return state
 
-    def _load_state(self) -> dict[str, dict]:
-        row = self._conn.execute(
+    def _load_state(self, conn: sqlite3.Connection) -> dict[str, dict]:
+        row = conn.execute(
             "SELECT members FROM catalog_v2_generations ORDER BY generation_id DESC LIMIT 1"
         ).fetchone()
         generation: dict[str, dict] = json.loads(row[0]) if row else {}
         versions: dict[str, dict] = {}
-        for version_id, identity, version_fp, payload, status, occurrence_count, activation_status, activation_diagnostic, meta in self._conn.execute(
+        for version_id, identity, version_fp, payload, status, occurrence_count, activation_status, activation_diagnostic, meta in conn.execute(
             "SELECT version_id, identity, version_fp, payload, status, occurrence_count, activation_status, activation_diagnostic, meta "
             "FROM catalog_v2_versions"
         ):
@@ -253,7 +271,7 @@ class SqliteCatalogStore(MutableMapping):
             if activation_diagnostic is not None:
                 versions[version_id]["activation_diagnostic"] = activation_diagnostic
         approved: dict[str, dict] = {}
-        for identity, version_id, approved_fingerprint, actor, git_sha in self._conn.execute(
+        for identity, version_id, approved_fingerprint, actor, git_sha in conn.execute(
             "SELECT identity, version_id, approved_fingerprint, actor, git_sha FROM catalog_v2_approvals"
         ):
             approved[identity] = {
@@ -263,16 +281,16 @@ class SqliteCatalogStore(MutableMapping):
                 "git_sha": git_sha,
             }
         causes: dict[tuple[str, str, str], bool] = {}
-        for identity, producer, scope in self._conn.execute(
+        for identity, producer, scope in conn.execute(
             "SELECT identity, producer, scope FROM catalog_v2_causes"
         ):
             causes[(identity, producer, scope)] = True
         latest: dict[str, str] = {}
-        for identity, version_id in self._conn.execute(
+        for identity, version_id in conn.execute(
             "SELECT identity, version_id FROM catalog_v2_latest"
         ):
             latest[identity] = version_id
-        meta_row = self._conn.execute(
+        meta_row = conn.execute(
             "SELECT generation_number FROM catalog_v2_meta WHERE singleton=1"
         ).fetchone()
         generation_number = int(meta_row[0]) if meta_row else 0
@@ -285,7 +303,7 @@ class SqliteCatalogStore(MutableMapping):
             "generation_number": generation_number,
         }
 
-    def _flush(self, state: dict[str, dict]) -> None:
+    def _flush(self, state: dict[str, dict], conn: sqlite3.Connection) -> None:
         now = _now()
         versions, approved, generation, causes, latest, generation_number = (
             state["versions"],
@@ -295,10 +313,10 @@ class SqliteCatalogStore(MutableMapping):
             state.get("latest", {}),
             int(state.get("generation_number", 0)),
         )
-        self._conn.execute("DELETE FROM catalog_v2_versions")
+        conn.execute("DELETE FROM catalog_v2_versions")
         for version_id, record in versions.items():
             meta = {k: v for k, v in record.items() if k not in self._VERSION_COLUMNS}
-            self._conn.execute(
+            conn.execute(
                 "INSERT INTO catalog_v2_versions "
                 "(version_id, identity, version_fp, payload, status, occurrence_count, activation_status, activation_diagnostic, created_at, updated_at, meta) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -316,9 +334,9 @@ class SqliteCatalogStore(MutableMapping):
                     json.dumps(meta, sort_keys=True, default=str),
                 ),
             )
-        self._conn.execute("DELETE FROM catalog_v2_approvals")
+        conn.execute("DELETE FROM catalog_v2_approvals")
         for identity, record in approved.items():
-            self._conn.execute(
+            conn.execute(
                 "INSERT INTO catalog_v2_approvals "
                 "(identity, version_id, approved_fingerprint, actor, git_sha, approved_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
@@ -331,23 +349,23 @@ class SqliteCatalogStore(MutableMapping):
                     now,
                 ),
             )
-        self._conn.execute("DELETE FROM catalog_v2_causes")
+        conn.execute("DELETE FROM catalog_v2_causes")
         for (identity, producer, scope), _ in causes.items():
-            self._conn.execute(
+            conn.execute(
                 "INSERT INTO catalog_v2_causes (identity, producer, scope, created_at) VALUES (?, ?, ?, ?)",
                 (identity, producer, scope, now),
             )
-        self._conn.execute("DELETE FROM catalog_v2_latest")
+        conn.execute("DELETE FROM catalog_v2_latest")
         for identity, version_id in latest.items():
-            self._conn.execute(
+            conn.execute(
                 "INSERT INTO catalog_v2_latest (identity, version_id) VALUES (?, ?)",
                 (identity, version_id),
             )
-        self._conn.execute(
+        conn.execute(
             "INSERT INTO catalog_v2_generations (members, created_at) VALUES (?, ?)",
             (json.dumps(generation, sort_keys=True), now),
         )
-        self._conn.execute(
+        conn.execute(
             "INSERT INTO catalog_v2_meta (singleton, generation_number) VALUES (1, ?) "
             "ON CONFLICT(singleton) DO UPDATE SET generation_number=excluded.generation_number",
             (generation_number,),
@@ -359,14 +377,14 @@ class SqliteCatalogStore(MutableMapping):
         return self._state()[key]
 
     def __setitem__(self, key: str, value: object) -> None:
-        if self._overlay is None:
+        if getattr(self._local, "overlay", None) is None:
             raise RuntimeError("writes require a write transaction")
-        self._overlay[key] = value  # type: ignore[assignment]
+        self._local.overlay[key] = value  # type: ignore[index]
 
     def __delitem__(self, key: str) -> None:
-        if self._overlay is None:
+        if getattr(self._local, "overlay", None) is None:
             raise RuntimeError("writes require a write transaction")
-        del self._overlay[key]
+        del self._local.overlay[key]
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._state())
@@ -378,15 +396,12 @@ class SqliteCatalogStore(MutableMapping):
 class RelationCatalogV2:
     """In-memory v2 relation catalog.
 
-    The optional ``store`` is a persistence seam (dict in tests, SQLite later).
-    A single lock protects all mutations and the current_generation snapshot.
+    The optional ``store`` is a persistence seam (dict in tests, SQLite later);
+    SQLite stores provide thread-local transaction isolation.
     """
 
     def __init__(self, store: MutableMapping | None = None) -> None:
         self.store: MutableMapping = store if store is not None else {}
-        self._lock = getattr(self.store, "_lock", None)
-        if self._lock is None:
-            self._lock = threading.RLock()  # ponytail: global lock; shard if throughput matters
 
     @contextmanager
     def _write(self) -> Iterator[None]:
@@ -414,61 +429,58 @@ class RelationCatalogV2:
         if begin is None:
             yield
             return
-        with self._lock:
-            begin()
-            try:
-                yield
-            finally:
-                self.store.end_read()
+        begin()
+        try:
+            yield
+        finally:
+            self.store.end_read()
 
     # -- mutations ---------------------------------------------------------
 
     def ingest(self, payload: object) -> dict:
-        with self._lock:
-            with self._write():
-                identity, version_fields = _canonicalize(payload)
-                version_fp = _fp(version_fields)
-                version_id = "v-" + _fp({"identity": identity, "fingerprint": version_fp})
-                versions = self.store.setdefault("versions", {})
-                if version_id in versions:
-                    versions[version_id]["occurrence_count"] += 1
-                    status = versions[version_id]["status"]
-                else:
-                    versions[version_id] = {
-                        "payload": payload,
-                        "identity": identity,
-                        "version_fp": version_fp,
-                        "status": "PENDING",
-                        "occurrence_count": 1,
-                    }
-                    self.store.setdefault("latest", {})[identity] = version_id
-                    status = "PENDING"
-                return {
+        with self._write():
+            identity, version_fields = _canonicalize(payload)
+            version_fp = _fp(version_fields)
+            version_id = "v-" + _fp({"identity": identity, "fingerprint": version_fp})
+            versions = self.store.setdefault("versions", {})
+            if version_id in versions:
+                versions[version_id]["occurrence_count"] += 1
+                status = versions[version_id]["status"]
+            else:
+                versions[version_id] = {
+                    "payload": payload,
                     "identity": identity,
-                    "version_id": version_id,
-                    "status": status,
-                    "occurrence_count": versions[version_id]["occurrence_count"],
+                    "version_fp": version_fp,
+                    "status": "PENDING",
+                    "occurrence_count": 1,
                 }
+                self.store.setdefault("latest", {})[identity] = version_id
+                status = "PENDING"
+            return {
+                "identity": identity,
+                "version_id": version_id,
+                "status": status,
+                "occurrence_count": versions[version_id]["occurrence_count"],
+            }
 
     def approve(self, version_id: str, *, actor: str, git_sha: str) -> dict:
-        with self._lock:
-            with self._write():
-                versions = self.store.setdefault("versions", {})
-                if version_id not in versions:
-                    raise ValueError(f"unknown version: {version_id}")
-                identity, version_fields = _canonicalize(versions[version_id]["payload"])
-                self.store.setdefault("approved", {})[identity] = {
-                    "version_id": version_id,
-                    "actor": actor,
-                    "git_sha": git_sha,
-                    "approved_fingerprints": _fingerprints(version_fields),
-                }
-                versions[version_id]["status"] = "APPROVED"
-                self.store.setdefault("generation", {})[identity] = {
-                    "version_id": version_id,
-                    "status": "ACTIVE",
-                }
-                return {"version_id": version_id, "identity": identity, "status": "APPROVED"}
+        with self._write():
+            versions = self.store.setdefault("versions", {})
+            if version_id not in versions:
+                raise ValueError(f"unknown version: {version_id}")
+            identity, version_fields = _canonicalize(versions[version_id]["payload"])
+            self.store.setdefault("approved", {})[identity] = {
+                "version_id": version_id,
+                "actor": actor,
+                "git_sha": git_sha,
+                "approved_fingerprints": _fingerprints(version_fields),
+            }
+            versions[version_id]["status"] = "APPROVED"
+            self.store.setdefault("generation", {})[identity] = {
+                "version_id": version_id,
+                "status": "ACTIVE",
+            }
+            return {"version_id": version_id, "identity": identity, "status": "APPROVED"}
 
     def reject(
         self,
@@ -479,123 +491,117 @@ class RelationCatalogV2:
         git_sha: str,
         note: str = "",
     ) -> dict:
-        with self._lock:
-            with self._write():
-                versions = self.store.setdefault("versions", {})
-                if version_id not in versions:
-                    raise ValueError(f"unknown version: {version_id}")
-                versions[version_id]["status"] = "REJECTED"
-                versions[version_id]["reject_reason"] = reason
-                versions[version_id]["reject_note"] = note
-                return {"version_id": version_id, "status": "REJECTED"}
+        with self._write():
+            versions = self.store.setdefault("versions", {})
+            if version_id not in versions:
+                raise ValueError(f"unknown version: {version_id}")
+            versions[version_id]["status"] = "REJECTED"
+            versions[version_id]["reject_reason"] = reason
+            versions[version_id]["reject_note"] = note
+            return {"version_id": version_id, "status": "REJECTED"}
 
     def revoke(self, version_id: str, *, actor: str, git_sha: str) -> dict:
-        with self._lock:
-            with self._write():
-                versions = self.store.setdefault("versions", {})
-                if version_id not in versions:
-                    raise ValueError(f"unknown version: {version_id}")
-                identity = versions[version_id]["identity"]
-                self.store.setdefault("causes", {})[(identity, "revoked", version_id)] = True
-                return {"version_id": version_id, "identity": identity, "status": "UNKNOWN"}
+        with self._write():
+            versions = self.store.setdefault("versions", {})
+            if version_id not in versions:
+                raise ValueError(f"unknown version: {version_id}")
+            identity = versions[version_id]["identity"]
+            self.store.setdefault("causes", {})[(identity, "revoked", version_id)] = True
+            return {"version_id": version_id, "identity": identity, "status": "UNKNOWN"}
 
     def replace(self, change_set: list, *, actor: str, git_sha: str) -> dict:
-        with self._lock:
-            with self._write():
-                self._generation()  # fail closed on any tampered active payload
-                versions = self.store.setdefault("versions", {})
-                entries: list[tuple[str, str, dict]] = []
-                for payload in change_set:
-                    identity, version_fields = _canonicalize(payload)
-                    version_fp = _fp(version_fields)
-                    version_id = "v-" + _fp({"identity": identity, "fingerprint": version_fp})
-                    if version_id not in versions:
-                        versions[version_id] = {
-                            "payload": payload,
-                            "identity": identity,
-                            "version_fp": version_fp,
-                            "status": "PENDING",
-                            "occurrence_count": 1,
-                        }
-                    entries.append((identity, version_id, version_fields))
-
-                new_generation: dict[str, dict] = {}
-                blocked: list[dict[str, str]] = []
-                inconsistent = False
-                for component in _relation_groups(entries):
-                    contracts = {
-                        contract
-                        for entry in component
-                        for contract in _entry_contracts(entry)
+        with self._write():
+            self._generation()  # fail closed on any tampered active payload
+            versions = self.store.setdefault("versions", {})
+            entries: list[tuple[str, str, dict]] = []
+            for payload in change_set:
+                identity, version_fields = _canonicalize(payload)
+                version_fp = _fp(version_fields)
+                version_id = "v-" + _fp({"identity": identity, "fingerprint": version_fp})
+                if version_id not in versions:
+                    versions[version_id] = {
+                        "payload": payload,
+                        "identity": identity,
+                        "version_fp": version_fp,
+                        "status": "PENDING",
+                        "occurrence_count": 1,
                     }
-                    if len(contracts) > GROUP_BUDGET:
-                        blocked.extend(
-                            {"identity": identity, "reason": "UNSUPPORTED_SIZE"}
-                            for identity, _, _ in component
-                        )
-                        continue
-                    if not _satisfiable(component):
-                        inconsistent = True
-                        blocked.extend(
-                            {"identity": identity, "reason": "ACTIVATION_BLOCKED_INCONSISTENT"}
-                            for identity, _, _ in component
-                        )
-                        continue
-                    approved = self.store.setdefault("approved", {})
-                    for identity, version_id, version_fields in component:
-                        approved[identity] = {
-                            "version_id": version_id,
-                            "actor": actor,
-                            "git_sha": git_sha,
-                            "approved_fingerprints": _fingerprints(version_fields),
-                        }
-                        versions[version_id]["status"] = "APPROVED"
-                        new_generation[identity] = {"version_id": version_id, "status": "ACTIVE"}
-                self.store["generation"] = new_generation
-                return {
-                    "status": "ACTIVATION_BLOCKED_INCONSISTENT" if inconsistent else "ACTIVE",
-                    "blocked": blocked,
+                entries.append((identity, version_id, version_fields))
+
+            new_generation: dict[str, dict] = {}
+            blocked: list[dict[str, str]] = []
+            inconsistent = False
+            for component in _relation_groups(entries):
+                contracts = {
+                    contract
+                    for entry in component
+                    for contract in _entry_contracts(entry)
                 }
+                if len(contracts) > GROUP_BUDGET:
+                    blocked.extend(
+                        {"identity": identity, "reason": "UNSUPPORTED_SIZE"}
+                        for identity, _, _ in component
+                    )
+                    continue
+                if not _satisfiable(component):
+                    inconsistent = True
+                    blocked.extend(
+                        {"identity": identity, "reason": "ACTIVATION_BLOCKED_INCONSISTENT"}
+                        for identity, _, _ in component
+                    )
+                    continue
+                approved = self.store.setdefault("approved", {})
+                for identity, version_id, version_fields in component:
+                    approved[identity] = {
+                        "version_id": version_id,
+                        "actor": actor,
+                        "git_sha": git_sha,
+                        "approved_fingerprints": _fingerprints(version_fields),
+                    }
+                    versions[version_id]["status"] = "APPROVED"
+                    new_generation[identity] = {"version_id": version_id, "status": "ACTIVE"}
+            self.store["generation"] = new_generation
+            return {
+                "status": "ACTIVATION_BLOCKED_INCONSISTENT" if inconsistent else "ACTIVE",
+                "blocked": blocked,
+            }
 
     def authoritative_reconcile(
         self, producer: str, scope: str, complete_facts: list
     ) -> dict:
         # ponytail: producer/scope labels are recorded but not enforced (payload has no producer/scope field); enforce when #52 adds a second producer.
-        with self._lock:
-            with self._write():
-                causes = self.store.setdefault("causes", {})
-                known: set[str] = set()
-                for fact in complete_facts:
-                    try:
-                        known.add(_canonicalize(fact)[0])
-                    except ValueError:
-                        continue  # incomplete/invalid facts cannot clear a cause
-                for identity in list(self.store.get("generation", {})):
-                    key = (identity, producer, scope)
-                    if identity in known:
-                        causes.pop(key, None)
-                    else:
-                        causes[key] = True
-                return {"reconciled": f"{producer}:{scope}"}
+        with self._write():
+            causes = self.store.setdefault("causes", {})
+            known: set[str] = set()
+            for fact in complete_facts:
+                try:
+                    known.add(_canonicalize(fact)[0])
+                except ValueError:
+                    continue  # incomplete/invalid facts cannot clear a cause
+            for identity in list(self.store.get("generation", {})):
+                key = (identity, producer, scope)
+                if identity in known:
+                    causes.pop(key, None)
+                else:
+                    causes[key] = True
+            return {"reconciled": f"{producer}:{scope}"}
 
     # -- reads -------------------------------------------------------------
 
     def current_generation(self) -> dict[str, dict]:
-        with self._lock:
-            return self._generation()
+        return self._generation()
 
     def admit(self, producer_facts: object) -> bool:
-        with self._lock:
-            try:
-                identity = _canonicalize(producer_facts)[0]
-                entry = self._generation().get(identity)
-                if entry is None or entry["status"] != "ACTIVE":
-                    return False
-                frozen = self.store["approved"][identity]
-                _, version_fields = _canonicalize(producer_facts)
-                return _fingerprints(version_fields) == frozen["approved_fingerprints"]
-            except (KeyError, TypeError, ValueError):
+        try:
+            identity = _canonicalize(producer_facts)[0]
+            entry = self._generation().get(identity)
+            if entry is None or entry["status"] != "ACTIVE":
                 return False
+            frozen = self.store["approved"][identity]
+            _, version_fields = _canonicalize(producer_facts)
+            return _fingerprints(version_fields) == frozen["approved_fingerprints"]
+        except (KeyError, TypeError, ValueError):
+            return False
 
     # -- internals ---------------------------------------------------------
 
