@@ -288,6 +288,48 @@ def test_cli_relation_ingest_validation_failure(
     assert "error:" in capsys.readouterr().err
 
 
+def test_cli_catalog_dedup_dry_run_and_apply(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    catalog = RelationCatalog(tmp_path / "data")
+    base = threshold_relation()
+    first_id = catalog.ingest_threshold_relation(base)["version_id"]
+    second_id = catalog.ingest_threshold_relation(drifted_question(base))["version_id"]
+
+    code = cli.main([
+        "prediction-arb",
+        "catalog-dedup",
+        "--dry-run",
+        "--data-dir",
+        str(tmp_path / "data"),
+    ])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "duplicates: 1" in out
+    assert first_id in out
+    assert second_id in out
+    assert catalog.pending_count() == 2  # dry-run leaves rows untouched
+
+    code = cli.main([
+        "prediction-arb",
+        "catalog-dedup",
+        "--apply",
+        "--data-dir",
+        str(tmp_path / "data"),
+    ])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "applied: 1" in out
+
+    # An externally-run CLI write is visible to a freshly opened catalog; the
+    # pre-existing handle keeps its thread-local read cache by design (#91).
+    reopened = RelationCatalog(tmp_path / "data")
+    assert reopened.pending_count() == 1
+    rows = {row["version_id"]: row for row in reopened.review_rows()}
+    assert rows[first_id]["status"] == "REJECTED"
+    assert rows[second_id]["status"] == "PENDING"
+
+
 def test_cli_catalog_cleanup_dry_run(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:

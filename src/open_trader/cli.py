@@ -1163,6 +1163,18 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_mode.add_argument("--apply", action="store_true")
     prediction_catalog_cleanup.add_argument("--data-dir", type=Path, default=Path("data"))
 
+    prediction_catalog_dedup = prediction_commands.add_parser(
+        "catalog-dedup", help="Reject duplicate COMPLETE PENDING relation versions"
+    )
+    dedup_mode = prediction_catalog_dedup.add_mutually_exclusive_group(required=True)
+    dedup_mode.add_argument("--dry-run", action="store_true")
+    dedup_mode.add_argument("--apply", action="store_true")
+    prediction_catalog_dedup.add_argument(
+        "--limit", type=positive_int, default=200,
+        help="Max duplicate versions rejected per apply run",
+    )
+    prediction_catalog_dedup.add_argument("--data-dir", type=Path, default=Path("data"))
+
     prediction_relation_candidates = prediction_commands.add_parser(
         "relation-candidates",
         help="Auto-prepare connected threshold IMPLIES candidates",
@@ -1642,6 +1654,26 @@ def main(argv: list[str] | None = None) -> int:
             for row in result["rejected"]:
                 print(f"{row['version_id']} {row['identity']} {row['status']}")
             print(f"applied: {result['applied']}")
+            return 0
+
+        if args.prediction_command == "catalog-dedup":
+            from .relation_catalog import RelationCatalog
+
+            catalog = RelationCatalog(args.data_dir)
+            dry_run = bool(args.dry_run)
+            result = catalog.dedup_complete_pending(
+                actor="cli", git_sha="", dry_run=dry_run, limit=args.limit
+            )
+            if dry_run:
+                for match in result:
+                    rejected = " ".join(str(item) for item in match["reject_version_ids"])
+                    print(f"{match['identity']} kept {match['kept_version_id']} reject {rejected}")
+                print(f"duplicates: {len(result)}")
+                return 0
+            for row in result["rejected"]:
+                print(f"{row['version_id']} {row['identity']} {row['status']}")
+            print(f"applied: {result['applied']}")
+            print(f"remaining: {result['remaining']}")
             return 0
 
         if args.prediction_command == "relation-candidates":
