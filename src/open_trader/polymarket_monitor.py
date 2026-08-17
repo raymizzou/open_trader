@@ -376,7 +376,6 @@ class PolymarketMonitor:
         self._catalog_counts: dict[str, object] = {}
         self._catalog_last_full_run: dict[str, object] | None = None
         self._catalog_last_event_run: dict[str, object] | None = None
-        self._prepared_candidate_fps: set[str] = set()
         self._activity_scan_due_at: datetime | None = None
         self._activity_next_scan_at: datetime | None = None
         self._activity_scan_started_at: datetime | None = None
@@ -1761,12 +1760,7 @@ class PolymarketMonitor:
                         self._relation_catalog,
                         relations,
                         max_components=1,
-                        prepared_fingerprints=self._prepared_candidate_fps,
                     )
-                    if candidate_report.get("status") == "PREPARED":
-                        fingerprint = candidate_report.get("fingerprint")
-                        if fingerprint is not None:
-                            self._prepared_candidate_fps.add(str(fingerprint))
                     self._log_relation_scan(
                         phase="candidate_prepared",
                         status=str(candidate_report.get("status")),

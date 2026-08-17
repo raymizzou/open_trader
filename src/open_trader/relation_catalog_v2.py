@@ -230,6 +230,14 @@ class SqliteCatalogStore(MutableMapping):
     def end_read(self) -> None:
         self._local.cache = None
 
+    def prepared_identities(self) -> set[str]:
+        """Identities holding PENDING/APPROVED versions, without loading payloads."""
+        rows = self._connection().execute(
+            "SELECT DISTINCT identity FROM catalog_v2_versions "
+            "WHERE status IN ('PENDING', 'APPROVED')"
+        ).fetchall()
+        return {str(row[0]) for row in rows}
+
     # -- state materialization --------------------------------------------
 
     def _state(self) -> dict[str, dict]:

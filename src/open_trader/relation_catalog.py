@@ -286,6 +286,31 @@ def _threshold_complete_model(relation: object) -> dict[str, object] | None:
     }
 
 
+def _threshold_discovery_payload(
+    relation: object, model: dict[str, object]
+) -> dict[str, object]:
+    """One deterministic Polymarket threshold relation as a v1 discovery payload."""
+    def market(value: object) -> dict[str, object]:
+        end_date = _string(getattr(value, "end_date"), "threshold end_date")
+        return {
+            "venue": "Polymarket", "contract_id": _string(getattr(value, "condition_id"), "condition_id"),
+            "title": _string(getattr(value, "question"), "question"), "market_date": end_date,
+            "expires_at": end_date, "event_identity_basis": _string(getattr(value, "event_id"), "event_id"),
+            "settlement_observation_key": _string(getattr(value, "resolution_source") or getattr(value, "condition_id"), "resolution_source"),
+            "settlement_rules": _string(getattr(value, "rules"), "rules"), "cancellation_rules": "not supplied by threshold discovery",
+        }
+    relation_direction = str(getattr(relation, "relation"))
+    endpoints = [market(getattr(relation, "market_a")), market(getattr(relation, "market_b"))]
+    if relation_direction in {"B_IMPLIES_A", "B_TO_A"}:
+        endpoints = list(reversed(endpoints))
+    return {
+        "discovery_source": "deterministic_rule", "discovered_at": _now(),
+        "relation_type": "IMPLIES", "semantics": {"statement": relation_direction, "direction": relation_direction},
+        "source_evidence": [{"event_id": getattr(relation, "event_id"), "rules_hash_a": getattr(relation, "rules_hash_a"), "rules_hash_b": getattr(relation, "rules_hash_b")}],
+        "model": model, "markets": endpoints,
+    }
+
+
 class RelationCatalog:
     """V2-backed public domain API; readers consume only ``current_generation``."""
 
@@ -373,32 +398,31 @@ class RelationCatalog:
 
     def ingest_threshold_relation(self, relation: object, *, git_sha: str = "") -> dict[str, object]:
         """Adapt the existing deterministic Polymarket discovery codec once."""
-        market_a = getattr(relation, "market_a")
-        market_b = getattr(relation, "market_b")
-        discovered_at = _now()
-        def market(value: object) -> dict[str, object]:
-            end_date = _string(getattr(value, "end_date"), "threshold end_date")
-            return {
-                "venue": "Polymarket", "contract_id": _string(getattr(value, "condition_id"), "condition_id"),
-                "title": _string(getattr(value, "question"), "question"), "market_date": end_date,
-                "expires_at": end_date, "event_identity_basis": _string(getattr(value, "event_id"), "event_id"),
-                "settlement_observation_key": _string(getattr(value, "resolution_source") or getattr(value, "condition_id"), "resolution_source"),
-                "settlement_rules": _string(getattr(value, "rules"), "rules"), "cancellation_rules": "not supplied by threshold discovery",
-            }
-        relation_direction = str(getattr(relation, "relation"))
-        endpoints = [market(market_a), market(market_b)]
-        if relation_direction in {"B_IMPLIES_A", "B_TO_A"}:
-            endpoints = list(reversed(endpoints))
-        model: dict[str, object] = {"completeness": "INCOMPLETE"}
         enriched = _threshold_complete_model(relation)
-        if enriched is not None:
-            model = enriched
-        return self.ingest({
-            "discovery_source": "deterministic_rule", "discovered_at": discovered_at,
-            "relation_type": "IMPLIES", "semantics": {"statement": relation_direction, "direction": relation_direction},
-            "source_evidence": [{"event_id": getattr(relation, "event_id"), "rules_hash_a": getattr(relation, "rules_hash_a"), "rules_hash_b": getattr(relation, "rules_hash_b")}],
-            "model": model, "markets": endpoints,
-        }, git_sha=git_sha)
+        model: dict[str, object] = (
+            enriched if enriched is not None else {"completeness": "INCOMPLETE"}
+        )
+        return self.ingest(
+            _threshold_discovery_payload(relation, model), git_sha=git_sha
+        )
+
+    def threshold_relation_identity(self, relation: object) -> str:
+        """Catalog identity for one threshold relation, via the ingest codec path."""
+        payload = _threshold_discovery_payload(
+            relation, {"completeness": "INCOMPLETE"}
+        )
+        return str(_canonicalize(self._converted(payload))[0])
+
+    def prepared_relation_identities(self) -> set[str]:
+        """Identities that already hold PENDING or APPROVED versions."""
+        prepared = getattr(self._store, "prepared_identities", None)
+        if callable(prepared):
+            return set(prepared())
+        return {
+            str(record["identity"])
+            for record in self._versions().values()
+            if record.get("status") in {"PENDING", "APPROVED"}
+        }
 
     def _versions(self) -> dict[str, dict[str, object]]:
         return self._store.get("versions", {})
