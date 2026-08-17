@@ -311,13 +311,18 @@ def _threshold_discovery_payload(
     }
 
 
+def default_catalog_path(data_dir: Path) -> Path:
+    """The conventional v2 catalog SQLite path under one data directory."""
+    return Path(data_dir) / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+
+
 class RelationCatalog:
     """V2-backed public domain API; readers consume only ``current_generation``."""
 
     def __init__(self, data_dir: Path, *, group_budget: int = _GROUP_BUDGET) -> None:
         if type(group_budget) is not int or group_budget < 2:
             raise ValueError("group_budget must be at least two")
-        self.path = Path(data_dir) / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+        self.path = default_catalog_path(data_dir)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.group_budget = group_budget
         self._store = SqliteCatalogStore(self.path)

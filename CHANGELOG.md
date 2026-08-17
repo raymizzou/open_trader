@@ -6,6 +6,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-08-18
 
 - #92 修复 #90 自动候选准备重启即重复 ingest 的问题：`prepare_relation_candidates` 不再用进程内存指纹集合，改为从 v2 catalog 派生"已准备"集合——组件全部成员 relation identity 已有 PENDING/APPROVED 版本即跳过（与 ingest 共用同一 canonicalize 路径），重启和源文本漂移都不再为同一真实组件新增 COMPLETE PENDING 版本；monitor 移除 `_prepared_candidate_fps`。生产审计：948 个 PENDING 分布在 948 个不同 identity，未发现同 identity 重复，修复前 `/relations?view=pending` 载荷 11.9MB/10.4s。新增 `prediction-arb catalog-dedup --dry-run/--apply [--limit]`：同 identity 多个 COMPLETE PENDING 保留 `catalog_v2_latest` 指向版本、其余 REJECTED（只翻状态不删行，meta 留 actor/git_sha/保留版本，单写事务批量，每轮有界可重跑）；relations 列表 API 行去掉 `model.problem`（detail 保留），支持 `limit`/`offset`（默认 500）并返回 `total`。不自动 approve/activate，不动 solver/执行/订单。聚焦 candidate/catalog/v2/sqlite/service/monitor/read-model/selection 回归 262 passed；本地生产部署与验证随本次 issue 跟进执行；未推送。
+- #92 附带修复 acceptance 门禁的两处遗留违规（`test_production_consumers_do_not_open_prediction_sqlite_directly` 自 #71/#90 起红）：`relation-candidates --apply` 读 `relation_state` 改用 `mode=ro` 只读加载器（该命令只读 store、写全部走 catalog）；`nleg-validate --live-catalog` 的默认 SQLite 路径字面量移入 `relation_catalog.default_catalog_path`，cli 不再直接出现路径/构造器字符串。聚焦 health/candidates/catalog/service/nleg-validation 回归 91 passed。
 
 ## 2026-08-17
 

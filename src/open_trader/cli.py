@@ -1126,8 +1126,8 @@ def build_parser() -> argparse.ArgumentParser:
     prediction_nleg_validate.add_argument(
         "--live-catalog",
         type=Path,
-        default=Path("data/prediction_arbitrage/prediction_arbitrage.sqlite3"),
-        help="Read-only v2 relation catalog SQLite path",
+        default=None,
+        help="Read-only v2 relation catalog SQLite path (default: catalog DB under ./data)",
     )
     prediction_nleg_validate.add_argument(
         "--book-source", default="", help="MODULE:ATTR callable returning current books"
@@ -1521,8 +1521,10 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.prediction_command == "nleg-validate":
             from open_trader.prediction_n_leg_validation import main as nleg_validate_main
+            from .relation_catalog import default_catalog_path
 
-            nleg_argv = ["--replay", str(args.replay), "--live-catalog", str(args.live_catalog)]
+            live_catalog = args.live_catalog or default_catalog_path(Path("data"))
+            nleg_argv = ["--replay", str(args.replay), "--live-catalog", str(live_catalog)]
             if args.data_dir is not None:
                 nleg_argv += ["--data-dir", str(args.data_dir)]
             if args.book_source:
@@ -1677,19 +1679,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.prediction_command == "relation-candidates":
-            from .prediction_arbitrage_store import (
-                PredictionArbitrageStore,
-                load_relation_state_readonly,
-            )
+            from .prediction_arbitrage_store import load_relation_state_readonly
             from .polymarket_relation_discovery import threshold_relation_from_payload
             from .prediction_relation_candidates import prepare_relation_candidates
             from .relation_catalog import RelationCatalog
 
             try:
-                if args.dry_run:
-                    state = load_relation_state_readonly(args.data_dir)
-                else:
-                    state = PredictionArbitrageStore(args.data_dir).load_relation_state()
+                # relation_state is only read here; the catalog owns all writes.
+                state = load_relation_state_readonly(args.data_dir)
                 payloads = [] if state is None else state.get("relations") or []
                 relations = [
                     threshold_relation_from_payload(payload) for payload in payloads
