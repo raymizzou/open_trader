@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -230,3 +232,36 @@ def test_cli_catalog_cleanup_apply(
     rows = {row["version_id"]: row for row in catalog.review_rows()}
     assert rows[incomplete_id]["status"] == "REJECTED"
     assert rows[incomplete_id]["activation"] == "REJECTED"
+
+
+def test_concurrent_readers_on_shared_catalog_do_not_nest_transactions(
+    tmp_path: Path,
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+    version_id = catalog.ingest(discovery())["version_id"]
+    catalog.approve(version_id, {"version_id": version_id}, actor="op", git_sha="a" * 40)
+
+    errors: list[BaseException] = []
+
+    def read_once() -> None:
+        catalog.current_generation()
+        catalog.generation_meta()
+        _ = catalog._store["generation_number"]
+        _ = catalog._store["versions"]
+
+    def reader() -> None:
+        for _ in range(100):
+            try:
+                read_once()
+            except BaseException as exc:  # noqa: BLE001 - race must not leak
+                errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for future in [pool.submit(reader) for _ in range(6)]:
+            future.result()
+
+    transaction_errors = [
+        exc for exc in errors if isinstance(exc, sqlite3.OperationalError)
+    ]
+    assert not errors
+    assert not transaction_errors

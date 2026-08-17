@@ -14,6 +14,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 - #89 停止 full relation scan 自动把两腿 INCOMPLETE IMPLIES 写入 v2 catalog；discovery 证据继续保存在 `relation_state` 和 scan 统计中，v2 catalog 改为只接受受控 candidate。新增 `relation-ingest` 入口，只允许同所同事件、模型完整、N>=3 且 `model.problem` 可解码验证的 relation；新增 `catalog-cleanup --dry-run/--apply`，将现存 PENDING 且无完整模型的候选标记为 REJECTED，保留版本历史不删除。聚焦 catalog/monitor/selection/validation/runtime-graph 回归 188 passed；未部署、未推送。
 - #90 新增自动候选准备：full relation scan 后，把 `relation_state` 里的同事件 pairwise IMPLIES 按 contract 连通分量分组，筛选 3..10 contracts 且全部可编译 COMPLETE 的组件，每轮最多自动 ingest 1 个为 PENDING candidate；成功 fingerprint 进入集合避免重复写入，候选准备失败不影响 scan 健康。新增 `relation-candidates --dry-run/--apply` 诊断/执行。不自动 approve/activate。聚焦 candidate/relation-catalog/monitor/selection 回归 172 passed；未部署、未推送。
 - 修复 `relation-candidates --dry-run` 对生产只读 SQLite 仍走写连接、导致 `readonly database` 的问题：dry-run 改用 `mode=ro` 只读读取 `relation_state`，apply 保持原写路径。聚焦 candidate/relation-catalog/monitor 回归 153 passed；未部署、未推送。
+- 修复 `RelationCatalogV2` 读路径并发竞态：`PredictionLiveResolver` 与 selection driver 同时读共享 SQLite connection 时可能触发 `cannot start a transaction within a transaction`。改为 store 级 `RLock` 串行化 `_state`/`_read`，保持写语义和 schema 不变。聚焦 relation-catalog/monitor-selection/live-resolver/validation 回归 58 passed；未部署、未推送。
 
 ## 2026-08-16
 
