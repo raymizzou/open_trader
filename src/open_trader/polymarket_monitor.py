@@ -376,6 +376,7 @@ class PolymarketMonitor:
         self._catalog_counts: dict[str, object] = {}
         self._catalog_last_full_run: dict[str, object] | None = None
         self._catalog_last_event_run: dict[str, object] | None = None
+        self._prepared_candidate_fps: set[str] = set()
         self._activity_scan_due_at: datetime | None = None
         self._activity_next_scan_at: datetime | None = None
         self._activity_scan_started_at: datetime | None = None
@@ -1752,6 +1753,36 @@ class PolymarketMonitor:
                 full_scanned_at=completed.isoformat(),
             )
             self._set_relation_state(relations, events, scanned_at=completed)
+            if self._relation_catalog is not None:
+                try:
+                    from .prediction_relation_candidates import prepare_relation_candidates
+
+                    candidate_report = prepare_relation_candidates(
+                        self._relation_catalog,
+                        relations,
+                        max_components=1,
+                        prepared_fingerprints=self._prepared_candidate_fps,
+                    )
+                    if candidate_report.get("status") == "PREPARED":
+                        fingerprint = candidate_report.get("fingerprint")
+                        if fingerprint is not None:
+                            self._prepared_candidate_fps.add(str(fingerprint))
+                    self._log_relation_scan(
+                        phase="candidate_prepared",
+                        status=str(candidate_report.get("status")),
+                        scope="full",
+                        prepared=int(candidate_report.get("prepared", 0)),
+                        incomplete=int(candidate_report.get("incomplete", 0)),
+                        skipped=int(candidate_report.get("skipped", 0)),
+                        fingerprint=candidate_report.get("fingerprint"),
+                    )
+                except Exception as exc:
+                    self._log_relation_scan(
+                        phase="candidate_prepared",
+                        status="failed",
+                        scope="full",
+                        reason=type(exc).__name__,
+                    )
             self._invalidate_rule_cache()
             # A completed catalog scan is a fresh episode boundary.  Even an
             # unchanged relation gets one new chance after a prior mismatch.
