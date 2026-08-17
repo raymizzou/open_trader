@@ -1116,6 +1116,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prediction_monitor_once.add_argument("--data-dir", type=Path, default=Path("data"))
     prediction_monitor_once.add_argument("--timeout", type=positive_float, default=30.0)
+
+    prediction_nleg_validate = prediction_commands.add_parser(
+        "nleg-validate", help="Run the N-leg no-submit validation harness (replay + live read-only)"
+    )
+    prediction_nleg_validate.add_argument(
+        "--replay", type=Path, required=True, help="Frozen N>=3 validation snapshot (JSON)"
+    )
+    prediction_nleg_validate.add_argument(
+        "--live-catalog",
+        type=Path,
+        default=Path("data/prediction_arbitrage/prediction_arbitrage.sqlite3"),
+        help="Read-only v2 relation catalog SQLite path",
+    )
+    prediction_nleg_validate.add_argument(
+        "--book-source", default="", help="MODULE:ATTR callable returning current books"
+    )
+    prediction_nleg_validate.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="Isolated validation data dir (default: fresh temp dir)",
+    )
+    prediction_nleg_validate.add_argument(
+        "--report", type=Path, help="Write the JSON report to this path"
+    )
     prediction_status = prediction_commands.add_parser(
         "status", help="Show safe local Dashboard prediction runtime facts"
     )
@@ -1450,6 +1475,18 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 print(f"{key}: {report.get(key, 'BLOCKED')}")
             return 0 if report.get("result") == "PASS" else 2
+
+        if args.prediction_command == "nleg-validate":
+            from open_trader.prediction_n_leg_validation import main as nleg_validate_main
+
+            nleg_argv = ["--replay", str(args.replay), "--live-catalog", str(args.live_catalog)]
+            if args.data_dir is not None:
+                nleg_argv += ["--data-dir", str(args.data_dir)]
+            if args.book_source:
+                nleg_argv += ["--book-source", args.book_source]
+            if args.report is not None:
+                nleg_argv += ["--report", str(args.report)]
+            return nleg_validate_main(nleg_argv)
 
         if args.prediction_command == "monitor-once":
             try:

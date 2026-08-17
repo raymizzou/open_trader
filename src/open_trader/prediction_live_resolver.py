@@ -26,11 +26,12 @@ from pathlib import Path
 
 from open_trader.prediction_market_solution import (
     AccountView,
+    ComponentResolution,
     ExecutionSolution,
     MarketSolution,
     build_solve_request,
     execution_solution_from_market,
-    market_solution_from_verification,
+    resolution_from_verification,
 )
 from open_trader.prediction_monitor_selection import (
     MonitorSelectionStore,
@@ -59,6 +60,7 @@ from open_trader.prediction_solver_verified import (
     PROOF_REQUEST_SCHEMA_V1,
     CandidateEvidence,
     ProofInput,
+    VerificationResult,
     model_fingerprint,
     quote_fingerprint,
     solver_evidence_from_payload,
@@ -185,6 +187,10 @@ class PredictionLiveResolver:
         poll_interval: float = 0.25,
         account_freshness_seconds: float = 60.0,
         code_version: str = "issue-52",
+        # Seam: the issue-71 validation harness must exercise this chain with
+        # its N>=3 budget (8 joint states) instead of the 2-leg LIVE_BUDGET.
+        budget: OracleBudget = LIVE_BUDGET,
+        limits: BenchmarkLimits = LIVE_LIMITS,
     ) -> None:
         if not isinstance(poll_interval, (int, float)) or poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
@@ -194,6 +200,10 @@ class PredictionLiveResolver:
             or account_freshness_seconds <= 0
         ):
             raise ValueError("account_freshness_seconds must be positive")
+        if not isinstance(budget, OracleBudget):
+            raise ValueError("budget must be an OracleBudget")
+        if not isinstance(limits, BenchmarkLimits):
+            raise ValueError("limits must be BenchmarkLimits")
         self._data_dir = Path(data_dir)
         self._relation_catalog = relation_catalog
         self._monitor = monitor
@@ -203,6 +213,8 @@ class PredictionLiveResolver:
         self._code_version = str(code_version)
         self._poll_interval = float(poll_interval)
         self._account_freshness = timedelta(seconds=account_freshness_seconds)
+        self._budget = budget
+        self._limits = limits
         self._tracking = _OutcomeTrackingServer(solver_server)
         self._graph = RuntimeRelationGraph(
             generation_source=relation_catalog.current_generation,
@@ -223,6 +235,8 @@ class PredictionLiveResolver:
         self._solutions: dict[
             str, tuple[MarketSolution, ExecutionSolution | None]
         ] = {}
+        self._resolutions: dict[str, ComponentResolution] = {}
+        self._verifications: dict[str, VerificationResult] = {}
         self._request_components: dict[str, tuple[str, str]] = {}
         self._applied_generation: tuple[int, str] | None = None
         self._account_view_cache: AccountView | None = None
@@ -279,6 +293,14 @@ class PredictionLiveResolver:
             for component_id in ordered
             for market, execution in (solutions[component_id],)
         ]
+
+    def latest_resolution(self, component_id: str) -> ComponentResolution | None:
+        with self._lock:
+            return self._resolutions.get(component_id)
+
+    def latest_verification(self, component_id: str) -> VerificationResult | None:
+        with self._lock:
+            return self._verifications.get(component_id)
 
     def _loop(self) -> None:
         while not self._stop_event.wait(self._poll_interval):
@@ -337,6 +359,16 @@ class PredictionLiveResolver:
                 for component_id, solution in self._solutions.items()
                 if component_id in kept
             }
+            self._resolutions = {
+                component_id: resolution
+                for component_id, resolution in self._resolutions.items()
+                if component_id in kept
+            }
+            self._verifications = {
+                component_id: verification
+                for component_id, verification in self._verifications.items()
+                if component_id in kept
+            }
             self._request_components = {
                 request_id: entry
                 for request_id, entry in self._request_components.items()
@@ -386,8 +418,8 @@ class PredictionLiveResolver:
         request = build_solve_request(
             problem,
             snapshot,
-            budget=LIVE_BUDGET,
-            limits=LIVE_LIMITS,
+            budget=self._budget,
+            limits=self._limits,
             price_units_per_quote_unit=USD_UNITS_PER_DOLLAR,
         )
         with self._lock:
@@ -423,11 +455,9 @@ class PredictionLiveResolver:
         if dispatched_fingerprint != model_fingerprint(current_problem):
             self._drop_solution(component_id)
             return
+        verification = None
         try:
             solver_evidence = solver_evidence_from_payload(outcome.response.evidence)
-            if solver_evidence.candidate is None:
-                self._drop_solution(component_id)
-                return
             proof_input = ProofInput(
                 PROOF_REQUEST_SCHEMA_V1,
                 request.request,
@@ -442,19 +472,39 @@ class PredictionLiveResolver:
                 "cp_sat",
                 outcome.solver_version or "unavailable",
                 model_fingerprint(problem),
-                fingerprint({"quantities": solver_evidence.candidate.quantities}),
+                (
+                    None
+                    if solver_evidence.candidate is None
+                    else fingerprint(
+                        {"quantities": solver_evidence.candidate.quantities}
+                    )
+                ),
                 solver_evidence,
             )
-            verification = verification_result_from_payload(
-                verify(canonical_payload(evidence)), source=evidence
-            )
-            market = market_solution_from_verification(
-                component_id, problem, evidence, verification
+            if solver_evidence.candidate is None:
+                verification = verification_result_from_payload(
+                    verify(canonical_payload(proof_input)), source=proof_input
+                )
+            else:
+                verification = verification_result_from_payload(
+                    verify(canonical_payload(evidence)), source=evidence
+                )
+            resolution = resolution_from_verification(
+                component_id, problem, evidence, verification,
+                code_version=self._code_version,
             )
         except (TypeError, ValueError, OverflowError):
-            market = None
-        if market is None:
+            resolution = None
+        if resolution is None:
             self._drop_solution(component_id)
+            return
+        with self._lock:
+            self._resolutions[component_id] = resolution
+            self._verifications[component_id] = verification
+        market = resolution.market_solution
+        if market is None:
+            with self._lock:
+                self._solutions.pop(component_id, None)
             return
         execution = self._execution_solution(component_id, market, problem)
         with self._lock:
@@ -515,6 +565,8 @@ class PredictionLiveResolver:
     def _drop_solution(self, component_id: str) -> None:
         with self._lock:
             self._solutions.pop(component_id, None)
+            self._resolutions.pop(component_id, None)
+            self._verifications.pop(component_id, None)
 
 
 __all__ = [
