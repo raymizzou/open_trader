@@ -37,6 +37,8 @@ from .prediction_n_leg import (
     TerminalKind,
     TerminalStateSet,
     canonical_payload,
+    problem_from_payload,
+    validate_problem,
 )
 
 
@@ -153,6 +155,14 @@ def _normalise_discovery(value: Mapping[str, object]) -> dict[str, object]:
         "markets": sorted(markets, key=lambda item: (str(item["venue"]).casefold(), str(item["contract_id"]))),
         "relation_id": f"relation:{_digest(endpoints)}",
     }
+
+
+def _stored_payload_complete(payload: Mapping[str, object]) -> bool:
+    """Mirror the read-model completeness rule over a stored v2 payload."""
+    return all(
+        payload.get(name) not in (None, "", [])
+        for name in ("terminal_states", "payouts", "capital_release")
+    )
 
 
 def _threshold_complete_model(relation: object) -> dict[str, object] | None:
@@ -335,6 +345,32 @@ class RelationCatalog:
             "occurrence_count": int(result["occurrence_count"]),
         }
 
+    def ingest_controlled(self, discovery: Mapping[str, object], *, git_sha: str = "") -> dict[str, object]:
+        """Admit only same-venue, same-event, COMPLETE N>=3 relation discoveries."""
+        normalized = _normalise_discovery(discovery)
+        model = normalized["model"]
+        if str(model.get("completeness")) != "COMPLETE":
+            raise ValueError("ingest_controlled requires model.completeness=COMPLETE")
+        markets = normalized["markets"]
+        if len(markets) < 3:
+            raise ValueError("ingest_controlled requires at least three market endpoints")
+        venues = {str(item["venue"]).casefold() for item in markets}
+        event_bases = {str(item["event_identity_basis"]) for item in markets}
+        if len(venues) != 1:
+            raise ValueError("ingest_controlled requires all endpoints to share one venue")
+        if len(event_bases) != 1:
+            raise ValueError("ingest_controlled requires all endpoints to share one event_identity_basis")
+        problem = model.get("problem")
+        if not isinstance(problem, Mapping) or not problem:
+            raise ValueError("ingest_controlled requires a compiled model.problem")
+        try:
+            decoded = problem_from_payload(problem)
+        except Exception as exc:
+            raise ValueError(f"ingest_controlled requires a valid compiled model.problem: {exc}") from exc
+        if validate_problem(decoded):
+            raise ValueError("ingest_controlled requires a valid compiled model.problem")
+        return self.ingest(discovery, git_sha=git_sha)
+
     def ingest_threshold_relation(self, relation: object, *, git_sha: str = "") -> dict[str, object]:
         """Adapt the existing deterministic Polymarket discovery codec once."""
         market_a = getattr(relation, "market_a")
@@ -465,6 +501,46 @@ class RelationCatalog:
             for record in self._versions().values()
             if record.get("status") == "PENDING"
         )
+
+    def cleanup_incomplete_pending(self, *, actor: str, git_sha: str, dry_run: bool = True):
+        """Reject PENDING versions whose stored model is missing or incomplete."""
+        matches: list[dict[str, object]] = []
+        for version_id, record in self._versions().items():
+            if record.get("status") != "PENDING":
+                continue
+            if _stored_payload_complete(record["payload"]):
+                continue
+            matches.append({
+                "version_id": version_id,
+                "identity": str(record["identity"]),
+                "fingerprint": str(record["version_fp"]),
+            })
+        if dry_run:
+            return matches
+        rejected: list[dict[str, object]] = []
+        for match in matches:
+            version_id = str(match["version_id"])
+            self._catalog.reject(
+                version_id,
+                reason="model_incomplete_or_wrong",
+                note="issue-89 catalog cleanup",
+                actor=actor,
+                git_sha=git_sha,
+            )
+            record = self._versions()[version_id]
+            self._store_write({
+                version_id: {
+                    **record,
+                    "activation_status": "REJECTED",
+                    "activation_diagnostic": "MODEL_INCOMPLETE",
+                }
+            })
+            rejected.append({
+                "version_id": version_id,
+                "identity": str(match["identity"]),
+                "status": "REJECTED",
+            })
+        return {"applied": len(rejected), "rejected": rejected}
 
     def detail(self, relation_version_id: str) -> dict[str, object]:
         versions = self._versions()
@@ -603,7 +679,7 @@ class RelationCatalog:
             actor=actor,
             git_sha=git_sha,
         )
-        record = versions[relation_version_id]
+        record = self._versions()[relation_version_id]
         self._store_write({
             relation_version_id: {
                 **record,

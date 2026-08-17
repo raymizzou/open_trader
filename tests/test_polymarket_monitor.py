@@ -19,7 +19,8 @@ from open_trader.polymarket_relation_discovery import (
     threshold_relation_payload,
 )
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
-from open_trader.polymarket_monitor import _relation_fingerprint
+from open_trader.polymarket_monitor import PolymarketMonitor, _relation_fingerprint
+from open_trader.relation_catalog import RelationCatalog
 
 
 NOW = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
@@ -1072,6 +1073,28 @@ def test_full_scan_consumes_every_paginator_page_and_publishes_once(
     assert state["relations"]
     assert PagePaginator.iter_calls == 1
     assert monitor.snapshot()["relation_discovery"]["catalog"]["status"] == "healthy"
+
+
+def test_full_scan_saves_discovery_but_does_not_grow_v2_catalog(
+    tmp_path: Path,
+) -> None:
+    setup_public([threshold_event()])
+    catalog = RelationCatalog(tmp_path / "catalog")
+    monitor = PolymarketMonitor(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        trading=FakeTrading(),
+        public_client_factory=FakePublicClient,
+        clock=lambda: NOW,
+        relation_discovery=discover_threshold_relation_catalog,
+        relation_validator=FakeRelationValidator(),
+        relation_catalog=catalog,
+    )
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    state = monitor._store.load_relation_state()
+    assert state is not None
+    assert state["relations"]
+    assert catalog.review_rows() == []
+    assert catalog.current_generation() == {}
 
 
 def test_failed_full_scan_keeps_previous_catalog(tmp_path: Path) -> None:

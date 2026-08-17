@@ -1147,6 +1147,22 @@ def build_parser() -> argparse.ArgumentParser:
     prediction_status.add_argument("--url", default="http://127.0.0.1:8766")
     prediction_status.add_argument("--timeout", type=positive_float, default=5.0)
 
+    prediction_relation_ingest = prediction_commands.add_parser(
+        "relation-ingest", help="Admit a controlled N>=3 relation discovery"
+    )
+    prediction_relation_ingest.add_argument(
+        "--file", type=Path, required=True, help="Canonical discovery JSON"
+    )
+    prediction_relation_ingest.add_argument("--data-dir", type=Path, default=Path("data"))
+
+    prediction_catalog_cleanup = prediction_commands.add_parser(
+        "catalog-cleanup", help="Reject model-less PENDING relation versions"
+    )
+    cleanup_mode = prediction_catalog_cleanup.add_mutually_exclusive_group(required=True)
+    cleanup_mode.add_argument("--dry-run", action="store_true")
+    cleanup_mode.add_argument("--apply", action="store_true")
+    prediction_catalog_cleanup.add_argument("--data-dir", type=Path, default=Path("data"))
+
     cross_auto_parser = prediction_commands.add_parser(
         "cross-auto", help="Inspect Service-owned cross-venue execution state"
     )
@@ -1579,6 +1595,39 @@ def main(argv: list[str] | None = None) -> int:
             print(f"masked_wallet: {payload.get('masked_wallet') or readiness.get('masked_address') or 'unknown'}")
             print(f"result: {'PASS' if status not in {'unavailable', 'error'} else 'BLOCKED'}")
             return 0 if status not in {"unavailable", "error"} else 2
+
+        if args.prediction_command == "relation-ingest":
+            from .relation_catalog import RelationCatalog
+
+            try:
+                discovery = json.loads(args.file.read_text(encoding="utf-8"))
+                catalog = RelationCatalog(args.data_dir)
+                result = catalog.ingest_controlled(discovery)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+                return 2
+            print(f"version_id: {result['version_id']}")
+            print(f"identity: {result['identity']}")
+            print(f"status: {result['status']}")
+            return 0
+
+        if args.prediction_command == "catalog-cleanup":
+            from .relation_catalog import RelationCatalog
+
+            catalog = RelationCatalog(args.data_dir)
+            dry_run = bool(args.dry_run)
+            result = catalog.cleanup_incomplete_pending(
+                actor="cli", git_sha="", dry_run=dry_run
+            )
+            if dry_run:
+                for match in result:
+                    print(f"{match['version_id']} {match['identity']} {match['fingerprint']}")
+                print(f"matches: {len(result)}")
+                return 0
+            for row in result["rejected"]:
+                print(f"{row['version_id']} {row['identity']} {row['status']}")
+            print(f"applied: {result['applied']}")
+            return 0
 
         if args.prediction_command == "health-check":
             from .prediction_arbitrage_health import main as health_main
