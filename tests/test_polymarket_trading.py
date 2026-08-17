@@ -5,7 +5,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
 from types import SimpleNamespace
@@ -473,6 +473,8 @@ class FakeClient:
         forced_quantity: Decimal | None = None,
         identity: bool = True,
         gasless_ready: bool = True,
+        buy_fee: Decimal = Decimal("0"),
+        buy_fee_tokens: set[str] | None = None,
     ) -> None:
         self.taker_scale = taker_scale
         if identity:
@@ -491,6 +493,8 @@ class FakeClient:
         self.forced_quantity = forced_quantity
         self.gasless_ready = gasless_ready
         self.gasless_calls = 0
+        self.buy_fee = buy_fee
+        self.buy_fee_tokens = buy_fee_tokens
         self.trade_rows: list[object] = [SimpleNamespace(id="trade")]
         self.position_rows: list[object] = [
             {"condition_id": "condition-1", "size": "20"}
@@ -513,6 +517,22 @@ class FakeClient:
             )
         amount = kwargs["amount"]
         assert isinstance(amount, Decimal)
+        max_spend = kwargs.get("max_spend")
+        if (
+            self.buy_fee > 0
+            and isinstance(max_spend, Decimal)
+            and max_spend < amount + self.buy_fee
+            and (
+                self.buy_fee_tokens is None
+                or str(kwargs["token_id"]) in self.buy_fee_tokens
+            )
+        ):
+            if max_spend > self.buy_fee:
+                amount = (max_spend - self.buy_fee).quantize(
+                    Decimal("0.01"), rounding=ROUND_FLOOR
+                )
+            else:
+                amount = Decimal("0")
         if self.forced_quantity is not None:
             quantity = self.forced_quantity
         else:
@@ -866,7 +886,7 @@ def test_threshold_preflight_signs_independent_conditions_without_merge_or_post(
             "token_id": "a-token",
             "side": "BUY",
             "amount": Decimal("1.00"),
-            "max_spend": Decimal("1.00"),
+            "max_spend": Decimal("1.03"),
             "max_price": Decimal("0.10"),
             "order_type": "FOK",
         },
@@ -874,11 +894,50 @@ def test_threshold_preflight_signs_independent_conditions_without_merge_or_post(
             "token_id": "b-token",
             "side": "BUY",
             "amount": Decimal("1.10"),
-            "max_spend": Decimal("1.10"),
+            "max_spend": Decimal("1.13"),
             "max_price": Decimal("0.11"),
             "order_type": "FOK",
         },
     ]
+
+
+def test_threshold_preflight_includes_fee_budget_so_shares_are_not_shrunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, fake = make_adapter(FakeClient(buy_fee=Decimal("0.01")))
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+
+    summary = adapter.no_submit_threshold_preflight(threshold_intent())
+
+    assert summary["result"] == "PASS"
+    assert summary["fok_pair_signed_not_submitted"] == "pass"
+    assert summary["equal_requested_shares"] == "pass"
+    assert fake.post_calls == []
+    assert [call["max_spend"] for call in fake.create_calls] == [
+        Decimal("1.03"),
+        Decimal("1.13"),
+    ]
+
+
+def test_threshold_preflight_keeps_boundary_when_one_leg_uses_whole_fee_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, fake = make_adapter(
+        FakeClient(buy_fee=Decimal("0.02"), buy_fee_tokens={"b-token"})
+    )
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+
+    summary = adapter.no_submit_threshold_preflight(threshold_intent())
+
+    assert summary["result"] == "PASS"
+    assert summary["equal_requested_shares"] == "pass"
+    assert fake.post_calls == []
 
 
 def test_threshold_submit_requires_preflight_and_posts_once(

@@ -703,12 +703,13 @@ class PolymarketTradingClient:
         token_id: str,
         amount: Decimal,
         max_price: Decimal,
+        max_spend: Decimal | None = None,
     ) -> object:
         return self._client.create_market_order(
             token_id=token_id,
             side="BUY",
             amount=amount,
-            max_spend=amount,
+            max_spend=max_spend if max_spend is not None else amount,
             max_price=max_price,
             order_type="FOK",
         )
@@ -1390,15 +1391,23 @@ class PolymarketTradingClient:
         self, intent: ThresholdHedgeIntent
     ) -> tuple[object, object, str | None]:
         try:
+            # The venue fee is budgeted in intent.maximum_fee. If max_spend only
+            # covered leg.max_cost, the SDK would shrink the buy to fit the fee
+            # inside it and sign fewer shares than intent.quantity. One cent is
+            # added because the SDK shrinks on <=; it only widens the SDK's
+            # internal prep cap (not the signed order) and keeps the boundary
+            # valid when one leg consumes the entire fee budget.
             signed_a = self._sign_leg(
                 token_id=intent.leg_a.token_id,
                 amount=intent.leg_a.max_cost,
                 max_price=intent.leg_a.max_price,
+                max_spend=intent.leg_a.max_cost + intent.maximum_fee + CENT,
             )
             signed_b = self._sign_leg(
                 token_id=intent.leg_b.token_id,
                 amount=intent.leg_b.max_cost,
                 max_price=intent.leg_b.max_price,
+                max_spend=intent.leg_b.max_cost + intent.maximum_fee + CENT,
             )
         except Exception as exc:
             return object(), object(), _safe_error_code(exc)
