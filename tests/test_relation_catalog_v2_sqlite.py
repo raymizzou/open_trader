@@ -125,7 +125,8 @@ def test_sqlite_read_rolls_back_when_commit_raises(tmp_path) -> None:
     db_path = str(tmp_path / "catalog.db")
     catalog = _catalog(db_path)
     store = catalog.store
-    real_conn = store._conn
+    real_conn = sqlite3.connect(db_path, check_same_thread=False)
+    real_conn.isolation_level = None
 
     class ExplodingConnection:
         def execute(self, sql, *args, **kwargs):
@@ -133,11 +134,118 @@ def test_sqlite_read_rolls_back_when_commit_raises(tmp_path) -> None:
                 raise sqlite3.OperationalError("cannot commit")
             return real_conn.execute(sql, *args, **kwargs)
 
-    store._conn = ExplodingConnection()
-    try:
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(store, "_connection", lambda: ExplodingConnection())
         with pytest.raises(sqlite3.OperationalError):
             catalog.current_generation()
-    finally:
-        store._conn = real_conn
+    real_conn.close()
 
     assert catalog.current_generation() == {}
+
+
+def test_sqlite_thread_local_readers_share_one_catalog(tmp_path) -> None:
+    db_path = str(tmp_path / "catalog.db")
+    catalog = _catalog(db_path)
+    _approve(catalog, _payload())
+    expected = catalog.current_generation()
+    snapshots: list[dict[str, dict]] = []
+    errors: list[BaseException] = []
+
+    def read_loop() -> None:
+        for _ in range(100):
+            try:
+                snapshots.append(catalog.current_generation())
+            except BaseException as exc:  # pragma: no cover - readers must not fail
+                errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(read_loop) for _ in range(8)]
+        for future in futures:
+            future.result()
+
+    assert not errors
+    assert snapshots == [expected] * len(snapshots)
+
+
+def test_sqlite_thread_local_writers_fail_cleanly(tmp_path) -> None:
+    db_path = str(tmp_path / "catalog.db")
+    catalog = _catalog(db_path)
+    payloads = [
+        _payload(
+            relation_type="EXACTLY_ONE",
+            endpoints=[
+                _endpoint("polymarket", f"writer-{i}-A"),
+                _endpoint("predict.fun", f"writer-{i}-B"),
+            ],
+        )
+        for i in range(16)
+    ]
+    results: list[dict[str, object]] = []
+    errors: list[BaseException] = []
+
+    def write_loop(payload: dict[str, object]) -> None:
+        try:
+            results.append(catalog.ingest(payload))
+        except BaseException as exc:
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(write_loop, payload) for payload in payloads]
+        for future in futures:
+            future.result()
+
+    locked = [
+        exc
+        for exc in errors
+        if isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
+    ]
+    assert locked == errors
+    assert len(_catalog(db_path).store["versions"]) == len(results)
+
+
+def test_sqlite_thread_local_mixed_reads_and_writes(tmp_path) -> None:
+    db_path = str(tmp_path / "catalog.db")
+    catalog = _catalog(db_path)
+    _approve(catalog, _payload())
+    expected = catalog.current_generation()
+    payloads = [
+        _payload(
+            relation_type="EXACTLY_ONE",
+            endpoints=[
+                _endpoint("polymarket", f"mixed-{i}-A"),
+                _endpoint("predict.fun", f"mixed-{i}-B"),
+            ],
+        )
+        for i in range(16)
+    ]
+    snapshots: list[dict[str, dict]] = []
+    read_errors: list[BaseException] = []
+    write_errors: list[BaseException] = []
+
+    def read_loop() -> None:
+        for _ in range(100):
+            try:
+                snapshots.append(catalog.current_generation())
+            except BaseException as exc:  # pragma: no cover - readers must not fail
+                read_errors.append(exc)
+
+    def write_loop(payload: dict[str, object]) -> None:
+        try:
+            catalog.ingest(payload)
+        except BaseException as exc:
+            write_errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(read_loop) for _ in range(4)]
+        futures += [pool.submit(write_loop, payload) for payload in payloads]
+        for future in futures:
+            future.result()
+
+    assert not read_errors
+    assert snapshots == [expected] * len(snapshots)
+    locked = [
+        exc
+        for exc in write_errors
+        if isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
+    ]
+    assert locked == write_errors
