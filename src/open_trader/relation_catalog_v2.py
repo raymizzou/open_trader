@@ -101,6 +101,7 @@ class SqliteCatalogStore(MutableMapping):
     def __init__(self, db_path: str | os.PathLike[str]) -> None:
         # Callers are serialized by RelationCatalogV2's lock, so one connection
         # may be shared across threads (pooled readers/writers in tests).
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.isolation_level = None  # manual transactions
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -209,18 +210,19 @@ class SqliteCatalogStore(MutableMapping):
     # -- state materialization --------------------------------------------
 
     def _state(self) -> dict[str, dict]:
-        if self._overlay is not None:
-            return self._overlay
-        if self._cache is not None:
-            return self._cache
-        self._conn.execute("BEGIN")
-        try:
-            state = self._load_state()
-        except BaseException:
-            self._conn.execute("ROLLBACK")
-            raise
-        self._conn.execute("COMMIT")
-        return state
+        with self._lock:
+            if self._overlay is not None:
+                return self._overlay
+            if self._cache is not None:
+                return self._cache
+            self._conn.execute("BEGIN")
+            try:
+                state = self._load_state()
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._conn.execute("COMMIT")
+            return state
 
     def _load_state(self) -> dict[str, dict]:
         row = self._conn.execute(
@@ -376,7 +378,9 @@ class RelationCatalogV2:
 
     def __init__(self, store: MutableMapping | None = None) -> None:
         self.store: MutableMapping = store if store is not None else {}
-        self._lock = threading.Lock()  # ponytail: global lock; shard if throughput matters
+        self._lock = getattr(self.store, "_lock", None)
+        if self._lock is None:
+            self._lock = threading.RLock()  # ponytail: global lock; shard if throughput matters
 
     @contextmanager
     def _write(self) -> Iterator[None]:
@@ -404,11 +408,12 @@ class RelationCatalogV2:
         if begin is None:
             yield
             return
-        begin()
-        try:
-            yield
-        finally:
-            self.store.end_read()
+        with self._lock:
+            begin()
+            try:
+                yield
+            finally:
+                self.store.end_read()
 
     # -- mutations ---------------------------------------------------------
 
