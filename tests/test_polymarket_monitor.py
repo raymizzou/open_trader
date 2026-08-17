@@ -1108,6 +1108,53 @@ def test_failed_full_scan_keeps_previous_catalog(tmp_path: Path) -> None:
     assert monitor.snapshot()["relation_discovery"]["catalog"]["status"] == "degraded"
 
 
+def test_candidate_prepare_failure_does_not_fail_full_scan(tmp_path: Path) -> None:
+    setup_public(
+        [
+            event(
+                "threshold-event",
+                volume="250",
+                markets=(
+                    threshold_market(
+                        "threshold-low",
+                        question="Will Bitcoin be above $80,000 on December 31?",
+                        yes="yes-low",
+                        no="no-low",
+                    ),
+                    threshold_market(
+                        "threshold-mid",
+                        question="Will Bitcoin be above $90,000 on December 31?",
+                        yes="yes-mid",
+                        no="no-mid",
+                    ),
+                    threshold_market(
+                        "threshold-high",
+                        question="Will Bitcoin be above $100,000 on December 31?",
+                        yes="yes-high",
+                        no="no-high",
+                    ),
+                ),
+            )
+        ]
+    )
+
+    def fail_ingest(relation: object) -> dict[str, object]:
+        raise RuntimeError("sentinel ingest failure")
+
+    monitor = PolymarketMonitor(
+        store=PredictionArbitrageStore(tmp_path / "data"),
+        trading=FakeTrading(),
+        public_client_factory=FakePublicClient,
+        clock=lambda: NOW,
+        relation_discovery=discover_threshold_relation_catalog,
+        relation_validator=FakeRelationValidator(),
+        relation_catalog=SimpleNamespace(ingest_threshold_relation=fail_ingest),
+    )
+    asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    assert monitor._relations_failed is False
+    assert monitor.snapshot()["relation_discovery"]["catalog"]["status"] == "healthy"
+
+
 def test_full_scan_due_at_twenty_four_hours_without_blocking_universe(
     tmp_path: Path,
 ) -> None:

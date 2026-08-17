@@ -1163,6 +1163,21 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_mode.add_argument("--apply", action="store_true")
     prediction_catalog_cleanup.add_argument("--data-dir", type=Path, default=Path("data"))
 
+    prediction_relation_candidates = prediction_commands.add_parser(
+        "relation-candidates",
+        help="Auto-prepare connected threshold IMPLIES candidates",
+    )
+    prediction_relation_candidates.add_argument("--data-dir", type=Path, default=Path("data"))
+    candidates_mode = prediction_relation_candidates.add_mutually_exclusive_group(
+        required=True
+    )
+    candidates_mode.add_argument("--dry-run", action="store_true")
+    candidates_mode.add_argument("--apply", action="store_true")
+    prediction_relation_candidates.add_argument(
+        "--max-components", type=positive_int, default=1
+    )
+    prediction_relation_candidates.add_argument("--report", type=Path)
+
     cross_auto_parser = prediction_commands.add_parser(
         "cross-auto", help="Inspect Service-owned cross-venue execution state"
     )
@@ -1627,6 +1642,33 @@ def main(argv: list[str] | None = None) -> int:
             for row in result["rejected"]:
                 print(f"{row['version_id']} {row['identity']} {row['status']}")
             print(f"applied: {result['applied']}")
+            return 0
+
+        if args.prediction_command == "relation-candidates":
+            from .prediction_arbitrage_store import PredictionArbitrageStore
+            from .polymarket_relation_discovery import threshold_relation_from_payload
+            from .prediction_relation_candidates import prepare_relation_candidates
+            from .relation_catalog import RelationCatalog
+
+            try:
+                state = PredictionArbitrageStore(args.data_dir).load_relation_state()
+                payloads = [] if state is None else state.get("relations") or []
+                relations = [
+                    threshold_relation_from_payload(payload) for payload in payloads
+                ]
+                catalog = RelationCatalog(args.data_dir) if args.apply else None
+                report = prepare_relation_candidates(
+                    catalog,
+                    relations,
+                    max_components=args.max_components,
+                )
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+                return 2
+            text = json.dumps(report, ensure_ascii=False, indent=2)
+            if args.report is not None:
+                args.report.write_text(text + "\n", encoding="utf-8")
+            print(text)
             return 0
 
         if args.prediction_command == "health-check":
