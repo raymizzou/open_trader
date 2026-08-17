@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -75,6 +76,23 @@ def driver(
         idle_check=lambda: idle,
         poll_interval=poll_interval,
     )
+
+
+class _DepthLock:
+    """RLock wrapper that records acquisition depth for lock-scope assertions."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.depth = 0
+
+    def __enter__(self) -> "_DepthLock":
+        self.depth += 1
+        self._lock.__enter__()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._lock.__exit__(*exc)
+        self.depth -= 1
 
 
 def observation(contract_id: str) -> SettlementObservationKey:
@@ -312,12 +330,70 @@ def test_pass_discovers_selects_and_saves(
     assert captured["components"] == components
     assert captured["generation"] == 5
     assert captured["code_version"] == "issue-87"
-    assert captured["max_components"] == 10
+    assert captured["max_components"] == 1
     assert store.load()[1] == {component.component_id: selected}
     assert instance.status() == {
         "selection_pending": 0,
         "selection_failures_consecutive": 0,
         "selection_applied_generation": 5,
+    }
+
+
+def test_discovery_runs_with_selection_lock_released(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = {"r:a": row("r:a", raw_problem())}
+    catalog = FakeCatalog(rows, generation=5, fingerprint="fp-5")
+    lock = _DepthLock()
+    instance = PredictionMonitorSelectionDriver(
+        relation_catalog=catalog,
+        selection_store=MonitorSelectionStore(tmp_path),
+        selection_lock=lock,
+        idle_check=lambda: True,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_discovery(*args: object, **kwargs: object) -> tuple[()]:
+        captured["lock_depth"] = lock.depth
+        return ()
+
+    monkeypatch.setattr(
+        "open_trader.prediction_monitor_selection_driver.run_discovery",
+        fake_discovery,
+    )
+    instance._tick()
+
+    assert captured["lock_depth"] == 0
+
+
+def test_generation_change_during_discovery_skips_stale_save_and_keeps_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = {"r:a": row("r:a", raw_problem())}
+    catalog = FakeCatalog(rows, generation=5, fingerprint="fp-5")
+    store = MonitorSelectionStore(tmp_path)
+    instance = PredictionMonitorSelectionDriver(
+        relation_catalog=catalog,
+        selection_store=store,
+        idle_check=lambda: True,
+    )
+
+    def fake_discovery(*args: object, **kwargs: object) -> tuple[()]:
+        catalog.generation = 6
+        catalog.fingerprint = "fp-6"
+        return ()
+
+    monkeypatch.setattr(
+        "open_trader.prediction_monitor_selection_driver.run_discovery",
+        fake_discovery,
+    )
+    instance._tick()
+
+    assert store.load()[1] == {}
+    assert instance.status() == {
+        "selection_pending": 1,
+        "selection_failures_consecutive": 0,
+        "selection_applied_generation": None,
     }
 
 

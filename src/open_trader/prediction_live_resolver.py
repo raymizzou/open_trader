@@ -184,6 +184,7 @@ class PredictionLiveResolver:
         monitor: object,
         solver_server: object,
         selection_store: MonitorSelectionStore,
+        selection_lock: threading.RLock | None = None,
         store: object,
         execution: object,
         poll_interval: float = 0.25,
@@ -204,6 +205,7 @@ class PredictionLiveResolver:
         self._execution = execution
         self._store = store
         self._selection_store = selection_store
+        self._selection_lock = selection_lock or threading.RLock()
         self._code_version = str(code_version)
         self._poll_interval = float(poll_interval)
         self._account_freshness = timedelta(seconds=account_freshness_seconds)
@@ -316,41 +318,46 @@ class PredictionLiveResolver:
             raw = problem_for_component(problem, component)
             raw_problems[component.component_id] = raw
             problem_map[component.component_id] = normalize_problem(raw)
-        _, persisted = self._selection_store.load()
-        kept = {
-            component_id: selected
-            for component_id, selected in persisted.items()
-            if (
-                component_id in raw_problems
-                and fingerprint(
-                    {"constraint_model": raw_problems[component_id].constraint_model}
+        with self._selection_lock:
+            _, persisted = self._selection_store.load()
+            kept = {
+                component_id: selected
+                for component_id, selected in persisted.items()
+                if (
+                    component_id in raw_problems
+                    and fingerprint(
+                        {
+                            "constraint_model": raw_problems[
+                                component_id
+                            ].constraint_model
+                        }
+                    )
+                    == selected.relation_fingerprint
+                    and fingerprint(
+                        {
+                            "terminal_state_sets": raw_problems[
+                                component_id
+                            ].terminal_state_sets
+                        }
+                    )
+                    == selected.terminal_fingerprint
                 )
-                == selected.relation_fingerprint
-                and fingerprint(
-                    {
-                        "terminal_state_sets": raw_problems[
-                            component_id
-                        ].terminal_state_sets
-                    }
-                )
-                == selected.terminal_fingerprint
-            )
-        }
-        with self._lock:
-            self._problem_map = problem_map
-            self._selection = kept
-            self._solutions = {
-                component_id: solution
-                for component_id, solution in self._solutions.items()
-                if component_id in kept
             }
-            self._request_components = {
-                request_id: entry
-                for request_id, entry in self._request_components.items()
-                if entry[0] in kept
-            }
-        if set(kept) != set(persisted):
-            self._selection_store.save(kept)
+            with self._lock:
+                self._problem_map = problem_map
+                self._selection = kept
+                self._solutions = {
+                    component_id: solution
+                    for component_id, solution in self._solutions.items()
+                    if component_id in kept
+                }
+                self._request_components = {
+                    request_id: entry
+                    for request_id, entry in self._request_components.items()
+                    if entry[0] in kept
+                }
+                if set(kept) != set(persisted):
+                    self._selection_store.save(kept)
 
     def _snapshot_for(self, selected: SelectedComponent) -> ComponentSnapshot | None:
         problem = self._problem_map.get(selected.component_id)

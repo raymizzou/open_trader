@@ -611,12 +611,14 @@ class PredictionRuntime:
                     if callable(set_cross_venue_monitor):
                         set_cross_venue_monitor(self.cross_venue_monitor)
             selection_store = MonitorSelectionStore(self._data_dir)
+            selection_lock = threading.RLock()
             self.live_resolver = PredictionLiveResolver(
                 data_dir=self._data_dir,
                 relation_catalog=self.relation_catalog,
                 monitor=self.monitor,
                 solver_server=self.solver_server,
                 selection_store=selection_store,
+                selection_lock=selection_lock,
                 store=self.store,
                 execution=self.execution,
             )
@@ -624,6 +626,7 @@ class PredictionRuntime:
             self.monitor_selection_driver = PredictionMonitorSelectionDriver(
                 relation_catalog=self.relation_catalog,
                 selection_store=selection_store,
+                selection_lock=selection_lock,
                 idle_check=self.live_resolver.is_idle,
             )
             self.monitor_selection_driver.start()
@@ -783,10 +786,7 @@ class PredictionRuntime:
     def n_leg_metrics(self) -> dict[str, object]:
         driver = self.monitor_selection_driver
         if driver is None:
-            return {
-                "selection_pending": 0,
-                "selection_failures_consecutive": 0,
-            }
+            return {}
         status = driver.status()
         return {
             "selection_pending": int(status.get("selection_pending", 0)),

@@ -50,6 +50,7 @@ class PredictionMonitorSelectionDriver:
         *,
         relation_catalog: object,
         selection_store: MonitorSelectionStore,
+        selection_lock: threading.RLock | None = None,
         idle_check: Callable[[], bool],
         poll_interval: float = 1.0,
     ) -> None:
@@ -63,6 +64,7 @@ class PredictionMonitorSelectionDriver:
             raise ValueError("poll_interval must be positive")
         self._relation_catalog = relation_catalog
         self._selection_store = selection_store
+        self._selection_lock = selection_lock or threading.RLock()
         self._idle_check = idle_check
         self._poll_interval = float(poll_interval)
         self._lock = threading.RLock()
@@ -143,15 +145,21 @@ class PredictionMonitorSelectionDriver:
         generation = key[0]
         rows = dict(self._relation_catalog.current_generation())
         problem, components = relation_generation_problem(rows)
+
         if problem is None:
-            self._selection_store.save({})
+            with self._selection_lock:
+                self._selection_store.save({})
             self._record_success(key)
             return
+
         components_by_id = {
             component.component_id: component for component in components
         }
-        _, current = self._selection_store.load()
-        retained = self._retain(current, problem, components_by_id)
+
+        with self._selection_lock:
+            _, current = self._selection_store.load()
+            retained = self._retain(current, problem, components_by_id)
+
         new_components = tuple(
             component
             for component in components
@@ -164,20 +172,29 @@ class PredictionMonitorSelectionDriver:
             limits=LIVE_LIMITS,
             generation=generation,
             code_version=_CODE_VERSION,
-            max_components=_MAX_COMPONENTS,
+            max_components=len(new_components),
         )
+
+        if self._generation_key(self._relation_catalog.generation_meta()) != key:
+            return
+
         candidates = {
             component.component_id: resolution
             for component, resolution in zip(new_components, results)
         }
-        selection = select_monitor_components(
-            candidates,
-            retained,
-            problem=problem,
-            components=components_by_id,
-            max_slots=_MAX_COMPONENTS,
-        )
-        self._selection_store.save(selection)
+
+        with self._selection_lock:
+            _, latest = self._selection_store.load()
+            retained = self._retain(latest, problem, components_by_id)
+            selection = select_monitor_components(
+                candidates,
+                retained,
+                problem=problem,
+                components=components_by_id,
+                max_slots=_MAX_COMPONENTS,
+            )
+            self._selection_store.save(selection)
+
         self._record_success(key)
 
     def _retain(
