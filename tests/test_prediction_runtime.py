@@ -574,6 +574,112 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
     assert events.index("store.close") < events.index("owner.release")
 
 
+def test_disabled_n_leg_background_skips_resolver_and_driver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import open_trader.prediction_runtime as runtime_module
+
+    class Fake:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        def apply_safety_policy(
+            self, _policy: object, *, git_sha: str
+        ) -> dict[str, object]:
+            return {"state": "baseline_enrolled"}
+
+        def reconcile_startup(self) -> dict[str, object]:
+            return {"status": "ready"}
+
+        def notify_ready_opportunity(self, *_: object) -> None:
+            pass
+
+        def notify_observation(self, *_: object) -> None:
+            pass
+
+        def notify_monitor_failure(self, *_: object) -> None:
+            pass
+
+        def auto_eat_threshold(self, *_: object) -> None:
+            pass
+
+        def set_ready_observer(self, _observer: object) -> None:
+            pass
+
+        def set_observation_observer(self, _observer: object) -> None:
+            pass
+
+        def set_auto_eat_observer(self, _observer: object) -> None:
+            pass
+
+        def set_failure_observer(self, _observer: object) -> None:
+            pass
+
+        def set_cross_venue_monitor(self, _monitor: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        runtime_module,
+        "load_trading_config",
+        lambda _path: SimpleNamespace(
+            signer_address="0x1111111111111111111111111111111111111111",
+            wallet_address="0x2222222222222222222222222222222222222222",
+            predict=None,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PolymarketTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: Fake()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        SimpleNamespace(from_keychain=lambda _config: None),
+        raising=False,
+    )
+    for name in (
+        "PredictionArbitrageStore",
+        "RelationCatalog",
+        "PolymarketMonitor",
+        "PredictionExecutionService",
+        "CodexRelationValidator",
+        "CodexTitleTranslator",
+        "PredictionLiveResolver",
+        "PredictionMonitorSelectionDriver",
+    ):
+        monkeypatch.setattr(runtime_module, name, Fake, raising=False)
+
+    runtime = PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        solver_server_factory=lambda: object(),
+        cross_venue_monitor=_UnavailableCrossVenueMonitor("test-disabled"),
+        enable_n_leg_background=False,
+    )
+    runtime.start()
+    try:
+        assert runtime.state == "RUNNING"
+        assert runtime.live_resolver is None
+        assert runtime.monitor_selection_driver is None
+    finally:
+        runtime.stop()
+
+    assert runtime.state == "STOPPED"
+
+
 def test_incompatible_release_stops_before_writable_resources_and_releases_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

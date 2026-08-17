@@ -828,6 +828,9 @@ def serve_prediction_service(
         notifier=notifier,
         git_sha=str(metadata.get("git_sha", "")),
         reader_generation=None if release is None else release.reader_generation,
+        enable_n_leg_background=(
+            os.environ.get("OPEN_TRADER_DISABLE_NLEG_BACKGROUND") != "1"
+        ),
     )
     server: ThreadingHTTPServer | None = None
     previous_handlers: dict[int, Any] = {}

@@ -361,6 +361,7 @@ class PredictionRuntime:
         git_sha: str = "",
         reader_generation: int | None = None,
         solver_server_factory: Callable[[], SolverServerOwner] | None = None,
+        enable_n_leg_background: bool = True,
     ) -> None:
         if mode not in {"production", "shadow"}:
             raise ValueError("prediction runtime mode must be production or shadow")
@@ -374,6 +375,7 @@ class PredictionRuntime:
         self._mode = mode
         self._git_sha = str(git_sha)
         self._reader_generation = reader_generation
+        self._enable_n_leg_background = bool(enable_n_leg_background)
         self._solver_server_factory = solver_server_factory or (
             lambda: SolverServerOwner(
                 [sys.executable, "-m", "open_trader.prediction_solver_worker", "--backend", "cp_sat"]
@@ -610,26 +612,27 @@ class PredictionRuntime:
                     )
                     if callable(set_cross_venue_monitor):
                         set_cross_venue_monitor(self.cross_venue_monitor)
-            selection_store = MonitorSelectionStore(self._data_dir)
-            selection_lock = threading.RLock()
-            self.live_resolver = PredictionLiveResolver(
-                data_dir=self._data_dir,
-                relation_catalog=self.relation_catalog,
-                monitor=self.monitor,
-                solver_server=self.solver_server,
-                selection_store=selection_store,
-                selection_lock=selection_lock,
-                store=self.store,
-                execution=self.execution,
-            )
-            self.live_resolver.start()
-            self.monitor_selection_driver = PredictionMonitorSelectionDriver(
-                relation_catalog=self.relation_catalog,
-                selection_store=selection_store,
-                selection_lock=selection_lock,
-                idle_check=self.live_resolver.is_idle,
-            )
-            self.monitor_selection_driver.start()
+            if self._enable_n_leg_background:
+                selection_store = MonitorSelectionStore(self._data_dir)
+                selection_lock = threading.RLock()
+                self.live_resolver = PredictionLiveResolver(
+                    data_dir=self._data_dir,
+                    relation_catalog=self.relation_catalog,
+                    monitor=self.monitor,
+                    solver_server=self.solver_server,
+                    selection_store=selection_store,
+                    selection_lock=selection_lock,
+                    store=self.store,
+                    execution=self.execution,
+                )
+                self.live_resolver.start()
+                self.monitor_selection_driver = PredictionMonitorSelectionDriver(
+                    relation_catalog=self.relation_catalog,
+                    selection_store=selection_store,
+                    selection_lock=selection_lock,
+                    idle_check=self.live_resolver.is_idle,
+                )
+                self.monitor_selection_driver.start()
             self._state = "RUNNING"
             logger.info(
                 "prediction_runtime_state state=RUNNING pid=%s data_dir=%s",
