@@ -29,6 +29,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping
@@ -38,7 +39,12 @@ from decimal import Decimal
 from pathlib import Path
 
 from open_trader.prediction_arbitrage import BookLevel
-from open_trader.prediction_live_resolver import USD_UNITS_PER_DOLLAR, normalize_problem
+from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+from open_trader.prediction_live_resolver import (
+    PredictionLiveResolver,
+    USD_UNITS_PER_DOLLAR,
+    normalize_problem,
+)
 from open_trader.prediction_market_solution import (
     AccountView,
     ExecutionSolution,
@@ -46,9 +52,10 @@ from open_trader.prediction_market_solution import (
     build_solve_request,
     execution_solution_from_market,
     market_solution_from_verification,
-    negative_proof_matches,
 )
 from open_trader.prediction_monitor_selection import (
+    MonitorSelectionStore,
+    SelectedComponent,
     problem_for_component,
     relation_generation_problem,
 )
@@ -69,14 +76,16 @@ from open_trader.prediction_snapshot_scheduler import (
     SnapshotLeg,
 )
 from open_trader.prediction_solver import BenchmarkLimits
+from open_trader.prediction_solver_server import SolverServerOwner
 from open_trader.prediction_solver_verified import (
     PROOF_REQUEST_SCHEMA_V1,
     ProofInput,
-    VerificationStatus,
+    VerificationResult,
     candidate_evidence_from_payload,
     model_fingerprint,
     quote_fingerprint,
     solve,
+    VerificationStatus,
     verification_result_from_payload,
     verify,
 )
@@ -189,6 +198,7 @@ def readonly_v2_relations(db_path: str | Path) -> dict[str, object]:
                 "version_id": version_id,
                 "status": status,
                 "activation": activation,
+                "endpoints": payload.get("endpoints") if isinstance(payload, dict) else [],
                 "model": model if isinstance(model, dict) else {},
             }
         return {
@@ -232,40 +242,17 @@ def _snapshot_from_frozen(snapshot: Mapping[str, object]) -> ComponentSnapshot:
             BookLevel(Decimal(str(level["price"])), Decimal(str(level["size"])))
             for level in levels
         )
-        legs.append(
-            SnapshotLeg(
-                action.action_id,
-                LegBook((), converted, None, True),
-                problem.as_of,
-                problem.as_of,
-                None,
-            )
+        book = (
+            LegBook((), converted, None, True)
+            if action.side.value == "BUY_YES"
+            else LegBook(converted, (), None, True)
         )
-    return ComponentSnapshot(component_id, tuple(legs))
-
-
-def _snapshot_from_live_books(
-    component_id: str,
-    problem: object,
-    books: Mapping[str, object],
-) -> ComponentSnapshot | None:
-    legs: list[SnapshotLeg] = []
-    for action in problem.actions:
-        book = books.get(action.market_contract_id) or books.get(action.action_id)
-        if book is None or not hasattr(book, "asks") or not hasattr(book, "bids"):
-            return None
-        confirmed_at = getattr(book, "confirmed_at", None)
         legs.append(
             SnapshotLeg(
                 action.action_id,
-                LegBook(
-                    bids=tuple(book.bids),
-                    asks=tuple(book.asks),
-                    taker_fee_bps=Decimal("0"),
-                    available=True,
-                ),
-                confirmed_at,
-                confirmed_at,
+                book,
+                problem.as_of,
+                problem.as_of,
                 None,
             )
         )
@@ -547,6 +534,166 @@ def run_replay(
     }
 
 
+class _ReadonlyCatalogAdapter:
+    """Read-only v2 catalog seam for RuntimeRelationGraph/PredictionLiveResolver."""
+
+    def __init__(
+        self,
+        rows: Mapping[str, Mapping[str, object]],
+        generation: object,
+    ) -> None:
+        self._rows = {identity: dict(row) for identity, row in rows.items()}
+        self._generation = int(generation) if generation is not None else 0
+
+    def current_generation(self) -> dict[str, object]:
+        return {identity: dict(row) for identity, row in self._rows.items()}
+
+    def generation_meta(self) -> dict[str, object]:
+        return {
+            "generation": self._generation,
+            "fingerprint": fingerprint({"generation": self._generation}),
+        }
+
+
+class _MonitorAdapter:
+    """Adapt the injected read-only book seam to the live resolver monitor API."""
+
+    def __init__(
+        self, book_source: Callable[[tuple[str, ...]], Mapping[str, object]]
+    ) -> None:
+        self._book_source = book_source
+
+    def cross_venue_books(self, token_ids: tuple[str, ...]) -> Mapping[str, object]:
+        return self._book_source(token_ids)
+
+    def cross_venue_book_meta(self, token_id: str) -> dict[str, object]:
+        # ponytail: no venue timing/sequence seam; the resolver only uses these
+        # for order_ready, which stays False under the frozen no-submit decision.
+        return {"exchange_time": None, "sequence": None}
+
+
+def _seed_selected_component(
+    problem: object, component: object
+) -> SelectedComponent:
+    sub = problem_for_component(problem, component)
+    return SelectedComponent(
+        component_id=component.component_id,
+        contract_ids=component.contract_ids,
+        constraint_ids=component.constraint_ids,
+        action_ids=component.action_ids,
+        # ponytail: empty portfolio and zero score claim no approval; the live
+        # resolver computes the real verified portfolio from the injected solver.
+        admission_score=0,
+        portfolio=(),
+        relation_fingerprint=fingerprint({"constraint_model": sub.constraint_model}),
+        terminal_fingerprint=fingerprint(
+            {"terminal_state_sets": sub.terminal_state_sets}
+        ),
+        portfolio_fingerprint=fingerprint({"quantities": ()}),
+        status="ACTIVE",
+    )
+
+
+def _positive_market_legs(market: MarketSolution) -> int:
+    return sum(1 for quantity in market.quantities if quantity.quantity_lots > 0)
+
+
+def _live_execution_decision(
+    market: MarketSolution, execution_solution: ExecutionSolution
+) -> dict[str, object]:
+    return {
+        "order_ready": False,
+        "reason": PARTIAL_FILL_PROOF_REQUIRED,
+        "partial_fill_proof": "UNKNOWN",
+        "quantities": [
+            {"action_id": q.action_id, "quantity_lots": q.quantity_lots}
+            for q in market.quantities
+        ],
+        "capital_use_units": execution_solution.capital_use_units,
+        "market_solution_fingerprint": execution_solution.market_solution_fingerprint,
+    }
+
+
+def _live_resolver_pass(
+    component_id: str,
+    market: MarketSolution,
+    execution_solution: ExecutionSolution,
+    catalog_rows: Mapping[str, Mapping[str, object]],
+    catalog: Mapping[str, object] | None,
+    execution: FailClosedExecution,
+    data_dir: Path,
+    started: float,
+) -> dict[str, object]:
+    return {
+        "status": "PASS",
+        "component_id": component_id,
+        "legs": _positive_market_legs(market),
+        "qualified_verified": True,
+        "guaranteed_profit_units": market.guaranteed_profit_units,
+        "execution_decision": _live_execution_decision(market, execution_solution),
+        "fingerprints": {
+            "quote": market.quote_fingerprint,
+            "structure": market.structure_fingerprint,
+            "portfolio": fingerprint({"quantities": market.quantities}),
+            "qualification": market.verification_fingerprint,
+            "catalog_generation": (
+                catalog.get("generation") if isinstance(catalog, dict) else None
+            ),
+            "catalog_rows": fingerprint({"rows": catalog_rows}),
+        },
+        "zero_side_effects": {
+            "submitted_orders": execution.submit_attempts,
+            "mutation_attempts": execution.mutation_attempts,
+            "data_dir": str(data_dir),
+            "catalog_read_only": True,
+        },
+        "timings": {
+            "end_to_end_seconds": round(time.perf_counter() - started, 6),
+        },
+    }
+
+
+def _live_negative_pass(
+    component_id: str,
+    catalog_rows: Mapping[str, Mapping[str, object]],
+    catalog: Mapping[str, object] | None,
+    execution: FailClosedExecution,
+    data_dir: Path,
+    started: float,
+    verification: VerificationResult | None,
+) -> dict[str, object]:
+    proof = verification.negative_proof if verification is not None else None
+    return {
+        "status": "PASS",
+        "component_id": component_id,
+        "legs": 0,
+        "qualified_verified": False,
+        "guaranteed_profit_units": None,
+        "execution_decision": None,
+        "fingerprints": {
+            "catalog_generation": (
+                catalog.get("generation") if isinstance(catalog, dict) else None
+            ),
+            "catalog_rows": fingerprint({"rows": catalog_rows}),
+            "negative_proof": (
+                fingerprint(canonical_payload(proof)) if proof is not None else None
+            ),
+            "qualification": (
+                proof.qualification_fingerprint if proof is not None else None
+            ),
+        },
+        "zero_side_effects": {
+            "submitted_orders": execution.submit_attempts,
+            "mutation_attempts": execution.mutation_attempts,
+            "data_dir": str(data_dir),
+            "catalog_read_only": True,
+        },
+        "timings": {
+            "end_to_end_seconds": round(time.perf_counter() - started, 6),
+        },
+    }
+
+
 def run_live(
     catalog_rows: Mapping[str, Mapping[str, object]],
     *,
@@ -557,9 +704,18 @@ def run_live(
     code_version: str = "issue-71",
     execution: FailClosedExecution | None = None,
     catalog: Mapping[str, object] | None = None,
+    solver_server: object | None = None,
+    poll_timeout_seconds: float = 15.0,
 ) -> dict[str, object]:
     data_dir = Path(data_dir)
     execution = execution or FailClosedExecution()
+    if (data_dir / "prediction_arbitrage" / "prediction_arbitrage.sqlite3").exists():
+        return _live_blocked(
+            "NON_ISOLATED_DATA_DIR",
+            data_dir,
+            execution,
+            "refusing to write validation stores into an existing prediction_arbitrage.sqlite3",
+        )
     started = time.perf_counter()
     try:
         problem, components = relation_generation_problem(catalog_rows)
@@ -567,7 +723,9 @@ def run_live(
         return _live_blocked(
             "NO_ACTIVE_RELATION_WITH_COMPILED_MODEL", data_dir, execution, str(exc)
         )
-    n3_components = [item for item in (components or ()) if len(item.action_ids) >= MIN_LEGS]
+    n3_components = [
+        item for item in (components or ()) if len(item.action_ids) >= MIN_LEGS
+    ]
     if problem is None or not n3_components:
         return _live_blocked(
             "NO_ACTIVE_N3_RELATION",
@@ -576,167 +734,151 @@ def run_live(
             "no approved ACTIVE same-venue N>=3 relation in the read-only catalog (tracked as #88)",
         )
     component = n3_components[0]
-    raw = problem_for_component(problem, component)
-    live_problem = normalize_problem(raw)
     if book_source is None:
         return _live_blocked(
             "LIVE_BOOK_SOURCE_UNAVAILABLE", data_dir, execution, "no read-only book seam configured"
         )
-    token_ids = tuple(action.market_contract_id for action in live_problem.actions)
+    monitor = _MonitorAdapter(book_source)
+    raw = problem_for_component(problem, component)
+    live_problem = normalize_problem(raw)
+    token_ids = tuple(action.market_contract_id for action in raw.actions)
     try:
-        books = book_source(token_ids)
-        component_snapshot = _snapshot_from_live_books(
-            component.component_id, live_problem, books
-        )
+        books = monitor.cross_venue_books(token_ids)
     except (TypeError, ValueError, OverflowError) as exc:
-        return _live_blocked(
-            "MISSING_BOOKS", data_dir, execution, f"book fetch failed: {exc}"
-        )
-    if component_snapshot is None:
+        return _live_blocked("MISSING_BOOKS", data_dir, execution, f"book fetch failed: {exc}")
+    if any(books.get(token) is None for token in token_ids):
         return _live_blocked("MISSING_BOOKS", data_dir, execution, "one or more books missing")
+
+    owned_solver_server = solver_server is None
+    resolver: PredictionLiveResolver | None = None
+    resolution = None
+    max_unsettled_capital = 0
+    lock_path = data_dir / "prediction_arbitrage" / ".nleg-validation.lock"
+    lock = _OwnershipLock(lock_path)
     try:
-        request = build_solve_request(
-            live_problem,
-            component_snapshot,
-            budget=budget,
-            limits=limits,
-            price_units_per_quote_unit=USD_UNITS_PER_DOLLAR,
+        lock.__enter__()
+    except RuntimeError as exc:
+        return _live_blocked(
+            "VALIDATION_LOCK_UNAVAILABLE", data_dir, execution, str(exc)
         )
-        evidence, verification, market, solve_seconds = _solve_verified(
-            component.component_id,
-            request.request.problem,
+    try:
+        if owned_solver_server:
+            solver_server = SolverServerOwner(
+                [
+                    sys.executable,
+                    "-m",
+                    "open_trader.prediction_solver_worker",
+                    "--backend",
+                    "cp_sat",
+                ]
+            )
+        adapter = _ReadonlyCatalogAdapter(
+            catalog_rows,
+            catalog.get("generation") if isinstance(catalog, dict) else 0,
+        )
+        store = PredictionArbitrageStore(data_dir)
+        selection_store = MonitorSelectionStore(data_dir)
+        selection_store.save(
+            {
+                component.component_id: _seed_selected_component(
+                    problem, component
+                )
+            }
+        )
+        resolver = PredictionLiveResolver(
+            data_dir=data_dir,
+            relation_catalog=adapter,
+            monitor=monitor,
+            solver_server=solver_server,
+            selection_store=selection_store,
+            store=store,
+            execution=execution,
             budget=budget,
             limits=limits,
             code_version=code_version,
         )
-    except (TypeError, ValueError, OverflowError) as exc:
-        return _live_blocked(
-            "SOLVER_UNAVAILABLE", data_dir, execution, str(exc)
+        max_unsettled_capital = int(
+            (store.n_leg_safety_config_latest() or {})
+            .get("config", {})
+            .get("max_total_unsettled_capital_units", 0)
         )
-    if market is None and verification.status != VerificationStatus.NO_QUALIFIED_OPPORTUNITY:
+        resolver.start()
+        deadline = time.monotonic() + poll_timeout_seconds
+        while time.monotonic() < deadline:
+            candidate = resolver.latest_resolution(component.component_id)
+            if candidate is not None:
+                resolution = candidate
+                break
+            time.sleep(0.01)
+    except RuntimeError as exc:
         return _live_blocked(
-            "UNKNOWN",
+            "VALIDATION_RUNTIME_ERROR", data_dir, execution, str(exc), status="FAIL"
+        )
+    finally:
+        if resolver is not None:
+            resolver.stop()
+        if owned_solver_server and solver_server is not None:
+            solver_server.close()
+        lock.__exit__(None, None, None)
+
+    if execution.submit_attempts != 0 or execution.mutation_attempts != 0:
+        raise RuntimeError(
+            "no-submit validation violated: submission/mutation reached "
+            f"(submit_attempts={execution.submit_attempts}, "
+            f"mutation_attempts={execution.mutation_attempts})"
+        )
+    if resolution is None or resolution.status == VerificationStatus.UNKNOWN:
+        return _live_blocked(
+            "NO_QUALIFIED_SOLUTION",
             data_dir,
             execution,
-            f"{verification.status.value}:{verification.unknown_reason or 'NO_MARKET_SOLUTION'}",
+            "resolver produced no qualified N>=3 MarketSolution within timeout",
             status="FAIL",
         )
-    if verification.status == VerificationStatus.NO_QUALIFIED_OPPORTUNITY:
-        proven = negative_proof_matches(
-            evidence,
-            verification,
-            request.request.problem,
-            code_version=code_version,
-        )
-        if not proven:
-            return _live_blocked(
-                "NEGATIVE_PROOF_MISMATCH", data_dir, execution, "negative proof does not bind",
-                status="FAIL",
-            )
-        return _live_pass(
+    if resolution.status == VerificationStatus.NO_QUALIFIED_OPPORTUNITY:
+        verification = resolver.latest_verification(component.component_id)
+        return _live_negative_pass(
             component.component_id,
-            0,
-            False,
-            None,
-            None,
-            request,
-            evidence,
-            verification,
             catalog_rows,
             catalog,
             execution,
             data_dir,
             started,
-            solve_seconds,
+            verification,
         )
-    assert market is not None
-    legs = len([q for q in market.quantities if q.quantity_lots > 0])
-    if legs < MIN_LEGS:
+    market = resolution.market_solution
+    if market is None:
         return _live_blocked(
-            "N_LESS_THAN_3", data_dir, execution, f"solver selected {legs} positive legs",
+            "NO_QUALIFIED_SOLUTION",
+            data_dir,
+            execution,
+            "resolver produced no qualified N>=3 MarketSolution within timeout",
             status="FAIL",
         )
-    return _live_pass(
+    if _positive_market_legs(market) < MIN_LEGS:
+        return _live_blocked(
+            "N_LESS_THAN_3",
+            data_dir,
+            execution,
+            f"solver selected {_positive_market_legs(market)} positive legs",
+            status="FAIL",
+        )
+    execution_solution = execution_solution_from_market(
+        market,
+        live_problem,
+        execution.n_leg_account_view(),
+        max_total_unsettled_capital=max_unsettled_capital,
+    )
+    return _live_resolver_pass(
         component.component_id,
-        legs,
-        True,
-        market.guaranteed_profit_units,
-        _execution_decision(market, request.request.problem),
-        request,
-        evidence,
-        verification,
+        market,
+        execution_solution,
         catalog_rows,
         catalog,
         execution,
         data_dir,
         started,
-        solve_seconds,
     )
-
-
-def _live_pass(
-    component_id: str,
-    legs: int,
-    qualified: bool,
-    profit: int | None,
-    decision: dict[str, object] | None,
-    request: object,
-    evidence: object,
-    verification: object,
-    catalog_rows: Mapping[str, Mapping[str, object]],
-    catalog: Mapping[str, object] | None,
-    execution: FailClosedExecution,
-    data_dir: Path,
-    started: float,
-    solve_seconds: float,
-) -> dict[str, object]:
-    return {
-        "status": "PASS",
-        "component_id": component_id,
-        "legs": legs,
-        "qualified_verified": qualified,
-        "guaranteed_profit_units": profit,
-        "execution_decision": decision,
-        "fingerprints": {
-            "model": model_fingerprint(request.request.problem),
-            "quote": quote_fingerprint(request.request.problem),
-            "portfolio": (
-                fingerprint({"quantities": verification.solution.quantities})
-                if verification.solution is not None
-                else None
-            ),
-            "qualification": (
-                (
-                    verification.solution.payout_proof.qualification_fingerprint
-                    if verification.solution is not None
-                    else verification.negative_proof.qualification_fingerprint
-                )
-                if (
-                    verification.solution is not None
-                    or verification.negative_proof is not None
-                )
-                else None
-            ),
-            "catalog_generation": (
-                catalog.get("generation") if isinstance(catalog, dict) else None
-            ),
-            "catalog_rows": fingerprint({"rows": catalog_rows}),
-        },
-        "constraint_generation_rounds": {
-            "master_rounds": evidence.solver_evidence.master_rounds,
-            "adversary_rounds": evidence.solver_evidence.adversary_rounds,
-        },
-        "zero_side_effects": {
-            "submitted_orders": execution.submit_attempts,
-            "mutation_attempts": execution.mutation_attempts,
-            "data_dir": str(data_dir),
-            "catalog_read_only": True,
-        },
-        "timings": {
-            "solve_seconds": round(solve_seconds, 6),
-            "end_to_end_seconds": round(time.perf_counter() - started, 6),
-        },
-    }
 
 
 def _live_blocked(
