@@ -78,7 +78,7 @@ class PredictionMonitorSelectionDriver:
 
     def start(self) -> None:
         with self._lock:
-            if self._thread is not None:
+            if self._thread is not None and self._thread.is_alive():
                 return
             self._stop_event.clear()
             self._thread = threading.Thread(
@@ -94,7 +94,10 @@ class PredictionMonitorSelectionDriver:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2)
         with self._lock:
-            self._thread = None
+            # ponytail: let a pass already in progress finish; it is synchronous
+            # and bounded by the discovery budget.
+            if thread is not None and not thread.is_alive():
+                self._thread = None
 
     def status(self) -> dict[str, object]:
         with self._lock:
@@ -180,7 +183,7 @@ class PredictionMonitorSelectionDriver:
 
         candidates = {
             component.component_id: resolution
-            for component, resolution in zip(new_components, results)
+            for component, resolution in zip(new_components, results, strict=True)
         }
 
         with self._selection_lock:

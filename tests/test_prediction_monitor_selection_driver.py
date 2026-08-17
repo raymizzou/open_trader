@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Mapping
 from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +24,7 @@ from open_trader.prediction_monitor_selection import (
 from open_trader.prediction_monitor_selection_driver import (
     PredictionMonitorSelectionDriver,
 )
+from open_trader.prediction_runtime import PredictionRuntime
 from open_trader.prediction_n_leg import (
     OBSERVATION_SCHEMA_V1,
     PROBLEM_SCHEMA_V1,
@@ -311,11 +313,11 @@ def test_pass_discovers_selects_and_saves(
     selected = selected_component(component.component_id)
     captured: dict[str, object] = {}
 
-    def fake_discovery(*args: object, **kwargs: object) -> tuple[()]:
+    def fake_discovery(*args: object, **kwargs: object) -> tuple[object, ...]:
         captured["problem"] = args[0]
         captured["components"] = args[1]
         captured.update(kwargs)
-        return ()
+        return (object(),)
 
     monkeypatch.setattr(
         "open_trader.prediction_monitor_selection_driver.run_discovery",
@@ -426,3 +428,73 @@ def test_start_stop_is_idempotent(tmp_path: Path) -> None:
     instance.stop()
     assert instance._thread is None
     assert not thread.is_alive()
+
+
+def test_runtime_n_leg_metrics_empty_without_selection_driver(
+    tmp_path: Path,
+) -> None:
+    runtime = PredictionRuntime(
+        data_dir=tmp_path / "data",
+        prediction_config_path=tmp_path / "prediction_config.json",
+        dashboard_url="http://127.0.0.1:8766",
+    )
+    assert runtime.n_leg_metrics() == {}
+
+
+def test_pass_resolves_all_new_components_before_capped_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = {"r:a": row("r:a", raw_problem())}
+    catalog = FakeCatalog(rows, generation=5, fingerprint="fp-5")
+    instance = PredictionMonitorSelectionDriver(
+        relation_catalog=catalog,
+        selection_store=MonitorSelectionStore(tmp_path),
+        idle_check=lambda: True,
+    )
+    components = tuple(
+        SimpleNamespace(component_id=f"component:{index}") for index in range(12)
+    )
+    captured: dict[str, object] = {}
+
+    def fake_relation_generation_problem(
+        _generation: object,
+    ) -> tuple[ArbitrageProblem, tuple[object, ...]]:
+        return raw_problem(), components
+
+    def fake_discovery(
+        _problem: object,
+        discovered: tuple[object, ...],
+        **kwargs: object,
+    ) -> tuple[object, ...]:
+        captured["discovered"] = discovered
+        captured["discovery_kwargs"] = kwargs
+        return tuple(object() for _ in discovered)
+
+    def fake_select(
+        candidates: Mapping[str, object],
+        _current: Mapping[str, object],
+        **kwargs: object,
+    ) -> dict[str, object]:
+        captured["candidates"] = dict(candidates)
+        captured["select_kwargs"] = kwargs
+        return {}
+
+    monkeypatch.setattr(
+        "open_trader.prediction_monitor_selection_driver.relation_generation_problem",
+        fake_relation_generation_problem,
+    )
+    monkeypatch.setattr(
+        "open_trader.prediction_monitor_selection_driver.run_discovery",
+        fake_discovery,
+    )
+    monkeypatch.setattr(
+        "open_trader.prediction_monitor_selection_driver.select_monitor_components",
+        fake_select,
+    )
+
+    instance._tick()
+
+    assert captured["discovered"] == components
+    assert set(captured["candidates"]) == {component.component_id for component in components}
+    assert len(captured["candidates"]) == 12
+    assert captured["select_kwargs"]["max_slots"] == 10

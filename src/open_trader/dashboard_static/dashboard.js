@@ -2629,7 +2629,7 @@ function predictionNLegMetrics(payload) {
     predictionUnifiedMetric("超时 / 陈旧拒绝", escapeHtml(`${predictionValue(metrics.timeout, "-")} / ${predictionValue(metrics.stale_reject, "-")}`)),
     predictionUnifiedMetric("机会存活时间", escapeHtml(`p95 ${survivalP95}`), "", "<small>内存 / 线程 / 队列有界</small>"),
   ].join("");
-  return `<section class="pm-metrics pm-n-leg-overview" aria-label="N_LEG 性能指标">${cards}</section>`;
+  return `<section class="pm-metrics pm-n-leg-metrics-overview" aria-label="N_LEG 性能指标">${cards}</section>`;
 }
 
 const PREDICTION_RELATION_REVIEW_STATES = {
