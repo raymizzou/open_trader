@@ -1751,10 +1751,6 @@ class PolymarketMonitor:
                 payload,
                 full_scanned_at=completed.isoformat(),
             )
-            ingest = getattr(self._relation_catalog, "ingest_threshold_relation", None)
-            if callable(ingest):
-                for relation in relations:
-                    ingest(relation)
             self._set_relation_state(relations, events, scanned_at=completed)
             self._invalidate_rule_cache()
             # A completed catalog scan is a fresh episode boundary.  Even an
