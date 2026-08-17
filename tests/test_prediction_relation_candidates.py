@@ -19,7 +19,10 @@ from open_trader.polymarket_relation_discovery import (
     discover_threshold_relations,
     threshold_relation_payload,
 )
-from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+from open_trader.prediction_arbitrage_store import (
+    PredictionArbitrageStore,
+    load_relation_state_readonly,
+)
 from open_trader.prediction_relation_candidates import (
     group_relation_candidates,
     prepare_relation_candidates,
@@ -307,3 +310,42 @@ def test_cli_relation_candidates_dry_run_and_apply(tmp_path: Path, capsys: pytes
     assert applied["status"] == "PREPARED"
     assert len(applied["version_ids"]) == 2
     assert RelationCatalog(data_dir).pending_count() == 2
+
+
+def test_cli_relation_candidates_dry_run_readonly_database(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "data"
+    store = PredictionArbitrageStore(data_dir)
+    store.save_relation_state(
+        {
+            "relations": [
+                threshold_relation_payload(relation("e", "a", "b")),
+                threshold_relation_payload(relation("e", "b", "c")),
+            ]
+        },
+        full_scanned_at="2026-08-17T00:00:00Z",
+    )
+
+    db = data_dir / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    db.chmod(0o444)
+    try:
+        assert load_relation_state_readonly(data_dir) is not None
+        assert (
+            cli.main(
+                [
+                    "prediction-arb",
+                    "relation-candidates",
+                    "--data-dir",
+                    str(data_dir),
+                    "--dry-run",
+                ]
+            )
+            == 0
+        )
+        report = json.loads(capsys.readouterr().out)
+        assert report["status"] == "PREPARED"
+        assert report["prepared"] == 1
+        assert report["version_ids"] == []
+    finally:
+        db.chmod(0o644)
