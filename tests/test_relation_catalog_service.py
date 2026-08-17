@@ -125,6 +125,51 @@ def test_relation_catalog_mutation_rejects_extra_fields_before_approval(tmp_path
     assert forbidden["activation"] == "ACTIVE"
 
 
+def test_relations_list_is_bounded_and_excludes_compiled_problem(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    for index in range(3):
+        payload = discovery()
+        payload["markets"][0]["contract_id"] = f"condition-a-{index}"
+        payload["markets"][1]["contract_id"] = f"condition-b-{index}"
+        catalog.ingest(payload)
+    with running(catalog) as base:
+        status, page = response(
+            base + "/api/prediction-arbitrage/relations?view=pending&limit=2&offset=0"
+        )
+        assert status == 200
+        assert page["total"] == 3
+        assert page["pending_count"] == 3
+        assert len(page["items"]) == 2
+        assert all("problem" not in item["model"] for item in page["items"])
+
+        status, tail = response(
+            base + "/api/prediction-arbitrage/relations?view=pending&limit=2&offset=2"
+        )
+        assert status == 200
+        assert len(tail["items"]) == 1
+
+        status, invalid = response(
+            base + "/api/prediction-arbitrage/relations?view=pending&limit=0"
+        )
+        assert status == 400
+
+        status, unknown = response(
+            base + "/api/prediction-arbitrage/relations?view=pending&surprise=1"
+        )
+        assert status == 400
+
+
+def test_relations_detail_still_carries_compiled_problem(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    version_id = catalog.ingest_threshold_relation(threshold_relation())["version_id"]
+    with running(catalog) as base:
+        status, detail = response(base + f"/api/prediction-arbitrage/relations/{version_id}")
+        assert status == 200
+        assert detail["model"]["problem"] is not None
+        _, page = response(base + "/api/prediction-arbitrage/relations?view=pending")
+        assert "problem" not in page["items"][0]["model"]
+
+
 def test_relation_catalog_review_rows_expose_every_version_without_views(tmp_path: Path) -> None:
     catalog = RelationCatalog(tmp_path)
     pending_id = catalog.ingest(discovery(complete=False))["version_id"]

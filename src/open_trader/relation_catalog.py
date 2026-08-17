@@ -427,9 +427,18 @@ class RelationCatalog:
     def _versions(self) -> dict[str, dict[str, object]]:
         return self._store.get("versions", {})
 
-    def _row(self, version_id: str, occurrences: int = 0) -> dict[str, object]:
+    def _row(
+        self, version_id: str, occurrences: int = 0, *, include_problem: bool = True
+    ) -> dict[str, object]:
         record = self._versions()[version_id]
         payload = record["payload"]
+        model: dict[str, object] = {
+            "terminal_states": payload.get("terminal_states", []),
+            "payouts": payload.get("payouts", {}),
+            "capital_release": payload.get("capital_release"),
+        }
+        if include_problem:
+            model["problem"] = payload.get("problem")
         return {
             "version_id": version_id,
             "identity": str(record["identity"]),
@@ -444,12 +453,7 @@ class RelationCatalog:
             "relation_type": payload["relation_type"],
             "endpoints": payload["endpoints"],
             "statement": payload.get("statement", ""),
-            "model": {
-                "terminal_states": payload.get("terminal_states", []),
-                "payouts": payload.get("payouts", {}),
-                "capital_release": payload.get("capital_release"),
-                "problem": payload.get("problem"),
-            },
+            "model": model,
         }
 
     def _current_generation(self) -> dict[str, dict[str, str]]:
@@ -474,7 +478,7 @@ class RelationCatalog:
         generation = self._current_generation()
         versions = self._versions()
         result = [
-            self._row(version_id, int(record.get("occurrence_count", 1)))
+            self._row(version_id, int(record.get("occurrence_count", 1)), include_problem=False)
             for version_id, record in versions.items()
             if self._in_view(view, version_id, record, generation)
         ]
