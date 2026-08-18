@@ -3272,12 +3272,12 @@ function predictionLlmEngineHtml(discovery) {
   const selected = String(engine.selected || "");
   if (!selected) return "";
   const models = engine.models && typeof engine.models === "object" ? engine.models : {};
-  const credentials = engine.credentials && typeof engine.credentials === "object" ? engine.credentials : {};
+  const configuredMap = engine.configured && typeof engine.configured === "object" ? engine.configured : {};
   const usageByProvider = discovery?.llm_usage_24h_by_provider && typeof discovery.llm_usage_24h_by_provider === "object" ? discovery.llm_usage_24h_by_provider : {};
   const switching = String(state.predictionMarket.llmSwitchInFlight || "");
   const buttons = PREDICTION_LLM_PROVIDERS.map((item) => {
     const isCurrent = item.id === selected;
-    const configured = credentials[item.id] !== false;
+    const configured = configuredMap[item.id] !== false;
     const inFlight = switching === item.id;
     const disabled = isCurrent || !configured || (Boolean(switching) && !inFlight);
     const sub = isCurrent ? "当前" : configured ? item.sub : "未配置 Key";

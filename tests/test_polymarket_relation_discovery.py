@@ -831,7 +831,7 @@ def test_current_provider_prefers_store_row_over_env_and_defaults(
         "selected": "deepseek",
         "models": dict(env_default.models),
         "default": "codex",
-        "credentials": {"codex": True, "deepseek": False, "zhipu": False},
+        "configured": {"codex": True, "deepseek": False, "zhipu": False},
     }
 
     with pytest.raises(ValueError, match="invalid llm provider"):

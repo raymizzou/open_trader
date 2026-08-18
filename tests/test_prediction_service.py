@@ -24,6 +24,8 @@ import open_trader.prediction_service as prediction_service
 from open_trader.llm_providers import PROVIDER_IDS, resolve_provider
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_read_model import (
+    _prediction_relation_safe_value,
+    _prediction_safe_value,
     prediction_history_payload,
     prediction_state_payload,
 )
@@ -1188,7 +1190,7 @@ class _ProviderSnapshotValidator:
                 "zhipu": "glm-5",
             },
             "default": default,
-            "credentials": {"codex": True, "deepseek": False, "zhipu": False},
+            "configured": {"codex": True, "deepseek": False, "zhipu": False},
         }
 
 
@@ -1754,3 +1756,41 @@ def test_production_bind_failure_stops_runtime_and_uses_one_metadata_snapshot(
     assert {
         signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
     } == previous
+
+
+class TestPredictionSafeValueConfiguredNotStripped:
+    """Regression: the 'configured' key in llm_provider snapshot must survive
+    _prediction_safe_value / _prediction_relation_safe_value, unlike the old
+    'credentials' key which contained 'credential' and was silently dropped."""
+
+    def test_safe_value_preserves_configured_key(self) -> None:
+        payload = {
+            "llm_provider": {
+                "selected": "codex",
+                "models": {"codex": "gpt-5.6-sol", "zhipu": "glm-5"},
+                "default": "codex",
+                "configured": {"codex": True, "zhipu": False},
+            }
+        }
+        result = _prediction_safe_value(payload)
+        assert isinstance(result, dict)
+        lp = result["llm_provider"]
+        assert isinstance(lp, dict)
+        assert "configured" in lp
+        assert lp["configured"] == {"codex": True, "zhipu": False}
+
+    def test_relation_safe_value_preserves_configured_key(self) -> None:
+        payload = {
+            "llm_provider": {
+                "selected": "zhipu",
+                "models": {"codex": "gpt-5.6-sol", "zhipu": "glm-5"},
+                "default": "zhipu",
+                "configured": {"codex": True, "zhipu": True},
+            }
+        }
+        result = _prediction_relation_safe_value(payload)
+        assert isinstance(result, dict)
+        lp = result["llm_provider"]
+        assert isinstance(lp, dict)
+        assert "configured" in lp
+        assert lp["configured"] == {"codex": True, "zhipu": True}

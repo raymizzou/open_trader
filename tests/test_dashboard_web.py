@@ -3729,7 +3729,7 @@ const payload = {relation_discovery:{
   scan_logs:[{scope:"activity",status:"completed"}],
   codex_usage_24h:{calls:10,successes:9,failures:1,cache_hits:200},
   llm_usage_24h_by_provider:{zhipu:{calls:6,successes:6,failures:0,cache_hits:198},codex:{calls:4,successes:3,failures:1,cache_hits:2}},
-  llm_provider:{selected:"zhipu",models:{codex:"gpt-5.6-sol",deepseek:"deepseek-v4-flash",zhipu:"glm-5"},default:"zhipu",credentials:{codex:true,deepseek:false,zhipu:true}},
+  llm_provider:{selected:"zhipu",models:{codex:"gpt-5.6-sol",deepseek:"deepseek-v4-flash",zhipu:"glm-5"},default:"zhipu",configured:{codex:true,deepseek:false,zhipu:true}},
 }};
 const html = predictionRelationDiscoveryPanel(payload);
 const funnel = predictionRelationFunnel(payload);
