@@ -173,6 +173,7 @@ def test_failed_engine_does_not_fallback_and_switch_restores_translation(
     codex, codex_calls = title_completer("比特币高于九万美元吗？")
     translator = LlmTitleTranslator(
         target,
+        default_provider="zhipu",
         completers={"codex": codex, "deepseek": codex, "zhipu": zhipu},
     )
 

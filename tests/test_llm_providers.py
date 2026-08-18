@@ -39,7 +39,7 @@ SCHEMA = (
 
 def test_resolve_provider_accepts_known_ids_case_insensitively() -> None:
     assert PROVIDER_IDS == ("codex", "deepseek", "zhipu")
-    assert DEFAULT_PROVIDER == "zhipu"
+    assert DEFAULT_PROVIDER == "deepseek"
     assert resolve_provider("codex") == "codex"
     assert resolve_provider(" DeepSeek ") == "deepseek"
     assert resolve_provider("ZHIPU") == "zhipu"
