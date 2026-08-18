@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 import open_trader.cli as cli
-from open_trader.relation_catalog import RelationCatalog, _threshold_complete_model
+from open_trader.relation_catalog import (
+    RelationCatalog,
+    _derive_statement,
+    _threshold_complete_model,
+)
 from open_trader.relation_catalog_v2 import SqliteCatalogStore
 from test_prediction_arbitrage import threshold_relation
 
@@ -405,3 +409,176 @@ def test_concurrent_readers_on_shared_catalog_do_not_nest_transactions(
     ]
     assert not errors
     assert not transaction_errors
+
+
+def _unique_discovery(suffix: str, *, completeness: str = "COMPLETE") -> dict[str, object]:
+    payload = discovery(completeness=completeness, n=2)
+    payload["markets"][0]["contract_id"] = f"condition-a-{suffix}"
+    payload["markets"][1]["contract_id"] = f"condition-b-{suffix}"
+    return payload
+
+
+def _force_record(catalog: RelationCatalog, version_id: str, **overrides: object) -> None:
+    record = dict(catalog._versions()[version_id])
+    record.update(overrides)
+    catalog._store_write({version_id: record})
+
+
+def test_list_filters_the_six_review_state_views_and_counts_them(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+
+    pending_id = catalog.ingest(
+        _unique_discovery("p1", completeness="INCOMPLETE")
+    )["version_id"]
+    incomplete_id = catalog.ingest(
+        _unique_discovery("i1", completeness="INCOMPLETE")
+    )["version_id"]
+    approved_incomplete = catalog.approve(
+        incomplete_id, {"version_id": incomplete_id}, actor="op", git_sha="sha"
+    )
+    assert approved_incomplete["activation"] == "INCOMPLETE"
+
+    active_id = catalog.ingest(_unique_discovery("a1"))["version_id"]
+    catalog.approve(active_id, {"version_id": active_id}, actor="op", git_sha="sha")
+
+    blocked_id = catalog.ingest(_unique_discovery("b1"))["version_id"]
+    catalog.approve(blocked_id, {"version_id": blocked_id}, actor="op", git_sha="sha")
+    _force_record(catalog, blocked_id, activation_status="ACTIVATION_BLOCKED_INCONSISTENT")
+
+    size_blocked_id = catalog.ingest(_unique_discovery("b2"))["version_id"]
+    catalog.approve(size_blocked_id, {"version_id": size_blocked_id}, actor="op", git_sha="sha")
+    _force_record(catalog, size_blocked_id, activation_status="UNSUPPORTED_SIZE")
+
+    compiled_id = catalog.ingest(_unique_discovery("c1"))["version_id"]
+    catalog.approve(compiled_id, {"version_id": compiled_id}, actor="op", git_sha="sha")
+    _force_record(catalog, compiled_id, activation_status="PENDING")
+
+    superseded_id = catalog.ingest(_unique_discovery("s1"))["version_id"]
+    catalog.approve(superseded_id, {"version_id": superseded_id}, actor="op", git_sha="sha")
+    _force_record(catalog, superseded_id, activation_status="SUPERSEDED")
+
+    rejected_id = catalog.ingest(
+        _unique_discovery("r1", completeness="INCOMPLETE")
+    )["version_id"]
+    catalog.reject(
+        rejected_id, {"version_id": rejected_id}, reason="other", actor="op", git_sha="sha"
+    )
+
+    views = {
+        "pending_approval": [pending_id],
+        "approved_model_incomplete": [incomplete_id],
+        "compiled_pending_activation": [compiled_id],
+        "activation_blocked": {blocked_id, size_blocked_id},
+        "activated": [active_id],
+        "source_changed_reapproval": [superseded_id],
+    }
+    for view, expected in views.items():
+        rows = catalog.list(view)
+        assert {row["version_id"] for row in rows} == set(expected)
+        assert rejected_id not in {row["version_id"] for row in rows}
+
+    assert catalog.review_counts() == {
+        "counts": {
+            "PENDING_APPROVAL": 1,
+            "APPROVED_MODEL_INCOMPLETE": 1,
+            "COMPILED_PENDING_ACTIVATION": 1,
+            "ACTIVATION_BLOCKED": 2,
+            "ACTIVATED": 1,
+            "SOURCE_CHANGED_REAPPROVAL": 1,
+        },
+        "pending_count": 1,
+    }
+
+
+def test_list_legacy_view_aliases_keep_their_semantics(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+
+    pending_id = catalog.ingest(
+        _unique_discovery("p1", completeness="INCOMPLETE")
+    )["version_id"]
+    active_id = catalog.ingest(_unique_discovery("a1"))["version_id"]
+    catalog.approve(active_id, {"version_id": active_id}, actor="op", git_sha="sha")
+
+    base = _unique_discovery("a1")
+    drifted = dict(base)
+    drifted["markets"] = [dict(market) for market in base["markets"]]
+    drifted["markets"][0]["title"] = "Market 0 (edited)"
+    blocked_id = catalog.ingest(drifted)["version_id"]
+    blocked = catalog.approve(
+        blocked_id, {"version_id": blocked_id}, actor="op", git_sha="sha"
+    )
+    assert blocked["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+
+    superseded_id = catalog.ingest(_unique_discovery("s1"))["version_id"]
+    _force_record(
+        catalog, superseded_id, status="APPROVED", activation_status="SUPERSEDED"
+    )
+
+    rejected_id = catalog.ingest(
+        _unique_discovery("r1", completeness="INCOMPLETE")
+    )["version_id"]
+    catalog.reject(
+        rejected_id, {"version_id": rejected_id}, reason="other", actor="op", git_sha="sha"
+    )
+
+    assert {row["version_id"] for row in catalog.list("pending")} == {pending_id}
+    assert {row["version_id"] for row in catalog.list("pending_approval")} == {pending_id}
+    assert {row["version_id"] for row in catalog.list("approved_active")} == {active_id}
+    # Six-state semantics: blocked covers INCONSISTENT/UNSUPPORTED_SIZE; the
+    # legacy INCOMPLETE rows now live in approved_model_incomplete.
+    assert {row["version_id"] for row in catalog.list("activation_blocked")} == {blocked_id}
+    assert {row["version_id"] for row in catalog.list("history")} == {
+        rejected_id, superseded_id,
+    }
+    with pytest.raises(ValueError):
+        catalog.list("nonsense")
+
+
+def test_threshold_statement_is_derived_at_read_time_with_direction_code(
+    tmp_path: Path,
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+    version_id = catalog.ingest_threshold_relation(threshold_relation())["version_id"]
+
+    detail = catalog.detail(version_id)
+    assert detail["direction_code"] == "B_IMPLIES_A"
+    assert detail["statement"] == "B『BTC above $100000?』为 YES ⇒ A『BTC above $90000?』必须 YES"
+    assert "B_IMPLIES_A" not in detail["statement"]
+
+    row = catalog.list("pending")[0]
+    assert row["version_id"] == version_id
+    assert row["direction_code"] == "B_IMPLIES_A"
+    assert row["statement"] == detail["statement"]
+
+
+def test_list_truncates_statement_titles_but_detail_keeps_full_text(
+    tmp_path: Path,
+) -> None:
+    base = threshold_relation()
+    relation = replace(
+        base,
+        market_a=replace(base.market_a, question="A" * 40),
+        market_b=replace(base.market_b, question="B" * 5),
+    )
+    catalog = RelationCatalog(tmp_path)
+    version_id = catalog.ingest_threshold_relation(relation)["version_id"]
+
+    detail = catalog.detail(version_id)
+    assert f"B『{'B' * 5}』为 YES ⇒ A『{'A' * 40}』必须 YES" == detail["statement"]
+
+    row = catalog.list("pending")[0]
+    assert "A" * 40 not in row["statement"]
+    assert f"A『{'A' * 28}…』必须 YES" in row["statement"]
+    assert f"B『{'B' * 5}』为 YES" in row["statement"]
+
+
+def test_derive_statement_only_rewrites_direction_code_literals() -> None:
+    assert _derive_statement("exactly one resolves YES", [{"title": "A"}, {"title": "B"}]) == (
+        "exactly one resolves YES", "",
+    )
+    assert _derive_statement("A_IMPLIES_B", [{"title": "A"}]) == ("A_IMPLIES_B", "")
+    statement, code = _derive_statement(
+        "A_TO_B", [{"title": "Q1"}, {"title": "Q2"}]
+    )
+    assert statement == "A『Q1』为 YES ⇒ B『Q2』必须 YES"
+    assert code == "A_TO_B"

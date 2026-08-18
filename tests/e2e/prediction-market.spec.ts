@@ -13,7 +13,7 @@ test.describe('unified N_LEG opportunity page', () => {
       await page.setViewportSize(viewport);
       await openPrediction(page);
       const root = page.locator('#prediction-market-workspace');
-      const markers = ['pm-mode-bar', 'pm-venue-readiness', '资金占用', '机会列表', '关系审核'];
+      const markers = ['pm-mode-bar', 'pm-venue-readiness', '资金占用', '机会列表', '六态状态计数'];
       for (const marker of ['[aria-label="资金占用"]', '.pm-opportunity', '.pm-relation-drawer']) {
         await expect(page.locator(marker).first()).toBeVisible();
       }
@@ -67,14 +67,28 @@ test.describe('unified N_LEG opportunity page', () => {
     expect(previewRequests.length).toBeGreaterThanOrEqual(1);
   });
 
-  test('relation review projects the six approval states', async ({ page }) => {
+  test('relation review overview opens the six-state drawer', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 1100 });
     await openPrediction(page);
-    const review = page.locator('.pm-relation-drawer');
+    const overview = page.locator('[aria-label="关系审核概览"]');
+    await expect(overview).toBeVisible();
     for (const label of ['待批准', '已批准 · 模型不完整', '编译补全待激活', '激活阻断', '已激活', '来源变化需重批']) {
-      await expect(review).toContainText(label);
+      await expect(overview.locator('.pm-relation-chip', { hasText: label })).toBeVisible();
     }
-    await expect(review).toContainText('ACTIVATION_BLOCKED_INCONSISTENT · 冲突候选 2');
+
+    await page.locator('[data-open-relation-view="activation_blocked"]').click();
+    const drawer = page.locator('.pm-relation-drawer[role="dialog"]');
+    await expect(drawer).toBeVisible();
+    for (const label of ['待批准', '模型不完整', '编译补全待激活', '激活阻断', '已激活', '需重批']) {
+      await expect(drawer.locator('.pm-relation-tabs')).toContainText(label);
+    }
+    await expect(drawer.locator('.pm-relation-pager')).toContainText('显示 1–1 / 1');
+
+    await page.locator('[data-action="close-relation-review"]').click();
+    await expect(drawer).toHaveCount(0);
+    await page.locator('[data-action="open-relation-review"]').first().click();
+    await expect(page.locator('.pm-relation-drawer[role="dialog"]')).toBeVisible();
+    await expect(page.locator('.pm-relation-drawer[role="dialog"] .pm-relation-list')).toContainText('必须为 YES');
   });
 
   test('captures the unified page screenshot for mock parity', async ({ page }) => {

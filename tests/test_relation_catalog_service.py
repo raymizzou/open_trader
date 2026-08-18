@@ -159,6 +159,61 @@ def test_relations_list_is_bounded_and_excludes_compiled_problem(tmp_path: Path)
         assert status == 400
 
 
+def test_relations_api_accepts_six_state_views_history_and_paging(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    pending_ids = []
+    for index in range(4):
+        payload = discovery()
+        payload["markets"][0]["contract_id"] = f"condition-a-{index}"
+        payload["markets"][1]["contract_id"] = f"condition-b-{index}"
+        pending_ids.append(catalog.ingest(payload)["version_id"])
+    active_id = catalog.ingest_threshold_relation(threshold_relation())["version_id"]
+    catalog.approve(active_id, {"version_id": active_id}, actor="operator", git_sha="sha")
+    catalog.reject(
+        pending_ids[0], {"version_id": pending_ids[0]},
+        reason="other", actor="operator", git_sha="sha",
+    )
+    with running(catalog) as base:
+        status, page = response(
+            base + "/api/prediction-arbitrage/relations?view=pending_approval&limit=2&offset=0"
+        )
+        assert status == 200
+        assert page["total"] == 3
+        assert page["pending_count"] == 3
+        assert len(page["items"]) == 2
+        status, tail = response(
+            base + "/api/prediction-arbitrage/relations?view=pending_approval&limit=2&offset=2"
+        )
+        assert status == 200
+        assert len(tail["items"]) == 1
+
+        status, activated = response(
+            base + "/api/prediction-arbitrage/relations?view=activated"
+        )
+        assert status == 200
+        assert [item["version_id"] for item in activated["items"]] == [active_id]
+        item = activated["items"][0]
+        assert item["direction_code"] == "B_IMPLIES_A"
+        assert item["statement"] == "B『BTC above $100000?』为 YES ⇒ A『BTC above $90000?』必须 YES"
+
+        for view in ("approved_model_incomplete", "compiled_pending_activation", "activation_blocked", "source_changed_reapproval"):
+            status, empty = response(base + f"/api/prediction-arbitrage/relations?view={view}")
+            assert status == 200
+            assert empty["items"] == []
+            assert empty["total"] == 0
+
+        status, history = response(
+            base + "/api/prediction-arbitrage/relations?view=history"
+        )
+        assert status == 200
+        assert {item["version_id"] for item in history["items"]} == {pending_ids[0]}
+
+        status, invalid = response(
+            base + "/api/prediction-arbitrage/relations?view=nonsense"
+        )
+        assert status == 400
+
+
 def test_relations_detail_still_carries_compiled_problem(tmp_path: Path) -> None:
     catalog = RelationCatalog(tmp_path)
     version_id = catalog.ingest_threshold_relation(threshold_relation())["version_id"]

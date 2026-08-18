@@ -14,7 +14,7 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from .relation_catalog_v2 import (
     RelationCatalogV2,
@@ -51,6 +51,91 @@ _COMPLETENESS = frozenset({"COMPLETE", "INCOMPLETE"})
 _RELATION_TYPES = frozenset({"IMPLIES", "MUTUALLY_EXCLUSIVE", "EXACTLY_ONE"})
 _ACTIVATION_BLOCKED = frozenset({"ACTIVATION_BLOCKED_INCONSISTENT", "UNSUPPORTED_SIZE"})
 _GROUP_BUDGET = 10
+
+#: The six-state review vocabulary shared by the catalog views, counts, and UI.
+REVIEW_STATES = (
+    "PENDING_APPROVAL",
+    "APPROVED_MODEL_INCOMPLETE",
+    "COMPILED_PENDING_ACTIVATION",
+    "ACTIVATION_BLOCKED",
+    "ACTIVATED",
+    "SOURCE_CHANGED_REAPPROVAL",
+)
+
+#: Lowercase ``list(view)`` keys, one per review state.
+REVIEW_STATE_VIEWS = {
+    "pending_approval": "PENDING_APPROVAL",
+    "approved_model_incomplete": "APPROVED_MODEL_INCOMPLETE",
+    "compiled_pending_activation": "COMPILED_PENDING_ACTIVATION",
+    "activation_blocked": "ACTIVATION_BLOCKED",
+    "activated": "ACTIVATED",
+    "source_changed_reapproval": "SOURCE_CHANGED_REAPPROVAL",
+}
+
+#: Legacy API aliases; ``pending`` maps to the identical review state.
+_LEGACY_VIEW_ALIASES = {"pending": "PENDING_APPROVAL"}
+
+_DIRECTION_CODES = frozenset({"A_IMPLIES_B", "B_IMPLIES_A", "A_TO_B", "B_TO_A"})
+_LIST_TITLE_LIMIT = 28
+
+
+def review_state(record: Mapping[str, object]) -> str | None:
+    """Map one stored version record onto the six-state review vocabulary.
+
+    ``PENDING`` versions are awaiting approval; ``APPROVED`` versions split by
+    activation status and compiled-model presence; ``REJECTED``/``REVOKED``
+    versions map to ``None`` (history only).
+    """
+
+    status = str(record.get("status") or "")
+    activation = str(record.get("activation_status") or "")
+    payload = record.get("payload")
+    compiled = bool(payload.get("terminal_states")) if isinstance(payload, Mapping) else False
+    if status == "PENDING":
+        return "PENDING_APPROVAL"
+    if status != "APPROVED":
+        return None
+    if activation == "ACTIVE":
+        return "ACTIVATED"
+    if activation in _ACTIVATION_BLOCKED:
+        return "ACTIVATION_BLOCKED"
+    if activation == "SUPERSEDED":
+        return "SOURCE_CHANGED_REAPPROVAL"
+    return "COMPILED_PENDING_ACTIVATION" if compiled else "APPROVED_MODEL_INCOMPLETE"
+
+
+def _truncate_title(title: str, limit: int = _LIST_TITLE_LIMIT) -> str:
+    if len(title) <= limit:
+        return title
+    return f"{title[:limit].rstrip()}…"
+
+
+def _derive_statement(
+    statement: str,
+    endpoints: Sequence[Mapping[str, object]],
+    *,
+    truncate: bool = False,
+) -> tuple[str, str]:
+    """Derive the human-readable sentence for one stored direction-code statement.
+
+    ``endpoints`` are already ordered antecedent-first (``endpoints[0]`` is the
+    前件). Returns ``(statement, direction_code)``; non direction-code
+    statements are returned unchanged with an empty direction code.
+    """
+
+    direction = statement if statement in _DIRECTION_CODES else ""
+    if not direction or len(endpoints) < 2:
+        return statement, ""
+    first, second = ("B", "A") if direction in {"B_IMPLIES_A", "B_TO_A"} else ("A", "B")
+    title_first = str(endpoints[0].get("title", ""))
+    title_second = str(endpoints[1].get("title", ""))
+    if truncate:
+        title_first = _truncate_title(title_first)
+        title_second = _truncate_title(title_second)
+    return (
+        f"{first}『{title_first}』为 YES ⇒ {second}『{title_second}』必须 YES",
+        direction,
+    )
 
 
 class RelationConflictError(ValueError):
@@ -433,7 +518,12 @@ class RelationCatalog:
         return self._store.get("versions", {})
 
     def _row(
-        self, version_id: str, occurrences: int = 0, *, include_problem: bool = True
+        self,
+        version_id: str,
+        occurrences: int = 0,
+        *,
+        include_problem: bool = True,
+        truncate_statement: bool = False,
     ) -> dict[str, object]:
         record = self._versions()[version_id]
         payload = record["payload"]
@@ -444,6 +534,11 @@ class RelationCatalog:
         }
         if include_problem:
             model["problem"] = payload.get("problem")
+        statement, direction_code = _derive_statement(
+            str(payload.get("statement", "")),
+            payload["endpoints"],
+            truncate=truncate_statement,
+        )
         return {
             "version_id": version_id,
             "identity": str(record["identity"]),
@@ -457,7 +552,8 @@ class RelationCatalog:
             "discovered_at": payload["discovered_at"],
             "relation_type": payload["relation_type"],
             "endpoints": payload["endpoints"],
-            "statement": payload.get("statement", ""),
+            "statement": statement,
+            "direction_code": direction_code,
             "model": model,
         }
 
@@ -478,16 +574,41 @@ class RelationCatalog:
             raise
 
     def list(self, view: str) -> list[dict[str, object]]:
-        if view not in {"pending", "approved_active", "activation_blocked", "history"}:
-            raise ValueError("relation catalog view is invalid")
+        """List version rows for one review view.
+
+        Accepts the six review-state keys plus the legacy aliases ``pending``,
+        ``approved_active``, and ``history``. List rows truncate statement
+        titles; ``detail()`` returns full statements.
+        """
+
+        state = REVIEW_STATE_VIEWS.get(view) or _LEGACY_VIEW_ALIASES.get(view)
         generation = self._current_generation()
         versions = self._versions()
-        result = [
-            self._row(version_id, int(record.get("occurrence_count", 1)), include_problem=False)
-            for version_id, record in versions.items()
-            if self._in_view(view, version_id, record, generation)
-        ]
-        if view == "pending":
+        if state is not None:
+            result = [
+                self._row(
+                    version_id,
+                    int(record.get("occurrence_count", 1)),
+                    include_problem=False,
+                    truncate_statement=True,
+                )
+                for version_id, record in versions.items()
+                if review_state(record) == state
+            ]
+        elif view in {"approved_active", "history"}:
+            result = [
+                self._row(
+                    version_id,
+                    int(record.get("occurrence_count", 1)),
+                    include_problem=False,
+                    truncate_statement=True,
+                )
+                for version_id, record in versions.items()
+                if self._in_view(view, version_id, record, generation)
+            ]
+        else:
+            raise ValueError("relation catalog view is invalid")
+        if state == "PENDING_APPROVAL":
             active_endpoints = {
                 str(endpoint["contract_id"])
                 for identity in generation
@@ -498,8 +619,18 @@ class RelationCatalog:
             result.sort(key=lambda item: not bool(active_endpoints & {str(endpoint["contract_id"]) for endpoint in item["endpoints"]}))
         return result
 
+    def review_counts(self) -> dict[str, object]:
+        """Six-state counts plus the pending total for the read model payload."""
+
+        counts: dict[str, int] = {state: 0 for state in REVIEW_STATES}
+        for record in self._versions().values():
+            state = review_state(record)
+            if state is not None:
+                counts[state] += 1
+        return {"counts": counts, "pending_count": counts["PENDING_APPROVAL"]}
+
     def review_rows(self) -> list[dict[str, object]]:
-        """All catalog versions as raw rows for the read model six-state projection."""
+        """All catalog versions as raw rows (full statements, compiled problem)."""
 
         return [
             self._row(version_id, int(record.get("occurrence_count", 1)))
@@ -518,14 +649,8 @@ class RelationCatalog:
         active = any(
             entry["version_id"] == version_id for entry in generation.values()
         )
-        if view == "pending":
-            return status == "PENDING"
         if view == "approved_active":
             return status == "APPROVED" and active
-        if view == "activation_blocked":
-            return status == "APPROVED" and not active and activation in {
-                "ACTIVATION_BLOCKED_INCONSISTENT", "UNSUPPORTED_SIZE", "INCOMPLETE",
-            }
         return status in {"REJECTED", "REVOKED"} or activation == "SUPERSEDED"
 
     def pending_count(self) -> int:
