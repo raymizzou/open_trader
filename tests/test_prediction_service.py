@@ -1229,6 +1229,8 @@ def test_llm_provider_get_reports_selection_and_provider_cards(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("OPEN_TRADER_PREDICTION_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
     runtime = _ProviderRuntime(PredictionArbitrageStore(tmp_path / "data"))
     with _provider_server(runtime) as (base, _runtime, handler_errors):
         status, payload = _response(base + "/api/prediction-arbitrage/llm-provider")
@@ -1263,6 +1265,8 @@ def test_llm_provider_post_switches_engine_without_handler_errors(
     # Env default codex + empty selection table: the first click on zhipu
     # must durably win (no swallowed no-op) and the handler thread must
     # survive the response (no fall-through past the branch).
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
     monkeypatch.setenv("OPEN_TRADER_PREDICTION_LLM_PROVIDER", "codex")
     db = PredictionArbitrageStore(tmp_path / "data")
     runtime = _ProviderRuntime(db)
