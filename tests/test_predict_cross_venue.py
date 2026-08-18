@@ -3121,3 +3121,65 @@ def test_monitor_slow_codex_validation_does_not_pause_hot_books(
         await monitor.stop()
 
     asyncio.run(exercise())
+
+
+def test_equivalence_result_violation_classifies_schema_deviations() -> None:
+    from open_trader.predict_cross_venue import (
+        _equivalence_result_violation,
+        _valid_equivalence_result,
+    )
+
+    pair = explicit_pair()
+    good = equivalence_result(pair)
+    assert _valid_equivalence_result(good)
+    assert _equivalence_result_violation(good) is None
+
+    bad = json.loads(json.dumps(good))
+    bad["extra"] = 1
+    assert _equivalence_result_violation(bad) == "top_level_keys"
+
+    version = json.loads(json.dumps(good))
+    version["schema_version"] = "2"
+    assert _equivalence_result_violation(version) == "schema_version"
+
+    mapping_bad = json.loads(json.dumps(good))
+    mapping_bad["direct_outcome_mapping"]["extra"] = "YES"
+    assert _equivalence_result_violation(mapping_bad) == "direct_outcome_mapping_keys"
+
+    evidence_bad = json.loads(json.dumps(good))
+    evidence_bad["evidence"][0]["note"] = "x"
+    assert _equivalence_result_violation(evidence_bad) == "evidence_row:keys"
+
+
+def test_cross_venue_output_invalid_logs_violation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+
+    db = PredictionArbitrageStore(tmp_path / "data")
+
+    def invalid(prompt: str, payload: object) -> LlmCompletion:
+        return LlmCompletion('{"unexpected": true}', None, {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 3, "reasoning_output_tokens": 0})
+
+    validator = LlmCrossVenueEquivalenceValidator(
+        db,
+        default_provider="codex",
+        completers={provider: invalid for provider in PROVIDER_IDS},
+    )
+    with caplog.at_level("WARNING", logger="open_trader.predict_cross_venue"):
+        result = validator.validate(explicit_pair())
+
+    assert result.reason == "CODEX_OUTPUT_INVALID"
+    record = next(r for r in caplog.records if "llm_output_invalid" in r.message)
+    assert "provider=codex" in record.message
+    assert "violation=top_level_keys" in record.message
+
+
+def test_cross_venue_prompt_states_output_contract() -> None:
+    from open_trader.predict_cross_venue import _cross_equivalence_prompt
+
+    prompt = _cross_equivalence_prompt()
+    assert "OUTPUT CONTRACT" in prompt
+    assert "schema_version must be the JSON number 2" in prompt
+    assert "EXACTLY these top-level keys" in prompt
+    assert "direct_outcome_mapping" in prompt
