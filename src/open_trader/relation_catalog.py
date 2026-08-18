@@ -115,31 +115,165 @@ def _derive_statement(
     endpoints: Sequence[Mapping[str, object]],
     *,
     truncate: bool = False,
+    roles: Sequence[object] = (),
 ) -> tuple[str, str]:
     """Derive the human-readable sentence for one stored direction-code statement.
 
-    ``endpoints`` are already ordered antecedent-first (``endpoints[0]`` is the
-    前件). Returns ``(statement, direction_code)``; non direction-code
-    statements are returned unchanged with an empty direction code.
+    ``roles`` are the per-endpoint ``"A"|"B"`` letters; the endpoint whose role
+    equals the direction code's antecedent letter becomes the antecedent, so the
+    stored endpoint order can never flip the implication. Without two distinct
+    A/B roles the raw direction code is returned unchanged — direction is never
+    guessed from endpoint order. Returns ``(statement, direction_code)``; non
+    direction-code statements are returned unchanged with an empty direction
+    code.
     """
 
     direction = statement if statement in _DIRECTION_CODES else ""
     if not direction or len(endpoints) < 2:
         return statement, ""
-    first, second = ("B", "A") if direction in {"B_IMPLIES_A", "B_TO_A"} else ("A", "B")
-    title_first = str(endpoints[0].get("title", ""))
-    title_second = str(endpoints[1].get("title", ""))
+    letters = [str(item) for item in roles[:2]]
+    if (
+        len(roles) < 2
+        or letters[0] not in ("A", "B")
+        or letters[1] not in ("A", "B")
+        or letters[0] == letters[1]
+    ):
+        return statement, direction
+    antecedent_letter = "B" if direction in {"B_IMPLIES_A", "B_TO_A"} else "A"
+    consequent_letter = "A" if antecedent_letter == "B" else "B"
+    by_letter = {
+        letters[index]: endpoints[index]
+        for index in range(2)
+    }
+    title_first = str(by_letter[antecedent_letter].get("title", ""))
+    title_second = str(by_letter[consequent_letter].get("title", ""))
     if truncate:
         title_first = _truncate_title(title_first)
         title_second = _truncate_title(title_second)
     return (
-        f"{first}『{title_first}』为 YES ⇒ {second}『{title_second}』必须 YES",
+        f"{antecedent_letter}『{title_first}』为 YES ⇒ {consequent_letter}『{title_second}』必须 YES",
         direction,
     )
 
 
 class RelationConflictError(ValueError):
     """The reviewed version is not the catalog version the operator opened."""
+
+
+def _valid_role_letters(letters: Sequence[object]) -> bool:
+    """Two distinct ``A``/``B`` letters — one antecedent and one consequent."""
+
+    values = [str(item) for item in letters]
+    return (
+        len(values) == 2
+        and values[0] in ("A", "B")
+        and values[1] in ("A", "B")
+        and values[0] != values[1]
+    )
+
+
+def _semantics_endpoint_roles(
+    semantics: Mapping[str, object],
+    endpoints: Sequence[Mapping[str, object]],
+    direction: str,
+) -> dict[str, str]:
+    """Map contract_id → ``"A"|"B"`` from the discovery payload's semantics.
+
+    ``_normalise_discovery`` reorders markets by ``(venue, contract_id)``, so
+    the antecedent/consequent contract ids ride inside ``semantics`` (which
+    passes normalisation verbatim) instead of relying on market order.
+    """
+
+    if direction not in _DIRECTION_CODES:
+        return {}
+    antecedent_id = semantics.get("antecedent_contract_id")
+    consequent_id = semantics.get("consequent_contract_id")
+    if not isinstance(antecedent_id, str) or not isinstance(consequent_id, str):
+        return {}
+    ids = [str(endpoint.get("contract_id", "")) for endpoint in endpoints]
+    if len(set(ids)) != 2 or set(ids) != {antecedent_id, consequent_id}:
+        return {}
+    antecedent_letter = "B" if direction in {"B_IMPLIES_A", "B_TO_A"} else "A"
+    consequent_letter = "A" if antecedent_letter == "B" else "B"
+    return {antecedent_id: antecedent_letter, consequent_id: consequent_letter}
+
+
+def _model_endpoint_roles(
+    payload: Mapping[str, object],
+    contract_ids: Sequence[str],
+    direction: str,
+) -> list[str]:
+    """Read-time role letters for legacy rows, from the compiled IMPLIES constraint.
+
+    ``_threshold_complete_model`` builds the constraint antecedent-first and
+    canonical serialisation preserves ``contract_ids`` order for IMPLIES
+    (``_sort_values``), so ``contract_ids[0] -> contract_ids[1]`` is the stored
+    proof of direction. Anything ambiguous — missing model, several IMPLIES
+    constraints, contract sets that do not match the row — resolves to no roles;
+    direction is never guessed.
+    """
+
+    if direction not in _DIRECTION_CODES or len(set(contract_ids)) != 2:
+        return []
+    problem = payload.get("problem")
+    if not isinstance(problem, Mapping):
+        return []
+    constraint_model = problem.get("constraint_model")
+    if not isinstance(constraint_model, Mapping):
+        return []
+    relations = constraint_model.get("relations")
+    if not isinstance(relations, list):
+        return []
+    implied: list[list[str]] = []
+    for relation in relations:
+        if not isinstance(relation, Mapping) or str(relation.get("kind")) != "IMPLIES":
+            continue
+        ids = relation.get("contract_ids")
+        if (
+            isinstance(ids, list)
+            and len(ids) == 2
+            and all(isinstance(item, str) for item in ids)
+        ):
+            implied.append([str(ids[0]), str(ids[1])])
+    if len(implied) != 1 or set(implied[0]) != set(contract_ids):
+        return []
+    antecedent_id = implied[0][0]
+    antecedent_letter = "B" if direction in {"B_IMPLIES_A", "B_TO_A"} else "A"
+    consequent_letter = "A" if antecedent_letter == "B" else "B"
+    letters = [
+        antecedent_letter if cid == antecedent_id else consequent_letter
+        for cid in contract_ids
+    ]
+    return letters if _valid_role_letters(letters) else []
+
+
+def _row_endpoints_and_roles(
+    payload: Mapping[str, object],
+) -> tuple[list[dict[str, object]], list[str]]:
+    """Row endpoints plus their role letters: stored roles, else compiled model.
+
+    Stored endpoint roles are authoritative. Legacy rows without them fall
+    back to the compiled IMPLIES constraint (read-time annotation only — the
+    stored payload is never mutated); rows that cannot be proven keep no roles
+    so the direction code is displayed as-is.
+    """
+
+    endpoints: list[dict[str, object]] = [
+        dict(endpoint) for endpoint in payload["endpoints"]
+    ]
+    stored = [endpoint.get("role") for endpoint in endpoints]
+    if _valid_role_letters(stored):
+        return endpoints, [str(item) for item in stored]
+    statement = str(payload.get("statement", ""))
+    if statement not in _DIRECTION_CODES:
+        return endpoints, []
+    contract_ids = [str(endpoint.get("contract_id", "")) for endpoint in endpoints]
+    model_roles = _model_endpoint_roles(payload, contract_ids, statement)
+    if not model_roles:
+        return endpoints, []
+    for endpoint, letter in zip(endpoints, model_roles):
+        endpoint["role"] = letter
+    return endpoints, model_roles
 
 
 def _now() -> str:
@@ -388,9 +522,18 @@ def _threshold_discovery_payload(
     endpoints = [market(getattr(relation, "market_a")), market(getattr(relation, "market_b"))]
     if relation_direction in {"B_IMPLIES_A", "B_TO_A"}:
         endpoints = list(reversed(endpoints))
+    semantics: dict[str, object] = {
+        "statement": relation_direction, "direction": relation_direction,
+    }
+    if relation_direction in _DIRECTION_CODES:
+        # After the reversal above endpoints are antecedent-first; persist the
+        # antecedent/consequent contract ids because _normalise_discovery sorts
+        # markets by (venue, contract_id) and would otherwise drop that order.
+        semantics["antecedent_contract_id"] = str(endpoints[0]["contract_id"])
+        semantics["consequent_contract_id"] = str(endpoints[1]["contract_id"])
     return {
         "discovery_source": "deterministic_rule", "discovered_at": _now(),
-        "relation_type": "IMPLIES", "semantics": {"statement": relation_direction, "direction": relation_direction},
+        "relation_type": "IMPLIES", "semantics": semantics,
         "source_evidence": [{"event_id": getattr(relation, "event_id"), "rules_hash_a": getattr(relation, "rules_hash_a"), "rules_hash_b": getattr(relation, "rules_hash_b")}],
         "model": model, "markets": endpoints,
     }
@@ -432,6 +575,11 @@ class RelationCatalog:
         direction = str(payload["semantics"].get("direction", ""))
         if direction in {"B_IMPLIES_A", "B_TO_A"}:
             endpoints = list(reversed(endpoints))
+        roles = _semantics_endpoint_roles(payload["semantics"], endpoints, direction)
+        for endpoint in endpoints:
+            letter = roles.get(str(endpoint["contract_id"]))
+            if letter is not None:
+                endpoint["role"] = letter
         converted: dict[str, object] = {
             "relation_type": payload["relation_type"],
             "endpoints": endpoints,
@@ -534,10 +682,12 @@ class RelationCatalog:
         }
         if include_problem:
             model["problem"] = payload.get("problem")
+        endpoints, roles = _row_endpoints_and_roles(payload)
         statement, direction_code = _derive_statement(
             str(payload.get("statement", "")),
-            payload["endpoints"],
+            endpoints,
             truncate=truncate_statement,
+            roles=roles,
         )
         return {
             "version_id": version_id,
@@ -551,7 +701,7 @@ class RelationCatalog:
             "discovery_source": payload["discovery_source"],
             "discovered_at": payload["discovered_at"],
             "relation_type": payload["relation_type"],
-            "endpoints": payload["endpoints"],
+            "endpoints": endpoints,
             "statement": statement,
             "direction_code": direction_code,
             "model": model,

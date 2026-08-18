@@ -608,8 +608,8 @@ def _relation_review_fixture() -> dict[str, object]:
         "direction_code": "A_IMPLIES_B",
         "relation_type": "IMPLIES",
         "endpoints": [
-            {"venue": "Polymarket", "contract_id": "condition-a", "title": "Will Bitcoin trade above $100,000 at any time before December 31, 2026?", "market_date": "2026-08-15T00:00:00Z", "expires_at": "2026-12-31T17:00:00Z", "settlement_observation_key": "btc-usd"},
-            {"venue": "Polymarket", "contract_id": "condition-b", "title": "Will Bitcoin trade above $90,000 at any time before December 31, 2026?", "market_date": "2026-08-15T00:00:00Z", "expires_at": "2026-12-31T17:00:00Z", "settlement_observation_key": "btc-usd"},
+            {"venue": "Polymarket", "contract_id": "condition-a", "title": "Will Bitcoin trade above $100,000 at any time before December 31, 2026?", "market_date": "2026-08-15T00:00:00Z", "expires_at": "2026-12-31T17:00:00Z", "settlement_observation_key": "btc-usd", "role": "A"},
+            {"venue": "Polymarket", "contract_id": "condition-b", "title": "Will Bitcoin trade above $90,000 at any time before December 31, 2026?", "market_date": "2026-08-15T00:00:00Z", "expires_at": "2026-12-31T17:00:00Z", "settlement_observation_key": "btc-usd", "role": "B"},
         ],
         "model": {"terminal_states": [], "payouts": {}, "capital_release": None},
         "evidence": [{"source_evidence": [{"source": "Polymarket rules", "quote": "resolves YES if..."}]}],
