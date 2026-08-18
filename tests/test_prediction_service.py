@@ -1239,8 +1239,8 @@ def test_llm_provider_get_reports_selection_and_provider_cards(
     assert payload["schema_version"] == (
         "open_trader.prediction_service.llm_provider.v1"
     )
-    assert payload["selected"] == "zhipu"
-    assert payload["default"] == "zhipu"
+    assert payload["selected"] == "deepseek"
+    assert payload["default"] == "deepseek"
     providers = payload["providers"]
     assert isinstance(providers, list)
     assert [item["provider"] for item in providers] == list(PROVIDER_IDS)

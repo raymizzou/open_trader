@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 PROVIDER_IDS = ("codex", "deepseek", "zhipu")
-DEFAULT_PROVIDER = "zhipu"
+DEFAULT_PROVIDER = "deepseek"
 PROVIDER_LABELS = {
     "codex": "Codex",
     "deepseek": "DeepSeek",

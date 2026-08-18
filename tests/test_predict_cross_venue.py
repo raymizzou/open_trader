@@ -440,6 +440,7 @@ def test_cross_venue_selected_engine_failure_is_strict_without_fallback(
     assert deepseek_calls == []
     assert store.llm_usage_24h_by_provider()["codex"]["failures"] == 1
 
+    store.set_llm_provider("codex")  # durable row first: deepseek is the shipped default
     store.set_llm_provider("deepseek")
 
     second = validator.validate(pair)
@@ -474,6 +475,7 @@ def test_cross_venue_circuit_breaker_skips_selected_engine_after_failures(
     assert open_circuit.reason == "CODEX_CIRCUIT_OPEN"
     assert len(codex_calls) == 3
 
+    store.set_llm_provider("codex")  # durable row first: deepseek is the shipped default
     store.set_llm_provider("deepseek")
     switched = validator.validate(pair)
 

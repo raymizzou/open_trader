@@ -350,20 +350,20 @@ def test_llm_provider_selection_is_audited_and_fails_closed(
     db = store(tmp_path)
     audit = {"actor": "local_operator", "git_sha": "abc123"}
 
-    assert db.get_llm_provider() == "zhipu"
-    assert db.set_llm_provider("deepseek", audit=audit) == "deepseek"
     assert db.get_llm_provider() == "deepseek"
-    assert db.get_llm_provider(default="codex") == "deepseek"
+    assert db.set_llm_provider("zhipu", audit=audit) == "zhipu"
+    assert db.get_llm_provider() == "zhipu"
+    assert db.get_llm_provider(default="codex") == "zhipu"
 
-    assert db.set_llm_provider("deepseek", audit=audit) == "deepseek"
+    assert db.set_llm_provider("zhipu", audit=audit) == "zhipu"
     event = db.latest_control_event("set_llm_provider", "llm_provider_selection")
     assert event is not None
     assert event["outcome"] == "no_op"
-    assert event["payload"] == {**audit, "before": "deepseek", "after": "deepseek"}
+    assert event["payload"] == {**audit, "before": "zhipu", "after": "zhipu"}
 
     with pytest.raises(ValueError, match="invalid llm provider"):
         db.set_llm_provider("unknown")
-    assert db.get_llm_provider() == "deepseek"
+    assert db.get_llm_provider() == "zhipu"
 
 
 def test_set_llm_provider_resolves_empty_table_against_caller_default(
@@ -372,9 +372,9 @@ def test_set_llm_provider_resolves_empty_table_against_caller_default(
     db = store(tmp_path)
     audit = {"actor": "local_operator", "git_sha": "abc123"}
 
-    # Empty table + env default codex: selecting the shipped default (zhipu)
-    # must durably write the row instead of collapsing into a no-op against
-    # the hardcoded default while codex stays in effect.
+    # Empty table + caller default codex: selecting another provider (zhipu)
+    # must durably write the row instead of collapsing into a no-op while
+    # codex stays in effect.
     assert db.set_llm_provider("zhipu", default="codex", audit=audit) == "zhipu"
     assert db.get_llm_provider(default="codex") == "zhipu"
     event = db.latest_control_event("set_llm_provider", "llm_provider_selection")
@@ -393,10 +393,10 @@ def test_set_llm_provider_resolves_empty_table_against_caller_default(
     assert no_op_event is not None
     assert no_op_event["outcome"] == "no_op"
 
-    # An unrecognized default falls back to the shipped default, keeping the
-    # before-resolution aligned with get_llm_provider.
-    assert fresh.set_llm_provider("deepseek", default="bogus") == "deepseek"
-    assert fresh.get_llm_provider(default="codex") == "deepseek"
+    # An unrecognized default falls back to the shipped default (deepseek),
+    # keeping the before-resolution aligned with get_llm_provider.
+    assert fresh.set_llm_provider("zhipu", default="bogus") == "zhipu"
+    assert fresh.get_llm_provider(default="codex") == "zhipu"
 
 
 def test_audited_validation_mode_and_pause_are_naturally_idempotent(

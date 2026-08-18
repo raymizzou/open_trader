@@ -725,7 +725,7 @@ def select_provider(db: PredictionArbitrageStore, provider: str) -> None:
     pre-write of another provider first.
     """
 
-    if provider == "zhipu":
+    if provider == "deepseek":
         db.set_llm_provider("codex")
     db.set_llm_provider(provider)
     assert db.get_llm_provider() == provider
@@ -813,7 +813,7 @@ def test_current_provider_prefers_store_row_over_env_and_defaults(
 ) -> None:
     db = codex_store(tmp_path)
 
-    assert LlmRelationValidator(db).current_provider() == "zhipu"
+    assert LlmRelationValidator(db).current_provider() == "deepseek"
 
     monkeypatch.setenv("OPEN_TRADER_PREDICTION_LLM_PROVIDER", "codex")
     env_default = LlmRelationValidator(db)
@@ -824,7 +824,7 @@ def test_current_provider_prefers_store_row_over_env_and_defaults(
 
     # The durable store row beats both the env default and the constructor
     # default once it has been written.
-    db.set_llm_provider("deepseek")
+    select_provider(db, "deepseek")
     assert env_default.current_provider() == "deepseek"
     assert explicit.current_provider() == "deepseek"
     assert env_default.provider_snapshot() == {
@@ -1051,7 +1051,7 @@ def test_selected_engine_failure_is_strict_without_fallback(
     assert db.llm_usage_24h_by_provider()["codex"]["failures"] == 1
     assert db.llm_usage_24h_by_provider().get("deepseek", {}).get("calls", 0) == 0
 
-    db.set_llm_provider("deepseek")
+    select_provider(db, "deepseek")
 
     second = validator.validate(relation)
 
@@ -1187,7 +1187,7 @@ def test_circuit_breaker_is_independent_per_provider(tmp_path: Path) -> None:
     assert open_circuit.summary == "Codex 连续失败已临时熔断，暂停新校验，稍后自动恢复。"
     assert len(codex_calls) == 3
 
-    db.set_llm_provider("deepseek")
+    select_provider(db, "deepseek")
     switched = validator.validate(threshold_relation())
 
     assert switched.reason_codes == ("DEEPSEEK_TIMEOUT",)
