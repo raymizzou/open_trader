@@ -6090,6 +6090,22 @@ table {
 .pm-funnel-header p { color: var(--muted); margin: 3px 0 0; }
 .pm-funnel-chips { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
 .pm-funnel-chip { background: #f2eee7; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: 11px; font-weight: 800; padding: 5px 8px; white-space: nowrap; }
+.pm-llm-engine { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 12px; }
+.pm-llm-engine-label { align-items: center; color: var(--muted); display: flex; font-size: 12px; font-weight: 800; gap: 8px; letter-spacing: 0.02em; margin-bottom: 8px; }
+.pm-llm-segment { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.pm-llm-option { align-items: center; background: var(--surface); border: 1px solid var(--line); border-radius: 999px; color: var(--primary); cursor: pointer; display: inline-flex; font: inherit; font-size: 12px; font-weight: 800; gap: 6px; line-height: 1; min-height: 32px; padding: 8px 12px; white-space: nowrap; }
+.pm-llm-option:hover:not(:disabled):not([aria-pressed="true"]) { border-color: var(--accent); }
+.pm-llm-option[aria-pressed="true"] { background: var(--primary); border-color: var(--primary); color: var(--surface); cursor: default; }
+.pm-llm-option[aria-pressed="true"] .pm-llm-sub { color: #cfc9bf; }
+.pm-llm-option:disabled { cursor: not-allowed; opacity: 0.46; }
+.pm-llm-option .pm-llm-sub { color: var(--muted); font-size: 11px; font-weight: 600; }
+.pm-llm-status { display: grid; font-size: 12px; gap: 4px; margin-top: 10px; }
+.pm-llm-status .pm-llm-current { font-weight: 700; }
+.pm-llm-status .pm-llm-current small { color: var(--muted); font-weight: 600; }
+.pm-llm-usage { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.pm-llm-usage .pm-funnel-chip.active { background: #e8f4ed; border-color: #b9dac6; color: #21623f; }
+.pm-llm-usage .pm-funnel-chip.failing { background: #fff4df; border-color: #e5c98f; color: #704915; }
+.pm-llm-hint { color: var(--muted); font-size: 11px; margin: 8px 0 0; }
 .pm-funnel-lane { padding: 11px 14px 12px; }
 .pm-funnel-lane + .pm-funnel-lane { border-top: 1px solid var(--line); }
 .pm-funnel-lane-title { align-items: center; display: flex; gap: 8px; justify-content: space-between; margin-bottom: 8px; }

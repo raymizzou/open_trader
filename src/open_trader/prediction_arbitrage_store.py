@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, Mapping
 from zoneinfo import ZoneInfo
 
+from open_trader.llm_providers import DEFAULT_PROVIDER, PROVIDER_IDS
 from open_trader.prediction_arbitrage import MAX_CROSS_UNSETTLED_PRINCIPAL
 
 
@@ -509,6 +510,12 @@ class PredictionArbitrageStore:
             CREATE TABLE IF NOT EXISTS validation_mode (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 mode TEXT NOT NULL CHECK (mode IN ('observe_only', 'manual', 'auto')),
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS llm_provider_selection (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                provider TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
 
@@ -1409,6 +1416,57 @@ class PredictionArbitrageStore:
         ]
 
     VALIDATION_MODES = frozenset({"observe_only", "manual", "auto"})
+    LLM_PROVIDERS = frozenset(PROVIDER_IDS)
+
+    def get_llm_provider(self, *, default: str = DEFAULT_PROVIDER) -> str:
+        fallback = default if default in self.LLM_PROVIDERS else DEFAULT_PROVIDER
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT provider FROM llm_provider_selection WHERE singleton=1"
+            ).fetchone()
+        if row is None or str(row["provider"]) not in self.LLM_PROVIDERS:
+            return fallback
+        return str(row["provider"])
+
+    def set_llm_provider(
+        self,
+        provider: str,
+        *,
+        default: str = DEFAULT_PROVIDER,
+        audit: Mapping[str, object] | None = None,
+    ) -> str:
+        if provider not in self.LLM_PROVIDERS:
+            raise ValueError(f"invalid llm provider: {provider}")
+        fallback = default if default in self.LLM_PROVIDERS else DEFAULT_PROVIDER
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT provider FROM llm_provider_selection WHERE singleton=1"
+            ).fetchone()
+            before = (
+                str(row["provider"])
+                if row is not None and str(row["provider"]) in self.LLM_PROVIDERS
+                else fallback
+            )
+            if before != provider:
+                connection.execute(
+                    """
+                    INSERT INTO llm_provider_selection(singleton, provider, updated_at)
+                    VALUES (1, ?, ?)
+                    ON CONFLICT(singleton) DO UPDATE SET
+                        provider=excluded.provider,
+                        updated_at=excluded.updated_at
+                    """,
+                    (provider, _utc_now()),
+                )
+            if audit is not None:
+                self._insert_control_event(
+                    connection,
+                    action="set_llm_provider",
+                    target="llm_provider_selection",
+                    outcome="succeeded" if before != provider else "no_op",
+                    payload={**dict(audit), "before": before, "after": provider},
+                )
+        return provider
 
     def get_validation_mode(self) -> str:
         with self._read_connection() as connection:

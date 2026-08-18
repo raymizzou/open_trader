@@ -1354,10 +1354,10 @@ class PredictionExecutionService:
             message = "\n".join(
                 (
                     summary
-                    or "Codex 与 DeepSeek 校验均不可用，当前无法校验新关系。",
+                    or "当前选中的 LLM 校验引擎不可用，无法校验新关系。",
                     f"原因：{reason_text}",
                     f"Dashboard：{self._dashboard_url}",
-                    "降级期间不自动下单；Codex 恢复后会重新校验。",
+                    "期间不自动下单；引擎恢复后自动重新校验，可在看板一键切换引擎。",
                 )
             )
             if self._deliver_feishu_notification("预测市场 LLM 校验不可用", message):

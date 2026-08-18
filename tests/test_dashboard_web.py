@@ -3728,6 +3728,8 @@ const payload = {relation_discovery:{
   codex_queue:{pending:12,inflight:1,oldest_wait_seconds:45},
   scan_logs:[{scope:"activity",status:"completed"}],
   codex_usage_24h:{calls:10,successes:9,failures:1,cache_hits:200},
+  llm_usage_24h_by_provider:{zhipu:{calls:6,successes:6,failures:0,cache_hits:198},codex:{calls:4,successes:3,failures:1,cache_hits:2}},
+  llm_provider:{selected:"zhipu",models:{codex:"gpt-5.6-sol",deepseek:"deepseek-v4-flash",zhipu:"glm-5"},default:"zhipu",credentials:{codex:true,deepseek:false,zhipu:true}},
 }};
 const html = predictionRelationDiscoveryPanel(payload);
 const funnel = predictionRelationFunnel(payload);
@@ -3738,7 +3740,10 @@ if (html.includes("内存") || funnel.includes("内存")) throw new Error("stale
 console.log(JSON.stringify({html, funnel}));
 ''')
     rendered = json.loads(output)
-    assert "Codex queue" in rendered["html"] or "Codex queue" in rendered["funnel"]
+    assert "LLM queue" in rendered["html"] or "LLM queue" in rendered["funnel"]
+    assert "LLM 校验引擎" in rendered["html"]
+    assert "当前 智谱 GLM · glm-5" in rendered["html"]
+    assert "已批准/已拒绝的缓存结论跨引擎复用" in rendered["html"]
 
 
 def test_prediction_relation_funnel_handles_scanning_empty_and_history_states() -> None:
@@ -4035,7 +4040,7 @@ console.log(JSON.stringify({readiness,safeguards,cleanup,order}));
     for text in (
         "predict-market", "predict-condition", "predict-yes", "https://predict.fun/markets/predict-market",
         "poly-market", "poly-condition", "poly-no", "https://polymarket.com/event/poly-market",
-        "冻结数量", "最高价冻结", "$5.00", "2026-08-03T15:40:00Z", "Codex 2026-08-03T15:41:00Z",
+        "冻结数量", "最高价冻结", "$5.00", "2026-08-03T15:40:00Z", "LLM 2026-08-03T15:41:00Z",
         "统一截止", "待结算占用", "$100.00", "不是原子交易",
     ):
         assert text in rendered["order"]

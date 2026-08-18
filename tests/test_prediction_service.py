@@ -21,6 +21,8 @@ from urllib.request import Request, urlopen
 import pytest
 
 import open_trader.prediction_service as prediction_service
+from open_trader.llm_providers import PROVIDER_IDS, resolve_provider
+from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_read_model import (
     prediction_history_payload,
     prediction_state_payload,
@@ -1166,6 +1168,147 @@ def test_production_control_maps_conflict_and_storage_failure() -> None:
         "git_sha": "abc123",
         "safety_fingerprint": "policy-1",
     }
+
+
+class _ProviderSnapshotValidator:
+    """The runtime validator's snapshot contract, backed by a real store."""
+
+    def __init__(self, store: PredictionArbitrageStore) -> None:
+        self._store = store
+
+    def provider_snapshot(self) -> dict[str, object]:
+        default = resolve_provider(
+            os.environ.get("OPEN_TRADER_PREDICTION_LLM_PROVIDER")
+        )
+        return {
+            "selected": self._store.get_llm_provider(default=default),
+            "models": {
+                "codex": "gpt-test",
+                "deepseek": "deepseek-test",
+                "zhipu": "glm-5",
+            },
+            "default": default,
+            "credentials": {"codex": True, "deepseek": False, "zhipu": False},
+        }
+
+
+class _ProviderMonitor(_Monitor):
+    def __init__(self, validator: _ProviderSnapshotValidator) -> None:
+        self._relation_validator = validator
+
+
+class _ProviderRuntime(_ProductionRuntime):
+    def __init__(self, store: PredictionArbitrageStore) -> None:
+        super().__init__()
+        self.store = store
+        self.monitor = _ProviderMonitor(_ProviderSnapshotValidator(store))
+
+
+@contextmanager
+def _provider_server(
+    runtime: _ProviderRuntime,
+) -> Iterator[tuple[str, _ProviderRuntime, list[BaseException]]]:
+    with _running_server(
+        runtime,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    ) as (base, server):
+        handler_errors: list[BaseException] = []
+
+        def _record_handler_error(request: object, client_address: object) -> None:
+            handler_errors.append(sys.exc_info()[1])  # type: ignore[arg-type]
+
+        server.handle_error = _record_handler_error  # type: ignore[method-assign]
+        yield base, runtime, handler_errors
+
+
+def test_llm_provider_get_reports_selection_and_provider_cards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OPEN_TRADER_PREDICTION_LLM_PROVIDER", raising=False)
+    runtime = _ProviderRuntime(PredictionArbitrageStore(tmp_path / "data"))
+    with _provider_server(runtime) as (base, _runtime, handler_errors):
+        status, payload = _response(base + "/api/prediction-arbitrage/llm-provider")
+
+    assert status == 200
+    assert payload["schema_version"] == (
+        "open_trader.prediction_service.llm_provider.v1"
+    )
+    assert payload["selected"] == "zhipu"
+    assert payload["default"] == "zhipu"
+    providers = payload["providers"]
+    assert isinstance(providers, list)
+    assert [item["provider"] for item in providers] == list(PROVIDER_IDS)
+    for item in providers:
+        assert set(item) == {
+            "provider",
+            "model",
+            "credentials_configured",
+            "usage_24h",
+        }
+    by_provider = {item["provider"]: item for item in providers}
+    assert by_provider["zhipu"]["model"] == "glm-5"
+    assert by_provider["codex"]["credentials_configured"] is True
+    assert by_provider["deepseek"]["credentials_configured"] is False
+    assert by_provider["zhipu"]["usage_24h"] == {}
+    assert handler_errors == []
+
+
+def test_llm_provider_post_switches_engine_without_handler_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Env default codex + empty selection table: the first click on zhipu
+    # must durably win (no swallowed no-op) and the handler thread must
+    # survive the response (no fall-through past the branch).
+    monkeypatch.setenv("OPEN_TRADER_PREDICTION_LLM_PROVIDER", "codex")
+    db = PredictionArbitrageStore(tmp_path / "data")
+    runtime = _ProviderRuntime(db)
+    with _provider_server(runtime) as (base, _runtime, handler_errors):
+        before_status, before = _response(
+            base + "/api/prediction-arbitrage/llm-provider"
+        )
+        switch_status, switched = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/llm-provider",
+                data=b'{"provider":"zhipu"}',
+            )
+        )
+        after_status, after = _response(
+            base + "/api/prediction-arbitrage/llm-provider"
+        )
+        invalid_status, _invalid = _response(
+            _production_request(
+                base,
+                "/api/prediction-arbitrage/llm-provider",
+                data=b'{"provider":"grok"}',
+            )
+        )
+
+    assert before_status == after_status == 200
+    assert before["selected"] == "codex"
+    assert switch_status == 200
+    assert switched["selected"] == "zhipu"
+    assert after["selected"] == "zhipu"
+    assert db.get_llm_provider(default="codex") == "zhipu"
+    assert invalid_status == 400
+    assert handler_errors == []
+
+
+def test_llm_provider_post_is_read_only_in_shadow_mode() -> None:
+    with _server(_Runtime()) as base:
+        status, payload = _response(
+            Request(
+                base + "/api/prediction-arbitrage/llm-provider",
+                data=b'{"provider":"zhipu"}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+        )
+
+    assert status == 403
+    assert payload == prediction_service._READ_ONLY_ERROR
 
 
 def test_production_reads_and_controls_fail_closed_after_owner_loss() -> None:

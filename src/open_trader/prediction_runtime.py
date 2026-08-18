@@ -15,12 +15,12 @@ from typing import Callable, Literal
 from .notifications import NullNotifier
 from .polymarket_monitor import PolymarketMonitor
 from .polymarket_relation_discovery import (
-    CodexRelationValidator,
+    LlmRelationValidator,
     discover_threshold_relation_catalog,
 )
 from .polymarket_trading import PolymarketTradingClient, load_trading_config
 from .predict_cross_venue import (
-    CodexCrossVenueEquivalenceValidator,
+    LlmCrossVenueEquivalenceValidator,
     POLYMARKET_CHAIN_ID,
     PREDICT_CHAIN_ID,
     PredictCrossVenueMonitor,
@@ -60,7 +60,7 @@ from .prediction_n_leg_shadow import (
     NLegShadowScheduler,
     legacy_shadow_snapshot,
 )
-from .prediction_title_translation import CodexTitleTranslator
+from .prediction_title_translation import LlmTitleTranslator
 from .relation_catalog import RelationCatalog
 
 logger = logging.getLogger(__name__)
@@ -273,10 +273,8 @@ def _build_cross_venue_monitor(
     prediction_monitor: PolymarketMonitor,
     store: PredictionArbitrageStore,
     execution: PredictionExecutionService,
-    codex_model: str,
     predict_trading: object | None = None,
-    fallback_enabled: bool = True,
-    max_codex_calls: int | None = None,
+    max_llm_calls: int | None = None,
     holding_reconciler: Callable[[], object] | None | object = _DEFAULT_HOLDING_RECONCILER,
     shadow_observer: Callable[[Mapping[str, object], str], object] | None = None,
 ) -> PredictCrossVenueMonitor | _UnavailableCrossVenueMonitor:
@@ -302,11 +300,9 @@ def _build_cross_venue_monitor(
         return PredictCrossVenueMonitor(
             predict_source=PredictSource(predict_config),
             polymarket_monitor=prediction_monitor,
-            validator=CodexCrossVenueEquivalenceValidator(
+            validator=LlmCrossVenueEquivalenceValidator(
                 store,
-                model=codex_model,
-                fallback_enabled=fallback_enabled,
-                max_codex_calls=max_codex_calls,
+                max_llm_calls=max_llm_calls,
             ),
             gamma_lookup=_cross_venue_gamma_lookup,
             predict_quote_fn=getattr(predict_trading, "quote_market_buy", None),
@@ -509,14 +505,8 @@ class PredictionRuntime:
                 )
             except Exception:
                 self._predict_trading = None
-            codex_model = os.environ.get(
-                "OPEN_TRADER_CODEX_MODEL", "gpt-5.6-sol"
-            ).strip()
-            relation_validator = CodexRelationValidator(
-                self.store,
-                model=codex_model,
-            )
-            title_translator = CodexTitleTranslator(self.store)
+            relation_validator = LlmRelationValidator(self.store)
+            title_translator = LlmTitleTranslator(self.store)
             self.monitor = PolymarketMonitor(
                 store=self.store,
                 trading=self._prediction_trading,
@@ -556,7 +546,6 @@ class PredictionRuntime:
                     prediction_monitor=self.monitor,
                     store=self.store,
                     execution=self.execution,
-                    codex_model=codex_model,
                     predict_trading=self._predict_trading,
                     holding_reconciler=getattr(
                         self.execution, "reconcile_cross_holdings_once", None
@@ -667,21 +656,16 @@ class PredictionRuntime:
                 self._predict_trading = PredictTradingClient.from_keychain(trading_config)
             except Exception:
                 self._predict_trading = None
-            codex_model = os.environ.get(
-                "OPEN_TRADER_CODEX_MODEL", "gpt-5.6-sol"
-            ).strip()
-            self._relation_validator = CodexRelationValidator(
+            self._relation_validator = LlmRelationValidator(
                 self.store,
-                model=codex_model,
-                fallback_enabled=False,
-                max_codex_calls=3,
+                max_llm_calls=3,
             )
             self.monitor = PolymarketMonitor(
                 store=self.store,
                 trading=self._prediction_trading,
                 relation_discovery=discover_threshold_relation_catalog,
                 relation_validator=self._relation_validator,
-                title_translator=CodexTitleTranslator(self.store),
+                title_translator=LlmTitleTranslator(self.store),
             )
             self.execution = PredictionExecutionService(
                 store=self.store,
@@ -703,10 +687,8 @@ class PredictionRuntime:
                     prediction_monitor=self.monitor,
                     store=self.store,
                     execution=self.execution,
-                    codex_model=codex_model,
                     predict_trading=self._predict_trading,
-                    fallback_enabled=False,
-                    max_codex_calls=3,
+                    max_llm_calls=3,
                     holding_reconciler=None,
                     shadow_observer=shadow_observer,
                 )

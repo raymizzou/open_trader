@@ -660,11 +660,21 @@ class PolymarketMonitor:
                     "llm_usage_24h_by_provider": copy.deepcopy(
                         self._llm_usage_by_provider_cache or {}
                     ),
+                    "llm_provider": self._llm_provider_snapshot(),
                     "annualized_distribution": copy.deepcopy(
                         self._annualized_distribution_cache or {}
                     ),
                 },
             }
+
+    def _llm_provider_snapshot(self) -> dict[str, object]:
+        snapshot = getattr(self._relation_validator, "provider_snapshot", None)
+        if callable(snapshot):
+            try:
+                return copy.deepcopy(snapshot())
+            except Exception:
+                pass
+        return {}
 
     def _activity_snapshot(self, now: datetime) -> dict[str, object]:
         activity = copy.deepcopy(self._activity)
@@ -2753,7 +2763,7 @@ class PolymarketMonitor:
                     decision=None,
                     relation=None,
                     summary="关系校验正在排队，当前不可下单。",
-                    reason_codes=("CODEX_PENDING",),
+                    reason_codes=("LLM_PENDING",),
                     evidence=(),
                     uncertainties=(),
                     model="",
@@ -2930,13 +2940,13 @@ class PolymarketMonitor:
         return await asyncio.to_thread(method, relation)
 
     @staticmethod
-    def _codex_unavailable(summary: str = "Codex 校验不可用，当前不可下单。") -> RelationValidation:
+    def _codex_unavailable(summary: str = "LLM 语义校验不可用，当前不可下单。") -> RelationValidation:
         return RelationValidation(
             status="llm_unavailable",
             decision=None,
             relation=None,
             summary=summary,
-            reason_codes=("CODEX_FAILED",),
+            reason_codes=("LLM_FAILED",),
             evidence=(),
             uncertainties=(),
             model="",
