@@ -5196,7 +5196,9 @@ tbody tr.active-row,
 .trend-discipline-workspace > summary small,
 .trend-controller-status > summary small,
 .trend-risk-summary > summary small,
-.trend-industry-context-table thead th {
+.trend-industry-context-table thead th,
+.pm-relation-chip,
+.pm-relation-tag {
   --muted: var(--text);
 }
 
@@ -5988,6 +5990,33 @@ table {
 .pm-relation-reason textarea { min-height: 72px; resize: vertical; }
 .pm-relation-actions { align-items: center; justify-content: flex-end; }
 .pm-relation-empty { color: var(--muted); margin: 8px 0; }
+button { cursor: pointer; }
+.pm-relation-badge.ok { background: #e8f4ed; border-color: #b9dac6; color: #21623f; }
+.pm-relation-badge.ok strong { background: #21623f; }
+.pm-relation-badge.block { background: #fbeeec; border-color: #e3b4ad; color: #8a1f14; }
+.pm-relation-badge.block strong { background: #8a1f14; }
+.pm-relation-chips { display: grid; gap: 10px; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 12px; }
+.pm-relation-chip { background: var(--surface-soft); border: 1px solid var(--line); border-radius: 8px; color: var(--text); display: block; min-height: 44px; padding: 10px 12px; text-align: left; transition: border-color .18s ease, background-color .18s ease; width: 100%; }
+.pm-relation-chip:hover { background: #fff; border-color: var(--accent); }
+.pm-relation-chip-label { color: var(--muted); display: block; font-size: 12px; font-weight: 800; }
+.pm-relation-chip-count { display: block; font-variant-numeric: tabular-nums; font-size: 20px; font-weight: 800; margin-top: 4px; }
+.pm-relation-chip.is-ok .pm-relation-chip-count { color: var(--success); }
+.pm-relation-chip.is-block .pm-relation-chip-count { color: var(--danger); }
+.pm-relation-tabs button[aria-pressed="true"] .pm-relation-tab-count { background: var(--primary); }
+.pm-relation-tab-count { background: var(--muted); border-radius: 999px; color: #fff; display: inline-block; font-size: 11px; font-weight: 800; line-height: 1; margin-left: 6px; min-width: 18px; padding: 3px 6px; }
+.pm-relation-tag { background: var(--surface-soft); border: 1px solid var(--line); border-radius: 999px; color: var(--muted); display: inline-block; font-size: 11px; font-weight: 800; line-height: 1.4; margin-right: 6px; padding: 2px 8px; }
+.pm-relation-row { transition: border-color .18s ease; }
+.pm-relation-row:hover { border-color: var(--accent); }
+.pm-relation-markets { display: grid; gap: 10px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.pm-relation-market-role { color: var(--muted); display: block; font-size: 12px; font-weight: 800; margin-bottom: 6px; }
+.pm-relation-pager { align-items: center; color: var(--muted); display: flex; font-size: 13px; font-variant-numeric: tabular-nums; gap: 10px; justify-content: space-between; margin-top: 4px; }
+.pm-relation-pager-pages { align-items: center; display: inline-flex; gap: 8px; }
+.pm-relation-pager button { background: transparent; border: 1px solid var(--line); border-radius: 6px; color: var(--text); min-height: 36px; padding: 6px 10px; }
+.pm-relation-pager button:disabled { cursor: not-allowed; opacity: 0.46; }
+@media (max-width: 640px) {
+  .pm-relation-chips { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .pm-relation-markets { grid-template-columns: 1fr; }
+}
 .pm-page-head h1 { font-size: 25px; margin: 0 0 5px; }
 .pm-page-head p { color: var(--muted); margin: 0; }
 .pm-strategy-tabs { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; display: inline-flex; flex-wrap: wrap; gap: 4px; margin-bottom: 10px; padding: 4px; }

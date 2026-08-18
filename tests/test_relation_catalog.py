@@ -9,7 +9,12 @@ from pathlib import Path
 import pytest
 
 import open_trader.cli as cli
-from open_trader.relation_catalog import RelationCatalog, _threshold_complete_model
+from open_trader.relation_catalog import (
+    RelationCatalog,
+    _derive_statement,
+    _threshold_complete_model,
+    _threshold_discovery_payload,
+)
 from open_trader.relation_catalog_v2 import SqliteCatalogStore
 from test_prediction_arbitrage import threshold_relation
 
@@ -405,3 +410,362 @@ def test_concurrent_readers_on_shared_catalog_do_not_nest_transactions(
     ]
     assert not errors
     assert not transaction_errors
+
+
+def _unique_discovery(suffix: str, *, completeness: str = "COMPLETE") -> dict[str, object]:
+    payload = discovery(completeness=completeness, n=2)
+    payload["markets"][0]["contract_id"] = f"condition-a-{suffix}"
+    payload["markets"][1]["contract_id"] = f"condition-b-{suffix}"
+    return payload
+
+
+def _force_record(catalog: RelationCatalog, version_id: str, **overrides: object) -> None:
+    record = dict(catalog._versions()[version_id])
+    record.update(overrides)
+    catalog._store_write({version_id: record})
+
+
+def test_list_filters_the_six_review_state_views_and_counts_them(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+
+    pending_id = catalog.ingest(
+        _unique_discovery("p1", completeness="INCOMPLETE")
+    )["version_id"]
+    incomplete_id = catalog.ingest(
+        _unique_discovery("i1", completeness="INCOMPLETE")
+    )["version_id"]
+    approved_incomplete = catalog.approve(
+        incomplete_id, {"version_id": incomplete_id}, actor="op", git_sha="sha"
+    )
+    assert approved_incomplete["activation"] == "INCOMPLETE"
+
+    active_id = catalog.ingest(_unique_discovery("a1"))["version_id"]
+    catalog.approve(active_id, {"version_id": active_id}, actor="op", git_sha="sha")
+
+    blocked_id = catalog.ingest(_unique_discovery("b1"))["version_id"]
+    catalog.approve(blocked_id, {"version_id": blocked_id}, actor="op", git_sha="sha")
+    _force_record(catalog, blocked_id, activation_status="ACTIVATION_BLOCKED_INCONSISTENT")
+
+    size_blocked_id = catalog.ingest(_unique_discovery("b2"))["version_id"]
+    catalog.approve(size_blocked_id, {"version_id": size_blocked_id}, actor="op", git_sha="sha")
+    _force_record(catalog, size_blocked_id, activation_status="UNSUPPORTED_SIZE")
+
+    compiled_id = catalog.ingest(_unique_discovery("c1"))["version_id"]
+    catalog.approve(compiled_id, {"version_id": compiled_id}, actor="op", git_sha="sha")
+    _force_record(catalog, compiled_id, activation_status="PENDING")
+
+    superseded_id = catalog.ingest(_unique_discovery("s1"))["version_id"]
+    catalog.approve(superseded_id, {"version_id": superseded_id}, actor="op", git_sha="sha")
+    _force_record(catalog, superseded_id, activation_status="SUPERSEDED")
+
+    rejected_id = catalog.ingest(
+        _unique_discovery("r1", completeness="INCOMPLETE")
+    )["version_id"]
+    catalog.reject(
+        rejected_id, {"version_id": rejected_id}, reason="other", actor="op", git_sha="sha"
+    )
+
+    views = {
+        "pending_approval": [pending_id],
+        "approved_model_incomplete": [incomplete_id],
+        "compiled_pending_activation": [compiled_id],
+        "activation_blocked": {blocked_id, size_blocked_id},
+        "activated": [active_id],
+        "source_changed_reapproval": [superseded_id],
+    }
+    for view, expected in views.items():
+        rows = catalog.list(view)
+        assert {row["version_id"] for row in rows} == set(expected)
+        assert rejected_id not in {row["version_id"] for row in rows}
+
+    assert catalog.review_counts() == {
+        "counts": {
+            "PENDING_APPROVAL": 1,
+            "APPROVED_MODEL_INCOMPLETE": 1,
+            "COMPILED_PENDING_ACTIVATION": 1,
+            "ACTIVATION_BLOCKED": 2,
+            "ACTIVATED": 1,
+            "SOURCE_CHANGED_REAPPROVAL": 1,
+        },
+        "pending_count": 1,
+    }
+
+
+def test_list_legacy_view_aliases_keep_their_semantics(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+
+    pending_id = catalog.ingest(
+        _unique_discovery("p1", completeness="INCOMPLETE")
+    )["version_id"]
+    active_id = catalog.ingest(_unique_discovery("a1"))["version_id"]
+    catalog.approve(active_id, {"version_id": active_id}, actor="op", git_sha="sha")
+
+    base = _unique_discovery("a1")
+    drifted = dict(base)
+    drifted["markets"] = [dict(market) for market in base["markets"]]
+    drifted["markets"][0]["title"] = "Market 0 (edited)"
+    blocked_id = catalog.ingest(drifted)["version_id"]
+    blocked = catalog.approve(
+        blocked_id, {"version_id": blocked_id}, actor="op", git_sha="sha"
+    )
+    assert blocked["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+
+    superseded_id = catalog.ingest(_unique_discovery("s1"))["version_id"]
+    _force_record(
+        catalog, superseded_id, status="APPROVED", activation_status="SUPERSEDED"
+    )
+
+    rejected_id = catalog.ingest(
+        _unique_discovery("r1", completeness="INCOMPLETE")
+    )["version_id"]
+    catalog.reject(
+        rejected_id, {"version_id": rejected_id}, reason="other", actor="op", git_sha="sha"
+    )
+
+    assert {row["version_id"] for row in catalog.list("pending")} == {pending_id}
+    assert {row["version_id"] for row in catalog.list("pending_approval")} == {pending_id}
+    assert {row["version_id"] for row in catalog.list("approved_active")} == {active_id}
+    # Six-state semantics: blocked covers INCONSISTENT/UNSUPPORTED_SIZE; the
+    # legacy INCOMPLETE rows now live in approved_model_incomplete.
+    assert {row["version_id"] for row in catalog.list("activation_blocked")} == {blocked_id}
+    assert {row["version_id"] for row in catalog.list("history")} == {
+        rejected_id, superseded_id,
+    }
+    with pytest.raises(ValueError):
+        catalog.list("nonsense")
+
+
+def test_threshold_statement_is_derived_at_read_time_with_direction_code(
+    tmp_path: Path,
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+    version_id = catalog.ingest_threshold_relation(threshold_relation())["version_id"]
+
+    detail = catalog.detail(version_id)
+    assert detail["direction_code"] == "B_IMPLIES_A"
+    assert detail["statement"] == "B『BTC above $100000?』为 YES ⇒ A『BTC above $90000?』必须 YES"
+    assert "B_IMPLIES_A" not in detail["statement"]
+
+    row = catalog.list("pending")[0]
+    assert row["version_id"] == version_id
+    assert row["direction_code"] == "B_IMPLIES_A"
+    assert row["statement"] == detail["statement"]
+
+
+def test_list_truncates_statement_titles_but_detail_keeps_full_text(
+    tmp_path: Path,
+) -> None:
+    base = threshold_relation()
+    relation = replace(
+        base,
+        market_a=replace(base.market_a, question="A" * 40),
+        market_b=replace(base.market_b, question="B" * 5),
+    )
+    catalog = RelationCatalog(tmp_path)
+    version_id = catalog.ingest_threshold_relation(relation)["version_id"]
+
+    detail = catalog.detail(version_id)
+    assert f"B『{'B' * 5}』为 YES ⇒ A『{'A' * 40}』必须 YES" == detail["statement"]
+
+    row = catalog.list("pending")[0]
+    assert "A" * 40 not in row["statement"]
+    assert f"A『{'A' * 28}…』必须 YES" in row["statement"]
+    assert f"B『{'B' * 5}』为 YES" in row["statement"]
+
+
+def test_derive_statement_only_rewrites_direction_code_literals() -> None:
+    assert _derive_statement("exactly one resolves YES", [{"title": "A"}, {"title": "B"}]) == (
+        "exactly one resolves YES", "",
+    )
+    assert _derive_statement("A_IMPLIES_B", [{"title": "A"}]) == ("A_IMPLIES_B", "")
+    # Direction codes without resolvable endpoint roles stay as the raw code;
+    # guessing the antecedent from endpoint order is what flipped statements.
+    assert _derive_statement("A_IMPLIES_B", [{"title": "A"}, {"title": "B"}]) == (
+        "A_IMPLIES_B", "A_IMPLIES_B",
+    )
+    statement, code = _derive_statement(
+        "A_TO_B", [{"title": "Q1"}, {"title": "Q2"}], roles=("A", "B")
+    )
+    assert statement == "A『Q1』为 YES ⇒ B『Q2』必须 YES"
+    assert code == "A_TO_B"
+    # Roles decide the antecedent, never the stored endpoint order.
+    statement, code = _derive_statement(
+        "A_TO_B", [{"title": "Q1"}, {"title": "Q2"}], roles=("B", "A")
+    )
+    assert statement == "A『Q2』为 YES ⇒ B『Q1』必须 YES"
+    assert code == "A_TO_B"
+    statement, code = _derive_statement(
+        "B_IMPLIES_A", [{"title": "Q1"}, {"title": "Q2"}], roles=("B", "A")
+    )
+    assert statement == "B『Q1』为 YES ⇒ A『Q2』必须 YES"
+    assert code == "B_IMPLIES_A"
+    # Degenerate role payloads never derive.
+    assert _derive_statement(
+        "B_IMPLIES_A", [{"title": "Q1"}, {"title": "Q2"}], roles=("A", "A")
+    ) == ("B_IMPLIES_A", "B_IMPLIES_A")
+    assert _derive_statement(
+        "B_IMPLIES_A", [{"title": "Q1"}, {"title": "Q2"}], roles=("", "B")
+    ) == ("B_IMPLIES_A", "B_IMPLIES_A")
+
+
+def _threshold_with_ids(
+    condition_a_id: str, condition_b_id: str, *, relation_code: str
+) -> object:
+    base = threshold_relation()
+    return replace(
+        base,
+        relation=relation_code,
+        market_a=replace(base.market_a, condition_id=condition_a_id),
+        market_b=replace(base.market_b, condition_id=condition_b_id),
+    )
+
+
+B_IMPLIES_A_ANTENECENT_LOW = (
+    # B_IMPLIES_A: market_b (BTC above $100000) is the antecedent and its
+    # condition_id sorts BELOW market_a's — the ordering that used to flip.
+    _threshold_with_ids("0xbeef000000000001", "0x0aaa000000000001", relation_code="B_IMPLIES_A"),
+    "B『BTC above $100000?』为 YES ⇒ A『BTC above $90000?』必须 YES",
+    "BTC above $100000?",
+    "B",
+)
+B_IMPLIES_A_ANTENECENT_HIGH = (
+    # Same direction with the antecedent sorting above the consequent; the
+    # pre-fix code only passed this case by contract_id coincidence.
+    _threshold_with_ids("0x1aaa000000000001", "0x9fff000000000001", relation_code="B_IMPLIES_A"),
+    "B『BTC above $100000?』为 YES ⇒ A『BTC above $90000?』必须 YES",
+    "BTC above $100000?",
+    "B",
+)
+A_IMPLIES_B_ANTENECENT_HIGH = (
+    # A_IMPLIES_B: market_a (BTC above $90000) is the antecedent and its
+    # condition_id sorts ABOVE market_b's — the ordering that used to flip.
+    _threshold_with_ids("0xe111000000000001", "0x0bbb000000000001", relation_code="A_IMPLIES_B"),
+    "A『BTC above $90000?』为 YES ⇒ B『BTC above $100000?』必须 YES",
+    "BTC above $90000?",
+    "A",
+)
+A_IMPLIES_B_ANTENECENT_LOW = (
+    _threshold_with_ids("0x0ccc000000000001", "0xd222000000000001", relation_code="A_IMPLIES_B"),
+    "A『BTC above $90000?』为 YES ⇒ B『BTC above $100000?』必须 YES",
+    "BTC above $90000?",
+    "A",
+)
+
+
+@pytest.mark.parametrize(
+    "relation,expected_statement,antecedent_title,antecedent_letter",
+    [
+        B_IMPLIES_A_ANTENECENT_LOW,
+        B_IMPLIES_A_ANTENECENT_HIGH,
+        A_IMPLIES_B_ANTENECENT_HIGH,
+        A_IMPLIES_B_ANTENECENT_LOW,
+    ],
+    ids=[
+        "b_implies_a-antecedent-low",
+        "b_implies_a-antecedent-high",
+        "a_implies_b-antecedent-high",
+        "a_implies_b-antecedent-low",
+    ],
+)
+def test_threshold_statement_keeps_true_direction_regardless_of_contract_order(
+    tmp_path: Path,
+    relation: object,
+    expected_statement: str,
+    antecedent_title: str,
+    antecedent_letter: str,
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+    version_id = catalog.ingest_threshold_relation(relation)["version_id"]
+
+    detail = catalog.detail(version_id)
+    assert detail["statement"] == expected_statement
+
+    # Endpoint roles are persisted on the stored payload and survive into rows.
+    stored = catalog._versions()[version_id]["payload"]["endpoints"]
+    roles = {str(endpoint["title"]): str(endpoint.get("role", "")) for endpoint in stored}
+    assert roles[antecedent_title] == antecedent_letter
+    assert sorted(roles.values()) == ["A", "B"]
+
+    row = [item for item in catalog.list("pending") if item["version_id"] == version_id][0]
+    assert row["statement"] == expected_statement
+    row_roles = {
+        str(endpoint["title"]): str(endpoint.get("role", ""))
+        for endpoint in row["endpoints"]
+    }
+    assert row_roles[antecedent_title] == antecedent_letter
+
+
+def _legacy_threshold_discovery(relation: object) -> dict[str, object]:
+    """A pre-role-fields discovery payload, as written before this fix."""
+    model = _threshold_complete_model(relation)
+    payload = _threshold_discovery_payload(
+        relation, model if model is not None else {"completeness": "INCOMPLETE"}
+    )
+    semantics = dict(payload["semantics"])
+    semantics.pop("antecedent_contract_id", None)
+    semantics.pop("consequent_contract_id", None)
+    return {**payload, "semantics": semantics}
+
+
+def test_legacy_row_without_roles_derives_direction_from_compiled_model(
+    tmp_path: Path,
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+    relation = B_IMPLIES_A_ANTENECENT_LOW[0]
+    version_id = catalog.ingest(_legacy_threshold_discovery(relation))["version_id"]
+
+    # No roles were persisted for this legacy row...
+    stored = catalog._versions()[version_id]["payload"]["endpoints"]
+    assert all("role" not in endpoint for endpoint in stored)
+
+    # ...so the statement comes from the compiled IMPLIES constraint, whose
+    # contract order is antecedent-first and order-preserving.
+    detail = catalog.detail(version_id)
+    assert detail["direction_code"] == "B_IMPLIES_A"
+    assert detail["statement"] == B_IMPLIES_A_ANTENECENT_LOW[1]
+    roles = {
+        str(endpoint["title"]): str(endpoint.get("role", ""))
+        for endpoint in detail["endpoints"]
+    }
+    assert roles["BTC above $100000?"] == "B"
+    assert roles["BTC above $90000?"] == "A"
+
+
+def test_legacy_row_without_model_shows_direction_code_without_role_labels(
+    tmp_path: Path,
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+    relation = replace(
+        B_IMPLIES_A_ANTENECENT_LOW[0],
+        market_a=replace(
+            B_IMPLIES_A_ANTENECENT_LOW[0].market_a, resolution_source=""  # type: ignore[attr-defined]
+        ),
+    )
+    version_id = catalog.ingest(_legacy_threshold_discovery(relation))["version_id"]
+
+    # No roles, no compiled model: the raw direction code stays and no
+    # antecedent/consequent roles are invented.
+    detail = catalog.detail(version_id)
+    assert detail["statement"] == "B_IMPLIES_A"
+    assert detail["direction_code"] == "B_IMPLIES_A"
+    assert all("role" not in endpoint for endpoint in detail["endpoints"])
+    row = [item for item in catalog.list("pending") if item["version_id"] == version_id][0]
+    assert row["statement"] == "B_IMPLIES_A"
+    assert all("role" not in endpoint for endpoint in row["endpoints"])
+
+
+def test_legacy_row_with_mismatched_model_constraint_never_guesses_roles(
+    tmp_path: Path,
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+    # The compiled problem speaks about condition-a/condition-b, but the row's
+    # endpoints are different contracts; roles must not be inferred.
+    payload = _legacy_threshold_discovery(B_IMPLIES_A_ANTENECENT_LOW[0])
+    for market in payload["markets"]:
+        market["contract_id"] = f"{market['contract_id']}-other"
+    version_id = catalog.ingest(payload)["version_id"]
+
+    detail = catalog.detail(version_id)
+    assert detail["statement"] == "B_IMPLIES_A"
+    assert detail["direction_code"] == "B_IMPLIES_A"
+    assert all("role" not in endpoint for endpoint in detail["endpoints"])

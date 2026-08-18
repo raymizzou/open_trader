@@ -3087,9 +3087,10 @@ const connectedButBooksStale = {
   breaker:{open:false},
 };
 console.log(JSON.stringify({
-  healthyHeader:predictionPageHeader(healthy),
-  unavailableHeader:predictionPageHeader(unavailable),
-  connectedButStaleHeader:predictionPageHeader(connectedButBooksStale),
+  healthyHeader:predictionUnifiedPageHeader(healthy),
+  unavailableHeader:predictionUnifiedPageHeader(unavailable),
+  unavailablePanel:predictionOpportunityPanel(unavailable),
+  connectedButStaleHeader:predictionUnifiedPageHeader(connectedButBooksStale),
   connectedButStaleAlert:predictionExecutionAlert(connectedButBooksStale),
   healthyReadiness:predictionReadinessStrip(healthy),
   unavailableReadiness:predictionReadinessStrip(unavailable),
@@ -3100,8 +3101,9 @@ console.log(JSON.stringify({
     rendered = json.loads(output)
 
     assert "Watcher 正常" in rendered["healthyHeader"]
+    assert "关系审核" in rendered["healthyHeader"]
     assert "Watcher 不可用" in rendered["unavailableHeader"]
-    assert "盘口心跳已过期" in rendered["unavailableHeader"]
+    assert "盘口心跳已过期" in rendered["unavailablePanel"]
     assert "Watcher 正常" in rendered["connectedButStaleHeader"]
     assert "可参与盘口已过期" not in rendered["connectedButStaleHeader"]
     assert "当前盘口暂不可交易" in rendered["connectedButStaleAlert"]
@@ -3155,8 +3157,8 @@ const exhausted = {
 console.log(JSON.stringify({
   retrying:predictionExecutionAlert(retrying),
   exhausted:predictionExecutionAlert(exhausted),
-  retryingHeader:predictionPageHeader(retrying),
-  exhaustedHeader:predictionPageHeader(exhausted),
+  retryingHeader:predictionUnifiedPageHeader(retrying),
+  exhaustedHeader:predictionUnifiedPageHeader(exhausted),
   retryingYesNo:predictionTradingAvailable(retrying, "yes_no"),
   retryingLlm:predictionTradingAvailable(retrying, "llm_hedge"),
   exhaustedLlm:predictionTradingAvailable(exhausted, "llm_hedge"),
@@ -3540,32 +3542,244 @@ console.log(JSON.stringify(cases));
     assert "数据未返回" in rendered["missing"]
 
 
-def test_prediction_relation_review_renders_six_states_and_blocked_conflicts() -> None:
+def test_prediction_relation_review_renders_six_state_count_chips() -> None:
     output = run_dashboard_js(r'''
 const payload = {relation_review: {
   pending_count: 2,
-  items: [
-    {version_id: "v-pending", title: "BTC $120k 互补关系", relation_type: "NATIVE_COMPLEMENT", discovery_source: "VENUE_METADATA", status: "PENDING_APPROVAL"},
-    {version_id: "v-incomplete", title: "Hurupay 阈值关系", relation_type: "IMPLIES", discovery_source: "LLM", status: "APPROVED_MODEL_INCOMPLETE"},
-    {version_id: "v-compiled", title: "编译补全关系", relation_type: "IMPLIES", discovery_source: "RULE", status: "COMPILED_PENDING_ACTIVATION"},
-    {version_id: "v-blocked", title: "SPY 单调关系", relation_type: "IMPLIES", discovery_source: "MANUAL", status: "ACTIVATION_BLOCKED", reason: "ACTIVATION_BLOCKED_INCONSISTENT", conflict_candidates: 2},
-    {version_id: "v-active", title: "已激活关系", relation_type: "MUTUALLY_EXCLUSIVE", discovery_source: "RULE", status: "ACTIVATED"},
-    {version_id: "v-superseded", title: "旧版本关系", relation_type: "EXACTLY_ONE", discovery_source: "LLM", status: "SOURCE_CHANGED_REAPPROVAL", reason: "rules fingerprint 变化 · 保留批准不等于可交易"},
-  ],
+  counts: {
+    PENDING_APPROVAL: 2,
+    APPROVED_MODEL_INCOMPLETE: 12,
+    COMPILED_PENDING_ACTIVATION: 3,
+    ACTIVATION_BLOCKED: 2,
+    ACTIVATED: 8,
+    SOURCE_CHANGED_REAPPROVAL: 1,
+  },
 }};
-const html = predictionRelationReview(payload, "all");
-const blockedOnly = predictionRelationReview(payload, "ACTIVATION_BLOCKED");
-console.log(JSON.stringify({html, blockedOnly}));
+const html = predictionRelationReview(payload);
+console.log(JSON.stringify({html}));
 ''')
     rendered = json.loads(output)
 
     for label in ("待批准", "已批准 · 模型不完整", "编译补全待激活", "激活阻断", "已激活", "来源变化需重批"):
         assert label in rendered["html"]
-    assert "ACTIVATION_BLOCKED_INCONSISTENT · 冲突候选 2" in rendered["html"]
-    assert "rules fingerprint 变化 · 保留批准不等于可交易" in rendered["html"]
-    assert "SPY 单调关系" in rendered["blockedOnly"]
-    assert "已激活关系" not in rendered["blockedOnly"]
-    assert "不显示预计收益" in rendered["html"]
+    for view in ("pending_approval", "approved_model_incomplete", "compiled_pending_activation", "activation_blocked", "activated", "source_changed_reapproval"):
+        assert f'data-open-relation-view="{view}"' in rendered["html"]
+    assert 'data-action="open-relation-review"' in rendered["html"]
+    assert "待批准 <strong>2</strong>" in rendered["html"]
+    assert rendered["html"].count("pm-relation-chip") >= 12
+    assert "is-block" in rendered["html"]
+    assert "is-ok" in rendered["html"]
+    assert "六态状态计数" in rendered["html"]
+
+
+def test_relation_review_drawer_renders_tabs_pager_and_detail_roles() -> None:
+    output = run_dashboard_js(r'''
+state.predictionMarket.payload = {relation_review: {pending_count: 2, counts: {PENDING_APPROVAL: 2, APPROVED_MODEL_INCOMPLETE: 12, COMPILED_PENDING_ACTIVATION: 3, ACTIVATION_BLOCKED: 2, ACTIVATED: 8, SOURCE_CHANGED_REAPPROVAL: 1}}};
+state.predictionMarket.relationReview = {
+  ...state.predictionMarket.relationReview,
+  open: true,
+  view: "pending_approval",
+  offset: 50,
+  total: 958,
+  items: [{
+    version_id: "9f3ac2d4e5f60718293a4b5c6d7e8f90a1b2c3d4",
+    statement: "B『Trump vetos bill in August』为 YES ⇒ A『Congress passes the ELON Act』必须 YES",
+    direction_code: "B_IMPLIES_A",
+    discovery_source: "deterministic_rule",
+    discovered_at: "2026-08-17T06:32:00Z",
+    status: "PENDING",
+    activation: "PENDING",
+    endpoints: [
+      {venue: "Polymarket", title: "Trump vetos bill in August", expires_at: "2026-09-01T00:00:00Z", role: "B"},
+      {venue: "Polymarket", title: "Congress passes the ELON Act", expires_at: "2026-09-30T00:00:00Z", role: "A"},
+    ],
+  }],
+};
+const listHtml = relationReviewDrawer();
+state.predictionMarket.relationReview.detail = {
+  version_id: "9f3ac2d4e5f60718293a4b5c6d7e8f90a1b2c3d4",
+  statement: "B『Trump vetos bill in August』为 YES ⇒ A『Congress passes the ELON Act』必须 YES",
+  direction_code: "B_IMPLIES_A",
+  discovery_source: "deterministic_rule",
+  discovered_at: "2026-08-17T06:32:00Z",
+  status: "PENDING",
+  activation: "PENDING",
+  endpoints: [
+    {venue: "Polymarket", contract_id: "0x91f2", title: "Trump vetos bill in August", market_date: "2026-09-01T00:00:00Z", expires_at: "2026-09-01T00:00:00Z", settlement_observation_key: "ump-fees-2026-09", role: "B"},
+    {venue: "Polymarket", contract_id: "0x33ab", title: "Congress passes the ELON Act", market_date: "2026-09-30T00:00:00Z", expires_at: "2026-09-30T00:00:00Z", settlement_observation_key: "ump-fees-2026-09", role: "A"},
+  ],
+  evidence: [],
+};
+const detailHtml = relationReviewDrawer();
+console.log(JSON.stringify({listHtml, detailHtml}));
+''')
+    rendered = json.loads(output)
+
+    for tab in ("待批准", "模型不完整", "编译补全待激活", "激活阻断", "已激活", "需重批"):
+        assert tab in rendered["listHtml"]
+    assert 'data-relation-view="pending_approval"' in rendered["listHtml"]
+    assert "pm-relation-tab-count" in rendered["listHtml"]
+    assert "B『Trump vetos bill in August』为 YES ⇒ A『Congress passes the ELON Act』必须 YES" in rendered["listHtml"]
+    assert "pm-relation-tag" in rendered["listHtml"]
+    assert "B_IMPLIES_A" in rendered["listHtml"]
+    assert "deterministic_rule" in rendered["listHtml"]
+    assert "版本 9f3a…d4" in rendered["listHtml"]
+    assert "显示 51–100 / 958" in rendered["listHtml"]
+    assert "第 2 / 20 页" in rendered["listHtml"]
+    assert 'data-action="relation-prev-page"' in rendered["listHtml"]
+    assert 'data-action="relation-next-page"' in rendered["listHtml"]
+
+    assert "市场 B · 前件" in rendered["detailHtml"]
+    assert "市场 A · 后件" in rendered["detailHtml"]
+    assert 'data-action="approve-relation"' in rendered["detailHtml"]
+    assert 'data-action="reject-relation"' in rendered["detailHtml"]
+
+
+def test_relation_role_labels_follow_endpoint_roles_not_storage_order() -> None:
+    output = run_dashboard_js(r'''
+const consequentFirst = {
+  version_id: "aa11", statement: "B『Antecedent market』为 YES ⇒ A『Consequent market』必须 YES",
+  direction_code: "B_IMPLIES_A", discovery_source: "deterministic_rule",
+  discovered_at: "2026-08-17T06:32:00Z", status: "PENDING", activation: "PENDING",
+  endpoints: [
+    {venue: "Polymarket", contract_id: "0x11", title: "Consequent market", expires_at: "2026-09-01T00:00:00Z", role: "A"},
+    {venue: "Polymarket", contract_id: "0x99", title: "Antecedent market", expires_at: "2026-09-30T00:00:00Z", role: "B"},
+  ],
+};
+state.predictionMarket.relationReview = {
+  ...state.predictionMarket.relationReview,
+  open: true, view: "pending_approval", offset: 0, total: 1,
+  items: [consequentFirst], detail: {...consequentFirst, evidence: []},
+};
+const html = relationReviewDrawer();
+const listLine = relationCatalogItem(consequentFirst);
+console.log(JSON.stringify({
+  html,
+  aIndex: listLine.indexOf("A 到期"),
+  bIndex: listLine.indexOf("B 到期"),
+}));
+''')
+    rendered = json.loads(output)
+
+    # Antecedent labels follow the role letters, never the endpoint index.
+    assert "市场 A · 后件" in rendered["html"]
+    assert "市场 B · 前件" in rendered["html"]
+    # The list letter prefixes attach to the matching endpoint: the stored
+    # order is consequent-first, so A (index 0) must precede B (index 1).
+    assert rendered["aIndex"] != -1
+    assert rendered["bIndex"] != -1
+    assert rendered["aIndex"] < rendered["bIndex"]
+
+
+def test_relation_rows_without_roles_show_no_antecedent_labels() -> None:
+    output = run_dashboard_js(r'''
+const legacyRow = {
+  version_id: "bb22", statement: "B_IMPLIES_A",
+  direction_code: "B_IMPLIES_A", discovery_source: "deterministic_rule",
+  discovered_at: "2026-08-17T06:32:00Z", status: "PENDING", activation: "PENDING",
+  endpoints: [
+    {venue: "Polymarket", contract_id: "0x11", title: "Consequent market", expires_at: "2026-09-01T00:00:00Z"},
+    {venue: "Polymarket", contract_id: "0x99", title: "Antecedent market", expires_at: "2026-09-30T00:00:00Z"},
+  ],
+};
+state.predictionMarket.relationReview = {
+  ...state.predictionMarket.relationReview,
+  open: true, view: "pending_approval", offset: 0, total: 1,
+  items: [legacyRow], detail: {...legacyRow, evidence: []},
+};
+const html = relationReviewDrawer();
+const listLine = relationCatalogItem(legacyRow);
+console.log(JSON.stringify({html, listLine}));
+''')
+    rendered = json.loads(output)
+
+    # No provable roles: no role spans, no letter prefixes — but the raw
+    # direction code and the decision form stay visible.
+    assert "前件" not in rendered["html"]
+    assert "后件" not in rendered["html"]
+    assert "pm-relation-market-role" not in rendered["html"]
+    assert "A 到期" not in rendered["listLine"]
+    assert "B 到期" not in rendered["listLine"]
+    assert "B_IMPLIES_A" in rendered["listLine"]
+    assert 'data-relation-reason' in rendered["html"]
+
+
+def test_relation_catalog_item_escapes_venue_text() -> None:
+    output = run_dashboard_js(r'''
+const item = {
+  version_id: "cc33", statement: "B_IMPLIES_A", direction_code: "B_IMPLIES_A",
+  discovery_source: "exchange_metadata", discovered_at: "2026-08-17T06:32:00Z",
+  status: "PENDING", activation: "PENDING",
+  endpoints: [
+    {venue: "<b>Polymarket</b>", title: "Market one", expires_at: "2026-09-01T00:00:00Z"},
+    {venue: "<b>Polymarket</b>", title: "Market two", expires_at: "2026-09-01T00:00:00Z"},
+  ],
+};
+console.log(relationCatalogItem(item));
+''')
+    assert "&lt;b&gt;Polymarket&lt;/b&gt;" in output
+    assert "<b>Polymarket</b>" not in output
+
+
+def test_prediction_polling_rerender_preserves_relation_decision_form() -> None:
+    output = run_dashboard_js(r'''
+const reasonOptions = [
+  "source_evidence_insufficient", "relation_semantics_wrong",
+  "model_incomplete_or_wrong", "identity_mismatch", "rules_changed", "other",
+].map((value) => ({value}));
+let rendered = false;
+const selects = [];
+const notes = [];
+const root = {
+  _html: "",
+  set innerHTML(html) { this._html = html; rendered = true; },
+  get innerHTML() { return this._html; },
+  querySelector(selector) {
+    if (selector === "[data-relation-reason]") {
+      const select = {value: "source_evidence_insufficient", options: reasonOptions.slice()};
+      if (!rendered) select.value = "relation_semantics_wrong";
+      selects.push(select);
+      return select;
+    }
+    if (selector === "[data-relation-note]") {
+      const note = {value: ""};
+      if (!rendered) note.value = "statement flipped";
+      notes.push(note);
+      return note;
+    }
+    return null;
+  },
+};
+elements["prediction-market-root"] = root;
+state.predictionMarket.payload = {status: "healthy", events: [], opportunities: []};
+state.predictionMarket.relationReview = {
+  ...state.predictionMarket.relationReview,
+  open: true,
+  detail: {
+    version_id: "dd44", statement: "B_IMPLIES_A", direction_code: "B_IMPLIES_A",
+    discovery_source: "deterministic_rule", discovered_at: "2026-08-17T06:32:00Z",
+    status: "PENDING", activation: "PENDING",
+    endpoints: [
+      {venue: "Polymarket", contract_id: "0x11", title: "Market one", expires_at: "2026-09-01T00:00:00Z"},
+      {venue: "Polymarket", contract_id: "0x99", title: "Market two", expires_at: "2026-09-30T00:00:00Z"},
+    ],
+    evidence: [],
+  },
+};
+renderPredictionMarket();
+console.log(JSON.stringify({
+  formRendered: root.innerHTML.includes("data-relation-reason"),
+  restoredReason: selects.length === 2 ? selects[1].value : "missing",
+  restoredNote: notes.length === 2 ? notes[1].value : "missing",
+}));
+''')
+    rendered = json.loads(output)
+
+    # The re-rendered drawer detail still carries the operator's picked
+    # reason and typed note instead of silently resetting them.
+    assert rendered["formRendered"] is True
+    assert rendered["restoredReason"] == "relation_semantics_wrong"
+    assert rendered["restoredNote"] == "statement flipped"
 
 
 def test_prediction_mode_bar_and_capital_usage_render_read_only_preview() -> None:
@@ -3626,10 +3840,13 @@ const payload = {
   ],
   capital_usage: {max_total_unsettled_capital: "0.00", max_total_unsettled_capital_set: false, current_conservative: "0.00", active_batch_reserved: "0.00", remaining: null},
   qualified_opportunities: [],
-  relation_review: {pending_count: 0, items: []},
+  relation_review: {
+    pending_count: 2,
+    counts: {PENDING_APPROVAL: 2, APPROVED_MODEL_INCOMPLETE: 0, COMPILED_PENDING_ACTIVATION: 0, ACTIVATION_BLOCKED: 0, ACTIVATED: 0, SOURCE_CHANGED_REAPPROVAL: 0},
+  },
 };
 const html = predictionUnifiedPage(payload, {kind: "all", legs: null, scope: null});
-const marks = ["pm-page-head", "pm-mode-bar", "pm-venue-readiness", "资金占用", "机会列表", "关系审核"].map((label) => html.indexOf(label)).filter((index) => index >= 0);
+const marks = ["pm-page-head", "pm-mode-bar", "pm-venue-readiness", "资金占用", "机会列表", "六态状态计数"].map((label) => html.indexOf(label)).filter((index) => index >= 0);
 console.log(JSON.stringify({html, ordered: marks.every((index, i) => i === 0 || marks[i - 1] < index)}));
 ''')
     rendered = json.loads(output)

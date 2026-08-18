@@ -14,7 +14,7 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from .relation_catalog_v2 import (
     RelationCatalogV2,
@@ -52,9 +52,228 @@ _RELATION_TYPES = frozenset({"IMPLIES", "MUTUALLY_EXCLUSIVE", "EXACTLY_ONE"})
 _ACTIVATION_BLOCKED = frozenset({"ACTIVATION_BLOCKED_INCONSISTENT", "UNSUPPORTED_SIZE"})
 _GROUP_BUDGET = 10
 
+#: The six-state review vocabulary shared by the catalog views, counts, and UI.
+REVIEW_STATES = (
+    "PENDING_APPROVAL",
+    "APPROVED_MODEL_INCOMPLETE",
+    "COMPILED_PENDING_ACTIVATION",
+    "ACTIVATION_BLOCKED",
+    "ACTIVATED",
+    "SOURCE_CHANGED_REAPPROVAL",
+)
+
+#: Lowercase ``list(view)`` keys, one per review state.
+REVIEW_STATE_VIEWS = {
+    "pending_approval": "PENDING_APPROVAL",
+    "approved_model_incomplete": "APPROVED_MODEL_INCOMPLETE",
+    "compiled_pending_activation": "COMPILED_PENDING_ACTIVATION",
+    "activation_blocked": "ACTIVATION_BLOCKED",
+    "activated": "ACTIVATED",
+    "source_changed_reapproval": "SOURCE_CHANGED_REAPPROVAL",
+}
+
+#: Legacy API aliases; ``pending`` maps to the identical review state.
+_LEGACY_VIEW_ALIASES = {"pending": "PENDING_APPROVAL"}
+
+_DIRECTION_CODES = frozenset({"A_IMPLIES_B", "B_IMPLIES_A", "A_TO_B", "B_TO_A"})
+_LIST_TITLE_LIMIT = 28
+
+
+def review_state(record: Mapping[str, object]) -> str | None:
+    """Map one stored version record onto the six-state review vocabulary.
+
+    ``PENDING`` versions are awaiting approval; ``APPROVED`` versions split by
+    activation status and compiled-model presence; ``REJECTED``/``REVOKED``
+    versions map to ``None`` (history only).
+    """
+
+    status = str(record.get("status") or "")
+    activation = str(record.get("activation_status") or "")
+    payload = record.get("payload")
+    compiled = bool(payload.get("terminal_states")) if isinstance(payload, Mapping) else False
+    if status == "PENDING":
+        return "PENDING_APPROVAL"
+    if status != "APPROVED":
+        return None
+    if activation == "ACTIVE":
+        return "ACTIVATED"
+    if activation in _ACTIVATION_BLOCKED:
+        return "ACTIVATION_BLOCKED"
+    if activation == "SUPERSEDED":
+        return "SOURCE_CHANGED_REAPPROVAL"
+    return "COMPILED_PENDING_ACTIVATION" if compiled else "APPROVED_MODEL_INCOMPLETE"
+
+
+def _truncate_title(title: str, limit: int = _LIST_TITLE_LIMIT) -> str:
+    if len(title) <= limit:
+        return title
+    return f"{title[:limit].rstrip()}…"
+
+
+def _derive_statement(
+    statement: str,
+    endpoints: Sequence[Mapping[str, object]],
+    *,
+    truncate: bool = False,
+    roles: Sequence[object] = (),
+) -> tuple[str, str]:
+    """Derive the human-readable sentence for one stored direction-code statement.
+
+    ``roles`` are the per-endpoint ``"A"|"B"`` letters; the endpoint whose role
+    equals the direction code's antecedent letter becomes the antecedent, so the
+    stored endpoint order can never flip the implication. Without two distinct
+    A/B roles the raw direction code is returned unchanged — direction is never
+    guessed from endpoint order. Returns ``(statement, direction_code)``; non
+    direction-code statements are returned unchanged with an empty direction
+    code.
+    """
+
+    direction = statement if statement in _DIRECTION_CODES else ""
+    if not direction or len(endpoints) < 2:
+        return statement, ""
+    letters = [str(item) for item in roles[:2]]
+    if (
+        len(roles) < 2
+        or letters[0] not in ("A", "B")
+        or letters[1] not in ("A", "B")
+        or letters[0] == letters[1]
+    ):
+        return statement, direction
+    antecedent_letter = "B" if direction in {"B_IMPLIES_A", "B_TO_A"} else "A"
+    consequent_letter = "A" if antecedent_letter == "B" else "B"
+    by_letter = {
+        letters[index]: endpoints[index]
+        for index in range(2)
+    }
+    title_first = str(by_letter[antecedent_letter].get("title", ""))
+    title_second = str(by_letter[consequent_letter].get("title", ""))
+    if truncate:
+        title_first = _truncate_title(title_first)
+        title_second = _truncate_title(title_second)
+    return (
+        f"{antecedent_letter}『{title_first}』为 YES ⇒ {consequent_letter}『{title_second}』必须 YES",
+        direction,
+    )
+
 
 class RelationConflictError(ValueError):
     """The reviewed version is not the catalog version the operator opened."""
+
+
+def _valid_role_letters(letters: Sequence[object]) -> bool:
+    """Two distinct ``A``/``B`` letters — one antecedent and one consequent."""
+
+    values = [str(item) for item in letters]
+    return (
+        len(values) == 2
+        and values[0] in ("A", "B")
+        and values[1] in ("A", "B")
+        and values[0] != values[1]
+    )
+
+
+def _semantics_endpoint_roles(
+    semantics: Mapping[str, object],
+    endpoints: Sequence[Mapping[str, object]],
+    direction: str,
+) -> dict[str, str]:
+    """Map contract_id → ``"A"|"B"`` from the discovery payload's semantics.
+
+    ``_normalise_discovery`` reorders markets by ``(venue, contract_id)``, so
+    the antecedent/consequent contract ids ride inside ``semantics`` (which
+    passes normalisation verbatim) instead of relying on market order.
+    """
+
+    if direction not in _DIRECTION_CODES:
+        return {}
+    antecedent_id = semantics.get("antecedent_contract_id")
+    consequent_id = semantics.get("consequent_contract_id")
+    if not isinstance(antecedent_id, str) or not isinstance(consequent_id, str):
+        return {}
+    ids = [str(endpoint.get("contract_id", "")) for endpoint in endpoints]
+    if len(set(ids)) != 2 or set(ids) != {antecedent_id, consequent_id}:
+        return {}
+    antecedent_letter = "B" if direction in {"B_IMPLIES_A", "B_TO_A"} else "A"
+    consequent_letter = "A" if antecedent_letter == "B" else "B"
+    return {antecedent_id: antecedent_letter, consequent_id: consequent_letter}
+
+
+def _model_endpoint_roles(
+    payload: Mapping[str, object],
+    contract_ids: Sequence[str],
+    direction: str,
+) -> list[str]:
+    """Read-time role letters for legacy rows, from the compiled IMPLIES constraint.
+
+    ``_threshold_complete_model`` builds the constraint antecedent-first and
+    canonical serialisation preserves ``contract_ids`` order for IMPLIES
+    (``_sort_values``), so ``contract_ids[0] -> contract_ids[1]`` is the stored
+    proof of direction. Anything ambiguous — missing model, several IMPLIES
+    constraints, contract sets that do not match the row — resolves to no roles;
+    direction is never guessed.
+    """
+
+    if direction not in _DIRECTION_CODES or len(set(contract_ids)) != 2:
+        return []
+    problem = payload.get("problem")
+    if not isinstance(problem, Mapping):
+        return []
+    constraint_model = problem.get("constraint_model")
+    if not isinstance(constraint_model, Mapping):
+        return []
+    relations = constraint_model.get("relations")
+    if not isinstance(relations, list):
+        return []
+    implied: list[list[str]] = []
+    for relation in relations:
+        if not isinstance(relation, Mapping) or str(relation.get("kind")) != "IMPLIES":
+            continue
+        ids = relation.get("contract_ids")
+        if (
+            isinstance(ids, list)
+            and len(ids) == 2
+            and all(isinstance(item, str) for item in ids)
+        ):
+            implied.append([str(ids[0]), str(ids[1])])
+    if len(implied) != 1 or set(implied[0]) != set(contract_ids):
+        return []
+    antecedent_id = implied[0][0]
+    antecedent_letter = "B" if direction in {"B_IMPLIES_A", "B_TO_A"} else "A"
+    consequent_letter = "A" if antecedent_letter == "B" else "B"
+    letters = [
+        antecedent_letter if cid == antecedent_id else consequent_letter
+        for cid in contract_ids
+    ]
+    return letters if _valid_role_letters(letters) else []
+
+
+def _row_endpoints_and_roles(
+    payload: Mapping[str, object],
+) -> tuple[list[dict[str, object]], list[str]]:
+    """Row endpoints plus their role letters: stored roles, else compiled model.
+
+    Stored endpoint roles are authoritative. Legacy rows without them fall
+    back to the compiled IMPLIES constraint (read-time annotation only — the
+    stored payload is never mutated); rows that cannot be proven keep no roles
+    so the direction code is displayed as-is.
+    """
+
+    endpoints: list[dict[str, object]] = [
+        dict(endpoint) for endpoint in payload["endpoints"]
+    ]
+    stored = [endpoint.get("role") for endpoint in endpoints]
+    if _valid_role_letters(stored):
+        return endpoints, [str(item) for item in stored]
+    statement = str(payload.get("statement", ""))
+    if statement not in _DIRECTION_CODES:
+        return endpoints, []
+    contract_ids = [str(endpoint.get("contract_id", "")) for endpoint in endpoints]
+    model_roles = _model_endpoint_roles(payload, contract_ids, statement)
+    if not model_roles:
+        return endpoints, []
+    for endpoint, letter in zip(endpoints, model_roles):
+        endpoint["role"] = letter
+    return endpoints, model_roles
 
 
 def _now() -> str:
@@ -303,9 +522,18 @@ def _threshold_discovery_payload(
     endpoints = [market(getattr(relation, "market_a")), market(getattr(relation, "market_b"))]
     if relation_direction in {"B_IMPLIES_A", "B_TO_A"}:
         endpoints = list(reversed(endpoints))
+    semantics: dict[str, object] = {
+        "statement": relation_direction, "direction": relation_direction,
+    }
+    if relation_direction in _DIRECTION_CODES:
+        # After the reversal above endpoints are antecedent-first; persist the
+        # antecedent/consequent contract ids because _normalise_discovery sorts
+        # markets by (venue, contract_id) and would otherwise drop that order.
+        semantics["antecedent_contract_id"] = str(endpoints[0]["contract_id"])
+        semantics["consequent_contract_id"] = str(endpoints[1]["contract_id"])
     return {
         "discovery_source": "deterministic_rule", "discovered_at": _now(),
-        "relation_type": "IMPLIES", "semantics": {"statement": relation_direction, "direction": relation_direction},
+        "relation_type": "IMPLIES", "semantics": semantics,
         "source_evidence": [{"event_id": getattr(relation, "event_id"), "rules_hash_a": getattr(relation, "rules_hash_a"), "rules_hash_b": getattr(relation, "rules_hash_b")}],
         "model": model, "markets": endpoints,
     }
@@ -347,6 +575,11 @@ class RelationCatalog:
         direction = str(payload["semantics"].get("direction", ""))
         if direction in {"B_IMPLIES_A", "B_TO_A"}:
             endpoints = list(reversed(endpoints))
+        roles = _semantics_endpoint_roles(payload["semantics"], endpoints, direction)
+        for endpoint in endpoints:
+            letter = roles.get(str(endpoint["contract_id"]))
+            if letter is not None:
+                endpoint["role"] = letter
         converted: dict[str, object] = {
             "relation_type": payload["relation_type"],
             "endpoints": endpoints,
@@ -433,7 +666,12 @@ class RelationCatalog:
         return self._store.get("versions", {})
 
     def _row(
-        self, version_id: str, occurrences: int = 0, *, include_problem: bool = True
+        self,
+        version_id: str,
+        occurrences: int = 0,
+        *,
+        include_problem: bool = True,
+        truncate_statement: bool = False,
     ) -> dict[str, object]:
         record = self._versions()[version_id]
         payload = record["payload"]
@@ -444,6 +682,13 @@ class RelationCatalog:
         }
         if include_problem:
             model["problem"] = payload.get("problem")
+        endpoints, roles = _row_endpoints_and_roles(payload)
+        statement, direction_code = _derive_statement(
+            str(payload.get("statement", "")),
+            endpoints,
+            truncate=truncate_statement,
+            roles=roles,
+        )
         return {
             "version_id": version_id,
             "identity": str(record["identity"]),
@@ -456,8 +701,9 @@ class RelationCatalog:
             "discovery_source": payload["discovery_source"],
             "discovered_at": payload["discovered_at"],
             "relation_type": payload["relation_type"],
-            "endpoints": payload["endpoints"],
-            "statement": payload.get("statement", ""),
+            "endpoints": endpoints,
+            "statement": statement,
+            "direction_code": direction_code,
             "model": model,
         }
 
@@ -478,16 +724,41 @@ class RelationCatalog:
             raise
 
     def list(self, view: str) -> list[dict[str, object]]:
-        if view not in {"pending", "approved_active", "activation_blocked", "history"}:
-            raise ValueError("relation catalog view is invalid")
+        """List version rows for one review view.
+
+        Accepts the six review-state keys plus the legacy aliases ``pending``,
+        ``approved_active``, and ``history``. List rows truncate statement
+        titles; ``detail()`` returns full statements.
+        """
+
+        state = REVIEW_STATE_VIEWS.get(view) or _LEGACY_VIEW_ALIASES.get(view)
         generation = self._current_generation()
         versions = self._versions()
-        result = [
-            self._row(version_id, int(record.get("occurrence_count", 1)), include_problem=False)
-            for version_id, record in versions.items()
-            if self._in_view(view, version_id, record, generation)
-        ]
-        if view == "pending":
+        if state is not None:
+            result = [
+                self._row(
+                    version_id,
+                    int(record.get("occurrence_count", 1)),
+                    include_problem=False,
+                    truncate_statement=True,
+                )
+                for version_id, record in versions.items()
+                if review_state(record) == state
+            ]
+        elif view in {"approved_active", "history"}:
+            result = [
+                self._row(
+                    version_id,
+                    int(record.get("occurrence_count", 1)),
+                    include_problem=False,
+                    truncate_statement=True,
+                )
+                for version_id, record in versions.items()
+                if self._in_view(view, version_id, record, generation)
+            ]
+        else:
+            raise ValueError("relation catalog view is invalid")
+        if state == "PENDING_APPROVAL":
             active_endpoints = {
                 str(endpoint["contract_id"])
                 for identity in generation
@@ -498,8 +769,18 @@ class RelationCatalog:
             result.sort(key=lambda item: not bool(active_endpoints & {str(endpoint["contract_id"]) for endpoint in item["endpoints"]}))
         return result
 
+    def review_counts(self) -> dict[str, object]:
+        """Six-state counts plus the pending total for the read model payload."""
+
+        counts: dict[str, int] = {state: 0 for state in REVIEW_STATES}
+        for record in self._versions().values():
+            state = review_state(record)
+            if state is not None:
+                counts[state] += 1
+        return {"counts": counts, "pending_count": counts["PENDING_APPROVAL"]}
+
     def review_rows(self) -> list[dict[str, object]]:
-        """All catalog versions as raw rows for the read model six-state projection."""
+        """All catalog versions as raw rows (full statements, compiled problem)."""
 
         return [
             self._row(version_id, int(record.get("occurrence_count", 1)))
@@ -518,14 +799,8 @@ class RelationCatalog:
         active = any(
             entry["version_id"] == version_id for entry in generation.values()
         )
-        if view == "pending":
-            return status == "PENDING"
         if view == "approved_active":
             return status == "APPROVED" and active
-        if view == "activation_blocked":
-            return status == "APPROVED" and not active and activation in {
-                "ACTIVATION_BLOCKED_INCONSISTENT", "UNSUPPORTED_SIZE", "INCOMPLETE",
-            }
         return status in {"REJECTED", "REVOKED"} or activation == "SUPERSEDED"
 
     def pending_count(self) -> int:

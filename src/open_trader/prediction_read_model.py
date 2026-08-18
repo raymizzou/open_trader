@@ -16,6 +16,7 @@ from .prediction_arbitrage import (
 )
 from .prediction_arbitrage_store import PredictionArbitrageStore
 from .prediction_n_leg_mode import n_leg_order_readiness
+from .relation_catalog import REVIEW_STATES
 from .prediction_n_leg_read_model import project_n_leg_solution
 from .prediction_title_translation import cached_prediction_title_zh
 
@@ -1020,78 +1021,35 @@ def _prediction_balance_shortfall(
     return balances.get("p_usd") is None or balances.get("p_usd") < max_cost
 
 
-def _prediction_relation_review_item(
-    row: Mapping[str, object],
-) -> dict[str, object] | None:
-    """Map one v2 catalog row onto the six-state review vocabulary (no profit/preview)."""
-
-    status = str(row.get("status") or "")
-    activation = str(row.get("activation") or "")
-    model = row.get("model")
-    terminal_states = model.get("terminal_states") if isinstance(model, Mapping) else None
-    compiled = bool(terminal_states)
-    if status == "PENDING":
-        key = "PENDING_APPROVAL"
-    elif status == "APPROVED":
-        if activation == "ACTIVE":
-            key = "ACTIVATED"
-        elif activation in {"ACTIVATION_BLOCKED_INCONSISTENT", "UNSUPPORTED_SIZE"}:
-            key = "ACTIVATION_BLOCKED"
-        elif activation == "SUPERSEDED":
-            key = "SOURCE_CHANGED_REAPPROVAL"
-        elif compiled:
-            key = "COMPILED_PENDING_ACTIVATION"
-        else:
-            key = "APPROVED_MODEL_INCOMPLETE"
-    else:
-        return None
-    item: dict[str, object] = {
-        "version_id": row.get("version_id"),
-        "title": row.get("statement") or row.get("title"),
-        "relation_type": row.get("relation_type"),
-        "discovery_source": row.get("discovery_source"),
-        "status": key,
-        "reason": "",
-        "conflict_candidates": 0,
-    }
-    if key == "ACTIVATION_BLOCKED" and activation == "ACTIVATION_BLOCKED_INCONSISTENT":
-        item["reason"] = "ACTIVATION_BLOCKED_INCONSISTENT"
-        try:
-            item["conflict_candidates"] = int(row.get("conflict_candidates") or 0)
-        except (TypeError, ValueError):
-            item["conflict_candidates"] = 0
-    elif activation in {"ACTIVATION_BLOCKED_INCONSISTENT", "UNSUPPORTED_SIZE"}:
-        item["reason"] = activation
-    elif key == "SOURCE_CHANGED_REAPPROVAL":
-        item["reason"] = "rules fingerprint 变化 · 保留批准不等于可交易"
-    return item
-
-
 def _prediction_relation_review(relation_catalog: object | None) -> dict[str, object]:
-    review: dict[str, object] = {"pending_count": 0, "items": []}
+    """Six-state review counts from the catalog; rows live behind the list API."""
+
+    review: dict[str, object] = {
+        "pending_count": 0,
+        "counts": {state: 0 for state in REVIEW_STATES},
+    }
     if relation_catalog is None:
         return review
-    pending = getattr(relation_catalog, "pending_count", None)
-    if callable(pending):
-        try:
-            review["pending_count"] = int(pending())
-        except Exception:
-            review["pending_count"] = 0
-    rows = getattr(relation_catalog, "review_rows", None)
-    if not callable(rows):
+    counts = getattr(relation_catalog, "review_counts", None)
+    if not callable(counts):
         return review
     try:
-        raw_rows = rows()
+        result = counts()
     except Exception:
         return review
-    items: list[dict[str, object]] = []
-    for row in raw_rows:
-        if not isinstance(row, Mapping):
-            continue
-        item = _prediction_relation_review_item(row)
-        if item is not None:
-            items.append(item)
-    review["items"] = items
+    if not isinstance(result, Mapping):
+        return review
+    raw_counts = result.get("counts")
+    if isinstance(raw_counts, Mapping):
+        for state in REVIEW_STATES:
+            try:
+                review["counts"][state] = int(raw_counts.get(state) or 0)
+            except (TypeError, ValueError):
+                review["counts"][state] = 0
+    try:
+        review["pending_count"] = int(result.get("pending_count") or 0)
+    except (TypeError, ValueError):
+        review["pending_count"] = 0
     return review
 
 

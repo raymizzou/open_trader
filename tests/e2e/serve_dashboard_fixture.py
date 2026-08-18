@@ -247,31 +247,14 @@ def _prediction_payload(scenario: str) -> dict[str, object]:
     }
     payload["relation_review"] = {
         "pending_count": 2,
-        "items": [
-            {
-                "version_id": "v-btc-complement",
-                "title": "BTC $120k 互补关系",
-                "relation_type": "NATIVE_COMPLEMENT",
-                "discovery_source": "VENUE_METADATA",
-                "status": "ACTIVATED",
-            },
-            {
-                "version_id": "v-hurupay-threshold",
-                "title": "Hurupay 阈值关系",
-                "relation_type": "IMPLIES",
-                "discovery_source": "LLM",
-                "status": "APPROVED_MODEL_INCOMPLETE",
-            },
-            {
-                "version_id": "v-spy-monotonic",
-                "title": "SPY 单调关系",
-                "relation_type": "IMPLIES",
-                "discovery_source": "MANUAL",
-                "status": "ACTIVATION_BLOCKED",
-                "reason": "ACTIVATION_BLOCKED_INCONSISTENT",
-                "conflict_candidates": 2,
-            },
-        ],
+        "counts": {
+            "PENDING_APPROVAL": 2,
+            "APPROVED_MODEL_INCOMPLETE": 1,
+            "COMPILED_PENDING_ACTIVATION": 0,
+            "ACTIVATION_BLOCKED": 1,
+            "ACTIVATED": 1,
+            "SOURCE_CHANGED_REAPPROVAL": 0,
+        },
     }
     payload["n_leg"] = {
         "mode": "MANUAL",
@@ -622,10 +605,11 @@ def _relation_review_fixture() -> dict[str, object]:
         "status": "PENDING", "activation": "PENDING",
         "discovery_source": "deterministic_rule", "discovered_at": "2026-08-15T02:32:00Z",
         "statement": "若 ‘Will Bitcoin trade above $100,000 at any time before December 31, 2026?’ 为 YES，则下方市场也必须为 YES。",
+        "direction_code": "A_IMPLIES_B",
         "relation_type": "IMPLIES",
         "endpoints": [
-            {"venue": "Polymarket", "contract_id": "condition-a", "title": "Will Bitcoin trade above $100,000 at any time before December 31, 2026?", "market_date": "2026-08-15T00:00:00Z", "expires_at": "2026-12-31T17:00:00Z", "settlement_observation_key": "btc-usd"},
-            {"venue": "Polymarket", "contract_id": "condition-b", "title": "Will Bitcoin trade above $90,000 at any time before December 31, 2026?", "market_date": "2026-08-15T00:00:00Z", "expires_at": "2026-12-31T17:00:00Z", "settlement_observation_key": "btc-usd"},
+            {"venue": "Polymarket", "contract_id": "condition-a", "title": "Will Bitcoin trade above $100,000 at any time before December 31, 2026?", "market_date": "2026-08-15T00:00:00Z", "expires_at": "2026-12-31T17:00:00Z", "settlement_observation_key": "btc-usd", "role": "A"},
+            {"venue": "Polymarket", "contract_id": "condition-b", "title": "Will Bitcoin trade above $90,000 at any time before December 31, 2026?", "market_date": "2026-08-15T00:00:00Z", "expires_at": "2026-12-31T17:00:00Z", "settlement_observation_key": "btc-usd", "role": "B"},
         ],
         "model": {"terminal_states": [], "payouts": {}, "capital_release": None},
         "evidence": [{"source_evidence": [{"source": "Polymarket rules", "quote": "resolves YES if..."}]}],
@@ -675,7 +659,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/prediction-arbitrage/relations":
             item = _relation_review_fixture()
-            self._send_json({"view": str(query.get("view", ["pending"])[0]), "pending_count": 1, "items": [item]})
+            self._send_json({"view": str(query.get("view", ["pending"])[0]), "pending_count": 1, "total": 1, "items": [item]})
             return
         if path.startswith("/api/prediction-arbitrage/relations/"):
             self._send_json(_relation_review_fixture())
