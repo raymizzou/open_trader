@@ -218,6 +218,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "incidents",
         "llm_cache",
         "llm_usage",
+        "llm_provider_selection",
         "relation_state",
         "relation_scan_runs",
         "cross_execution_reservations",
@@ -341,6 +342,28 @@ def test_changed_safety_policy_atomically_downgrades_automatic_modes(
         "downgraded": True,
         "git_sha": "def456",
     }
+
+
+def test_llm_provider_selection_is_audited_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    audit = {"actor": "local_operator", "git_sha": "abc123"}
+
+    assert db.get_llm_provider() == "zhipu"
+    assert db.set_llm_provider("deepseek", audit=audit) == "deepseek"
+    assert db.get_llm_provider() == "deepseek"
+    assert db.get_llm_provider(default="codex") == "deepseek"
+
+    assert db.set_llm_provider("deepseek", audit=audit) == "deepseek"
+    event = db.latest_control_event("set_llm_provider", "llm_provider_selection")
+    assert event is not None
+    assert event["outcome"] == "no_op"
+    assert event["payload"] == {**audit, "before": "deepseek", "after": "deepseek"}
+
+    with pytest.raises(ValueError, match="invalid llm provider"):
+        db.set_llm_provider("unknown")
+    assert db.get_llm_provider() == "deepseek"
 
 
 def test_audited_validation_mode_and_pause_are_naturally_idempotent(

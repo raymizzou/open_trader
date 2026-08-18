@@ -1044,8 +1044,8 @@ def test_notify_monitor_failure_llm_validation_uses_feishu_operator_copy(
     result = service.notify_monitor_failure(
         {
             "component": "llm_validation",
-            "reason_codes": ["CODEX_FAILED", "DEEPSEEK_FAILED"],
-            "summary": "Codex 与 DeepSeek 校验均不可用，当前不可下单。",
+            "reason_codes": ["ZHIPU_HTTP_ERROR"],
+            "summary": "智谱 GLM 语义校验不可用，当前不可下单。",
         }
     )
 
@@ -1054,9 +1054,27 @@ def test_notify_monitor_failure_llm_validation_uses_feishu_operator_copy(
     assert feishu.calls == 1
     title, message = feishu.messages[-1]
     assert title == "预测市场 LLM 校验不可用"
-    assert "Codex 与 DeepSeek 校验均不可用" in message
-    assert "CODEX_FAILED · DEEPSEEK_FAILED" in message
+    assert "智谱 GLM 语义校验不可用" in message
+    assert "ZHIPU_HTTP_ERROR" in message
+    assert "期间不自动下单；引擎恢复后自动重新校验，可在看板一键切换引擎。" in message
     assert "Dashboard：http://127.0.0.1:8766/" in message
+
+
+def test_notify_monitor_failure_llm_validation_defaults_operator_copy(
+    tmp_path: Path,
+) -> None:
+    service, _trading, _store, _monitor, _macos, feishu = (
+        standard_notification_fixture(tmp_path)
+    )
+
+    result = service.notify_monitor_failure({"component": "llm_validation"})
+
+    assert result == {"state": "sent"}
+    assert feishu.calls == 1
+    title, message = feishu.messages[-1]
+    assert title == "预测市场 LLM 校验不可用"
+    assert "当前选中的 LLM 校验引擎不可用，无法校验新关系。" in message
+    assert "原因：未知原因" in message
 
 
 def test_notify_ready_opportunity_standard_sends_feishu_observation_without_preflight(

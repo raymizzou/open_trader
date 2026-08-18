@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import time
 import json
-import subprocess
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -27,8 +26,9 @@ from open_trader.prediction_arbitrage import (
 
 def test_cross_venue_unsettled_principal_policy_is_one_hundred_usdt() -> None:
     assert MAX_CROSS_UNSETTLED_PRINCIPAL == Decimal("100")
+from open_trader.llm_providers import PROVIDER_IDS, LlmCompletion
 from open_trader.polymarket_relation_discovery import (
-    CodexRelationValidator,
+    LlmRelationValidator,
     ThresholdBuyLeg,
     ThresholdMarket,
     ThresholdRelation,
@@ -102,127 +102,118 @@ def _shadow_relation_result() -> dict[str, object]:
     }
 
 
-def _shadow_relation_jsonl() -> str:
-    return "\n".join(
-        (
-            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(_shadow_relation_result())}}),
-            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1}}),
-        )
-    )
+SHADOW_RELATION_USAGE: dict[str, int] = {
+    "input_tokens": 1,
+    "cached_input_tokens": 0,
+    "output_tokens": 0,
+    "reasoning_output_tokens": 0,
+}
 
 
-class _ShadowRelationRunner:
-    def __init__(self) -> None:
-        self.calls: list[list[str]] = []
+def _shadow_relation_completer(*, reason: str | None = None):
+    calls: list[tuple[str, str]] = []
 
-    def __call__(
-        self, command: list[str], **_kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        self.calls.append(command)
-        return subprocess.CompletedProcess(
-            command, 0, stdout=_shadow_relation_jsonl(), stderr=""
+    def complete(system: str, user: str) -> LlmCompletion:
+        calls.append((system, user))
+        if reason is not None:
+            return LlmCompletion(None, reason, dict(SHADOW_RELATION_USAGE))
+        return LlmCompletion(
+            json.dumps(_shadow_relation_result()), None, dict(SHADOW_RELATION_USAGE)
         )
 
+    return complete, calls
 
-def test_relation_codex_rejects_negative_budget(tmp_path: Path) -> None:
+
+def _shadow_relation_completers(complete) -> dict[str, object]:
+    return {provider: complete for provider in PROVIDER_IDS}
+
+
+def test_relation_llm_rejects_negative_budget(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="non-negative"):
-        CodexRelationValidator(
-            PredictionArbitrageStore(tmp_path), model="gpt-test", max_codex_calls=-1
-        )
+        LlmRelationValidator(PredictionArbitrageStore(tmp_path), max_llm_calls=-1)
 
 
-def test_relation_codex_budget_caps_only_uncached_calls(tmp_path: Path) -> None:
-    runner = _ShadowRelationRunner()
-    fallback_calls: list[str] = []
-    validator = CodexRelationValidator(
+def test_relation_llm_budget_caps_only_uncached_calls(tmp_path: Path) -> None:
+    complete, calls = _shadow_relation_completer()
+    validator = LlmRelationValidator(
         PredictionArbitrageStore(tmp_path),
-        model="gpt-test",
-        runner=runner,
-        fallback_enabled=False,
-        max_codex_calls=3,
-        fallback=lambda *_: (fallback_calls.append("called") or None, "disabled"),
+        default_provider="codex",
+        completers=_shadow_relation_completers(complete),
+        max_llm_calls=3,
     )
 
     results = [validator.validate(_shadow_relation(index)) for index in range(4)]
 
-    assert len(runner.calls) == 3
-    assert validator.codex_calls == 3
-    assert validator.codex_successes == 3
+    assert len(calls) == 3
+    assert validator.llm_calls == 3
+    assert validator.llm_successes == 3
     assert results[3].reason_codes == ("CODEX_BUDGET_EXHAUSTED",)
-    assert fallback_calls == []
 
 
-def test_relation_codex_cached_hit_does_not_consume_budget(tmp_path: Path) -> None:
+def test_relation_llm_cached_hit_does_not_consume_budget(tmp_path: Path) -> None:
     store = PredictionArbitrageStore(tmp_path)
     relation = _shadow_relation(0)
-    assert CodexRelationValidator(store, model="gpt-test", runner=_ShadowRelationRunner()).validate(relation).cached is False
-    runner = _ShadowRelationRunner()
-    validator = CodexRelationValidator(
-        store, model="gpt-test", runner=runner, fallback_enabled=False, max_codex_calls=0
+    seed, _seed_calls = _shadow_relation_completer()
+    assert LlmRelationValidator(
+        store,
+        default_provider="codex",
+        completers=_shadow_relation_completers(seed),
+    ).validate(relation).cached is False
+
+    complete, calls = _shadow_relation_completer()
+    validator = LlmRelationValidator(
+        store,
+        default_provider="codex",
+        completers=_shadow_relation_completers(complete),
+        max_llm_calls=0,
     )
 
     cached = validator.validate(relation)
     exhausted = validator.validate(_shadow_relation(1))
 
     assert cached.cached is True
+    assert cached.status == "llm_rejected"
     assert exhausted.reason_codes == ("CODEX_BUDGET_EXHAUSTED",)
-    assert runner.calls == []
-    assert validator.codex_calls == validator.codex_successes == 0
+    assert calls == []
+    assert validator.llm_calls == validator.llm_successes == 0
 
 
-def test_relation_codex_timeout_without_fallback_records_no_deepseek_usage(tmp_path: Path) -> None:
-    fallback_calls: list[str] = []
-
-    def timeout(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        raise subprocess.TimeoutExpired(command, 1)
+def test_relation_llm_timeout_is_strict_without_fallback(tmp_path: Path) -> None:
+    complete, calls = _shadow_relation_completer(reason="CODEX_TIMEOUT")
 
     store = PredictionArbitrageStore(tmp_path)
-    result = CodexRelationValidator(
+    result = LlmRelationValidator(
         store,
-        model="gpt-test",
-        runner=timeout,
-        fallback_enabled=False,
-        fallback=lambda *_: (fallback_calls.append("called") or None, "disabled"),
+        default_provider="codex",
+        completers=_shadow_relation_completers(complete),
     ).validate(_shadow_relation(0))
 
     assert result.reason_codes == ("CODEX_TIMEOUT",)
-    assert fallback_calls == []
+    assert len(calls) == 1
     assert store.llm_usage_24h_by_provider().get("deepseek", {}) == {}
+    assert store.llm_usage_24h_by_provider().get("zhipu", {}) == {}
 
 
-def test_relation_codex_default_fallback_is_preserved(tmp_path: Path) -> None:
-    fallback_calls: list[str] = []
-    result = CodexRelationValidator(
-        PredictionArbitrageStore(tmp_path),
-        model="gpt-test",
-        runner=lambda command, **_kwargs: subprocess.CompletedProcess(command, 1, stdout="", stderr="failed"),
-        fallback=lambda *_: (fallback_calls.append("called") or json.dumps(_shadow_relation_result()), None),
-    ).validate(_shadow_relation(0))
-
-    assert result.status == "llm_rejected"
-    assert fallback_calls == ["called"]
-
-
-def test_relation_codex_nonzero_exit_with_fallback_does_not_count_success(
+def test_relation_llm_failure_does_not_fallback_or_count_success(
     tmp_path: Path,
 ) -> None:
-    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            command, 1, stdout=_shadow_relation_jsonl(), stderr="failed"
-        )
+    complete, calls = _shadow_relation_completer(reason="CODEX_FAILED")
 
-    validator = CodexRelationValidator(
-        PredictionArbitrageStore(tmp_path),
-        model="gpt-test",
-        runner=runner,
-        fallback_enabled=False,
+    store = PredictionArbitrageStore(tmp_path)
+    validator = LlmRelationValidator(
+        store,
+        default_provider="codex",
+        completers=_shadow_relation_completers(complete),
     )
 
     result = validator.validate(_shadow_relation(0))
 
+    assert result.status == "llm_unavailable"
     assert result.reason_codes == ("CODEX_FAILED",)
-    assert validator.codex_calls == 1
-    assert validator.codex_successes == 0
+    assert len(calls) == 1
+    assert validator.llm_calls == 1
+    assert validator.llm_successes == 0
+    assert store.llm_usage_24h_by_provider().get("deepseek", {}).get("calls", 0) == 0
 
 
 def market_facts(

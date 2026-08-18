@@ -13,9 +13,10 @@ from pathlib import Path
 import pytest
 
 import open_trader.predict_cross_venue as predict_cross_venue
+from open_trader.llm_providers import PROVIDER_IDS, LlmCompletion
 from open_trader.predict_cross_venue import (
     CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION,
-    CodexCrossVenueEquivalenceValidator,
+    LlmCrossVenueEquivalenceValidator,
     CrossVenueIntent,
     CrossVenueLeg,
     CrossVenueValidation,
@@ -23,6 +24,8 @@ from open_trader.predict_cross_venue import (
     PredictCrossVenueMonitor,
     VenueMarket,
     build_cross_venue_intents,
+    cross_exchange_equivalence_cache_key,
+    legacy_equivalence_cache_keys,
     resolve_explicit_market_pairs,
     validate_cross_execution_mode,
 )
@@ -296,25 +299,69 @@ def equivalence_result(pair: ExplicitMarketPair) -> dict[str, object]:
     }
 
 
-def codex_jsonl(result: dict[str, object]) -> str:
-    return "\n".join(
-        (
-            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(result)}}),
-            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10}}),
+CROSS_COMPLETER_USAGE: dict[str, int] = {
+    "input_tokens": 10,
+    "cached_input_tokens": 0,
+    "output_tokens": 0,
+    "reasoning_output_tokens": 0,
+}
+
+
+@pytest.fixture(autouse=True)
+def _isolated_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "OPEN_TRADER_PREDICTION_LLM_PROVIDER",
+        "OPEN_TRADER_CODEX_MODEL",
+        "OPEN_TRADER_LLM_FALLBACK_MODEL",
+        "OPEN_TRADER_DEEPSEEK_MODEL",
+        "OPEN_TRADER_ZHIPU_MODEL",
+        "DEEPSEEK_API_KEY",
+        "ZHIPU_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def cross_completer(
+    structured: dict[str, object] | None = None,
+    *,
+    reason: str | None = None,
+):
+    """Build one injectable cross-venue completer plus its call log."""
+
+    calls: list[tuple[str, str]] = []
+
+    def complete(system: str, user: str) -> LlmCompletion:
+        calls.append((system, user))
+        if reason is not None:
+            return LlmCompletion(None, reason, dict(CROSS_COMPLETER_USAGE))
+        payload = (
+            json.dumps(structured)
+            if structured is not None
+            else json.dumps(equivalence_result(explicit_pair()))
         )
-    )
+        return LlmCompletion(payload, None, dict(CROSS_COMPLETER_USAGE))
+
+    return complete, calls
 
 
-def test_equivalence_approval_uses_required_namespace_schema_and_cache(tmp_path: Path) -> None:
+def cross_completers_for(
+    complete,
+) -> dict[str, object]:
+    return {provider: complete for provider in PROVIDER_IDS}
+
+
+def test_equivalence_approval_uses_shared_cache_key_and_records_usage(
+    tmp_path: Path,
+) -> None:
     pair = explicit_pair()
-    calls: list[list[str]] = []
-
-    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        calls.append(command)
-        return subprocess.CompletedProcess(command, 0, stdout=codex_jsonl(equivalence_result(pair)), stderr="")
+    complete, calls = cross_completer(equivalence_result(pair))
 
     store = PredictionArbitrageStore(tmp_path / "data")
-    validator = CodexCrossVenueEquivalenceValidator(store, model="gpt-test", runner=runner)
+    validator = LlmCrossVenueEquivalenceValidator(
+        store,
+        default_provider="codex",
+        completers=cross_completers_for(complete),
+    )
 
     first = validator.validate(pair)
     second = validator.validate(pair)
@@ -326,36 +373,39 @@ def test_equivalence_approval_uses_required_namespace_schema_and_cache(tmp_path:
         "predict_yes": "YES", "predict_no": "NO",
         "polymarket_yes": "YES", "polymarket_no": "NO",
     }
-    assert first.cache_key == predict_cross_venue.cross_exchange_equivalence_cache_key(
-        pair, model="gpt-test"
-    )
+    assert first.cache_key == cross_exchange_equivalence_cache_key(pair)
     assert second.approved is True
     assert len(calls) == 1
-    assert CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION == "cross-exchange-yes-no-equivalence-v4"
-    assert Path(calls[0][calls[0].index("--output-schema") + 1]).name == "cross_exchange_yes_no_equivalence.json"
-    assert store.llm_usage_24h()["cache_hits"] == 1
+    assert CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION == (
+        "cross-exchange-yes-no-equivalence-v4"
+    )
+    assert store.llm_usage_24h_by_provider()["codex"] == {
+        "calls": 1,
+        "successes": 1,
+        "failures": 0,
+        "cache_hits": 1,
+        "input_tokens": 10,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+    }
 
 
-def test_cross_venue_codex_prompt_embeds_fixed_output_schema(
+def test_cross_venue_prompt_embeds_fixed_output_schema(
     tmp_path: Path,
 ) -> None:
     pair = explicit_pair()
     captured: list[str] = []
 
-    def runner(
-        command: list[str], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        captured.append(str(kwargs.get("input") or ""))
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            stdout=codex_jsonl(equivalence_result(pair)),
-            stderr="",
+    def complete(system: str, user: str) -> LlmCompletion:
+        captured.append(system)
+        return LlmCompletion(
+            json.dumps(equivalence_result(pair)), None, dict(CROSS_COMPLETER_USAGE)
         )
 
     store = PredictionArbitrageStore(tmp_path / "data")
-    validator = CodexCrossVenueEquivalenceValidator(
-        store, model="gpt-test", runner=runner
+    validator = LlmCrossVenueEquivalenceValidator(
+        store, default_provider="codex", completers=cross_completers_for(complete)
     )
 
     result = validator.validate(pair)
@@ -363,127 +413,202 @@ def test_cross_venue_codex_prompt_embeds_fixed_output_schema(
     assert result.approved is True
     assert captured
     prompt = captured[0]
-    schema_text = predict_cross_venue._CODEX_SCHEMA.read_text(encoding="utf-8")
+    schema_text = predict_cross_venue._EQUIVALENCE_SCHEMA.read_text(encoding="utf-8")
     assert "OUTPUT JSON SCHEMA" in prompt
     assert "Never include schema meta keys" in prompt
     assert schema_text in prompt
-    assert "INPUT JSON" in prompt
 
 
-def test_cross_venue_codex_failure_falls_back_to_deepseek_and_caches(
+def test_cross_venue_selected_engine_failure_is_strict_without_fallback(
     tmp_path: Path,
 ) -> None:
     pair = explicit_pair()
-    fallback_calls: list[str] = []
-    runner_calls = 0
+    codex, codex_calls = cross_completer(reason="CODEX_FAILED")
+    deepseek, deepseek_calls = cross_completer()
     store = PredictionArbitrageStore(tmp_path / "data")
-
-    def runner(
-        command: list[str], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        nonlocal runner_calls
-        runner_calls += 1
-        return subprocess.CompletedProcess(command, 1, stdout="", stderr="401")
-
-    validator = CodexCrossVenueEquivalenceValidator(
+    validator = LlmCrossVenueEquivalenceValidator(
         store,
-        model="gpt-test",
-        fallback_model="deepseek-v4-flash-max",
-        runner=runner,
-        fallback=lambda prompt, payload: (
-            fallback_calls.append(prompt) or json.dumps(equivalence_result(pair)),
-            None,
-        ),
+        default_provider="codex",
+        completers={"codex": codex, "deepseek": deepseek, "zhipu": deepseek},
     )
 
     first = validator.validate(pair)
 
-    assert first.approved is True
-    assert len(fallback_calls) == 1
-    assert store.llm_usage_24h_by_provider()["deepseek"]["successes"] == 1
+    assert first.approved is False
+    assert first.reason == "CODEX_FAILED"
+    assert len(codex_calls) == 1
+    assert deepseek_calls == []
     assert store.llm_usage_24h_by_provider()["codex"]["failures"] == 1
 
-    fallback_calls.clear()
+    store.set_llm_provider("deepseek")
+
     second = validator.validate(pair)
 
     assert second.approved is True
-    assert fallback_calls == []
-    assert runner_calls == 2
-    assert store.llm_usage_24h()["cache_hits"] == 1
+    assert len(deepseek_calls) == 1
+    assert len(codex_calls) == 1
 
 
-def test_cross_venue_circuit_breaker_skips_codex_after_repeated_failures(
+def test_cross_venue_circuit_breaker_skips_selected_engine_after_failures(
     tmp_path: Path,
 ) -> None:
     pair = explicit_pair()
-    runner_calls = 0
+    codex, codex_calls = cross_completer(reason="CODEX_TIMEOUT")
+    deepseek, deepseek_calls = cross_completer(reason="DEEPSEEK_TIMEOUT")
     store = PredictionArbitrageStore(tmp_path / "data")
-
-    def runner(
-        command: list[str], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        nonlocal runner_calls
-        runner_calls += 1
-        return subprocess.CompletedProcess(command, 1, stdout="", stderr="401")
-
-    validator = CodexCrossVenueEquivalenceValidator(
+    validator = LlmCrossVenueEquivalenceValidator(
         store,
-        model="gpt-test",
-        fallback_model="deepseek-v4-flash-max",
-        runner=runner,
-        fallback=lambda prompt, payload: (
-            json.dumps(equivalence_result(pair)),
-            None,
-        ),
+        default_provider="codex",
+        completers={"codex": codex, "deepseek": deepseek, "zhipu": codex},
     )
 
     for _ in range(3):
-        assert validator.validate(pair).approved is True
-    assert runner_calls == 3
+        result = validator.validate(pair)
+        assert result.approved is False
+        assert result.reason == "CODEX_TIMEOUT"
+    assert len(codex_calls) == 3
 
-    assert validator.validate(pair).approved is True
-    assert runner_calls == 3  # circuit open: Codex skipped, DeepSeek cache hit
+    open_circuit = validator.validate(pair)
+
+    assert open_circuit.approved is False
+    assert open_circuit.reason == "CODEX_CIRCUIT_OPEN"
+    assert len(codex_calls) == 3
+
+    store.set_llm_provider("deepseek")
+    switched = validator.validate(pair)
+
+    assert switched.approved is False
+    assert switched.reason == "DEEPSEEK_TIMEOUT"
+    assert len(deepseek_calls) == 1
 
 
-def test_cross_venue_deepseek_failure_reason_propagates(tmp_path: Path) -> None:
+def test_cross_venue_switched_engine_failure_reason_propagates(
+    tmp_path: Path,
+) -> None:
     pair = explicit_pair()
+    deepseek, deepseek_calls = cross_completer(reason="DEEPSEEK_AUTH_FAILED")
     store = PredictionArbitrageStore(tmp_path / "data")
-    validator = CodexCrossVenueEquivalenceValidator(
+    validator = LlmCrossVenueEquivalenceValidator(
         store,
-        model="gpt-test",
-        fallback_model="deepseek-v4-flash-max",
-        runner=lambda command, **kwargs: subprocess.CompletedProcess(
-            command, 1, stdout="", stderr="401"
-        ),
-        fallback=lambda prompt, payload: (None, "DEEPSEEK_AUTH_FAILED"),
+        default_provider="deepseek",
+        completers=cross_completers_for(deepseek),
     )
 
     result = validator.validate(pair)
 
     assert result.approved is False
     assert result.reason == "DEEPSEEK_AUTH_FAILED"
+    assert len(deepseek_calls) == 1
+    assert store.llm_usage_24h()["failures"] == 1
 
 
-def test_cross_venue_double_failure_reports_deepseek_unavailable(
+def test_cross_venue_unavailable_results_are_not_cached(
     tmp_path: Path,
 ) -> None:
     pair = explicit_pair()
+    complete, calls = cross_completer(reason="ZHIPU_HTTP_ERROR")
     store = PredictionArbitrageStore(tmp_path / "data")
-    validator = CodexCrossVenueEquivalenceValidator(
+    validator = LlmCrossVenueEquivalenceValidator(
+        store, default_provider="zhipu", completers=cross_completers_for(complete)
+    )
+
+    first = validator.validate(pair)
+    second = validator.validate(pair)
+
+    assert first.approved is second.approved is False
+    assert first.reason == second.reason == "ZHIPU_HTTP_ERROR"
+    assert len(calls) == 2
+    assert store.llm_usage_24h()["cache_hits"] == 0
+    assert store.llm_usage_24h()["failures"] == 2
+
+
+def test_cross_venue_approved_verdict_is_shared_across_engines(
+    tmp_path: Path,
+) -> None:
+    pair = explicit_pair()
+    codex, codex_calls = cross_completer(equivalence_result(pair))
+    zhipu, zhipu_calls = cross_completer(equivalence_result(pair))
+    store = PredictionArbitrageStore(tmp_path / "data")
+    validator = LlmCrossVenueEquivalenceValidator(
         store,
-        model="gpt-test",
-        fallback_model="deepseek-v4-flash-max",
-        runner=lambda command, **kwargs: subprocess.CompletedProcess(
-            command, 1, stdout="", stderr="401"
-        ),
-        fallback=lambda prompt, payload: (None, "DEEPSEEK_FAILED"),
+        default_provider="codex",
+        completers={"codex": codex, "deepseek": codex, "zhipu": zhipu},
+    )
+
+    assert validator.validate(pair).approved is True
+
+    if store.get_llm_provider() == "zhipu":
+        store.set_llm_provider("codex")
+    store.set_llm_provider("zhipu")
+    second = validator.validate(pair)
+
+    assert second.approved is True
+    assert len(codex_calls) == 1
+    assert zhipu_calls == []
+    assert store.llm_usage_24h()["cache_hits"] == 1
+
+
+def test_cross_venue_legacy_cache_keys_and_migration_to_shared_key(
+    tmp_path: Path,
+) -> None:
+    pair = explicit_pair()
+    payload = predict_cross_venue._equivalence_cache_payload(pair)
+    assert payload is not None
+    legacy = legacy_equivalence_cache_keys(pair)
+    assert legacy == [
+        hashlib.sha256(
+            f"gpt-5.6-sol{CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION}{payload}".encode()
+        ).hexdigest(),
+        hashlib.sha256(
+            f"deepseek-v4-flash{CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION}{payload}".encode()
+        ).hexdigest(),
+    ]
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    store.save_llm_cache(
+        legacy[0],
+        {
+            "model": "gpt-5.6-sol",
+            "prompt_version": CROSS_EXCHANGE_YES_NO_EQUIVALENCE_PROMPT_VERSION,
+            "structured_result": equivalence_result(pair),
+        },
+    )
+
+    def must_not_complete(*_args: object) -> LlmCompletion:
+        raise AssertionError("legacy cache row must be reused")
+
+    validator = LlmCrossVenueEquivalenceValidator(
+        store,
+        default_provider="zhipu",
+        completers=cross_completers_for(must_not_complete),
     )
 
     result = validator.validate(pair)
 
-    assert result.approved is False
-    assert result.reason == "DEEPSEEK_FAILED"
-    assert store.llm_usage_24h()["failures"] == 2
+    assert result.approved is True
+    shared_key = cross_exchange_equivalence_cache_key(pair)
+    assert shared_key is not None
+    assert store.load_llm_cache(shared_key) is not None
+    assert store.llm_usage_24h()["cache_hits"] == 1
+    assert store.llm_usage_24h()["calls"] == 0
+
+
+def equivalence_validator_with(
+    structured: dict[str, object] | None,
+    tmp_path: Path,
+    *,
+    reason: str | None = None,
+) -> tuple[
+    LlmCrossVenueEquivalenceValidator,
+    list[tuple[str, str]],
+]:
+    complete, calls = cross_completer(structured, reason=reason)
+    validator = LlmCrossVenueEquivalenceValidator(
+        PredictionArbitrageStore(tmp_path / "data"),
+        default_provider="codex",
+        completers=cross_completers_for(complete),
+    )
+    return validator, calls
 
 
 def test_equivalence_approval_accepts_one_minute_raw_metadata_difference(tmp_path: Path) -> None:
@@ -493,12 +618,7 @@ def test_equivalence_approval_accepts_one_minute_raw_metadata_difference(tmp_pat
         predict=replace(pair.predict, event_end_at=datetime(2026, 12, 31, 23, 58, tzinfo=UTC)),
         polymarket=replace(pair.polymarket, close_at=datetime(2026, 12, 31, 23, 59, tzinfo=UTC)),
     )
-    validator = CodexCrossVenueEquivalenceValidator(
-        PredictionArbitrageStore(tmp_path / "data"), model="gpt-test",
-        runner=lambda command, **kwargs: subprocess.CompletedProcess(
-            command, 0, stdout=codex_jsonl(equivalence_result(pair)), stderr=""
-        ),
-    )
+    validator, _calls = equivalence_validator_with(equivalence_result(pair), tmp_path)
 
     result = validator.validate(pair)
 
@@ -513,12 +633,7 @@ def test_equivalence_approval_accepts_twenty_nine_hour_raw_metadata_difference(t
         predict=replace(pair.predict, event_end_at=datetime(2027, 1, 1, 23, 59, tzinfo=UTC)),
         polymarket=replace(pair.polymarket, close_at=datetime(2027, 1, 3, 4, 59, tzinfo=UTC)),
     )
-    validator = CodexCrossVenueEquivalenceValidator(
-        PredictionArbitrageStore(tmp_path / "data"), model="gpt-test",
-        runner=lambda command, **kwargs: subprocess.CompletedProcess(
-            command, 0, stdout=codex_jsonl(equivalence_result(pair)), stderr=""
-        ),
-    )
+    validator, _calls = equivalence_validator_with(equivalence_result(pair), tmp_path)
 
     assert validator.validate(pair).approved is True
 
@@ -538,12 +653,7 @@ def test_equivalence_rejects_opening_time_quote_as_cutoff_evidence(tmp_path: Pat
             {"exchange": "polymarket", "field": "cutoff", "quote": opening},
         ],
     }
-    validator = CodexCrossVenueEquivalenceValidator(
-        PredictionArbitrageStore(tmp_path / "data"), model="gpt-test",
-        runner=lambda command, **kwargs: subprocess.CompletedProcess(
-            command, 0, stdout=codex_jsonl(structured), stderr=""
-        ),
-    )
+    validator, _calls = equivalence_validator_with(structured, tmp_path)
 
     result = validator.validate(pair)
 
@@ -569,12 +679,7 @@ def test_equivalence_rejects_ambiguous_opening_and_closing_time_quote(tmp_path: 
             {"exchange": "polymarket", "field": "cutoff", "quote": quote},
         ],
     }
-    validator = CodexCrossVenueEquivalenceValidator(
-        PredictionArbitrageStore(tmp_path / "data"), model="gpt-test",
-        runner=lambda command, **kwargs: subprocess.CompletedProcess(
-            command, 0, stdout=codex_jsonl(structured), stderr=""
-        ),
-    )
+    validator, _calls = equivalence_validator_with(structured, tmp_path)
 
     result = validator.validate(pair)
 
@@ -606,11 +711,7 @@ def test_equivalence_rejects_ambiguous_opening_and_closing_time_quote(tmp_path: 
 def test_equivalence_approval_fails_closed_for_all_post_check_mismatches(tmp_path: Path, mutate, reason: str) -> None:
     pair = explicit_pair()
     structured = mutate(equivalence_result(pair))
-    validator = CodexCrossVenueEquivalenceValidator(
-        PredictionArbitrageStore(tmp_path / "data"),
-        model="gpt-test",
-        runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout=codex_jsonl(structured), stderr=""),
-    )
+    validator, _calls = equivalence_validator_with(structured, tmp_path)
 
     result = validator.validate(pair)
 
@@ -661,7 +762,7 @@ def test_equivalence_schema_requires_explicit_exchange_evidence_and_divergent_ch
 
 def test_equivalence_cache_and_hot_pool_invalidate_every_admission_input() -> None:
     pair = explicit_pair()
-    baseline = predict_cross_venue.cross_exchange_equivalence_cache_key(pair, model="gpt-test")
+    baseline = cross_exchange_equivalence_cache_key(pair)
     variants = (
         replace(pair, predict=replace(pair.predict, rules="changed rules")),
         replace(pair, predict=replace(pair.predict, event_end_at=datetime(2027, 1, 1, tzinfo=UTC))),
@@ -670,12 +771,15 @@ def test_equivalence_cache_and_hot_pool_invalidate_every_admission_input() -> No
     )
     assert baseline is not None
     assert all(
-        predict_cross_venue.cross_exchange_equivalence_cache_key(variant, model="gpt-test") != baseline
+        cross_exchange_equivalence_cache_key(variant) != baseline
         for variant in variants
     )
-    assert predict_cross_venue.cross_exchange_equivalence_cache_key(
-        pair, model="gpt-test", prompt_version="changed-prompt"
+    assert cross_exchange_equivalence_cache_key(
+        pair, prompt_version="changed-prompt"
     ) != baseline
+    # The shared key deliberately ignores the model: switching providers must
+    # reuse one durable verdict per pair and prompt version.
+    assert cross_exchange_equivalence_cache_key(pair) == baseline
 
     monitor = PredictCrossVenueMonitor(
         predict_source=FakeCrossVenuePredict(()), polymarket_monitor=FakeCrossVenuePolymarket(),
@@ -718,15 +822,15 @@ def test_direct_validator_and_cache_key_fail_closed_for_malformed_pair(tmp_path:
     pair = explicit_pair()
     malformed = replace(pair, predict=replace(pair.predict, event_start_at=None))
 
-    assert predict_cross_venue.cross_exchange_equivalence_cache_key(
-        malformed, model="gpt-test"
-    ) is None
-    validator = CodexCrossVenueEquivalenceValidator(
+    assert cross_exchange_equivalence_cache_key(malformed) is None
+
+    def must_not_complete(*_args: object) -> LlmCompletion:
+        raise AssertionError("the LLM must not run for malformed metadata")
+
+    validator = LlmCrossVenueEquivalenceValidator(
         PredictionArbitrageStore(tmp_path / "data"),
-        model="gpt-test",
-        runner=lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("Codex must not run for malformed metadata")
-        ),
+        default_provider="codex",
+        completers=cross_completers_for(must_not_complete),
     )
 
     result = validator.validate(malformed)

@@ -4,7 +4,6 @@ import asyncio
 import json
 import multiprocessing
 import os
-import subprocess
 import threading
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
@@ -22,8 +21,9 @@ from open_trader.prediction_runtime import (
     _UnavailableCrossVenueMonitor,
     _RuntimeOwnershipLock,
 )
+from open_trader.llm_providers import PROVIDER_IDS, LlmCompletion
 from open_trader.predict_cross_venue import (
-    CodexCrossVenueEquivalenceValidator,
+    LlmCrossVenueEquivalenceValidator,
     ExplicitMarketPair,
     VenueMarket,
 )
@@ -115,54 +115,72 @@ def _shadow_cross_jsonl() -> str:
     )
 
 
-class _ShadowCrossRunner:
-    def __init__(self) -> None:
-        self.calls: list[list[str]] = []
+SHADOW_CROSS_USAGE: dict[str, int] = {
+    "input_tokens": 1,
+    "cached_input_tokens": 0,
+    "output_tokens": 0,
+    "reasoning_output_tokens": 0,
+}
 
-    def __call__(
-        self, command: list[str], **_kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        self.calls.append(command)
-        return subprocess.CompletedProcess(
-            command, 0, stdout=_shadow_cross_jsonl(), stderr=""
+
+def _shadow_cross_completer(*, reason: str | None = None):
+    calls: list[tuple[str, str]] = []
+
+    def complete(system: str, user: str) -> LlmCompletion:
+        calls.append((system, user))
+        if reason is not None:
+            return LlmCompletion(None, reason, dict(SHADOW_CROSS_USAGE))
+        return LlmCompletion(
+            json.dumps(_shadow_cross_result()), None, dict(SHADOW_CROSS_USAGE)
         )
 
+    return complete, calls
 
-def test_cross_venue_codex_rejects_negative_budget(tmp_path: Path) -> None:
+
+def _shadow_completers(complete) -> dict[str, object]:
+    return {provider: complete for provider in PROVIDER_IDS}
+
+
+def test_cross_venue_llm_rejects_negative_budget(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="non-negative"):
-        CodexCrossVenueEquivalenceValidator(
-            PredictionArbitrageStore(tmp_path), model="gpt-test", max_codex_calls=-1
+        LlmCrossVenueEquivalenceValidator(
+            PredictionArbitrageStore(tmp_path), max_llm_calls=-1
         )
 
 
-def test_cross_venue_codex_budget_caps_only_uncached_calls(tmp_path: Path) -> None:
-    runner = _ShadowCrossRunner()
-    fallback_calls: list[str] = []
-    validator = CodexCrossVenueEquivalenceValidator(
+def test_cross_venue_llm_budget_caps_only_uncached_calls(tmp_path: Path) -> None:
+    complete, calls = _shadow_cross_completer()
+    validator = LlmCrossVenueEquivalenceValidator(
         PredictionArbitrageStore(tmp_path),
-        model="gpt-test",
-        runner=runner,
-        fallback_enabled=False,
-        max_codex_calls=3,
-        fallback=lambda *_: (fallback_calls.append("called") or None, "disabled"),
+        default_provider="codex",
+        completers=_shadow_completers(complete),
+        max_llm_calls=3,
     )
 
     results = [validator.validate(_shadow_cross_pair(index)) for index in range(4)]
 
-    assert len(runner.calls) == 3
-    assert validator.codex_calls == 3
-    assert validator.codex_successes == 3
+    assert len(calls) == 3
+    assert validator.llm_calls == 3
+    assert validator.llm_successes == 3
     assert results[3].reason == "CODEX_BUDGET_EXHAUSTED"
-    assert fallback_calls == []
 
 
-def test_cross_venue_codex_cached_hit_does_not_consume_budget(tmp_path: Path) -> None:
+def test_cross_venue_llm_cached_hit_does_not_consume_budget(tmp_path: Path) -> None:
     store = PredictionArbitrageStore(tmp_path)
     pair = _shadow_cross_pair(0)
-    assert CodexCrossVenueEquivalenceValidator(store, model="gpt-test", runner=_ShadowCrossRunner()).validate(pair).approved is False
-    runner = _ShadowCrossRunner()
-    validator = CodexCrossVenueEquivalenceValidator(
-        store, model="gpt-test", runner=runner, fallback_enabled=False, max_codex_calls=0
+    seed, _seed_calls = _shadow_cross_completer()
+    assert LlmCrossVenueEquivalenceValidator(
+        store,
+        default_provider="codex",
+        completers=_shadow_completers(seed),
+    ).validate(pair).approved is False
+
+    complete, calls = _shadow_cross_completer()
+    validator = LlmCrossVenueEquivalenceValidator(
+        store,
+        default_provider="codex",
+        completers=_shadow_completers(complete),
+        max_llm_calls=0,
     )
 
     cached = validator.validate(pair)
@@ -170,63 +188,42 @@ def test_cross_venue_codex_cached_hit_does_not_consume_budget(tmp_path: Path) ->
 
     assert cached.reason == "LLM_REJECTED"
     assert exhausted.reason == "CODEX_BUDGET_EXHAUSTED"
-    assert runner.calls == []
-    assert validator.codex_calls == validator.codex_successes == 0
+    assert calls == []
+    assert validator.llm_calls == validator.llm_successes == 0
 
 
-def test_cross_venue_codex_timeout_without_fallback_records_no_deepseek_usage(tmp_path: Path) -> None:
-    fallback_calls: list[str] = []
-
-    def timeout(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        raise subprocess.TimeoutExpired(command, 1)
+def test_cross_venue_llm_timeout_is_strict_without_fallback(tmp_path: Path) -> None:
+    complete, calls = _shadow_cross_completer(reason="CODEX_TIMEOUT")
 
     store = PredictionArbitrageStore(tmp_path)
-    result = CodexCrossVenueEquivalenceValidator(
+    result = LlmCrossVenueEquivalenceValidator(
         store,
-        model="gpt-test",
-        runner=timeout,
-        fallback_enabled=False,
-        fallback=lambda *_: (fallback_calls.append("called") or None, "disabled"),
+        default_provider="codex",
+        completers=_shadow_completers(complete),
     ).validate(_shadow_cross_pair(0))
 
+    assert result.approved is False
     assert result.reason == "CODEX_TIMEOUT"
-    assert fallback_calls == []
+    assert len(calls) == 1
     assert store.llm_usage_24h_by_provider().get("deepseek", {}) == {}
+    assert store.llm_usage_24h_by_provider().get("zhipu", {}) == {}
 
 
-def test_cross_venue_codex_default_fallback_is_preserved(tmp_path: Path) -> None:
-    fallback_calls: list[str] = []
-    result = CodexCrossVenueEquivalenceValidator(
+def test_cross_venue_llm_failure_does_not_count_success(tmp_path: Path) -> None:
+    complete, calls = _shadow_cross_completer(reason="CODEX_FAILED")
+
+    validator = LlmCrossVenueEquivalenceValidator(
         PredictionArbitrageStore(tmp_path),
-        model="gpt-test",
-        runner=lambda command, **_kwargs: subprocess.CompletedProcess(command, 1, stdout="", stderr="failed"),
-        fallback=lambda *_: (fallback_calls.append("called") or json.dumps(_shadow_cross_result()), None),
-    ).validate(_shadow_cross_pair(0))
-
-    assert result.reason == "LLM_REJECTED"
-    assert fallback_calls == ["called"]
-
-
-def test_cross_venue_codex_nonzero_exit_with_fallback_does_not_count_success(
-    tmp_path: Path,
-) -> None:
-    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            command, 1, stdout=_shadow_cross_jsonl(), stderr="failed"
-        )
-
-    validator = CodexCrossVenueEquivalenceValidator(
-        PredictionArbitrageStore(tmp_path),
-        model="gpt-test",
-        runner=runner,
-        fallback_enabled=False,
+        default_provider="codex",
+        completers=_shadow_completers(complete),
     )
 
     result = validator.validate(_shadow_cross_pair(0))
 
     assert result.reason == "CODEX_FAILED"
-    assert validator.codex_calls == 1
-    assert validator.codex_successes == 0
+    assert len(calls) == 1
+    assert validator.llm_calls == 1
+    assert validator.llm_successes == 0
 
 
 def _hold_owner_lock(path: str, ready: object, release: object) -> None:
@@ -534,10 +531,10 @@ def test_runtime_starts_and_stops_prediction_resources_in_order(
         runtime_module, "PredictionExecutionService", FakeExecution, raising=False
     )
     monkeypatch.setattr(
-        runtime_module, "CodexRelationValidator", lambda *_args, **_kwargs: object(), raising=False
+        runtime_module, "LlmRelationValidator", lambda *_args, **_kwargs: object(), raising=False
     )
     monkeypatch.setattr(
-        runtime_module, "CodexTitleTranslator", lambda *_args, **_kwargs: object(), raising=False
+        runtime_module, "LlmTitleTranslator", lambda *_args, **_kwargs: object(), raising=False
     )
 
     runtime = PredictionRuntime(
@@ -654,8 +651,8 @@ def test_disabled_n_leg_background_skips_resolver_and_driver(
         "RelationCatalog",
         "PolymarketMonitor",
         "PredictionExecutionService",
-        "CodexRelationValidator",
-        "CodexTitleTranslator",
+        "LlmRelationValidator",
+        "LlmTitleTranslator",
         "PredictionLiveResolver",
         "PredictionMonitorSelectionDriver",
     ):
@@ -880,8 +877,8 @@ def test_runtime_owns_one_shared_solver_server_for_its_start_stop_lifetime(
     monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
     monkeypatch.setattr(runtime_module, "PolymarketTradingClient", SimpleNamespace(from_keychain=lambda _config: FakeTrading()))
     monkeypatch.setattr(runtime_module, "PredictTradingClient", SimpleNamespace(from_keychain=lambda _config: None))
-    monkeypatch.setattr(runtime_module, "CodexRelationValidator", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(runtime_module, "CodexTitleTranslator", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(runtime_module, "LlmRelationValidator", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(runtime_module, "LlmTitleTranslator", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
     monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
     monkeypatch.setattr(
@@ -1012,8 +1009,8 @@ def test_reconcile_failure_keeps_runtime_locked_and_does_not_start_monitors(
         SimpleNamespace(from_keychain=lambda _config: None),
     )
     monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
-    monkeypatch.setattr(runtime_module, "CodexRelationValidator", lambda *_a, **_k: object())
-    monkeypatch.setattr(runtime_module, "CodexTitleTranslator", lambda *_a, **_k: object())
+    monkeypatch.setattr(runtime_module, "LlmRelationValidator", lambda *_a, **_k: object())
+    monkeypatch.setattr(runtime_module, "LlmTitleTranslator", lambda *_a, **_k: object())
     monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
     monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
 
@@ -1106,8 +1103,8 @@ def test_locked_reconcile_result_keeps_runtime_not_ready(
         SimpleNamespace(from_keychain=lambda _config: None),
     )
     monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
-    monkeypatch.setattr(runtime_module, "CodexRelationValidator", lambda *_a, **_k: object())
-    monkeypatch.setattr(runtime_module, "CodexTitleTranslator", lambda *_a, **_k: object())
+    monkeypatch.setattr(runtime_module, "LlmRelationValidator", lambda *_a, **_k: object())
+    monkeypatch.setattr(runtime_module, "LlmTitleTranslator", lambda *_a, **_k: object())
     monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
     monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
 
@@ -1244,8 +1241,8 @@ def test_cross_start_failure_degrades_only_cross_source(
         SimpleNamespace(from_keychain=lambda _config: None),
     )
     monkeypatch.setattr(runtime_module, "load_trading_config", lambda _path: object())
-    monkeypatch.setattr(runtime_module, "CodexRelationValidator", lambda *_a, **_k: object())
-    monkeypatch.setattr(runtime_module, "CodexTitleTranslator", lambda *_a, **_k: object())
+    monkeypatch.setattr(runtime_module, "LlmRelationValidator", lambda *_a, **_k: object())
+    monkeypatch.setattr(runtime_module, "LlmTitleTranslator", lambda *_a, **_k: object())
     monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor)
     monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
 
@@ -1486,10 +1483,10 @@ def test_shadow_runtime_stops_on_first_guard_violation_from_owner_thread(
     monkeypatch.setattr(runtime_module, "PredictionExecutionService", FakeExecution)
     monkeypatch.setattr(
         runtime_module,
-        "CodexRelationValidator",
+        "LlmRelationValidator",
         lambda *_a, **kwargs: (validator_kwargs.append(kwargs) or object()),
     )
-    monkeypatch.setattr(runtime_module, "CodexTitleTranslator", lambda *_a, **_k: object())
+    monkeypatch.setattr(runtime_module, "LlmTitleTranslator", lambda *_a, **_k: object())
     monkeypatch.setattr(
         runtime_module,
         "_build_cross_venue_monitor",
@@ -1533,8 +1530,7 @@ def test_shadow_runtime_stops_on_first_guard_violation_from_owner_thread(
     assert runtime.state == "STOPPED"
     assert runtime.shadow_evidence["guard_attempts"][0]["method"] == "cancel_all"
     assert runtime.shadow_evidence["guard_attempts"][1]["method"] == "place_order"
-    assert validator_kwargs[0]["fallback_enabled"] is False
-    assert validator_kwargs[0]["max_codex_calls"] == 3
+    assert validator_kwargs[0]["max_llm_calls"] == 3
     assert cross_kwargs[0]["holding_reconciler"] is None
     assert events == [
         "shadow_owner.acquire", "shadow_store.open", "clients.open", "guards.enter",

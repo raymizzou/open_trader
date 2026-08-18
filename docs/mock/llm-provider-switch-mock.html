@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mock · LLM 校验引擎切换控件（与现有看板风格一致）</title>
+<style>
+  /* ── 设计令牌：逐项复制自 dashboard.css :root，保证风格一致 ── */
+  :root {
+    --bg: #f7f5f1;
+    --surface: #fffefa;
+    --surface-soft: #f2eee7;
+    --muted: #746e64;
+    --accent: #8b5e34;
+    --line: #d8d2c8;
+    --primary: #24211d;
+    --danger: #b42318;
+    --good-bg: #e8f4ed;
+    --good-line: #b9dac6;
+    --good-text: #21623f;
+    --watch-bg: #fff4df;
+    --watch-line: #e5c98f;
+    --watch-text: #704915;
+    --shadow: 0 8px 30px rgba(68, 55, 38, 0.06);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--primary);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 14px;
+    font-variant-numeric: tabular-nums;
+    padding: 32px 20px 64px;
+  }
+  .mock-wrap { max-width: 720px; margin: 0 auto; display: grid; gap: 12px; }
+  .mock-note { color: var(--muted); font-size: 12px; }
+
+  /* ── pm-panel 复刻 ── */
+  .pm-panel {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: var(--shadow);
+    padding: 14px;
+  }
+  .pm-panel-heading { display: flex; gap: 16px; justify-content: space-between; align-items: start; margin-bottom: 12px; }
+  .pm-panel-heading h2 { margin: 0; font-size: 16px; }
+  .pm-panel-heading p { color: var(--muted); margin: 4px 0 0; font-size: 12px; }
+  .pm-relation-summary { display: grid; gap: 6px 18px; grid-template-columns: repeat(3, minmax(0, 1fr)); font-size: 12px; margin-bottom: 12px; }
+  .pm-relation-summary span { color: var(--muted); display: block; }
+
+  /* ── 新增：LLM 校验引擎控件 ── */
+  .pm-llm-engine { border-top: 1px solid var(--line); padding-top: 12px; }
+  .pm-llm-engine-label { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 800; color: var(--muted); letter-spacing: 0.02em; margin-bottom: 8px; }
+  .pm-llm-segment { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+  .pm-llm-option {
+    align-items: center; border: 1px solid var(--line); border-radius: 999px;
+    background: var(--surface); color: var(--primary);
+    cursor: pointer; display: inline-flex; font: inherit; font-size: 12px; font-weight: 800;
+    gap: 6px; line-height: 1; min-height: 32px; padding: 8px 12px; white-space: nowrap;
+  }
+  .pm-llm-option:hover:not(:disabled):not([aria-pressed="true"]) { border-color: var(--accent); }
+  .pm-llm-option:focus-visible { outline: 3px solid var(--accent); outline-offset: 1px; }
+  .pm-llm-option[aria-pressed="true"] { background: var(--primary); border-color: var(--primary); color: var(--surface); cursor: default; }
+  .pm-llm-option[aria-pressed="true"] .pm-llm-sub { color: #cfc9bf; }
+  .pm-llm-option:disabled { cursor: not-allowed; opacity: 0.46; }
+  .pm-llm-option .pm-llm-sub { color: var(--muted); font-weight: 600; font-size: 11px; }
+  .pm-llm-option svg { flex: none; }
+  .pm-llm-status { display: grid; gap: 4px; font-size: 12px; margin-top: 10px; }
+  .pm-llm-status .pm-llm-current { font-weight: 700; }
+  .pm-llm-status .pm-llm-current small { color: var(--muted); font-weight: 600; }
+  .pm-llm-usage { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .pm-llm-usage .pm-funnel-chip {
+    background: var(--surface-soft); border: 1px solid var(--line); border-radius: 999px;
+    color: var(--muted); font-size: 11px; font-weight: 800; padding: 5px 8px; white-space: nowrap;
+  }
+  .pm-llm-usage .pm-funnel-chip.active { background: var(--good-bg); border-color: var(--good-line); color: var(--good-text); }
+  .pm-llm-usage .pm-funnel-chip.failing { background: var(--watch-bg); border-color: var(--watch-line); color: var(--watch-text); }
+  .pm-llm-hint { color: var(--muted); font-size: 11px; margin-top: 8px; }
+  .pm-llm-toast {
+    background: var(--good-bg); border: 1px solid var(--good-line); border-radius: 8px;
+    color: var(--good-text); font-size: 12px; font-weight: 700; margin-top: 10px;
+    padding: 8px 10px; display: none;
+  }
+  .pm-llm-toast.visible { display: block; }
+</style>
+</head>
+<body>
+<div class="mock-wrap">
+  <p class="mock-note">Mock · 数据为模拟值。控件嵌在「关联合约扫描」面板内，样式令牌逐项取自 dashboard.css。</p>
+
+  <section class="pm-panel" aria-label="关联合约扫描">
+    <header class="pm-panel-heading">
+      <div>
+        <h2>关联合约扫描</h2>
+        <p>关系目录持久化，成交筛选每分钟刷新。</p>
+      </div>
+    </header>
+
+    <div class="pm-relation-summary">
+      <div><span>最近全量扫描</span><strong>14:02</strong></div>
+      <div><span>扫描耗时</span><strong>3.1s</strong></div>
+      <div><span>下次计划</span><strong>14:07</strong></div>
+    </div>
+
+    <!-- ══ 新增控件：LLM 校验引擎 ══ -->
+    <div class="pm-llm-engine">
+      <div class="pm-llm-engine-label">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2l1.2 1.5h5.8A1.5 1.5 0 0 1 14 6v6a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 12V4.5Z" stroke="#8b5e34" stroke-width="1.4" stroke-linejoin="round"/>
+        </svg>
+        LLM 校验引擎
+      </div>
+
+      <div class="pm-llm-segment" role="group" aria-label="选择 LLM 校验引擎">
+        <button type="button" class="pm-llm-option" data-provider="codex" data-model="gpt-5.6-sol" aria-pressed="false">
+          Codex <span class="pm-llm-sub">CLI</span>
+        </button>
+        <button type="button" class="pm-llm-option" data-provider="deepseek" data-model="deepseek-v4-flash" aria-pressed="false" disabled title="未配置 API Key（DEEPSEEK_API_KEY 为空）">
+          DeepSeek <span class="pm-llm-sub">未配置 Key</span>
+        </button>
+        <button type="button" class="pm-llm-option" data-provider="zhipu" data-model="glm-5" aria-pressed="true">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          智谱 GLM <span class="pm-llm-sub">当前</span>
+        </button>
+      </div>
+
+      <div class="pm-llm-status">
+        <div class="pm-llm-current">当前 智谱 GLM · glm-5 <small>· 选中失败即停止新下单（不降级），恢复后自动重审</small></div>
+        <div class="pm-llm-current"><small>上次切换 14:03 · 操作者 dashboard</small></div>
+      </div>
+
+      <div class="pm-llm-usage" aria-label="各 LLM 24 小时用量">
+        <span class="pm-funnel-chip active">智谱 24h 12 calls · 0 fail · 45 cache</span>
+        <span class="pm-funnel-chip">Codex 24h 3 calls · 0 fail · 210 cache</span>
+        <span class="pm-funnel-chip failing">DeepSeek 24h 4 calls · 4 fail · 12 cache</span>
+      </div>
+
+      <p class="pm-llm-hint">切换立即生效：下一次校验走新引擎；已批准/已拒绝的缓存结论跨引擎复用，不重审。</p>
+      <div class="pm-llm-toast" role="status" aria-live="polite">已切换到 <span id="toast-provider">智谱 GLM</span> · 下一次校验生效</div>
+    </div>
+  </section>
+
+  <p class="mock-note">状态演示：智谱＝选中（深色实心 + 对勾 + “当前”）；Codex＝可切换；DeepSeek＝未配 Key（禁用置灰 + 悬停说明）。点击 Codex 可体验切换反馈。</p>
+</div>
+
+<script>
+  const buttons = Array.from(document.querySelectorAll(".pm-llm-option"));
+  const toast = document.querySelector(".pm-llm-toast");
+  const toastProvider = document.getElementById("toast-provider");
+  const statusMain = document.querySelector(".pm-llm-current");
+  const statusSub = document.querySelectorAll(".pm-llm-current")[1];
+  const names = { codex: "Codex", deepseek: "DeepSeek", zhipu: "智谱 GLM" };
+  buttons.forEach((button) => {
+    button.addEventListener("click", () => {
+      if (button.getAttribute("aria-pressed") === "true" || button.disabled) return;
+      buttons.forEach((b) => (b.disabled = b !== button));
+      const label = button.textContent;
+      button.textContent = "切换中…";
+      setTimeout(() => {
+        buttons.forEach((b) => {
+          b.disabled = b.dataset.provider === "deepseek"; // mock: DeepSeek 未配 Key
+          b.setAttribute("aria-pressed", String(b === button));
+          if (b === button) {
+            b.innerHTML =
+              '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> ' +
+              names[button.dataset.provider] + ' <span class="pm-llm-sub">当前</span>';
+          } else if (b.dataset.provider === "codex") {
+            b.innerHTML = 'Codex <span class="pm-llm-sub">CLI</span>';
+          } else {
+            b.innerHTML = 'DeepSeek <span class="pm-llm-sub">未配置 Key</span>';
+          }
+        });
+        statusMain.innerHTML =
+          "当前 " + names[button.dataset.provider] + " · " + button.dataset.model +
+          ' <small>· 选中失败即停止新下单（不降级），恢复后自动重审</small>';
+        statusSub.innerHTML = "<small>上次切换 14:05 · 操作者 dashboard</small>";
+        toastProvider.textContent = names[button.dataset.provider];
+        toast.classList.add("visible");
+        setTimeout(() => toast.classList.remove("visible"), 3500);
+      }, 600);
+    });
+  });
+</script>
+</body>
+</html>

@@ -20,6 +20,7 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, urlparse
 
 from .daily_premarket import build_notifier, load_env_config
+from .llm_providers import PROVIDER_IDS
 from .prediction_read_model import (
     PREDICTION_HISTORY_KINDS,
     _prediction_safe_value,
@@ -205,6 +206,48 @@ def _shadow_evidence(runtime: PredictionRuntime) -> Mapping[str, object]:
     return evidence if isinstance(evidence, Mapping) else {}
 
 
+def _llm_provider_payload(runtime: PredictionRuntime) -> dict[str, object]:
+    store = getattr(runtime, "store", None)
+    monitor = getattr(runtime, "monitor", None)
+    validator = getattr(monitor, "_relation_validator", None)
+    snapshot = getattr(validator, "provider_snapshot", None)
+    info: dict[str, object] = {}
+    if callable(snapshot):
+        try:
+            candidate = snapshot()
+            if isinstance(candidate, Mapping):
+                info = dict(candidate)
+        except Exception:
+            info = {}
+    credentials = {
+        "codex": True,
+        "deepseek": bool(os.environ.get("DEEPSEEK_API_KEY")),
+        "zhipu": bool(os.environ.get("ZHIPU_API_KEY")),
+    }
+    usage: dict[str, dict[str, int]] = {}
+    try:
+        if store is not None:
+            usage = store.llm_usage_24h_by_provider()
+    except Exception:
+        usage = {}
+    models = info.get("models") if isinstance(info.get("models"), Mapping) else {}
+    providers = [
+        {
+            "provider": provider,
+            "model": str(models.get(provider, "")),
+            "credentials_configured": bool(credentials.get(provider, False)),
+            "usage_24h": usage.get(provider, {}),
+        }
+        for provider in PROVIDER_IDS
+    ]
+    return {
+        "schema_version": "open_trader.prediction_service.llm_provider.v1",
+        "selected": str(info.get("selected", "")),
+        "default": str(info.get("default", "")),
+        "providers": providers,
+    }
+
+
 def _is_available(runtime: PredictionRuntime) -> bool:
     evidence = _shadow_evidence(runtime)
     return (
@@ -373,6 +416,20 @@ def create_prediction_server(
                 except (sqlite3.Error, OSError, RuntimeError) as exc:
                     self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                 return
+            if parsed.path == "/api/prediction-arbitrage/llm-provider":
+                if (
+                    mode == "shadow"
+                    and not _is_available(runtime)
+                    or mode == "production"
+                    and not _is_production_available(runtime)
+                ):
+                    self._send_unavailable()
+                    return
+                try:
+                    self._send_json(HTTPStatus.OK, _llm_provider_payload(runtime))
+                except (sqlite3.Error, OSError, RuntimeError) as exc:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+                return
             if parsed.path not in {
                 "/api/prediction-arbitrage/state",
                 "/api/prediction-arbitrage/history",
@@ -531,6 +588,7 @@ def create_prediction_server(
                 "/api/prediction-arbitrage/n-leg/mode",
                 "/api/prediction-arbitrage/n-leg/config",
                 "/api/prediction-arbitrage/n-leg/scope",
+                "/api/prediction-arbitrage/llm-provider",
             }:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
@@ -544,7 +602,19 @@ def create_prediction_server(
                     if execution_mutation
                     else self._audit_context()
                 )
-                if path.endswith("/preview"):
+                if path == "/api/prediction-arbitrage/llm-provider":
+                    self._require_schema(payload, {"provider"})
+                    provider = self._required_string(payload, "provider").strip().lower()
+                    if provider not in PROVIDER_IDS:
+                        raise ValueError(
+                            "provider must be one of: " + ", ".join(PROVIDER_IDS)
+                        )
+                    store = getattr(runtime, "store", None)
+                    if store is None:
+                        raise RuntimeError("prediction store is unavailable")
+                    store.set_llm_provider(provider, audit=audit)
+                    self._send_json(HTTPStatus.OK, _llm_provider_payload(runtime))
+                elif path.endswith("/preview"):
                     self._require_schema(payload, {"opportunity_id"})
                     result = execution.preview(
                         self._required_string(payload, "opportunity_id")

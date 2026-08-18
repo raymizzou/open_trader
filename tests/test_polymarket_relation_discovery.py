@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -20,18 +19,20 @@ from polymarket.models.gamma.market import (
     MarketTrading,
 )
 
+from open_trader.llm_providers import PROVIDER_IDS, LlmCompletion
 from open_trader.polymarket_relation_discovery import (
-    CODEX_PROMPT_VERSION,
-    _CODEX_SCHEMA,
-    _deepseek_completion,
-    CodexRelationValidator,
+    RELATION_PROMPT_VERSION,
+    LlmRelationValidator,
     RelationActivityAssessment,
     ThresholdRelation,
     ThresholdRelationDiscoveryResult,
+    _RELATION_SCHEMA,
+    _relation_cache_payload,
     assess_threshold_relation_activity,
-    codex_relation_cache_key,
     discover_threshold_relation_catalog,
     discover_threshold_relations,
+    legacy_relation_cache_keys,
+    relation_llm_cache_key,
     threshold_relation_from_payload,
     threshold_relation_payload,
 )
@@ -423,6 +424,20 @@ def threshold_relation():
     )[0]
 
 
+def relation_variant(index: int) -> ThresholdRelation:
+    suffix = f" variant {index}"
+    relation = threshold_relation()
+    return replace(
+        relation,
+        market_a=replace(
+            relation.market_a, question=relation.market_a.question + suffix
+        ),
+        market_b=replace(
+            relation.market_b, question=relation.market_b.question + suffix
+        ),
+    )
+
+
 def activity_relation() -> ThresholdRelation:
     relation = threshold_relation()
     return replace(
@@ -531,7 +546,10 @@ def test_activity_assessment_reports_invalid_tick_before_depth() -> None:
     )
     books = activity_books(relation, price_a="0.50")
 
-    assessment = assess_threshold_relation_activity(relation, books)
+    assessment = assess_threshold_relation_activity(
+        relation,
+        books,
+    )
 
     assert assessment.reason == "tick_invalid"
     assert assessment.intent is None
@@ -575,6 +593,20 @@ def test_activity_assessment_accepts_exact_twenty_dollar_boundary() -> None:
     assert assessment.reason == "eligible"
     assert assessment.intent is not None
     assert assessment.intent.total_max_cost == Decimal("20.00")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "OPEN_TRADER_PREDICTION_LLM_PROVIDER",
+        "OPEN_TRADER_CODEX_MODEL",
+        "OPEN_TRADER_LLM_FALLBACK_MODEL",
+        "OPEN_TRADER_DEEPSEEK_MODEL",
+        "OPEN_TRADER_ZHIPU_MODEL",
+        "DEEPSEEK_API_KEY",
+        "ZHIPU_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 def codex_market_result(
@@ -646,74 +678,66 @@ def codex_result(*, decision: str = "APPROVE") -> dict[str, object]:
     }
 
 
-def codex_jsonl(
-    result: dict[str, object],
+DEFAULT_USAGE: dict[str, int] = {
+    "input_tokens": 100,
+    "cached_input_tokens": 60,
+    "output_tokens": 20,
+    "reasoning_output_tokens": 5,
+}
+
+
+def make_completer(
+    result: dict[str, object] | None = None,
     *,
+    content: str | None = None,
+    reason: str | None = None,
     usage: dict[str, int] | None = None,
-) -> str:
-    return "\n".join(
-        (
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "type": "agent_message",
-                        "text": json.dumps(result),
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "turn.completed",
-                    "usage": usage
-                    or {
-                        "input_tokens": 100,
-                        "cached_input_tokens": 60,
-                        "output_tokens": 20,
-                        "reasoning_output_tokens": 5,
-                    },
-                }
-            ),
+):
+    """Build one injectable completer plus its (system, user) call log."""
+
+    calls: list[tuple[str, str]] = []
+
+    def complete(system: str, user: str) -> LlmCompletion:
+        calls.append((system, user))
+        if reason is not None:
+            return LlmCompletion(None, reason, dict(usage or DEFAULT_USAGE))
+        payload = content if content is not None else json.dumps(
+            result if result is not None else codex_result()
         )
-    )
+        return LlmCompletion(payload, None, dict(usage or DEFAULT_USAGE))
+
+    return complete, calls
+
+
+def all_providers(complete) -> dict[str, object]:
+    return {provider: complete for provider in PROVIDER_IDS}
 
 
 def codex_store(tmp_path: Path) -> PredictionArbitrageStore:
     return PredictionArbitrageStore(tmp_path / "data")
 
 
-def test_codex_fingerprint_uses_only_versioned_semantic_payload() -> None:
+def select_provider(db: PredictionArbitrageStore, provider: str) -> None:
+    """Persist a provider selection even when it equals the shipped default.
+
+    set_llm_provider skips the write when the effective selection already
+    matches, so selecting the default provider with no row present needs a
+    pre-write of another provider first.
+    """
+
+    if provider == "zhipu":
+        db.set_llm_provider("codex")
+    db.set_llm_provider(provider)
+    assert db.get_llm_provider() == provider
+
+
+def test_relation_cache_key_uses_only_versioned_semantic_payload() -> None:
     relation = threshold_relation()
-    expected = codex_relation_cache_key(
-        relation,
-        model="gpt-test",
-        prompt_version=CODEX_PROMPT_VERSION,
-    )
-    payload = {
-        "market_a": {
-            "condition_id": "condition-lower",
-            "question": "Will Bitcoin be above $90,000 on December 31?",
-            "rules": RULES,
-            "resolution_source": "Binance",
-            "end_date": "2026-12-31T17:00:00Z",
-        },
-        "market_b": {
-            "condition_id": "condition-higher",
-            "question": "Will Bitcoin be above $100,000 on December 31?",
-            "rules": RULES,
-            "resolution_source": "Binance",
-            "end_date": "2026-12-31T17:00:00Z",
-        },
-    }
-    canonical = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    assert expected == hashlib.sha256(
-        f"gpt-test{CODEX_PROMPT_VERSION}{canonical}".encode()
+    payload = _relation_cache_payload(relation)
+    expected = hashlib.sha256(
+        f"shared|{RELATION_PROMPT_VERSION}|{payload}".encode()
     ).hexdigest()
+    assert relation_llm_cache_key(relation) == expected
     price_only_change = replace(
         relation,
         market_a=replace(relation.market_a, fee_rate=Decimal("0.99")),
@@ -731,52 +755,12 @@ def test_codex_fingerprint_uses_only_versioned_semantic_payload() -> None:
         market_a=replace(relation.market_a, condition_id="condition-new"),
     )
 
+    assert relation_llm_cache_key(price_only_change) == expected
+    assert relation_llm_cache_key(updated_at_change) == expected
+    assert relation_llm_cache_key(rules_change) != expected
+    assert relation_llm_cache_key(condition_change) != expected
     assert (
-        codex_relation_cache_key(
-            price_only_change,
-            model="gpt-test",
-            prompt_version=CODEX_PROMPT_VERSION,
-        )
-        == expected
-    )
-    assert (
-        codex_relation_cache_key(
-            updated_at_change,
-            model="gpt-test",
-            prompt_version=CODEX_PROMPT_VERSION,
-        )
-        == expected
-    )
-    assert (
-        codex_relation_cache_key(
-            rules_change,
-            model="gpt-test",
-            prompt_version=CODEX_PROMPT_VERSION,
-        )
-        != expected
-    )
-    assert (
-        codex_relation_cache_key(
-            condition_change,
-            model="gpt-test",
-            prompt_version=CODEX_PROMPT_VERSION,
-        )
-        != expected
-    )
-    assert (
-        codex_relation_cache_key(
-            relation,
-            model="different-model",
-            prompt_version=CODEX_PROMPT_VERSION,
-        )
-        != expected
-    )
-    assert (
-        codex_relation_cache_key(
-            relation,
-            model="gpt-test",
-            prompt_version="polymarket-threshold-relation-v4",
-        )
+        relation_llm_cache_key(relation, prompt_version="polymarket-threshold-relation-v4")
         != expected
     )
 
@@ -791,107 +775,133 @@ def test_cache_key_ignores_generic_updated_at_but_not_rules() -> None:
         relation,
         market_a=replace(relation.market_a, rules=relation.market_a.rules + " Changed."),
     )
-    assert codex_relation_cache_key(relation, model="gpt-test") == (
-        codex_relation_cache_key(touched, model="gpt-test")
-    )
-    assert codex_relation_cache_key(relation, model="gpt-test") != (
-        codex_relation_cache_key(changed_rules, model="gpt-test")
-    )
+    assert relation_llm_cache_key(relation) == relation_llm_cache_key(touched)
+    assert relation_llm_cache_key(relation) != relation_llm_cache_key(changed_rules)
 
 
-def test_cached_validation_never_invokes_runner(tmp_path: Path) -> None:
+def test_legacy_relation_cache_keys_cover_old_model_namespaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     relation = threshold_relation()
-    validator = CodexRelationValidator(
-        codex_store(tmp_path),
-        model="gpt-test",
-        runner=lambda command, **kwargs: subprocess.CompletedProcess(
-            command,
-            0,
-            stdout=codex_jsonl(codex_result()),
-            stderr="",
-        ),
-    )
-    assert validator.validate(relation).status == "approved"
-    validator.runner = lambda *args, **kwargs: pytest.fail("runner called")
-    cached = validator.cached_validation(relation)
-    assert cached is not None
-    assert cached.status == "approved"
-    assert cached.cached is True
+    payload = _relation_cache_payload(relation)
+    legacy = legacy_relation_cache_keys(relation)
+
+    assert legacy == [
+        hashlib.sha256(
+            f"gpt-5.6-sol{RELATION_PROMPT_VERSION}{payload}".encode()
+        ).hexdigest(),
+        hashlib.sha256(
+            f"deepseek-v4-flash{RELATION_PROMPT_VERSION}{payload}".encode()
+        ).hexdigest(),
+    ]
+
+    monkeypatch.setenv("OPEN_TRADER_CODEX_MODEL", "gpt-custom")
+    monkeypatch.setenv("OPEN_TRADER_LLM_FALLBACK_MODEL", "deepseek-custom")
+
+    assert legacy_relation_cache_keys(relation) == legacy + [
+        hashlib.sha256(
+            f"gpt-custom{RELATION_PROMPT_VERSION}{payload}".encode()
+        ).hexdigest(),
+        hashlib.sha256(
+            f"deepseek-custom{RELATION_PROMPT_VERSION}{payload}".encode()
+        ).hexdigest(),
+    ]
 
 
-def test_codex_prompt_embeds_fixed_output_schema(tmp_path: Path) -> None:
-    relation = threshold_relation()
-    captured: list[str] = []
+def test_current_provider_prefers_store_row_over_env_and_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = codex_store(tmp_path)
 
-    def runner(
-        command: list[str], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        captured.append(str(kwargs.get("input") or ""))
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            stdout=codex_jsonl(codex_result()),
-            stderr="",
-        )
+    assert LlmRelationValidator(db).current_provider() == "zhipu"
 
-    validator = CodexRelationValidator(
-        codex_store(tmp_path), model="gpt-test", runner=runner
-    )
+    monkeypatch.setenv("OPEN_TRADER_PREDICTION_LLM_PROVIDER", "codex")
+    env_default = LlmRelationValidator(db)
+    assert env_default.current_provider() == "codex"
 
-    result = validator.validate(relation)
+    explicit = LlmRelationValidator(db, default_provider="deepseek")
+    assert explicit.current_provider() == "deepseek"
 
-    assert result.status == "approved"
-    assert captured
-    prompt = captured[0]
-    schema_text = _CODEX_SCHEMA.read_text(encoding="utf-8")
-    assert "OUTPUT JSON SCHEMA" in prompt
-    assert "Never include schema meta keys" in prompt
-    assert schema_text in prompt
-    assert "INPUT JSON" in prompt
+    # The durable store row beats both the env default and the constructor
+    # default once it has been written.
+    db.set_llm_provider("deepseek")
+    assert env_default.current_provider() == "deepseek"
+    assert explicit.current_provider() == "deepseek"
+    assert env_default.provider_snapshot() == {
+        "selected": "deepseek",
+        "models": dict(env_default.models),
+        "default": "codex",
+        "credentials": {"codex": True, "deepseek": False, "zhipu": False},
+    }
+
+    with pytest.raises(ValueError, match="invalid llm provider"):
+        db.set_llm_provider("unknown")
 
 
-def test_codex_approve_uses_isolated_structured_command_and_records_usage(
+def test_selected_provider_rejects_unknown_completers_and_models(
     tmp_path: Path,
 ) -> None:
-    calls: list[tuple[list[str], dict[str, object]]] = []
-
-    def runner(
-        command: list[str], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        calls.append((command, kwargs))
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            stdout=codex_jsonl(codex_result()),
-            stderr="",
-        )
-
     db = codex_store(tmp_path)
-    result = CodexRelationValidator(
+    with pytest.raises(ValueError, match="completer for deepseek is required"):
+        LlmRelationValidator(db, completers={"codex": make_completer()[0]})
+    with pytest.raises(ValueError, match="unknown llm provider"):
+        LlmRelationValidator(db, models={"unknown": "model"})
+    with pytest.raises(ValueError, match="non-negative"):
+        LlmRelationValidator(db, max_llm_calls=-1)
+
+
+def test_llm_approve_uses_selected_engine_and_records_usage(
+    tmp_path: Path,
+) -> None:
+    complete, calls = make_completer(codex_result())
+    db = codex_store(tmp_path)
+    validator = LlmRelationValidator(
         db,
-        model="gpt-test",
-        runner=runner,
-    ).validate(threshold_relation())
+        models={"codex": "gpt-test"},
+        default_provider="codex",
+        completers=all_providers(complete),
+    )
+
+    result = validator.validate(threshold_relation())
 
     assert result.status == "approved"
     assert result.decision == "APPROVE"
     assert result.relation == "B_IMPLIES_A"
     assert result.cached is False
+    assert result.provider == "codex"
+    assert result.model == "gpt-test"
     assert len(calls) == 1
-    command, kwargs = calls[0]
-    assert command[:2] == ["codex", "exec"]
-    assert "--ephemeral" in command
-    assert command[command.index("--sandbox") + 1] == "read-only"
-    assert "--ignore-user-config" in command
-    assert "--ignore-rules" in command
-    assert "--output-schema" in command
-    assert "--json" in command
-    assert kwargs["input"].endswith("\n")
-    assert kwargs["text"] is True
-    assert kwargs["capture_output"] is True
-    assert kwargs["timeout"] == 45.0
-    assert Path(str(kwargs["cwd"])) != Path.cwd()
+    system, user = calls[0]
+    assert "untrusted" in system.lower()
+    assert json.loads(user) == {
+        "market_a": {
+            "condition_id": "condition-lower",
+            "question": "Will Bitcoin be above $90,000 on December 31?",
+            "rules": RULES,
+            "resolution_source": "Binance",
+            "end_date": "2026-12-31T17:00:00Z",
+            "updated_at": "",
+        },
+        "market_b": {
+            "condition_id": "condition-higher",
+            "question": "Will Bitcoin be above $100,000 on December 31?",
+            "rules": RULES,
+            "resolution_source": "Binance",
+            "end_date": "2026-12-31T17:00:00Z",
+            "updated_at": "",
+        },
+    }
     assert db.llm_usage_24h() == {
+        "calls": 1,
+        "successes": 1,
+        "failures": 0,
+        "cache_hits": 0,
+        "input_tokens": 100,
+        "cached_input_tokens": 60,
+        "output_tokens": 20,
+        "reasoning_output_tokens": 5,
+    }
+    assert db.llm_usage_24h_by_provider()["codex"] == {
         "calls": 1,
         "successes": 1,
         "failures": 0,
@@ -903,317 +913,308 @@ def test_codex_approve_uses_isolated_structured_command_and_records_usage(
     }
 
 
-def test_codex_cache_survives_validator_restart_without_new_process(
-    tmp_path: Path,
-) -> None:
-    db = codex_store(tmp_path)
-    relation = threshold_relation()
-    first = CodexRelationValidator(
-        db,
-        model="gpt-test",
-        runner=lambda command, **kwargs: subprocess.CompletedProcess(
-            command,
-            0,
-            stdout=codex_jsonl(codex_result()),
-            stderr="",
-        ),
-    ).validate(relation)
+def test_llm_prompt_embeds_fixed_output_schema(tmp_path: Path) -> None:
+    captured: list[str] = []
 
-    def must_not_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        raise AssertionError("persistent cache miss")
+    def complete(system: str, user: str) -> LlmCompletion:
+        captured.append(system)
+        return LlmCompletion(json.dumps(codex_result()), None, dict(DEFAULT_USAGE))
 
-    second = CodexRelationValidator(
-        PredictionArbitrageStore(db.data_dir),
-        model="gpt-test",
-        runner=must_not_run,
-    ).validate(relation)
-
-    assert first.status == second.status == "approved"
-    assert second.cached is True
-    assert db.llm_usage_24h()["calls"] == 1
-    # Cache-hit accounting is process-local: a new store instance starts at 0,
-    # while llm_cache itself persists (verified by second.cached is True).
-    assert db.llm_usage_24h()["cache_hits"] == 0
-
-
-def test_codex_reject_is_cached_with_operator_visible_reason(
-    tmp_path: Path,
-) -> None:
-    db = codex_store(tmp_path)
-    relation = threshold_relation()
-    runner = lambda command, **kwargs: subprocess.CompletedProcess(
-        command,
-        0,
-        stdout=codex_jsonl(codex_result(decision="REJECT")),
-        stderr="",
-    )
-
-    first = CodexRelationValidator(
-        db, model="gpt-test", runner=runner
-    ).validate(relation)
-    second = CodexRelationValidator(
-        db, model="gpt-test", runner=runner
-    ).validate(relation)
-
-    assert first.status == "llm_rejected"
-    assert first.reason_codes == ("AMBIGUOUS_RULES",)
-    assert "歧义" in first.summary
-    assert second.cached is True
-    assert db.llm_usage_24h()["calls"] == 1
-
-
-def test_codex_failure_falls_back_to_deepseek_and_caches_by_fallback_model(
-    tmp_path: Path,
-) -> None:
-    relation = threshold_relation()
-    fallback_calls: list[tuple[str, dict[str, object]]] = []
-    runner_calls = 0
-    db = codex_store(tmp_path)
-
-    def runner(
-        command: list[str], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        nonlocal runner_calls
-        runner_calls += 1
-        return subprocess.CompletedProcess(command, 1, stdout="", stderr="401")
-
-    validator = CodexRelationValidator(
-        db,
-        model="gpt-test",
-        fallback_model="deepseek-v4-flash-max",
-        runner=runner,
-        fallback=lambda prompt, payload: (
-            (
-                fallback_calls.append((prompt, dict(payload)))
-                or json.dumps(codex_result()),
-                None,
-            )
-        ),
-    )
-
-    first = validator.validate(relation)
-
-    assert first.status == "approved"
-    assert first.model == "deepseek-v4-flash-max"
-    assert first.cached is False
-    assert len(fallback_calls) == 1
-    assert db.llm_usage_24h()["failures"] == 1
-    assert db.llm_usage_24h()["successes"] == 1
-    assert db.llm_usage_24h_by_provider()["deepseek"]["successes"] == 1
-    assert db.llm_usage_24h_by_provider()["codex"]["failures"] == 1
-
-    fallback_calls.clear()
-    second = validator.validate(relation)
-
-    assert second.status == "approved"
-    assert second.cached is True
-    assert second.model == "deepseek-v4-flash-max"
-    assert fallback_calls == []
-    assert runner_calls == 2
-    assert db.llm_usage_24h()["cache_hits"] == 1
-
-
-def test_codex_circuit_breaker_skips_codex_after_repeated_failures(
-    tmp_path: Path,
-) -> None:
-    relation = threshold_relation()
-    runner_calls = 0
-    db = codex_store(tmp_path)
-
-    def runner(
-        command: list[str], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        nonlocal runner_calls
-        runner_calls += 1
-        return subprocess.CompletedProcess(command, 1, stdout="", stderr="401")
-
-    validator = CodexRelationValidator(
-        db,
-        model="gpt-test",
-        fallback_model="deepseek-v4-flash-max",
-        runner=runner,
-        fallback=lambda prompt, payload: (json.dumps(codex_result()), None),
-    )
-
-    for _ in range(3):
-        assert validator.validate(relation).status == "approved"
-    assert runner_calls == 3
-
-    assert validator.validate(relation).status == "approved"
-    assert runner_calls == 3  # circuit open: Codex skipped, DeepSeek cache hit
-
-
-def test_deepseek_completion_missing_key_reports_reason(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "")
-
-    content, reason = _deepseek_completion(
-        "prompt", {}, model="deepseek-v4-flash"
-    )
-
-    assert content is None
-    assert reason == "DEEPSEEK_KEY_MISSING"
-
-
-def test_deepseek_completion_retries_once_on_empty_content(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import openai
-    from types import SimpleNamespace
-
-    calls = {"n": 0}
-
-    class FakeOpenAI:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            pass
-
-        @property
-        def chat(self) -> "FakeOpenAI":
-            return self
-
-        @property
-        def completions(self) -> "FakeOpenAI":
-            return self
-
-        def create(self, **kwargs: object) -> SimpleNamespace:
-            calls["n"] += 1
-            content = None if calls["n"] == 1 else '{"ok": true}'
-            return SimpleNamespace(
-                choices=[
-                    SimpleNamespace(message=SimpleNamespace(content=content))
-                ]
-            )
-
-    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
-
-    content, reason = _deepseek_completion(
-        "prompt", {}, model="deepseek-v4-flash"
-    )
-
-    assert content == '{"ok": true}'
-    assert reason is None
-    assert calls["n"] == 2
-
-
-def test_deepseek_completion_reports_empty_after_single_retry(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import openai
-    from types import SimpleNamespace
-
-    calls = {"n": 0}
-
-    class FakeOpenAI:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            pass
-
-        @property
-        def chat(self) -> "FakeOpenAI":
-            return self
-
-        @property
-        def completions(self) -> "FakeOpenAI":
-            return self
-
-        def create(self, **kwargs: object) -> SimpleNamespace:
-            calls["n"] += 1
-            return SimpleNamespace(
-                choices=[
-                    SimpleNamespace(message=SimpleNamespace(content=None))
-                ]
-            )
-
-    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
-
-    content, reason = _deepseek_completion(
-        "prompt", {}, model="deepseek-v4-flash"
-    )
-
-    assert content is None
-    assert reason == "DEEPSEEK_EMPTY_CONTENT"
-    assert calls["n"] == 2
-
-
-def test_deepseek_failure_reason_propagates_to_validation(tmp_path: Path) -> None:
-    db = codex_store(tmp_path)
-    validator = CodexRelationValidator(
-        db,
-        model="gpt-test",
-        fallback_model="deepseek-v4-flash-max",
-        runner=lambda command, **kwargs: subprocess.CompletedProcess(
-            command, 1, stdout="", stderr="401"
-        ),
-        fallback=lambda prompt, payload: (None, "DEEPSEEK_KEY_MISSING"),
+    validator = LlmRelationValidator(
+        codex_store(tmp_path),
+        default_provider="codex",
+        completers=all_providers(complete),
     )
 
     result = validator.validate(threshold_relation())
 
-    assert result.status == "llm_unavailable"
-    assert result.reason_codes == ("CODEX_FAILED", "DEEPSEEK_KEY_MISSING")
+    assert result.status == "approved"
+    assert captured
+    prompt = captured[0]
+    schema_text = _RELATION_SCHEMA.read_text(encoding="utf-8")
+    assert "OUTPUT JSON SCHEMA" in prompt
+    assert "Never include schema meta keys" in prompt
+    assert schema_text in prompt
 
 
-@pytest.mark.parametrize(
-    ("response", "expected_reason"),
-    [
-        (subprocess.TimeoutExpired(["codex"], 45), "CODEX_TIMEOUT"),
-        (
-            subprocess.CompletedProcess(["codex"], 1, stdout="", stderr="secret"),
-            "CODEX_FAILED",
-        ),
-        (
-            subprocess.CompletedProcess(
-                ["codex"],
-                0,
-                stdout=json.dumps({"type": "turn.completed", "usage": {}}),
-                stderr="",
-            ),
-            "CODEX_OUTPUT_INVALID",
-        ),
-        (
-            subprocess.CompletedProcess(
-                ["codex"],
-                0,
-                stdout=codex_jsonl({**codex_result(), "unknown": True}),
-                stderr="",
-            ),
-            "CODEX_OUTPUT_INVALID",
-        ),
-    ],
-)
-def test_codex_unavailable_results_are_not_cached(
-    tmp_path: Path,
-    response: object,
-    expected_reason: str,
-) -> None:
-    calls = 0
-
-    def runner(
-        command: list[str], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        nonlocal calls
-        calls += 1
-        if isinstance(response, BaseException):
-            raise response
-        assert isinstance(response, subprocess.CompletedProcess)
-        return response
-
-    validator = CodexRelationValidator(
-        codex_store(tmp_path),
-        model="gpt-test",
-        runner=runner,
-        fallback=lambda prompt, payload: (None, "DEEPSEEK_FAILED"),
+def test_cached_validation_never_invokes_completer(tmp_path: Path) -> None:
+    relation = threshold_relation()
+    db = codex_store(tmp_path)
+    complete, calls = make_completer()
+    validator = LlmRelationValidator(
+        db, default_provider="codex", completers=all_providers(complete)
     )
+    assert validator.validate(relation).status == "approved"
+    assert len(calls) == 1
+
+    def must_not_complete(*_args: object) -> LlmCompletion:
+        raise AssertionError("persistent cache miss")
+
+    restarted = LlmRelationValidator(
+        PredictionArbitrageStore(db.data_dir),
+        default_provider="codex",
+        completers=all_providers(must_not_complete),
+    )
+
+    cached = restarted.validate(relation)
+
+    assert cached.status == "approved"
+    assert cached.cached is True
+    assert cached.provider == "codex"
+    assert db.llm_usage_24h()["calls"] == 1
+    # Cache-hit accounting is process-local: a new store instance starts at 0,
+    # while the llm_cache row itself persists (verified by cached.cached).
+    assert db.llm_usage_24h()["cache_hits"] == 0
+
+
+def test_llm_reject_is_cached_with_operator_visible_reason(
+    tmp_path: Path,
+) -> None:
+    complete, calls = make_completer(codex_result(decision="REJECT"))
+    db = codex_store(tmp_path)
+    validator = LlmRelationValidator(
+        db, default_provider="codex", completers=all_providers(complete)
+    )
+
     first = validator.validate(threshold_relation())
     second = validator.validate(threshold_relation())
 
+    assert first.status == "llm_rejected"
+    assert first.reason_codes == ("AMBIGUOUS_RULES",)
+    assert "歧义" in first.summary
+    assert first.provider == "codex"
+    assert second.cached is True
+    assert second.status == "llm_rejected"
+    assert len(calls) == 1
+    assert db.llm_usage_24h()["calls"] == 1
+
+
+def test_selected_engine_failure_is_strict_without_fallback(
+    tmp_path: Path,
+) -> None:
+    relation = threshold_relation()
+    codex, codex_calls = make_completer(reason="CODEX_FAILED")
+    deepseek, deepseek_calls = make_completer()
+    zhipu, zhipu_calls = make_completer()
+    db = codex_store(tmp_path)
+    validator = LlmRelationValidator(
+        db,
+        default_provider="codex",
+        completers={"codex": codex, "deepseek": deepseek, "zhipu": zhipu},
+    )
+
+    first = validator.validate(relation)
+
+    assert first.status == "llm_unavailable"
+    assert first.reason_codes == ("CODEX_FAILED",)
+    assert first.provider == "codex"
+    assert first.summary == "Codex 语义校验不可用，当前不可下单。"
+    assert len(codex_calls) == 1
+    assert deepseek_calls == []
+    assert zhipu_calls == []
+    assert db.llm_usage_24h_by_provider()["codex"]["failures"] == 1
+    assert db.llm_usage_24h_by_provider().get("deepseek", {}).get("calls", 0) == 0
+
+    db.set_llm_provider("deepseek")
+
+    second = validator.validate(relation)
+
+    assert second.status == "approved"
+    assert second.provider == "deepseek"
+    assert second.model == "deepseek-v4-flash"
+    assert len(deepseek_calls) == 1
+    assert len(codex_calls) == 1
+
+
+def test_approved_verdict_is_shared_across_engines(tmp_path: Path) -> None:
+    relation = threshold_relation()
+    codex, codex_calls = make_completer()
+    zhipu, zhipu_calls = make_completer()
+    db = codex_store(tmp_path)
+    validator = LlmRelationValidator(
+        db,
+        default_provider="codex",
+        completers={"codex": codex, "deepseek": codex, "zhipu": zhipu},
+    )
+
+    assert validator.validate(relation).status == "approved"
+
+    select_provider(db, "zhipu")
+    second = validator.validate(relation)
+
+    assert second.status == "approved"
+    assert second.cached is True
+    assert second.provider == "codex"  # verdict keeps its producing provider
+    assert len(codex_calls) == 1
+    assert zhipu_calls == []
+    assert db.llm_usage_24h()["cache_hits"] == 1
+    assert db.llm_usage_24h_by_provider()["codex"]["cache_hits"] == 1
+
+
+def test_legacy_cache_row_is_migrated_to_the_shared_key(tmp_path: Path) -> None:
+    relation = threshold_relation()
+    legacy_model = "gpt-5.6-sol"
+    payload = _relation_cache_payload(relation)
+    legacy_key = hashlib.sha256(
+        f"{legacy_model}{RELATION_PROMPT_VERSION}{payload}".encode()
+    ).hexdigest()
+    db = codex_store(tmp_path)
+    db.save_llm_cache(
+        legacy_key,
+        {
+            "model": legacy_model,
+            "prompt_version": RELATION_PROMPT_VERSION,
+            "structured_result": codex_result(),
+        },
+    )
+
+    def must_not_complete(*_args: object) -> LlmCompletion:
+        raise AssertionError("legacy cache row must be reused")
+
+    validator = LlmRelationValidator(
+        db,
+        default_provider="zhipu",
+        completers=all_providers(must_not_complete),
+    )
+
+    result = validator.validate(relation)
+
+    assert result.status == "approved"
+    assert result.cached is True
+    assert result.provider == "codex"  # inferred from the legacy model name
+    shared_key = relation_llm_cache_key(relation)
+    assert db.load_llm_cache(shared_key) == {
+        "model": legacy_model,
+        "prompt_version": RELATION_PROMPT_VERSION,
+        "structured_result": codex_result(),
+    }
+    assert db.llm_usage_24h()["cache_hits"] == 1
+    assert db.llm_usage_24h()["calls"] == 0
+
+
+def test_circuit_breaker_is_independent_per_provider(tmp_path: Path) -> None:
+    codex, codex_calls = make_completer(reason="CODEX_TIMEOUT")
+    deepseek, deepseek_calls = make_completer(reason="DEEPSEEK_TIMEOUT")
+    db = codex_store(tmp_path)
+    validator = LlmRelationValidator(
+        db,
+        default_provider="codex",
+        completers={"codex": codex, "deepseek": deepseek, "zhipu": codex},
+    )
+
+    for _ in range(3):
+        result = validator.validate(threshold_relation())
+        assert result.status == "llm_unavailable"
+        assert result.reason_codes == ("CODEX_TIMEOUT",)
+    assert len(codex_calls) == 3
+
+    open_circuit = validator.validate(threshold_relation())
+
+    assert open_circuit.status == "llm_unavailable"
+    assert open_circuit.reason_codes == ("CODEX_CIRCUIT_OPEN",)
+    assert open_circuit.summary == "Codex 连续失败已临时熔断，暂停新校验，稍后自动恢复。"
+    assert len(codex_calls) == 3
+
+    db.set_llm_provider("deepseek")
+    switched = validator.validate(threshold_relation())
+
+    assert switched.reason_codes == ("DEEPSEEK_TIMEOUT",)
+    assert len(deepseek_calls) == 1
+
+
+def test_budget_exhaustion_only_limits_the_current_engine(tmp_path: Path) -> None:
+    complete, calls = make_completer()
+    db = codex_store(tmp_path)
+    validator = LlmRelationValidator(
+        db,
+        default_provider="codex",
+        completers=all_providers(complete),
+        max_llm_calls=2,
+    )
+
+    first = validator.validate(relation_variant(0))
+    second = validator.validate(relation_variant(1))
+    exhausted = validator.validate(relation_variant(2))
+
+    assert first.status == second.status == "approved"
+    assert validator.llm_calls == 2
+    assert validator.llm_successes == 2
+    assert exhausted.status == "llm_unavailable"
+    assert exhausted.reason_codes == ("CODEX_BUDGET_EXHAUSTED",)
+    assert exhausted.summary == "Codex 校验额度已耗尽，当前不可下单。"
+    assert len(calls) == 2
+
+    # The shared budget still gates the switched engine: there is no
+    # cross-engine escape hatch, and the reason code carries the new engine.
+    select_provider(db, "zhipu")
+    switched = validator.validate(relation_variant(3))
+
+    assert switched.status == "llm_unavailable"
+    assert switched.reason_codes == ("ZHIPU_BUDGET_EXHAUSTED",)
+    assert switched.provider == "zhipu"
+    assert len(calls) == 2
+
+
+def test_budget_is_not_consumed_by_cache_hits(tmp_path: Path) -> None:
+    relation = threshold_relation()
+    complete, calls = make_completer()
+    db = codex_store(tmp_path)
+    seeded = LlmRelationValidator(
+        db, default_provider="codex", completers=all_providers(complete)
+    )
+    assert seeded.validate(relation).status == "approved"
+
+    validator = LlmRelationValidator(
+        db,
+        default_provider="codex",
+        completers=all_providers(complete),
+        max_llm_calls=0,
+    )
+
+    cached = validator.validate(relation)
+    exhausted = validator.validate(relation_variant(1))
+
+    assert cached.status == "approved"
+    assert cached.cached is True
+    assert exhausted.reason_codes == ("CODEX_BUDGET_EXHAUSTED",)
+    assert len(calls) == 1
+    assert validator.llm_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("reason", "content"),
+    [
+        ("CODEX_TIMEOUT", None),
+        ("ZHIPU_HTTP_ERROR", None),
+        ("DEEPSEEK_AUTH_FAILED", None),
+        ("CODEX_FAILED", None),
+        (None, "not json"),
+        (None, json.dumps({**codex_result(), "unknown": True})),
+    ],
+)
+def test_unavailable_results_are_not_cached(
+    tmp_path: Path, reason: str | None, content: str | None
+) -> None:
+    complete, calls = make_completer(
+        content=content if content is not None else None,
+        reason=reason,
+    )
+    db = codex_store(tmp_path)
+    provider = (reason or "CODEX").split("_")[0].lower()
+    validator = LlmRelationValidator(
+        db, default_provider=provider, completers=all_providers(complete)
+    )
+
+    first = validator.validate(threshold_relation())
+    second = validator.validate(threshold_relation())
+
+    expected = reason or "CODEX_OUTPUT_INVALID"
     assert first.status == second.status == "llm_unavailable"
-    assert first.reason_codes == (expected_reason, "DEEPSEEK_FAILED")
-    assert calls == 2
-    assert validator.store.llm_usage_24h()["failures"] == 4
-    assert validator.store.llm_usage_24h()["cache_hits"] == 0
+    assert first.reason_codes == (expected,)
+    assert first.provider == provider
+    assert len(calls) == 2
+    assert db.llm_usage_24h()["failures"] == 2
+    assert db.llm_usage_24h()["cache_hits"] == 0
 
 
 @pytest.mark.parametrize(
@@ -1256,35 +1257,22 @@ def test_codex_unavailable_results_are_not_cached(
         ),
     ],
 )
-def test_codex_approve_must_pass_deterministic_post_validation(
+def test_llm_approve_must_pass_deterministic_post_validation(
     tmp_path: Path,
     mutate,
     reason: str,
 ) -> None:
     structured = mutate(codex_result())
-    calls = 0
-
-    def runner(
-        command: list[str], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        nonlocal calls
-        calls += 1
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            stdout=codex_jsonl(structured),
-            stderr="",
-        )
-
-    validator = CodexRelationValidator(
+    complete, calls = make_completer(structured)
+    validator = LlmRelationValidator(
         codex_store(tmp_path),
-        model="gpt-test",
-        runner=runner,
+        default_provider="codex",
+        completers=all_providers(complete),
     )
     first = validator.validate(threshold_relation())
     second = validator.validate(threshold_relation())
 
     assert first.status == second.status == "deterministic_rejected"
     assert first.reason_codes == (reason,)
-    assert calls == 2
+    assert len(calls) == 2
     assert validator.store.llm_usage_24h()["cache_hits"] == 0

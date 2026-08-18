@@ -327,7 +327,7 @@ class FakeRelationValidator:
         reason = (
             ("AMBIGUOUS_RULES",)
             if rejected
-            else (("CODEX_FAILED",) if not approved else ())
+            else (("LLM_FAILED",) if not approved else ())
         )
         result = RelationValidation(
             status=self.status,  # type: ignore[arg-type]
@@ -2759,7 +2759,7 @@ def test_llm_unavailable_notifies_failure_observer_once_and_resets_on_success(
         monitor._reap_llm_failure_notification_task()
         assert len(calls) == 1
         assert calls[0]["component"] == "llm_validation"
-        assert calls[0]["reason_codes"] == ["CODEX_FAILED"]
+        assert calls[0]["reason_codes"] == ["LLM_FAILED"]
 
         relation_id = next(iter(monitor._active_relation_ids))
         validator.status = "approved"
