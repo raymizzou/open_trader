@@ -1349,7 +1349,7 @@ class LlmCrossVenueEquivalenceValidator:
                 "llm_output_invalid provider=%s violation=%s raw_head=%r",
                 provider,
                 _equivalence_result_violation(structured),
-                (completion.content or "")[:500],
+                (completion.content or "")[:1200],
             )
             breaker.record_failure(time.monotonic())
             self.store.record_llm_call(status="failed", usage={**completion.usage, "provider": provider})
