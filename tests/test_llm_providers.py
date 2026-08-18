@@ -27,6 +27,7 @@ from open_trader.llm_providers import (
     title_completers,
     validation_completers,
     zhipu_completion,
+    zhipu_validation_timeout,
 )
 
 
@@ -613,6 +614,39 @@ def test_validation_completers_cover_all_providers(
     assert set(completers) == set(PROVIDER_IDS)
     assert completers["deepseek"]("sys", "user").reason == "DEEPSEEK_KEY_MISSING"
     assert completers["zhipu"]("sys", "user").reason == "ZHIPU_KEY_MISSING"
+
+
+def test_zhipu_validation_timeout_defaults_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPEN_TRADER_ZHIPU_TIMEOUT_SECONDS", raising=False)
+    assert zhipu_validation_timeout() == 120.0
+
+    monkeypatch.setenv("OPEN_TRADER_ZHIPU_TIMEOUT_SECONDS", "77.5")
+    assert zhipu_validation_timeout() == 77.5
+
+    monkeypatch.setenv("OPEN_TRADER_ZHIPU_TIMEOUT_SECONDS", "not-a-number")
+    assert zhipu_validation_timeout() == 120.0
+
+
+def test_validation_completers_pass_zhipu_timeout_to_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPEN_TRADER_ZHIPU_TIMEOUT_SECONDS", "77")
+    calls: list[dict[str, object]] = []
+
+    def fake_completion(system: str, user: str, **kwargs: object) -> LlmCompletion:
+        calls.append({"system": system, "user": user, **kwargs})
+        return LlmCompletion(None, "ZHIPU_KEY_MISSING", {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0})
+
+    monkeypatch.setattr(llm_providers, "zhipu_completion", fake_completion)
+
+    completers = validation_completers(SCHEMA)
+    result = completers["zhipu"]("sys", "user")
+
+    assert result.reason == "ZHIPU_KEY_MISSING"
+    assert len(calls) == 1
+    assert calls[0]["system"] == "sys"
+    assert calls[0]["user"] == "user"
+    assert calls[0]["timeout_seconds"] == 77.0
 
 
 def test_title_completers_cover_all_providers(

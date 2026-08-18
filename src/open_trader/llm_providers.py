@@ -113,6 +113,17 @@ def deepseek_reasoning_effort() -> str | None:
     return os.environ.get("OPEN_TRADER_DEEPSEEK_REASONING_EFFORT", "max") or None
 
 
+def zhipu_validation_timeout() -> float:
+    """Validation timeout for glm-5 thinking audits (P95≈93s measured)."""
+
+    try:
+        return float(
+            os.environ.get("OPEN_TRADER_ZHIPU_TIMEOUT_SECONDS", "120") or 120
+        )
+    except ValueError:
+        return 120.0
+
+
 REASON_SUMMARIES = {
     "TIMEOUT": "{label} 语义校验超时，当前不可下单。",
     "FAILED": "{label} 语义校验不可用，当前不可下单。",
@@ -407,6 +418,7 @@ def validation_completers(
             system,
             user,
             model=provider_model("zhipu"),
+            timeout_seconds=zhipu_validation_timeout(),
         ),
     }
 
