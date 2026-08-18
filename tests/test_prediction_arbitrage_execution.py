@@ -3673,19 +3673,53 @@ def test_cross_venue_preview_accepts_zero_allowance_snapshot_without_allowance_r
     assert preview["balances"]["predict.fun"]["available_balance"] == "5"
 
 
-def test_fresh_predict_account_snapshot_normalizes_legacy_allowance_ready_fallback(
+def test_live_predict_account_snapshot_normalizes_legacy_allowance_ready_fallback(
     tmp_path: Path,
 ) -> None:
     service, _store, _trading, _cross, predict = _cross_service(tmp_path)
     predict.use_legacy_allowance_ready = True
     predict.allowance_ready = True
 
-    snapshot = service._fresh_predict_account_snapshot()
+    snapshot = service._live_predict_account_snapshot()
 
     assert snapshot is not None
     assert snapshot["scope_ready"] is True
     assert snapshot["gas_ready"] is True
     assert snapshot["allowance_breaker"] is False
+
+
+def test_predict_account_snapshot_cache_read_and_refresh(tmp_path: Path) -> None:
+    service, _store, _trading, _cross, predict = _cross_service(tmp_path)
+
+    assert service._fresh_predict_account_snapshot() is None
+
+    # reconcile_startup() already performed one live fetch.
+    baseline = predict.account_calls
+    refreshed = service._refresh_predict_account_snapshot()
+    assert refreshed is not None
+    reads = [service._fresh_predict_account_snapshot() for _ in range(3)]
+    assert all(snapshot == refreshed for snapshot in reads)
+    assert predict.account_calls == baseline + 1
+
+    predict.account_available = False
+    assert service._refresh_predict_account_snapshot() is None
+    # A failed refresh keeps the previous cache entry until the 60s gate
+    # expires it; the read path never falls back to a live fetch.
+    assert service._fresh_predict_account_snapshot() == refreshed
+    assert predict.account_calls == baseline + 2
+
+
+def test_predict_account_snapshot_cache_expires_after_60s(tmp_path: Path) -> None:
+    service, _store, _trading, _cross, _predict = _cross_service(tmp_path)
+    refreshed = service._refresh_predict_account_snapshot()
+    assert refreshed is not None
+
+    stale = dict(refreshed)
+    stale["checked_at"] = datetime.now(UTC) - timedelta(seconds=61)
+    with service._predict_snapshot_lock:
+        service._predict_snapshot_cache = stale
+
+    assert service._fresh_predict_account_snapshot() is None
 
 
 def test_cross_venue_confirmation_rechecks_fingerprint_before_no_submit_release(

@@ -47,6 +47,7 @@ from .prediction_arbitrage_store import (
 from .prediction_live_resolver import PredictionLiveResolver
 from .prediction_monitor_selection import MonitorSelectionStore
 from .prediction_monitor_selection_driver import PredictionMonitorSelectionDriver
+from .prediction_predict_snapshot_refresher import PredictAccountSnapshotRefresher
 from .prediction_read_only import (
     PolymarketReadOnlyGuard,
     PredictReadOnlyGuard,
@@ -399,6 +400,7 @@ class PredictionRuntime:
         self.solver_server: SolverServerOwner | None = None
         self.live_resolver: PredictionLiveResolver | None = None
         self.monitor_selection_driver: PredictionMonitorSelectionDriver | None = None
+        self.predict_snapshot_refresher: PredictAccountSnapshotRefresher | None = None
         self.n_leg_shadow: NLegShadowScheduler | None = None
         self._shadow_guards: ExitStack | None = None
         self._shadow_failure_lock = threading.Lock()
@@ -612,6 +614,14 @@ class PredictionRuntime:
                     )
                     if callable(set_cross_venue_monitor):
                         set_cross_venue_monitor(self.cross_venue_monitor)
+            if self._predict_trading is not None and callable(
+                getattr(self.execution, "_refresh_predict_account_snapshot", None)
+            ):
+                # #93: keep the predict snapshot cache warm off the HTTP threads.
+                self.predict_snapshot_refresher = PredictAccountSnapshotRefresher(
+                    execution=self.execution
+                )
+                self.predict_snapshot_refresher.start()
             if self._enable_n_leg_background:
                 selection_store = MonitorSelectionStore(self._data_dir)
                 selection_lock = threading.RLock()
@@ -731,6 +741,14 @@ class PredictionRuntime:
             self.monitor.start()
             if self._cross_runtime is not None:
                 self._cross_runtime.start()
+            if self._predict_trading is not None and callable(
+                getattr(self.execution, "_refresh_predict_account_snapshot", None)
+            ):
+                # #93: keep the predict snapshot cache warm off the HTTP threads.
+                self.predict_snapshot_refresher = PredictAccountSnapshotRefresher(
+                    execution=self.execution
+                )
+                self.predict_snapshot_refresher.start()
             self._state = "RUNNING"
             logger.info(
                 "prediction_runtime_state state=RUNNING mode=shadow pid=%s data_dir=%s",
@@ -815,6 +833,13 @@ class PredictionRuntime:
                 errors.append(exc)
             finally:
                 self.live_resolver = None
+        if self.predict_snapshot_refresher is not None:
+            try:
+                self.predict_snapshot_refresher.stop()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                self.predict_snapshot_refresher = None
         if self._cross_runtime is not None:
             try:
                 self._cross_runtime.stop()
