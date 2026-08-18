@@ -1182,7 +1182,7 @@ class LlmCrossVenueEquivalenceValidator:
             "selected": self.current_provider(),
             "models": dict(self.models),
             "default": self._default_provider,
-            "credentials": provider_credentials_configured(),
+            "configured": provider_credentials_configured(),
         }
 
     def _result(self, pair: ExplicitMarketPair, reason: str) -> CrossVenueValidation:
