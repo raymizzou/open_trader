@@ -258,12 +258,14 @@ class PredictionExecutionService:
         self._threads: dict[str, threading.Thread] = {}
         self._clock = time.monotonic
         self._sleep = time.sleep
+        self._predict_snapshot_lock = threading.RLock()
+        self._predict_snapshot_cache: dict[str, object] | None = None
 
     def set_cross_venue_monitor(self, monitor: object) -> None:
         self._cross_venue_monitor = monitor
 
     def _predict_canary_fingerprint(self) -> str | None:
-        snapshot = self._fresh_predict_account_snapshot()
+        snapshot = self._live_predict_account_snapshot()
         if snapshot is None:
             return None
         values = [
@@ -1013,11 +1015,11 @@ class PredictionExecutionService:
         elif reason == "books_stale":
             current, limit = ">10s", "10s"
         elif reason == "insufficient_bnb":
-            account = self._fresh_predict_account_snapshot() or {}
+            account = self._live_predict_account_snapshot() or {}
             current = _safe_decimal(account.get("bnb_balance"))
             limit = _safe_decimal(account.get("required_bnb"))
         elif reason == "account_insufficient":
-            account = self._fresh_predict_account_snapshot() or {}
+            account = self._live_predict_account_snapshot() or {}
             current = _safe_decimal(account.get("available_usdt"))
             limit = "required"
         elif reason == "notification_config_unavailable":
@@ -1224,7 +1226,7 @@ class PredictionExecutionService:
         lease_id = reservation.get("lease_id")
         if not isinstance(lease_id, str):
             return {"state": "failed", "reason": "notification_state_unavailable"}
-        account = self._fresh_predict_account_snapshot() or {}
+        account = self._live_predict_account_snapshot() or {}
         top_up = str(account.get("minimum_top_up_bnb", ""))
         required = str(account.get("required_bnb", ""))
         balance = str(account.get("bnb_balance", ""))
@@ -1553,7 +1555,7 @@ class PredictionExecutionService:
             polymarket_leg = by_exchange.get("polymarket")
             predict_leg = by_exchange.get("predict.fun")
             polymarket = self._fresh_account_snapshot()
-            predict = self._fresh_predict_account_snapshot()
+            predict = self._live_predict_account_snapshot()
             if (
                 polymarket_leg is None
                 or predict_leg is None
@@ -1803,7 +1805,7 @@ class PredictionExecutionService:
 
         active = self._store.active_execution()
         active_id = str(active.get("execution_id", "")) if active else ""
-        predict = self._fresh_predict_account_snapshot()
+        predict = self._live_predict_account_snapshot()
         residual_allowance = _decimal(predict.get("allowance")) if predict else None
         residual_allowance_raw = _decimal(predict.get("allowance_raw")) if predict else None
         if active is None and (
@@ -2159,7 +2161,7 @@ class PredictionExecutionService:
     ) -> dict[str, object]:
         if self._store.active_execution() is not None:
             return {"state": "locked", "reason": "active_execution"}
-        before = self._fresh_predict_account_snapshot()
+        before = self._live_predict_account_snapshot()
         if before is None:
             return {"state": "locked", "reason": "account_unavailable"}
         allowance = _decimal(before.get("allowance"))
@@ -2225,7 +2227,7 @@ class PredictionExecutionService:
             except Exception:
                 return {"state": "locked", "reason": "audit_persistence_failed"}
         proof = self._clear_predict_allowance_zero(market_id)
-        after = self._fresh_predict_account_snapshot()
+        after = self._live_predict_account_snapshot()
         if (
             proof is None
             or after is None
@@ -2983,7 +2985,7 @@ class PredictionExecutionService:
             return None, True
         if str(result.get("status", "")).lower() != "confirmed":
             return None, result.get("possible_mutation") is True
-        snapshot = self._fresh_predict_account_snapshot()
+        snapshot = self._live_predict_account_snapshot()
         expected = Decimal(exact_debit_wei) / Decimal(PREDICT_BASE_UNITS)
         if (
             snapshot is None
@@ -3008,7 +3010,7 @@ class PredictionExecutionService:
             return None
         if not isinstance(result, Mapping) or str(result.get("status", "")).lower() != "confirmed":
             return None
-        snapshot = self._fresh_predict_account_snapshot()
+        snapshot = self._live_predict_account_snapshot()
         if (
             snapshot is None
             or _decimal(snapshot.get("allowance")) != 0
@@ -3059,7 +3061,7 @@ class PredictionExecutionService:
         if not isinstance(order_id, str) or not order_id:
             if self._cross_result_ambiguous(result):
                 return {"status": "unknown", "verified": False, "conclusively_absent": False}
-            snapshot = self._fresh_predict_account_snapshot()
+            snapshot = self._live_predict_account_snapshot()
             positions = snapshot.get("positions") if snapshot is not None else None
             if not isinstance(positions, (list, tuple)):
                 return {"status": "unknown", "verified": False, "conclusively_absent": False}
@@ -3231,7 +3233,7 @@ class PredictionExecutionService:
         """
 
         polymarket = self._fresh_account_snapshot()
-        predict = self._fresh_predict_account_snapshot()
+        predict = self._live_predict_account_snapshot()
         if polymarket is None or predict is None:
             return None
         values = {
@@ -3560,7 +3562,7 @@ class PredictionExecutionService:
         self, predict_leg: CrossVenueLeg, polymarket_leg: CrossVenueLeg
     ) -> bool:
         polymarket = self._fresh_account_snapshot()
-        predict = self._fresh_predict_account_snapshot()
+        predict = self._live_predict_account_snapshot()
         if polymarket is None or predict is None:
             return False
         return (
@@ -4241,7 +4243,7 @@ class PredictionExecutionService:
         except Exception:
             return None, "geoblock_unavailable"
         polymarket = self._fresh_account_snapshot()
-        predict = self._fresh_predict_account_snapshot()
+        predict = self._live_predict_account_snapshot()
         if polymarket is None or predict is None:
             return None, "account_unavailable"
         by_exchange = {leg.exchange: leg for leg in intent.legs}
@@ -4304,7 +4306,7 @@ class PredictionExecutionService:
             },
         }, None
 
-    def _fresh_predict_account_snapshot(self) -> dict[str, object] | None:
+    def _live_predict_account_snapshot(self) -> dict[str, object] | None:
         if self._predict_trading is None:
             return None
         method = getattr(self._predict_trading, "account_snapshot", None)
@@ -4320,6 +4322,28 @@ class PredictionExecutionService:
             return None
         age = _age_seconds(snapshot.get("checked_at"))
         if age is None or age > 60 or not self._snapshot_collections_valid({"open_order_ids": snapshot["open_orders"], "positions": snapshot["positions"]}):
+            return None
+        return snapshot
+
+    def _refresh_predict_account_snapshot(self) -> dict[str, object] | None:
+        """Fetch a live predict snapshot and publish it to the read cache (#93)."""
+        snapshot = self._live_predict_account_snapshot()
+        if snapshot is not None:
+            # A failed refresh keeps the previous entry; the <=60s age gate in
+            # _fresh_predict_account_snapshot expires it naturally.
+            with self._predict_snapshot_lock:
+                self._predict_snapshot_cache = snapshot
+        return snapshot
+
+    def _fresh_predict_account_snapshot(self) -> dict[str, object] | None:
+        # #93: pure cache read for the HTTP read path; the background refresher
+        # publishes via _refresh_predict_account_snapshot. No network I/O here.
+        with self._predict_snapshot_lock:
+            snapshot = self._predict_snapshot_cache
+        if snapshot is None:
+            return None
+        age = _age_seconds(snapshot.get("checked_at"))
+        if age is None or age > 60:
             return None
         return snapshot
 
@@ -6028,7 +6052,7 @@ class PredictionExecutionService:
         self, intent: CrossVenueIntent
     ) -> dict[str, object] | None:
         polymarket = self._fresh_account_snapshot()
-        predict = self._fresh_predict_account_snapshot()
+        predict = self._live_predict_account_snapshot()
         if polymarket is None or predict is None:
             return None
         if (

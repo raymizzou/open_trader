@@ -2339,6 +2339,10 @@ def test_prediction_cross_venue_payload_projects_source_health_funnel_and_observ
         _cross_breaker_open = False
         _predict_trading = FakePredictTrading()
 
+        def _fresh_predict_account_snapshot(self) -> dict[str, object]:
+            # #93: the read path resolves the execution cache read seam only.
+            return self._predict_trading.account_snapshot()
+
     store = FakeStore()
     cross = FakeCrossMonitor()
     state = _prediction_state_payload(
@@ -2482,6 +2486,10 @@ def test_prediction_state_payload_accepts_legacy_predict_allowance_ready_fallbac
         _cross_breaker_open = False
         _predict_trading = FakePredictTrading()
 
+        def _fresh_predict_account_snapshot(self) -> dict[str, object]:
+            # #93: the read path resolves the execution cache read seam only.
+            return self._predict_trading.account_snapshot()
+
     state = _prediction_state_payload(
         store=None,
         monitor=FakeMonitor(),
@@ -2564,6 +2572,10 @@ def test_predict_account_projection_labels_account_gas_and_masks_addresses() -> 
         _breaker_open = False
         _cross_breaker_open = False
         _predict_trading = FakePredictTrading()
+
+        def _fresh_predict_account_snapshot(self) -> dict[str, object]:
+            # #93: the read path resolves the execution cache read seam only.
+            return self._predict_trading.account_snapshot()
 
     state = _prediction_state_payload(
         store=None,

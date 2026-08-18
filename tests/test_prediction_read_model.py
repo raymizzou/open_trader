@@ -931,3 +931,71 @@ def test_shared_prediction_read_model_rejects_unknown_history_kind(
         prediction_history_payload(
             frozen_prediction_inputs["store"], kind="unknown", limit=10, offset=0
         )
+
+
+def test_state_read_path_never_performs_live_predict_fetch() -> None:
+    """#93: the read path resolves only the execution cache read seam.
+
+    Before #93 each state request performed two live on-chain/REST snapshot
+    fetches on the HTTP request thread (10-28s in production). Now a live
+    ``_predict_trading.account_snapshot`` must never be reached.
+    """
+
+    class LivePredictTrading:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            self.calls += 1
+            raise AssertionError("live predict fetch must not run on the read path")
+
+    class CachedExecution(_NlegExecution):
+        def __init__(self) -> None:
+            self._predict_trading = LivePredictTrading()
+
+    execution = CachedExecution()
+    state = prediction_state_payload(
+        store=_Store(),
+        monitor=_NlegMonitor([_nleg_cross_row()]),
+        execution=execution,
+        csrf_token="csrf",
+    )
+    again = prediction_state_payload(
+        store=_Store(),
+        monitor=_NlegMonitor([_nleg_cross_row()]),
+        execution=execution,
+        csrf_token="csrf",
+    )
+    assert state["status"] != "unavailable"
+    assert again["status"] != "unavailable"
+    assert execution._predict_trading.calls == 0
+
+
+def test_read_model_returns_empty_without_direct_predict_client_fallback() -> None:
+    """#93: an execution object without the cache seam yields {}, not a live fetch."""
+    from open_trader.prediction_read_model import _prediction_predict_account_snapshot
+
+    class LivePredictTrading:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            self.calls += 1
+            return {
+                "wallet_address": "0x2222222222222222222222222222222222222222",
+                "available_usdt": "40.00",
+                "open_orders": [],
+                "positions": [],
+                "checked_at": "2026-08-16T01:00:00Z",
+                "allowance_ready": True,
+            }
+
+    class ClientOnlyExecution:
+        _breaker_open = False
+        _cross_breaker_open = False
+        _predict_trading = LivePredictTrading()
+
+    execution = ClientOnlyExecution()
+    assert _prediction_predict_account_snapshot(execution) == {}
+    assert execution._predict_trading.calls == 0
+    assert _prediction_predict_account_snapshot(_NlegExecution()) != {}

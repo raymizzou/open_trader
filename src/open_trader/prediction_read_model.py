@@ -1225,10 +1225,10 @@ def _prediction_qualification(
 
 
 def _prediction_predict_account_snapshot(execution: object | None) -> Mapping[str, object]:
-    fresh = getattr(execution, "_fresh_predict_account_snapshot", None)
-    method = fresh if callable(fresh) else getattr(
-        getattr(execution, "_predict_trading", None), "account_snapshot", None
-    )
+    # #93: this serves the HTTP read path and must stay network-free. It only
+    # resolves the execution cache read (_fresh_predict_account_snapshot); no
+    # fallback to a live _predict_trading.account_snapshot() fetch exists.
+    method = getattr(execution, "_fresh_predict_account_snapshot", None)
     if not callable(method):
         return {}
     try:
