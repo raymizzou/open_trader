@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 from collections.abc import Mapping
@@ -19,6 +20,9 @@ from .llm_providers import (
 )
 from .polymarket_relation_discovery import _parse_structured
 from .prediction_arbitrage_store import PredictionArbitrageStore
+
+
+logger = logging.getLogger(__name__)
 
 
 TITLE_TRANSLATION_PROMPT_VERSION = "polymarket-title-zh-v1"
@@ -261,6 +265,12 @@ class LlmTitleTranslator:
                     # even if the optional durable cache cannot be written.
                     pass
                 return translated
+        if completion.content is not None:
+            logger.warning(
+                "title_output_invalid provider=%s raw_head=%r",
+                provider,
+                (completion.content or "")[:300],
+            )
         try:
             self.store.record_llm_call(
                 status="failed",

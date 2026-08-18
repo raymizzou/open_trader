@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -36,6 +37,9 @@ from .prediction_arbitrage import (
     _worst_price,
 )
 from .prediction_arbitrage_store import PredictionArbitrageStore
+
+
+logger = logging.getLogger(__name__)
 
 
 Relation = Literal["A_IMPLIES_B", "B_IMPLIES_A"]
@@ -137,6 +141,15 @@ def _relation_audit_prompt() -> str:
         "Return ONLY the data object that satisfies the schema above. "
         "Never include schema meta keys in the output: no \"$schema\", \"type\", "
         "\"required\", \"properties\", \"additionalProperties\", \"$defs\".\n"
+        "OUTPUT CONTRACT\n"
+        "The output object must contain EXACTLY these top-level keys and no others: "
+        "schema_version, decision, relation, market_a, market_b, proof, reason_codes, "
+        "summary, evidence, uncertainties. schema_version must be the JSON number 1 "
+        "(never the string \"1\"). Each market object must contain EXACTLY: "
+        "condition_id, subject, metric, operator, threshold, unit, currency, "
+        "observation_start, observation_end, timezone, resolution_source, "
+        "special_settlement. reason_codes entries must come ONLY from the codes "
+        "defined in this prompt. Do not add any extra key at any level.\n"
     )
 _TOP_LEVEL_RESULT_FIELDS = {
     "schema_version",
@@ -1260,6 +1273,68 @@ def _valid_structured_result(value: object) -> bool:
     )
 
 
+def _structured_result_violation(value: object) -> str | None:
+    """Coarse classifier for operator logs: which schema check tripped."""
+
+    if not isinstance(value, Mapping):
+        return "not_mapping"
+    if set(value) != _TOP_LEVEL_RESULT_FIELDS:
+        return "top_level_keys"
+    schema_version = value.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != 1:
+        return "schema_version"
+    if value.get("decision") not in {"APPROVE", "REJECT"}:
+        return "decision"
+    if value.get("relation") not in {"A_IMPLIES_B", "B_IMPLIES_A", "NONE"}:
+        return "relation"
+    if not isinstance(value.get("summary"), str):
+        return "summary"
+    for label in ("market_a", "market_b"):
+        market = value.get(label)
+        if not isinstance(market, Mapping) or set(market) != _MARKET_RESULT_FIELDS:
+            return f"market_keys:{label}"
+        if not isinstance(market.get("condition_id"), str):
+            return f"market_field:{label}:condition_id"
+        for field in _MARKET_RESULT_FIELDS - {"condition_id", "operator"}:
+            if not _nullable_string(market.get(field)):
+                return f"market_field:{label}:{field}"
+        if market.get("operator") not in {">", ">=", "<", "<=", None}:
+            return f"operator:{label}"
+    proof = value.get("proof")
+    if not isinstance(proof, Mapping) or set(proof) != {"excluded_state", "why_excluded"}:
+        return "proof_keys"
+    if proof.get("excluded_state") not in {"A=YES,B=NO", "A=NO,B=YES", None}:
+        return "proof_excluded_state"
+    if not _nullable_string(proof.get("why_excluded")):
+        return "proof_why_excluded"
+    reason_codes = value.get("reason_codes")
+    if not isinstance(reason_codes, list):
+        return "reason_codes_shape"
+    for code in reason_codes:
+        if code not in _REASON_CODES:
+            return f"reason_code_enum:{code}"
+    if value.get("decision") == "REJECT" and not reason_codes:
+        return "reject_without_reasons"
+    evidence = value.get("evidence")
+    if not isinstance(evidence, list):
+        return "evidence_shape"
+    for row in evidence:
+        if not isinstance(row, Mapping) or set(row) != {"market", "field", "quote"}:
+            return "evidence_row:keys"
+        if row.get("market") not in {"A", "B"}:
+            return "evidence_row:market"
+        if not isinstance(row.get("field"), str):
+            return "evidence_row:field"
+        if not isinstance(row.get("quote"), str):
+            return "evidence_row:quote"
+    uncertainties = value.get("uncertainties")
+    if not isinstance(uncertainties, list) or not all(
+        isinstance(item, str) for item in uncertainties
+    ):
+        return "uncertainties_shape"
+    return None
+
+
 def _parse_structured(content: str) -> Mapping[str, object] | None:
     try:
         result = json.loads(content)
@@ -1674,6 +1749,12 @@ class LlmRelationValidator:
             )
         structured = _parse_structured(completion.content)
         if not _valid_structured_result(structured):
+            logger.warning(
+                "llm_output_invalid provider=%s violation=%s raw_head=%r",
+                provider,
+                _structured_result_violation(structured),
+                (completion.content or "")[:500],
+            )
             breaker.record_failure(time.monotonic())
             self.store.record_llm_call(
                 status="failed",

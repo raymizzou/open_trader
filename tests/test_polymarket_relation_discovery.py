@@ -1348,3 +1348,82 @@ def test_llm_approve_must_pass_deterministic_post_validation(
     assert first.reason_codes == (reason,)
     assert len(calls) == 2
     assert validator.store.llm_usage_24h()["cache_hits"] == 0
+
+
+def test_structured_result_violation_classifies_schema_deviations() -> None:
+    from open_trader.polymarket_relation_discovery import (
+        _relation_audit_prompt,
+        _structured_result_violation,
+        _valid_structured_result,
+    )
+
+    good = codex_result()
+    assert _valid_structured_result(good)
+    assert _structured_result_violation(good) is None
+
+    def mutate(**overrides):
+        bad = json.loads(json.dumps(good))
+        bad.update(overrides)
+        return bad
+
+    assert _structured_result_violation(mutate(extra_key="x")) == "top_level_keys"
+    assert _structured_result_violation(mutate(schema_version="1")) == "schema_version"
+    assert (
+        _structured_result_violation(mutate(reason_codes=["NOT_A_CODE"]))
+        == "reason_code_enum:NOT_A_CODE"
+    )
+    reject = mutate(decision="REJECT")
+    reject["reason_codes"] = []
+    assert _structured_result_violation(reject) == "reject_without_reasons"
+    evidence_bad = json.loads(json.dumps(good))
+    evidence_bad["evidence"][0]["note"] = "extra"
+    assert _structured_result_violation(evidence_bad) == "evidence_row:keys"
+    proof_bad = json.loads(json.dumps(good))
+    proof_bad["proof"]["extra"] = 1
+    assert _structured_result_violation(proof_bad) == "proof_keys"
+
+
+def test_output_invalid_logs_violation_and_raw_head(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from open_trader.polymarket_relation_discovery import _structured_result_violation
+
+    def invalid(prompt: str, payload: object) -> LlmCompletion:
+        return LlmCompletion('{"unexpected": true}', None, {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 3, "reasoning_output_tokens": 0})
+
+    validator = LlmRelationValidator(
+        codex_store(tmp_path),
+        default_provider="codex",
+        completers=all_providers(invalid),
+    )
+    with caplog.at_level("WARNING", logger="open_trader.polymarket_relation_discovery"):
+        result = validator.validate(threshold_relation())
+
+    assert result.status == "llm_unavailable"
+    assert result.reason_codes == ("CODEX_OUTPUT_INVALID",)
+    record = next(r for r in caplog.records if "llm_output_invalid" in r.message)
+    assert "provider=codex" in record.message
+    assert "violation=top_level_keys" in record.message
+    assert "unexpected" in record.message
+
+
+def test_relation_prompt_states_output_contract() -> None:
+    from open_trader.polymarket_relation_discovery import _relation_audit_prompt
+
+    prompt = _relation_audit_prompt()
+    assert "OUTPUT CONTRACT" in prompt
+    assert "schema_version must be the JSON number 1" in prompt
+    assert "EXACTLY these top-level keys" in prompt
+    for key in (
+        "schema_version",
+        "decision",
+        "relation",
+        "market_a",
+        "market_b",
+        "proof",
+        "reason_codes",
+        "summary",
+        "evidence",
+        "uncertainties",
+    ):
+        assert key in prompt

@@ -7,6 +7,7 @@ import contextlib
 import copy
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -46,6 +47,9 @@ from .prediction_arbitrage import (
     _worst_price,
 )
 from .prediction_arbitrage_store import PredictionArbitrageStore
+
+
+logger = logging.getLogger(__name__)
 
 
 Direction = Literal["PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"]
@@ -102,6 +106,14 @@ def _cross_equivalence_prompt() -> str:
         "Return ONLY the data object that satisfies the schema above. "
         "Never include schema meta keys in the output: no \"$schema\", \"type\", "
         "\"required\", \"properties\", \"additionalProperties\", \"$defs\".\n"
+        "OUTPUT CONTRACT\n"
+        "The output object must contain EXACTLY these top-level keys and no others: "
+        "schema_version, decision, summary, predict, polymarket, "
+        "direct_outcome_mapping, canonical_cutoff, contract_shape, divergent_states, "
+        "evidence, uncertainties. schema_version must be the JSON number 2 "
+        "(never the string \"2\"). Each market object must contain EXACTLY: "
+        "exchange, market_id, condition_id, rules_fingerprint. Do not add any "
+        "extra key at any level.\n"
     )
 _RESULT_FIELDS = {
     "schema_version", "decision", "summary", "predict", "polymarket",
@@ -990,6 +1002,73 @@ def _valid_equivalence_result(value: object) -> bool:
     return isinstance(uncertainties, list) and all(isinstance(item, str) for item in uncertainties)
 
 
+def _equivalence_result_violation(value: object) -> str | None:
+    """Coarse classifier for operator logs: which schema check tripped."""
+
+    if not isinstance(value, Mapping):
+        return "not_mapping"
+    if set(value) != _RESULT_FIELDS:
+        return "top_level_keys"
+    if value.get("schema_version") != 2:
+        return "schema_version"
+    if value.get("decision") not in {"APPROVE", "REJECT"}:
+        return "decision"
+    if not isinstance(value.get("summary"), str):
+        return "summary"
+    for label in ("predict", "polymarket"):
+        market = value.get(label)
+        if not isinstance(market, Mapping) or set(market) != {
+            "exchange", "market_id", "condition_id", "rules_fingerprint"
+        }:
+            return f"market_keys:{label}"
+        if market.get("exchange") not in {"predict.fun", "polymarket"}:
+            return f"market_field:{label}:exchange"
+        for field in ("market_id", "condition_id", "rules_fingerprint"):
+            if not isinstance(market.get(field), str) or not market[field]:
+                return f"market_field:{label}:{field}"
+    mapping = value.get("direct_outcome_mapping")
+    if not isinstance(mapping, Mapping) or set(mapping) != {
+        "predict_yes", "predict_no", "polymarket_yes", "polymarket_no"
+    }:
+        return "direct_outcome_mapping_keys"
+    if any(not isinstance(item, str) for item in mapping.values()):
+        return "direct_outcome_mapping_values"
+    if not isinstance(value.get("canonical_cutoff"), str):
+        return "canonical_cutoff"
+    if value.get("contract_shape") not in {"BINARY", "COMPOUND"}:
+        return "contract_shape"
+    states = value.get("divergent_states")
+    if not isinstance(states, Mapping) or set(states) != {
+        "PREDICT_YES_POLYMARKET_NO", "POLYMARKET_YES_PREDICT_NO"
+    }:
+        return "divergent_states_keys"
+    for key, state in states.items():
+        if not isinstance(state, Mapping) or set(state) != {"possible", "reason"}:
+            return f"divergent_state:{key}:keys"
+        if not isinstance(state.get("possible"), bool):
+            return f"divergent_state:{key}:possible"
+        if not isinstance(state.get("reason"), str):
+            return f"divergent_state:{key}:reason"
+    evidence = value.get("evidence")
+    if not isinstance(evidence, list):
+        return "evidence_shape"
+    for row in evidence:
+        if not isinstance(row, Mapping) or set(row) != {"exchange", "field", "quote"}:
+            return "evidence_row:keys"
+        if row.get("exchange") not in {"predict.fun", "polymarket"}:
+            return "evidence_row:exchange"
+        if not isinstance(row.get("field"), str):
+            return "evidence_row:field"
+        if not isinstance(row.get("quote"), str):
+            return "evidence_row:quote"
+    uncertainties = value.get("uncertainties")
+    if not isinstance(uncertainties, list) or not all(
+        isinstance(item, str) for item in uncertainties
+    ):
+        return "uncertainties_shape"
+    return None
+
+
 def _equivalence_validation(
     pair: ExplicitMarketPair,
     structured: Mapping[str, object],
@@ -1266,6 +1345,12 @@ class LlmCrossVenueEquivalenceValidator:
             return self._result(pair, completion.reason or f"{provider.upper()}_FAILED")
         structured = _parse_structured(completion.content)
         if not _valid_equivalence_result(structured):
+            logger.warning(
+                "llm_output_invalid provider=%s violation=%s raw_head=%r",
+                provider,
+                _equivalence_result_violation(structured),
+                (completion.content or "")[:500],
+            )
             breaker.record_failure(time.monotonic())
             self.store.record_llm_call(status="failed", usage={**completion.usage, "provider": provider})
             return self._result(pair, f"{provider.upper()}_OUTPUT_INVALID")

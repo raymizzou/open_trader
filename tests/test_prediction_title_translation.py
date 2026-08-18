@@ -244,3 +244,27 @@ def test_invalid_or_failed_output_does_not_poison_cache(tmp_path: Path) -> None:
     assert len(calls) == 5
     assert cached_prediction_title_zh(target, "Bitcoin above $90?") is None
     assert target.llm_usage_24h_by_provider()["zhipu"]["failures"] == 5
+
+
+def test_title_output_invalid_logs_raw_head(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from open_trader.llm_providers import PROVIDER_IDS, LlmCompletion
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    from open_trader.prediction_title_translation import LlmTitleTranslator
+
+    def invalid(prompt: str, payload: object) -> LlmCompletion:
+        return LlmCompletion('{"answer": "不是中文标题形状"}', None, {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 5, "reasoning_output_tokens": 0})
+
+    translator = LlmTitleTranslator(
+        PredictionArbitrageStore(tmp_path / "data"),
+        default_provider="codex",
+        completers={provider: invalid for provider in PROVIDER_IDS},
+    )
+    with caplog.at_level("WARNING", logger="open_trader.prediction_title_translation"):
+        result = translator.translate("Will BTC close above 100k?")
+
+    assert result is None
+    record = next(r for r in caplog.records if "title_output_invalid" in r.message)
+    assert "provider=codex" in record.message
+    assert "answer" in record.message
