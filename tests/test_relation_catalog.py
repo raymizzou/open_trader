@@ -552,7 +552,7 @@ def test_threshold_statement_is_derived_at_read_time_with_direction_code(
     assert row["statement"] == detail["statement"]
 
 
-def test_list_truncates_statement_titles_but_detail_keeps_full_text(
+def test_list_and_detail_keep_full_statement_titles(
     tmp_path: Path,
 ) -> None:
     base = threshold_relation()
@@ -568,9 +568,9 @@ def test_list_truncates_statement_titles_but_detail_keeps_full_text(
     assert f"B『{'B' * 5}』为 YES ⇒ A『{'A' * 40}』必须 YES" == detail["statement"]
 
     row = catalog.list("pending")[0]
-    assert "A" * 40 not in row["statement"]
-    assert f"A『{'A' * 28}…』必须 YES" in row["statement"]
-    assert f"B『{'B' * 5}』为 YES" in row["statement"]
+    assert row["statement"] == detail["statement"]
+    assert "A" * 40 in row["statement"]
+    assert "…" not in row["statement"]
 
 
 def test_derive_statement_only_rewrites_direction_code_literals() -> None:

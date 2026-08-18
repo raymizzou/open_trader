@@ -76,7 +76,6 @@ REVIEW_STATE_VIEWS = {
 _LEGACY_VIEW_ALIASES = {"pending": "PENDING_APPROVAL"}
 
 _DIRECTION_CODES = frozenset({"A_IMPLIES_B", "B_IMPLIES_A", "A_TO_B", "B_TO_A"})
-_LIST_TITLE_LIMIT = 28
 
 
 def review_state(record: Mapping[str, object]) -> str | None:
@@ -104,17 +103,10 @@ def review_state(record: Mapping[str, object]) -> str | None:
     return "COMPILED_PENDING_ACTIVATION" if compiled else "APPROVED_MODEL_INCOMPLETE"
 
 
-def _truncate_title(title: str, limit: int = _LIST_TITLE_LIMIT) -> str:
-    if len(title) <= limit:
-        return title
-    return f"{title[:limit].rstrip()}…"
-
-
 def _derive_statement(
     statement: str,
     endpoints: Sequence[Mapping[str, object]],
     *,
-    truncate: bool = False,
     roles: Sequence[object] = (),
 ) -> tuple[str, str]:
     """Derive the human-readable sentence for one stored direction-code statement.
@@ -147,9 +139,6 @@ def _derive_statement(
     }
     title_first = str(by_letter[antecedent_letter].get("title", ""))
     title_second = str(by_letter[consequent_letter].get("title", ""))
-    if truncate:
-        title_first = _truncate_title(title_first)
-        title_second = _truncate_title(title_second)
     return (
         f"{antecedent_letter}『{title_first}』为 YES ⇒ {consequent_letter}『{title_second}』必须 YES",
         direction,
@@ -671,7 +660,6 @@ class RelationCatalog:
         occurrences: int = 0,
         *,
         include_problem: bool = True,
-        truncate_statement: bool = False,
     ) -> dict[str, object]:
         record = self._versions()[version_id]
         payload = record["payload"]
@@ -686,7 +674,6 @@ class RelationCatalog:
         statement, direction_code = _derive_statement(
             str(payload.get("statement", "")),
             endpoints,
-            truncate=truncate_statement,
             roles=roles,
         )
         return {
@@ -727,8 +714,8 @@ class RelationCatalog:
         """List version rows for one review view.
 
         Accepts the six review-state keys plus the legacy aliases ``pending``,
-        ``approved_active``, and ``history``. List rows truncate statement
-        titles; ``detail()`` returns full statements.
+        ``approved_active``, and ``history``. List rows and ``detail()`` return
+        the same full statements.
         """
 
         state = REVIEW_STATE_VIEWS.get(view) or _LEGACY_VIEW_ALIASES.get(view)
@@ -740,7 +727,6 @@ class RelationCatalog:
                     version_id,
                     int(record.get("occurrence_count", 1)),
                     include_problem=False,
-                    truncate_statement=True,
                 )
                 for version_id, record in versions.items()
                 if review_state(record) == state
@@ -751,7 +737,6 @@ class RelationCatalog:
                     version_id,
                     int(record.get("occurrence_count", 1)),
                     include_problem=False,
-                    truncate_statement=True,
                 )
                 for version_id, record in versions.items()
                 if self._in_view(view, version_id, record, generation)
