@@ -1429,10 +1429,15 @@ class PredictionArbitrageStore:
         return str(row["provider"])
 
     def set_llm_provider(
-        self, provider: str, *, audit: Mapping[str, object] | None = None
+        self,
+        provider: str,
+        *,
+        default: str = DEFAULT_PROVIDER,
+        audit: Mapping[str, object] | None = None,
     ) -> str:
         if provider not in self.LLM_PROVIDERS:
             raise ValueError(f"invalid llm provider: {provider}")
+        fallback = default if default in self.LLM_PROVIDERS else DEFAULT_PROVIDER
         with self._transaction() as connection:
             row = connection.execute(
                 "SELECT provider FROM llm_provider_selection WHERE singleton=1"
@@ -1440,7 +1445,7 @@ class PredictionArbitrageStore:
             before = (
                 str(row["provider"])
                 if row is not None and str(row["provider"]) in self.LLM_PROVIDERS
-                else DEFAULT_PROVIDER
+                else fallback
             )
             if before != provider:
                 connection.execute(

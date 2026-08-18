@@ -967,6 +967,42 @@ def test_cached_validation_never_invokes_completer(tmp_path: Path) -> None:
     assert db.llm_usage_24h()["cache_hits"] == 0
 
 
+def test_cached_validation_restores_durable_verdict_for_monitor_restart(
+    tmp_path: Path,
+) -> None:
+    # The monitor's restart fast path looks up the public single-argument
+    # cached_validation(relation) on the real validator, so restoring an
+    # approved verdict must work without re-invoking any completer.
+    relation = threshold_relation()
+    db = codex_store(tmp_path)
+    complete, calls = make_completer()
+    validator = LlmRelationValidator(
+        db, default_provider="codex", completers=all_providers(complete)
+    )
+    assert validator.validate(relation).status == "approved"
+    assert len(calls) == 1
+
+    def must_not_complete(*_args: object) -> LlmCompletion:
+        raise AssertionError("restore path must not call the completer")
+
+    restarted_store = PredictionArbitrageStore(db.data_dir)
+    restarted = LlmRelationValidator(
+        restarted_store,
+        default_provider="codex",
+        completers=all_providers(must_not_complete),
+    )
+
+    cached = restarted.cached_validation(relation)
+
+    assert cached is not None
+    assert cached.status == "approved"
+    assert cached.cached is True
+    assert cached.provider == "codex"
+    assert cached.model == restarted.models["codex"]
+    assert len(calls) == 1
+    assert restarted_store.llm_usage_24h_by_provider()["codex"]["cache_hits"] == 1
+
+
 def test_llm_reject_is_cached_with_operator_visible_reason(
     tmp_path: Path,
 ) -> None:
@@ -1024,6 +1060,42 @@ def test_selected_engine_failure_is_strict_without_fallback(
     assert second.model == "deepseek-v4-flash"
     assert len(deepseek_calls) == 1
     assert len(codex_calls) == 1
+
+
+def test_failure_verdict_keeps_the_model_of_the_engine_that_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OPEN_TRADER_ZHIPU_MODEL", raising=False)
+    relation = threshold_relation()
+    db = codex_store(tmp_path)
+    zhipu_calls: list[tuple[str, str]] = []
+
+    def zhipu_fails(system: str, user: str) -> LlmCompletion:
+        zhipu_calls.append((system, user))
+        # The engine is switched while the zhipu call is in flight, exactly
+        # as an operator dashboard click would interleave. The failure
+        # verdict must still carry zhipu's model next to zhipu's reason.
+        db.set_llm_provider("codex")
+        return LlmCompletion(None, "ZHIPU_HTTP_ERROR", dict(DEFAULT_USAGE))
+
+    validator = LlmRelationValidator(
+        db,
+        default_provider="zhipu",
+        completers={
+            "codex": make_completer()[0],
+            "deepseek": make_completer()[0],
+            "zhipu": zhipu_fails,
+        },
+    )
+
+    result = validator.validate(relation)
+
+    assert result.status == "llm_unavailable"
+    assert result.provider == "zhipu"
+    assert result.model == "glm-5"
+    assert result.reason_codes == ("ZHIPU_HTTP_ERROR",)
+    assert len(zhipu_calls) == 1
+    assert db.get_llm_provider() == "codex"  # the mid-flight switch did happen
 
 
 def test_approved_verdict_is_shared_across_engines(tmp_path: Path) -> None:

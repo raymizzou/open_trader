@@ -1460,6 +1460,13 @@ class LlmRelationValidator:
             "credentials": provider_credentials_configured(),
         }
 
+    def cached_validation(self, relation: ThresholdRelation) -> RelationValidation | None:
+        """Restore the durable shared-cache verdict for one relation."""
+        return self._cached_validation(
+            relation,
+            relation_llm_cache_key(relation, prompt_version=self.prompt_version),
+        )
+
     def _validation(
         self,
         *,
@@ -1631,6 +1638,7 @@ class LlmRelationValidator:
                 structured=None,
                 status="llm_unavailable",
                 reason=f"{provider.upper()}_BUDGET_EXHAUSTED",
+                model=model,
                 provider=provider,
             )
         breaker = self._breakers[provider]
@@ -1641,6 +1649,7 @@ class LlmRelationValidator:
                 structured=None,
                 status="llm_unavailable",
                 reason=f"{provider.upper()}_CIRCUIT_OPEN",
+                model=model,
                 provider=provider,
             )
         self.llm_calls += 1
@@ -1660,6 +1669,7 @@ class LlmRelationValidator:
                 structured=None,
                 status="llm_unavailable",
                 reason=completion.reason or f"{provider.upper()}_FAILED",
+                model=model,
                 provider=provider,
             )
         structured = _parse_structured(completion.content)
@@ -1675,6 +1685,7 @@ class LlmRelationValidator:
                 structured=None,
                 status="llm_unavailable",
                 reason=f"{provider.upper()}_OUTPUT_INVALID",
+                model=model,
                 provider=provider,
             )
         assert isinstance(structured, Mapping)

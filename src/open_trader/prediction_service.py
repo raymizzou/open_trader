@@ -20,7 +20,7 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, urlparse
 
 from .daily_premarket import build_notifier, load_env_config
-from .llm_providers import PROVIDER_IDS
+from .llm_providers import PROVIDER_IDS, resolve_provider
 from .prediction_read_model import (
     PREDICTION_HISTORY_KINDS,
     _prediction_safe_value,
@@ -612,8 +612,15 @@ def create_prediction_server(
                     store = getattr(runtime, "store", None)
                     if store is None:
                         raise RuntimeError("prediction store is unavailable")
-                    store.set_llm_provider(provider, audit=audit)
+                    store.set_llm_provider(
+                        provider,
+                        default=resolve_provider(
+                            os.environ.get("OPEN_TRADER_PREDICTION_LLM_PROVIDER")
+                        ),
+                        audit=audit,
+                    )
                     self._send_json(HTTPStatus.OK, _llm_provider_payload(runtime))
+                    return
                 elif path.endswith("/preview"):
                     self._require_schema(payload, {"opportunity_id"})
                     result = execution.preview(
