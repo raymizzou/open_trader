@@ -15,6 +15,7 @@ from open_trader.prediction_title_translation import (
     legacy_prediction_title_cache_keys,
     prediction_title_cache_key,
 )
+from open_trader.prediction_title_translation import _PROMPT as _TITLE_PROMPT
 
 
 TITLE_USAGE: dict[str, int] = {
@@ -105,6 +106,13 @@ def test_legacy_cache_keys_use_the_old_luna_model_namespace() -> None:
     assert legacy_prediction_title_cache_keys("Bitcoin above $90?")[0] != (
         prediction_title_cache_key("Bitcoin above $90?")
     )
+
+
+def test_prompt_includes_title_zh_key_contract() -> None:
+    """Regression guard: the translation prompt must explicitly name the
+    output key so that json_object-mode LLMs (e.g. glm-5) use ``title_zh``
+    instead of a generic key like ``answer``."""
+    assert "title_zh" in _TITLE_PROMPT
 
 
 def test_cache_hit_does_not_invoke_completer(tmp_path: Path) -> None:
