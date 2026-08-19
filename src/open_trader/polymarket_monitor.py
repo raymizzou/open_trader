@@ -8,6 +8,7 @@ import copy
 import hashlib
 import inspect
 import json
+import logging
 import math
 import threading
 import time
@@ -45,7 +46,11 @@ from .polymarket_relation_discovery import (
     threshold_relation_from_payload,
     threshold_relation_payload,
     _fee_rate,
+    relation_llm_cache_key,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 TOP_EVENT_LIMIT = 20
@@ -69,6 +74,7 @@ RELATION_ACTIVITY_MIN_EDGE = Decimal("-0.05")
 RELATION_APR_TARGET_LIMIT = 100
 RELATION_APR_PREWARM_LIMIT = 100
 RELATION_VALIDATION_RETRY_SECONDS = 60 * 60
+RELATION_RESCAN_MIN_INTERVAL_SECONDS = 2.0
 
 
 def _value(value: object, *names: str, default: object = None) -> object:
@@ -418,6 +424,8 @@ class PolymarketMonitor:
         self._llm_failure_notified = False
         self._llm_failure_notification_task: asyncio.Task[object] | None = None
         self._notification_task: asyncio.Task[object] | None = None
+        self._relation_rescan_last: datetime | None = None
+        self._legacy_migration_done = False
         self._notification_signal_id: str | None = None
         self._title_translation_queue: asyncio.Queue[str] | None = None
         self._title_translation_task: asyncio.Task[None] | None = None
@@ -966,6 +974,15 @@ class PolymarketMonitor:
         self._ensure_title_translation_worker()
         if not self._catalog_loaded:
             self._load_relation_catalog()
+        if not self._legacy_migration_done and self._relation_validator is not None:
+            migrate_fn = getattr(self._relation_validator, "migrate_legacy_validations", None)
+            if callable(migrate_fn):
+                try:
+                    n = migrate_fn(list(self._relations.values()))
+                    logger.info("legacy validation migration: %d entries migrated", n)
+                except Exception:
+                    logger.exception("legacy validation migration failed")
+            self._legacy_migration_done = True
         client = self._public_client_factory()
         self._client = client
         next_refresh = 0.0
@@ -2997,33 +3014,58 @@ class PolymarketMonitor:
         validator = self._relation_validator
         if validator is None:
             return
-        cache_reader = getattr(validator, "cached_validation", None)
-        if not callable(cache_reader):
-            cache_reader = None
+        # --- throttle: skip rescan if called again within 2 s ---
         now = self._now()
-        candidates: list[tuple[Decimal, str, ThresholdRelation]] = []
-        restored_relation_ids: set[str] = set()
+        if (
+            self._relation_rescan_last is not None
+            and (now - self._relation_rescan_last).total_seconds()
+            < RELATION_RESCAN_MIN_INTERVAL_SECONDS
+        ):
+            return
+        self._relation_rescan_last = now
+        # --- batch cache restore ---
+        TERMINAL_STATUSES = {"approved", "llm_rejected", "deterministic_rejected"}
+        due_relations: list[ThresholdRelation] = []
+        due_ids: list[str] = []
         for relation_id in sorted(self._active_relation_ids):
-            relation = self._relations.get(relation_id)
-            if relation is None:
-                continue
             status = self._codex_statuses.get(relation_id)
-            if status in {"approved", "llm_rejected", "deterministic_rejected"}:
+            if status not in TERMINAL_STATUSES:
+                relation = self._relations.get(relation_id)
+                if relation is not None:
+                    due_relations.append(relation)
+                    due_ids.append(relation_id)
+        # Try batch cache lookup
+        batch_fn = getattr(validator, "cached_validations", None)
+        batch_results: dict[str, object] = {}
+        if callable(batch_fn) and due_relations:
+            try:
+                batch_results = batch_fn(due_relations)
+            except Exception:
+                batch_results = {}
+        restored_relation_ids: set[str] = set()
+        key_fn = (
+            getattr(validator, "relation_cache_key", None)
+            or relation_llm_cache_key
+        )
+        for relation_id, relation in zip(due_ids, due_relations):
+            try:
+                cache_key = key_fn(relation)
+            except Exception:
+                continue  # un-keyable relation: skip restore, keep candidate path
+            cached = batch_results.get(cache_key)
+            if cached is not None and getattr(cached, "status", None) in {
+                "approved",
+                "llm_rejected",
+            }:
+                self._codex_validations[relation_id] = cached
+                self._codex_statuses[relation_id] = str(cached.status)
+                self._codex_retry_at.pop(relation_id, None)
+                restored_relation_ids.add(relation_id)
                 continue
-            if cache_reader is not None:
-                try:
-                    cached = cache_reader(relation)
-                except Exception:
-                    cached = None
-                if cached is not None and getattr(cached, "status", None) in {
-                    "approved",
-                    "llm_rejected",
-                }:
-                    self._codex_validations[relation_id] = cached
-                    self._codex_statuses[relation_id] = str(cached.status)
-                    self._codex_retry_at.pop(relation_id, None)
-                    restored_relation_ids.add(relation_id)
-                    continue
+        candidates: list[tuple[Decimal, str, ThresholdRelation]] = []
+        for relation_id, relation in zip(due_ids, due_relations):
+            if relation_id in restored_relation_ids:
+                continue
             retry_at = self._codex_retry_at.get(relation_id)
             if retry_at is not None and now < retry_at:
                 continue

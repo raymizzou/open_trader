@@ -2445,3 +2445,39 @@ def test_existing_metadata_table_without_singleton_fails_closed(tmp_path: Path) 
         )
     with pytest.raises(ValueError, match="generation is missing"):
         read_minimum_reader_generation(tmp_path)
+
+
+def test_load_llm_cache_entries_returns_only_hit_keys(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    db.save_llm_cache("key-a", {"decision": "APPROVE"})
+    db.save_llm_cache("key-b", {"decision": "REJECT"})
+    result = db.load_llm_cache_entries(["key-a", "key-b", "key-missing"])
+    assert set(result.keys()) == {"key-a", "key-b"}
+    assert result["key-a"] == {"decision": "APPROVE"}
+    assert result["key-b"] == {"decision": "REJECT"}
+
+
+def test_load_llm_cache_entries_chunks_over_900_keys(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    # Insert 1001 entries
+    payloads = {}
+    for i in range(1001):
+        key = f"chunk-key-{i}"
+        payload = {"index": i}
+        db.save_llm_cache(key, payload)
+        payloads[key] = payload
+    keys = list(payloads.keys())
+    result = db.load_llm_cache_entries(keys)
+    assert len(result) == 1001
+    for key, payload in payloads.items():
+        assert result[key] == payload
+
+
+def test_load_llm_cache_entries_empty_and_whitespace(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    assert db.load_llm_cache_entries([]) == {}
+    assert db.load_llm_cache_entries(["", "  "]) == {}
+    # Dedup and strip
+    db.save_llm_cache("a", {"x": 1})
+    result = db.load_llm_cache_entries(["  a  ", "  a  ", "b"])
+    assert set(result.keys()) == {"a"}

@@ -970,9 +970,11 @@ def test_cached_validation_never_invokes_completer(tmp_path: Path) -> None:
 def test_cached_validation_restores_durable_verdict_for_monitor_restart(
     tmp_path: Path,
 ) -> None:
-    # The monitor's restart fast path looks up the public single-argument
-    # cached_validation(relation) on the real validator, so restoring an
-    # approved verdict must work without re-invoking any completer.
+    # The monitor's restart fast path restores durable verdicts through the
+    # public single-argument cached_validation(relation).  Shared new-key
+    # rows are read directly; legacy provider-namespaced rows are migrated
+    # once at process startup by migrate_legacy_validations.  Neither path
+    # may re-invoke any completer.
     relation = threshold_relation()
     db = codex_store(tmp_path)
     complete, calls = make_completer()
@@ -985,22 +987,229 @@ def test_cached_validation_restores_durable_verdict_for_monitor_restart(
     def must_not_complete(*_args: object) -> LlmCompletion:
         raise AssertionError("restore path must not call the completer")
 
+    # Direct new-key restore: the shared row written by the previous
+    # process is read back without any legacy row or completer call.
+    direct_store = PredictionArbitrageStore(db.data_dir)
+    direct = LlmRelationValidator(
+        direct_store,
+        default_provider="codex",
+        completers=all_providers(must_not_complete),
+    )
+    restored = direct.cached_validation(relation)
+
+    assert restored is not None
+    assert restored.status == "approved"
+    assert restored.cached is True
+    assert restored.provider == "codex"
+    assert restored.model == direct.models["codex"]
+    assert len(calls) == 1
+    assert direct_store.llm_usage_24h_by_provider()["codex"]["cache_hits"] == 1
+
+    # Legacy restore: an old provider-namespaced row for another relation is
+    # migrated once at startup, then restored through the shared new key.
+    legacy_relation = relation_variant(1)
+    legacy_key = legacy_relation_cache_keys(legacy_relation)[0]
+    db.save_llm_cache(
+        legacy_key,
+        {
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "prompt_version": RELATION_PROMPT_VERSION,
+            "structured_result": codex_result(),
+        },
+    )
     restarted_store = PredictionArbitrageStore(db.data_dir)
     restarted = LlmRelationValidator(
         restarted_store,
         default_provider="codex",
         completers=all_providers(must_not_complete),
     )
+    assert restarted.migrate_legacy_validations([legacy_relation]) == 1
+    assert restarted_store.llm_usage_24h_by_provider()["codex"]["cache_hits"] == 1
 
-    cached = restarted.cached_validation(relation)
+    cached = restarted.cached_validation(legacy_relation)
 
     assert cached is not None
     assert cached.status == "approved"
     assert cached.cached is True
     assert cached.provider == "codex"
-    assert cached.model == restarted.models["codex"]
+    assert cached.model == "gpt-5.6-sol"
     assert len(calls) == 1
-    assert restarted_store.llm_usage_24h_by_provider()["codex"]["cache_hits"] == 1
+    assert restarted_store.llm_usage_24h_by_provider()["codex"]["cache_hits"] == 2
+
+
+def test_cached_validations_batch_lookup_uses_one_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = codex_store(tmp_path)
+    relations = [threshold_relation(), relation_variant(1), relation_variant(2)]
+    keys = [relation_llm_cache_key(item) for item in relations]
+    for key, decision in ((keys[0], "APPROVE"), (keys[1], "REJECT")):
+        db.save_llm_cache(
+            key,
+            {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "prompt_version": RELATION_PROMPT_VERSION,
+                "structured_result": codex_result(decision=decision),
+            },
+        )
+    validator = LlmRelationValidator(
+        db, default_provider="codex", completers=all_providers(make_completer()[0])
+    )
+    per_key: list[str] = []
+    batch_calls: list[list[str]] = []
+    original_load = db.load_llm_cache
+    original_entries = db.load_llm_cache_entries
+    monkeypatch.setattr(
+        db,
+        "load_llm_cache",
+        lambda key: per_key.append(key) or original_load(key),
+    )
+    monkeypatch.setattr(
+        db,
+        "load_llm_cache_entries",
+        lambda cache_keys: batch_calls.append(list(cache_keys)) or original_entries(cache_keys),
+    )
+
+    result = validator.cached_validations(relations)
+
+    assert set(result) == {keys[0], keys[1]}
+    assert result[keys[0]].status == "approved"
+    assert result[keys[1]].status == "llm_rejected"
+    assert per_key == []  # zero per-key probes
+    assert len(batch_calls) == 1  # exactly one batch call
+
+
+def test_cached_validation_does_not_probe_legacy_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relation = threshold_relation()
+    db = codex_store(tmp_path)
+    legacy_key = legacy_relation_cache_keys(relation)[0]
+    db.save_llm_cache(
+        legacy_key,
+        {
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "prompt_version": RELATION_PROMPT_VERSION,
+            "structured_result": codex_result(),
+        },
+    )
+    validator = LlmRelationValidator(
+        db, default_provider="codex", completers=all_providers(make_completer()[0])
+    )
+    new_key = relation_llm_cache_key(relation)
+    probed: list[str] = []
+    original = db.load_llm_cache
+    monkeypatch.setattr(
+        db,
+        "load_llm_cache",
+        lambda key: probed.append(key) or original(key),
+    )
+
+    assert validator._cached_validation(relation, new_key) is None
+    assert probed == [new_key]  # exactly one probe: the new key only
+    assert validator.cached_validations([relation]) == {}
+
+
+def test_migrate_legacy_validations_migrates_once_then_noops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relation = threshold_relation()
+    monkeypatch.setenv("OPEN_TRADER_CODEX_MODEL", "gpt-custom")
+    monkeypatch.setenv("OPEN_TRADER_LLM_FALLBACK_MODEL", "deepseek-custom")
+    db = codex_store(tmp_path)
+    legacy = legacy_relation_cache_keys(relation)
+    assert len(legacy) == 4  # two shipped models plus the two env models
+    valid_payload = {
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "prompt_version": RELATION_PROMPT_VERSION,
+        "structured_result": codex_result(),
+    }
+    db.save_llm_cache(legacy[0], valid_payload)
+    validator = LlmRelationValidator(
+        db, default_provider="codex", completers=all_providers(make_completer()[0])
+    )
+    new_key = relation_llm_cache_key(relation)
+    saves: list[str] = []
+    hits: list[str] = []
+    original_save = db.save_llm_cache
+    original_hit = db.record_llm_cache_hit
+    monkeypatch.setattr(
+        db,
+        "save_llm_cache",
+        lambda key, payload: saves.append(key) or original_save(key, payload),
+    )
+    monkeypatch.setattr(
+        db,
+        "record_llm_cache_hit",
+        lambda *, provider="codex": hits.append(provider) or original_hit(provider=provider),
+    )
+
+    assert validator.migrate_legacy_validations([relation]) == 1
+    assert saves == [new_key]
+    assert hits == ["codex"]
+
+    # Idempotent: a second run in the same process migrates nothing.
+    assert validator.migrate_legacy_validations([relation]) == 0
+    assert saves == [new_key]  # no second save
+    assert hits == ["codex"]  # no second hit
+    # The migrated row now resolves through the normal restore path.
+    assert validator.cached_validation(relation) is not None
+
+
+def test_migrate_legacy_validations_skips_invalid_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Invalid legacy rows (wrong prompt version / bad structured result) are
+    actually read and skipped without any save or cache-hit record."""
+    relation = threshold_relation()
+    monkeypatch.setenv("OPEN_TRADER_CODEX_MODEL", "gpt-custom")
+    monkeypatch.setenv("OPEN_TRADER_LLM_FALLBACK_MODEL", "deepseek-custom")
+    db = codex_store(tmp_path)
+    legacy = legacy_relation_cache_keys(relation)
+    assert len(legacy) == 4  # two shipped models plus the two env models
+    valid_payload = {
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "prompt_version": RELATION_PROMPT_VERSION,
+        "structured_result": codex_result(),
+    }
+    # Only invalid rows exist, so every legacy key is probed and skipped.
+    db.save_llm_cache(
+        legacy[0],
+        {**valid_payload, "prompt_version": "polymarket-threshold-relation-v9"},
+    )
+    # Invalid structured result: must be skipped.
+    db.save_llm_cache(
+        legacy[1],
+        {**valid_payload, "structured_result": {"schema_version": 99}},
+    )
+    validator = LlmRelationValidator(
+        db, default_provider="codex", completers=all_providers(make_completer()[0])
+    )
+    saves: list[str] = []
+    hits: list[str] = []
+    original_save = db.save_llm_cache
+    original_hit = db.record_llm_cache_hit
+    monkeypatch.setattr(
+        db,
+        "save_llm_cache",
+        lambda key, payload: saves.append(key) or original_save(key, payload),
+    )
+    monkeypatch.setattr(
+        db,
+        "record_llm_cache_hit",
+        lambda *, provider="codex": hits.append(provider) or original_hit(provider=provider),
+    )
+
+    assert validator.migrate_legacy_validations([relation]) == 0
+    assert saves == []  # no save_llm_cache call
+    assert hits == []  # no cache hit recorded
+    # Nothing was migrated: the restore path still misses.
+    assert validator.cached_validation(relation) is None
 
 
 def test_llm_reject_is_cached_with_operator_visible_reason(
@@ -1149,6 +1358,7 @@ def test_legacy_cache_row_is_migrated_to_the_shared_key(tmp_path: Path) -> None:
         completers=all_providers(must_not_complete),
     )
 
+    assert validator.migrate_legacy_validations([relation]) == 1
     result = validator.validate(relation)
 
     assert result.status == "approved"
@@ -1160,7 +1370,7 @@ def test_legacy_cache_row_is_migrated_to_the_shared_key(tmp_path: Path) -> None:
         "prompt_version": RELATION_PROMPT_VERSION,
         "structured_result": codex_result(),
     }
-    assert db.llm_usage_24h()["cache_hits"] == 1
+    assert db.llm_usage_24h()["cache_hits"] == 2  # migrate plus the restore read
     assert db.llm_usage_24h()["calls"] == 0
 
 
