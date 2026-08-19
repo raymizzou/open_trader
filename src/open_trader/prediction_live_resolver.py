@@ -280,7 +280,18 @@ class PredictionLiveResolver:
             if self._thread is not None:
                 return
             self._stop_event.clear()
-            self._reconcile()
+            try:
+                self._reconcile()
+            except Exception:
+                # #74 hotfix: a conflicting catalog generation (e.g. the same
+                # action compiled under two inconsistent relations) must not
+                # take the whole prediction service down at startup. The
+                # live tick keeps retrying reconcile whenever the generation
+                # changes and self-heals once the conflict is resolved.
+                logger.exception(
+                    "prediction_live_resolver startup reconcile failed; "
+                    "the live tick will retry on the next generation change"
+                )
             self._thread = threading.Thread(
                 target=self._loop,
                 name="prediction-live-resolver",

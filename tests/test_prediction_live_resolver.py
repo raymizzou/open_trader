@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from concurrent.futures import Future
 from dataclasses import replace
@@ -661,3 +662,44 @@ def test_start_stop_idempotent_and_per_tick_exception_isolation(
     instance.stop()
     instance.stop()
     assert instance._thread is None
+
+
+def conflicting_rows() -> dict[str, object]:
+    """Two ACTIVE rows sharing action ``a-yes`` with conflicting definitions.
+
+    This reproduces the #74 production incident: one action compiled under
+    two inconsistent relations makes ``relation_generation_problem`` raise
+    ``ValueError`` at the shared compile seam.
+    """
+    base = raw_problem()
+    conflicting = replace(
+        base,
+        actions=tuple(
+            replace(action, max_quantity_lots=1)
+            if action.action_id == "a-yes"
+            else action
+            for action in base.actions
+        ),
+    )
+    return {"r:one": row("r:one", base), "r:two": row("r:two", conflicting)}
+
+
+def test_start_survives_startup_reconcile_conflict(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    rows = conflicting_rows()
+    # Guard: the fixture must exercise the production failure mode itself.
+    with pytest.raises(ValueError, match="conflicts across compiled relations"):
+        relation_generation_problem(rows)
+    instance, server, _ = resolver(tmp_path, rows=rows)
+    with caplog.at_level(
+        logging.ERROR, logger="open_trader.prediction_live_resolver"
+    ):
+        instance.start()
+    assert "startup reconcile failed" in caplog.text
+    thread = instance._thread
+    assert thread is not None and thread.is_alive()
+    instance.stop()
+    instance.stop()
+    assert instance._thread is None
+    assert server.requests == []
