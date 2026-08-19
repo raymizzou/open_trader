@@ -429,6 +429,22 @@ def evaluate_fixed_portfolio(
     return replace(provisional, failed_qualification_ids=failed_qualification_ids)
 
 
+def evaluate_fill_adversary(
+    problem: object, budget: OracleBudget
+) -> object:
+    """Oracle entry for the #74 fill-adversary problem (test/verification only).
+
+    Exhaustively enumerates fill vectors x joint atoms inside the budget and
+    returns the exact worst loss.  Production never calls this; the
+    differential tests use it to confirm SAFE proofs are not false-safe and
+    to reproduce UNSAFE counterexamples exactly.  Over budget it returns an
+    unclosed result, never a sampled or partial "safe".
+    """
+    from open_trader.prediction_partial_fill import enumerate_fill_adversary
+
+    return enumerate_fill_adversary(problem, budget)
+
+
 def _constraint_contract_ids(problem: ArbitrageProblem, constraint_id: str) -> tuple[str, ...]:
     for relation in problem.constraint_model.relations:
         if relation.constraint_id == constraint_id:

@@ -140,8 +140,22 @@ def test_replay_n3_happy_path() -> None:
     ]
     decision = report["execution_decision"]
     assert decision["order_ready"] is False
-    assert decision["partial_fill_proof"] == "UNKNOWN"
-    assert decision["reason"] == "PARTIAL_FILL_PROOF_REQUIRED"
+    # #74: the fixed n3 solution is proven UNSAFE against the default zero
+    # cap: the adversary closes at 650,000 (fills a+b, scenario a:no/b:no/c:yes).
+    assert decision["partial_fill_proof"] == "PARTIAL_FILL_UNSAFE"
+    assert decision["reason"] == "PARTIAL_FILL_UNSAFE"
+    proof = decision["proof"]
+    assert proof["solver_termination"] == "CLOSED"
+    assert proof["verifier_status"] == "QUALIFIED_VERIFIED"
+    assert proof["lower_bound_units"] == proof["upper_bound_units"] == 650_000
+    assert proof["cap_units"] == 0
+    counterexample = proof["counterexample"]
+    assert counterexample["loss_units"] == 650_000
+    assert counterexample["cap_units"] == 0
+    assert {
+        (row["action_id"], row["quantity_lots"])
+        for row in counterexample["fill_quantities"]
+    } == {("buy-yes-a", 1), ("buy-yes-b", 1)}
     assert report["market"]["guaranteed_profit_units"] == 40_000
     assert report["oracle_differential"]["pass"] is True
     assert all(item["pass"] for item in report["oracle_differential"]["checks"])
@@ -253,7 +267,12 @@ def test_live_active_n3_relation_with_injected_books_qualifies(tmp_path: Path) -
     assert live["qualified_verified"] is True
     assert live["guaranteed_profit_units"] == 40_000
     assert live["execution_decision"]["order_ready"] is False
-    assert live["execution_decision"]["reason"] == "PARTIAL_FILL_PROOF_REQUIRED"
+    # The harness store has no safety config, so the execution fails the
+    # unsettled-capital gate before the #74 proof is ever applicable.
+    assert (
+        live["execution_decision"]["reason"]
+        == "UNSETTLED_CAP_EXCEEDED"
+    )
     assert live["execution_decision"]["capital_use_units"] == 960_000
     assert live["execution_decision"]["market_solution_fingerprint"] == (
         "sha256:9d51b1158c352878df159fe2fcb12d0e3160cdd30c5d70056491f294cb2b4cc2"

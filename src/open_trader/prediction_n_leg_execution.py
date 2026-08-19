@@ -180,17 +180,26 @@ def partial_fill_proof_from_payload(payload: object) -> PartialFillProofRecord:
     return PartialFillProofRecord(**payload)  # type: ignore[arg-type]
 
 
-def _proof_is_bound(proof: PartialFillProofRecord, solution: ExecutionSolution) -> bool:
+def _proof_is_bound_status(
+    proof: PartialFillProofRecord,
+    solution: ExecutionSolution,
+    status: str,
+) -> bool:
+    """The six binding facts + verifier + termination close for one status."""
     try:
         binding = execution_solution_binding(solution)
     except ValueError:
         return False
     return (
-        proof.status == "PARTIAL_FILL_SAFE"
+        proof.status == status
         and proof.verifier_status == "QUALIFIED_VERIFIED"
         and proof.solver_termination == "CLOSED"
         and all(proof.to_payload()[key] == value for key, value in binding.items())
     )
+
+
+def _proof_is_bound(proof: PartialFillProofRecord, solution: ExecutionSolution) -> bool:
+    return _proof_is_bound_status(proof, solution, "PARTIAL_FILL_SAFE")
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,6 +444,14 @@ class NLegExecutionService:
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("EXECUTION_SOLUTION_SOURCE_REQUIRED") from exc
+        if (
+            _proof_is_bound_status(
+                partial_fill_proof, execution_solution, "PARTIAL_FILL_UNSAFE"
+            )
+            and partial_fill_proof.cap_config_version
+            == _text(cap_config_version, "cap_config_version")
+        ):
+            raise ValueError("PARTIAL_FILL_UNSAFE")
         if not _proof_is_bound(partial_fill_proof, execution_solution) or partial_fill_proof.cap_config_version != _text(cap_config_version, "cap_config_version"):
             raise ValueError("PARTIAL_FILL_PROOF_REQUIRED")
         if partial_fill_proof.solver_upper_bound > partial_fill_proof.max_partial_fill_loss:
