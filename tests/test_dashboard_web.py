@@ -3633,6 +3633,15 @@ console.log(JSON.stringify({listHtml, detailHtml}));
     assert "市场 A · 后件" in rendered["detailHtml"]
     assert 'data-action="approve-relation"' in rendered["detailHtml"]
     assert 'data-action="reject-relation"' in rendered["detailHtml"]
+    # 详情内联展开:列表 section 不再 hidden,分页器保持可见,详情紧跟被点击行。
+    assert '<section class="pm-relation-list">' in rendered["detailHtml"]
+    assert "pm-relation-list hidden" not in rendered["detailHtml"]
+    assert "pm-relation-pager" in rendered["detailHtml"]
+    assert "显示 51–100 / 958" in rendered["detailHtml"]
+    assert "收起详情" in rendered["detailHtml"]
+    assert 'class="pm-relation-row expanded"' in rendered["detailHtml"]
+    detail_index = rendered["detailHtml"].index("pm-relation-detail")
+    assert rendered["detailHtml"].index("pm-relation-row") < detail_index < rendered["detailHtml"].index("pm-relation-pager")
 
 
 def test_relation_role_labels_follow_endpoint_roles_not_storage_order() -> None:
@@ -3752,19 +3761,21 @@ const root = {
 };
 elements["prediction-market-root"] = root;
 state.predictionMarket.payload = {status: "healthy", events: [], opportunities: []};
+const relation = {
+  version_id: "dd44", statement: "B_IMPLIES_A", direction_code: "B_IMPLIES_A",
+  discovery_source: "deterministic_rule", discovered_at: "2026-08-17T06:32:00Z",
+  status: "PENDING", activation: "PENDING",
+  endpoints: [
+    {venue: "Polymarket", contract_id: "0x11", title: "Market one", expires_at: "2026-09-01T00:00:00Z"},
+    {venue: "Polymarket", contract_id: "0x99", title: "Market two", expires_at: "2026-09-30T00:00:00Z"},
+  ],
+  evidence: [],
+};
 state.predictionMarket.relationReview = {
   ...state.predictionMarket.relationReview,
   open: true,
-  detail: {
-    version_id: "dd44", statement: "B_IMPLIES_A", direction_code: "B_IMPLIES_A",
-    discovery_source: "deterministic_rule", discovered_at: "2026-08-17T06:32:00Z",
-    status: "PENDING", activation: "PENDING",
-    endpoints: [
-      {venue: "Polymarket", contract_id: "0x11", title: "Market one", expires_at: "2026-09-01T00:00:00Z"},
-      {venue: "Polymarket", contract_id: "0x99", title: "Market two", expires_at: "2026-09-30T00:00:00Z"},
-    ],
-    evidence: [],
-  },
+  items: [relation],
+  detail: relation,
 };
 renderPredictionMarket();
 console.log(JSON.stringify({

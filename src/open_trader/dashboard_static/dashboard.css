@@ -6007,6 +6007,8 @@ button { cursor: pointer; }
 .pm-relation-tag { background: var(--surface-soft); border: 1px solid var(--line); border-radius: 999px; color: var(--muted); display: inline-block; font-size: 11px; font-weight: 800; line-height: 1.4; margin-right: 6px; padding: 2px 8px; }
 .pm-relation-row { transition: border-color .18s ease; }
 .pm-relation-row:hover { border-color: var(--accent); }
+.pm-relation-row.expanded { border-color: var(--accent); }
+.pm-relation-list .pm-relation-detail { background: #fffefa; border: 1px solid var(--accent); border-radius: 8px; padding: 12px; }
 .pm-relation-markets { display: grid; gap: 10px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .pm-relation-market-role { color: var(--muted); display: block; font-size: 12px; font-weight: 800; margin-bottom: 6px; }
 .pm-relation-pager { align-items: center; color: var(--muted); display: flex; font-size: 13px; font-variant-numeric: tabular-nums; gap: 10px; justify-content: space-between; margin-top: 4px; }
