@@ -601,7 +601,7 @@ def test_nleg_solution_projection_is_exposed_and_attached_to_opportunities() -> 
         "capital_use_units": 31_200_000,
         "reason": "EXECUTABLE",
         "order_ready": False,
-        "partial_fill_proof": "UNKNOWN",
+        "partial_fill_proof": "PARTIAL_FILL_SAFE",
     }
     state = prediction_state_payload(
         store=_Store(),
