@@ -4035,7 +4035,7 @@ function relationAbbreviatedId(versionId) {
   return value.length > 12 ? `${value.slice(0, 4)}…${value.slice(-2)}` : value;
 }
 
-function relationCatalogItem(item) {
+function relationCatalogItem(item, expanded = false) {
   const endpoints = Array.isArray(item?.endpoints) ? item.endpoints : [];
   const directionCode = String(item?.direction_code || "");
   const letters = relationRoleLetters(item);
@@ -4044,10 +4044,23 @@ function relationCatalogItem(item) {
   const expiryLine = [venue ? escapeHtml(venue) : "", ...endpoints.map((market, index) => `${letters[index] ? `${letters[index]} ` : ""}到期 ${escapeHtml(predictionHktTimestamp(market?.expires_at))}`)]
     .filter(Boolean).join(" · ");
   const tags = `${directionCode ? `<span class="pm-relation-tag">${escapeHtml(directionCode)}</span>` : ""}${item?.discovery_source ? `<span class="pm-relation-tag">${escapeHtml(String(item.discovery_source))}</span>` : ""}`;
-  return `<button type="button" class="pm-relation-row" data-relation-version-id="${escapeHtml(predictionValue(item?.version_id, ""))}"><div style="display:flex;justify-content:space-between;align-items:start;gap:10px"><strong>${escapeHtml(predictionValue(item?.statement, "关系表述未返回"))}</strong><span class="pm-relation-badge${stateMeta.tone ? ` ${stateMeta.tone}` : ""}">${escapeHtml(stateMeta.label)}</span></div><div class="pm-relation-market"><small>${expiryLine}</small><small>${tags}版本 ${escapeHtml(relationAbbreviatedId(item?.version_id))} · 发现 ${escapeHtml(predictionHktTimestamp(item?.discovered_at))}</small></div></button>`;
+  return `<button type="button" class="pm-relation-row${expanded ? " expanded" : ""}" data-relation-version-id="${escapeHtml(predictionValue(item?.version_id, ""))}"><div style="display:flex;justify-content:space-between;align-items:start;gap:10px"><strong>${escapeHtml(predictionValue(item?.statement, "关系表述未返回"))}</strong><span class="pm-relation-badge${stateMeta.tone ? ` ${stateMeta.tone}` : ""}">${escapeHtml(stateMeta.label)}</span></div><div class="pm-relation-market"><small>${expiryLine}</small><small>${tags}版本 ${escapeHtml(relationAbbreviatedId(item?.version_id))} · 发现 ${escapeHtml(predictionHktTimestamp(item?.discovered_at))}</small></div></button>`;
 }
 
 const RELATION_REVIEW_PAGE_SIZE = 50;
+
+function relationDetailHtml(detail) {
+  if (!detail) return "";
+  const endpoints = Array.isArray(detail?.endpoints) ? detail.endpoints : [];
+  const letters = relationRoleLetters(detail);
+  const antecedentLetter = letters.length === 2 ? relationAntecedentLetter(detail?.direction_code) : "";
+  const detailMarkets = `<div class="pm-relation-markets">${endpoints.map((market, index) => `<article class="pm-relation-detail-market"><strong>${escapeHtml(predictionValue(market?.title, "标题未返回"))}</strong>${letters.length === 2 ? `<span class="pm-relation-market-role">市场 ${letters[index]} · ${letters[index] === antecedentLetter ? "前件" : "后件"}</span>` : ""}<dl><div><dt>交易所</dt><dd>${escapeHtml(predictionValue(market?.venue, "-"))}</dd></div><div><dt>Native ID</dt><dd>${escapeHtml(predictionValue(market?.contract_id, "-"))}</dd></div><div><dt>市场日期</dt><dd>${escapeHtml(predictionHktTimestamp(market?.market_date))}</dd></div><div><dt>到期日</dt><dd>${escapeHtml(predictionHktTimestamp(market?.expires_at))}</dd></div><div><dt>结算依据</dt><dd>${escapeHtml(predictionValue(market?.settlement_observation_key, "-"))}</dd></div></dl></article>`).join("")}</div>`;
+  const evidence = Array.isArray(detail?.evidence) ? detail.evidence.map((item) => `<li>${escapeHtml(JSON.stringify(item?.source_evidence || item))}</li>`).join("") : "";
+  const expected = relationExpected(detail);
+  const actions = detail?.status === "PENDING" && expected ? `<div class="pm-relation-actions"><button class="pm-button" type="button" data-action="reject-relation" data-relation-version-id="${escapeHtml(expected.version_id)}">拒绝</button><button class="pm-button primary" type="button" data-action="approve-relation" data-relation-version-id="${escapeHtml(expected.version_id)}">确认并尝试激活</button></div>` : detail?.activation === "ACTIVE" && expected ? `<div class="pm-relation-actions"><button class="pm-button danger" type="button" data-action="revoke-relation" data-relation-version-id="${escapeHtml(expected.version_id)}">撤销当前关系</button></div>` : "";
+  const decision = `<label class="pm-relation-reason">决定原因<select data-relation-reason><option value="source_evidence_insufficient">来源证据不足</option><option value="relation_semantics_wrong">关系语义错误</option><option value="model_incomplete_or_wrong">模型不完整或错误</option><option value="identity_mismatch">身份不匹配</option><option value="rules_changed">规则已变化</option><option value="other">其他</option></select><textarea data-relation-note maxlength="1000" placeholder="备注（可选）"></textarea></label>`;
+  return `<section class="pm-relation-detail" data-relation-detail><button type="button" class="pm-relation-back" data-action="relation-back">收起详情</button><h2>${escapeHtml(predictionValue(detail?.statement, "关系表述未返回"))}</h2><p>版本 ${escapeHtml(predictionValue(detail?.version_id, "-"))} · 发现 ${escapeHtml(predictionHktTimestamp(detail?.discovered_at))} · 来源 ${escapeHtml(predictionValue(detail?.discovery_source, "-"))}</p>${detailMarkets}<section><h3>来源证据</h3><ul class="pm-relation-evidence">${evidence}</ul></section>${decision}${actions}</section>`;
+}
 
 function relationReviewDrawer() {
   const review = state.predictionMarket.relationReview;
@@ -4059,22 +4072,16 @@ function relationReviewDrawer() {
     return `<button type="button" data-relation-view="${view}" aria-pressed="${review.view === view}">${meta.short} <span class="pm-relation-tab-count">${Number.isFinite(count) ? count : 0}</span></button>`;
   }).join("");
   const detail = review.detail;
-  const list = review.loading ? `<p class="pm-relation-empty">正在加载关系目录…</p>` : review.items.length ? review.items.map(relationCatalogItem).join("") : `<p class="pm-relation-empty">此视图暂无关系。</p>`;
+  const list = review.loading ? `<p class="pm-relation-empty">正在加载关系目录…</p>` : review.items.length ? review.items.map((item) => {
+    const expanded = Boolean(detail && item.version_id === detail.version_id);
+    return relationCatalogItem(item, expanded) + (expanded ? relationDetailHtml(detail) : "");
+  }).join("") : `<p class="pm-relation-empty">此视图暂无关系。</p>`;
   const total = Number(review.total || 0);
   const offset = Math.max(0, Number(review.offset) || 0);
   const pages = Math.max(1, Math.ceil(total / RELATION_REVIEW_PAGE_SIZE));
   const page = Math.min(Math.floor(offset / RELATION_REVIEW_PAGE_SIZE) + 1, pages);
   const pager = `<div class="pm-relation-pager"><span>显示 ${total === 0 ? 0 : offset + 1}–${total === 0 ? 0 : Math.min(offset + RELATION_REVIEW_PAGE_SIZE, total)} / ${total}</span><span class="pm-relation-pager-pages"><button type="button" data-action="relation-prev-page" ${offset <= 0 ? "disabled" : ""}>‹ 上一页</button><span>第 ${page} / ${pages} 页</span><button type="button" data-action="relation-next-page" ${offset + RELATION_REVIEW_PAGE_SIZE >= total ? "disabled" : ""}>下一页 ›</button></span></div>`;
-  const endpoints = Array.isArray(detail?.endpoints) ? detail.endpoints : [];
-  const letters = relationRoleLetters(detail);
-  const antecedentLetter = letters.length === 2 ? relationAntecedentLetter(detail?.direction_code) : "";
-  const detailMarkets = `<div class="pm-relation-markets">${endpoints.map((market, index) => `<article class="pm-relation-detail-market"><strong>${escapeHtml(predictionValue(market?.title, "标题未返回"))}</strong>${letters.length === 2 ? `<span class="pm-relation-market-role">市场 ${letters[index]} · ${letters[index] === antecedentLetter ? "前件" : "后件"}</span>` : ""}<dl><div><dt>交易所</dt><dd>${escapeHtml(predictionValue(market?.venue, "-"))}</dd></div><div><dt>Native ID</dt><dd>${escapeHtml(predictionValue(market?.contract_id, "-"))}</dd></div><div><dt>市场日期</dt><dd>${escapeHtml(predictionHktTimestamp(market?.market_date))}</dd></div><div><dt>到期日</dt><dd>${escapeHtml(predictionHktTimestamp(market?.expires_at))}</dd></div><div><dt>结算依据</dt><dd>${escapeHtml(predictionValue(market?.settlement_observation_key, "-"))}</dd></div></dl></article>`).join("")}</div>`;
-  const evidence = Array.isArray(detail?.evidence) ? detail.evidence.map((item) => `<li>${escapeHtml(JSON.stringify(item?.source_evidence || item))}</li>`).join("") : "";
-  const expected = detail ? relationExpected(detail) : null;
-  const actions = detail?.status === "PENDING" && expected ? `<div class="pm-relation-actions"><button class="pm-button" type="button" data-action="reject-relation" data-relation-version-id="${escapeHtml(expected.version_id)}">拒绝</button><button class="pm-button primary" type="button" data-action="approve-relation" data-relation-version-id="${escapeHtml(expected.version_id)}">确认并尝试激活</button></div>` : detail?.activation === "ACTIVE" && expected ? `<div class="pm-relation-actions"><button class="pm-button danger" type="button" data-action="revoke-relation" data-relation-version-id="${escapeHtml(expected.version_id)}">撤销当前关系</button></div>` : "";
-  const decision = detail ? `<label class="pm-relation-reason">决定原因<select data-relation-reason><option value="source_evidence_insufficient">来源证据不足</option><option value="relation_semantics_wrong">关系语义错误</option><option value="model_incomplete_or_wrong">模型不完整或错误</option><option value="identity_mismatch">身份不匹配</option><option value="rules_changed">规则已变化</option><option value="other">其他</option></select><textarea data-relation-note maxlength="1000" placeholder="备注（可选）"></textarea></label>` : "";
-  const detailHtml = detail ? `<section class="pm-relation-detail"><button type="button" class="pm-relation-back" data-action="relation-back">返回列表</button><h2>${escapeHtml(predictionValue(detail?.statement, "关系表述未返回"))}</h2><p>版本 ${escapeHtml(predictionValue(detail?.version_id, "-"))} · 发现 ${escapeHtml(predictionHktTimestamp(detail?.discovered_at))} · 来源 ${escapeHtml(predictionValue(detail?.discovery_source, "-"))}</p>${detailMarkets}<section><h3>来源证据</h3><ul class="pm-relation-evidence">${evidence}</ul></section>${decision}${actions}</section>` : "";
-  return `<aside class="pm-relation-drawer" aria-label="关系审核" role="dialog" aria-modal="true"><header><div><h2>关系审核</h2><p>只审核系统发现的关系事实；不展示价格、利润或机会排序。</p></div><button type="button" class="pm-relation-close" data-action="close-relation-review" aria-label="关闭关系审核">关闭</button></header><nav class="pm-relation-tabs" aria-label="关系审核视图">${tabs}</nav><div class="pm-relation-drawer-body"><section class="pm-relation-list" ${detail ? "hidden" : ""}>${list}</section>${detail ? "" : pager}${detailHtml}</div></aside>`;
+  return `<aside class="pm-relation-drawer" aria-label="关系审核" role="dialog" aria-modal="true"><header><div><h2>关系审核</h2><p>只审核系统发现的关系事实；不展示价格、利润或机会排序。</p></div><button type="button" class="pm-relation-close" data-action="close-relation-review" aria-label="关闭关系审核">关闭</button></header><nav class="pm-relation-tabs" aria-label="关系审核视图">${tabs}</nav><div class="pm-relation-drawer-body"><section class="pm-relation-list">${list}</section>${pager}</div></aside>`;
 }
 
 async function loadRelationReview(view = state.predictionMarket.relationReview.view, offset = 0) {
@@ -4107,6 +4114,7 @@ async function loadRelationDetail(relationVersionId) {
     state.predictionMarket.relationReview.detail = await response.json();
   } catch (error) { state.predictionMarket.error = error instanceof Error ? error.message : String(error); }
   renderPredictionMarket();
+  document.querySelector("[data-relation-detail]")?.scrollIntoView?.({block: "nearest", behavior: "smooth"});
 }
 
 async function mutateRelation(action, relationVersionId) {
@@ -4134,7 +4142,16 @@ async function handlePredictionMarketClick(event) {
   const relationAction = event.target.closest("[data-action='approve-relation'], [data-action='reject-relation'], [data-action='revoke-relation']");
   if (relationAction) { await mutateRelation(relationAction.dataset.action.replace("-relation", ""), relationAction.dataset.relationVersionId || ""); return; }
   const relationRow = event.target.closest("[data-relation-version-id]");
-  if (relationRow) { await loadRelationDetail(relationRow.dataset.relationVersionId || ""); return; }
+  if (relationRow) {
+    const review = state.predictionMarket.relationReview;
+    if (relationRow.dataset.relationVersionId === review.detail?.version_id) {
+      review.detail = null;
+      renderPredictionMarket();
+      return;
+    }
+    await loadRelationDetail(relationRow.dataset.relationVersionId || "");
+    return;
+  }
   const filterKind = event.target.closest("[data-prediction-filter-kind]");
   if (filterKind) {
     state.predictionMarket.filter.kind = filterKind.dataset.predictionFilterKind || "all";
