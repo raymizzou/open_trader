@@ -8,9 +8,10 @@ dispatches live Polymarket books to the bounded solver server, and turns
 completed worker evidence into a verified MarketSolution without any second
 solver pass.
 
-Scope: no discovery/selection, no orders, no ORDER_READY, no partial-fill
-proofs (#74/#85), and Predict.fun legs fail closed. The solver server is
-injected and never closed here.
+Scope: no discovery/selection, no orders, no ORDER_READY, and Predict.fun
+legs fail closed. The synchronous #74 partial-fill proof runs on the
+execution hot path and its records are cached and persisted. The solver
+server is injected and never closed here.
 """
 
 from __future__ import annotations
@@ -23,8 +24,10 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+import sqlite3
 
 from open_trader.prediction_market_solution import (
+    EXECUTABLE_REASON,
     AccountView,
     ComponentResolution,
     ExecutionSolution,
@@ -46,6 +49,15 @@ from open_trader.prediction_n_leg import (
     TerminalAtom,
     canonical_payload,
     fingerprint,
+)
+from open_trader.prediction_n_leg_execution import (
+    PartialFillProofRecord,
+    partial_fill_proof_from_payload,
+)
+from open_trader.prediction_partial_fill import (
+    PARTIAL_FILL_UNKNOWN,
+    fill_adversary_problem_from_market_solution,
+    prove_partial_fill,
 )
 from open_trader.prediction_runtime_graph import RuntimeRelationGraph
 from open_trader.prediction_snapshot_scheduler import (
@@ -81,6 +93,10 @@ LIVE_LIMITS = BenchmarkLimits(
     memory_limit_bytes=1 << 30,
     max_constraint_generation_rounds=3,
 )
+# #74: independent hard wall-clock bound for the synchronous partial-fill
+# proof; a timeout yields a cached UNKNOWN proof for the same snapshot
+# fingerprint and never retries within this process.
+LIVE_PROOF_TIME_LIMIT_MS = 1_000
 USD_UNITS_PER_DOLLAR = 1_000_000
 
 
@@ -196,6 +212,7 @@ class PredictionLiveResolver:
         # its N>=3 budget (8 joint states) instead of the 2-leg LIVE_BUDGET.
         budget: OracleBudget = LIVE_BUDGET,
         limits: BenchmarkLimits = LIVE_LIMITS,
+        proof_time_limit_ms: int = LIVE_PROOF_TIME_LIMIT_MS,
     ) -> None:
         if not isinstance(poll_interval, (int, float)) or poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
@@ -209,6 +226,8 @@ class PredictionLiveResolver:
             raise ValueError("budget must be an OracleBudget")
         if not isinstance(limits, BenchmarkLimits):
             raise ValueError("limits must be BenchmarkLimits")
+        if type(proof_time_limit_ms) is not int or proof_time_limit_ms <= 0:
+            raise ValueError("proof_time_limit_ms must be a positive integer")
         self._data_dir = Path(data_dir)
         self._relation_catalog = relation_catalog
         self._monitor = monitor
@@ -221,6 +240,7 @@ class PredictionLiveResolver:
         self._account_freshness = timedelta(seconds=account_freshness_seconds)
         self._budget = budget
         self._limits = limits
+        self._proof_time_limit_ms = proof_time_limit_ms
         self._tracking = _OutcomeTrackingServer(solver_server)
         self._graph = RuntimeRelationGraph(
             generation_source=relation_catalog.current_generation,
@@ -244,6 +264,13 @@ class PredictionLiveResolver:
         self._resolutions: dict[str, ComponentResolution] = {}
         self._verifications: dict[str, VerificationResult] = {}
         self._request_components: dict[str, tuple[str, str]] = {}
+        # #74: synchronous partial-fill proofs, keyed by the stable adversary
+        # fingerprint (fixed execution solution + cap config). UNKNOWN results
+        # are cached too, so a timed-out snapshot fingerprint is never retried.
+        self._fill_proofs: dict[
+            str, tuple[PartialFillProofRecord, dict[str, object] | None]
+        ] = {}
+        self._fill_proof_components: dict[str, str] = {}
         self._applied_generation: tuple[int, str] | None = None
         self._account_view_cache: AccountView | None = None
         self._account_view_cached_at: datetime | None = None
@@ -310,6 +337,21 @@ class PredictionLiveResolver:
     def latest_verification(self, component_id: str) -> VerificationResult | None:
         with self._lock:
             return self._verifications.get(component_id)
+
+    def latest_execution(self, component_id: str) -> ExecutionSolution | None:
+        with self._lock:
+            entry = self._solutions.get(component_id)
+            return entry[1] if entry is not None else None
+
+    def latest_partial_fill_proof(
+        self, component_id: str
+    ) -> Mapping[str, object] | None:
+        with self._lock:
+            proof_fingerprint = self._fill_proof_components.get(component_id)
+            if proof_fingerprint is None:
+                return None
+            cached = self._fill_proofs.get(proof_fingerprint)
+            return cached[0].to_payload() if cached is not None else None
 
     def _loop(self) -> None:
         while not self._stop_event.wait(self._poll_interval):
@@ -386,6 +428,19 @@ class PredictionLiveResolver:
                 request_id: entry
                 for request_id, entry in self._request_components.items()
                 if entry[0] in kept
+            }
+            self._fill_proof_components = {
+                component_id: proof_fingerprint
+                for component_id, proof_fingerprint in (
+                    self._fill_proof_components.items()
+                )
+                if component_id in kept
+            }
+            referenced = set(self._fill_proof_components.values())
+            self._fill_proofs = {
+                proof_fingerprint: cached
+                for proof_fingerprint, cached in self._fill_proofs.items()
+                if proof_fingerprint in referenced
             }
             if set(kept) != set(persisted):
                 self._selection_store.save(kept)
@@ -533,12 +588,12 @@ class PredictionLiveResolver:
         if account is None:
             return None
         try:
+            safety = self._store.n_leg_safety_config_latest() or {}
+            config = safety.get("config") or {}
             max_unsettled = int(
-                (self._store.n_leg_safety_config_latest() or {})
-                .get("config", {})
-                .get("max_total_unsettled_capital_units", 0)
+                config.get("max_total_unsettled_capital_units", 0)
             )
-            return execution_solution_from_market(
+            execution = execution_solution_from_market(
                 market,
                 problem,
                 account,
@@ -546,6 +601,91 @@ class PredictionLiveResolver:
             )
         except (TypeError, ValueError, RuntimeError):
             return None
+        if execution is None or execution.reason != EXECUTABLE_REASON:
+            return execution
+        # #74: synchronous partial-fill proof on the live hot path. Structural
+        # failures (bad caps, unknown action, solver unavailable) fail closed
+        # to UNKNOWN status; timed-out proofs are cached UNKNOWN records for
+        # the same snapshot fingerprint and are never retried.
+        try:
+            record, _counterexample = self._prove_fixed(
+                component_id,
+                execution,
+                market,
+                problem,
+                config,
+                int(safety.get("version", 1)),
+            )
+            return replace(execution, partial_fill_proof=record.status)
+        except (TypeError, ValueError, RuntimeError, OverflowError):
+            return replace(
+                execution, partial_fill_proof=PARTIAL_FILL_UNKNOWN
+            )
+
+    def _prove_fixed(
+        self,
+        component_id: str,
+        execution: ExecutionSolution,
+        market: MarketSolution,
+        problem: ArbitrageProblem,
+        config: Mapping[str, object],
+        config_version: int,
+    ) -> tuple[PartialFillProofRecord, dict[str, object] | None]:
+        """Run (or replay) the #74 proof for this fixed solution, cache by
+        adversary fingerprint, and persist best-effort to the store."""
+        adversary = fill_adversary_problem_from_market_solution(
+            execution,
+            problem,
+            cap_config_version=f"caps-v{config_version or 1}",
+            max_partial_fill_loss=int(
+                config.get("max_partial_fill_loss_units", 0)
+            ),
+            max_auto_repair_loss=int(
+                config.get("max_auto_repair_loss_units", 0)
+            ),
+        )
+        proof_fingerprint = adversary.fingerprint
+        with self._lock:
+            cached = self._fill_proofs.get(proof_fingerprint)
+            if cached is not None:
+                self._fill_proof_components[component_id] = proof_fingerprint
+                return cached
+        try:
+            stored = self._store.partial_fill_proof(proof_fingerprint)
+        except (TypeError, ValueError, RuntimeError, AttributeError, sqlite3.Error):
+            stored = None
+        if stored is not None:
+            try:
+                record = partial_fill_proof_from_payload(stored.get("proof"))
+                counterexample = stored.get("unsafe_counterexample")
+                with self._lock:
+                    self._fill_proofs[proof_fingerprint] = (
+                        record,
+                        counterexample,
+                    )
+                    self._fill_proof_components[
+                        component_id
+                    ] = proof_fingerprint
+                return record, counterexample
+            except (TypeError, ValueError):
+                pass
+        record, counterexample = prove_partial_fill(
+            adversary, time_limit_ms=self._proof_time_limit_ms
+        )
+        try:
+            # Persist under the stable adversary fingerprint so a later
+            # process can replay the proof before re-solving.
+            self._store.partial_fill_proof_save(
+                record,
+                counterexample,
+                proof_fingerprint=proof_fingerprint,
+            )
+        except (TypeError, ValueError, RuntimeError, AttributeError, sqlite3.Error):
+            pass
+        with self._lock:
+            self._fill_proofs[proof_fingerprint] = (record, counterexample)
+            self._fill_proof_components[component_id] = proof_fingerprint
+        return record, counterexample
 
     def _account_view(self) -> AccountView | None:
         now = datetime.now(UTC)
@@ -580,11 +720,19 @@ class PredictionLiveResolver:
             self._solutions.pop(component_id, None)
             self._resolutions.pop(component_id, None)
             self._verifications.pop(component_id, None)
+            proof_fingerprint = self._fill_proof_components.pop(
+                component_id, None
+            )
+            if proof_fingerprint is not None and proof_fingerprint not in (
+                self._fill_proof_components.values()
+            ):
+                self._fill_proofs.pop(proof_fingerprint, None)
 
 
 __all__ = [
     "LIVE_BUDGET",
     "LIVE_LIMITS",
+    "LIVE_PROOF_TIME_LIMIT_MS",
     "USD_UNITS_PER_DOLLAR",
     "PredictionLiveResolver",
     "normalize_problem",

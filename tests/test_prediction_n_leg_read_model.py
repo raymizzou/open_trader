@@ -49,6 +49,7 @@ def _execution(
     reason: str = EXECUTABLE_REASON,
     capital_use_units: int = 180,
     market_solution_fingerprint: object = None,
+    proof_status: str = "PARTIAL_FILL_SAFE",
 ) -> dict[str, object]:
     return {
         "market_solution_fingerprint": (
@@ -60,7 +61,7 @@ def _execution(
         "capital_use_units": capital_use_units,
         "reason": reason,
         "order_ready": False,
-        "partial_fill_proof": "UNKNOWN",
+        "partial_fill_proof": proof_status,
     }
 
 
@@ -237,3 +238,47 @@ def test_projection_scope_ready_false_keeps_execution_reason() -> None:
     assert item is not None
     assert item["execution"]["order_ready"] is False
     assert item["execution"]["reason"] == "SCOPE_NOT_ENABLED"
+
+
+def test_projection_unknown_proof_requires_proof() -> None:
+    market = _market()
+    item = project_n_leg_solution(
+        market=market,
+        execution=_execution(market, proof_status="UNKNOWN"),
+        scope=_manual_canary_scope(),
+        max_total_unsettled_capital_units=1000,
+    )
+
+    assert item is not None
+    assert item["execution"]["order_ready"] is False
+    assert item["execution"]["reason"] == PARTIAL_FILL_PROOF_REQUIRED
+    assert item["execution"]["partial_fill_proof"] == "UNKNOWN"
+
+
+def test_projection_unsafe_proof_blocks_ready() -> None:
+    market = _market()
+    proof_payload = {
+        "status": "PARTIAL_FILL_UNSAFE",
+        "solver_termination": "CLOSED",
+        "verifier_status": "QUALIFIED_VERIFIED",
+        "solver_lower_bound": 490_000,
+        "solver_upper_bound": 490_000,
+        "max_partial_fill_loss": 0,
+        "fingerprint": "sha256:proof",
+    }
+    item = project_n_leg_solution(
+        market=market,
+        execution=_execution(market, proof_status="PARTIAL_FILL_SAFE"),
+        scope=_manual_canary_scope(),
+        max_total_unsettled_capital_units=1000,
+        partial_fill_proof=proof_payload,
+    )
+
+    assert item is not None
+    assert item["execution"]["order_ready"] is False
+    assert item["execution"]["reason"] == "PARTIAL_FILL_UNSAFE"
+    # The explicit record payload wins over the execution status string.
+    assert item["execution"]["partial_fill_proof"] == "PARTIAL_FILL_UNSAFE"
+    assert item["execution"]["partial_fill_upper_bound_units"] == 490_000
+    assert item["execution"]["partial_fill_cap_units"] == 0
+    assert item["execution"]["partial_fill_proof_fingerprint"] == "sha256:proof"

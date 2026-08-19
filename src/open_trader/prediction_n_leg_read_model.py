@@ -20,9 +20,12 @@ from open_trader.prediction_n_leg import canonical_payload, fingerprint
 _NLEG_UNITS_PER_DOLLAR = Decimal("1000000")
 
 PARTIAL_FILL_PROOF_REQUIRED = "PARTIAL_FILL_PROOF_REQUIRED"
+PARTIAL_FILL_UNSAFE = "PARTIAL_FILL_UNSAFE"
 SCOPE_OBSERVE_ONLY = "SCOPE_OBSERVE_ONLY"
 EXECUTION_FINGERPRINT_MISMATCH = "EXECUTION_FINGERPRINT_MISMATCH"
 UNSETTLED_CAP_EXCEEDED = "UNSETTLED_CAP_EXCEEDED"
+
+PARTIAL_FILL_SAFE = "PARTIAL_FILL_SAFE"
 
 _READY_CAPABILITIES = ("MANUAL_CANARY", "AUTO_ELIGIBLE")
 
@@ -91,12 +94,16 @@ def project_n_leg_solution(
     max_total_unsettled_capital_units: int,
     total_unsettled_capital_units: int = 0,
     legs: Sequence[Mapping[str, object]] | None = None,
+    partial_fill_proof: Mapping[str, object] | None = None,
 ) -> dict[str, object] | None:
     """Project one solution into dashboard market/execution fields.
 
     ``scope`` is the merged n_leg entry: ``capability`` from the mode contract
     plus ``order_ready``/``reason``/``action`` from ``n_leg_order_readiness``.
-    Returns ``None`` when no MarketSolution exists.
+    ``partial_fill_proof`` is the optional #74 proof record payload; when
+    absent the projection falls back to the ``partial_fill_proof`` status
+    string carried by the execution payload.  Returns ``None`` when no
+    MarketSolution exists.
     """
     if not isinstance(market, Mapping):
         return None
@@ -134,6 +141,23 @@ def project_n_leg_solution(
     projected_total_units = int(execution_payload.get("capital_use_units") or 0) if execution_payload is not None else 0
     projected_with_unsettled = projected_total_units + int(total_unsettled_capital_units or 0)
 
+    # #74 three-state proof status: explicit record payload wins, otherwise
+    # the status string carried by the execution solution.
+    proof_payload = (
+        dict(partial_fill_proof)
+        if isinstance(partial_fill_proof, Mapping)
+        else None
+    )
+    proof_status = (
+        str(proof_payload.get("status") or "")
+        if proof_payload is not None
+        else (
+            str(execution_payload.get("partial_fill_proof") or "")
+            if execution_payload is not None
+            else ""
+        )
+    )
+
     order_ready = False
     reason = ""
     if scope_blocked:
@@ -142,6 +166,11 @@ def project_n_leg_solution(
         reason = PARTIAL_FILL_PROOF_REQUIRED
     elif str(execution_payload.get("reason") or "") not in (EXECUTABLE_REASON, ""):
         reason = str(execution_payload.get("reason") or PARTIAL_FILL_PROOF_REQUIRED)
+    elif proof_status == PARTIAL_FILL_UNSAFE:
+        reason = PARTIAL_FILL_UNSAFE
+    elif proof_status != PARTIAL_FILL_SAFE:
+        # Missing, unknown-semantics, timeout or unclosed proofs never unlock.
+        reason = PARTIAL_FILL_PROOF_REQUIRED
     elif execution_payload.get("market_solution_fingerprint") != fingerprint(
         canonical_payload(market)
     ):
@@ -165,6 +194,26 @@ def project_n_leg_solution(
         "projected_total_units": projected_total_units,
         "total_unsettled_capital_units": int(total_unsettled_capital_units or 0),
         "max_total_unsettled_capital_units": int(max_total_unsettled_capital_units or 0),
+        # #74 proof state: three-state status plus the closed upper bound and
+        # cap for display, and a counterexample reference when UNSAFE.
+        "partial_fill_proof": proof_status,
+        "partial_fill_upper_bound_units": (
+            int(proof_payload["solver_upper_bound"])
+            if proof_payload is not None
+            and proof_payload.get("solver_upper_bound") is not None
+            else None
+        ),
+        "partial_fill_cap_units": (
+            int(proof_payload["max_partial_fill_loss"])
+            if proof_payload is not None
+            and proof_payload.get("max_partial_fill_loss") is not None
+            else None
+        ),
+        "partial_fill_proof_fingerprint": (
+            str(proof_payload.get("fingerprint") or "")
+            if proof_payload is not None
+            else None
+        ),
         "legs": (
             _merge_leg_display(_quantity_rows(execution_payload.get("quantities")), legs)
             if execution_payload is not None

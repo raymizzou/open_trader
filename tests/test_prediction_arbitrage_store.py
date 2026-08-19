@@ -11,6 +11,11 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+from open_trader.prediction_n_leg import fingerprint
+from open_trader.prediction_n_leg_execution import (
+    PartialFillProofRecord,
+    partial_fill_proof_from_payload,
+)
 
 
 UTC = timezone.utc
@@ -185,7 +190,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] > 0
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         names = {
             row[1]
             for row in connection.execute("PRAGMA table_list")
@@ -236,6 +241,7 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
         "n_leg_qualification_policy",
         "n_leg_safety_config",
         "n_leg_execution_scopes",
+        "partial_fill_proofs",
     }
     assert "signals_market_started_at" in indexes
     assert "signals_started_at" in indexes
@@ -243,6 +249,78 @@ def test_store_uses_expected_sqlite_path_and_safety_pragmas(tmp_path: Path) -> N
     assert any("signals_market_started_at" in row[3] for row in query_plan)
     assert any("signals_started_at" in row[3] for row in history_query_plan)
     assert any("signals_open_started_at" in row[3] for row in open_query_plan)
+
+
+def _fill_proof_record(*, status: str = "PARTIAL_FILL_SAFE") -> PartialFillProofRecord:
+    values: dict[str, object] = {
+        "execution_solution_fingerprint": "sha256:exec",
+        "execution_solution_payload_fingerprint": "sha256:payload",
+        "model_fingerprint": "sha256:model",
+        "quote_fingerprint": "sha256:quote",
+        "cost_fingerprint": "sha256:cost",
+        "order_semantics_fingerprint": "sha256:semantics",
+        "cap_config_version": "caps-v1",
+        "max_partial_fill_loss": 100,
+        "max_auto_repair_loss": 10,
+        "solver_lower_bound": 0,
+        "solver_upper_bound": 50,
+        "solver_termination": "CLOSED",
+        "solver_evidence_fingerprint": "sha256:solver-evidence",
+        "verifier_status": "QUALIFIED_VERIFIED",
+        "verifier_fingerprint": "sha256:verifier",
+        "verifier_evidence_fingerprint": "sha256:verifier-evidence",
+        "status": status,
+        "schema_version": "open_trader.prediction_n_leg.partial_fill_proof.v1",
+    }
+    values["fingerprint"] = fingerprint(values)
+    return PartialFillProofRecord(**values)  # type: ignore[arg-type]
+
+
+def test_partial_fill_proof_persists_and_round_trips(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    assert db.partial_fill_proof("missing") is None
+
+    record = _fill_proof_record()
+    db.partial_fill_proof_save(record, unsafe_counterexample={"loss_units": 7})
+    stored = db.partial_fill_proof(record.fingerprint)
+    assert stored is not None
+    assert partial_fill_proof_from_payload(stored["proof"]) == record
+    assert stored["unsafe_counterexample"] == {"loss_units": 7}
+
+    # Upsert under the same fingerprint key replaces the stored payload
+    # instead of inserting a second row (status is part of the record, so a
+    # different status is a different fingerprint by construction).
+    db.partial_fill_proof_save(record, unsafe_counterexample=None)
+    stored = db.partial_fill_proof(record.fingerprint)
+    assert stored["proof"]["status"] == "PARTIAL_FILL_SAFE"
+    assert stored["unsafe_counterexample"] is None
+    path = tmp_path / "data" / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    with sqlite3.connect(path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM partial_fill_proofs"
+        ).fetchone()[0]
+    assert count == 1
+
+    # A fresh store instance reads the same row back.
+    reopened = store(tmp_path)
+    assert (
+        partial_fill_proof_from_payload(
+            reopened.partial_fill_proof(record.fingerprint)["proof"]
+        )
+        == record
+    )
+
+    # The live resolver keys rows by the stable adversary fingerprint, which
+    # differs from the record's own fingerprint; both keys must be addressable.
+    cache_key = "sha256:adversary"
+    db.partial_fill_proof_save(
+        record, unsafe_counterexample=None, proof_fingerprint=cache_key
+    )
+    stored = db.partial_fill_proof(cache_key)
+    assert stored["proof_fingerprint"] == cache_key
+    assert stored["proof"]["status"] == "PARTIAL_FILL_SAFE"
+    with pytest.raises(ValueError, match="non-empty"):
+        db.partial_fill_proof("")
 
 
 def test_first_safety_policy_enrollment_preserves_legacy_automatic_modes(

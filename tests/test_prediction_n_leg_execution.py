@@ -360,6 +360,11 @@ def test_entry_fails_closed_for_unsafe_or_over_partial_fill_cap(tmp_path) -> Non
             opportunity_episode_id="episode-1", episode_lineage_id="lineage-1", execution_batch_id="batch-1",
             source=source_and_solution()[0], partial_fill_proof=proof(execution, status="UNKNOWN"), mode="MANUAL", cap_config_version="caps-v1",
         )
+    with pytest.raises(ValueError, match="PARTIAL_FILL_UNSAFE"):
+        current.enter(
+            opportunity_episode_id="episode-1", episode_lineage_id="lineage-1", execution_batch_id="batch-1",
+            source=source_and_solution()[0], partial_fill_proof=proof(execution, status="PARTIAL_FILL_UNSAFE"), mode="MANUAL", cap_config_version="caps-v1",
+        )
     with pytest.raises(ValueError, match="PARTIAL_FILL_LOSS_CAP_EXCEEDED"):
         current.enter(
             opportunity_episode_id="episode-1", episode_lineage_id="lineage-1", execution_batch_id="batch-1",
