@@ -4664,8 +4664,8 @@ function cnTrendRows(items) {
 function usesFinalPlanTrendAudit(report) {
   const market = String(report?.market || "").toUpperCase();
   const version = String(report?.strategy_version || "");
-  return (market === "CN" && version === "v13")
-    || (["HK", "US"].includes(market) && version === "v11");
+  return (market === "CN" && ["v13", "v14"].includes(version))
+    || (["HK", "US"].includes(market) && ["v11", "v12"].includes(version));
 }
 
 function renderCnTrendCell(label, value, ariaLabel = "", missingLabel = "—") {
@@ -4921,6 +4921,8 @@ function renderTrendRiskSummary(summary, drawdown, reportDate) {
     <div class="trend-risk-summary-body">
     ${hasPlanRisk ? `<header><strong>组合计划风险</strong><span>${escapeHtml(formatPlain(summary.status_label))}</span></header>
       ${hasValue(summary.pause_reason) ? `<p class="trend-risk-pause">${escapeHtml(formatPlain(summary.pause_reason))}</p>` : ""}
+      ${hasValue(summary.data_defect_reason) ? `<p class="trend-risk-data-defect">数据缺陷：${escapeHtml(formatPlain(summary.data_defect_reason))}</p>` : ""}
+      ${hasValue(summary.pending_entries_note) ? `<p class="trend-risk-pending">${escapeHtml(formatPlain(summary.pending_entries_note))}</p>` : ""}
       <dl>
         <div><dt>组合计划风险</dt><dd>${escapeHtml(planned)}</dd></div>
         <div><dt>组合剩余风险</dt><dd>${escapeHtml(remaining)}</dd></div>
@@ -5178,16 +5180,18 @@ function renderTrendBuyStage(report) {
   const headings = [
     "标的", "动作", "筛选价（Trend Animals）", "执行参考价",
     "温度变化", "节气", "大类内强度", "全局强度", "行业", "行业温度", "行业确认", "市值（亿元）",
-    "日成交额（亿元）", "目标仓位（占净值）", "目标金额", "预计数量", "预计保护线",
+    "日成交额（亿元）", "目标仓位（占净值）", "目标金额", "预计数量", "预计保护线", "额外风险",
   ];
   const optionMarket = ["US", "HK"].includes(String(report?.market || "").toUpperCase());
   const row = (item, action) => {
     const targetWeight = decimalAsPercent(item.target_weight, null);
     const shares = hasValue(item.estimated_shares)
       ? `${formatDisplayNumber(item.estimated_shares)} 股` : null;
-    return `<tr class="cn-trend-card">
+    const pending = item.executable === false;
+    const sizingNote = hasValue(item.sizing_note) ? formatPlain(item.sizing_note) : null;
+    return `<tr class="cn-trend-card${pending ? " trend-buy-pending" : ""}">
       ${optionMarket ? renderTrendOptionIdentityCell(item) : renderTrendCell("标的", trendIdentity(item))}
-      ${renderTrendCell("动作", action)}
+      ${renderTrendCell("动作", pending ? "待条件" : action)}
       ${renderTrendCell("筛选价（Trend Animals）", hasValue(item.filter_price) ? formatDisplayNumber(item.filter_price) : null)}
       ${renderTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : null)}
       ${renderTrendCell("温度变化", trendTemperature(item))}
@@ -5203,6 +5207,7 @@ function renderTrendBuyStage(report) {
       ${renderTrendCell("目标金额", hasValue(item.target_amount) ? formatDisplayNumber(item.target_amount) : null)}
       ${renderTrendCell("预计数量", shares)}
       ${renderTrendCell("预计保护线", hasValue(item.estimated_initial_line) ? formatDisplayNumber(item.estimated_initial_line) : null)}
+      ${renderTrendCell("额外风险", sizingNote)}
     </tr>`;
   };
   const rows = trendFinalPlanBuyActions(report).map((item) => row(item, "正式买入"));

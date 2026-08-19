@@ -5223,6 +5223,86 @@ def test_buy_without_terminal_event_remains_incomplete(
     assert controller._execution_completed(config, cycle) is False
 
 
+def test_execution_completion_skips_pending_and_data_missing_buys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = active_cn_cycle()
+    report_path = tmp_path / "locked.json"
+    report = {
+        "as_of_date": "2026-07-17",
+        "strategy_judgments": {
+            "formal_actions": [
+                {
+                    "action": "BUY",
+                    "symbol": "600001",
+                    "target_weight": "0.04",
+                    "lot_size": 100,
+                    "estimated_shares": 100,
+                    "atr": "0.5",
+                    "executable": False,
+                    "sizing_note": "席位已满，待现金/席位释放",
+                },
+                {
+                    "action": "BUY",
+                    "symbol": "600002",
+                    "target_weight": "0.04",
+                    "lot_size": 0,
+                    "estimated_shares": 0,
+                    "atr": "0",
+                    "sizing_note": "每手股数未知，无法定量",
+                },
+            ],
+            "simulate_rotation_pairs": [{"buy_futu_symbol": "SH.STRONG"}],
+            "real_rotation_pairs": [],
+        },
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    batch = config.data_dir / "trend_review/ledgers/CN/batches/2026-07-20.json"
+    batch.parent.mkdir(parents=True)
+    batch.write_text(json.dumps({
+        "schema_version": "open_trader.trend_review.batch.v1", "market": "CN",
+        "execution_date": "2026-07-20", "report_path": str(report_path),
+        "report_sha256": _report_hash(report),
+    }), encoding="utf-8")
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(
+        controller,
+        "load_trend_action_audit",
+        lambda *_args, **_kwargs: pytest.fail(
+            "pending/data-missing buys must not load the action audit"
+        ),
+    )
+    audited: list[object] = []
+    monkeypatch.setattr(
+        controller,
+        "relative_rotations_completed",
+        lambda *_args, **_kwargs: audited.append(_kwargs["report"]) or True,
+    )
+
+    # 待条件（executable=False）与数据缺失类（0 股/0 手/0 ATR）买入不产生终态
+    # 事件：视为已完成，不阻塞轮换执行与当日批次完成。
+    assert controller._execution_completed(config, cycle) is True
+    assert audited == [report]
+
+    # 回归对照：可执行买入（executable 缺失、数量齐全）无终态事件时仍视为未完成。
+    monkeypatch.setattr(
+        controller, "load_trend_action_audit", lambda *_args, **_kwargs: ([], [])
+    )
+    executable = json.loads(json.dumps(report))
+    action = executable["strategy_judgments"]["formal_actions"][0]
+    action.pop("executable")
+    action["sizing_note"] = ""
+    executable_path = tmp_path / "executable.json"
+    executable_path.write_text(json.dumps(executable), encoding="utf-8")
+    batch.write_text(json.dumps({
+        "schema_version": "open_trader.trend_review.batch.v1", "market": "CN",
+        "execution_date": "2026-07-20", "report_path": str(executable_path),
+        "report_sha256": _report_hash(executable),
+    }), encoding="utf-8")
+    assert controller._execution_completed(config, cycle) is False
+
+
 def test_active_session_restart_recovers_prior_close_after_protection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7015,6 +7095,75 @@ def test_relative_rotation_runs_after_ordinary_actions_and_merges_results(
 
     assert calls == ["ordinary", "rotation"]
     assert result["submitted_count"] == 2
+    assert result["artifact_paths"] == ["ordinary", "rotation"]
+
+
+def test_execute_locked_report_runs_rotations_when_buys_are_pending_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report_path = tmp_path / "locked.json"
+    report = valid_cn_report(
+        as_of_date="2026-07-17", execution_date="2026-07-20",
+    )
+    report["strategy_judgments"]["formal_actions"] = [
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": False,
+            "sizing_note": "席位已满，待现金/席位释放",
+        },
+    ]
+    report["strategy_judgments"]["simulate_rotation_pairs"] = [
+        {"buy_futu_symbol": "SH.STRONG"},
+    ]
+    report["strategy_judgments"]["real_rotation_pairs"] = []
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    calls: list[str] = []
+
+    class Client:
+        def close(self) -> None:
+            pass
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_revision_state", lambda *_args: (None, None))
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(
+        controller, "_new_order_client", lambda *_args, **_kwargs: Client()
+    )
+    monkeypatch.setattr(
+        controller,
+        "execute_trend_review_open",
+        lambda **_kwargs: calls.append("ordinary") or {
+            "status": "unchanged", "submitted_count": 0, "artifact_paths": ["ordinary"],
+        },
+    )
+    monkeypatch.setattr(
+        controller,
+        "execute_relative_rotations",
+        lambda **_kwargs: calls.append("rotation") or {
+            "status": "submitted", "submitted_count": 1, "artifact_paths": ["rotation"],
+        },
+    )
+
+    result = controller._execute_locked_report(
+        config, "CN", "2026-07-20", report_path, report, quote_client=Quote()
+    )
+
+    # 席位满 + 仅待条件买入：ordinary_complete=True，轮换照常执行，待条件不阻塞。
+    assert calls == ["ordinary", "rotation"]
+    assert result["submitted_count"] == 1
     assert result["artifact_paths"] == ["ordinary", "rotation"]
 
 

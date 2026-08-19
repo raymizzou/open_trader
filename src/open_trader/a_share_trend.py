@@ -148,12 +148,22 @@ LEGACY_CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.02")}
 CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.04")}
 CURRENT_TREND_STRATEGY_VERSIONS = {"CN": "v10", "US": "v8", "HK": "v8"}
 ALLOCATION_REPORT_VERSIONS = {
-    "CN": frozenset({"v11", "v12", "v13"}),
-    "HK": frozenset({"v9", "v10", "v11"}),
-    "US": frozenset({"v9", "v10", "v11"}),
+    "CN": frozenset({"v11", "v12", "v13", "v14"}),
+    "HK": frozenset({"v9", "v10", "v11", "v12"}),
+    "US": frozenset({"v9", "v10", "v11", "v12"}),
 }
 INDIVIDUAL_GLOBAL_RANKING_VERSIONS = frozenset({
-    ("CN", "v13"), ("HK", "v11"), ("US", "v11"),
+    ("CN", "v13"), ("CN", "v14"),
+    ("HK", "v11"), ("HK", "v12"),
+    ("US", "v11"), ("US", "v12"),
+})
+# 最终计划买入名单语义（全部趋势候选列入、仓位约束转为 sizing_note 提示）仅对
+# 这些版本生效；更早版本（CN v13、HK/US v11 及之前）保持原有 risk_skip 剔除路径，
+# 保证存量证据回放决策不变。
+FINAL_PLAN_TREND_VERSIONS = frozenset({
+    ("CN", "v14"),
+    ("HK", "v12"),
+    ("US", "v12"),
 })
 CURRENT_TREND_EFFECTIVE_FROM = "2026-07-27"
 CURRENT_ENTRY_DISCIPLINES = frozenset({
@@ -161,10 +171,12 @@ CURRENT_ENTRY_DISCIPLINES = frozenset({
     ("US", "v9"),
     ("US", "v10"),
     ("US", "v11"),
+    ("US", "v12"),
     ("HK", "v8"),
     ("HK", "v9"),
     ("HK", "v10"),
     ("HK", "v11"),
+    ("HK", "v12"),
 })
 CURRENT_EXIT_DISCIPLINES = frozenset({
     ("CN", "v9"),
@@ -172,18 +184,21 @@ CURRENT_EXIT_DISCIPLINES = frozenset({
     ("CN", "v11"),
     ("CN", "v12"),
     ("CN", "v13"),
+    ("CN", "v14"),
     ("US", "v6"),
     ("US", "v7"),
     ("US", "v8"),
     ("US", "v9"),
     ("US", "v10"),
     ("US", "v11"),
+    ("US", "v12"),
     ("HK", "v6"),
     ("HK", "v7"),
     ("HK", "v8"),
     ("HK", "v9"),
     ("HK", "v10"),
     ("HK", "v11"),
+    ("HK", "v12"),
 })
 REAL_HOLDING_TREND_EXCLUDED_SYMBOLS = frozenset({"US.AGRZ"})
 OVERHEAT_PARAMETER_NAMES = frozenset({
@@ -339,11 +354,17 @@ def valid_v2_risk_contract(
 
     status = summary.get("status")
     pause_reason = summary.get("pause_reason")
+    data_defect = bool(summary.get("data_defect_reason"))
     if status == "active":
         if (
             summary.get("status_label") != "风险预算内"
             or pause_reason != ""
-            or any(values[key] is None for key in V2_RISK_NUMERIC_FIELDS)
+            or (
+                not data_defect
+                and any(
+                    values[key] is None for key in V2_RISK_NUMERIC_FIELDS
+                )
+            )
         ):
             return False
     elif status == "paused":
@@ -1305,10 +1326,12 @@ def live_trend_strategy_snapshot(
     else:
         version = "v4"
     if (
-        version not in {"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"}
-        or version in {"v12", "v13"} and market != "CN"
-        or version == "v11" and market == "CN"
-        or version == "v5" and market == "CN"
+        version
+        not in {
+            "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+        }
+        or version in {"v5", "v11"} and market == "CN"
+        or version in {"v13", "v14"} and market != "CN"
         or version == allocation_version and allocation_market is None
     ):
         raise ValueError("unsupported live trend strategy version")
@@ -1390,14 +1413,16 @@ def live_trend_strategy_snapshot(
                     "趋势右侧、可交易、无危险信号、日期一致、非当前持仓、"
                     "右侧天数存在、ATR14 可计算"
                 )
-    if market == "CN" and version in {"v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"}:
+    if market == "CN" and version in {
+        "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+    }:
         parameters.pop("max_filter_price", None)
         parameters["allowed_industry_temperatures"] = ["温", "热", "沸"]
         rows = [row for row in rows if row["name"] != "筛选价格"]
         for row in rows:
             if row["name"] == "行业温度":
                 row["value"] = "温、热或沸"
-    if market == "CN" and version in {"v9", "v10", "v11", "v12", "v13"}:
+    if market == "CN" and version in {"v9", "v10", "v11", "v12", "v13", "v14"}:
         parameters["allowed_assets"] = ["A股", "ETF基金"]
         for row in rows:
             if row["name"] == "交易市场":
@@ -1543,6 +1568,15 @@ def live_trend_strategy_snapshot(
             }
             for item in ("v4", "v7", "v8", "v9", "v10", "v11")
         ]
+    if market == "CN" and version == "v14":
+        parameters["kelly_sample_inherits"] = [
+            {
+                "market": "CN",
+                "strategy_id": f"trend_animals_warm_to_hot/CN/{item}",
+                "opening_strategy_version": item,
+            }
+            for item in ("v4", "v7", "v8", "v9", "v10", "v11")
+        ]
     if version == "v6" and market in {"US", "HK"}:
         parameters["kelly_sample_inherits"] = [
             {
@@ -1597,6 +1631,15 @@ def live_trend_strategy_snapshot(
             }
             for item in ("v4", "v5", "v6", "v7", "v8", "v9")
         ]
+    if version == "v12" and market in {"US", "HK"}:
+        parameters["kelly_sample_inherits"] = [
+            {
+                "market": market,
+                "strategy_id": f"trend_animals_warm_to_hot/{market}/{item}",
+                "opening_strategy_version": item,
+            }
+            for item in ("v4", "v5", "v6", "v7", "v8", "v9")
+        ]
     current_discipline = (market, version) in CURRENT_EXIT_DISCIPLINES
     if current_discipline:
         for name in OVERHEAT_PARAMETER_NAMES:
@@ -1631,6 +1674,21 @@ def live_trend_strategy_snapshot(
         for row in rows:
             if row["name"] == "退出条件":
                 row["value"] = "危险信号、离开趋势右侧、温度转平或触发保护线时全部卖出"
+    if market == "CN" and version == "v14" or (
+        market in {"US", "HK"} and version == "v12"
+    ):
+        quantity_rule_text = {
+            "CN": "100 股整数倍",
+            "HK": "Futu 每标的整手",
+            "US": "1 股整数倍",
+        }[market]
+        for row in rows:
+            if row["name"] == "买入数量":
+                row["value"] = (
+                    f"使用已有现金，按{quantity_rule_text}向下取整；"
+                    "最小一手不因名义仓位、单笔风险、组合剩余风险、Kelly 或现金上限被排除，"
+                    "仅以额外风险提示标注；现金不足、席位已满等待条件条目同样列入计划"
+                )
     parameters.update(
         {
             "drawdown_limit": str(DRAWDOWN_LIMIT),
@@ -1706,9 +1764,9 @@ def _expected_report_strategy_snapshot(
     allocation = None
     if (
         (market.upper(), requested_version) in {
-            ("CN", "v11"), ("CN", "v12"), ("CN", "v13"),
-            ("HK", "v9"), ("HK", "v10"), ("HK", "v11"),
-            ("US", "v9"), ("US", "v10"), ("US", "v11"),
+            ("CN", "v11"), ("CN", "v12"), ("CN", "v13"), ("CN", "v14"),
+            ("HK", "v9"), ("HK", "v10"), ("HK", "v11"), ("HK", "v12"),
+            ("US", "v9"), ("US", "v10"), ("US", "v11"), ("US", "v12"),
         }
         and isinstance(parameters, Mapping)
     ):
@@ -1727,7 +1785,9 @@ def _expected_report_strategy_snapshot(
                 },
             },
         }
-    if requested_version in {"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"}:
+    if requested_version in {
+        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+    }:
         return live_trend_strategy_snapshot(
             market,
             process_version,
@@ -1931,6 +1991,8 @@ class BuyAction:
     normal_cost: Decimal
     decisive_constraint: str
     futu_symbol: str | None = None
+    sizing_note: str = ""
+    executable: bool = True
 
 
 @dataclass(frozen=True)
@@ -3006,7 +3068,7 @@ def _candidate_reasons(
     if shared_discipline:
         allowed_assets = (
             {"A股", "ETF基金"}
-            if strategy_version in {"v9", "v10", "v11", "v12", "v13"}
+            if strategy_version in {"v9", "v10", "v11", "v12", "v13", "v14"}
             else {"A股"}
         )
         if market == "CN" and item.asset not in allowed_assets:
@@ -3590,6 +3652,7 @@ def _plan_account_rotation_pairs(
     require_mapping: bool,
     excluded_sell_symbols: Sequence[str] = (),
     cash_unconstrained: bool = False,
+    use_final_plan_semantics: bool = True,
 ) -> tuple[tuple[RotationPair, ...], tuple[RotationComparison, ...]]:
     """Pair first, then reuse ordinary entry sizing with each sell's proceeds."""
     positions_by_symbol = {item.symbol: item for item in account.positions}
@@ -3651,7 +3714,7 @@ def _plan_account_rotation_pairs(
                 )
             continue
         candidate_sell_symbols = selected_sell_symbols | {pair.sell_symbol}
-        existing_risk, risk_reason = _post_sell_planned_risk(
+        existing_risk, account_reason, portfolio_reason = _post_sell_planned_risk(
             account=account,
             holdings=holdings,
             sell_symbols=candidate_sell_symbols,
@@ -3674,18 +3737,26 @@ def _plan_account_rotation_pairs(
             portfolio_planned_risk=existing_risk,
             normal_cost_rate=normal_cost_rate,
             cn_target_weights=cn_target_weights,
-            critical_data_reason=critical_data_reason or risk_reason,
+            critical_data_reason=critical_data_reason or account_reason,
+            portfolio_risk_unavailable_reason=portfolio_reason,
             kelly_state=kelly_state,
+            use_final_plan_semantics=use_final_plan_semantics,
         )
-        if not actions:
+        if not actions or actions[0].estimated_shares == 0:
+            # 数据缺失类买入（每手未知/价格保护线缺失）与普通 blocked 一样不生成
+            # 轮换对，避免 0 股/0 手轮换对在执行侧抛异常。
             if pair.pair_index in comparisons_by_index:
-                skip_reason = next(
-                    (
-                        str(item.get("reason") or "")
-                        for item in skips
-                        if isinstance(item, Mapping)
-                    ),
-                    "买入规则阻止",
+                skip_reason = (
+                    actions[0].sizing_note
+                    if actions
+                    else next(
+                        (
+                            str(item.get("reason") or "")
+                            for item in skips
+                            if isinstance(item, Mapping)
+                        ),
+                        "买入规则阻止",
+                    )
                 )
                 comparisons_by_index[pair.pair_index] = replace(
                     comparisons_by_index[pair.pair_index],
@@ -4522,6 +4593,9 @@ def _risk_summary(
     normal_cost_rate: Decimal,
     pause_reason: str = "",
     kelly_state: TrendKellyState | None = None,
+    pending_entries: int = 0,
+    data_defect_reason: str = "",
+    use_final_plan_semantics: bool = True,
 ) -> dict[str, object]:
     valid_nav = net_value.is_finite() and net_value > 0
     portfolio_limit = net_value * PORTFOLIO_RISK_LIMIT if valid_nav else None
@@ -4575,6 +4649,14 @@ def _risk_summary(
         "disclaimer": RISK_BUDGET_DISCLAIMER,
         "portfolio_remaining_risk_note": PORTFOLIO_REMAINING_RISK_NOTE,
     }
+    if use_final_plan_semantics:
+        # 仅新语义输出这两个键；旧语义（≤v13/v11）回放产物保持原键集逐字一致。
+        summary["pending_entries_note"] = (
+            f"另有 {pending_entries} 条待现金/席位，未计入"
+            if pending_entries > 0
+            else ""
+        )
+        summary["data_defect_reason"] = data_defect_reason
     if kelly_state is not None:
         reason = (
             kelly_state.reason
@@ -4603,6 +4685,48 @@ def _risk_summary(
     return summary
 
 
+def _data_missing_buy_action(
+    item: CandidateInput,
+    *,
+    weight: Decimal,
+    target_amount: Decimal,
+    lot_size: int,
+    sizing_note: str,
+    decisive_constraint: str,
+) -> BuyAction:
+    """List a trend-passing candidate that cannot be sized due to missing facts."""
+    close = item.close if item.close is not None else Decimal("0")
+    atr = item.atr if item.atr is not None else Decimal("0")
+    return BuyAction(
+        symbol=item.symbol,
+        name=item.name,
+        industry=item.industry,
+        target_weight=weight,
+        target_amount=target_amount,
+        estimated_shares=0,
+        lot_size=lot_size,
+        filter_price=item.filter_price,
+        close=close,
+        market_cap=item.market_cap,
+        industry_tm_id=item.industry_tm_id,
+        industry_temperature=item.industry_temperature,
+        temperature_prev=item.temperature_prev,
+        temperature_curr=item.temperature_curr,
+        phase=item.phase,
+        strength=item.strength,
+        amount=item.amount,
+        atr=atr,
+        estimated_initial_line=close - INITIAL_PROTECTION_ATR_MULTIPLE * atr,
+        planned_stop_risk=Decimal("0"),
+        planned_stop_risk_pct=Decimal("0"),
+        normal_cost=Decimal("0"),
+        decisive_constraint=decisive_constraint,
+        futu_symbol=item.futu_symbol,
+        sizing_note=sizing_note,
+        executable=False,
+    )
+
+
 def _plan_buy_actions(
     *,
     ranked: Sequence[CandidateInput],
@@ -4617,7 +4741,9 @@ def _plan_buy_actions(
     normal_cost_rate: Decimal,
     cn_target_weights: Mapping[str, Decimal] = CN_TARGET_WEIGHTS,
     critical_data_reason: str = "",
+    portfolio_risk_unavailable_reason: str = "",
     kelly_state: TrendKellyState | None = None,
+    use_final_plan_semantics: bool = True,
 ) -> tuple[list[BuyAction], list[dict[str, object]], dict[str, object]]:
     def entry_weight(item: CandidateInput) -> Decimal | None:
         nominal = (
@@ -4644,18 +4770,23 @@ def _plan_buy_actions(
             or price_fx_to_account_currency <= 0
         ):
             critical_data_reason = "汇率缺失，暂停新开仓"
-        elif portfolio_planned_risk is None:
-            critical_data_reason = "模拟持仓风险事实缺失，暂停新开仓"
-        elif any(
-            item.close is None
-            or not item.close.is_finite()
-            or item.close <= 0
-            or item.atr is None
-            or not item.atr.is_finite()
-            or item.atr <= 0
-            for item in ranked
-        ):
-            critical_data_reason = "候选价格或活动保护线缺失，暂停新开仓"
+        elif not use_final_plan_semantics:
+            # 旧版本语义：组合风险事实或候选价格/保护线任一缺失即整批暂停。
+            if portfolio_planned_risk is None:
+                critical_data_reason = (
+                    portfolio_risk_unavailable_reason
+                    or "模拟持仓风险事实缺失，暂停新开仓"
+                )
+            elif any(
+                item.close is None
+                or not item.close.is_finite()
+                or item.close <= 0
+                or item.atr is None
+                or not item.atr.is_finite()
+                or item.atr <= 0
+                for item in ranked
+            ):
+                critical_data_reason = "候选价格或活动保护线缺失，暂停新开仓"
 
     if critical_data_reason:
         skips = [
@@ -4675,9 +4806,10 @@ def _plan_buy_actions(
             normal_cost_rate=normal_cost_rate,
             pause_reason=critical_data_reason,
             kelly_state=kelly_state,
+            data_defect_reason=critical_data_reason,
+            use_final_plan_semantics=use_final_plan_semantics,
         )
 
-    assert portfolio_planned_risk is not None
     if (
         kelly_state is not None
         and kelly_state.enabled
@@ -4701,8 +4833,13 @@ def _plan_buy_actions(
             normal_cost_rate=normal_cost_rate,
             pause_reason=pause_reason,
             kelly_state=kelly_state,
+            use_final_plan_semantics=use_final_plan_semantics,
         )
-    if portfolio_planned_risk >= net_value * PORTFOLIO_RISK_LIMIT:
+    if (
+        not use_final_plan_semantics
+        and portfolio_planned_risk is not None
+        and portfolio_planned_risk >= net_value * PORTFOLIO_RISK_LIMIT
+    ):
         pause_reason = "组合正常计划风险已达到净值 4%"
         skips = [
             _risk_skip(
@@ -4721,11 +4858,23 @@ def _plan_buy_actions(
             normal_cost_rate=normal_cost_rate,
             pause_reason=pause_reason,
             kelly_state=kelly_state,
+            use_final_plan_semantics=use_final_plan_semantics,
         )
+    if not portfolio_risk_unavailable_reason:
+        portfolio_risk_unavailable_reason = "持仓计划风险缺失"
+    portfolio_risk_unavailable_reason = (
+        portfolio_risk_unavailable_reason
+        .removeprefix("模拟持仓 ")
+        .removesuffix("，暂停新开仓")
+    )
     remaining_cash = available_cash
-    remaining_risk = max(
-        Decimal("0"),
-        net_value * PORTFOLIO_RISK_LIMIT - portfolio_planned_risk,
+    remaining_risk = (
+        max(
+            Decimal("0"),
+            net_value * PORTFOLIO_RISK_LIMIT - portfolio_planned_risk,
+        )
+        if portfolio_planned_risk is not None
+        else None
     )
     single_entry_limit = net_value * SINGLE_ENTRY_RISK_LIMIT
     slots = max(0, POSITION_LIMIT - current_position_count)
@@ -4740,19 +4889,51 @@ def _plan_buy_actions(
         weight = entry_weight(item)
         if weight is None:
             continue
-        target_amount = min(net_value * weight, remaining_cash).quantize(
+        base_amount = min(net_value * weight, remaining_cash).quantize(
             Decimal("0.01")
         )
-        if slots == 0:
+        slot_full = slots == 0
+        if not use_final_plan_semantics and slot_full:
             skips.append(
                 _risk_skip(
                     item,
                     weight=weight,
-                    target_amount=target_amount,
+                    target_amount=base_amount,
                     reason="10 个持仓席位已满",
                     decisive_constraint="持仓席位",
                 )
             )
+            continue
+        if (
+            item.close is None
+            or not item.close.is_finite()
+            or item.close <= 0
+            or item.atr is None
+            or not item.atr.is_finite()
+            or item.atr <= 0
+        ):
+            if use_final_plan_semantics:
+                actions.append(
+                    _data_missing_buy_action(
+                        item,
+                        weight=weight,
+                        target_amount=base_amount,
+                        lot_size=0,
+                        sizing_note="候选价格或活动保护线缺失",
+                        decisive_constraint="关键风险数据",
+                    )
+                )
+            else:
+                # 旧语义下该情形已在批前 critical 检查中整体暂停，此处仅兜底。
+                skips.append(
+                    _risk_skip(
+                        item,
+                        weight=weight,
+                        target_amount=base_amount,
+                        reason="候选价格或活动保护线缺失，暂停新开仓",
+                        decisive_constraint="关键风险数据",
+                    )
+                )
             continue
         lot_size = (
             100
@@ -4762,17 +4943,28 @@ def _plan_buy_actions(
             else 1
         )
         if lot_size <= 0:
-            skips.append(
-                _risk_skip(
-                    item,
-                    weight=weight,
-                    target_amount=target_amount,
-                    reason="缺少实际每手股数",
-                    decisive_constraint="交易单位",
+            if use_final_plan_semantics:
+                actions.append(
+                    _data_missing_buy_action(
+                        item,
+                        weight=weight,
+                        target_amount=base_amount,
+                        lot_size=0,
+                        sizing_note="每手股数未知，无法定量",
+                        decisive_constraint="交易单位",
+                    )
                 )
-            )
+            else:
+                skips.append(
+                    _risk_skip(
+                        item,
+                        weight=weight,
+                        target_amount=base_amount,
+                        reason="缺少实际每手股数",
+                        decisive_constraint="交易单位",
+                    )
+                )
             continue
-        assert item.close is not None and item.atr is not None
         protection_line = item.close - INITIAL_PROTECTION_ATR_MULTIPLE * item.atr
         sized = size_entry_by_risk(
             entry_price=item.close,
@@ -4786,18 +4978,59 @@ def _plan_buy_actions(
             lot_size=Decimal(lot_size),
             normal_cost_rate=normal_cost_rate,
         )
-        if sized.final_quantity <= 0:
+        quantity = int(sized.final_quantity)
+        if not use_final_plan_semantics and sized.exceeded_limits:
+            # 旧语义下任意上限低于一手的候选按原剔除路径处理（对应原
+            # size_entry_by_risk 返回 final_quantity=0 的整批剔除行为）。
+            lot_text = format(lot_size, "f")
+            if "." in lot_text:
+                lot_text = lot_text.rstrip("0").rstrip(".")
             skips.append(
                 _risk_skip(
                     item,
                     weight=weight,
-                    target_amount=target_amount,
-                    reason=sized.reason,
+                    target_amount=base_amount,
+                    reason=(
+                        f"最小交易单位 {lot_text} 股超过"
+                        f"{sized.decisive_constraint}"
+                    ),
                     decisive_constraint=sized.decisive_constraint,
                 )
             )
             continue
-        quantity = int(sized.final_quantity)
+        notes: list[str] = []
+        for limit_name in sized.exceeded_limits:
+            if limit_name == "现金":
+                # 现金超限只保留专属模板「现金不足一手（需约 X，可用 Y）」，
+                # 不叠加「一手超过现金」文案。
+                continue
+            if (
+                limit_name == "名义仓位上限"
+                and nominal_weight is not None
+                and weight < nominal_weight
+            ):
+                notes.append("一手超过 Kelly 收缩上限")
+            else:
+                notes.append(f"一手超过{limit_name}")
+        if portfolio_planned_risk is None:
+            notes.append(
+                f"组合剩余风险不可用（{portfolio_risk_unavailable_reason}）"
+            )
+        if slot_full:
+            notes.append("10 个持仓席位已满")
+        cash_short = sized.cash_required > remaining_cash
+        if cash_short:
+            notes.append(
+                f"现金不足一手（需约 {_money(sized.cash_required)}，"
+                f"可用 {_money(remaining_cash)}）"
+            )
+        executable = not slot_full and not cash_short
+        if not use_final_plan_semantics:
+            executable = True
+        target_amount = max(
+            base_amount,
+            quantity * item.close * price_fx_to_account_currency,
+        ).quantize(Decimal("0.01"))
         actions.append(
             BuyAction(
                 symbol=item.symbol,
@@ -4830,14 +5063,41 @@ def _plan_buy_actions(
                     else sized.decisive_constraint
                 ),
                 futu_symbol=item.futu_symbol,
+                sizing_note="；".join(notes),
+                executable=executable,
             )
         )
-        remaining_cash -= sized.cash_required
-        remaining_risk -= sized.planned_stop_risk
-        slots -= 1
+        if executable:
+            remaining_cash -= sized.cash_required
+            if remaining_risk is not None:
+                remaining_risk = max(
+                    Decimal("0"), remaining_risk - sized.planned_stop_risk
+                )
+            slots -= 1
 
     new_planned_risk = sum(
-        (item.planned_stop_risk for item in actions), Decimal("0")
+        (
+            item.planned_stop_risk
+            for item in actions
+            if item.executable
+        ),
+        Decimal("0"),
+    )
+    pending_entries = sum(1 for item in actions if not item.executable)
+    defect_reasons: list[str] = []
+    if portfolio_planned_risk is None:
+        defect_reasons.append(
+            f"组合剩余风险不可用（{portfolio_risk_unavailable_reason}）"
+        )
+    defect_reasons.extend(
+        sorted(
+            {
+                item.sizing_note
+                for item in actions
+                if not item.executable and item.estimated_shares == 0
+                and item.sizing_note
+            }
+        )
     )
     return actions, skips, _risk_summary(
         net_value=net_value,
@@ -4845,6 +5105,9 @@ def _plan_buy_actions(
         new_planned_risk=new_planned_risk,
         normal_cost_rate=normal_cost_rate,
         kelly_state=kelly_state,
+        pending_entries=pending_entries,
+        data_defect_reason="；".join(defect_reasons),
+        use_final_plan_semantics=use_final_plan_semantics,
     )
 
 
@@ -4987,20 +5250,26 @@ def _post_sell_planned_risk(
     price_fx_to_account_currency: Decimal,
     normal_cost_rate: Decimal,
     cash_unconstrained: bool = False,
-) -> tuple[Decimal | None, str]:
+) -> tuple[Decimal | None, str, str]:
+    """Return (planned risk, account-level reason, portfolio fact reason).
+
+    Account-level facts (nav/cash/fx/cost model) stop the whole entry batch as
+    a data error.  A missing per-position fact only makes the portfolio risk
+    unavailable; callers degrade the 组合剩余风险 cap instead of stopping.
+    """
     if not account.net_value.is_finite() or account.net_value <= 0:
-        return None, "模拟盘净值缺失，暂停新开仓"
+        return None, "模拟盘净值缺失，暂停新开仓", ""
     if not account.available_cash.is_finite() or (
         not cash_unconstrained and account.available_cash < 0
     ):
-        return None, "模拟盘现金缺失，暂停新开仓"
+        return None, "模拟盘现金缺失，暂停新开仓", ""
     if (
         not price_fx_to_account_currency.is_finite()
         or price_fx_to_account_currency <= 0
     ):
-        return None, "汇率缺失，暂停新开仓"
+        return None, "汇率缺失，暂停新开仓", ""
     if not normal_cost_rate.is_finite() or normal_cost_rate < 0:
-        return None, "正常成本模型缺失，暂停新开仓"
+        return None, "正常成本模型缺失，暂停新开仓", ""
 
     holding_by_symbol = {item.symbol: item for item in holdings}
     planned_risk = Decimal("0")
@@ -5008,7 +5277,9 @@ def _post_sell_planned_risk(
         if position.symbol in sell_symbols:
             continue
         if not position.quantity.is_finite() or position.quantity <= 0:
-            return None, f"模拟持仓 {position.symbol} 数量缺失，暂停新开仓"
+            return None, "", (
+                f"模拟持仓 {position.symbol} 数量缺失，暂停新开仓"
+            )
         holding = holding_by_symbol.get(position.symbol)
         if (
             holding is None
@@ -5017,19 +5288,23 @@ def _post_sell_planned_risk(
             or not holding.active_line.is_finite()
             or holding.active_line < 0
         ):
-            return None, f"模拟持仓 {position.symbol} 活动保护线缺失，暂停新开仓"
+            return None, "", (
+                f"模拟持仓 {position.symbol} 活动保护线缺失，暂停新开仓"
+            )
         if (
             holding.close is None
             or not holding.close.is_finite()
             or holding.close <= 0
         ):
-            return None, f"模拟持仓 {position.symbol} 价格缺失，暂停新开仓"
+            return None, "", (
+                f"模拟持仓 {position.symbol} 价格缺失，暂停新开仓"
+            )
         planned_risk += position.quantity * (
             max(Decimal("0"), holding.close - holding.active_line)
             * price_fx_to_account_currency
             + holding.close * price_fx_to_account_currency * normal_cost_rate
         )
-    return planned_risk, ""
+    return planned_risk, "", ""
 
 
 def _evaluate_holding_positions(
@@ -5395,7 +5670,7 @@ def build_report(
                 key: Decimal(str(raw_cn_weights))
                 for key in ("热", "沸")
             }
-            if market == "CN" and snapshot_version in {"v11", "v12", "v13"}
+            if market == "CN" and snapshot_version in {"v11", "v12", "v13", "v14"}
             else CN_TARGET_WEIGHTS
         )
     except (InvalidOperation, KeyError, ValueError):
@@ -5416,14 +5691,20 @@ def build_report(
             last_closed_at="",
             selected_round_ids=(),
         )
-        if snapshot_version in {"v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"} and kelly_data_reason
+        if snapshot_version in {
+            "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+            "v11", "v12", "v13", "v14",
+        } and kelly_data_reason
         else calculate_trend_kelly(
             kelly_rounds,
             market=market,
             strategy_id=str(resolved_strategy_snapshot.get("strategy_id") or ""),
             opening_strategy_version=snapshot_version,
         )
-        if snapshot_version in {"v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"}
+        if snapshot_version in {
+            "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+            "v11", "v12", "v13", "v14",
+        }
         else None
     )
     held_symbols = {position.symbol for position in account.positions}
@@ -5546,7 +5827,14 @@ def build_report(
         risk_skips: list[dict[str, object]] = []
         risk_summary: dict[str, object] = {}
     else:
-        existing_planned_risk, inferred_critical_data_reason = _post_sell_planned_risk(
+        use_final_plan_semantics = (
+            market.upper(), snapshot_version
+        ) in FINAL_PLAN_TREND_VERSIONS
+        (
+            existing_planned_risk,
+            inferred_critical_data_reason,
+            portfolio_risk_unavailable_reason,
+        ) = _post_sell_planned_risk(
             account=account,
             holdings=holdings,
             sell_symbols=sell_symbols,
@@ -5569,9 +5857,14 @@ def build_report(
             normal_cost_rate=normal_cost_rate,
             cn_target_weights=cn_target_weights,
             critical_data_reason=critical_data_reason,
+            portfolio_risk_unavailable_reason=portfolio_risk_unavailable_reason,
             kelly_state=kelly_state,
+            use_final_plan_semantics=use_final_plan_semantics,
         )
-        if snapshot_version in {"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"} and (
+        if snapshot_version in {
+            "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+            "v11", "v12", "v13", "v14",
+        } and (
             not valid_drawdown_decision(
                 drawdown_summary,
                 expected_market=market,
@@ -5612,6 +5905,10 @@ def build_report(
                     new_planned_risk=Decimal("0"),
                     normal_cost_rate=normal_cost_rate,
                     kelly_state=kelly_state,
+                    data_defect_reason=str(
+                        risk_summary.get("data_defect_reason") or ""
+                    ),
+                    use_final_plan_semantics=use_final_plan_semantics,
                 )
     if symbol_mapping_required:
         missing_mapping = {
@@ -5651,16 +5948,30 @@ def build_report(
                 net_value=account.net_value,
                 existing_planned_risk=existing_risk,
                 new_planned_risk=sum(
-                    (item.planned_stop_risk for item in buy_actions),
+                    (
+                        item.planned_stop_risk
+                        for item in buy_actions
+                        if item.executable
+                    ),
                     Decimal("0"),
                 ),
                 normal_cost_rate=normal_cost_rate,
                 pause_reason=str(risk_summary.get("pause_reason") or ""),
                 kelly_state=kelly_state,
+                pending_entries=sum(
+                    1 for item in buy_actions if not item.executable
+                ),
+                data_defect_reason=str(
+                    risk_summary.get("data_defect_reason") or ""
+                ),
+                use_final_plan_semantics=use_final_plan_semantics,
             )
 
     drawdown_pause_reason = ""
-    if snapshot_version in {"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"} and (
+    if snapshot_version in {
+        "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        "v11", "v12", "v13", "v14",
+    } and (
         not valid_drawdown_decision(
             drawdown_summary,
             expected_market=market,
@@ -5694,7 +6005,7 @@ def build_report(
     if (
         rotation_enabled
         and post_sell_position_count == POSITION_LIMIT
-        and not buy_actions
+        and not any(action.executable for action in buy_actions)
         and not drawdown_pause_reason
     ):
         simulate_rotation_pairs, simulate_rotation_comparisons = _plan_account_rotation_pairs(
@@ -5713,6 +6024,7 @@ def build_report(
             critical_data_reason=critical_data_reason,
             require_mapping=symbol_mapping_required,
             excluded_sell_symbols=(),
+            use_final_plan_semantics=use_final_plan_semantics,
         )
         simulate_rotation_pairs = tuple(
             replace(
@@ -5766,6 +6078,7 @@ def build_report(
                 require_mapping=symbol_mapping_required,
                 excluded_sell_symbols=tuple(real_blocked_symbols),
                 cash_unconstrained=True,
+                use_final_plan_semantics=use_final_plan_semantics,
             )
             real_rotation_pairs = tuple(
                 replace(
@@ -6287,6 +6600,11 @@ def _append_feishu_action_sections(
                 f"约 {item.get('estimated_shares', '-')} 股｜"
                 f"金额上限 {_feishu_money(item.get('target_amount') or '0')}｜"
                 f"保护线 {_feishu_money(item.get('estimated_initial_line') or '0')}"
+                + (
+                    f"｜额外风险：{item['sizing_note']}"
+                    if item.get("sizing_note")
+                    else ""
+                )
             )
     if reviews:
         lines.extend(["", "人工复核"])
@@ -6743,7 +7061,8 @@ def render_markdown(report: TrendReport) -> str:
             )
         )
     if report.strategy_snapshot.get("strategy_version") in {
-        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        "v11", "v12", "v13", "v14",
     }:
         phase = {
             "cold_start": "冷启动",
@@ -6777,6 +7096,14 @@ def render_markdown(report: TrendReport) -> str:
             f"{_risk_percent(report.risk_summary['abnormal_loss_buffer_pct'])}（不得用于开仓）",
             "",
         ])
+        if report.risk_summary.get("pending_entries_note"):
+            lines.append(f"- {report.risk_summary['pending_entries_note']}")
+        if report.risk_summary.get("data_defect_reason"):
+            lines.append(f"- 数据缺陷：{report.risk_summary['data_defect_reason']}")
+        if report.risk_summary.get("pending_entries_note") or report.risk_summary.get(
+            "data_defect_reason"
+        ):
+            lines.append("")
     if report.drawdown_summary is not None:
         drawdown = report.drawdown_summary.get("drawdown_pct")
         drawdown_text = _risk_percent(drawdown)
@@ -6885,12 +7212,22 @@ def render_markdown(report: TrendReport) -> str:
                         f"目标仓位 {_money(item.target_weight * Decimal('100'))}%｜"
                         f"金额上限 {_money(item.target_amount)} 元｜约 {item.estimated_shares} 股｜"
                         f"预计保护线 {_money(item.estimated_initial_line)}"
+                        + (
+                            f"｜额外风险：{item.sizing_note}"
+                            if item.sizing_note
+                            else ""
+                        )
                     )
                 else:
                     lines.append(
                         f"- {index}. {item.symbol} {item.name}｜约 {item.estimated_shares} 股｜"
                         f"金额上限 {_money(item.target_amount)} {currency}｜"
                         f"预计保护线 {_money(item.estimated_initial_line)}"
+                        + (
+                            f"｜额外风险：{item.sizing_note}"
+                            if item.sizing_note
+                            else ""
+                        )
                     )
             if market == "CN":
                 quantity_rule = "按富途数据日前复权日线收盘价向下取整为 100 股整数倍"
@@ -7116,7 +7453,8 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         raise ValueError("strategy snapshot does not match report actions")
     version = snapshot.get("strategy_version")
     if version not in {
-        "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+        "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        "v11", "v12", "v13", "v14",
     }:
         raise ValueError("strategy snapshot does not match report actions")
     expected_snapshot = _expected_report_strategy_snapshot(
@@ -7148,7 +7486,10 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         or parameters.get("full_exit_precedes_partial_exit") is not True
     ):
         raise ValueError("strategy snapshot does not match report actions")
-    if version in {"v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"}:
+    if version in {
+        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        "v11", "v12", "v13", "v14",
+    }:
         valid_contract = {
             "v2": valid_v2_risk_contract,
             "v3": valid_v3_risk_contract,
@@ -7162,6 +7503,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             "v11": valid_v4_risk_contract,
             "v12": valid_v4_risk_contract,
             "v13": valid_v4_risk_contract,
+            "v14": valid_v4_risk_contract,
         }[version]
         if not valid_contract(
             parameters,
@@ -7183,9 +7525,26 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             nav = portfolio_limit / PORTFOLIO_RISK_LIMIT
         else:
             raise ValueError("strategy snapshot does not match report actions")
+        data_missing_notes = {
+            "每手股数未知，无法定量",
+            "候选价格或活动保护线缺失",
+        }
         for action in report.buy_actions:
             assert nav is not None
-            if (
+            data_missing = (
+                action.estimated_shares == 0
+                and action.sizing_note in data_missing_notes
+            )
+            if data_missing:
+                if (
+                    action.lot_size != 0
+                    or action.planned_stop_risk != 0
+                    or action.planned_stop_risk_pct != 0
+                    or action.normal_cost != 0
+                    or action.executable is not False
+                ):
+                    raise ValueError("strategy snapshot does not match report actions")
+            elif (
                 action.estimated_shares <= 0
                 or action.lot_size <= 0
                 or action.estimated_shares % action.lot_size != 0
@@ -7195,7 +7554,10 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
                 or action.planned_stop_risk_pct <= 0
                 or action.planned_stop_risk_pct
                 != action.planned_stop_risk / nav
-                or action.planned_stop_risk > nav * SINGLE_ENTRY_RISK_LIMIT
+                or (
+                    action.planned_stop_risk > nav * SINGLE_ENTRY_RISK_LIMIT
+                    and action.estimated_shares != action.lot_size
+                )
                 or not action.normal_cost.is_finite()
                 or action.normal_cost <= 0
                 or action.normal_cost > action.planned_stop_risk
@@ -7209,12 +7571,16 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
                 }
             ):
                 raise ValueError("strategy snapshot does not match report actions")
-            new_planned_risk += action.planned_stop_risk
+            if action.executable:
+                new_planned_risk += action.planned_stop_risk
         if _nonnegative_risk_decimal(
             report.risk_summary.get("new_planned_risk")
         ) != new_planned_risk:
             raise ValueError("strategy snapshot does not match report actions")
-    if version in {"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"}:
+    if version in {
+        "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        "v11", "v12", "v13", "v14",
+    }:
         if (
             not valid_drawdown_decision(
                 report.drawdown_summary,
@@ -7250,7 +7616,8 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         )
         expected_weight = Decimal(str(nominal_weight))
         if version in {
-            "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+            "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+            "v11", "v12", "v13", "v14",
         } and report.risk_summary.get("kelly_phase") not in {
             "cold_start", "unavailable",
         }:
@@ -7259,12 +7626,19 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
                 raise ValueError("strategy snapshot does not match report actions")
             expected_weight = min(expected_weight, cap)
         expected_lot = parameters.get("lot_size")
+        data_missing = (
+            action.estimated_shares == 0
+            and action.sizing_note in data_missing_notes
+        )
         if (
             action.target_weight != expected_weight
-            or (expected_lot is not None and action.lot_size != expected_lot)
-            or action.lot_size <= 0
             or action.estimated_initial_line
             != action.close - protection_multiple * action.atr
+            or not data_missing
+            and (
+                expected_lot is not None and action.lot_size != expected_lot
+                or action.lot_size <= 0
+            )
         ):
             raise ValueError("strategy snapshot does not match report actions")
 
