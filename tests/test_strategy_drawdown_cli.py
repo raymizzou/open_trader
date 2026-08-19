@@ -200,7 +200,7 @@ def test_trend_drawdown_preflight_cli_bootstraps_all_markets_independently(
     for market, directory, equity in (
         ("CN", "trend_a_share", "100"),
         ("HK", "trend_hk_phillips", "200"),
-        ("US", "trend_us_tiger", "300"),
+        ("US", "trend_us_futu", "300"),
     ):
         path = config.reports_dir / directory / "2026-07-17.json"
         path.parent.mkdir(parents=True, exist_ok=True)

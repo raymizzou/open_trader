@@ -15,13 +15,13 @@ from .trend_review import _report_hash
 
 
 TREND_SIMULATE_BROKERS = {
-    "tiger": ("US", "USD"),
+    "futu": ("US", "USD"),
     "phillips": ("HK", "HKD"),
     "eastmoney": ("CN", "CNY"),
 }
 
 _REPORT_DIRECTORIES = {
-    "tiger": "trend_us_tiger",
+    "futu": "trend_us_futu",
     "phillips": "trend_hk_phillips",
     "eastmoney": "trend_a_share",
 }

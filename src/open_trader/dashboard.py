@@ -108,12 +108,12 @@ BROKER_LABELS = {
     "eastmoney": "东方财富",
 }
 TREND_REPORT_SOURCES = {
-    "tiger": ("US", "美股", "老虎", "trend_us_tiger", "美股常规交易时段"),
+    "futu": ("US", "美股", "富途", "trend_us_futu", "美股常规交易时段"),
     "phillips": ("HK", "港股", "辉立", "trend_hk_phillips", "09:30–10:00"),
     "eastmoney": ("CN", "A股", "东方财富", "trend_a_share", "09:30–10:00"),
 }
 TREND_HOLDING_EVIDENCE_ALLOWLIST = {
-    ("tiger", "US"): frozenset({
+    ("futu", "US"): frozenset({
         "US.AMZN",
         "US.CRNX",
         "US.GRMN",
@@ -165,7 +165,7 @@ OPTION_ATTENTION_TRANSITIONS = {
     "champagne",
 }
 TREND_REVIEW_SOURCES = {
-    "tiger": ("US", "美股", "老虎"),
+    "futu": ("US", "美股", "富途"),
     "phillips": ("HK", "港股", "辉立"),
     "eastmoney": ("CN", "A股", "东方财富"),
 }
@@ -3016,7 +3016,7 @@ def _project_trend_trade_stats(
     actual_broker = (
         str(actual_sources[0]["broker"])
         if len(actual_sources) == 1
-        else {"CN": "eastmoney", "HK": "phillips", "US": "tiger"}[market]
+        else {"CN": "eastmoney", "HK": "phillips", "US": "futu"}[market]
     )
     def compact(source: str) -> dict[str, Any]:
         stat = by_source[source]

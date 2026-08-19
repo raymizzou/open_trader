@@ -79,7 +79,7 @@ DISCLAIMER_TEXT = (
     "本报告是确定性纪律清单，不是订单或成交事实；所有交易由用户人工确认与执行。"
 )
 NON_REALTIME_ACCOUNT_WARNING = "账户数据非实时，执行前核对现金与持仓"
-STALE_TIGER_ACCOUNT_WARNING = "账户数据非实时，禁止新增买入；持仓需复核"
+STALE_FUTU_ACCOUNT_WARNING = "账户数据非实时，禁止新增买入；持仓需复核"
 TREND_API_COST_UNIT = "Trend Animals 余额单位"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 UNIFIED_TREND_FIELDS = (
@@ -2059,6 +2059,7 @@ class RealHoldingInput:
     position_count: int | None = None
     instrument_ids_by_symbol: Mapping[str, str] = field(default_factory=dict)
     blocked_instrument_ids: Mapping[str, str] = field(default_factory=dict)
+    account_exceptions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2245,7 +2246,7 @@ def load_real_holding_input(
     broker_by_market = {
         "CN": ("eastmoney", "东方财富"),
         "HK": ("phillips", "辉立"),
-        "US": ("tiger", "老虎"),
+        "US": ("futu", "富途"),
     }
     try:
         broker, broker_label = broker_by_market[normalized_market]
@@ -2310,6 +2311,7 @@ def load_real_holding_input(
     positions: list[AccountPosition] = []
     instrument_ids_by_symbol: dict[str, str] = {}
     blocked_instrument_ids: dict[str, str] = {}
+    account_exceptions: list[str] = []
     account_currency = {"CN": "CNY", "HK": "HKD", "US": "USD"}[
         normalized_market
     ]
@@ -2325,6 +2327,11 @@ def load_real_holding_input(
         if not asset_class:
             asset_class = detect_asset_class(symbol_text, name).value
         if asset_class not in {"stock", "etf"}:
+            if normalized_market == "US":
+                account_exceptions.append(
+                    "unsupported Futu asset: "
+                    f"{symbol_text or '<missing-symbol>'} ({name or '<missing-name>'})"
+                )
             continue
         currency = str(row.get("currency") or "").strip().upper()
         if currency != account_currency:
@@ -2445,6 +2452,9 @@ def load_real_holding_input(
     # subscriptions and margin financing); only the converted net value gates
     # rotation sizing.
     available_cash = sum(converted_cash, Decimal("0")) if converted_cash else Decimal("0")
+    source = dict(source)
+    if account_exceptions:
+        source["account_exceptions"] = "；".join(account_exceptions)
     return RealHoldingInput(
         status="available",
         reason="",
@@ -5940,7 +5950,7 @@ def _finalize_market_report(
                 replace(
                     holding,
                     action="MANUAL_REVIEW",
-                    reason="stale_tiger_account",
+                    reason="stale_futu_account",
                 )
                 for holding in report.holdings
             ),
@@ -6091,7 +6101,7 @@ REASON_LABELS = {
     "holding_trend_excluded": "已排除趋势查询",
     "holding_kline_unavailable": "持仓日线数据不可用",
     "holding_lot_size_unavailable": "持仓整手信息不可用",
-    "stale_tiger_account": "老虎账户数据非实时，禁止新增买入；持仓需复核",
+    "stale_futu_account": "富途账户数据非实时，禁止新增买入；持仓需复核",
     "trend_intact": "趋势保持完好",
     "temperature_changed_to_flat": "趋势温度转平",
     "overheat_take_profit": "沸腾/开香槟过热止盈",
@@ -6190,6 +6200,14 @@ def _account_exception_label(value: str) -> str:
                 "<missing-name>", "名称缺失"
             )
             return f"东方财富账户不支持的资产：{identity}"
+    futu_prefix = "unsupported Futu asset: "
+    if value.startswith(futu_prefix):
+        identity, separator, details = value[len(futu_prefix) :].rpartition(" (")
+        if identity and separator and details.endswith(")"):
+            identity = identity.replace("<missing-symbol>", "代码缺失").replace(
+                "<missing-name>", "名称缺失"
+            )
+            return f"富途账户不支持的资产：{identity}"
     return "其他账户例外：详见 JSON 审计文件"
 
 
@@ -6386,8 +6404,8 @@ def render_trend_feishu_text(
     status = (
         "已更新"
         if fresh
-        else STALE_TIGER_ACCOUNT_WARNING
-        if metadata.get("broker") == "tiger"
+        else STALE_FUTU_ACCOUNT_WARNING
+        if metadata.get("broker") == "futu"
         else NON_REALTIME_ACCOUNT_WARNING
     )
     summary = (
@@ -6699,8 +6717,8 @@ def render_markdown(report: TrendReport) -> str:
     freshness = (
         "已更新"
         if report.account.fresh is True
-        else STALE_TIGER_ACCOUNT_WARNING
-        if report.metadata.get("broker") == "tiger"
+        else STALE_FUTU_ACCOUNT_WARNING
+        if report.metadata.get("broker") == "futu"
         else NON_REALTIME_ACCOUNT_WARNING
     )
     sells = [

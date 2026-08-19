@@ -17,7 +17,7 @@ def account_snapshot() -> dict[str, object]:
     for market, broker, currency, symbol, instrument_id in (
         ("CN", "eastmoney", "CNY", "SH.600001", "ins_cn"),
         ("HK", "phillips", "HKD", "700", "ins_hk"),
-        ("US", "tiger", "USD", "AAPL", "ins_us"),
+        ("US", "futu", "USD", "AAPL", "ins_us"),
     ):
         positions.append({
             "broker": broker,
@@ -51,7 +51,7 @@ def account_snapshot() -> dict[str, object]:
                 "reason": None,
                 "brokers": {
                     broker: {
-                        "source_kind": "live" if broker == "tiger" else "statement",
+                        "source_kind": "live" if broker == "futu" else "statement",
                         "data_as_of": "2026-08-04T12:00:00+08:00",
                         "last_success_at": "2026-08-04T12:00:00+08:00",
                         "status": "healthy",
@@ -76,7 +76,7 @@ def account_snapshot() -> dict[str, object]:
     [
         ("CN", "eastmoney", "CNY", "600001", "ins_cn"),
         ("HK", "phillips", "HKD", "00700", "ins_hk"),
-        ("US", "tiger", "USD", "AAPL", "ins_us"),
+        ("US", "futu", "USD", "AAPL", "ins_us"),
     ],
 )
 def test_real_input_projects_only_the_market_trend_broker(
@@ -173,12 +173,12 @@ def test_real_input_applies_one_block_to_every_row_of_an_instrument(
     snapshot = account_snapshot()
     original = next(
         item for item in snapshot["positions"]  # type: ignore[index]
-        if item["broker"] == "tiger"
+        if item["broker"] == "futu"
     )
     second = deepcopy(original)
-    second.update(account_alias="tiger_secondary", position_id="pos_us_secondary")
+    second.update(account_alias="futu_secondary", position_id="pos_us_secondary")
     snapshot["positions"].append(second)  # type: ignore[union-attr]
-    broker = snapshot["sources"]["account"]["brokers"]["tiger"]  # type: ignore[index]
+    broker = snapshot["sources"]["account"]["brokers"]["futu"]  # type: ignore[index]
     broker.update(status="stale", reason="broker_refresh_failed")
     snapshot["status"] = "stale"
 
@@ -191,7 +191,7 @@ def test_real_input_applies_one_block_to_every_row_of_an_instrument(
     assert len(loaded.positions) == 2
     assert loaded.instrument_ids_by_symbol == {"AAPL": "ins_us"}
     assert loaded.blocked_instrument_ids == {
-        "ins_us": "account_broker_stale:tiger"
+        "ins_us": "account_broker_stale:futu"
     }
 
 
@@ -215,19 +215,19 @@ def test_real_input_tolerates_multi_currency_and_negative_cash(
     tmp_path: Path,
 ) -> None:
     snapshot = account_snapshot()
-    tiger_position = next(
+    futu_position = next(
         row for row in snapshot["positions"]  # type: ignore[index]
-        if row["broker"] == "tiger"
+        if row["broker"] == "futu"
     )
-    tiger_position["current_valuation"] = {
+    futu_position["current_valuation"] = {
         "market_value_usd": "1234.5",
         "market_value_hkd": "12345",
     }
-    tiger_cash = next(
+    futu_cash = next(
         row for row in snapshot["cash_balances"]  # type: ignore[index]
-        if row["broker"] == "tiger"
+        if row["broker"] == "futu"
     )
-    tiger_cash.update(
+    futu_cash.update(
         currency="HKD",
         cash_balance="1000",
         available_balance="1000",
@@ -235,8 +235,8 @@ def test_real_input_tolerates_multi_currency_and_negative_cash(
         available_balance_hkd="1000",
     )
     snapshot["cash_balances"].append({  # type: ignore[union-attr]
-        "broker": "tiger",
-        "account_alias": "tiger_main",
+        "broker": "futu",
+        "account_alias": "futu_main",
         "currency": "USD",
         "cash_balance": "-200",
         "available_balance": "-200",
@@ -258,11 +258,11 @@ def test_real_input_tolerates_multi_currency_and_negative_cash(
 
 def test_real_input_fails_closed_for_malformed_cash(tmp_path: Path) -> None:
     snapshot = account_snapshot()
-    tiger_cash = next(
+    futu_cash = next(
         row for row in snapshot["cash_balances"]  # type: ignore[index]
-        if row["broker"] == "tiger"
+        if row["broker"] == "futu"
     )
-    tiger_cash["available_balance"] = "bad"
+    futu_cash["available_balance"] = "bad"
 
     loaded = load_real_holding_input(
         snapshot,
@@ -272,3 +272,66 @@ def test_real_input_fails_closed_for_malformed_cash(tmp_path: Path) -> None:
 
     assert loaded.status == "unavailable"
     assert "可用现金" in loaded.reason
+
+
+def test_real_input_excludes_futu_us_option_position_with_account_exception(
+    tmp_path: Path,
+) -> None:
+    snapshot = account_snapshot()
+    snapshot["positions"].append({  # type: ignore[union-attr]
+        "broker": "futu",
+        "account_alias": "futu_main",
+        "market": "US",
+        "asset_class": "option",
+        "symbol": "VIXY260821C22000",
+        "name": "VIXY 260821 22.00C",
+        "currency": "USD",
+        "quantity": "1",
+        "cost_price": "0.5",
+        "market_value": "55",
+        "instrument_id": "ins_us_option",
+        "position_id": "pos_us_option",
+    })
+
+    loaded = load_real_holding_input(
+        snapshot,
+        "US",
+        state_path=tmp_path / "real_protection_state.json",
+    )
+
+    assert loaded.status == "available"
+    assert [position.symbol for position in loaded.positions] == ["AAPL"]
+    assert loaded.source["account_exceptions"] == (
+        "unsupported Futu asset: VIXY260821C22000 (VIXY 260821 22.00C)"
+    )
+    assert loaded.instrument_ids_by_symbol == {"AAPL": "ins_us"}
+
+
+def test_real_input_ignores_futu_non_us_rows_when_loading_us(
+    tmp_path: Path,
+) -> None:
+    snapshot = account_snapshot()
+    snapshot["positions"].append({  # type: ignore[union-attr]
+        "broker": "futu",
+        "account_alias": "futu_main",
+        "market": "HK",
+        "asset_class": "stock",
+        "symbol": "02840",
+        "name": "SPDR Gold",
+        "currency": "HKD",
+        "quantity": "100",
+        "cost_price": "1700",
+        "market_value": "170000",
+        "instrument_id": "ins_hk_futu",
+        "position_id": "pos_hk_futu",
+    })
+
+    loaded = load_real_holding_input(
+        snapshot,
+        "US",
+        state_path=tmp_path / "real_protection_state.json",
+    )
+
+    assert loaded.status == "available"
+    assert [position.symbol for position in loaded.positions] == ["AAPL"]
+    assert "account_exceptions" not in loaded.source

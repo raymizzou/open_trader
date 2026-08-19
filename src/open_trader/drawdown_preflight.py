@@ -22,7 +22,7 @@ from .strategy_drawdown import (
 REPORT_DIRECTORIES = {
     "CN": "trend_a_share",
     "HK": "trend_hk_phillips",
-    "US": "trend_us_tiger",
+    "US": "trend_us_futu",
 }
 MARKET_TIMEZONES = {
     "CN": ZoneInfo("Asia/Shanghai"),

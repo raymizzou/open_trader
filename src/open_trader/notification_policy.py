@@ -6,7 +6,7 @@ from decimal import Decimal, InvalidOperation
 
 
 MARKET_LABELS = {"CN": "A股", "HK": "港股", "US": "美股"}
-BROKER_LABELS = {"CN": "东方财富", "HK": "辉立", "US": "老虎"}
+BROKER_LABELS = {"CN": "东方财富", "HK": "辉立", "US": "富途"}
 SIDE_LABELS = {"buy": "买入", "sell": "卖出"}
 STATUS_LABELS = {
     "pending": "待执行",

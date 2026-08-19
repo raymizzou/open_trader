@@ -86,7 +86,7 @@ from .strategy_drawdown import observe_strategy_equity
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MARKET_SETTINGS = {
-    "US": {"broker": "tiger", "currency": "HKD", "asset": "美股", "deadline": time(19)},
+    "US": {"broker": "futu", "currency": "HKD", "asset": "美股", "deadline": time(19)},
     "HK": {"broker": "phillips", "currency": "HKD", "asset": "港股", "deadline": time(19)},
 }
 MARKET_UPDATE_ASSETS = {
@@ -96,7 +96,7 @@ MARKET_UPDATE_ASSETS = {
 HK_ETF_ROOT_TM_ID = 707617
 HK_ETF_WARM_TO_HOT_NAME = "温转热(香港ETF)"
 MARKET_NOTIFICATION_LABELS = {
-    "US": ("老虎", "美股", "确认 Trend Animals 与老虎账户状态后手动重跑老虎报告"),
+    "US": ("富途", "美股", "确认 Trend Animals 与富途账户状态后手动重跑富途报告"),
     "HK": ("辉立", "港股", "确认 Trend Animals 与辉立日结单状态后手动重跑辉立报告"),
 }
 ATTENTION_CHANGE_FIELDS = (
@@ -138,7 +138,7 @@ def _market(value: str) -> str:
 
 def market_paths(data_dir: Path, reports_dir: Path, market: str) -> MarketTrendPaths:
     market = _market(market)
-    suffix = "us_tiger" if market == "US" else "hk_phillips"
+    suffix = "us_futu" if market == "US" else "hk_phillips"
     root = data_dir / f"trend_{suffix}"
     return MarketTrendPaths(
         root=root,
@@ -381,11 +381,12 @@ def build_option_attention(
     return attention
 
 
-def _attention_rows(signal_snapshots: object) -> list[Mapping[str, object]] | None:
+def _attention_rows(signal_snapshots: object, market: str) -> list[Mapping[str, object]] | None:
     if not isinstance(signal_snapshots, Mapping):
         return None
     candidates = signal_snapshots.get("candidates", [])
     holdings = signal_snapshots.get("holdings", {})
+    real_holdings = signal_snapshots.get("real_holdings", {})
     if not isinstance(candidates, list) or not all(
         isinstance(row, Mapping) for row in candidates
     ):
@@ -394,7 +395,22 @@ def _attention_rows(signal_snapshots: object) -> list[Mapping[str, object]] | No
         row is None or isinstance(row, Mapping) for row in holdings.values()
     ):
         return None
-    return [*candidates, *(row for row in holdings.values() if row is not None)]
+    if not isinstance(real_holdings, Mapping) or not all(
+        row is None or isinstance(row, Mapping) for row in real_holdings.values()
+    ):
+        return None
+    rows = [
+        *candidates,
+        *(row for row in holdings.values() if row is not None),
+    ]
+    if _market(market) == "US":
+        # Real-holding rows come last so that, for symbols present in both the
+        # simulated account and the real account, the real-holding row wins the
+        # attention merge (they are the authoritative positions). Approved
+        # scope: only US real holdings enter option attention; HK/CN flows are
+        # untouched.
+        rows.extend(row for row in real_holdings.values() if row is not None)
+    return rows
 
 
 def _attention_report_rows(
@@ -405,7 +421,7 @@ def _attention_report_rows(
         if not isinstance(payload, Mapping):
             return None
         as_of_date = date.fromisoformat(str(payload.get("as_of_date") or ""))
-        rows = _attention_rows(payload.get("signal_snapshots"))
+        rows = _attention_rows(payload.get("signal_snapshots"), market)
         if rows is None:
             return None
         for row in rows:
@@ -413,6 +429,23 @@ def _attention_report_rows(
             if not isinstance(symbol, str) or not symbol.strip():
                 return None
             _normalized_symbol(market, symbol)
+        # real_holdings rows are part of the report schema even though only US
+        # emits them into attention; malformed ones still invalidate the
+        # report so report readers behave consistently across markets.
+        snapshots = payload.get("signal_snapshots")
+        real_holdings = (
+            snapshots.get("real_holdings")
+            if isinstance(snapshots, Mapping)
+            else None
+        )
+        if isinstance(real_holdings, Mapping):
+            for row in real_holdings.values():
+                if row is None:
+                    continue
+                symbol = row.get("symbol")
+                if not isinstance(symbol, str) or not symbol.strip():
+                    return None
+                _normalized_symbol(market, symbol)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         return None
     return (as_of_date, rows) if rows is not None else None
@@ -442,7 +475,7 @@ def _previous_attention_rows(
     return []
 
 
-def _attention_actions(payload: Mapping[str, object]) -> dict[str, str]:
+def _attention_actions(payload: Mapping[str, object], market: str) -> dict[str, str]:
     judgments = payload.get("strategy_judgments")
     if not isinstance(judgments, Mapping):
         return {}
@@ -458,6 +491,21 @@ def _attention_actions(payload: Mapping[str, object]) -> dict[str, str]:
             action = row.get("action")
             if isinstance(symbol, str) and isinstance(action, str):
                 actions[symbol] = action
+    if _market(market) == "US":
+        # Only US real-holding decisions enter option attention (approved
+        # scope); HK/CN flows are untouched.
+        real_holding_decisions = judgments.get("real_holding_decisions")
+        if isinstance(real_holding_decisions, list):
+            for row in real_holding_decisions:
+                if not isinstance(row, Mapping):
+                    continue
+                symbol = row.get("symbol")
+                action = row.get("action")
+                if isinstance(symbol, str) and isinstance(action, str):
+                    # Real-holding rows win symbol precedence in the attention
+                    # merge; a REAL_ prefix keeps them distinguishable from
+                    # simulated-account decisions without new schema fields.
+                    actions[symbol] = f"REAL_{action}"
     return actions
 
 
@@ -1332,11 +1380,13 @@ def _attempt_market_report(
             },
         )
         payload = _report_payload(report)
-        current_attention_rows = _attention_rows(payload.get("signal_snapshots")) or []
+        current_attention_rows = _attention_rows(
+            payload.get("signal_snapshots"), market
+        ) or []
         payload["option_attention"] = build_option_attention(
             current_attention_rows,
             previous_attention_rows,
-            _attention_actions(payload),
+            _attention_actions(payload, market),
             market,
             option_attention_broker_label,
         )

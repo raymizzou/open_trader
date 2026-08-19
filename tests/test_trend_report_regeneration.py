@@ -25,7 +25,7 @@ SPEC.loader.exec_module(publisher)
 MARKETS = {
     "CN": ("trend_a_share", "v13", "0.4"),
     "HK": ("trend_hk_phillips", "v11", "0.6"),
-    "US": ("trend_us_tiger", "v11", "0.8"),
+    "US": ("trend_us_futu", "v11", "0.8"),
 }
 
 
