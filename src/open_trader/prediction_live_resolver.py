@@ -24,6 +24,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+import sqlite3
 
 from open_trader.prediction_market_solution import (
     EXECUTABLE_REASON,
@@ -651,7 +652,7 @@ class PredictionLiveResolver:
                 return cached
         try:
             stored = self._store.partial_fill_proof(proof_fingerprint)
-        except (TypeError, ValueError, RuntimeError, AttributeError):
+        except (TypeError, ValueError, RuntimeError, AttributeError, sqlite3.Error):
             stored = None
         if stored is not None:
             try:
@@ -679,7 +680,7 @@ class PredictionLiveResolver:
                 counterexample,
                 proof_fingerprint=proof_fingerprint,
             )
-        except (TypeError, ValueError, RuntimeError, AttributeError):
+        except (TypeError, ValueError, RuntimeError, AttributeError, sqlite3.Error):
             pass
         with self._lock:
             self._fill_proofs[proof_fingerprint] = (record, counterexample)

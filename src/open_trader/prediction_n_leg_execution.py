@@ -120,13 +120,35 @@ def execution_solution_binding(solution: ExecutionSolution) -> dict[str, str]:
     })
     if solution.fingerprint != expected:
         raise ValueError("execution solution fingerprint mismatch")
+    # The order-semantics fingerprint carries the versioned semantics table
+    # plus the per-leg (venue, default order type) assertions, so a table
+    # bump invalidates every earlier proof record at the binding check
+    # (design decision 3).  Imported lazily: prediction_partial_fill imports
+    # this module at import time.
+    from open_trader.prediction_partial_fill import (
+        default_order_type,
+        order_semantics_fingerprint_for,
+        order_semantics_lookup,
+    )
+
     return {
         "execution_solution_fingerprint": solution.fingerprint,
         "execution_solution_payload_fingerprint": fingerprint(canonical_payload(solution)),
         "model_fingerprint": solution.market_solution_fingerprint,
         "quote_fingerprint": fingerprint({"sources": tuple(leg.source_fingerprint for leg in solution.execution_legs)}),
         "cost_fingerprint": fingerprint({"capital_use_units": solution.capital_use_units, "legs": tuple((leg.action_id, leg.max_cost_units, leg.max_fee_units) for leg in solution.execution_legs)}),
-        "order_semantics_fingerprint": fingerprint({"legs": solution.execution_legs}),
+        "order_semantics_fingerprint": order_semantics_fingerprint_for(
+            tuple(
+                (
+                    leg.action_id,
+                    leg.venue_id,
+                    order_type or "UNKNOWN",
+                    order_semantics_lookup(leg.venue_id, order_type or "UNKNOWN").value,
+                )
+                for leg in solution.execution_legs
+                for order_type in (default_order_type(leg.venue_id),)
+            )
+        ),
     }
 
 

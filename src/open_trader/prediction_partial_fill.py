@@ -152,7 +152,6 @@ class FillLeg:
     action_id: str
     venue_id: str
     quantity_lots: int
-    lot_size: int
     order_type: str
     semantics: str
     max_cost_units: int
@@ -164,18 +163,16 @@ class FillLeg:
                 raise ValueError(f"fill leg {name} must be a non-empty string")
         if self.semantics not in tuple(FillSemantics):
             raise ValueError(f"unknown fill semantics: {self.semantics}")
-        for name in ("quantity_lots", "lot_size"):
-            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
-                raise ValueError(f"fill leg {name} must be a positive integer")
+        # Lot space is discrete in 1-lot units: every fill between 0 and
+        # quantity_lots is reachable.  The venue's lot_step_units is only a
+        # units-per-lot conversion factor (size * quantity_scale /
+        # lot_step_units -> lots) and never restricts the fill domain, so it
+        # is not part of the fill leg at all.
+        if type(self.quantity_lots) is not int or self.quantity_lots <= 0:
+            raise ValueError(f"fill leg quantity_lots must be a positive integer")
         for name in ("max_cost_units", "max_fee_units"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 0:
                 raise ValueError(f"fill leg {name} must be a non-negative integer")
-        if self.semantics == FillSemantics.PARTIAL.value and (
-            self.quantity_lots % self.lot_size != 0
-        ):
-            raise ValueError(
-                f"partial fill quantity must be whole lots: {self.action_id}"
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,7 +352,8 @@ def compile_fill_adversary(problem: FillAdversaryProblem) -> CompiledFillAdversa
     """Compile the fill-adversary LinearModel (terminal model reused #48).
 
     Fill integer variables: ATOMIC legs fill ``{0, q}`` (binary selection),
-    PARTIAL legs fill ``0..q`` in ``lot_size`` steps.  The payout term
+    PARTIAL legs fill ``0..q`` in 1-lot steps (lot space is discrete in whole
+    lots).  The payout term
     ``f_i * payout_i(atom)`` is bilinear in the fill variable and the terminal
     atom binary, linearized with big-M helper variables ``y_{i,a} = f_i * z_a``:
     ``y <= f``, ``y <= q*z``, ``y - f - q*z >= -q``.  The adversary maximizes
@@ -389,25 +387,8 @@ def compile_fill_adversary(problem: FillAdversaryProblem) -> CompiledFillAdversa
                 )
             )
         else:
-            steps = leg.quantity_lots // leg.lot_size
-            if leg.quantity_lots % leg.lot_size != 0:
-                raise ValueError(
-                    f"partial fill quantity must be whole lots: {leg.action_id}"
-                )
-            step = IntVariable(f"fill-steps:{leg.action_id}", 0, steps)
             fill = IntVariable(f"fill:{leg.action_id}", 0, leg.quantity_lots)
-            variables.extend((step, fill))
-            constraints.append(
-                LinearConstraint(
-                    f"fill:partial:{leg.action_id}",
-                    (
-                        (f"fill:{leg.action_id}", 1),
-                        (f"fill-steps:{leg.action_id}", -leg.lot_size),
-                    ),
-                    0,
-                    0,
-                )
-            )
+            variables.append(fill)
         unit_cost = _ceil_div(leg.max_cost_units, leg.quantity_lots)
         unit_fee = _ceil_div(leg.max_fee_units, leg.quantity_lots)
         objective_terms.append((f"fill:{leg.action_id}", unit_cost + unit_fee))
@@ -1042,7 +1023,6 @@ def fill_adversary_problem_from_execution_solution(
                 leg.action_id,
                 leg.venue_id,
                 leg.quantity_lots,
-                action.lot_step_units,
                 order_type,
                 order_semantics_lookup(leg.venue_id, order_type).value,
                 leg.max_cost_units,
@@ -1059,7 +1039,12 @@ def fill_adversary_problem_from_execution_solution(
         model_fingerprint=binding["model_fingerprint"],
         quote_fingerprint=binding["quote_fingerprint"],
         cost_fingerprint=binding["cost_fingerprint"],
-        order_semantics_fingerprint=binding["order_semantics_fingerprint"],
+        order_semantics_fingerprint=order_semantics_fingerprint_for(
+            tuple(
+                (leg.action_id, leg.venue_id, leg.order_type, leg.semantics)
+                for leg in legs
+            )
+        ),
         cap_config_version=cap_config_version,
         max_partial_fill_loss=max_partial_fill_loss,
         max_auto_repair_loss=max_auto_repair_loss,
@@ -1105,7 +1090,6 @@ def fill_adversary_problem_from_market_solution(
                 quantity.action_id,
                 action.venue_id,
                 quantity.quantity_lots,
-                action.lot_step_units,
                 order_type,
                 order_semantics_lookup(action.venue_id, order_type).value,
                 max_cost,
@@ -1200,10 +1184,7 @@ def enumerate_fill_adversary(
             if leg.semantics == FillSemantics.ATOMIC.value:
                 domain = (0, leg.quantity_lots)
             else:
-                domain = tuple(
-                    step * leg.lot_size
-                    for step in range(0, leg.quantity_lots // leg.lot_size + 1)
-                )
+                domain = tuple(range(0, leg.quantity_lots + 1))
             fill_domains.append(domain)
             vector_count *= len(domain)
             if vector_count > budget.max_quantity_vectors:

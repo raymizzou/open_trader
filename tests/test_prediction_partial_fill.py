@@ -295,22 +295,41 @@ def test_partial_leg_fills_in_lot_steps() -> None:
     adversary = make_adversary(problem, execution, cap=400_000)
     (leg,) = adversary.legs
     assert leg.semantics == "PARTIAL"
-    assert leg.quantity_lots == 4 and leg.lot_size == 1
+    assert leg.quantity_lots == 4
     record, counterexample = prove_partial_fill(adversary, time_limit_ms=30_000)
     assert record.status == PARTIAL_FILL_SAFE
     assert record.solver_upper_bound == 400_000  # all four lots, atom "a:no"
-    # A 2-lot step partial domain: fills are 0, 2, 4 only.
+    # lot_step_units is a units-per-lot conversion factor (size *
+    # quantity_scale / lot_step_units -> lots); the fill domain in lot space
+    # steps by one lot, so the factor neither restricts the domain nor
+    # requires divisibility.
     problem_lot2 = make_problem(
         (_action("buy-yes-a", "a", "predict.fun", 4, 100_000, lot_step_units=2),),
     )
     execution_lot2 = make_execution(problem_lot2, (ActionQuantity("buy-yes-a", 4),))
     adversary_lot2 = make_adversary(problem_lot2, execution_lot2, cap=400_000)
     (leg2,) = adversary_lot2.legs
-    assert leg2.lot_size == 2 and leg2.semantics == "PARTIAL"
+    assert leg2.semantics == "PARTIAL" and leg2.quantity_lots == 4
     oracle = evaluate_fill_adversary(adversary_lot2, budget())
     assert oracle.closed is True and oracle.worst_loss_units == 400_000
+    assert oracle.worst_fill_quantities == (ActionQuantity("buy-yes-a", 4),)
     record_lot2, _ = prove_partial_fill(adversary_lot2, time_limit_ms=30_000)
     assert record_lot2.solver_upper_bound == 400_000
+    # A factor that does not divide the quantity is still only a conversion
+    # factor: the problem compiles (no fail-closed divisibility error) and
+    # the domain stays 0..4.
+    problem_lot3 = make_problem(
+        (_action("buy-yes-a", "a", "predict.fun", 4, 100_000, lot_step_units=3),),
+    )
+    execution_lot3 = make_execution(problem_lot3, (ActionQuantity("buy-yes-a", 4),))
+    adversary_lot3 = make_adversary(problem_lot3, execution_lot3, cap=400_000)
+    oracle_lot3 = evaluate_fill_adversary(adversary_lot3, budget())
+    assert oracle_lot3.closed is True and oracle_lot3.worst_loss_units == 400_000
+    assert oracle_lot3.worst_fill_quantities == (
+        ActionQuantity("buy-yes-a", 4),
+    )
+    record_lot3, _ = prove_partial_fill(adversary_lot3, time_limit_ms=30_000)
+    assert record_lot3.solver_upper_bound == 400_000
 
 
 def test_zero_fill_vector_loss_is_zero() -> None:
