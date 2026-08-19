@@ -974,6 +974,7 @@ def test_frozen_contract_accepts_local_basis_rotation_pair() -> None:
         strategy_snapshot=strategy,
         drawdown_summary=active_drawdown_for(strategy, equity="100000"),
         allocation_reference=allocation,
+        position_weight=Decimal("0.06"),
     )
     payload = trend_module._report_payload(built)
     pair = payload["strategy_judgments"]["simulate_rotation_pairs"][0]
@@ -1082,25 +1083,34 @@ def _frozen_us_2026_08_07_final_plan_audit(
         strategy_snapshot=strategy,
         drawdown_summary=active_drawdown_for(strategy, equity="100000"),
         allocation_reference=allocation,
+        position_weight=Decimal("0.06"),
     )
 
 
-def test_frozen_2026_08_07_final_plan_audit_omits_rotation_buy_and_explains_skips() -> None:
+def test_frozen_2026_08_07_final_plan_audit_lists_all_candidates_as_pending_buys() -> None:
     built = _frozen_us_2026_08_07_final_plan_audit()
 
     assert [item.symbol for item in built.candidates] == [
         "GRMN", "WTW", "ABNB", "REGN", "TEAM", "CRWD", "HPQ", "PATH", "SWK", "WSM",
     ]
-    assert "GRMN" not in {item["symbol"] for item in built.risk_skips}
-    assert next(item for item in built.risk_skips if item["symbol"] == "WTW")["reason"] == (
-        "10 个持仓席位已满；强度差 12.3 小于门槛 20"
-    )
-    assert next(item for item in built.risk_skips if item["symbol"] == "ABNB")["reason"] == (
-        "10 个持仓席位已满；未进入 2 个轮换比较席位"
-    )
+    assert not built.risk_skips
+    assert [item.symbol for item in built.buy_actions] == [
+        "GRMN", "WTW", "ABNB", "REGN", "TEAM", "CRWD", "HPQ", "PATH", "SWK", "WSM",
+    ]
+    for action in built.buy_actions:
+        assert action.estimated_shares == action.lot_size == 1
+        assert action.executable is False
+        assert action.sizing_note == (
+            "10 个持仓席位已满；"
+            "现金不足一手（需约 10.01，可用 0.00）"
+        )
     markdown = render_markdown(built)
-    assert "## 下个常规交易时段：按顺序考虑买入" not in markdown
+    assert "## 下个常规交易时段：按顺序考虑买入" in markdown
     assert "现金也是有效仓位，本日无需交易。" not in markdown
+    assert (
+        "- 1. GRMN 股票GRMN｜约 1 股｜金额上限 10.00 美元｜预计保护线 9.00｜额外风险："
+        "10 个持仓席位已满；现金不足一手（需约 10.01，可用 0.00）"
+    ) in markdown
 
 
 def test_final_plan_audit_keeps_ranked_candidate_below_display_top10() -> None:
@@ -1117,9 +1127,11 @@ def test_final_plan_audit_keeps_ranked_candidate_below_display_top10() -> None:
     built = _frozen_us_2026_08_07_final_plan_audit((lower,))
 
     assert len(built.candidates) == 10
-    assert next(item for item in built.risk_skips if item["symbol"] == "LOWER")[
-        "reason"
-    ] == "10 个持仓席位已满；未进入 2 个轮换比较席位"
+    lower_action = next(item for item in built.buy_actions if item.symbol == "LOWER")
+    assert lower_action.estimated_shares == lower_action.lot_size
+    assert lower_action.executable is False
+    assert "10 个持仓席位已满" in lower_action.sizing_note
+    assert "LOWER" not in {item["symbol"] for item in built.risk_skips}
 
 
 def test_final_plan_audit_missing_global_precedes_normal_plan_eligibility() -> None:
@@ -1177,7 +1189,7 @@ def test_final_plan_audit_missing_global_precedes_normal_plan_eligibility() -> N
     assert built.risk_skips[0]["reason"] == "全局强度缺失，无法排序"
 
 
-def test_final_plan_audit_markdown_lists_qualified_skips_before_generic_discipline_failures() -> None:
+def test_final_plan_audit_markdown_lists_pending_buys_before_generic_discipline_failures() -> None:
     failing = replace(candidate("FAIL", strength="94"), as_of_date="2026-08-07")
     built = _frozen_us_2026_08_07_final_plan_audit((
         replace(
@@ -1189,10 +1201,13 @@ def test_final_plan_audit_markdown_lists_qualified_skips_before_generic_discipli
 
     markdown = render_markdown(built)
 
-    assert "- WTW 股票WTW｜10 个持仓席位已满；强度差 12.3 小于门槛 20" in markdown
+    assert (
+        "- 2. WTW 股票WTW｜约 1 股｜金额上限 10.00 美元｜预计保护线 9.00｜额外风险："
+        "10 个持仓席位已满；现金不足一手（需约 10.01，可用 0.00）"
+    ) in markdown
     assert "- FAIL 股票FAIL｜没有通过纪律" in markdown
     assert "趋势强度低于 95" not in markdown
-    assert markdown.index("- WTW") < markdown.index("- FAIL")
+    assert markdown.index("- 2. WTW") < markdown.index("- FAIL")
 
 
 def test_final_plan_audit_markdown_reduces_new_industry_context_to_temperature_and_direction() -> None:
@@ -1835,9 +1850,9 @@ def active_drawdown_for(
 @pytest.mark.parametrize(
     ("market", "version", "rank", "weight"),
     [
-        ("CN", "v13", 1, "0.06"),
-        ("HK", "v11", 2, "0.04"),
-        ("US", "v11", 3, "0.02"),
+        ("CN", "v14", 1, "0.06"),
+        ("HK", "v12", 2, "0.04"),
+        ("US", "v12", 3, "0.02"),
     ],
 )
 def test_current_allocation_versions_freeze_rank_weight(
@@ -3906,8 +3921,16 @@ def test_buy_actions_respect_four_percent_cash_slots_and_round_lots() -> None:
     )
 
     assert [
-        (item.symbol, item.target_amount, item.estimated_shares) for item in actions
-    ] == [("600001", Decimal("7000"), 600)]
+        (item.symbol, item.target_amount, item.estimated_shares, item.executable)
+        for item in actions
+    ] == [
+        ("600001", Decimal("7000"), 600, True),
+        ("600002", Decimal("1000"), 100, False),
+    ]
+    assert actions[1].sizing_note == (
+        "10 个持仓席位已满；"
+        "现金不足一手（需约 1001.00，可用 994.00）"
+    )
 
 
 def test_buy_action_targets_never_reserve_more_than_available_cash() -> None:
@@ -3919,11 +3942,18 @@ def test_buy_action_targets_never_reserve_more_than_available_cash() -> None:
         position_weight=Decimal("0.04"),
     )
 
-    assert [(item.symbol, item.target_amount) for item in actions] == [
-        ("600001", Decimal("7000"))
+    assert [(item.symbol, item.target_amount, item.executable) for item in actions] == [
+        ("600001", Decimal("7000"), True),
+        ("600002", Decimal("1000"), False),
     ]
-    assert sum((item.target_amount for item in actions), Decimal("0")) <= Decimal(
-        "7000"
+    assert "现金不足一手" in actions[1].sizing_note
+    assert "10 个持仓席位已满" not in actions[1].sizing_note
+    assert (
+        sum(
+            (item.target_amount for item in actions if item.executable),
+            Decimal("0"),
+        )
+        <= Decimal("7000")
     )
 
 
@@ -4156,6 +4186,62 @@ def test_v3_kelly_only_reduces_nominal_before_fixed_risk_constraints() -> None:
     assert built.risk_summary["kelly_reason"] == ""
 
 
+def test_kelly_shrink_below_one_lot_lists_one_lot_with_kelly_note() -> None:
+    returns = ["0.10"] * 15 + ["-0.099"] * 15
+    rounds = tuple(
+        replace(
+            _trend_kelly_rounds("0.10")[0],
+            round_id=f"round-{index:03d}",
+            strategy_id="trend_animals_warm_to_hot/US/v4",
+            opening_strategy_version="v4",
+            net_return=Decimal(value),
+        )
+        for index, value in enumerate(returns)
+    )
+    allocation = allocation_for("US", rank=1, entry_weight="0.06")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "US", "abc123", (622460, 705013),
+        allocation=allocation,
+        execution_date="2026-07-15",
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=[
+            replace(
+                candidate("600001"),
+                exchange="US",
+                close=Decimal("5000"),
+                atr=Decimal("50"),
+                global_strength=Decimal("90"),
+            )
+        ],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="US",
+        metadata={"market": "US", "broker": "tiger"},
+        kelly_rounds=rounds,
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        allocation_reference=allocation,
+    )
+
+    action = built.buy_actions[0]
+    assert action.target_weight == Decimal("0.012626")
+    assert action.estimated_shares == action.lot_size == 1
+    assert action.executable is True
+    assert action.sizing_note == "一手超过 Kelly 收缩上限"
+    assert action.decisive_constraint == "Kelly 上限"
+
+
 def test_v3_zero_kelly_pauses_only_future_entries_and_keeps_sell_decision() -> None:
     zero_rounds = _trend_kelly_rounds(*(["0.10"] * 15), *(["-0.10"] * 15))
     existing = AccountSnapshot(
@@ -4368,7 +4454,13 @@ def test_sell_all_releases_cash_slot_and_planned_risk_before_new_entries() -> No
     assert sold.buy_actions[0].decisive_constraint == "单笔风险上限"
 
 
-def test_full_existing_portfolio_risk_pauses_new_entries_explicitly() -> None:
+def test_full_existing_portfolio_risk_lists_one_lot_with_note_but_no_pause() -> None:
+    allocation = allocation_for("CN", rank=1, entry_weight="0.06")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622460, 705013),
+        allocation=allocation,
+        execution_date="2026-07-15",
+    )
     built = build_report(
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
@@ -4385,7 +4477,7 @@ def test_full_existing_portfolio_risk_pauses_new_entries_explicitly() -> None:
             ),
             exceptions=(),
         ),
-        candidates=[candidate("600002")],
+        candidates=[candidate("600002", global_strength="90")],
         holding_snapshots={"600001": holding("600001")},
         bars_by_symbol={"600001": bars()},
         prior_state={
@@ -4396,13 +4488,20 @@ def test_full_existing_portfolio_risk_pauses_new_entries_explicitly() -> None:
                 }
             }
         },
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        allocation_reference=allocation,
     )
 
-    assert built.buy_actions == ()
-    assert built.risk_summary["status"] == "paused"
-    assert built.risk_summary["status_label"] == "组合风险已满"
+    assert len(built.buy_actions) == 1
+    action = built.buy_actions[0]
+    assert action.symbol == "600002"
+    assert action.estimated_shares == action.lot_size == 100
+    assert action.executable is True
+    assert action.sizing_note == "一手超过组合剩余风险"
+    assert built.risk_summary["status"] == "active"
     assert built.risk_summary["portfolio_remaining_risk"] == Decimal("0")
-    assert built.risk_skips[0]["reason"] == "组合正常计划风险已达到净值 4%"
+    assert built.risk_skips == ()
 
 
 def test_v7_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None:
@@ -4492,7 +4591,13 @@ def test_v7_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None
     assert "策略累计回撤" in markdown
 
 
-def test_minimum_lot_skip_keeps_plain_integer_reason() -> None:
+def test_minimum_lot_over_single_entry_risk_lists_one_lot_with_note() -> None:
+    allocation = allocation_for("CN", rank=1, entry_weight="0.06")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622460, 705013),
+        allocation=allocation,
+        execution_date="2026-07-15",
+    )
     built = build_report(
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
@@ -4501,27 +4606,206 @@ def test_minimum_lot_skip_keeps_plain_integer_reason() -> None:
             net_value=Decimal("100000"), available_cash=Decimal("100000"),
             positions=(), exceptions=(),
         ),
-        candidates=[candidate("600001", atr="2")],
+        candidates=[
+            replace(candidate("600001", atr="2.25"), global_strength=Decimal("90"))
+        ],
         holding_snapshots={},
         bars_by_symbol={},
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        allocation_reference=allocation,
     )
 
-    assert built.buy_actions == ()
-    assert built.risk_skips[0]["reason"] == "最小交易单位 100 股超过单笔风险上限"
+    assert len(built.buy_actions) == 1
+    action = built.buy_actions[0]
+    assert action.estimated_shares == action.lot_size == 100
+    assert action.executable is True
+    assert action.sizing_note == "一手超过单笔风险上限"
+    assert action.planned_stop_risk_pct > Decimal("0.004")
+    assert built.risk_skips == ()
 
 
-@pytest.mark.parametrize("unknown", ["nav", "quantity", "price", "fx", "line"])
-def test_unknown_critical_simulation_fact_pauses_the_whole_entry_batch(
+def test_hk_06160_one_lot_over_nominal_cap_still_lists_buy_action() -> None:
+    allocation = allocation_for("HK", rank=1, entry_weight="0.04")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "HK", "abc123", (622460, 705013),
+        allocation=allocation,
+        execution_date="2026-08-20",
+    )
+    built = build_report(
+        as_of_date="2026-08-19",
+        execution_date="2026-08-20",
+        market="HK",
+        metadata={"market": "HK", "broker": "tiger"},
+        account=AccountSnapshot(
+            source_date="2026-08-19",
+            fresh=True,
+            net_value=Decimal("300000"),
+            available_cash=Decimal("200000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=[
+            replace(
+                candidate(
+                    "06160",
+                    exchange="HK",
+                    asset="港股",
+                    market_cap="2000",
+                    amount="20",
+                    global_strength="90",
+                ),
+                as_of_date="2026-08-19",
+                close=Decimal("150"),
+                atr=Decimal("3"),
+            )
+        ],
+        holding_snapshots={},
+        bars_by_symbol={},
+        lot_sizes={"06160": 100},
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="300000"),
+        allocation_reference=allocation,
+        position_weight=Decimal("0.04"),
+    )
+
+    assert built.risk_skips == ()
+    assert [item.symbol for item in built.buy_actions] == ["06160"]
+    action = built.buy_actions[0]
+    assert action.estimated_shares == action.lot_size == 100
+    assert action.target_amount == Decimal("15000.00")
+    assert action.executable is True
+    assert action.sizing_note == "一手超过名义仓位上限"
+    assert action.decisive_constraint == "名义仓位上限"
+    assert action.planned_stop_risk_pct <= Decimal("0.004")
+
+
+def test_hk_candidate_without_lot_size_lists_data_missing_action() -> None:
+    allocation = allocation_for("HK", rank=1, entry_weight="0.06")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "HK", "abc123", (622460, 705013),
+        allocation=allocation,
+        execution_date="2026-07-15",
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14", fresh=True,
+            net_value=Decimal("100000"), available_cash=Decimal("100000"),
+            positions=(), exceptions=(),
+        ),
+        candidates=[
+            replace(
+                candidate(
+                    "600001",
+                    global_strength="90",
+                    market_cap="2000",
+                    amount="20",
+                ),
+                exchange="HK",
+                asset="港股",
+            )
+        ],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="HK",
+        lot_sizes={},
+        metadata={"market": "HK", "broker": "tiger"},
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        allocation_reference=allocation,
+    )
+
+    assert built.risk_skips == ()
+    assert len(built.buy_actions) == 1
+    action = built.buy_actions[0]
+    assert action.estimated_shares == 0
+    assert action.lot_size == 0
+    assert action.executable is False
+    assert action.sizing_note == "每手股数未知，无法定量"
+    assert action.planned_stop_risk == Decimal("0")
+    assert action.planned_stop_risk_pct == Decimal("0")
+    assert built.risk_summary["new_planned_risk"] == Decimal("0")
+
+
+def test_hk_full_account_unknown_lot_size_candidate_never_plans_rotation() -> None:
+    held_symbols = tuple(f"10{index:04d}" for index in range(10))
+    allocation = allocation_for("HK", rank=1, entry_weight="0.06")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "HK", "abc123", (622460, 705013),
+        allocation=allocation,
+        execution_date="2026-07-15",
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="HK",
+        metadata={"market": "HK", "broker": "tiger"},
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("0"),
+            positions=tuple(
+                AccountPosition(
+                    symbol, symbol, "stock", Decimal("500"), Decimal("10"),
+                    Decimal("5000"),
+                )
+                for symbol in held_symbols
+            ),
+            exceptions=(),
+        ),
+        candidates=[
+            replace(
+                candidate(
+                    "600001",
+                    global_strength="90",
+                    market_cap="2000",
+                    amount="20",
+                ),
+                exchange="HK",
+                asset="港股",
+            )
+        ],
+        holding_snapshots={
+            symbol: holding(
+                symbol,
+                asset="港股",
+                strength=("10" if index == 0 else "20"),
+                global_strength=("10" if index == 0 else "20"),
+            )
+            for index, symbol in enumerate(held_symbols)
+        },
+        bars_by_symbol={symbol: bars() for symbol in held_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in held_symbols
+            }
+        },
+        lot_sizes={},
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        allocation_reference=allocation,
+    )
+
+    # 每手未知的数据缺失候选：不生成 0 股/0 手轮换对，比较记录标记 sizing_blocked。
+    assert built.simulate_rotation_pairs == ()
+    assert built.simulate_rotation_comparisons
+    assert {
+        item.outcome for item in built.simulate_rotation_comparisons
+    } == {"sizing_blocked"}
+
+
+@pytest.mark.parametrize("unknown", ["nav", "fx"])
+def test_account_level_missing_fact_pauses_the_whole_entry_batch(
     unknown: str,
 ) -> None:
-    quantity = Decimal("NaN") if unknown == "quantity" else Decimal("100")
     nav = Decimal("NaN") if unknown == "nav" else Decimal("100000")
-    prior_positions = {} if unknown == "line" else {
-        "600001": {
-            "initial_line": "9", "active_line": "9", "atr14": "0.5",
-            "position_started_for": "2026-07-01", "updated_for": "2026-07-13",
-        }
-    }
     built = build_report(
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
@@ -4532,7 +4816,7 @@ def test_unknown_critical_simulation_fact_pauses_the_whole_entry_batch(
             available_cash=Decimal("50000"),
             positions=(
                 AccountPosition(
-                    "600001", "持仓", "stock", quantity,
+                    "600001", "持仓", "stock", Decimal("100"),
                     Decimal("9.5"), Decimal("1000"),
                 ),
             ),
@@ -4540,8 +4824,13 @@ def test_unknown_critical_simulation_fact_pauses_the_whole_entry_batch(
         ),
         candidates=[candidate("600002"), candidate("600003")],
         holding_snapshots={"600001": holding("600001")},
-        bars_by_symbol={} if unknown == "price" else {"600001": bars()},
-        prior_state={"positions": prior_positions},
+        bars_by_symbol={"600001": bars()},
+        prior_state={"positions": {
+            "600001": {
+                "initial_line": "9", "active_line": "9", "atr14": "0.5",
+                "position_started_for": "2026-07-01", "updated_for": "2026-07-13",
+            }
+        }},
         price_fx_to_account_currency=(
             Decimal("NaN") if unknown == "fx" else Decimal("1")
         ),
@@ -4550,8 +4839,74 @@ def test_unknown_critical_simulation_fact_pauses_the_whole_entry_batch(
     assert built.buy_actions == ()
     assert built.risk_summary["status"] == "paused"
     assert built.risk_summary["pause_reason"]
+    # 旧语义（≤v13/v11）回放产物冻结 risk_summary 键集：不含新语义专属键。
+    assert "data_defect_reason" not in built.risk_summary
+    assert "pending_entries_note" not in built.risk_summary
     assert [item["symbol"] for item in built.risk_skips] == ["600002", "600003"]
     assert all(item["reason"] == built.risk_summary["pause_reason"] for item in built.risk_skips)
+
+
+@pytest.mark.parametrize(
+    "unknown, expected_reason",
+    [
+        ("quantity", "组合剩余风险不可用（600001 数量缺失）"),
+        ("price", "组合剩余风险不可用（600001 价格缺失）"),
+        ("line", "组合剩余风险不可用（600001 活动保护线缺失）"),
+    ],
+)
+def test_candidate_level_missing_fact_degrades_entry_batch_with_note(
+    unknown: str,
+    expected_reason: str,
+) -> None:
+    quantity = Decimal("NaN") if unknown == "quantity" else Decimal("100")
+    prior_positions = {} if unknown == "line" else {
+        "600001": {
+            "initial_line": "9", "active_line": "9", "atr14": "0.5",
+            "position_started_for": "2026-07-01", "updated_for": "2026-07-13",
+        }
+    }
+    allocation = allocation_for("CN", rank=1, entry_weight="0.06")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622460, 705013),
+        allocation=allocation,
+        execution_date="2026-07-15",
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("50000"),
+            positions=(
+                AccountPosition(
+                    "600001", "持仓", "stock", quantity,
+                    Decimal("9.5"), Decimal("1000"),
+                ),
+            ),
+            exceptions=(),
+        ),
+        candidates=[
+            candidate("600002", global_strength="90"),
+            candidate("600003", global_strength="88"),
+        ],
+        holding_snapshots={"600001": holding("600001")},
+        bars_by_symbol={} if unknown == "price" else {"600001": bars()},
+        prior_state={"positions": prior_positions},
+        price_fx_to_account_currency=Decimal("1"),
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        allocation_reference=allocation,
+    )
+
+    assert built.risk_skips == ()
+    assert built.risk_summary["status"] == "active"
+    assert built.risk_summary["data_defect_reason"] == expected_reason
+    assert [item.symbol for item in built.buy_actions] == ["600002", "600003"]
+    for item in built.buy_actions:
+        assert item.executable is True
+        assert item.sizing_note == expected_reason
 
 
 def test_cn_buy_action_serializes_candidate_industry(tmp_path: Path) -> None:
@@ -4630,20 +4985,23 @@ def test_hk_four_percent_weight_can_buy_one_board_lot() -> None:
     assert actions[0].estimated_shares == 100
 
 
-def test_more_than_ten_positions_has_no_formal_buys() -> None:
-    assert (
-        estimate_buy_actions(
-            ranked=[candidate("600001")],
-            net_value=Decimal("100000"),
-            available_cash=Decimal("100000"),
-            current_position_count=11,
-            position_weight=Decimal("0.04"),
-        )
-        == []
+def test_more_than_ten_positions_lists_pending_buy_with_slot_note() -> None:
+    actions = estimate_buy_actions(
+        ranked=[candidate("600001")],
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        current_position_count=11,
+        position_weight=Decimal("0.04"),
     )
+    assert len(actions) == 1
+    assert actions[0].symbol == "600001"
+    assert actions[0].executable is False
+    assert actions[0].sizing_note == "10 个持仓席位已满"
+    assert actions[0].lot_size == 100
+    assert actions[0].estimated_shares == 300
 
 
-def test_unaffordable_candidate_does_not_consume_cash_or_slot() -> None:
+def test_unaffordable_candidate_lists_one_lot_without_consuming_cash_or_slot() -> None:
     actions = estimate_buy_actions(
         ranked=[
             candidate("600001", close="20"),
@@ -4654,14 +5012,176 @@ def test_unaffordable_candidate_does_not_consume_cash_or_slot() -> None:
         current_position_count=9,
         position_weight=Decimal("0.04"),
     )
-    assert [(item.symbol, item.target_amount, item.estimated_shares) for item in actions] == [
-        ("600002", Decimal("400.00"), 400)
+    assert [
+        (item.symbol, item.target_amount, item.estimated_shares, item.executable)
+        for item in actions
+    ] == [
+        ("600001", Decimal("2000.00"), 100, False),
+        ("600002", Decimal("400.00"), 400, True),
+    ]
+    assert actions[0].sizing_note == (
+        "一手超过名义仓位上限；一手超过单笔风险上限；"
+        "现金不足一手（需约 2002.00，可用 600.00）"
+    )
+    assert actions[1].sizing_note == ""
+
+
+def test_legacy_semantics_pause_batch_when_candidate_price_or_atr_missing() -> None:
+    actions, skips, _ = trend_module._plan_buy_actions(
+        ranked=(replace(candidate("600001"), close=None),),
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        current_position_count=0,
+        position_weight=Decimal("0.04"),
+        market="CN",
+        lot_sizes={"600001": 100},
+        price_fx_to_account_currency=Decimal("1"),
+        portfolio_planned_risk=Decimal("0"),
+        normal_cost_rate=Decimal("0.001"),
+        use_final_plan_semantics=False,
+    )
+
+    assert actions == []
+    assert [(item["symbol"], item["reason"], item["decisive_constraint"]) for item in skips] == [
+        ("600001", "候选价格或活动保护线缺失，暂停新开仓", "关键风险数据")
     ]
 
 
-def test_unaffordable_top_ten_promotes_later_affordable_candidate() -> None:
-    ranked = [candidate(f"6000{index:02d}", close="100") for index in range(1, 11)]
-    ranked.append(candidate("600011", close="1", atr="0.01"))
+def test_legacy_semantics_keep_original_elimination_path() -> None:
+    # 席位已满 → 原剔除路径 risk_skip
+    actions, skips, _ = trend_module._plan_buy_actions(
+        ranked=(candidate("600001"),),
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        current_position_count=10,
+        position_weight=Decimal("0.04"),
+        market="CN",
+        lot_sizes={"600001": 100},
+        price_fx_to_account_currency=Decimal("1"),
+        portfolio_planned_risk=Decimal("0"),
+        normal_cost_rate=Decimal("0.001"),
+        use_final_plan_semantics=False,
+    )
+    assert actions == []
+    assert [(item["reason"], item["decisive_constraint"]) for item in skips] == [
+        ("10 个持仓席位已满", "持仓席位")
+    ]
+
+    # HK 每手股数未知 → 原剔除路径 risk_skip
+    actions, skips, _ = trend_module._plan_buy_actions(
+        ranked=(candidate("00700", exchange="HK"),),
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        current_position_count=0,
+        position_weight=Decimal("0.04"),
+        market="HK",
+        lot_sizes={},
+        price_fx_to_account_currency=Decimal("1"),
+        portfolio_planned_risk=Decimal("0"),
+        normal_cost_rate=Decimal("0.001"),
+        use_final_plan_semantics=False,
+    )
+    assert actions == []
+    assert [(item["reason"], item["decisive_constraint"]) for item in skips] == [
+        ("缺少实际每手股数", "交易单位")
+    ]
+
+    # 现金不足以买一手 → 原剔除路径 risk_skip（最小交易单位文案）
+    actions, skips, _ = trend_module._plan_buy_actions(
+        ranked=(candidate("600002", close="100"),),
+        net_value=Decimal("100000"),
+        available_cash=Decimal("600"),
+        current_position_count=0,
+        position_weight=Decimal("0.04"),
+        market="CN",
+        lot_sizes={"600002": 100},
+        price_fx_to_account_currency=Decimal("1"),
+        portfolio_planned_risk=Decimal("0"),
+        normal_cost_rate=Decimal("0.001"),
+        use_final_plan_semantics=False,
+    )
+    assert actions == []
+    assert [(item["reason"], item["decisive_constraint"]) for item in skips] == [
+        ("最小交易单位 100 股超过现金", "现金")
+    ]
+
+    # 正常候选仍照常列入并可执行
+    actions, skips, _ = trend_module._plan_buy_actions(
+        ranked=(candidate("600001"),),
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        current_position_count=0,
+        position_weight=Decimal("0.04"),
+        market="CN",
+        lot_sizes={"600001": 100},
+        price_fx_to_account_currency=Decimal("1"),
+        portfolio_planned_risk=Decimal("0"),
+        normal_cost_rate=Decimal("0.001"),
+        use_final_plan_semantics=False,
+    )
+    assert skips == []
+    assert [
+        (item.symbol, item.estimated_shares, item.executable)
+        for item in actions
+    ] == [("600001", 300, True)]
+
+
+def test_final_plan_semantics_list_data_missing_and_cash_waiting_buys() -> None:
+    # 价格缺失 → 列入+提示（executable=False），不剔除
+    actions, skips, _ = trend_module._plan_buy_actions(
+        ranked=(replace(candidate("600001"), close=None),),
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        current_position_count=0,
+        position_weight=Decimal("0.04"),
+        market="CN",
+        lot_sizes={"600001": 100},
+        price_fx_to_account_currency=Decimal("1"),
+        portfolio_planned_risk=Decimal("0"),
+        normal_cost_rate=Decimal("0.001"),
+        use_final_plan_semantics=True,
+    )
+    assert skips == []
+    assert [
+        (item.symbol, item.estimated_shares, item.executable)
+        for item in actions
+    ] == [("600001", 0, False)]
+    assert actions[0].sizing_note == "候选价格或活动保护线缺失"
+
+    # 现金不足一手 → 列入+仅保留专属现金模板（不叠加「一手超过现金」）
+    actions, skips, _ = trend_module._plan_buy_actions(
+        ranked=(candidate("600002", close="100"),),
+        net_value=Decimal("100000"),
+        available_cash=Decimal("600"),
+        current_position_count=0,
+        position_weight=Decimal("0.04"),
+        market="CN",
+        lot_sizes={"600002": 100},
+        price_fx_to_account_currency=Decimal("1"),
+        portfolio_planned_risk=Decimal("0"),
+        normal_cost_rate=Decimal("0.001"),
+        use_final_plan_semantics=True,
+    )
+    assert skips == []
+    assert actions[0].executable is False
+    assert "一手超过现金" not in actions[0].sizing_note
+    assert "现金不足一手（需约 10010.00，可用 600.00）" in actions[0].sizing_note
+
+
+def test_unaffordable_top_ten_keeps_later_candidate_as_pending_buy() -> None:
+    ranked = [
+        replace(candidate(f"6000{index:02d}", close="100"), global_strength=Decimal("90"))
+        for index in range(1, 11)
+    ]
+    ranked.append(
+        replace(candidate("600011", close="1", atr="0.01"), global_strength=Decimal("50"))
+    )
+    allocation = allocation_for("CN", rank=1, entry_weight="0.06")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622460, 705013),
+        allocation=allocation,
+        execution_date="2026-07-15",
+    )
     built = build_report(
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
@@ -4669,9 +5189,25 @@ def test_unaffordable_top_ten_promotes_later_affordable_candidate() -> None:
         candidates=ranked,
         holding_snapshots={},
         bars_by_symbol={},
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="10000"),
+        allocation_reference=allocation,
     )
     assert len(built.candidates) == 10
-    assert [item.symbol for item in built.buy_actions] == ["600011"]
+    assert [item.symbol for item in built.buy_actions] == [
+        *[f"6000{index:02d}" for index in range(1, 11)],
+        "600011",
+    ]
+    assert all(item.executable for item in built.buy_actions[:-1])
+    assert all(
+        "一手超过名义仓位上限" in item.sizing_note
+        for item in built.buy_actions[:-1]
+    )
+    last = built.buy_actions[-1]
+    assert last.symbol == "600011"
+    assert last.executable is False
+    assert "10 个持仓席位已满" in last.sizing_note
+    assert last.estimated_shares == last.lot_size == 100
 
 
 def test_duplicate_pool_members_produce_one_candidate_and_one_buy() -> None:
@@ -5127,30 +5663,40 @@ def test_explicit_overheat_survives_unavailable_kline_and_preserves_old_line(
     assert action.warnings == ("holding_kline_unavailable",)
 
 
-def test_explicit_overheat_without_line_persists_lifecycle_and_pauses_buys() -> None:
+def test_explicit_overheat_without_line_persists_lifecycle_and_degrades_buys() -> None:
+    allocation = allocation_for("CN", rank=1, entry_weight="0.06")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622460, 705013),
+        allocation=allocation,
+        execution_date="2026-07-15",
+    )
     built = build_report(
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
         account=account("600001"),
-        candidates=(candidate("600002"),),
+        candidates=(
+            replace(candidate("600002"), global_strength=Decimal("90")),
+        ),
         holding_snapshots={
             "600001": holding(
                 "600001", boiling=True, danger=None, right_side=None, champagne=None
             )
         },
         bars_by_symbol={"600001": None},
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="676549.55"),
+        allocation_reference=allocation,
     )
     action = built.holdings[0]
     assert (action.action, action.reason, action.initial_line, action.active_line) == (
-        "SELL_PARTIAL", "overheat_take_profit", None, None
-    )
-    assert action.warnings == (
-        "holding_signal_unknown", "holding_kline_unavailable"
+        "MANUAL_REVIEW", "holding_signal_unknown", None, None
     )
     assert built.protection_state["positions"]["600001"]["position_started_for"] == "2026-07-14"
-    assert built.buy_actions == ()
-    assert built.risk_summary["status"] == "paused"
-    assert "活动保护线缺失" in str(built.risk_summary["pause_reason"])
+    assert [item.symbol for item in built.buy_actions] == ["600002"]
+    assert built.buy_actions[0].executable is True
+    assert built.buy_actions[0].sizing_note == "组合剩余风险不可用（600001 活动保护线缺失）"
+    assert built.risk_summary["status"] == "active"
+    assert "活动保护线缺失" in str(built.risk_summary["data_defect_reason"])
 
 
 @pytest.mark.parametrize("lot_size", [None, 0])
@@ -7786,7 +8332,7 @@ def test_current_cn_runner_skips_candidate_industry_breadth(tmp_path: Path) -> N
     )
 
     payload = json.loads(result.json_path.read_text(encoding="utf-8"))
-    assert payload["strategy_snapshot"]["strategy_version"] == "v13"
+    assert payload["strategy_snapshot"]["strategy_version"] == "v14"
     assert payload["industry_context_status"]["ordering_mode"] == "individual_global"
     assert [
         fields for _, fields in api.snapshot_requests

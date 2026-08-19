@@ -19,10 +19,10 @@ DRAWDOWN_LIMIT = Decimal("0.05")
 OVERHEAT_TRIM_COMPATIBILITY_REVISION = "trend_overheat_trim_v1"
 UNIFIED_TREND_V5_COMPATIBILITY_REVISION = "unified_trend_v5_v1"
 ALLOCATION_PROJECTION_COMPATIBILITY_REVISION = "allocation_projection_v1"
-ALLOCATION_PROJECTION_VERSIONS = {"CN": "v13", "HK": "v11", "US": "v11"}
+ALLOCATION_PROJECTION_VERSIONS = {"CN": "v14", "HK": "v12", "US": "v12"}
 # Keep the immediately preceding allocation-era reports readable while the
 # current version owns new state and parameter transitions.
-LEGACY_ALLOCATION_PROJECTION_VERSIONS = {"CN": "v12", "HK": "v10", "US": "v10"}
+LEGACY_ALLOCATION_PROJECTION_VERSIONS = {"CN": "v13", "HK": "v11", "US": "v11"}
 ALLOCATION_PROJECTION_PARAMETER_HASHES = {
     "CN": (
         "c9f06d07dfb9d889041c34e99b00b4484d36e48dedb5707cf705a9e152b119f7",

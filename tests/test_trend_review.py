@@ -819,11 +819,17 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
             danger=False,
             close=Decimal("100"),
             atr=Decimal("5"),
+            temperature_prev="温",
             temperature_curr="热",
+            phase="夏至",
             phase_curr="夏至",
             strength_change="上升",
             boiling=False,
             champagne=False,
+            global_strength=Decimal(str(97 - index)),
+            market_cap=Decimal("2000"),
+            industry_tm_id=700001,
+            industry_temperature="热",
         )
         for index, symbol in enumerate(("AAPL", "MSFT"), start=1)
     ]
@@ -835,6 +841,94 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
         positions=(),
         exceptions=(),
         position_count=9,
+    )
+    allocation = {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": "b" * 64,
+        "snapshot": {
+            "version": 1,
+            "allocation_date": "2026-08-03",
+            "generated_at": "2026-08-03T16:18:00+08:00",
+            "generator_version": "trend-allocation-v1",
+            "git_sha": "a" * 40,
+            "roots": {
+                "CN": {
+                    "stock": {
+                        "asset": "A股",
+                        "tm_id": 11,
+                        "as_of_date": "2026-08-03",
+                        "global_strength": "80",
+                    },
+                    "etf": {
+                        "asset": "ETF基金",
+                        "tm_id": 12,
+                        "as_of_date": "2026-08-03",
+                        "global_strength": "70",
+                    },
+                },
+                "HK": {
+                    "stock": {
+                        "asset": "港股",
+                        "tm_id": 21,
+                        "as_of_date": "2026-08-03",
+                        "global_strength": "70",
+                    },
+                    "etf": {
+                        "asset": "香港ETF",
+                        "tm_id": 22,
+                        "as_of_date": "2026-08-03",
+                        "global_strength": "60",
+                    },
+                },
+                "US": {
+                    "stock": {
+                        "asset": "美股",
+                        "tm_id": 31,
+                        "as_of_date": "2026-08-03",
+                        "global_strength": "90",
+                    },
+                    "etf": {
+                        "asset": "美国ETF",
+                        "tm_id": 32,
+                        "as_of_date": "2026-08-03",
+                        "global_strength": "80",
+                    },
+                },
+            },
+            "markets": {
+                "CN": {
+                    "rank": 2,
+                    "score": "80",
+                    "score_source": "A股",
+                    "entry_weight": "0.04",
+                    "nominal_weight": "0.40",
+                },
+                "HK": {
+                    "rank": 3,
+                    "score": "70",
+                    "score_source": "港股",
+                    "entry_weight": "0.02",
+                    "nominal_weight": "0.20",
+                },
+                "US": {
+                    "rank": 1,
+                    "score": "90",
+                    "score_source": "美股",
+                    "entry_weight": "0.06",
+                    "nominal_weight": "0.60",
+                },
+            },
+        },
+    }
+    snapshot_body = json.dumps(
+        allocation["snapshot"], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ) + "\n"
+    allocation["sha256"] = hashlib.sha256(snapshot_body.encode("utf-8")).hexdigest()
+    allocation_path = tmp_path / "trend_allocation/daily/2026-08-03.json"
+    allocation_path.parent.mkdir(parents=True, exist_ok=True)
+    allocation_path.write_text(snapshot_body, encoding="utf-8")
+    strategy = live_trend_strategy_snapshot(
+        "US", "oldsha", (1,), allocation=allocation, execution_date="2026-07-17",
     )
     report = build_report(
         as_of_date="2026-07-16",
@@ -849,6 +943,29 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
         price_fx_to_account_currency=Decimal("7.85"),
         process_version="oldsha",
         candidate_pool_ids=(1,),
+        strategy_snapshot=strategy,
+        position_weight=Decimal("0.06"),
+        drawdown_summary={
+            "schema_version": "open_trader.strategy_drawdown.v1",
+            "market": "US",
+            "strategy_id": strategy["strategy_id"],
+            "strategy_version": "v12",
+            "kelly_sample_key": "US|trend_animals_warm_to_hot/US/v12|v12",
+            "state_status": "ok",
+            "status": "active",
+            "status_label": "纪律内",
+            "entry_allowed": True,
+            "current_equity": "100000",
+            "high_water_mark": "100000",
+            "drawdown_pct": "0",
+            "drawdown_limit_pct": "0.05",
+            "pause_reason": "",
+            "paused_at": None,
+            "observed_at": "2026-07-16T18:00:00+08:00",
+            "bootstrap_event": None,
+            "recovery_event": None,
+        },
+        allocation_reference=allocation,
     )
     source = _report_payload(report)
     current_rows = market_trend._attention_rows(source["signal_snapshots"]) or []
@@ -921,8 +1038,15 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
     source_actions = source["strategy_judgments"]["formal_actions"]
     rebuilt_actions = rebuilt["strategy_judgments"]["formal_actions"]
     assert rebuilt["account"]["position_count"] == 9
-    assert len(rebuilt_actions) == len(source_actions) == 1
-    assert rebuilt_actions[0]["estimated_shares"] == source_actions[0]["estimated_shares"] == 5
+    assert len(rebuilt_actions) == len(source_actions) == 2
+    assert [action["symbol"] for action in rebuilt_actions] == [
+        action["symbol"] for action in source_actions
+    ] == ["AAPL", "MSFT"]
+    assert all(
+        rebuilt["estimated_shares"] == source["estimated_shares"] == 5
+        for rebuilt, source in zip(rebuilt_actions, source_actions)
+    )
+    assert all(action["executable"] is False for action in rebuilt_actions[1:])
     assert rebuilt["option_attention"] == source["option_attention"]
 
     corrected_path = trend_review.replay_trend_evidence(
@@ -1639,6 +1763,40 @@ def test_relative_rotation_zero_candidate_quantity_never_writes_sell_intent(
 
 
 @pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda pair: pair.update(lot_size=0),
+        lambda pair: pair.update(lot_size=-100),
+        lambda pair: pair.update(atr="0"),
+        lambda pair: pair.update(atr=None),
+    ],
+)
+def test_relative_rotation_data_defect_pair_writes_terminal_skipped(
+    tmp_path: Path, mutate: object,
+) -> None:
+    client = FakeTrendSimClient(cash="0", positions=full_rotation_positions())
+    report = relative_rotation_report()
+    mutate(report["strategy_judgments"]["simulate_rotation_pairs"][0])
+
+    for _ in range(2):
+        trend_review.execute_relative_rotations(
+            data_dir=tmp_path, report=report, client=client, market="CN",
+            execution_date="2026-07-20", now="2026-07-20T10:30:00+08:00",
+            quote_prices={"SH.STRONG": Decimal("10")},
+        )
+
+    # 每手/ATR 缺失的数据缺陷轮换对：写终态 skipped 而非抛异常，且重放幂等。
+    assert client.requests == []
+    terminal = list(
+        tmp_path.glob("trend_review/ledgers/CN/rotations/2026-07-20/*/terminal.json")
+    )
+    assert len(terminal) == 1
+    payload = json.loads(terminal[0].read_text(encoding="utf-8"))
+    assert payload["status"] == "skipped"
+    assert payload["reason"] == "rotation_sizing_inputs_invalid"
+
+
+@pytest.mark.parametrize(
     ("status", "filled"),
     [("FILLED_PART", "100"), ("REJECTED", "0"), ("MYSTERY", "0")],
 )
@@ -2250,6 +2408,127 @@ def test_legacy_report_without_mapping_marker_keeps_symbol_conversion() -> None:
     assert trend_review._preflight_open_actions(cn_buy_report(), "CN")[0] == [
         action
     ]
+
+
+def test_data_missing_buy_entries_are_skipped_not_rejected() -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600002",
+            "target_weight": "0.04",
+            "lot_size": 0,
+            "estimated_shares": 0,
+            "atr": "0",
+            "sizing_note": "每手股数未知，无法定量",
+        },
+        {
+            "action": "BUY",
+            "symbol": "600003",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 200,
+            "atr": "0.5",
+        },
+    ])
+
+    validated, _ = trend_review._preflight_open_actions(report, "CN")
+
+    assert [item["symbol"] for item in validated] == ["600003"]
+
+
+def test_data_missing_buy_entry_does_not_block_other_executions(
+    tmp_path: Path,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600002",
+            "target_weight": "0.04",
+            "lot_size": 0,
+            "estimated_shares": 0,
+            "atr": "0",
+            "sizing_note": "每手股数未知，无法定量",
+        },
+        {
+            "action": "BUY",
+            "symbol": "600003",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 200,
+            "atr": "0.5",
+        },
+    ])
+    client = FakeTrendSimClient()
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+
+    assert result["submitted_count"] == 1
+    assert [request["futu_code"] for request in client.requests] == ["SH.600003"]
+    assert not list(
+        tmp_path.glob("trend_review/ledgers/CN/actions/2026-07-17/*SH.600002*/*.json")
+    )
+
+
+def test_non_executable_buy_never_orders_and_never_misses(tmp_path: Path) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600002",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 200,
+            "atr": "0.5",
+            "executable": False,
+        },
+    ])
+    client = FakeTrendSimClient()
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+
+    assert result["submitted_count"] == 0
+    assert client.requests == []
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-17", "SH.600002", "buy"
+    )
+    action_root = (
+        tmp_path
+        / f"trend_review/ledgers/CN/actions/2026-07-17"
+        / action_key
+    )
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in action_root.glob("*.json")
+    ]
+    assert [(event["status"], event["reason"]) for event in events] == [
+        ("pending", "waiting_for_cash_or_slot")
+    ]
+
+    missed = trend_review.record_trend_review_missed_buys(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-17",
+        now="2026-07-17T10:01:00+08:00",
+    )
+
+    assert missed == 0
+    assert all(event["status"] != "missed" for event in events)
 
 
 def partial_sell_report(
@@ -8757,7 +9036,7 @@ def test_projection_tolerates_daily_allocation_identity_changes(
 
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
-    assert projection["strategy_snapshot"]["strategy_version"] == "v13"
+    assert projection["strategy_snapshot"]["strategy_version"] == "v14"
 
 
 def test_projection_excludes_non_allocation_parameter_drift_fact(
