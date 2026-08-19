@@ -8,7 +8,7 @@ import logging
 import os
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -1542,6 +1542,17 @@ class LlmRelationValidator:
             relation_llm_cache_key(relation, prompt_version=self.prompt_version),
         )
 
+    def relation_cache_key(self, relation: ThresholdRelation) -> str:
+        """Shared cache key for *relation* under this validator's prompt version.
+
+        The monitor's batch restore path keys its lookup with this method so
+        custom prompt_version configurations always agree with the keys
+        written by cached_validations/migrate_legacy_validations.
+        """
+        return relation_llm_cache_key(
+            relation, prompt_version=self.prompt_version
+        )
+
     def _validation(
         self,
         *,
@@ -1675,24 +1686,96 @@ class LlmRelationValidator:
                     provider=str(validation.provider or self.current_provider())
                 )
                 return validation
-        for legacy_key in legacy_relation_cache_keys(
-            relation, prompt_version=self.prompt_version
-        ):
-            legacy = self.store.load_llm_cache(legacy_key)
-            if not isinstance(legacy, Mapping):
-                continue
-            validation = self._validation_from_cache(relation, cache_key, legacy)
-            if validation is None:
-                continue
-            try:
-                self.store.save_llm_cache(cache_key, dict(legacy))
-            except Exception:
-                pass
-            self.store.record_llm_cache_hit(
-                provider=str(validation.provider or self.current_provider())
-            )
-            return validation
         return None
+
+    def migrate_legacy_validations(
+        self, relations: Iterable[ThresholdRelation],
+    ) -> int:
+        """One-time migration of legacy per-provider cache entries to shared keys.
+
+        Call once at process startup.  Returns the number of entries migrated.
+        """
+        all_legacy_keys: list[str] = []
+        legacy_by_new: dict[str, list[str]] = {}
+        new_key_to_relation: dict[str, ThresholdRelation] = {}
+        for relation in relations:
+            new_key = relation_llm_cache_key(
+                relation, prompt_version=self.prompt_version
+            )
+            new_key_to_relation[new_key] = relation
+            lkeys = legacy_relation_cache_keys(
+                relation, prompt_version=self.prompt_version
+            )
+            if lkeys:
+                legacy_by_new[new_key] = lkeys
+                all_legacy_keys.extend(lkeys)
+        if not all_legacy_keys:
+            return 0
+        # Batch the new shared keys alongside the legacy ones so the single
+        # lookup also detects verdicts already migrated by a previous run.
+        hits = self.store.load_llm_cache_entries(
+            all_legacy_keys + list(legacy_by_new)
+        )
+        if not hits:
+            return 0
+        migrated = 0
+        for new_key, lkeys in legacy_by_new.items():
+            relation = new_key_to_relation.get(new_key)
+            if relation is None:
+                continue
+            existing = hits.get(new_key)
+            if (
+                existing is not None
+                and self._validation_from_cache(relation, new_key, existing) is not None
+            ):
+                continue  # already migrated in a previous process run
+            for lkey in lkeys:
+                payload = hits.get(lkey)
+                if payload is None:
+                    continue
+                v = self._validation_from_cache(relation, new_key, payload)
+                if v is None:
+                    continue
+                try:
+                    self.store.save_llm_cache(new_key, dict(payload))
+                except Exception:
+                    pass
+                self.store.record_llm_cache_hit(
+                    provider=str(v.provider or self.current_provider())
+                )
+                migrated += 1
+                break  # one successful legacy key per relation is enough
+        return migrated
+
+    def cached_validations(
+        self, relations: Iterable[ThresholdRelation],
+    ) -> dict[str, RelationValidation]:
+        """Batch cache lookup: one DB connection for all *relations*.
+
+        Returns {new_cache_key: RelationValidation} for hits.
+        No legacy probing is performed.
+        """
+        key_to_relation: dict[str, ThresholdRelation] = {}
+        keys: list[str] = []
+        for relation in relations:
+            k = relation_llm_cache_key(
+                relation, prompt_version=self.prompt_version
+            )
+            key_to_relation[k] = relation
+            keys.append(k)
+        if not keys:
+            return {}
+        hits = self.store.load_llm_cache_entries(keys)
+        result: dict[str, RelationValidation] = {}
+        for k, payload in hits.items():
+            relation = key_to_relation[k]
+            v = self._validation_from_cache(relation, k, payload)
+            if v is not None:
+                self.store.record_llm_cache_hit(
+                    provider=str(v.provider or self.current_provider())
+                )
+                result[k] = v
+        return result
 
     def validate(self, relation: ThresholdRelation) -> RelationValidation:
         provider = self.current_provider()

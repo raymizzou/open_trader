@@ -12,10 +12,14 @@ from typing import Mapping
 
 import pytest
 
+from open_trader.llm_providers import PROVIDER_IDS
 from open_trader.polymarket_relation_discovery import (
+    RELATION_PROMPT_VERSION,
+    LlmRelationValidator,
     RelationValidation,
     discover_threshold_relation_catalog,
     discover_threshold_relations,
+    relation_llm_cache_key,
     threshold_relation_payload,
 )
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
@@ -313,6 +317,9 @@ class FakeRelationValidator:
     def __init__(self, status: str = "approved") -> None:
         self.status = status
         self.calls = 0
+        self.batch_calls = 0
+        self.migrate_calls = 0
+        self.migrated_relations: list[object] = []
         self.relation_ids: list[str] = []
         self.cached: dict[str, RelationValidation] = {}
         self.block: threading.Event | None = None
@@ -376,6 +383,21 @@ class FakeRelationValidator:
         if value is None:
             return None
         return replace(value, cached=True)
+
+    def migrate_legacy_validations(self, relations) -> int:
+        self.migrate_calls += 1
+        self.migrated_relations = list(relations)
+        return 0
+
+    def cached_validations(self, relations) -> dict[str, RelationValidation]:
+        self.batch_calls += 1
+        results: dict[str, RelationValidation] = {}
+        for relation in relations:
+            value = self.cached.get(relation.relation_id)
+            if value is None:
+                continue
+            results[relation_llm_cache_key(relation)] = replace(value, cached=True)
+        return results
 
 
 def setup_public(event_rows: list[object]) -> None:
@@ -1491,6 +1513,234 @@ def test_background_monitor_prioritizes_top_twenty_before_bulk_scans(
     asyncio.run(monitor.run_forever())
 
     assert calls[:3] == ["universe", "full", "activity"]
+
+
+def test_run_forever_runs_legacy_validation_migration_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relation = discover_threshold_relations([threshold_event()])[0]
+    setup_public([])
+    db = PredictionArbitrageStore(tmp_path / "data")
+    db.save_relation_state(
+        {"relations": [threshold_relation_payload(relation)]},
+        full_scanned_at=NOW.isoformat(),
+    )
+    validator = FakeRelationValidator()
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+    )
+    calls: list[str] = []
+
+    async def refresh_universe(
+        client: object, *, subscribe: bool = True,
+    ) -> None:
+        del client, subscribe
+        calls.append("universe")
+        monitor._universe_at = NOW
+
+    def schedule_full(client: object) -> None:
+        del client
+        calls.append("full")
+
+    def schedule_activity(client: object) -> None:
+        del client
+        calls.append("activity")
+        monitor._stop_event.set()
+
+    monkeypatch.setattr(monitor, "_refresh_universe_bounded", refresh_universe)
+    monkeypatch.setattr(monitor, "_maybe_schedule_full_scan", schedule_full)
+    monkeypatch.setattr(
+        monitor, "_maybe_schedule_activity_scan", schedule_activity
+    )
+
+    asyncio.run(monitor.run_forever())
+
+    assert validator.migrate_calls == 1
+    # The migration ran exactly once with every catalog-loaded relation.
+    assert validator.migrated_relations == list(monitor._relations.values())
+    assert [item.relation_id for item in validator.migrated_relations] == [
+        relation.relation_id
+    ]
+    assert calls[:3] == ["universe", "full", "activity"]
+
+
+def test_run_forever_survives_legacy_validation_migration_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relation = discover_threshold_relations([threshold_event()])[0]
+    setup_public([])
+    db = PredictionArbitrageStore(tmp_path / "data")
+    db.save_relation_state(
+        {"relations": [threshold_relation_payload(relation)]},
+        full_scanned_at=NOW.isoformat(),
+    )
+
+    class FailingMigrationValidator(FakeRelationValidator):
+        def migrate_legacy_validations(self, relations) -> int:
+            self.migrate_calls += 1
+            self.migrated_relations = list(relations)
+            raise RuntimeError("sentinel migration failure")
+
+    validator = FailingMigrationValidator()
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+    )
+    calls: list[str] = []
+
+    async def refresh_universe(
+        client: object, *, subscribe: bool = True,
+    ) -> None:
+        del client, subscribe
+        calls.append("universe")
+        monitor._universe_at = NOW
+
+    def schedule_full(client: object) -> None:
+        del client
+        calls.append("full")
+
+    def schedule_activity(client: object) -> None:
+        del client
+        calls.append("activity")
+        monitor._stop_event.set()
+
+    monkeypatch.setattr(monitor, "_refresh_universe_bounded", refresh_universe)
+    monkeypatch.setattr(monitor, "_maybe_schedule_full_scan", schedule_full)
+    monkeypatch.setattr(
+        monitor, "_maybe_schedule_activity_scan", schedule_activity
+    )
+
+    # A failing migration must not abort startup: run_forever still enters
+    # and completes the main loop.
+    asyncio.run(monitor.run_forever())
+
+    assert validator.migrate_calls == 1
+    assert calls[:3] == ["universe", "full", "activity"]
+
+
+def cache_payload(relation, *, approved: bool) -> dict[str, object]:
+    def market_result(market) -> dict[str, object]:
+        return {
+            "condition_id": market.condition_id,
+            "subject": "Bitcoin",
+            "metric": "Binance BTC/USDT close",
+            "operator": market.operator,
+            "threshold": str(market.threshold),
+            "unit": "USD",
+            "currency": "USD",
+            "observation_start": "2026-12-31T17:00:00Z",
+            "observation_end": "2026-12-31T17:00:00Z",
+            "timezone": "America/New_York",
+            "resolution_source": "Binance",
+            "special_settlement": None,
+        }
+
+    return {
+        "schema_version": 1,
+        "decision": "APPROVE" if approved else "REJECT",
+        "relation": relation.relation if approved else "NONE",
+        "market_a": market_result(relation.market_a),
+        "market_b": market_result(relation.market_b),
+        "proof": {
+            "excluded_state": (
+                "A=YES,B=NO"
+                if relation.relation == "A_IMPLIES_B"
+                else "A=NO,B=YES"
+            )
+            if approved
+            else None,
+            "why_excluded": (
+                "one threshold bound implies the other" if approved else None
+            ),
+        },
+        "reason_codes": [] if approved else ["AMBIGUOUS_RULES"],
+        "summary": (
+            "高阈值合约为 YES 时，低阈值合约必为 YES。"
+            if approved
+            else "完整规则仍有歧义，不能证明蕴含关系。"
+        ),
+        "evidence": (
+            [
+                {
+                    "market": "A",
+                    "field": "metric",
+                    "quote": "Binance BTC/USDT close at 12:00 ET",
+                },
+                {
+                    "market": "B",
+                    "field": "metric",
+                    "quote": "Binance BTC/USDT close at 12:00 ET",
+                },
+            ]
+            if approved
+            else []
+        ),
+        "uncertainties": [] if approved else ["规则存在无法消除的歧义"],
+    }
+
+
+def test_monitor_restore_uses_validator_prompt_version_cache_keys(
+    tmp_path: Path,
+) -> None:
+    """Batch restore keys rows by the validator's prompt version, so a custom
+    prompt_version build restores its own rows instead of default-version
+    rows."""
+    relation = discover_threshold_relations([threshold_event()])[0]
+
+    def must_not_complete(*_args: object) -> object:
+        raise AssertionError("restore path must not call the completer")
+
+    db = PredictionArbitrageStore(tmp_path / "data")
+    validator = LlmRelationValidator(
+        db,
+        default_provider="codex",
+        completers={provider: must_not_complete for provider in PROVIDER_IDS},
+        prompt_version="polymarket-threshold-relation-v9",
+    )
+    custom_key = relation_llm_cache_key(
+        relation, prompt_version="polymarket-threshold-relation-v9"
+    )
+    default_key = relation_llm_cache_key(relation)
+    assert custom_key != default_key
+    # The row under the validator's own prompt version must be restored.
+    db.save_llm_cache(
+        custom_key,
+        {
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "prompt_version": "polymarket-threshold-relation-v9",
+            "structured_result": cache_payload(relation, approved=True),
+        },
+    )
+    # A default-version row must NOT satisfy the restore; otherwise the
+    # lookup key is not derived from the validator's prompt version.
+    db.save_llm_cache(
+        default_key,
+        {
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "prompt_version": RELATION_PROMPT_VERSION,
+            "structured_result": cache_payload(relation, approved=False),
+        },
+    )
+
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+    )
+    monitor._relations = {relation.relation_id: relation}
+    monitor._active_relation_ids = {relation.relation_id}
+
+    asyncio.run(monitor._poll_relation_validation(object()))
+
+    assert monitor._codex_statuses[relation.relation_id] == "approved"
+    restored = monitor._codex_validations[relation.relation_id]
+    assert restored.cached is True
+    assert restored.prompt_version == "polymarket-threshold-relation-v9"
 
 
 def test_background_monitor_refreshes_top_twenty_while_bulk_scan_is_running(
@@ -2632,10 +2882,12 @@ def test_codex_worker_selects_highest_edge_then_reaps_one_at_a_time(
     setup_threshold_books(low_ask="0.50", high_no_ask="0.51", token_prefix="a-")
     setup_threshold_books(low_ask="0.49", high_no_ask="0.49", token_prefix="b-")
     validator = FakeRelationValidator()
+    now = [NOW]
     monitor = make_monitor(
         tmp_path,
         relation_discovery=discover_threshold_relations,
         relation_validator=validator,
+        clock=lambda: now[0],
     )
     client = FakePublicClient()
     asyncio.run(monitor._run_full_relation_scan(client))
@@ -2652,6 +2904,9 @@ def test_codex_worker_selects_highest_edge_then_reaps_one_at_a_time(
         assert monitor._codex_task is not None
         await monitor._codex_task
         await monitor._poll_relation_validation(client)
+        # The rescan path is throttled to one round per 2 s; step the clock
+        # past the window before the next rescan can start a second verdict.
+        now[0] = NOW + timedelta(seconds=3)
         await monitor._poll_relation_validation(client)
         await asyncio.sleep(0.01)
         assert len(validator.relation_ids) == 2
@@ -2718,12 +2973,48 @@ def test_transient_codex_failure_retries_once_at_the_retry_boundary(
         now[0] = NOW + timedelta(seconds=59)
         await monitor._poll_relation_validation(client)
         assert validator.calls == 1
-        now[0] = NOW + timedelta(seconds=60)
+        # The rescan throttle allows a new round 2 s after the previous one
+        # (which rescanned at +59 s), so the retry becomes due at +61 s.
+        now[0] = NOW + timedelta(seconds=61)
         await monitor._poll_relation_validation(client)
         await asyncio.sleep(0.01)
         assert validator.calls == 2
 
     asyncio.run(tick())
+
+
+def test_relation_rescan_is_throttled_but_harvest_is_not(tmp_path: Path) -> None:
+    setup_public([threshold_event()])
+    setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
+    validator = FakeRelationValidator()
+    monitor = make_monitor(
+        tmp_path,
+        relation_discovery=discover_threshold_relations,
+        relation_validator=validator,
+    )
+    client = FakePublicClient()
+    asyncio.run(monitor._run_full_relation_scan(client))
+    asyncio.run(monitor._refresh_relation_activity(client))
+
+    async def exercise() -> None:
+        # First poll: one rescan round that starts the codex task.
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is not None
+        assert validator.batch_calls == 1
+        # A completed codex task is harvested by the next poll even though
+        # far less than 2 s have elapsed since the rescan.
+        await monitor._codex_task
+        relation_id = next(iter(monitor._active_relation_ids))
+        await monitor._poll_relation_validation(client)
+        assert monitor._codex_task is None
+        assert monitor._codex_statuses[relation_id] == "approved"
+        # A second rescan attempt within 2 s is throttled: no batch lookup
+        # and no new verdict.
+        await monitor._poll_relation_validation(client)
+        assert validator.batch_calls == 1
+        assert validator.relation_ids == [relation_id]
+
+    asyncio.run(exercise())
 
 
 def test_llm_unavailable_notifies_failure_observer_once_and_resets_on_success(
@@ -2765,6 +3056,7 @@ def test_llm_unavailable_notifies_failure_observer_once_and_resets_on_success(
         validator.status = "approved"
         monitor._codex_statuses[relation_id] = "pending"
         monitor._codex_retry_at.pop(relation_id, None)
+        now[0] = NOW + timedelta(seconds=3)
         await monitor._poll_relation_validation(client)
         assert monitor._codex_task is not None
         await monitor._codex_task
@@ -2776,6 +3068,7 @@ def test_llm_unavailable_notifies_failure_observer_once_and_resets_on_success(
         monitor._codex_validations.pop(relation_id, None)
         monitor._codex_statuses[relation_id] = "pending"
         monitor._codex_retry_at.pop(relation_id, None)
+        now[0] = NOW + timedelta(seconds=6)
         await monitor._poll_relation_validation(client)
         assert monitor._codex_task is not None
         await monitor._codex_task
@@ -3292,10 +3585,12 @@ def test_threshold_discovery_full_scan_and_only_calls_codex_for_positive_relatio
     FakePublicClient.page_mode = True
     setup_threshold_books()
     validator = FakeRelationValidator()
+    now = [NOW]
     monitor = make_monitor(
         tmp_path,
         relation_discovery=discover_threshold_relations,
         relation_validator=validator,
+        clock=lambda: now[0],
     )
 
     monitor.refresh_once()
@@ -3316,6 +3611,8 @@ def test_threshold_discovery_full_scan_and_only_calls_codex_for_positive_relatio
     }
     assert PagePaginator.first_page_calls == 1
     assert PagePaginator.iter_calls == 1
+    # Step past the 2 s rescan throttle before the second diagnostic refresh.
+    now[0] = NOW + timedelta(seconds=3)
     monitor.refresh_once()
     assert len(monitor.snapshot()["events"]) == 20
     threshold_rows = [
@@ -3330,8 +3627,10 @@ def test_threshold_discovery_full_scan_and_only_calls_codex_for_positive_relatio
     assert row["annualized_yield"] is not None
     assert row["minimum_profit"] == row["estimated_profit"]
     assert row["resolution_at"] == "2026-12-31T17:00:00Z"
+    # remaining_days is computed at the advanced clock (NOW + 3 s) because
+    # the second diagnostic refresh must clear the 2 s rescan throttle.
     assert row["remaining_days"] == Decimal(
-        "157.2083333333333333333333333"
+        "157.2082986111111111111111111"
     )
     assert validator.calls == 1
     subscribed = FakePublicClient.subscribe_specs[-1]
@@ -3346,14 +3645,18 @@ def test_nonpositive_threshold_economics_enters_codex_but_stays_invisible(
     setup_public([threshold_event()])
     setup_threshold_books(low_ask="0.52", high_no_ask="0.50")
     validator = FakeRelationValidator()
+    now = [NOW]
     monitor = make_monitor(
         tmp_path,
         relation_discovery=discover_threshold_relations,
         relation_validator=validator,
+        clock=lambda: now[0],
     )
 
     monitor.refresh_once()
     asyncio.run(monitor._run_full_relation_scan(FakePublicClient()))
+    # Step past the 2 s rescan throttle before the second diagnostic refresh.
+    now[0] = NOW + timedelta(seconds=3)
     monitor.refresh_once()
 
     assert validator.calls == 1

@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal, Mapping
+from typing import Any, Callable, Iterable, Iterator, Literal, Mapping
 from zoneinfo import ZoneInfo
 
 from open_trader.llm_providers import DEFAULT_PROVIDER, PROVIDER_IDS
@@ -2004,6 +2004,37 @@ class PredictionArbitrageStore:
                 (key,),
             ).fetchone()
         return None if row is None else _load_payload(str(row["payload"]))
+
+    def load_llm_cache_entries(
+        self, cache_keys: Iterable[str],
+    ) -> dict[str, dict[str, object]]:
+        """Batch-load multiple cache keys in a single DB connection.
+
+        Returns a dict mapping *hit* cache_key -> parsed payload dict.
+        Opens zero connections when *cache_keys* is empty.
+        """
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in cache_keys:
+            key = str(raw).strip()
+            if key and key not in seen:
+                cleaned.append(key)
+                seen.add(key)
+        if not cleaned:
+            return {}
+        result: dict[str, dict[str, object]] = {}
+        CHUNK = 900
+        with self._read_connection() as connection:
+            for i in range(0, len(cleaned), CHUNK):
+                chunk = cleaned[i : i + CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    f"SELECT cache_key, payload FROM llm_cache WHERE cache_key IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    result[str(row["cache_key"])] = _load_payload(str(row["payload"]))
+        return result
 
     @staticmethod
     def _llm_usage_payload(
