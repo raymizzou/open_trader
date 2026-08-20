@@ -21,6 +21,10 @@ from .relation_catalog_v2 import (
     SqliteCatalogStore,
     _canonicalize,
 )
+from .prediction_monitor_selection import (
+    relation_generation_problem,
+    relation_row_admitted,
+)
 from .prediction_n_leg import (
     OBSERVATION_SCHEMA_V1,
     PROBLEM_SCHEMA_V1,
@@ -973,7 +977,10 @@ class RelationCatalog:
                 "status": "APPROVED",
                 "activation": "ACTIVATION_BLOCKED_INCONSISTENT",
             }
-        self._catalog.approve(relation_version_id, actor=actor, git_sha=git_sha)
+        # Activation is published by _activate's v2 replace(); calling v2
+        # approve() first would pre-pollute the store generation with this
+        # candidate, which the activation gate must not see as a
+        # previously-existing member.
         activation = self._activate(relation_version_id)
         return {
             "version_id": relation_version_id,
@@ -1003,6 +1010,10 @@ class RelationCatalog:
         updated = dict(self._versions()[relation_version_id])
         updated["activation_status"] = activation
         if activation != "ACTIVE":
+            # The operator approved this version; it simply could not publish.
+            # v2 replace() rolls a blocked candidate back to PENDING, so the
+            # approval must be re-recorded here for the review-state mapping.
+            updated["status"] = "APPROVED"
             updated["activation_diagnostic"] = activation
         self._store_write({relation_version_id: updated})
         if activation == "ACTIVE":
@@ -1109,7 +1120,9 @@ class RelationCatalog:
             if ident != versions[active_id]["identity"]
         ]
         change_set.append(versions[candidate_id]["payload"])
-        self._catalog.approve(candidate_id, actor=actor, git_sha=git_sha)
+        # No v2 approve() here: it would pre-pollute the store generation
+        # with the candidate, defeating the activation gate's fail-closed
+        # snapshot. replace() itself approves and publishes on success.
         result = self._catalog.replace(change_set, actor=actor, git_sha=git_sha)
         if result["status"] != "ACTIVE":
             raise ValueError("replacement candidate is not activatable")
@@ -1128,6 +1141,125 @@ class RelationCatalog:
         return {
             "revoked_version_id": active_id,
             "activated_version_id": candidate_id,
+        }
+
+    def rebuild_generation(
+        self,
+        drop_identities: Sequence[str],
+        *,
+        actor: str,
+        git_sha: str,
+        note: str = "",
+        allow_uncompilable: bool = False,
+    ) -> dict[str, object]:
+        """Surgically rewrite the generation without dropped ACTIVE members.
+
+        The whole post-drop member set is republished in one v2 ``replace()``;
+        dropped versions are marked REVOKED directly in the facade store and
+        never run through the v2 cause ledger, so no component is poisoned
+        UNKNOWN. Each dropped version gets one ``rebuild_generation_drop``
+        audit row (``catalog_v2_audit``, created lazily on first write),
+        written **before** the v2 ``replace``: the drop intent (identity,
+        version_id, actor, git_sha) is durable first, so an audit-write
+        failure aborts the apply with zero data changes, and a crash between
+        the audit and the publish leaves an intent record instead of an
+        unobservable partial apply. A post-drop set that still fails the
+        compile seam is refused (``ValueError``) before any audit row is
+        written; the precheck compiles only the seam's admission set (ACTIVE
+        and model-complete remaining members, ``relation_row_admitted``), so
+        UNKNOWN members never participate, matching the real consumer.
+        ``allow_uncompilable`` defers to the fail-closed activation gate,
+        which then refuses anyway (generation unchanged, nothing dropped).
+        """
+        drops = [str(identity) for identity in drop_identities]
+        if not drops:
+            raise ValueError("drop_identities must be non-empty")
+        if len(set(drops)) != len(drops):
+            raise ValueError("drop_identities must be unique")
+        versions = self._versions()
+        generation = self._current_generation()
+        unknown = [identity for identity in drops if identity not in generation]
+        if unknown:
+            raise ValueError(f"drop identity is not a generation member: {unknown[0]}")
+        not_active = [
+            identity
+            for identity in drops
+            if generation[identity].get("status") != "ACTIVE"
+        ]
+        if not_active:
+            raise ValueError(f"drop identity is not ACTIVE: {not_active[0]}")
+        drop_set = set(drops)
+        change_set = [
+            versions[entry["version_id"]]["payload"]
+            for identity, entry in generation.items()
+            if identity not in drop_set
+        ]
+        if not allow_uncompilable:
+            rows = {
+                identity: {
+                    "activation": entry.get("status", "ACTIVE"),
+                    "model": {
+                        name: versions[entry["version_id"]]["payload"].get(name)
+                        for name in ("terminal_states", "payouts", "capital_release", "problem")
+                    },
+                }
+                for identity, entry in generation.items()
+                if identity not in drop_set
+            }
+            # Precheck only the seam's admission set, exactly like the real
+            # consumer: remaining UNKNOWN (cause-marked) members do not
+            # participate, so their payloads cannot lift the merged as_of or
+            # flip a conflict verdict and wrongly reject or admit a drop.
+            rows = {
+                identity: row
+                for identity, row in rows.items()
+                if relation_row_admitted(row)
+            }
+            try:
+                relation_generation_problem(rows)
+            except ValueError as exc:
+                raise ValueError(f"post-drop generation does not compile: {exc}") from exc
+        # Intent-first audit: record each drop before any data change so an
+        # audit-write failure aborts with the generation bitwise unchanged
+        # and a mid-apply crash leaves a durable, reconstructable record.
+        write_audit = getattr(self._store, "write_audit", None)
+        if callable(write_audit):
+            intent_note = (
+                f"{note} intent; drop via rebuild_generation"
+                if note
+                else "intent; drop via rebuild_generation"
+            )
+            for identity in drops:
+                write_audit(
+                    action="rebuild_generation_drop",
+                    identity=identity,
+                    version_id=generation[identity]["version_id"],
+                    actor=actor,
+                    git_sha=git_sha,
+                    note=intent_note,
+                )
+        result = self._catalog.replace(change_set, actor=actor, git_sha=git_sha)
+        if result["status"] != "ACTIVE":
+            raise ValueError(
+                f"post-drop generation rejected by the activation gate: {result['status']}"
+            )
+        updates: dict[str, dict[str, object]] = {}
+        for identity in drops:
+            version_id = generation[identity]["version_id"]
+            updates[version_id] = {
+                **versions[version_id],
+                "status": "REVOKED",
+                "activation_status": "REVOKED",
+                "revoke_reason": "issue-99 doctor rebuild",
+                "revoke_note": note,
+            }
+        self._store_write(updates)
+        return {
+            "dropped": drops,
+            "remaining": sorted(
+                identity for identity in generation if identity not in drop_set
+            ),
+            "status": "ACTIVE",
         }
 
     def current_generation(self) -> dict[str, object]:

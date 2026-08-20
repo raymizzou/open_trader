@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from open_trader.prediction_runtime_graph import RuntimeGraphStore, RuntimeRelationGraph
+from test_relation_catalog import compiled_problem
 
 
 def row(
@@ -283,6 +284,12 @@ def test_real_catalog_generation_and_pure_update(tmp_path: Path) -> None:
                 "terminal_states": ["YES", "NO"],
                 "payouts": {"YES": "1"},
                 "capital_release": "resolution",
+                # Issue #99: the activation gate compiles every prospective
+                # ACTIVE set, so the fixture must carry a compiled problem.
+                "problem": compiled_problem(
+                    [contract_a, contract_b],
+                    {contract_a: "BUY_YES", contract_b: "BUY_YES"},
+                ),
             },
             "markets": [
                 {

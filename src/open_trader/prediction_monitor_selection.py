@@ -94,14 +94,23 @@ def relation_generation_problem(
     and the #52 live resolver.
     """
     rows = tuple(
-        row
-        for row in generation.values()
-        if row.get("activation") == "ACTIVE" and _model_complete(row)
+        row for row in generation.values() if relation_row_admitted(row)
     )
     if not rows:
         return None, ()
     problem = _compile(rows)
     return problem, build_relation_components(problem)
+
+
+def relation_row_admitted(row: Mapping[str, object]) -> bool:
+    """True when the row may enter monitoring selection (#77 admission).
+
+    The single admission predicate of the compile seam: ``activation`` is
+    ACTIVE and the model is complete. Every consumer that must mirror what
+    the seam actually compiles (the issue-99 doctor attribution and the
+    rebuild precheck) reuses this predicate so the two can never drift.
+    """
+    return row.get("activation") == "ACTIVE" and _model_complete(row)
 
 
 def _model_complete(row: Mapping[str, object]) -> bool:

@@ -4,6 +4,7 @@ import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -15,11 +16,141 @@ from open_trader.relation_catalog import (
     _threshold_complete_model,
     _threshold_discovery_payload,
 )
+from open_trader.prediction_n_leg import (
+    OBSERVATION_SCHEMA_V1,
+    PROBLEM_SCHEMA_V1,
+    ActionPayout,
+    ActionSide,
+    ArbitrageProblem,
+    CandidateAction,
+    ConstraintModel,
+    ExecutableCostSlice,
+    RelationConstraint,
+    RelationKind,
+    SettlementObservationKey,
+    TerminalAtom,
+    TerminalKind,
+    TerminalStateSet,
+    canonical_payload,
+)
 from open_trader.relation_catalog_v2 import SqliteCatalogStore
 from test_prediction_arbitrage import threshold_relation
 
 
 PROBLEM = _threshold_complete_model(threshold_relation())["problem"]
+
+
+def compiled_problem(
+    contract_ids: list[str],
+    sides: dict[str, str],
+    *,
+    as_of: str = "2026-08-15T00:00:00Z",
+    release_at: str = "2026-12-31T17:00:00Z",
+    rule: str = "rules-issue-99",
+    problem_id: str = "issue-99",
+) -> dict[str, object]:
+    """A canonical compiled problem over ``contract_ids`` with per-contract sides.
+
+    Mirrors ``_threshold_complete_model``: one EXACTLY_ONE constraint over the
+    contracts, NORMAL_YES/NORMAL_NO/VOID atoms per contract releasing at
+    ``release_at``, and a BUY_YES/BUY_NO action per contract at
+    ``polymarket:{contract_id}``.
+    """
+    as_of_dt = datetime.fromisoformat(as_of.replace("Z", "+00:00")).astimezone(UTC)
+    release_dt = datetime.fromisoformat(release_at.replace("Z", "+00:00")).astimezone(UTC)
+    key = SettlementObservationKey(
+        OBSERVATION_SCHEMA_V1,
+        "oracle-issue-99",
+        "indicator-issue-99",
+        as_of_dt,
+        as_of_dt,
+        "UTC",
+        rule,
+    )
+    actions: list[CandidateAction] = []
+    states: list[TerminalStateSet] = []
+    for contract_id in contract_ids:
+        side = ActionSide(sides[contract_id])
+        action_id = f"polymarket:{contract_id}"
+        yes_payout = 1 if side == ActionSide.BUY_YES else 0
+        no_payout = 0 if side == ActionSide.BUY_YES else 1
+        actions.append(CandidateAction(
+            action_id,
+            venue_id="polymarket",
+            account_id="catalog-v2",
+            chain_id="polymarket",
+            market_contract_id=contract_id,
+            settlement_observation_key=key,
+            side=side,
+            lot_step_units=1,
+            quantity_scale=1,
+            min_quantity_lots=1,
+            max_quantity_lots=1,
+            settlement_asset_id="USD",
+            valuation_unit_id="USD",
+            asset_valuation_rule_id="usd-1:1-v1",
+            cost_slices=(ExecutableCostSlice(1, 1, 0),),
+        ))
+        states.append(TerminalStateSet(
+            contract_id,
+            key,
+            rule,
+            (
+                TerminalAtom(
+                    f"{contract_id}:NORMAL_YES", TerminalKind.NORMAL_YES, rule,
+                    (ActionPayout(action_id, yes_payout),), release_dt,
+                ),
+                TerminalAtom(
+                    f"{contract_id}:NORMAL_NO", TerminalKind.NORMAL_NO, rule,
+                    (ActionPayout(action_id, no_payout),), release_dt,
+                ),
+                TerminalAtom(
+                    f"{contract_id}:VOID", TerminalKind.VOID, rule,
+                    (ActionPayout(action_id, 0),), release_dt,
+                ),
+            ),
+        ))
+    problem = ArbitrageProblem(
+        PROBLEM_SCHEMA_V1,
+        problem_id,
+        as_of_dt,
+        "USD",
+        tuple(actions),
+        tuple(states),
+        ConstraintModel(
+            (
+                RelationConstraint(
+                    f"exactly-one:{':'.join(contract_ids)}",
+                    RelationKind.EXACTLY_ONE,
+                    tuple(contract_ids),
+                    rule,
+                ),
+            ),
+            (),
+        ),
+        (),
+    )
+    return canonical_payload(problem)
+
+
+def compiled_relation_discovery(
+    contract_ids: list[str],
+    sides: dict[str, str],
+    *,
+    relation_type: str = "EXACTLY_ONE",
+    as_of: str = "2026-08-15T00:00:00Z",
+    release: str = "2026-12-31T17:00:00Z",
+) -> dict[str, object]:
+    """A facade discovery payload carrying a compiled problem over contracts."""
+    payload = discovery(
+        relation_type=relation_type,
+        n=len(contract_ids),
+        problem=compiled_problem(contract_ids, sides, as_of=as_of, release_at=release),
+    )
+    for index, contract_id in enumerate(contract_ids):
+        payload["markets"][index]["contract_id"] = contract_id
+    payload["model"]["capital_release"] = release
+    return payload
 
 
 def discovery(
@@ -769,3 +900,71 @@ def test_legacy_row_with_mismatched_model_constraint_never_guesses_roles(
     assert detail["statement"] == "B_IMPLIES_A"
     assert detail["direction_code"] == "B_IMPLIES_A"
     assert all("role" not in endpoint for endpoint in detail["endpoints"])
+
+
+# Issue #99: activation gate compile precheck (facade level).
+
+def test_activation_gate_blocks_compile_conflict_candidate(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    first = compiled_relation_discovery(
+        ["condition-a", "condition-b", "condition-z"],
+        {"condition-a": "BUY_YES", "condition-b": "BUY_YES", "condition-z": "BUY_YES"},
+    )
+    second = compiled_relation_discovery(
+        ["condition-a", "condition-c", "condition-w"],
+        {"condition-a": "BUY_NO", "condition-c": "BUY_YES", "condition-w": "BUY_YES"},
+    )
+    first_id = catalog.ingest_controlled(first)["version_id"]
+    assert catalog.approve(first_id, {"version_id": first_id}, actor="op", git_sha="sha")["activation"] == "ACTIVE"
+    before = dict(catalog.current_generation())
+    assert len(before) == 1
+    second_id = catalog.ingest_controlled(second)["version_id"]
+    blocked = catalog.approve(second_id, {"version_id": second_id}, actor="op", git_sha="sha")
+    assert blocked["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+    assert catalog.current_generation() == before
+    rows = {row["version_id"]: row for row in catalog.review_rows()}
+    assert rows[second_id]["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+    assert rows[second_id]["status"] == "APPROVED"
+
+
+def test_activation_gate_blocks_stale_capital_release_candidate(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    first = compiled_relation_discovery(
+        ["condition-a", "condition-b", "condition-z"],
+        {"condition-a": "BUY_YES", "condition-b": "BUY_YES", "condition-z": "BUY_YES"},
+        as_of="2026-08-15T00:00:00Z",
+        release="2026-12-31T17:00:00Z",
+    )
+    later = compiled_relation_discovery(
+        ["condition-c", "condition-d", "condition-w"],
+        {"condition-c": "BUY_YES", "condition-d": "BUY_YES", "condition-w": "BUY_YES"},
+        as_of="2027-03-01T00:00:00Z",
+        release="2027-06-01T17:00:00Z",
+    )
+    first_id = catalog.ingest_controlled(first)["version_id"]
+    assert catalog.approve(first_id, {"version_id": first_id}, actor="op", git_sha="sha")["activation"] == "ACTIVE"
+    before = dict(catalog.current_generation())
+    later_id = catalog.ingest_controlled(later)["version_id"]
+    blocked = catalog.approve(later_id, {"version_id": later_id}, actor="op", git_sha="sha")
+    assert blocked["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+    assert catalog.current_generation() == before
+
+
+def test_activation_gate_accepts_compile_compatible_candidate(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    first = compiled_relation_discovery(
+        ["condition-a", "condition-b", "condition-z"],
+        {"condition-a": "BUY_YES", "condition-b": "BUY_YES", "condition-z": "BUY_YES"},
+    )
+    compatible = compiled_relation_discovery(
+        ["condition-a", "condition-c", "condition-w"],
+        {"condition-a": "BUY_YES", "condition-c": "BUY_YES", "condition-w": "BUY_YES"},
+    )
+    first_id = catalog.ingest_controlled(first)["version_id"]
+    assert catalog.approve(first_id, {"version_id": first_id}, actor="op", git_sha="sha")["activation"] == "ACTIVE"
+    compatible_id = catalog.ingest_controlled(compatible)["version_id"]
+    result = catalog.approve(compatible_id, {"version_id": compatible_id}, actor="op", git_sha="sha")
+    assert result["activation"] == "ACTIVE"
+    generation = catalog.current_generation()
+    assert len(generation) == 2
+    assert all(row["activation"] == "ACTIVE" for row in generation.values())

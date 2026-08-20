@@ -14,6 +14,7 @@ from open_trader.prediction_n_leg_oracle import build_relation_components
 from open_trader.prediction_service import create_prediction_server
 from open_trader.relation_catalog import RelationCatalog
 from test_prediction_arbitrage import threshold_relation
+from test_relation_catalog import compiled_problem
 
 
 def discovery(*, title: str = "Will Bitcoin trade above $100,000 before December 31, 2026?", complete: bool = True) -> dict[str, object]:
@@ -28,6 +29,14 @@ def discovery(*, title: str = "Will Bitcoin trade above $100,000 before December
             "terminal_states": ["YES", "NO", "VOID"],
             "payouts": "YES=1, NO=0, VOID=refund",
             "capital_release": "resolution",
+            # Issue #99: the activation gate compiles every prospective ACTIVE
+            # set, so COMPLETE fixtures must carry a compiled problem.
+            "problem": compiled_problem(
+                ["condition-a", "condition-b"],
+                {"condition-a": "BUY_YES", "condition-b": "BUY_YES"},
+            )
+            if complete
+            else None,
         },
         "markets": [
             {

@@ -30,7 +30,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from open_trader.relation_catalog_v2 import RelationCatalogV2  # noqa: F401 - RED: module does not exist yet
+from open_trader.relation_catalog_v2 import RelationCatalogV2, _canonicalize  # noqa: F401 - RED: module does not exist yet
+from test_relation_catalog import compiled_problem
 
 # #49 full-matrix oracle budget reused by decision 6 (per-component size ceiling).
 GROUP_BUDGET = 7  # ponytail: matches #49 scale_16 oracle limits; confirm exact ceiling at implementation
@@ -93,6 +94,30 @@ def _approve(catalog: RelationCatalogV2, payload: dict[str, object]) -> dict[str
     result = catalog.ingest(payload)
     catalog.approve(result["version_id"], actor="auditor", git_sha="a" * 40)
     return result
+
+
+def _payload_with_problem(
+    contract_ids: list[str],
+    sides: dict[str, str],
+    *,
+    relation_type: str = "EXACTLY_ONE",
+    venues: list[str] | None = None,
+    as_of: str = "2026-08-15T00:00:00Z",
+    release: str = "2026-12-31T17:00:00Z",
+    **overrides: object,
+) -> dict[str, object]:
+    """Payload over ``contract_ids`` carrying a compiled problem."""
+    venues = venues or ["polymarket"] * len(contract_ids)
+    return _payload(
+        relation_type=relation_type,
+        endpoints=[
+            _endpoint(venues[index], contract_ids[index])
+            for index in range(len(contract_ids))
+        ],
+        capital_release=release,
+        problem=compiled_problem(contract_ids, sides, as_of=as_of, release_at=release),
+        **overrides,
+    )
 
 
 @pytest.fixture
@@ -262,7 +287,13 @@ def test_explicit_revoke_deactivates_relation(store) -> None:
 def test_replacement_switches_generation_atomically(store) -> None:
     catalog = _catalog(store)
     old = _approve(catalog, _payload())
-    new_payload = _payload(capital_release="2026-09-07T00:00:00Z")
+    new_payload = _payload_with_problem(
+        ["cY", "cX"],
+        {"cY": "BUY_YES", "cX": "BUY_YES"},
+        relation_type="IMPLIES",
+        venues=["polymarket", "predict.fun"],
+        release="2026-09-07T00:00:00Z",
+    )
     new_version_id = catalog.ingest(new_payload)["version_id"]
     result = catalog.replace([new_payload], actor="auditor", git_sha="a" * 40)
     assert result["status"] == "ACTIVE"
@@ -358,8 +389,10 @@ def test_group_over_budget_blocked_other_groups_unaffected(store) -> None:
         )
         for i in range(GROUP_BUDGET)
     ]
-    small = _payload(
-        relation_type="EXACTLY_ONE", endpoints=[_endpoint("polymarket", "cZ"), _endpoint("predict.fun", "cW")]
+    small = _payload_with_problem(
+        ["cZ", "cW"],
+        {"cZ": "BUY_YES", "cW": "BUY_YES"},
+        venues=["polymarket", "predict.fun"],
     )
     big_identity = catalog.ingest(oversized[0])["identity"]
     small_identity = catalog.ingest(small)["identity"]
@@ -368,6 +401,57 @@ def test_group_over_budget_blocked_other_groups_unaffected(store) -> None:
     assert blocked[big_identity] == "UNSUPPORTED_SIZE"
     assert small_identity not in blocked
     assert catalog.current_generation()[small_identity]["status"] == "ACTIVE"
+
+
+# Issue #99: full compile precheck inside replace().
+
+def test_replace_blocks_compile_conflict_and_keeps_previous_generation(store) -> None:
+    catalog = _catalog(store)
+    first = _payload_with_problem(["cA", "cB"], {"cA": "BUY_YES", "cB": "BUY_YES"})
+    second = _payload_with_problem(["cA", "cC"], {"cA": "BUY_NO", "cC": "BUY_YES"})
+    approved = _approve(catalog, first)
+    first_identity = approved["identity"]
+    second_identity = _canonicalize(second)[0]
+    before = catalog.current_generation()
+    result = catalog.replace([first, second], actor="auditor", git_sha="a" * 40)
+    assert result["status"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+    blocked = {entry["identity"] for entry in result["blocked"]}
+    assert blocked == {second_identity}
+    assert catalog.current_generation() == before
+    assert catalog.current_generation()[first_identity]["status"] == "ACTIVE"
+    assert second_identity not in catalog.current_generation()
+
+
+def test_replace_blocks_stale_capital_release_and_keeps_generation(store) -> None:
+    catalog = _catalog(store)
+    first = _payload_with_problem(
+        ["cA", "cB"], {"cA": "BUY_YES", "cB": "BUY_YES"},
+        as_of="2026-08-15T00:00:00Z", release="2026-12-31T17:00:00Z",
+    )
+    later = _payload_with_problem(
+        ["cC", "cD"], {"cC": "BUY_YES", "cD": "BUY_YES"},
+        as_of="2027-03-01T00:00:00Z", release="2027-06-01T17:00:00Z",
+    )
+    approved = _approve(catalog, first)
+    before = catalog.current_generation()
+    result = catalog.replace([first, later], actor="auditor", git_sha="a" * 40)
+    assert result["status"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+    later_identity = _canonicalize(later)[0]
+    blocked = {entry["identity"] for entry in result["blocked"]}
+    assert later_identity in blocked
+    assert catalog.current_generation() == before
+    assert catalog.current_generation()[approved["identity"]]["status"] == "ACTIVE"
+
+
+def test_replace_accepts_compile_compatible_generation(store) -> None:
+    catalog = _catalog(store)
+    first = _payload_with_problem(["cA", "cB"], {"cA": "BUY_YES", "cB": "BUY_YES"})
+    second = _payload_with_problem(["cA", "cC"], {"cA": "BUY_YES", "cC": "BUY_YES"})
+    result = catalog.replace([first, second], actor="auditor", git_sha="a" * 40)
+    assert result["status"] == "ACTIVE"
+    generation = catalog.current_generation()
+    assert len(generation) == 2
+    assert all(entry["status"] == "ACTIVE" for entry in generation.values())
 
 
 # Decision 7: monitor admission is the only seam.

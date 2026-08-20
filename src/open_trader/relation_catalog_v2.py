@@ -18,6 +18,8 @@ from collections.abc import Iterator, MutableMapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from .prediction_monitor_selection import relation_generation_problem
+
 ALLOWED_VENUES = frozenset({"polymarket", "predict.fun"})
 RELATION_TYPES = frozenset({"IMPLIES", "MUTUALLY_EXCLUSIVE", "EXACTLY_ONE"})
 GROUP_BUDGET = 7  # ponytail: #49 scale_16 per-group endpoint ceiling
@@ -174,6 +176,47 @@ class SqliteCatalogStore(MutableMapping):
                 )
             except sqlite3.OperationalError:
                 pass
+
+    def write_audit(
+        self,
+        action: str,
+        identity: str,
+        version_id: str,
+        actor: str,
+        git_sha: str,
+        note: str = "",
+    ) -> None:
+        """Append one operator-facing audit row.
+
+        Rows live in ``catalog_v2_audit``: the legacy v1-era
+        ``relation_catalog_audit`` table (different schema, historical rows)
+        must never be written or dropped. The table is created lazily here
+        (not in ``_create_tables``) so that merely opening a catalog —
+        including a read-only smoke open against production data — never
+        writes to the database.
+        """
+        with sqlite3.connect(self._path) as connection:
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS catalog_v2_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action TEXT NOT NULL,
+                    identity TEXT NOT NULL,
+                    version_id TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    git_sha TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO catalog_v2_audit "
+                "(action, identity, version_id, actor, git_sha, note, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (action, identity, version_id, actor, git_sha, note, _now()),
+            )
 
     # -- transactions ------------------------------------------------------
 
@@ -543,8 +586,21 @@ class RelationCatalogV2:
             return {"version_id": version_id, "identity": identity, "status": "UNKNOWN"}
 
     def replace(self, change_set: list, *, actor: str, git_sha: str) -> dict:
+        """Atomically publish a generation; fail closed on a non-compiling set.
+
+        Beyond the per-component ``_satisfiable``/``GROUP_BUDGET`` checks, the
+        whole prospective ACTIVE set is replayed through the compile seam
+        (``relation_generation_problem``) before the generation is committed.
+        A ``ValueError`` from the seam (merge conflicts or stale capital
+        release) blocks every change-set identity that was not already in the
+        previous generation (snapshot at method entry) with
+        ``ACTIVATION_BLOCKED_INCONSISTENT``; previously-existing members keep
+        their original approval and ACTIVE status — the current generation is
+        left untouched.
+        """
         with self._write():
             self._generation()  # fail closed on any tampered active payload
+            previous_generation = dict(self.store.get("generation", {}))
             versions = self.store.setdefault("versions", {})
             entries: list[tuple[str, str, dict]] = []
             for payload in change_set:
@@ -561,9 +617,15 @@ class RelationCatalogV2:
                     }
                 entries.append((identity, version_id, version_fields))
 
+            approved_before = dict(self.store.get("approved", {}))
+            status_before = {
+                version_id: versions[version_id]["status"]
+                for _, version_id, _ in entries
+            }
             new_generation: dict[str, dict] = {}
             blocked: list[dict[str, str]] = []
             inconsistent = False
+            approved_version_fields: dict[str, dict] = {}
             for component in _relation_groups(entries):
                 contracts = {
                     contract
@@ -593,7 +655,44 @@ class RelationCatalogV2:
                     }
                     versions[version_id]["status"] = "APPROVED"
                     new_generation[identity] = {"version_id": version_id, "status": "ACTIVE"}
-            self.store["generation"] = new_generation
+                    approved_version_fields[identity] = version_fields
+
+            compile_failed = False
+            if new_generation:
+                # Full compile precheck over the prospective ACTIVE set. The
+                # rows mirror what the compile seam consumes for a live
+                # generation (relation_catalog facade's row shape).
+                rows = {
+                    identity: {
+                        "activation": "ACTIVE",
+                        "model": {
+                            name: version_fields.get(name)
+                            for name in ("terminal_states", "payouts", "capital_release", "problem")
+                        },
+                    }
+                    for identity, version_fields in approved_version_fields.items()
+                }
+                try:
+                    relation_generation_problem(rows)
+                except ValueError:
+                    # Fail closed: block every identity that was not already
+                    # in the previous generation; members of the previous
+                    # generation keep their original approval and ACTIVE
+                    # status. The store is rolled back to the pre-call
+                    # snapshot, so the current generation is unchanged.
+                    compile_failed = True
+                    inconsistent = True
+                    previous_ids = set(previous_generation)
+                    blocked.extend(
+                        {"identity": identity, "reason": "ACTIVATION_BLOCKED_INCONSISTENT"}
+                        for identity in approved_version_fields
+                        if identity not in previous_ids
+                    )
+                    self.store["approved"] = approved_before
+                    for version_id, status in status_before.items():
+                        versions[version_id]["status"] = status
+            if not compile_failed:
+                self.store["generation"] = new_generation
             return {
                 "status": "ACTIVATION_BLOCKED_INCONSISTENT" if inconsistent else "ACTIVE",
                 "blocked": blocked,

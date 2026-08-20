@@ -1185,6 +1185,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prediction_relation_candidates.add_argument("--report", type=Path)
 
+    prediction_catalog_doctor = prediction_commands.add_parser(
+        "catalog-doctor",
+        help="Diagnose current relation generation compile health (read-only)",
+    )
+    prediction_catalog_doctor.add_argument("--data-dir", type=Path, default=Path("data"))
+    prediction_catalog_doctor.add_argument(
+        "--json", action="store_true", help="Emit the full JSON report"
+    )
+    prediction_catalog_doctor.add_argument(
+        "--apply", action="store_true",
+        help="Apply a doctor-proposed drop through rebuild_generation",
+    )
+    prediction_catalog_doctor.add_argument(
+        "--drop", nargs="*", default=[], metavar="IDENTITY",
+        help="Identities to drop (requires --apply and --yes)",
+    )
+    prediction_catalog_doctor.add_argument(
+        "--yes", action="store_true", help="Confirm the apply without prompting"
+    )
+    prediction_catalog_doctor.add_argument(
+        "--allow-uncompilable", action="store_true",
+        help="Attempt the apply even when the post-drop set does not compile",
+    )
+
     cross_auto_parser = prediction_commands.add_parser(
         "cross-auto", help="Inspect Service-owned cross-venue execution state"
     )
@@ -1699,6 +1723,71 @@ def main(argv: list[str] | None = None) -> int:
             if args.report is not None:
                 args.report.write_text(text + "\n", encoding="utf-8")
             print(text)
+            return 0
+
+        if args.prediction_command == "catalog-doctor":
+            from .prediction_catalog_doctor import report
+            from .relation_catalog import RelationCatalog
+
+            try:
+                catalog = RelationCatalog(args.data_dir)
+                if not args.apply:
+                    payload = report(catalog)
+                else:
+                    if not args.yes:
+                        print("catalog-doctor apply requires --yes", file=sys.stderr)
+                        return 2
+                    if not args.drop:
+                        print(
+                            "catalog-doctor apply requires --drop identities",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    payload = None
+                    result = catalog.rebuild_generation(
+                        args.drop,
+                        actor="cli",
+                        git_sha="",
+                        note="catalog-doctor apply",
+                        allow_uncompilable=args.allow_uncompilable,
+                    )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+                return 2
+            if not args.apply:
+                if args.json:
+                    print(json.dumps(payload, ensure_ascii=False, indent=2))
+                    return 0
+                print(f"compiles: {payload['compiles']}")
+                for conflict in payload["conflicts"]:
+                    sides = sorted(
+                        {
+                            str(holder["side"])
+                            for holder in conflict["holders"]
+                            if holder["side"]
+                        }
+                    )
+                    print(
+                        f"conflict: {conflict['label']} {conflict['key']!r} "
+                        f"holders={len(conflict['holders'])} "
+                        f"sides={','.join(sides) if sides else '-'} "
+                        f"remove={len(conflict['removal'])}"
+                    )
+                for finding in payload["stale"]:
+                    for item in finding["identities"]:
+                        print(
+                            f"stale: {item['identity']} "
+                            f"as_of={item['as_of']} "
+                            f"merged_as_of={finding['merged_as_of']}"
+                        )
+                print(f"proposed_removal: {len(payload['proposed_removal'])}")
+                print(f"remaining: {payload['remaining']}")
+                if payload["error"] is not None:
+                    print(f"error: {payload['error']}", file=sys.stderr)
+                return 0
+            print(f"dropped: {' '.join(result['dropped'])}")
+            print(f"remaining: {len(result['remaining'])}")
+            print(f"status: {result['status']}")
             return 0
 
         if args.prediction_command == "health-check":
