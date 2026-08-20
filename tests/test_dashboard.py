@@ -622,6 +622,205 @@ def test_historical_buy_plan_membership_does_not_publish_partial_allowlist(
     }
 
 
+LEGACY_TIGER_BUY_SYMBOLS = ("ADP", "DGX", "GPN", "LPLA", "MMM", "RJF", "SNOW")
+_FUTU_US_ALLOWLIST = {
+    "US.AMZN", "US.CRNX", "US.GRMN", "US.KO", "US.LH",
+    "US.NUE", "US.PYPL", "US.REGN", "US.XLV",
+}
+
+
+def _write_legacy_tiger_buys(tmp_path: Path) -> None:
+    write_buy_plan_history(
+        tmp_path,
+        "trend_us_tiger",
+        "2026-08-14.json",
+        market="US",
+        actions=[{"action": "BUY", "symbol": symbol} for symbol in LEGACY_TIGER_BUY_SYMBOLS],
+    )
+
+
+def test_historical_buy_plan_membership_merges_legacy_directory_buy_evidence(
+    tmp_path: Path,
+) -> None:
+    write_buy_plan_history(
+        tmp_path, "reports", "2026-08-20.json", market="US", actions=[]
+    )
+    _write_legacy_tiger_buys(tmp_path)
+
+    membership = dashboard_module._historical_buy_plan_membership(
+        tmp_path / "reports", broker="futu", market="US"
+    )
+
+    expected = sorted(_FUTU_US_ALLOWLIST | {
+        "US.ADP", "US.DGX", "US.GPN", "US.LPLA", "US.MMM", "US.RJF", "US.SNOW",
+    })
+    assert membership == {
+        "available": True,
+        "symbols": expected,
+        "reason": "",
+    }
+    # 14 只真实持仓全部具备成员资格（7 allowlist 持仓 + 7 老虎时代买入）。
+    held = {
+        "US.ADP", "US.CRNX", "US.DGX", "US.GPN", "US.GRMN", "US.KO", "US.LH",
+        "US.LPLA", "US.MMM", "US.NUE", "US.PYPL", "US.REGN", "US.RJF", "US.SNOW",
+    }
+    assert held <= set(membership["symbols"])
+
+
+def test_historical_buy_plan_membership_empty_current_directory_uses_legacy(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "reports").mkdir()
+    _write_legacy_tiger_buys(tmp_path)
+
+    membership = dashboard_module._historical_buy_plan_membership(
+        tmp_path / "reports", broker="futu", market="US"
+    )
+
+    assert membership["available"] is True
+    assert {"US.ADP", "US.SNOW"} <= set(membership["symbols"])
+
+
+def test_historical_buy_plan_membership_skips_missing_legacy_directory(
+    tmp_path: Path,
+) -> None:
+    write_buy_plan_history(
+        tmp_path, "reports", "2026-08-20.json", market="US", actions=[]
+    )
+
+    membership = dashboard_module._historical_buy_plan_membership(
+        tmp_path / "reports", broker="futu", market="US"
+    )
+
+    assert membership == {
+        "available": True,
+        "symbols": sorted(_FUTU_US_ALLOWLIST),
+        "reason": "",
+    }
+
+
+def test_historical_buy_plan_membership_legacy_directory_fails_closed(
+    tmp_path: Path,
+) -> None:
+    write_buy_plan_history(
+        tmp_path, "reports", "2026-08-20.json", market="US", actions=[]
+    )
+    legacy_dir = tmp_path / "trend_us_tiger"
+    legacy_dir.mkdir()
+    (legacy_dir / "broken.json").write_text("{broken", encoding="utf-8")
+
+    membership = dashboard_module._historical_buy_plan_membership(
+        tmp_path / "reports", broker="futu", market="US"
+    )
+
+    assert membership == {
+        "available": False,
+        "symbols": [],
+        "reason": "遗留趋势报告不可读取",
+    }
+
+
+@pytest.mark.parametrize(
+    ("legacy_actions", "expected_reason"),
+    [
+        ({"strategy_judgments": {"formal_actions": "invalid"}},
+         "遗留买入计划格式无效"),
+        ([{"action": "BUY", "symbol": "AAPL/2026"}], "遗留买入计划标的无效"),
+    ],
+)
+def test_historical_buy_plan_membership_legacy_directory_invalid_evidence(
+    tmp_path: Path, legacy_actions: object, expected_reason: str
+) -> None:
+    write_buy_plan_history(
+        tmp_path, "reports", "2026-08-20.json", market="US", actions=[]
+    )
+    if isinstance(legacy_actions, list):
+        write_buy_plan_history(
+            tmp_path, "trend_us_tiger", "legacy.json", market="US",
+            actions=legacy_actions,
+        )
+    else:
+        legacy_dir = tmp_path / "trend_us_tiger"
+        legacy_dir.mkdir()
+        (legacy_dir / "legacy.json").write_text(
+            json.dumps(legacy_actions), encoding="utf-8"
+        )
+
+    membership = dashboard_module._historical_buy_plan_membership(
+        tmp_path / "reports", broker="futu", market="US"
+    )
+
+    assert membership == {
+        "available": False,
+        "symbols": [],
+        "reason": expected_reason,
+    }
+
+
+@pytest.mark.parametrize(
+    ("broker", "market", "expected_symbols"),
+    [
+        ("tiger", "US", []),
+        ("phillips", "HK", ["HK.06823"]),
+    ],
+)
+def test_historical_buy_plan_membership_does_not_read_legacy_for_other_identities(
+    tmp_path: Path, broker: str, market: str, expected_symbols: list[str]
+) -> None:
+    write_buy_plan_history(
+        tmp_path, "reports", "2026-08-20.json", market=market, actions=[]
+    )
+    write_buy_plan_history(
+        tmp_path, "trend_us_tiger", "legacy.json", market="US",
+        actions=[{"action": "BUY", "symbol": "ZZZ"}],
+    )
+
+    membership = dashboard_module._historical_buy_plan_membership(
+        tmp_path / "reports", broker=broker, market=market
+    )
+
+    assert membership == {
+        "available": True,
+        "symbols": expected_symbols,
+        "reason": "",
+    }
+
+
+def test_historical_buy_plan_membership_reads_legacy_automatic_rotation_buy(
+    tmp_path: Path,
+) -> None:
+    write_buy_plan_history(
+        tmp_path, "reports", "2026-08-20.json", market="US", actions=[]
+    )
+    write_buy_plan_history(
+        tmp_path, "trend_us_tiger", "2026-08-13.json", market="US", actions=[]
+    )
+    rotation_report = tmp_path / "trend_us_tiger" / "2026-08-13.json"
+    payload = json.loads(rotation_report.read_text(encoding="utf-8"))
+    payload["strategy_judgments"]["simulate_rotation_pairs"] = [
+        {
+            "buy_symbol": "SNOW",
+            "sell_symbol": "ARWR",
+            "execution_mode": "automatic",
+            "execution_date": "2026-08-14",
+        },
+        {
+            "buy_symbol": "ZZZ",
+            "sell_symbol": "AAA",
+            "execution_mode": "manual",
+        },
+    ]
+    rotation_report.write_text(json.dumps(payload), encoding="utf-8")
+
+    membership = dashboard_module._historical_buy_plan_membership(
+        tmp_path / "reports", broker="futu", market="US"
+    )
+
+    assert membership["available"] is True
+    assert "US.SNOW" in membership["symbols"]
+    assert "US.ZZZ" not in membership["symbols"]
+
+
 def test_trend_report_history_uses_payload_date_and_keeps_revisions(
     tmp_path: Path,
 ) -> None:

@@ -126,6 +126,13 @@ TREND_HOLDING_EVIDENCE_ALLOWLIST = {
     }),
     ("phillips", "HK"): frozenset({"HK.06823"}),
 }
+# Legacy read-only trend report directories: historical facts stay resolvable
+# for membership continuity (precedent: trend_api_stats._LEGACY_REPORT_DIRECTORIES).
+# The (futu, US) identity also scans tiger-era reports read-only so BUY evidence
+# from before the 2026-08 Futu cutover keeps those holdings trend members.
+LEGACY_TREND_REPORT_DIRECTORIES = {
+    ("futu", "US"): ("trend_us_tiger",),
+}
 CURRENT_FINAL_PLAN_TREND_VERSIONS = frozenset({
     ("CN", "v13"),
     ("CN", "v14"),
@@ -2485,29 +2492,59 @@ def _historical_buy_plan_membership(
     reports_dir: Path, *, broker: str, market: str
 ) -> dict[str, object]:
     reports_dir = reports_dir.resolve()
-    paths = sorted(reports_dir.glob("*.json"))
-    if not paths:
+    directories: list[tuple[Path, bool]] = [(reports_dir, False)]
+    directories.extend(
+        (reports_dir.parent.joinpath(name).resolve(), True)
+        for name in LEGACY_TREND_REPORT_DIRECTORIES.get((broker, market), ())
+        if reports_dir.parent.joinpath(name).resolve().is_dir()
+    )
+    symbols: set[str] = set()
+    found_reports = False
+    for directory, legacy in directories:
+        directory_symbols, error = _scan_buy_plan_history_directory(
+            directory, market=market, legacy=legacy
+        )
+        if error:
+            return {
+                "available": False,
+                "symbols": [],
+                "reason": error,
+            }
+        if directory_symbols is not None:
+            found_reports = True
+            symbols.update(directory_symbols)
+    if not found_reports:
         return {
             "available": False,
             "symbols": [],
             "reason": "历史趋势报告不存在",
         }
+    symbols.update(TREND_HOLDING_EVIDENCE_ALLOWLIST.get((broker, market), ()))
+    return {"available": True, "symbols": sorted(symbols), "reason": ""}
+
+
+def _scan_buy_plan_history_directory(
+    reports_dir: Path, *, market: str, legacy: bool
+) -> tuple[set[str] | None, str]:
+    """Scan one report directory for historical buy-plan evidence.
+
+    Returns ``(None, "")`` when the directory holds no report files (a missing
+    or empty legacy directory is skipped silently), ``(symbols, "")`` on
+    success, or ``(None, reason)`` on failure. ``legacy`` switches the failure
+    wording so the reported directory is identifiable.
+    """
+    prefix = "遗留" if legacy else "历史"
+    paths = sorted(reports_dir.glob("*.json"))
+    if not paths:
+        return None, ""
     symbols: set[str] = set()
     for path in paths:
         try:
             if path.resolve().parent != reports_dir:
-                return {
-                    "available": False,
-                    "symbols": [],
-                    "reason": "历史趋势报告不可读取",
-                }
+                return None, f"{prefix}趋势报告不可读取"
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError):
-            return {
-                "available": False,
-                "symbols": [],
-                "reason": "历史趋势报告不可读取",
-            }
+            return None, f"{prefix}趋势报告不可读取"
         judgments = (
             payload.get("strategy_judgments") if isinstance(payload, dict) else None
         )
@@ -2517,11 +2554,7 @@ def _historical_buy_plan_membership(
         if not isinstance(actions, list) or not all(
             isinstance(item, dict) for item in actions
         ):
-            return {
-                "available": False,
-                "symbols": [],
-                "reason": "历史买入计划格式无效",
-            }
+            return None, f"{prefix}买入计划格式无效"
         for item in actions:
             if item.get("action") != "BUY" or _trend_action_needs_review(item):
                 continue
@@ -2530,14 +2563,32 @@ def _historical_buy_plan_membership(
                     market, str(item.get("symbol") or "")
                 )
             except ValueError:
-                return {
-                    "available": False,
-                    "symbols": [],
-                    "reason": "历史买入计划标的无效",
-                }
+                return None, f"{prefix}买入计划标的无效"
             symbols.add(f"{market}.{symbol}")
-    symbols.update(TREND_HOLDING_EVIDENCE_ALLOWLIST.get((broker, market), ()))
-    return {"available": True, "symbols": sorted(symbols), "reason": ""}
+        pairs = (
+            judgments.get("simulate_rotation_pairs")
+            if isinstance(judgments, dict)
+            else None
+        )
+        if pairs is not None:
+            if not isinstance(pairs, list) or not all(
+                isinstance(item, dict) for item in pairs
+            ):
+                return None, f"{prefix}买入计划格式无效"
+            for item in pairs:
+                # Automatic rotation legs surface as formal buy actions
+                # elsewhere in the dashboard; treat their buy side as the same
+                # historical buy-plan evidence.
+                if item.get("execution_mode") != "automatic":
+                    continue
+                try:
+                    symbol = normalize_backtest_symbol(
+                        market, str(item.get("buy_symbol") or "")
+                    )
+                except ValueError:
+                    return None, f"{prefix}买入计划标的无效"
+                symbols.add(f"{market}.{symbol}")
+    return symbols, ""
 
 
 def _project_broker_trend_report(
