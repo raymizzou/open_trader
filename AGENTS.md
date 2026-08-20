@@ -2,76 +2,68 @@
 
 ## Worktree Baseline
 
-Start new isolated feature or fix work from the local `main` branch unless the
-user explicitly selects another baseline. Create a separate branch and worktree
-from `main`; do not derive the branch from an unrelated or dirty checkout.
+Start every implementation or repository-change task from the current local `main` in an isolated branch and
+worktree. Do not derive work from an unrelated or dirty checkout.
 
-## Merge Log Gate
+## Development Verification
 
-Before merging any branch into `main`, update and commit its dated
-operator-facing entry in `CHANGELOG.md`. Do not merge first and add the log
-afterward.
+While developing, run focused tests and direct non-destructive workflow checks
+when practical. For any code or test change, `make test` must exit 0 in the
+prepared worktree before review. Existing declared skips and xfails may remain;
+adding or weakening one requires explicit user approval. Pure docs/config
+changes do not run `make test`.
 
-## Verification Discipline
+For behavior changes, retain the live-process discipline: when old code can
+remain in a background process, inspect the relevant process and service manager
+state, stop or restart stale processes, and verify fresh PID/timestamped logs
+before claiming live behavior changed.
 
-For any behavior change, especially changes that affect notifications, background
-watchers, launchd jobs, screen sessions, or other long-running processes, do not
-stop at unit tests.
+## Review Staging
 
-Before reporting that the change is done:
+Before review, update the dated operator-facing entry in `CHANGELOG.md`, then
+stage only the exact task files. The reviewer target is `git diff --cached`.
+After any post-review change, restage the exact files, rerun relevant
+verification, and obtain a fresh review.
 
-1. Run the relevant automated tests and confirm the exact pass/fail output.
-2. Run the affected command or workflow directly when it is practical, and check
-   the real output.
-3. If a background process can keep old code in memory, inspect running
-   processes and service managers such as `screen` and `launchctl`.
-4. Stop or restart old processes that are still using pre-change code.
-5. Verify fresh logs from the new process, including PID/timestamp when useful,
-   before claiming the live behavior has changed.
+## Rebase and Merge
 
-Do not describe a change as fully verified if only tests were run and the live
-background process was not checked.
+If local `main` advances, rebase the task commit(s) onto the current local
+`main`, then rerun the required worktree tests and reviewer. Conflicts or
+behavior changes require a new user-approved plan. Merge into local `main` with
+`--ff-only`.
 
-## Dashboard Acceptance Gate
+Before merging, the dated `CHANGELOG.md` entry must already be included; do not
+merge first and add the log afterward.
 
-Do not run `make acceptance` after intermediate modifications. Run focused
-tests and direct workflow checks while developing, and run `make acceptance`
-only as the final gate before asking the user to review or accept a completed
-Dashboard task, unless the user explicitly requests it earlier. Its result is
-the only review-readiness status:
+## Acceptance and Deployment
 
-- `PASS`: automated tests, real API/data, one live account/quote refresh, process version,
-  logs, and desktop/mobile browser flows all passed.
-- `FAIL`: a page, data, process, log, or test check failed.
-- `BLOCKED`: the required browser or external environment is unavailable.
+Never run `make acceptance` in a feature worktree. After worktree tests and
+review pass, merge to local `main`, then run `make acceptance` from local `main`
+only for Dashboard, Prediction, Trend, or another change covered by the runtime
+acceptance suite. Pure docs/config, test-only, and unrelated changes do not run
+acceptance.
 
-Only `PASS` may be described as complete, deployed successfully, or accepted.
-`FAIL` must be fixed. `BLOCKED` must be reported as blocked and must not be
-substituted with curl, fixtures, mocks, screenshots, or unit tests.
+Acceptance results are authoritative:
 
-## Post-Acceptance Review Deployment
+- `PASS`: only then may a covered runtime task be described as accepted or
+  complete.
+- `FAIL`: do not push, deploy, or claim completion. Diagnose, present the exact
+  repair plan, obtain user approval, and use a fresh fix-forward worker from
+  merged `main`.
+- `BLOCKED`: do not push, deploy, or claim completion; report the blocker and do not substitute other evidence.
 
-After `make acceptance` returns `PASS`, redeploy the exact accepted Git SHA
-before asking the user to review it. Then verify the new process PID, working
-directory, Git SHA, fresh logs, and an HTTP 200 response from the review URL.
-Provide that URL so the user can open it directly.
+For `PASS` on a Dashboard or other reviewable runtime task, redeploy the exact
+accepted local SHA and verify the new PID, cwd, SHA, fresh logs, and HTTP 200
+from the review URL. An exact-SHA restart needs no second acceptance run when
+source and data are unchanged.
 
-This post-acceptance restart does not require another acceptance run when it
-deploys the exact already-accepted SHA and makes no source or data changes.
+Local merge, remote push, and remote deployment are separate actions. Never
+push or remotely deploy without explicit user authorization.
 
-## Optional UI Screenshots
+Screenshots remain optional unless explicitly requested.
 
-Do not capture or require screenshots for Dashboard acceptance or handoff unless
-the user explicitly asks for them. Missing screenshots do not affect `PASS`
-status or block a task from being described as accepted, complete, or deployed.
+## Cleanup
 
-## Task Handoff Gate
-
-Before asking the user to review any completed Dashboard task, the agent must
-run `make acceptance` as the final verification step. The user must not be
-asked to run it manually.
-
-- On `FAIL`, continue diagnosing and fixing, then rerun the gate.
-- On `BLOCKED`, report the blocker; do not present the task for acceptance.
-- Only on `PASS` may the agent provide the deployed URL and ask the user to
-  review the result.
+Clean up the task branch, worktree, and brief only after applicable acceptance
+and deployment are complete and the user confirms. Never delete a dirty
+worktree.
