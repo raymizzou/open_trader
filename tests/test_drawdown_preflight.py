@@ -69,7 +69,7 @@ def write_report(root: Path, market: str, state_status: str) -> Path:
     directory = {
         "CN": "trend_a_share",
         "HK": "trend_hk_phillips",
-        "US": "trend_us_tiger",
+        "US": "trend_us_futu",
     }[market]
     path = root / "reports" / directory / "2026-07-17.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -439,7 +439,7 @@ def test_market_preflight_dates_move_late_bootstrap_to_next_session() -> None:
 def test_load_frozen_baseline_returns_original_account_equity(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "reports/trend_us_tiger/2026-07-17-r2.json"
+    path = tmp_path / "reports/trend_us_futu/2026-07-17-r2.json"
     path.parent.mkdir(parents=True)
     path.write_text(
         json.dumps(
@@ -471,7 +471,7 @@ def test_load_frozen_baseline_returns_original_account_equity(
 def test_load_frozen_baseline_reports_missing_current_strategy(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "reports/trend_us_tiger/2026-07-17.json"
+    path = tmp_path / "reports/trend_us_futu/2026-07-17.json"
     path.parent.mkdir(parents=True)
     path.write_text(
         json.dumps({
@@ -525,7 +525,7 @@ def test_load_frozen_baseline_rejects_invalid_completed_date_artifacts(
     content: str,
     error_text: str,
 ) -> None:
-    path = tmp_path / "reports/trend_us_tiger/2026-07-17.json"
+    path = tmp_path / "reports/trend_us_futu/2026-07-17.json"
     path.parent.mkdir(parents=True)
     path.write_text(content, encoding="utf-8")
 

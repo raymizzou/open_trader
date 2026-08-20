@@ -117,11 +117,10 @@ from .prediction_arbitrage_health import (
     validate_prediction_service_health,
 )
 from .report_translation import DeepSeekReportTranslator, translate_agent_report_files
-from .tiger_account import load_tiger_account_config
 from .technical_facts import LLMTechnicalFactsExtractor, generate_technical_facts
 from .trend_api_stats import (
+    FutuActualFillClient,
     FutuSimulateFillClient,
-    TigerActualFillClient,
     run_trend_statistics_cycle,
 )
 from .tradingagents_summary import (
@@ -488,10 +487,6 @@ def build_parser() -> argparse.ArgumentParser:
     sync_stats_parser.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
-    sync_stats_parser.add_argument(
-        "--tiger-config-dir", type=Path, default=Path("~/.tigeropen/")
-    )
-    sync_stats_parser.add_argument("--tiger-account")
     refresh_benchmark_parser = trend_review_commands.add_parser("refresh-benchmark")
     refresh_benchmark_parser.add_argument(
         "--market", choices=("CN", "HK", "US"), required=True
@@ -2056,15 +2051,14 @@ def main(argv: list[str] | None = None) -> int:
                     trd_market=args.market,
                 )
                 stats_clients.append(futu_client)
-                tiger_client = None
+                actual_client = None
                 if args.market == "US":
-                    tiger_config = load_tiger_account_config(
-                        config_dir=args.tiger_config_dir,
-                        account=args.tiger_account,
-                        sandbox=False,
+                    actual_client = FutuActualFillClient(
+                        host=config.futu_host,
+                        port=config.futu_port,
+                        trd_market="US",
                     )
-                    tiger_client = TigerActualFillClient(config=tiger_config)
-                    stats_clients.append(tiger_client)
+                    stats_clients.append(actual_client)
                 timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
                 result = run_trend_statistics_cycle(
                     data_dir=config.data_dir,
@@ -2074,7 +2068,7 @@ def main(argv: list[str] | None = None) -> int:
                     generated_at=timestamp,
                     process_git_sha=_process_version(config.repo),
                     futu_client=futu_client,
-                    tiger_client=tiger_client,
+                    actual_client=actual_client,
                     force=args.force,
                     actor=args.actor,
                     reason=args.reason,

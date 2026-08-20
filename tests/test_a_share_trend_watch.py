@@ -734,8 +734,8 @@ def test_deadline_groups_same_side_and_status(tmp_path: Path) -> None:
     )
 
     assert [title for title, _ in feishu.messages] == [
-        "【需处理｜老虎｜美股买入未完成｜2026-07-22】",
-        "【需处理｜老虎｜美股卖出未完成｜2026-07-22】",
+        "【需处理｜富途｜美股买入未完成｜2026-07-22】",
+        "【需处理｜富途｜美股卖出未完成｜2026-07-22】",
     ]
     assert "- HIG" in feishu.messages[0][1]
     assert "- HST" in feishu.messages[0][1]

@@ -175,12 +175,15 @@ def test_dashboard_omits_controller_owned_account_fields(
         "summary", "broker_summaries", "broker_positions", "cash_details",
         "account_sync", "holdings",
     }.intersection(state)
-def test_dashboard_does_not_project_futu_option_attention(tmp_path: Path) -> None:
+def test_dashboard_projects_futu_as_us_trend_source_and_retires_tiger(
+    tmp_path: Path,
+) -> None:
     config = dashboard_config(tmp_path)
 
     state = load_dashboard_state(config).to_dict()
 
-    assert "futu" not in state["trend_reports"]
+    assert "futu" in state["trend_reports"]
+    assert "tiger" not in state["trend_reports"]
 
 
 def test_futu_signal_detail_marks_explicit_api_unsupported_reason() -> None:
@@ -333,7 +336,7 @@ def write_trend_history_report(
     execution_date: str,
     generated_at: str,
     market: str = "US",
-    broker: str = "tiger",
+    broker: str = "futu",
     symbol: str = "VIXY",
 ) -> dict[str, object]:
     payload: dict[str, object] = {
@@ -350,7 +353,7 @@ def write_trend_history_report(
         },
         "option_attention": [],
     }
-    path = reports_dir / "trend_us_tiger" / artifact
+    path = reports_dir / "trend_us_futu" / artifact
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
     return payload
@@ -389,7 +392,7 @@ def write_buy_plan_history(
             ["HK.00622", "HK.00700"],
         ),
         (
-            "US", "trend_us_tiger", "adp", "msft",
+            "US", "trend_us_futu", "adp", "msft",
             ("sell", "hold", "review"), "tsla", "US.TSLA",
             ["US.ADP", "US.MSFT"],
         ),
@@ -556,7 +559,7 @@ def test_historical_buy_plan_membership_rejects_symlink_loop(tmp_path: Path) -> 
     ("broker", "market", "expected_symbols"),
     [
         (
-            "tiger",
+            "futu",
             "US",
             [
                 "US.AMZN", "US.CRNX", "US.GRMN", "US.KO", "US.LH",
@@ -589,7 +592,7 @@ def test_historical_buy_plan_membership_adds_scoped_evidence_allowlist(
 
 @pytest.mark.parametrize(
     ("broker", "market"),
-    [("phillips", "US"), ("tiger", "HK")],
+    [("phillips", "US"), ("futu", "HK")],
 )
 def test_historical_buy_plan_membership_scopes_evidence_allowlist(
     tmp_path: Path, broker: str, market: str
@@ -609,7 +612,7 @@ def test_historical_buy_plan_membership_does_not_publish_partial_allowlist(
     tmp_path: Path,
 ) -> None:
     membership = dashboard_module._historical_buy_plan_membership(
-        tmp_path / "missing", broker="tiger", market="US"
+        tmp_path / "missing", broker="futu", market="US"
     )
 
     assert membership == {
@@ -643,7 +646,7 @@ def test_trend_report_history_uses_payload_date_and_keeps_revisions(
         generated_at="2026-07-17T09:00:00+08:00",
     )
 
-    history = load_trend_report_history(tmp_path, broker="tiger")
+    history = load_trend_report_history(tmp_path, broker="futu")
 
     assert [row["execution_date"] for row in history[:2]] == [
         "2026-07-20",
@@ -676,11 +679,11 @@ def test_trend_report_history_marks_corrupt_artifact_without_hiding_siblings(
         execution_date="2026-07-20",
         generated_at="2026-07-18T09:00:00+08:00",
     )
-    (tmp_path / "trend_us_tiger" / "broken.json").write_text(
+    (tmp_path / "trend_us_futu" / "broken.json").write_text(
         "{broken", encoding="utf-8"
     )
 
-    history = load_trend_report_history(tmp_path, broker="tiger")
+    history = load_trend_report_history(tmp_path, broker="futu")
 
     assert history[0]["artifact"] == "valid.json"
     assert history[-1] == {
@@ -701,11 +704,11 @@ def test_trend_report_history_marks_symlink_escape_unreadable(tmp_path: Path) ->
         generated_at="2026-07-18T09:00:00+08:00",
     )
     reports_dir = tmp_path / "reports"
-    linked = reports_dir / "trend_us_tiger" / "linked.json"
+    linked = reports_dir / "trend_us_futu" / "linked.json"
     linked.parent.mkdir(parents=True)
-    linked.symlink_to(outside / "trend_us_tiger" / "external.json")
+    linked.symlink_to(outside / "trend_us_futu" / "external.json")
 
-    history = load_trend_report_history(reports_dir, broker="tiger")
+    history = load_trend_report_history(reports_dir, broker="futu")
 
     assert history == [{
         "available": False,
@@ -746,7 +749,7 @@ def test_exact_historical_report_includes_its_immutable_execution(
 
     report = load_historical_trend_report(
         config,
-        broker="tiger",
+        broker="futu",
         artifact="2026-07-16.json",
     )
 
@@ -773,7 +776,7 @@ def test_trend_report_projects_only_same_day_futu_derivatives(
     payload["strategy_judgments"]["holding_decisions"] = [
         {"action": "HOLD", "reason": "trend_intact", "symbol": "SPY"},
     ]
-    (config.reports_dir / "trend_us_tiger/2026-07-15.json").write_text(
+    (config.reports_dir / "trend_us_futu/2026-07-15.json").write_text(
         json.dumps(payload), encoding="utf-8"
     )
     write_futu_skill_facts(
@@ -785,7 +788,7 @@ def test_trend_report_projects_only_same_day_futu_derivatives(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["tiger"]
+    )["futu"]
 
     assert report["buy_actions"][0]["option_anomaly"]["available"] is True
     assert report["buy_actions"][0]["option_anomaly"]["summary"] == "期权波动率偏高。"
@@ -854,7 +857,7 @@ def test_trend_report_projects_frozen_real_positions_separately_from_simulation(
         ],
         "real_holding_decisions_status": "available",
         "real_holding_decisions_source": {
-            "broker": "tiger", "broker_label": "老虎",
+            "broker": "futu", "broker_label": "富途",
             "snapshot_period": "2026-07-15", "source_kind": "statement",
             "freshness_text": "非实时", "read_only_text": "只读，不自动下单",
         },
@@ -884,7 +887,7 @@ def test_trend_report_projects_frozen_real_positions_separately_from_simulation(
     payload["signal_snapshots"] = {
         "real_holdings": {"SPY": {"industry": "ETF", "phase": "立夏"}}
     }
-    (config.reports_dir / "trend_us_tiger/2026-07-15.json").write_text(
+    (config.reports_dir / "trend_us_futu/2026-07-15.json").write_text(
         json.dumps(payload), encoding="utf-8"
     )
     write_futu_skill_facts(
@@ -894,7 +897,7 @@ def test_trend_report_projects_frozen_real_positions_separately_from_simulation(
 
     report = dashboard_module._load_trend_reports(
         config.data_dir, config.reports_dir, today=date(2026, 7, 15)
-    )["tiger"]
+    )["futu"]
 
     assert report["real_position_status"] == "available"
     assert report["real_position_reason"] == ""
@@ -977,7 +980,7 @@ def test_trend_report_disables_mismatched_futu_derivatives(
         generated_at="2026-07-15T09:00:00+08:00",
     )
     payload["as_of_date"] = "2026-07-15"
-    (config.reports_dir / "trend_us_tiger/2026-07-15.json").write_text(
+    (config.reports_dir / "trend_us_futu/2026-07-15.json").write_text(
         json.dumps(payload), encoding="utf-8"
     )
     write_futu_skill_facts(
@@ -989,7 +992,7 @@ def test_trend_report_disables_mismatched_futu_derivatives(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["tiger"]
+    )["futu"]
 
     option_anomaly = report["buy_actions"][0]["option_anomaly"]
     assert option_anomaly["available"] is False
@@ -1008,7 +1011,7 @@ def test_historical_trend_report_uses_archived_futu_derivatives(
         generated_at="2026-07-15T09:00:00+08:00",
     )
     payload["as_of_date"] = "2026-07-15"
-    (config.reports_dir / "trend_us_tiger/2026-07-15.json").write_text(
+    (config.reports_dir / "trend_us_futu/2026-07-15.json").write_text(
         json.dumps(payload), encoding="utf-8"
     )
     write_futu_skill_facts(
@@ -1022,7 +1025,7 @@ def test_historical_trend_report_uses_archived_futu_derivatives(
 
     report = dashboard_module.load_historical_trend_report(
         config,
-        broker="tiger",
+        broker="futu",
         artifact="2026-07-15.json",
     )
 
@@ -1041,7 +1044,7 @@ def test_historical_report_rejects_unsafe_artifact_paths(
     with pytest.raises(ValueError, match="unsafe trend report artifact"):
         load_historical_trend_report(
             config,
-            broker="tiger",
+            broker="futu",
             artifact=artifact,
         )
 
@@ -1054,14 +1057,14 @@ def test_historical_report_rejects_artifact_resolving_outside_broker_directory(
     config = dashboard_config(tmp_path)
     outside = tmp_path / "outside.json"
     outside.write_text("{}", encoding="utf-8")
-    linked = config.reports_dir / "trend_us_tiger" / "linked.json"
+    linked = config.reports_dir / "trend_us_futu" / "linked.json"
     linked.parent.mkdir(parents=True)
     linked.symlink_to(outside)
 
     with pytest.raises(ValueError, match="unsafe trend report artifact"):
         load_historical_trend_report(
             config,
-            broker="tiger",
+            broker="futu",
             artifact="linked.json",
         )
 
@@ -1081,7 +1084,7 @@ def test_historical_report_rejects_wrong_report_market(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="trend report artifact is unreadable"):
         load_historical_trend_report(
             config,
-            broker="tiger",
+            broker="futu",
             artifact="wrong-market.json",
         )
 
@@ -1102,10 +1105,10 @@ def test_trend_report_history_and_exact_loading_reject_missing_strategy_version(
         generated_at="2026-07-18T09:00:00+08:00",
     )
     payload.pop("strategy_snapshot")
-    artifact = config.reports_dir / "trend_us_tiger" / "missing-version.json"
+    artifact = config.reports_dir / "trend_us_futu" / "missing-version.json"
     artifact.write_text(json.dumps(payload), encoding="utf-8")
 
-    assert load_trend_report_history(config.reports_dir, broker="tiger") == [{
+    assert load_trend_report_history(config.reports_dir, broker="futu") == [{
         "available": False,
         "artifact": "missing-version.json",
         "status_text": "报告不可读取",
@@ -1113,7 +1116,7 @@ def test_trend_report_history_and_exact_loading_reject_missing_strategy_version(
     with pytest.raises(ValueError, match="trend report artifact is unreadable"):
         load_historical_trend_report(
             config,
-            broker="tiger",
+            broker="futu",
             artifact="missing-version.json",
         )
 
@@ -1459,16 +1462,16 @@ def test_dashboard_loads_only_strict_market_matched_trend_reviews(
     write_csv(config.portfolio_path, PORTFOLIO_FIELDNAMES, [])
     latest = config.data_dir / "latest"
     latest.mkdir(parents=True, exist_ok=True)
-    for market, broker in (("CN", "eastmoney"), ("US", "tiger"), ("HK", "phillips")):
+    for market, broker in (("CN", "eastmoney"), ("US", "futu"), ("HK", "phillips")):
         (latest / f"trend_review_{market.lower()}.json").write_text(
             json.dumps(trend_review_projection_v3(market, broker)), encoding="utf-8"
         )
 
     reviews = load_dashboard_state(config).to_dict()["trend_reviews"]
 
-    assert set(reviews) == {"eastmoney", "tiger", "phillips"}
+    assert set(reviews) == {"eastmoney", "futu", "phillips"}
     assert reviews["eastmoney"]["market"] == "CN"
-    assert reviews["tiger"]["strategy_snapshot"]["strategy_version"] == "v1"
+    assert reviews["futu"]["strategy_snapshot"]["strategy_version"] == "v1"
     assert reviews["eastmoney"]["sample_counts"] == {
         "discipline": 31,
         "actual": 29,
@@ -1485,11 +1488,11 @@ def test_dashboard_loads_only_strict_market_matched_trend_reviews(
         "batch_path",
         "source_path",
         "source_artifacts",
-    } & reviews["tiger"].keys()
+    } & reviews["futu"].keys()
 
 
 def test_dashboard_keeps_null_common_cutoff_available(tmp_path: Path) -> None:
-    payload = trend_review_projection_v3("US", "tiger")
+    payload = trend_review_projection_v3("US", "futu")
     payload["common_cutoff"] = None
     payload["interval"] = {"start": "2026-07-17", "end": None}
     payload["metric_cutoffs"]["actual"] = None  # type: ignore[index]
@@ -1497,7 +1500,7 @@ def test_dashboard_keeps_null_common_cutoff_available(tmp_path: Path) -> None:
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    review = dashboard_module._load_trend_reviews(tmp_path / "data")["tiger"]
+    review = dashboard_module._load_trend_reviews(tmp_path / "data")["futu"]
 
     assert review["available"] is True
     assert review["sample_counts"] == {
@@ -1516,7 +1519,7 @@ def test_dashboard_keeps_null_common_cutoff_available(tmp_path: Path) -> None:
 def test_dashboard_rejects_incomplete_snapshot_without_common_cutoff(
     tmp_path: Path, snapshot: dict[str, object]
 ) -> None:
-    payload = trend_review_projection_v3("US", "tiger")
+    payload = trend_review_projection_v3("US", "futu")
     payload["common_cutoff"] = None
     payload["interval"] = {"start": "2026-07-17", "end": None}
     payload["strategy_snapshot"] = snapshot
@@ -1524,7 +1527,7 @@ def test_dashboard_rejects_incomplete_snapshot_without_common_cutoff(
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    review = dashboard_module._load_trend_reviews(tmp_path / "data")["tiger"]
+    review = dashboard_module._load_trend_reviews(tmp_path / "data")["futu"]
 
     assert review["available"] is False
 
@@ -1533,10 +1536,10 @@ def test_dashboard_accepts_strict_v5_trend_review_projection(tmp_path: Path) -> 
     path = tmp_path / "data/latest/trend_review_us.json"
     path.parent.mkdir(parents=True)
     path.write_text(
-        json.dumps(trend_review_projection_v3("US", "tiger")), encoding="utf-8"
+        json.dumps(trend_review_projection_v3("US", "futu")), encoding="utf-8"
     )
 
-    review = dashboard_module._load_trend_reviews(tmp_path / "data")["tiger"]
+    review = dashboard_module._load_trend_reviews(tmp_path / "data")["futu"]
 
     assert review["available"] is True
     assert review["metrics"]["calmar"]["actual"]["value"] == "9.4"
@@ -1545,7 +1548,7 @@ def test_dashboard_accepts_strict_v5_trend_review_projection(tmp_path: Path) -> 
 def test_dashboard_accepts_current_snapshot_after_historical_interval_start(
     tmp_path: Path,
 ) -> None:
-    payload = trend_review_projection_v3("US", "tiger")
+    payload = trend_review_projection_v3("US", "futu")
     snapshot = payload["strategy_snapshot"]
     assert isinstance(snapshot, dict)
     snapshot.update(
@@ -1559,7 +1562,7 @@ def test_dashboard_accepts_current_snapshot_after_historical_interval_start(
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    review = dashboard_module._load_trend_reviews(tmp_path / "data")["tiger"]
+    review = dashboard_module._load_trend_reviews(tmp_path / "data")["futu"]
 
     assert review["available"] is True
     assert review["interval"] == {"start": "2026-07-17", "end": "2026-07-17"}
@@ -1569,7 +1572,7 @@ def test_dashboard_accepts_current_snapshot_after_historical_interval_start(
 def test_dashboard_accepts_failed_benchmark_refresh_with_prior_snapshot_metadata(
     tmp_path: Path,
 ) -> None:
-    payload = trend_review_projection_v3("US", "tiger")
+    payload = trend_review_projection_v3("US", "futu")
     payload["benchmark_refresh"] = {
         "status": "failed",
         "month": "2026-07",
@@ -1586,7 +1589,7 @@ def test_dashboard_accepts_failed_benchmark_refresh_with_prior_snapshot_metadata
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    review = dashboard_module._load_trend_reviews(tmp_path / "data")["tiger"]
+    review = dashboard_module._load_trend_reviews(tmp_path / "data")["futu"]
 
     assert review["available"] is True
     assert review["benchmark_refresh"]["status"] == "failed"
@@ -1596,112 +1599,112 @@ def test_dashboard_accepts_failed_benchmark_refresh_with_prior_snapshot_metadata
 @pytest.mark.parametrize(
     ("mutation", "broker"),
     [
-        (lambda payload: payload.update(schema_version="v1"), "tiger"),
+        (lambda payload: payload.update(schema_version="v1"), "futu"),
         (
             lambda payload: payload.update(
                 schema_version="open_trader.trend_review.projection.v4"
             ),
-            "tiger",
+            "futu",
         ),
-        (lambda payload: payload.update(market="HK"), "tiger"),
-        (lambda payload: payload["metrics"].pop("sharpe"), "tiger"),
+        (lambda payload: payload.update(market="HK"), "futu"),
+        (lambda payload: payload["metrics"].pop("sharpe"), "futu"),
         (
             lambda payload: payload["metrics"]["calmar"]["actual"].update(
                 value="NaN"
             ),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["strategy_snapshot"].update(parameter_rows=[]),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["sample_counts"].update(discipline=True),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["sample_counts"].update(actual=-1),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["sample_counts"].update(required=29),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["sample_counts"].update(internal=1),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["sample_details"]["discipline"].update(
                 winning_sample_count=32
             ),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["sample_details"]["discipline"].update(
                 win_rate="0.5"
             ),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["sample_details"]["discipline"].pop(
                 "win_rate"
             ),
-            "tiger",
+            "futu",
         ),
-        (lambda payload: payload.update(common_cutoff="2026/07/17"), "tiger"),
-        (lambda payload: payload.update(common_cutoff="2026-02-30"), "tiger"),
+        (lambda payload: payload.update(common_cutoff="2026/07/17"), "futu"),
+        (lambda payload: payload.update(common_cutoff="2026-02-30"), "futu"),
         (
             lambda payload: payload["interval"].update(start="2026-02-30"),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["interval"].update(end="2026-07-18"),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["interval"].update(source="internal"),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["metric_cutoffs"].update(actual=None),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["benchmark_context"].update(futu_symbol="US.QQQ"),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["benchmark_context"]["same_period_dates"].append("2026-02-30"),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["benchmark_context"]["windows"]["5Y"].update(return_basis="period_return"),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["benchmark_context"]["windows"]["1Y"].update(start="2027-01-01"),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["benchmark_refresh"].update(status="stale"),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["benchmark_refresh"]["refresh"].update(actor="operator"),
-            "tiger",
+            "futu",
         ),
         (
             lambda payload: payload["benchmark_refresh"].update(extra="control"),
-            "tiger",
+            "futu",
         ),
-        (lambda payload: payload.update(extra="control"), "tiger"),
+        (lambda payload: payload.update(extra="control"), "futu"),
     ],
 )
 def test_dashboard_rejects_invalid_trend_review_projection(
     tmp_path: Path, mutation: object, broker: str
 ) -> None:
-    payload = trend_review_projection_v3("US", "tiger")
+    payload = trend_review_projection_v3("US", "futu")
     mutation(payload)  # type: ignore[operator]
     path = tmp_path / "data/latest/trend_review_us.json"
     path.parent.mkdir(parents=True)
@@ -1711,8 +1714,8 @@ def test_dashboard_rejects_invalid_trend_review_projection(
 
     assert reviews[broker] == {
         "available": False,
-        "broker": "tiger",
-        "broker_label": "老虎",
+        "broker": "futu",
+        "broker_label": "富途",
         "market": "US",
         "market_label": "美股",
         "status_text": "复盘数据无效",
@@ -1720,7 +1723,7 @@ def test_dashboard_rejects_invalid_trend_review_projection(
 
 
 def option_attention(
-    symbol: str, *, market: str = "US", source_broker: str = "老虎"
+    symbol: str, *, market: str = "US", source_broker: str = "富途"
 ) -> dict[str, object]:
     unchanged = {"previous": False, "current": False, "changed": False}
     return {
@@ -1773,9 +1776,9 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     )
     for directory, account_source_date, data_sources in [
         (
-            "trend_us_tiger",
+            "trend_us_futu",
             "2026-07-14",
-            ["Trend Animals", "Tiger US daily K-line"],
+            ["Trend Animals", "Futu US daily K-line"],
         ),
         (
             "trend_hk_phillips",
@@ -1789,7 +1792,7 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
         ),
     ]:
         market, broker = {
-            "trend_us_tiger": ("US", "tiger"),
+            "trend_us_futu": ("US", "futu"),
             "trend_hk_phillips": ("HK", "phillips"),
             "trend_a_share": ("CN", "eastmoney"),
         }[directory]
@@ -1807,7 +1810,7 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
                 "source_date": account_source_date,
                 "exceptions": (
                     ["趋势判断不支持当前持仓：AAPL260717C200000（option）"]
-                    if directory == "trend_us_tiger"
+                    if directory == "trend_us_futu"
                     else []
                 ),
             },
@@ -1834,7 +1837,7 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
                     option_attention(
                         "VIXY",
                         market=market,
-                        source_broker="老虎" if market == "US" else "辉立",
+                        source_broker="富途" if market == "US" else "辉立",
                     )
                 ]
             ),
@@ -1845,7 +1848,7 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
             },
         }
         path.write_text(json.dumps(payload), encoding="utf-8")
-        if directory == "trend_us_tiger":
+        if directory == "trend_us_futu":
             for filename, generated_at, symbol in (
                 ("2026-07-15-a.json", "2026-07-15T11:30:36+08:00", "WRONG-A"),
                 ("2026-07-15-z.json", "2026-07-15T10:00:00+08:00", "WRONG-Z"),
@@ -1854,13 +1857,13 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
                 revision["generated_at"] = generated_at
                 revision["strategy_judgments"]["formal_actions"][0]["symbol"] = symbol
                 (path.parent / filename).write_text(json.dumps(revision), encoding="utf-8")
-    events = config.data_dir / "trend_us_tiger/watch_events.jsonl"
+    events = config.data_dir / "trend_us_futu/watch_events.jsonl"
     events.parent.mkdir(parents=True)
     events.write_text(json.dumps({
         "event_type": "protection_triggered", "symbol": "AAPL",
         "occurred_at": "2026-07-15T22:00:00+08:00", "active_line": "190",
     }) + "\n", encoding="utf-8")
-    log = config.data_dir / "trend_us_tiger/run.log"
+    log = config.data_dir / "trend_us_futu/run.log"
     log.write_text(json.dumps({
         "event": "failed", "run_date": "2026-07-15",
     }) + "\n", encoding="utf-8")
@@ -1878,7 +1881,7 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
                 "report_sha256": _report_hash(json.loads(
                     (
                         config.reports_dir
-                        / "trend_us_tiger/2026-07-15-b.json"
+                        / "trend_us_futu/2026-07-15-b.json"
                     ).read_text(encoding="utf-8")
                 )),
                 "symbol": "VIXY",
@@ -1898,15 +1901,15 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
     state = load_dashboard_state(config).to_dict()
     reports = state["trend_reports"]
 
-    assert set(reports) == {"tiger", "phillips", "eastmoney"}
+    assert set(reports) == {"futu", "phillips", "eastmoney"}
     assert "trend_market_summaries" not in state
-    assert reports["tiger"]["report_date"] == "2026-07-15"
-    assert reports["tiger"]["data_date"] == "2026-07-14"
-    assert reports["tiger"]["data_status"] == "current"
-    assert reports["tiger"]["ready_for_next_trading_day"] is True
-    assert reports["tiger"]["generated_at"] == "2026-07-15T11:30:36+08:00"
-    assert reports["tiger"]["sell_actions"][0]["symbol"] == "AAPL"
-    assert reports["tiger"]["buy_actions"][0]["execution"] == {
+    assert reports["futu"]["report_date"] == "2026-07-15"
+    assert reports["futu"]["data_date"] == "2026-07-14"
+    assert reports["futu"]["data_status"] == "current"
+    assert reports["futu"]["ready_for_next_trading_day"] is True
+    assert reports["futu"]["generated_at"] == "2026-07-15T11:30:36+08:00"
+    assert reports["futu"]["sell_actions"][0]["symbol"] == "AAPL"
+    assert reports["futu"]["buy_actions"][0]["execution"] == {
         "status": "partially_filled",
         "filled_qty": "20",
         "target_qty": "40",
@@ -1915,17 +1918,17 @@ def test_dashboard_projects_latest_same_day_trend_report_for_each_broker(
         "updated_at": "2026-07-15T10:00:00-04:00",
         "reason": "",
     }
-    assert reports["tiger"]["counts"] == {"sell": 1, "buy": 1, "hold": 1, "review": 0}
-    assert reports["tiger"]["run_status"] == "failed"
-    assert reports["tiger"]["recent_protection_alert"] == (
+    assert reports["futu"]["counts"] == {"sell": 1, "buy": 1, "hold": 1, "review": 0}
+    assert reports["futu"]["run_status"] == "failed"
+    assert reports["futu"]["recent_protection_alert"] == (
         "AAPL · 2026-07-15T22:00:00+08:00 · 保护线 190"
     )
-    assert reports["tiger"]["audit"] == {
+    assert reports["futu"]["audit"] == {
         "candidates": [{"symbol": "VIXY", "strength": "95"}],
         "strategy_parameters": {},
         "excluded": {"QQQ": ["already_held"]},
         "industry_concentration": [["科技", 1, "0.25"]],
-        "data_sources": ["Trend Animals", "Tiger US daily K-line"],
+        "data_sources": ["Trend Animals", "Futu US daily K-line"],
         "estimated_api_cost": "1.20",
         "actual_api_cost": "1.00",
         "account_exceptions": ["趋势判断不支持当前持仓：AAPL260717C200000（option）"],
@@ -1957,7 +1960,7 @@ def test_dashboard_projects_complete_candidate_audit_for_every_market(
     ]
     for directory, market, broker in (
         ("trend_a_share", "CN", "eastmoney"),
-        ("trend_us_tiger", "US", "tiger"),
+        ("trend_us_futu", "US", "futu"),
     ):
         path = config.reports_dir / directory / "2026-07-15.json"
         path.parent.mkdir(parents=True)
@@ -1980,7 +1983,7 @@ def test_dashboard_projects_complete_candidate_audit_for_every_market(
         config.data_dir, config.reports_dir, today=date(2026, 7, 15)
     )
 
-    for broker in ("eastmoney", "tiger"):
+    for broker in ("eastmoney", "futu"):
         assert [item["symbol"] for item in reports[broker]["audit"]["candidates"]] == [
             "688046", "600000",
         ]
@@ -1988,7 +1991,7 @@ def test_dashboard_projects_complete_candidate_audit_for_every_market(
 
 @pytest.mark.parametrize(
     ("market", "version", "broker"),
-    [("CN", "v14", "eastmoney"), ("HK", "v12", "phillips"), ("US", "v12", "tiger")],
+    [("CN", "v14", "eastmoney"), ("HK", "v12", "phillips"), ("US", "v12", "futu")],
 )
 def test_dashboard_current_trend_uses_candidate_snapshot_and_fails_closed(
     tmp_path: Path,
@@ -2445,7 +2448,7 @@ def test_dashboard_trend_report_falls_back_to_latest_valid_stale_report(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
-    path = config.reports_dir / "trend_us_tiger" / "2026-07-14.json"
+    path = config.reports_dir / "trend_us_futu" / "2026-07-14.json"
     path.parent.mkdir(parents=True)
     stale_attention = [option_attention("STALE-OPTION")]
     stale_payload = {
@@ -2453,7 +2456,7 @@ def test_dashboard_trend_report_falls_back_to_latest_valid_stale_report(
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-14T18:00:00+08:00",
         "account": serialized_trend_account(fresh=True),
-        "metadata": {"market": "US", "broker": "tiger"},
+        "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "formal_actions": [
                 {"action": "BUY", "symbol": "STALE-BUY"},
@@ -2477,7 +2480,7 @@ def test_dashboard_trend_report_falls_back_to_latest_valid_stale_report(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["tiger"]
+    )["futu"]
 
     assert report["available"] is True
     assert report["data_status"] == "stale"
@@ -2492,7 +2495,7 @@ def test_dashboard_trend_report_returns_unavailable_without_a_valid_report(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
-    path = config.reports_dir / "trend_us_tiger" / "2026-07-15.json"
+    path = config.reports_dir / "trend_us_futu" / "2026-07-15.json"
     path.parent.mkdir(parents=True)
     path.write_text("{malformed", encoding="utf-8")
 
@@ -2500,7 +2503,7 @@ def test_dashboard_trend_report_returns_unavailable_without_a_valid_report(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["tiger"]
+    )["futu"]
 
     assert report["available"] is False
     assert report["data_status"] == "unavailable"
@@ -2511,12 +2514,12 @@ def test_dashboard_trend_report_switches_from_stale_to_later_current_report(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
-    reports_dir = config.reports_dir / "trend_us_tiger"
+    reports_dir = config.reports_dir / "trend_us_futu"
     reports_dir.mkdir(parents=True)
     base = {
         "as_of_date": "2026-07-14",
         "account": serialized_trend_account(fresh=True),
-        "metadata": {"market": "US", "broker": "tiger"},
+        "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "formal_actions": [],
             "holding_decisions": [],
@@ -2542,7 +2545,7 @@ def test_dashboard_trend_report_switches_from_stale_to_later_current_report(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["tiger"]
+    )["futu"]
 
     assert report["data_status"] == "current"
     assert report["report_date"] == "2026-07-15"
@@ -2553,14 +2556,14 @@ def test_dashboard_uses_market_local_date_for_current_us_report(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
-    reports_dir = config.reports_dir / "trend_us_tiger"
+    reports_dir = config.reports_dir / "trend_us_futu"
     reports_dir.mkdir(parents=True)
     (reports_dir / "2026-07-20.json").write_text(json.dumps({
         "execution_date": "2026-07-21",
         "as_of_date": "2026-07-20",
         "generated_at": "2026-07-21T22:44:00+08:00",
         "account": serialized_trend_account(fresh=True),
-        "metadata": {"market": "US", "broker": "tiger"},
+        "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "formal_actions": [],
             "holding_decisions": [],
@@ -2575,7 +2578,7 @@ def test_dashboard_uses_market_local_date_for_current_us_report(
         now=datetime(
             2026, 7, 22, 1, 0, tzinfo=dashboard_module.SHANGHAI
         ),
-    )["tiger"]
+    )["futu"]
 
     assert report["data_status"] == "current"
     assert report["report_date"] == "2026-07-21"
@@ -3223,7 +3226,7 @@ def test_dashboard_accepts_frozen_provider_aggregate_industry_ratios(
 @pytest.mark.parametrize(
     ("market", "broker", "directory", "frozen_ids", "current_ids"),
     [
-        ("US", "tiger", "trend_us_tiger", (622460,), (622460, 705013)),
+        ("US", "futu", "trend_us_futu", (622460,), (622460, 705013)),
         ("HK", "phillips", "trend_hk_phillips", (622494,), (622494, 707617)),
     ],
 )
@@ -3272,10 +3275,10 @@ def test_dashboard_does_not_label_frozen_pools_as_current_without_config(
     config = dashboard_config(tmp_path)
     payload = _dashboard_frozen_report_payload(
         market="US",
-        broker="tiger",
+        broker="futu",
         candidate_pool_ids=(622460,),
     )
-    path = config.reports_dir / "trend_us_tiger/2026-07-15.json"
+    path = config.reports_dir / "trend_us_futu/2026-07-15.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
@@ -3284,7 +3287,7 @@ def test_dashboard_does_not_label_frozen_pools_as_current_without_config(
         config.reports_dir,
         today=date(2026, 7, 15),
         current_candidate_pool_ids={},
-    )["tiger"]
+    )["futu"]
 
     assert report["current_strategy_version"] == ""
     assert report["current_strategy_parameter_rows"] is None
@@ -4072,14 +4075,14 @@ def test_dashboard_trend_report_skips_invalid_newest_candidate(
     invalid_value: object,
 ) -> None:
     config = dashboard_config(tmp_path)
-    reports_dir = config.reports_dir / "trend_us_tiger"
+    reports_dir = config.reports_dir / "trend_us_futu"
     reports_dir.mkdir(parents=True)
     valid_payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
         "account": serialized_trend_account(fresh=True),
-        "metadata": {"market": "US", "broker": "tiger"},
+        "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "formal_actions": [{"action": "BUY", "symbol": "VALID-BUT-OLDER"}],
             "holding_decisions": [],
@@ -4107,7 +4110,7 @@ def test_dashboard_trend_report_skips_invalid_newest_candidate(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["tiger"]
+    )["futu"]
 
     assert report["available"] is True
     assert report["data_status"] == "current"
@@ -4118,13 +4121,13 @@ def test_dashboard_trend_report_ranks_revisions_by_generated_instant(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
-    reports_dir = config.reports_dir / "trend_us_tiger"
+    reports_dir = config.reports_dir / "trend_us_futu"
     reports_dir.mkdir(parents=True)
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-15",
         "account": serialized_trend_account(fresh=True),
-        "metadata": {"market": "US", "broker": "tiger"},
+        "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "formal_actions": [{"action": "BUY", "symbol": "EARLIER"}],
             "holding_decisions": [],
@@ -4147,7 +4150,7 @@ def test_dashboard_trend_report_ranks_revisions_by_generated_instant(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["tiger"]
+    )["futu"]
 
     assert report["generated_at"] == "2026-07-15T09:30:00+07:00"
     assert report["buy_actions"][0]["symbol"] == "LATER"
@@ -4176,7 +4179,7 @@ def _write_valid_us_trend_report(
         "generated_at": generated_at,
         "metadata": {
             "market": "US",
-            "broker": "tiger",
+            "broker": "futu",
             "run_date": execution_date,
         },
     }), encoding="utf-8")
@@ -4186,7 +4189,7 @@ def test_dashboard_trend_report_selects_latest_valid_next_execution_day(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
-    reports_dir = config.reports_dir / "trend_us_tiger"
+    reports_dir = config.reports_dir / "trend_us_futu"
     reports_dir.mkdir(parents=True)
     for execution_date, as_of_date in (
         ("2026-07-15", "2026-07-14"),
@@ -4203,7 +4206,7 @@ def test_dashboard_trend_report_selects_latest_valid_next_execution_day(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["tiger"]
+    )["futu"]
 
     assert report["available"] is True
     assert report["artifact"] == "2026-07-16.json"
@@ -4214,7 +4217,7 @@ def test_dashboard_us_main_view_uses_latest_report_before_new_york_midnight(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
-    reports_dir = config.reports_dir / "trend_us_tiger"
+    reports_dir = config.reports_dir / "trend_us_futu"
     reports_dir.mkdir(parents=True)
     for execution_date, as_of_date, generated_at in (
         ("2026-07-15", "2026-07-14", "2026-07-15T23:57:00+08:00"),
@@ -4232,7 +4235,7 @@ def test_dashboard_us_main_view_uses_latest_report_before_new_york_midnight(
         config.data_dir,
         config.reports_dir,
         now=now,
-    )["tiger"]
+    )["futu"]
 
     assert dashboard_module._trend_market_date("US", now=now) == date(2026, 7, 15)
     assert report["artifact"] == "2026-07-16.json"
@@ -4243,7 +4246,7 @@ def test_dashboard_trend_report_rejects_invalid_source_run_date(
     tmp_path: Path, run_date: str,
 ) -> None:
     config = dashboard_config(tmp_path)
-    reports_dir = config.reports_dir / "trend_us_tiger"
+    reports_dir = config.reports_dir / "trend_us_futu"
     reports_dir.mkdir(parents=True)
     base = {
         "account": serialized_trend_account(fresh=True),
@@ -4259,7 +4262,7 @@ def test_dashboard_trend_report_rejects_invalid_source_run_date(
         "execution_date": "2026-07-14",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-14T18:00:00+08:00",
-        "metadata": {"market": "US", "broker": "tiger"},
+        "metadata": {"market": "US", "broker": "futu"},
     }), encoding="utf-8")
     (reports_dir / "2026-07-15.json").write_text(json.dumps({
         **base,
@@ -4267,13 +4270,13 @@ def test_dashboard_trend_report_rejects_invalid_source_run_date(
         "as_of_date": "2026-07-15",
         "generated_at": "2026-07-15T18:00:00+08:00",
         "metadata": {
-            "market": "US", "broker": "tiger", "run_date": run_date,
+            "market": "US", "broker": "futu", "run_date": run_date,
         },
     }), encoding="utf-8")
 
     report = dashboard_module._load_trend_reports(
         config.data_dir, config.reports_dir, today=date(2026, 7, 15)
-    )["tiger"]
+    )["futu"]
 
     assert report["data_status"] == "stale"
     assert report["report_date"] == "2026-07-14"
@@ -4322,7 +4325,7 @@ def test_dashboard_trend_report_rejects_misrouted_broker_metadata(
     tmp_path: Path,
 ) -> None:
     config = dashboard_config(tmp_path)
-    path = config.reports_dir / "trend_us_tiger" / "2026-07-15.json"
+    path = config.reports_dir / "trend_us_futu" / "2026-07-15.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({
         "execution_date": "2026-07-15",
@@ -4345,7 +4348,7 @@ def test_dashboard_trend_report_rejects_misrouted_broker_metadata(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["tiger"]
+    )["futu"]
 
     assert report["available"] is False
     assert report["data_status"] == "unavailable"
@@ -4450,13 +4453,13 @@ def test_dashboard_trend_report_rejects_missing_or_malformed_account(
     tmp_path: Path, account: object,
 ) -> None:
     config = dashboard_config(tmp_path)
-    path = config.reports_dir / "trend_us_tiger" / "2026-07-15.json"
+    path = config.reports_dir / "trend_us_futu" / "2026-07-15.json"
     path.parent.mkdir(parents=True)
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
-        "metadata": {"market": "US", "broker": "tiger"},
+        "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "formal_actions": [{"action": "BUY", "symbol": "VIXY"}],
             "holding_decisions": [],
@@ -4475,7 +4478,7 @@ def test_dashboard_trend_report_rejects_missing_or_malformed_account(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["tiger"]
+    )["futu"]
 
     assert report["available"] is False
     assert report["status_text"] == "暂时不可用"
@@ -4498,14 +4501,14 @@ def test_dashboard_trend_report_rejects_malformed_nested_audit_collections(
     tmp_path: Path, field: str, value: object,
 ) -> None:
     config = dashboard_config(tmp_path)
-    path = config.reports_dir / "trend_us_tiger" / "2026-07-15.json"
+    path = config.reports_dir / "trend_us_futu" / "2026-07-15.json"
     path.parent.mkdir(parents=True)
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-14",
         "generated_at": "2026-07-15T11:30:36+08:00",
         "account": serialized_trend_account(),
-        "metadata": {"market": "US", "broker": "tiger"},
+        "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "formal_actions": [],
             "holding_decisions": [],
@@ -4527,7 +4530,7 @@ def test_dashboard_trend_report_rejects_malformed_nested_audit_collections(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["tiger"]
+    )["futu"]
 
     assert report["available"] is False
     assert report["status_text"] == "暂时不可用"
@@ -4586,14 +4589,14 @@ def test_dashboard_trend_report_rejects_malformed_option_attention(
     tmp_path: Path, attention: object,
 ) -> None:
     config = dashboard_config(tmp_path)
-    path = config.reports_dir / "trend_us_tiger" / "2026-07-15.json"
+    path = config.reports_dir / "trend_us_futu" / "2026-07-15.json"
     path.parent.mkdir(parents=True)
     payload = {
         "execution_date": "2026-07-15",
         "as_of_date": "2026-07-15",
         "generated_at": "2026-07-15T18:00:00+08:00",
         "account": serialized_trend_account(fresh=True),
-        "metadata": {"market": "US", "broker": "tiger"},
+        "metadata": {"market": "US", "broker": "futu"},
         "strategy_judgments": {
             "formal_actions": [],
             "holding_decisions": [],
@@ -4608,7 +4611,7 @@ def test_dashboard_trend_report_rejects_malformed_option_attention(
         config.data_dir,
         config.reports_dir,
         today=date(2026, 7, 15),
-    )["tiger"]
+    )["futu"]
 
     assert report["available"] is False
     assert report["data_status"] == "unavailable"

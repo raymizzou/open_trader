@@ -576,7 +576,7 @@ def serve_dashboard(
         port=config.futu_port,
         account_ids={
             "eastmoney": config.trend_review_cn_simulate_acc_id,
-            "tiger": config.trend_review_us_simulate_acc_id,
+            "futu": config.trend_review_us_simulate_acc_id,
             "phillips": config.trend_review_hk_simulate_acc_id,
         },
         fx_to_hkd=DEFAULT_FX_TO_HKD,

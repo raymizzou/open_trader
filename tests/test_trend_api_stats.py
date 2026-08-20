@@ -342,7 +342,7 @@ def test_statement_fills_sort_by_source_sequence_without_changing_api_order() ->
             fee="0.1",
             filled_at="2026-07-10T07:00:00+00:00",
             source="actual",
-            broker="tiger",
+            broker="futu",
             account_id="U1",
         )
         for fill_id in ("z-api", "a-api")
@@ -363,7 +363,7 @@ def test_statement_fills_sort_by_source_sequence_without_changing_api_order() ->
     assert [
         item["fill_id"]
         for item in payload["fills"]
-        if item["broker"] == "tiger"
+        if item["broker"] == "futu"
     ] == ["a-api", "z-api"]
     statement_round = next(
         round_ for round_ in payload["rounds"] if round_["broker"] == "eastmoney"
@@ -378,10 +378,10 @@ def test_statement_fills_sort_by_source_sequence_without_changing_api_order() ->
 
 def test_closed_round_deduplicates_fills_and_aggregates_scaled_entry_partial_exit_and_fees() -> None:
     fills = [
-        fill("b1", side="buy", quantity="10", price="10", fee="1", filled_at="2026-01-01T10:00:00+00:00", source="actual", broker="tiger", account_id="U1"),
-        fill("b2", side="buy", quantity="5", price="12", fee="0.5", filled_at="2026-01-02T10:00:00+00:00", source="actual", broker="tiger", account_id="U1"),
-        fill("s1", side="sell", quantity="4", price="15", fee="0.4", filled_at="2026-01-03T10:00:00+00:00", source="actual", broker="tiger", account_id="U1"),
-        fill("s2", side="sell", quantity="11", price="14", fee="1.1", filled_at="2026-01-04T10:00:00+00:00", source="actual", broker="tiger", account_id="U1"),
+        fill("b1", side="buy", quantity="10", price="10", fee="1", filled_at="2026-01-01T10:00:00+00:00", source="actual", broker="futu", account_id="U1"),
+        fill("b2", side="buy", quantity="5", price="12", fee="0.5", filled_at="2026-01-02T10:00:00+00:00", source="actual", broker="futu", account_id="U1"),
+        fill("s1", side="sell", quantity="4", price="15", fee="0.4", filled_at="2026-01-03T10:00:00+00:00", source="actual", broker="futu", account_id="U1"),
+        fill("s2", side="sell", quantity="11", price="14", fee="1.1", filled_at="2026-01-04T10:00:00+00:00", source="actual", broker="futu", account_id="U1"),
     ]
 
     partial = build_trend_api_stats_payload(
@@ -411,8 +411,8 @@ def test_closed_round_deduplicates_fills_and_aggregates_scaled_entry_partial_exi
     assert closed["rounds"] == [{
         "round_id": closed["rounds"][0]["round_id"],
         "source": "actual",
-        "source_id": "actual:tiger:U1",
-        "broker": "tiger",
+        "source_id": "actual:futu:U1",
+        "broker": "futu",
         "account_id": "U1",
         "market": "US",
         "symbol": "AAA",
@@ -464,14 +464,14 @@ def test_round_keeps_opening_version_and_new_version_has_empty_actual_stats() ->
     buy = fill(
         "actual-buy", side="buy", quantity="2", price="10", fee="0.1",
         filled_at="2026-01-01T10:00:00+00:00",
-        source="actual", broker="tiger", account_id="U1",
+        source="actual", broker="futu", account_id="U1",
     )
     sell = fill(
         "actual-sell", side="sell", quantity="2", price="12", fee="0.1",
         filled_at="2026-02-01T10:00:00+00:00",
         strategy_id="trend_animals_warm_to_hot/US/v2",
         strategy_version="v2",
-        source="actual", broker="tiger", account_id="U1",
+        source="actual", broker="futu", account_id="U1",
     )
 
     payload = build_trend_api_stats_payload(
@@ -678,13 +678,13 @@ def test_derived_decimals_ignore_the_process_global_decimal_context() -> None:
         fill(
             "buy", side="buy", quantity="3", price="1", fee="0",
             filled_at="2026-01-01T10:00:00+00:00",
-            source="actual", broker="tiger", account_id="U1",
+            source="actual", broker="futu", account_id="U1",
         ),
         fill(
             "sell", side="sell", quantity="3",
             price="1.333333333333333333333333333333", fee="0",
             filled_at="2026-01-02T10:00:00+00:00",
-            source="actual", broker="tiger", account_id="U1",
+            source="actual", broker="futu", account_id="U1",
         ),
     ]
     original_precision = getcontext().prec
@@ -758,12 +758,12 @@ def test_payoff_ratio_uses_average_round_returns_and_reports_edge_states() -> No
             fill(
                 f"b{index}", side="buy", quantity="1", price="1", fee="0",
                 filled_at=f"2026-01-{index * 2 - 1:02d}T10:00:00+00:00",
-                source="actual", broker="tiger", account_id="U1",
+                source="actual", broker="futu", account_id="U1",
             ),
             fill(
                 f"s{index}", side="sell", quantity="1", price=exit_price, fee="0",
                 filled_at=f"2026-01-{index * 2:02d}T10:00:00+00:00",
-                source="actual", broker="tiger", account_id="U1",
+                source="actual", broker="futu", account_id="U1",
             ),
         ])
 
@@ -788,8 +788,8 @@ def test_eligible_simulation_adapter_revalidates_derivation_and_isolates_actual(
     fills = [
         fill("sim-buy", side="buy", quantity="1", price="10", fee="0", filled_at="2026-01-01T10:00:00+00:00"),
         fill("sim-sell", side="sell", quantity="1", price="12", fee="0", filled_at="2026-01-02T10:00:00+00:00"),
-        fill("actual-buy", side="buy", quantity="1", price="10", fee="0.1", filled_at="2026-01-01T10:00:00+00:00", source="actual", broker="tiger", account_id="U1"),
-        fill("actual-sell", side="sell", quantity="1", price="20", fee="0.1", filled_at="2026-01-02T10:00:00+00:00", source="actual", broker="tiger", account_id="U1"),
+        fill("actual-buy", side="buy", quantity="1", price="10", fee="0.1", filled_at="2026-01-01T10:00:00+00:00", source="actual", broker="futu", account_id="U1"),
+        fill("actual-sell", side="sell", quantity="1", price="20", fee="0.1", filled_at="2026-01-02T10:00:00+00:00", source="actual", broker="futu", account_id="U1"),
     ]
     payload = build_trend_api_stats_payload(
         fills,
@@ -835,14 +835,14 @@ def test_non_strategy_actual_rounds_are_explicit_and_excluded(
             "buy", side="buy", quantity="1", price="10", fee="0.1",
             filled_at="2026-01-01T10:00:00+00:00",
             strategy_id="", strategy_version="", source="actual",
-            broker="tiger", account_id="U1", attribution_status=status,
+            broker="futu", account_id="U1", attribution_status=status,
             exclusion_reason=reason,
         ),
         fill(
             "sell", side="sell", quantity="1", price="11", fee="0.1",
             filled_at="2026-01-02T10:00:00+00:00",
             strategy_id="", strategy_version="", source="actual",
-            broker="tiger", account_id="U1", attribution_status=status,
+            broker="futu", account_id="U1", attribution_status=status,
             exclusion_reason=reason,
         ),
     ]
@@ -1017,7 +1017,7 @@ def test_snapshot_loader_returns_hash_of_exact_bytes(tmp_path) -> None:
 
 def test_statistics_disposition_conserves_every_candidate() -> None:
     actual = {
-        "source": "actual", "broker": "tiger", "account_id": "U1",
+        "source": "actual", "broker": "futu", "account_id": "U1",
         "strategy_id": "trend_animals_warm_to_hot/US/v8",
         "strategy_version": "v8",
     }
@@ -1025,8 +1025,8 @@ def test_statistics_disposition_conserves_every_candidate() -> None:
         [
             fill("eligible-buy", side="buy", quantity="1", price="10", fee="0.1", filled_at="2026-08-04T10:00:00-04:00", **actual),
             fill("eligible-sell", side="sell", quantity="1", price="12", fee="0.1", filled_at="2026-08-05T10:00:00-04:00", **actual),
-            fill("manual-buy", side="buy", quantity="1", price="10", fee="0.1", filled_at="2026-08-06T10:00:00-04:00", source="actual", broker="tiger", account_id="U1", strategy_id="", strategy_version="", attribution_status="outside_strategy", exclusion_reason="no_matching_opening_strategy_action"),
-            fill("manual-sell", side="sell", quantity="1", price="11", fee="0.1", filled_at="2026-08-07T10:00:00-04:00", source="actual", broker="tiger", account_id="U1", strategy_id="", strategy_version="", attribution_status="outside_strategy", exclusion_reason="no_matching_opening_strategy_action"),
+            fill("manual-buy", side="buy", quantity="1", price="10", fee="0.1", filled_at="2026-08-06T10:00:00-04:00", source="actual", broker="futu", account_id="U1", strategy_id="", strategy_version="", attribution_status="outside_strategy", exclusion_reason="no_matching_opening_strategy_action"),
+            fill("manual-sell", side="sell", quantity="1", price="11", fee="0.1", filled_at="2026-08-07T10:00:00-04:00", source="actual", broker="futu", account_id="U1", strategy_id="", strategy_version="", attribution_status="outside_strategy", exclusion_reason="no_matching_opening_strategy_action"),
             fill("still-open", side="buy", quantity="1", price="9", fee="0.1", filled_at="2026-08-08T10:00:00-04:00", **actual),
         ],
         strategy_versions=[{"market": "US", "strategy_id": "trend_animals_warm_to_hot/US/v8", "strategy_version": "v8"}],
@@ -1034,7 +1034,7 @@ def test_statistics_disposition_conserves_every_candidate() -> None:
         statistics_cutoff_at="2026-08-08T16:00:00-04:00",
     )
     payload["sources"] = [{
-        "source": "actual", "source_id": "actual:tiger:U1", "broker": "tiger",
+        "source": "actual", "source_id": "actual:futu:U1", "broker": "futu",
         "account_id": "U1", "market": "US", "orders_seen": 5, "fill_count": 5,
         "statistics_cutoff_at": "2026-08-08T16:00:00-04:00", "status": "available",
     }]
@@ -1054,7 +1054,7 @@ def test_statistics_disposition_reports_win_rate_per_source_and_counts_flat() ->
         label: str, *, source: str, sell_price: str, day: int,
     ) -> list[dict[str, object]]:
         broker, account_id = (
-            ("futu", "101") if source == "simulation" else ("tiger", "U1")
+            ("futu", "101") if source == "simulation" else ("futu", "U1")
         )
         rows = [
             fill(
@@ -1091,8 +1091,8 @@ def test_statistics_disposition_reports_win_rate_per_source_and_counts_flat() ->
             "status": "available",
         },
         {
-            "source": "actual", "source_id": "actual:tiger:U1",
-            "broker": "tiger", "account_id": "U1", "market": "US",
+            "source": "actual", "source_id": "actual:futu:U1",
+            "broker": "futu", "account_id": "U1", "market": "US",
             "orders_seen": 2, "fill_count": 2,
             "statistics_cutoff_at": "2026-08-07T16:00:00-04:00",
             "status": "available",

@@ -63,9 +63,9 @@ CONTROLLER_DOM_FIELDS = {
 }
 
 ACCOUNT_BROKERS = ("futu", "tiger", "phillips", "eastmoney")
-TREND_REPORT_BROKERS = ("tiger", "phillips", "eastmoney")
+TREND_REPORT_BROKERS = ("futu", "phillips", "eastmoney")
 TREND_REPORT_DIRECTORIES = {
-    "tiger": "trend_us_tiger",
+    "futu": "trend_us_futu",
     "phillips": "trend_hk_phillips",
     "eastmoney": "trend_a_share",
 }
@@ -91,7 +91,7 @@ ACCOUNT_SNAPSHOT_REFRESH_ATTEMPTS = 3
 ACCOUNT_SNAPSHOT_REFRESH_RETRY_SECONDS = 5
 ACCOUNT_VIEW_LABELS = {
     broker: ("真实持仓", "模拟盘持仓", "趋势报告")
-    for broker in ("tiger", "phillips", "eastmoney")
+    for broker in ("futu", "phillips", "eastmoney")
 }
 SIMULATE_POSITIONS_READY_EXPRESSION = """
 ({broker, expected}) => {
@@ -733,7 +733,7 @@ def validate_integrated_candidate(
     reports = payload.get("trend_reports")
     if not isinstance(reports, Mapping):
         return [*errors, "Dashboard 缺少三市场趋势报告"]
-    labels = {"tiger": "老虎", "phillips": "辉立", "eastmoney": "东方财富"}
+    labels = {"futu": "富途", "phillips": "辉立", "eastmoney": "东方财富"}
     for broker, market in TREND_SIMULATE_MARKETS.items():
         try:
             report = reports.get(broker)
@@ -1067,7 +1067,7 @@ def _account_outage_isolation_errors(
             errors.append("Account 故障时 Gateway 未返回 503 account_module_unavailable")
         for path in (
             "/api/dashboard",
-            "/api/trend-reports/tiger/history",
+            "/api/trend-reports/futu/history",
         ):
             status, payload = fetch(path)
             if status != 200:
@@ -3019,7 +3019,7 @@ def _check_trend_artifact_projection(
     assert isinstance(payload, Mapping), f"{broker} 冻结趋势报告不是对象"
     metadata = payload.get("metadata")
     metadata = metadata if isinstance(metadata, Mapping) else {}
-    expected_market = {"tiger": "US", "phillips": "HK", "eastmoney": "CN"}[broker]
+    expected_market = {"futu": "US", "phillips": "HK", "eastmoney": "CN"}[broker]
     assert (
         payload.get("execution_date") == report.get("report_date")
         and payload.get("as_of_date") == report.get("data_date")
@@ -3790,8 +3790,8 @@ def _check_account_holdings(
     positions = payload.get("broker_positions") or []
     check_accepted_counts = isinstance(payload.get("broker_positions"), list) and bool(positions)
     profiles = {
-        "futu": ("富途", "期权增强"),
-        "tiger": ("老虎", "趋势", "美股趋势交易"),
+        "futu": ("富途", "趋势", "美股趋势交易"),
+        "tiger": ("老虎", "已调仓", "现金管理"),
         "phillips": ("辉立", "趋势", "港股趋势交易"),
         "eastmoney": ("东方财富", "偏短线", "趋势交易"),
     }
@@ -3804,8 +3804,14 @@ def _check_account_holdings(
             assert required in text, f"{broker} 账户区块缺少 {required}"
         for legacy in ("数据日", "账户源", "最近保护提醒", "策略指标待接入"):
             assert legacy not in text, f"账户持仓视图仍包含旧趋势摘要 {legacy}"
-        for retired in ("SMA200 策略", "SMA200 " + "组合策略", "富途｜美股"):
+        for retired in ("SMA200 策略", "SMA200 " + "组合策略"):
             assert retired not in text, f"账户持仓视图仍包含已退役身份 {retired}"
+        if broker == "tiger":
+            # 老虎已退役美股趋势身份：不得再出现趋势策略/趋势报告入口。
+            for retired_trend in ("美股趋势交易", "趋势报告", "模拟盘持仓"):
+                assert retired_trend not in text, (
+                    f"老虎账户视图仍包含已退役趋势身份 {retired_trend}"
+                )
         for forbidden in (
             "tiger-long-term-panel", "calibration_required", "provenance_incomplete",
         ):
@@ -3849,9 +3855,9 @@ def _check_account_holdings(
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"
         ), f"{broker} 账户区块出现横向滚动"
-        if broker == "futu":
+        if broker == "tiger":
             assert section.locator(".trend-report-entry").count() == 0, (
-                "futu 仍显示旧期权关注入口"
+                "tiger 仍显示已退役的美股趋势报告入口"
             )
             continue
         entry_label = "当天趋势报告"
@@ -3945,7 +3951,7 @@ def _check_account_holdings(
         _check_open_report_layout(
             page, workspace, broker, expected_buy_count=expected_buy_count
         )
-        if broker in {"tiger", "phillips"}:
+        if broker in {"futu", "phillips"}:
             _check_trend_option_buttons(page, workspace, report, broker)
         if (
             (getattr(page, "viewport_size", None) or {}).get("width", 0) <= 760
@@ -4622,7 +4628,7 @@ def _check_trend_review(
     screenshot_dir: Path | None = None,
 ) -> None:
     assert review.get("available") is True, f"{broker} 趋势复盘不可用"
-    labels = {"tiger": "美股复盘", "phillips": "港股复盘", "eastmoney": "A股复盘"}
+    labels = {"futu": "美股复盘", "phillips": "港股复盘", "eastmoney": "A股复盘"}
     assert labels[broker] in section.inner_text(), f"{broker} 账户区块缺少 {labels[broker]}"
     trigger = section.locator(f'[data-trend-review="{broker}"]')
     assert trigger.count() == 1, f"{broker} 趋势复盘入口数量不是 1"

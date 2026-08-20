@@ -185,7 +185,7 @@ def test_controller_notification_retries_only_feishu_once(
         "occurred_at": "2026-07-22T10:00:00+08:00",
         "non_feishu_attempted": True,
         "feishu_attempts": 1,
-        "feishu_title": "【需处理｜老虎｜美股趋势控制器阻塞｜2026-07-22】",
+        "feishu_title": "【需处理｜富途｜美股趋势控制器阻塞｜2026-07-22】",
         "feishu_message": (
             "发生：趋势控制器已进入阻塞状态\n"
             "影响：美股自动趋势流程暂停\n"
@@ -553,7 +553,7 @@ def test_ambiguous_legacy_v1_controller_notification_does_not_suppress_current_r
         "occurred_at": "2026-07-22T10:00:00+08:00",
         "non_feishu_attempted": True,
         "feishu_attempts": 1,
-        "feishu_title": "【需处理｜老虎｜美股趋势复盘待恢复｜2026-07-22】",
+        "feishu_title": "【需处理｜富途｜美股趋势复盘待恢复｜2026-07-22】",
         "feishu_message": (
             "发生：趋势复盘未完成\n"
             "影响：复盘数据暂未更新\n"
@@ -589,7 +589,7 @@ def test_delivered_legacy_v2_review_is_not_replayed_as_current_review(
             "occurred_at": "2026-07-22T09:00:00+08:00",
             "non_feishu_attempted": True,
             "feishu_attempts": 1,
-            "feishu_title": "【需处理｜老虎｜美股趋势复盘待恢复｜2026-07-22】",
+            "feishu_title": "【需处理｜富途｜美股趋势复盘待恢复｜2026-07-22】",
             "feishu_message": "review unavailable",
             "channels": ["feishu_app"],
         }),
@@ -639,7 +639,7 @@ def test_legacy_v2_controller_alert_does_not_suppress_current_review(
             "occurred_at": "2026-07-22T09:00:00+08:00",
             "non_feishu_attempted": True,
             "feishu_attempts": 1,
-            "feishu_title": "【需处理｜老虎｜美股趋势控制器阻塞｜2026-07-22】",
+            "feishu_title": "【需处理｜富途｜美股趋势控制器阻塞｜2026-07-22】",
             "feishu_message": "controller unavailable",
             "channels": ["feishu_app"],
         }),
@@ -692,7 +692,7 @@ def test_pending_legacy_v2_review_retries_only_its_feishu_delivery(
             "occurred_at": "2026-07-22T09:00:00+08:00",
             "non_feishu_attempted": True,
             "feishu_attempts": 1,
-            "feishu_title": "【需处理｜老虎｜美股趋势复盘待恢复｜2026-07-22】",
+            "feishu_title": "【需处理｜富途｜美股趋势复盘待恢复｜2026-07-22】",
             "feishu_message": "review unavailable",
             "channels": ["macos"],
         }),
@@ -724,7 +724,7 @@ def test_pending_legacy_v2_review_retries_only_its_feishu_delivery(
         "occurred_at": "2026-07-22T09:00:00+08:00",
         "non_feishu_attempted": True,
         "feishu_attempts": 2,
-        "feishu_title": "【需处理｜老虎｜美股趋势复盘待恢复｜2026-07-22】",
+        "feishu_title": "【需处理｜富途｜美股趋势复盘待恢复｜2026-07-22】",
         "feishu_message": "review unavailable",
         "channels": ["macos", "feishu_app"],
     }
@@ -902,7 +902,7 @@ def test_unknown_controller_errors_stay_per_market(
 
     feishu = [item for item in sent if "feishu" in item[2]]
     assert len(feishu) == 1
-    assert feishu[0][0] == "【需处理｜老虎｜美股趋势控制器阻塞｜2026-07-22】"
+    assert feishu[0][0] == "【需处理｜富途｜美股趋势控制器阻塞｜2026-07-22】"
     local = [item for item in sent if "feishu" not in item[2]]
     assert local == [
         (
@@ -2586,8 +2586,8 @@ def test_completed_statistics_cycle_opens_no_broker_clients_after_restart(
     )
     monkeypatch.setattr(
         controller,
-        "TigerActualFillClient",
-        lambda **_kwargs: pytest.fail("completed CN cycle opened Tiger"),
+        "FutuActualFillClient",
+        lambda **_kwargs: pytest.fail("completed cycle opened actual client"),
         raising=False,
     )
 
@@ -2596,7 +2596,7 @@ def test_completed_statistics_cycle_opens_no_broker_clients_after_restart(
     assert result["status"] == "already_completed"
 
 
-def test_statistics_wrapper_selects_futu_for_market_and_tiger_only_for_us(
+def test_statistics_wrapper_selects_futu_for_market_and_futu_actual_only_for_us(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = controller_config(tmp_path)
@@ -2616,22 +2616,16 @@ def test_statistics_wrapper_selects_futu_for_market_and_tiger_only_for_us(
         opened.append(("futu", market))
         return Client("futu", market)
 
-    def tiger_client(*, config: object) -> Client:
-        del config
-        opened.append(("tiger", "US"))
-        return Client("tiger", "US")
+    def actual_client(**kwargs: object) -> Client:
+        market = str(kwargs["trd_market"])
+        opened.append(("actual", market))
+        return Client("actual", market)
 
     monkeypatch.setattr(
         controller, "FutuSimulateFillClient", futu_client, raising=False
     )
     monkeypatch.setattr(
-        controller, "TigerActualFillClient", tiger_client, raising=False
-    )
-    monkeypatch.setattr(
-        controller,
-        "load_tiger_account_config",
-        lambda **kwargs: kwargs,
-        raising=False,
+        controller, "FutuActualFillClient", actual_client, raising=False
     )
     monkeypatch.setattr(
         controller,
@@ -2650,13 +2644,13 @@ def test_statistics_wrapper_selects_futu_for_market_and_tiger_only_for_us(
     controller._run_cycle_statistics(config, active_cn_cycle(), NOW, "test-sha")
     controller._run_cycle_statistics(config, us_cycle, NOW, "test-sha")
 
-    assert opened == [("futu", "CN"), ("futu", "US"), ("tiger", "US")]
+    assert opened == [("futu", "CN"), ("futu", "US"), ("actual", "US")]
     assert closed == opened
-    assert received[0]["tiger_client"] is None
-    assert received[1]["tiger_client"].source == "tiger"
+    assert received[0]["actual_client"] is None
+    assert received[1]["actual_client"].source == "actual"
 
 
-def test_statistics_wrapper_closes_tiger_when_futu_close_fails(
+def test_statistics_wrapper_closes_actual_when_futu_close_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = controller_config(tmp_path)
@@ -2667,9 +2661,9 @@ def test_statistics_wrapper_closes_tiger_when_futu_close_fails(
             closed.append("futu")
             raise RuntimeError("futu close failed")
 
-    class Tiger:
+    class Actual:
         def close(self) -> None:
-            closed.append("tiger")
+            closed.append("actual")
 
     monkeypatch.setattr(
         controller,
@@ -2679,14 +2673,8 @@ def test_statistics_wrapper_closes_tiger_when_futu_close_fails(
     )
     monkeypatch.setattr(
         controller,
-        "TigerActualFillClient",
-        lambda **_kwargs: Tiger(),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        controller,
-        "load_tiger_account_config",
-        lambda **kwargs: kwargs,
+        "FutuActualFillClient",
+        lambda **_kwargs: Actual(),
         raising=False,
     )
     monkeypatch.setattr(
@@ -2706,7 +2694,7 @@ def test_statistics_wrapper_closes_tiger_when_futu_close_fails(
             config, replace(active_cn_cycle(), market="US"), NOW, "test-sha"
         )
 
-    assert closed == ["futu", "tiger"]
+    assert closed == ["futu", "actual"]
 
 
 def test_statistics_failure_and_recovery_notify_once_per_cycle(
@@ -6316,7 +6304,7 @@ def test_prepared_recovery_rejects_receipt_protection_state_not_in_report(
     )
     report["metadata"] = {
         "market": market,
-        "broker": {"CN": "eastmoney", "HK": "phillips", "US": "tiger"}[market],
+        "broker": {"CN": "eastmoney", "HK": "phillips", "US": "futu"}[market],
     }
     report_path = controller._report_dir(config, market) / "2026-07-17-r1.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -7221,7 +7209,7 @@ def test_revision_request_freezes_latest_report_baseline(
     [
         ("CN", "runs/.trend_a_share_report.lock"),
         ("HK", "runs/.trend_hk_phillips_report.lock"),
-        ("US", "runs/.trend_us_tiger_report.lock"),
+        ("US", "runs/.trend_us_futu_report.lock"),
     ],
 )
 def test_revision_request_waits_for_report_freeze_before_capturing_baseline(

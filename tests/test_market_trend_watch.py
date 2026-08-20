@@ -637,7 +637,7 @@ def _write_hk_details(data_dir: Path) -> None:
 def _write_us_details(data_dir: Path) -> None:
     run_dir = data_dir / "runs/2026-07-15"
     run_dir.mkdir(parents=True)
-    (run_dir / "tiger_account_snapshot.json").write_text(json.dumps({
+    (run_dir / "futu_account_snapshot.json").write_text(json.dumps({
         "accounts": [],
         "cash_records": [
             {"record_type": "account_total", "currency": "USD", "account_total": "2500"},
@@ -1170,7 +1170,7 @@ def test_session_review_callback_failure_does_not_stop_watcher(tmp_path: Path) -
 def test_market_watcher_uses_us_account_and_queues_voice(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     _write_us_details(data_dir)
-    state_path = data_dir / "trend_us_tiger/protection_state.json"
+    state_path = data_dir / "trend_us_futu/protection_state.json"
     write_protection_state(
         state_path,
         {
@@ -1210,8 +1210,8 @@ def test_market_watcher_uses_us_account_and_queues_voice(tmp_path: Path) -> None
         data_dir=data_dir,
         portfolio_path=tmp_path / "unused.csv",
         state_path=state_path,
-        events_path=data_dir / "trend_us_tiger/watch_events.jsonl",
-        report_lock_path=data_dir / "runs/.trend_us_tiger_report.lock",
+        events_path=data_dir / "trend_us_futu/watch_events.jsonl",
+        report_lock_path=data_dir / "runs/.trend_us_futu_report.lock",
         quote_client=Quote(),
         notifier=CompositeNotifier([NullNotifier(), voice]),
         poll_seconds=5,
@@ -1226,12 +1226,12 @@ def test_market_watcher_uses_us_account_and_queues_voice(tmp_path: Path) -> None
     assert voice.messages[0][1].startswith("名称：NVIDIA\n最新价 ")
 
 
-def test_us_watcher_ignores_unmanaged_tiger_holdings_without_protection_seed(
+def test_us_watcher_ignores_unmanaged_futu_holdings_without_protection_seed(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / "data"
     _write_us_details(data_dir)
-    state_path = data_dir / "trend_us_tiger/protection_state.json"
+    state_path = data_dir / "trend_us_futu/protection_state.json"
 
     class Quote:
         host = "127.0.0.1"
@@ -1248,8 +1248,8 @@ def test_us_watcher_ignores_unmanaged_tiger_holdings_without_protection_seed(
         data_dir=data_dir,
         portfolio_path=tmp_path / "unused.csv",
         state_path=state_path,
-        events_path=data_dir / "trend_us_tiger/watch_events.jsonl",
-        report_lock_path=data_dir / "runs/.trend_us_tiger_report.lock",
+        events_path=data_dir / "trend_us_futu/watch_events.jsonl",
+        report_lock_path=data_dir / "runs/.trend_us_futu_report.lock",
         quote_client=Quote(),
         notifier=NullNotifier(),
         poll_seconds=5,
@@ -1263,5 +1263,5 @@ def test_us_watcher_ignores_unmanaged_tiger_holdings_without_protection_seed(
     assert result.exception_count == 0
 
 
-def test_us_watcher_uses_tiger_label() -> None:
-    assert BROKER_LABELS["US"] == "老虎"
+def test_us_watcher_uses_futu_label() -> None:
+    assert BROKER_LABELS["US"] == "富途"

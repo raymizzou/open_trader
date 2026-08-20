@@ -26,7 +26,7 @@ MARKET_TIMEZONES = {
     "US": ZoneInfo("America/New_York"),
 }
 MARKET_LABELS = {"HK": "港股", "US": "美股"}
-BROKER_LABELS = {"HK": "辉立", "US": "老虎"}
+BROKER_LABELS = {"HK": "辉立", "US": "富途"}
 
 
 def _abnormal_result(events_path: Path) -> AShareWatchResult:

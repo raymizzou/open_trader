@@ -539,7 +539,7 @@ def test_rebuild_preserves_excluded_real_holding_reason(tmp_path: Path) -> None:
     real_input = RealHoldingInput(
         status="available",
         reason="",
-        source={"broker": "tiger"},
+        source={"broker": "futu"},
         positions=(
             AccountPosition(
                 symbol="US.AGRZ",
@@ -571,7 +571,7 @@ def test_rebuild_preserves_excluded_real_holding_reason(tmp_path: Path) -> None:
         holding_snapshots={},
         bars_by_symbol={},
         generated_at="2026-07-16T17:00:00+08:00",
-        metadata={"market": "US", "broker": "tiger"},
+        metadata={"market": "US", "broker": "futu"},
         market="US",
         process_version="oldsha",
         candidate_pool_ids=(1,),
@@ -592,7 +592,7 @@ def test_rebuild_preserves_excluded_real_holding_reason(tmp_path: Path) -> None:
         lot_sizes={},
         price_fx_to_account_currency=Decimal("1"),
         previous_attention_rows=[],
-        option_attention_broker_label="老虎",
+        option_attention_broker_label="富途",
         real_holdings_input=real_input,
     )
     evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
@@ -780,11 +780,11 @@ def test_v1_rebuild_keeps_legacy_nominal_sizing_without_v2_risk_fields() -> None
             "price_fx_to_account_currency": "1",
             "candidate_pool_ids": [622460],
             "generated_at": "2026-07-16T17:00:00+08:00",
-            "metadata": {"market": "US", "broker": "tiger"},
+            "metadata": {"market": "US", "broker": "futu"},
             "managed_symbols": [],
             "option_attention": {
                 "previous_rows": [],
-                "broker_label": "老虎",
+                "broker_label": "富途",
             },
         },
     }
@@ -938,7 +938,7 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
         holding_snapshots={},
         bars_by_symbol={},
         generated_at="2026-07-16T17:00:00+08:00",
-        metadata={"market": "US", "broker": "tiger"},
+        metadata={"market": "US", "broker": "futu"},
         market="US",
         price_fx_to_account_currency=Decimal("7.85"),
         process_version="oldsha",
@@ -968,7 +968,9 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
         allocation_reference=allocation,
     )
     source = _report_payload(report)
-    current_rows = market_trend._attention_rows(source["signal_snapshots"]) or []
+    current_rows = market_trend._attention_rows(
+        source["signal_snapshots"], "US"
+    ) or []
     previous_rows = [
         {
             **row,
@@ -981,9 +983,9 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
     source["option_attention"] = market_trend.build_option_attention(
         current_rows,
         previous_rows,
-        market_trend._attention_actions(source),
+        market_trend._attention_actions(source, "US"),
         "US",
-        "老虎",
+        "富途",
     )
     frozen = trend_review.freeze_report_evidence(
         data_dir=tmp_path,
@@ -999,7 +1001,7 @@ def test_us_replay_preserves_position_cap_fx_quantity_and_option_attention(
         lot_sizes={},
         price_fx_to_account_currency=Decimal("7.85"),
         previous_attention_rows=previous_rows,
-        option_attention_broker_label="老虎",
+        option_attention_broker_label="富途",
     )
     evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
     assert evidence["rebuild_inputs"]["normal_cost_rate"] == "0.001"
@@ -8942,7 +8944,7 @@ def write_projection_strategy_facts(
     trend_review.freeze_actual_fill_batch(
         root,
         {
-            "broker": {"CN": "eastmoney", "US": "tiger", "HK": "phillips"}[market],
+            "broker": {"CN": "eastmoney", "US": "futu", "HK": "phillips"}[market],
             "market": market,
             "source": "test",
         },
@@ -10301,7 +10303,7 @@ def test_projection_without_cutoff_keeps_latest_complete_discipline_snapshot(
     assert projection["strategy_snapshot"]["parameter_rows"]
 
 
-def test_us_projection_belongs_to_tiger_trend_account(tmp_path: Path) -> None:
+def test_us_projection_belongs_to_futu_trend_account(tmp_path: Path) -> None:
     daily = tmp_path / "trend_review/daily/US"
     daily.mkdir(parents=True)
     daily.joinpath("2026-07-16.json").write_text(json.dumps({
@@ -10337,7 +10339,7 @@ def test_us_projection_belongs_to_tiger_trend_account(tmp_path: Path) -> None:
 
     projection = trend_review.build_trend_review_projection(tmp_path, "US")
 
-    assert projection["broker"] == "tiger"
+    assert projection["broker"] == "futu"
 
 
 def test_projection_rejects_wrong_benchmark_identity(tmp_path: Path) -> None:
@@ -10814,7 +10816,7 @@ def write_projection_metric_history(
     if market == "US" and actual_days:
         trend_review.freeze_actual_fill_batch(
             root,
-            {"broker": "tiger"},
+            {"broker": "futu"},
             [],
             (start + timedelta(days=actual_days - 1)).isoformat(),
             coverage_start=start.isoformat(),
@@ -11155,12 +11157,12 @@ def write_projection_stats(
         broker = "futu" if source == "simulation" else {
             "CN": "eastmoney",
             "HK": "phillips",
-            "US": "tiger",
+            "US": "futu",
         }[market]
         account_id = "101" if source == "simulation" else {
             "CN": "eastmoney_main",
             "HK": "phillips_main",
-            "US": "tiger_main",
+            "US": "futu_main",
         }[market]
         source_fills = [fill for fill in fills if fill["source"] == source]
         sources.append({

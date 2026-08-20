@@ -65,6 +65,9 @@ TREND_V1_EFFECTIVE_FROM = {
 ACTUAL_FILL_MARKETS_BY_BROKER = {
     "eastmoney": "CN",
     "phillips": "HK",
+    "futu": "US",
+    # "tiger" stays legacy-readable: historical tiger fill artifacts keep
+    # their source facts valid even though no new tiger fills are produced.
     "tiger": "US",
 }
 REJECTED_ORDER_STATUSES = {
@@ -96,7 +99,7 @@ RESOLUTION_STATUSES = {
 PROTECTION_STATE_ROOTS = {
     "CN": "trend_a_share",
     "HK": "trend_hk_phillips",
-    "US": "trend_us_tiger",
+    "US": "trend_us_futu",
 }
 TREND_STRATEGY_VERSIONS = frozenset(
     {
@@ -8622,7 +8625,7 @@ def build_trend_review_projection(
         "available": True,
         "market": market,
         "market_label": {"CN": "A 股", "US": "美股", "HK": "港股"}[market],
-        "broker": {"CN": "eastmoney", "US": "tiger", "HK": "phillips"}[market],
+        "broker": {"CN": "eastmoney", "US": "futu", "HK": "phillips"}[market],
         "strategy_snapshot": snapshot,
         "sample_counts": sample_counts,
         "sample_details": {
@@ -9362,7 +9365,7 @@ def rebuild_trend_report_from_evidence(
             build_option_attention,
         )
 
-        current_rows = _attention_rows(payload.get("signal_snapshots"))
+        current_rows = _attention_rows(payload.get("signal_snapshots"), market)
         if current_rows is None:
             raise TrendReplayIncompleteError(
                 "missing original input: signal_snapshots"
@@ -9370,7 +9373,7 @@ def rebuild_trend_report_from_evidence(
         payload["option_attention"] = build_option_attention(
             current_rows,
             previous_rows,
-            _attention_actions(payload),
+            _attention_actions(payload, market),
             market,
             broker_label,
         )

@@ -18,7 +18,7 @@ from open_trader.trend_simulate_positions import (
 
 
 REPORT_DIRS = {
-    "tiger": "trend_us_tiger",
+    "futu": "trend_us_futu",
     "phillips": "trend_hk_phillips",
     "eastmoney": "trend_a_share",
 }
@@ -42,7 +42,7 @@ def _frozen_report(
     *,
     execution_date: str = "2026-07-20",
     market: str = "US",
-    broker: str = "tiger",
+    broker: str = "futu",
     symbol: str = "TRV",
     version: str = "v1",
 ) -> dict[str, Any]:
@@ -209,7 +209,7 @@ def _service(
         host="127.0.0.1",
         port=11111,
         account_ids=(
-            {"eastmoney": 101, "tiger": 102, "phillips": 103}
+            {"eastmoney": 101, "futu": 102, "phillips": 103}
             if account_ids is None
             else account_ids
         ),
@@ -231,19 +231,19 @@ def test_simulated_positions_route_account_and_link_exact_filled_report(
 ) -> None:
     report = _frozen_report()
     _write_report(
-        tmp_path, broker="tiger", artifact="2026-07-17.json", payload=report
+        tmp_path, broker="futu", artifact="2026-07-17.json", payload=report
     )
     _write_action_event(tmp_path, report_sha256=_report_hash(report))
     clients = FakeClientFactory(positions=[_position()])
 
-    payload = _service(tmp_path, clients).load("tiger")
+    payload = _service(tmp_path, clients).load("futu")
 
     assert clients.calls == [{"market": "US", "simulate_acc_id": 102}]
     assert clients.clients[0].closed is True
     assert payload["available"] is True
     assert payload["synced_at"] == "2026-07-18T12:34:56+08:00"
     assert payload["positions"][0] == {
-        "broker": "tiger",
+        "broker": "futu",
         "market": "US",
         "symbol": "TRV",
         "name": "旅行者保险",
@@ -277,7 +277,7 @@ def test_simulated_positions_route_account_and_link_exact_filled_report(
 def test_simulated_position_publishes_complete_current_valuation(tmp_path: Path) -> None:
     clients = FakeClientFactory(positions=[_position()])
 
-    payload = _service(tmp_path, clients).load("tiger")
+    payload = _service(tmp_path, clients).load("futu")
 
     assert payload["positions"][0]["current_valuation"] == {
         "price": "371.20",
@@ -290,7 +290,7 @@ def test_simulated_position_publishes_complete_current_valuation(tmp_path: Path)
 
 @pytest.mark.parametrize(
     ("broker", "market", "account_id"),
-    [("tiger", "US", 102), ("phillips", "HK", 103), ("eastmoney", "CN", 101)],
+    [("futu", "US", 102), ("phillips", "HK", 103), ("eastmoney", "CN", 101)],
 )
 def test_simulated_positions_route_each_broker_account(
     tmp_path: Path, broker: str, market: str, account_id: int
@@ -308,8 +308,8 @@ def test_simulated_positions_reuse_fresh_cached_snapshot(tmp_path: Path) -> None
     clients = FakeClientFactory(positions=[_position()])
     service = _service(tmp_path, clients)
 
-    first = service.load("tiger")
-    second = service.load("tiger")
+    first = service.load("futu")
+    second = service.load("futu")
 
     assert first == second
     assert len(clients.calls) == 1
@@ -340,10 +340,10 @@ def test_simulated_positions_return_stale_cache_while_refreshing(
         now=lambda: current[0],
         refresh_seconds=30,
     )
-    first = service.load("tiger")
+    first = service.load("futu")
     current[0] = datetime.fromisoformat("2026-07-18T12:35:27+08:00")
 
-    stale = service.load("tiger")
+    stale = service.load("futu")
 
     assert entered.wait(timeout=1)
     assert stale == first
@@ -351,7 +351,7 @@ def test_simulated_positions_return_stale_cache_while_refreshing(
     release.set()
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        refreshed = service.load("tiger")
+        refreshed = service.load("futu")
         if refreshed["positions"][0]["symbol"] == "NEW":
             break
         time.sleep(0.01)
@@ -362,15 +362,15 @@ def test_simulated_positions_return_stale_cache_while_refreshing(
 
 def test_simulated_positions_reject_unsupported_broker(tmp_path: Path) -> None:
     with pytest.raises(
-        ValueError, match="^unsupported trend simulate broker: futu$"
+        ValueError, match="^unsupported trend simulate broker: tiger$"
     ):
-        _service(tmp_path, FakeClientFactory([])).load("futu")
+        _service(tmp_path, FakeClientFactory([])).load("tiger")
 
 
 def test_simulated_positions_keep_unlinked_position_visible(tmp_path: Path) -> None:
     payload = _service(
         tmp_path, FakeClientFactory(positions=[_position("US.OLD")])
-    ).load("tiger")
+    ).load("futu")
 
     assert payload["positions"][0]["attribution_status"] == "unlinked"
     assert payload["positions"][0]["report"] is None
@@ -381,8 +381,8 @@ def test_simulated_positions_fail_closed_on_conflicting_reports(
 ) -> None:
     first = _frozen_report(version="v1")
     second = _frozen_report(version="v2")
-    _write_report(tmp_path, broker="tiger", artifact="first.json", payload=first)
-    _write_report(tmp_path, broker="tiger", artifact="second.json", payload=second)
+    _write_report(tmp_path, broker="futu", artifact="first.json", payload=first)
+    _write_report(tmp_path, broker="futu", artifact="second.json", payload=second)
     _write_action_event(
         tmp_path,
         report_sha256=_report_hash(first),
@@ -395,7 +395,7 @@ def test_simulated_positions_fail_closed_on_conflicting_reports(
         recorded_at="2026-07-20T10:01:00-04:00",
     )
 
-    payload = _service(tmp_path, FakeClientFactory([_position()])).load("tiger")
+    payload = _service(tmp_path, FakeClientFactory([_position()])).load("futu")
 
     assert payload["positions"][0]["attribution_status"] == "conflict"
     assert payload["positions"][0]["report"] is None
@@ -406,8 +406,8 @@ def test_simulated_positions_conflict_takes_precedence_over_unattributable_buy(
 ) -> None:
     first = _frozen_report(version="v1")
     second = _frozen_report(version="v2")
-    _write_report(tmp_path, broker="tiger", artifact="first.json", payload=first)
-    _write_report(tmp_path, broker="tiger", artifact="second.json", payload=second)
+    _write_report(tmp_path, broker="futu", artifact="first.json", payload=first)
+    _write_report(tmp_path, broker="futu", artifact="second.json", payload=second)
     _write_action_event(
         tmp_path,
         report_sha256=_report_hash(first),
@@ -426,7 +426,7 @@ def test_simulated_positions_conflict_takes_precedence_over_unattributable_buy(
         recorded_at="2026-07-20T10:02:00-04:00",
     )
 
-    payload = _service(tmp_path, FakeClientFactory([_position()])).load("tiger")
+    payload = _service(tmp_path, FakeClientFactory([_position()])).load("futu")
 
     assert payload["positions"][0]["attribution_status"] == "conflict"
     assert payload["positions"][0]["report"] is None
@@ -435,8 +435,8 @@ def test_simulated_positions_conflict_takes_precedence_over_unattributable_buy(
 def test_simulated_positions_replay_sell_then_new_partial_buy(tmp_path: Path) -> None:
     first = _frozen_report(version="v1")
     second = _frozen_report(version="v2")
-    _write_report(tmp_path, broker="tiger", artifact="first.json", payload=first)
-    _write_report(tmp_path, broker="tiger", artifact="second.json", payload=second)
+    _write_report(tmp_path, broker="futu", artifact="first.json", payload=first)
+    _write_report(tmp_path, broker="futu", artifact="second.json", payload=second)
     _write_action_event(
         tmp_path,
         report_sha256=_report_hash(first),
@@ -457,7 +457,7 @@ def test_simulated_positions_replay_sell_then_new_partial_buy(tmp_path: Path) ->
         recorded_at="2026-07-20T10:02:00-04:00",
     )
 
-    payload = _service(tmp_path, FakeClientFactory([_position()])).load("tiger")
+    payload = _service(tmp_path, FakeClientFactory([_position()])).load("futu")
 
     assert payload["positions"][0]["attribution_status"] == "linked"
     assert payload["positions"][0]["report"]["artifact"] == "second.json"
@@ -477,7 +477,7 @@ def test_simulated_positions_clear_only_terminal_incomplete_sell(
     tmp_path: Path, status: str, reason: str | None, expected_status: str,
 ) -> None:
     report = _frozen_report()
-    _write_report(tmp_path, broker="tiger", artifact="report.json", payload=report)
+    _write_report(tmp_path, broker="futu", artifact="report.json", payload=report)
     _write_action_event(
         tmp_path,
         report_sha256=_report_hash(report),
@@ -493,19 +493,19 @@ def test_simulated_positions_clear_only_terminal_incomplete_sell(
         reason=reason,
     )
 
-    payload = _service(tmp_path, FakeClientFactory([_position()])).load("tiger")
+    payload = _service(tmp_path, FakeClientFactory([_position()])).load("futu")
 
     assert payload["positions"][0]["attribution_status"] == expected_status
 
 
 def test_simulated_positions_do_not_link_zero_quantity_buy(tmp_path: Path) -> None:
     report = _frozen_report()
-    _write_report(tmp_path, broker="tiger", artifact="report.json", payload=report)
+    _write_report(tmp_path, broker="futu", artifact="report.json", payload=report)
     _write_action_event(
         tmp_path, report_sha256=_report_hash(report), filled_qty="0"
     )
 
-    payload = _service(tmp_path, FakeClientFactory([_position()])).load("tiger")
+    payload = _service(tmp_path, FakeClientFactory([_position()])).load("futu")
 
     assert payload["positions"][0]["attribution_status"] == "unlinked"
 
@@ -515,7 +515,7 @@ def test_simulated_positions_fail_closed_after_unattributable_positive_buy(
     tmp_path: Path, unattributable_hash: str | None
 ) -> None:
     report = _frozen_report()
-    _write_report(tmp_path, broker="tiger", artifact="report.json", payload=report)
+    _write_report(tmp_path, broker="futu", artifact="report.json", payload=report)
     _write_action_event(
         tmp_path,
         report_sha256=_report_hash(report),
@@ -527,7 +527,7 @@ def test_simulated_positions_fail_closed_after_unattributable_positive_buy(
         recorded_at="2026-07-20T10:01:00-04:00",
     )
 
-    payload = _service(tmp_path, FakeClientFactory([_position()])).load("tiger")
+    payload = _service(tmp_path, FakeClientFactory([_position()])).load("futu")
 
     assert payload["positions"][0]["attribution_status"] == "unlinked"
     assert payload["positions"][0]["report"] is None
@@ -538,14 +538,14 @@ def test_simulated_positions_never_link_report_by_hash_without_matching_version(
     tmp_path: Path, strategy_version: str | None,
 ) -> None:
     report = _frozen_report(version="v1")
-    _write_report(tmp_path, broker="tiger", artifact="report.json", payload=report)
+    _write_report(tmp_path, broker="futu", artifact="report.json", payload=report)
     _write_action_event(
         tmp_path,
         report_sha256=_report_hash(report),
         strategy_version=strategy_version,
     )
 
-    payload = _service(tmp_path, FakeClientFactory([_position()])).load("tiger")
+    payload = _service(tmp_path, FakeClientFactory([_position()])).load("futu")
 
     assert payload["positions"][0]["attribution_status"] == "unlinked"
     assert payload["positions"][0]["report"] is None
@@ -555,10 +555,10 @@ def test_simulated_positions_require_report_hash_and_identity_match(
     tmp_path: Path,
 ) -> None:
     report = _frozen_report(market="HK", broker="phillips")
-    _write_report(tmp_path, broker="tiger", artifact="wrong.json", payload=report)
+    _write_report(tmp_path, broker="futu", artifact="wrong.json", payload=report)
     _write_action_event(tmp_path, report_sha256=_report_hash(report))
 
-    payload = _service(tmp_path, FakeClientFactory([_position()])).load("tiger")
+    payload = _service(tmp_path, FakeClientFactory([_position()])).load("futu")
 
     assert payload["positions"][0]["attribution_status"] == "unlinked"
     assert payload["positions"][0]["report"] is None
@@ -570,7 +570,7 @@ def test_simulated_positions_skip_non_positive_positions(tmp_path: Path) -> None
 
     payload = _service(
         tmp_path, FakeClientFactory([zero, negative, _position()])
-    ).load("tiger")
+    ).load("futu")
 
     assert [row["symbol"] for row in payload["positions"]] == ["TRV"]
 
@@ -588,12 +588,12 @@ def test_simulated_positions_return_unavailable_instead_of_fallback(
     tmp_path: Path,
 ) -> None:
     payload = _service(tmp_path, FailingClientFactory("OpenD unavailable")).load(
-        "tiger"
+        "futu"
     )
 
     assert payload == {
         "available": False,
-        "broker": "tiger",
+        "broker": "futu",
         "market": "US",
         "synced_at": "",
         "positions": [],
@@ -606,7 +606,7 @@ def test_simulated_positions_return_unavailable_for_missing_account(
 ) -> None:
     clients = FakeClientFactory([])
 
-    payload = _service(tmp_path, clients, account_ids={}).load("tiger")
+    payload = _service(tmp_path, clients, account_ids={}).load("futu")
 
     assert clients.calls == []
     assert payload["available"] is False

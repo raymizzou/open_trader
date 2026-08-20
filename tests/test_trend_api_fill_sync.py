@@ -12,12 +12,15 @@ from types import SimpleNamespace
 import pytest
 import open_trader.trend_api_stats as trend_api_stats_module
 
+from open_trader.kelly_order_execution import FutuOrderExecutionError
 from open_trader.tiger_account import TigerAccountConfig, TigerAccountError
 from open_trader.trend_api_stats import (
+    FutuActualFillClient,
     FutuSimulateFillClient,
     TigerActualFillClient,
     _attribute_actual_fills,
     _futu_order_attributions,
+    _load_frozen_strategy_facts,
     _merge_synced_fills,
     _tiger_order_fee,
     _tiger_transaction_record,
@@ -131,6 +134,476 @@ def test_futu_simulate_adapter_deduplicates_orders_and_fills_without_trusting_ze
     assert [name for name, _ in context.calls] == ["active_orders", "orders"]
 
 
+class FakeFutuRealContext:
+    def __init__(
+        self,
+        *,
+        accounts: list[dict[str, object]],
+        order_rows: list[dict[str, object]] | None = None,
+        fee_rows: dict[str, object] | None = None,
+        fee_fail: bool = False,
+        missing_fee_ids: set[str] | None = None,
+        negative_fee_ids: set[str] | None = None,
+    ) -> None:
+        self.accounts = accounts
+        self.order_rows = order_rows or []
+        self.fee_rows = fee_rows or {}
+        self.fee_fail = fee_fail
+        self.missing_fee_ids = missing_fee_ids or set()
+        self.negative_fee_ids = negative_fee_ids or set()
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def get_acc_list(self) -> tuple[int, FakeDataFrame]:
+        return 0, FakeDataFrame(self.accounts)
+
+    def history_order_list_query(self, **kwargs: object) -> tuple[int, FakeDataFrame]:
+        self.calls.append(("orders", dict(kwargs)))
+        return 0, FakeDataFrame(self.order_rows)
+
+    def order_fee_query(self, **kwargs: object) -> tuple[int, object]:
+        # Mirrors the real OpenSecTradeContext.order_fee_query contract: a
+        # ret code plus a table of order_id/fee_amount/fee_details rows. The
+        # broker reports 'N/A' when no fee amount exists for an order, may
+        # omit an order's row entirely, or may report a negative amount.
+        self.calls.append(("fees", dict(kwargs)))
+        if self.fee_fail:
+            return 1, "fee query failed"
+        rows = []
+        for order_id in kwargs.get("order_id_list") or []:
+            if order_id in self.missing_fee_ids:
+                # The broker returns no fee record for this order at all.
+                continue
+            if order_id in self.negative_fee_ids:
+                amount = -1
+            else:
+                amount = self.fee_rows.get(order_id, "N/A")
+            rows.append({
+                "order_id": order_id,
+                "fee_amount": amount,
+                "fee_details": [],
+            })
+        return 0, FakeDataFrame(rows)
+
+    def close(self) -> None:
+        pass
+
+
+def _futu_actual_client(
+    context: FakeFutuRealContext, *, acc_id: int | None = None
+) -> FutuActualFillClient:
+    return FutuActualFillClient(
+        host="127.0.0.1",
+        port=11112,
+        acc_id=acc_id,
+        trd_market="US",
+        context_factory=lambda **_: context,
+        connectivity_checker=lambda *_: True,
+    )
+
+
+def test_futu_real_adapter_reads_stock_fills_skips_option_and_zero_fill_rows() -> None:
+    stock_row = {
+        "order_id": "o1", "code": "US.AAA", "trd_side": "BUY",
+        "currency": "USD", "create_time": "2026-08-18 09:30:00",
+        "updated_time": "2026-08-18 09:31:00", "dealt_qty": "2",
+        "dealt_avg_price": "10",
+    }
+    context = FakeFutuRealContext(
+        accounts=[{
+            "acc_id": 201, "acc_index": 0, "trd_env": "REAL", "acc_status": "ACTIVE",
+        }],
+        order_rows=[
+            stock_row,
+            dict(stock_row),
+            {
+                "order_id": "o2", "code": "US.VIXY260821C22000", "trd_side": "BUY",
+                "currency": "USD", "create_time": "2026-08-18 09:35:00",
+                "updated_time": "2026-08-18 09:36:00", "dealt_qty": "1",
+                "dealt_avg_price": "0.5",
+            },
+            {
+                "order_id": "o3", "code": "US.BBB", "trd_side": "BUY",
+                "currency": "USD", "create_time": "2026-08-18 09:40:00",
+                "updated_time": "2026-08-18 09:41:00", "dealt_qty": "0",
+                "dealt_avg_price": "10",
+            },
+        ],
+        fee_rows={"o1": 1.5},
+    )
+    client = _futu_actual_client(context)
+
+    result = client.fetch_fills(
+        start="2026-08-18",
+        end="2026-08-18",
+        attributions_by_order={"o1": {
+            "strategy_id": "trend_animals_warm_to_hot/US/v2",
+            "strategy_version": "v2",
+            "report_sha256": "b" * 64,
+        }},
+    )
+
+    assert context.calls == [
+        ("orders", {
+            "trd_env": "REAL", "acc_id": 201, "acc_index": 0,
+            "start": "2026-08-18", "end": "2026-08-18",
+        }),
+        ("fees", {
+            "order_id_list": ["o1"],
+            "trd_env": "REAL", "acc_id": 201, "acc_index": 0,
+        }),
+    ]
+    assert result["orders_seen"] == 3
+    assert result["fills"] == [{
+        "fill_id": "futu-act-order:o1:aggregate",
+        "broker_fill_id": None,
+        "execution_granularity": "order_aggregate",
+        "order_id": "o1",
+        "source": "actual",
+        "source_id": "actual:futu:201",
+        "broker": "futu",
+        "account_id": "201",
+        "market": "US",
+        "symbol": "AAA",
+        "currency": "USD",
+        "side": "buy",
+        "quantity": "2",
+        "price": "10",
+        "fee": "1.5",
+        "costs_complete": True,
+        "cost_source": "broker_actual",
+        "broker_fee_used": True,
+        "cost_degradation_reason": "",
+        "filled_at": "2026-08-18T09:31:00-04:00",
+        "strategy_id": "trend_animals_warm_to_hot/US/v2",
+        "strategy_version": "v2",
+        "report_sha256": "b" * 64,
+        "normal_cost_rate": "",
+        "normal_cost_model": "",
+        "attribution_status": "attributed",
+        "exclusion_reason": "",
+    }]
+    assert result["account_id"] == "201"
+    assert result["source_id"] == "actual:futu:201"
+
+
+def test_futu_real_adapter_records_explicit_fee_degradation_when_fee_query_fails() -> None:
+    context = FakeFutuRealContext(
+        accounts=[{
+            "acc_id": 201, "acc_index": 0, "trd_env": "REAL", "acc_status": "ACTIVE",
+        }],
+        order_rows=[{
+            "order_id": "o1", "code": "US.AAA", "trd_side": "BUY",
+            "currency": "USD", "create_time": "2026-08-18 09:30:00",
+            "updated_time": "2026-08-18 09:31:00", "dealt_qty": "2",
+            "dealt_avg_price": "10",
+        }],
+        fee_fail=True,
+    )
+    client = _futu_actual_client(context)
+
+    result = client.fetch_fills(
+        start="2026-08-18", end="2026-08-18", attributions_by_order={},
+    )
+
+    fill = result["fills"][0]
+    assert fill["fee"] == "0"
+    assert fill["costs_complete"] is False
+    assert fill["cost_source"] == "unavailable"
+    assert fill["broker_fee_used"] is False
+    assert fill["cost_degradation_reason"].startswith("order_fee_query failed")
+    # The degradation reason is explicit, never a silent zero.
+    assert "order_fee_query" in fill["cost_degradation_reason"]
+
+
+def test_futu_real_adapter_records_explicit_fee_degradation_when_broker_reports_no_amount() -> None:
+    context = FakeFutuRealContext(
+        accounts=[{
+            "acc_id": 201, "acc_index": 0, "trd_env": "REAL", "acc_status": "ACTIVE",
+        }],
+        order_rows=[{
+            "order_id": "o1", "code": "US.AAA", "trd_side": "BUY",
+            "currency": "USD", "create_time": "2026-08-18 09:30:00",
+            "updated_time": "2026-08-18 09:31:00", "dealt_qty": "2",
+            "dealt_avg_price": "10",
+        }],
+        # fee_rows lacks o1, so order_fee_query reports fee_amount 'N/A'.
+    )
+    client = _futu_actual_client(context)
+
+    result = client.fetch_fills(
+        start="2026-08-18", end="2026-08-18", attributions_by_order={},
+    )
+
+    fill = result["fills"][0]
+    assert fill["fee"] == "0"
+    assert fill["costs_complete"] is False
+    assert fill["cost_source"] == "unavailable"
+    assert fill["broker_fee_used"] is False
+    assert fill["cost_degradation_reason"] == "order_fee_query returned no fee_amount"
+
+
+def test_futu_real_adapter_degrades_fill_when_broker_returns_no_fee_record() -> None:
+    context = FakeFutuRealContext(
+        accounts=[{
+            "acc_id": 201, "acc_index": 0, "trd_env": "REAL", "acc_status": "ACTIVE",
+        }],
+        order_rows=[
+            {
+                "order_id": "o1", "code": "US.AAA", "trd_side": "BUY",
+                "currency": "USD", "create_time": "2026-08-18 09:30:00",
+                "updated_time": "2026-08-18 09:31:00", "dealt_qty": "2",
+                "dealt_avg_price": "10",
+            },
+            {
+                "order_id": "o2", "code": "US.BBB", "trd_side": "BUY",
+                "currency": "USD", "create_time": "2026-08-18 10:30:00",
+                "updated_time": "2026-08-18 10:31:00", "dealt_qty": "1",
+                "dealt_avg_price": "12",
+            },
+        ],
+        fee_rows={"o1": 1.5},
+        # The broker returns no fee record for o2 at all, while o1 is normal.
+        missing_fee_ids={"o2"},
+    )
+    client = _futu_actual_client(context)
+
+    result = client.fetch_fills(
+        start="2026-08-18", end="2026-08-18", attributions_by_order={},
+    )
+
+    by_order = {fill["order_id"]: fill for fill in result["fills"]}
+    normal = by_order["o1"]
+    assert normal["fee"] == "1.5"
+    assert normal["costs_complete"] is True
+    assert normal["cost_source"] == "broker_actual"
+    assert normal["broker_fee_used"] is True
+    assert normal["cost_degradation_reason"] == ""
+    degraded = by_order["o2"]
+    assert degraded["fee"] == "0"
+    assert degraded["costs_complete"] is False
+    assert degraded["cost_source"] == "unavailable"
+    assert degraded["broker_fee_used"] is False
+    assert degraded["cost_degradation_reason"] == (
+        "order_fee_query returned no record for this order"
+    )
+
+
+def test_futu_real_adapter_fails_loudly_on_negative_broker_fee() -> None:
+    context = FakeFutuRealContext(
+        accounts=[{
+            "acc_id": 201, "acc_index": 0, "trd_env": "REAL", "acc_status": "ACTIVE",
+        }],
+        order_rows=[{
+            "order_id": "o1", "code": "US.AAA", "trd_side": "BUY",
+            "currency": "USD", "create_time": "2026-08-18 09:30:00",
+            "updated_time": "2026-08-18 09:31:00", "dealt_qty": "2",
+            "dealt_avg_price": "10",
+        }],
+        negative_fee_ids={"o1"},
+    )
+    client = _futu_actual_client(context)
+
+    # A negative broker fee must fail loudly, never be synthesized into a
+    # plausible-looking zero.
+    with pytest.raises(
+        ValueError, match="Futu order fee amount must be non-negative"
+    ):
+        client.fetch_fills(
+            start="2026-08-18", end="2026-08-18", attributions_by_order={},
+        )
+
+
+def test_futu_real_adapter_accepts_dotted_class_share_codes_and_skips_option_contracts() -> None:
+    context = FakeFutuRealContext(
+        accounts=[{
+            "acc_id": 201, "acc_index": 0, "trd_env": "REAL", "acc_status": "ACTIVE",
+        }],
+        order_rows=[
+            {
+                "order_id": "o1", "code": "US.BRK.B", "trd_side": "BUY",
+                "currency": "USD", "create_time": "2026-08-18 09:30:00",
+                "updated_time": "2026-08-18 09:31:00", "dealt_qty": "2",
+                "dealt_avg_price": "300",
+            },
+            {
+                "order_id": "o2", "code": "US.VIXY260821C22000", "trd_side": "BUY",
+                "currency": "USD", "create_time": "2026-08-18 09:35:00",
+                "updated_time": "2026-08-18 09:36:00", "dealt_qty": "1",
+                "dealt_avg_price": "0.5",
+            },
+        ],
+        fee_rows={"o1": "0.5"},
+    )
+    client = _futu_actual_client(context)
+
+    result = client.fetch_fills(
+        start="2026-08-18", end="2026-08-18", attributions_by_order={},
+    )
+
+    assert [fill["fill_id"] for fill in result["fills"]] == [
+        "futu-act-order:o1:aggregate"
+    ]
+    assert result["fills"][0]["symbol"] == "BRK.B"
+    assert result["fills"][0]["fee"] == "0.5"
+    assert result["fills"][0]["costs_complete"] is True
+
+
+def test_futu_real_adapter_requires_exactly_one_real_account_for_auto_selection() -> None:
+    no_real = FakeFutuRealContext(accounts=[{
+        "acc_id": 101, "acc_index": 0, "trd_env": "SIMULATE", "acc_status": "ACTIVE",
+    }])
+    with pytest.raises(
+        FutuOrderExecutionError,
+        match="no REAL Futu securities accounts found",
+    ) as exc:
+        _futu_actual_client(no_real)
+    assert exc.value.error_type == "no_real_accounts"
+
+    multiple = FakeFutuRealContext(accounts=[
+        {"acc_id": 201, "acc_index": 0, "trd_env": "REAL", "acc_status": "ACTIVE"},
+        {"acc_id": 202, "acc_index": 1, "trd_env": "REAL", "acc_status": ""},
+    ])
+    with pytest.raises(
+        FutuOrderExecutionError,
+        match="multiple REAL Futu accounts found \\(201, 202\\); this system "
+        "expects the OpenD login session to expose exactly one REAL account",
+    ) as exc:
+        _futu_actual_client(multiple)
+    assert exc.value.error_type == "multiple_real_accounts"
+    # The message must not point operators at a --acc-id parameter that does
+    # not exist; multi-account selection is explicitly out of scope.
+    assert "separate feature request" in str(exc.value)
+
+
+def test_futu_real_adapter_selects_requested_acc_id_and_rejects_unknown_ids() -> None:
+    context = FakeFutuRealContext(
+        accounts=[
+            {"acc_id": 201, "acc_index": 0, "trd_env": "REAL", "acc_status": "ACTIVE"},
+            {"acc_id": 202, "acc_index": 1, "trd_env": "REAL", "acc_status": "ACTIVE"},
+        ],
+        order_rows=[{
+            "order_id": "o1", "code": "US.AAA", "trd_side": "BUY",
+            "currency": "USD", "create_time": "2026-08-18 09:30:00",
+            "updated_time": "2026-08-18 09:31:00", "dealt_qty": "2",
+            "dealt_avg_price": "10",
+        }],
+        fee_rows={"o1": "0.8"},
+    )
+    client = _futu_actual_client(context, acc_id=202)
+
+    result = client.fetch_fills(
+        start="2026-08-18", end="2026-08-18", attributions_by_order={},
+    )
+
+    assert context.calls == [
+        ("orders", {
+            "trd_env": "REAL", "acc_id": 202, "acc_index": 1,
+            "start": "2026-08-18", "end": "2026-08-18",
+        }),
+        ("fees", {
+            "order_id_list": ["o1"],
+            "trd_env": "REAL", "acc_id": 202, "acc_index": 1,
+        }),
+    ]
+    assert result["source_id"] == "actual:futu:202"
+    assert result["fills"][0]["costs_complete"] is True
+    assert result["fills"][0]["fee"] == "0.8"
+
+    with pytest.raises(
+        FutuOrderExecutionError, match="REAL Futu account 999 was not found",
+    ) as exc:
+        _futu_actual_client(context, acc_id=999)
+    assert exc.value.error_type == "real_account_not_found"
+
+
+def test_futu_real_adapter_batches_fee_query_for_all_fills_in_one_call() -> None:
+    context = FakeFutuRealContext(
+        accounts=[{
+            "acc_id": 201, "acc_index": 0, "trd_env": "REAL", "acc_status": "ACTIVE",
+        }],
+        order_rows=[
+            {
+                "order_id": "o1", "code": "US.AAA", "trd_side": "BUY",
+                "currency": "USD", "create_time": "2026-08-18 09:30:00",
+                "updated_time": "2026-08-18 09:31:00", "dealt_qty": "2",
+                "dealt_avg_price": "10",
+            },
+            {
+                "order_id": "o2", "code": "US.BBB", "trd_side": "SELL",
+                "currency": "USD", "create_time": "2026-08-18 10:30:00",
+                "updated_time": "2026-08-18 10:31:00", "dealt_qty": "1",
+                "dealt_avg_price": "12",
+            },
+        ],
+        fee_rows={"o1": 1.5, "o2": 0.5},
+    )
+    client = _futu_actual_client(context)
+
+    result = client.fetch_fills(
+        start="2026-08-18", end="2026-08-18", attributions_by_order={},
+    )
+
+    # All order ids in the fetch window go into a single batched fee query,
+    # never one call per order (the API accepts up to 400 ids per call but is
+    # rate-limited to 10 calls per 30 seconds per account id).
+    assert context.calls == [
+        ("orders", {
+            "trd_env": "REAL", "acc_id": 201, "acc_index": 0,
+            "start": "2026-08-18", "end": "2026-08-18",
+        }),
+        ("fees", {
+            "order_id_list": ["o1", "o2"],
+            "trd_env": "REAL", "acc_id": 201, "acc_index": 0,
+        }),
+    ]
+    assert [fill["order_id"] for fill in result["fills"]] == ["o1", "o2"]
+    assert [fill["fee"] for fill in result["fills"]] == ["1.5", "0.5"]
+    assert all(fill["costs_complete"] for fill in result["fills"])
+
+
+def test_futu_real_adapter_chunks_fee_query_at_400_order_ids() -> None:
+    # Zero-padded ids so dedup's lexicographic sort keeps numeric order.
+    order_rows = [{
+        "order_id": f"o{i:04d}", "code": "US.AAA", "trd_side": "BUY",
+        "currency": "USD", "create_time": "2026-08-18 09:30:00",
+        "updated_time": "2026-08-18 09:31:00", "dealt_qty": "1",
+        "dealt_avg_price": "10",
+    } for i in range(405)]
+    context = FakeFutuRealContext(
+        accounts=[{
+            "acc_id": 201, "acc_index": 0, "trd_env": "REAL", "acc_status": "ACTIVE",
+        }],
+        order_rows=order_rows,
+        fee_rows={f"o{i:04d}": 0.1 for i in range(405)},
+    )
+    client = _futu_actual_client(context)
+
+    result = client.fetch_fills(
+        start="2026-08-18", end="2026-08-18", attributions_by_order={},
+    )
+
+    fee_calls = [kwargs for name, kwargs in context.calls if name == "fees"]
+    assert len(fee_calls) == 2
+    assert fee_calls[0]["order_id_list"] == [f"o{i:04d}" for i in range(400)]
+    assert fee_calls[1]["order_id_list"] == [f"o{i:04d}" for i in range(400, 405)]
+    assert len(result["fills"]) == 405
+    assert all(fill["costs_complete"] for fill in result["fills"])
+
+
+def test_futu_real_adapter_fails_closed_when_opend_is_unreachable() -> None:
+    with pytest.raises(
+        FutuOrderExecutionError,
+        match="Futu OpenD is not reachable at 127.0.0.1:11112",
+    ) as exc:
+        FutuActualFillClient(
+            host="127.0.0.1",
+            port=11112,
+            trd_market="US",
+            connectivity_checker=lambda *_: False,
+        )
+    assert exc.value.error_type == "opend_unreachable"
+
+
 def test_rotation_action_events_flow_through_futu_attribution_and_kelly_rounds(
     tmp_path: Path,
 ) -> None:
@@ -229,6 +702,90 @@ def test_rotation_action_events_flow_through_futu_attribution_and_kelly_rounds(
     assert rounds[0].kelly_eligible is True
 
 
+def test_tiger_report_facts_keep_order_attribution_across_cutover_directories(
+    tmp_path: Path,
+) -> None:
+    # The US fact index reads both the current futu report directory and the
+    # legacy tiger directory (read-only). An order linked to a tiger report
+    # sha must stay attributed — not ambiguous — and re-syncing the same
+    # window must merge idempotently instead of raising a merge conflict.
+    data_dir = tmp_path / "data"
+    reports_dir = tmp_path / "reports"
+    common = {
+        "strategy_id": "trend_animals_warm_to_hot/US/v2",
+        "strategy_version": "v2",
+        "parameters": {
+            "normal_cost_rate": "0.001",
+            "normal_cost_model": "预计完整开平仓正常成本按名义金额计提",
+        },
+    }
+    tiger_report = {
+        "execution_date": "2026-01-01",
+        "metadata": {"market": "US", "broker": "tiger"},
+        "strategy_snapshot": dict(common),
+        "strategy_judgments": {"formal_actions": [{"action": "BUY", "symbol": "AAA"}]},
+    }
+    tiger_path = reports_dir / "trend_us_tiger" / "2026-01-01.json"
+    tiger_path.parent.mkdir(parents=True)
+    tiger_path.write_text(json.dumps(tiger_report), encoding="utf-8")
+    tiger_sha = _report_hash(tiger_report)
+    futu_report = {
+        "execution_date": "2026-01-02",
+        "metadata": {"market": "US", "broker": "futu"},
+        "strategy_snapshot": dict(common),
+        "strategy_judgments": {"formal_actions": [{"action": "BUY", "symbol": "AAA"}]},
+    }
+    futu_path = reports_dir / "trend_us_futu" / "2026-01-02.json"
+    futu_path.parent.mkdir(parents=True)
+    futu_path.write_text(json.dumps(futu_report), encoding="utf-8")
+
+    _write_action_event(
+        data_dir=data_dir,
+        market="US",
+        execution_date="2026-01-01",
+        action_key="tiger-era-opening",
+        payload={
+            "market": "US", "date": "2026-01-01",
+            "strategy_id": "trend_animals_warm_to_hot/US/v2",
+            "strategy_version": "v2", "report_sha256": tiger_sha,
+            "symbol": "AAA", "futu_code": "US.AAA", "side": "buy",
+            "status": "filled", "order_ids": ["TIGER-BUY"],
+        },
+        recorded_at="2026-01-01T10:01:00-05:00",
+    )
+
+    facts = _load_frozen_strategy_facts(reports_dir)
+    assert {fact["report_sha256"] for fact in facts} == {
+        tiger_sha, _report_hash(futu_report),
+    }
+    attributions = _futu_order_attributions(data_dir, facts)
+    assert attributions["US"]["TIGER-BUY"]["attribution_status"] == "attributed"
+    assert attributions["US"]["TIGER-BUY"]["report_sha256"] == tiger_sha
+
+    simulation = FakeSyncClient([
+        normalized_fill(
+            "sim-buy", "TIGER-BUY", source="simulation", side="buy",
+            filled_at="2026-01-01T10:01:00-05:00", price="10",
+        ),
+    ])
+    sync_args = {
+        "data_dir": data_dir,
+        "reports_dir": reports_dir,
+        "futu_clients": {"US": simulation},
+        "start": "2026-01-01",
+        "end": "2026-01-03",
+        "generated_at": "2026-01-03T12:00:00+00:00",
+        "statistics_cutoff_at": "2026-01-03T12:00:00+00:00",
+    }
+    first = sync_trend_api_stats(**sync_args)
+    assert first["fills"][0]["attribution_status"] == "attributed"
+    assert first["fills"][0]["report_sha256"] == tiger_sha
+    # Re-syncing the same window must merge idempotently, not conflict.
+    second = sync_trend_api_stats(**sync_args)
+    assert second["fills"][0]["report_sha256"] == tiger_sha
+    assert len(second["fills"]) == 1
+
+
 def test_futu_cn_order_aggregate_accepts_exchange_prefixed_symbol() -> None:
     context = FakeFutuContext()
     original = context.history_order_list_query
@@ -282,6 +839,33 @@ def test_futu_order_aggregate_snapshot_advances_monotonically_across_syncs() -> 
     )
     with pytest.raises(ValueError, match="conflicting duplicate fill"):
         _merge_synced_fills([actual], [{**actual, "price": "11"}])
+
+
+def test_futu_actual_order_aggregate_snapshot_advances_monotonically_across_syncs() -> None:
+    earlier = normalized_fill(
+        "futu-act-order:7:aggregate", "7", source="actual", side="buy",
+        filled_at="2026-01-01T10:00:00-05:00", price="10",
+    ) | {
+        "quantity": "1",
+        "fee": "0.1",
+        "broker_fill_id": None,
+        "execution_granularity": "order_aggregate",
+    }
+    later = {
+        **earlier,
+        "quantity": "2",
+        "price": "10.5",
+        "fee": "0.25",
+        "filled_at": "2026-01-01T10:01:00-05:00",
+    }
+
+    # Actual order aggregates grow as limit orders keep filling; the merged
+    # snapshot replaces the earlier one instead of failing.
+    assert _merge_synced_fills([earlier], [later]) == [later]
+    with pytest.raises(ValueError, match="aggregate snapshot regressed"):
+        _merge_synced_fills([later], [earlier])
+    with pytest.raises(ValueError, match="aggregate fee regressed"):
+        _merge_synced_fills([earlier], [{**later, "fee": "0.05"}])
 
 
 @pytest.mark.parametrize("incoming_status", ["outside_strategy", "ambiguous"])
@@ -539,7 +1123,7 @@ def normalized_fill(
     fill_id: str, order_id: str, *, source: str, side: str,
     filled_at: str, price: str,
 ) -> dict[str, object]:
-    broker = "futu" if source == "simulation" else "tiger"
+    broker = "futu" if source == "simulation" else "futu"
     account = "101" if source == "simulation" else "U1"
     return {
         "fill_id": fill_id,
@@ -656,7 +1240,7 @@ def test_sync_uses_frozen_attribution_merges_idempotently_and_writes_canonical_a
 ) -> None:
     report = {
         "execution_date": "2026-01-01",
-        "metadata": {"market": "US", "broker": "tiger"},
+        "metadata": {"market": "US", "broker": "futu"},
         "strategy_snapshot": {
             "strategy_id": "trend_animals_warm_to_hot/US/v2",
             "strategy_version": "v2",
@@ -669,12 +1253,12 @@ def test_sync_uses_frozen_attribution_merges_idempotently_and_writes_canonical_a
             "formal_actions": [{"action": "BUY", "symbol": "AAA"}],
         },
     }
-    report_path = tmp_path / "reports/trend_us_tiger/2026-01-01.json"
+    report_path = tmp_path / "reports/trend_us_futu/2026-01-01.json"
     report_path.parent.mkdir(parents=True)
     report_path.write_text(json.dumps(report), encoding="utf-8")
     (report_path.parent / "2025-12-31.json").write_text(json.dumps({
         "execution_date": "2025-12-31",
-        "metadata": {"market": "US", "broker": "tiger"},
+        "metadata": {"market": "US", "broker": "futu"},
         "strategy_snapshot": {"parameters": {}},
         "strategy_judgments": {"formal_actions": []},
     }), encoding="utf-8")
@@ -705,7 +1289,7 @@ def test_sync_uses_frozen_attribution_merges_idempotently_and_writes_canonical_a
         "data_dir": tmp_path / "data",
         "reports_dir": tmp_path / "reports",
         "futu_clients": {"US": simulation},
-        "tiger_client": actual,
+        "actual_client": actual,
         "start": "2026-01-01",
         "end": "2026-01-03",
         "generated_at": "2026-01-03T12:00:00+00:00",
@@ -792,7 +1376,7 @@ def cycle_kwargs(
     *,
     market: str,
     futu_client: RecordingCycleClient,
-    tiger_client: RecordingCycleClient | None = None,
+    actual_client: RecordingCycleClient | None = None,
 ) -> dict[str, object]:
     return {
         "data_dir": tmp_path / "data",
@@ -802,7 +1386,7 @@ def cycle_kwargs(
         "generated_at": "2026-08-09T08:00:00+08:00",
         "process_git_sha": "abc1234",
         "futu_client": futu_client,
-        "tiger_client": tiger_client,
+        "actual_client": actual_client,
     }
 
 
@@ -1141,7 +1725,7 @@ def test_failed_cycle_retries_and_downtime_uses_one_range_request(tmp_path: Path
         tmp_path,
         market="US",
         futu_client=client,
-        tiger_client=RecordingCycleClient(account_id="U1"),
+        actual_client=RecordingCycleClient(account_id="U1"),
     )
 
     assert run_trend_statistics_cycle(**kwargs)["status"] == "failed"
@@ -1193,7 +1777,7 @@ def test_market_cycle_publications_are_order_independent(tmp_path: Path) -> None
         tmp_path,
         market="US",
         futu_client=RecordingCycleClient(account_id="us-sim"),
-        tiger_client=RecordingCycleClient(account_id="U1"),
+        actual_client=RecordingCycleClient(account_id="U1"),
     )
     assert run_trend_statistics_cycle(**us_kwargs)["status"] == "completed"
 
@@ -1324,7 +1908,7 @@ def test_market_cutoff_filters_late_fill_until_later_cycle(tmp_path: Path) -> No
         tmp_path,
         market="US",
         futu_client=RecordingCycleClient(account_id="us-sim"),
-        tiger_client=RecordingCycleClient(account_id="U1"),
+        actual_client=RecordingCycleClient(account_id="U1"),
     )
     assert run_trend_statistics_cycle(**us_kwargs)["status"] == "completed"
 

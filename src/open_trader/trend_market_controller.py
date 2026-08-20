@@ -62,11 +62,10 @@ from .opend_incident import (
     record_opend_failure,
     record_opend_health,
 )
-from .tiger_account import load_tiger_account_config
 from .trend_api_stats import (
     STATISTICS_CYCLE_SCHEMA,
+    FutuActualFillClient,
     FutuSimulateFillClient,
-    TigerActualFillClient,
     _read_optional_json,
     run_trend_statistics_cycle,
     trend_statistics_cycle_path,
@@ -474,7 +473,7 @@ def _valid_report(
     snapshot = payload.get("strategy_snapshot")
     judgments = payload.get("strategy_judgments")
     actions = judgments.get("formal_actions") if isinstance(judgments, dict) else None
-    expected_broker = {"CN": "eastmoney", "US": "tiger", "HK": "phillips"}[market]
+    expected_broker = {"CN": "eastmoney", "US": "futu", "HK": "phillips"}[market]
     expected_account = getattr(
         config, f"trend_review_{market.lower()}_simulate_acc_id"
     )
@@ -787,15 +786,13 @@ def _run_cycle_statistics(
         simulate_acc_id=require_trend_review_config(config, cycle.market),
         trd_market=cycle.market,
     )
-    tiger = None
+    actual = None
     try:
         if cycle.market == "US":
-            tiger = TigerActualFillClient(
-                config=load_tiger_account_config(
-                    config_dir=Path("~/.tigeropen/"),
-                    account=None,
-                    sandbox=False,
-                )
+            actual = FutuActualFillClient(
+                host=config.futu_host,
+                port=config.futu_port,
+                trd_market="US",
             )
         return run_trend_statistics_cycle(
             data_dir=config.data_dir,
@@ -805,14 +802,14 @@ def _run_cycle_statistics(
             generated_at=now.isoformat(timespec="seconds"),
             process_git_sha=process_version,
             futu_client=futu,
-            tiger_client=tiger,
+            actual_client=actual,
         )
     finally:
         try:
             futu.close()
         finally:
-            if tiger is not None:
-                tiger.close()
+            if actual is not None:
+                actual.close()
 
 
 def _run_cycle_long_term_benchmark(

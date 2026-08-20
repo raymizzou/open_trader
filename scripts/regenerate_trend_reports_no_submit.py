@@ -43,7 +43,7 @@ EXPECTED_VERSIONS = {"CN": "v14", "HK": "v12", "US": "v12"}
 REPORT_DIRECTORIES = {
     "CN": "trend_a_share",
     "HK": "trend_hk_phillips",
-    "US": "trend_us_tiger",
+    "US": "trend_us_futu",
 }
 _REPORT_STEM = re.compile(r"^(?P<date>\d{4}-\d{2}-\d{2})(?:-r(?P<revision>\d+))?$")
 

@@ -12,9 +12,15 @@ from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from .kelly_order_execution import (
+    FutuOrderExecutionError,
     FutuSimulateOrderExecutionClient,
+    _as_int,
+    _can_connect_to_opend,
+    _default_trade_context_factory,
+    _records,
 )
 from .daily_premarket import RunLock
+from .futu_account import TRD_ENV_REAL
 from .kelly_trade_samples import _write_json_atomic
 from .tiger_account import TigerAccountClient, TigerAccountError
 from .trend_kelly import trend_kelly_identity_matches
@@ -34,10 +40,19 @@ _MARKET_TIMEZONES = {
 _REPORT_DIRECTORIES = {
     "CN": "trend_a_share",
     "HK": "trend_hk_phillips",
-    "US": "trend_us_tiger",
+    "US": "trend_us_futu",
+}
+# Legacy read-only report directories: historical facts stay resolvable for
+# attribution continuity (e.g. US tiger-era orders link to tiger report shas)
+# without re-introducing the old identity as a write/identity path.
+_LEGACY_REPORT_DIRECTORIES = {
+    "US": ("trend_us_tiger",),
 }
 _SOURCE_MARKETS = {
     ("simulation", "futu"): {"CN", "HK", "US"},
+    ("actual", "futu"): {"US"},
+    # ("actual", "tiger") stays legacy-readable: historical artifacts keep
+    # their source facts valid even though no new tiger fills are produced.
     ("actual", "tiger"): {"US"},
     ("actual", "eastmoney"): {"CN"},
     ("actual", "phillips"): {"HK"},
@@ -46,6 +61,12 @@ _STATEMENT_ACCOUNTS = {
     "eastmoney": ("eastmoney_main", "CN"),
     "phillips": ("phillips_main", "HK"),
 }
+# Futu OpenD order_fee_query accepts at most 400 order ids per call and is
+# rate-limited to 10 calls per 30 seconds per account id. Merging the whole
+# fetch window into one call per chunk keeps a rotation day (a few dozen
+# orders) to a single call; even a 10x larger window stays far below the
+# rate limit, so batching never self-inflicts throttling.
+_FUTU_FEE_QUERY_BATCH_LIMIT = 400
 
 
 class FutuSimulateFillClient(FutuSimulateOrderExecutionClient):
@@ -99,6 +120,199 @@ class FutuSimulateFillClient(FutuSimulateOrderExecutionClient):
             "orders_seen": len(orders),
             "fills": fills,
         }
+
+
+class FutuActualFillClient:
+    """Read executed US stock fills from the Futu real (REAL) trade account.
+
+    Mirrors the TigerActualFillClient.fetch_fills contract so the daily
+    statistics cycle treats it identically, but talks to OpenD over the real
+    trade environment. Only stock-class fills enter trend statistics; option
+    and other derivative fills are surfaced as account exceptions, not fills.
+    """
+
+    environment = TRD_ENV_REAL
+    source = "futu_actual_fill_client"
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        acc_id: int | None = None,
+        trd_market: str = "US",
+        context_factory: Any = None,
+        connectivity_checker: Any = None,
+    ) -> None:
+        connectivity_checker = connectivity_checker or _can_connect_to_opend
+        context_factory = context_factory or _default_trade_context_factory
+        if not connectivity_checker(host, port):
+            raise FutuOrderExecutionError(
+                f"Futu OpenD is not reachable at {host}:{port}. Start OpenD, log in, and check host/port.",
+                error_type="opend_unreachable",
+            )
+        try:
+            self.context = context_factory(
+                host=host,
+                port=port,
+                trd_market=trd_market,
+            )
+        except FutuOrderExecutionError:
+            raise
+        except Exception as exc:
+            raise FutuOrderExecutionError(
+                f"failed to create Futu trade context at {host}:{port}: {exc}",
+                error_type="trade_context_failed",
+            ) from exc
+        self.host = host
+        self.port = port
+        self.trd_market = str(trd_market).strip().upper()
+        self.account = self._select_real_account(acc_id)
+
+    def fetch_fills(
+        self,
+        *,
+        start: str,
+        end: str,
+        attributions_by_order: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        start_date = date.fromisoformat(start)
+        end_date = date.fromisoformat(end)
+        if end_date < start_date:
+            raise ValueError("Futu fill end date must not precede start date")
+        ret_code, data = self.context.history_order_list_query(
+            trd_env=TRD_ENV_REAL,
+            acc_id=self.account["acc_id"],
+            acc_index=self.account["acc_index"],
+            start=start,
+            end=end,
+        )
+        if ret_code != 0:
+            raise FutuOrderExecutionError(
+                str(data), error_type="history_order_list_query_failed"
+            )
+        orders = _deduplicate_records(
+            [dict(item) for item in _records(data)], "order_id"
+        )
+        fills: list[dict[str, object]] = []
+        fee_order_ids: list[str] = []
+        account_id = str(self.account["acc_id"])
+        for order in orders:
+            dealt_quantity = _required_decimal(
+                order.get("dealt_qty"), "Futu order dealt quantity"
+            )
+            if dealt_quantity < 0:
+                raise ValueError("Futu order dealt quantity must be non-negative")
+            if dealt_quantity == 0:
+                continue
+            dealt_price = _required_decimal(
+                order.get("dealt_avg_price"), "Futu order dealt average price"
+            )
+            if dealt_price <= 0:
+                raise ValueError("Futu dealt average price must be positive")
+            code = str(order.get("code") or "").strip().upper()
+            if not _is_futu_stock_class_code(code, self.trd_market):
+                # Only stock-class fills enter trend statistics; option and
+                # other derivative fills are account exceptions, not fills.
+                continue
+            order_id = str(order["order_id"]).strip()
+            fill = _normalized_futu_fill(
+                {
+                    "deal_id": f"futu-act-order:{order_id}:aggregate",
+                    "broker_fill_id": None,
+                    "execution_granularity": "order_aggregate",
+                    "order_id": order_id,
+                    "code": order.get("code"),
+                    "trd_side": order.get("trd_side"),
+                    "qty": order.get("dealt_qty"),
+                    "price": order.get("dealt_avg_price"),
+                    "create_time": order.get("updated_time") or order.get("create_time"),
+                },
+                order=order,
+                account_id=account_id,
+                market=self.trd_market,
+                attribution=attributions_by_order.get(order_id),
+            )
+            fills.append(fill)
+            fee_order_ids.append(order_id)
+        # One batched fee query for the whole window (not one call per order):
+        # order_fee_query is rate-limited to 10 calls per 30 seconds per
+        # account, so per-order calls would be throttled on rotation days and
+        # silently degrade every affected fill to costs_complete=false.
+        fees_by_order = _futu_order_fees(
+            self.context,
+            order_ids=fee_order_ids,
+            trd_env=TRD_ENV_REAL,
+            acc_id=self.account["acc_id"],
+            acc_index=self.account["acc_index"],
+        )
+        for fill in fills:
+            fee, fee_degradation = fees_by_order[str(fill["order_id"])]
+            fill.update({
+                "source": "actual",
+                "source_id": f"actual:futu:{account_id}",
+                "broker": "futu",
+                "account_id": account_id,
+                "fee": _decimal_text(fee) if fee is not None else "0",
+                "costs_complete": fee is not None,
+                "cost_source": "broker_actual" if fee is not None else "unavailable",
+                "broker_fee_used": fee is not None,
+                "cost_degradation_reason": fee_degradation,
+            })
+        return {
+            "source_id": f"actual:futu:{account_id}",
+            "account_id": account_id,
+            "market": self.trd_market,
+            "orders_seen": len(orders),
+            "fills": fills,
+        }
+
+    def close(self) -> None:
+        self.context.close()
+
+    def _select_real_account(self, acc_id: int | None) -> dict[str, int]:
+        ret_code, data = self.context.get_acc_list()
+        if ret_code != 0:
+            raise FutuOrderExecutionError(
+                str(data),
+                error_type="account_query_failed",
+            )
+        accounts: list[dict[str, int]] = []
+        for record in _records(data):
+            trd_env = str(record.get("trd_env", "")).strip().upper()
+            acc_status = str(record.get("acc_status", "ACTIVE")).strip().upper()
+            if trd_env != TRD_ENV_REAL or acc_status not in {"", "ACTIVE"}:
+                continue
+            account = {
+                "acc_id": _as_int(record.get("acc_id"), field_name="acc_id"),
+                "acc_index": _as_int(record.get("acc_index", 0), field_name="acc_index"),
+            }
+            accounts.append(account)
+        if not accounts:
+            raise FutuOrderExecutionError(
+                "no REAL Futu securities accounts found",
+                error_type="no_real_accounts",
+            )
+        if acc_id is not None:
+            for account in accounts:
+                if account["acc_id"] == acc_id:
+                    return account
+            raise FutuOrderExecutionError(
+                f"REAL Futu account {acc_id} was not found",
+                error_type="real_account_not_found",
+            )
+        if len(accounts) > 1:
+            account_ids = ", ".join(str(account["acc_id"]) for account in accounts)
+            raise FutuOrderExecutionError(
+                "multiple REAL Futu accounts found ("
+                f"{account_ids}); this system expects the OpenD login "
+                "session to expose exactly one REAL account and selects it "
+                "automatically. Expose only one REAL account in OpenD and "
+                "retry; selecting among multiple REAL accounts is a separate "
+                "feature request",
+                error_type="multiple_real_accounts",
+            )
+        return accounts[0]
 
 
 class TigerActualFillClient(TigerAccountClient):
@@ -279,6 +493,72 @@ def _tiger_timestamp(value: object, *, market: str) -> str:
     return parsed.isoformat()
 
 
+def _futu_order_fees(
+    context: Any,
+    *,
+    order_ids: Sequence[str],
+    trd_env: str,
+    acc_id: int,
+    acc_index: int,
+) -> dict[str, tuple[Decimal | None, str]]:
+    """Query authoritative Futu order fees via batched ``order_fee_query``.
+
+    OpenD order-list records never carry fee columns (history_order_list_query
+    has no fee/total_fee/commission fields); the dedicated order fee query
+    does. Each call accepts up to ``_FUTU_FEE_QUERY_BATCH_LIMIT`` order ids, so
+    the whole fetch window is merged into the fewest possible calls (one call
+    for any realistic rotation day) instead of one call per order — the API is
+    rate-limited to 10 calls per 30 seconds per account id, and per-order
+    calls would exceed that on rotation days. Returns a mapping from order id
+    to ``(fee, "")`` when the broker reports a concrete fee amount, or
+    ``(None, reason)`` with an explicit degradation reason when the fee cannot
+    be obtained — costs stay incomplete rather than trusting a synthetic zero,
+    and the reason is recorded on the fill, never swallowed.
+    """
+    fees: dict[str, tuple[Decimal | None, str]] = {}
+    for chunk_start in range(0, len(order_ids), _FUTU_FEE_QUERY_BATCH_LIMIT):
+        chunk = list(
+            order_ids[chunk_start : chunk_start + _FUTU_FEE_QUERY_BATCH_LIMIT]
+        )
+        try:
+            ret_code, data = context.order_fee_query(
+                order_id_list=chunk,
+                trd_env=trd_env,
+                acc_id=acc_id,
+                acc_index=acc_index,
+            )
+        except Exception as exc:
+            reason = f"order_fee_query raised {type(exc).__name__}: {exc}"
+            fees.update({order_id: (None, reason) for order_id in chunk})
+            continue
+        if ret_code != 0:
+            reason = f"order_fee_query failed with ret code {ret_code}"
+            fees.update({order_id: (None, reason) for order_id in chunk})
+            continue
+        records_by_order = {
+            str(record.get("order_id") or "").strip(): record
+            for record in _records(data)
+        }
+        for order_id in chunk:
+            record = records_by_order.get(order_id)
+            if record is None:
+                fees[order_id] = (
+                    None, "order_fee_query returned no record for this order"
+                )
+                continue
+            amount = record.get("fee_amount")
+            if amount is None or str(amount).strip().upper() == "N/A":
+                fees[order_id] = (
+                    None, "order_fee_query returned no fee_amount"
+                )
+                continue
+            fee = _required_decimal(amount, "Futu order fee amount")
+            if fee < 0:
+                raise ValueError("Futu order fee amount must be non-negative")
+            fees[order_id] = (fee, "")
+    return fees
+
+
 def _tiger_order_fee(order: object) -> Decimal | None:
     gst = _optional_nonnegative_decimal(getattr(order, "gst", None)) or Decimal("0")
     commission = getattr(order, "commission", None)
@@ -332,6 +612,29 @@ def _deduplicate_records(
             raise ValueError(f"conflicting duplicate broker {identity_field}: {identity}")
         unique[identity] = record
     return [unique[key] for key in sorted(unique)]
+
+
+def _is_futu_stock_class_code(code: str, market: str) -> bool:
+    """Whitelist-style stock-class check for Futu order codes.
+
+    Accepts market-prefixed plain equity codes (``US.AAA``) and dotted class
+    shares (``US.BRK.B``) — the same dotted-symbol codes
+    ``_normalized_futu_fill`` accepts — and rejects option-contract expiry
+    shapes (a YYMMDD date immediately followed by C/P), whitespace, and more
+    than one dotted segment after the market prefix.
+    """
+    text = str(code or "").strip().upper()
+    if not text or " " in text:
+        return False
+    prefix, separator, symbol = text.partition(".")
+    if not separator or prefix != market or not symbol:
+        return False
+    segments = symbol.split(".")
+    if len(segments) > 2 or any(not segment for segment in segments):
+        return False
+    if re.search(r"\d{6}[CP]", symbol):
+        return False
+    return True
 
 
 def _normalized_futu_fill(
@@ -465,7 +768,7 @@ def sync_trend_api_stats(
     data_dir: Any,
     reports_dir: Any,
     futu_clients: Mapping[str, object],
-    tiger_client: object | None = None,
+    actual_client: object | None = None,
     start: str,
     end: str,
     generated_at: str,
@@ -507,32 +810,38 @@ def sync_trend_api_stats(
             "statistics_cutoff_at": statistics_cutoff_at,
             "status": "available",
         })
-    if tiger_client is not None:
-        tiger_result = tiger_client.fetch_fills(
+    if actual_client is not None:
+        actual_result = actual_client.fetch_fills(
             start=start,
             end=end,
             attributions_by_order={},
         )
-        tiger_fills = [
-            fill for fill in _attribute_actual_fills(_result_fills(tiger_result), facts)
+        actual_fills = [
+            fill for fill in _attribute_actual_fills(_result_fills(actual_result), facts)
             if _aware_timestamp(fill["filled_at"], "fill filled_at") <= source_cutoff
         ]
-        fetched_fills.extend(tiger_fills)
-        tiger_account = str(
-            tiger_result.get("account_id")
-            or (tiger_fills[0].get("account_id") if tiger_fills else "")
+        fetched_fills.extend(actual_fills)
+        actual_account = str(
+            actual_result.get("account_id")
+            or (actual_fills[0].get("account_id") if actual_fills else "")
         )
-        tiger_source_id = str(
-            tiger_result.get("source_id") or f"actual:tiger:{tiger_account}"
+        actual_broker = "futu"
+        for fill in actual_fills:
+            if str(fill.get("broker") or "").strip():
+                actual_broker = str(fill["broker"]).strip()
+                break
+        actual_source_id = str(
+            actual_result.get("source_id")
+            or f"actual:{actual_broker}:{actual_account}"
         )
         sources.append({
             "source": "actual",
-            "source_id": tiger_source_id,
-            "broker": "tiger",
-            "account_id": tiger_account,
+            "source_id": actual_source_id,
+            "broker": actual_broker,
+            "account_id": actual_account,
             "market": "US",
-            "orders_seen": int(tiger_result.get("orders_seen", 0)),
-            "fill_count": len(tiger_fills),
+            "orders_seen": int(actual_result.get("orders_seen", 0)),
+            "fill_count": len(actual_fills),
             "statistics_cutoff_at": statistics_cutoff_at,
             "status": "available",
         })
@@ -626,7 +935,7 @@ def run_trend_statistics_cycle(
     generated_at: str,
     process_git_sha: str,
     futu_client: object,
-    tiger_client: object | None = None,
+    actual_client: object | None = None,
     force: bool = False,
     actor: str = "",
     reason: str = "",
@@ -658,13 +967,13 @@ def run_trend_statistics_cycle(
             start, end = _statistics_fetch_range(
                 _path(data_dir), _path(reports_dir), normalized_market, normalized_date
             )
-            if normalized_market == "US" and tiger_client is None:
-                raise ValueError("US statistics cycle requires Tiger actual client")
+            if normalized_market == "US" and actual_client is None:
+                raise ValueError("US statistics cycle requires Futu actual client")
             sync_trend_api_stats(
                 data_dir=data_dir,
                 reports_dir=reports_dir,
                 futu_clients={normalized_market: futu_client},
-                tiger_client=tiger_client if normalized_market == "US" else None,
+                actual_client=actual_client if normalized_market == "US" else None,
                 start=start,
                 end=end,
                 generated_at=generated_at,
@@ -849,7 +1158,7 @@ def _statistics_fetch_range(
         existing = None
     if existing is not None:
         has_simulation = False
-        has_tiger_actual = normalized_market != "US"
+        has_broker_actual = normalized_market != "US"
         for source in existing["sources"]:
             if source["market"] != normalized_market:
                 continue
@@ -860,14 +1169,14 @@ def _statistics_fetch_range(
                         source["statistics_cutoff_at"], "source statistics_cutoff_at"
                     ).astimezone(_MARKET_TIMEZONES[normalized_market]).date().isoformat()
                 )
-            elif normalized_market == "US" and source["broker"] == "tiger":
-                has_tiger_actual = True
+            elif normalized_market == "US" and source["broker"] in {"tiger", "futu"}:
+                has_broker_actual = True
                 starts.append(
                     _aware_timestamp(
                         source["statistics_cutoff_at"], "source statistics_cutoff_at"
                     ).astimezone(_MARKET_TIMEZONES[normalized_market]).date().isoformat()
                 )
-        if not has_simulation or not has_tiger_actual:
+        if not has_simulation or not has_broker_actual:
             starts.extend(
                 str(fact["execution_date"])
                 for fact in _load_frozen_strategy_facts(reports_dir)
@@ -1128,7 +1437,8 @@ def _merge_synced_fills(
             merged[identity] = incoming
             continue
         aggregate = (
-            existing.get("source") == incoming.get("source") == "simulation"
+            existing.get("source") == incoming.get("source")
+            and existing.get("source") in {"simulation", "actual"}
             and existing.get("broker") == incoming.get("broker") == "futu"
             and existing.get("execution_granularity")
             == incoming.get("execution_granularity")
@@ -1167,6 +1477,14 @@ def _merge_synced_fills(
             or new_price != old_price
         ):
             raise ValueError("conflicting duplicate fill: Futu aggregate snapshot")
+        if (
+            existing["costs_complete"] is True
+            and incoming["costs_complete"] is True
+        ):
+            old_fee = _required_decimal(existing["fee"], "existing aggregate fee")
+            new_fee = _required_decimal(incoming["fee"], "incoming aggregate fee")
+            if new_fee < old_fee:
+                raise ValueError("Futu aggregate fee regressed")
         if (
             existing["attribution_status"] == "attributed"
             and (
@@ -1215,43 +1533,55 @@ def _load_frozen_strategy_facts(reports_dir: Any) -> list[dict[str, object]]:
     reports_dir = _path(reports_dir)
     facts: list[dict[str, object]] = []
     for market, directory in _REPORT_DIRECTORIES.items():
-        for path in sorted((reports_dir / directory).glob("*.json")):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError):
-                raise ValueError(f"frozen trend report is unreadable: {path}") from None
-            if not isinstance(payload, Mapping):
-                raise ValueError(f"frozen trend report is invalid: {path}")
-            metadata = payload.get("metadata")
-            snapshot = payload.get("strategy_snapshot")
-            judgments = payload.get("strategy_judgments")
-            if not isinstance(snapshot, Mapping):
-                continue
-            strategy_id = str(snapshot.get("strategy_id") or "").strip()
-            strategy_version = str(snapshot.get("strategy_version") or "").strip()
-            if not strategy_id and not strategy_version:
-                continue
-            if not (
-                isinstance(metadata, Mapping)
-                and str(metadata.get("market") or "").strip().upper() == market
-                and strategy_id
-                and strategy_version
-                and isinstance(judgments, Mapping)
-                and isinstance(judgments.get("formal_actions"), list)
-            ):
-                raise ValueError(f"frozen trend report strategy facts are invalid: {path}")
-            parameters = snapshot.get("parameters")
-            parameters = parameters if isinstance(parameters, Mapping) else {}
-            facts.append({
-                "market": market,
-                "execution_date": _required_text(payload.get("execution_date"), "execution_date"),
-                "strategy_id": strategy_id,
-                "strategy_version": strategy_version,
-                "report_sha256": _report_hash(dict(payload)),
-                "normal_cost_rate": str(parameters.get("normal_cost_rate") or "").strip(),
-                "normal_cost_model": str(parameters.get("normal_cost_model") or "").strip(),
-                "formal_actions": judgments["formal_actions"],
-            })
+        directories = [directory, *_LEGACY_REPORT_DIRECTORIES.get(market, ())]
+        for directory in directories:
+            for path in sorted((reports_dir / directory).glob("*.json")):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    raise ValueError(
+                        f"frozen trend report is unreadable: {path}"
+                    ) from None
+                if not isinstance(payload, Mapping):
+                    raise ValueError(f"frozen trend report is invalid: {path}")
+                metadata = payload.get("metadata")
+                snapshot = payload.get("strategy_snapshot")
+                judgments = payload.get("strategy_judgments")
+                if not isinstance(snapshot, Mapping):
+                    continue
+                strategy_id = str(snapshot.get("strategy_id") or "").strip()
+                strategy_version = str(snapshot.get("strategy_version") or "").strip()
+                if not strategy_id and not strategy_version:
+                    continue
+                if not (
+                    isinstance(metadata, Mapping)
+                    and str(metadata.get("market") or "").strip().upper() == market
+                    and strategy_id
+                    and strategy_version
+                    and isinstance(judgments, Mapping)
+                    and isinstance(judgments.get("formal_actions"), list)
+                ):
+                    raise ValueError(
+                        f"frozen trend report strategy facts are invalid: {path}"
+                    )
+                parameters = snapshot.get("parameters")
+                parameters = parameters if isinstance(parameters, Mapping) else {}
+                facts.append({
+                    "market": market,
+                    "execution_date": _required_text(
+                        payload.get("execution_date"), "execution_date"
+                    ),
+                    "strategy_id": strategy_id,
+                    "strategy_version": strategy_version,
+                    "report_sha256": _report_hash(dict(payload)),
+                    "normal_cost_rate": str(
+                        parameters.get("normal_cost_rate") or ""
+                    ).strip(),
+                    "normal_cost_model": str(
+                        parameters.get("normal_cost_model") or ""
+                    ).strip(),
+                    "formal_actions": judgments["formal_actions"],
+                })
     return facts
 
 

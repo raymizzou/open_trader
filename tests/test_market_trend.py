@@ -65,7 +65,7 @@ ACCOUNT_SNAPSHOT = {
             "reason": None,
             "brokers": {
                 broker: {
-                    "source_kind": "live" if broker == "tiger" else "statement",
+                    "source_kind": "live" if broker == "futu" else "statement",
                     "data_as_of": "2026-07-15T12:00:00+08:00",
                     "last_success_at": "2026-07-15T12:00:00+08:00",
                     "status": "healthy",
@@ -90,7 +90,7 @@ ACCOUNT_SNAPSHOT = {
             "available_balance": "0",
         }
         for broker, currency in (
-            ("eastmoney", "CNY"), ("phillips", "HKD"), ("tiger", "USD")
+            ("eastmoney", "CNY"), ("phillips", "HKD"), ("futu", "USD")
         )
     ],
 }
@@ -412,10 +412,10 @@ def config(tmp_path: Path) -> DailyPremarketConfig:
 
 
 def test_market_paths_are_completely_separate() -> None:
-    assert market_paths(Path("data"), Path("reports"), "US").root == Path("data/trend_us_tiger")
+    assert market_paths(Path("data"), Path("reports"), "US").root == Path("data/trend_us_futu")
     assert market_paths(Path("data"), Path("reports"), "HK").root.name == "trend_hk_phillips"
-    assert MARKET_SETTINGS["US"]["broker"] == "tiger"
-    assert MARKET_NOTIFICATION_LABELS["US"][0] == "老虎"
+    assert MARKET_SETTINGS["US"]["broker"] == "futu"
+    assert MARKET_NOTIFICATION_LABELS["US"][0] == "富途"
 
 
 def test_resolve_market_dates_uses_same_day_hk_and_prior_day_us() -> None:
@@ -797,14 +797,14 @@ def test_market_report_failure_owns_day_at_19_shanghai_deadline(tmp_path: Path) 
     assert result.status == "failed"
     assert notifier.messages == [
         (
-            "【需处理｜老虎｜美股趋势报告生成失败｜2026-07-15】",
+            "【需处理｜富途｜美股趋势报告生成失败｜2026-07-15】",
             "发生：趋势报告未生成\n"
             "影响：不能依据旧报告交易\n"
-            "现在做：确认 Trend Animals 与老虎账户状态后手动重跑老虎报告\n"
+            "现在做：确认 Trend Animals 与富途账户状态后手动重跑富途报告\n"
             "原因：趋势数据在截止时间前仍未更新",
         )
     ]
-    ledger = cfg.data_dir / "trend_us_tiger/daily_delivery/2026-07-15.json"
+    ledger = cfg.data_dir / "trend_us_futu/daily_delivery/2026-07-15.json"
     assert __import__("json").loads(ledger.read_text(encoding="utf-8"))["status"] == "sent"
 
 
@@ -1583,8 +1583,8 @@ def test_account_snapshot_does_not_change_us_simulation_report(
     )
     account_snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)
     account_snapshot["positions"] = [{
-        "instrument_id": "tiger:US:VIXY",
-        "broker": "tiger",
+        "instrument_id": "futu:US:VIXY",
+        "broker": "futu",
         "market": "US",
         "asset_class": "etf",
         "symbol": "VIXY",
@@ -1595,8 +1595,8 @@ def test_account_snapshot_does_not_change_us_simulation_report(
         "market_value": "200000",
     }]
     account_snapshot["cash_balances"] = [{
-        "broker": "tiger",
-        "account_alias": "tiger_main",
+        "broker": "futu",
+        "account_alias": "futu_main",
         "currency": "USD",
         "cash_balance": "20000",
         "available_balance": "20000",
@@ -1994,7 +1994,7 @@ def test_build_option_attention_emits_only_raw_trend_transitions() -> None:
     ]
 
     attention = market_trend.build_option_attention(
-        current, previous, {"QQQ": "BUY"}, "US", "tiger"
+        current, previous, {"QQQ": "BUY"}, "US", "futu"
     )
 
     assert [item["symbol"] for item in attention] == ["DRAM", "QQQ"]
@@ -2038,7 +2038,7 @@ def test_build_option_attention_emits_only_raw_trend_transitions() -> None:
     assert "summary" not in attention[1]
     protection_only = [{**row, "active_line": "200"} for row in current]
     assert market_trend.build_option_attention(
-        protection_only, current, {"MSFT": "SELL_ALL"}, "US", "tiger"
+        protection_only, current, {"MSFT": "SELL_ALL"}, "US", "futu"
     ) == []
 
 
@@ -2085,7 +2085,7 @@ def test_build_option_attention_preserves_missing_values_and_holding_precedence(
         [],
         {},
         "US",
-        "tiger",
+        "futu",
     )
     assert [item["symbol"] for item in first_entries] == ["RIGHT"]
     assert first_entries[0]["boiling"] == {
@@ -2095,7 +2095,7 @@ def test_build_option_attention_preserves_missing_values_and_holding_precedence(
     }
 
 
-def test_previous_attention_rows_use_strict_dates_and_one_time_tiger_baseline(
+def test_previous_attention_rows_use_strict_dates_and_one_time_futu_baseline(
     tmp_path: Path,
 ) -> None:
     paths = market_paths(tmp_path / "data", tmp_path / "reports", "US")
@@ -2156,7 +2156,9 @@ def test_previous_attention_rows_use_strict_dates_and_one_time_tiger_baseline(
         ("US", "candidates", {}, "OLDER", "NEWER"),
         ("US", "candidates", {"symbol": "  "}, "OLDER", "NEWER"),
         ("US", "holdings", {"symbol": "600001"}, "OLDER", "NEWER"),
+        ("US", "real_holdings", {"symbol": "600001"}, "OLDER", "NEWER"),
         ("HK", "holdings", {"symbol": "AAPL"}, "00001", "00002"),
+        ("HK", "real_holdings", {"symbol": "AAPL"}, "00001", "00002"),
     ],
 )
 def test_previous_attention_rows_skip_newest_report_with_invalid_symbol_row(
@@ -2203,19 +2205,165 @@ def test_current_attention_rows_keep_valid_rows_when_one_symbol_is_invalid() -> 
                 _attention_row("QQQ", right_side=True, danger=False),
                 _attention_row("600001", right_side=True, danger=False),
             ]
-        }
+        },
+        "US",
     )
 
     assert rows is not None
     assert [
         item["symbol"]
         for item in market_trend.build_option_attention(
-            rows, [], {}, "US", "tiger"
+            rows, [], {}, "US", "futu"
         )
     ] == ["QQQ"]
 
 
-def test_previous_attention_rows_reject_malformed_tiger_baseline(
+def test_attention_rows_include_real_holdings_last_and_real_rows_win_merge() -> None:
+    rows = market_trend._attention_rows(
+        {
+            "candidates": [
+                _attention_row("AAPL", right_side=True, danger=False),
+            ],
+            "holdings": {
+                "AAPL": None,
+                "MSFT": _attention_row("MSFT"),
+            },
+            "real_holdings": {
+                "AAPL": _attention_row(
+                    "AAPL", right_side=True, danger=False, temperature_curr="热"
+                ),
+                "SNOW": None,
+            },
+        },
+        "US",
+    )
+
+    assert [row["symbol"] for row in rows] == ["AAPL", "MSFT", "AAPL"]
+    # SNOW's None entry contributes no row; the real-holding AAPL row wins the
+    # attention merge over the simulated-account candidate row.
+    attention = market_trend.build_option_attention(rows, [], {}, "US", "futu")
+
+    # Real-holding rows come last so the authoritative position wins the
+    # merge over the simulated-account candidate row.
+    assert [item["symbol"] for item in attention] == ["AAPL"]
+    assert attention[0]["temperature"]["current"] == "热"
+    assert attention[0]["source_broker"] == "futu"
+
+
+def test_attention_rows_exclude_real_holdings_for_hk() -> None:
+    rows = market_trend._attention_rows(
+        {
+            "candidates": [_attention_row("00001", right_side=True, danger=False)],
+            "holdings": {"00002": _attention_row("00002")},
+            "real_holdings": {"00003": _attention_row("00003")},
+        },
+        "HK",
+    )
+
+    # HK flow stays byte-identical to pre-cutover: real-holding rows must not
+    # enter option attention outside US.
+    assert [row["symbol"] for row in rows] == ["00001", "00002"]
+
+
+def test_attention_actions_include_real_holding_decisions_only_for_us() -> None:
+    payload = {
+        "strategy_judgments": {
+            "formal_actions": [{"symbol": "AAA", "action": "BUY"}],
+            "real_holding_decisions": [{"symbol": "SNOW", "action": "SELL_ALL"}],
+        }
+    }
+
+    assert market_trend._attention_actions(payload, "US") == {
+        "AAA": "BUY",
+        "SNOW": "REAL_SELL_ALL",
+    }
+    assert market_trend._attention_actions(payload, "HK") == {"AAA": "BUY"}
+
+
+def test_option_attention_diffs_real_holding_rows_across_days() -> None:
+    previous = [
+        _attention_row("SNOW", right_side=True, temperature_curr="温"),
+        _attention_row("AAPL", right_side=True, temperature_curr="热"),
+    ]
+    current = [
+        _attention_row(
+            "SNOW",
+            right_side=True,
+            temperature_curr="热",
+            phase_curr="立夏",
+            strength_change="↑↑",
+            days=3,
+            gain_since_entry="0.048",
+        ),
+        _attention_row("AAPL", right_side=True, temperature_curr="热"),
+    ]
+
+    attention = market_trend.build_option_attention(
+        current, previous, {"SNOW": "HOLD"}, "US", "futu"
+    )
+
+    assert [item["symbol"] for item in attention] == ["SNOW"]
+    assert attention[0]["category"] == "strengthened"
+    assert attention[0]["temperature"] == {
+        "previous": "温",
+        "current": "热",
+        "changed": True,
+    }
+    assert attention[0]["phase"]["changed"] is True
+    assert attention[0]["days"] == 3
+    assert attention[0]["gain_since_entry"] == "0.048"
+    assert attention[0]["source_action"] == "HOLD"
+
+
+def test_option_attention_emits_risk_for_real_holding_danger_transition() -> None:
+    attention = market_trend.build_option_attention(
+        [_attention_row("SNOW", right_side=True, danger=True)],
+        [_attention_row("SNOW", right_side=True, danger=False)],
+        {"SNOW": "SELL_ALL"},
+        "US",
+        "futu",
+    )
+
+    assert [item["symbol"] for item in attention] == ["SNOW"]
+    assert attention[0]["category"] == "risk"
+    assert attention[0]["danger"] == {
+        "previous": False,
+        "current": True,
+        "changed": True,
+    }
+    assert attention[0]["source_action"] == "SELL_ALL"
+
+
+def test_previous_attention_rows_read_real_holdings_from_prior_report(
+    tmp_path: Path,
+) -> None:
+    paths = market_paths(tmp_path / "data", tmp_path / "reports", "US")
+    paths.reports.mkdir(parents=True)
+    (paths.reports / "2026-07-15.json").write_text(
+        json.dumps(
+            {
+                "as_of_date": "2026-07-15",
+                "signal_snapshots": {
+                    "candidates": [],
+                    "holdings": {},
+                    "real_holdings": {
+                        "AAPL": _attention_row("AAPL", right_side=True, danger=False),
+                        "SNOW": None,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows = market_trend._previous_attention_rows(
+        paths, current_as_of_date="2026-07-16", market="US"
+    )
+
+    assert [row["symbol"] for row in rows] == ["AAPL"]
+
+
+def test_previous_attention_rows_reject_malformed_futu_baseline(
     tmp_path: Path,
 ) -> None:
     paths = market_paths(tmp_path / "data", tmp_path / "reports", "US")
@@ -2393,7 +2541,7 @@ def test_allocation_market_runner_ledger_excludes_real_only_candidates(
             return None
 
     self_market = market
-    broker = "phillips" if market == "HK" else "tiger"
+    broker = "phillips" if market == "HK" else "futu"
     currency = "HKD" if market == "HK" else "USD"
     real_symbol = "02802" if market == "HK" else "SPY"
     real_snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)

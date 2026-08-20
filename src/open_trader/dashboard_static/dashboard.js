@@ -74,8 +74,8 @@ const elements = {};
 const WORKSPACE_VIEWS = new Set(["portfolio", "prediction_market", "kelly_lab", "standard_backtest", "trend_report"]);
 
 const ACCOUNT_STRATEGY_PROFILES = {
-  futu: {horizon: "期权增强", strategy: "跨市场期权关注"},
-  tiger: {horizon: "趋势", strategy: "美股趋势交易"},
+  futu: {horizon: "趋势", strategy: "美股趋势交易"},
+  tiger: {horizon: "已调仓", strategy: "现金管理"},
   phillips: {horizon: "趋势", strategy: "港股趋势交易"},
   eastmoney: {horizon: "偏短线", strategy: "趋势交易"},
 };
@@ -85,7 +85,7 @@ const ACCOUNT_SOURCE_GROUPS = [
   {label: "实时账户", brokers: ["futu", "tiger"]},
   {label: "券商结单", brokers: ["phillips", "eastmoney"]},
 ];
-const TREND_ACCOUNT_BROKERS = ["tiger", "phillips", "eastmoney"];
+const TREND_ACCOUNT_BROKERS = ["futu", "phillips", "eastmoney"];
 const ACCOUNT_VIEW_KEYS = ["real", "simulate", "report"];
 
 const DECISION_TABS = [
@@ -5048,6 +5048,32 @@ function renderHistoricalTrendHoldingWarning() {
   return '<p class="account-empty missing-text">历史买入计划归属暂不可用，未执行分组</p>';
 }
 
+function renderTrendAccountExceptions(source) {
+  const raw = source?.account_exceptions;
+  if (!raw) return "";
+  const labels = String(raw).split("；").map((item) => {
+    const trimmed = String(item).trim();
+    const futuPrefix = "unsupported Futu asset: ";
+    const eastmoneyPrefix = "unsupported Eastmoney asset: ";
+    let prefix = "";
+    let identity = trimmed;
+    if (trimmed.startsWith(futuPrefix)) {
+      prefix = "富途账户不支持的资产";
+      identity = trimmed.slice(futuPrefix.length);
+    } else if (trimmed.startsWith(eastmoneyPrefix)) {
+      prefix = "东方财富账户不支持的资产";
+      identity = trimmed.slice(eastmoneyPrefix.length);
+    }
+    if (!prefix) return trimmed;
+    const match = identity.match(/^(.*?)\s*\((.*)\)$/);
+    const symbol = match
+      ? match[1].replace("<missing-symbol>", "代码缺失").replace("<missing-name>", "名称缺失")
+      : identity;
+    return `${prefix}：${symbol}`;
+  });
+  return `<p class="cn-trend-price-sources">账户例外：${labels.map(escapeHtml).join("；")}</p>`;
+}
+
 function renderTrendHoldingSource(report) {
   const status = trendRealHoldingStatus(report);
   if (status !== "available") return "";
@@ -5057,7 +5083,7 @@ function renderTrendHoldingSource(report) {
   const kind = source.source_kind === "live_account" ? "账户" : "结单";
   const freshness = source.freshness_text || "数据未提供";
   const readOnly = source.read_only_text || "只读，不自动下单";
-  return `<p class="cn-trend-price-sources">${escapeHtml(formatPlain(`${broker} · ${kind} ${period} · ${freshness} · ${readOnly}`))}</p>`;
+  return `<p class="cn-trend-price-sources">${escapeHtml(formatPlain(`${broker} · ${kind} ${period} · ${freshness} · ${readOnly}`))}</p>${renderTrendAccountExceptions(source)}`;
 }
 
 function renderTrendHoldingPanel(report, view, items) {
