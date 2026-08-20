@@ -14,10 +14,11 @@ an order:
   N>=3 relation it returns BLOCKED with a precise reason instead of inventing
   one (production state today, tracked as #88).
 
-The preflight decision is intentionally frozen at ``order_ready=false``,
-``partial_fill_proof=UNKNOWN``, ``reason=PARTIAL_FILL_PROOF_REQUIRED`` until
-#74 ships a partial-fill proof.  A fail-closed execution seam raises on any
-submit/mutation call and every report asserts zero side effects.
+The preflight decision is no longer a hardcoded UNKNOWN: every replay and
+live run proves the fixed execution solution with the #74 fill adversary and
+reports the three-state result.  ``order_ready`` stays False in this harness
+(observe phase, no scope capability), and a fail-closed execution seam raises
+on any submit/mutation call and every report asserts zero side effects.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ from open_trader.prediction_live_resolver import (
     normalize_problem,
 )
 from open_trader.prediction_market_solution import (
+    EXECUTABLE_REASON,
     AccountView,
     ExecutionSolution,
     MarketSolution,
@@ -68,8 +70,19 @@ from open_trader.prediction_n_leg import (
     fingerprint,
     problem_from_payload,
 )
+from open_trader.prediction_n_leg_mode import DEFAULT_SAFETY_CONFIG
 from open_trader.prediction_n_leg_oracle import evaluate_fixed_portfolio
-from open_trader.prediction_n_leg_read_model import PARTIAL_FILL_PROOF_REQUIRED
+from open_trader.prediction_n_leg_read_model import (
+    PARTIAL_FILL_PROOF_REQUIRED,
+    PARTIAL_FILL_UNSAFE,
+    SCOPE_OBSERVE_ONLY,
+)
+from open_trader.prediction_partial_fill import (
+    PARTIAL_FILL_SAFE,
+    PARTIAL_FILL_UNKNOWN,
+    fill_adversary_problem_from_market_solution,
+    prove_partial_fill,
+)
 from open_trader.prediction_snapshot_scheduler import (
     ComponentSnapshot,
     LegBook,
@@ -108,6 +121,13 @@ VALIDATION_LIMITS = BenchmarkLimits(
 )
 
 _VALIDATION_ACCOUNT = AccountView(10**18, 10**18, 0)
+
+#: The validation harness proves every fixed solution with the #74 fill
+#: adversary.  Caps default to the mode contract's safety config; the proof
+#: runs synchronously under its own hard time limit (independent of the
+#: master solve limits) and a timeout is reported UNKNOWN, never safe.
+DEFAULT_CAP_CONFIG_VERSION = "caps-v1"
+PROOF_TIME_LIMIT_MS = 4_000
 
 
 class FailClosedExecution:
@@ -367,23 +387,70 @@ def _oracle_differential(
     }
 
 
-def _execution_decision(
+def _prove_fixed_solution(
     market: MarketSolution,
     problem: object,
-    account: AccountView = _VALIDATION_ACCOUNT,
+    execution: ExecutionSolution,
+    *,
+    cap_config_version: str,
+    max_partial_fill_loss: int,
+    max_auto_repair_loss: int,
+    proof_time_limit_ms: int,
 ) -> dict[str, object]:
-    execution = execution_solution_from_market(
-        market,
-        problem,
-        account,
-        max_total_unsettled_capital=account.available_units,
+    """Run the #74 fill-adversary proof for one fixed execution solution."""
+    try:
+        adversary = fill_adversary_problem_from_market_solution(
+            execution,
+            problem,
+            cap_config_version=cap_config_version,
+            max_partial_fill_loss=max_partial_fill_loss,
+            max_auto_repair_loss=max_auto_repair_loss,
+        )
+        record, counterexample = prove_partial_fill(
+            adversary, time_limit_ms=proof_time_limit_ms
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        return {
+            "order_ready": False,
+            "partial_fill_proof": PARTIAL_FILL_UNKNOWN,
+            "reason": PARTIAL_FILL_PROOF_REQUIRED,
+            "proof": {
+                "status": PARTIAL_FILL_UNKNOWN,
+                "reason": f"INVALID_INPUT:{exc}",
+                "lower_bound_units": 0,
+                "upper_bound_units": 0,
+                "fingerprint": None,
+            },
+            "quantities": [
+                {"action_id": q.action_id, "quantity_lots": q.quantity_lots}
+                for q in market.quantities
+            ],
+            "capital_use_units": execution.capital_use_units,
+            "market_solution_fingerprint": execution.market_solution_fingerprint,
+        }
+    reason = (
+        PARTIAL_FILL_UNSAFE
+        if record.status == PARTIAL_FILL_UNSAFE
+        else (
+            PARTIAL_FILL_PROOF_REQUIRED
+            if record.status != PARTIAL_FILL_SAFE
+            else SCOPE_OBSERVE_ONLY
+        )
     )
-    # ponytail: forced decision until #74 proves partial-fill safety; revisit
-    # when #74 ships, do not read execution.reason here.
     return {
         "order_ready": False,
-        "reason": PARTIAL_FILL_PROOF_REQUIRED,
-        "partial_fill_proof": "UNKNOWN",
+        "partial_fill_proof": record.status,
+        "reason": reason,
+        "proof": {
+            "status": record.status,
+            "solver_termination": record.solver_termination,
+            "verifier_status": record.verifier_status,
+            "lower_bound_units": record.solver_lower_bound,
+            "upper_bound_units": record.solver_upper_bound,
+            "cap_units": record.max_partial_fill_loss,
+            "fingerprint": record.fingerprint,
+            "counterexample": counterexample,
+        },
         "quantities": [
             {"action_id": q.action_id, "quantity_lots": q.quantity_lots}
             for q in market.quantities
@@ -391,6 +458,37 @@ def _execution_decision(
         "capital_use_units": execution.capital_use_units,
         "market_solution_fingerprint": execution.market_solution_fingerprint,
     }
+
+
+def _execution_decision(
+    market: MarketSolution,
+    problem: object,
+    account: AccountView = _VALIDATION_ACCOUNT,
+    *,
+    cap_config_version: str = DEFAULT_CAP_CONFIG_VERSION,
+    max_partial_fill_loss: int = int(
+        DEFAULT_SAFETY_CONFIG["max_partial_fill_loss_units"]
+    ),
+    max_auto_repair_loss: int = int(
+        DEFAULT_SAFETY_CONFIG["max_auto_repair_loss_units"]
+    ),
+    proof_time_limit_ms: int = PROOF_TIME_LIMIT_MS,
+) -> dict[str, object]:
+    execution = execution_solution_from_market(
+        market,
+        problem,
+        account,
+        max_total_unsettled_capital=account.available_units,
+    )
+    return _prove_fixed_solution(
+        market,
+        problem,
+        execution,
+        cap_config_version=cap_config_version,
+        max_partial_fill_loss=max_partial_fill_loss,
+        max_auto_repair_loss=max_auto_repair_loss,
+        proof_time_limit_ms=proof_time_limit_ms,
+    )
 
 
 def run_replay(
@@ -599,18 +697,59 @@ def _positive_market_legs(market: MarketSolution) -> int:
 
 
 def _live_execution_decision(
-    market: MarketSolution, execution_solution: ExecutionSolution
+    market: MarketSolution,
+    execution_solution: ExecutionSolution,
+    proof_payload: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
+    status = str(
+        execution_solution.partial_fill_proof
+        if execution_solution is not None
+        else PARTIAL_FILL_UNKNOWN
+    )
+    execution_reason = (
+        str(execution_solution.reason or "")
+        if execution_solution is not None
+        else ""
+    )
+    # Mirror the read model chain: a non-EXECUTABLE solution reports its own
+    # reason (the proof is only meaningful for a fixed, executable solution),
+    # then the #74 three-state proof gates everything else.
+    if execution_reason not in (EXECUTABLE_REASON, ""):
+        reason = execution_reason
+    elif status == PARTIAL_FILL_UNSAFE:
+        reason = PARTIAL_FILL_UNSAFE
+    elif status != PARTIAL_FILL_SAFE:
+        reason = PARTIAL_FILL_PROOF_REQUIRED
+    else:
+        reason = SCOPE_OBSERVE_ONLY
+    proof = dict(proof_payload) if isinstance(proof_payload, Mapping) else {}
     return {
         "order_ready": False,
-        "reason": PARTIAL_FILL_PROOF_REQUIRED,
-        "partial_fill_proof": "UNKNOWN",
+        "reason": reason,
+        "partial_fill_proof": status,
+        "proof": {
+            "status": status,
+            "solver_termination": proof.get("solver_termination"),
+            "verifier_status": proof.get("verifier_status"),
+            "lower_bound_units": proof.get("solver_lower_bound"),
+            "upper_bound_units": proof.get("solver_upper_bound"),
+            "cap_units": proof.get("max_partial_fill_loss"),
+            "fingerprint": proof.get("fingerprint"),
+        },
         "quantities": [
             {"action_id": q.action_id, "quantity_lots": q.quantity_lots}
             for q in market.quantities
         ],
-        "capital_use_units": execution_solution.capital_use_units,
-        "market_solution_fingerprint": execution_solution.market_solution_fingerprint,
+        "capital_use_units": (
+            execution_solution.capital_use_units
+            if execution_solution is not None
+            else 0
+        ),
+        "market_solution_fingerprint": (
+            execution_solution.market_solution_fingerprint
+            if execution_solution is not None
+            else None
+        ),
     }
 
 
@@ -623,6 +762,7 @@ def _live_resolver_pass(
     execution: FailClosedExecution,
     data_dir: Path,
     started: float,
+    proof_payload: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "status": "PASS",
@@ -630,7 +770,9 @@ def _live_resolver_pass(
         "legs": _positive_market_legs(market),
         "qualified_verified": True,
         "guaranteed_profit_units": market.guaranteed_profit_units,
-        "execution_decision": _live_execution_decision(market, execution_solution),
+        "execution_decision": _live_execution_decision(
+            market, execution_solution, proof_payload
+        ),
         "fingerprints": {
             "quote": market.quote_fingerprint,
             "structure": market.structure_fingerprint,
@@ -740,7 +882,6 @@ def run_live(
         )
     monitor = _MonitorAdapter(book_source)
     raw = problem_for_component(problem, component)
-    live_problem = normalize_problem(raw)
     token_ids = tuple(action.market_contract_id for action in raw.actions)
     try:
         books = monitor.cross_venue_books(token_ids)
@@ -752,7 +893,6 @@ def run_live(
     owned_solver_server = solver_server is None
     resolver: PredictionLiveResolver | None = None
     resolution = None
-    max_unsettled_capital = 0
     lock_path = data_dir / "prediction_arbitrage" / ".nleg-validation.lock"
     lock = _OwnershipLock(lock_path)
     try:
@@ -797,19 +937,23 @@ def run_live(
             limits=limits,
             code_version=code_version,
         )
-        max_unsettled_capital = int(
-            (store.n_leg_safety_config_latest() or {})
-            .get("config", {})
-            .get("max_total_unsettled_capital_units", 0)
-        )
         resolver.start()
         deadline = time.monotonic() + poll_timeout_seconds
         while time.monotonic() < deadline:
             candidate = resolver.latest_resolution(component.component_id)
-            if candidate is not None:
-                resolution = candidate
-                break
-            time.sleep(0.01)
+            if candidate is None:
+                time.sleep(0.01)
+                continue
+            resolution = candidate
+            if (
+                resolution.status == VerificationStatus.QUALIFIED_VERIFIED
+                and resolver.latest_execution(component.component_id) is None
+            ):
+                # The execution solution (with its #74 proof) is produced in
+                # the same tick right after the resolution; wait for it.
+                time.sleep(0.01)
+                continue
+            break
     except RuntimeError as exc:
         return _live_blocked(
             "VALIDATION_RUNTIME_ERROR", data_dir, execution, str(exc), status="FAIL"
@@ -863,12 +1007,16 @@ def run_live(
             f"solver selected {_positive_market_legs(market)} positive legs",
             status="FAIL",
         )
-    execution_solution = execution_solution_from_market(
-        market,
-        live_problem,
-        execution.n_leg_account_view(),
-        max_total_unsettled_capital=max_unsettled_capital,
-    )
+    execution_solution = resolver.latest_execution(component.component_id)
+    proof_payload = resolver.latest_partial_fill_proof(component.component_id)
+    if execution_solution is None:
+        return _live_blocked(
+            "NO_QUALIFIED_SOLUTION",
+            data_dir,
+            execution,
+            "resolver produced no execution solution for the qualified market",
+            status="FAIL",
+        )
     return _live_resolver_pass(
         component.component_id,
         market,
@@ -878,6 +1026,7 @@ def run_live(
         execution,
         data_dir,
         started,
+        proof_payload,
     )
 
 

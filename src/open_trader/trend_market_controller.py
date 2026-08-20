@@ -2749,6 +2749,23 @@ def _execution_due(cycle: ControllerCycle, now: datetime) -> bool:
     )
 
 
+def _pending_or_data_missing_buy(action: Mapping[str, object]) -> bool:
+    """BUY 待条件（executable=False）或数据缺失类（0 股/0 手/无 ATR）条目判定。
+
+    口径与 trend_review.record_trend_review_missed_buys 的跳过条件一致：此类条目
+    不真实下单、不产生终态事件，也不应阻塞轮换执行与当日批次完成。
+    """
+    if action.get("executable") is False:
+        return True
+    try:
+        shares = Decimal(str(action.get("estimated_shares") or "0"))
+        lot_size = Decimal(str(action.get("lot_size") or "0"))
+        atr = Decimal(str(action.get("atr") or "0"))
+    except (InvalidOperation, TypeError, ValueError):
+        return True
+    return shares <= 0 or lot_size <= 0 or atr <= 0
+
+
 def _execution_completed(
     config: DailyPremarketConfig,
     cycle: ControllerCycle,
@@ -2803,6 +2820,10 @@ def _execution_completed(
             and trend_action_futu_symbol(report, action, cycle.market)
             in sell_symbols
         ):
+            continue
+        if action_name == "BUY" and _pending_or_data_missing_buy(action):
+            # 待条件/数据缺失买入不产生终态事件，直接视为已完成，避免轮换执行
+            # 与当日批次完成被此类条目永久阻塞。
             continue
         events, resolutions = load_trend_action_audit(
             config.data_dir,

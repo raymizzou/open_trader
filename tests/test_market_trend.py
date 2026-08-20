@@ -372,7 +372,7 @@ def test_live_market_strategy_snapshot_defaults_to_v8_with_exact_inheritance(
         ("US", 3, "0.02", (622460,)),
     ],
 )
-def test_allocation_market_v11_freezes_rank_weight(
+def test_allocation_market_v12_freezes_rank_weight(
     market: str, rank: int, weight: str, pools: tuple[int, ...],
 ) -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
@@ -382,7 +382,7 @@ def test_allocation_market_v11_freezes_rank_weight(
         allocation=allocation_for(market, rank=rank, entry_weight=weight),
     )
 
-    assert snapshot["strategy_version"] == "v11"
+    assert snapshot["strategy_version"] == "v12"
     assert snapshot["parameters"]["target_weight"] == weight
     assert snapshot["parameters"]["allocation_rank"] == rank
     assert snapshot["parameters"]["min_strength"] == "95"

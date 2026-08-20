@@ -128,8 +128,11 @@ TREND_HOLDING_EVIDENCE_ALLOWLIST = {
 }
 CURRENT_FINAL_PLAN_TREND_VERSIONS = frozenset({
     ("CN", "v13"),
+    ("CN", "v14"),
     ("HK", "v11"),
+    ("HK", "v12"),
     ("US", "v11"),
+    ("US", "v12"),
 })
 TREND_ACTUAL_BROKERS = {
     market: broker for broker, (market, *_rest) in TREND_REPORT_SOURCES.items()
@@ -2200,8 +2203,14 @@ def _valid_v2_risk_items(
     allowed_buy_constraints = {
         "名义仓位上限", "单笔风险上限", "组合剩余风险", "现金"
     }
-    if strategy_version in {"v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10"}:
+    if strategy_version in {
+        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+    }:
         allowed_buy_constraints.add("Kelly 上限")
+    data_missing_notes = {
+        "每手股数未知，无法定量",
+        "候选价格或活动保护线缺失",
+    }
     for item in buys:
         shares = item.get("estimated_shares")
         lot_size = item.get("lot_size")
@@ -2211,14 +2220,45 @@ def _valid_v2_risk_items(
         target_weight = _dashboard_risk_decimal(item.get("target_weight"))
         target_amount = _dashboard_risk_decimal(item.get("target_amount"))
         close = _dashboard_risk_decimal(item.get("close"))
+        sizing_note = item.get("sizing_note")
+        data_missing = (
+            shares == 0
+            and isinstance(sizing_note, str)
+            and sizing_note in data_missing_notes
+        )
         if (
             not isinstance(item.get("symbol"), str)
             or not item["symbol"].strip()
             or isinstance(shares, bool)
             or not isinstance(shares, int)
-            or shares <= 0
             or isinstance(lot_size, bool)
             or not isinstance(lot_size, int)
+            or target_weight is None
+            or target_weight <= 0
+            or target_weight > target_weight_limit
+            or strategy_version in {
+                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+            }
+            and summary.get("kelly_phase") != "cold_start"
+            and target_weight
+            > (_dashboard_risk_decimal(summary.get("kelly_cap")) or Decimal("0"))
+            or target_amount is None
+        ):
+            return False
+        if data_missing:
+            if (
+                lot_size != 0
+                or planned_risk not in (Decimal("0"), None)
+                or planned_pct not in (Decimal("0"), None)
+                or normal_cost not in (Decimal("0"), None)
+                or item.get("executable") is not False
+                or item.get("decisive_constraint")
+                not in {"交易单位", "关键风险数据"}
+            ):
+                return False
+            continue
+        if (
+            shares <= 0
             or lot_size <= 0
             or shares % lot_size != 0
             or planned_risk is None
@@ -2227,26 +2267,18 @@ def _valid_v2_risk_items(
             or planned_pct <= 0
             or normal_cost is None
             or normal_cost <= 0
-            or target_weight is None
-            or target_weight <= 0
-            or target_weight > target_weight_limit
-            or strategy_version in {
-                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            }
-            and summary.get("kelly_phase") != "cold_start"
-            and target_weight
-            > (_dashboard_risk_decimal(summary.get("kelly_cap")) or Decimal("0"))
-            or target_amount is None
             or close is None
             or close <= 0
             or normal_cost > planned_risk
             or nav is None
             or planned_pct != planned_risk / nav
             or planned_pct > SINGLE_ENTRY_RISK_LIMIT
+            and shares != lot_size
             or item.get("decisive_constraint") not in allowed_buy_constraints
         ):
             return False
-        new_planned_risk += planned_risk
+        if item.get("executable") is not False:
+            new_planned_risk += planned_risk
 
     summary_new_risk = _dashboard_risk_decimal(summary.get("new_planned_risk"))
     if summary_new_risk != new_planned_risk:
@@ -2260,9 +2292,13 @@ def _valid_v2_risk_items(
         "交易单位",
         "关键风险数据",
     }
-    if strategy_version in {"v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10"}:
+    if strategy_version in {
+        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+    }:
         allowed_constraints.add("Kelly 上限")
-    if strategy_version in {"v4", "v5", "v6", "v7", "v8", "v9", "v10"}:
+    if strategy_version in {
+        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+    }:
         allowed_constraints.add("策略累计回撤")
     for item in judgments["risk_skips"]:
         shares = item.get("estimated_shares")
@@ -2271,7 +2307,7 @@ def _valid_v2_risk_items(
         target_amount = _dashboard_risk_decimal(target_amount_raw)
         zero_kelly_skip = (
             strategy_version in {
-                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
             }
             and summary.get("status") == "paused"
             and summary.get("kelly_cap") in {"0", "0.000000", 0}

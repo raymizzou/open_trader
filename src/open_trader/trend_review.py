@@ -104,7 +104,7 @@ PROTECTION_STATE_ROOTS = {
 TREND_STRATEGY_VERSIONS = frozenset(
     {
         "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13",
+        "v11", "v12", "v13", "v14",
     }
 )
 
@@ -2258,6 +2258,7 @@ def record_trend_review_missed_buys(
         if (
             action.get("action") != "BUY"
             or trend_action_futu_symbol(report, action, market) in sell_symbols
+            or action.get("executable") is False
         ):
             continue
         futu_code = trend_action_futu_symbol(report, action, market)
@@ -3858,14 +3859,14 @@ def _rotation_position(
     )
 
 
-def _rotation_quantity(
+def _rotation_sized(
     pair: Mapping[str, object],
     report: Mapping[str, object],
     snapshot: Mapping[str, object],
     price: Decimal,
     cash: Decimal,
-) -> int:
-    from .portfolio_risk import size_entry_by_risk
+) -> EntryRiskResult:
+    from .portfolio_risk import EntryRiskResult, size_entry_by_risk
 
     nav = _required_decimal(snapshot.get("net_value"), "simulate net value")
     weight = _required_decimal(pair.get("target_weight"), "rotation target weight")
@@ -3956,7 +3957,19 @@ def _rotation_quantity(
         lot_size=Decimal(lot_size),
         normal_cost_rate=cost_rate,
     )
-    return int(sized.final_quantity)
+    return sized
+
+
+def _rotation_quantity(
+    pair: Mapping[str, object],
+    report: Mapping[str, object],
+    snapshot: Mapping[str, object],
+    price: Decimal,
+    cash: Decimal,
+) -> int:
+    return int(
+        _rotation_sized(pair, report, snapshot, price, cash).final_quantity
+    )
 
 
 def _rotation_events(root: Path) -> list[dict[str, object]]:
@@ -4913,13 +4926,29 @@ def execute_relative_rotations(
                     "normal cost rate",
                 )
                 price = _required_decimal(quote_prices.get(buy_code), "current quote price")
-                preflight_qty = _rotation_quantity(
-                    pair, report, snapshot, price,
-                    cash + market_value * max(Decimal("0"), Decimal("1") - cost),
+                rotation_cash = (
+                    cash + market_value * max(Decimal("0"), Decimal("1") - cost)
+                )
+                try:
+                    atr_value = _required_decimal(pair.get("atr"), "rotation ATR")
+                except ValueError:
+                    atr_value = Decimal("0")
+                if int(pair.get("lot_size") or 0) <= 0 or atr_value <= 0:
+                    # 每手/ATR 缺失的数据缺陷轮换对：写终态 skipped 而非抛异常，
+                    # 避免 execute_relative_rotations 整体中断。
+                    path = _rotation_terminal(
+                        root, {**evidence, "kind": "terminal"}, status="skipped",
+                        reason="rotation_sizing_inputs_invalid", recorded_at=now,
+                    )
+                    artifacts.append(str(path))
+                    terminal_count += 1
+                    continue
+                preflight = _rotation_sized(
+                    pair, report, snapshot, price, rotation_cash,
                 )
             if not reason and sell_qty <= 0:
                 reason = "weak_holding_unsellable"
-            if not reason and preflight_qty <= 0:
+            if not reason and preflight.cash_required > rotation_cash:
                 reason = "candidate_quantity_zero"
             if reason:
                 path = _rotation_terminal(
@@ -5161,15 +5190,17 @@ def execute_relative_rotations(
                      "reason": "post_sell_quote_unavailable", "recorded_at": now},
                 )))
             continue
-        buy_qty = _rotation_quantity(
+        refreshed_cash = _required_decimal(
+            refreshed.get("available_cash", refreshed.get("cash")),
+            "simulate available cash",
+        )
+        buy = _rotation_sized(
             pair, report, refreshed,
             _required_decimal(quote_prices.get(buy_code), "current quote price"),
-            _required_decimal(
-                refreshed.get("available_cash", refreshed.get("cash")),
-                "simulate available cash",
-            ),
+            refreshed_cash,
         )
-        if buy_qty <= 0:
+        buy_qty = int(buy.final_quantity)
+        if buy.cash_required > refreshed_cash:
             path = _rotation_terminal(
                 root, {**evidence, "kind": "terminal"}, status="incomplete",
                 reason="post_sell_candidate_quantity_zero", recorded_at=now,
@@ -5545,7 +5576,10 @@ def _remaining_buy_quantity(
         if isinstance(strategy_snapshot, Mapping)
         else ""
     )
-    if version in {"v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"}:
+    if version in {
+        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        "v11", "v12", "v13", "v14",
+    }:
         risk_summary = report.get("risk_summary")
         if not isinstance(risk_summary, Mapping):
             raise ValueError("trend review risk summary is unavailable")
@@ -5652,6 +5686,15 @@ def _preflight_open_actions(
                 )
             except (TypeError, ValueError):
                 raise ValueError("trend review buy action is invalid") from None
+            # 数据缺失类 BUY（每手未知/价格缺失）无法定量下单，跳过而非判为无效：
+            # 不真实下单、不记 missed 纪律事件。
+            data_missing = (
+                str(action.get("sizing_note") or "")
+                in {"每手股数未知，无法定量", "候选价格或活动保护线缺失"}
+                and (quantity <= 0 or lot_size <= 0 or atr <= 0)
+            )
+            if data_missing:
+                continue
             if (
                 target_weight <= 0
                 or atr <= 0
@@ -5894,6 +5937,20 @@ def execute_trend_review_open(
                 buy_window_event = ("pending", "buy_window_not_open")
             elif local_current.date() > execution_day or not buy_window_open:
                 buy_window_event = ("missed", "buy_window_closed")
+        if action_name == "BUY" and action.get("executable") is False:
+            # 待现金/席位条目：不真实下单、不记 missed；仅记一条说明性 pending 事件。
+            _write_action_status_once(
+                data_dir=data_dir,
+                market=market,
+                execution_date=execution_date,
+                action_key=action_key,
+                action_root=action_events_root,
+                evidence=action_evidence,
+                status="pending",
+                reason="waiting_for_cash_or_slot",
+                recorded_at=now,
+            )
+            continue
         if action_name == "SELL_ALL":
             reason_id = str(
                 action.get("event_id") or action.get("reason") or ""
@@ -7158,9 +7215,9 @@ def normalize_trend_strategy_snapshot(
         version = str(snapshot.get("strategy_version") or "")
         allocation = None
         if (market, version) in {
-            ("CN", "v11"), ("CN", "v12"), ("CN", "v13"),
-            ("HK", "v9"), ("HK", "v10"), ("HK", "v11"),
-            ("US", "v9"), ("US", "v10"), ("US", "v11"),
+            ("CN", "v11"), ("CN", "v12"), ("CN", "v13"), ("CN", "v14"),
+            ("HK", "v9"), ("HK", "v10"), ("HK", "v11"), ("HK", "v12"),
+            ("US", "v9"), ("US", "v10"), ("US", "v11"), ("US", "v12"),
         }:
             allocation = {
                 "daily_path": parameters.get("allocation_snapshot_path"),
@@ -7178,7 +7235,8 @@ def normalize_trend_strategy_snapshot(
                 },
             }
         if version in {
-            "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+            "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+            "v11", "v12", "v13", "v14",
         }:
             expected_snapshot = live_trend_strategy_snapshot(
                 market,
@@ -8231,7 +8289,8 @@ def build_trend_review_projection(
         fact
         for fact in effective_facts
         if fact_identity(fact)[2] in {
-            "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+            "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+            "v11", "v12", "v13", "v14",
         }
     ]
     target_candidates = live_facts or effective_facts
@@ -8631,15 +8690,18 @@ def rebuild_trend_report_from_evidence(
         "price_fx_to_account_currency",
     }
     if strategy_version in {
-        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        "v11", "v12", "v13", "v14",
     }:
         required.add("normal_cost_rate")
     if strategy_version in {
-        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        "v11", "v12", "v13", "v14",
     }:
         required.update({"kelly_rounds", "kelly_data_reason"})
     if strategy_version in {
-        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+        "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        "v11", "v12", "v13", "v14",
     }:
         required.add("drawdown_summary")
     missing = sorted(required - inputs.keys())
@@ -9018,7 +9080,8 @@ def rebuild_trend_report_from_evidence(
         )
     normal_cost_rate = decimal_or_none(inputs.get("normal_cost_rate"))
     if strategy_version in {
-        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        "v11", "v12", "v13", "v14",
     } and (
         normal_cost_rate is None
         or not normal_cost_rate.is_finite()
@@ -9147,7 +9210,8 @@ def rebuild_trend_report_from_evidence(
         drawdown_summary=(
             inputs["drawdown_summary"]
             if strategy_version in {
-                "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+                "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                "v11", "v12", "v13", "v14",
             }
             and isinstance(inputs.get("drawdown_summary"), Mapping)
             else None

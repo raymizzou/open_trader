@@ -120,13 +120,35 @@ def execution_solution_binding(solution: ExecutionSolution) -> dict[str, str]:
     })
     if solution.fingerprint != expected:
         raise ValueError("execution solution fingerprint mismatch")
+    # The order-semantics fingerprint carries the versioned semantics table
+    # plus the per-leg (venue, default order type) assertions, so a table
+    # bump invalidates every earlier proof record at the binding check
+    # (design decision 3).  Imported lazily: prediction_partial_fill imports
+    # this module at import time.
+    from open_trader.prediction_partial_fill import (
+        default_order_type,
+        order_semantics_fingerprint_for,
+        order_semantics_lookup,
+    )
+
     return {
         "execution_solution_fingerprint": solution.fingerprint,
         "execution_solution_payload_fingerprint": fingerprint(canonical_payload(solution)),
         "model_fingerprint": solution.market_solution_fingerprint,
         "quote_fingerprint": fingerprint({"sources": tuple(leg.source_fingerprint for leg in solution.execution_legs)}),
         "cost_fingerprint": fingerprint({"capital_use_units": solution.capital_use_units, "legs": tuple((leg.action_id, leg.max_cost_units, leg.max_fee_units) for leg in solution.execution_legs)}),
-        "order_semantics_fingerprint": fingerprint({"legs": solution.execution_legs}),
+        "order_semantics_fingerprint": order_semantics_fingerprint_for(
+            tuple(
+                (
+                    leg.action_id,
+                    leg.venue_id,
+                    order_type or "UNKNOWN",
+                    order_semantics_lookup(leg.venue_id, order_type or "UNKNOWN").value,
+                )
+                for leg in solution.execution_legs
+                for order_type in (default_order_type(leg.venue_id),)
+            )
+        ),
     }
 
 
@@ -180,17 +202,26 @@ def partial_fill_proof_from_payload(payload: object) -> PartialFillProofRecord:
     return PartialFillProofRecord(**payload)  # type: ignore[arg-type]
 
 
-def _proof_is_bound(proof: PartialFillProofRecord, solution: ExecutionSolution) -> bool:
+def _proof_is_bound_status(
+    proof: PartialFillProofRecord,
+    solution: ExecutionSolution,
+    status: str,
+) -> bool:
+    """The six binding facts + verifier + termination close for one status."""
     try:
         binding = execution_solution_binding(solution)
     except ValueError:
         return False
     return (
-        proof.status == "PARTIAL_FILL_SAFE"
+        proof.status == status
         and proof.verifier_status == "QUALIFIED_VERIFIED"
         and proof.solver_termination == "CLOSED"
         and all(proof.to_payload()[key] == value for key, value in binding.items())
     )
+
+
+def _proof_is_bound(proof: PartialFillProofRecord, solution: ExecutionSolution) -> bool:
+    return _proof_is_bound_status(proof, solution, "PARTIAL_FILL_SAFE")
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,6 +466,14 @@ class NLegExecutionService:
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("EXECUTION_SOLUTION_SOURCE_REQUIRED") from exc
+        if (
+            _proof_is_bound_status(
+                partial_fill_proof, execution_solution, "PARTIAL_FILL_UNSAFE"
+            )
+            and partial_fill_proof.cap_config_version
+            == _text(cap_config_version, "cap_config_version")
+        ):
+            raise ValueError("PARTIAL_FILL_UNSAFE")
         if not _proof_is_bound(partial_fill_proof, execution_solution) or partial_fill_proof.cap_config_version != _text(cap_config_version, "cap_config_version"):
             raise ValueError("PARTIAL_FILL_PROOF_REQUIRED")
         if partial_fill_proof.solver_upper_bound > partial_fill_proof.max_partial_fill_loss:

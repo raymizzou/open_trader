@@ -2746,6 +2746,21 @@ table {
   font-weight: 700;
 }
 
+.trend-risk-data-defect {
+  color: var(--danger) !important;
+  font-weight: 700;
+}
+
+.trend-risk-pending {
+  color: var(--warning) !important;
+  font-weight: 600;
+}
+
+.cn-trend-table .cn-trend-card.trend-buy-pending td {
+  background: var(--surface-soft);
+  color: var(--muted);
+}
+
 .cn-trend-stage {
   background: var(--surface);
   border: 1px solid var(--line);
@@ -5175,6 +5190,7 @@ tbody tr.active-row,
 .trend-risk-summary dl div,
 .cn-trend-card td:nth-child(-n + 2),
 .cn-trend-table .cn-trend-card.trend-holding-blacklisted td,
+.cn-trend-table .cn-trend-card.trend-buy-pending td,
 .trend-option-button:disabled,
 .trend-option-dialog-meta div,
 .trend-option-dialog-signal div,

@@ -1991,7 +1991,7 @@ def test_dashboard_projects_complete_candidate_audit_for_every_market(
 
 @pytest.mark.parametrize(
     ("market", "version", "broker"),
-    [("CN", "v13", "eastmoney"), ("HK", "v11", "phillips"), ("US", "v11", "futu")],
+    [("CN", "v14", "eastmoney"), ("HK", "v12", "phillips"), ("US", "v12", "futu")],
 )
 def test_dashboard_current_trend_uses_candidate_snapshot_and_fails_closed(
     tmp_path: Path,
@@ -2109,8 +2109,8 @@ def test_dashboard_current_trend_risk_audit_requires_final_plan_rows() -> None:
     assert isinstance(snapshot, dict) and isinstance(metadata, dict)
     assert isinstance(judgments, dict)
     snapshot.update({
-        "strategy_id": "trend_animals_warm_to_hot/CN/v13",
-        "strategy_version": "v13",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v14",
+        "strategy_version": "v14",
     })
     parameters = snapshot["parameters"]
     assert isinstance(parameters, dict)
@@ -2119,15 +2119,15 @@ def test_dashboard_current_trend_risk_audit_requires_final_plan_rows() -> None:
     drawdown = payload["drawdown_summary"]
     assert isinstance(drawdown, dict)
     drawdown.update({
-        "strategy_id": "trend_animals_warm_to_hot/CN/v13",
-        "strategy_version": "v13",
-        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v13|v13",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v14",
+        "strategy_version": "v14",
+        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v14|v14",
     })
     bootstrap = drawdown["bootstrap_event"]
     assert isinstance(bootstrap, dict)
     bootstrap.update({
-        "strategy_id": "trend_animals_warm_to_hot/CN/v13",
-        "strategy_version": "v13",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v14",
+        "strategy_version": "v14",
     })
     summary = payload["risk_summary"]
     assert isinstance(summary, dict)
@@ -2243,8 +2243,8 @@ def test_dashboard_individual_global_context_mode_requires_current_only_facts() 
     metadata = payload["metadata"]
     assert isinstance(snapshot, dict) and isinstance(metadata, dict)
     snapshot.update({
-        "strategy_id": "trend_animals_warm_to_hot/CN/v13",
-        "strategy_version": "v13",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v14",
+        "strategy_version": "v14",
     })
     metadata["market"] = "CN"
     status = payload["industry_context_status"]
@@ -2293,6 +2293,125 @@ def test_dashboard_individual_global_context_mode_requires_current_only_facts() 
     legacy_without_facts.pop("industry_context_status", None)
     legacy_without_facts.pop("industry_contexts", None)
     assert dashboard_module._valid_frozen_trend_facts(legacy_without_facts)
+
+
+@pytest.mark.parametrize(
+    ("market", "version", "broker"),
+    [("CN", "v13", "eastmoney"), ("HK", "v11", "phillips")],
+)
+def test_dashboard_legacy_final_plan_versions_stay_valid_with_individual_global(
+    market: str,
+    version: str,
+    broker: str,
+) -> None:
+    """v13/v11 报告（ordering_mode=individual_global）仍通过完整 payload 校验。
+
+    钉住 CURRENT_FINAL_PLAN_TREND_VERSIONS 被整体替换时的回归形态：若该集合被
+    换成仅含 v14/v12/v12，v13/v11 + individual_global 的 mode 门控将不再匹配。
+    """
+    payload = _dashboard_frozen_report_payload(market=market, broker=broker)
+    snapshot = payload["strategy_snapshot"]
+    metadata = payload["metadata"]
+    judgments = payload["strategy_judgments"]
+    assert isinstance(snapshot, dict) and isinstance(metadata, dict)
+    assert isinstance(judgments, dict)
+    snapshot.update({
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+        "strategy_version": version,
+    })
+    metadata.update({"market": market, "broker": broker})
+    drawdown = copy.deepcopy(
+        _valid_v4_dashboard_trend_payload()["drawdown_summary"]
+    )
+    drawdown.update({
+        "market": market,
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+        "strategy_version": version,
+        "kelly_sample_key": (
+            f"{market}|trend_animals_warm_to_hot/{market}/{version}|{version}"
+        ),
+    })
+    bootstrap = drawdown["bootstrap_event"]
+    assert isinstance(bootstrap, dict)
+    bootstrap.update({
+        "market": market,
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+        "strategy_version": version,
+    })
+    payload["drawdown_summary"] = drawdown
+    roots = {
+        market: {
+            "stock": {
+                "asset": stock, "tm_id": index * 10,
+                "as_of_date": "2026-08-03", "global_strength": stock_strength,
+            },
+            "etf": {
+                "asset": etf, "tm_id": index * 10 + 1,
+                "as_of_date": "2026-08-03", "global_strength": etf_strength,
+            },
+        }
+        for index, (market, stock, etf, stock_strength, etf_strength) in enumerate(
+            (
+                ("CN", "A股", "ETF基金", "90", "80"),
+                ("HK", "港股", "香港ETF", "70", "60"),
+                ("US", "美股", "美国ETF", "50", "40"),
+            ),
+            1,
+        )
+    }
+    allocation = build_allocation_snapshot(
+        allocation_date="2026-08-03",
+        generated_at="2026-08-03T16:18:00+08:00",
+        git_sha="a" * 40,
+        roots=roots,
+        previous=None,
+    )
+    payload["allocation"] = {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": "c" * 64,
+        "allocation_date": "2026-08-03",
+        "generated_at": "2026-08-03T16:18:00+08:00",
+        "reused": False,
+        "stale_a_trading_days": 0,
+        "failure_reason": "",
+        "roots": allocation["roots"],
+        "markets": allocation["markets"],
+    }
+    payload["strategy_snapshot"] = trend_module.live_trend_strategy_snapshot(
+        market,
+        "abc123",
+        (622466, 697199),
+        strategy_version=version,
+        allocation={
+            "daily_path": payload["allocation"]["daily_path"],
+            "sha256": payload["allocation"]["sha256"],
+            "snapshot": allocation,
+        },
+    )
+    payload["industry_context_status"] = {
+        "ordering_mode": "individual_global",
+        "current_complete": True,
+        "history_complete": False,
+        "fallback_reason": None,
+    }
+    for key in (
+        "simulate_rotation_pairs",
+        "simulate_rotation_comparisons",
+        "real_rotation_pairs",
+        "real_rotation_comparisons",
+    ):
+        judgments[key] = []
+
+    assert dashboard_module._valid_trend_report_payload(
+        payload, market=market, broker=broker
+    ) is not None
+
+    status = payload["industry_context_status"]
+    assert isinstance(status, dict)
+    status["ordering_mode"] = "legacy_no_eligible_candidates"
+    assert dashboard_module._valid_trend_report_payload(
+        payload, market=market, broker=broker
+    ) is None
 
 
 def test_dashboard_rejects_malformed_signal_candidate_audit_when_present(
@@ -2919,15 +3038,15 @@ def test_dashboard_projects_only_valid_frozen_allocation_contract(
     drawdown = payload["drawdown_summary"]
     assert isinstance(drawdown, dict)
     drawdown.update({
-        "strategy_id": "trend_animals_warm_to_hot/CN/v13",
-        "strategy_version": "v13",
-        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v13|v13",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v14",
+        "strategy_version": "v14",
+        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v14|v14",
     })
     bootstrap = drawdown["bootstrap_event"]
     assert isinstance(bootstrap, dict)
     bootstrap.update({
-        "strategy_id": "trend_animals_warm_to_hot/CN/v13",
-        "strategy_version": "v13",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v14",
+        "strategy_version": "v14",
     })
     payload["industry_context_status"] = {
         "ordering_mode": "individual_global",
@@ -2953,7 +3072,7 @@ def test_dashboard_projects_only_valid_frozen_allocation_contract(
     )["eastmoney"]
     assert projected["allocation"] == payload["allocation"]
     assert projected["simulate_rotation_pairs"] == []
-    assert projected["current_strategy_version"] == "v13"
+    assert projected["current_strategy_version"] == "v14"
     assert next(
         row["value"]
         for row in projected["current_strategy_parameter_rows"]

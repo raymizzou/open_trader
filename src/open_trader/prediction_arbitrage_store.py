@@ -654,6 +654,14 @@ class PredictionArbitrageStore:
 
             CREATE INDEX IF NOT EXISTS n_leg_transitions_batch_created
             ON n_leg_transitions(execution_batch_id, created_at DESC, transition_id DESC);
+
+            CREATE TABLE IF NOT EXISTS partial_fill_proofs (
+                proof_fingerprint TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -727,6 +735,10 @@ class PredictionArbitrageStore:
                         f"ALTER TABLE n_leg_controls ADD COLUMN {name} {definition}"
                     )
             connection.execute("PRAGMA user_version=9")
+            version = 9
+        if version < 10:
+            connection.execute("PRAGMA user_version=10")
+            version = 10
 
     @staticmethod
     def _execution_fields(row: sqlite3.Row) -> dict[str, object]:
@@ -2274,6 +2286,69 @@ class PredictionArbitrageStore:
                 "INSERT INTO n_leg_safety_config(version, config, updated_at) VALUES (?, ?, ?) ON CONFLICT(version) DO UPDATE SET config=excluded.config, updated_at=excluded.updated_at",
                 (version, _dump_payload(config), now),
             )
+
+    def partial_fill_proof_save(
+        self,
+        proof: object,
+        unsafe_counterexample: Mapping[str, object] | None = None,
+        *,
+        proof_fingerprint: str | None = None,
+    ) -> None:
+        """Upsert one #74 partial-fill proof record by its cache fingerprint.
+
+        The record is duck-typed (``to_payload``/``status``/``fingerprint``)
+        so this store module never imports the execution module (which itself
+        imports this store).  The UNSAFE counterexample is persisted alongside
+        the proof payload.
+
+        The row key defaults to the record's own fingerprint; the live
+        resolver passes the stable adversary fingerprint instead, because a
+        proof can only be replayed from storage before solving when the key
+        is the same stable per-snapshot fingerprint (read-before-solve).
+        """
+        payload = proof.to_payload()
+        if not isinstance(payload, dict):
+            raise TypeError("proof payload must be a mapping")
+        status = str(proof.status)
+        key = proof_fingerprint if proof_fingerprint is not None else str(proof.fingerprint)
+        if not isinstance(key, str) or not key:
+            raise ValueError("proof fingerprint must be a non-empty string")
+        stored = {
+            "proof": payload,
+            "proof_fingerprint": key,
+            "unsafe_counterexample": (
+                dict(unsafe_counterexample)
+                if unsafe_counterexample is not None
+                else None
+            ),
+        }
+        now = _utc_now()
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO partial_fill_proofs(
+                    proof_fingerprint, status, payload, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(proof_fingerprint) DO UPDATE SET
+                    status=excluded.status,
+                    payload=excluded.payload,
+                    updated_at=excluded.updated_at
+                """,
+                (key, status, _dump_payload(stored), now, now),
+            )
+
+    def partial_fill_proof(self, proof_fingerprint: str) -> dict[str, object] | None:
+        """Read one #74 proof record payload, or None when never persisted."""
+        if not isinstance(proof_fingerprint, str) or not proof_fingerprint:
+            raise ValueError("proof fingerprint must be a non-empty string")
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM partial_fill_proofs WHERE proof_fingerprint = ?",
+                (proof_fingerprint,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _load_payload(str(row["payload"]))
 
     def n_leg_scopes(self) -> dict[str, dict[str, object]]:
         with self._read_connection() as connection:

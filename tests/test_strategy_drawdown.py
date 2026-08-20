@@ -25,7 +25,7 @@ from open_trader.strategy_drawdown import (
 )
 
 
-@pytest.mark.parametrize("market,version", [("CN", "v12"), ("HK", "v10"), ("US", "v10")])
+@pytest.mark.parametrize("market,version", [("CN", "v13"), ("HK", "v11"), ("US", "v11")])
 def test_legacy_allocation_compatibility_event_remains_readable(
     market: str, version: str,
 ) -> None:

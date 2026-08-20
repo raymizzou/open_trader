@@ -39,7 +39,7 @@ from open_trader.market_trend import run_market_trend_report
 from open_trader.notifications import NullNotifier
 
 
-EXPECTED_VERSIONS = {"CN": "v13", "HK": "v11", "US": "v11"}
+EXPECTED_VERSIONS = {"CN": "v14", "HK": "v12", "US": "v12"}
 REPORT_DIRECTORIES = {
     "CN": "trend_a_share",
     "HK": "trend_hk_phillips",

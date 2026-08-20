@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from concurrent.futures import Future
 from dataclasses import replace
@@ -12,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from open_trader.prediction_arbitrage import BookLevel, ThresholdOrderBook
+from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_live_resolver import (
     LIVE_LIMITS,
     PredictionLiveResolver,
@@ -424,7 +426,85 @@ def test_completed_evidence_becomes_market_and_execution_solution(
     execution = solutions[0]["execution"]
     assert execution["reason"] == "EXECUTABLE"
     assert execution["order_ready"] is False
-    assert execution["partial_fill_proof"] == "UNKNOWN"
+    # #74: the synchronous proof ran on the live hot path; the 2-leg
+    # contract-a adversary closes at a worst-case loss of 490,000 against a
+    # zero cap, so the decision is UNSAFE and the record is queryable.
+    assert execution["partial_fill_proof"] == "PARTIAL_FILL_UNSAFE"
+    proof = instance.latest_partial_fill_proof(valid.component_id)
+    assert proof is not None
+    assert proof["status"] == "PARTIAL_FILL_UNSAFE"
+    assert proof["solver_termination"] == "CLOSED"
+    assert proof["verifier_status"] == "QUALIFIED_VERIFIED"
+    assert proof["solver_lower_bound"] == proof["solver_upper_bound"] == 490_000
+    assert proof["max_partial_fill_loss"] == 0
+    assert proof["cap_config_version"] == "caps-v1"
+    assert instance.latest_execution(valid.component_id) is not None
+
+
+def test_proof_persists_to_real_store_and_replays_without_resolve(
+    tmp_path: Path,
+) -> None:
+    import open_trader.prediction_live_resolver as resolver_module
+
+    rows = {"r:a": row("r:a", raw_problem())}
+    store = PredictionArbitrageStore(tmp_path / "data")
+    store.n_leg_safety_config_write(
+        1, {"max_total_unsettled_capital_units": 5_000_000}
+    )
+    instance, server, _ = resolver(
+        tmp_path / "run1",
+        rows=rows,
+        monitor=FakeMonitor({"contract-a": live_book("contract-a")}),
+        execution=FakeExecution(AccountView(1_000_000, 1_000_000, 0)),
+        store=store,
+    )
+    valid = valid_selected(rows)
+    instance._selection_store.save({valid.component_id: valid})
+    instance._tick()
+    request = server.requests[0]
+    server.futures[0].set_result(
+        worker_outcome(request, worker_evidence(request.request.problem))
+    )
+    instance._tick()
+    proof = instance.latest_partial_fill_proof(valid.component_id)
+    assert proof is not None and proof["status"] == "PARTIAL_FILL_UNSAFE"
+    # Rows are keyed by the stable adversary fingerprint (read-before-solve
+    # key), not the record's own fingerprint.
+    cache_key = instance._fill_proof_components[valid.component_id]
+    persisted = store.partial_fill_proof(cache_key)
+    assert persisted is not None
+    assert persisted["proof"] == proof
+    assert persisted["proof_fingerprint"] == cache_key
+
+    # A fresh resolver on the same store replays the persisted proof instead
+    # of re-running the fill-adversary solver (read-before-solve).
+    calls = {"n": 0}
+    original = resolver_module.prove_partial_fill
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return original(*args, **kwargs)
+
+    resolver_module.prove_partial_fill = counting
+    try:
+        instance2, server2, _ = resolver(
+            tmp_path / "run2",
+            rows=rows,
+            monitor=FakeMonitor({"contract-a": live_book("contract-a")}),
+            execution=FakeExecution(AccountView(1_000_000, 1_000_000, 0)),
+            store=store,
+        )
+        instance2._selection_store.save({valid.component_id: valid})
+        instance2._tick()
+        request2 = server2.requests[0]
+        server2.futures[0].set_result(
+            worker_outcome(request2, worker_evidence(request2.request.problem))
+        )
+        instance2._tick()
+        assert instance2.latest_partial_fill_proof(valid.component_id) == proof
+        assert calls["n"] == 0
+    finally:
+        resolver_module.prove_partial_fill = original
 
 
 def test_unavailable_account_leaves_execution_none(tmp_path: Path) -> None:
@@ -582,3 +662,44 @@ def test_start_stop_idempotent_and_per_tick_exception_isolation(
     instance.stop()
     instance.stop()
     assert instance._thread is None
+
+
+def conflicting_rows() -> dict[str, object]:
+    """Two ACTIVE rows sharing action ``a-yes`` with conflicting definitions.
+
+    This reproduces the #74 production incident: one action compiled under
+    two inconsistent relations makes ``relation_generation_problem`` raise
+    ``ValueError`` at the shared compile seam.
+    """
+    base = raw_problem()
+    conflicting = replace(
+        base,
+        actions=tuple(
+            replace(action, max_quantity_lots=1)
+            if action.action_id == "a-yes"
+            else action
+            for action in base.actions
+        ),
+    )
+    return {"r:one": row("r:one", base), "r:two": row("r:two", conflicting)}
+
+
+def test_start_survives_startup_reconcile_conflict(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    rows = conflicting_rows()
+    # Guard: the fixture must exercise the production failure mode itself.
+    with pytest.raises(ValueError, match="conflicts across compiled relations"):
+        relation_generation_problem(rows)
+    instance, server, _ = resolver(tmp_path, rows=rows)
+    with caplog.at_level(
+        logging.ERROR, logger="open_trader.prediction_live_resolver"
+    ):
+        instance.start()
+    assert "startup reconcile failed" in caplog.text
+    thread = instance._thread
+    assert thread is not None and thread.is_alive()
+    instance.stop()
+    instance.stop()
+    assert instance._thread is None
+    assert server.requests == []

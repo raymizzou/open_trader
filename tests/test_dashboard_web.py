@@ -8362,7 +8362,7 @@ const sectionHeaders = (html, marker) => {
   const end = html.indexOf("</section>", headingIndex);
   return [...html.slice(start, end).matchAll(/<th scope="col">([^<]+)<\/th>/g)].map((match) => match[1]);
 };
-const expectedBuy = ["标的", "动作", "筛选价（Trend Animals）", "执行参考价", "温度变化", "节气", "大类内强度", "全局强度", "行业", "行业温度", "行业确认", "市值（亿元）", "日成交额（亿元）", "目标仓位（占净值）", "目标金额", "预计数量", "预计保护线"];
+const expectedBuy = ["标的", "动作", "筛选价（Trend Animals）", "执行参考价", "温度变化", "节气", "大类内强度", "全局强度", "行业", "行业温度", "行业确认", "市值（亿元）", "日成交额（亿元）", "目标仓位（占净值）", "目标金额", "预计数量", "预计保护线", "额外风险"];
 const expectedSell = ["标的", "动作", "执行参考价", "温度变化", "节气", "强度", "触发原因", "活动保护线", "持仓提示"];
 const expectedHold = ["标的", "动作", "执行参考价", "温度变化", "节气", "大类内强度", "全局强度", "行业", "当前判断", "活动保护线", "持仓提示"];
 const expectedReview = ["标的", "动作", "执行参考价", "温度变化", "节气", "强度", "复核原因", "活动保护线", "持仓提示"];
@@ -8445,9 +8445,54 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_buy_rows_show_extra_risk_note_and_pending_rows() -> None:
+    output = run_dashboard_js(r'''
+const html = renderTrendBuyStage({
+  buy_window:"常规交易时段",
+  buy_actions:[
+    {symbol:"BUY-A",industry:"金融",target_weight:"0.04",target_amount:"15000",estimated_shares:100,lot_size:100,close:"150",executable:false,sizing_note:"一手超过名义仓位上限；10 个持仓席位已满"},
+    {symbol:"BUY-B",industry:"金融",target_weight:"0.04",target_amount:"4000",estimated_shares:0,lot_size:0,executable:false,sizing_note:"候选价格或活动保护线缺失"},
+    {symbol:"BUY-C",industry:"金融",target_weight:"0.04",target_amount:"4000",estimated_shares:100,lot_size:100,close:"40"},
+  ],
+  risk_skips:[],
+});
+if (!html.includes("trend-buy-pending")) throw new Error(html);
+if ((html.match(/trend-buy-pending/g) || []).length !== 2) throw new Error(html);
+if (!html.includes(">待条件</td>")) throw new Error(html);
+if (!html.includes('data-label="额外风险">一手超过名义仓位上限；10 个持仓席位已满</td>')) throw new Error(html);
+if (!html.includes('data-label="额外风险">候选价格或活动保护线缺失</td>')) throw new Error(html);
+if (!html.includes(">正式买入</td>")) throw new Error(html);
+if (!html.includes('data-label="额外风险">数据未提供</td>')) throw new Error(html);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_risk_summary_renders_data_defect_and_pending_banners() -> None:
+    output = run_dashboard_js(r'''
+const html = renderTrendRiskSummary({
+  status:"active",status_label:"风险预算内",
+  pause_reason:"",existing_planned_risk:"0",new_planned_risk:"0",
+  portfolio_planned_risk:"0",portfolio_remaining_risk:"0",
+  single_entry_risk_limit:"0",abnormal_loss_buffer:"0",
+  portfolio_remaining_risk_note:"组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。",
+  data_defect_reason:"模拟持仓 600000 数量缺失，暂停新开仓",
+  pending_entries_note:"另有 2 条待现金/席位，未计入",
+  disclaimer:"仅供内部模拟参考",
+}, {}, "2026-08-10");
+if (!html.includes("数据缺陷：模拟持仓 600000 数量缺失，暂停新开仓")) throw new Error(html);
+if (!html.includes("另有 2 条待现金/席位，未计入")) throw new Error(html);
+if (!html.includes("trend-risk-data-defect") || !html.includes("trend-risk-pending")) throw new Error(html);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_renders_final_plan_audit_for_current_three_market_versions() -> None:
     output = run_dashboard_js(r'''
-const version = (market) => market === "CN" ? "v13" : "v11";
+const version = (market) => market === "CN" ? "v14" : "v12";
 const base = (market) => ({
   available:true, market, strategy_version:version(market),
   broker:market === "CN" ? "eastmoney" : market === "US" ? "futu" : "phillips",
@@ -9334,7 +9379,7 @@ if (usBuyHold.includes('disabled title="富途未返回该标的期权异动"'))
 if ((usBuyHold.match(/>期权异动<\/button>/g) || []).length !== 2) throw new Error(usBuyHold);
 if (usSell.includes("期权异动") || usReview.includes("期权异动")) throw new Error(usSell + usReview);
 if (cn.includes("期权异动")) throw new Error(cn);
-if ((usBuy.match(/<th scope="col">/g) || []).length !== 26) throw new Error(usBuy);
+if ((usBuy.match(/<th scope="col">/g) || []).length !== 27) throw new Error(usBuy);
 let opened = 0;
 let closed = 0;
 const dialog = {showModal(){opened += 1;}, close(){closed += 1;}};
