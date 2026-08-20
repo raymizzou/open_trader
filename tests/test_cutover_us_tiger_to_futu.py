@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
-from datetime import datetime, timezone
+import shutil
+import socket
+import sys
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+
+from open_trader.daily_premarket import DailyPremarketConfig
 
 
 SCRIPT_PATH = (
@@ -20,6 +26,14 @@ SPEC.loader.exec_module(cutover)
 
 
 NOW = datetime(2026, 8, 19, 3, 0, 0, tzinfo=timezone.utc)
+# Production-like cutover moment: 2026-08-20 09:11 +08:00, i.e. after the
+# 08-19 US buy window (16:00 ET) so the legacy cutover authorization window
+# passes exactly like the manual production fix.
+CUTOVER_NOW = datetime(2026, 8, 20, 9, 11, 35, tzinfo=timezone(timedelta(hours=8)))
+# 2026-08-19 12:00 UTC = 08:00 ET: still inside the anchor execution day's US
+# buy window (which closes 16:00 ET), so the authorization-window check must
+# fail closed before any file is moved.
+PRE_WINDOW_NOW = datetime(2026, 8, 19, 12, 0, 0, tzinfo=timezone.utc)
 
 TIGER_REPORT = {
     "as_of_date": "2026-07-15",
@@ -42,7 +56,16 @@ TIGER_REPORT = {
 }
 
 
-def _seed_roots(tmp_path: Path) -> None:
+def _seed_roots(
+    tmp_path: Path,
+    *,
+    batch_cycles: tuple[tuple[str, str], ...] = (
+        ("2026-08-15", "2026-08-14"),
+        ("2026-08-18", "2026-08-17"),
+        ("2026-08-19", "2026-08-18"),
+    ),
+    daily_dates: tuple[str, ...] = ("2026-08-18", "2026-08-19"),
+) -> None:
     tiger_data = tmp_path / "data" / "trend_us_tiger"
     tiger_data.mkdir(parents=True)
     (tiger_data / "protection_state.json").write_text(
@@ -90,6 +113,58 @@ def _seed_roots(tmp_path: Path) -> None:
         json.dumps({"as_of_date": "2026-07-15"}), encoding="utf-8"
     )
 
+    # Tiger-era US batch ledger (the durable-cycle source that must be
+    # archived) and the daily close ledger (trading-day evidence).  The
+    # anchor-date derivation only reads the date prefix of the filenames,
+    # so the payloads carry the same shape but the dates are parameterized.
+    batches = tmp_path / "data" / "trend_review" / "ledgers" / "US" / "batches"
+    batches.mkdir(parents=True)
+    for execution, as_of in batch_cycles:
+        (batches / f"{execution}.json").write_text(
+            json.dumps({
+                "schema_version": "open_trader.trend_review.batch.v1",
+                "market": "US",
+                "execution_date": execution,
+                "report_path": str(
+                    tmp_path / "reports" / "trend_us_tiger" / f"{as_of}.json"
+                ),
+            }),
+            encoding="utf-8",
+        )
+    daily = tmp_path / "data" / "trend_review" / "daily" / "US"
+    daily.mkdir(parents=True)
+    for trading_date in daily_dates:
+        (daily / f"{trading_date}.json").write_text(
+            json.dumps({"trading_date": trading_date}), encoding="utf-8"
+        )
+
+
+def _test_config(tmp_path: Path, *, executor_host: str | None = None) -> DailyPremarketConfig:
+    """Config with the local host as trend executor, rooted in the tmp data."""
+    return DailyPremarketConfig(
+        repo=tmp_path,
+        python=Path(sys.executable),
+        timezone="Asia/Shanghai",
+        deadline="09:30",
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports",
+        logs_dir=tmp_path / "data" / "logs",
+        portfolio=tmp_path / "data" / "latest" / "portfolio.csv",
+        trend_review_us_simulate_acc_id=0,
+        trend_executor_host=executor_host or socket.gethostname(),
+    )
+
+
+def _write_env_file(tmp_path: Path, *, host: str | None = None) -> Path:
+    env_path = tmp_path / "daily_premarket.env"
+    env_path.write_text(
+        f"OPEN_TRADER_TREND_EXECUTOR_HOST={host or socket.gethostname()}\n",
+        encoding="utf-8",
+    )
+    return env_path
+
 
 def _all_tiger_state_paths(tmp_path: Path) -> dict[str, Path]:
     return {
@@ -112,6 +187,10 @@ def test_dry_run_prints_plan_without_touching_filesystem(
         path: path.read_bytes()
         for path in _all_tiger_state_paths(tmp_path).values()
     }
+    batch_files = list(
+        (tmp_path / "data" / "trend_review" / "ledgers" / "US" / "batches").glob("*.json")
+    )
+    before_batches = {path.name: path.read_bytes() for path in batch_files}
 
     return_code = cutover.main([
         "--dry-run",
@@ -125,14 +204,22 @@ def test_dry_run_prints_plan_without_touching_filesystem(
     assert "归档" in out.out
     assert "迁移 protection_state.json" in out.out
     assert "重建 attention_baseline.json" in out.out
+    # Hardening steps print their plan in dry-run.
+    assert "批次账本归档：3 份（2026-08-15 至 2026-08-19）" in out.out
+    assert "锚定切割前周期：as_of=2026-08-18 / execution=2026-08-19" in out.out
     # Dry-run must never create anything.
     for path, body in before.items():
         assert path.read_bytes() == body
+    for name, body in before_batches.items():
+        assert (
+            tmp_path / "data" / "trend_review" / "ledgers" / "US" / "batches" / name
+        ).read_bytes() == body
     assert not (tmp_path / "data" / "archive").exists()
     assert not (tmp_path / "reports" / "archive").exists()
     assert not (tmp_path / "data" / "trend_us_futu" / "attention_baseline.json").exists()
     assert not (tmp_path / "data" / "trend_us_futu" / ".cutover-complete.json").exists()
     assert not (tmp_path / "data" / "trend_us_futu" / "manifest.json").exists()
+    assert not (tmp_path / "data" / "trend_controller").exists()
 
 
 def test_dry_run_manifest_lists_planned_actions_and_validations(
@@ -145,6 +232,8 @@ def test_dry_run_manifest_lists_planned_actions_and_validations(
         reports_root=tmp_path / "reports",
         dry_run=True,
         now=NOW,
+        anchor_as_of="2026-08-18",
+        anchor_execution="2026-08-19",
     )
 
     assert manifest["dry_run"] is True
@@ -152,6 +241,7 @@ def test_dry_run_manifest_lists_planned_actions_and_validations(
     assert manifest["archives"] == {
         "data": "archive/trend_us_futu-20260819T030000",
         "reports": "archive/trend_us_futu-20260819T030000",
+        "batches": "archive/trend_us_batches-tiger-era-20260819T030000",
     }
     assert manifest["migrated"] == {
         "protection_state.json": "dry-run",
@@ -163,6 +253,8 @@ def test_dry_run_manifest_lists_planned_actions_and_validations(
     assert "归档" in actions
     assert "迁移 protection_state.json -> protection_state.json（dry-run）" in actions
     assert "重建 attention_baseline.json（来源 2026-07-15.json" in actions
+    assert "归档老虎时代批次账本 3 份 -> " in actions
+    assert "锚定切割前周期 as_of=2026-08-18 / execution=2026-08-19" in actions
     baseline = manifest["baseline"]
     assert isinstance(baseline, dict)
     assert baseline["as_of_date"] == "2026-07-15"
@@ -174,17 +266,36 @@ def test_dry_run_manifest_lists_planned_actions_and_validations(
         "files": 1, "from": "2026-08-15", "to": "2026-08-15",
         "note": "投递去重账本，防切换日重发飞书",
     }
+    assert manifest["batch_archive"] == {
+        "files": 3,
+        "from": "2026-08-15",
+        "to": "2026-08-19",
+        "destination": "archive/trend_us_batches-tiger-era-20260819T030000",
+        "note": "老虎时代批次账本归档（移动不删除），防 durable 周期回溯到 7 月",
+    }
+    assert manifest["anchor_cycle"] == {
+        "market": "US",
+        "as_of_date": "2026-08-18",
+        "execution_date": "2026-08-19",
+        "skipped": False,
+        "legacy_cutover_path": None,
+        "revision_request_path": None,
+        "note": "锚定切割前最后一个老虎周期为已完成，防控制器回溯补产旧报告",
+    }
     assert all(item["ok"] is True for item in manifest["validations"])
 
 
 def test_real_mode_migrates_archives_and_rebuilds_baseline(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _seed_roots(tmp_path)
+    monkeypatch.setattr(cutover, "_now", lambda: CUTOVER_NOW)
 
     return_code = cutover.main([
         "--data-root", str(tmp_path / "data"),
         "--reports-root", str(tmp_path / "reports"),
+        "--config", str(_write_env_file(tmp_path)),
+        "--actor", "test-actor",
     ])
     capsys.readouterr()
 
@@ -212,6 +323,26 @@ def test_real_mode_migrates_archives_and_rebuilds_baseline(
     assert (data_archives[0] / "protection_state.json").is_file()
     assert (data_archives[0] / "manifest.json").is_file()
     assert (reports_archives[0] / "2026-07-15.json").is_file()
+
+    # Hardening steps ran through the CLI path as well: batch ledger archived,
+    # revision request + legacy cutover anchored.
+    batch_archives = list(
+        (tmp_path / "data" / "archive").glob("trend_us_batches-tiger-era-*")
+    )
+    assert len(batch_archives) == 1
+    assert sorted(
+        path.name for path in batch_archives[0].glob("*.json")
+        if path.name != "manifest.json"
+    ) == ["2026-08-15.json", "2026-08-18.json", "2026-08-19.json"]
+    assert not list(
+        (tmp_path / "data" / "trend_review" / "ledgers" / "US" / "batches").glob("*.json")
+    )
+    assert (
+        tmp_path / "data" / "trend_controller" / "US" / "revision_requests" / "2026-08-18.json"
+    ).is_file()
+    assert (
+        tmp_path / "data" / "trend_controller" / "US" / "legacy_cutovers" / "2026-08-18.json"
+    ).is_file()
 
     baseline = json.loads(
         (futu_data / "attention_baseline.json").read_text(encoding="utf-8")
@@ -244,6 +375,8 @@ def test_real_mode_migrates_archives_and_rebuilds_baseline(
     again = cutover.main([
         "--data-root", str(tmp_path / "data"),
         "--reports-root", str(tmp_path / "reports"),
+        "--config", str(_write_env_file(tmp_path)),
+        "--actor", "test-actor",
     ])
     out = capsys.readouterr()
     assert again == 0
@@ -255,6 +388,151 @@ def test_real_mode_migrates_archives_and_rebuilds_baseline(
     } == before
 
 
+def test_real_mode_archives_batches_and_anchors_last_cycle(
+    tmp_path: Path,
+) -> None:
+    _seed_roots(tmp_path)
+
+    manifest = cutover._run(
+        data_root=tmp_path / "data",
+        reports_root=tmp_path / "reports",
+        dry_run=False,
+        now=CUTOVER_NOW,
+        anchor_as_of="2026-08-18",
+        anchor_execution="2026-08-19",
+        config=_test_config(tmp_path),
+        actor="test-actor",
+    )
+
+    # Batch ledger archived (moved, not deleted) and source emptied.
+    batch_source = tmp_path / "data" / "trend_review" / "ledgers" / "US" / "batches"
+    batch_archives = list(
+        (tmp_path / "data" / "archive").glob("trend_us_batches-tiger-era-*")
+    )
+    assert len(batch_archives) == 1
+    assert sorted(
+        path.name for path in batch_archives[0].glob("*.json")
+        if path.name != "manifest.json"
+    ) == ["2026-08-15.json", "2026-08-18.json", "2026-08-19.json"]
+    assert not list(batch_source.glob("*.json"))
+    assert (batch_archives[0] / "manifest.json").is_file()
+
+    # Revision request with empty baseline for the anchored cycle.
+    request_path = (
+        tmp_path / "data" / "trend_controller" / "US" / "revision_requests" / "2026-08-18.json"
+    )
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    assert request["schema_version"] == "open_trader.trend_controller.revision_request.v1"
+    assert request["market"] == "US"
+    assert request["as_of_date"] == "2026-08-18"
+    assert request["execution_date"] == "2026-08-19"
+    assert request["baseline_report_path"] is None
+    assert request["baseline_report_sha256"] is None
+    assert request["baseline_revision"] == -1
+
+    # report_missing legacy cutover anchored to that request.
+    cutover_record = json.loads(
+        (
+            tmp_path / "data" / "trend_controller" / "US" / "legacy_cutovers" / "2026-08-18.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert cutover_record["schema_version"] == "open_trader.trend_controller.legacy_cutover.v1"
+    assert cutover_record["market"] == "US"
+    assert cutover_record["as_of_date"] == "2026-08-18"
+    assert cutover_record["execution_date"] == "2026-08-19"
+    assert cutover_record["report_missing"] is True
+    assert cutover_record["report_path"] is None
+    assert cutover_record["report_sha256"] is None
+    assert cutover_record["actor"] == "test-actor"
+    assert cutover_record["revision_request_sha256"] == hashlib.sha256(
+        request_path.read_bytes()
+    ).hexdigest()
+
+    # Manifest records both hardening steps.
+    assert manifest["batch_archive"] == {
+        "files": 3,
+        "from": "2026-08-15",
+        "to": "2026-08-19",
+        "destination": "archive/trend_us_batches-tiger-era-20260820T091135",
+        "note": "老虎时代批次账本归档（移动不删除），防 durable 周期回溯到 7 月",
+    }
+    assert manifest["anchor_cycle"]["market"] == "US"
+    assert manifest["anchor_cycle"]["as_of_date"] == "2026-08-18"
+    assert manifest["anchor_cycle"]["execution_date"] == "2026-08-19"
+    assert manifest["anchor_cycle"]["skipped"] is False
+    assert manifest["anchor_cycle"]["legacy_cutover_path"] == (
+        "trend_controller/US/legacy_cutovers/2026-08-18.json"
+    )
+    assert manifest["anchor_cycle"]["revision_request_path"] == (
+        "trend_controller/US/revision_requests/2026-08-18.json"
+    )
+
+
+def test_real_mode_rerun_is_idempotent_for_batches_and_anchor(
+    tmp_path: Path,
+) -> None:
+    _seed_roots(tmp_path)
+    config = _test_config(tmp_path)
+
+    first = cutover._run(
+        data_root=tmp_path / "data",
+        reports_root=tmp_path / "reports",
+        dry_run=False,
+        now=CUTOVER_NOW,
+        anchor_as_of="2026-08-18",
+        anchor_execution="2026-08-19",
+        config=config,
+        actor="test-actor",
+    )
+    assert first["anchor_cycle"]["skipped"] is False
+    request_bytes = (
+        tmp_path / "data" / "trend_controller" / "US" / "revision_requests" / "2026-08-18.json"
+    ).read_bytes()
+    cutover_bytes = (
+        tmp_path / "data" / "trend_controller" / "US" / "legacy_cutovers" / "2026-08-18.json"
+    ).read_bytes()
+
+    # Simulate the recovery state of a second attempt: the hardening steps
+    # already ran (batches archived, anchor written) while the tiger-side
+    # files are back in place, so the pre-migration validations pass again.
+    futu_data = tmp_path / "data" / "trend_us_futu"
+    tiger_data = tmp_path / "data" / "trend_us_tiger"
+    for name in (
+        "protection_state.json",
+        "real_protection_state.json",
+        "watch_events.jsonl",
+    ):
+        shutil.copy2(futu_data / name, tiger_data / name)
+    shutil.copytree(futu_data / "daily_delivery", tiger_data / "daily_delivery")
+
+    # Re-running must not re-archive or re-anchor, and must not error.
+    second = cutover._run(
+        data_root=tmp_path / "data",
+        reports_root=tmp_path / "reports",
+        dry_run=False,
+        now=CUTOVER_NOW,
+        anchor_as_of="2026-08-18",
+        anchor_execution="2026-08-19",
+        config=config,
+        actor="test-actor",
+    )
+    assert second["anchor_cycle"]["skipped"] is True
+    assert second["batch_archive"]["files"] == 0
+    assert not list(
+        (tmp_path / "data" / "trend_review" / "ledgers" / "US" / "batches").glob("*.json")
+    )
+    batch_archives = list(
+        (tmp_path / "data" / "archive").glob("trend_us_batches-tiger-era-*")
+    )
+    assert len(batch_archives) == 1
+    assert (
+        tmp_path / "data" / "trend_controller" / "US" / "revision_requests" / "2026-08-18.json"
+    ).read_bytes() == request_bytes
+    assert (
+        tmp_path / "data" / "trend_controller" / "US" / "legacy_cutovers" / "2026-08-18.json"
+    ).read_bytes() == cutover_bytes
+
+
 def test_real_mode_manifest_records_ledger_range_before_move(
     tmp_path: Path,
 ) -> None:
@@ -264,7 +542,10 @@ def test_real_mode_manifest_records_ledger_range_before_move(
         data_root=tmp_path / "data",
         reports_root=tmp_path / "reports",
         dry_run=False,
-        now=NOW,
+        now=CUTOVER_NOW,
+        anchor_as_of="2026-08-18",
+        anchor_execution="2026-08-19",
+        config=_test_config(tmp_path),
     )
 
     # The ledger range is computed before daily_delivery/ is moved, so a real
@@ -282,9 +563,11 @@ def test_real_mode_manifest_records_ledger_range_before_move(
 def test_missing_tiger_state_fails_closed(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    env_file = _write_env_file(tmp_path)
     return_code = cutover.main([
         "--data-root", str(tmp_path / "data"),
         "--reports-root", str(tmp_path / "reports"),
+        "--config", str(env_file),
     ])
     err = capsys.readouterr().err
     assert return_code == 1
@@ -295,7 +578,175 @@ def test_missing_tiger_state_fails_closed(
     return_code = cutover.main([
         "--data-root", str(tmp_path / "data"),
         "--reports-root", str(tmp_path / "reports"),
+        "--config", str(env_file),
     ])
     err = capsys.readouterr().err
     assert return_code == 1
     assert "FAIL: 迁移前校验失败" in err
+
+
+def test_real_mode_anchor_fails_closed_without_executor_identity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Real mode aborts before touching anything when the config cannot prove
+    the trend executor identity."""
+    _seed_roots(tmp_path)
+    env_file = _write_env_file(tmp_path, host="some-other-host.example")
+    before = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    return_code = cutover.main([
+        "--data-root", str(tmp_path / "data"),
+        "--reports-root", str(tmp_path / "reports"),
+        "--config", str(env_file),
+    ])
+    err = capsys.readouterr().err
+    assert return_code == 1
+    assert "FAIL: trend automation is readonly" in err
+    assert {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    } == before
+
+
+def test_real_mode_anchor_fails_closed_without_config_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Real mode fails closed when the env config file is missing."""
+    _seed_roots(tmp_path)
+    missing = tmp_path / "no-such.env"
+    return_code = cutover.main([
+        "--data-root", str(tmp_path / "data"),
+        "--reports-root", str(tmp_path / "reports"),
+        "--config", str(missing),
+    ])
+    err = capsys.readouterr().err
+    assert return_code == 1
+    assert "FAIL: 缺少配置文件" in err
+    assert not (tmp_path / "data" / "archive").exists()
+
+
+def test_real_mode_no_trading_day_evidence_fails_closed_before_any_move(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Real mode fails closed on the anchor dates before any file is moved
+    when neither the batch nor the daily close ledger has dated evidence."""
+    _seed_roots(tmp_path, batch_cycles=(), daily_dates=())
+    env_file = _write_env_file(tmp_path)
+    before = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    return_code = cutover.main([
+        "--data-root", str(tmp_path / "data"),
+        "--reports-root", str(tmp_path / "reports"),
+        "--config", str(env_file),
+        "--actor", "test-actor",
+    ])
+    err = capsys.readouterr().err
+    assert return_code == 1
+    assert "均无交易日证据" in err
+    # Fail-closed happened before any archive or migration: no archive
+    # directory was created and no file moved.
+    assert not (tmp_path / "data" / "archive").exists()
+    assert not (tmp_path / "reports" / "archive").exists()
+    assert (tmp_path / "data" / "trend_us_futu" / "protection_state.json").is_file()
+    assert (tmp_path / "data" / "trend_us_tiger" / "protection_state.json").is_file()
+    assert {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    } == before
+
+
+def test_real_mode_single_day_evidence_fails_closed_before_any_move(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Real mode fails closed on the anchor dates before any file is moved
+    when only one trading day is on record (no prior completed day)."""
+    _seed_roots(
+        tmp_path,
+        batch_cycles=(("2026-08-19", "2026-08-18"),),
+        daily_dates=(),
+    )
+    env_file = _write_env_file(tmp_path)
+    before = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    return_code = cutover.main([
+        "--data-root", str(tmp_path / "data"),
+        "--reports-root", str(tmp_path / "reports"),
+        "--config", str(env_file),
+        "--actor", "test-actor",
+    ])
+    err = capsys.readouterr().err
+    assert return_code == 1
+    assert "之前没有已完成的交易日" in err
+    # Fail-closed happened before any archive or migration: no archive
+    # directory was created and no file moved.
+    assert not (tmp_path / "data" / "archive").exists()
+    assert not (tmp_path / "reports" / "archive").exists()
+    assert (tmp_path / "data" / "trend_us_futu" / "protection_state.json").is_file()
+    assert (tmp_path / "data" / "trend_us_tiger" / "protection_state.json").is_file()
+    assert {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    } == before
+
+
+def test_real_mode_anchor_authorization_window_fails_closed_before_window_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real mode fails closed before any file is moved when the authorization
+    moment is still inside the anchor execution day's US buy window (before
+    16:00 ET), the untested branch of _check_anchor_authorization_window."""
+    _seed_roots(tmp_path)
+    monkeypatch.setattr(cutover, "_now", lambda: PRE_WINDOW_NOW)
+    env_file = _write_env_file(tmp_path)
+    before = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    return_code = cutover.main([
+        "--data-root", str(tmp_path / "data"),
+        "--reports-root", str(tmp_path / "reports"),
+        "--config", str(env_file),
+        "--actor", "test-actor",
+    ])
+    err = capsys.readouterr().err
+    window_end = datetime.combine(
+        date(2026, 8, 19),
+        cutover.BUY_WINDOWS["US"][1],
+        tzinfo=cutover.TIMEZONES["US"],
+    )
+    expected = (
+        "FAIL: 锚定授权窗口未开启：legacy cutover 写入要求授权时刻晚于 "
+        f"{window_end.isoformat()}（{cutover.TIMEZONES['US']}）且 as_of "
+        f"2026-08-18 早于授权日；当前授权时刻 "
+        f"{PRE_WINDOW_NOW.astimezone(cutover.TIMEZONES['US']).isoformat()}"
+    )
+    assert return_code == 1
+    assert err.strip() == expected
+    # Fail-closed happened before any archive or migration: no archive
+    # directory was created and no file moved.
+    assert not (tmp_path / "data" / "archive").exists()
+    assert not (tmp_path / "reports" / "archive").exists()
+    assert (tmp_path / "data" / "trend_us_futu" / "protection_state.json").is_file()
+    assert (tmp_path / "data" / "trend_us_tiger" / "protection_state.json").is_file()
+    assert {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    } == before
