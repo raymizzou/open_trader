@@ -23,9 +23,9 @@ SPEC.loader.exec_module(publisher)
 
 
 MARKETS = {
-    "CN": ("trend_a_share", "v14", "0.4"),
-    "HK": ("trend_hk_phillips", "v12", "0.6"),
-    "US": ("trend_us_futu", "v12", "0.8"),
+    "CN": ("trend_a_share", "v15", "0.4"),
+    "HK": ("trend_hk_phillips", "v13", "0.6"),
+    "US": ("trend_us_futu", "v13", "0.8"),
 }
 
 
@@ -245,3 +245,49 @@ def test_publish_uses_immutable_pairs_and_records_hashes_and_costs(
         assert record["old_sha256"]["json"] == publisher._sha256(previous[config.reports_dir / directory / f"{config.run_date}.json"])
         assert record["old_sha256"]["markdown"] == publisher._sha256(previous[config.reports_dir / directory / f"{config.run_date}.md"])
         assert record["actual_api_cost"] == cost
+
+
+@pytest.mark.parametrize(
+    ("market", "version", "strategy_id", "metadata_market"),
+    [
+        ("CN", "v14", "trend_animals_warm_to_hot/CN/v14", "CN"),
+        ("HK", "v12", "trend_animals_warm_to_hot/HK/v12", "HK"),
+        ("US", "v13", "trend_animals_warm_to_hot/US/v12", "US"),
+        ("CN", "v15", "trend_animals_warm_to_hot/CN/v15", "HK"),
+    ],
+)
+def test_validate_artifact_rejects_old_and_hybrid_strategy_identity(
+    tmp_path: Path,
+    market: str,
+    version: str,
+    strategy_id: str,
+    metadata_market: str,
+) -> None:
+    directory = MARKETS[market][0]
+    stage_root = tmp_path / "reports"
+    root = stage_root / directory
+    root.mkdir(parents=True)
+    json_path = root / "2026-08-07-r1.json"
+    markdown_path = root / "2026-08-07-r1.md"
+    json_path.write_text(
+        json.dumps({
+            "metadata": {"market": metadata_market},
+            "strategy_snapshot": {
+                "market": market,
+                "strategy_id": strategy_id,
+                "strategy_version": version,
+            },
+        }),
+        encoding="utf-8",
+    )
+    markdown_path.write_text("# report\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        publisher._validate_artifact(
+            market=market,
+            result=SimpleNamespace(
+                status="generated", json_path=json_path, report_path=markdown_path,
+            ),
+            stage_root=stage_root,
+            before={},
+        )

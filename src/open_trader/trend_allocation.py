@@ -33,6 +33,9 @@ ROOT_ASSETS = {
 }
 ENTRY_WEIGHTS = {1: Decimal("0.06"), 2: Decimal("0.04"), 3: Decimal("0.02")}
 NOMINAL_WEIGHTS = {1: Decimal("0.60"), 2: Decimal("0.40"), 3: Decimal("0.20")}
+V2_ENTRY_WEIGHT = Decimal("0.04")
+V2_NOMINAL_WEIGHTS = {1: Decimal("0.80"), 2: Decimal("0.60"), 3: Decimal("0.40")}
+V2_POSITION_LIMITS = {1: 20, 2: 15, 3: 10}
 ROOT_FIELDS = (
     "tmId", "tickerName", "asset", "asOfDate", "trendStrengthGlobalCurr",
 )
@@ -374,7 +377,12 @@ def run_trend_allocation_controller(
                 snapshot = build_allocation_snapshot(
                     allocation_date=day, generated_at=now.isoformat(timespec="seconds"),
                     git_sha=process_version, roots=fetch_allocation_roots(api), previous=previous,
+                    version=2,
                 )
+                if snapshot.get("allocation_date") != day:
+                    raise TrendAnimalsError(
+                        "allocation stock-root data unavailable; reusing previous snapshot"
+                    )
                 reference = write_allocation_snapshot(config.data_dir, snapshot, revision=revision)
             except Exception as exc:
                 failures += 1
@@ -482,34 +490,67 @@ def build_allocation_snapshot(
     git_sha: str,
     roots: Mapping[str, object],
     previous: Mapping[str, object] | None,
+    version: int = 1,
 ) -> dict[str, object]:
     allocation_date = _date_text(allocation_date, "allocation_date")
     _timestamp(generated_at)
     _git_sha(git_sha)
+    if isinstance(version, bool) or not isinstance(version, int) or version not in {1, 2}:
+        raise ValueError("unsupported allocation snapshot version")
+    if version == 2 and _v2_ranking_fallback_required(roots):
+        if previous is None:
+            raise TrendAnimalsError(
+                "allocation stock-root ranking is unavailable without a previous snapshot"
+            )
+        _validate_snapshot(previous)
+        if previous.get("version") != 2:
+            raise TrendAnimalsError(
+                "allocation stock-root fallback requires a v2 previous snapshot"
+            )
+        # A malformed current root cannot be serialized without weakening the
+        # immutable schema. Reuse the last successful v2 fact as a whole; the
+        # controller's terminal fallback status records that it was reused.
+        return dict(previous)
     normalized_roots = _normalise_roots(roots)
-    order = _rank_markets(normalized_roots, previous)
+    order = (
+        _rank_markets_v2(normalized_roots, previous)
+        if version == 2
+        else _rank_markets(normalized_roots, previous)
+    )
     markets: dict[str, object] = {}
     for rank, market in enumerate(order, 1):
-        stock, etf = normalized_roots[market].values()
-        stock_strength = Decimal(stock["global_strength"])
-        etf_strength = Decimal(etf["global_strength"])
-        score_source, score = (
-            (stock["asset"], stock_strength)
-            if stock_strength >= etf_strength
-            else (etf["asset"], etf_strength)
-        )
-        markets[market] = {
-            "rank": rank,
-            "score": _decimal_text(score),
-            "score_source": score_source,
-            "entry_weight": _decimal_text(ENTRY_WEIGHTS[rank]),
-            "nominal_weight": _decimal_text(NOMINAL_WEIGHTS[rank]),
-        }
+        stock = normalized_roots[market]["stock"]
+        if version == 2:
+            stock_strength = Decimal(stock["global_strength"])
+            markets[market] = {
+                "rank": rank,
+                "score": _decimal_text(stock_strength),
+                "score_source": stock["asset"],
+                "entry_weight": _decimal_text(V2_ENTRY_WEIGHT),
+                "nominal_weight": _decimal_text(V2_NOMINAL_WEIGHTS[rank]),
+                "position_limit": V2_POSITION_LIMITS[rank],
+            }
+        else:
+            etf = normalized_roots[market]["etf"]
+            stock_strength = Decimal(stock["global_strength"])
+            etf_strength = Decimal(etf["global_strength"])
+            score_source, score = (
+                (stock["asset"], stock_strength)
+                if stock_strength >= etf_strength
+                else (etf["asset"], etf_strength)
+            )
+            markets[market] = {
+                "rank": rank,
+                "score": _decimal_text(score),
+                "score_source": score_source,
+                "entry_weight": _decimal_text(ENTRY_WEIGHTS[rank]),
+                "nominal_weight": _decimal_text(NOMINAL_WEIGHTS[rank]),
+            }
     return {
-        "version": 1,
+        "version": version,
         "allocation_date": allocation_date,
         "generated_at": generated_at,
-        "generator_version": "trend-allocation-v1",
+        "generator_version": f"trend-allocation-v{version}",
         "git_sha": git_sha,
         "roots": normalized_roots,
         "markets": markets,
@@ -693,6 +734,67 @@ def _rank_markets(
     return ordered
 
 
+def _rank_markets_v2(
+    roots: Mapping[str, Mapping[str, Mapping[str, str | int]]],
+    previous: Mapping[str, object] | None,
+) -> list[str]:
+    stock_roots = {market: values["stock"] for market, values in roots.items()}
+    dates = {str(root["as_of_date"]) for root in stock_roots.values()}
+    try:
+        values = {
+            market: Decimal(str(root["global_strength"]))
+            for market, root in stock_roots.items()
+        }
+    except (KeyError, InvalidOperation, ValueError):
+        values = {}
+    if len(dates) != 1 or len(values) != len(ROOT_ASSETS):
+        if previous is None:
+            raise TrendAnimalsError(
+                "allocation stock-root ranking is unavailable without a previous snapshot"
+            )
+        return _previous_order(previous)
+    ordered: list[str] = []
+    for value in sorted(set(values.values()), reverse=True):
+        tied = [market for market, strength in values.items() if strength == value]
+        if len(tied) > 1:
+            if previous is None or previous.get("version") != 2:
+                raise TrendAnimalsError(
+                    "allocation market tie needs a v2 previous snapshot"
+                )
+            previous_order = _previous_order(previous)
+            tied.sort(key=previous_order.index)
+        ordered.extend(tied)
+    return ordered
+
+
+def _v2_ranking_fallback_required(roots: object) -> bool:
+    """Identify missing strengths or inconsistent stock dates before normalization."""
+    if not isinstance(roots, Mapping) or set(roots) != set(ROOT_ASSETS):
+        return True
+    stock_dates: list[str] = []
+    for market in ROOT_ASSETS:
+        market_roots = roots.get(market)
+        if not isinstance(market_roots, Mapping):
+            return True
+        stock = market_roots.get("stock")
+        if isinstance(stock, Mapping) and isinstance(stock.get("as_of_date"), str):
+            stock_dates.append(str(stock["as_of_date"]))
+        for role in ("stock", "etf"):
+            root = market_roots.get(role)
+            if not isinstance(root, Mapping):
+                return True
+            strength = root.get("global_strength")
+            if isinstance(strength, bool) or strength is None:
+                return True
+            try:
+                parsed = Decimal(str(strength))
+            except (InvalidOperation, TypeError, ValueError):
+                return True
+            if not parsed.is_finite():
+                return True
+    return len(stock_dates) != len(ROOT_ASSETS) or len(set(stock_dates)) != 1
+
+
 def _previous_order(previous: Mapping[str, object]) -> list[str]:
     _validate_snapshot(previous)
     if not isinstance(previous, Mapping) or not isinstance(previous.get("markets"), Mapping):
@@ -716,7 +818,13 @@ def _previous_order(previous: Mapping[str, object]) -> list[str]:
 def _validate_snapshot(snapshot: Mapping[str, object]) -> None:
     if not isinstance(snapshot, Mapping) or set(snapshot) != {"version", "allocation_date", "generated_at", "generator_version", "git_sha", "roots", "markets"}:
         raise TrendAnimalsError("allocation snapshot schema is invalid")
-    if snapshot.get("version") != 1 or snapshot.get("generator_version") != "trend-allocation-v1":
+    version = snapshot.get("version")
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version not in {1, 2}
+        or snapshot.get("generator_version") != f"trend-allocation-v{version}"
+    ):
         raise TrendAnimalsError("allocation snapshot schema is invalid")
     _date_text(snapshot.get("allocation_date"), "allocation_date")
     _timestamp(snapshot.get("generated_at"))
@@ -727,28 +835,52 @@ def _validate_snapshot(snapshot: Mapping[str, object]) -> None:
         raise TrendAnimalsError("allocation market mapping is invalid")
     ranks: set[int] = set()
     for market, values in markets.items():
-        if not isinstance(values, Mapping) or set(values) != {"rank", "score", "score_source", "entry_weight", "nominal_weight"}:
+        expected_fields = (
+            {"rank", "score", "score_source", "entry_weight", "nominal_weight", "position_limit"}
+            if version == 2
+            else {"rank", "score", "score_source", "entry_weight", "nominal_weight"}
+        )
+        if not isinstance(values, Mapping) or set(values) != expected_fields:
             raise TrendAnimalsError("allocation market mapping is invalid")
         rank = values.get("rank")
+        if (
+            isinstance(rank, bool)
+            or not isinstance(rank, int)
+            or rank not in ENTRY_WEIGHTS
+            or rank in ranks
+        ):
+            raise TrendAnimalsError("allocation market mapping is invalid")
         stock, etf = roots[market].values()
         stock_strength, etf_strength = Decimal(stock["global_strength"]), Decimal(etf["global_strength"])
-        source, score = (stock["asset"], stock_strength) if stock_strength >= etf_strength else (etf["asset"], etf_strength)
+        source, score = (
+            (stock["asset"], stock_strength)
+            if version == 2 or stock_strength >= etf_strength
+            else (etf["asset"], etf_strength)
+        )
+        expected_entry = V2_ENTRY_WEIGHT if version == 2 else ENTRY_WEIGHTS.get(rank)
+        expected_nominal = V2_NOMINAL_WEIGHTS.get(rank) if version == 2 else NOMINAL_WEIGHTS.get(rank)
         if (
-            isinstance(rank, bool) or not isinstance(rank, int) or rank not in ENTRY_WEIGHTS
-            or rank in ranks or values.get("score") != _decimal_text(score)
+            values.get("score") != _decimal_text(score)
             or values.get("score_source") != source
-            or values.get("entry_weight") != _decimal_text(ENTRY_WEIGHTS[rank])
-            or values.get("nominal_weight") != _decimal_text(NOMINAL_WEIGHTS[rank])
+            or values.get("entry_weight") != _decimal_text(expected_entry)
+            or values.get("nominal_weight") != _decimal_text(expected_nominal)
+            or version == 2 and values.get("position_limit") != V2_POSITION_LIMITS[rank]
         ):
             raise TrendAnimalsError("allocation market mapping is invalid")
         ranks.add(rank)
     if ranks != {1, 2, 3}:
         raise TrendAnimalsError("allocation market mapping is invalid")
+    if version == 2 and len({str(values["stock"]["as_of_date"]) for values in roots.values()}) != 1:
+        raise TrendAnimalsError("allocation stock-root dates are inconsistent")
     pairs = {
-        market: tuple(
-            sorted(
-                (Decimal(str(root["global_strength"])) for root in values.values()),
-                reverse=True,
+        market: (
+            (Decimal(str(values["stock"]["global_strength"])),)
+            if version == 2
+            else tuple(
+                sorted(
+                    (Decimal(str(root["global_strength"])) for root in values.values()),
+                    reverse=True,
+                )
             )
         )
         for market, values in roots.items()

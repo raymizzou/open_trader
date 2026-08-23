@@ -1120,6 +1120,8 @@ def test_trend_report_projects_frozen_real_positions_separately_from_simulation(
 
 def test_project_rotation_execution_actions_surfaces_executed_legs() -> None:
     payload = {
+        "metadata": {"market": "US"},
+        "strategy_snapshot": {"strategy_version": "v13"},
         "strategy_judgments": {
             "simulate_rotation_pairs": [
                 {
@@ -1162,10 +1164,89 @@ def test_project_rotation_execution_actions_surfaces_executed_legs() -> None:
     assert [item["symbol"] for item in sell_actions] == ["HIG"]
     assert [item["symbol"] for item in buy_actions] == ["PYPL"]
     assert sell_actions[0]["action"] == "全部卖出"
+    assert sell_actions[0]["clearance_type"] == "轮换清仓"
     assert sell_actions[0]["futu_symbol"] == "US.HIG"
     assert sell_actions[0]["execution"]["status"] == "filled"
     assert buy_actions[0]["target_amount"] == "60308.86"
     assert buy_actions[0]["estimated_shares"] == 1030
+
+
+def test_v2_dashboard_plan_projection_ignores_execution_progress() -> None:
+    payload = {
+        "metadata": {"market": "CN"},
+        "strategy_snapshot": {"strategy_version": "v15"},
+        "allocation": {"version": 2},
+        "strategy_judgments": {
+            "formal_actions": [{
+                "action": "BUY", "symbol": "600001", "target_amount": "4000",
+                "estimated_shares": 300,
+            }],
+            "holding_decisions": [],
+            "top10_candidates": [],
+            "simulate_rotation_pairs": [{
+                "execution_mode": "automatic", "sell_symbol": "600002",
+                "buy_symbol": "600003",
+            }],
+        },
+    }
+    sells, buys, _, _ = dashboard_module._project_trend_actions(
+        payload, {("600001", "buy"): {"status": "filled"}}
+    )
+    rotation_sells, rotation_buys = dashboard_module._project_rotation_execution_actions(
+        payload,
+        {
+            ("600002", "sell"): {"status": "filled"},
+            ("600003", "buy"): {"status": "filled"},
+        },
+    )
+
+    assert "execution" not in buys[0]
+    assert sells == []
+    assert rotation_sells == []
+    assert rotation_buys == []
+
+
+def test_dashboard_real_buy_projection_keeps_global_strength() -> None:
+    payload = {
+        "metadata": {"market": "CN"},
+        "strategy_judgments": {
+            "real_buy_actions": [{
+                "action": "BUY",
+                "symbol": "600001",
+                "global_strength": "99",
+            }],
+        },
+    }
+
+    projected = dashboard_module._project_trend_real_buy_actions(payload)
+
+    assert projected[0]["global_strength"] == "99"
+
+
+def test_dashboard_classifies_signal_clearance_and_preserves_rotation_overlap() -> None:
+    payload = {
+        "metadata": {"market": "CN"},
+        "strategy_snapshot": {"strategy_version": "v15"},
+        "strategy_judgments": {
+            "formal_actions": [{
+                "action": "SELL_ALL",
+                "symbol": "600001",
+                "reason": "danger_signal",
+            }],
+            "holding_decisions": [],
+            "top10_candidates": [],
+            "simulate_rotation_pairs": [{
+                "execution_mode": "automatic",
+                "sell_symbol": "600001",
+            }],
+        },
+    }
+
+    sells, _, _, _ = dashboard_module._project_trend_actions(payload, {})
+
+    assert sells[0]["clearance_type"] == "信号清仓"
+    assert sells[0]["clearance_note"] == "同时符合轮换清仓"
+    assert sells[0]["reason"] == "danger_signal"
 
 
 def test_trend_report_disables_mismatched_futu_derivatives(

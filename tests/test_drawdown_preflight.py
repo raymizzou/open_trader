@@ -190,6 +190,59 @@ def test_new_strategy_versions_inherit_approved_predecessor_high_water_marks(
     } == {"CN": "94", "HK": "188", "US": "282"}
 
 
+@pytest.mark.parametrize(
+    ("market", "predecessor_version", "current_version"),
+    [("CN", "v14", "v15"), ("HK", "v12", "v13"), ("US", "v12", "v13")],
+)
+def test_current_v2_versions_inherit_paused_predecessor_state(
+    tmp_path: Path,
+    market: str,
+    predecessor_version: str,
+    current_version: str,
+) -> None:
+    data_dir = tmp_path / "data"
+    parameters = {"drawdown_limit": "0.05", "market": market}
+    key = {
+        "market": market,
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/{predecessor_version}",
+        "strategy_version": predecessor_version,
+    }
+    automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        **key,
+        parameters=parameters,
+        baseline_equity=Decimal("100"),
+        source_date="2026-08-20",
+        accepted_git_sha="a" * 40,
+        actor="acceptance",
+        occurred_at="2026-08-20T08:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from="2026-08-21",
+    )
+    observe_strategy_equity(
+        data_dir,
+        **key,
+        current_equity=Decimal("94"),
+        observed_at="2026-08-20T17:00:00+08:00",
+    )
+
+    item = replace(
+        market_input(market),
+        baseline_equity=None,
+        strategy_snapshot={
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/{current_version}",
+            "strategy_version": current_version,
+            "parameters": parameters,
+        },
+    )
+    result = run_preflight(tmp_path, {market: item})
+
+    assert result["status"] == "ready"
+    assert result["markets"][0]["status"] == "bootstrapped"
+    assert result["markets"][0]["high_water_mark"] == "100"
+    assert result["markets"][0]["entry_allowed"] is False
+
+
 def test_missing_approved_predecessor_fails_closed_without_writing_state(
     tmp_path: Path,
 ) -> None:

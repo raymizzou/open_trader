@@ -68,6 +68,194 @@ def test_protection_reason_label_accepts_current_rank_versions(
     ) == "2×ATR14 硬止损"
 
 
+class _V2FakeCount:
+    def __init__(self, value: int = 0) -> None:
+        self.value = value
+
+    def count(self) -> int:
+        return self.value
+
+
+class _V2FakeTexts(_V2FakeCount):
+    def __init__(self, values: list[str]) -> None:
+        super().__init__(len(values))
+        self.values = values
+
+    def all_inner_texts(self) -> list[str]:
+        return self.values
+
+
+class _V2FakeCell(_V2FakeCount):
+    def __init__(self, text: str) -> None:
+        super().__init__(1)
+        self.text = text
+
+    def inner_text(self) -> str:
+        return self.text
+
+
+class _V2FakeRow:
+    def __init__(self, cells: int, symbol: str) -> None:
+        self.cells = cells
+        self.symbol = symbol
+
+    def locator(self, selector: str) -> _V2FakeCount:
+        if selector == "td":
+            return _V2FakeCount(self.cells)
+        if selector == 'td[data-label="标的"]':
+            return _V2FakeCell(self.symbol)
+        raise AssertionError(f"unexpected row selector: {selector}")
+
+
+class _V2FakeRows(_V2FakeCount):
+    def __init__(self, cells: int, symbols: list[str]) -> None:
+        super().__init__(len(symbols))
+        self.rows = [_V2FakeRow(cells, symbol) for symbol in symbols]
+
+    def nth(self, index: int) -> _V2FakeRow:
+        return self.rows[index]
+
+
+class _V2FakeTable:
+    def __init__(self, headings: list[str], symbols: list[str]) -> None:
+        self.headings = headings
+        self.rows = _V2FakeRows(len(headings), symbols)
+
+    def count(self) -> int:
+        return 1
+
+    def locator(self, selector: str) -> _V2FakeTexts | _V2FakeRows:
+        if selector == "thead th":
+            return _V2FakeTexts(self.headings)
+        if selector == "tbody tr.cn-trend-card:visible":
+            return self.rows
+        raise AssertionError(f"unexpected table selector: {selector}")
+
+
+class _V2FakePlan:
+    def __init__(self, headings: list[str], symbols: list[str]) -> None:
+        self.table = _V2FakeTable(headings, symbols)
+
+    def locator(self, selector: str) -> _V2FakeTable | _V2FakeCount:
+        if selector == "table.cn-trend-table":
+            return self.table
+        return _V2FakeCount()
+
+
+class _V2FakePlans(_V2FakeCount):
+    def __init__(
+        self, titles: list[str], headings: list[list[str]], symbols: list[list[str]],
+    ) -> None:
+        super().__init__(4)
+        self.plans = [
+            _V2FakePlan(columns, rows)
+            for columns, rows in zip(headings, symbols)
+        ]
+        self.titles = titles
+
+    def locator(self, selector: str) -> _V2FakeTexts:
+        assert selector == "h2"
+        return _V2FakeTexts(self.titles)
+
+    def nth(self, index: int) -> _V2FakePlan:
+        return self.plans[index]
+
+
+class _V2FakeStatus(_V2FakeCount):
+    def __init__(self) -> None:
+        super().__init__(1)
+
+    def inner_text(self) -> str:
+        return "报告与执行状态 已完成"
+
+
+class _V2FakeRoot:
+    def __init__(self, plans: _V2FakePlans) -> None:
+        self.plans = plans
+
+    def locator(self, selector: str) -> _V2FakePlans | _V2FakeStatus | _V2FakeCount:
+        if selector == ".trend-plan":
+            return self.plans
+        if selector == ".trend-execution-status":
+            return _V2FakeStatus()
+        return _V2FakeCount()
+
+
+def test_v2_dashboard_acceptance_requires_four_separate_plan_tables() -> None:
+
+    sell_headings = [
+        "标的", "动作", "卖出类型", "执行参考价", "温度变化", "节气",
+        "个体全局强度", "触发原因", "活动保护线", "持仓提示",
+    ]
+    buy_headings = ["序号", "标的", "个体全局强度", "4%目标金额", "预计数量"]
+    report = {
+        "market": "CN",
+        "strategy_version": "v15",
+        "allocation": {"version": 2},
+        "sell_actions": [{"action": "SELL_ALL", "symbol": "SIMSELL"}],
+        "real_position_actions": [{"action": "SELL_ALL", "symbol": "REALSELL"}],
+        "buy_actions": [{"symbol": "SIMBUY"}],
+        "real_buy_actions": [{"symbol": "REALBUY"}],
+        "simulate_rotation_pairs": [{"sell_symbol": "SIMROTSELL", "buy_symbol": "SIMROTBUY"}],
+        "real_rotation_pairs": [{"sell_symbol": "REALROTSELL", "buy_symbol": "REALROTBUY"}],
+    }
+
+    dashboard_acceptance._check_trend_v2_plan_layout(
+        _V2FakeRoot(_V2FakePlans(
+            ["模拟盘卖出计划", "实盘卖出计划", "模拟盘买入计划", "实盘买入计划"],
+            [sell_headings, sell_headings, buy_headings, buy_headings],
+            [
+                ["SIMSELL", "SIMROTSELL"], ["REALSELL", "REALROTSELL"],
+                ["SIMBUY", "SIMROTBUY"], ["REALBUY", "REALROTBUY"],
+            ],
+        )),
+        report,
+        "eastmoney",
+    )
+
+
+def test_v2_dashboard_acceptance_rejects_swapped_account_plan_symbols() -> None:
+    sell_headings = [
+        "标的", "动作", "卖出类型", "执行参考价", "温度变化", "节气",
+        "个体全局强度", "触发原因", "活动保护线", "持仓提示",
+    ]
+    buy_headings = ["序号", "标的", "个体全局强度", "4%目标金额", "预计数量"]
+    report = {
+        "market": "CN",
+        "strategy_version": "v15",
+        "allocation": {"version": 2},
+        "sell_actions": [{"action": "SELL_ALL", "symbol": "SIMSELL"}],
+        "real_position_actions": [{"action": "SELL_ALL", "symbol": "REALSELL"}],
+        "buy_actions": [{"symbol": "SIMBUY"}],
+        "real_buy_actions": [{"symbol": "REALBUY"}],
+        "simulate_rotation_pairs": [{"sell_symbol": "SIMROTSELL", "buy_symbol": "SIMROTBUY"}],
+        "real_rotation_pairs": [{"sell_symbol": "REALROTSELL", "buy_symbol": "REALROTBUY"}],
+    }
+    plans = _V2FakePlans(
+        ["模拟盘卖出计划", "实盘卖出计划", "模拟盘买入计划", "实盘买入计划"],
+        [sell_headings, sell_headings, buy_headings, buy_headings],
+        [
+            ["REALSELL", "REALROTSELL"], ["SIMSELL", "SIMROTSELL"],
+            ["REALBUY", "REALROTBUY"], ["SIMBUY", "SIMROTBUY"],
+        ],
+    )
+
+    with pytest.raises(AssertionError):
+        dashboard_acceptance._check_trend_v2_plan_layout(
+            _V2FakeRoot(plans), report, "eastmoney"
+        )
+
+
+def test_v1_dashboard_acceptance_does_not_require_v2_plan_dom() -> None:
+    class Root:
+        def locator(self, selector: str) -> object:
+            raise AssertionError(f"v1 unexpectedly queried v2 selector: {selector}")
+
+    dashboard_acceptance._check_trend_v2_plan_layout(
+        Root(), {"market": "CN", "strategy_version": "v14"}, "eastmoney"
+    )
+
+
 def test_prediction_acceptance_registry_is_exact_and_ordered() -> None:
     assert len(SCENARIO_IDS) == 63
     assert len(set(SCENARIO_IDS)) == 63
@@ -1935,6 +2123,7 @@ def integrated_v4_payload(
             git_sha="a" * 40,
             roots=roots,
             previous=None,
+            version=2,
         )
         allocation_reference = {
             "daily_path": "data/trend_allocation/daily/2026-08-03.json",

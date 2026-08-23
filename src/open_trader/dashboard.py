@@ -136,10 +136,13 @@ LEGACY_TREND_REPORT_DIRECTORIES = {
 CURRENT_FINAL_PLAN_TREND_VERSIONS = frozenset({
     ("CN", "v13"),
     ("CN", "v14"),
+    ("CN", "v15"),
     ("HK", "v11"),
     ("HK", "v12"),
+    ("HK", "v13"),
     ("US", "v11"),
     ("US", "v12"),
+    ("US", "v13"),
 })
 TREND_ACTUAL_BROKERS = {
     market: broker for broker, (market, *_rest) in TREND_REPORT_SOURCES.items()
@@ -1364,6 +1367,81 @@ def _project_trend_holding_individual_key(item: dict[str, Any]) -> tuple[object,
     )
 
 
+def _is_trend_discipline_v2_payload(
+    payload: Mapping[str, object], market: str,
+) -> bool:
+    allocation = payload.get("allocation")
+    if isinstance(allocation, Mapping) and allocation.get("version") == 2:
+        return True
+    snapshot = payload.get("strategy_snapshot")
+    version = snapshot.get("strategy_version") if isinstance(snapshot, Mapping) else None
+    return (market.upper(), str(version or "")) in {
+        ("CN", "v15"), ("HK", "v13"), ("US", "v13"),
+    }
+
+
+def _project_trend_plan_availability(
+    payload: Mapping[str, object],
+    *,
+    required: bool = False,
+) -> dict[str, dict[str, object]] | None:
+    missing = {
+        "status": "unavailable",
+        "reason": "计划可用性数据缺失",
+        "executable": False,
+    }
+    invalid = {
+        "status": "unavailable",
+        "reason": "计划可用性数据无效",
+        "executable": False,
+    }
+    raw = payload.get("plan_availability")
+    if raw is None:
+        return (
+            {
+                "simulated_account": dict(missing),
+                "real_account": dict(missing),
+            }
+            if required
+            else None
+        )
+    if not isinstance(raw, Mapping):
+        return (
+            {
+                "simulated_account": dict(invalid),
+                "real_account": dict(invalid),
+            }
+            if required
+            else None
+        )
+    projected: dict[str, dict[str, object]] = {}
+    for account in ("simulated_account", "real_account"):
+        component = raw.get(account)
+        if component is None:
+            if required:
+                projected[account] = dict(missing)
+            continue
+        if not isinstance(component, Mapping):
+            if required:
+                projected[account] = dict(invalid)
+                continue
+            return None
+        status = component.get("status")
+        reason = component.get("reason", "")
+        executable = component.get("executable")
+        if (
+            status not in {"available", "unavailable"}
+            or not isinstance(reason, str)
+            or not isinstance(executable, bool)
+        ):
+            if required:
+                projected[account] = dict(invalid)
+                continue
+            return None
+        projected[account] = copy.deepcopy(dict(component))
+    return projected
+
+
 def _project_trend_actions(
     payload: dict[str, Any],
     executions: dict[tuple[str, str], dict[str, Any]],
@@ -1380,6 +1458,7 @@ def _project_trend_actions(
         if isinstance(metadata, dict)
         else "CN"
     )
+    v2_report = _is_trend_discipline_v2_payload(payload, market)
     formal = [
         {
             **(
@@ -1394,12 +1473,34 @@ def _project_trend_actions(
                     {"BUY": "buy", "SELL_ALL": "sell", "SELL_PARTIAL": "sell"}.get(
                         projected_item.get("action"), ""
                     ),
-                )) in executions
+                )) in executions and not v2_report
                 else {}
             ),
         }
         for item in judgments["formal_actions"]
     ]
+    rotation_sell_symbols = {
+        str(pair.get("sell_symbol") or "").strip()
+        for pair in judgments.get("simulate_rotation_pairs", [])
+        if isinstance(pair, Mapping)
+        and pair.get("execution_mode") == "automatic"
+        and str(pair.get("sell_symbol") or "").strip()
+    }
+    for item in formal:
+        if item.get("action") != "SELL_ALL":
+            continue
+        reason = item.get("reason")
+        known_reason = (
+            isinstance(reason, str)
+            and (reason in REASON_LABELS or reason == "relative_rotation")
+        )
+        if not v2_report or not known_reason:
+            continue
+        item["clearance_type"] = (
+            "轮换清仓" if reason == "relative_rotation" else "信号清仓"
+        )
+        if str(item.get("symbol") or "").strip() in rotation_sell_symbols:
+            item["clearance_note"] = "同时符合轮换清仓"
     frozen_holding_snapshots = payload.get("signal_snapshots", {})
     frozen_holding_snapshots = (
         frozen_holding_snapshots.get("holdings", {})
@@ -1503,6 +1604,27 @@ def _project_trend_real_actions(payload: dict[str, Any]) -> list[dict[str, Any]]
     )
 
 
+def _project_trend_real_buy_actions(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Project the frozen informational real-account buy plan."""
+    judgments = payload.get("strategy_judgments")
+    if not isinstance(judgments, dict):
+        return []
+    raw_items = judgments.get("real_buy_actions")
+    if not isinstance(raw_items, list):
+        return []
+    metadata = payload.get("metadata")
+    market = (
+        str(metadata.get("market") or "CN").upper()
+        if isinstance(metadata, dict)
+        else "CN"
+    )
+    return [
+        _project_trend_money_fields(item, payload=payload, market=market)
+        for item in raw_items
+        if isinstance(item, dict) and item.get("action") == "BUY"
+    ]
+
+
 def _project_rotation_execution_actions(
     payload: dict[str, Any],
     executions: Mapping[tuple[str, str], dict[str, Any]],
@@ -1514,6 +1636,19 @@ def _project_rotation_execution_actions(
         if isinstance(judgments, dict)
         else None
     )
+    metadata = payload.get("metadata")
+    market = (
+        str(metadata.get("market") or "CN").upper()
+        if isinstance(metadata, Mapping)
+        else "CN"
+    )
+    v2_report = _is_trend_discipline_v2_payload(payload, market)
+    if (
+        v2_report
+        and isinstance(payload.get("allocation"), Mapping)
+        and payload["allocation"].get("version") == 2
+    ):
+        return [], []
     sell_actions: list[dict[str, Any]] = []
     buy_actions: list[dict[str, Any]] = []
     for pair in pairs or []:
@@ -1533,6 +1668,7 @@ def _project_rotation_execution_actions(
                 "futu_symbol": str(pair.get(futu_key) or "").strip(),
                 "action": action,
                 "reason": "relative_rotation",
+                **({"clearance_type": "轮换清仓"} if side == "sell" and v2_report else {}),
                 "target_weight": str(pair.get("target_weight") or ""),
                 "target_amount": str(pair.get("target_amount") or ""),
                 "estimated_shares": pair.get("estimated_shares"),
@@ -2211,7 +2347,7 @@ def _valid_v2_risk_items(
         "名义仓位上限", "单笔风险上限", "组合剩余风险", "现金"
     }
     if strategy_version in {
-        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
     }:
         allowed_buy_constraints.add("Kelly 上限")
     data_missing_notes = {
@@ -2244,7 +2380,7 @@ def _valid_v2_risk_items(
             or target_weight <= 0
             or target_weight > target_weight_limit
             or strategy_version in {
-                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
             }
             and summary.get("kelly_phase") != "cold_start"
             and target_weight
@@ -2300,11 +2436,11 @@ def _valid_v2_risk_items(
         "关键风险数据",
     }
     if strategy_version in {
-        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
     }:
         allowed_constraints.add("Kelly 上限")
     if strategy_version in {
-        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
     }:
         allowed_constraints.add("策略累计回撤")
     for item in judgments["risk_skips"]:
@@ -2314,7 +2450,7 @@ def _valid_v2_risk_items(
         target_amount = _dashboard_risk_decimal(target_amount_raw)
         zero_kelly_skip = (
             strategy_version in {
-                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
             }
             and summary.get("status") == "paused"
             and summary.get("kelly_cap") in {"0", "0.000000", 0}
@@ -2610,6 +2746,7 @@ def _project_broker_trend_report(
         reports_dir, broker=broker, market=market
     )
     _, latest_payload, *_ = selected
+    v2_report = _is_trend_discipline_v2_payload(latest_payload, market)
     latest_report_sha256 = _report_hash(latest_payload)
     execution_batch: dict[str, object] | None = None
     execution_batch_error = ""
@@ -2680,13 +2817,15 @@ def _project_broker_trend_report(
                     generated_at,
                 )
                 if (
+                    not v2_report
+                    and
                     latest_payload["strategy_judgments"]["formal_actions"]
                     != payload["strategy_judgments"]["formal_actions"]
                 ):
                     selected = locked_selected
                 execution_batch = batch
                 revision_anomaly = batch["report_sha256"] != latest_report_sha256
-    if execution_batch_error:
+    if execution_batch_error and not v2_report:
         return {
             "available": False,
             "data_status": "unavailable",
@@ -2718,6 +2857,7 @@ def _project_broker_trend_report(
             "run_status": "",
             "sell_actions": [],
             "buy_actions": [],
+            "real_buy_actions": [],
             "hold_actions": [],
             "review_actions": [],
             "real_position_actions": [],
@@ -2760,6 +2900,7 @@ def _project_broker_trend_report(
     sell_actions = [*sell_actions, *rotation_sell_actions]
     buy_actions = [*buy_actions, *rotation_buy_actions]
     real_position_actions = _project_trend_real_actions(payload)
+    real_buy_actions = _project_trend_real_buy_actions(payload)
     frozen_signals = payload.get("signal_snapshots")
     frozen_signals = frozen_signals if isinstance(frozen_signals, dict) else {}
     buy_actions = _project_trend_strength_fields(
@@ -2872,7 +3013,10 @@ def _project_broker_trend_report(
         {
             "daily_path": allocation["daily_path"],
             "sha256": allocation["sha256"],
-            "snapshot": {"markets": allocation["markets"]},
+            "snapshot": {
+                "version": allocation.get("version", 1),
+                "markets": allocation["markets"],
+            },
         }
         if isinstance(allocation, dict)
         else None
@@ -2903,6 +3047,10 @@ def _project_broker_trend_report(
     )
     if real_status == "legacy":
         real_reason = "当前报告未包含真实持仓判断"
+    plan_availability = _project_trend_plan_availability(
+        payload,
+        required=v2_report,
+    )
     return {
         "available": True,
         "artifact": path.name,
@@ -2937,8 +3085,14 @@ def _project_broker_trend_report(
             else f"数据截至 {data_date}；今日未更新"
         ),
         "historical_buy_plan_membership": historical_buy_plan_membership,
+        **(
+            {"plan_availability": plan_availability}
+            if plan_availability is not None
+            else {}
+        ),
         "option_attention": payload.get("option_attention", []),
         "real_position_actions": real_position_actions,
+        "real_buy_actions": real_buy_actions,
         "real_position_status": real_status,
         "real_position_reason": real_reason,
         "real_position_source": payload["strategy_judgments"].get(
@@ -2959,16 +3113,26 @@ def _project_broker_trend_report(
         "drawdown_summary": payload.get("drawdown_summary", {}),
         "api_cost": frozen_api_cost,
         "allocation": payload.get("allocation"),
-        "simulate_rotation_pairs": _project_simulated_rotation_pairs(
-            payload["strategy_judgments"].get("simulate_rotation_pairs", []),
-            data_dir=data_dir,
-            market=market,
-            execution_date=execution_date.isoformat(),
-            report_sha256=report_sha256,
-            account_id=metadata.get("simulate_acc_id"),
-        ) if payload.get("allocation") is not None else [],
+        "simulate_rotation_pairs": (
+            copy.deepcopy(
+                payload["strategy_judgments"].get("simulate_rotation_pairs", [])
+            )
+            if payload.get("allocation") is not None and v2_report
+            else _project_simulated_rotation_pairs(
+                payload["strategy_judgments"].get("simulate_rotation_pairs", []),
+                data_dir=data_dir,
+                market=market,
+                execution_date=execution_date.isoformat(),
+                report_sha256=report_sha256,
+                account_id=metadata.get("simulate_acc_id"),
+            )
+            if payload.get("allocation") is not None
+            else []
+        ),
         "real_rotation_pairs": (
-            payload["strategy_judgments"].get("real_rotation_pairs", [])
+            copy.deepcopy(
+                payload["strategy_judgments"].get("real_rotation_pairs", [])
+            )
             if payload.get("allocation") is not None
             else []
         ),

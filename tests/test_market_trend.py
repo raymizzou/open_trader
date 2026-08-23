@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import socket
+from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -11,7 +13,8 @@ from zoneinfo import ZoneInfo
 import pytest
 import open_trader.a_share_trend as trend_module
 
-from open_trader import market_trend, trend_review
+from open_trader import market_trend, trend_market_controller, trend_review
+from open_trader.account_http import AccountHttpError
 from open_trader.a_share_trend import (
     AShareTrendRunResult,
     write_protection_state,
@@ -21,6 +24,7 @@ from open_trader.a_share_trend import favorite_candidate_ids
 from open_trader.market_trend import (
     MARKET_NOTIFICATION_LABELS,
     MARKET_SETTINGS,
+    MARKET_UPDATE_ASSETS,
     MarketHoliday,
     _candidate_pool_components,
     market_paths,
@@ -47,6 +51,7 @@ from open_trader.a_share_trend import (
     UNIFIED_TREND_FIELDS,
 )
 from open_trader.strategy_drawdown import automatic_bootstrap_strategy_drawdown
+from open_trader.trend_allocation import build_allocation_snapshot
 from open_trader.trend_api_stats import (
     build_trend_api_stats_payload,
     write_trend_api_stats,
@@ -189,6 +194,23 @@ def allocation_reference_for_runner() -> dict[str, object]:
                 for market in ("CN", "HK", "US")
             },
         },
+    }
+
+
+def allocation_v2_reference_for_runner() -> dict[str, object]:
+    base = allocation_reference_for_runner()
+    snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-03",
+        generated_at="2026-08-03T16:18:00+08:00",
+        git_sha="a" * 40,
+        roots=base["snapshot"]["roots"],
+        previous=None,
+        version=2,
+    )
+    return {
+        "daily_path": base["daily_path"],
+        "sha256": base["sha256"],
+        "snapshot": snapshot,
     }
 
 
@@ -1086,7 +1108,7 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert recovered.json_path is not None
     assert recovered.json_path.read_text(encoding="utf-8") == frozen_json
     assert len(notifier.messages) == 1
-    assert api_instances == 2  # initial report plus explicit revision; recovery did not refetch
+    assert api_instances == 1  # receipt recovery and planning revision do not refetch
     title, message = notifier.messages[0]
     assert title == "【日报｜辉立｜港股趋势报告｜2026-07-16】"
     assert "账户状态：已更新" in message
@@ -1134,6 +1156,16 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert payload["metadata"]["simulate_acc_id"] == 103
     assert payload["metadata"]["position_weight"] == "0.04"
     assert payload["metadata"]["position_weight_source"] == "fallback_4pct"
+    assert payload["replay_evidence"]["planning_path"]
+    assert payload["replay_evidence"]["planning_sha256"]
+    assert revised.json_path is not None
+    revised_payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
+    assert revised_payload["replay_evidence"]["planning_path"] == (
+        payload["replay_evidence"]["planning_path"]
+    )
+    assert revised_payload["replay_evidence"]["planning_sha256"] == (
+        payload["replay_evidence"]["planning_sha256"]
+    )
     assert any(
         getattr(snapshot, "symbol", None) == "00700"
         for snapshot in holding_context_snapshots
@@ -1172,7 +1204,577 @@ def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     assert evidence["market"] == "HK"
     assert evidence["query"]["component_pool_ids"] == [622494]
     assert evidence["rebuild_inputs"]["lot_sizes"] == {"00700": 100, "02800": 100}
-    assert lot_requests == [["HK.00700", "HK.02800"], ["HK.00700", "HK.02800"]]
+    assert lot_requests == [["HK.00700", "HK.02800"]]
+
+
+@pytest.mark.parametrize("market", ["HK", "US"])
+def test_market_planning_crash_retry_publishes_frozen_components(
+    tmp_path: Path, market: str,
+) -> None:
+    cfg = config(tmp_path)
+    run_date = "2026-07-15"
+    as_of_date = run_date if market == "HK" else "2026-07-14"
+    execution_date = "2026-07-16" if market == "HK" else run_date
+    symbol = "00700" if market == "HK" else "VIXY"
+    wire_symbol = (
+        f"{symbol[1:]}.{market}" if market == "HK" else f"{symbol}.{market}"
+    )
+    asset = "港股" if market == "HK" else "美股"
+    receipt_path = (
+        market_paths(cfg.data_dir, cfg.reports_dir, market).root
+        / "delivery"
+        / f"{as_of_date}.json"
+    )
+    names = iter(("首轮市场事实", "重捕市场事实"))
+    cash_values = iter(("100000", "2"))
+
+    class Api:
+        ignored_stale_components: tuple[object, ...] = ()
+
+        def __init__(self, **_kwargs: object) -> None:
+            self.name = next(names)
+            self.balance_calls = 0
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": item, "asOfDate": as_of_date}
+                for item in MARKET_UPDATE_ASSETS[market]
+            ]
+
+        def get_account_balance(self) -> dict[str, object]:
+            self.balance_calls += 1
+            return {"balance": "100" if self.balance_calls == 1 else "99"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str,
+        ) -> list[dict[str, object]]:
+            return [{"tmId": 1, "tickerSymbol": wire_symbol, "asOfDate": expected_date}]
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            fields = tuple(dict.fromkeys(
+                (
+                    *UNIFIED_TREND_FIELDS,
+                    *A_SHARE_INDUSTRY_FIELDS,
+                    *INDUSTRY_MEMBER_FIELDS,
+                    *INDUSTRY_STATE_FIELDS,
+                )
+            ))
+            return [
+                {
+                    "field": field,
+                    "priceCost": (
+                        "0.071" if field == "tickerName"
+                        else "0.004"
+                        if field in {"TrendRightSideCountRatio", "TrendRightSideMktCapRatio"}
+                        else "0"
+                    ),
+                }
+                for field in fields
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            fields = kwargs["fields"]
+            expected_date = kwargs["expected_date"]
+            tm_ids = kwargs["tm_ids"]
+            if fields == A_SHARE_INDUSTRY_FIELDS:
+                return [
+                    {"tmId": tm_id, "asOfDate": expected_date, "trendTemperatureCurr": "热"}
+                    for tm_id in tm_ids
+                ]
+            if fields == INDUSTRY_MEMBER_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": expected_date,
+                        "tradableFlag": True,
+                        "isTrendRightSide": True,
+                    }
+                    for tm_id in tm_ids
+                ]
+            if fields == INDUSTRY_STATE_FIELDS:
+                return [{
+                    "tmId": tm_id,
+                    "asOfDate": expected_date,
+                    "trendTemperatureCurr": "热",
+                    "trendStrengthLocalCurr": "92",
+                    "TrendRightSideCountRatio": "0.191",
+                    "TrendRightSideMktCapRatio": "0.650",
+                } for tm_id in tm_ids]
+            assert fields == UNIFIED_TREND_FIELDS
+            return [{
+                "tmId": 1,
+                "tickerName": self.name,
+                "tickerSymbol": wire_symbol,
+                "asset": asset,
+                "asOfDate": expected_date,
+                "tradableFlag": True,
+                "industryTmId": 700001,
+                "industryName": "科技",
+                "priceIndex": "10",
+                "marketCap": "200",
+                "amount1d": "3",
+                "isTrendRightSide": True,
+                "trendTemperaturePrev": "温",
+                "trendTemperatureCurr": "热",
+                "daysSinceTrendEntry": 3,
+                "gainSinceTrendEntry": "0.1",
+                "trendPhasePrev": "谷雨",
+                "trendPhaseCurr": "立夏",
+                "trendStrengthLocalCurr": "98",
+                "trendStrengthLocalChange": "1",
+                "trendStrengthGlobalCurr": "98",
+                "trendStrengthLocalPrevWeek": "97",
+                "trendStrengthLocalPrevMonth": "95",
+                "stopwinFlagByDangerSignal": False,
+                "stopwinFlagByBoilingTemperature": False,
+                "stopwinFlagByPopChampagne": False,
+                "tickerLabels": "成交主力",
+            }]
+
+        def remember_symbol_row(self, **_kwargs: object) -> None:
+            pass
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return sorted({as_of_date, run_date, execution_date})
+
+        def get_daily_kline(self, *args: object, **_kwargs: object) -> list[DailyKlineBar]:
+            end = datetime.fromisoformat(as_of_date)
+            return [
+                DailyKlineBar(
+                    date=(end - timedelta(days=14 - index)).date().isoformat(),
+                    open=10, high=10.1, low=9.9, close=10, volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def get_lot_sizes(self, symbols: list[str]) -> dict[str, int]:
+            return {symbol: 100 for symbol in symbols}
+
+        def close(self) -> None:
+            pass
+
+    class ChangingAccount:
+        def __init__(self, cash: str) -> None:
+            self.cash = cash
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 103 if market == "HK" else 102,
+                "net_value": "100000",
+                "cash": self.cash,
+                "positions": [],
+            }
+
+        def close(self) -> None:
+            pass
+
+    def account_factory(**_kwargs: object) -> ChangingAccount:
+        nonlocal collision_created
+        if not collision_created:
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            receipt_path.mkdir()
+            collision_created = True
+        return ChangingAccount(next(cash_values))
+
+    collision_created = False
+    first = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        notifier=NullNotifier(),
+        api_factory=Api,
+        quote_factory=Quote,
+        account_factory=account_factory,
+        now_fn=lambda: datetime(2026, 7, 15, 19, tzinfo=SHANGHAI),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert first.status == "failed", first.waiting_reason
+    planning_path = (
+        cfg.data_dir
+        / "trend_review/planning"
+        / market
+        / f"{execution_date}.json"
+    )
+    assert planning_path.exists()
+    assert receipt_path.is_dir()
+    receipt_path.rmdir()
+    result = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        notifier=NullNotifier(),
+        api_factory=Api,
+        quote_factory=Quote,
+        account_factory=account_factory,
+        now_fn=lambda: datetime(2026, 7, 15, 16, tzinfo=SHANGHAI),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result.status == "generated", result.waiting_reason
+    assert result.json_path is not None
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    evidence_path = cfg.data_dir / payload["replay_evidence"]["path"]
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    published_candidate = next(
+        item for item in payload["signal_snapshots"]["candidates"]
+        if item["symbol"] == symbol
+    )
+    frozen_candidate = next(
+        item for item in evidence["rebuild_inputs"]["candidates"]
+        if item["symbol"] == symbol
+    )
+    assert (
+        published_candidate["name"],
+        payload["account"]["available_cash"],
+        evidence["rebuild_inputs"]["account"]["available_cash"],
+    ) == ("首轮市场事实", "100000", "100000")
+    assert frozen_candidate["name"] == published_candidate["name"]
+    assert payload["replay_evidence"]["planning_path"]
+    assert payload["replay_evidence"]["planning_sha256"]
+
+
+def _write_market_v2_allocation(cfg: DailyPremarketConfig) -> dict[str, object]:
+    base = allocation_v2_reference_for_runner()
+    snapshot = base["snapshot"]
+    path = cfg.data_dir / "trend_allocation/daily/2026-08-03.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps(snapshot, ensure_ascii=False, sort_keys=True) + "\n"
+    path.write_text(body, encoding="utf-8")
+    return {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": hashlib.sha256(body.encode()).hexdigest(),
+        "snapshot": snapshot,
+    }
+
+
+def _run_market_crash_retry(
+    tmp_path: Path,
+    market: str,
+    account_values: tuple[str | None, str],
+    *,
+    eligible_owner: bool = True,
+) -> tuple[DailyPremarketConfig, dict[str, object]]:
+    cfg = config(tmp_path)
+    allocation = _write_market_v2_allocation(cfg)
+    run_date = "2026-07-15"
+    as_of_date = run_date if market == "HK" else "2026-07-14"
+    execution_date = "2026-07-16" if market == "HK" else run_date
+    symbol = "00700" if market == "HK" else "VIXY"
+    wire_symbol = (
+        f"{symbol[1:]}.{market}" if market == "HK" else f"{symbol}.{market}"
+    )
+    asset = "港股" if market == "HK" else "美股"
+    receipt_path = (
+        market_paths(cfg.data_dir, cfg.reports_dir, market).root
+        / "delivery"
+        / f"{as_of_date}.json"
+    )
+    account_states = iter(account_values)
+
+    class Api:
+        ignored_stale_components: tuple[object, ...] = ()
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": item, "asOfDate": as_of_date}
+                for item in MARKET_UPDATE_ASSETS[market]
+            ]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str,
+        ) -> list[dict[str, object]]:
+            return [{"tmId": 1, "tickerSymbol": wire_symbol, "asOfDate": expected_date}]
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            fields = tuple(dict.fromkeys(
+                (
+                    *UNIFIED_TREND_FIELDS,
+                    *A_SHARE_INDUSTRY_FIELDS,
+                    *INDUSTRY_MEMBER_FIELDS,
+                    *INDUSTRY_STATE_FIELDS,
+                )
+            ))
+            return [
+                {
+                    "field": field,
+                    "priceCost": (
+                        "0.071" if field == "tickerName"
+                        else "0.004"
+                        if field in {"TrendRightSideCountRatio", "TrendRightSideMktCapRatio"}
+                        else "0"
+                    ),
+                }
+                for field in fields
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            fields = kwargs["fields"]
+            expected_date = str(kwargs["expected_date"])
+            tm_ids = kwargs["tm_ids"]
+            if fields == A_SHARE_INDUSTRY_FIELDS:
+                return [
+                    {"tmId": tm_id, "asOfDate": expected_date, "trendTemperatureCurr": "热"}
+                    for tm_id in tm_ids  # type: ignore[union-attr]
+                ]
+            if fields == INDUSTRY_MEMBER_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": expected_date,
+                        "tradableFlag": True,
+                        "isTrendRightSide": True,
+                    }
+                    for tm_id in tm_ids  # type: ignore[union-attr]
+                ]
+            if fields == INDUSTRY_STATE_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": expected_date,
+                        "trendTemperatureCurr": "热",
+                        "trendStrengthLocalCurr": "92",
+                        "TrendRightSideCountRatio": "0.191",
+                        "TrendRightSideMktCapRatio": "0.650",
+                    }
+                    for tm_id in tm_ids  # type: ignore[union-attr]
+                ]
+            return [{
+                "tmId": tm_id,
+                "tickerName": symbol,
+                "tickerSymbol": wire_symbol,
+                "asset": asset,
+                "asOfDate": expected_date,
+                "tradableFlag": eligible_owner,
+                "industryTmId": 700001,
+                "industryName": "科技",
+                "priceIndex": "10",
+                "marketCap": "200",
+                "amount1d": "3",
+                "isTrendRightSide": eligible_owner,
+                "trendTemperaturePrev": "温",
+                "trendTemperatureCurr": "热",
+                "daysSinceTrendEntry": 3,
+                "gainSinceEntry": "0.1",
+                "trendPhasePrev": "谷雨",
+                "trendPhaseCurr": "立夏",
+                "trendStrengthLocalCurr": "98",
+                "trendStrengthLocalChange": "1",
+                "trendStrengthGlobalCurr": "98",
+                "trendStrengthLocalPrevWeek": "97",
+                "trendStrengthLocalPrevMonth": "95",
+                "stopwinFlagByDangerSignal": False,
+                "stopwinFlagByBoilingTemperature": False,
+                "stopwinFlagByPopChampagne": False,
+                "tickerLabels": "成交主力",
+            } for tm_id in tm_ids]  # type: ignore[union-attr]
+
+        def remember_symbol_row(self, **_kwargs: object) -> None:
+            pass
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return sorted({as_of_date, run_date, execution_date})
+
+        def get_daily_kline(self, *args: object, **_kwargs: object) -> list[DailyKlineBar]:
+            end = datetime.fromisoformat(as_of_date)
+            return [
+                DailyKlineBar(
+                    date=(end - timedelta(days=14 - index)).date().isoformat(),
+                    open=10, high=10.1, low=9.9, close=10, volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def get_lot_sizes(self, symbols: list[str]) -> dict[str, int]:
+            return {item: 100 for item in symbols}
+
+        def close(self) -> None:
+            pass
+
+    class RetryAccount:
+        def account_snapshot(self) -> dict[str, object]:
+            value = next(account_states)
+            if value is None:
+                raise RuntimeError("simulation account offline")
+            return {
+                "acc_id": 103 if market == "HK" else 102,
+                "net_value": value,
+                "cash": value,
+                "positions": [],
+            }
+
+        def close(self) -> None:
+            pass
+
+    collision_created = False
+
+    def account_factory(**_kwargs: object) -> RetryAccount:
+        nonlocal collision_created
+        if not collision_created:
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            receipt_path.mkdir()
+            collision_created = True
+        return RetryAccount()
+
+    first = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        allocation_reference=allocation,
+        notifier=NullNotifier(),
+        api_factory=Api,
+        quote_factory=Quote,
+        account_factory=account_factory,
+        now_fn=lambda: datetime(2026, 7, 15, 19, tzinfo=SHANGHAI),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert first.status == "failed", first.waiting_reason
+    planning_path = (
+        cfg.data_dir
+        / "trend_review/planning"
+        / market
+        / f"{execution_date}.json"
+    )
+    assert planning_path.exists()
+    assert receipt_path.is_dir()
+    receipt_path.rmdir()
+    result = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        allocation_reference=allocation,
+        notifier=NullNotifier(),
+        api_factory=Api,
+        quote_factory=Quote,
+        account_factory=account_factory,
+        now_fn=lambda: datetime(2026, 7, 15, 16, tzinfo=SHANGHAI),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert result.status == "generated", result.waiting_reason
+    assert result.json_path is not None
+    return cfg, json.loads(result.json_path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("market", ["HK", "US"])
+def test_market_planning_crash_retry_recovers_simulated_plan_for_controller(
+    tmp_path: Path,
+    market: str,
+) -> None:
+    unlock_live_drawdown(tmp_path / "data", market, version="v13")
+    cfg, payload = _run_market_crash_retry(
+        tmp_path, market, (None, "100000"), eligible_owner=False
+    )
+    judgments = payload["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    evidence_path = cfg.data_dir / str(payload["replay_evidence"]["path"])
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    inputs = evidence["rebuild_inputs"]
+    assert (
+        inputs["simulate_rotation_pairs"],
+        inputs["simulate_rotation_comparisons"],
+        inputs["simulated_buy_fifo"],
+        inputs["planned_new_seats"],
+    ) == ([], [], [], 0)
+    cfg = replace(cfg, trend_executor_host=socket.gethostname())
+
+    class NeverOrderClient:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {"positions": []}
+
+        def place_order(self, *args: object, **kwargs: object) -> None:
+            self.requests.append((args, kwargs))
+            raise AssertionError("recovered empty plan submitted an order")
+
+    never_order = NeverOrderClient()
+
+    execution_day = str(payload["execution_date"])
+    controller_now = datetime.fromisoformat(
+        f"{execution_day}T09:31:00+08:00"
+        if market == "HK"
+        else f"{execution_day}T21:31:00+08:00"
+    )
+    controller_result = trend_market_controller.execute_simulated_trend_report(
+        cfg,
+        market,
+        str(payload["execution_date"]),
+        trend_review._report_hash(payload),
+        actor="pytest",
+        reason="recovered simulated plan",
+        now=controller_now,
+        order_client=never_order,
+        allow_new_buys=False,
+    )
+    assert payload["plan_availability"]["simulated_account"] == {
+        "status": "available", "reason": "", "executable": True,
+    }
+    strategy = payload["strategy_snapshot"]
+    state = json.loads(
+        (cfg.data_dir / "trend_drawdown/state.json").read_text(encoding="utf-8")
+    )
+    matching_records = [
+        record
+        for record in state["records"]
+        if record["market"] == market
+        and record["strategy_id"] == strategy["strategy_id"]
+        and record["strategy_version"] == strategy["strategy_version"]
+    ]
+    assert (
+        payload["drawdown_summary"]["market"],
+        payload["drawdown_summary"]["strategy_id"],
+        payload["drawdown_summary"]["strategy_version"],
+        [
+            (record["current_equity"], record["high_water_mark"])
+            for record in matching_records
+        ],
+    ) == (
+        market,
+        strategy["strategy_id"],
+        strategy["strategy_version"],
+        [("100000", "100000")],
+    )
+    assert market_trend.valid_frozen_report_contract(payload) is True
+    assert controller_result["status"] in {"unchanged", "missed_window"}
+    assert controller_result["submitted_count"] == 0
+    assert never_order.requests == []
+
+
+@pytest.mark.parametrize("market", ["HK", "US"])
+def test_market_planning_crash_retry_keeps_frozen_drawdown_state(
+    tmp_path: Path,
+    market: str,
+) -> None:
+    cfg = config(tmp_path)
+    unlock_live_drawdown(cfg.data_dir, market, version="v13")
+    # The helper performs both attempts in one runner invocation; the second
+    # value is deliberately discarded by the frozen planning snapshot.
+    _, payload = _run_market_crash_retry(
+        tmp_path, market, ("100000", "90000")
+    )
+    state = json.loads(
+        (cfg.data_dir / "trend_drawdown/state.json").read_text(encoding="utf-8")
+    )
+    assert (
+        payload["account"]["net_value"],
+        payload["drawdown_summary"]["current_equity"],
+        state["records"][-1]["current_equity"],
+        state["records"][-1]["high_water_mark"],
+    ) == ("100000", "100000", "100000", "100000")
 
 
 @pytest.mark.parametrize(
@@ -1825,6 +2427,33 @@ def test_account_snapshot_does_not_change_us_simulation_report(
         )
     )
     assert "200000" not in output
+
+    frozen_evidence = evidence_path.read_bytes()
+
+    def forbidden(**_kwargs: object) -> object:
+        raise AssertionError("target-day revision must reuse frozen components")
+
+    revised = run_market_trend_report(
+        config=cfg,
+        market="US",
+        run_date="2026-07-15",
+        revision=True,
+        notifier=NullNotifier(),
+        api_factory=forbidden,
+        quote_factory=forbidden,
+    )
+
+    assert revised.status == "generated"
+    assert revised.json_path is not None
+    assert revised.json_path.name == "2026-07-14-r1.json"
+    assert evidence_path.read_bytes() == frozen_evidence
+    revised_payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
+    assert revised_payload["replay_evidence"]["planning_path"] == (
+        payload["replay_evidence"]["planning_path"]
+    )
+    assert revised_payload["replay_evidence"]["planning_sha256"] == (
+        payload["replay_evidence"]["planning_sha256"]
+    )
 
 
 def test_market_report_rejects_catalog_cost_drift_before_paid_snapshots(
@@ -2664,3 +3293,1190 @@ def test_allocation_market_runner_ledger_excludes_real_only_candidates(
     assert Decimal(payload["estimated_api_cost"]) == expected_cost
     if market == "US":
         assert Decimal(payload["estimated_api_cost"]) <= Decimal("2.852")
+
+
+@pytest.mark.parametrize(
+    ("market", "run_date", "as_of_date", "execution_date", "symbol", "wire_symbol", "asset"),
+    [
+        ("HK", "2026-07-15", "2026-07-15", "2026-07-16", "02800", "2800.HK", "港股"),
+        ("US", "2026-07-15", "2026-07-14", "2026-07-15", "QQQ", "QQQ.US", "美股"),
+    ],
+)
+def test_market_planning_revision_fills_unavailable_account_components(
+    tmp_path: Path,
+    market: str,
+    run_date: str,
+    as_of_date: str,
+    execution_date: str,
+    symbol: str,
+    wire_symbol: str,
+    asset: str,
+) -> None:
+    cfg = config(tmp_path)
+    paths = market_paths(cfg.data_dir, cfg.reports_dir, market)
+    unlock_live_drawdown(cfg.data_dir, market)
+    calls: list[str] = []
+    account_calls = 0
+
+    class SimulationAccount:
+        def __init__(self, **kwargs: object) -> None:
+            nonlocal account_calls
+            account_calls += 1
+            self.acc_id = int(kwargs["simulate_acc_id"])
+
+        def account_snapshot(self) -> object:
+            if account_calls == 1:
+                raise RuntimeError("simulation account offline")
+            return {
+                "acc_id": self.acc_id,
+                "net_value": "100000",
+                "cash": "100000",
+                "positions": [],
+            }
+
+        def close(self) -> None:
+            pass
+
+    def snapshot() -> dict[str, object]:
+        return {
+            "tmId": 1,
+            "tickerName": "测试标的",
+            "tickerSymbol": wire_symbol,
+            "asset": asset,
+            "asOfDate": as_of_date,
+            "tradableFlag": True,
+            "industryName": "科技",
+            "industryTmId": 700001,
+            "amount1d": "2",
+            "isTrendRightSide": True,
+            "trendTemperaturePrev": "温",
+            "trendTemperatureCurr": "热",
+            "daysSinceTrendEntry": 3,
+            "trendPhasePrev": "谷雨",
+            "trendPhaseCurr": "立夏",
+            "trendStrengthLocalCurr": "96",
+            "trendStrengthLocalChange": "↑↑",
+            "trendStrengthGlobalCurr": "91.8",
+            "trendStrengthLocalPrevWeek": "86.0",
+            "trendStrengthLocalPrevMonth": "77.4",
+            "stopwinFlagByDangerSignal": False,
+            "stopwinFlagByBoilingTemperature": False,
+            "stopwinFlagByPopChampagne": False,
+        }
+
+    class Api:
+        ignored_stale_components: tuple[object, ...] = ()
+
+        def __init__(self, **_kwargs: object) -> None:
+            calls.append("api.init")
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            calls.append("api.update")
+            return [
+                {"asset": item, "asOfDate": as_of_date}
+                for item in MARKET_UPDATE_ASSETS[market]
+            ]
+
+        def get_account_balance(self) -> dict[str, object]:
+            calls.append("api.balance")
+            return {"balance": "100"}
+
+        def get_favorites_tickers(self) -> list[dict[str, object]]:
+            return []
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            if tm_id == 700001:
+                return [
+                    {
+                        "tmId": member_id,
+                        "tickerSymbol": wire_symbol,
+                        "asOfDate": expected_date,
+                    }
+                    for member_id in range(1, 11)
+                ]
+            return [{"tmId": 1, "tickerSymbol": wire_symbol, "asOfDate": expected_date}]
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            fields = tuple(
+                dict.fromkeys(
+                    (
+                        *UNIFIED_TREND_FIELDS,
+                        *A_SHARE_INDUSTRY_FIELDS,
+                        *INDUSTRY_MEMBER_FIELDS,
+                        *INDUSTRY_STATE_FIELDS,
+                    )
+                )
+            )
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in fields
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            fields = tuple(kwargs["fields"])
+            if fields == A_SHARE_INDUSTRY_FIELDS:
+                return [{
+                    "tmId": 700001,
+                    "asOfDate": as_of_date,
+                    "trendTemperatureCurr": "热",
+                }]
+            if fields == INDUSTRY_MEMBER_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": as_of_date,
+                        "tradableFlag": True,
+                        "isTrendRightSide": True,
+                    }
+                    for tm_id in kwargs["tm_ids"]
+                ]
+            if fields == INDUSTRY_STATE_FIELDS:
+                return [{
+                    "tmId": 700001,
+                    "asOfDate": as_of_date,
+                    "trendTemperatureCurr": "热",
+                    "trendStrengthLocalCurr": "92",
+                    "TrendRightSideCountRatio": "0.191",
+                    "TrendRightSideMktCapRatio": "0.650",
+                }]
+            assert fields == UNIFIED_TREND_FIELDS
+            return [snapshot()]
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            calls.append("quote.init")
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            calls.append("quote.calendar")
+            return [as_of_date, execution_date]
+
+        def get_daily_kline(
+            self, *_args: object, **_kwargs: object
+        ) -> list[DailyKlineBar]:
+            calls.append("quote.kline")
+            end = datetime.fromisoformat(as_of_date)
+            return [
+                DailyKlineBar(
+                    date=(end - timedelta(days=14 - index)).date().isoformat(),
+                    open=10,
+                    high=10.1,
+                    low=9.9,
+                    close=10,
+                    volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def get_lot_sizes(self, symbols: list[str]) -> dict[str, int]:
+            return {item: 100 for item in symbols}
+
+        def close(self) -> None:
+            pass
+
+    first = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        notifier=NullNotifier(),
+        api_factory=Api,
+        quote_factory=Quote,
+        account_factory=SimulationAccount,
+        now_fn=lambda: datetime(2026, 7, 15, 19, tzinfo=SHANGHAI),
+    )
+
+    assert first.status == "generated", first.waiting_reason
+    assert first.json_path is not None
+    first_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
+    assert first_payload["plan_availability"]["simulated_account"] == {
+        "status": "unavailable",
+        "reason": "模拟盘账户事实不可用：simulation account offline",
+        "executable": False,
+    }
+    planning_path = cfg.data_dir / first_payload["replay_evidence"]["planning_path"]
+    before = json.loads(planning_path.read_text(encoding="utf-8"))
+    before_components = before["components"]
+    before_evidence = (cfg.data_dir / first_payload["replay_evidence"]["path"]).read_bytes()
+    paths.state.unlink(missing_ok=True)
+    calls_before_revision = list(calls)
+
+    def forbidden(**_kwargs: object) -> object:
+        raise AssertionError("target-day revision must reuse frozen components")
+
+    revised = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        revision=True,
+        notifier=NullNotifier(),
+        api_factory=forbidden,
+        quote_factory=forbidden,
+        account_factory=SimulationAccount,
+    )
+
+    assert revised.status == "generated"
+    assert revised.json_path is not None
+    revised_payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
+    assert revised_payload["plan_availability"]["simulated_account"] == {
+        "status": "available",
+        "reason": "",
+        "executable": True,
+    }
+    receipt = json.loads(
+        (paths.root / "delivery" / f"{revised.json_path.stem}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    expected_state = {
+        "schema_version": 1,
+        "positions": {},
+        "managed_symbols": (
+            ["00700", "02800"] if market == "HK" else ["QQQ", "VIXY"]
+        ),
+    }
+    assert (
+        receipt["protection_state"],
+        revised_payload["protection_state"],
+        paths.state.exists(),
+        trend_module.load_protection_state(paths.state),
+    ) == (expected_state, expected_state, True, expected_state)
+    after = json.loads(planning_path.read_text(encoding="utf-8"))
+    assert after["components"]["market"] == before_components["market"]
+    assert after["components"]["simulated_account"]["status"] == "complete"
+    assert after["components"]["real_account"]["status"] == "complete"
+    assert (cfg.data_dir / first_payload["replay_evidence"]["path"]).read_bytes() == before_evidence
+    assert revised_payload["replay_evidence"]["planning_path"] == (
+        first_payload["replay_evidence"]["planning_path"]
+    )
+    assert revised_payload["replay_evidence"]["planning_sha256"]
+    assert calls == calls_before_revision
+    assert first.report_path is not None and "模拟盘计划不可用" in (
+        first.report_path.read_text(encoding="utf-8")
+    )
+    assert revised.report_path is not None and "模拟盘计划不可用" not in (
+        revised.report_path.read_text(encoding="utf-8")
+    )
+
+
+@pytest.mark.parametrize(
+    ("market", "run_date", "as_of_date", "execution_date"),
+    [
+        ("HK", "2026-07-15", "2026-07-15", "2026-07-16"),
+        ("US", "2026-07-15", "2026-07-14", "2026-07-15"),
+    ],
+)
+def test_market_revision_rejects_changed_planning_manifest(
+    tmp_path: Path,
+    market: str,
+    run_date: str,
+    as_of_date: str,
+    execution_date: str,
+) -> None:
+    cfg = config(tmp_path)
+
+    class Api:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": asset, "asOfDate": as_of_date}
+                for asset in MARKET_UPDATE_ASSETS[market]
+            ]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            return []
+
+        def get_favorites_tickers(self) -> list[dict[str, object]]:
+            return []
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            fields = tuple(
+                dict.fromkeys(
+                    (
+                        *UNIFIED_TREND_FIELDS,
+                        *A_SHARE_INDUSTRY_FIELDS,
+                        *INDUSTRY_MEMBER_FIELDS,
+                        *INDUSTRY_STATE_FIELDS,
+                    )
+                )
+            )
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in fields
+            ]
+
+        def get_snapshots(self, **_kwargs: object) -> list[dict[str, object]]:
+            return []
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return [as_of_date, execution_date]
+
+        def close(self) -> None:
+            pass
+
+    first = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        notifier=NullNotifier(),
+        api_factory=Api,
+        quote_factory=Quote,
+    )
+    assert first.status == "generated"
+    assert first.json_path is not None
+    first_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
+    planning_path = cfg.data_dir / first_payload["replay_evidence"]["planning_path"]
+    manifest = json.loads(planning_path.read_text(encoding="utf-8"))
+    manifest["as_of_date"] = "2026-07-15"
+    planning_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="planning snapshot hash mismatch"):
+        run_market_trend_report(
+            config=cfg,
+            market=market,
+            run_date=run_date,
+            revision=True,
+            notifier=NullNotifier(),
+            api_factory=lambda **_kwargs: pytest.fail(
+                "revision must reject the changed planning manifest before recapture"
+            ),
+            quote_factory=lambda **_kwargs: pytest.fail(
+                "revision must reject the changed planning manifest before recapture"
+            ),
+        )
+
+
+def _write_foreign_market_planning_manifest(
+    cfg: DailyPremarketConfig,
+    planning_path: Path,
+    foreign_market: str,
+) -> tuple[Path, str]:
+    original = json.loads(planning_path.read_text(encoding="utf-8"))
+    components: dict[str, dict[str, str]] = {}
+    for name, reference in original["components"].items():
+        component = {
+            "schema_version": original["schema_version"],
+            "market": foreign_market,
+            "target_date": original["target_date"],
+            "component": name,
+            "status": reference["status"],
+            "value": {},
+        }
+        body = json.dumps(component, ensure_ascii=False, sort_keys=True).encode()
+        component_path = (
+            cfg.data_dir
+            / "trend_review/planning_components"
+            / foreign_market
+            / str(original["target_date"])
+            / f"{name}-foreign.json"
+        )
+        component_path.parent.mkdir(parents=True, exist_ok=True)
+        component_path.write_bytes(body)
+        components[name] = {
+            "path": str(component_path.relative_to(cfg.data_dir)),
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "status": reference["status"],
+        }
+    foreign = {**original, "market": foreign_market, "components": components}
+    body = json.dumps(foreign, ensure_ascii=False, sort_keys=True).encode()
+    foreign_path = (
+        cfg.data_dir
+        / "trend_review/planning"
+        / foreign_market
+        / f"{original['target_date']}.json"
+    )
+    foreign_path.parent.mkdir(parents=True, exist_ok=True)
+    foreign_path.write_bytes(body)
+    return foreign_path, hashlib.sha256(body).hexdigest()
+
+
+def _market_identity_fixture(
+    tmp_path: Path,
+    market: str,
+    *,
+    allocation_reference: dict[str, object] | None = None,
+) -> tuple[DailyPremarketConfig, Path, Path, str, str]:
+    cfg = config(tmp_path)
+    if allocation_reference is not None:
+        allocation_path = cfg.data_dir / Path(
+            str(allocation_reference["daily_path"])
+        ).relative_to("data")
+        allocation_path.parent.mkdir(parents=True, exist_ok=True)
+        allocation_path.write_text(
+            json.dumps(
+                allocation_reference["snapshot"],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        allocation_reference = {
+            **allocation_reference,
+            "sha256": hashlib.sha256(allocation_path.read_bytes()).hexdigest(),
+        }
+    run_date = "2026-07-15"
+    as_of_date, execution_date = (
+        ("2026-07-15", "2026-07-16")
+        if market == "HK"
+        else ("2026-07-14", "2026-07-15")
+    )
+
+    class Api:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": asset, "asOfDate": as_of_date}
+                for asset in MARKET_UPDATE_ASSETS[market]
+            ]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            return []
+
+        def get_favorites_tickers(self) -> list[dict[str, object]]:
+            return []
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            fields = tuple(
+                dict.fromkeys(
+                    (
+                        *UNIFIED_TREND_FIELDS,
+                        *A_SHARE_INDUSTRY_FIELDS,
+                        *INDUSTRY_MEMBER_FIELDS,
+                        *INDUSTRY_STATE_FIELDS,
+                    )
+                )
+            )
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in fields
+            ]
+
+        def get_snapshots(self, **_kwargs: object) -> list[dict[str, object]]:
+            return []
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return [as_of_date, execution_date]
+
+        def close(self) -> None:
+            pass
+
+    first = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        notifier=NullNotifier(),
+        api_factory=Api,
+        quote_factory=Quote,
+        allocation_reference=allocation_reference,
+    )
+    assert first.status == "generated", first.waiting_reason
+    paths = market_paths(cfg.data_dir, cfg.reports_dir, market)
+    return cfg, paths, paths.reports / f"{as_of_date}.json", run_date, as_of_date
+
+
+@pytest.mark.parametrize(
+    ("market", "invalid_identity"),
+    [
+        ("HK", "missing_replay"),
+        ("HK", "foreign_manifest"),
+        ("HK", "path_shaped_as_of"),
+        ("US", "missing_replay"),
+        ("US", "foreign_manifest"),
+        ("US", "path_shaped_as_of"),
+    ],
+)
+def test_market_planning_revision_rejects_invalid_revision_chain_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    market: str,
+    invalid_identity: str,
+) -> None:
+    cfg, paths, report_path, run_date, _as_of_date = _market_identity_fixture(
+        tmp_path,
+        market,
+        allocation_reference=allocation_v2_reference_for_runner(),
+    )
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    if invalid_identity == "missing_replay":
+        payload["replay_evidence"] = {
+            "planning_sha256": payload["replay_evidence"]["planning_sha256"]
+        }
+    elif invalid_identity == "foreign_manifest":
+        planning_path = cfg.data_dir / payload["replay_evidence"]["planning_path"]
+        foreign_path, foreign_sha256 = _write_foreign_market_planning_manifest(
+            cfg, planning_path, "US" if market == "HK" else "HK"
+        )
+        payload["replay_evidence"].update(
+            {
+                "planning_path": str(foreign_path.relative_to(cfg.data_dir)),
+                "planning_sha256": foreign_sha256,
+            }
+        )
+    else:
+        payload["as_of_date"] = "../escape"
+    report_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+    )
+    files_before = {path for path in tmp_path.rglob("*") if path.is_file()}
+    monkeypatch.setattr(
+        market_trend,
+        "fetch_account_snapshot",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("invalid planning chain must not fetch account")
+        ),
+    )
+
+    def forbidden(**_kwargs: object) -> object:
+        raise AssertionError("invalid planning chain must fail before recapture")
+
+    with pytest.raises(ValueError, match="planning|as_of|identity"):
+        run_market_trend_report(
+            config=cfg,
+            market=market,
+            run_date=run_date,
+            revision=True,
+            notifier=NullNotifier(),
+            api_factory=forbidden,
+            quote_factory=forbidden,
+            attempt_fn=forbidden,
+        )
+    files_after = {path for path in tmp_path.rglob("*") if path.is_file()}
+    assert all(path in files_before or paths.reports in path.parents for path in files_after)
+
+
+@pytest.mark.parametrize("market", ["HK", "US"])
+def test_market_planning_revision_ignores_auxiliary_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    market: str,
+) -> None:
+    cfg, paths, report_path, run_date, as_of_date = _market_identity_fixture(
+        tmp_path, market
+    )
+    base_payload = json.loads(report_path.read_text(encoding="utf-8"))
+    exact_revision = paths.reports / f"{as_of_date}-r1.json"
+    exact_revision.write_text(
+        json.dumps(base_payload, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+    )
+    auxiliary_payload = dict(base_payload)
+    auxiliary_payload.pop("as_of_date", None)
+    (paths.reports / "malformed-r999.json").write_text(
+        json.dumps(auxiliary_payload, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        market_trend,
+        "fetch_account_snapshot",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("auxiliary JSON must not trigger account recapture")
+        ),
+    )
+
+    def forbidden(**_kwargs: object) -> object:
+        raise AssertionError("auxiliary JSON must not trigger report recapture")
+
+    revised = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        revision=True,
+        notifier=NullNotifier(),
+        api_factory=forbidden,
+        quote_factory=forbidden,
+        attempt_fn=forbidden,
+    )
+    assert revised.status == "generated"
+    assert revised.json_path is not None
+    assert revised.json_path.name == f"{as_of_date}-r2.json"
+    files_after = {path for path in tmp_path.rglob("*") if path.is_file()}
+    assert not any(
+        path.name.startswith("escape") and paths.reports not in path.parents
+        for path in files_after
+    )
+
+
+@pytest.mark.parametrize("market", ["HK", "US"])
+def test_market_legacy_allocation_v1_revision_uses_legacy_fallback(
+    tmp_path: Path,
+    market: str,
+) -> None:
+    cfg, _paths, report_path, run_date, _as_of_date = _market_identity_fixture(
+        tmp_path,
+        market,
+        allocation_reference=allocation_reference_for_runner(),
+    )
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["allocation"].get("version", 1) == 1
+    replay = payload["replay_evidence"]
+    payload["replay_evidence"] = {
+        "path": replay["path"],
+        "sha256": replay["sha256"],
+    }
+    report_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+    )
+    attempts: list[str] = []
+
+    def legacy_attempt(**_kwargs: object) -> AShareTrendRunResult:
+        attempts.append("legacy_attempt")
+        return AShareTrendRunResult("generated", None, None)
+
+    revised = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        revision=True,
+        notifier=NullNotifier(),
+        attempt_fn=legacy_attempt,
+    )
+
+    assert revised.status == "generated"
+    assert attempts == ["legacy_attempt"]
+
+
+def test_market_planning_revision_rejects_us_weekend_chain_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg, paths, report_path, _run_date, _as_of_date = _market_identity_fixture(
+        tmp_path, "US"
+    )
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload["metadata"]["run_date"] = "2026-07-13"
+    payload["as_of_date"] = "../escape"
+    replay = dict(payload["replay_evidence"])
+    replay["planning_path"] = "../escape"
+    payload["replay_evidence"] = replay
+    friday_path = paths.reports / "2026-07-10.json"
+    report_path.rename(friday_path)
+    friday_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+    )
+    account_calls: list[str] = []
+    monkeypatch.setattr(
+        market_trend,
+        "fetch_account_snapshot",
+        lambda: account_calls.append("account") or copy.deepcopy(ACCOUNT_SNAPSHOT),
+    )
+    attempts: list[str] = []
+
+    def forbidden_attempt(**_kwargs: object) -> AShareTrendRunResult:
+        attempts.append("attempt")
+        return AShareTrendRunResult("generated", None, None)
+
+    with pytest.raises(ValueError, match="planning"):
+        run_market_trend_report(
+            config=cfg,
+            market="US",
+            run_date="2026-07-13",
+            revision=True,
+            notifier=NullNotifier(),
+            attempt_fn=forbidden_attempt,
+        )
+
+    assert account_calls == []
+    assert attempts == []
+
+
+@pytest.mark.parametrize(
+    ("market", "run_date", "as_of_date", "execution_date"),
+    [
+        ("HK", "2026-07-15", "2026-07-15", "2026-07-16"),
+        ("US", "2026-07-15", "2026-07-14", "2026-07-15"),
+    ],
+)
+def test_account_transport_failure_leaves_market_real_component_for_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    market: str,
+    run_date: str,
+    as_of_date: str,
+    execution_date: str,
+) -> None:
+    fetches = 0
+    broker = "phillips" if market == "HK" else "futu"
+    currency = "HKD" if market == "HK" else "USD"
+    symbol = "02800" if market == "HK" else "QQQ"
+    real_snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)
+    real_snapshot["positions"] = [{
+        "instrument_id": f"{broker}:{market}:{symbol}",
+        "broker": broker,
+        "market": market,
+        "asset_class": "etf",
+        "symbol": symbol,
+        "name": symbol,
+        "currency": currency,
+        "quantity": "10",
+        "cost_price": "10",
+        "market_value": "100",
+    }]
+    real_snapshot["cash_balances"] = [{
+        "broker": broker,
+        "account_alias": f"{broker}_main",
+        "currency": currency,
+        "cash_balance": "100",
+        "available_balance": "100",
+    }]
+
+    def fetch() -> dict[str, object]:
+        nonlocal fetches
+        fetches += 1
+        if fetches == 1:
+            return copy.deepcopy(real_snapshot)
+        raise AssertionError("revision must reuse frozen account snapshot")
+
+    monkeypatch.setattr(market_trend, "fetch_account_snapshot", fetch)
+    enrich_calls = 0
+
+    def enrich(real_input: object, **_kwargs: object) -> tuple[object, dict[int, object], dict[str, object], int]:
+        nonlocal enrich_calls
+        enrich_calls += 1
+        if enrich_calls == 1:
+            return replace(
+                real_input,  # type: ignore[arg-type]
+                status="unavailable",
+                reason="real enrichment unavailable",
+                holding_snapshots={},
+                bars_by_symbol={},
+            ), {}, {}, 0
+        return replace(
+            real_input,  # type: ignore[arg-type]
+            status="available",
+            reason="",
+        ), {}, {}, 0
+
+    monkeypatch.setattr(market_trend, "enrich_real_holding_input", enrich)
+
+    class Api:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": asset, "asOfDate": as_of_date}
+                for asset in MARKET_UPDATE_ASSETS[market]
+            ]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, **_kwargs: object
+        ) -> list[dict[str, object]]:
+            return []
+
+        def get_favorites_tickers(self) -> list[dict[str, object]]:
+            return []
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in UNIFIED_TREND_FIELDS
+            ]
+
+        def get_snapshots(self, **_kwargs: object) -> list[dict[str, object]]:
+            return []
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return [as_of_date, execution_date]
+
+        def get_lot_sizes(self, _symbols: list[str]) -> dict[str, int]:
+            return {}
+
+        def close(self) -> None:
+            pass
+
+    cfg = config(tmp_path)
+    paths = market_paths(cfg.data_dir, cfg.reports_dir, market)
+    first = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        notifier=NullNotifier(),
+        api_factory=Api,
+        quote_factory=Quote,
+    )
+    assert first.json_path is not None
+    first_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
+    assert first_payload["account_input"] == {
+        key: real_snapshot[key]
+        for key in ("snapshot_generation", "account_generation", "status")
+    }
+    assert first_payload["plan_availability"]["real_account"]["status"] == "unavailable"
+    planning_path = cfg.data_dir / first_payload["replay_evidence"]["planning_path"]
+    before = json.loads(planning_path.read_text(encoding="utf-8"))
+    evidence = json.loads(
+        (cfg.data_dir / first_payload["replay_evidence"]["path"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert evidence["rebuild_inputs"]["account_snapshot"] == real_snapshot
+    paths.real_state.unlink(missing_ok=True)
+
+    class RevisionApi:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class RevisionQuote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    revised = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        revision=True,
+        notifier=NullNotifier(),
+        api_factory=RevisionApi,
+        quote_factory=RevisionQuote,
+    )
+
+    assert revised.status == "generated"
+    assert revised.json_path is not None
+    revised_payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
+    assert revised_payload["plan_availability"]["real_account"]["status"] == "available"
+    assert revised_payload["strategy_judgments"]["real_holding_decisions_status"] == "available"
+    assert revised_payload["strategy_judgments"]["real_holding_decisions"][0]["symbol"] == symbol
+    receipt = json.loads(
+        (paths.root / "delivery" / f"{revised.json_path.stem}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    real_state = receipt.get("real_protection_state")
+    assert (
+        isinstance(real_state, dict),
+        paths.real_state.exists(),
+        trend_module.load_protection_state(paths.real_state),
+    ) == (True, True, real_state)
+    after = json.loads(planning_path.read_text(encoding="utf-8"))
+    assert after["components"]["market"] == before["components"]["market"]
+    assert after["components"]["simulated_account"] == before["components"]["simulated_account"]
+    assert after["components"]["real_account"]["status"] == "complete"
+    assert fetches == 1
+    assert enrich_calls == 2
+
+
+@pytest.mark.parametrize(
+    ("market", "run_date", "as_of_date", "execution_date", "wire_symbol", "asset"),
+    [
+        ("HK", "2026-07-15", "2026-07-15", "2026-07-16", "2800.HK", "港股"),
+        ("US", "2026-07-15", "2026-07-14", "2026-07-15", "QQQ.US", "美股"),
+    ],
+)
+def test_staggered_planning_revisions_recover_remaining_account_component(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    market: str,
+    run_date: str,
+    as_of_date: str,
+    execution_date: str,
+    wire_symbol: str,
+    asset: str,
+) -> None:
+    cfg = config(tmp_path)
+    paths = market_paths(cfg.data_dir, cfg.reports_dir, market)
+    unlock_live_drawdown(cfg.data_dir, market)
+    api_calls: list[str] = []
+    simulation_calls = 0
+    real_snapshot_calls = 0
+
+    class StaggeredSimulationAccount(DefaultSimAccountClient):
+        def __init__(self, **kwargs: object) -> None:
+            nonlocal simulation_calls
+            simulation_calls += 1
+            super().__init__(**kwargs)
+
+        def account_snapshot(self) -> dict[str, object]:
+            if simulation_calls == 1:
+                raise RuntimeError("simulation account offline")
+            return super().account_snapshot()
+
+    def staggered_real_snapshot() -> dict[str, object]:
+        nonlocal real_snapshot_calls
+        real_snapshot_calls += 1
+        if real_snapshot_calls < 3:
+            raise AccountHttpError("real account offline")
+        return copy.deepcopy(ACCOUNT_SNAPSHOT)
+
+    monkeypatch.setattr(market_trend, "fetch_account_snapshot", staggered_real_snapshot)
+
+    class Api:
+        def __init__(self, **_kwargs: object) -> None:
+            api_calls.append("api.init")
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            api_calls.append("api.update")
+            return [
+                {"asset": item, "asOfDate": as_of_date}
+                for item in MARKET_UPDATE_ASSETS[market]
+            ]
+
+        def get_account_balance(self) -> dict[str, object]:
+            api_calls.append("api.balance")
+            return {"balance": "100"}
+
+        def get_favorites_tickers(self) -> list[dict[str, object]]:
+            return []
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str
+        ) -> list[dict[str, object]]:
+            if tm_id == 700001:
+                return [
+                    {
+                        "tmId": member_id,
+                        "tickerSymbol": wire_symbol,
+                        "asOfDate": expected_date,
+                    }
+                    for member_id in range(1, 11)
+                ]
+            return [{"tmId": 1, "tickerSymbol": wire_symbol, "asOfDate": expected_date}]
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            fields = tuple(
+                dict.fromkeys(
+                    (
+                        *UNIFIED_TREND_FIELDS,
+                        *A_SHARE_INDUSTRY_FIELDS,
+                        *INDUSTRY_MEMBER_FIELDS,
+                        *INDUSTRY_STATE_FIELDS,
+                    )
+                )
+            )
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in fields
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            fields = tuple(kwargs["fields"])
+            expected_date = str(kwargs["expected_date"])
+            if fields == A_SHARE_INDUSTRY_FIELDS:
+                return [{
+                    "tmId": 700001,
+                    "asOfDate": expected_date,
+                    "trendTemperatureCurr": "热",
+                }]
+            if fields == INDUSTRY_MEMBER_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": expected_date,
+                        "tradableFlag": True,
+                        "isTrendRightSide": True,
+                    }
+                    for tm_id in kwargs["tm_ids"]
+                ]
+            if fields == INDUSTRY_STATE_FIELDS:
+                return [{
+                    "tmId": 700001,
+                    "asOfDate": expected_date,
+                    "trendTemperatureCurr": "热",
+                    "trendStrengthLocalCurr": "92",
+                    "TrendRightSideCountRatio": "0.191",
+                    "TrendRightSideMktCapRatio": "0.650",
+                }]
+            return [{
+                "tmId": 1,
+                "tickerName": "测试标的",
+                "tickerSymbol": wire_symbol,
+                "asset": asset,
+                "asOfDate": as_of_date,
+                "tradableFlag": True,
+                "industryName": "科技",
+                "industryTmId": 700001,
+                "amount1d": "2",
+                "isTrendRightSide": True,
+                "trendTemperaturePrev": "温",
+                "trendTemperatureCurr": "热",
+                "daysSinceTrendEntry": 3,
+                "trendPhasePrev": "谷雨",
+                "trendPhaseCurr": "立夏",
+                "trendStrengthLocalCurr": "96",
+                "trendStrengthLocalChange": "↑↑",
+                "trendStrengthGlobalCurr": "91.8",
+                "trendStrengthLocalPrevWeek": "86.0",
+                "trendStrengthLocalPrevMonth": "77.4",
+                "stopwinFlagByDangerSignal": False,
+                "stopwinFlagByBoilingTemperature": False,
+                "stopwinFlagByPopChampagne": False,
+            }]
+
+        def close(self) -> None:
+            pass
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            api_calls.append("quote.init")
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return [as_of_date, execution_date]
+
+        def get_daily_kline(
+            self, *_args: object, **_kwargs: object
+        ) -> list[DailyKlineBar]:
+            end = datetime.fromisoformat(as_of_date)
+            return [
+                DailyKlineBar(
+                    date=(end - timedelta(days=14 - index)).date().isoformat(),
+                    open=10,
+                    high=10.1,
+                    low=9.9,
+                    close=10,
+                    volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def get_lot_sizes(self, symbols: list[str]) -> dict[str, int]:
+            return {symbol: 1 if market == "US" else 100 for symbol in symbols}
+
+        def close(self) -> None:
+            pass
+
+    first = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        notifier=NullNotifier(),
+        api_factory=Api,
+        quote_factory=Quote,
+        account_factory=StaggeredSimulationAccount,
+    )
+    assert first.status == "generated"
+    first_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
+    planning_path = cfg.data_dir / first_payload["replay_evidence"]["planning_path"]
+    first_manifest = json.loads(planning_path.read_text(encoding="utf-8"))
+    first_component_bytes = {
+        name: (cfg.data_dir / reference["path"]).read_bytes()
+        for name, reference in first_manifest["components"].items()
+    }
+    assert {
+        name: reference["status"]
+        for name, reference in first_manifest["components"].items()
+    } == {
+        "market": "complete",
+        "simulated_account": "unavailable",
+        "real_account": "unavailable",
+    }
+    initial_api_calls = list(api_calls)
+
+    def forbidden(**_kwargs: object) -> object:
+        raise AssertionError("completed market facts must not be recaptured")
+
+    revised_once = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        revision=True,
+        notifier=NullNotifier(),
+        api_factory=forbidden,
+        quote_factory=forbidden,
+        account_factory=StaggeredSimulationAccount,
+    )
+    assert revised_once.status == "generated"
+    first_revision_payload = json.loads(
+        revised_once.json_path.read_text(encoding="utf-8")
+    )
+    first_revision_manifest = json.loads(planning_path.read_text(encoding="utf-8"))
+    first_revision_component_bytes = {
+        name: (cfg.data_dir / reference["path"]).read_bytes()
+        for name, reference in first_revision_manifest["components"].items()
+    }
+    assert {
+        name: reference["status"]
+        for name, reference in first_revision_manifest["components"].items()
+    } == {
+        "market": "complete",
+        "simulated_account": "complete",
+        "real_account": "unavailable",
+    }
+    assert first_revision_component_bytes["market"] == first_component_bytes["market"]
+    assert first_revision_component_bytes["real_account"] == first_component_bytes["real_account"]
+    assert first_revision_payload["plan_availability"]["simulated_account"]["status"] == "available"
+    assert first_revision_payload["plan_availability"]["real_account"]["status"] == "unavailable"
+
+    revised_twice = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        revision=True,
+        notifier=NullNotifier(),
+        api_factory=forbidden,
+        quote_factory=forbidden,
+        account_factory=StaggeredSimulationAccount,
+    )
+    assert revised_twice.status == "generated"
+    final_payload = json.loads(revised_twice.json_path.read_text(encoding="utf-8"))
+    final_manifest = json.loads(planning_path.read_text(encoding="utf-8"))
+    final_component_bytes = {
+        name: (cfg.data_dir / reference["path"]).read_bytes()
+        for name, reference in final_manifest["components"].items()
+    }
+    assert {
+        name: reference["status"]
+        for name, reference in final_manifest["components"].items()
+    } == {
+        "market": "complete",
+        "simulated_account": "complete",
+        "real_account": "complete",
+    }
+    assert final_component_bytes["market"] == first_revision_component_bytes["market"]
+    assert final_component_bytes["simulated_account"] == first_revision_component_bytes["simulated_account"]
+    assert final_component_bytes["real_account"] != first_revision_component_bytes["real_account"]
+    assert final_payload["plan_availability"]["simulated_account"]["status"] == "available"
+    assert final_payload["plan_availability"]["real_account"]["status"] == "available"
+    assert simulation_calls == 2
+    assert real_snapshot_calls == 3
+    assert api_calls == initial_api_calls

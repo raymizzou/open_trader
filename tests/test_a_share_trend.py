@@ -5,7 +5,8 @@ import csv
 import hashlib
 import json
 import os
-from dataclasses import replace
+import socket
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -15,7 +16,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import open_trader.a_share_trend as trend_module
 import open_trader.trend_delivery as trend_delivery_module
-from open_trader import trend_review
+from open_trader import trend_market_controller, trend_review
 
 from open_trader.a_share_trend import (
     A_SHARE_INDUSTRY_FIELDS,
@@ -47,6 +48,7 @@ from open_trader.a_share_trend import (
     write_frozen_report,
 )
 from open_trader.daily_premarket import DailyPremarketConfig, RunLock
+from open_trader.account_http import AccountHttpError
 from open_trader.futu_quote import FutuQuoteError
 from open_trader.kline_technical_facts import DailyKlineBar
 from open_trader.notifications import CompositeNotifier, FeishuWebhookNotifier, MacOSNotifier
@@ -56,6 +58,7 @@ from open_trader.trend_animals import (
     TrendAnimalsNoCurrentRowsError,
 )
 from open_trader.trend_kelly import TrendKellyRound
+from open_trader.trend_allocation import build_allocation_snapshot
 from open_trader.trend_api_stats import (
     build_trend_api_stats_payload,
     write_trend_api_stats,
@@ -146,18 +149,21 @@ class DefaultSimAccountClient:
 
 def simulation_account_with_positions(
     *codes: str,
+    cash: str = "100000",
+    market_values: Mapping[str, str] | None = None,
 ) -> type[DefaultSimAccountClient]:
     class SimAccountClient(DefaultSimAccountClient):
         def account_snapshot(self) -> dict[str, object]:
             return {
                 **super().account_snapshot(),
+                "cash": cash,
                 "positions": [
                     {
                         "code": code,
                         "stock_name": code.split(".", 1)[-1],
                         "qty": "100",
                         "cost_price": "9.5",
-                        "market_val": "1000",
+                        "market_val": (market_values or {}).get(code, "1000"),
                     }
                     for code in codes
                 ],
@@ -837,6 +843,34 @@ def test_full_simulate_account_freezes_two_rotation_pairs_after_buy_planning() -
         assert "市场资源排名" in text
         assert "模拟盘自动轮换" in text
         assert "MARKET 卖出全成后才买入" in text
+    v2_snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-03",
+        generated_at="2026-08-03T16:18:00+08:00",
+        git_sha="a" * 40,
+        roots=payload["allocation"]["roots"],
+        previous=None,
+        version=2,
+    )
+    v2_allocation = {
+        **payload["allocation"],
+        "version": 2,
+        "allocation_date": v2_snapshot["allocation_date"],
+        "generated_at": v2_snapshot["generated_at"],
+        "roots": v2_snapshot["roots"],
+        "markets": v2_snapshot["markets"],
+    }
+    v2_payload = json.loads(json.dumps(payload))
+    v2_payload["allocation"] = v2_allocation
+    _, v2_feishu = render_trend_feishu_text(
+        v2_payload, broker_label="东方财富", market_label="A股"
+    )
+    assert built.allocation is not None
+    v2_markdown = render_markdown(
+        replace(built, allocation=v2_allocation)
+    )
+    for text in (v2_markdown, v2_feishu):
+        assert "卖单先提交，买单独立执行" in text
+        assert "MARKET 卖出全成后才买入" not in text
     assert (
         feishu.index("市场资源排名")
         < feishu.index("\n卖出\n")
@@ -1467,6 +1501,570 @@ def test_real_rotation_plan_is_independent_of_simulate_account() -> None:
     ]
 
 
+def test_v2_real_rotation_uses_candidates_not_held_by_simulate_account() -> None:
+    simulated_symbols = tuple(f"10{index:04d}" for index in range(10))
+    real_symbols = tuple(f"30{index:04d}" for index in range(10))
+    base = allocation_for("CN", rank=3, entry_weight="0.02")
+    v2_snapshot = build_allocation_snapshot(
+        allocation_date="2026-07-14",
+        generated_at="2026-07-14T16:20:00+08:00",
+        git_sha="a" * 40,
+        roots=base["snapshot"]["roots"],
+        previous=None,
+        version=2,
+    )
+    allocation = {
+        "daily_path": "data/trend_allocation/daily/2026-07-14.json",
+        "sha256": base["sha256"],
+        "snapshot": v2_snapshot,
+    }
+    simulated = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("50000"),
+        positions=tuple(
+            AccountPosition(symbol, symbol, "stock", Decimal("500"), Decimal("10"), Decimal("5000"))
+            for symbol in simulated_symbols
+        ),
+        exceptions=(),
+    )
+    real = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "eastmoney"},
+        positions=tuple(
+            AccountPosition(symbol, symbol, "stock", Decimal("500"), Decimal("10"), Decimal("5000"))
+            for symbol in real_symbols
+        ),
+        holding_snapshots={
+            symbol: (
+                None
+                if symbol == real_symbols[-1]
+                else holding(symbol, strength="60", global_strength="60")
+            )
+            for symbol in real_symbols
+        },
+        bars_by_symbol={symbol: bars() for symbol in real_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in real_symbols
+            }
+        },
+        net_value=Decimal("50000"),
+        available_cash=Decimal("10000"),
+        position_count=10,
+        instrument_ids_by_symbol={
+            symbol: f"ins_{symbol}" for symbol in real_symbols
+        },
+        blocked_instrument_ids={
+            f"ins_{real_symbols[0]}": "account_broker_stale:eastmoney"
+        },
+    )
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199),
+        strategy_version="v15", allocation=allocation,
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=simulated,
+        candidates=[
+            candidate(simulated_symbols[0], asset="ETF基金", strength="96", global_strength="100"),
+            candidate(real_symbols[-1], asset="ETF基金", strength="96", global_strength="90"),
+            candidate("200001", asset="ETF基金", strength="96", global_strength="70"),
+            candidate("200002", asset="ETF基金", strength="96", global_strength="40"),
+        ],
+        holding_snapshots={
+            symbol: holding(symbol, strength="10", global_strength="10")
+            for symbol in simulated_symbols
+        },
+        bars_by_symbol={symbol: bars() for symbol in simulated_symbols},
+        prior_state={
+            "positions": {
+                symbol: {
+                    "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                    "tracking_active": False,
+                }
+                for symbol in simulated_symbols
+            }
+        },
+        real_holdings=real,
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    simulated_rotation_buys = {
+        pair.buy_symbol for pair in built.simulate_rotation_pairs
+    }
+    real_rotation_buys = {
+        pair.buy_symbol for pair in built.real_rotation_pairs
+    }
+    assert simulated_symbols[0] not in simulated_rotation_buys
+    assert simulated_symbols[0] in real_rotation_buys
+    assert [(pair.sell_symbol, pair.buy_symbol) for pair in built.real_rotation_pairs] == [
+        ("300001", simulated_symbols[0]),
+    ]
+
+
+def test_recovered_simulated_account_rebuilds_rotation_evidence(
+    tmp_path: Path,
+) -> None:
+    simulated_symbols = tuple(f"10{index:04d}" for index in range(10))
+    base = allocation_for("CN", rank=3, entry_weight="0.02")
+    v2_snapshot = build_allocation_snapshot(
+        allocation_date="2026-07-14",
+        generated_at="2026-07-14T16:20:00+08:00",
+        git_sha="a" * 40,
+        roots=base["snapshot"]["roots"],
+        previous=None,
+        version=2,
+    )
+    allocation_path = tmp_path / "data/trend_allocation/daily/2026-07-14.json"
+    allocation_path.parent.mkdir(parents=True, exist_ok=True)
+    allocation_path.write_text(
+        json.dumps(v2_snapshot, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    allocation = {
+        "daily_path": "data/trend_allocation/daily/2026-07-14.json",
+        "sha256": hashlib.sha256(allocation_path.read_bytes()).hexdigest(),
+        "snapshot": v2_snapshot,
+    }
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199),
+        strategy_version="v15", allocation=allocation,
+    )
+    positions = tuple(
+        AccountPosition(
+            symbol,
+            symbol,
+            "stock",
+            Decimal("500"),
+            Decimal("10"),
+            Decimal("5000"),
+            f"SH.{symbol}",
+        )
+        for symbol in simulated_symbols
+    )
+    candidates = [
+        candidate(simulated_symbols[0], asset="ETF基金", global_strength="100"),
+        candidate("300009", asset="ETF基金", global_strength="90"),
+        candidate("200001", asset="ETF基金", global_strength="70"),
+        candidate("200002", asset="ETF基金", global_strength="40"),
+    ]
+    holding_snapshots = {
+        symbol: holding(symbol, strength="10", global_strength="10")
+        for symbol in simulated_symbols
+    }
+    bars_by_symbol = {symbol: bars() for symbol in simulated_symbols}
+    prior_state = {
+        "positions": {
+            symbol: {
+                "initial_line": "10", "active_line": "10", "atr14": "0.5",
+                "tracking_active": False,
+            }
+            for symbol in simulated_symbols
+        }
+    }
+    real = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "eastmoney"},
+        positions=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state=None,
+        net_value=Decimal("50000"),
+        available_cash=Decimal("50000"),
+        position_count=0,
+    )
+    unavailable = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=False,
+        net_value=Decimal("0"),
+        available_cash=Decimal("0"),
+        positions=(),
+        exceptions=(),
+        position_count=0,
+        status="unavailable",
+        reason="simulation account offline",
+    )
+    recovered = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("50000"),
+        positions=positions,
+        exceptions=(),
+        position_count=10,
+    )
+    initial = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=unavailable,
+        candidates=candidates,
+        holding_snapshots=holding_snapshots,
+        bars_by_symbol=bars_by_symbol,
+        prior_state=prior_state,
+        market="CN",
+        process_version="abc123",
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        real_holdings=real,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    frozen = trend_review.freeze_report_evidence(
+        data_dir=tmp_path / "data",
+        report=initial,
+        candidates=candidates,
+        holding_snapshots=holding_snapshots,
+        bars_by_symbol=bars_by_symbol,
+        prior_state=prior_state,
+        watch_events=(),
+        query={},
+        responses={},
+        candidate_pool_ids=(622466, 697199),
+        lot_sizes={},
+        price_fx_to_account_currency=Decimal("1"),
+        previous_attention_rows=(),
+        option_attention_broker_label=None,
+        real_holdings_input=real,
+    )
+    evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
+    serialized_recovered = trend_review._json_value(asdict(recovered))
+    evidence["account"] = serialized_recovered
+    evidence["rebuild_inputs"]["account"] = serialized_recovered
+
+    rebuilt_report = trend_review.rebuild_trend_report_from_evidence(
+        evidence,
+        _return_report=True,
+        _recompute_account_components=("simulated_account",),
+    )
+    assert rebuilt_report.simulate_rotation_pairs
+    assert rebuilt_report.real_rotation_pairs == ()
+
+    frozen_report = trend_module._freeze_report_simulated_buy_plan(
+        rebuilt_report, tmp_path / "data"
+    )
+    recovered_judgments = trend_module._report_payload(frozen_report)[
+        "strategy_judgments"
+    ]
+    evidence["rebuild_inputs"].update(
+        {
+            "simulate_rotation_pairs": recovered_judgments[
+                "simulate_rotation_pairs"
+            ],
+            "simulate_rotation_comparisons": recovered_judgments[
+                "simulate_rotation_comparisons"
+            ],
+            "simulated_buy_fifo": recovered_judgments["simulated_buy_fifo"],
+            "planned_new_seats": recovered_judgments["planned_new_seats"],
+        }
+    )
+    final = trend_review.rebuild_trend_report_from_evidence(evidence)
+    assert final["strategy_judgments"]["simulate_rotation_pairs"]
+    assert final["strategy_judgments"]["real_rotation_pairs"] == []
+
+
+def test_real_buy_plan_uses_real_snapshot_without_real_rotation_pairs(
+    tmp_path: Path,
+) -> None:
+    base = allocation_for("CN", rank=2, entry_weight="0.04")
+    v2_snapshot = build_allocation_snapshot(
+        allocation_date="2026-07-14",
+        generated_at="2026-07-14T16:20:00+08:00",
+        git_sha="a" * 40,
+        roots=base["snapshot"]["roots"],
+        previous=None,
+        version=2,
+    )
+    allocation = {
+        "daily_path": "data/trend_allocation/daily/2026-07-14.json",
+        "sha256": base["sha256"],
+        "snapshot": v2_snapshot,
+    }
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199),
+        strategy_version="v15", allocation=allocation,
+    )
+    real = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "eastmoney"},
+        positions=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state=None,
+        net_value=Decimal("50000"),
+        available_cash=Decimal("50000"),
+        position_count=0,
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=[candidate("600006", global_strength="100")],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="CN",
+        process_version="abc123",
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        real_holdings=real,
+        drawdown_summary=active_drawdown_for(strategy, equity="676549.55"),
+    )
+
+    assert built.real_rotation_pairs == ()
+    assert [item.symbol for item in built.real_buy_actions] == ["600006"]
+    assert built.real_buy_actions[0].target_amount == Decimal("2000.00")
+    assert built.real_buy_actions[0].global_strength == Decimal("100")
+    assert built.buy_actions[0].target_amount != built.real_buy_actions[0].target_amount
+    frozen = trend_module._freeze_report_simulated_buy_plan(built, tmp_path)
+    frozen_payload = trend_module._report_payload(frozen)
+    assert [
+        item["futu_symbol"]
+        for item in frozen_payload["strategy_judgments"]["simulated_buy_fifo"]
+    ] == ["SH.600006"]
+    assert frozen_payload["strategy_judgments"]["planned_new_seats"] == 15
+    payload = trend_module._report_payload(built)
+    assert payload["strategy_judgments"]["real_buy_actions"][0]["symbol"] == "600006"
+    assert payload["strategy_judgments"]["real_buy_actions"][0]["global_strength"] == "100"
+    payload["strategy_judgments"]["simulate_rotation_pairs"] = [{
+        "pair_index": 0,
+        "sell_symbol": "600001",
+        "sell_futu_symbol": "SH.600001",
+        "buy_symbol": "600007",
+        "buy_futu_symbol": "SH.600007",
+        "buy_global_strength": "90",
+        "execution_mode": "automatic",
+    }]
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=payload,
+        market="CN",
+        execution_date="2026-07-15",
+    )
+    assert [item["futu_symbol"] for item in entries] == [
+        "SH.600006", "SH.600007",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("case", "held_count", "formal_action", "rotation_sell", "expected_seats"),
+    [
+        ("at_cap", 10, "SELL_ALL", None, 1),
+        ("above_cap", 20, "SELL_ALL", None, 1),
+        ("below_cap_full_exit", 8, "SELL_ALL", None, 3),
+        ("overlap_dedup", 10, "SELL_ALL", "600001", 1),
+        ("partial_sell", 10, "SELL_PARTIAL", None, 0),
+    ],
+)
+def test_freeze_report_plans_seats_from_projected_full_exits(
+    tmp_path: Path,
+    case: str,
+    held_count: int,
+    formal_action: str,
+    rotation_sell: str | None,
+    expected_seats: int,
+) -> None:
+    symbols = tuple(f"6000{index:02d}" for index in range(1, held_count + 1))
+    candidate_global_strength = "100" if rotation_sell is not None else "10"
+    allocation_reference = None
+    if rotation_sell is not None or formal_action == "SELL_ALL":
+        base = allocation_for("CN", rank=3, entry_weight="0.04")
+        snapshot = build_allocation_snapshot(
+            allocation_date="2026-07-14",
+            generated_at="2026-07-14T16:20:00+08:00",
+            git_sha="a" * 40,
+            roots=base["snapshot"]["roots"],
+            previous=None,
+            version=2,
+        )
+        allocation_path = tmp_path / "data/trend_allocation/daily/2026-07-14.json"
+        allocation_body = (
+            json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        allocation_path.parent.mkdir(parents=True, exist_ok=True)
+        allocation_path.write_bytes(allocation_body)
+        allocation_reference = {
+            "daily_path": "data/trend_allocation/daily/2026-07-14.json",
+            "sha256": hashlib.sha256(allocation_body).hexdigest(),
+            "snapshot": snapshot,
+        }
+
+    snapshot_symbols = {999001: "600999"}
+    snapshot_ids = [*(int(symbol) for symbol in symbols), 999001]
+    snapshot_overrides = {
+        tm_id: {
+            "trendStrengthLocalCurr": "100" if tm_id == 999001 else "10",
+            "trendStrengthGlobalCurr": (
+                candidate_global_strength if tm_id == 999001 else "10"
+            ),
+            "stopwinFlagByDangerSignal": (
+                tm_id == 600001 and formal_action == "SELL_ALL"
+            ),
+            "stopwinFlagByBoilingTemperature": (
+                tm_id == 600001 and formal_action == "SELL_PARTIAL"
+            ),
+        }
+        for tm_id in snapshot_ids
+    }
+    component_rows = {
+        622466: [{
+            "tmId": 999001,
+            "tickerSymbol": "600999.SH",
+            "asOfDate": "2026-07-14",
+        }],
+        697199: [],
+    }
+
+    if formal_action == "SELL_ALL":
+        unlock_live_drawdown(
+            tmp_path / "data",
+            strategy_version="v15",
+        )
+    else:
+        unlock_live_drawdown(
+            tmp_path / "data",
+            strategy_version="v8",
+        )
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path),
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi(
+            [],
+            component_rows=component_rows,
+            snapshot_symbols=snapshot_symbols,
+            snapshot_overrides=snapshot_overrides,
+        ),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        account_factory=simulation_account_with_positions(
+            *(f"SH.{symbol}" for symbol in symbols), cash="50000"
+        ),
+        allocation_reference=allocation_reference,
+        notifier=RecordingFeishu(),
+        now_fn=lambda: datetime(2026, 7, 14, 18, tzinfo=SHANGHAI),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert result.status == "generated"
+    assert result.json_path is not None
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    evidence_path = tmp_path / "data" / payload["replay_evidence"]["path"]
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    holdings = payload["strategy_judgments"]["holding_decisions"]
+    target = next(item for item in holdings if item["symbol"] == "600001")
+    serialized_seats = payload["strategy_judgments"].get("planned_new_seats")
+    evidence_seats = evidence["rebuild_inputs"].get("planned_new_seats")
+    assert (
+        target["action"],
+        serialized_seats if serialized_seats is not None else 0,
+        evidence_seats if evidence_seats is not None else 0,
+        any(
+            pair["sell_symbol"] == "600001"
+            for pair in payload["strategy_judgments"].get(
+                "simulate_rotation_pairs", []
+            )
+        ),
+    ) == (
+        formal_action,
+        expected_seats,
+        expected_seats,
+        rotation_sell is not None,
+    )
+
+
+def test_rotation_cash_does_not_count_signal_sale_twice(tmp_path: Path) -> None:
+    symbols = tuple(f"6000{index:02d}" for index in range(1, 11))
+    base = allocation_for("CN", rank=3, entry_weight="0.04")
+    snapshot = build_allocation_snapshot(
+        allocation_date="2026-07-14",
+        generated_at="2026-07-14T16:20:00+08:00",
+        git_sha="a" * 40,
+        roots=base["snapshot"]["roots"],
+        previous=None,
+        version=2,
+    )
+    allocation_path = Path("trend_allocation/daily/2026-07-14.json")
+    allocation_body = (
+        json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+
+    snapshot_symbols = {999001: "600999"}
+    snapshot_ids = [*(int(symbol) for symbol in symbols), 999001]
+    snapshot_overrides = {
+        tm_id: {
+            "trendStrengthLocalCurr": "100" if tm_id == 999001 else "10",
+            "trendStrengthGlobalCurr": "100" if tm_id == 999001 else "10",
+            "stopwinFlagByDangerSignal": tm_id == 600001,
+        }
+        for tm_id in snapshot_ids
+    }
+    component_rows = {
+        622466: [{
+            "tmId": 999001,
+            "tickerSymbol": "600999.SH",
+            "asOfDate": "2026-07-14",
+        }],
+        697199: [],
+    }
+
+    config = trend_config(tmp_path)
+    allocation_path = config.data_dir / allocation_path
+    allocation_path.parent.mkdir(parents=True, exist_ok=True)
+    allocation_path.write_bytes(allocation_body)
+    unlock_live_drawdown(config.data_dir, strategy_version="v15")
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi(
+            [],
+            component_rows=component_rows,
+            snapshot_symbols=snapshot_symbols,
+            snapshot_overrides=snapshot_overrides,
+        ),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        account_factory=simulation_account_with_positions(
+            *(f"SH.{symbol}" for symbol in symbols),
+            cash="0",
+            market_values={"SH.600001": "600"},
+        ),
+        allocation_reference={
+            "daily_path": "data/trend_allocation/daily/2026-07-14.json",
+            "sha256": hashlib.sha256(allocation_body).hexdigest(),
+            "snapshot": snapshot,
+        },
+        notifier=RecordingFeishu(),
+        now_fn=lambda: datetime(2026, 7, 14, 18, tzinfo=SHANGHAI),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert result.status == "generated"
+    assert result.json_path is not None
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    evidence = json.loads(
+        (config.data_dir / payload["replay_evidence"]["path"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    target = next(
+        item
+        for item in payload["strategy_judgments"]["holding_decisions"]
+        if item["symbol"] == "600001"
+    )
+    assert (
+        target["action"],
+        payload["strategy_judgments"]["simulate_rotation_pairs"],
+        evidence["rebuild_inputs"]["simulate_rotation_pairs"],
+    ) == ("SELL_ALL", [], [])
+
+
 def test_real_rotation_sizing_uses_net_value_when_cash_is_negative() -> None:
     simulated_symbols = tuple(f"10{index:04d}" for index in range(10))
     real_symbols = tuple(f"30{index:04d}" for index in range(10))
@@ -1816,6 +2414,60 @@ def test_valid_frozen_allocation_rejects_null_success_reason() -> None:
     frozen["failure_reason"] = None
 
     assert not trend_module.valid_frozen_allocation(frozen)
+
+
+def test_v2_allocation_markdown_uses_stock_only_dynamic_capacity() -> None:
+    frozen_by_rank: dict[int, dict[str, object]] = {}
+    for rank, position_limit, nominal in (
+        (1, 20, "80.00"), (2, 15, "60.00"), (3, 10, "40.00"),
+    ):
+        base = allocation_for("CN", rank=rank, entry_weight="0.04")
+        snapshot = build_allocation_snapshot(
+            allocation_date="2026-08-03",
+            generated_at="2026-08-03T16:18:00+08:00",
+            git_sha="a" * 40,
+            roots=base["snapshot"]["roots"],
+            previous=None,
+            version=2,
+        )
+        frozen = trend_module.freeze_allocation_reference({
+            "daily_path": base["daily_path"],
+            "sha256": base["sha256"],
+            "snapshot": snapshot,
+        })
+        assert frozen is not None
+        frozen_by_rank[rank] = frozen
+        rendered = "\n".join(
+            trend_module._allocation_markdown_lines(
+                frozen, execution_date="2026-08-04"
+            )
+        )
+        assert f"- A股 第 {rank}｜A股 全局强度" in rendered
+        assert f"｜单仓基准 4.00%｜{position_limit} 席位名义仓位 {nominal}%" in rendered
+        assert "ETF" not in rendered
+
+    missing_limit = copy.deepcopy(frozen_by_rank[2])
+    del missing_limit["markets"]["CN"]["position_limit"]
+    with pytest.raises(ValueError, match="frozen allocation is invalid"):
+        trend_module._allocation_markdown_lines(
+            missing_limit, execution_date="2026-08-04"
+        )
+
+
+def test_v1_allocation_markdown_keeps_etf_and_legacy_capacity_wording() -> None:
+    frozen = trend_module.freeze_allocation_reference(
+        allocation_for("CN", rank=2, entry_weight="0.04")
+    )
+    assert frozen is not None
+
+    rendered = "\n".join(
+        trend_module._allocation_markdown_lines(
+            frozen, execution_date="2026-08-04"
+        )
+    )
+
+    assert "ETF基金 全局强度" in rendered
+    assert "10 席位名义仓位 40.00%" in rendered
 
 
 def active_drawdown_for(
@@ -5001,6 +5653,92 @@ def test_more_than_ten_positions_lists_pending_buy_with_slot_note() -> None:
     assert actions[0].estimated_shares == 300
 
 
+@pytest.mark.parametrize("position_limit", [15, 20])
+def test_dynamic_position_limit_is_used_in_full_seat_notes(position_limit: int) -> None:
+    actions = estimate_buy_actions(
+        ranked=[candidate("600001")],
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        current_position_count=position_limit,
+        position_weight=Decimal("0.04"),
+        position_limit=position_limit,
+    )
+    assert actions[0].sizing_note == f"{position_limit} 个持仓席位已满"
+
+    legacy_actions, skips, _ = trend_module._plan_buy_actions(
+        ranked=(candidate("600001"),),
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        current_position_count=position_limit,
+        position_weight=Decimal("0.04"),
+        market="CN",
+        lot_sizes={"600001": 100},
+        price_fx_to_account_currency=Decimal("1"),
+        portfolio_planned_risk=Decimal("0"),
+        normal_cost_rate=Decimal("0.001"),
+        use_final_plan_semantics=False,
+        position_limit=position_limit,
+    )
+    assert legacy_actions == []
+    assert skips[0]["reason"] == f"{position_limit} 个持仓席位已满"
+
+
+@pytest.mark.parametrize(("rank", "position_limit"), [(1, 20), (2, 15)])
+def test_v2_report_uses_frozen_allocation_limit_in_full_seat_note(
+    rank: int, position_limit: int,
+) -> None:
+    base = allocation_for("CN", rank=rank, entry_weight="0.04")
+    v2_snapshot = build_allocation_snapshot(
+        allocation_date="2026-07-14",
+        generated_at="2026-07-14T16:20:00+08:00",
+        git_sha="a" * 40,
+        roots=base["snapshot"]["roots"],
+        previous=None,
+        version=2,
+    )
+    allocation = {
+        "daily_path": "data/trend_allocation/daily/2026-07-14.json",
+        "sha256": base["sha256"],
+        "snapshot": v2_snapshot,
+    }
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199),
+        strategy_version="v15", allocation=allocation,
+    )
+    real = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "eastmoney"},
+        positions=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state=None,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        position_count=position_limit + 1,
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14", fresh=True,
+            net_value=Decimal("100000"), available_cash=Decimal("100000"),
+            positions=(), exceptions=(), position_count=position_limit + 1,
+        ),
+        candidates=[candidate("600001", global_strength="90")],
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="CN",
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        real_holdings=real,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    assert built.buy_actions[0].sizing_note == f"{position_limit} 个持仓席位已满"
+    assert built.real_buy_actions[0].sizing_note == f"{position_limit} 个持仓席位已满"
+
+
 def test_unaffordable_candidate_lists_one_lot_without_consuming_cash_or_slot() -> None:
     actions = estimate_buy_actions(
         ranked=[
@@ -8128,6 +8866,9 @@ class ReadyApi:
         industry_ids: dict[int, int] | None = None,
         industry_state_temperature: str = "热",
         ignored_stale_components: tuple[dict[str, str], ...] = (),
+        component_rows: Mapping[int, list[dict[str, object]]] | None = None,
+        snapshot_symbols: Mapping[int, str] | None = None,
+        snapshot_overrides: Mapping[int, Mapping[str, object]] | None = None,
     ) -> None:
         self.calls = calls
         self.ready = ready
@@ -8141,6 +8882,9 @@ class ReadyApi:
         self.industry_ids = industry_ids or {}
         self.industry_state_temperature = industry_state_temperature
         self.ignored_stale_components = ignored_stale_components
+        self.component_rows = component_rows or {}
+        self.snapshot_symbols = snapshot_symbols or {}
+        self.snapshot_overrides = snapshot_overrides or {}
         self.snapshot_requests: list[tuple[list[int], tuple[str, ...]]] = []
         self.balance_calls = 0
 
@@ -8156,6 +8900,8 @@ class ReadyApi:
 
     def get_components(self, *, tm_id: int, expected_date: str) -> list[dict[str, object]]:
         self.calls.append(f"api.components.{tm_id}")
+        if tm_id in self.component_rows:
+            return self.component_rows[tm_id]
         if tm_id == 700001:
             return [
                 {"tmId": member_id, "tickerSymbol": f"60000{member_id}.SH", "asOfDate": expected_date}
@@ -8238,8 +8984,10 @@ class ReadyApi:
             ]
         rows = []
         for tm_id in self.snapshot_ids if self.snapshot_ids is not None else tm_ids:
-            symbol = f"{tm_id:06d}" if isinstance(tm_id, int) else "600099"
-            rows.append({
+            symbol = self.snapshot_symbols.get(
+                tm_id, f"{tm_id:06d}" if isinstance(tm_id, int) else "600099"
+            )
+            row = {
                 "tmId": tm_id,
                 "tickerName": f"股票{symbol}",
                 "tickerSymbol": f"{symbol}.SH",
@@ -8260,7 +9008,9 @@ class ReadyApi:
                 "trendTemperaturePrev": "温",
                 "trendTemperatureCurr": "热",
                 "trendPhaseCurr": "立夏",
-            })
+            }
+            row.update(self.snapshot_overrides.get(tm_id, {}))
+            rows.append(row)
         return rows
 
 
@@ -8311,6 +9061,566 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     assert evidence["query"]["component_pool_ids"] == [622466, 697199]
     assert evidence["responses"]["snapshots"]
     assert evidence["rebuild_inputs"]["candidates"]
+
+
+def test_planning_crash_retry_publishes_frozen_components(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    receipt_path = config.data_dir / "trend_a_share/delivery/2026-07-14.json"
+    api_instances = [
+        ReadyApi([], snapshot_overrides={1: {"tickerName": "首轮市场事实"}}),
+        ReadyApi([], snapshot_overrides={1: {"tickerName": "重捕市场事实"}}),
+    ]
+    for api in api_instances:
+        api.remember_symbol_row = lambda **_kwargs: None  # type: ignore[attr-defined]
+        api.symbol_mapping = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
+    account_values = iter(("100000", "2"))
+
+    class ChangingAccount:
+        def __init__(self, cash: str) -> None:
+            self.cash = cash
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "cash": self.cash,
+                "positions": [],
+            }
+
+        def close(self) -> None:
+            pass
+
+    def account_factory(**_kwargs: object) -> ChangingAccount:
+        nonlocal collision_created
+        if not collision_created:
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            receipt_path.mkdir()
+            collision_created = True
+        return ChangingAccount(next(account_values))
+
+    collision_created = False
+    with pytest.raises(OSError):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            api_factory=lambda **_kwargs: api_instances.pop(0),
+            quote_factory=lambda **_kwargs: ReadyQuote([]),
+            account_factory=account_factory,
+            notifier=RecordingFeishu(),
+        )
+
+    planning_path = config.data_dir / "trend_review/planning/CN/2026-07-15.json"
+    assert planning_path.exists()
+    assert receipt_path.is_dir()
+    receipt_path.rmdir()
+    first_planning = json.loads(planning_path.read_text(encoding="utf-8"))
+    first_evidence_path = config.data_dir / first_planning["evidence"]["path"]
+    first_evidence = json.loads(first_evidence_path.read_text(encoding="utf-8"))
+
+    recovered = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **_kwargs: api_instances.pop(0),
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        account_factory=account_factory,
+        notifier=RecordingFeishu(),
+    )
+    payload = json.loads(recovered.json_path.read_text(encoding="utf-8"))
+    evidence_path = config.data_dir / payload["replay_evidence"]["path"]
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+
+    frozen_candidate = next(
+        item for item in first_evidence["rebuild_inputs"]["candidates"]
+        if item["symbol"] == "000001"
+    )
+    published_candidate = next(
+        item for item in payload["signal_snapshots"]["candidates"]
+        if item["symbol"] == "000001"
+    )
+    assert (
+        published_candidate["name"],
+        payload["account"]["available_cash"],
+        evidence["rebuild_inputs"]["account"]["available_cash"],
+    ) == (
+        frozen_candidate["name"],
+        first_evidence["rebuild_inputs"]["account"]["available_cash"],
+        first_evidence["rebuild_inputs"]["account"]["available_cash"],
+    )
+    assert evidence_path == first_evidence_path
+
+
+def _write_cn_v2_allocation(config: DailyPremarketConfig) -> dict[str, object]:
+    base = allocation_for("CN", rank=3, entry_weight="0.04")
+    snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-03",
+        generated_at="2026-08-03T16:18:00+08:00",
+        git_sha="a" * 40,
+        roots=base["snapshot"]["roots"],  # type: ignore[index]
+        previous=None,
+        version=2,
+    )
+    path = config.data_dir / "trend_allocation/daily/2026-08-03.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps(snapshot, ensure_ascii=False, sort_keys=True) + "\n"
+    path.write_text(body, encoding="utf-8")
+    return {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": hashlib.sha256(body.encode()).hexdigest(),
+        "snapshot": snapshot,
+    }
+
+
+def test_planning_crash_retry_recovers_simulated_plan_for_controller(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    allocation = _write_cn_v2_allocation(config)
+    unlock_live_drawdown(config.data_dir, strategy_version="v15")
+
+    class MappingReadyApi(ReadyApi):
+        def remember_symbol_row(self, **_kwargs: object) -> None:
+            pass
+
+    api_instances = [
+        MappingReadyApi(
+            [],
+            snapshot_overrides={
+                1: {
+                    "tickerName": "首轮市场事实",
+                    "trendStrengthGlobalCurr": "96",
+                    "tradableFlag": False,
+                },
+                2: {"trendStrengthGlobalCurr": "95", "tradableFlag": False},
+            },
+        ),
+        MappingReadyApi(
+            [],
+            snapshot_overrides={
+                1: {
+                    "tickerName": "重捕市场事实",
+                    "trendStrengthGlobalCurr": "96",
+                    "tradableFlag": False,
+                },
+                2: {"trendStrengthGlobalCurr": "95", "tradableFlag": False},
+            },
+        ),
+    ]
+    account_states = iter(("unavailable", "available"))
+
+    class RetryAccount:
+        def account_snapshot(self) -> dict[str, object]:
+            if next(account_states) == "unavailable":
+                raise RuntimeError("simulation account offline")
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "cash": "100000",
+                "positions": [],
+            }
+
+        def close(self) -> None:
+            pass
+
+    receipt_path = config.data_dir / "trend_a_share/delivery/2026-07-14.json"
+    collision_created = False
+
+    def account_factory(**_kwargs: object) -> RetryAccount:
+        nonlocal collision_created
+        if not collision_created:
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            receipt_path.mkdir()
+            collision_created = True
+        return RetryAccount()
+
+    with pytest.raises(OSError):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            allocation_reference=allocation,
+            api_factory=lambda **_kwargs: api_instances.pop(0),
+            quote_factory=lambda **_kwargs: ReadyQuote([]),
+            account_factory=account_factory,
+            notifier=RecordingFeishu(),
+        )
+
+    planning_path = config.data_dir / "trend_review/planning/CN/2026-07-15.json"
+    assert planning_path.exists()
+    assert receipt_path.is_dir()
+    receipt_path.rmdir()
+    recovered = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        allocation_reference=allocation,
+        api_factory=lambda **_kwargs: api_instances.pop(0),
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        account_factory=account_factory,
+        notifier=RecordingFeishu(),
+    )
+    assert recovered.json_path is not None
+    payload = json.loads(recovered.json_path.read_text(encoding="utf-8"))
+    judgments = payload["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    evidence_path = config.data_dir / str(payload["replay_evidence"]["path"])
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    inputs = evidence["rebuild_inputs"]
+    assert (
+        inputs["simulate_rotation_pairs"],
+        inputs["simulate_rotation_comparisons"],
+        inputs["simulated_buy_fifo"],
+        inputs["planned_new_seats"],
+    ) == ([], [], [], 0)
+    config = replace(config, trend_executor_host=socket.gethostname())
+
+    class NeverOrderClient:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {"positions": []}
+
+        def place_order(self, *args: object, **kwargs: object) -> None:
+            self.requests.append((args, kwargs))
+            raise AssertionError("recovered empty plan submitted an order")
+
+    never_order = NeverOrderClient()
+    assert (
+        judgments["simulated_buy_fifo"],
+        judgments["planned_new_seats"],
+    ) == ([], 0)
+    controller_result = trend_market_controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        str(payload["execution_date"]),
+        trend_review._report_hash(payload),
+        actor="pytest",
+        reason="recovered simulated plan",
+        now=datetime(2026, 7, 15, 9, 31, tzinfo=SHANGHAI),
+        order_client=never_order,
+        allow_new_buys=False,
+    )
+    assert payload["plan_availability"]["simulated_account"] == {
+        "status": "available", "reason": "", "executable": True,
+    }
+    strategy = payload["strategy_snapshot"]
+    state = json.loads(
+        (config.data_dir / "trend_drawdown/state.json").read_text(encoding="utf-8")
+    )
+    matching_records = [
+        record
+        for record in state["records"]
+        if record["market"] == "CN"
+        and record["strategy_id"] == strategy["strategy_id"]
+        and record["strategy_version"] == strategy["strategy_version"]
+    ]
+    assert (
+        payload["drawdown_summary"]["market"],
+        payload["drawdown_summary"]["strategy_id"],
+        payload["drawdown_summary"]["strategy_version"],
+        [
+            (record["current_equity"], record["high_water_mark"])
+            for record in matching_records
+        ],
+    ) == (
+        "CN",
+        strategy["strategy_id"],
+        strategy["strategy_version"],
+        [("100000", "100000")],
+    )
+    assert trend_module.valid_frozen_report_contract(payload) is True
+    assert controller_result["status"] in {"unchanged", "missed_window"}
+    assert controller_result["submitted_count"] == 0
+    assert never_order.requests == []
+
+
+def test_real_plan_recovery_after_receipt_collision_matches_fresh_control(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_symbols = tuple(f"30{index:04d}" for index in range(10))
+    real_snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)
+    real_snapshot["positions"] = [
+        {
+            "instrument_id": f"eastmoney:CN:{symbol}",
+            "broker": "eastmoney",
+            "market": "CN",
+            "asset_class": "stock",
+            "symbol": symbol,
+            "name": f"股票{symbol}",
+            "currency": "CNY",
+            "quantity": "500",
+            "cost_price": "10",
+            "market_value": "5000",
+        }
+        for symbol in real_symbols
+    ]
+    real_snapshot["cash_balances"] = [{
+        "broker": "eastmoney",
+        "account_alias": "eastmoney_main",
+        "currency": "CNY",
+        "cash_balance": "10000",
+        "available_balance": "10000",
+    }]
+
+    def enrich(
+        real_input: RealHoldingInput, **_kwargs: object
+    ) -> tuple[RealHoldingInput, dict[int, object], dict[str, object], int]:
+        if real_input.status != "available":
+            return real_input, {}, {}, 0
+        return (
+            replace(
+                real_input,
+                holding_snapshots={
+                    symbol: holding(symbol, strength="10", global_strength="10")
+                    for symbol in real_symbols
+                },
+                bars_by_symbol={symbol: bars() for symbol in real_symbols},
+                position_count=10,
+            ),
+            {},
+            {},
+            0,
+        )
+
+    monkeypatch.setattr(trend_module, "enrich_real_holding_input", enrich)
+
+    def v2_api(**_kwargs: object) -> ReadyApi:
+        return ReadyApi(
+            [],
+            snapshot_overrides={
+                1: {"trendStrengthGlobalCurr": "100"},
+                2: {"trendStrengthGlobalCurr": "99"},
+            },
+        )
+
+    recovery_config = trend_config(tmp_path / "recovery")
+    allocation = _write_cn_v2_allocation(recovery_config)
+    unlock_live_drawdown(recovery_config.data_dir, strategy_version="v15")
+    receipt_path = recovery_config.data_dir / (
+        "trend_a_share/delivery/2026-07-14.json"
+    )
+    fetch_calls = 0
+
+    def fetch_recovery() -> dict[str, object]:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        if fetch_calls == 1:
+            raise AccountHttpError("real account offline")
+        return copy.deepcopy(real_snapshot)
+
+    monkeypatch.setattr(trend_module, "fetch_account_snapshot", fetch_recovery)
+    collision_created = False
+
+    class StableSimulationAccount(DefaultSimAccountClient):
+        pass
+
+    def account_factory(**_kwargs: object) -> StableSimulationAccount:
+        nonlocal collision_created
+        if not collision_created:
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            receipt_path.mkdir()
+            collision_created = True
+        return StableSimulationAccount(simulate_acc_id=101)
+
+    with pytest.raises(OSError):
+        run_a_share_trend_report(
+            config=recovery_config,
+            run_date="2026-07-14",
+            allocation_reference=allocation,
+            api_factory=v2_api,
+            quote_factory=lambda **_kwargs: ReadyQuote([]),
+            account_factory=account_factory,
+            notifier=RecordingFeishu(),
+        )
+
+    planning_path = recovery_config.data_dir / (
+        "trend_review/planning/CN/2026-07-15.json"
+    )
+    first_manifest = json.loads(planning_path.read_text(encoding="utf-8"))
+    first_components = first_manifest["components"]
+    assert first_components["real_account"]["status"] == "unavailable"
+    receipt_path.rmdir()
+
+    recovered = run_a_share_trend_report(
+        config=recovery_config,
+        run_date="2026-07-14",
+        allocation_reference=allocation,
+        api_factory=v2_api,
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        account_factory=account_factory,
+        notifier=RecordingFeishu(),
+    )
+    recovered_payload = json.loads(
+        recovered.json_path.read_text(encoding="utf-8")
+    )
+    recovered_judgments = recovered_payload["strategy_judgments"]
+    after_manifest = json.loads(planning_path.read_text(encoding="utf-8"))
+
+    control_root = tmp_path / "control"
+    control_config = trend_config(control_root)
+    control_allocation = _write_cn_v2_allocation(control_config)
+    unlock_live_drawdown(control_config.data_dir, strategy_version="v15")
+    monkeypatch.setattr(
+        trend_module,
+        "fetch_account_snapshot",
+        lambda: copy.deepcopy(real_snapshot),
+    )
+    control = run_a_share_trend_report(
+        config=control_config,
+        run_date="2026-07-14",
+        allocation_reference=control_allocation,
+        api_factory=v2_api,
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        account_factory=lambda **_kwargs: StableSimulationAccount(
+            simulate_acc_id=101
+        ),
+        notifier=RecordingFeishu(),
+    )
+    control_payload = json.loads(control.json_path.read_text(encoding="utf-8"))
+    control_judgments = control_payload["strategy_judgments"]
+
+    assert (
+        recovered_judgments["real_rotation_pairs"],
+        recovered_judgments["real_rotation_comparisons"],
+        recovered_payload["plan_availability"]["real_account"]["status"],
+        after_manifest["components"]["market"],
+        after_manifest["components"]["simulated_account"],
+        after_manifest["components"]["real_account"]["status"],
+    ) == (
+        control_judgments["real_rotation_pairs"],
+        control_judgments["real_rotation_comparisons"],
+        "available",
+        first_components["market"],
+        first_components["simulated_account"],
+        "complete",
+    )
+    assert recovered_judgments["real_rotation_pairs"]
+    assert recovered_judgments["real_rotation_comparisons"]
+    assert fetch_calls == 2
+
+
+def test_planning_crash_retry_keeps_frozen_drawdown_state(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    allocation = _write_cn_v2_allocation(config)
+    unlock_live_drawdown(config.data_dir, strategy_version="v15")
+    api_instances = [ReadyApi([]), ReadyApi([])]
+    equity_values = iter(("100000", "90000"))
+
+    class ChangingAccount:
+        def account_snapshot(self) -> dict[str, object]:
+            equity = next(equity_values)
+            return {
+                "acc_id": 101,
+                "net_value": equity,
+                "cash": equity,
+                "positions": [],
+            }
+
+        def close(self) -> None:
+            pass
+
+    receipt_path = config.data_dir / "trend_a_share/delivery/2026-07-14.json"
+    collision_created = False
+
+    def account_factory(**_kwargs: object) -> ChangingAccount:
+        nonlocal collision_created
+        if not collision_created:
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            receipt_path.mkdir()
+            collision_created = True
+        return ChangingAccount()
+
+    with pytest.raises(OSError):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            allocation_reference=allocation,
+            api_factory=lambda **_kwargs: api_instances.pop(0),
+            quote_factory=lambda **_kwargs: ReadyQuote([]),
+            account_factory=account_factory,
+            notifier=RecordingFeishu(),
+        )
+
+    planning_path = config.data_dir / "trend_review/planning/CN/2026-07-15.json"
+    assert planning_path.exists()
+    assert receipt_path.is_dir()
+    receipt_path.rmdir()
+    recovered = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        allocation_reference=allocation,
+        api_factory=lambda **_kwargs: api_instances.pop(0),
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        account_factory=account_factory,
+        notifier=RecordingFeishu(),
+    )
+    assert recovered.json_path is not None
+    payload = json.loads(recovered.json_path.read_text(encoding="utf-8"))
+    state = json.loads(
+        (config.data_dir / "trend_drawdown/state.json").read_text(encoding="utf-8")
+    )
+    assert (
+        payload["account"]["net_value"],
+        payload["drawdown_summary"]["current_equity"],
+        state["records"][-1]["current_equity"],
+        state["records"][-1]["high_water_mark"],
+    ) == ("100000", "100000", "100000", "100000")
+
+
+def test_empty_v2_buy_fifo_is_controller_accepted_noop(tmp_path: Path) -> None:
+    config = trend_config(tmp_path)
+    allocation = _write_cn_v2_allocation(config)
+    unlock_live_drawdown(config.data_dir, strategy_version="v15")
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        allocation_reference=allocation,
+        api_factory=lambda **_kwargs: ReadyApi([]),
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        account_factory=simulation_account_with_positions(
+            "SH.000001", "SH.000002"
+        ),
+        notifier=RecordingFeishu(),
+    )
+    assert result.json_path is not None
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    judgments = payload["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    config = replace(config, trend_executor_host=socket.gethostname())
+
+    class NeverOrderClient:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {"positions": []}
+
+        def place_order(self, *args: object, **kwargs: object) -> None:
+            self.requests.append((args, kwargs))
+            raise AssertionError("empty frozen buy plan submitted an order")
+
+    never_order = NeverOrderClient()
+    assert (
+        judgments["simulated_buy_fifo"],
+        judgments["planned_new_seats"],
+    ) == ([], 0)
+    controller_result = trend_market_controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        str(payload["execution_date"]),
+        trend_review._report_hash(payload),
+        actor="pytest",
+        reason="empty frozen buy plan",
+        now=datetime(2026, 7, 15, 9, 31, tzinfo=SHANGHAI),
+        order_client=never_order,
+        allow_new_buys=False,
+    )
+    assert controller_result["status"] in {"unchanged", "missed_window"}
+    assert controller_result["submitted_count"] == 0
+    assert never_order.requests == []
 
 
 def test_current_cn_runner_skips_candidate_industry_breadth(tmp_path: Path) -> None:
@@ -9419,6 +10729,522 @@ def test_report_runner_uses_cn_simulation_account_and_ignores_actual_portfolio(
     assert payload["strategy_judgments"]["formal_actions"] == []
 
 
+def test_report_revision_reuses_target_day_frozen_components(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    first_calls: list[str] = []
+    first = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi(first_calls),
+        quote_factory=lambda **kwargs: ReadyQuote(first_calls),
+        notifier=RecordingFeishu(),
+    )
+    assert first.status == "generated"
+    first_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
+    evidence_path = config.data_dir / first_payload["replay_evidence"]["path"]
+    frozen_evidence = evidence_path.read_bytes()
+
+    def forbidden(**_kwargs: object) -> object:
+        raise AssertionError("target-day revision must reuse frozen components")
+
+    revised = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        revision=True,
+        api_factory=forbidden,
+        quote_factory=forbidden,
+        notifier=RecordingFeishu(),
+    )
+
+    assert revised.status == "generated"
+    assert revised.json_path.name == "2026-07-14-r1.json"
+    assert evidence_path.read_bytes() == frozen_evidence
+    revised_payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
+    assert revised_payload["execution_date"] == "2026-07-15"
+
+
+def test_report_revision_rejects_changed_planning_manifest(tmp_path: Path) -> None:
+    config = trend_config(tmp_path)
+    first = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+    first_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
+    planning_path = config.data_dir / first_payload["replay_evidence"]["planning_path"]
+    manifest = json.loads(planning_path.read_text(encoding="utf-8"))
+    manifest["as_of_date"] = "2026-07-15"
+    planning_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="planning snapshot hash mismatch"):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            revision=True,
+            api_factory=lambda **kwargs: pytest.fail(
+                "revision must reject the changed planning manifest before recapture"
+            ),
+            quote_factory=lambda **kwargs: pytest.fail(
+                "revision must reject the changed planning manifest before recapture"
+            ),
+            notifier=RecordingFeishu(),
+        )
+
+
+@pytest.mark.parametrize("replay_evidence", [None, {}], ids=["missing", "malformed"])
+def test_planning_revision_rejects_invalid_revision_chain_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replay_evidence: dict[str, object] | None,
+) -> None:
+    config = trend_config(tmp_path)
+    base = allocation_for("CN", rank=2, entry_weight="0.04")
+    snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-03",
+        generated_at="2026-08-03T16:18:00+08:00",
+        git_sha="a" * 40,
+        roots=base["snapshot"]["roots"],
+        previous=None,
+        version=2,
+    )
+    allocation_path = config.data_dir / "trend_allocation/daily/2026-08-03.json"
+    allocation_path.parent.mkdir(parents=True, exist_ok=True)
+    allocation_path.write_text(
+        json.dumps(snapshot, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    allocation = {
+        "daily_path": base["daily_path"],
+        "sha256": hashlib.sha256(allocation_path.read_bytes()).hexdigest(),
+        "snapshot": snapshot,
+    }
+    first = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        allocation_reference=allocation,
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+    report_path = config.reports_dir / "trend_a_share/2026-07-14.json"
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    if replay_evidence is None:
+        payload["replay_evidence"] = {
+            "planning_sha256": payload["replay_evidence"]["planning_sha256"]
+        }
+    else:
+        payload["replay_evidence"] = replay_evidence
+    report_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+    )
+    recapture: list[str] = []
+
+    def forbidden(**_kwargs: object) -> object:
+        recapture.append("report")
+        raise AssertionError("invalid planning chain must fail before recapture")
+
+    monkeypatch.setattr(
+        trend_module,
+        "fetch_account_snapshot",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("invalid planning chain must not fetch account")
+        ),
+    )
+    files_before = {path for path in tmp_path.rglob("*") if path.is_file()}
+    with pytest.raises(ValueError, match="planning"):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            revision=True,
+            api_factory=forbidden,
+            quote_factory=forbidden,
+            notifier=RecordingFeishu(),
+        )
+    assert recapture == []
+    files_after = {path for path in tmp_path.rglob("*") if path.is_file()}
+    report_dir = config.reports_dir / "trend_a_share"
+    assert all(path in files_before or report_dir in path.parents for path in files_after)
+
+
+def test_cn_legacy_allocation_v1_revision_uses_legacy_fallback(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    base = allocation_for("CN", rank=3, entry_weight="0.02")
+    snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-03",
+        generated_at="2026-08-03T16:18:00+08:00",
+        git_sha="a" * 40,
+        roots=base["snapshot"]["roots"],
+        previous=None,
+        version=1,
+    )
+    allocation_path = config.data_dir / "trend_allocation/daily/2026-08-03.json"
+    allocation_path.parent.mkdir(parents=True, exist_ok=True)
+    allocation_path.write_text(
+        json.dumps(snapshot, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    allocation = {
+        "daily_path": base["daily_path"],
+        "sha256": hashlib.sha256(allocation_path.read_bytes()).hexdigest(),
+        "snapshot": snapshot,
+    }
+    first = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        allocation_reference=allocation,
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+    assert first.status == "generated", first.waiting_reason
+    report_path = config.reports_dir / "trend_a_share/2026-07-14.json"
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["allocation"].get("version", 1) == 1
+    replay = payload["replay_evidence"]
+    payload["replay_evidence"] = {
+        "path": replay["path"],
+        "sha256": replay["sha256"],
+    }
+    report_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+    )
+    quote_calls: list[str] = []
+
+    class LegacyQuote:
+        def __init__(self, **_kwargs: object) -> None:
+            quote_calls.append("legacy_attempt")
+
+        def get_cn_trading_days(self, **_kwargs: object) -> list[str]:
+            raise FutuQuoteError("legacy fallback reached")
+
+        def close(self) -> None:
+            pass
+
+    revised = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        revision=True,
+        quote_factory=LegacyQuote,
+        now_fn=lambda: datetime(2026, 7, 14, 19, 0, tzinfo=SHANGHAI),
+        notifier=RecordingFeishu(),
+    )
+
+    assert revised.status == "failed"
+    assert quote_calls == ["legacy_attempt"]
+    assert "planning snapshot hash mismatch" not in str(revised.waiting_reason)
+
+
+def test_report_publishes_when_simulated_account_component_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    class UnavailableSimulationAccount:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def account_snapshot(self) -> object:
+            raise RuntimeError("simulation account offline")
+
+        def close(self) -> None:
+            pass
+
+    result = run_a_share_trend_report(
+        config=trend_config(tmp_path),
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        account_factory=UnavailableSimulationAccount,
+        notifier=RecordingFeishu(),
+    )
+
+    assert result.status == "generated"
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    availability = payload["plan_availability"]["simulated_account"]
+    assert availability["status"] == "unavailable"
+    assert availability["executable"] is False
+    assert "simulation account offline" in availability["reason"]
+    assert payload["strategy_judgments"]["formal_actions"] == []
+    assert "no_action" not in payload
+    assert trend_module.valid_frozen_report_contract(payload)
+
+
+def test_revision_fills_only_missing_simulated_account_component(
+    tmp_path: Path,
+) -> None:
+    class UnavailableSimulationAccount:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def account_snapshot(self) -> object:
+            raise RuntimeError("simulation account offline")
+
+        def close(self) -> None:
+            pass
+
+    config = trend_config(tmp_path)
+    first = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        account_factory=UnavailableSimulationAccount,
+        notifier=RecordingFeishu(),
+    )
+    first_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
+    evidence_path = config.data_dir / first_payload["replay_evidence"]["path"]
+    frozen_evidence = evidence_path.read_bytes()
+    state_path = config.data_dir / "trend_a_share/protection_state.json"
+    state_path.unlink(missing_ok=True)
+
+    def forbidden(**_kwargs: object) -> object:
+        raise AssertionError("completed market facts must not be recaptured")
+
+    revised = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        revision=True,
+        api_factory=forbidden,
+        quote_factory=forbidden,
+        account_factory=DefaultSimAccountClient,
+        notifier=RecordingFeishu(),
+    )
+
+    assert revised.status == "generated"
+    assert evidence_path.read_bytes() == frozen_evidence
+    revised_payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
+    assert revised_payload["plan_availability"]["simulated_account"] == {
+        "status": "available",
+        "reason": "",
+        "executable": True,
+    }
+    assert revised_payload["drawdown_summary"]["entry_allowed"] is False
+    receipt = json.loads(
+        (config.data_dir / "trend_a_share/delivery/2026-07-14-r1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    expected_state = {"schema_version": 1, "positions": {}}
+    assert (
+        receipt["protection_state"],
+        revised_payload["protection_state"],
+        state_path.exists(),
+        load_protection_state(state_path),
+    ) == (expected_state, expected_state, True, expected_state)
+    assert first.report_path is not None and "模拟盘计划不可用" in (
+        first.report_path.read_text(encoding="utf-8")
+    )
+    assert revised.report_path is not None and "模拟盘计划不可用" not in (
+        revised.report_path.read_text(encoding="utf-8")
+    )
+
+
+def test_revision_reuses_frozen_account_snapshot_for_real_enrichment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)
+    real_snapshot["positions"] = [{
+        "instrument_id": "eastmoney:CN:600003",
+        "broker": "eastmoney",
+        "market": "CN",
+        "asset_class": "stock",
+        "symbol": "600003",
+        "name": "股票600003",
+        "currency": "CNY",
+        "quantity": "10",
+        "cost_price": "10",
+        "market_value": "100",
+    }]
+    real_snapshot["cash_balances"] = [{
+        "broker": "eastmoney",
+        "account_alias": "eastmoney_main",
+        "currency": "CNY",
+        "cash_balance": "100",
+        "available_balance": "100",
+    }]
+    fetches = 0
+
+    def fetch() -> dict[str, object]:
+        nonlocal fetches
+        fetches += 1
+        if fetches == 1:
+            return copy.deepcopy(real_snapshot)
+        raise AssertionError("revision must reuse frozen account snapshot")
+
+    monkeypatch.setattr(trend_module, "fetch_account_snapshot", fetch)
+    enrich_calls = 0
+
+    def enrich(real_input: RealHoldingInput, **_kwargs: object) -> object:
+        nonlocal enrich_calls
+        enrich_calls += 1
+        if enrich_calls == 1:
+            return (
+                replace(
+                    real_input,
+                    status="unavailable",
+                    reason="real enrichment unavailable",
+                    holding_snapshots={},
+                    bars_by_symbol={},
+                ),
+                {},
+                {},
+                0,
+            )
+        return replace(real_input, status="available", reason=""), {}, {}, 0
+
+    monkeypatch.setattr(trend_module, "enrich_real_holding_input", enrich)
+
+    config = trend_config(tmp_path)
+    first = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+    assert first.json_path is not None and first.report_path is not None
+    first_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
+    assert first_payload["plan_availability"] == {
+        "simulated_account": {
+            "status": "available",
+            "reason": "",
+            "executable": True,
+        },
+        "real_account": {
+            "status": "unavailable",
+            "reason": "real enrichment unavailable",
+            "executable": False,
+        },
+    }
+    evidence_path = config.data_dir / first_payload["replay_evidence"]["path"]
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["rebuild_inputs"]["account_snapshot"] == real_snapshot
+    assert evidence["rebuild_inputs"]["account_input"] == ACCOUNT_INPUT
+    planning_path = config.data_dir / first_payload["replay_evidence"]["planning_path"]
+    before = json.loads(planning_path.read_text(encoding="utf-8"))
+    frozen_evidence = evidence_path.read_bytes()
+
+    class RevisionApi:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class RevisionQuote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    revised = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        revision=True,
+        api_factory=RevisionApi,
+        quote_factory=RevisionQuote,
+        notifier=RecordingFeishu(),
+    )
+
+    assert revised.json_path is not None and revised.report_path is not None
+    revised_payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
+    assert revised_payload["plan_availability"]["simulated_account"]["status"] == "available"
+    assert revised_payload["plan_availability"]["real_account"]["status"] == "available"
+    assert revised_payload["account_input"] == ACCOUNT_INPUT
+    assert revised_payload["strategy_judgments"]["real_holding_decisions_status"] == "available"
+    assert revised_payload["strategy_judgments"]["real_holding_decisions"][0]["symbol"] == "600003"
+    after = json.loads(planning_path.read_text(encoding="utf-8"))
+    assert after["components"]["market"] == before["components"]["market"]
+    assert after["components"]["simulated_account"]["status"] == "complete"
+    assert after["components"]["real_account"]["status"] == "complete"
+    assert evidence_path.read_bytes() == frozen_evidence
+    assert fetches == 1
+    assert enrich_calls == 2
+    assert "模拟盘计划不可用" not in first.report_path.read_text(encoding="utf-8")
+    assert "模拟盘计划不可用" not in revised.report_path.read_text(encoding="utf-8")
+
+
+def test_account_transport_failure_leaves_real_component_for_same_day_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def fetch() -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise AccountHttpError("account_unavailable")
+        return copy.deepcopy(ACCOUNT_SNAPSHOT)
+
+    monkeypatch.setattr(trend_module, "fetch_account_snapshot", fetch)
+    config = trend_config(tmp_path)
+    first = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+    assert first.json_path is not None
+    first_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
+    assert "account_input" not in first_payload
+    assert first_payload["plan_availability"]["real_account"]["status"] == "unavailable"
+    real_state_path = config.data_dir / "trend_a_share/real_protection_state.json"
+    real_state_path.unlink(missing_ok=True)
+    strict_payload = copy.deepcopy(first_payload)
+    strict_payload["plan_availability"]["real_account"]["status"] = "available"
+    assert not trend_module.valid_frozen_report_contract(strict_payload)
+    planning_path = config.data_dir / first_payload["replay_evidence"]["planning_path"]
+    before = json.loads(planning_path.read_text(encoding="utf-8"))
+
+    def forbidden(**_kwargs: object) -> object:
+        raise AssertionError("completed market facts must not be recaptured")
+
+    revised = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        revision=True,
+        api_factory=forbidden,
+        quote_factory=forbidden,
+        notifier=RecordingFeishu(),
+    )
+
+    assert revised.status == "generated"
+    assert revised.json_path is not None
+    revised_payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
+    assert revised_payload["plan_availability"]["real_account"]["status"] == "available"
+    assert revised_payload["account_input"] == ACCOUNT_INPUT
+    receipt = json.loads(
+        (config.data_dir / "trend_a_share/delivery/2026-07-14-r1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    real_state = receipt.get("real_protection_state")
+    assert (
+        isinstance(real_state, dict),
+        real_state_path.exists(),
+        load_protection_state(real_state_path),
+    ) == (True, True, real_state)
+    assert revised_payload["replay_evidence"]["path"] != (
+        first_payload["replay_evidence"]["path"]
+    )
+    after = json.loads(planning_path.read_text(encoding="utf-8"))
+    assert after["components"]["market"] == before["components"]["market"]
+    assert after["components"]["simulated_account"] == before["components"]["simulated_account"]
+    assert after["components"]["real_account"]["status"] == "complete"
+    assert calls == 2
+
+
 def test_generated_report_keeps_v8_identity_kelly_scope_and_drawdown_continuity(
     tmp_path: Path,
 ) -> None:
@@ -9503,6 +11329,149 @@ def test_report_runner_sends_exact_broker_v7_text(tmp_path: Path) -> None:
     assert payload["process_version"]
     assert payload["metadata"]["market"] == "CN"
     assert payload["metadata"]["broker"] == "eastmoney"
+
+
+def test_report_runner_freezes_simulated_buy_plan_in_report_evidence(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    unlock_live_drawdown(config.data_dir, strategy_version="v15")
+    account_calls = 0
+
+    class RecoveringAccount:
+        def __init__(self, **_kwargs: object) -> None:
+            nonlocal account_calls
+            account_calls += 1
+
+        def account_snapshot(self) -> object:
+            if account_calls == 1:
+                raise RuntimeError("simulation account offline")
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "cash": "100000",
+                "positions": [],
+            }
+
+        def close(self) -> None:
+            pass
+
+    base = allocation_for("CN", rank=2, entry_weight="0.04")
+    snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-03",
+        generated_at="2026-08-03T16:18:00+08:00",
+        git_sha="a" * 40,
+        roots=base["snapshot"]["roots"],
+        previous=None,
+        version=2,
+    )
+    allocation_path = config.data_dir / "trend_allocation/daily/2026-08-03.json"
+    allocation_path.parent.mkdir(parents=True, exist_ok=True)
+    allocation_path.write_text(
+        json.dumps(snapshot, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    allocation = {
+        "daily_path": base["daily_path"],
+        "sha256": hashlib.sha256(allocation_path.read_bytes()).hexdigest(),
+        "snapshot": snapshot,
+    }
+
+    class V2Api(ReadyApi):
+        def get_snapshots(
+            self,
+            *,
+            tm_ids: list[int],
+            fields: tuple[str, ...],
+            expected_date: str,
+        ) -> list[dict[str, object]]:
+            rows = super().get_snapshots(
+                tm_ids=tm_ids, fields=fields, expected_date=expected_date
+            )
+            if "trendStrengthGlobalCurr" in fields:
+                for row in rows:
+                    row["trendStrengthGlobalCurr"] = "90"
+            return rows
+
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        allocation_reference=allocation,
+        api_factory=lambda **kwargs: V2Api([]),
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        account_factory=RecoveringAccount,
+        notifier=RecordingFeishu(),
+    )
+    assert result.json_path is not None
+    first_payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert first_payload["plan_availability"]["simulated_account"]["status"] == (
+        "unavailable"
+    )
+    evidence_path = config.data_dir / first_payload["replay_evidence"]["path"]
+    before_evidence = evidence_path.read_bytes()
+    before_planning = json.loads(
+        (
+            config.data_dir
+            / first_payload["replay_evidence"]["planning_path"]
+        ).read_text(encoding="utf-8")
+    )
+
+    def forbidden(**_kwargs: object) -> object:
+        raise AssertionError("completed report facts must not be recaptured")
+
+    revised = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        revision=True,
+        account_factory=RecoveringAccount,
+        api_factory=forbidden,
+        quote_factory=forbidden,
+        notifier=RecordingFeishu(),
+    )
+    assert revised.json_path is not None
+    revised_payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
+    revised_judgments = revised_payload["strategy_judgments"]
+    assert revised_payload["plan_availability"]["simulated_account"] == {
+        "status": "available",
+        "reason": "",
+        "executable": True,
+    }
+    assert [
+        item["futu_symbol"] for item in revised_judgments["simulated_buy_fifo"]
+    ] == ["SZ.000001", "SZ.000002"]
+    assert revised_judgments["planned_new_seats"] == 15
+    assert account_calls == 2
+    after_planning = json.loads(
+        (
+            config.data_dir
+            / revised_payload["replay_evidence"]["planning_path"]
+        ).read_text(encoding="utf-8")
+    )
+    assert after_planning["components"]["market"] == before_planning["components"]["market"]
+    assert after_planning["components"]["real_account"] == before_planning["components"]["real_account"]
+    assert evidence_path.read_bytes() == before_evidence
+    revised_evidence = json.loads(
+        (
+            config.data_dir
+            / revised_payload["replay_evidence"]["path"]
+        ).read_text(encoding="utf-8")
+    )
+    assert revised_evidence["rebuild_inputs"]["simulated_buy_fifo"] == (
+        revised_judgments["simulated_buy_fifo"]
+    )
+    assert revised_evidence["rebuild_inputs"]["planned_new_seats"] == 15
+    rebuilt = trend_review.rebuild_trend_report_from_evidence(revised_evidence)
+    assert rebuilt["strategy_judgments"]["simulated_buy_fifo"] == (
+        revised_judgments["simulated_buy_fifo"]
+    )
+    assert rebuilt["strategy_judgments"]["planned_new_seats"] == 15
+    assert revised.report_path is not None
+    revised_markdown = revised.report_path.read_text(encoding="utf-8")
+    assert "模拟盘计划不可用" not in revised_markdown
+    assert "000001" in revised_markdown and "000002" in revised_markdown
+    assert not list(
+        (config.data_dir / "trend_review/ledgers/CN/buy_fifo").rglob("*.json")
+    )
 
 
 def test_report_runner_holiday_is_silent_and_free(tmp_path: Path) -> None:
@@ -10989,3 +12958,126 @@ def test_report_runner_redacts_api_key_from_all_outputs(tmp_path: Path) -> None:
         if path.is_file():
             captured += path.read_text(encoding="utf-8")
     assert config.trend_animals_api_key not in captured
+
+
+def test_staggered_planning_revisions_recover_remaining_account_component(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = trend_config(tmp_path)
+    api_calls: list[str] = []
+    simulation_calls = 0
+    real_snapshot_calls = 0
+
+    class StaggeredSimulationAccount(DefaultSimAccountClient):
+        def __init__(self, **kwargs: object) -> None:
+            nonlocal simulation_calls
+            simulation_calls += 1
+            super().__init__(**kwargs)
+
+        def account_snapshot(self) -> dict[str, object]:
+            if simulation_calls == 1:
+                raise RuntimeError("simulation account offline")
+            return super().account_snapshot()
+
+    def staggered_real_snapshot() -> dict[str, object]:
+        nonlocal real_snapshot_calls
+        real_snapshot_calls += 1
+        if real_snapshot_calls < 3:
+            raise AccountHttpError("real account offline")
+        return copy.deepcopy(ACCOUNT_SNAPSHOT)
+
+    monkeypatch.setattr(trend_module, "fetch_account_snapshot", staggered_real_snapshot)
+
+    first = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: ReadyApi(api_calls),
+        quote_factory=lambda **kwargs: ReadyQuote(api_calls),
+        account_factory=StaggeredSimulationAccount,
+        notifier=RecordingFeishu(),
+    )
+    assert first.status == "generated"
+    first_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
+    planning_path = config.data_dir / first_payload["replay_evidence"]["planning_path"]
+    first_manifest = json.loads(planning_path.read_text(encoding="utf-8"))
+    first_component_bytes = {
+        name: (config.data_dir / reference["path"]).read_bytes()
+        for name, reference in first_manifest["components"].items()
+    }
+    assert {
+        name: reference["status"]
+        for name, reference in first_manifest["components"].items()
+    } == {
+        "market": "complete",
+        "simulated_account": "unavailable",
+        "real_account": "unavailable",
+    }
+    initial_api_calls = list(api_calls)
+
+    def forbidden(**_kwargs: object) -> object:
+        raise AssertionError("completed market facts must not be recaptured")
+
+    revised_once = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        revision=True,
+        api_factory=forbidden,
+        quote_factory=forbidden,
+        account_factory=StaggeredSimulationAccount,
+        notifier=RecordingFeishu(),
+    )
+    assert revised_once.status == "generated"
+    first_revision_payload = json.loads(
+        revised_once.json_path.read_text(encoding="utf-8")
+    )
+    first_revision_manifest = json.loads(planning_path.read_text(encoding="utf-8"))
+    first_revision_component_bytes = {
+        name: (config.data_dir / reference["path"]).read_bytes()
+        for name, reference in first_revision_manifest["components"].items()
+    }
+    assert {
+        name: reference["status"]
+        for name, reference in first_revision_manifest["components"].items()
+    } == {
+        "market": "complete",
+        "simulated_account": "complete",
+        "real_account": "unavailable",
+    }
+    assert first_revision_component_bytes["market"] == first_component_bytes["market"]
+    assert first_revision_component_bytes["real_account"] == first_component_bytes["real_account"]
+    assert first_revision_payload["plan_availability"]["simulated_account"]["status"] == "available"
+    assert first_revision_payload["plan_availability"]["real_account"]["status"] == "unavailable"
+
+    revised_twice = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        revision=True,
+        api_factory=forbidden,
+        quote_factory=forbidden,
+        account_factory=StaggeredSimulationAccount,
+        notifier=RecordingFeishu(),
+    )
+    assert revised_twice.status == "generated"
+    final_payload = json.loads(revised_twice.json_path.read_text(encoding="utf-8"))
+    final_manifest = json.loads(planning_path.read_text(encoding="utf-8"))
+    final_component_bytes = {
+        name: (config.data_dir / reference["path"]).read_bytes()
+        for name, reference in final_manifest["components"].items()
+    }
+    assert {
+        name: reference["status"]
+        for name, reference in final_manifest["components"].items()
+    } == {
+        "market": "complete",
+        "simulated_account": "complete",
+        "real_account": "complete",
+    }
+    assert final_component_bytes["market"] == first_revision_component_bytes["market"]
+    assert final_component_bytes["simulated_account"] == first_revision_component_bytes["simulated_account"]
+    assert final_component_bytes["real_account"] != first_revision_component_bytes["real_account"]
+    assert final_payload["plan_availability"]["simulated_account"]["status"] == "available"
+    assert final_payload["plan_availability"]["real_account"]["status"] == "available"
+    assert simulation_calls == 2
+    assert real_snapshot_calls == 3
+    assert api_calls == initial_api_calls

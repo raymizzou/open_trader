@@ -356,6 +356,47 @@ def test_current_strategy_versions_use_exact_inherited_kelly_samples(
     )
 
 
+@pytest.mark.parametrize(
+    ("market", "predecessor_version", "current_version"),
+    [("CN", "v14", "v15"), ("HK", "v12", "v13"), ("US", "v12", "v13")],
+)
+def test_current_v2_versions_accept_immediate_predecessor_kelly_samples(
+    market: str, predecessor_version: str, current_version: str,
+) -> None:
+    predecessor = (
+        market,
+        f"trend_animals_warm_to_hot/{market}/{predecessor_version}",
+        predecessor_version,
+    )
+    target = (
+        market,
+        f"trend_animals_warm_to_hot/{market}/{current_version}",
+        current_version,
+    )
+    assert trend_kelly_identity_matches(predecessor, target)
+    assert not trend_kelly_identity_matches(target, predecessor)
+    rounds = [
+        _round(
+            index,
+            "0.10",
+            market=market,
+            strategy_id=predecessor[1],
+            version=predecessor_version,
+        )
+        for index in range(30)
+    ]
+
+    state = calculate_trend_kelly(
+        rounds,
+        market=market,
+        strategy_id=target[1],
+        opening_strategy_version=current_version,
+    )
+
+    assert state.phase == "active_all_samples"
+    assert state.selected_sample_count == 30
+
+
 def test_kelly_uses_latest_200_by_close_identity_not_input_order() -> None:
     rounds = [_round(index, "0.10") for index in range(201)]
     rounds[0] = _round(0, "-1")

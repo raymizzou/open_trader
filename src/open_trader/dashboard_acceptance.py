@@ -77,9 +77,9 @@ TREND_SIMULATE_MARKETS = {
     broker: market for broker, (market, _currency) in TREND_SIMULATE_BROKERS.items()
 }
 TREND_ACCEPTED_STRATEGY_VERSIONS = {
-    "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14"}),
-    "US": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"}),
-    "HK": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"}),
+    "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15"}),
+    "US": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"}),
+    "HK": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"}),
 }
 # Simulate positions are a stable contract; their served copy can lag one
 # publication behind the live Futu snapshot, so convergence is bounded.
@@ -2239,14 +2239,18 @@ def _check_trend_account_views(
             _check_frozen_trend_disciplines(
                 panel.locator(".cn-trend-report"), expectation, broker, page=page
             )
+            _check_trend_v2_plan_layout(
+                panel.locator(".cn-trend-report"), expectation, broker
+            )
             _check_history_control_contract(current, f"{broker} 历史报告返回")
             historical_text = panel.inner_text()
             assert panel.locator(".cn-trend-execution").count() == 0, (
                 f"{broker} 精确历史报告仍包含已删除的执行状态行"
             )
-            assert not any(
-                label in historical_text for label in REMOVED_TREND_EXECUTION_LABELS
-            ), f"{broker} 精确历史报告仍包含已删除的执行状态文案"
+            if not _is_v2_trend_report(expectation):
+                assert not any(
+                    label in historical_text for label in REMOVED_TREND_EXECUTION_LABELS
+                ), f"{broker} 精确历史报告仍包含已删除的执行状态文案"
             current.click()
             history_button = panel.locator("[data-report-history]")
             history_button.wait_for()
@@ -2741,6 +2745,179 @@ def _check_visible_decimal_precision(text: str, label: str) -> None:
     assert not offenders, f"{label} 数值超过两位小数：{offenders[:3]}"
 
 
+def _is_v2_trend_report(report: Mapping[str, Any]) -> bool:
+    market = str(report.get("market") or "").upper()
+    version = str(report.get("strategy_version") or "")
+    allocation = report.get("allocation")
+    return (
+        (market == "CN" and version == "v15")
+        or (market in {"HK", "US"} and version == "v13")
+        or (isinstance(allocation, Mapping) and allocation.get("version") == 2)
+    )
+
+
+def _normalize_trend_v2_symbol(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _trend_v2_plan_symbols(
+    items: Any, *, symbol_key: str, filter_sell_actions: bool = False,
+    pair_items: bool = False,
+) -> list[str]:
+    symbols: list[str] = []
+    seen: set[str] = set()
+    if not isinstance(items, list):
+        return symbols
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        action = item.get("action")
+        if filter_sell_actions and action and action not in {"SELL_ALL", "SELL_PARTIAL"}:
+            continue
+        value = (
+            item.get(symbol_key)
+            if pair_items
+            else item.get("symbol") or item.get("futu_symbol")
+        )
+        symbol = _normalize_trend_v2_symbol(value)
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        symbols.append(symbol)
+    return symbols
+
+
+def _trend_v2_plan_sequence(*groups: list[str]) -> list[str]:
+    return list(dict.fromkeys(symbol for group in groups for symbol in group))
+
+
+def _check_trend_v2_plan_layout(
+    report_root: Any, report: Mapping[str, Any], broker: str,
+) -> None:
+    if not _is_v2_trend_report(report):
+        return
+    titles = (
+        "模拟盘卖出计划", "实盘卖出计划", "模拟盘买入计划", "实盘买入计划",
+    )
+    sell_headings = (
+        "标的", "动作", "卖出类型", "执行参考价", "温度变化", "节气",
+        "个体全局强度", "触发原因", "活动保护线", "持仓提示",
+    )
+    buy_headings = ("序号", "标的", "个体全局强度", "4%目标金额", "预计数量")
+    plan_rows = (
+        (
+            _trend_v2_plan_sequence(
+                _trend_v2_plan_symbols(
+                    report.get("sell_actions"),
+                    symbol_key="sell_symbol",
+                    filter_sell_actions=True,
+                ),
+                _trend_v2_plan_symbols(
+                    report.get("simulate_rotation_pairs"),
+                    symbol_key="sell_symbol",
+                    pair_items=True,
+                ),
+            ),
+            sell_headings,
+        ),
+        (
+            _trend_v2_plan_sequence(
+                _trend_v2_plan_symbols(
+                    report.get("real_position_actions"),
+                    symbol_key="sell_symbol",
+                    filter_sell_actions=True,
+                ),
+                _trend_v2_plan_symbols(
+                    report.get("real_rotation_pairs"),
+                    symbol_key="sell_symbol",
+                    pair_items=True,
+                ),
+            ),
+            sell_headings,
+        ),
+        (
+            _trend_v2_plan_sequence(
+                _trend_v2_plan_symbols(
+                    report.get("buy_actions"), symbol_key="buy_symbol"
+                ),
+                _trend_v2_plan_symbols(
+                    report.get("simulate_rotation_pairs"),
+                    symbol_key="buy_symbol",
+                    pair_items=True,
+                ),
+            ),
+            buy_headings,
+        ),
+        (
+            _trend_v2_plan_sequence(
+                _trend_v2_plan_symbols(
+                    report.get("real_buy_actions"), symbol_key="buy_symbol"
+                ),
+                _trend_v2_plan_symbols(
+                    report.get("real_rotation_pairs"),
+                    symbol_key="buy_symbol",
+                    pair_items=True,
+                ),
+            ),
+            buy_headings,
+        ),
+    )
+    plans = report_root.locator(".trend-plan")
+    assert plans.count() == 4, f"{broker} v2 趋势计划区块数量不是 4"
+    assert plans.locator("h2").all_inner_texts() == list(titles), (
+        f"{broker} v2 趋势计划标题或顺序不正确"
+    )
+    for index, (expected_symbols, headings) in enumerate(plan_rows):
+        plan = plans.nth(index)
+        table = plan.locator("table.cn-trend-table")
+        assert table.count() == 1, f"{broker} v2 第 {index + 1} 个计划缺少表格"
+        assert table.locator("thead th").all_inner_texts() == list(headings), (
+            f"{broker} v2 第 {index + 1} 个计划列定义不正确"
+        )
+        rows = table.locator("tbody tr.cn-trend-card:visible")
+        assert rows.count() == len(expected_symbols), (
+            f"{broker} v2 第 {index + 1} 个计划行数与 API 不一致"
+        )
+        actual_symbols: list[str] = []
+        for row_index in range(rows.count()):
+            row = rows.nth(row_index)
+            assert row.locator("td").count() == len(headings), (
+                f"{broker} v2 第 {index + 1} 个计划行列数不一致"
+            )
+            identity = row.locator('td[data-label="标的"]')
+            assert identity.count() == 1, (
+                f"{broker} v2 第 {index + 1} 个计划标的单元格不唯一"
+            )
+            identity_text = identity.inner_text().strip()
+            actual_symbols.append(
+                _normalize_trend_v2_symbol(identity_text.split(maxsplit=1)[0])
+                if identity_text else ""
+            )
+        assert actual_symbols == expected_symbols, (
+            f"{broker} v2 第 {index + 1} 个计划标的顺序与 API 不一致"
+        )
+        for selector in (
+            ".trend-execution-status", ".cn-trend-execution",
+            ".trend-execution-queue", "[data-execution-status]",
+            ".trend-buy-fifo", "[data-buy-fifo]",
+            ".trend-frozen-list", "[data-frozen-list]",
+        ):
+            assert plan.locator(selector).count() == 0, (
+                f"{broker} v2 计划混入执行/冻结结构 {selector}"
+            )
+    assert report_root.locator(".cn-trend-buy, .cn-trend-sell").count() == 0, (
+        f"{broker} v2 计划仍包含旧买卖区结构"
+    )
+    assert report_root.locator(".trend-rotation-panel").count() == 0, (
+        f"{broker} v2 趋势报告仍显示旧轮换面板"
+    )
+    status = report_root.locator(".trend-execution-status")
+    assert status.count() == 1, f"{broker} v2 缺少报告与执行状态"
+    assert "报告与执行状态" in status.inner_text(), (
+        f"{broker} v2 执行状态标题不正确"
+    )
+
+
 def _check_integrated_trend_ui(
     report_root: Any, report: Mapping[str, Any], broker: str,
 ) -> None:
@@ -2764,6 +2941,7 @@ def _check_integrated_trend_ui(
         assert report_root.locator(selector).count() == 0, (
             f"{broker} 趋势报告仍包含已删除的 {selector}"
         )
+    _check_trend_v2_plan_layout(report_root, report, broker)
     bootstrap = drawdown.get("bootstrap_event")
     if isinstance(bootstrap, Mapping):
         audit = risk.locator(".trend-drawdown-bootstrap-audit")
@@ -2835,6 +3013,11 @@ def _check_integrated_trend_ui(
 def _check_trend_rotation_visibility(
     report_root: Any, report: Mapping[str, Any], broker: str,
 ) -> None:
+    if _is_v2_trend_report(report):
+        assert report_root.locator(".trend-rotation-panel").count() == 0, (
+            f"{broker} v2 趋势报告仍显示旧轮换面板"
+        )
+        return
     if not report.get("allocation"):
         assert report_root.locator(".trend-rotation-panel").count() == 0, (
             f"{broker} 无资源排名时仍显示轮换面板"
@@ -3151,16 +3334,19 @@ def _trend_action_reason_label(
         ("CN", "v12"),
         ("CN", "v13"),
         ("CN", "v14"),
+        ("CN", "v15"),
         ("US", "v6"),
         ("US", "v7"),
         ("US", "v10"),
         ("US", "v11"),
         ("US", "v12"),
+        ("US", "v13"),
         ("HK", "v6"),
         ("HK", "v7"),
         ("HK", "v10"),
         ("HK", "v11"),
         ("HK", "v12"),
+        ("HK", "v13"),
     }:
         try:
             initial = Decimal(str(item.get("initial_line")))
@@ -3949,7 +4135,11 @@ def _check_account_holdings(
         buy_actions = report.get("buy_actions")
         expected_buy_count = len(buy_actions) if isinstance(buy_actions, list) else 0
         _check_open_report_layout(
-            page, workspace, broker, expected_buy_count=expected_buy_count
+            page,
+            workspace,
+            broker,
+            expected_buy_count=expected_buy_count,
+            report=report,
         )
         if broker in {"futu", "phillips"}:
             _check_trend_option_buttons(page, workspace, report, broker)
@@ -3988,60 +4178,63 @@ def _check_account_holdings(
             assert f"{label} {_display_number(counts.get(key) or 0)}" in workspace_text, (
                 f"{broker} 趋势报告缺少 {label}计数"
             )
-        required_stages = [
-            "优先处理 · 卖出触发",
-            f"{_plain(report.get('buy_window'))} · 正式买入计划",
-            "盘中持续 · 已有持仓", "全部卖出", "正式买入", "继续持有",
-        ]
-        if isinstance(report.get("review_actions"), list) and report.get("review_actions"):
-            required_stages.insert(2, "需要确认 · 人工复核")
-            required_stages.append("人工复核")
-        for required in required_stages:
-            assert required in workspace_text, (
-                f"{broker} 趋势报告工作区缺少 {required}"
-            )
-        assert workspace.locator(".cn-trend-report").count() == 1, (
-            f"{broker} 趋势报告未使用动作优先结构"
-        )
-        stage_texts = workspace.locator(".cn-trend-stage").all_inner_texts()
-        _check_action_trend_stages(stage_texts, report, broker)
-        _check_trend_holding_tabs(workspace, report, broker)
-        expected_stage_tables = 3 + int(
-            isinstance(report.get("review_actions"), list)
-            and bool(report.get("review_actions"))
-        ) + int(report.get("real_position_status") == "available")
-        assert workspace.locator(".cn-trend-table").count() == expected_stage_tables, (
-            f"{broker} 趋势报告动作表数量与 API 不一致"
-        )
-        execution_rows = workspace.locator(".cn-trend-execution")
-        assert execution_rows.count() == 0, (
-            f"{broker} 趋势报告仍包含已删除的执行状态行"
-        )
-        assert not any(
-            label in workspace_text for label in REMOVED_TREND_EXECUTION_LABELS
-        ), f"{broker} 趋势报告仍包含已删除的执行状态文案"
-        if broker == "eastmoney" and not (
-            isinstance(report.get("strategy_parameter_rows"), list)
-            and report.get("strategy_parameter_rows")
-        ):
-            for required in (
-                "筛选价（Trend Animals）", "执行参考价（Futu 前复权）",
-                "纪律", "行业上下文",
-            ):
+        if _is_v2_trend_report(report):
+            _check_trend_holding_tabs(workspace, report, broker)
+        else:
+            required_stages = [
+                "优先处理 · 卖出触发",
+                f"{_plain(report.get('buy_window'))} · 正式买入计划",
+                "盘中持续 · 已有持仓", "全部卖出", "正式买入", "继续持有",
+            ]
+            if isinstance(report.get("review_actions"), list) and report.get("review_actions"):
+                required_stages.insert(2, "需要确认 · 人工复核")
+                required_stages.append("人工复核")
+            for required in required_stages:
                 assert required in workspace_text, (
-                    f"eastmoney 趋势报告工作区缺少 {required}"
+                    f"{broker} 趋势报告工作区缺少 {required}"
                 )
-            _check_cn_buy_rows(workspace, report)
-            _check_displayed_protection_prices(
-                workspace.locator(
-                    'td[data-label="活动保护线"], td[data-label="预计保护线"]'
-                ).all_inner_texts()
+            assert workspace.locator(".cn-trend-report").count() == 1, (
+                f"{broker} 趋势报告未使用动作优先结构"
             )
-            discipline = workspace.locator(".trend-discipline-workspace")
-            assert discipline.count() == 1, "eastmoney 趋势报告纪律区块缺失"
-            assert discipline.get_attribute("open") is None, (
-                "eastmoney 趋势报告纪律默认展开"
+            stage_texts = workspace.locator(".cn-trend-stage").all_inner_texts()
+            _check_action_trend_stages(stage_texts, report, broker)
+            _check_trend_holding_tabs(workspace, report, broker)
+            expected_stage_tables = 3 + int(
+                isinstance(report.get("review_actions"), list)
+                and bool(report.get("review_actions"))
+            ) + int(report.get("real_position_status") == "available")
+            assert workspace.locator(".cn-trend-table").count() == expected_stage_tables, (
+                f"{broker} 趋势报告动作表数量与 API 不一致"
             )
+            execution_rows = workspace.locator(".cn-trend-execution")
+            assert execution_rows.count() == 0, (
+                f"{broker} 趋势报告仍包含已删除的执行状态行"
+            )
+            assert not any(
+                label in workspace_text for label in REMOVED_TREND_EXECUTION_LABELS
+            ), f"{broker} 趋势报告仍包含已删除的执行状态文案"
+            if broker == "eastmoney" and not (
+                isinstance(report.get("strategy_parameter_rows"), list)
+                and report.get("strategy_parameter_rows")
+            ):
+                for required in (
+                    "筛选价（Trend Animals）", "执行参考价（Futu 前复权）",
+                    "纪律", "行业上下文",
+                ):
+                    assert required in workspace_text, (
+                        f"eastmoney 趋势报告工作区缺少 {required}"
+                    )
+                _check_cn_buy_rows(workspace, report)
+                _check_displayed_protection_prices(
+                    workspace.locator(
+                        'td[data-label="活动保护线"], td[data-label="预计保护线"]'
+                    ).all_inner_texts()
+                )
+                discipline = workspace.locator(".trend-discipline-workspace")
+                assert discipline.count() == 1, "eastmoney 趋势报告纪律区块缺失"
+                assert discipline.get_attribute("open") is None, (
+                    "eastmoney 趋势报告纪律默认展开"
+                )
         viewport = getattr(page, "viewport_size", None)
         if viewport and viewport.get("width", 0) <= 760:
             assert page.evaluate(
@@ -5096,7 +5289,12 @@ def _check_visual_contract(page: Any) -> None:
 
 
 def _check_open_report_layout(
-    page: Any, workspace: Any, broker: str, *, expected_buy_count: int | None = None,
+    page: Any,
+    workspace: Any,
+    broker: str,
+    *,
+    expected_buy_count: int | None = None,
+    report: Mapping[str, Any] | None = None,
 ) -> None:
     viewport = getattr(page, "viewport_size", None) or {}
     width = viewport.get("width", 0)
@@ -5133,6 +5331,10 @@ def _check_open_report_layout(
         assert abs(geometry["holdingsRight"] - geometry["reportRight"]) <= 1, (
             "趋势报告右边线未与持仓面板右边线对齐"
         )
+
+    if report is not None and _is_v2_trend_report(report):
+        _check_trend_v2_plan_layout(workspace, report, broker)
+        return
 
     buy_stage = workspace.locator(".cn-trend-buy")
     assert buy_stage.count() == 1, f"{broker} 趋势报告缺少正式买入区"

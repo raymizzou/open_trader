@@ -48,6 +48,11 @@ def test_trend_market_parser_exposes_run_status_and_resolve() -> None:
         "--actor", "ray", "--reason", "checked Futu history",
         "--futu-order-id", "SIM-42", "--config", "config/resolve.env",
     ])
+    execute_sim = parser.parse_args([
+        "trend-market", "execute-sim", "--market", "CN",
+        "--execution-date", "2026-08-21", "--report-sha", "a" * 64,
+        "--actor", "ray", "--reason", "manual retry", "--config", "config/sim.env",
+    ])
 
     assert (run.trend_market_command, run.market, run.revision) == (
         "run", "US", True,
@@ -66,6 +71,18 @@ def test_trend_market_parser_exposes_run_status_and_resolve() -> None:
         "reason": "checked Futu history",
         "futu_order_id": "SIM-42",
     } == vars(resolve)
+    assert (
+        execute_sim.trend_market_command,
+        execute_sim.market,
+        execute_sim.execution_date,
+        execute_sim.report_sha,
+        execute_sim.actor,
+        execute_sim.reason,
+        execute_sim.config,
+    ) == (
+        "execute-sim", "CN", "2026-08-21", "a" * 64,
+        "ray", "manual retry", Path("config/sim.env"),
+    )
 
 
 def test_trend_allocation_parser_routes_once_revision_and_status() -> None:
@@ -224,6 +241,38 @@ def test_trend_market_status_routes_without_broker_or_notifier(
     assert calls == [(config, "HK")]
     assert json.loads(capsys.readouterr().out) == {
         "effective_mode": "execute", "market": "HK",
+    }
+
+
+def test_trend_market_execute_sim_routes_exact_report_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = _config(tmp_path)
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(cli, "load_env_config", lambda *_args, **_kwargs: config)
+    monkeypatch.setattr(
+        cli,
+        "execute_simulated_trend_report",
+        lambda loaded, market, execution_date, report_sha, **kwargs: calls.append(
+            (loaded, market, execution_date, report_sha, kwargs)
+        ) or {"status": "complete", "execution_id": "exec-1"},
+    )
+
+    assert cli.main([
+        "trend-market", "execute-sim", "--market", "CN",
+        "--execution-date", "2026-08-21", "--report-sha", "a" * 64,
+        "--actor", "ray", "--reason", "manual retry",
+    ]) == 0
+
+    assert calls == [(
+        config, "CN", "2026-08-21", "a" * 64,
+        {"actor": "ray", "reason": "manual retry"},
+    )]
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "complete", "execution_id": "exec-1",
     }
 
 

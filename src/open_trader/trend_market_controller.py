@@ -5,7 +5,7 @@ import json
 import os
 import re
 import socket
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from contextlib import suppress
 from dataclasses import dataclass
@@ -80,11 +80,15 @@ from .trend_review import (
     execute_relative_rotations,
     execute_trend_review_open,
     execute_trend_review_stop,
+    freeze_simulated_buy_fifo,
     long_term_benchmark_cycle_path,
     load_trend_action_audit,
     lock_trend_execution_batch,
     overheat_trim_progress,
     _preflight_open_actions,
+    _normalize_futu_symbol,
+    _projected_simulated_buy_seats,
+    reconcile_deduplicated_buy_owners,
     record_trend_review_missed_buys,
     refresh_long_term_benchmark,
     relative_rotations_completed,
@@ -149,6 +153,79 @@ def _batch_path(config: DailyPremarketConfig, market: str, execution_date: str) 
         / "batches"
         / f"{execution_date}.json"
     )
+
+
+def _request_batch_path(
+    config: DailyPremarketConfig, market: str, execution_date: str, execution_id: str
+) -> Path:
+    return (
+        config.data_dir
+        / "trend_review"
+        / "ledgers"
+        / market
+        / "batches"
+        / "requests"
+        / execution_date
+        / f"{execution_id}.json"
+    )
+
+
+def _request_completion_path(
+    config: DailyPremarketConfig, market: str, execution_date: str, execution_id: str
+) -> Path:
+    return (
+        _controller_root(config, market)
+        / "simulation_requests"
+        / "completions"
+        / execution_date
+        / f"{execution_id}.json"
+    )
+
+
+def _simulation_execution_id(
+    account_id: int,
+    market: str,
+    execution_date: str,
+    report_sha: str,
+    actor: str,
+    reason: str,
+    *,
+    scheduled: bool,
+) -> str:
+    return hashlib.sha256(
+        "|".join(
+            (
+                "scheduled" if scheduled else "manual",
+                str(account_id),
+                market,
+                execution_date,
+                report_sha,
+                actor,
+                reason,
+            )
+        ).encode()
+    ).hexdigest()[:32]
+
+
+def _request_result_is_terminal(result: Mapping[str, object]) -> bool:
+    status = str(result.get("status") or "")
+    if status in {
+        "submitted",
+        "pending",
+        "uncertain",
+        "conflict",
+        "quote_unavailable",
+        "sell_failed",
+    }:
+        return False
+    return bool(result.get("terminal_rejected")) or status in {
+        "complete",
+        "unchanged",
+        "missed_window",
+        "reconciled",
+        "terminal_rejected",
+        "cancelled",
+    }
 
 
 def _close_path(config: DailyPremarketConfig, market: str, trading_date: str) -> Path:
@@ -473,6 +550,262 @@ def _valid_report(
     snapshot = payload.get("strategy_snapshot")
     judgments = payload.get("strategy_judgments")
     actions = judgments.get("formal_actions") if isinstance(judgments, dict) else None
+    strategy_version = (
+        str(snapshot.get("strategy_version") or "")
+        if isinstance(snapshot, Mapping)
+        else ""
+    )
+    allocation = payload.get("allocation")
+    v2_report = bool(
+        (
+            isinstance(allocation, Mapping)
+            and allocation.get("version", 1) == 2
+        )
+        or (market, strategy_version) in {
+            ("CN", "v15"), ("HK", "v13"), ("US", "v13"),
+        }
+    )
+    simulated_plan = (
+        payload.get("plan_availability", {}).get("simulated_account")
+        if isinstance(payload.get("plan_availability"), Mapping)
+        else None
+    )
+    plan_availability = payload.get("plan_availability")
+    if v2_report and not isinstance(plan_availability, Mapping):
+        return False
+    if plan_availability is not None:
+        if not isinstance(plan_availability, Mapping) or not isinstance(
+            simulated_plan, Mapping
+        ):
+            return False
+        if v2_report:
+            real_plan = plan_availability.get("real_account")
+            if not isinstance(real_plan, Mapping):
+                return False
+            for component in (simulated_plan, real_plan):
+                if (
+                    component.get("status") not in {"available", "unavailable"}
+                    or not isinstance(component.get("reason", ""), str)
+                    or not isinstance(component.get("executable"), bool)
+                ):
+                    return False
+        simulated_status = simulated_plan.get("status")
+        simulated_executable = simulated_plan.get("executable")
+        simulated_work = bool(actions) or bool(
+            judgments.get("simulate_rotation_pairs")
+            if isinstance(judgments, Mapping)
+            else False
+        )
+        account_available = (
+            isinstance(account, Mapping)
+            and account.get("fresh") is True
+            and account.get("status", "available") == "available"
+        )
+        account_unavailable = (
+            isinstance(account, Mapping)
+            and account.get("fresh") is False
+            and account.get("status") == "unavailable"
+        )
+        if simulated_status == "available":
+            if simulated_executable is not True or not account_available:
+                return False
+        elif simulated_status == "unavailable":
+            if simulated_executable is not False or not account_unavailable:
+                return False
+            if simulated_work:
+                return False
+        else:
+            return False
+    if (
+        v2_report
+        and isinstance(simulated_plan, Mapping)
+        and simulated_plan.get("status") == "available"
+        and simulated_plan.get("executable") is True
+    ):
+        if not isinstance(judgments, Mapping):
+            return False
+        simulated_buy_fifo = judgments.get("simulated_buy_fifo")
+        planned_new_seats = judgments.get("planned_new_seats")
+        if (
+            not isinstance(simulated_buy_fifo, list)
+            or not all(isinstance(entry, Mapping) for entry in simulated_buy_fifo)
+            or not isinstance(planned_new_seats, int)
+            or isinstance(planned_new_seats, bool)
+            or planned_new_seats < 0
+        ):
+            return False
+        held_symbols: list[str] = []
+        for position in account.get("positions", []) if isinstance(account, Mapping) else []:
+            if not isinstance(position, Mapping):
+                continue
+            try:
+                quantity = Decimal(str(position.get("quantity", "0")))
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+            if quantity <= 0:
+                continue
+            code = str(
+                position.get("futu_symbol")
+                or position.get("code")
+                or position.get("symbol")
+                or ""
+            ).strip()
+            if code:
+                held_symbols.append(code)
+        frozen_holding_codes = {
+            code
+            for value in held_symbols
+            if (code := _normalize_futu_symbol(market, value))
+        }
+        position_count = account.get("position_count") if isinstance(account, Mapping) else None
+        if (
+            isinstance(position_count, bool)
+            or not isinstance(position_count, int)
+            or position_count != len(frozen_holding_codes)
+        ):
+            return False
+        frozen_judgments = dict(judgments)
+        frozen_judgments.pop("simulated_buy_fifo", None)
+        frozen_judgments.pop("planned_new_seats", None)
+        frozen_report = {**payload, "strategy_judgments": frozen_judgments}
+        try:
+            generated_fifo = freeze_simulated_buy_fifo(
+                data_dir=config.data_dir,
+                report=frozen_report,
+                market=market,
+                execution_date=execution_date,
+                pre_sell_position_count=len(frozen_holding_codes),
+                held_symbols=tuple(held_symbols),
+                persist=False,
+            )
+        except (TypeError, ValueError):
+            return False
+        target_position_count = getattr(generated_fifo, "target_position_count", None)
+        if (
+            isinstance(target_position_count, bool)
+            or not isinstance(target_position_count, int)
+            or target_position_count <= 0
+        ):
+            return False
+        generated_entries = [
+            entry for entry in generated_fifo if isinstance(entry, Mapping)
+        ]
+        if len(generated_entries) != len(generated_fifo):
+            return False
+        generated_by_code = {
+            str(entry.get("futu_symbol") or "").strip().upper(): entry
+            for entry in generated_entries
+        }
+        frozen_codes: set[str] = set()
+        def identity(entry: object) -> tuple[str, str, str] | None:
+            if not isinstance(entry, Mapping):
+                return None
+            source = str(entry.get("source") or "").strip().lower()
+            symbol = str(entry.get("symbol") or "").strip().upper()
+            futu_symbol = _normalize_futu_symbol(market, entry.get("futu_symbol"))
+            if source not in {"formal", "rotation"} or not symbol or not futu_symbol:
+                return None
+            return source, symbol, futu_symbol
+
+        def owner_identity(
+            owner: object,
+        ) -> tuple[str, int, str, str] | None:
+            if not isinstance(owner, Mapping):
+                return None
+            source = str(owner.get("source") or "").strip().lower()
+            index_key = "action_index" if source == "formal" else "pair_index"
+            index = owner.get(index_key)
+            symbol = str(owner.get("symbol") or "").strip().upper()
+            futu_symbol = _normalize_futu_symbol(
+                market, owner.get("futu_symbol")
+            )
+            if (
+                source not in {"formal", "rotation"}
+                or isinstance(index, bool)
+                or not isinstance(index, int)
+                or index < 0
+                or not symbol
+                or not futu_symbol
+            ):
+                return None
+            return source, index, symbol, futu_symbol
+
+        if len(simulated_buy_fifo) != len(generated_entries):
+            return False
+        for entry, expected in zip(simulated_buy_fifo, generated_entries):
+            actual_identity = identity(entry)
+            expected_identity = identity(expected)
+            if actual_identity is None or actual_identity != expected_identity:
+                return False
+            code = actual_identity[2]
+            if code in frozen_codes:
+                return False
+            expected_owners = expected.get("owners")
+            owners = entry.get("owners") if isinstance(entry, Mapping) else None
+            if (
+                not isinstance(owners, list)
+                or not isinstance(expected_owners, list)
+                or not owners
+                or not expected_owners
+            ):
+                return False
+            actual_owners = [owner_identity(owner) for owner in owners]
+            expected_owner_identities = [
+                owner_identity(owner) for owner in expected_owners
+            ]
+            if (
+                any(owner is None for owner in actual_owners)
+                or any(owner is None for owner in expected_owner_identities)
+                or actual_owners != expected_owner_identities
+            ):
+                return False
+            frozen_codes.add(code)
+        if frozen_codes != set(generated_by_code):
+            return False
+        full_exit_symbols: list[object] = []
+        for action in actions if isinstance(actions, list) else []:
+            if not isinstance(action, Mapping) or action.get("action") != "SELL_ALL":
+                continue
+            try:
+                full_exit_symbols.append(
+                    trend_action_futu_symbol(payload, action, market)
+                )
+            except (TypeError, ValueError):
+                return False
+        for pair in (
+            judgments.get("simulate_rotation_pairs", [])
+            if isinstance(judgments, Mapping)
+            else []
+        ):
+            if (
+                isinstance(pair, Mapping)
+                and pair.get("execution_mode") == "automatic"
+            ):
+                full_exit_symbols.append(
+                    pair.get("sell_futu_symbol") or pair.get("sell_symbol")
+                )
+        derived_seats = _projected_simulated_buy_seats(
+            market=market,
+            target_position_count=target_position_count,
+            held_symbols=held_symbols,
+            full_exit_symbols=full_exit_symbols,
+        )
+        if generated_by_code and planned_new_seats != derived_seats:
+            return False
+        if not generated_by_code and planned_new_seats != 0:
+            return False
+    unavailable_simulated_account = (
+        isinstance(account, Mapping)
+        and account.get("fresh") is False
+        and account.get("status") == "unavailable"
+        and isinstance(simulated_plan, Mapping)
+        and simulated_plan.get("status") == "unavailable"
+        and simulated_plan.get("executable") is False
+        and isinstance(actions, list)
+        and not actions
+        and isinstance(judgments, Mapping)
+        and not judgments.get("simulate_rotation_pairs", [])
+    )
     expected_broker = {"CN": "eastmoney", "US": "futu", "HK": "phillips"}[market]
     expected_account = getattr(
         config, f"trend_review_{market.lower()}_simulate_acc_id"
@@ -489,7 +822,7 @@ def _valid_report(
         and str(metadata.get("broker") or "").lower() == expected_broker
         and isinstance(account, dict)
         and valid_serialized_account(account)
-        and account.get("fresh") is True
+        and (account.get("fresh") is True or unavailable_simulated_account)
         and account.get("source_date") == as_of.isoformat()
         and isinstance(snapshot, dict)
         and all(
@@ -533,10 +866,10 @@ def _valid_report(
         ):
             return False
     try:
-        _preflight_open_actions(payload, market)
+        executable_actions, _ = _preflight_open_actions(payload, market)
     except ValueError:
         return False
-    for action in actions:
+    for action in executable_actions:
         if (
             not isinstance(action, dict)
             or action.get("action") not in {"BUY", "SELL_ALL", "SELL_PARTIAL"}
@@ -605,6 +938,234 @@ def _load_latest_valid_report(
     return None
 
 
+def execute_simulated_trend_report(
+    config: DailyPremarketConfig,
+    market: str,
+    execution_date: str,
+    report_sha: str,
+    *,
+    actor: str,
+    reason: str,
+    now: datetime | None = None,
+    quote_client: object | None = None,
+    order_client: object | None = None,
+    allow_new_buys: bool = True,
+    scheduled: bool = False,
+) -> dict[str, object]:
+    """Create an immutable simulation request and execute that report only."""
+    market = _market(market)
+    execution_date = date.fromisoformat(execution_date).isoformat()
+    report_sha = report_sha.strip().lower()
+    actor = actor.strip()
+    reason = reason.strip()
+    if (
+        len(report_sha) != 64
+        or any(character not in "0123456789abcdef" for character in report_sha)
+    ):
+        raise ValueError("report SHA must be a 64-character hexadecimal digest")
+    if not actor or not reason:
+        raise ValueError("actor and reason are required")
+    matches: list[tuple[Path, dict[str, object]]] = []
+    for path in _report_dir(config, market).glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and _report_hash(payload) == report_sha:
+            matches.append((path, payload))
+    if not matches:
+        raise FileNotFoundError(f"no trend report matches SHA {report_sha}")
+    if len(matches) != 1:
+        raise ValueError(f"report SHA matches multiple trend reports: {report_sha}")
+    report_path, report = matches[0]
+    if not _valid_report(config, market, execution_date, report_path, report):
+        raise ValueError(f"invalid frozen trend report: {report_path}")
+    account_id = require_trend_review_config(config, market)
+    requested_at = _localized(now or datetime.now(TIMEZONES[market]), config.timezone)
+    execution_id = _simulation_execution_id(
+        account_id,
+        market,
+        execution_date,
+        report_sha,
+        actor,
+        reason,
+        scheduled=scheduled,
+    )
+    request_path = (
+        _controller_root(config, market)
+        / "simulation_requests"
+        / execution_date
+        / f"{execution_id}.json"
+    )
+    request = {
+        "schema_version": "open_trader.trend_controller.simulation_request.v1",
+        "execution_id": execution_id,
+        "account_type": "futu_simulate",
+        "account_id": account_id,
+        "market": market,
+        "execution_date": execution_date,
+        "report_path": str(report_path),
+        "report_sha256": report_sha,
+        "actor": actor,
+        "reason": reason,
+        "requested_at": requested_at.isoformat(timespec="seconds"),
+    }
+    request_reused = False
+    if request_path.exists():
+        try:
+            existing = json.loads(request_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid simulation request: {request_path}") from exc
+        expected_identity = {
+            key: value for key, value in request.items() if key != "requested_at"
+        }
+        existing_identity = (
+            {
+                key: existing.get(key)
+                for key in expected_identity
+            }
+            if isinstance(existing, Mapping)
+            else None
+        )
+        if existing_identity != expected_identity:
+            raise ValueError(f"simulation request identity collision: {request_path}")
+        request_reused = True
+    else:
+        _write_immutable(request_path, _canonical_json_bytes(request))
+    completion_path = _request_completion_path(
+        config, market, execution_date, execution_id
+    )
+    expected_result_identity = {
+        "market": market,
+        "date": execution_date,
+        "account_id": account_id,
+        "execution_id": execution_id,
+        "request_path": str(request_path),
+        "report_sha256": report_sha,
+        "actor": actor,
+        "reason": reason,
+    }
+    if request_reused and completion_path.exists():
+        completion = _read_json(completion_path, "simulation request completion")
+        stored_request = completion.get("request")
+        stored_result = completion.get("result")
+        if (
+            completion.get("schema_version")
+            != "open_trader.trend_controller.simulation_completion.v1"
+            or completion.get("execution_id") != execution_id
+            or completion.get("request_path") != str(request_path)
+            or not isinstance(stored_request, Mapping)
+            or {
+                key: stored_request.get(key) for key in expected_identity
+            }
+            != expected_identity
+            or not isinstance(stored_result, Mapping)
+            or {
+                key: stored_result.get(key) for key in expected_result_identity
+            }
+            != expected_result_identity
+        ):
+            raise ValueError(f"invalid simulation request completion: {completion_path}")
+        reconciled = {
+            **dict(stored_result),
+            "status": "reconciled",
+            "execution_id": execution_id,
+            "request_path": str(request_path),
+            "report_sha256": report_sha,
+            "actor": actor,
+            "reason": reason,
+            "request_reused": True,
+        }
+        if reconciled.get("terminal_rejected") is True:
+            _notify_terminal_rejections(
+                config,
+                market,
+                execution_date,
+                requested_at.isoformat(timespec="seconds"),
+            )
+        return reconciled
+    if request_reused and scheduled:
+        cycle = ControllerCycle(
+            market=market,
+            as_of_date=str(report.get("as_of_date") or execution_date),
+            execution_date=execution_date,
+            report_run_date=str(report.get("generated_at") or "")[:10],
+            session="execution",
+            market_open=True,
+            next_check_at=requested_at,
+        )
+        if _execution_completed(config, cycle, execution_id=execution_id):
+            reconciled = {
+                "status": "reconciled",
+                "market": market,
+                "date": execution_date,
+                "submitted_count": 0,
+                "artifact_paths": [],
+                "account_id": account_id,
+                "execution_id": execution_id,
+                "request_path": str(request_path),
+                "report_sha256": report_sha,
+                "actor": actor,
+                "reason": reason,
+                "request_reused": True,
+            }
+            _notify_terminal_rejections(
+                config,
+                market,
+                execution_date,
+                requested_at.isoformat(timespec="seconds"),
+            )
+            return reconciled
+    result = _execute_locked_report(
+        config,
+        market,
+        execution_date,
+        report_path,
+        report,
+        allow_new_buys=allow_new_buys,
+        quote_client=quote_client,
+        order_client=order_client,
+        scheduled=scheduled,
+        execution_id=execution_id,
+        request_path=request_path,
+        account_id=account_id,
+    )
+    if any(
+        key in result and result.get(key) != value
+        for key, value in expected_result_identity.items()
+    ):
+        raise ValueError(f"simulation result identity collision: {request_path}")
+    result_with_identity = {
+        **result,
+        **expected_result_identity,
+        "request_reused": request_reused,
+    }
+    if _request_result_is_terminal(result_with_identity):
+        _write_immutable(
+            completion_path,
+            _canonical_json_bytes(
+                {
+                    "schema_version": (
+                        "open_trader.trend_controller.simulation_completion.v1"
+                    ),
+                    "execution_id": execution_id,
+                    "request_path": str(request_path),
+                    "request": request,
+                    "result": result_with_identity,
+                    "completed_at": requested_at.isoformat(timespec="seconds"),
+                }
+            ),
+        )
+    if result_with_identity.get("terminal_rejected") is True:
+        _notify_terminal_rejections(
+            config,
+            market,
+            execution_date,
+            requested_at.isoformat(timespec="seconds"),
+        )
+    return result_with_identity
+
+
 def _load_cycle_report(
     config: DailyPremarketConfig, cycle: ControllerCycle
 ) -> tuple[Path, dict[str, object]] | None:
@@ -640,6 +1201,37 @@ def _load_cycle_report(
     if latest is None or latest[1].get("as_of_date") != cycle.as_of_date:
         return None
     return latest
+
+
+def _load_first_valid_report(
+    config: DailyPremarketConfig, cycle: ControllerCycle
+) -> tuple[Path, dict[str, object]] | None:
+    paths = sorted(
+        (
+            path
+            for path in _report_dir(config, cycle.market).glob(
+                f"{cycle.as_of_date}*.json"
+            )
+            if (match := REPORT_STEM.fullmatch(path.stem)) is not None
+            and match.group("date") == cycle.as_of_date
+        ),
+        key=_report_order,
+    )
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"invalid frozen trend report: {path}; run --revision"
+            ) from exc
+        if not _valid_report(
+            config, cycle.market, cycle.execution_date, path, payload
+        ):
+            raise ValueError(
+                f"invalid frozen trend report: {path}; run --revision"
+            )
+        return path, payload
+    return None
 
 
 def _delivery_receipt_path(
@@ -1057,32 +1649,79 @@ def _execute_locked_report(
     *,
     allow_new_buys: bool = True,
     quote_client: object | None = None,
+    order_client: object | None = None,
+    scheduled: bool = True,
+    execution_id: str | None = None,
+    request_path: Path | None = None,
+    account_id: int | None = None,
 ) -> dict[str, object]:
     require_trend_executor(config, hostname_fn=socket.gethostname)
     now = datetime.now(TIMEZONES[market]).isoformat(timespec="seconds")
     as_of_date = str(report.get("as_of_date") or "")
     with RunLock(_revision_gate_path(config, market, execution_date)):
-        request, completion = _revision_state(
-            config, market, as_of_date, execution_date
-        )
-        if request is not None and completion is None:
-            raise RuntimeError("trend report revision request is pending")
-        if completion is not None:
-            if completion.get("report_sha256") != _report_hash(report):
-                raise RuntimeError("completed trend report revision is not selected")
-        batch = lock_trend_execution_batch(
-            config.data_dir,
-            market=market,
-            execution_date=execution_date,
-            report_path=report_path,
-            report=report,
-            locked_at=now,
-        )
-    locked_path = Path(str(batch["report_path"]))
-    locked_report = _read_json(locked_path, "locked trend report")
+        locked_batch_sha: str | None = None
+        if scheduled:
+            batch = lock_trend_execution_batch(
+                config.data_dir,
+                market=market,
+                execution_date=execution_date,
+                report_path=report_path,
+                report=report,
+                locked_at=now,
+            )
+            locked_path = Path(str(batch["report_path"]))
+            locked_report = _read_json(locked_path, "locked trend report")
+            locked_batch_sha = str(batch["report_sha256"])
+        else:
+            locked_path = report_path
+            locked_report = dict(report)
+            if execution_id:
+                manual_batch_path = _request_batch_path(
+                    config, market, execution_date, execution_id
+                )
+                manual_batch = {
+                    "schema_version": "open_trader.trend_review.batch.v1",
+                    "market": market,
+                    "execution_date": execution_date,
+                    "report_path": str(report_path),
+                    "report_sha256": _report_hash(locked_report),
+                    "locked_at": now,
+                    "execution_id": execution_id,
+                    "request_path": str(request_path) if request_path else None,
+                    "account_id": account_id,
+                }
+                if manual_batch_path.exists():
+                    existing_manual_batch = _read_json(
+                        manual_batch_path, "manual trend execution batch"
+                    )
+                    identity_fields = (
+                        "schema_version",
+                        "market",
+                        "execution_date",
+                        "report_path",
+                        "report_sha256",
+                        "execution_id",
+                        "request_path",
+                        "account_id",
+                    )
+                    if any(
+                        existing_manual_batch.get(field) != manual_batch.get(field)
+                        for field in identity_fields
+                    ):
+                        raise ValueError(
+                            f"manual trend execution batch identity collision: "
+                            f"{manual_batch_path}"
+                        )
+                else:
+                    _write_immutable(
+                        manual_batch_path, _canonical_json_bytes(manual_batch)
+                    )
     if (
         not _valid_report(config, market, execution_date, locked_path, locked_report)
-        or _report_hash(locked_report) != batch["report_sha256"]
+        or (
+            locked_batch_sha is not None
+            and _report_hash(locked_report) != locked_batch_sha
+        )
     ):
         raise ValueError(f"invalid locked trend report: {locked_path}")
     judgments = locked_report["strategy_judgments"]
@@ -1102,6 +1741,9 @@ def _execute_locked_report(
         market=market,
         execution_date=execution_date,
         now=now,
+        execution_id=execution_id,
+        request_path=str(request_path) if request_path else None,
+        account_id=account_id,
     ) if actions else 0
     sell_symbols = {
         trend_action_futu_symbol(locked_report, action, market)
@@ -1140,10 +1782,30 @@ def _execute_locked_report(
             and str(pair.get("buy_futu_symbol") or "")
         }
     )
+    rotation_quote_symbols = tuple(
+        sorted(
+            {
+                str(pair.get("buy_futu_symbol") or "")
+                for pair in rotation_pairs
+                if isinstance(pair, Mapping)
+                and str(pair.get("buy_futu_symbol") or "")
+            }
+            | {
+                str(item.get("futu_symbol") or "")
+                for item in (
+                    locked_report.get("metadata", {}).get("candidate_fallbacks", [])
+                    if isinstance(locked_report.get("metadata"), Mapping)
+                    else []
+                )
+                if isinstance(item, Mapping) and str(item.get("futu_symbol") or "")
+            }
+        )
+    )
     quote = quote_client
     owns_quote = False
     prices: dict[str, Decimal] = {}
-    client = None
+    client = order_client
+    owns_client = order_client is None
     try:
         if symbols:
             try:
@@ -1158,35 +1820,108 @@ def _execute_locked_report(
                 }
             except Exception:
                 prices = {}
-        client = _new_order_client(
-            config, market, quote_client if quote_client is not None else quote
-        )
-        ordinary = execute_trend_review_open(
-            data_dir=config.data_dir,
-            report=locked_report,
-            client=client,
+        if client is None:
+            client = _new_order_client(
+                config, market, quote_client if quote_client is not None else quote
+            )
+
+        class ControllerObservedOrderClient:
+            def __init__(self, wrapped: object, observed_at: str) -> None:
+                self._wrapped = wrapped
+                self._observed_at = observed_at
+
+            def account_snapshot(self, *args: object, **kwargs: object) -> object:
+                snapshot = self._wrapped.account_snapshot(*args, **kwargs)  # type: ignore[attr-defined]
+                if isinstance(snapshot, Mapping):
+                    return {
+                        **snapshot,
+                        "controller_observed_at": self._observed_at,
+                    }
+                return snapshot
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._wrapped, name)
+
+        client = ControllerObservedOrderClient(client, now)
+
+        def refresh_rotation_quotes(
+            symbols: Sequence[str] | None = None,
+        ) -> Mapping[str, Decimal]:
+            if quote is None or not callable(getattr(quote, "get_snapshots", None)):
+                raise RuntimeError("rotation quote client is unavailable")
+            requested = rotation_quote_symbols if symbols is None else tuple(symbols)
+            snapshots = quote.get_snapshots(list(requested))
+            if not isinstance(snapshots, Mapping):
+                raise RuntimeError("rotation quote snapshot is invalid")
+            return {
+                str(symbol): Decimal(str(snapshot.last_price))
+                for symbol, snapshot in snapshots.items()
+                if getattr(snapshot, "last_price", None) is not None
+            }
+
+        execution_cycle = ControllerCycle(
             market=market,
+            as_of_date=as_of_date,
             execution_date=execution_date,
-            now=now,
-            quote_prices=prices,
+            report_run_date=str(locked_report.get("generated_at") or "")[:10],
+            session="execution",
+            market_open=True,
+            next_check_at=datetime.fromisoformat(now),
         )
-        if allow_new_buys and ordinary.get("status") == "quote_unavailable":
-            raise RuntimeError("current quote unavailable for pending trend buy")
-        ordinary_complete = not actions or _execution_completed(
-            config,
-            ControllerCycle(
-                market=market,
-                as_of_date=as_of_date,
-                execution_date=execution_date,
-                report_run_date=str(locked_report.get("generated_at") or "")[:10],
-                session="execution",
-                market_open=True,
-                next_check_at=datetime.fromisoformat(now),
-            ),
-            include_rotations=False,
+        strategy_snapshot = locked_report.get("strategy_snapshot")
+        strategy_version = (
+            str(strategy_snapshot.get("strategy_version") or "")
+            if isinstance(strategy_snapshot, Mapping)
+            else ""
         )
-        rotation = (
-            execute_relative_rotations(
+        allocation = locked_report.get("allocation")
+        staged_rotation_batch = bool(
+            (
+                isinstance(allocation, Mapping)
+                and allocation.get("version", 1) == 2
+                or (market, strategy_version) in {
+                    ("CN", "v15"), ("HK", "v13"), ("US", "v13"),
+                }
+            )
+        )
+        if staged_rotation_batch:
+            def snapshot_position_count(snapshot: object) -> int | None:
+                if not isinstance(snapshot, Mapping):
+                    return None
+                raw_positions = snapshot.get("positions")
+                if not isinstance(raw_positions, list):
+                    return None
+                count = 0
+                for item in raw_positions:
+                    if not isinstance(item, Mapping):
+                        continue
+                    try:
+                        if Decimal(
+                            str(item.get("qty", item.get("quantity", "0")))
+                        ) > 0:
+                            count += 1
+                    except (InvalidOperation, TypeError, ValueError):
+                        continue
+                return count
+
+            snapshot_reader = getattr(client, "account_snapshot", None)
+            pre_sell_snapshot = None
+            if callable(snapshot_reader):
+                try:
+                    pre_sell_snapshot = snapshot_reader()
+                except Exception:
+                    pre_sell_snapshot = None
+            account_report = locked_report.get("account")
+            pre_sell_position_count = snapshot_position_count(pre_sell_snapshot)
+            if pre_sell_position_count is None and isinstance(account_report, Mapping):
+                raw_count = account_report.get("position_count")
+                if isinstance(raw_count, int) and not isinstance(raw_count, bool):
+                    pre_sell_position_count = raw_count
+                else:
+                    pre_sell_position_count = snapshot_position_count(account_report)
+            if pre_sell_position_count is None:
+                pre_sell_position_count = 0
+            ordinary = execute_trend_review_open(
                 data_dir=config.data_dir,
                 report=locked_report,
                 client=client,
@@ -1194,19 +1929,557 @@ def _execute_locked_report(
                 execution_date=execution_date,
                 now=now,
                 quote_prices=prices,
+                include_buys=False,
+                include_sells=True,
+                execution_id=execution_id,
+                request_path=str(request_path) if request_path else None,
+                account_id=account_id,
             )
-            if allow_new_buys and rotation_pairs and ordinary_complete
-            else {
-                "status": "unchanged", "submitted_count": 0,
-                "artifact_paths": [],
-            }
+            rotation = (
+                execute_relative_rotations(
+                    data_dir=config.data_dir,
+                    report=locked_report,
+                    client=client,
+                    market=market,
+                    execution_date=execution_date,
+                    now=now,
+                    quote_prices=prices,
+                    _phase="sell",
+                    execution_id=execution_id,
+                    request_path=str(request_path) if request_path else None,
+                    account_id=account_id,
+                )
+                if rotation_pairs
+                else {
+                    "status": "unchanged", "submitted_count": 0,
+                    "artifact_paths": [],
+                }
+            )
+            if allow_new_buys and (actions or rotation_pairs):
+                def snapshot_codes(snapshot: object) -> set[str]:
+                    if not isinstance(snapshot, Mapping):
+                        return set()
+                    raw_positions = snapshot.get("positions")
+                    if not isinstance(raw_positions, list):
+                        return set()
+                    codes: set[str] = set()
+                    for item in raw_positions:
+                        if not isinstance(item, Mapping):
+                            continue
+                        code = str(
+                            item.get("code") or item.get("futu_code") or ""
+                        ).strip().upper()
+                        if not code:
+                            continue
+                        try:
+                            quantity = Decimal(
+                                str(item.get("qty", item.get("quantity", "0")))
+                            )
+                        except (InvalidOperation, TypeError, ValueError):
+                            continue
+                        if quantity.is_finite() and quantity > 0:
+                            codes.add(code)
+                    return codes
+
+                post_sell_snapshot = None
+                if callable(snapshot_reader):
+                    try:
+                        post_sell_snapshot = snapshot_reader()
+                    except Exception:
+                        post_sell_snapshot = None
+                held_codes = snapshot_codes(post_sell_snapshot)
+                order_reader = getattr(client, "list_orders", None)
+                terminal_buy_statuses = {
+                    "FILLED", "FILLED_ALL", "CANCELLED", "CANCELLED_ALL",
+                    "CANCELLED_PART", "FAILED", "SUBMIT_FAILED", "TIMEOUT",
+                    "DISABLED", "DELETED", "REJECTED",
+                }
+
+                def listed_buy_orders() -> list[Mapping[str, object]] | None:
+                    if not callable(order_reader):
+                        return None
+                    try:
+                        listed = order_reader(start=execution_date, end=execution_date)
+                        orders = listed.get("orders") if isinstance(listed, Mapping) else None
+                    except Exception:
+                        return None
+                    if not isinstance(orders, list):
+                        return None
+                    return [
+                        order for order in orders if isinstance(order, Mapping)
+                    ]
+
+                pending_codes: set[str] = set()
+                initial_orders = listed_buy_orders()
+                if initial_orders is not None:
+                    for order in initial_orders:
+                        side = str(
+                            order.get("side") or order.get("trd_side") or ""
+                        ).upper()
+                        status = str(
+                            order.get("order_status") or order.get("status") or ""
+                        ).upper()
+                        code = str(
+                            order.get("futu_code") or order.get("code") or ""
+                        ).strip().upper()
+                        if side in {"BUY", "BUY_BACK"} and code and status not in terminal_buy_statuses:
+                            pending_codes.add(code)
+                buy_entries = freeze_simulated_buy_fifo(
+                    data_dir=config.data_dir,
+                    report=locked_report,
+                    market=market,
+                    execution_date=execution_date,
+                    pre_sell_position_count=pre_sell_position_count,
+                    held_symbols=tuple(held_codes),
+                    pending_symbols=tuple(pending_codes),
+                )
+                frozen_buy_plan = bool(
+                    isinstance(judgments, Mapping)
+                    and isinstance(judgments.get("simulated_buy_fifo"), list)
+                    and isinstance(judgments.get("planned_new_seats"), int)
+                    and not isinstance(judgments.get("planned_new_seats"), bool)
+                    and judgments.get("planned_new_seats", -1) >= 0
+                )
+                frozen_buy_symbols = tuple(dict.fromkeys(
+                    str(entry.get("futu_symbol") or "").strip().upper()
+                    for entry in buy_entries
+                    if isinstance(entry, Mapping)
+                    and str(entry.get("futu_symbol") or "").strip()
+                ))
+                if frozen_buy_symbols:
+                    try:
+                        prices = {
+                            **prices,
+                            **refresh_rotation_quotes(frozen_buy_symbols),
+                        }
+                    except Exception as exc:
+                        rotation = {
+                            **rotation,
+                            "status": "uncertain",
+                            "failure_details": [
+                                {"reason": "post_sell_quote_refresh_unavailable"}
+                            ],
+                            "notification": {
+                                "title": f"{market} 趋势轮换暂缓",
+                                "message": f"卖出后刷新行情不可用，继续使用冻结前行情：{exc}",
+                            },
+                        }
+                    rotation_buy = {
+                        "status": "unchanged",
+                        "submitted_count": 0,
+                        "artifact_paths": [],
+                    }
+                    ordinary_buy = {
+                        "status": "unchanged",
+                        "submitted_count": 0,
+                        "artifact_paths": [],
+                    }
+                    allocation_markets = (
+                        allocation.get("markets")
+                        if isinstance(allocation, Mapping)
+                        else None
+                    )
+                    allocation_values = (
+                        allocation_markets.get(market)
+                        if isinstance(allocation_markets, Mapping)
+                        else None
+                    )
+                    raw_limit = (
+                        allocation_values.get("position_limit")
+                        if isinstance(allocation_values, Mapping)
+                        else None
+                    )
+                    position_limit = (
+                        raw_limit
+                        if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0
+                        else 10
+                    )
+                    target_position_count = max(position_limit, pre_sell_position_count)
+                    frozen_target_position_count = getattr(
+                        buy_entries, "target_position_count", None
+                    )
+                    if (
+                        isinstance(frozen_target_position_count, int)
+                        and not isinstance(frozen_target_position_count, bool)
+                        and frozen_target_position_count > 0
+                    ):
+                        target_position_count = frozen_target_position_count
+
+                    planned_new_seats = (
+                        int(judgments["planned_new_seats"])
+                        if frozen_buy_plan
+                        else max(
+                            0,
+                            target_position_count - len(held_codes | pending_codes),
+                        )
+                    )
+                    consumed_seat_codes: set[str] = (
+                        {
+                            code
+                            for code in held_codes | pending_codes
+                            if any(
+                                isinstance(entry, Mapping)
+                                and str(entry.get("futu_symbol") or "").strip().upper()
+                                == code
+                                for entry in buy_entries
+                            )
+                        }
+                        if frozen_buy_plan
+                        else set()
+                    )
+
+                    def attempt_consumes_seat(
+                        code: str,
+                        result: Mapping[str, object],
+                    ) -> bool:
+                        explicit = result.get("seat_consumed")
+                        if explicit is True:
+                            return True
+                        if (
+                            explicit is False
+                            and result.get("terminal_rejected") is not True
+                        ):
+                            return str(result.get("status") or "").lower() not in {
+                                "unchanged", "missed_window",
+                            }
+                        seat_release_proven = (
+                            result.get("seat_release_proven") is True
+                        )
+                        current_snapshot = None
+                        if callable(snapshot_reader):
+                            try:
+                                current_snapshot = snapshot_reader()
+                            except Exception:
+                                current_snapshot = None
+                        if isinstance(current_snapshot, Mapping):
+                            if code in snapshot_codes(current_snapshot):
+                                return True
+                        current_orders = listed_buy_orders()
+                        if current_orders is None:
+                            return not seat_release_proven
+                        matching = [
+                            order for order in current_orders
+                            if str(
+                                order.get("side") or order.get("trd_side") or ""
+                            ).upper() in {"BUY", "BUY_BACK"}
+                            and str(
+                                order.get("futu_code") or order.get("code") or ""
+                            ).strip().upper() == code
+                        ]
+                        if not matching:
+                            return not seat_release_proven
+                        for order in matching:
+                            status = str(
+                                order.get("order_status") or order.get("status") or ""
+                            ).upper()
+                            if status not in terminal_buy_statuses:
+                                return True
+                            try:
+                                filled = order.get(
+                                    "dealt_qty", order.get("filled_qty")
+                                )
+                                if filled in (None, ""):
+                                    return True
+                                if Decimal(str(filled)) > 0:
+                                    return True
+                            except (InvalidOperation, TypeError, ValueError):
+                                return True
+                        return False
+
+                    def merge_result(
+                        current_result: dict[str, object],
+                        next_result: Mapping[str, object],
+                    ) -> dict[str, object]:
+                        next_status = str(next_result.get("status") or "")
+                        current_status = str(current_result.get("status") or "")
+                        current_failures = current_result.get("failure_details")
+                        next_failures = next_result.get("failure_details")
+                        failure_details = [
+                            *(
+                                current_failures
+                                if isinstance(current_failures, list)
+                                else []
+                            ),
+                            *(
+                                next_failures
+                                if isinstance(next_failures, list)
+                                else []
+                            ),
+                        ]
+                        notification = next_result.get("notification")
+                        if not isinstance(notification, Mapping):
+                            notification = current_result.get("notification")
+                        terminal_statuses = {
+                            "",
+                            "unchanged",
+                            "complete",
+                            "reconciled",
+                            "cancelled",
+                            "missed_window",
+                            "terminal_rejected",
+                        }
+                        if current_status not in terminal_statuses:
+                            merged_status = current_status
+                        elif next_status not in terminal_statuses:
+                            merged_status = next_status
+                        elif next_status and next_status != "unchanged":
+                            merged_status = next_status
+                        else:
+                            merged_status = current_status
+                        return {
+                            **current_result,
+                            "status": merged_status,
+                            "submitted_count": int(current_result.get("submitted_count") or 0)
+                            + int(next_result.get("submitted_count") or 0),
+                            "artifact_paths": [
+                                *current_result.get("artifact_paths", []),
+                                *next_result.get("artifact_paths", []),
+                            ],
+                            "buy_fifo_blocked": bool(
+                                current_result.get("buy_fifo_blocked")
+                                or next_result.get("buy_fifo_blocked")
+                            ),
+                            "terminal_rejected": bool(
+                                current_result.get("terminal_rejected")
+                                or next_result.get("terminal_rejected")
+                            ),
+                            **(
+                                {"failure_details": failure_details}
+                                if failure_details
+                                else {}
+                            ),
+                            **(
+                                {"notification": notification}
+                                if isinstance(notification, Mapping)
+                                else {}
+                            ),
+                        }
+
+                    for entry in buy_entries:
+                        if not isinstance(entry, Mapping):
+                            continue
+                        code = str(entry.get("futu_symbol") or "").strip().upper()
+                        if not code:
+                            continue
+                        existing_code = code in held_codes or code in pending_codes
+                        if (
+                            code in consumed_seat_codes
+                            and not (frozen_buy_plan and existing_code)
+                        ):
+                            continue
+                        if not existing_code and len(consumed_seat_codes) >= planned_new_seats:
+                            continue
+                        owners = entry.get("owners")
+                        has_formal_owner = (
+                            isinstance(owners, list)
+                            and any(
+                                isinstance(owner, Mapping)
+                                and owner.get("source") == "formal"
+                                for owner in owners
+                            )
+                        )
+                        if has_formal_owner or entry.get("source") != "rotation":
+                            owner_artifacts = (
+                                reconcile_deduplicated_buy_owners(
+                                    data_dir=config.data_dir,
+                                    report=locked_report,
+                                    market=market,
+                                    execution_date=execution_date,
+                                    entry=entry,
+                                    client=client,
+                                    recorded_at=now,
+                                    execution_id=execution_id,
+                                    request_path=(
+                                        str(request_path) if request_path else None
+                                    ),
+                                    account_id=account_id,
+                                )
+                                if has_formal_owner
+                                else []
+                            )
+                            if owner_artifacts:
+                                ordinary_buy = merge_result(
+                                    ordinary_buy,
+                                    {
+                                        "status": "complete",
+                                        "submitted_count": 0,
+                                        "artifact_paths": owner_artifacts,
+                                    },
+                                )
+                            result = execute_trend_review_open(
+                                data_dir=config.data_dir,
+                                report=locked_report,
+                                client=client,
+                                market=market,
+                                execution_date=execution_date,
+                                now=now,
+                                quote_prices=prices,
+                                include_buys=True,
+                                include_sells=False,
+                                buy_symbols=(code,),
+                                execution_id=execution_id,
+                                request_path=str(request_path) if request_path else None,
+                                account_id=account_id,
+                            )
+                            ordinary_buy = merge_result(ordinary_buy, result)
+                            if has_formal_owner:
+                                owner_artifacts = reconcile_deduplicated_buy_owners(
+                                    data_dir=config.data_dir,
+                                    report=locked_report,
+                                    market=market,
+                                    execution_date=execution_date,
+                                    entry=entry,
+                                    client=client,
+                                    recorded_at=now,
+                                    execution_id=execution_id,
+                                    request_path=(
+                                        str(request_path) if request_path else None
+                                    ),
+                                    account_id=account_id,
+                                )
+                                if owner_artifacts:
+                                    ordinary_buy = merge_result(
+                                        ordinary_buy,
+                                        {
+                                            "status": "complete",
+                                            "submitted_count": 0,
+                                            "artifact_paths": owner_artifacts,
+                                        },
+                                    )
+                        else:
+                            result = execute_relative_rotations(
+                                data_dir=config.data_dir,
+                                report=locked_report,
+                                client=client,
+                                market=market,
+                                execution_date=execution_date,
+                                now=now,
+                                quote_prices=prices,
+                                _phase="buy",
+                                buy_symbols=(code,),
+                                execution_id=execution_id,
+                                request_path=str(request_path) if request_path else None,
+                                account_id=account_id,
+                            )
+                            rotation_buy = merge_result(rotation_buy, result)
+                        if not existing_code and attempt_consumes_seat(code, result):
+                            consumed_seat_codes.add(code)
+                    rotation = merge_result(rotation, rotation_buy)
+                    ordinary = merge_result(ordinary, ordinary_buy)
+        else:
+            ordinary = execute_trend_review_open(
+                data_dir=config.data_dir,
+                report=locked_report,
+                client=client,
+                market=market,
+                execution_date=execution_date,
+                now=now,
+                quote_prices=prices,
+                execution_id=execution_id,
+                request_path=str(request_path) if request_path else None,
+                account_id=account_id,
+            )
+            if allow_new_buys and ordinary.get("status") == "quote_unavailable":
+                raise RuntimeError("current quote unavailable for pending trend buy")
+            ordinary_complete = not actions or (
+                scheduled
+                and _execution_completed(
+                    config, execution_cycle,
+                    include_rotations=False,
+                    execution_id=execution_id,
+                )
+            ) or (
+                not scheduled
+                and str(ordinary.get("status") or "") in {
+                    "complete", "submitted", "reconciled", "unchanged",
+                }
+            )
+            rotation = (
+                execute_relative_rotations(
+                    data_dir=config.data_dir,
+                    report=locked_report,
+                    client=client,
+                    market=market,
+                    execution_date=execution_date,
+                    now=now,
+                    quote_prices=prices,
+                    quote_refresh=(
+                        refresh_rotation_quotes
+                        if rotation_quote_symbols
+                        else None
+                    ),
+                    execution_id=execution_id,
+                    request_path=str(request_path) if request_path else None,
+                    account_id=account_id,
+                )
+                if allow_new_buys and rotation_pairs and ordinary_complete
+                else {
+                    "status": "unchanged", "submitted_count": 0,
+                    "artifact_paths": [],
+                }
+            )
+        rotation_notification = rotation.get("notification")
+        if isinstance(rotation_notification, Mapping):
+            account_id = (
+                locked_report.get("metadata", {}).get("simulate_acc_id")
+                if isinstance(locked_report.get("metadata"), Mapping)
+                else None
+            )
+            _notify_once(
+                str(rotation_notification.get("title") or f"{market} 趋势轮换结果"),
+                str(rotation_notification.get("message") or "趋势轮换执行存在失败或暂缓项"),
+                (
+                    config,
+                    market,
+                    execution_date,
+                    "rotation_batch",
+                    f"rotation_result:{account_id or 'unknown'}",
+                    now,
+                ),
+            )
+        rotation_fields = {
+            field: rotation[field]
+            for field in (
+                "sell_phase",
+                "failure_details",
+                "fallbacks_used",
+                "final_position_count",
+                "notification",
+            )
+            if field in rotation
+        }
+        phase_statuses = [
+            str(result.get("status") or "")
+            for result in (ordinary, rotation)
+        ]
+        unfinished_status = next(
+            (
+                status
+                for status in phase_statuses
+                if status
+                not in {
+                    "unchanged",
+                    "complete",
+                    "reconciled",
+                    "cancelled",
+                    "missed_window",
+                    "terminal_rejected",
+                }
+            ),
+            None,
+        )
+        aggregate_status = (
+            unfinished_status
+            if unfinished_status is not None
+            else "terminal_rejected"
+            if ordinary.get("terminal_rejected")
+            or rotation.get("terminal_rejected")
+            else "complete"
+            if any(status == "complete" for status in phase_statuses)
+            else "unchanged"
         )
         return {
-            "status": (
-                rotation.get("status")
-                if rotation.get("status") != "unchanged"
-                else ordinary.get("status")
-            ),
+            "status": aggregate_status,
             "market": market,
             "date": execution_date,
             "submitted_count": int(ordinary.get("submitted_count") or 0)
@@ -1215,11 +2488,16 @@ def _execute_locked_report(
                 *ordinary.get("artifact_paths", []),
                 *rotation.get("artifact_paths", []),
             ],
+            **rotation_fields,
+            "terminal_rejected": bool(
+                ordinary.get("terminal_rejected")
+                or rotation.get("terminal_rejected")
+            ),
         }
     finally:
         if quote is not None and owns_quote:
             quote.close()
-        if client is not None:
+        if client is not None and owns_client:
             client.close()
 
 
@@ -1747,6 +3025,70 @@ def _latest_action_events(
     return events
 
 
+def _notify_terminal_rejections(
+    config: DailyPremarketConfig,
+    market: str,
+    execution_date: str,
+    occurred_at: str,
+) -> int:
+    sent = 0
+    for event in _latest_action_events(config, market, execution_date):
+        if event.get("status") != "failed":
+            continue
+        reason = str(event.get("reason") or "")
+        if not (
+            reason == "broker_order_no_progress"
+            or reason.startswith("simulate ")
+            and " order rejected: " in reason
+        ):
+            continue
+        try:
+            filled_qty = Decimal(
+                str(event.get("filled_qty", event.get("dealt_qty", "0")))
+            )
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if not filled_qty.is_finite() or filled_qty != 0:
+            continue
+        groups = group_order_alerts(market, [event])
+        if len(groups) != 1:
+            continue
+        title, message = render_order_alert(
+            groups[0],
+            broker_label=BROKER_LABELS[market],
+            trading_date=execution_date,
+        )
+        identity = "|".join(
+            str(event.get(field) or "")
+            for field in (
+                "report_sha256",
+                "action_index",
+                "symbol",
+                "futu_code",
+                "side",
+                "attempt",
+                "execution_id",
+                "request_path",
+                "reason",
+            )
+        )
+        sent += int(
+            _notify_once(
+                title,
+                message,
+                (
+                    config,
+                    market,
+                    execution_date,
+                    "terminal_rejection",
+                    identity,
+                    str(event.get("recorded_at") or occurred_at),
+                ),
+            )
+        )
+    return sent
+
+
 def _notify_order_groups(
     config: DailyPremarketConfig,
     market: str,
@@ -2059,10 +3401,6 @@ def _request_revision(
         with RunLock(
             _revision_gate_path(config, cycle.market, cycle.execution_date)
         ):
-            if _batch_path(config, cycle.market, cycle.execution_date).exists():
-                raise ValueError(
-                    "trend report revision rejected: execution has begun"
-                )
             request, _ = _revision_paths(config, cycle.market, cycle.as_of_date)
             if request.exists():
                 _revision_state(
@@ -2712,7 +4050,7 @@ def _locked_report(
 ) -> tuple[Path, dict[str, object]]:
     batch_path = _batch_path(config, cycle.market, cycle.execution_date)
     if not batch_path.exists():
-        return latest
+        return _load_first_valid_report(config, cycle) or latest
     batch = _read_json(batch_path, "trend execution batch")
     path = Path(str(batch.get("report_path") or ""))
     report = _read_json(path, "locked trend report")
@@ -2772,6 +4110,8 @@ def _execution_completed(
     *,
     progress: Callable[[], None] | None = None,
     include_rotations: bool = True,
+    include_buys: bool = True,
+    execution_id: str | None = None,
 ) -> bool:
     if _legacy_cycle_cutover(config, cycle):
         return True
@@ -2805,6 +4145,7 @@ def _execution_completed(
             report=report,
             market=cycle.market,
             execution_date=cycle.execution_date,
+            execution_id=execution_id,
         )
 
     sell_symbols = {
@@ -2815,6 +4156,8 @@ def _execution_completed(
     for action in actions:
         action_name = str(action.get("action") or "")
         symbol = str(action.get("symbol") or "").strip()
+        if action_name == "BUY" and not include_buys:
+            continue
         if (
             action_name == "BUY"
             and trend_action_futu_symbol(report, action, cycle.market)
@@ -2833,6 +4176,7 @@ def _execution_completed(
             futu_symbol=trend_action_futu_symbol(report, action, cycle.market),
             side="buy" if action_name == "BUY" else "sell",
             progress=progress,
+            execution_id=execution_id,
         )
         position_zero_events = [
             item for item in events if item.get("sell_goal") == "position_zero"
@@ -2846,12 +4190,18 @@ def _execution_completed(
                 continue
             return False
         if any(
-            item.get("resolution") in {"confirm-submitted", "abandon"}
+            item.get("resolution") == "abandon"
             for item in resolutions
         ):
             continue
         if action_name == "BUY" and any(
-            item.get("status") in {"filled", "missed"} for item in events
+            item.get("status") in {"filled", "missed"}
+            or item.get("status") == "terminal_partial"
+            and (
+                item.get("holdings_synchronized") is True
+                or execution_id is None
+            )
+            for item in events
         ):
             continue
         if action_name == "SELL_PARTIAL":
@@ -2911,6 +4261,7 @@ def _execution_completed(
         report=report,
         market=cycle.market,
         execution_date=cycle.execution_date,
+        execution_id=execution_id,
     )
 
 
@@ -3519,12 +4870,6 @@ def run_trend_market_controller(
                     and can_start
                     and (latest is None or recovery_revision is not None)
                 ):
-                    if revision_pending and _batch_path(
-                        config, market, work_cycle.execution_date
-                    ).exists():
-                        raise ValueError(
-                            "trend report revision rejected: execution has begun"
-                        )
                     generator_revision = (
                         recovery_revision
                         if recovery_revision is not None
@@ -3629,11 +4974,31 @@ def run_trend_market_controller(
                         if isinstance(judgments, dict)
                         else None
                     )
+                    selected = _locked_report(config, work_cycle, latest, now)
+                    configured_account_id = getattr(
+                        config,
+                        f"trend_review_{market.lower()}_simulate_acc_id",
+                        0,
+                    )
+                    scheduled_execution_id = (
+                        _simulation_execution_id(
+                            configured_account_id,
+                            market,
+                            work_cycle.execution_date,
+                            _report_hash(selected[1]),
+                            "trend-market-controller",
+                            "scheduled execution",
+                            scheduled=True,
+                        )
+                        if configured_account_id > 0
+                        else None
+                    )
                     if (
                         _execution_completed(
                             config,
                             work_cycle,
                             progress=reconciliation_progress,
+                            execution_id=scheduled_execution_id,
                         )
                         and (formal_actions or rotation_pairs)
                     ):
@@ -3645,26 +5010,18 @@ def run_trend_market_controller(
                             "artifact_paths": [],
                         }
                     else:
-                        selected = _locked_report(config, work_cycle, latest, now)
-                        if protection_error is not None:
-                            execution = _execute_locked_report(
-                                config,
-                                market,
-                                work_cycle.execution_date,
-                                selected[0],
-                                selected[1],
-                                allow_new_buys=False,
-                                quote_client=shared_quote(),
-                            )
-                        else:
-                            execution = _execute_locked_report(
-                                config,
-                                market,
-                                work_cycle.execution_date,
-                                selected[0],
-                                selected[1],
-                                quote_client=shared_quote(),
-                            )
+                        execution = execute_simulated_trend_report(
+                            config,
+                            market,
+                            work_cycle.execution_date,
+                            _report_hash(selected[1]),
+                            actor="trend-market-controller",
+                            reason="scheduled execution",
+                            now=now,
+                            quote_client=shared_quote(),
+                            allow_new_buys=protection_error is None,
+                            scheduled=True,
+                        )
                     last_success = execution
                     operation_failures = 0
                     operation_retry_after = None
@@ -3707,6 +5064,15 @@ def run_trend_market_controller(
                             ],
                             occurred_at,
                             status,
+                        )
+                    elif status == "terminal_rejected":
+                        blocker = status
+                        phase = status
+                        _notify_terminal_rejections(
+                            config,
+                            market,
+                            work_cycle.execution_date,
+                            now.isoformat(timespec="seconds"),
                         )
                     elif status == "missed_window":
                         phase = "missed"
@@ -3759,6 +5125,7 @@ def run_trend_market_controller(
                         "recovering_report",
                         "uncertain",
                         "conflict",
+                        "terminal_rejected",
                         "missed",
                     }
                 ):
@@ -3807,6 +5174,7 @@ def run_trend_market_controller(
                             "recovering_report",
                             "uncertain",
                             "conflict",
+                            "terminal_rejected",
                             "missed",
                         }:
                             phase = "recovering_review"
@@ -3864,6 +5232,7 @@ def run_trend_market_controller(
                     "blocked",
                     "uncertain",
                     "conflict",
+                    "terminal_rejected",
                     "missed",
                 }
             ):

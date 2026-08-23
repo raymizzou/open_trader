@@ -37,9 +37,10 @@ from open_trader.a_share_trend import (
 from open_trader.daily_premarket import DailyPremarketConfig, load_env_config
 from open_trader.market_trend import run_market_trend_report
 from open_trader.notifications import NullNotifier
+from open_trader.strategy_drawdown import ALLOCATION_PROJECTION_VERSIONS
 
 
-EXPECTED_VERSIONS = {"CN": "v14", "HK": "v12", "US": "v12"}
+EXPECTED_VERSIONS = dict(ALLOCATION_PROJECTION_VERSIONS)
 REPORT_DIRECTORIES = {
     "CN": "trend_a_share",
     "HK": "trend_hk_phillips",

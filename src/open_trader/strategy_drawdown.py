@@ -19,10 +19,17 @@ DRAWDOWN_LIMIT = Decimal("0.05")
 OVERHEAT_TRIM_COMPATIBILITY_REVISION = "trend_overheat_trim_v1"
 UNIFIED_TREND_V5_COMPATIBILITY_REVISION = "unified_trend_v5_v1"
 ALLOCATION_PROJECTION_COMPATIBILITY_REVISION = "allocation_projection_v1"
-ALLOCATION_PROJECTION_VERSIONS = {"CN": "v14", "HK": "v12", "US": "v12"}
+ALLOCATION_PROJECTION_VERSIONS = {"CN": "v15", "HK": "v13", "US": "v13"}
 # Keep the immediately preceding allocation-era reports readable while the
 # current version owns new state and parameter transitions.
-LEGACY_ALLOCATION_PROJECTION_VERSIONS = {"CN": "v13", "HK": "v11", "US": "v11"}
+LEGACY_ALLOCATION_PROJECTION_VERSIONS = {"CN": "v14", "HK": "v12", "US": "v12"}
+# Allocation-era audit records from before the immediately preceding version
+# remain readable; only the current version owns new state transitions.
+HISTORICAL_ALLOCATION_PROJECTION_VERSIONS = {
+    "CN": frozenset({"v13", "v14", "v15"}),
+    "HK": frozenset({"v11", "v12", "v13"}),
+    "US": frozenset({"v11", "v12", "v13"}),
+}
 ALLOCATION_PROJECTION_PARAMETER_HASHES = {
     "CN": (
         "c9f06d07dfb9d889041c34e99b00b4484d36e48dedb5707cf705a9e152b119f7",
@@ -64,6 +71,14 @@ ALLOCATION_DYNAMIC_PARAMETER_NAMES = frozenset({
     "target_weight",
     "nominal_weight",
 })
+ALLOCATION_V2_DYNAMIC_PARAMETER_NAMES = ALLOCATION_DYNAMIC_PARAMETER_NAMES | {
+    "allocation_position_limit",
+}
+ALLOCATION_V2_WEIGHTS = {
+    1: (Decimal("0.04"), Decimal("0.80")),
+    2: (Decimal("0.04"), Decimal("0.60")),
+    3: (Decimal("0.04"), Decimal("0.40")),
+}
 ALLOCATION_WEIGHTS = {
     1: (Decimal("0.06"), Decimal("0.60")),
     2: (Decimal("0.04"), Decimal("0.40")),
@@ -318,11 +333,22 @@ def _strategy_parameter_identity(
 ) -> tuple[dict[str, object], dict[str, object] | None]:
     identity = dict(parameters)
     allocation_parameters = None
+    allocation_v2 = "allocation_position_limit" in identity
     allocation_markers = (
-        ALLOCATION_DYNAMIC_PARAMETER_NAMES - {"target_weight"}
+        (
+            ALLOCATION_V2_DYNAMIC_PARAMETER_NAMES
+            if allocation_v2
+            else ALLOCATION_DYNAMIC_PARAMETER_NAMES
+        )
+        - {"target_weight"}
     ) & identity.keys()
     if allocation_markers:
-        if not ALLOCATION_DYNAMIC_PARAMETER_NAMES <= identity.keys():
+        required = (
+            ALLOCATION_V2_DYNAMIC_PARAMETER_NAMES
+            if allocation_v2
+            else ALLOCATION_DYNAMIC_PARAMETER_NAMES
+        )
+        if not required <= identity.keys():
             raise ValueError("allocation strategy parameters are invalid")
         rank = identity["allocation_rank"]
         try:
@@ -340,7 +366,8 @@ def _strategy_parameter_identity(
             or not score.is_finite()
             or not target_weight.is_finite()
             or not nominal_weight.is_finite()
-            or (target_weight, nominal_weight) != ALLOCATION_WEIGHTS[rank]
+            or (target_weight, nominal_weight)
+            != (ALLOCATION_V2_WEIGHTS if allocation_v2 else ALLOCATION_WEIGHTS)[rank]
             or not isinstance(path, str)
             or ALLOCATION_DAILY_PATH.fullmatch(path) is None
             or not isinstance(sha256, str)
@@ -348,10 +375,15 @@ def _strategy_parameter_identity(
             or any(character not in "0123456789abcdef" for character in sha256)
             or not isinstance(score_source, str)
             or not score_source
+            or allocation_v2
+            and (
+                type(identity["allocation_position_limit"]) is not int
+                or identity["allocation_position_limit"] != {1: 20, 2: 15, 3: 10}[rank]
+            )
         ):
             raise ValueError("allocation strategy parameters are invalid")
         allocation_parameters = {
-            name: identity.pop(name) for name in ALLOCATION_DYNAMIC_PARAMETER_NAMES
+            name: identity.pop(name) for name in required
         }
     return identity, allocation_parameters
 
@@ -1159,10 +1191,7 @@ def _approved_unified_trend_v5_transition(
 
 
 def _allocation_projection_key(key: tuple[str, str, str]) -> bool:
-    versions = {
-        ALLOCATION_PROJECTION_VERSIONS.get(key[0]),
-        LEGACY_ALLOCATION_PROJECTION_VERSIONS.get(key[0]),
-    }
+    versions = HISTORICAL_ALLOCATION_PROJECTION_VERSIONS.get(key[0], frozenset())
     return key[2] in versions and key[1] == f"trend_animals_warm_to_hot/{key[0]}/{key[2]}"
 
 

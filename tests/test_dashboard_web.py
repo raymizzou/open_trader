@@ -71,6 +71,69 @@ def _controller_status(*, heartbeat_at: str) -> dict[str, object]:
     }
 
 
+def _v2_dashboard_plan_payload(
+    *, symbol: str = "LATEST", pair_index: int = 0,
+) -> dict[str, object]:
+    return {
+        "execution_date": "2026-08-20",
+        "as_of_date": "2026-08-19",
+        "generated_at": "2026-08-20T20:00:00+08:00",
+        "account": {
+            "source_date": "2026-08-20",
+            "net_value": "100000",
+            "available_cash": "50000",
+            "positions": [],
+            "exceptions": [],
+            "fresh": True,
+        },
+        "metadata": {
+            "market": "US",
+            "broker": "futu",
+            "simulate_acc_id": 101,
+        },
+        "strategy_snapshot": {"strategy_version": "v13"},
+        "strategy_judgments": {
+            "formal_actions": [
+                {"action": "SELL_ALL", "symbol": f"{symbol}.SELL", "reason": "danger_signal"},
+                {"action": "BUY", "symbol": symbol},
+            ],
+            "holding_decisions": [
+                {"action": "HOLD", "symbol": f"{symbol}.HOLD", "reason": "trend_intact"},
+            ],
+            "real_holding_decisions": [
+                {"action": "SELL_ALL", "symbol": f"{symbol}.REAL", "reason": "trend_intact"},
+            ],
+            "real_buy_actions": [{"action": "BUY", "symbol": f"{symbol}.REALBUY"}],
+            "top10_candidates": [],
+            "risk_skips": [],
+            "simulate_rotation_pairs": [{
+                "pair_index": pair_index,
+                "execution_mode": "automatic",
+                "sell_symbol": f"{symbol}.ROT.SELL",
+                "buy_symbol": f"{symbol}.ROT.BUY",
+            }],
+            "real_rotation_pairs": [{
+                "pair_index": pair_index,
+                "sell_symbol": f"{symbol}.REAL.ROT.SELL",
+                "buy_symbol": f"{symbol}.REAL.ROT.BUY",
+            }],
+        },
+        "signal_snapshots": {"holdings": {}, "candidates": [], "real_holdings": {}},
+        "allocation": {
+            "version": 2,
+            "daily_path": "data/trend_allocation/daily/2026-08-20.json",
+            "sha256": "c" * 64,
+            "markets": {},
+        },
+        "option_attention": [],
+        "risk_summary": {},
+        "drawdown_summary": {},
+        "excluded": {},
+        "industry_concentration": [],
+        "data_sources": [],
+    }
+
+
 @pytest.mark.parametrize(
     ("status", "executor_host", "local_host", "health", "blocking"),
     [
@@ -324,6 +387,311 @@ def test_dashboard_projects_only_valid_simulated_rotation_facts(
         "完成", "卖出已成交", "待执行",
     ]
     assert frozen_pairs == [{"pair_index": index} for index in range(3)]
+
+
+def test_dashboard_v2_keeps_latest_report_plans_when_batch_is_older(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import _project_broker_trend_report
+    from open_trader.trend_review import _report_hash
+
+    data_dir = tmp_path / "data"
+    reports_root = tmp_path / "reports"
+    reports_dir = reports_root / "trend_us_futu"
+    older = write_trend_history_report(
+        reports_root,
+        "2026-08-19.json",
+        execution_date="2026-08-20",
+        generated_at="2026-08-19T20:00:00+08:00",
+    )
+    older_path = reports_dir / "2026-08-19.json"
+    batch_path = data_dir / "trend_review/ledgers/US/batches/2026-08-20.json"
+    batch_path.parent.mkdir(parents=True)
+    batch_path.write_text(json.dumps({
+        "schema_version": "open_trader.trend_review.batch.v1",
+        "market": "US",
+        "execution_date": "2026-08-20",
+        "report_path": str(older_path),
+        "report_sha256": _report_hash(older),
+        "locked_at": "2026-08-20T09:30:00-04:00",
+    }), encoding="utf-8")
+    latest = _v2_dashboard_plan_payload()
+    selected = (
+        reports_dir / "2026-08-20-r1.json",
+        latest,
+        date(2026, 8, 20),
+        date(2026, 8, 19),
+        date(2026, 8, 20),
+        datetime(2026, 8, 20, 20, tzinfo=timezone(timedelta(hours=8))),
+    )
+
+    projected = _project_broker_trend_report(
+        selected=selected,
+        data_dir=data_dir,
+        reports_dir=reports_dir,
+        broker="futu",
+        market="US",
+        market_label="美股",
+        broker_label="富途",
+        buy_window="美股常规交易时段",
+        report_date="2026-08-21",
+        use_execution_batch=True,
+    )
+
+    assert projected["available"] is True
+    assert projected["artifact"] == "2026-08-20-r1.json"
+    assert projected["buy_actions"][0]["symbol"] == "LATEST"
+    assert projected["execution_batch"]["report_sha256"] == _report_hash(older)
+    assert projected["latest_report_sha256"] == _report_hash(latest)
+    assert projected["revision_anomaly"] is True
+
+
+def test_dashboard_v2_keeps_plans_when_execution_batch_is_invalid(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import _project_broker_trend_report
+    from open_trader.trend_review import _report_hash
+
+    latest = _v2_dashboard_plan_payload()
+    data_dir = tmp_path / "data"
+    reports_dir = tmp_path / "reports" / "trend_us_futu"
+    batch_path = data_dir / "trend_review/ledgers/US/batches/2026-08-20.json"
+    batch_path.parent.mkdir(parents=True)
+    batch_path.write_text("{broken", encoding="utf-8")
+
+    projected = _project_broker_trend_report(
+        selected=(
+            reports_dir / "2026-08-20.json",
+            latest,
+            date(2026, 8, 20),
+            date(2026, 8, 19),
+            date(2026, 8, 20),
+            datetime(2026, 8, 20, 20, tzinfo=timezone(timedelta(hours=8))),
+        ),
+        data_dir=data_dir,
+        reports_dir=reports_dir,
+        broker="futu",
+        market="US",
+        market_label="美股",
+        broker_label="富途",
+        buy_window="美股常规交易时段",
+        report_date="2026-08-21",
+        use_execution_batch=True,
+    )
+
+    assert projected["available"] is True
+    assert projected["artifact"] == "2026-08-20.json"
+    assert projected["report_sha256"] == _report_hash(latest)
+    assert projected["buy_actions"][0]["symbol"] == "LATEST"
+    assert projected["execution_batch"] is None
+    assert projected["execution_batch_blocking"] is True
+    assert projected["execution_batch_error"] == "执行批次无效，已阻止操作投影"
+
+
+def test_dashboard_v2_plan_rows_and_rotation_pairs_have_no_execution_fields(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import _project_broker_trend_report
+
+    payload = _v2_dashboard_plan_payload()
+    projected = _project_broker_trend_report(
+        selected=(
+            tmp_path / "reports/trend_us_futu/2026-08-20.json",
+            payload,
+            date(2026, 8, 20),
+            date(2026, 8, 19),
+            date(2026, 8, 20),
+            datetime(2026, 8, 20, 20, tzinfo=timezone(timedelta(hours=8))),
+        ),
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports/trend_us_futu",
+        broker="futu",
+        market="US",
+        market_label="美股",
+        broker_label="富途",
+        buy_window="美股常规交易时段",
+        report_date="2026-08-21",
+    )
+
+    for key in (
+        "sell_actions", "real_position_actions", "buy_actions", "real_buy_actions",
+    ):
+        assert all("execution" not in item for item in projected[key])
+    assert "execution_status" not in projected["simulate_rotation_pairs"][0]
+    assert "execution_status" not in projected["real_rotation_pairs"][0]
+    assert projected["simulate_rotation_pairs"] == payload["strategy_judgments"][
+        "simulate_rotation_pairs"
+    ]
+    assert projected["real_rotation_pairs"] == payload["strategy_judgments"][
+        "real_rotation_pairs"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("unavailable_account", "reason"),
+    [
+        ("simulated_account", "模拟账户快照不可读"),
+        ("real_account", "实盘持仓快照不可读"),
+    ],
+)
+def test_dashboard_projects_v2_plan_availability_by_account_component(
+    tmp_path: Path, unavailable_account: str, reason: str,
+) -> None:
+    from open_trader.dashboard import _project_broker_trend_report
+
+    payload = _v2_dashboard_plan_payload()
+    payload["plan_availability"] = {
+        "simulated_account": {
+            "status": "unavailable" if unavailable_account == "simulated_account" else "available",
+            "reason": reason if unavailable_account == "simulated_account" else "",
+            "executable": False,
+        },
+        "real_account": {
+            "status": "unavailable" if unavailable_account == "real_account" else "available",
+            "reason": reason if unavailable_account == "real_account" else "",
+            "executable": False,
+        },
+    }
+    projected = _project_broker_trend_report(
+        selected=(
+            tmp_path / "reports/trend_us_futu/2026-08-20.json",
+            payload,
+            date(2026, 8, 20),
+            date(2026, 8, 19),
+            date(2026, 8, 20),
+            datetime(2026, 8, 20, 20, tzinfo=timezone(timedelta(hours=8))),
+        ),
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports/trend_us_futu",
+        broker="futu",
+        market="US",
+        market_label="美股",
+        broker_label="富途",
+        buy_window="美股常规交易时段",
+        report_date="2026-08-21",
+    )
+
+    assert projected["plan_availability"] == payload["plan_availability"]
+
+
+def test_dashboard_marks_missing_v2_plan_availability_unavailable(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import _project_broker_trend_report
+
+    payload = _v2_dashboard_plan_payload()
+    projected = _project_broker_trend_report(
+        selected=(
+            tmp_path / "reports/trend_us_futu/2026-08-20.json",
+            payload,
+            date(2026, 8, 20),
+            date(2026, 8, 19),
+            date(2026, 8, 20),
+            datetime(2026, 8, 20, 20, tzinfo=timezone(timedelta(hours=8))),
+        ),
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports/trend_us_futu",
+        broker="futu",
+        market="US",
+        market_label="美股",
+        broker_label="富途",
+        buy_window="美股常规交易时段",
+        report_date="2026-08-21",
+    )
+
+    assert projected["plan_availability"] == {
+        "simulated_account": {
+            "status": "unavailable",
+            "reason": "计划可用性数据缺失",
+            "executable": False,
+        },
+        "real_account": {
+            "status": "unavailable",
+            "reason": "计划可用性数据缺失",
+            "executable": False,
+        },
+    }
+
+
+def test_dashboard_marks_malformed_v2_plan_availability_unavailable(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import _project_broker_trend_report
+
+    payload = _v2_dashboard_plan_payload()
+    payload["plan_availability"] = {
+        "simulated_account": {
+            "status": "available",
+            "reason": "",
+            "executable": "yes",
+        },
+        "real_account": {
+            "status": "available",
+            "reason": "",
+            "executable": False,
+        },
+    }
+    projected = _project_broker_trend_report(
+        selected=(
+            tmp_path / "reports/trend_us_futu/2026-08-20.json",
+            payload,
+            date(2026, 8, 20),
+            date(2026, 8, 19),
+            date(2026, 8, 20),
+            datetime(2026, 8, 20, 20, tzinfo=timezone(timedelta(hours=8))),
+        ),
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports/trend_us_futu",
+        broker="futu",
+        market="US",
+        market_label="美股",
+        broker_label="富途",
+        buy_window="美股常规交易时段",
+        report_date="2026-08-21",
+    )
+
+    assert projected["plan_availability"] == {
+        "simulated_account": {
+            "status": "unavailable",
+            "reason": "计划可用性数据无效",
+            "executable": False,
+        },
+        "real_account": {
+            "status": "available",
+            "reason": "",
+            "executable": False,
+        },
+    }
+
+
+def test_dashboard_keeps_v1_plan_availability_omitted(
+    tmp_path: Path,
+) -> None:
+    from open_trader.dashboard import _project_broker_trend_report
+
+    payload = _v2_dashboard_plan_payload()
+    payload["allocation"]["version"] = 1
+    payload["strategy_snapshot"]["strategy_version"] = "v12"
+    projected = _project_broker_trend_report(
+        selected=(
+            tmp_path / "reports/trend_us_futu/2026-08-20.json",
+            payload,
+            date(2026, 8, 20),
+            date(2026, 8, 19),
+            date(2026, 8, 20),
+            datetime(2026, 8, 20, 20, tzinfo=timezone(timedelta(hours=8))),
+        ),
+        data_dir=tmp_path / "data",
+        reports_dir=tmp_path / "reports/trend_us_futu",
+        broker="futu",
+        market="US",
+        market_label="美股",
+        broker_label="富途",
+        buy_window="美股常规交易时段",
+        report_date="2026-08-21",
+    )
+
+    assert "plan_availability" not in projected
 
 
 def test_dashboard_uses_latest_action_event_across_timezone_offsets(
@@ -12990,6 +13358,163 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_renders_v2_market_cards_and_clearance_type() -> None:
+    output = run_dashboard_js(r'''
+const report = {
+  available:true, market:"CN", broker:"eastmoney", broker_label:"东方财富",
+  market_label:"A股", report_date:"2026-08-20", data_date:"2026-08-20",
+  generated_at:"2026-08-20T20:00:00+08:00", account_status:"已更新",
+  buy_window:"09:30–10:00", counts:{sell:1,buy:0,hold:0,review:0},
+  sell_actions:[{symbol:"SELL",name:"卖出",reason:"danger_signal",clearance_type:"信号清仓"}],
+  buy_actions:[], hold_actions:[], review_actions:[], risk_skips:[], audit:{},
+  plan_availability:{
+    simulated_account:{status:"available",reason:"",executable:false},
+    real_account:{status:"available",reason:"",executable:false},
+  },
+  allocation:{version:2, allocation_date:"2026-08-20", generated_at:"2026-08-20T16:20:00+08:00", reused:false, stale_a_trading_days:0, failure_reason:"", sha256:"a".repeat(64),
+    roots:{
+      CN:{stock:{asset:"A股",as_of_date:"2026-08-20",global_strength:"62"},etf:{asset:"ETF基金",as_of_date:"2026-08-20",global_strength:"99"}},
+      HK:{stock:{asset:"港股",as_of_date:"2026-08-20",global_strength:"78"},etf:{asset:"香港ETF",as_of_date:"2026-08-20",global_strength:"98"}},
+      US:{stock:{asset:"美股",as_of_date:"2026-08-20",global_strength:"80"},etf:{asset:"美国ETF",as_of_date:"2026-08-20",global_strength:"97"}},
+    },
+    markets:{CN:{rank:3,score:"62",score_source:"A股",entry_weight:"0.04",nominal_weight:"0.40",position_limit:10},HK:{rank:2,score:"78",score_source:"港股",entry_weight:"0.04",nominal_weight:"0.60",position_limit:15},US:{rank:1,score:"80",score_source:"美股",entry_weight:"0.04",nominal_weight:"0.80",position_limit:20}},
+  },
+};
+const html = renderTrendReportWorkspace(report);
+for (const text of ["单仓基准 4%", "持仓席位", "席位名义仓位 80%", "席位名义仓位 60%", "席位名义仓位 40%", "清仓类型", "信号清仓", "来源 2026-08-20"]) {
+  if (!html.includes(text)) throw new Error("missing " + text + "\n" + html);
+}
+for (const text of ["ETF基金", "香港ETF", "美国ETF", "市场分数", "分数来源", "10 席位名义仓位"]) {
+  if (html.includes(text)) throw new Error("unexpected " + text + "\n" + html);
+}
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_renders_four_v2_plans_without_execution_fields() -> None:
+    output = run_dashboard_js(r'''
+const report = {
+  available:true, market:"CN", broker:"eastmoney", broker_label:"东方财富",
+  market_label:"A股", report_date:"2026-08-21", data_date:"2026-08-20",
+  generated_at:"2026-08-20T20:00:00+08:00", account_status:"已更新",
+  strategy_version:"v15", buy_window:"09:30–10:00", counts:{sell:1,buy:1,hold:0,review:0},
+  sell_actions:[{symbol:"SIM.SELL",name:"模拟卖出",action:"SELL_ALL",reason:"danger_signal",clearance_type:"信号清仓",close:"10",temperature_prev:"温",temperature_curr:"热",phase:"立夏",global_strength:"41",active_line:"9",entry_hints:["保护线"]}],
+  buy_actions:[{symbol:"SIM.BUY",name:"模拟买入",action:"BUY",global_strength:"91",target_amount:"4000",estimated_shares:300,execution:{status:"filled"}}],
+  real_position_actions:[{symbol:"REAL.SELL",name:"实盘卖出",action:"SELL_ALL",reason:"trend_intact",close:"11",global_strength:"45",active_line:"10"}],
+  simulate_rotation_pairs:[{sell_symbol:"SIM.ROT.SELL",sell_name:"模拟轮换卖出",buy_symbol:"SIM.ROT.BUY",buy_name:"模拟轮换买入",buy_global_strength:"90",sell_global_strength:"40",target_amount:"4000",estimated_shares:200}],
+  real_rotation_pairs:[{sell_symbol:"REAL.ROT.SELL",sell_name:"实盘轮换卖出",buy_symbol:"REAL.ROT.BUY",buy_name:"实盘轮换买入",buy_global_strength:"88",sell_global_strength:"38",target_amount:"4000",estimated_shares:200}],
+  plan_availability:{
+    simulated_account:{status:"available",reason:"",executable:false},
+    real_account:{status:"available",reason:"",executable:false},
+  },
+  hold_actions:[], review_actions:[], risk_skips:[], audit:{}, allocation:{version:2},
+};
+const html = renderTrendReportWorkspace(report);
+const titles = ["模拟盘卖出计划", "实盘卖出计划", "模拟盘买入计划", "实盘买入计划"];
+for (const title of titles) if (!html.includes(`<h2>${title}</h2>`)) throw new Error(`missing ${title}\n${html}`);
+for (const subtitle of [
+  "趋势快照 + 模拟持仓快照", "趋势快照 + 实盘持仓快照",
+  "趋势快照 + 模拟账户快照", "趋势快照 + 实盘账户快照",
+]) if (!html.includes(subtitle)) throw new Error(`missing ${subtitle}\n${html}`);
+for (const heading of ["标的", "动作", "卖出类型", "执行参考价", "温度变化", "节气", "个体全局强度", "触发原因", "活动保护线", "持仓提示", "序号", "4%目标金额", "预计数量"]) {
+  if (!html.includes(`<th scope="col">${heading}</th>`)) throw new Error(`missing ${heading}\n${html}`);
+}
+if ((html.match(/class="trend-plan /g) || []).length !== 4) throw new Error(html);
+if (html.includes("优先处理 · 卖出触发") || html.includes("相对强度轮换")) throw new Error(html);
+const planBlocks = html.split('<section class="trend-plan ').slice(1).map((block) => block.split('</section>', 1)[0]);
+if (planBlocks.length !== 4) throw new Error(html);
+for (const block of planBlocks) {
+  if (block.includes("执行状态") || block.includes("待执行") || block.includes("队列") || block.includes("冻结")) throw new Error(block);
+}
+if (!html.includes("模拟卖出") || !html.includes("实盘卖出") || !html.includes("SIM.ROT.BUY") || !html.includes("REAL.ROT.BUY")) throw new Error(html);
+console.log("ok");
+''')
+    assert "ok" in output
+
+
+def test_dashboard_v2_partial_sell_type_is_reduction_not_clearance() -> None:
+    output = run_dashboard_js(r'''
+const report = {
+  available:true, market:"CN", broker:"eastmoney", broker_label:"东方财富",
+  market_label:"A股", report_date:"2026-08-21", data_date:"2026-08-20",
+  generated_at:"2026-08-20T20:00:00+08:00", account_status:"已更新",
+  strategy_version:"v15", buy_window:"09:30–10:00", counts:{sell:3,buy:0,hold:0,review:0},
+  sell_actions:[
+    {symbol:"SIM.PARTIAL",name:"部分卖出",action:"SELL_PARTIAL",reason:"overheat_take_profit",close:"10",active_line:"9",global_strength:"90"},
+    {symbol:"SIM.SIGNAL",name:"信号卖出",action:"SELL_ALL",reason:"danger_signal",clearance_type:"信号清仓",close:"9",active_line:"8",global_strength:"80"},
+  ],
+  real_position_actions:[],
+  simulate_rotation_pairs:[{sell_symbol:"SIM.ROTATION",sell_name:"轮换卖出",buy_symbol:"SIM.ROTATION.BUY",buy_name:"轮换买入",buy_global_strength:"90",sell_global_strength:"40"}],
+  real_rotation_pairs:[],
+  buy_actions:[], real_buy_actions:[], hold_actions:[], review_actions:[], risk_skips:[], audit:{},
+  plan_availability:{
+    simulated_account:{status:"available",reason:"",executable:false},
+    real_account:{status:"available",reason:"",executable:false},
+  },
+  allocation:{version:2},
+};
+const html = renderTrendReportWorkspace(report);
+const plan = html.split('<section class="trend-plan trend-plan-sell">')[1];
+const rows = plan.split("<tbody>")[1].split("</tbody>", 1)[0].split("</tr>");
+const rowFor = (symbol) => rows.find((row) => row.includes(symbol));
+const sellTypeFor = (symbol) => rowFor(symbol).match(/<td data-label="卖出类型">([^<]*)<\/td>/)[1];
+if (sellTypeFor("SIM.PARTIAL") !== "减仓") throw new Error(html);
+if (sellTypeFor("SIM.PARTIAL").includes("清仓") || sellTypeFor("SIM.PARTIAL").includes("轮换")) throw new Error(html);
+if (sellTypeFor("SIM.SIGNAL") !== "清仓") throw new Error(html);
+if (sellTypeFor("SIM.ROTATION") !== "轮换") throw new Error(html);
+console.log("ok");
+''')
+    assert "ok" in output
+
+
+def test_dashboard_distinguishes_unavailable_v2_plans_from_empty_plans() -> None:
+    output = run_dashboard_js(r'''
+const base = {
+  available:true, market:"CN", broker:"eastmoney", broker_label:"东方财富",
+  market_label:"A股", report_date:"2026-08-21", data_date:"2026-08-20",
+  generated_at:"2026-08-20T20:00:00+08:00", account_status:"已更新",
+  strategy_version:"v15", buy_window:"09:30–10:00", counts:{sell:0,buy:0,hold:0,review:0},
+  sell_actions:[], buy_actions:[], real_position_actions:[], real_buy_actions:[],
+  hold_actions:[], review_actions:[], risk_skips:[], audit:{}, allocation:{version:2},
+};
+const blocks = (report) => renderTrendReportWorkspace(report)
+  .split('<section class="trend-plan ').slice(1)
+  .map((block) => block.split('</section>', 1)[0]);
+const check = (report, unavailableIndexes, reason) => {
+  const planBlocks = blocks(report);
+  if (planBlocks.length !== 4) throw new Error(planBlocks.join("\n"));
+  for (const [index, block] of planBlocks.entries()) {
+    const unavailable = unavailableIndexes.includes(index);
+    if (unavailable) {
+      if (!block.includes(`不可用：${reason}`) || block.includes("<p>无</p>")) {
+        throw new Error(block);
+      }
+    } else if (!block.includes("<p>无</p>") || block.includes("不可用")) {
+      throw new Error(block);
+    }
+  }
+};
+check({...base, plan_availability:{
+  simulated_account:{status:"unavailable",reason:"模拟账户快照不可读",executable:false},
+  real_account:{status:"available",reason:"",executable:false},
+}}, [0, 2], "模拟账户快照不可读");
+check({...base, plan_availability:{
+  simulated_account:{status:"available",reason:"",executable:false},
+  real_account:{status:"unavailable",reason:"实盘持仓快照不可读",executable:false},
+}}, [1, 3], "实盘持仓快照不可读");
+check(base, [0, 1, 2, 3], "计划可用性数据缺失");
+check({...base, plan_availability:{
+  simulated_account:{status:"available",reason:"",executable:"invalid"},
+  real_account:{status:"available",reason:"",executable:false},
+}}, [0, 2], "计划可用性数据无效");
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_hides_unqualified_rotation_comparisons() -> None:
     output = run_dashboard_js(r'''
 const comparison = (overrides = {}) => ({
@@ -13076,6 +13601,39 @@ if (!legacy.includes("已回退旧排序")) throw new Error(legacy);
 console.log("ok");
 ''')
 
+    assert "ok" in output
+
+
+def test_dashboard_renders_current_v2_industry_context_layout() -> None:
+    output = run_dashboard_js(r'''
+const context = {
+  industry:"银行", temperature:"热", temperature_direction:"rising",
+  strength:"100", warm_to_hot_count:6, valid:true, invalid_reasons:[],
+  aggregate_right_count_ratio:"0.191", aggregate_right_market_cap_ratio:"0.650",
+  prior_aggregate_right_count_ratio:"0.150", prior_aggregate_right_market_cap_ratio:"0.600",
+};
+const current = (market, strategy_version, allocation = null) => ({
+  market, strategy_version, allocation,
+  industry_context_status:{current_complete:true}, industry_contexts:[context],
+});
+for (const report of [
+  current("CN", "v15"), current("HK", "v13"), current("US", "v13"),
+  current("US", "v10", {version:2}),
+]) {
+  const html = renderTrendIndustryContext(report);
+  for (const text of ["行业", "当前温度", "温度方向", "银行", "上升"]) {
+    if (!html.includes(text)) throw new Error(`${report.market}: ${text}\n${html}`);
+  }
+  for (const text of ["右侧个数占比", "右侧市值占比", "趋势强度", "温转热数量", "数据未提供"]) {
+    if (html.includes(text)) throw new Error(`${report.market}: legacy ${text}\n${html}`);
+  }
+}
+const historical = renderTrendIndustryContext(current("US", "v10"));
+if (!historical.includes("右侧个数占比") || !historical.includes("右侧市值占比")) {
+  throw new Error(`historical layout changed\n${historical}`);
+}
+console.log("ok");
+''')
     assert "ok" in output
 
 

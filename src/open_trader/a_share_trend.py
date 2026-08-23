@@ -15,7 +15,7 @@ from time import sleep
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from .account_http import fetch_account_snapshot
+from .account_http import AccountHttpError, fetch_account_snapshot
 from .daily_premarket import (
     DailyPremarketConfig,
     RunLock,
@@ -66,11 +66,19 @@ from .trend_animals import (
 from .trend_delivery import deliver_daily_trend_text
 from .trend_review import (
     _floor_to_lot,
+    _normalize_futu_symbol,
+    _projected_simulated_buy_seats,
+    freeze_simulated_buy_fifo,
     freeze_report_evidence,
+    freeze_trend_evidence,
     normalize_trend_strategy_snapshot,
+    planning_snapshot_path,
+    read_planning_snapshot,
+    rebuild_trend_report_from_evidence,
     rebuild_overheat_trim_projection,
     reserve_rotation_pairs,
     TREND_V1_EFFECTIVE_FROM,
+    update_planning_snapshot_components,
 )
 
 
@@ -147,23 +155,25 @@ CANDIDATE_LIMIT = 10
 LEGACY_CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.02")}
 CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.04")}
 CURRENT_TREND_STRATEGY_VERSIONS = {"CN": "v10", "US": "v8", "HK": "v8"}
+V2_ALLOCATION_VERSIONS = {"CN": "v15", "US": "v13", "HK": "v13"}
+V1_ALLOCATION_VERSIONS = {"CN": "v14", "US": "v12", "HK": "v12"}
 ALLOCATION_REPORT_VERSIONS = {
-    "CN": frozenset({"v11", "v12", "v13", "v14"}),
-    "HK": frozenset({"v9", "v10", "v11", "v12"}),
-    "US": frozenset({"v9", "v10", "v11", "v12"}),
+    "CN": frozenset({"v11", "v12", "v13", "v14", "v15"}),
+    "HK": frozenset({"v9", "v10", "v11", "v12", "v13"}),
+    "US": frozenset({"v9", "v10", "v11", "v12", "v13"}),
 }
 INDIVIDUAL_GLOBAL_RANKING_VERSIONS = frozenset({
-    ("CN", "v13"), ("CN", "v14"),
-    ("HK", "v11"), ("HK", "v12"),
-    ("US", "v11"), ("US", "v12"),
+    ("CN", "v13"), ("CN", "v14"), ("CN", "v15"),
+    ("HK", "v11"), ("HK", "v12"), ("HK", "v13"),
+    ("US", "v11"), ("US", "v12"), ("US", "v13"),
 })
 # 最终计划买入名单语义（全部趋势候选列入、仓位约束转为 sizing_note 提示）仅对
 # 这些版本生效；更早版本（CN v13、HK/US v11 及之前）保持原有 risk_skip 剔除路径，
 # 保证存量证据回放决策不变。
 FINAL_PLAN_TREND_VERSIONS = frozenset({
-    ("CN", "v14"),
-    ("HK", "v12"),
-    ("US", "v12"),
+    ("CN", "v14"), ("CN", "v15"),
+    ("HK", "v12"), ("HK", "v13"),
+    ("US", "v12"), ("US", "v13"),
 })
 CURRENT_TREND_EFFECTIVE_FROM = "2026-07-27"
 CURRENT_ENTRY_DISCIPLINES = frozenset({
@@ -172,11 +182,13 @@ CURRENT_ENTRY_DISCIPLINES = frozenset({
     ("US", "v10"),
     ("US", "v11"),
     ("US", "v12"),
+    ("US", "v13"),
     ("HK", "v8"),
     ("HK", "v9"),
     ("HK", "v10"),
     ("HK", "v11"),
     ("HK", "v12"),
+    ("HK", "v13"),
 })
 CURRENT_EXIT_DISCIPLINES = frozenset({
     ("CN", "v9"),
@@ -185,6 +197,7 @@ CURRENT_EXIT_DISCIPLINES = frozenset({
     ("CN", "v12"),
     ("CN", "v13"),
     ("CN", "v14"),
+    ("CN", "v15"),
     ("US", "v6"),
     ("US", "v7"),
     ("US", "v8"),
@@ -192,6 +205,7 @@ CURRENT_EXIT_DISCIPLINES = frozenset({
     ("US", "v10"),
     ("US", "v11"),
     ("US", "v12"),
+    ("US", "v13"),
     ("HK", "v6"),
     ("HK", "v7"),
     ("HK", "v8"),
@@ -199,6 +213,7 @@ CURRENT_EXIT_DISCIPLINES = frozenset({
     ("HK", "v10"),
     ("HK", "v11"),
     ("HK", "v12"),
+    ("HK", "v13"),
 })
 REAL_HOLDING_TREND_EXCLUDED_SYMBOLS = frozenset({"US.AGRZ"})
 OVERHEAT_PARAMETER_NAMES = frozenset({
@@ -725,6 +740,17 @@ def _allocation_market_for(
     snapshot = allocation.get("snapshot")
     markets = snapshot.get("markets") if isinstance(snapshot, Mapping) else None
     market_data = markets.get(market) if isinstance(markets, Mapping) else None
+    snapshot_version = (
+        snapshot.get("version", 1) if isinstance(snapshot, Mapping) else 1
+    )
+    if snapshot_version is None:
+        snapshot_version = 1
+    if (
+        isinstance(snapshot_version, bool)
+        or not isinstance(snapshot_version, int)
+        or snapshot_version not in {1, 2}
+    ):
+        raise ValueError("allocation reference is invalid")
     daily_path = allocation.get("daily_path")
     sha256 = allocation.get("sha256")
     if not (
@@ -752,8 +778,16 @@ def _allocation_market_for(
         2: (Decimal("0.04"), Decimal("0.40")),
         3: (Decimal("0.02"), Decimal("0.20")),
     }
+    v2_weights = {
+        1: (Decimal("0.04"), Decimal("0.80")),
+        2: (Decimal("0.04"), Decimal("0.60")),
+        3: (Decimal("0.04"), Decimal("0.40")),
+    }
+    if snapshot_version == 2:
+        expected_weights = v2_weights
     if (
         isinstance(rank, bool)
+        or not isinstance(rank, int)
         or rank not in expected_weights
         or not entry.is_finite()
         or not nominal.is_finite()
@@ -761,9 +795,11 @@ def _allocation_market_for(
         or (entry, nominal) != expected_weights[rank]
         or not isinstance(score_source, str)
         or not score_source
+        or snapshot_version == 2
+        and market_data.get("position_limit") != {1: 20, 2: 15, 3: 10}[rank]
     ):
         raise ValueError("allocation reference is invalid")
-    return {
+    frozen = {
         "daily_path": daily_path,
         "sha256": sha256,
         "rank": rank,
@@ -771,7 +807,14 @@ def _allocation_market_for(
         "score_source": score_source,
         "entry_weight": format(entry, "f"),
         "nominal_weight": format(nominal, "f"),
+        "position_limit": (
+            market_data.get("position_limit")
+            if snapshot_version == 2
+            else POSITION_LIMIT
+        ),
+        "allocation_version": snapshot_version,
     }
+    return frozen
 
 
 def freeze_allocation_reference(
@@ -810,7 +853,7 @@ def freeze_allocation_reference(
             raise ValueError
     except Exception:
         raise ValueError("allocation reference is invalid") from None
-    return {
+    frozen = {
         "daily_path": daily_path,
         "sha256": sha256,
         "allocation_date": allocation_date,
@@ -821,19 +864,28 @@ def freeze_allocation_reference(
         "roots": dict(snapshot["roots"]),
         "markets": dict(snapshot["markets"]),
     }
+    if snapshot.get("version") == 2:
+        frozen["version"] = 2
+    return frozen
 
 
 def valid_frozen_allocation(value: object) -> bool:
-    if not isinstance(value, Mapping) or set(value) != {
+    if not isinstance(value, Mapping) or set(value) not in ({
         "daily_path", "sha256", "allocation_date", "generated_at", "reused",
         "stale_a_trading_days", "failure_reason", "roots", "markets",
-    } or not isinstance(value.get("failure_reason"), str):
+    }, {
+        "daily_path", "sha256", "allocation_date", "generated_at", "reused",
+        "stale_a_trading_days", "failure_reason", "roots", "markets", "version",
+    }) or not isinstance(value.get("failure_reason"), str):
+        return False
+    version = value.get("version", 1)
+    if isinstance(version, bool) or not isinstance(version, int) or version not in {1, 2}:
         return False
     snapshot = {
-        "version": 1,
+        "version": version,
         "allocation_date": value.get("allocation_date"),
         "generated_at": value.get("generated_at"),
-        "generator_version": "trend-allocation-v1",
+        "generator_version": f"trend-allocation-v{version}",
         "git_sha": "0" * 40,
         "roots": value.get("roots"),
         "markets": value.get("markets"),
@@ -876,7 +928,11 @@ def _valid_rotation_comparison(
     ):
         return False
     pair_index = value.get("pair_index")
-    if isinstance(pair_index, bool) or pair_index not in {0, 1}:
+    if (
+        isinstance(pair_index, bool)
+        or not isinstance(pair_index, int)
+        or pair_index < 0
+    ):
         return False
     sell_symbol = str(value["sell_symbol"])
     buy_symbol = str(value["buy_symbol"])
@@ -916,7 +972,7 @@ def _valid_rotation_comparison(
         if sell_asset != buy_asset or sell_compared != sell_local or buy_compared != buy_local:
             return False
     elif basis == "global":
-        if sell_asset == buy_asset or sell_compared != sell_global or buy_compared != buy_global:
+        if sell_compared != sell_global or buy_compared != buy_global:
             return False
     elif sell_compared is not None or buy_compared is not None or gap is not None:
         return False
@@ -969,6 +1025,25 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
         payload.get("account_input")
     ):
         return False
+    availability = payload.get("plan_availability")
+    if availability is not None:
+        if not isinstance(availability, Mapping):
+            return False
+        for value in availability.values():
+            if not isinstance(value, Mapping) or value.get("status") not in {
+                "available", "unavailable"
+            }:
+                return False
+            if not isinstance(value.get("reason", ""), str) or not isinstance(
+                value.get("executable"), bool
+            ):
+                return False
+        if "account_input" not in payload:
+            real_account = availability.get("real_account")
+            if not isinstance(real_account, Mapping) or real_account.get(
+                "status"
+            ) != "unavailable":
+                return False
     allocation = payload.get("allocation")
     judgments = payload.get("strategy_judgments")
     metadata = payload.get("metadata")
@@ -1005,7 +1080,9 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
                 != f"trend_animals_warm_to_hot/{identity_market}/{identity_version}"
             ):
                 return False
-            if ALLOCATION_PROJECTION_VERSIONS.get(identity_market) == identity_version:
+            if identity_version in set(
+                ALLOCATION_REPORT_VERSIONS.get(identity_market, ())
+            ):
                 return False
         if isinstance(parameters, Mapping) and (
             ALLOCATION_DYNAMIC_PARAMETER_NAMES - {"target_weight"}
@@ -1050,7 +1127,8 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
         if isinstance(allocation_markets, Mapping)
         else None
     )
-    allocation_version = ALLOCATION_PROJECTION_VERSIONS[market]
+    allocation_version = V2_ALLOCATION_VERSIONS[market]
+    allocation_snapshot_version = allocation.get("version", 1)
     if (
         not isinstance(strategy_snapshot, Mapping)
         or strategy_snapshot.get("strategy_version") not in ALLOCATION_REPORT_VERSIONS[market]
@@ -1059,6 +1137,16 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
         or snapshot_market is None
         or not isinstance(parameters, Mapping)
         or not isinstance(allocation_market, Mapping)
+        or isinstance(allocation_snapshot_version, bool)
+        or not isinstance(allocation_snapshot_version, int)
+        or allocation_snapshot_version not in {1, 2}
+        or allocation_snapshot_version == 2
+        and strategy_snapshot.get("strategy_version") != allocation_version
+        or allocation_snapshot_version == 1
+        and strategy_snapshot.get("strategy_version") == allocation_version
+        or allocation_snapshot_version == 2
+        and parameters.get("allocation_position_limit")
+        != allocation_market.get("position_limit")
         or any(
             type(parameters.get(parameter_name)) is not type(expected)
             or parameters.get(parameter_name) != expected
@@ -1101,12 +1189,34 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
         for item in candidates
         if isinstance(item, Mapping) and isinstance(item.get("symbol"), str)
     }
+    signal_snapshots = payload.get("signal_snapshots")
+    if isinstance(signal_snapshots, Mapping):
+        raw_candidate_signals = signal_snapshots.get("candidates")
+        if isinstance(raw_candidate_signals, list):
+            candidate_symbols.update(
+                item.get("symbol")
+                for item in raw_candidate_signals
+                if isinstance(item, Mapping) and isinstance(item.get("symbol"), str)
+            )
+    real_buy_actions = judgments.get("real_buy_actions")
+    if real_buy_actions is not None:
+        if (
+            judgments.get("real_holding_decisions_status") != "available"
+            or not isinstance(real_buy_actions, list)
+            or any(
+                not isinstance(item, Mapping)
+                or item.get("action") != "BUY"
+                or not isinstance(item.get("symbol"), str)
+                or item.get("symbol") not in candidate_symbols
+                for item in real_buy_actions
+            )
+        ):
+            return False
     strategy_version = str(
         strategy_snapshot.get("strategy_version") or ""
         if isinstance(strategy_snapshot, Mapping)
         else ""
     )
-    signal_snapshots = payload.get("signal_snapshots")
     signal_snapshots = signal_snapshots if isinstance(signal_snapshots, Mapping) else {}
     holding_signals = signal_snapshots.get("holdings")
     holding_signals = holding_signals if isinstance(holding_signals, Mapping) else {}
@@ -1121,12 +1231,21 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
     }
     current_allocation_version = ALLOCATION_PROJECTION_VERSIONS[market]
     require_comparisons = strategy_version == current_allocation_version
+    max_rotation_pairs = (
+        max(
+            int(allocation_market.get("position_limit") or 0),
+            len(holdings),
+            len(candidates),
+        )
+        if allocation_snapshot_version == 2
+        else 2
+    )
     for field, mode, holding_symbols in (
         ("simulate_rotation_pairs", "automatic", simulate_holding_symbols),
         ("real_rotation_pairs", "manual", real_holding_symbols),
     ):
         pairs = judgments.get(field)
-        if not isinstance(pairs, list) or len(pairs) > 2:
+        if not isinstance(pairs, list) or len(pairs) > max_rotation_pairs:
             return False
         if field == "real_rotation_pairs" and pairs and (
             judgments.get("real_holding_decisions_status") != "available"
@@ -1142,7 +1261,8 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
             if (
                 isinstance(pair_index, bool)
                 or not isinstance(pair_index, int)
-                or pair_index not in {0, 1}
+                or pair_index < 0
+                or pair_index >= max_rotation_pairs
                 or pair_index in seen_indices
                 or pair.get("execution_mode") != mode
                 or pair.get("execution_date") != execution_date
@@ -1260,7 +1380,7 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
             if require_comparisons:
                 return False
             comparisons = []
-        if not isinstance(comparisons, list) or len(comparisons) > 2:
+        if not isinstance(comparisons, list) or len(comparisons) > max_rotation_pairs:
             return False
         pairs = judgments.get(pair_field)
         pairs_by_index = {
@@ -1277,6 +1397,8 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
             if (
                 isinstance(pair_index, bool)
                 or not isinstance(pair_index, int)
+                or pair_index < 0
+                or pair_index >= max_rotation_pairs
                 or pair_index in seen_indices
                 or comparison.get("sell_symbol") not in holding_symbols
                 or comparison.get("buy_symbol") not in candidate_symbols
@@ -1316,7 +1438,11 @@ def live_trend_strategy_snapshot(
     if strategy_version is not None:
         version = strategy_version
     elif allocation_market is not None:
-        version = allocation_version
+        version = (
+            V1_ALLOCATION_VERSIONS[market]
+            if allocation_market.get("allocation_version") == 1
+            else allocation_version
+        )
     elif execution_date is None or execution_date >= CURRENT_TREND_EFFECTIVE_FROM:
         version = CURRENT_TREND_STRATEGY_VERSIONS[market]
     elif market == "CN":
@@ -1325,13 +1451,25 @@ def live_trend_strategy_snapshot(
         version = "v5"
     else:
         version = "v4"
+    if allocation_market is not None:
+        allocation_snapshot_version = allocation_market.get("allocation_version")
+        if version == allocation_version:
+            if allocation_snapshot_version != 2:
+                raise ValueError("current strategy requires allocation version 2")
+        elif version in ALLOCATION_REPORT_VERSIONS[market]:
+            if allocation_snapshot_version != 1:
+                raise ValueError("legacy strategy requires allocation version 1")
+        else:
+            raise ValueError("strategy and allocation identities do not match")
     if (
         version
         not in {
             "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+            "v15",
         }
         or version in {"v5", "v11"} and market == "CN"
-        or version in {"v13", "v14"} and market != "CN"
+        or version == "v14" and market != "CN"
+        or version == "v15" and market != "CN"
         or version == allocation_version and allocation_market is None
     ):
         raise ValueError("unsupported live trend strategy version")
@@ -1414,7 +1552,7 @@ def live_trend_strategy_snapshot(
                     "右侧天数存在、ATR14 可计算"
                 )
     if market == "CN" and version in {
-        "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+        "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
     }:
         parameters.pop("max_filter_price", None)
         parameters["allowed_industry_temperatures"] = ["温", "热", "沸"]
@@ -1422,7 +1560,7 @@ def live_trend_strategy_snapshot(
         for row in rows:
             if row["name"] == "行业温度":
                 row["value"] = "温、热或沸"
-    if market == "CN" and version in {"v9", "v10", "v11", "v12", "v13", "v14"}:
+    if market == "CN" and version in {"v9", "v10", "v11", "v12", "v13", "v14", "v15"}:
         parameters["allowed_assets"] = ["A股", "ETF基金"]
         for row in rows:
             if row["name"] == "交易市场":
@@ -1568,14 +1706,17 @@ def live_trend_strategy_snapshot(
             }
             for item in ("v4", "v7", "v8", "v9", "v10", "v11")
         ]
-    if market == "CN" and version == "v14":
+    if market == "CN" and version in {"v14", "v15"}:
         parameters["kelly_sample_inherits"] = [
             {
                 "market": "CN",
                 "strategy_id": f"trend_animals_warm_to_hot/CN/{item}",
                 "opening_strategy_version": item,
             }
-            for item in ("v4", "v7", "v8", "v9", "v10", "v11")
+            for item in (
+                "v4", "v7", "v8", "v9", "v10", "v11",
+                *(('v14',) if version == "v15" else ()),
+            )
         ]
     if version == "v6" and market in {"US", "HK"}:
         parameters["kelly_sample_inherits"] = [
@@ -1631,14 +1772,17 @@ def live_trend_strategy_snapshot(
             }
             for item in ("v4", "v5", "v6", "v7", "v8", "v9")
         ]
-    if version == "v12" and market in {"US", "HK"}:
+    if version in {"v12", "v13"} and market in {"US", "HK"}:
         parameters["kelly_sample_inherits"] = [
             {
                 "market": market,
                 "strategy_id": f"trend_animals_warm_to_hot/{market}/{item}",
                 "opening_strategy_version": item,
             }
-            for item in ("v4", "v5", "v6", "v7", "v8", "v9")
+            for item in (
+                "v4", "v5", "v6", "v7", "v8", "v9",
+                *(("v12",) if version == "v13" else ()),
+            )
         ]
     current_discipline = (market, version) in CURRENT_EXIT_DISCIPLINES
     if current_discipline:
@@ -1674,8 +1818,8 @@ def live_trend_strategy_snapshot(
         for row in rows:
             if row["name"] == "退出条件":
                 row["value"] = "危险信号、离开趋势右侧、温度转平或触发保护线时全部卖出"
-    if market == "CN" and version == "v14" or (
-        market in {"US", "HK"} and version == "v12"
+    if market == "CN" and version in {"v14", "v15"} or (
+        market in {"US", "HK"} and version in {"v12", "v13"}
     ):
         quantity_rule_text = {
             "CN": "100 股整数倍",
@@ -1708,6 +1852,8 @@ def live_trend_strategy_snapshot(
                 "nominal_weight": allocation_market["nominal_weight"],
             }
         )
+        if allocation_market.get("allocation_version") == 2:
+            parameters["allocation_position_limit"] = allocation_market["position_limit"]
         for row in rows:
             if row["name"] == "目标仓位":
                 row["value"] = f"账户净值的 {Decimal(str(allocation_market['entry_weight'])):.0%}"
@@ -1721,7 +1867,13 @@ def live_trend_strategy_snapshot(
                 ("资源排名", str(allocation_market["rank"])),
                 ("市场分数", str(allocation_market["score"])),
                 ("分数来源", str(allocation_market["score_source"])),
-                ("10 席位名义仓位", str(allocation_market["nominal_weight"])),
+                (
+                    "持仓席位" if allocation_market.get("allocation_version") == 2
+                    else "10 席位名义仓位",
+                    str(allocation_market.get("position_limit", POSITION_LIMIT))
+                    if allocation_market.get("allocation_version") == 2
+                    else str(allocation_market["nominal_weight"]),
+                ),
                 ("配置快照", str(allocation_market["daily_path"])),
                 ("配置快照 SHA-256", str(allocation_market["sha256"])),
             ]
@@ -1764,29 +1916,41 @@ def _expected_report_strategy_snapshot(
     allocation = None
     if (
         (market.upper(), requested_version) in {
-            ("CN", "v11"), ("CN", "v12"), ("CN", "v13"), ("CN", "v14"),
-            ("HK", "v9"), ("HK", "v10"), ("HK", "v11"), ("HK", "v12"),
-            ("US", "v9"), ("US", "v10"), ("US", "v11"), ("US", "v12"),
+            ("CN", "v11"), ("CN", "v12"), ("CN", "v13"), ("CN", "v14"), ("CN", "v15"),
+            ("HK", "v9"), ("HK", "v10"), ("HK", "v11"), ("HK", "v12"), ("HK", "v13"),
+            ("US", "v9"), ("US", "v10"), ("US", "v11"), ("US", "v12"), ("US", "v13"),
         }
         and isinstance(parameters, Mapping)
     ):
+        allocation_version = (
+            2
+            if requested_version == V2_ALLOCATION_VERSIONS[market.upper()]
+            or "allocation_position_limit" in parameters
+            else 1
+        )
+        allocation_market = {
+            "rank": parameters.get("allocation_rank"),
+            "score": parameters.get("allocation_score"),
+            "score_source": parameters.get("allocation_score_source"),
+            "entry_weight": parameters.get("target_weight"),
+            "nominal_weight": parameters.get("nominal_weight"),
+        }
+        if allocation_version == 2:
+            allocation_market["position_limit"] = parameters.get(
+                "allocation_position_limit"
+            )
         allocation = {
             "daily_path": parameters.get("allocation_snapshot_path"),
             "sha256": parameters.get("allocation_snapshot_sha256"),
             "snapshot": {
+                "version": allocation_version,
                 "markets": {
-                    market.upper(): {
-                        "rank": parameters.get("allocation_rank"),
-                        "score": parameters.get("allocation_score"),
-                        "score_source": parameters.get("allocation_score_source"),
-                        "entry_weight": parameters.get("target_weight"),
-                        "nominal_weight": parameters.get("nominal_weight"),
-                    },
+                    market.upper(): allocation_market,
                 },
             },
         }
     if requested_version in {
-        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
     }:
         return live_trend_strategy_snapshot(
             market,
@@ -1855,6 +2019,8 @@ class AccountSnapshot:
     positions: tuple[AccountPosition, ...]
     exceptions: tuple[str, ...]
     position_count: int | None = None
+    status: str = "available"
+    reason: str = ""
 
 
 def _finite_decimal(value: object) -> bool:
@@ -1896,6 +2062,8 @@ def valid_serialized_account(value: object) -> bool:
         return False
     positions = value.get("positions")
     exceptions = value.get("exceptions")
+    status = value.get("status", "available")
+    reason = value.get("reason", "")
     return (
         _valid_account_source_date(value.get("source_date"))
         and _finite_decimal(value.get("net_value"))
@@ -1904,6 +2072,24 @@ def valid_serialized_account(value: object) -> bool:
         and all(_valid_serialized_position(item) for item in positions)
         and isinstance(exceptions, list)
         and all(isinstance(item, str) for item in exceptions)
+        and status in {"available", "unavailable"}
+        and isinstance(reason, str)
+    )
+
+
+def _unavailable_account_snapshot(
+    *, source_date: str, reason: str
+) -> AccountSnapshot:
+    return AccountSnapshot(
+        source_date=source_date,
+        fresh=False,
+        net_value=Decimal("0"),
+        available_cash=Decimal("0"),
+        positions=(),
+        exceptions=(),
+        position_count=0,
+        status="unavailable",
+        reason=reason,
     )
 
 
@@ -1993,6 +2179,7 @@ class BuyAction:
     futu_symbol: str | None = None
     sizing_note: str = ""
     executable: bool = True
+    global_strength: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -2170,6 +2357,10 @@ class TrendReport:
     simulate_rotation_comparisons: tuple[RotationComparison, ...] = ()
     real_rotation_pairs: tuple[RotationPair, ...] = ()
     real_rotation_comparisons: tuple[RotationComparison, ...] = ()
+    real_buy_actions: tuple[BuyAction, ...] = ()
+    simulated_buy_fifo: tuple[dict[str, object], ...] = ()
+    planned_new_seats: int | None = None
+    plan_availability: dict[str, object] = field(default_factory=dict)
 
 
 def _decimal(value: object) -> Decimal:
@@ -3078,7 +3269,7 @@ def _candidate_reasons(
     if shared_discipline:
         allowed_assets = (
             {"A股", "ETF基金"}
-            if strategy_version in {"v9", "v10", "v11", "v12", "v13", "v14"}
+            if strategy_version in {"v9", "v10", "v11", "v12", "v13", "v14", "v15"}
             else {"A股"}
         )
         if market == "CN" and item.asset not in allowed_assets:
@@ -3160,6 +3351,10 @@ def _uses_individual_global_ranking(
     market: str, strategy_version: str | None,
 ) -> bool:
     return (market.upper(), strategy_version) in INDIVIDUAL_GLOBAL_RANKING_VERSIONS
+
+
+def _uses_v2_allocation_behavior(market: str, strategy_version: str | None) -> bool:
+    return V2_ALLOCATION_VERSIONS.get(market.upper()) == strategy_version
 
 
 def _candidate_global_sort_key(item: CandidateInput) -> tuple[object, ...]:
@@ -3432,6 +3627,7 @@ def plan_rotation_pairs(
     market: str = "CN",
     lot_sizes: Mapping[str, int] | None = None,
     require_mapping: bool = False,
+    use_global_strength: bool = False,
 ) -> tuple[RotationPair, ...]:
     """Match eligible holdings with stronger candidates using frozen basis rules."""
     pairs, _ = plan_rotation_pairs_with_comparisons(
@@ -3445,6 +3641,7 @@ def plan_rotation_pairs(
         market=market,
         lot_sizes=lot_sizes,
         require_mapping=require_mapping,
+        use_global_strength=use_global_strength,
     )
     return pairs
 
@@ -3454,6 +3651,7 @@ def _rotation_comparison_values(
     candidate: CandidateInput,
     *,
     market: str,
+    use_global_strength: bool = False,
 ) -> tuple[str | None, Decimal | None, Decimal | None, str]:
     allowed_assets = SEARCH_ASSETS_BY_MARKET.get(market.upper(), frozenset())
     if (
@@ -3464,10 +3662,18 @@ def _rotation_comparison_values(
     ):
         return None, None, None, "大类未提供或不属于当前市场"
     same_category = holding.asset == candidate.asset
-    basis = "local" if same_category else "global"
-    sell_value = holding.strength if same_category else holding.global_strength
-    buy_value = candidate.strength if same_category else candidate.global_strength
-    label = "大类内强度" if same_category else "全局强度"
+    basis = "global" if use_global_strength else "local" if same_category else "global"
+    sell_value = (
+        holding.global_strength
+        if use_global_strength or not same_category
+        else holding.strength
+    )
+    buy_value = (
+        candidate.global_strength
+        if use_global_strength or not same_category
+        else candidate.strength
+    )
+    label = "全局强度" if basis == "global" else "大类内强度"
     if (
         sell_value is None
         or buy_value is None
@@ -3492,13 +3698,17 @@ def plan_rotation_pairs_with_comparisons(
     market: str = "CN",
     lot_sizes: Mapping[str, int] | None = None,
     require_mapping: bool = False,
+    use_global_strength: bool = False,
 ) -> tuple[tuple[RotationPair, ...], tuple[RotationComparison, ...]]:
     """Return executable pairs plus the frozen explanations used to choose them."""
     if available_slots > 0:
         return (), ()
-    slots = tuple(pair_slots[:2])
-    if len(set(slots)) != len(slots) or any(slot not in {0, 1} for slot in slots):
-        raise ValueError("rotation pair slots must be unique 0/1 values")
+    slots = tuple(pair_slots)
+    if len(set(slots)) != len(slots) or any(
+        isinstance(slot, bool) or not isinstance(slot, int) or slot < 0
+        for slot in slots
+    ):
+        raise ValueError("rotation pair slots must be unique non-negative values")
     unique_holdings = {item.symbol: item for item in holdings}
     held_symbols = set(unique_holdings)
     unique_candidates = {item.symbol: item for item in candidates}
@@ -3520,7 +3730,7 @@ def plan_rotation_pairs_with_comparisons(
     for holding in unique_holdings.values():
         for candidate in eligible_candidates:
             basis, sell_compared, buy_compared, data_reason = _rotation_comparison_values(
-                holding, candidate, market=market,
+                holding, candidate, market=market, use_global_strength=use_global_strength,
             )
             gap = (
                 buy_compared - sell_compared
@@ -3663,13 +3873,15 @@ def _plan_account_rotation_pairs(
     excluded_sell_symbols: Sequence[str] = (),
     cash_unconstrained: bool = False,
     use_final_plan_semantics: bool = True,
+    use_global_strength: bool = False,
+    position_limit: int = POSITION_LIMIT,
 ) -> tuple[tuple[RotationPair, ...], tuple[RotationComparison, ...]]:
     """Pair first, then reuse ordinary entry sizing with each sell's proceeds."""
     positions_by_symbol = {item.symbol: item for item in account.positions}
     snapshots = [
         snapshot
         for decision in holdings
-        if decision.action == "HOLD"
+        if decision.action in {"HOLD", "SELL_ALL"}
         and decision.symbol not in excluded_sell_symbols
         and (snapshot := holding_snapshots.get(decision.symbol)) is not None
     ]
@@ -3680,10 +3892,15 @@ def _plan_account_rotation_pairs(
         ],
         entry_weight=entry_weight,
         available_slots=0,
-        pair_slots=(0, 1),
+        pair_slots=(
+            tuple(range(min(len(snapshots), len(candidates))))
+            if use_global_strength
+            else (0, 1)
+        ),
         market=market,
         lot_sizes=lot_sizes,
         require_mapping=require_mapping,
+        use_global_strength=use_global_strength,
     )
     candidates_by_symbol = {item.symbol: item for item in candidates}
     selected: list[RotationPair] = []
@@ -3734,12 +3951,17 @@ def _plan_account_rotation_pairs(
         )
         if existing_risk is not None:
             existing_risk += replacement_risk
-        potential_cash = remaining_cash + position.market_value * sale_factor
+        potential_cash = remaining_cash + (
+            Decimal("0")
+            if pair.sell_symbol in forced_sell_symbols
+            else position.market_value * sale_factor
+        )
         actions, skips, _ = _plan_buy_actions(
             ranked=(candidate,),
             net_value=account.net_value,
             available_cash=potential_cash,
-            current_position_count=POSITION_LIMIT - 1,
+            current_position_count=position_limit - 1,
+            position_limit=position_limit,
             position_weight=entry_weight,
             market=market,
             lot_sizes=lot_sizes,
@@ -3752,7 +3974,7 @@ def _plan_account_rotation_pairs(
             kelly_state=kelly_state,
             use_final_plan_semantics=use_final_plan_semantics,
         )
-        if not actions or actions[0].estimated_shares == 0:
+        if not actions or actions[0].estimated_shares == 0 or not actions[0].executable:
             # 数据缺失类买入（每手未知/价格保护线缺失）与普通 blocked 一样不生成
             # 轮换对，避免 0 股/0 手轮换对在执行侧抛异常。
             if pair.pair_index in comparisons_by_index:
@@ -3841,6 +4063,11 @@ def _terminal_rotation_symbol_pairs(
 
 def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendReport:
     """Replace proposed pairs with the immutable reservations for this report date."""
+    if _uses_v2_allocation_behavior(
+        str(report.metadata.get("market") or "CN"),
+        str(report.strategy_snapshot.get("strategy_version") or ""),
+    ):
+        return report
     parameters = report.strategy_snapshot.get("parameters")
     allocation_sha256 = (
         str(parameters.get("allocation_snapshot_sha256") or "")
@@ -3855,15 +4082,21 @@ def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendRe
     def frozen(
         account_key: str, pairs: Sequence[RotationPair], execution_mode: str,
     ) -> tuple[RotationPair, ...]:
-        values = reserve_rotation_pairs(
-            data_dir,
-            market=str(report.metadata.get("market") or "CN"),
-            account_key=account_key,
-            execution_date=report.execution_date,
-            pairs=[asdict(pair) for pair in pairs],
-            allocation_sha256=allocation_sha256,
-            reserved_at=report.generated_at,
-        )
+        reservation_kwargs: dict[str, object] = {
+            "market": str(report.metadata.get("market") or "CN"),
+            "account_key": account_key,
+            "execution_date": report.execution_date,
+            "pairs": [asdict(pair) for pair in pairs],
+            "allocation_sha256": allocation_sha256,
+            "reserved_at": report.generated_at,
+        }
+        position_limit = report.metadata.get("position_limit")
+        if isinstance(position_limit, int) and not isinstance(position_limit, bool):
+            # v2 rotations may replace grandfathered holdings above the new
+            # seat cap; keep the reservation range at least as large as the
+            # complete frozen pair sequence.
+            reservation_kwargs["max_pairs"] = max(position_limit, len(pairs))
+        values = reserve_rotation_pairs(data_dir, **reservation_kwargs)
         decimal_fields = {
             "sell_global_strength",
             "sell_local_strength",
@@ -3898,6 +4131,15 @@ def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendRe
         proposed: Sequence[RotationComparison],
         pairs: Sequence[RotationPair],
     ) -> tuple[RotationComparison, ...]:
+        market = str(report.metadata.get("market") or "CN").upper()
+        strategy_version = str(
+            report.strategy_snapshot.get("strategy_version") or ""
+        )
+        comparison_limit = (
+            len(pairs)
+            if _uses_v2_allocation_behavior(market, strategy_version)
+            else 2
+        )
         result: list[RotationComparison] = []
         for pair in pairs:
             if pair.strength_basis not in {"local", "global"}:
@@ -3931,14 +4173,14 @@ def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendRe
             for symbol in (item.sell_symbol, item.buy_symbol)
         }
         for item in proposed:
-            if len(result) >= 2 or item.pair_index in used_indices:
+            if len(result) >= comparison_limit or item.pair_index in used_indices:
                 continue
             if {item.sell_symbol, item.buy_symbol} & used_symbols:
                 continue
             result.append(item)
             used_indices.add(item.pair_index)
             used_symbols.update((item.sell_symbol, item.buy_symbol))
-        return tuple(result[:2])
+        return tuple(result[:comparison_limit])
 
     simulate_acc_id = report.metadata.get("simulate_acc_id")
     if (report.simulate_rotation_pairs or isinstance(simulate_acc_id, int)) and (
@@ -4405,6 +4647,7 @@ def estimate_buy_actions(
     price_fx_to_account_currency: Decimal = Decimal("1"),
     portfolio_planned_risk: Decimal = Decimal("0"),
     normal_cost_rate: Decimal = NORMAL_COST_RATE,
+    position_limit: int = POSITION_LIMIT,
 ) -> list[BuyAction]:
     actions, _, _ = _plan_buy_actions(
         ranked=ranked,
@@ -4417,6 +4660,7 @@ def estimate_buy_actions(
         price_fx_to_account_currency=price_fx_to_account_currency,
         portfolio_planned_risk=portfolio_planned_risk,
         normal_cost_rate=normal_cost_rate,
+        position_limit=position_limit,
     )
     return actions
 
@@ -4431,9 +4675,10 @@ def _estimate_buy_actions_v1(
     market: str,
     lot_sizes: Mapping[str, int] | None,
     price_fx_to_account_currency: Decimal,
+    position_limit: int = POSITION_LIMIT,
 ) -> list[BuyAction]:
     """Preserve the frozen v1 nominal/cash/slot sizing for evidence replay."""
-    slots = max(0, POSITION_LIMIT - current_position_count)
+    slots = max(0, position_limit - current_position_count)
     if slots == 0:
         return []
     remaining_cash = available_cash
@@ -4481,6 +4726,7 @@ def _estimate_buy_actions_v1(
                 temperature_curr=item.temperature_curr,
                 phase=item.phase,
                 strength=item.strength,
+                global_strength=item.global_strength,
                 amount=item.amount,
                 atr=item.atr,
                 estimated_initial_line=(
@@ -4586,7 +4832,11 @@ def _final_plan_risk_skips(
                 )
         elif comparisons:
             reason = str(skip.get("reason") or "")
-            slot_reason = "未进入 2 个轮换比较席位"
+            slot_reason = (
+                "未进入轮换比较席位"
+                if _uses_v2_allocation_behavior(market, strategy_version)
+                else "未进入 2 个轮换比较席位"
+            )
             if slot_reason not in reason:
                 skip["reason"] = (
                     f"{reason}；{slot_reason}" if reason else slot_reason
@@ -4724,6 +4974,7 @@ def _data_missing_buy_action(
         temperature_curr=item.temperature_curr,
         phase=item.phase,
         strength=item.strength,
+        global_strength=item.global_strength,
         amount=item.amount,
         atr=atr,
         estimated_initial_line=close - INITIAL_PROTECTION_ATR_MULTIPLE * atr,
@@ -4754,7 +5005,17 @@ def _plan_buy_actions(
     portfolio_risk_unavailable_reason: str = "",
     kelly_state: TrendKellyState | None = None,
     use_final_plan_semantics: bool = True,
+    position_limit: int = POSITION_LIMIT,
+    configured_position_limit: int | None = None,
 ) -> tuple[list[BuyAction], list[dict[str, object]], dict[str, object]]:
+    configured_limit = (
+        configured_position_limit
+        if isinstance(configured_position_limit, int)
+        and not isinstance(configured_position_limit, bool)
+        and configured_position_limit > 0
+        else position_limit
+    )
+
     def entry_weight(item: CandidateInput) -> Decimal | None:
         nominal = (
             cn_target_weights.get(item.temperature_curr)
@@ -4887,7 +5148,7 @@ def _plan_buy_actions(
         else None
     )
     single_entry_limit = net_value * SINGLE_ENTRY_RISK_LIMIT
-    slots = max(0, POSITION_LIMIT - current_position_count)
+    slots = max(0, position_limit - current_position_count)
     actions: list[BuyAction] = []
     skips: list[dict[str, object]] = []
     for item in ranked:
@@ -4909,7 +5170,7 @@ def _plan_buy_actions(
                     item,
                     weight=weight,
                     target_amount=base_amount,
-                    reason="10 个持仓席位已满",
+                    reason=f"{configured_limit} 个持仓席位已满",
                     decisive_constraint="持仓席位",
                 )
             )
@@ -5027,7 +5288,7 @@ def _plan_buy_actions(
                 f"组合剩余风险不可用（{portfolio_risk_unavailable_reason}）"
             )
         if slot_full:
-            notes.append("10 个持仓席位已满")
+            notes.append(f"{configured_limit} 个持仓席位已满")
         cash_short = sized.cash_required > remaining_cash
         if cash_short:
             notes.append(
@@ -5059,6 +5320,7 @@ def _plan_buy_actions(
                 temperature_curr=item.temperature_curr,
                 phase=item.phase,
                 strength=item.strength,
+                global_strength=item.global_strength,
                 amount=item.amount,
                 atr=item.atr,
                 estimated_initial_line=protection_line,
@@ -5606,8 +5868,11 @@ def build_report(
     _allow_historical_account_input: bool = False,
 ) -> TrendReport:
     resolved_account_input = dict(account_input or {})
+    account_input_optional = (
+        real_holdings is not None and real_holdings.status == "unavailable"
+    )
     if not resolved_account_input:
-        if not _allow_historical_account_input:
+        if not (_allow_historical_account_input or account_input_optional):
             raise ValueError("new Trend reports require Account snapshot identity")
     elif not _valid_account_input(resolved_account_input):
         raise ValueError("Account snapshot identity is invalid")
@@ -5655,6 +5920,18 @@ def build_report(
             else normalized_strategy_snapshot
         )
     snapshot_version = str(resolved_strategy_snapshot.get("strategy_version") or "")
+    account_available = (
+        getattr(account, "status", "available") == "available"
+        and account.fresh is True
+    )
+    allocation_market = _allocation_market_for(allocation_reference, market)
+    position_limit = POSITION_LIMIT
+    if allocation_market is not None and allocation_market.get("allocation_version") == 2:
+        position_limit = int(allocation_market["position_limit"])
+    elif isinstance(snapshot_parameters := resolved_strategy_snapshot.get("parameters"), Mapping):
+        raw_limit = snapshot_parameters.get("allocation_position_limit")
+        if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0:
+            position_limit = raw_limit
     current_exit_discipline = (
         market.upper(), snapshot_version
     ) in CURRENT_EXIT_DISCIPLINES
@@ -5680,7 +5957,7 @@ def build_report(
                 key: Decimal(str(raw_cn_weights))
                 for key in ("热", "沸")
             }
-            if market == "CN" and snapshot_version in {"v11", "v12", "v13", "v14"}
+            if market == "CN" and snapshot_version in {"v11", "v12", "v13", "v14", "v15"}
             else CN_TARGET_WEIGHTS
         )
     except (InvalidOperation, KeyError, ValueError):
@@ -5703,7 +5980,7 @@ def build_report(
         )
         if snapshot_version in {
             "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            "v11", "v12", "v13", "v14",
+            "v11", "v12", "v13", "v14", "v15",
         } and kelly_data_reason
         else calculate_trend_kelly(
             kelly_rounds,
@@ -5713,7 +5990,7 @@ def build_report(
         )
         if snapshot_version in {
             "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            "v11", "v12", "v13", "v14",
+            "v11", "v12", "v13", "v14", "v15",
         }
         else None
     )
@@ -5749,7 +6026,7 @@ def build_report(
                 }
             }
         )
-    displayed_candidates = candidate_decision.eligible[:CANDIDATE_LIMIT]
+    displayed_candidates = candidate_decision.eligible[:position_limit]
     plan_eligible = (
         tuple(
             item
@@ -5773,6 +6050,22 @@ def build_report(
         trend_excluded_symbols=(),
     )
     holdings = list(simulated_evaluation.decisions)
+    if _uses_v2_allocation_behavior(market, snapshot_version):
+        holdings = [
+            replace(
+                item,
+                warnings=(
+                    *item.warnings,
+                    "个股全局强度缺失，无法参与轮换",
+                ),
+            )
+            if (
+                (snapshot := holding_snapshots.get(item.symbol)) is not None
+                and snapshot.global_strength is None
+            )
+            else item
+            for item in holdings
+        ]
     new_positions = simulated_evaluation.protection_state["positions"]
     assert isinstance(new_positions, dict)
     industries = simulated_evaluation.industry_counts
@@ -5803,9 +6096,15 @@ def build_report(
         )
         real_decisions = real_evaluation.decisions
         real_protection_state = real_evaluation.protection_state
+    real_buy_actions: list[BuyAction] = []
     sell_symbols = {
         holding.symbol for holding in holdings if holding.action == "SELL_ALL"
     }
+    pre_sell_position_count = max(
+        0,
+        account.position_count if account.position_count is not None
+        else len(account.positions),
+    )
     post_sell_cash = account.available_cash + sum(
         (
             position.market_value
@@ -5823,12 +6122,23 @@ def build_report(
         )
         - len(sell_symbols),
     )
-    if snapshot_version == "v1":
+    planning_position_limit = max(position_limit, pre_sell_position_count)
+    if not account_available:
+        buy_actions = []
+        risk_skips = []
+        risk_summary = {
+            "status": "unavailable",
+            "status_label": "模拟盘计划不可用",
+            "reason": account.reason or "模拟盘账户事实不可用",
+            "normal_cost_rate": normal_cost_rate,
+        }
+    elif snapshot_version == "v1":
         buy_actions = _estimate_buy_actions_v1(
             ranked=plan_eligible,
             net_value=account.net_value,
             available_cash=post_sell_cash,
             current_position_count=post_sell_position_count,
+            position_limit=planning_position_limit,
             position_weight=position_weight,
             market=market,
             lot_sizes=lot_sizes,
@@ -5859,6 +6169,8 @@ def build_report(
             net_value=account.net_value,
             available_cash=post_sell_cash,
             current_position_count=post_sell_position_count,
+            position_limit=planning_position_limit,
+            configured_position_limit=position_limit,
             position_weight=position_weight,
             market=market,
             lot_sizes=lot_sizes,
@@ -5871,9 +6183,9 @@ def build_report(
             kelly_state=kelly_state,
             use_final_plan_semantics=use_final_plan_semantics,
         )
-        if snapshot_version in {
+        if account_available and snapshot_version in {
             "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            "v11", "v12", "v13", "v14",
+            "v11", "v12", "v13", "v14", "v15",
         } and (
             not valid_drawdown_decision(
                 drawdown_summary,
@@ -5977,10 +6289,99 @@ def build_report(
                 use_final_plan_semantics=use_final_plan_semantics,
             )
 
+    if (
+        real_holdings is not None
+        and real_holdings.status == "available"
+        and _uses_v2_allocation_behavior(market, snapshot_version)
+    ):
+        real_account = AccountSnapshot(
+            source_date=as_of_date,
+            fresh=True,
+            net_value=real_holdings.net_value,
+            available_cash=real_holdings.available_cash,
+            positions=real_holdings.positions,
+            exceptions=real_holdings.account_exceptions,
+            position_count=real_holdings.position_count,
+        )
+        real_held_symbols = {position.symbol for position in real_account.positions}
+        real_candidate_decision = build_candidate_list(
+            candidates,
+            held_symbols=real_held_symbols,
+            expected_date=as_of_date,
+            market=market,
+            industry_contexts=industry_context_map,
+            strategy_version=snapshot_version,
+            cny_per_local_currency=cny_per_local_currency,
+        )
+        real_plan_eligible = tuple(
+            item
+            for item in real_candidate_decision.eligible
+            if item.global_strength is not None
+            and item.global_strength.is_finite()
+        )
+        real_sell_symbols = {
+            decision.symbol
+            for decision in real_decisions
+            if decision.action == "SELL_ALL"
+        }
+        real_pre_sell_count = max(
+            0,
+            real_account.position_count
+            if real_account.position_count is not None
+            else len(real_account.positions),
+        )
+        real_post_sell_cash = real_account.available_cash + sum(
+            (
+                position.market_value
+                for position in real_account.positions
+                if position.symbol in real_sell_symbols
+            ),
+            Decimal("0"),
+        )
+        real_post_sell_count = max(
+            0,
+            real_pre_sell_count - len(real_sell_symbols),
+        )
+        real_planned_risk, real_account_reason, real_portfolio_reason = (
+            _post_sell_planned_risk(
+                account=real_account,
+                holdings=real_decisions,
+                sell_symbols=real_sell_symbols,
+                price_fx_to_account_currency=price_fx_to_account_currency,
+                normal_cost_rate=normal_cost_rate,
+                cash_unconstrained=True,
+            )
+        )
+        real_buy_actions, _, _ = _plan_buy_actions(
+            ranked=real_plan_eligible,
+            net_value=real_account.net_value,
+            available_cash=real_post_sell_cash,
+            current_position_count=real_post_sell_count,
+            position_limit=max(position_limit, real_pre_sell_count),
+            configured_position_limit=position_limit,
+            position_weight=position_weight,
+            market=market,
+            lot_sizes=lot_sizes,
+            price_fx_to_account_currency=price_fx_to_account_currency,
+            portfolio_planned_risk=real_planned_risk,
+            normal_cost_rate=normal_cost_rate,
+            cn_target_weights=cn_target_weights,
+            critical_data_reason=real_account_reason,
+            portfolio_risk_unavailable_reason=real_portfolio_reason,
+            kelly_state=kelly_state,
+            use_final_plan_semantics=(
+                market.upper(), snapshot_version
+            ) in FINAL_PLAN_TREND_VERSIONS,
+        )
+        if symbol_mapping_required:
+            real_buy_actions = [
+                action for action in real_buy_actions if action.futu_symbol
+            ]
+
     drawdown_pause_reason = ""
-    if snapshot_version in {
+    if account_available and snapshot_version in {
         "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14",
+        "v11", "v12", "v13", "v14", "v15",
     } and (
         not valid_drawdown_decision(
             drawdown_summary,
@@ -5997,13 +6398,24 @@ def build_report(
             if isinstance(drawdown_summary, Mapping)
             else ""
         ) or "策略累计回撤状态无效，暂停新开仓"
+    if drawdown_pause_reason:
+        real_buy_actions = []
     allocation_sha256 = (
         snapshot_parameters.get("allocation_snapshot_sha256")
         if isinstance(snapshot_parameters, Mapping)
         else None
     )
+    rotation_version = (
+        V1_ALLOCATION_VERSIONS[market]
+        if allocation_market is None
+        else (
+            V1_ALLOCATION_VERSIONS[market]
+            if allocation_market.get("allocation_version") == 1
+            else V2_ALLOCATION_VERSIONS[market]
+        )
+    )
     rotation_enabled = (
-        snapshot_version == ALLOCATION_PROJECTION_VERSIONS[market]
+        snapshot_version == rotation_version
         and isinstance(allocation_sha256, str)
         and len(allocation_sha256) == 64
         and all(character in "0123456789abcdef" for character in allocation_sha256)
@@ -6014,8 +6426,7 @@ def build_report(
     simulate_rotation_comparisons: tuple[RotationComparison, ...] = ()
     if (
         rotation_enabled
-        and post_sell_position_count == POSITION_LIMIT
-        and not any(action.executable for action in buy_actions)
+        and pre_sell_position_count >= position_limit
         and not drawdown_pause_reason
     ):
         simulate_rotation_pairs, simulate_rotation_comparisons = _plan_account_rotation_pairs(
@@ -6035,6 +6446,8 @@ def build_report(
             require_mapping=symbol_mapping_required,
             excluded_sell_symbols=(),
             use_final_plan_semantics=use_final_plan_semantics,
+            use_global_strength=_uses_v2_allocation_behavior(market, snapshot_version),
+            position_limit=position_limit,
         )
         simulate_rotation_pairs = tuple(
             replace(
@@ -6059,7 +6472,11 @@ def build_report(
         )
         if (
             rotation_enabled
-            and real_post_sell_position_count == POSITION_LIMIT
+            and (
+                real_holdings.position_count
+                if real_holdings.position_count is not None
+                else len(real_holdings.positions)
+            ) >= position_limit
             and not drawdown_pause_reason
         ):
             real_account = AccountSnapshot(
@@ -6075,7 +6492,11 @@ def build_report(
                 account=real_account,
                 holdings=real_decisions,
                 holding_snapshots=real_holdings.holding_snapshots,
-                candidates=plan_eligible,
+                candidates=(
+                    real_plan_eligible
+                    if _uses_v2_allocation_behavior(market, snapshot_version)
+                    else plan_eligible
+                ),
                 entry_weight=position_weight,
                 forced_sell_symbols=real_sell_symbols,
                 market=market,
@@ -6089,6 +6510,8 @@ def build_report(
                 excluded_sell_symbols=tuple(real_blocked_symbols),
                 cash_unconstrained=True,
                 use_final_plan_semantics=use_final_plan_semantics,
+                use_global_strength=_uses_v2_allocation_behavior(market, snapshot_version),
+                position_limit=position_limit,
             )
             real_rotation_pairs = tuple(
                 replace(
@@ -6195,6 +6618,7 @@ def build_report(
         candidates=displayed_candidates,
         excluded=candidate_decision.excluded,
         buy_actions=tuple(buy_actions),
+        real_buy_actions=tuple(real_buy_actions),
         risk_skips=tuple(risk_skips),
         risk_summary=risk_summary,
         industry_concentration=industry_concentration,
@@ -6216,6 +6640,27 @@ def build_report(
             **dict(metadata or {}),
             "position_weight": str(position_weight),
             "position_weight_source": position_weight_source,
+            **(
+                {
+                    "position_limit": position_limit,
+                    "candidate_fallbacks": [
+                        {
+                            "symbol": item.symbol,
+                            "name": item.name,
+                            "futu_symbol": item.futu_symbol or to_futu_symbol(market, item.symbol),
+                            "asset": item.asset,
+                            "local_strength": item.strength,
+                            "global_strength": item.global_strength,
+                            "close": item.close,
+                            "atr": item.atr,
+                        }
+                        for item in candidate_decision.eligible
+                    ],
+                }
+                if allocation_market is not None
+                and allocation_market.get("allocation_version") == 2
+                else {}
+            ),
             **(
                 {
                     "trend_statistics": {
@@ -6248,6 +6693,27 @@ def build_report(
         simulate_rotation_comparisons=simulate_rotation_comparisons,
         real_rotation_comparisons=real_rotation_comparisons,
         account_input=resolved_account_input,
+        plan_availability={
+            "simulated_account": {
+                "status": "available" if account_available else "unavailable",
+                "reason": "" if account_available else account.reason,
+                "executable": account_available,
+            },
+            "real_account": {
+                "status": (
+                    "available"
+                    if real_holdings is not None
+                    and real_holdings.status == "available"
+                    else "unavailable"
+                ),
+                "reason": (
+                    ""
+                    if real_holdings is None
+                    else real_holdings.reason
+                ),
+                "executable": False,
+            },
+        },
     )
 
 
@@ -6773,6 +7239,7 @@ def render_trend_feishu_text(
                     ],
                     title="模拟盘自动轮换",
                     currency=currency,
+                    v2_execution=allocation.get("version") == 2,
                 )
             )
         else:
@@ -6784,6 +7251,7 @@ def render_trend_feishu_text(
                     ],
                     title="模拟盘自动轮换",
                     currency=currency,
+                    v2_execution=allocation.get("version") == 2,
                 )
             )
         if real_comparisons:
@@ -6796,6 +7264,7 @@ def render_trend_feishu_text(
                     ],
                     title="实盘手动轮换建议",
                     currency=currency,
+                    v2_execution=allocation.get("version") == 2,
                 )
             )
         else:
@@ -6807,6 +7276,7 @@ def render_trend_feishu_text(
                     ],
                     title="实盘手动轮换建议",
                     currency=currency,
+                    v2_execution=allocation.get("version") == 2,
                 )
             )
     _append_feishu_action_sections(
@@ -6928,20 +7398,35 @@ def _allocation_markdown_lines(
         lines.append(
             f"沿用旧排名 · {allocation['stale_a_trading_days']} 个 A 股交易日"
         )
-    for market, label in (("CN", "A股"), ("HK", "港股"), ("US", "美股")):
-        root = roots[market]
-        values = markets[market]
-        assert isinstance(root, Mapping) and isinstance(values, Mapping)
-        stock = root["stock"]
-        etf = root["etf"]
-        assert isinstance(stock, Mapping) and isinstance(etf, Mapping)
-        lines.append(
-            f"- {label} 第 {values['rank']}｜{stock['asset']} 全局强度 {stock['global_strength']}"
-            f"｜{etf['asset']} 全局强度 {etf['global_strength']}｜分数来源 {values['score_source']}"
-            f"｜单仓基准 {_money(Decimal(str(values['entry_weight'])) * Decimal('100'))}%"
-            f"｜10 席位名义仓位 {_money(Decimal(str(values['nominal_weight'])) * Decimal('100'))}%"
-            f"｜来源 {stock['as_of_date']}/{etf['as_of_date']}"
-        )
+    if allocation.get("version", 1) == 2:
+        for market, label in (("CN", "A股"), ("HK", "港股"), ("US", "美股")):
+            root = roots[market]
+            values = markets[market]
+            assert isinstance(root, Mapping) and isinstance(values, Mapping)
+            stock = root["stock"]
+            assert isinstance(stock, Mapping)
+            lines.append(
+                f"- {label} 第 {values['rank']}｜{stock['asset']} 全局强度 {stock['global_strength']}"
+                f"｜分数来源 {values['score_source']}"
+                f"｜单仓基准 {_money(Decimal(str(values['entry_weight'])) * Decimal('100'))}%"
+                f"｜{values['position_limit']} 席位名义仓位 {_money(Decimal(str(values['nominal_weight'])) * Decimal('100'))}%"
+                f"｜来源 {stock['as_of_date']}"
+            )
+    else:
+        for market, label in (("CN", "A股"), ("HK", "港股"), ("US", "美股")):
+            root = roots[market]
+            values = markets[market]
+            assert isinstance(root, Mapping) and isinstance(values, Mapping)
+            stock = root["stock"]
+            etf = root["etf"]
+            assert isinstance(stock, Mapping) and isinstance(etf, Mapping)
+            lines.append(
+                f"- {label} 第 {values['rank']}｜{stock['asset']} 全局强度 {stock['global_strength']}"
+                f"｜{etf['asset']} 全局强度 {etf['global_strength']}｜分数来源 {values['score_source']}"
+                f"｜单仓基准 {_money(Decimal(str(values['entry_weight'])) * Decimal('100'))}%"
+                f"｜10 席位名义仓位 {_money(Decimal(str(values['nominal_weight'])) * Decimal('100'))}%"
+                f"｜来源 {stock['as_of_date']}/{etf['as_of_date']}"
+            )
     lines.append(
         f"- 快照 {allocation['allocation_date']}｜生成 {allocation['generated_at']}"
         f"｜目标交易日 {execution_date}｜SHA {str(allocation['sha256'])[:12]}"
@@ -6955,6 +7440,7 @@ def _rotation_markdown_lines(
     pairs: Sequence[RotationPair] | Sequence[Mapping[str, object]], *,
     title: str,
     currency: str,
+    v2_execution: bool = False,
 ) -> list[str]:
     lines = ["", f"## {title}", ""]
     if not pairs:
@@ -6966,7 +7452,8 @@ def _rotation_markdown_lines(
             f"，再买入 {raw['buy_symbol']} {raw['buy_name']}（全局强度 {raw['buy_global_strength']}）"
             f"｜差值 {raw['strength_gap']}｜目标仓位 {_money(Decimal(str(raw['target_weight'])) * Decimal('100'))}%"
             f"｜金额 {_money(Decimal(str(raw['target_amount'])))} {currency}｜约 {raw['estimated_shares']} 股"
-            f"｜MARKET 卖出全成后才买入｜目标交易日 {raw['execution_date']}｜不得跨日"
+            f"｜{('卖单先提交，买单独立执行' if v2_execution else 'MARKET 卖出全成后才买入')}"
+            f"｜目标交易日 {raw['execution_date']}｜不得跨日"
         )
     return lines
 
@@ -6977,6 +7464,7 @@ def _rotation_comparison_markdown_lines(
     *,
     title: str,
     currency: str,
+    v2_execution: bool = False,
 ) -> list[str]:
     lines = ["", f"## {title}", ""]
     if not comparisons:
@@ -7014,7 +7502,8 @@ def _rotation_comparison_markdown_lines(
             f"｜差值 {gap_text}｜门槛 20"
             f"｜目标仓位 {_money(Decimal(str(pair['target_weight'])) * Decimal('100'))}%"
             f"｜金额 {_money(Decimal(str(pair['target_amount'])))} {currency}"
-            f"｜约 {pair['estimated_shares']} 股｜MARKET 卖出全成后才买入"
+            f"｜约 {pair['estimated_shares']} 股｜"
+            f"{('卖单先提交，买单独立执行' if v2_execution else 'MARKET 卖出全成后才买入')}"
             f"｜目标交易日 {pair.get('execution_date') or '待定'}｜不得跨日"
         )
     if not rendered:
@@ -7072,6 +7561,12 @@ def render_markdown(report: TrendReport) -> str:
         f"数据日期：{report.as_of_date}｜生成时间：{report.generated_at}｜账户：{freshness}",
         "｜".join(summary_counts),
     ]
+    simulated_plan = report.plan_availability.get("simulated_account")
+    if isinstance(simulated_plan, Mapping) and simulated_plan.get("status") == "unavailable":
+        lines.extend([
+            "",
+            f"模拟盘计划不可用：{simulated_plan.get('reason') or '账户事实不可用'}",
+        ])
     if report.allocation is not None:
         lines.extend(
             _allocation_markdown_lines(
@@ -7080,7 +7575,7 @@ def render_markdown(report: TrendReport) -> str:
         )
     if report.strategy_snapshot.get("strategy_version") in {
         "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14",
+        "v11", "v12", "v13", "v14", "v15",
     }:
         phase = {
             "cold_start": "冷启动",
@@ -7102,7 +7597,7 @@ def render_markdown(report: TrendReport) -> str:
                 "实盘结果不参与计算",
             ]
         )
-    if report.risk_summary:
+    if report.risk_summary and report.risk_summary.get("status") != "unavailable":
         lines.extend([
             "",
             "## 组合计划风险",
@@ -7182,6 +7677,10 @@ def render_markdown(report: TrendReport) -> str:
                     report.simulate_rotation_pairs,
                     title="模拟盘自动轮换",
                     currency=currency,
+                    v2_execution=(
+                        isinstance(report.allocation, Mapping)
+                        and report.allocation.get("version") == 2
+                    ),
                 )
             )
         else:
@@ -7190,6 +7689,10 @@ def render_markdown(report: TrendReport) -> str:
                     report.simulate_rotation_pairs,
                     title="模拟盘自动轮换",
                     currency=currency,
+                    v2_execution=(
+                        isinstance(report.allocation, Mapping)
+                        and report.allocation.get("version") == 2
+                    ),
                 )
             )
         if report.real_rotation_comparisons:
@@ -7199,6 +7702,10 @@ def render_markdown(report: TrendReport) -> str:
                     report.real_rotation_pairs,
                     title="实盘手动轮换建议",
                     currency=currency,
+                    v2_execution=(
+                        isinstance(report.allocation, Mapping)
+                        and report.allocation.get("version") == 2
+                    ),
                 )
             )
         else:
@@ -7207,6 +7714,10 @@ def render_markdown(report: TrendReport) -> str:
                     report.real_rotation_pairs,
                     title="实盘手动轮换建议",
                     currency=currency,
+                    v2_execution=(
+                        isinstance(report.allocation, Mapping)
+                        and report.allocation.get("version") == 2
+                    ),
                 )
             )
 
@@ -7459,6 +7970,12 @@ def _candidate_ordering_context(
 
 
 def validate_report_strategy_snapshot(report: TrendReport) -> None:
+    simulated_plan = report.plan_availability.get("simulated_account")
+    if (
+        isinstance(simulated_plan, Mapping)
+        and simulated_plan.get("status") == "unavailable"
+    ):
+        return
     snapshot = report.strategy_snapshot
     parameters = snapshot.get("parameters")
     if not isinstance(parameters, Mapping):
@@ -7472,7 +7989,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
     version = snapshot.get("strategy_version")
     if version not in {
         "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14",
+        "v11", "v12", "v13", "v14", "v15",
     }:
         raise ValueError("strategy snapshot does not match report actions")
     expected_snapshot = _expected_report_strategy_snapshot(
@@ -7506,7 +8023,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         raise ValueError("strategy snapshot does not match report actions")
     if version in {
         "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14",
+        "v11", "v12", "v13", "v14", "v15",
     }:
         valid_contract = {
             "v2": valid_v2_risk_contract,
@@ -7522,6 +8039,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             "v12": valid_v4_risk_contract,
             "v13": valid_v4_risk_contract,
             "v14": valid_v4_risk_contract,
+            "v15": valid_v4_risk_contract,
         }[version]
         if not valid_contract(
             parameters,
@@ -7597,7 +8115,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             raise ValueError("strategy snapshot does not match report actions")
     if version in {
         "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14",
+        "v11", "v12", "v13", "v14", "v15",
     }:
         if (
             not valid_drawdown_decision(
@@ -7635,7 +8153,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         expected_weight = Decimal(str(nominal_weight))
         if version in {
             "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            "v11", "v12", "v13", "v14",
+        "v11", "v12", "v13", "v14", "v15",
         } and report.risk_summary.get("kelly_phase") not in {
             "cold_start", "unavailable",
         }:
@@ -7666,8 +8184,9 @@ def _report_payload(
     *,
     _allow_historical_account_input: bool = False,
 ) -> dict[str, object]:
+    account_input_optional = report.real_holdings_status == "unavailable"
     if not report.account_input:
-        if not _allow_historical_account_input:
+        if not (_allow_historical_account_input or account_input_optional):
             raise ValueError("new Trend reports require Account snapshot identity")
     elif not _valid_account_input(report.account_input):
         raise ValueError("Account snapshot identity is invalid")
@@ -7679,7 +8198,23 @@ def _report_payload(
         if market in {"CN", "HK"}
         else f"{report.execution_date} regular session"
     )
-    holding_decisions = [_json_value(asdict(item)) for item in report.holdings]
+    current_v2 = _uses_v2_allocation_behavior(market, report.strategy_snapshot.get("strategy_version"))
+    rotation_sell_symbols = {
+        pair.sell_symbol
+        for pair in report.simulate_rotation_pairs
+        if pair.execution_mode == "automatic"
+    }
+
+    def serialized_holding(item: HoldingDecision) -> dict[str, object]:
+        value = _json_value(asdict(item))
+        assert isinstance(value, dict)
+        if current_v2 and item.action == "SELL_ALL":
+            value["clearance_type"] = "信号清仓"
+            if item.symbol in rotation_sell_symbols:
+                value["clearance_note"] = "同时符合轮换清仓"
+        return value
+
+    holding_decisions = [serialized_holding(item) for item in report.holdings]
     top10_candidates = []
     industry_context_map = {
         context.industry_tm_id: context for context in report.industry_contexts
@@ -7696,7 +8231,7 @@ def _report_payload(
         )
         top10_candidates.append(_json_value(candidate))
     formal_actions = [
-        _json_value(asdict(item))
+        serialized_holding(item)
         for item in report.holdings
         if item.action in {"SELL_ALL", "SELL_PARTIAL"}
     ]
@@ -7719,6 +8254,15 @@ def _report_payload(
         "top10_candidates": top10_candidates,
         "formal_actions": formal_actions,
     }
+    if report.allocation is not None and report.real_holdings_status == "available":
+        strategy_judgments["real_buy_actions"] = [
+            {
+                **_json_value(asdict(item)),
+                "action": "BUY",
+                "valid_window": buy_window,
+            }
+            for item in report.real_buy_actions
+        ]
     if (
         report.allocation is not None
         or report.simulate_rotation_pairs
@@ -7739,6 +8283,19 @@ def _report_payload(
                 _json_value(asdict(item))
                 for item in report.real_rotation_comparisons
             ],
+        )
+    if report.planned_new_seats is not None:
+        if (
+            isinstance(report.planned_new_seats, bool)
+            or not isinstance(report.planned_new_seats, int)
+            or report.planned_new_seats < 0
+        ):
+            raise ValueError("frozen simulated buy seat count is invalid")
+        strategy_judgments.update(
+            simulated_buy_fifo=[
+                _json_value(entry) for entry in report.simulated_buy_fifo
+            ],
+            planned_new_seats=report.planned_new_seats,
         )
     if not legacy_v1 or (
         report.metadata.get("symbol_mapping_schema")
@@ -7767,12 +8324,17 @@ def _report_payload(
                 ),
             }
         )
+    serialized_account = _json_value(asdict(report.account))
+    assert isinstance(serialized_account, dict)
+    if report.account.status == "available" and not report.account.reason:
+        serialized_account.pop("status", None)
+        serialized_account.pop("reason", None)
     payload = {
         "schema_version": report.schema_version,
         "generated_at": report.generated_at,
         "as_of_date": report.as_of_date,
         "execution_date": report.execution_date,
-        "account": _json_value(asdict(report.account)),
+        "account": serialized_account,
         "api_facts": list(report.api_facts),
         "strategy_judgments": strategy_judgments,
         "industry_concentration": _json_value(report.industry_concentration),
@@ -7799,6 +8361,7 @@ def _report_payload(
         "signal_snapshots": _json_value(report.signal_snapshots),
         "metadata": _json_value(report.metadata),
         "strategy_snapshot": _json_value(report.strategy_snapshot),
+        "plan_availability": _json_value(report.plan_availability),
         "disclaimer": DISCLAIMER_TEXT,
     }
     if report.account_input:
@@ -7815,11 +8378,72 @@ def _report_payload(
         value = report.metadata.get(key)
         if isinstance(value, str) and value:
             payload[key] = value
-    if not formal_actions:
+    simulated_plan = report.plan_availability.get("simulated_account")
+    simulated_unavailable = (
+        isinstance(simulated_plan, Mapping)
+        and simulated_plan.get("status") == "unavailable"
+    )
+    if not formal_actions and not simulated_unavailable:
         payload["no_action"] = NO_ACTION_TEXT
     if not valid_frozen_report_contract(payload):
         raise ValueError("frozen report contract is invalid")
     return payload
+
+
+def _freeze_report_simulated_buy_plan(
+    report: TrendReport, data_dir: Path
+) -> TrendReport:
+    """Freeze the v2 simulated buy queue before writing the report artifact."""
+    if report.account.status != "available" or report.account.fresh is not True:
+        return report
+    market = str(report.metadata.get("market") or "CN").upper()
+    payload = _report_payload(report)
+    held_symbols = tuple(
+        position.futu_symbol or position.symbol
+        for position in report.account.positions
+        if position.quantity > 0
+    )
+    frozen_holding_codes = {
+        code
+        for value in held_symbols
+        if (code := _normalize_futu_symbol(market, value))
+    }
+    entries = freeze_simulated_buy_fifo(
+        data_dir=data_dir,
+        report=payload,
+        market=market,
+        execution_date=report.execution_date,
+        pre_sell_position_count=len(frozen_holding_codes),
+        held_symbols=held_symbols,
+        persist=False,
+    )
+    target_position_count = getattr(entries, "target_position_count", None)
+    if (
+        isinstance(target_position_count, bool)
+        or not isinstance(target_position_count, int)
+        or target_position_count <= 0
+    ):
+        return report
+    full_exit_symbols = [
+        item.futu_symbol or item.symbol
+        for item in report.holdings
+        if item.action == "SELL_ALL"
+    ]
+    full_exit_symbols.extend(
+        pair.sell_futu_symbol
+        for pair in report.simulate_rotation_pairs
+        if pair.execution_mode == "automatic" and pair.sell_futu_symbol.strip()
+    )
+    return replace(
+        report,
+        simulated_buy_fifo=tuple(dict(entry) for entry in entries),
+        planned_new_seats=_projected_simulated_buy_seats(
+            market=market,
+            target_position_count=target_position_count,
+            held_symbols=held_symbols,
+            full_exit_symbols=full_exit_symbols,
+        ) if entries else 0,
+    )
 
 
 def load_protection_state(path: Path) -> dict[str, object]:
@@ -8520,6 +9144,393 @@ def _recover_receipt_report(
     return AShareTrendRunResult("generated", markdown_path, json_path)
 
 
+def _load_planning_revision_source(
+    *, config: DailyPremarketConfig, report_dir: Path, run_date: str
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]] | None:
+    if not report_dir.exists():
+        return None
+    report_pattern = re.compile(
+        rf"^{re.escape(run_date)}(?:-r([1-9]\d*))?\.json$"
+    )
+    candidates: list[tuple[int, str, Path]] = []
+    for path in report_dir.glob("*.json"):
+        match = report_pattern.fullmatch(path.name)
+        if match:
+            candidates.append((int(match.group(1) or 0), path.name, path))
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    has_planning_report = False
+    for _revision, _name, source_path in candidates:
+        try:
+            payload = json.loads(source_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            if source_path.name == f"{run_date}.json":
+                raise ValueError("frozen report is unreadable") from exc
+            continue
+        if not isinstance(payload, dict):
+            if source_path.name == f"{run_date}.json":
+                raise ValueError("frozen report is invalid")
+            continue
+        metadata = payload.get("metadata")
+        if (
+            not isinstance(metadata, Mapping)
+            or metadata.get("run_date") != run_date
+            or str(metadata.get("market") or "").upper() != "CN"
+        ):
+            continue
+        replay = payload.get("replay_evidence")
+        allocation = payload.get("allocation")
+        planning_era = (
+            isinstance(allocation, Mapping) and allocation.get("version") == 2
+        ) or (
+            isinstance(replay, Mapping) and "planning_path" in replay
+        )
+        if not planning_era:
+            continue
+        has_planning_report = True
+        as_of_date = payload.get("as_of_date")
+        execution_date = payload.get("execution_date")
+        try:
+            if (
+                not isinstance(as_of_date, str)
+                or date.fromisoformat(as_of_date).isoformat() != as_of_date
+                or not isinstance(execution_date, str)
+                or date.fromisoformat(execution_date).isoformat() != execution_date
+                or not valid_frozen_report_contract(payload)
+            ):
+                continue
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not isinstance(replay, Mapping):
+            continue
+        planning_value = replay.get("planning_path")
+        if not isinstance(planning_value, str) or not planning_value:
+            continue
+        planning_path = Path(planning_value)
+        if not planning_path.is_absolute():
+            planning_path = config.data_dir / planning_path
+        try:
+            planning_path.resolve().relative_to(config.data_dir.resolve())
+            if planning_path.resolve() != planning_snapshot_path(
+                config.data_dir, market="CN", target_date=execution_date
+            ).resolve():
+                continue
+        except ValueError:
+            continue
+        planning_sha256 = replay.get("planning_sha256")
+        if not isinstance(planning_sha256, str) or re.fullmatch(
+            r"[0-9a-fA-F]{64}", planning_sha256
+        ) is None:
+            continue
+        try:
+            planning_body = planning_path.read_bytes()
+        except OSError as exc:
+            continue
+        if hashlib.sha256(planning_body).hexdigest() != planning_sha256:
+            continue
+        try:
+            planning = read_planning_snapshot(planning_path, data_dir=config.data_dir)
+        except ValueError:
+            continue
+        if (
+            planning.get("market") != "CN"
+            or planning.get("as_of_date") != as_of_date
+            or planning.get("target_date") != execution_date
+        ):
+            continue
+        evidence_ref = planning.get("evidence")
+        if not isinstance(evidence_ref, Mapping):
+            continue
+        evidence_path = Path(str(evidence_ref.get("path") or ""))
+        if not evidence_path.is_absolute():
+            evidence_path = config.data_dir / evidence_path
+        try:
+            evidence_path.resolve().relative_to(config.data_dir.resolve())
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            continue
+        if not isinstance(evidence, dict):
+            continue
+        if hashlib.sha256(evidence_path.read_bytes()).hexdigest() != evidence_ref.get("sha256"):
+            continue
+        return payload, planning, evidence
+    if has_planning_report:
+        raise ValueError("planning snapshot hash mismatch")
+    return None
+
+
+def _reuse_planning_revision(
+    *,
+    config: DailyPremarketConfig,
+    report_dir: Path,
+    run_date: str,
+    artifact_stem: str,
+    notifier: Notifier,
+    account_factory: Callable[..., object] | None = None,
+    api_factory: Callable[..., object] = TrendAnimalsClient,
+    quote_factory: Callable[..., object] = FutuQuoteClient,
+) -> AShareTrendRunResult | None:
+    loaded = _load_planning_revision_source(
+        config=config, report_dir=report_dir, run_date=run_date
+    )
+    if loaded is None:
+        return None
+    source_payload, planning, evidence = loaded
+    evidence["process_version"] = _process_version(config.repo)
+    inputs = evidence.get("rebuild_inputs")
+    if not isinstance(inputs, dict):
+        raise ValueError("planning snapshot evidence is invalid")
+    components = planning.get("components")
+    if not isinstance(components, Mapping):
+        raise ValueError("planning snapshot components are invalid")
+    updates: dict[str, tuple[str, object]] = {}
+    simulated_component = components.get("simulated_account")
+    if (
+        isinstance(simulated_component, Mapping)
+        and simulated_component.get("status") == "unavailable"
+    ):
+        try:
+            account = load_futu_simulate_trend_account(
+                host=config.futu_host,
+                port=config.futu_port,
+                simulate_acc_id=require_trend_review_config(config, "CN"),
+                market="CN",
+                expected_date=str(inputs["as_of_date"]),
+                account_factory=account_factory or FutuSimulateOrderExecutionClient,
+            )
+        except (FutuQuoteError, OSError, RuntimeError, ValueError):
+            account = None
+        if account is not None:
+            serialized_account = _json_value(asdict(account))
+            inputs["account"] = serialized_account
+            evidence["account"] = serialized_account
+            strategy = evidence.get("strategy_snapshot")
+            if isinstance(strategy, Mapping):
+                inputs["drawdown_summary"] = observe_strategy_equity(
+                    config.data_dir,
+                    market="CN",
+                    strategy_id=str(strategy.get("strategy_id") or ""),
+                    strategy_version=str(strategy.get("strategy_version") or ""),
+                    current_equity=account.net_value,
+                    observed_at=datetime.now(SHANGHAI).isoformat(timespec="seconds"),
+                    entry_date=str(inputs["execution_date"]),
+                )
+            updates["simulated_account"] = (
+                "complete",
+                {"account": serialized_account, "account_input": inputs.get("account_input")},
+            )
+    real_component = components.get("real_account")
+    if (
+        isinstance(real_component, Mapping)
+        and real_component.get("status") == "unavailable"
+    ):
+        frozen_account_snapshot = inputs.get("account_snapshot")
+        if isinstance(frozen_account_snapshot, Mapping) and frozen_account_snapshot:
+            account_snapshot = frozen_account_snapshot
+        else:
+            try:
+                account_snapshot = fetch_account_snapshot()
+            except AccountHttpError:
+                account_snapshot = None
+        if account_snapshot is not None:
+            real_holdings = load_real_holding_input(
+                account_snapshot,
+                "CN",
+                state_path=config.data_dir
+                / "trend_a_share/real_protection_state.json",
+            )
+            real_snapshot_rows: dict[int, Mapping[str, object]] = {}
+            if real_holdings.status == "available" and real_holdings.positions:
+                api = None
+                quote = None
+                try:
+                    api = api_factory(
+                        api_key=config.trend_animals_api_key,
+                        cache_dir=config.data_dir / "trend_animals/cache",
+                    )
+                    quote = quote_factory(host=config.futu_host, port=config.futu_port)
+                    (
+                        real_holdings,
+                        real_snapshot_rows,
+                        _real_bars,
+                        _real_only_count,
+                    ) = enrich_real_holding_input(
+                        real_holdings,
+                        api=api,
+                        quote=quote,
+                        market="CN",
+                        as_of_date=str(inputs["as_of_date"]),
+                        kline_start=(
+                            date.fromisoformat(str(inputs["as_of_date"]))
+                            - timedelta(days=90)
+                        ).isoformat(),
+                        existing_holding_ids={},
+                        existing_rows_by_tm_id={},
+                        existing_holding_snapshots={},
+                        existing_bars_by_symbol={},
+                    )
+                finally:
+                    for client in (quote, api):
+                        close = getattr(client, "close", None)
+                        if callable(close):
+                            close()
+            if real_holdings.status == "available":
+                frozen_account_input = inputs.get("account_input")
+                account_input = (
+                    dict(frozen_account_input)
+                    if isinstance(frozen_account_input, Mapping)
+                    else _account_input(account_snapshot)
+                )
+                inputs["account_input"] = account_input
+                inputs["real_holdings"] = _json_value(asdict(real_holdings))
+                responses = evidence.get("responses")
+                if isinstance(responses, dict):
+                    responses["real_snapshots"] = list(real_snapshot_rows.values())
+                updates["real_account"] = (
+                    "complete",
+                    {
+                        "real_holdings": real_holdings,
+                        "account_input": account_input,
+                    },
+                )
+    evidence_reference: Mapping[str, str] | None = None
+    planning_reference = None
+    if updates:
+        recovered_report = rebuild_trend_report_from_evidence(
+            evidence,
+            _return_report=True,
+            _recompute_account_components=tuple(updates),
+        )
+        if "simulated_account" in updates:
+            recovered_report = _freeze_report_simulated_buy_plan(
+                recovered_report, config.data_dir  # type: ignore[arg-type]
+            )
+        recovered_judgments = _report_payload(recovered_report)["strategy_judgments"]
+        if isinstance(recovered_judgments, Mapping):
+            for component, fields in (
+                (
+                    "simulated_account",
+                    ("simulate_rotation_pairs", "simulate_rotation_comparisons"),
+                ),
+                (
+                    "real_account",
+                    ("real_rotation_pairs", "real_rotation_comparisons"),
+                ),
+            ):
+                if component in updates:
+                    for field in fields:
+                        if field in recovered_judgments:
+                            inputs[field] = recovered_judgments[field]
+            if (
+                "simulated_account" in updates
+                and "planned_new_seats" in recovered_judgments
+            ):
+                inputs["simulated_buy_fifo"] = recovered_judgments[
+                    "simulated_buy_fifo"
+                ]
+                inputs["planned_new_seats"] = recovered_judgments[
+                    "planned_new_seats"
+                ]
+        evidence_reference = freeze_trend_evidence(config.data_dir, evidence)
+        evidence = json.loads(
+            Path(str(evidence_reference["path"])).read_text(encoding="utf-8")
+        )
+        planning_reference = update_planning_snapshot_components(
+            data_dir=config.data_dir,
+            planning_path=Path(str(loaded[1].get("_path") or ""))
+            if loaded[1].get("_path")
+            else config.data_dir
+            / "trend_review"
+            / "planning"
+            / str(planning["market"])
+            / f"{planning['target_date']}.json",
+            evidence=evidence,
+            evidence_reference=evidence_reference,
+            updates=updates,
+        )
+    rebuilt = rebuild_trend_report_from_evidence(evidence)
+    replay = source_payload.get("replay_evidence")
+    if isinstance(replay, Mapping):
+        rebuilt["replay_evidence"] = dict(replay)
+        if planning_reference is not None:
+            assert evidence_reference is not None
+            rebuilt["replay_evidence"].update(
+                {
+                    "path": str(
+                        Path(str(evidence_reference["path"])).relative_to(
+                            config.data_dir
+                        )
+                    ),
+                    "sha256": evidence_reference["sha256"],
+                    "planning_path": str(
+                        Path(planning_reference["path"]).relative_to(config.data_dir)
+                    ),
+                    "planning_sha256": planning_reference["sha256"],
+                }
+            )
+    rebuilt_report = rebuild_trend_report_from_evidence(
+        evidence, _return_report=True
+    )
+    markdown = render_markdown(rebuilt_report)  # type: ignore[arg-type]
+    protection_state = rebuilt_report.protection_state
+    if not isinstance(protection_state, Mapping):
+        raise ValueError("rebuilt report protection state is invalid")
+    real_protection_state = rebuilt_report.real_protection_state
+    report_json = json.dumps(
+        rebuilt, ensure_ascii=False, indent=2, sort_keys=True
+    ) + "\n"
+    receipt_path = _receipt_path(config.data_dir, artifact_stem)
+    receipt = _write_delivery_receipt(
+        receipt_path,
+        status="prepared",
+        generated_at=str(rebuilt.get("generated_at") or ""),
+        artifact_stem=artifact_stem,
+        markdown=markdown,
+        report_json=report_json,
+        protection_state=dict(protection_state),
+        real_protection_state=(
+            dict(real_protection_state)
+            if isinstance(real_protection_state, Mapping)
+            else None
+        ),
+    )
+    write_protection_state(
+        config.data_dir / "trend_a_share/protection_state.json",
+        protection_state,
+    )
+    if isinstance(real_protection_state, Mapping):
+        write_protection_state(
+            config.data_dir / "trend_a_share/real_protection_state.json",
+            real_protection_state,
+        )
+    receipt = _transition_delivery_receipt(
+        receipt_path, receipt, status="pending", delivery_status="pending"
+    )
+    delivery_status = _deliver_a_share_daily_text(
+        config=config,
+        notifier=notifier,
+        run_date=run_date,
+        payload=json.loads(str(receipt["report_json"])),
+    )
+    receipt = _transition_delivery_receipt(
+        receipt_path,
+        receipt,
+        status=(
+            "sent" if delivery_status in {"sent", "sent_prior_message"}
+            else delivery_status
+        ),
+        delivery_status=delivery_status,
+    )
+    markdown_path, json_path = _freeze_receipt_report(
+        receipt=receipt,
+        reports_dir=report_dir,
+        artifact_stem=artifact_stem,
+    )
+    _notify_delivery_status(
+        notifier, run_date=run_date, delivery_status=delivery_status
+    )
+    return AShareTrendRunResult("generated", markdown_path, json_path)
+
+
 def _status_date(row: Mapping[str, object]) -> str:
     for key in ("asOfDate", "updateDate", "latestDate", "date"):
         value = row.get(key)
@@ -8949,6 +9960,24 @@ def _attempt_report(
         if not execution_dates:
             raise FutuQuoteError("Futu CN calendar has no later trading day")
         execution_date = execution_dates[0]
+        planning_snapshot_path_value = planning_snapshot_path(
+            config.data_dir, market="CN", target_date=execution_date
+        )
+        planning_snapshot_exists = planning_snapshot_path_value.exists()
+        planning_simulated_account_complete = False
+        if planning_snapshot_exists:
+            planning_snapshot = read_planning_snapshot(
+                planning_snapshot_path_value, data_dir=config.data_dir
+            )
+            planning_components = planning_snapshot.get("components")
+            if not isinstance(planning_components, Mapping):
+                raise ValueError("planning snapshot components are invalid")
+            simulated_component = planning_components.get("simulated_account")
+            if not isinstance(simulated_component, Mapping):
+                raise ValueError("planning snapshot components are invalid")
+            planning_simulated_account_complete = (
+                simulated_component.get("status") == "complete"
+            )
 
         api = api_factory(
             api_key=config.trend_animals_api_key,
@@ -8992,14 +10021,20 @@ def _attempt_report(
         candidate_ids = component_ids | favorite_ids
 
         simulate_acc_id = require_trend_review_config(config, "CN")
-        account = load_futu_simulate_trend_account(
-            host=config.futu_host,
-            port=config.futu_port,
-            simulate_acc_id=simulate_acc_id,
-            market="CN",
-            expected_date=run_date,
-            account_factory=account_factory,
-        )
+        try:
+            account = load_futu_simulate_trend_account(
+                host=config.futu_host,
+                port=config.futu_port,
+                simulate_acc_id=simulate_acc_id,
+                market="CN",
+                expected_date=run_date,
+                account_factory=account_factory,
+            )
+        except (FutuQuoteError, OSError, RuntimeError, ValueError) as exc:
+            account = _unavailable_account_snapshot(
+                source_date=run_date,
+                reason=f"模拟盘账户事实不可用：{exc}",
+            )
         real_holdings = load_real_holding_input(
             account_snapshot,
             "CN",
@@ -9411,14 +10446,19 @@ def _attempt_report(
             else f"Kelly 模拟闭环统计不可用，使用固定风险仓位：{kelly_evidence.reason}"
         )
         generated_at = datetime.now(SHANGHAI).isoformat(timespec="seconds")
-        drawdown_summary = observe_strategy_equity(
-            config.data_dir,
-            market="CN",
-            strategy_id=str(strategy_snapshot["strategy_id"]),
-            strategy_version=str(strategy_snapshot["strategy_version"]),
-            current_equity=account.net_value,
-            observed_at=generated_at,
-            entry_date=execution_date,
+        drawdown_summary = (
+            observe_strategy_equity(
+                config.data_dir,
+                market="CN",
+                strategy_id=str(strategy_snapshot["strategy_id"]),
+                strategy_version=str(strategy_snapshot["strategy_version"]),
+                current_equity=account.net_value,
+                observed_at=generated_at,
+                entry_date=execution_date,
+            )
+            if account.status == "available"
+            and not planning_simulated_account_complete
+            else None
         )
         report = build_report(
             as_of_date=run_date,
@@ -9483,7 +10523,9 @@ def _attempt_report(
             kelly_data_reason=kelly_data_reason,
             real_holdings=real_holdings,
             allocation_reference=allocation_reference,
-            account_input=_account_input(account_snapshot),
+            account_input=(
+                _account_input(account_snapshot) if account_snapshot else None
+            ),
         )
         report = freeze_report_rotation_pairs(report, config.data_dir)
         report = replace(
@@ -9494,6 +10536,8 @@ def _attempt_report(
                 "process_version": process_version,
             },
         )
+        if not planning_simulated_account_complete:
+            report = _freeze_report_simulated_buy_plan(report, config.data_dir)
         evidence = freeze_report_evidence(
             data_dir=config.data_dir,
             report=report,
@@ -9561,12 +10605,24 @@ def _attempt_report(
             kelly_rounds=kelly_rounds,
             kelly_data_reason=kelly_data_reason,
             real_holdings_input=real_holdings,
+            account_snapshot=account_snapshot,
         )
+        if planning_snapshot_exists:
+            frozen_evidence = json.loads(
+                Path(str(evidence["path"])).read_text(encoding="utf-8")
+            )
+            report = rebuild_trend_report_from_evidence(
+                frozen_evidence, _return_report=True
+            )
         report = replace(
             report,
             replay_evidence={
                 "path": str(Path(evidence["path"]).relative_to(config.data_dir)),
                 "sha256": evidence["sha256"],
+                "planning_path": str(
+                    Path(evidence["planning_path"]).relative_to(config.data_dir)
+                ),
+                "planning_sha256": evidence["planning_sha256"],
             },
         )
         receipt_path = _receipt_path(config.data_dir, artifact_stem)
@@ -9672,6 +10728,19 @@ def run_a_share_trend_report(
             reports_dir=report_dir,
             data_dir=config.data_dir,
         )
+        if revision:
+            reused = _reuse_planning_revision(
+                config=config,
+                report_dir=report_dir,
+                run_date=run_date,
+                artifact_stem=artifact_stem,
+                notifier=notifier,
+                account_factory=account_factory,
+                api_factory=api_factory,
+                quote_factory=quote_factory,
+            )
+            if reused is not None:
+                return reused
         if not revision and _legacy_sent_pair_matches(
             _receipt_path(config.data_dir, artifact_stem),
             artifact_stem,
@@ -9706,7 +10775,10 @@ def run_a_share_trend_report(
         )
         if recovered is not None:
             return recovered
-        account_snapshot = fetch_account_snapshot()
+        try:
+            account_snapshot = fetch_account_snapshot()
+        except AccountHttpError:
+            account_snapshot = {}
         version = _process_version(config.repo)
         log_path = config.logs_dir / "trend_a_share" / f"{run_date}.log"
         deadline = datetime.combine(run_day, time(19, 0), tzinfo=SHANGHAI)

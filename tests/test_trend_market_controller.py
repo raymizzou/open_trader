@@ -70,6 +70,60 @@ def controller_config(tmp_path: Path) -> DailyPremarketConfig:
     )
 
 
+@pytest.fixture(autouse=True)
+def legacy_scheduler_execution_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep pre-request-boundary execution fixtures focused on order behavior."""
+    original_require = controller.require_trend_review_config
+    original_execute = controller.execute_simulated_trend_report
+
+    def execute(
+        config: DailyPremarketConfig,
+        market: str,
+        execution_date: str,
+        report_sha: str,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        if (
+            controller.require_trend_review_config is original_require
+        ):
+            try:
+                original_require(config, market)
+            except ValueError:
+                for path in controller._report_dir(config, market).glob("*.json"):
+                    try:
+                        payload = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeError, json.JSONDecodeError):
+                        continue
+                    if isinstance(payload, dict) and controller._report_hash(payload) == report_sha:
+                        return controller._execute_locked_report(
+                            config,
+                            market,
+                            execution_date,
+                            path,
+                            payload,
+                            allow_new_buys=kwargs.get("allow_new_buys", True),
+                            quote_client=kwargs.get("quote_client"),
+                            order_client=kwargs.get("order_client"),
+                        )
+        return original_execute(
+            config,
+            market,
+            execution_date,
+            report_sha,
+            actor=str(kwargs.get("actor") or "trend-market-controller"),
+            reason=str(kwargs.get("reason") or "scheduled execution"),
+            now=kwargs.get("now") if isinstance(kwargs.get("now"), datetime) else None,
+            quote_client=kwargs.get("quote_client"),
+            order_client=kwargs.get("order_client"),
+            allow_new_buys=bool(kwargs.get("allow_new_buys", True)),
+            scheduled=bool(kwargs.get("scheduled", False)),
+        )
+
+    monkeypatch.setattr(controller, "execute_simulated_trend_report", execute)
+
+
 def write_controller_action(
     config: DailyPremarketConfig,
     key: str,
@@ -202,6 +256,122 @@ def test_controller_notification_retries_only_feishu_once(
 
     assert feishu.attempt_count == 2
     assert len(macos.messages) == 1
+
+
+def test_terminal_rejection_notification_is_stable_across_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(controller_config(tmp_path), notifiers=("macos",))
+    macos = RecordingMacOS()
+    monkeypatch.setattr(
+        controller,
+        "build_notifier",
+        lambda _config: CompositeNotifier([macos]),
+    )
+    failed = {
+        "market": "CN",
+        "date": "2026-07-20",
+        "report_sha256": "a" * 64,
+        "action_index": 0,
+        "symbol": "600001",
+        "futu_code": "SH.600001",
+        "side": "buy",
+        "status": "failed",
+        "reason": "broker_order_no_progress",
+        "filled_qty": "0",
+        "target_qty": "100",
+    }
+    events = [failed]
+    monkeypatch.setattr(
+        controller,
+        "_latest_action_events",
+        lambda *_args: list(events),
+    )
+
+    controller._notify_terminal_rejections(
+        config, "CN", "2026-07-20", "2026-07-20T09:31:00+08:00"
+    )
+    controller._notify_terminal_rejections(
+        config, "CN", "2026-07-20", "2026-07-20T09:32:00+08:00"
+    )
+
+    assert len(macos.messages) == 1
+    events[:] = [{**failed, "status": "submitted"}]
+    controller._notify_terminal_rejections(
+        config, "CN", "2026-07-20", "2026-07-20T09:33:00+08:00"
+    )
+    assert len(macos.messages) == 1
+
+
+def test_controller_terminal_rejection_sets_blocker_and_notifies_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    report = write_report(config)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller, "_load_latest_valid_report", lambda *_args: report
+    )
+
+    def execute(*_args: object, **_kwargs: object) -> dict[str, object]:
+        write_controller_action(config, "600001-buy", {
+            "market": "CN",
+            "date": "2026-07-20",
+            "report_sha256": _report_hash(report[1]),
+            "action_index": 0,
+            "symbol": "600001",
+            "futu_code": "SH.600001",
+            "side": "buy",
+            "status": "failed",
+            "reason": "broker_order_no_progress",
+            "filled_qty": "0",
+            "target_qty": "100",
+        })
+        return {
+            "status": "terminal_rejected",
+            "submitted_count": 0,
+            "terminal_rejected": True,
+        }
+
+    monkeypatch.setattr(controller, "_execute_locked_report", execute)
+    notifications: list[tuple[str, str, object]] = []
+    monkeypatch.setattr(
+        controller,
+        "_notify_once",
+        lambda title, message, key: notifications.append((title, message, key))
+        or True,
+    )
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW
+    )
+
+    assert result["phase"] == "terminal_rejected"
+    assert result["blocker"] == "terminal_rejected"
+    assert len(notifications) == 1
+
+
+@pytest.mark.parametrize("status", ["submitted", "filled", "complete", "unchanged"])
+def test_terminal_rejection_notification_ignores_normal_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    config = replace(controller_config(tmp_path), notifiers=("macos",))
+    macos = RecordingMacOS()
+    monkeypatch.setattr(
+        controller,
+        "build_notifier",
+        lambda _config: CompositeNotifier([macos]),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_latest_action_events",
+        lambda *_args: [{"status": status}],
+    )
+
+    assert controller._notify_terminal_rejections(
+        config, "CN", "2026-07-20", "2026-07-20T09:31:00+08:00"
+    ) == 0
+    assert macos.messages == []
 
 
 def test_controller_notification_stops_after_one_retry(
@@ -1750,6 +1920,213 @@ def write_report(
     return path, report
 
 
+def write_v2_controller_report(
+    config: DailyPremarketConfig,
+    *,
+    positions: list[dict[str, object]] | None = None,
+    actions: list[dict[str, object]] | None = None,
+    real_rotation: bool = False,
+    simulated_available: bool = True,
+) -> tuple[Path, dict[str, object]]:
+    report = valid_cn_report(as_of_date="2026-07-19", execution_date="2026-07-20")
+
+    def physical_symbol(value: object) -> str:
+        try:
+            return to_futu_symbol("CN", str(value)).strip().upper()
+        except ValueError:
+            return str(value).strip().upper()
+
+    held_symbols = {
+        physical_symbol(
+            position.get("futu_symbol")
+            or position.get("code")
+            or position.get("symbol")
+            or ""
+        )
+        for position in positions or []
+        if Decimal(
+            str(position.get("quantity", position.get("qty", "0")))
+        ) > 0
+    }
+    report["account"] = {
+        **report["account"],
+        "fresh": simulated_available,
+        "status": "available" if simulated_available else "unavailable",
+        "positions": positions or [],
+        "position_count": len(held_symbols),
+    }
+    report["metadata"] = {**report["metadata"], "simulate_acc_id": 101}
+    judgments = report["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    judgments.update({
+        "formal_actions": actions or [],
+        "holding_decisions": (
+            [{"symbol": "600001"}] if positions else []
+        ),
+        "top10_candidates": [{"symbol": "600002"}],
+        "simulate_rotation_pairs": [],
+        "simulate_rotation_comparisons": [],
+        "real_rotation_pairs": [],
+        "real_rotation_comparisons": [],
+    })
+    frozen_fifo = [
+        {
+            "source": "formal",
+            "symbol": str(action.get("symbol") or ""),
+            "futu_symbol": str(
+                action.get("futu_symbol")
+                or f"SH.{action.get('symbol')}"
+            ),
+            "owners": [{
+                "source": "formal",
+                "action_index": action_index,
+                "symbol": action.get("symbol"),
+                "futu_symbol": str(
+                    action.get("futu_symbol")
+                    or f"SH.{action.get('symbol')}"
+                ),
+            }],
+        }
+        for action_index, action in enumerate(actions or [])
+        if isinstance(action, dict) and action.get("action") == "BUY"
+    ]
+    judgments["simulated_buy_fifo"] = frozen_fifo
+    judgments["planned_new_seats"] = 0
+    if real_rotation:
+        judgments["real_holding_decisions"] = [{"symbol": "600001"}]
+        judgments["real_holding_decisions_status"] = "available"
+        judgments["real_holding_decisions_source"] = {}
+        judgments["real_rotation_pairs"] = [{
+            "pair_index": 0,
+            "sell_symbol": "600001",
+            "sell_name": "Weak",
+            "sell_futu_symbol": "SH.600001",
+            "sell_global_strength": "10",
+            "buy_symbol": "600002",
+            "buy_name": "Strong",
+            "buy_futu_symbol": "SH.600002",
+            "buy_global_strength": "90",
+            "strength_gap": "80",
+            "sell_asset": "A股",
+            "buy_asset": "A股",
+            "sell_local_strength": "10",
+            "buy_local_strength": "90",
+            "strength_basis": "local",
+            "sell_compared_strength": "10",
+            "buy_compared_strength": "90",
+            "threshold": "20",
+            "target_weight": "0.04",
+            "target_amount": "4000",
+            "estimated_shares": 400,
+            "lot_size": 100,
+            "atr": "0.5",
+            "reason": "relative_rotation",
+            "execution_date": "2026-07-20",
+            "execution_mode": "manual",
+        }]
+        judgments["real_rotation_comparisons"] = [{
+            **judgments["real_rotation_pairs"][0],
+            "outcome": "planned",
+        }]
+
+    roots = {
+        market: {
+            "stock": {
+                "asset": stock,
+                "tm_id": index * 10,
+                "as_of_date": "2026-08-03",
+                "global_strength": stock_strength,
+            },
+            "etf": {
+                "asset": etf,
+                "tm_id": index * 10 + 1,
+                "as_of_date": "2026-08-03",
+                "global_strength": etf_strength,
+            },
+        }
+        for index, (market, stock, etf, stock_strength, etf_strength) in enumerate(
+            (
+                ("CN", "A股", "ETF基金", "90", "80"),
+                ("HK", "港股", "香港ETF", "70", "60"),
+                ("US", "美股", "美国ETF", "50", "40"),
+            ),
+            1,
+        )
+    }
+    allocation_snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-03",
+        generated_at="2026-08-03T16:18:00+08:00",
+        git_sha="a" * 40,
+        roots=roots,
+        previous=None,
+        version=2,
+    )
+    daily_path = config.data_dir / "trend_allocation/daily/2026-08-03.json"
+    daily_path.parent.mkdir(parents=True, exist_ok=True)
+    allocation_body = (
+        json.dumps(
+            allocation_snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    daily_path.write_text(allocation_body, encoding="utf-8")
+    report["allocation"] = {
+        "version": allocation_snapshot["version"],
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": hashlib.sha256(allocation_body.encode()).hexdigest(),
+        "allocation_date": "2026-08-03",
+        "generated_at": "2026-08-03T16:18:00+08:00",
+        "reused": False,
+        "stale_a_trading_days": 0,
+        "failure_reason": "",
+        "roots": allocation_snapshot["roots"],
+        "markets": allocation_snapshot["markets"],
+    }
+    if frozen_fifo:
+        full_exit_symbols = {
+            physical_symbol(
+                action.get("futu_symbol")
+                or f"SH.{action.get('symbol')}"
+            )
+            for action in actions or []
+            if isinstance(action, dict) and action.get("action") == "SELL_ALL"
+        }
+        position_limit = allocation_snapshot["markets"]["CN"]["position_limit"]
+        judgments["planned_new_seats"] = max(
+            0,
+            position_limit - len(held_symbols - full_exit_symbols),
+        )
+    report["strategy_snapshot"] = a_share_trend.live_trend_strategy_snapshot(
+        "CN",
+        "test-sha",
+        (622466, 697199),
+        allocation={
+            "daily_path": report["allocation"]["daily_path"],
+            "sha256": report["allocation"]["sha256"],
+            "snapshot": allocation_snapshot,
+        },
+    )
+    report["plan_availability"] = {
+        "simulated_account": {
+            "status": "available" if simulated_available else "unavailable",
+            "reason": "" if simulated_available else "simulation account offline",
+            "executable": simulated_available,
+        },
+        "real_account": {
+            "status": "available" if real_rotation else "unavailable",
+            "reason": "" if real_rotation else "real account is informational",
+            "executable": False,
+        },
+    }
+    path = config.reports_dir / "trend_a_share/2026-07-19.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report), encoding="utf-8")
+    return path, report
+
+
 def partial_sell_action(symbol: str = "600001") -> dict[str, object]:
     return {
         "action": "SELL_PARTIAL",
@@ -1761,6 +2138,997 @@ def partial_sell_action(symbol: str = "600001") -> dict[str, object]:
         "position_started_for": "2026-07-01",
         "overheat_signals": ["boiling"],
     }
+
+
+def test_v2_allow_new_buys_false_suppresses_formal_buy_but_keeps_sell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    sell = {"action": "SELL_ALL", "symbol": "600001"}
+    buy = {
+        "action": "BUY",
+        "symbol": "600002",
+        "futu_symbol": "SH.600002",
+        "target_weight": "0.04",
+        "lot_size": 100,
+        "estimated_shares": 100,
+        "target_amount": "1000",
+        "atr": "0.5",
+    }
+    report_path, report = write_v2_controller_report(
+        config,
+        positions=[{
+            "symbol": "600001",
+            "name": "Weak",
+            "asset_class": "stock",
+            "quantity": "100",
+            "market_value": "1000",
+            "avg_cost_price": "10",
+        }],
+        actions=[sell, buy],
+    )
+    report["execution_date"] = NOW.date().isoformat()
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+
+    class OrderClient:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+            self.orders: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "cash": "100000",
+                "positions": [
+                    {"code": "SH.600001", "qty": "100", "can_sell_qty": "100"}
+                ],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": self.orders}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(dict(request))
+            order = {
+                **request,
+                "order_id": f"SIM-{len(self.requests)}",
+                "code": request["futu_code"],
+                "trd_side": request["side"],
+                "order_status": "FILLED_ALL",
+                "dealt_qty": request["qty"],
+            }
+            self.orders.append(order)
+            return {
+                "futu_order_id": order["order_id"],
+                "status": "FILLED_ALL",
+                "order_status": "FILLED_ALL",
+                "dealt_qty": request["qty"],
+            }
+
+    client = OrderClient()
+    result = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        NOW.date().isoformat(),
+        _report_hash(report),
+        actor="test",
+        reason="protection failure",
+        now=NOW,
+        order_client=client,
+        allow_new_buys=False,
+    )
+    assert (
+        result["submitted_count"],
+        [(request["side"], request["futu_code"], request["qty"])
+         for request in client.requests],
+    ) == (1, [("sell", "SH.600001", "100")])
+    assert report_path.exists()
+
+
+def test_controller_v2_requires_plan_availability(tmp_path: Path) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    report_path, report = write_v2_controller_report(config)
+    report.pop("plan_availability")
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    class NeverOrderClient:
+        def __getattr__(self, _name: str) -> object:
+            raise AssertionError("invalid v2 report reached the order client")
+
+    with pytest.raises(ValueError, match="invalid frozen trend report"):
+        controller.execute_simulated_trend_report(
+            config,
+            "CN",
+            report["execution_date"],
+            _report_hash(report),
+            actor="test",
+            reason="missing plan availability",
+            now=NOW,
+            order_client=NeverOrderClient(),
+        )
+
+
+def test_controller_simulated_unavailable_ignores_real_rotation_plan(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    report_path, report = write_v2_controller_report(
+        config,
+        real_rotation=True,
+        simulated_available=False,
+    )
+    report["account_input"] = {
+        "snapshot_generation": "sha256:" + "0" * 64,
+        "account_generation": "sha256:" + "1" * 64,
+        "status": "healthy",
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    class NeverOrderClient:
+        def __getattr__(self, _name: str) -> object:
+            raise AssertionError("unavailable simulated plan reached the order client")
+
+    result = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        report["execution_date"],
+        _report_hash(report),
+        actor="test",
+        reason="unavailable simulated account",
+        now=NOW,
+        order_client=NeverOrderClient(),
+    )
+
+    assert (
+        result["status"],
+        len(report["strategy_judgments"]["real_rotation_pairs"]),  # type: ignore[index]
+    ) == ("unchanged", 1)
+
+
+def test_controller_v2_executable_report_requires_frozen_buy_plan(
+    tmp_path: Path,
+) -> None:
+    invalid_reports = [
+        lambda judgments: (judgments.pop("simulated_buy_fifo"), judgments.pop("planned_new_seats")),
+        lambda judgments: judgments.pop("simulated_buy_fifo"),
+        lambda judgments: judgments.pop("planned_new_seats"),
+        lambda judgments: judgments.update({"simulated_buy_fifo": ["SH.600001"]}),
+        lambda judgments: judgments.update({"planned_new_seats": True}),
+    ]
+
+    class NeverOrderClient:
+        def __getattr__(self, _name: str) -> object:
+            raise AssertionError("invalid v2 report reached the order client")
+
+    outcomes: list[str] = []
+    for index, mutate in enumerate(invalid_reports):
+        config = replace(
+            controller_config(tmp_path / f"invalid-{index}"),
+            trend_review_cn_simulate_acc_id=101,
+            trend_executor_host=socket.gethostname(),
+        )
+        report_path, report = write_v2_controller_report(config)
+        judgments = report["strategy_judgments"]
+        assert isinstance(judgments, dict)
+        mutate(judgments)
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        try:
+            controller.execute_simulated_trend_report(
+                config,
+                "CN",
+                report["execution_date"],
+                _report_hash(report),
+                actor="test",
+                reason="invalid frozen buy plan",
+                now=NOW,
+                order_client=NeverOrderClient(),
+            )
+        except ValueError:
+            outcomes.append("ValueError")
+        else:
+            outcomes.append("accepted")
+
+    valid_config = replace(
+        controller_config(tmp_path / "valid"),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    _, valid_report = write_v2_controller_report(valid_config)
+    valid = controller.execute_simulated_trend_report(
+        valid_config,
+        "CN",
+        valid_report["execution_date"],
+        _report_hash(valid_report),
+        actor="test",
+        reason="empty frozen buy plan",
+        now=NOW,
+        order_client=NeverOrderClient(),
+    )
+
+    assert (outcomes, valid["status"], valid["submitted_count"]) == (
+        ["ValueError"] * 5,
+        "unchanged",
+        0,
+    )
+
+
+def test_controller_v2_rejects_frozen_fifo_entry_without_owner_identity(
+    tmp_path: Path,
+) -> None:
+    buy = {
+        "action": "BUY",
+        "symbol": "600001",
+        "futu_symbol": "SH.600001",
+        "target_weight": "0.04",
+        "lot_size": 100,
+        "estimated_shares": 100,
+        "target_amount": "1000",
+        "atr": "0.5",
+    }
+    valid_owner = {
+        "source": "formal",
+        "action_index": 0,
+        "symbol": "600001",
+        "futu_symbol": "SH.600001",
+    }
+    invalid_fifos = [
+        [{}],
+        [{"source": "formal", "symbol": "600001", "futu_symbol": "SH.600001"}],
+        [{"source": "formal", "symbol": "600999", "futu_symbol": "SH.600999"}],
+        [{
+            "source": "formal",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "owners": [{**valid_owner, "symbol": "600999"}],
+        }],
+        [{
+            "source": "formal",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "owners": [{key: value for key, value in valid_owner.items() if key != "futu_symbol"}],
+        }],
+        [{
+            "source": "formal",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "owners": [{**valid_owner, "futu_symbol": "SH.600999"}],
+        }],
+        [],
+    ]
+
+    class Boundary:
+        def __init__(self) -> None:
+            self.snapshot_calls = 0
+            self.quote_calls = 0
+            self.order_calls = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            self.snapshot_calls += 1
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "available_cash": "100000",
+                "positions": [],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": []}
+
+        def place_order(self, _request: dict[str, object]) -> dict[str, object]:
+            self.order_calls += 1
+            return {"futu_order_id": "UNEXPECTED", "status": "SUBMITTED"}
+
+    outcomes: list[str] = []
+    for index, fifo in enumerate(invalid_fifos):
+        config = replace(
+            controller_config(tmp_path / f"invalid-{index}"),
+            trend_review_cn_simulate_acc_id=101,
+            trend_executor_host=socket.gethostname(),
+        )
+        report_path, report = write_v2_controller_report(config, actions=[buy])
+        judgments = report["strategy_judgments"]
+        assert isinstance(judgments, dict)
+        judgments["simulated_buy_fifo"] = fifo
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        boundary = Boundary()
+        quote = SimpleNamespace(
+            get_snapshots=lambda _symbols: setattr(boundary, "quote_calls", boundary.quote_calls + 1)
+            or {},
+        )
+        try:
+            controller.execute_simulated_trend_report(
+                config,
+                "CN",
+                report["execution_date"],
+                _report_hash(report),
+                actor="test",
+                reason="invalid frozen FIFO owner",
+                now=NOW,
+                quote_client=quote,
+                order_client=boundary,
+            )
+        except ValueError:
+            outcomes.append("rejected")
+        else:
+            outcomes.append("accepted")
+        assert boundary.quote_calls == 0
+        assert boundary.order_calls == 0
+
+    valid_config = replace(
+        controller_config(tmp_path / "valid-empty"),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    _, valid_report = write_v2_controller_report(valid_config)
+    valid = controller.execute_simulated_trend_report(
+        valid_config,
+        "CN",
+        valid_report["execution_date"],
+        _report_hash(valid_report),
+        actor="test",
+        reason="truthful empty frozen FIFO",
+        now=NOW,
+        order_client=Boundary(),
+    )
+
+    assert (outcomes, valid["status"], valid["submitted_count"]) == (
+        ["rejected"] * len(invalid_fifos),
+        "unchanged",
+        0,
+    )
+
+
+def test_controller_v2_rejects_reordered_frozen_fifo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    positions = [
+        {
+            "symbol": f"600{index:03d}",
+            "name": f"Holding {index}",
+            "asset_class": "stock",
+            "quantity": "100",
+            "market_value": "1000",
+            "avg_cost_price": "10",
+        }
+        for index in range(100, 119)
+    ]
+    actions = [
+        {
+            "action": "BUY",
+            "symbol": symbol,
+            "futu_symbol": f"SH.{symbol}",
+            "target_weight": "0.04",
+            "global_strength": strength,
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "target_amount": "1000",
+            "atr": "0.5",
+        }
+        for symbol, strength in (("600001", "95"), ("600002", "90"))
+    ]
+    valid_config = replace(
+        controller_config(tmp_path / "valid"),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    _, valid_report = write_v2_controller_report(
+        valid_config, positions=positions, actions=actions
+    )
+
+    class Boundary:
+        def __init__(self) -> None:
+            self.snapshot_calls = 0
+            self.order_calls = 0
+            self.requests: list[dict[str, object]] = []
+            self.orders: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            self.snapshot_calls += 1
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "available_cash": "100000",
+                "positions": [
+                    {"code": f"SH.600{index:03d}", "qty": "100"}
+                    for index in range(100, 119)
+                ],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": self.orders}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.order_calls += 1
+            self.requests.append(dict(request))
+            self.orders.append({
+                **request,
+                "order_id": f"SIM-{self.order_calls}",
+                "order_status": "FILLED_ALL",
+                "dealt_qty": request["qty"],
+            })
+            return {
+                "futu_order_id": f"SIM-{self.order_calls}",
+                "status": "FILLED_ALL",
+                "order_status": "FILLED_ALL",
+                "dealt_qty": request["qty"],
+            }
+
+    class Quote:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            self.calls += 1
+            return {
+                symbol: SimpleNamespace(last_price=10)
+                for symbol in symbols
+            }
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+    valid_boundary = Boundary()
+    valid_quote = Quote()
+    valid = controller.execute_simulated_trend_report(
+        valid_config,
+        "CN",
+        valid_report["execution_date"],  # type: ignore[arg-type]
+        _report_hash(valid_report),
+        actor="test",
+        reason="valid frozen FIFO",
+        now=NOW,
+        quote_client=valid_quote,
+        order_client=valid_boundary,
+    )
+
+    assert (
+        valid_report["strategy_judgments"]["planned_new_seats"],  # type: ignore[index]
+        valid["submitted_count"],
+        [request["futu_code"] for request in valid_boundary.requests],
+    ) == (1, 1, ["SH.600001"])
+
+    reordered_config = replace(
+        controller_config(tmp_path / "reordered"),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    report_path, report = write_v2_controller_report(
+        reordered_config, positions=positions, actions=actions
+    )
+    judgments = report["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    judgments["simulated_buy_fifo"] = list(reversed(judgments["simulated_buy_fifo"]))
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    boundary = Boundary()
+    quote = Quote()
+    with pytest.raises(ValueError, match="invalid frozen trend report"):
+        controller.execute_simulated_trend_report(
+            reordered_config,
+            "CN",
+            report["execution_date"],  # type: ignore[arg-type]
+            _report_hash(report),
+            actor="test",
+            reason="reordered frozen FIFO",
+            now=NOW,
+            quote_client=quote,
+            order_client=boundary,
+        )
+
+    assert (quote.calls, boundary.order_calls) == (0, 0)
+
+
+def test_controller_v2_skips_data_missing_buy_and_executes_later_fifo_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    positions = [
+        {
+            "symbol": f"600{index:03d}",
+            "name": f"Holding {index}",
+            "asset_class": "stock",
+            "quantity": "100",
+            "market_value": "1000",
+            "avg_cost_price": "10",
+        }
+        for index in range(100, 119)
+    ]
+    actions = [
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "target_weight": "0.04",
+            "global_strength": "95",
+            "lot_size": 0,
+            "estimated_shares": 0,
+            "target_amount": "0",
+            "atr": "0",
+            "sizing_note": "每手股数未知，无法定量",
+        },
+        {
+            "action": "BUY",
+            "symbol": "600002",
+            "futu_symbol": "SH.600002",
+            "target_weight": "0.04",
+            "global_strength": "90",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "target_amount": "1000",
+            "atr": "0.5",
+        },
+    ]
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    report_path, report = write_v2_controller_report(
+        config, positions=positions, actions=actions
+    )
+    judgments = report["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    assert judgments["planned_new_seats"] == 1
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+
+    class Boundary:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+            self.orders: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "available_cash": "100000",
+                "positions": [
+                    {"code": f"SH.600{index:03d}", "qty": "100"}
+                    for index in range(100, 119)
+                ],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": self.orders}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(dict(request))
+            order_id = f"SIM-{len(self.requests)}"
+            self.orders.append({
+                **request,
+                "order_id": order_id,
+                "order_status": "FILLED_ALL",
+                "dealt_qty": request["qty"],
+            })
+            return {
+                "futu_order_id": order_id,
+                "status": "FILLED_ALL",
+                "order_status": "FILLED_ALL",
+                "dealt_qty": request["qty"],
+            }
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+    boundary = Boundary()
+    result = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        report["execution_date"],  # type: ignore[arg-type]
+        _report_hash(report),
+        actor="test",
+        reason="skip data-missing FIFO candidate",
+        now=NOW,
+        quote_client=Quote(),
+        order_client=boundary,
+    )
+    action_root = (
+        config.data_dir / "trend_review" / "ledgers" / "CN" / "actions"
+        / report["execution_date"]  # type: ignore[index]
+    )
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in action_root.rglob("*.json")
+    ] if action_root.exists() else []
+
+    assert (
+        result["submitted_count"],
+        [request["futu_code"] for request in boundary.requests],
+        [event for event in events if event.get("futu_code") == "SH.600001"],
+    ) == (1, ["SH.600002"], [])
+
+
+def test_controller_v2_rejects_frozen_seat_count_above_report_derived_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def report_position(index: int) -> dict[str, object]:
+        symbol = f"600{index:03d}"
+        return {
+            "symbol": symbol,
+            "name": symbol,
+            "asset_class": "stock",
+            "quantity": "100",
+            "market_value": "1000",
+            "avg_cost_price": "10",
+        }
+
+    def buy_action(symbol: str) -> dict[str, object]:
+        return {
+            "action": "BUY",
+            "symbol": symbol,
+            "futu_symbol": f"SH.{symbol}",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "target_amount": "1000",
+            "atr": "0.5",
+        }
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+
+    class Boundary:
+        def __init__(self, positions: list[dict[str, object]]) -> None:
+            self.positions = positions
+            self.quote_calls = 0
+            self.order_calls = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "available_cash": "100000",
+                "positions": self.positions,
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": []}
+
+        def place_order(self, _request: dict[str, object]) -> dict[str, object]:
+            self.order_calls += 1
+            raise AssertionError("seat-budget validation reached order submission")
+
+    class Quote:
+        def __init__(self, boundary: Boundary) -> None:
+            self.boundary = boundary
+
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            self.boundary.quote_calls += 1
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+    tampered_config = replace(
+        controller_config(tmp_path / "tampered"),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    tampered_positions = [report_position(index) for index in range(100, 119)]
+    tampered_path, tampered_report = write_v2_controller_report(
+        tampered_config,
+        positions=tampered_positions,
+        actions=[buy_action("600001"), buy_action("600002")],
+    )
+    tampered_report["account"]["position_count"] = 19  # type: ignore[index]
+    tampered_report["strategy_judgments"]["planned_new_seats"] = 2  # type: ignore[index]
+    tampered_path.write_text(json.dumps(tampered_report), encoding="utf-8")
+    tampered_boundary = Boundary([
+        {
+            "code": f"SH.{position['symbol']}",
+            "qty": position["quantity"],
+            "can_sell_qty": position["quantity"],
+        }
+        for position in tampered_positions
+    ])
+    tampered_quote = Quote(tampered_boundary)
+
+    with pytest.raises(ValueError, match="invalid frozen trend report"):
+        controller.execute_simulated_trend_report(
+            tampered_config,
+            "CN",
+            tampered_report["execution_date"],  # type: ignore[arg-type]
+            _report_hash(tampered_report),
+            actor="test",
+            reason="tampered frozen seat budget",
+            now=NOW,
+            quote_client=tampered_quote,
+            order_client=tampered_boundary,
+        )
+
+    assert (tampered_boundary.quote_calls, tampered_boundary.order_calls) == (0, 0)
+
+    truthful_config = replace(
+        controller_config(tmp_path / "truthful"),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    truthful_positions = [report_position(index) for index in range(100, 120)]
+    truthful_path, truthful_report = write_v2_controller_report(
+        truthful_config,
+        positions=truthful_positions,
+        actions=[buy_action("600001")],
+    )
+    truthful_report["account"]["position_count"] = 20  # type: ignore[index]
+    truthful_report["strategy_judgments"]["planned_new_seats"] = 0  # type: ignore[index]
+    truthful_path.write_text(json.dumps(truthful_report), encoding="utf-8")
+    truthful_boundary = Boundary([
+        {
+            "code": f"SH.{position['symbol']}",
+            "qty": position["quantity"],
+            "can_sell_qty": position["quantity"],
+        }
+        for position in truthful_positions
+    ])
+    truthful_quote = Quote(truthful_boundary)
+    truthful = controller.execute_simulated_trend_report(
+        truthful_config,
+        "CN",
+        truthful_report["execution_date"],  # type: ignore[arg-type]
+        _report_hash(truthful_report),
+        actor="test",
+        reason="truthful frozen seat budget at cap",
+        now=NOW,
+        quote_client=truthful_quote,
+        order_client=truthful_boundary,
+    )
+
+    assert (truthful["status"], truthful["submitted_count"], truthful_boundary.order_calls) == (
+        "unchanged",
+        0,
+        0,
+    )
+
+
+def test_controller_v2_rejects_frozen_position_count_inconsistent_with_positive_holdings(
+    tmp_path: Path,
+) -> None:
+    positions = [
+        {
+            "symbol": f"600{index:03d}",
+            "name": f"Holding {index}",
+            "asset_class": "stock",
+            "quantity": "100",
+            "market_value": "1000",
+            "avg_cost_price": "10",
+        }
+        for index in range(100, 119)
+    ]
+    actions = [
+        {
+            "action": "BUY",
+            "symbol": symbol,
+            "futu_symbol": f"SH.{symbol}",
+            "target_weight": "0.04",
+            "global_strength": strength,
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "target_amount": "1000",
+            "atr": "0.5",
+        }
+        for symbol, strength in (("600001", "90"), ("600002", "80"))
+    ]
+
+    class Boundary:
+        def __init__(self) -> None:
+            self.snapshot_calls = 0
+            self.order_calls = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            self.snapshot_calls += 1
+            raise AssertionError("inconsistent report reached account snapshot")
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            raise AssertionError("inconsistent report reached order history")
+
+        def place_order(self, _request: dict[str, object]) -> dict[str, object]:
+            self.order_calls += 1
+            raise AssertionError("inconsistent report reached order submission")
+
+    class Quote:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_snapshots(self, _symbols: list[str]) -> dict[str, object]:
+            self.calls += 1
+            raise AssertionError("inconsistent report reached quote lookup")
+
+    outcomes: list[tuple[int, int, int, int]] = []
+    for index, (position_count, planned_new_seats) in enumerate(((21, 2), (18, 1))):
+        config = replace(
+            controller_config(tmp_path / f"inconsistent-{index}"),
+            trend_review_cn_simulate_acc_id=101,
+            trend_executor_host=socket.gethostname(),
+        )
+        path, report = write_v2_controller_report(
+            config,
+            positions=positions,
+            actions=actions,
+        )
+        report["account"]["position_count"] = position_count  # type: ignore[index]
+        report["strategy_judgments"]["planned_new_seats"] = planned_new_seats  # type: ignore[index]
+        path.write_text(json.dumps(report), encoding="utf-8")
+        boundary = Boundary()
+        quote = Quote()
+
+        with pytest.raises(ValueError, match="invalid frozen trend report"):
+            controller.execute_simulated_trend_report(
+                config,
+                "CN",
+                report["execution_date"],  # type: ignore[arg-type]
+                _report_hash(report),
+                actor="test",
+                reason="inconsistent frozen position count",
+                now=NOW,
+                quote_client=quote,
+                order_client=boundary,
+            )
+
+        outcomes.append((boundary.snapshot_calls, quote.calls, boundary.order_calls, position_count))
+
+    assert outcomes == [(0, 0, 0, 21), (0, 0, 0, 18)]
+
+
+def test_controller_stamps_production_snapshot_observation_for_cross_execution_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    _report_path, report = write_v2_controller_report(
+        config,
+        actions=[{
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "target_weight": "0.04",
+            "global_strength": "90",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "target_amount": "1000",
+            "atr": "0.5",
+        }],
+    )
+
+    class FixedDateTime(datetime):
+        current = NOW
+
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return cls.current if tz is None else cls.current.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+
+    class ProductionOrderClient:
+        def __init__(self) -> None:
+            self.positions: list[dict[str, object]] = []
+            self.orders: list[dict[str, object]] = []
+            self.requests: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "cash": "100000",
+                "positions": [dict(position) for position in self.positions],
+                "updated_time": "2099-01-01T00:00:00+08:00",
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": [dict(order) for order in self.orders]}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(dict(request))
+            order = {
+                **request,
+                "order_id": f"SIM-{len(self.requests)}",
+                "code": request["futu_code"],
+                "trd_side": "BUY",
+                "order_status": "FILLED_ALL",
+                "dealt_qty": request["qty"],
+                "updated_time": "2099-01-01T00:00:00+08:00",
+            }
+            self.orders.append(order)
+            self.positions = [{"code": request["futu_code"], "qty": request["qty"]}]
+            return {
+                "futu_order_id": order["order_id"],
+                "status": "FILLED_ALL",
+                "order_status": "FILLED_ALL",
+                "dealt_qty": request["qty"],
+            }
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+    client = ProductionOrderClient()
+    quote = Quote()
+    first = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        report["execution_date"],  # type: ignore[arg-type]
+        _report_hash(report),
+        actor="first-owner",
+        reason="initial explicit buy",
+        now=NOW,
+        quote_client=quote,
+        order_client=client,
+    )
+
+    FixedDateTime.current = NOW + timedelta(minutes=1)
+    second = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        report["execution_date"],  # type: ignore[arg-type]
+        _report_hash(report),
+        actor="second-owner",
+        reason="reconcile explicit buy",
+        now=FixedDateTime.current,
+        quote_client=quote,
+        order_client=client,
+    )
+
+    action_root = config.data_dir / "trend_review/ledgers/CN/actions/2026-07-20"
+    reasons = {
+        json.loads(path.read_text(encoding="utf-8")).get("reason")
+        for path in action_root.glob("*/*.json")
+    }
+    assert (
+        first["submitted_count"],
+        second["status"],
+        second["submitted_count"],
+        len(client.requests),
+        [
+            (request["side"], request["futu_code"], request["qty"])
+            for request in client.requests
+        ],
+        "holdings_snapshot_not_newer" not in reasons,
+        "terminal_fill_not_reconciled" not in reasons,
+    ) == (1, "unchanged", 0, 1, [("buy", "SH.600001", "100")], True, True)
 
 
 def test_valid_report_accepts_only_strict_partial_sell_actions(tmp_path: Path) -> None:
@@ -1790,6 +3158,377 @@ def test_valid_report_accepts_only_strict_partial_sell_actions(tmp_path: Path) -
     assert not controller._valid_report(
         config, "CN", "2026-07-20", path, conflicting
     )
+
+
+def test_controller_loads_non_executable_unavailable_simulated_account_report(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=123,
+        trend_executor_host=socket.gethostname(),
+    )
+    report = valid_cn_report(
+        as_of_date="2026-07-19",
+        execution_date="2026-07-20",
+    )
+    report["account"] = {
+        **report["account"],
+        "fresh": False,
+        "status": "unavailable",
+        "reason": "simulation account offline",
+    }
+    report["metadata"] = {
+        **report["metadata"],
+        "simulate_acc_id": 123,
+    }
+    report["plan_availability"] = {
+        "simulated_account": {
+            "status": "unavailable",
+            "reason": "simulation account offline",
+            "executable": False,
+        },
+        "real_account": {
+            "status": "unavailable",
+            "reason": "real account is informational",
+            "executable": False,
+        },
+    }
+    report_path = config.reports_dir / "trend_a_share" / "2026-07-19.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    class NeverOrderClient:
+        def place_order(self, _request: dict[str, object]) -> dict[str, object]:
+            raise AssertionError("unavailable simulated account must not order")
+
+    result = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        _report_hash(report),
+        actor="test",
+        reason="unavailable report load",
+        now=NOW,
+        order_client=NeverOrderClient(),
+    )
+
+    assert result["status"] == "unchanged"
+
+
+@pytest.mark.parametrize("variant", ("missing_executable", "executable"))
+def test_controller_rejects_malformed_unavailable_simulated_account_report(
+    tmp_path: Path,
+    variant: str,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=123,
+    )
+    report = valid_cn_report(
+        as_of_date="2026-07-19",
+        execution_date="2026-07-20",
+    )
+    report["account"] = {
+        **report["account"],
+        "fresh": False,
+        "status": "unavailable",
+        "reason": "simulation account offline",
+    }
+    report["metadata"] = {
+        **report["metadata"],
+        "simulate_acc_id": 123,
+    }
+    simulated_plan: dict[str, object] = {
+        "status": "unavailable",
+        "reason": "simulation account offline",
+        "executable": False,
+    }
+    if variant == "missing_executable":
+        del simulated_plan["executable"]
+    else:
+        simulated_plan["executable"] = True
+    report["plan_availability"] = {
+        "simulated_account": simulated_plan,
+        "real_account": {
+            "status": "unavailable",
+            "reason": "real account is informational",
+            "executable": False,
+        },
+    }
+    report_path = config.reports_dir / "trend_a_share" / "2026-07-19.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid frozen trend report"):
+        controller.execute_simulated_trend_report(
+            config,
+            "CN",
+            "2026-07-20",
+            _report_hash(report),
+            actor="test",
+            reason="malformed unavailable report",
+            now=NOW,
+            order_client=object(),
+        )
+
+
+def test_controller_rejects_fresh_account_with_unavailable_formal_plan(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=123,
+        trend_executor_host=socket.gethostname(),
+    )
+    report = valid_cn_report(
+        as_of_date="2026-07-19",
+        execution_date="2026-07-20",
+        buy=True,
+    )
+    report["metadata"] = {**report["metadata"], "simulate_acc_id": 123}
+    report["plan_availability"] = {
+        "simulated_account": {
+            "status": "unavailable",
+            "reason": "simulation account offline",
+            "executable": False,
+        },
+        "real_account": {
+            "status": "unavailable",
+            "reason": "real account is informational",
+            "executable": False,
+        },
+    }
+    report_path = config.reports_dir / "trend_a_share" / "2026-07-19.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    class NeverOrderClient:
+        def __getattr__(self, _name: str) -> object:
+            raise AssertionError("contradictory report used the order client")
+
+    with pytest.raises(ValueError, match="invalid frozen trend report"):
+        controller.execute_simulated_trend_report(
+            config,
+            "CN",
+            "2026-07-20",
+            _report_hash(report),
+            actor="test",
+            reason="contradictory formal plan",
+            now=NOW,
+            order_client=NeverOrderClient(),
+        )
+
+
+def test_controller_rejects_fresh_account_with_unavailable_rotation_plan(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=123,
+        trend_executor_host=socket.gethostname(),
+    )
+    report = valid_cn_report(as_of_date="2026-07-19", execution_date="2026-07-20")
+    report["metadata"] = {**report["metadata"], "simulate_acc_id": 123}
+    roots = {
+        market: {
+            "stock": {
+                "asset": stock,
+                "tm_id": index * 10,
+                "as_of_date": "2026-08-03",
+                "global_strength": stock_strength,
+            },
+            "etf": {
+                "asset": etf,
+                "tm_id": index * 10 + 1,
+                "as_of_date": "2026-08-03",
+                "global_strength": etf_strength,
+            },
+        }
+        for index, (market, stock, etf, stock_strength, etf_strength) in enumerate(
+            (
+                ("CN", "A股", "ETF基金", "90", "80"),
+                ("HK", "港股", "香港ETF", "70", "60"),
+                ("US", "美股", "美国ETF", "50", "40"),
+            ),
+            1,
+        )
+    }
+    allocation_snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-03",
+        generated_at="2026-08-03T16:18:00+08:00",
+        git_sha="a" * 40,
+        roots=roots,
+        previous=None,
+        version=2,
+    )
+    daily_path = config.data_dir / "trend_allocation/daily/2026-08-03.json"
+    daily_path.parent.mkdir(parents=True, exist_ok=True)
+    allocation_body = (
+        json.dumps(
+            allocation_snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    daily_path.write_text(allocation_body, encoding="utf-8")
+    report["allocation"] = {
+        "version": allocation_snapshot["version"],
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": hashlib.sha256(allocation_body.encode()).hexdigest(),
+        "allocation_date": "2026-08-03",
+        "generated_at": "2026-08-03T16:18:00+08:00",
+        "reused": False,
+        "stale_a_trading_days": 0,
+        "failure_reason": "",
+        "roots": allocation_snapshot["roots"],
+        "markets": allocation_snapshot["markets"],
+    }
+    report["strategy_snapshot"] = a_share_trend.live_trend_strategy_snapshot(
+        "CN",
+        "test-sha",
+        (622466, 697199),
+        allocation={
+            "daily_path": report["allocation"]["daily_path"],  # type: ignore[index]
+            "sha256": report["allocation"]["sha256"],  # type: ignore[index]
+            "snapshot": allocation_snapshot,
+        },
+    )
+    judgments = report["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    judgments["holding_decisions"] = [{"symbol": "WEAK"}]
+    judgments["top10_candidates"] = [{"symbol": "STRONG"}]
+    judgments["simulate_rotation_pairs"] = [{
+        "pair_index": 0,
+        "sell_symbol": "WEAK",
+        "sell_name": "Weak",
+        "sell_futu_symbol": "SH.WEAK",
+        "sell_global_strength": "10",
+        "buy_symbol": "STRONG",
+        "buy_name": "Strong",
+        "buy_futu_symbol": "SH.STRONG",
+        "buy_global_strength": "90",
+        "strength_gap": "80",
+        "target_weight": "0.04",
+        "target_amount": "4000",
+        "estimated_shares": 400,
+        "lot_size": 100,
+        "atr": "0.5",
+        "reason": "relative_rotation",
+        "execution_date": "2026-07-20",
+        "execution_mode": "automatic",
+        "sell_asset": "A股",
+        "buy_asset": "A股",
+        "sell_local_strength": "10",
+        "buy_local_strength": "90",
+        "strength_basis": "local",
+        "sell_compared_strength": "10",
+        "buy_compared_strength": "90",
+        "threshold": "20",
+    }]
+    judgments["simulate_rotation_comparisons"] = [{
+        "pair_index": 0,
+        "sell_symbol": "WEAK",
+        "sell_name": "Weak",
+        "sell_asset": "A股",
+        "sell_local_strength": "10",
+        "sell_global_strength": "10",
+        "buy_symbol": "STRONG",
+        "buy_name": "Strong",
+        "buy_asset": "A股",
+        "buy_local_strength": "90",
+        "buy_global_strength": "90",
+        "strength_basis": "local",
+        "sell_compared_strength": "10",
+        "buy_compared_strength": "90",
+        "strength_gap": "80",
+        "threshold": "20",
+        "outcome": "planned",
+        "reason": "relative_rotation",
+    }]
+    judgments["real_rotation_pairs"] = []
+    judgments["real_rotation_comparisons"] = []
+    report["plan_availability"] = {
+        "simulated_account": {
+            "status": "unavailable",
+            "reason": "simulation account offline",
+            "executable": False,
+        },
+        "real_account": {
+            "status": "unavailable",
+            "reason": "real account is informational",
+            "executable": False,
+        },
+    }
+    report_path = config.reports_dir / "trend_a_share" / "2026-07-19.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    class NeverOrderClient:
+        def __getattr__(self, _name: str) -> object:
+            raise AssertionError("contradictory report used the order client")
+
+    with pytest.raises(ValueError, match="invalid frozen trend report"):
+        controller.execute_simulated_trend_report(
+            config,
+            "CN",
+            "2026-07-20",
+            _report_hash(report),
+            actor="test",
+            reason="contradictory rotation plan",
+            now=NOW,
+            order_client=NeverOrderClient(),
+        )
+
+
+def test_controller_requires_fresh_account_for_available_simulated_plan(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=123,
+        trend_executor_host=socket.gethostname(),
+    )
+    report = valid_cn_report(as_of_date="2026-07-19", execution_date="2026-07-20")
+    report["account"] = {
+        **report["account"],
+        "fresh": False,
+        "status": "available",
+    }
+    report["metadata"] = {**report["metadata"], "simulate_acc_id": 123}
+    report["plan_availability"] = {
+        "simulated_account": {
+            "status": "available",
+            "reason": "",
+            "executable": True,
+        },
+        "real_account": {
+            "status": "unavailable",
+            "reason": "real account is informational",
+            "executable": False,
+        },
+    }
+    report_path = config.reports_dir / "trend_a_share" / "2026-07-19.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    class NeverOrderClient:
+        def __getattr__(self, _name: str) -> object:
+            raise AssertionError("stale report used the order client")
+
+    with pytest.raises(ValueError, match="invalid frozen trend report"):
+        controller.execute_simulated_trend_report(
+            config,
+            "CN",
+            "2026-07-20",
+            _report_hash(report),
+            actor="test",
+            reason="stale available plan",
+            now=NOW,
+            order_client=NeverOrderClient(),
+        )
 
 
 def test_valid_report_rejects_invalid_frozen_allocation_and_rotation_pair(
@@ -4172,7 +5911,7 @@ def test_controller_groups_missed_buys_for_feishu(
             })
         return {"status": "missed_window", "submitted_count": 0}
 
-    monkeypatch.setattr(controller, "_execute_locked_report", execute)
+    monkeypatch.setattr(controller, "execute_simulated_trend_report", execute)
     non_feishu: list[str] = []
     feishu: list[tuple[str, str]] = []
     monkeypatch.setattr(
@@ -4381,6 +6120,104 @@ def test_later_revision_does_not_change_locked_batch(
 
     assert executed == [base_path]
     assert len(notifications) == 1
+
+
+def test_locked_report_selects_first_valid_report_before_batch_exists(
+    tmp_path: Path,
+) -> None:
+    config = controller_config(tmp_path)
+    base_path, _ = write_report(config)
+    revision_path, revision_report = write_report(config, revision=1)
+
+    selected_path, selected_report = controller._locked_report(
+        config,
+        active_cn_cycle(),
+        (revision_path, revision_report),
+        NOW,
+    )
+
+    assert selected_path == base_path
+    assert selected_report["generated_at"] == "2026-07-17T18:00:00+08:00"
+
+
+def test_manual_revision_sha_executes_without_replacing_locked_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    locked_path, locked_report = write_report(config)
+    requested_path, requested_report = write_report(config, revision=1)
+    lock_trend_execution_batch(
+        config.data_dir,
+        market="CN",
+        execution_date="2026-07-20",
+        report_path=locked_path,
+        report=locked_report,
+        locked_at=NOW.isoformat(),
+    )
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    result = controller._execute_locked_report(
+        config,
+        "CN",
+        "2026-07-20",
+        requested_path,
+        requested_report,
+        scheduled=False,
+    )
+
+    batch_path = config.data_dir / "trend_review/ledgers/CN/batches/2026-07-20.json"
+    batch = json.loads(batch_path.read_text(encoding="utf-8"))
+    assert result["status"] == "unchanged"
+    assert batch["report_path"] == str(locked_path)
+    assert batch["report_sha256"] == _report_hash(locked_report)
+
+
+@pytest.mark.parametrize("completed", [False, True], ids=["pending", "completed"])
+def test_manual_exact_revision_ignores_revision_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    completed: bool,
+) -> None:
+    config = controller_config(tmp_path)
+    base_path, base_report = write_report(config)
+    cycle = active_cn_cycle()
+    lock_trend_execution_batch(
+        config.data_dir,
+        market=cycle.market,
+        execution_date=cycle.execution_date,
+        report_path=base_path,
+        report=base_report,
+        locked_at=NOW.isoformat(),
+    )
+    controller._request_revision(config, cycle, NOW)
+    revision_path, revision_report = write_report(config, revision=1)
+    if completed:
+        write_report_delivery_receipt(
+            config, revision_path, revision_report, status="sent"
+        )
+        controller._complete_revision(
+            config, cycle, (revision_path, revision_report), NOW
+        )
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(
+        controller, "require_trend_review_config", lambda *_args: 123
+    )
+
+    result = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        cycle.execution_date,
+        _report_hash(revision_report),
+        actor="ray",
+        reason="manual revision retry",
+        now=NOW,
+        scheduled=False,
+    )
+
+    batch_path = config.data_dir / "trend_review/ledgers/CN/batches/2026-07-20.json"
+    batch = json.loads(batch_path.read_text(encoding="utf-8"))
+    assert result["status"] == "unchanged"
+    assert result["report_sha256"] == _report_hash(revision_report)
+    assert batch["report_sha256"] == _report_hash(base_report)
 
 
 def test_readonly_controller_returns_without_report_broker_or_notification_calls(
@@ -5470,7 +7307,7 @@ def test_multi_session_outage_reconciles_oldest_unfinished_cycle_first(
     assert controller._cycle_to_reconcile(config, current, now) == second_missing
 
 
-def test_invalid_historical_batch_remains_selected_but_cannot_be_revised(
+def test_invalid_historical_batch_remains_selected_and_can_be_revised(
     tmp_path: Path,
 ) -> None:
     config = controller_config(tmp_path)
@@ -5500,12 +7337,17 @@ def test_invalid_historical_batch_remains_selected_but_cannot_be_revised(
 
     assert selected.as_of_date == historical.as_of_date
     assert selected.execution_date == historical.execution_date
-    with pytest.raises(ValueError, match="execution has begun"):
-        controller._request_revision(config, selected, NOW)
-    request_path, _ = controller._revision_paths(
-        config, selected.market, selected.as_of_date
-    )
-    assert not request_path.exists()
+    request_path = controller._request_revision(config, selected, NOW)
+    assert request_path.exists()
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    assert request["market"] == historical.market
+    assert request["as_of_date"] == historical.as_of_date
+    assert request["execution_date"] == historical.execution_date
+    assert request["baseline_report_path"] == str(report_path)
+    assert request["baseline_report_sha256"] == hashlib.sha256(
+        report_path.read_bytes()
+    ).hexdigest()
+    assert request["baseline_revision"] == 2
 
 
 def test_missing_report_cutover_skips_exact_expired_cycle(
@@ -5922,13 +7764,11 @@ def test_revision_targets_invalid_historical_cycle_then_recovers_next_revision(
     monkeypatch.setattr(controller, "_capture_close", capture_close)
 
     def stop_after_reconcile(_seconds: float) -> None:
-        if controller._batch_path(
-            config, historical.market, historical.execution_date
-        ).exists():
-            raise RuntimeError("historical cycle reconciled")
+        if historical_completion.exists():
+            raise RuntimeError("historical revision completed")
         assert generated_ready.wait(timeout=1)
 
-    with pytest.raises(RuntimeError, match="historical cycle reconciled"):
+    with pytest.raises(RuntimeError, match="historical revision completed"):
         run_trend_market_controller(
             config,
             "CN",
@@ -5939,7 +7779,6 @@ def test_revision_targets_invalid_historical_cycle_then_recovers_next_revision(
 
     completion = json.loads(historical_completion.read_text(encoding="utf-8"))
     completed_report = Path(str(completion["report_path"]))
-    assert load_trend_market_status(config, "CN", now=NOW)["blocker"] is None
     assert generated == [(historical.report_run_date, True)]
     assert completed_report.name == "2026-07-17-r3.json"
     assert completion["request_sha256"] == hashlib.sha256(
@@ -5948,8 +7787,21 @@ def test_revision_targets_invalid_historical_cycle_then_recovers_next_revision(
     assert completion["report_sha256"] == _report_hash(
         json.loads(completed_report.read_text(encoding="utf-8"))
     )
-    assert controller._execution_completed(config, historical) is True
-    assert controller._cycle_to_reconcile(config, current, NOW) == current
+    assert not controller._batch_path(
+        config, historical.market, historical.execution_date
+    ).exists()
+    assert not list(config.data_dir.glob("trend_review/ledgers/CN/actions/**/*.json"))
+    assert controller._execution_completed(config, historical) is False
+    selected = controller._cycle_to_reconcile(config, current, NOW)
+    assert (
+        selected.market,
+        selected.as_of_date,
+        selected.execution_date,
+    ) == (
+        historical.market,
+        historical.as_of_date,
+        historical.execution_date,
+    )
 
 
 def test_explicit_revision_request_is_durable_while_controller_lock_is_held(
@@ -6003,10 +7855,28 @@ def test_explicit_revision_request_is_durable_while_controller_lock_is_held(
     monkeypatch.setattr(
         controller, "_derive_cycle", lambda *_args, **_kwargs: next_cycle
     )
-    with pytest.raises(ValueError, match="execution has begun"):
-        run_trend_market_controller(
+    next_lock_path = (
+        next_config.data_dir / "runs/.trend_market_controller.CN.lock"
+    )
+    with RunLock(next_lock_path):
+        result = run_trend_market_controller(
             next_config, "CN", revision=True, once=True, now_fn=lambda: NOW
         )
+
+    request_path, _ = controller._revision_paths(
+        next_config, next_cycle.market, next_cycle.as_of_date
+    )
+    assert result["phase"] == "revision_requested"
+    assert request_path.exists()
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    assert request["market"] == next_cycle.market
+    assert request["as_of_date"] == next_cycle.as_of_date
+    assert request["execution_date"] == next_cycle.execution_date
+    assert request["baseline_report_path"] == str(report_path)
+    assert request["baseline_report_sha256"] == hashlib.sha256(
+        report_path.read_bytes()
+    ).hexdigest()
+    assert request["baseline_revision"] == 0
 
 
 def test_pending_revision_does_not_lock_or_execute_the_base_report(
@@ -6057,6 +7927,27 @@ def test_revision_request_is_rejected_during_batch_lock_critical_section(
     assert not request.exists()
 
 
+def test_revision_request_allows_existing_execution_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    cycle = active_cn_cycle()
+    report_path, report = write_report(config)
+    lock_trend_execution_batch(
+        config.data_dir,
+        market=cycle.market,
+        execution_date=cycle.execution_date,
+        report_path=report_path,
+        report=report,
+        locked_at=NOW.isoformat(),
+    )
+
+    request_path = controller._request_revision(config, cycle, NOW)
+
+    assert request_path.exists()
+
+
 def test_pending_revision_is_checked_again_at_batch_lock_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -6066,16 +7957,16 @@ def test_pending_revision_is_checked_again_at_batch_lock_boundary(
     report_path, report = write_report(config)
     controller._request_revision(config, cycle, NOW)
 
-    with pytest.raises(RuntimeError, match="revision request is pending"):
-        controller._execute_locked_report(
-            config,
-            "CN",
-            cycle.execution_date,
-            report_path,
-            report,
-        )
+    result = controller._execute_locked_report(
+        config,
+        "CN",
+        cycle.execution_date,
+        report_path,
+        report,
+    )
 
-    assert not list(config.data_dir.glob("trend_review/ledgers/CN/batches/*.json"))
+    assert result["status"] == "unchanged"
+    assert list(config.data_dir.glob("trend_review/ledgers/CN/batches/*.json"))
 
 
 def test_revision_replaces_invalid_frozen_report_before_execution(
@@ -6112,8 +8003,31 @@ def test_revision_replaces_invalid_frozen_report_before_execution(
         config, "CN", revision=True, once=True, now_fn=lambda: NOW
     )
 
-    assert result["phase"] == "monitoring"
-    assert [path.name for path in executed] == ["2026-07-17-r1.json"]
+    request_path, completion_path = controller._revision_paths(
+        config, "CN", "2026-07-17"
+    )
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    revision_path = config.reports_dir / "trend_a_share/2026-07-17-r1.json"
+    revision_report = json.loads(revision_path.read_text(encoding="utf-8"))
+    assert request["baseline_report_path"] == str(invalid_path)
+    assert request["baseline_report_sha256"] == hashlib.sha256(
+        invalid_path.read_bytes()
+    ).hexdigest()
+    assert request["baseline_revision"] == 0
+    assert executed == []
+    assert completion["request_path"] == str(request_path)
+    assert completion["request_sha256"] == hashlib.sha256(
+        request_path.read_bytes()
+    ).hexdigest()
+    assert completion["report_path"] == str(revision_path)
+    assert completion["report_sha256"] == _report_hash(revision_report)
+    assert json.loads(
+        controller._delivery_receipt_path(config, "CN", revision_path).read_text(
+            encoding="utf-8"
+        )
+    )["status"] == "sent"
+    assert not controller._batch_path(config, "CN", "2026-07-20").exists()
 
 
 def test_malformed_expected_frozen_report_blocks_without_regeneration(
@@ -6694,7 +8608,7 @@ def test_abnormal_protection_result_disables_new_buys(
         allow_flags.append(allow_new_buys)
         return {"status": "unchanged", "submitted_count": 0}
 
-    monkeypatch.setattr(controller, "_execute_locked_report", execute)
+    monkeypatch.setattr(controller, "execute_simulated_trend_report", execute)
 
     result = run_trend_market_controller(
         config, "CN", once=True, now_fn=lambda: NOW
@@ -7021,6 +8935,121 @@ def test_fresh_zero_position_sell_writes_terminal_evidence(
     )
 
 
+def test_scheduled_sell_all_lock_time_zero_writes_terminal_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host="executor",
+    )
+    report_path, report = write_v2_controller_report(
+        config,
+        positions=[{"code": "SH.600001", "qty": "100", "can_sell_qty": "100"}],
+        actions=[{"action": "SELL_ALL", "symbol": "600001", "reason": "trend_exit"}],
+    )
+    report["account"]["positions"] = [{
+        "symbol": "600001",
+        "name": "600001",
+        "asset_class": "stock",
+        "quantity": "100",
+        "market_value": "1000",
+        "avg_cost_price": "10",
+    }]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+
+    class Client:
+        def __init__(self) -> None:
+            self.snapshot_calls = 0
+            self.requests: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            self.snapshot_calls += 1
+            positions = (
+                [{"code": "SH.600001", "qty": "100", "can_sell_qty": "100"}]
+                if self.snapshot_calls <= 2
+                else []
+            )
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "available_cash": "100000",
+                "positions": positions,
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": []}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(dict(request))
+            pytest.fail("lock-time zero-position sell submitted an order")
+
+    client = Client()
+    first = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        _report_hash(report),
+        actor="trend-market-controller",
+        reason="scheduled execution",
+        now=NOW,
+        order_client=client,
+        scheduled=True,
+    )
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in config.data_dir.glob(
+            "trend_review/ledgers/CN/actions/2026-07-20/*/*.json"
+        )
+    ]
+    snapshots_after_first = client.snapshot_calls
+    cycle = ControllerCycle(
+        market="CN",
+        as_of_date=str(report["as_of_date"]),
+        execution_date="2026-07-20",
+        report_run_date=str(report["generated_at"])[:10],
+        session="execution",
+        market_open=True,
+        next_check_at=NOW,
+    )
+    replay = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        _report_hash(report),
+        actor="trend-market-controller",
+        reason="scheduled execution",
+        now=NOW + timedelta(minutes=1),
+        order_client=client,
+        scheduled=True,
+    )
+
+    assert (
+        first["status"],
+        first["submitted_count"],
+        len(client.requests),
+        any(
+            event.get("status") == "incomplete"
+            and event.get("reason") == "position_zero_confirmed"
+            for event in events
+        ),
+        controller._request_completion_path(
+            config, "CN", "2026-07-20", str(first["execution_id"])
+        ).exists(),
+        controller._execution_completed(config, cycle, execution_id=str(first["execution_id"])),
+        replay["status"],
+        client.snapshot_calls,
+    ) == ("unchanged", 0, 0, True, True, True, "reconciled", snapshots_after_first)
+
+
 def test_global_execution_noop_protocol_is_removed() -> None:
     assert not hasattr(controller, "_record_execution_noop")
     assert not hasattr(controller, "_execution_noop_path")
@@ -7084,6 +9113,1819 @@ def test_relative_rotation_runs_after_ordinary_actions_and_merges_results(
     assert calls == ["ordinary", "rotation"]
     assert result["submitted_count"] == 2
     assert result["artifact_paths"] == ["ordinary", "rotation"]
+
+
+def test_v2_unfinished_ordinary_phase_stays_unfinished_without_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report_path = tmp_path / "locked.json"
+    report = valid_cn_report(
+        as_of_date="2026-07-17", execution_date="2026-07-20", buy=True,
+    )
+    report["allocation"] = {"version": 2, "markets": {"CN": {"position_limit": 10}}}
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+        "strategy_version": "v15",
+    }
+    report["strategy_judgments"]["simulate_rotation_pairs"] = []
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    class Client:
+        def account_snapshot(self) -> dict[str, object]:
+            return {"acc_id": 123, "positions": []}
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": []}
+
+        def close(self) -> None:
+            pass
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(
+        controller, "record_trend_review_missed_buys", lambda **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        controller, "_new_order_client", lambda *_args, **_kwargs: Client(),
+    )
+    monkeypatch.setattr(
+        controller, "freeze_simulated_buy_fifo", lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        controller,
+        "execute_trend_review_open",
+        lambda **_kwargs: {
+            "status": "submitted", "submitted_count": 1, "artifact_paths": [],
+        },
+    )
+
+    result = controller._execute_locked_report(
+        config, "CN", "2026-07-20", report_path, report, quote_client=Quote(),
+        scheduled=False, execution_id="manual-execution-1", account_id=123,
+    )
+
+    assert result["status"] == "submitted"
+    assert controller._request_result_is_terminal(result) is False
+
+
+def test_manual_simulation_request_binds_exact_report_sha_and_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report = {"schema_version": 1, "execution_date": "2026-07-20"}
+    report_path = config.reports_dir / "trend_a_share" / "2026-07-19.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = _report_hash(report)
+    monkeypatch.setattr(controller, "require_trend_review_config", lambda *_args: 123)
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda *_args, **_kwargs: {"status": "complete", "submitted_count": 1},
+    )
+
+    result = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="ray",
+        reason="manual retry",
+        now=NOW,
+    )
+
+    request_path = Path(str(result["request_path"]))
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    assert request == {
+        "schema_version": "open_trader.trend_controller.simulation_request.v1",
+        "execution_id": result["execution_id"],
+        "account_type": "futu_simulate",
+        "account_id": 123,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "report_path": str(report_path),
+        "report_sha256": report_sha,
+        "actor": "ray",
+        "reason": "manual retry",
+        "requested_at": "2026-07-20T09:31:00+08:00",
+    }
+    assert result["report_sha256"] == report_sha
+
+
+def test_manual_simulation_request_replays_one_identity_without_reexecuting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report = {"schema_version": 1, "execution_date": "2026-07-20"}
+    report_path = config.reports_dir / "trend_a_share" / "2026-07-19.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = _report_hash(report)
+    calls: list[str] = []
+    monkeypatch.setattr(controller, "require_trend_review_config", lambda *_args: 123)
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda *_args, **_kwargs: calls.append("execute") or {
+            "status": "complete", "submitted_count": 1,
+        },
+    )
+
+    first = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="ray",
+        reason="manual retry",
+        now=NOW,
+    )
+    second = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="ray",
+        reason="manual retry",
+        now=NOW + timedelta(minutes=5),
+    )
+
+    request_path = Path(str(first["request_path"]))
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    assert first["request_reused"] is False
+    assert second["request_reused"] is True
+    assert second["status"] == "reconciled"
+    assert second["execution_id"] == first["execution_id"]
+    assert second["request_path"] == first["request_path"]
+    assert request["requested_at"] == "2026-07-20T09:31:00+08:00"
+    assert calls == ["execute"]
+
+
+def test_simulation_completion_rejects_mismatched_stored_result_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=123,
+        trend_executor_host="executor",
+    )
+    report = valid_cn_report(as_of_date="2026-07-19", execution_date="2026-07-20")
+    report_path = config.reports_dir / "trend_a_share" / "2026-07-19.json"
+    report_path.parent.mkdir(parents=True)
+    report["metadata"]["simulate_acc_id"] = 123  # type: ignore[index]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = _report_hash(report)
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+
+    first = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="ray",
+        reason="manual identity check",
+        now=NOW,
+    )
+    completion_path = controller._request_completion_path(
+        config, "CN", "2026-07-20", str(first["execution_id"]),
+    )
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    completion["result"].update({
+        "market": "HK",
+        "account_id": 999,
+        "request_path": str(tmp_path / "other-request.json"),
+        "execution_id": "other-execution",
+        "report_sha256": "0" * 64,
+    })
+    completion_path.write_text(json.dumps(completion), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid simulation request completion"):
+        controller.execute_simulated_trend_report(
+            config,
+            "CN",
+            "2026-07-20",
+            report_sha,
+            actor="ray",
+            reason="manual identity check",
+            now=NOW + timedelta(minutes=5),
+        )
+
+
+def test_manual_simulation_request_reenters_until_phase_is_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report = {"schema_version": 1, "execution_date": "2026-07-20"}
+    report_path = config.reports_dir / "trend_a_share" / "2026-07-19.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = _report_hash(report)
+    calls: list[str] = []
+    monkeypatch.setattr(controller, "require_trend_review_config", lambda *_args: 123)
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+
+    def execute(*_args: object, **_kwargs: object) -> dict[str, object]:
+        calls.append("execute")
+        return (
+            {"status": "submitted", "submitted_count": 1}
+            if len(calls) == 1
+            else {"status": "complete", "submitted_count": 0}
+        )
+
+    monkeypatch.setattr(controller, "_execute_locked_report", execute)
+
+    first = controller.execute_simulated_trend_report(
+        config, "CN", "2026-07-20", report_sha,
+        actor="ray", reason="manual retry", now=NOW,
+    )
+    completion_path = controller._request_completion_path(
+        config, "CN", "2026-07-20", str(first["execution_id"]),
+    )
+    assert first["status"] == "submitted"
+    assert not completion_path.exists()
+
+    second = controller.execute_simulated_trend_report(
+        config, "CN", "2026-07-20", report_sha,
+        actor="ray", reason="manual retry", now=NOW + timedelta(minutes=5),
+    )
+    replay = controller.execute_simulated_trend_report(
+        config, "CN", "2026-07-20", report_sha,
+        actor="ray", reason="manual retry", now=NOW + timedelta(minutes=10),
+    )
+
+    assert second["status"] == "complete"
+    assert second["request_reused"] is True
+    assert replay["status"] == "reconciled"
+    assert calls == ["execute", "execute"]
+    assert completion_path.exists()
+
+
+def test_manual_simulation_request_replays_rejection_and_distinct_reason_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report = {"schema_version": 1, "execution_date": "2026-07-20"}
+    report_path = config.reports_dir / "trend_a_share" / "2026-07-19.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = _report_hash(report)
+    calls: list[str] = []
+    monkeypatch.setattr(controller, "require_trend_review_config", lambda *_args: 123)
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+
+    def execute(*_args: object, **_kwargs: object) -> dict[str, object]:
+        calls.append("execute")
+        return {
+            "status": "terminal_rejected",
+            "submitted_count": 1,
+            "terminal_rejected": True,
+        }
+
+    monkeypatch.setattr(controller, "_execute_locked_report", execute)
+
+    first = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="ray",
+        reason="manual retry",
+        now=NOW,
+    )
+    replay = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="ray",
+        reason="manual retry",
+        now=NOW + timedelta(minutes=5),
+    )
+    distinct = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="ray",
+        reason="manual retry after reconciliation",
+        now=NOW + timedelta(minutes=10),
+    )
+
+    assert first["terminal_rejected"] is True
+    assert replay["status"] == "reconciled"
+    assert replay["execution_id"] == first["execution_id"]
+    assert distinct["execution_id"] != first["execution_id"]
+    assert calls == ["execute", "execute"]
+
+
+def test_scheduled_zero_fill_replay_passes_stable_request_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report = {"schema_version": 1, "execution_date": "2026-07-20"}
+    report_path = config.reports_dir / "trend_a_share" / "2026-07-19.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = _report_hash(report)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(controller, "require_trend_review_config", lambda *_args: 123)
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(controller, "_execution_completed", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(controller, "_request_result_is_terminal", lambda *_args: False)
+
+    def execute(*_args: object, **kwargs: object) -> dict[str, object]:
+        calls.append(dict(kwargs))
+        return {
+            "status": "terminal_rejected",
+            "submitted_count": 0,
+            "terminal_rejected": True,
+        }
+
+    monkeypatch.setattr(controller, "_execute_locked_report", execute)
+
+    first = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="trend-market-controller",
+        reason="scheduled execution",
+        now=NOW,
+        scheduled=True,
+    )
+    second = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="trend-market-controller",
+        reason="scheduled execution",
+        now=NOW + timedelta(minutes=5),
+        scheduled=True,
+    )
+
+    assert first["execution_id"] == second["execution_id"]
+    assert len(calls) == 2
+    assert all(call["execution_id"] == first["execution_id"] for call in calls)
+    assert all(call["request_path"] == Path(str(first["request_path"])) for call in calls)
+    assert all(call["account_id"] == 123 for call in calls)
+
+
+def test_scheduled_terminal_rejection_replay_recovers_notification_via_public_order_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=123,
+        trend_executor_host=socket.gethostname(),
+        notifiers=("macos",),
+    )
+    report = valid_cn_report(
+        as_of_date="2026-07-19", execution_date="2026-07-20", buy=True,
+    )
+    report["metadata"]["simulate_acc_id"] = 123  # type: ignore[index]
+    roots = {
+        market: {
+            "stock": {
+                "asset": stock,
+                "tm_id": index * 10,
+                "as_of_date": "2026-08-03",
+                "global_strength": stock_strength,
+            },
+            "etf": {
+                "asset": etf,
+                "tm_id": index * 10 + 1,
+                "as_of_date": "2026-08-03",
+                "global_strength": etf_strength,
+            },
+        }
+        for index, (market, stock, etf, stock_strength, etf_strength) in enumerate(
+            (
+                ("CN", "A股", "ETF基金", "90", "80"),
+                ("HK", "港股", "香港ETF", "70", "60"),
+                ("US", "美股", "美国ETF", "50", "40"),
+            ),
+            1,
+        )
+    }
+    allocation_snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-03",
+        generated_at="2026-08-03T16:18:00+08:00",
+        git_sha="a" * 40,
+        roots=roots,
+        previous=None,
+        version=2,
+    )
+    daily_path = config.data_dir / "trend_allocation/daily/2026-08-03.json"
+    daily_path.parent.mkdir(parents=True)
+    allocation_body = (
+        json.dumps(
+            allocation_snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    daily_path.write_text(allocation_body, encoding="utf-8")
+    report["allocation"] = {
+        "version": allocation_snapshot["version"],
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": hashlib.sha256(allocation_body.encode()).hexdigest(),
+        "allocation_date": "2026-08-03",
+        "generated_at": "2026-08-03T16:18:00+08:00",
+        "reused": False,
+        "stale_a_trading_days": 0,
+        "failure_reason": "",
+        "roots": allocation_snapshot["roots"],
+        "markets": allocation_snapshot["markets"],
+    }
+    report["strategy_snapshot"] = a_share_trend.live_trend_strategy_snapshot(
+        "CN",
+        "test-sha",
+        (622466, 697199),
+        allocation={
+            "daily_path": report["allocation"]["daily_path"],  # type: ignore[index]
+            "sha256": report["allocation"]["sha256"],  # type: ignore[index]
+            "snapshot": allocation_snapshot,
+        },
+    )
+    report["risk_summary"] = {"normal_cost_rate": "0.001"}
+    report["strategy_judgments"]["formal_actions"][0]["planned_stop_risk"] = "4000"  # type: ignore[index]
+    report["strategy_judgments"].update({  # type: ignore[union-attr]
+        "simulate_rotation_pairs": [],
+        "real_rotation_pairs": [],
+        "simulate_rotation_comparisons": [],
+        "real_rotation_comparisons": [],
+        "simulated_buy_fifo": [
+            {
+                "source": "formal",
+                "symbol": "600001",
+                "futu_symbol": "SH.600001",
+                "owners": [{
+                    "source": "formal",
+                    "action_index": 0,
+                    "symbol": "600001",
+                    "futu_symbol": "SH.600001",
+                }],
+            }
+        ],
+        "planned_new_seats": 20,
+    })
+    report["plan_availability"] = {
+        "simulated_account": {
+            "status": "available",
+            "reason": "",
+            "executable": True,
+        },
+        "real_account": {
+            "status": "unavailable",
+            "reason": "real account is informational",
+            "executable": False,
+        },
+    }
+    report_path = config.reports_dir / "trend_a_share" / "2026-07-19.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = _report_hash(report)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            value = datetime.fromisoformat("2026-07-20T09:31:00+08:00")
+            return value if tz is None else value.astimezone(tz)  # type: ignore[arg-type]
+
+    class TerminalRejectingClient:
+        def __init__(self) -> None:
+            self.orders: list[dict[str, object]] = []
+            self.place_calls = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 123,
+                "net_value": "100000",
+                "cash": "100000",
+                "positions": [],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": self.orders}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.place_calls += 1
+            order = {
+                **request,
+                "order_id": "BROKER-1",
+                "code": request["futu_code"],
+                "trd_side": str(request["side"]).upper(),
+                "dealt_qty": "0",
+                "order_status": "REJECTED",
+            }
+            self.orders.append(order)
+            return {
+                "futu_order_id": "BROKER-1",
+                "status": "REJECTED",
+                "order_status": "REJECTED",
+                "dealt_qty": "0",
+            }
+
+        def close(self) -> None:
+            pass
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    client = TerminalRejectingClient()
+    monkeypatch.setattr(controller, "datetime", FrozenDateTime)
+
+    class CrashNotifier(MacOSNotifier):
+        def notify(self, _title: str, _message: str) -> None:
+            raise KeyboardInterrupt("simulated crash after completion")
+
+    monkeypatch.setattr(controller, "build_notifier", lambda _config: CrashNotifier())
+    with pytest.raises(KeyboardInterrupt, match="simulated crash"):
+        controller.execute_simulated_trend_report(
+            config,
+            "CN",
+            "2026-07-20",
+            report_sha,
+            actor="trend-market-controller",
+            reason="scheduled execution",
+            now=NOW,
+            quote_client=Quote(),
+            order_client=client,
+            scheduled=True,
+        )
+    request_path = next(
+        (config.data_dir / "trend_controller/CN/simulation_requests/2026-07-20").glob(
+            "*.json"
+        )
+    )
+    completion_path = controller._request_completion_path(
+        config, "CN", "2026-07-20", request_path.stem,
+    )
+    completion_bytes = completion_path.read_bytes()
+    completion_paths = list(completion_path.parent.glob("*.json"))
+    notification_paths = list(
+        (config.data_dir / "trend_controller/CN/notifications/2026-07-20").glob(
+            "*.json"
+        )
+    )
+    assert (client.place_calls, len(completion_paths), notification_paths) == (
+        1, 1, [],
+    )
+
+    recovered = RecordingMacOS()
+    monkeypatch.setattr(controller, "build_notifier", lambda _config: recovered)
+    replay = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="trend-market-controller",
+        reason="scheduled execution",
+        now=NOW + timedelta(minutes=5),
+        quote_client=Quote(),
+        order_client=client,
+        scheduled=True,
+    )
+    further_replay = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="trend-market-controller",
+        reason="scheduled execution",
+        now=NOW + timedelta(minutes=10),
+        quote_client=Quote(),
+        order_client=client,
+        scheduled=True,
+    )
+
+    assert (
+        replay["status"],
+        further_replay["status"],
+        client.place_calls,
+        len(recovered.messages),
+        completion_path.read_bytes(),
+    ) == (
+        "reconciled", "reconciled", 1, 1, completion_bytes,
+    )
+
+
+def test_manual_exact_sha_execution_keeps_scheduled_batch_and_passes_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report_path = tmp_path / "manual-report.json"
+    report = valid_cn_report(as_of_date="2026-07-19", execution_date="2026-07-20", buy=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    scheduled_batch_path = controller._batch_path(config, "CN", "2026-07-20")
+    scheduled_batch_path.parent.mkdir(parents=True, exist_ok=True)
+    scheduled_batch = {"schema_version": "scheduled-sentinel"}
+    scheduled_batch_path.write_text(json.dumps(scheduled_batch), encoding="utf-8")
+    request_path = config.data_dir / "trend_controller/CN/simulation_requests/2026-07-20/manual.json"
+    execution_id = "manual-execution-1"
+    calls: list[dict[str, object]] = []
+
+    class Quote:
+        def close(self) -> None:
+            pass
+
+    class Client:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(controller, "record_trend_review_missed_buys", lambda **_kwargs: 0)
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args, **_kwargs: Client())
+    monkeypatch.setattr(controller, "_execution_completed", lambda *_args, **_kwargs: True)
+
+    def execute_open(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {"status": "complete", "submitted_count": 1, "artifact_paths": []}
+
+    monkeypatch.setattr(controller, "execute_trend_review_open", execute_open)
+    result = controller._execute_locked_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_path,
+        report,
+        quote_client=Quote(),
+        scheduled=False,
+        execution_id=execution_id,
+        request_path=request_path,
+        account_id=123,
+    )
+
+    manual_batch_path = controller._request_batch_path(
+        config, "CN", "2026-07-20", execution_id
+    )
+    manual_batch = json.loads(manual_batch_path.read_text(encoding="utf-8"))
+    assert result["status"] == "complete"
+    assert json.loads(scheduled_batch_path.read_text(encoding="utf-8")) == scheduled_batch
+    assert manual_batch["execution_id"] == execution_id
+    assert manual_batch["request_path"] == str(request_path)
+    assert manual_batch["account_id"] == 123
+    assert calls and calls[0]["execution_id"] == execution_id
+    assert calls[0]["request_path"] == str(request_path)
+    assert calls[0]["account_id"] == 123
+
+
+def test_v2_execution_keeps_report_fifo_and_seats_when_live_positions_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report_path = tmp_path / "frozen-report.json"
+    report = valid_cn_report(as_of_date="2026-07-19", execution_date="2026-07-20", buy=True)
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+        "strategy_version": "v15",
+    }
+    report["allocation"] = {
+        "version": 2,
+        "markets": {"CN": {"position_limit": 10}},
+    }
+    report["strategy_judgments"]["formal_actions"] = [
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+        },
+        {
+            "action": "BUY",
+            "symbol": "600002",
+            "futu_symbol": "SH.600002",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+        },
+    ]
+    report["strategy_judgments"]["simulated_buy_fifo"] = [
+        {"source": "formal", "futu_symbol": "SH.600001", "symbol": "600001"},
+        {"source": "formal", "futu_symbol": "SH.600002", "symbol": "600002"},
+    ]
+    report["strategy_judgments"]["planned_new_seats"] = 1
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    buy_calls: list[str] = []
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    class Client:
+        snapshot_calls = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            self.snapshot_calls += 1
+            positions = []
+            if self.snapshot_calls > 1:
+                positions = [
+                    {"code": f"SH.LIVE{index}", "qty": "100"}
+                    for index in range(99)
+                ]
+            return {"acc_id": 123, "positions": positions}
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": []}
+
+        def close(self) -> None:
+            pass
+
+    client = Client()
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(controller, "record_trend_review_missed_buys", lambda **_kwargs: 0)
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args, **_kwargs: client)
+
+    def execute_open(**kwargs: object) -> dict[str, object]:
+        if not kwargs.get("include_buys"):
+            return {"status": "complete", "submitted_count": 0, "artifact_paths": []}
+        symbols = kwargs.get("buy_symbols")
+        assert isinstance(symbols, tuple) and len(symbols) == 1
+        code = symbols[0]
+        buy_calls.append(code)
+        rejected = code == "SH.600001"
+        return {
+            "status": "terminal_rejected" if rejected else "submitted",
+            "submitted_count": 1,
+            "artifact_paths": [],
+            "terminal_rejected": rejected,
+            "seat_consumed": not rejected,
+            "seat_release_proven": rejected,
+        }
+
+    monkeypatch.setattr(controller, "execute_trend_review_open", execute_open)
+    controller._execute_locked_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_path,
+        report,
+        quote_client=Quote(),
+        scheduled=False,
+        execution_id="manual-execution-1",
+        request_path=tmp_path / "request.json",
+        account_id=123,
+    )
+
+    assert buy_calls == ["SH.600001", "SH.600002"]
+
+
+@pytest.mark.parametrize("head_state", ["pending", "held"])
+def test_v2_frozen_fifo_head_consumes_seat_across_execution_passes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    head_state: str,
+) -> None:
+    config = controller_config(tmp_path)
+    report_path = tmp_path / "frozen-report.json"
+    report = valid_cn_report(as_of_date="2026-07-19", execution_date="2026-07-20", buy=True)
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+        "strategy_version": "v15",
+    }
+    report["allocation"] = {
+        "version": 2,
+        "markets": {"CN": {"position_limit": 10}},
+    }
+    report["strategy_judgments"]["formal_actions"] = [
+        {
+            "action": "BUY", "symbol": "600001", "futu_symbol": "SH.600001",
+            "global_strength": "95", "estimated_shares": 100,
+            "lot_size": 100, "atr": "0.5",
+        },
+        {
+            "action": "BUY", "symbol": "600002", "futu_symbol": "SH.600002",
+            "global_strength": "90", "estimated_shares": 100,
+            "lot_size": 100, "atr": "0.5",
+        },
+    ]
+    report["strategy_judgments"]["simulated_buy_fifo"] = [
+        {"source": "formal", "futu_symbol": "SH.600001", "symbol": "600001"},
+        {"source": "formal", "futu_symbol": "SH.600002", "symbol": "600002"},
+    ]
+    report["strategy_judgments"]["planned_new_seats"] = 1
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {symbol: SimpleNamespace(last_price=Decimal("10")) for symbol in symbols}
+
+        def close(self) -> None:
+            pass
+
+    class Client:
+        def __init__(self) -> None:
+            self.orders: list[dict[str, object]] = []
+            self.positions: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {"acc_id": 123, "positions": self.positions}
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": self.orders}
+
+        def close(self) -> None:
+            pass
+
+    client = Client()
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(controller, "record_trend_review_missed_buys", lambda **_kwargs: 0)
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args, **_kwargs: client)
+    place_calls: list[str] = []
+    reconcile_calls: list[str] = []
+
+    def execute_open(**kwargs: object) -> dict[str, object]:
+        if kwargs.get("include_buys") is False:
+            return {"status": "complete", "submitted_count": 0, "artifact_paths": []}
+        code = str(tuple(kwargs["buy_symbols"])[0])
+        if (
+            any(
+                str(order.get("code") or order.get("futu_code") or "").upper()
+                == code
+                for order in client.orders
+            )
+            or any(
+                str(position.get("code") or position.get("futu_code") or "").upper()
+                == code
+                for position in client.positions
+            )
+        ):
+            reconcile_calls.append(code)
+            return {"status": "reconciled", "submitted_count": 0, "artifact_paths": []}
+        place_calls.append(code)
+        client.orders = [{
+            "code": code,
+            "futu_code": code,
+            "trd_side": "BUY",
+            "order_status": "SUBMITTED",
+            "qty": "100",
+            "dealt_qty": "0",
+        }]
+        if head_state == "held" and code == "SH.600001":
+            client.positions = [{"code": code, "qty": "100"}]
+        return {"status": "submitted", "submitted_count": 1, "artifact_paths": []}
+
+    monkeypatch.setattr(controller, "execute_trend_review_open", execute_open)
+    monkeypatch.setattr(
+        controller,
+        "execute_relative_rotations",
+        lambda **_kwargs: {"status": "complete", "submitted_count": 0, "artifact_paths": []},
+    )
+
+    for _ in range(2):
+        controller._execute_locked_report(
+            config,
+            "CN",
+            "2026-07-20",
+            report_path,
+            report,
+            quote_client=Quote(),
+            scheduled=False,
+            execution_id="manual-execution-1",
+            request_path=tmp_path / "request.json",
+            account_id=123,
+        )
+
+    assert place_calls == ["SH.600001"]
+    assert reconcile_calls == ["SH.600001"]
+
+
+def test_scheduled_simulation_replays_one_request_without_reexecuting_completed_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report = {
+        "schema_version": 1,
+        "as_of_date": "2026-07-19",
+        "execution_date": "2026-07-20",
+    }
+    report_path = config.reports_dir / "trend_a_share" / "2026-07-19.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = _report_hash(report)
+    calls: list[str] = []
+    monkeypatch.setattr(controller, "require_trend_review_config", lambda *_args: 123)
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(
+        controller,
+        "_execute_locked_report",
+        lambda *_args, **_kwargs: calls.append("execute") or {
+            "status": "complete", "submitted_count": 1,
+        },
+    )
+    monkeypatch.setattr(controller, "_execution_completed", lambda *_args, **_kwargs: True)
+
+    first = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="trend-market-controller",
+        reason="scheduled execution",
+        now=NOW,
+        scheduled=True,
+    )
+    second = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="trend-market-controller",
+        reason="scheduled execution",
+        now=NOW + timedelta(minutes=5),
+        scheduled=True,
+    )
+
+    request_path = Path(str(first["request_path"]))
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    assert first["request_reused"] is False
+    assert second["request_reused"] is True
+    assert second["status"] == "reconciled"
+    assert second["execution_id"] == first["execution_id"]
+    assert second["request_path"] == first["request_path"]
+    assert request["report_sha256"] == report_sha
+    assert request["requested_at"] == "2026-07-20T09:31:00+08:00"
+    assert calls == ["execute"]
+    assert list(request_path.parent.glob("*.json")) == [request_path]
+
+
+def test_mixed_v2_execution_stages_sells_before_formal_and_rotation_buys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report_path = tmp_path / "locked.json"
+    report = {
+        "as_of_date": "2026-07-17",
+        "allocation": {"version": 2},
+        "strategy_judgments": {
+            "formal_actions": [{
+                "action": "BUY",
+                "symbol": "600001",
+                "futu_symbol": "SH.600001",
+                "global_strength": "80",
+                "estimated_shares": 100,
+                "lot_size": 100,
+                "atr": "0.5",
+            }],
+            "simulate_rotation_pairs": [{
+                "pair_index": 0,
+                "buy_futu_symbol": "SH.ROTATION",
+                "buy_global_strength": "90",
+            }],
+        },
+    }
+    report["strategy_snapshot"] = {"strategy_version": "v15"}
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    calls: list[tuple[str, object]] = []
+
+    class Client:
+        def close(self) -> None:
+            pass
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_revision_state", lambda *_args: (None, None))
+    monkeypatch.setattr(
+        controller,
+        "lock_trend_execution_batch",
+        lambda *_args, **_kwargs: {
+            "report_path": str(report_path), "report_sha256": _report_hash(report),
+        },
+    )
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(controller, "record_trend_review_missed_buys", lambda **_kwargs: 0)
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args, **_kwargs: Client())
+    monkeypatch.setattr(controller, "_execution_completed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        controller,
+        "execute_trend_review_open",
+        lambda **kwargs: calls.append(("ordinary", {
+            "include_buys": kwargs.get("include_buys"),
+            "include_sells": kwargs.get("include_sells"),
+        })) or {
+            "status": (
+                "uncertain" if kwargs.get("include_sells") else "unchanged"
+            ),
+            "submitted_count": 0, "artifact_paths": [],
+        },
+    )
+    monkeypatch.setattr(
+        controller,
+        "execute_relative_rotations",
+        lambda **kwargs: calls.append(("rotation", kwargs.get("_phase"))) or {
+            "status": (
+                "pending" if kwargs.get("_phase") == "sell" else "complete"
+            ),
+            "submitted_count": 0, "artifact_paths": [],
+        },
+    )
+    monkeypatch.setattr(controller, "_execution_completed", lambda *_args, **_kwargs: False)
+
+    controller._execute_locked_report(
+        config, "CN", "2026-07-20", report_path, report, quote_client=Quote()
+    )
+
+    assert calls == [
+        ("ordinary", {"include_buys": False, "include_sells": True}),
+        ("rotation", "sell"),
+        ("rotation", "buy"),
+        ("ordinary", {"include_buys": True, "include_sells": False}),
+    ]
+
+
+def test_v2_formal_only_execution_uses_fifo_and_dynamic_position_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report_path = tmp_path / "locked.json"
+    report = {
+        "as_of_date": "2026-07-17",
+        "allocation": {"version": 2, "markets": {"CN": {"position_limit": 20}}},
+        "strategy_snapshot": {"strategy_version": "v15"},
+        "strategy_judgments": {
+            "formal_actions": [{
+                "action": "BUY",
+                "symbol": "600001",
+                "futu_symbol": "SH.600001",
+                "global_strength": "90",
+                "estimated_shares": 100,
+                "lot_size": 100,
+                "atr": "0.5",
+            }],
+            "simulate_rotation_pairs": [],
+        },
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    calls: list[dict[str, object]] = []
+    fifo_calls: list[dict[str, object]] = []
+    quote_calls: list[tuple[str, ...]] = []
+
+    class Client:
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "positions": [
+                    {"code": f"SH.HOLD{index}", "qty": "100"}
+                    for index in range(20)
+                ],
+            }
+
+        def close(self) -> None:
+            pass
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            quote_calls.append(tuple(symbols))
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_revision_state", lambda *_args: (None, None))
+    monkeypatch.setattr(
+        controller,
+        "lock_trend_execution_batch",
+        lambda *_args, **_kwargs: {
+            "report_path": str(report_path), "report_sha256": _report_hash(report),
+        },
+    )
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(controller, "record_trend_review_missed_buys", lambda **_kwargs: 0)
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args, **_kwargs: Client())
+    monkeypatch.setattr(
+        controller,
+        "freeze_simulated_buy_fifo",
+        lambda **kwargs: fifo_calls.append(kwargs) or [
+            {"source": "formal", "futu_symbol": "SH.600001"},
+        ],
+    )
+    monkeypatch.setattr(
+        controller,
+        "execute_trend_review_open",
+        lambda **kwargs: calls.append(kwargs) or {
+            "status": "unchanged", "submitted_count": 0, "artifact_paths": [],
+        },
+    )
+    monkeypatch.setattr(controller, "_execution_completed", lambda *_args, **_kwargs: True)
+
+    controller._execute_locked_report(
+        config, "CN", "2026-07-20", report_path, report, quote_client=Quote()
+    )
+
+    assert fifo_calls
+    assert [bool(item.get("include_buys")) for item in calls] == [False]
+    assert quote_calls[1] == ("SH.600001",)
+
+
+def test_v2_mixed_execution_refreshes_formal_and_rotation_fifo_quotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report_path = tmp_path / "locked.json"
+    report = {
+        "as_of_date": "2026-07-17",
+        "allocation": {"version": 2, "markets": {"CN": {"position_limit": 10}}},
+        "strategy_snapshot": {"strategy_version": "v15"},
+        "strategy_judgments": {
+            "formal_actions": [{
+                "action": "BUY", "symbol": "600001", "futu_symbol": "SH.600001",
+                "global_strength": "80", "estimated_shares": 100,
+                "lot_size": 100, "atr": "0.5",
+            }],
+            "simulate_rotation_pairs": [{
+                "pair_index": 0, "buy_futu_symbol": "SH.ROTATION",
+                "buy_global_strength": "90",
+            }],
+        },
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    quote_calls: list[tuple[str, ...]] = []
+
+    class Client:
+        def close(self) -> None:
+            pass
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            quote_calls.append(tuple(sorted(symbols)))
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_revision_state", lambda *_args: (None, None))
+    monkeypatch.setattr(
+        controller,
+        "lock_trend_execution_batch",
+        lambda *_args, **_kwargs: {
+            "report_path": str(report_path), "report_sha256": _report_hash(report),
+        },
+    )
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(controller, "record_trend_review_missed_buys", lambda **_kwargs: 0)
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args, **_kwargs: Client())
+    monkeypatch.setattr(
+        controller,
+        "freeze_simulated_buy_fifo",
+        lambda **_kwargs: [
+            {"source": "formal", "futu_symbol": "SH.600001"},
+            {"source": "rotation", "futu_symbol": "SH.ROTATION"},
+        ],
+    )
+    monkeypatch.setattr(controller, "_execution_completed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        controller,
+        "execute_trend_review_open",
+        lambda **_kwargs: {
+            "status": "unchanged", "submitted_count": 0, "artifact_paths": [],
+        },
+    )
+    monkeypatch.setattr(
+        controller,
+        "execute_relative_rotations",
+        lambda **kwargs: {
+            "status": "complete", "submitted_count": 0, "artifact_paths": [],
+        },
+    )
+
+    controller._execute_locked_report(
+        config, "CN", "2026-07-20", report_path, report, quote_client=Quote()
+    )
+
+    assert quote_calls == [
+        ("SH.600001", "SH.ROTATION"),
+        ("SH.600001", "SH.ROTATION"),
+    ]
+
+
+def test_v2_empty_buy_batch_is_order_free_and_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report_path = tmp_path / "locked.json"
+    report = {
+        "as_of_date": "2026-07-17",
+        "allocation": {"version": 2, "markets": {"CN": {"position_limit": 10}}},
+        "strategy_snapshot": {"strategy_version": "v15"},
+        "strategy_judgments": {
+            "formal_actions": [], "simulate_rotation_pairs": [],
+        },
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    submitted: list[object] = []
+
+    class Client:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_revision_state", lambda *_args: (None, None))
+    monkeypatch.setattr(
+        controller,
+        "lock_trend_execution_batch",
+        lambda *_args, **_kwargs: {
+            "report_path": str(report_path), "report_sha256": _report_hash(report),
+        },
+    )
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args, **_kwargs: Client())
+    monkeypatch.setattr(
+        controller,
+        "execute_trend_review_open",
+        lambda **kwargs: submitted.append(kwargs) or {
+            "status": "complete", "submitted_count": 0, "artifact_paths": [],
+        },
+    )
+
+    first = controller._execute_locked_report(
+        config, "CN", "2026-07-20", report_path, report, quote_client=None
+    )
+    second = controller._execute_locked_report(
+        config, "CN", "2026-07-20", report_path, report, quote_client=None
+    )
+
+    assert first["submitted_count"] == second["submitted_count"] == 0
+    assert submitted == []
+
+
+@pytest.mark.parametrize("head_status", ["SUBMITTED", "BROKER_UNKNOWN"])
+def test_v2_fifo_head_consumes_one_seat_before_later_buy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    head_status: str,
+) -> None:
+    config = controller_config(tmp_path)
+    report_path = tmp_path / "locked.json"
+    report = {
+        "as_of_date": "2026-07-17",
+        "execution_date": "2026-07-20",
+        "allocation": {"version": 2, "markets": {"CN": {"position_limit": 10}}},
+        "strategy_snapshot": {"strategy_version": "v15"},
+        "metadata": {"market": "CN"},
+        "strategy_judgments": {
+            "formal_actions": [
+                {
+                    "action": "BUY", "symbol": "600001", "futu_symbol": "SH.600001",
+                    "global_strength": "95", "estimated_shares": 100,
+                    "lot_size": 100, "target_amount": "1000", "atr": "0.5",
+                },
+                {
+                    "action": "BUY", "symbol": "600002", "futu_symbol": "SH.600002",
+                    "global_strength": "90", "estimated_shares": 100,
+                    "lot_size": 100, "target_amount": "1000", "atr": "0.5",
+                },
+            ],
+            "simulate_rotation_pairs": [{"pair_index": 0}],
+        },
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_revision_state", lambda *_args: (None, None))
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(controller, "record_trend_review_missed_buys", lambda **_kwargs: 0)
+    monkeypatch.setattr(
+        controller,
+        "lock_trend_execution_batch",
+        lambda *_args, **_kwargs: {
+            "report_path": str(report_path), "report_sha256": _report_hash(report),
+        },
+    )
+    monkeypatch.setattr(controller, "_execution_completed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        controller,
+        "freeze_simulated_buy_fifo",
+        lambda **_kwargs: [
+            {"source": "formal", "futu_symbol": "SH.600001"},
+            {"source": "formal", "futu_symbol": "SH.600002"},
+        ],
+    )
+
+    class Client:
+        def __init__(self) -> None:
+            self.orders: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {"positions": []}
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": self.orders}
+
+        def close(self) -> None:
+            pass
+
+    client = Client()
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args, **_kwargs: client)
+    buy_calls: list[str] = []
+    head_calls = 0
+
+    def execute_open(**kwargs: object) -> dict[str, object]:
+        nonlocal head_calls
+        if kwargs.get("include_buys") is False:
+            return {"status": "unchanged", "submitted_count": 0, "artifact_paths": []}
+        code = str(tuple(kwargs["buy_symbols"])[0])
+        buy_calls.append(code)
+        if code == "SH.600001":
+            head_calls += 1
+            client.orders[:] = [{
+                "code": code, "trd_side": "BUY", "order_status": head_status,
+            }]
+            return {
+                "status": "submitted", "submitted_count": 1,
+                "artifact_paths": [], "buy_fifo_blocked": True,
+            }
+        assert head_calls == 1
+        client.orders.append({
+            "code": code, "trd_side": "BUY", "order_status": "SUBMITTED",
+        })
+        return {"status": "complete", "submitted_count": 1, "artifact_paths": []}
+
+    monkeypatch.setattr(controller, "execute_trend_review_open", execute_open)
+    monkeypatch.setattr(
+        controller,
+        "execute_relative_rotations",
+        lambda **kwargs: (
+            {"status": "complete", "submitted_count": 0, "artifact_paths": []}
+            if kwargs.get("_phase") == "sell"
+            else {"status": "unchanged", "submitted_count": 0, "artifact_paths": []}
+        ),
+    )
+    quote = SimpleNamespace(
+        get_snapshots=lambda symbols: {
+            symbol: SimpleNamespace(last_price=Decimal("10")) for symbol in symbols
+        }
+    )
+
+    controller._execute_locked_report(
+        config, "CN", "2026-07-20", report_path, report, quote_client=quote
+    )
+
+    assert buy_calls == ["SH.600001", "SH.600002"]
+
+
+@pytest.mark.parametrize(
+    "first_order",
+    [
+        None,
+        {
+            "code": "SH.600001", "trd_side": "BUY",
+            "order_status": "REJECTED", "dealt_qty": "0",
+        },
+    ],
+    ids=["no_order", "zero_fill_reject"],
+)
+def test_v2_fifo_zero_fill_releases_seat_and_respects_frozen_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first_order: dict[str, object] | None,
+) -> None:
+    config = controller_config(tmp_path)
+    report_path = tmp_path / "locked.json"
+    report = {
+        "as_of_date": "2026-07-17",
+        "allocation": {"version": 2, "markets": {"CN": {"position_limit": 1}}},
+        "strategy_snapshot": {"strategy_version": "v15"},
+        "strategy_judgments": {
+            "formal_actions": [
+                {
+                    "action": "BUY", "symbol": f"60000{index}",
+                    "futu_symbol": f"SH.60000{index}",
+                    "global_strength": str(100 - index),
+                    "estimated_shares": 100, "lot_size": 100, "atr": "0.5",
+                }
+                for index in range(1, 4)
+            ],
+            "simulate_rotation_pairs": [],
+        },
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_revision_state", lambda *_args: (None, None))
+    monkeypatch.setattr(
+        controller,
+        "lock_trend_execution_batch",
+        lambda *_args, **_kwargs: {
+            "report_path": str(report_path), "report_sha256": _report_hash(report),
+        },
+    )
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(controller, "record_trend_review_missed_buys", lambda **_kwargs: 0)
+
+    class Client:
+        def __init__(self) -> None:
+            self.orders: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {"positions": []}
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": self.orders}
+
+        def close(self) -> None:
+            pass
+
+    client = Client()
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args, **_kwargs: client)
+    monkeypatch.setattr(
+        controller,
+        "freeze_simulated_buy_fifo",
+        lambda **_kwargs: [
+            {"source": "formal", "futu_symbol": "SH.600001"},
+            {"source": "formal", "futu_symbol": "SH.600002"},
+            {"source": "formal", "futu_symbol": "SH.600003"},
+        ],
+    )
+    calls: list[str] = []
+
+    def execute_open(**kwargs: object) -> dict[str, object]:
+        if kwargs.get("include_buys") is False:
+            return {"status": "uncertain", "submitted_count": 0, "artifact_paths": []}
+        code = str(tuple(kwargs["buy_symbols"])[0])
+        calls.append(code)
+        if code == "SH.600001":
+            client.orders[:] = [] if first_order is None else [dict(first_order)]
+            return {
+                "status": "uncertain" if first_order is None else "terminal_rejected",
+                "submitted_count": 0,
+                "artifact_paths": [],
+                "terminal_rejected": first_order is not None,
+                "seat_consumed": False,
+            }
+        client.orders[:] = [{
+            "code": code, "trd_side": "BUY", "order_status": "SUBMITTED",
+        }]
+        return {"status": "submitted", "submitted_count": 1, "artifact_paths": []}
+
+    monkeypatch.setattr(controller, "execute_trend_review_open", execute_open)
+    quote = SimpleNamespace(
+        get_snapshots=lambda symbols: {
+            symbol: SimpleNamespace(last_price=Decimal("10")) for symbol in symbols
+        }
+    )
+
+    controller._execute_locked_report(
+        config, "CN", "2026-07-20", report_path, report, quote_client=quote
+    )
+
+    assert calls == (
+        ["SH.600001"]
+        if first_order is None
+        else ["SH.600001", "SH.600002"]
+    )
+
+
+def test_public_v2_fifo_rejection_with_inflight_order_does_not_complete_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=123,
+        trend_executor_host=socket.gethostname(),
+    )
+    actions = [
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "global_strength": "95",
+            "target_weight": "0.04",
+            "target_amount": "4000",
+            "planned_stop_risk": "400",
+            "estimated_shares": 100,
+            "lot_size": 100,
+            "atr": "0.5",
+        },
+        {
+            "action": "BUY",
+            "symbol": "600002",
+            "futu_symbol": "SH.600002",
+            "global_strength": "90",
+            "target_weight": "0.04",
+            "target_amount": "4000",
+            "planned_stop_risk": "400",
+            "estimated_shares": 100,
+            "lot_size": 100,
+            "atr": "0.5",
+        },
+    ]
+    report_path, report = write_v2_controller_report(config, actions=actions)
+    report["metadata"]["simulate_acc_id"] = 123  # type: ignore[index]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = _report_hash(report)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    class OrderClient:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+            self.orders: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 123,
+                "net_value": "100000",
+                "cash": "100000",
+                "available_cash": "100000",
+                "positions": [],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": self.orders}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            request = dict(request)
+            code = str(request["futu_code"])
+            rejected = code == "SH.600001"
+            status = "REJECTED" if rejected else "SUBMITTED"
+            self.requests.append(request)
+            order = {
+                **request,
+                "order_id": f"BROKER-{len(self.requests)}",
+                "code": code,
+                "trd_side": "BUY",
+                "dealt_qty": "0",
+                "order_status": status,
+            }
+            self.orders.append(order)
+            return {
+                "futu_order_id": order["order_id"],
+                "status": status,
+                "order_status": status,
+                "dealt_qty": "0",
+            }
+
+        def close(self) -> None:
+            pass
+
+    client = OrderClient()
+    first = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="trend-market-controller",
+        reason="manual FIFO execution",
+        now=NOW,
+        quote_client=Quote(),
+        order_client=client,
+        scheduled=False,
+    )
+    completion_path = controller._request_completion_path(
+        config, "CN", "2026-07-20", str(first["execution_id"])
+    )
+    replay = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="trend-market-controller",
+        reason="manual FIFO execution",
+        now=NOW + timedelta(minutes=1),
+        quote_client=Quote(),
+        order_client=client,
+        scheduled=False,
+    )
+
+    assert (
+        first.get("status"),
+        first["terminal_rejected"],
+        first["submitted_count"],
+        [request["futu_code"] for request in client.requests],
+        [order["order_status"] for order in client.orders],
+        completion_path.exists(),
+        replay["status"],
+        replay["terminal_rejected"],
+        replay["request_reused"],
+        len(client.requests),
+    ) == (
+        "submitted",
+        True,
+        1,
+        ["SH.600001", "SH.600002"],
+        ["REJECTED", "SUBMITTED"],
+        False,
+        "submitted",
+        True,
+        True,
+        2,
+    )
+
+
+def test_v2_fifo_overlap_uses_one_buy_and_closes_both_logical_owners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report_path = tmp_path / "locked.json"
+    pair = {
+        "pair_index": 0,
+        "sell_symbol": "WEAK",
+        "sell_futu_symbol": "SH.WEAK",
+        "buy_symbol": "600006",
+        "buy_futu_symbol": "SH.600006",
+        "buy_global_strength": "90",
+        "target_weight": "0.04",
+        "target_amount": "4000",
+        "estimated_shares": 400,
+        "lot_size": 100,
+        "atr": "0.5",
+        "reason": "relative_rotation",
+        "execution_date": "2026-07-20",
+        "execution_mode": "automatic",
+    }
+    report = {
+        "as_of_date": "2026-07-17",
+        "generated_at": "2026-07-17T18:00:00+08:00",
+        "execution_date": "2026-07-20",
+        "allocation": {"version": 2, "markets": {"CN": {"position_limit": 10}}},
+        "metadata": {
+            "market": "CN", "broker": "eastmoney",
+            "price_fx_to_account_currency": "1", "simulate_acc_id": 101,
+        },
+        "risk_summary": {
+            "normal_cost_rate": "0.001", "portfolio_remaining_risk": "4000",
+        },
+        "strategy_snapshot": {
+            "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+            "strategy_version": "v15",
+        },
+        "strategy_judgments": {
+            "formal_actions": [{
+                "action": "BUY", "symbol": "600006", "futu_symbol": "SH.600006",
+                "global_strength": "90", "target_weight": "0.04",
+                "lot_size": 100, "estimated_shares": 400,
+                "target_amount": "4000", "planned_stop_risk": "1000", "atr": "0.5",
+            }],
+            "simulate_rotation_pairs": [pair],
+        },
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(controller, "record_trend_review_missed_buys", lambda **_kwargs: 0)
+    monkeypatch.setattr(controller, "_revision_state", lambda *_args: (None, None))
+
+    class FilledClient:
+        def __init__(self) -> None:
+            self.cash = Decimal("0")
+            self.positions = [
+                {"code": "SH.WEAK", "qty": "1000", "can_sell_qty": "1000", "market_val": "7000"},
+                *[
+                    {"code": f"SH.HOLD{index}", "qty": "100", "can_sell_qty": "100", "market_val": "1000"}
+                    for index in range(1, 10)
+                ],
+            ]
+            self.requests: list[dict[str, object]] = []
+            self.orders: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101, "net_value": "100000", "cash": str(self.cash),
+                "available_cash": str(self.cash), "positions": self.positions,
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": self.orders}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(request)
+            order_id = f"SIM-{len(self.requests)}"
+            qty = Decimal(str(request["qty"]))
+            code = str(request["futu_code"])
+            side = str(request["side"]).upper()
+            order = {
+                **request,
+                "order_id": order_id,
+                "code": code,
+                "trd_side": side,
+                "qty": str(request["qty"]),
+                "dealt_qty": str(request["qty"]),
+                "dealt_avg_price": "10",
+                "order_status": "FILLED_ALL",
+            }
+            self.orders.append(order)
+            if side == "SELL":
+                self.positions[:] = [item for item in self.positions if item["code"] != code]
+                self.cash += Decimal("7000")
+            else:
+                self.positions.append({"code": code, "qty": str(request["qty"])})
+                self.cash -= qty * Decimal("10")
+            return {"futu_order_id": order_id, "status": "submitted"}
+
+        def close(self) -> None:
+            pass
+
+    client = FilledClient()
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args, **_kwargs: client)
+    quote = SimpleNamespace(
+        get_snapshots=lambda symbols: {
+            symbol: SimpleNamespace(last_price=Decimal("10")) for symbol in symbols
+        }
+    )
+
+    controller._execute_locked_report(
+        config, "CN", "2026-07-20", report_path, report, quote_client=quote
+    )
+    controller._execute_locked_report(
+        config, "CN", "2026-07-20", report_path, report, quote_client=quote
+    )
+
+    buy_orders = [order for order in client.orders if order["trd_side"] == "BUY"]
+    assert len(buy_orders) == 1
+    action_root = (
+        config.data_dir / "trend_review/ledgers/CN/actions/2026-07-20"
+        / trend_action_key("CN", "2026-07-20", "SH.600006", "buy")
+    )
+    formal_events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in action_root.glob("*.json")
+        if json.loads(path.read_text(encoding="utf-8")).get("status") == "filled"
+        and not json.loads(path.read_text(encoding="utf-8")).get("pair_key")
+    ]
+    rotation_events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in action_root.glob("*.json")
+        if json.loads(path.read_text(encoding="utf-8")).get("status") == "filled"
+        and json.loads(path.read_text(encoding="utf-8")).get("pair_key")
+    ]
+    assert len(formal_events) == 1
+    assert len(rotation_events) == 1
+    assert formal_events[0]["order_ids"] == rotation_events[0]["order_ids"]
+    assert len(list(config.data_dir.glob(
+        "trend_review/ledgers/CN/rotations/2026-07-20/*/buy-filled.json"
+    ))) == 1
+    assert len(list(config.data_dir.glob(
+        "trend_review/ledgers/CN/rotations/2026-07-20/*/terminal.json"
+    ))) == 1
+    assert controller._execution_completed(
+        config,
+        ControllerCycle(
+            market="CN", as_of_date="2026-07-17", execution_date="2026-07-20",
+            report_run_date="2026-07-17", session="execution", market_open=True,
+            next_check_at=NOW,
+        ),
+    ) is True
 
 
 def test_execute_locked_report_runs_rotations_when_buys_are_pending_only(
@@ -7297,7 +11139,24 @@ def test_revision_request_waits_for_report_freeze_before_capturing_baseline(
         run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
 
         assert generated == [(cycle.report_run_date, True)]
-        assert [path.name for path in executed] == ["2026-07-17-r1.json"]
+        assert executed == [report_path]
+        revision_path = config.reports_dir / "trend_a_share/2026-07-17-r1.json"
+        revision_report = json.loads(revision_path.read_text(encoding="utf-8"))
+        _, completion_path = controller._revision_paths(
+            config, cycle.market, cycle.as_of_date
+        )
+        completion = json.loads(completion_path.read_text(encoding="utf-8"))
+        assert completion["request_path"] == str(request_path)
+        assert completion["request_sha256"] == hashlib.sha256(
+            request_path.read_bytes()
+        ).hexdigest()
+        assert completion["report_path"] == str(revision_path)
+        assert completion["report_sha256"] == _report_hash(revision_report)
+        assert json.loads(
+            controller._delivery_receipt_path(
+                config, "CN", revision_path
+            ).read_text(encoding="utf-8")
+        )["status"] == "sent"
 
 
 def test_revision_requested_without_baseline_requires_r1_not_r0(
@@ -7339,8 +11198,20 @@ def test_revision_requested_without_baseline_requires_r1_not_r0(
     )
     completion = json.loads(completion_path.read_text(encoding="utf-8"))
     assert generated == [(cycle.report_run_date, True)]
-    assert [path.name for path in executed] == ["2026-07-17-r1.json"]
-    assert completion["report_path"].endswith("2026-07-17-r1.json")
+    assert executed == [r0_path]
+    r1_path = config.reports_dir / "trend_a_share/2026-07-17-r1.json"
+    r1 = json.loads(r1_path.read_text(encoding="utf-8"))
+    assert completion["request_path"] == str(request_path)
+    assert completion["request_sha256"] == hashlib.sha256(
+        request_path.read_bytes()
+    ).hexdigest()
+    assert completion["report_path"] == str(r1_path)
+    assert completion["report_sha256"] == _report_hash(r1)
+    assert json.loads(
+        controller._delivery_receipt_path(config, "CN", r1_path).read_text(
+            encoding="utf-8"
+        )
+    )["status"] == "sent"
 
 
 def test_revision_completion_rejects_r0_when_baseline_is_missing(
@@ -7457,8 +11328,8 @@ def test_pending_revision_does_not_accept_newer_report_without_receipt(
     config = controller_config(tmp_path)
     cycle = active_cn_cycle()
     patch_cycle(monkeypatch, cycle)
-    write_report(config)
-    controller._request_revision(config, cycle, NOW)
+    base_path, _ = write_report(config)
+    request_path = controller._request_revision(config, cycle, NOW)
     r1_path, _ = write_report(config, revision=1)
     generated: list[tuple[str, bool]] = []
 
@@ -7486,7 +11357,27 @@ def test_pending_revision_does_not_accept_newer_report_without_receipt(
     run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
 
     assert generated == [(cycle.report_run_date, True)]
-    assert [path.name for path in executed] == ["2026-07-17-r2.json"]
+    assert executed == [base_path]
+    r2_path = config.reports_dir / "trend_a_share/2026-07-17-r2.json"
+    r2 = json.loads(r2_path.read_text(encoding="utf-8"))
+    _, completion_path = controller._revision_paths(
+        config, cycle.market, cycle.as_of_date
+    )
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    assert completion["request_path"] == str(request_path)
+    assert completion["request_sha256"] == hashlib.sha256(
+        request_path.read_bytes()
+    ).hexdigest()
+    assert completion["report_path"] == str(r2_path)
+    assert completion["report_sha256"] == _report_hash(r2)
+    assert not controller._delivery_receipt_path(
+        config, "CN", r1_path
+    ).exists()
+    assert json.loads(
+        controller._delivery_receipt_path(config, "CN", r2_path).read_text(
+            encoding="utf-8"
+        )
+    )["status"] == "sent"
     assert r1_path.exists()
 
 
@@ -7794,3 +11685,132 @@ def test_generate_report_passes_allocation_reference_to_market_entrypoint(
     controller._generate_report(config, market, "2026-08-03", False, reference)
 
     assert captured["allocation_reference"] is reference
+
+
+def test_scheduled_confirm_submitted_does_not_complete_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    buy = {
+        "action": "BUY",
+        "symbol": "600001",
+        "futu_symbol": "SH.600001",
+        "target_weight": "0.04",
+        "lot_size": 100,
+        "estimated_shares": 400,
+        "target_amount": "4000",
+        "atr": "0.5",
+    }
+    report_path, report = write_v2_controller_report(config, actions=[buy])
+    report["execution_date"] = NOW.date().isoformat()
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    class OrderClient:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+            self.fail_orders = 1
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "cash": "100000",
+                "positions": [],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": []}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(dict(request))
+            if self.fail_orders:
+                self.fail_orders -= 1
+                raise RuntimeError("submission boundary lost response")
+            raise AssertionError("confirmed submission must not be retried")
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+    client = OrderClient()
+    first = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        NOW.date().isoformat(),
+        _report_hash(report),
+        actor="trend-market-controller",
+        reason="scheduled execution",
+        now=NOW,
+        quote_client=Quote(),
+        order_client=client,
+        scheduled=True,
+    )
+    second = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        NOW.date().isoformat(),
+        _report_hash(report),
+        actor="trend-market-controller",
+        reason="scheduled execution",
+        now=NOW + timedelta(minutes=1),
+        quote_client=Quote(),
+        order_client=client,
+        scheduled=True,
+    )
+    action_resolution = trend_review.resolve_trend_action(
+        config.data_dir,
+        market="CN",
+        execution_date=NOW.date().isoformat(),
+        symbol="600001",
+        side="buy",
+        resolution="confirm-submitted",
+        actor="ray",
+        reason="broker order accepted outside the client response",
+        resolved_at="2026-07-20T09:33:00+08:00",
+        futu_order_id="BROKER-42",
+        execution_id=str(first["execution_id"]),
+        request_path=str(first["request_path"]),
+    )
+    replay = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        NOW.date().isoformat(),
+        _report_hash(report),
+        actor="trend-market-controller",
+        reason="scheduled execution",
+        now=NOW + timedelta(minutes=2),
+        quote_client=Quote(),
+        order_client=client,
+        scheduled=True,
+    )
+
+    assert (
+        first["status"],
+        second["status"],
+        json.loads(action_resolution.read_text(encoding="utf-8"))["futu_order_id"],
+        replay["status"],
+        len(client.requests),
+    ) == (
+        "uncertain",
+        "uncertain",
+        "BROKER-42",
+        "uncertain",
+        1,
+    )

@@ -36,6 +36,7 @@ from open_trader.trend_api_stats import (
     build_trend_api_stats_payload,
     write_trend_api_stats,
 )
+from open_trader.trend_allocation import build_allocation_snapshot
 from open_trader.trend_kelly import (
     calculate_trend_kelly,
     trend_kelly_rounds_from_payload,
@@ -329,6 +330,39 @@ def test_risk_aware_buy_completion_accepts_current_and_legacy_versions(
     ) == 100
 
 
+def test_v2_buy_completion_uses_unique_fills_and_floors_report_residual() -> None:
+    action = {
+        "lot_size": 100,
+        "estimated_shares": 500,
+        "target_amount": "1",
+        "atr": "0.5",
+        "planned_stop_risk": "1",
+    }
+    report = {
+        "allocation": {"version": 2},
+        "metadata": {"price_fx_to_account_currency": "100"},
+        "risk_summary": {"normal_cost_rate": "0.001"},
+        "strategy_snapshot": {"strategy_version": "v1"},
+    }
+    snapshot = {"available_cash": "1"}
+    orders = [
+        {"order_id": "SIM-1", "dealt_qty": "150"},
+        {"order_id": "SIM-1", "dealt_qty": "150"},
+        {"order_id": "SIM-2", "dealt_qty": "100", "dealt_avg_price": "10"},
+    ]
+
+    assert trend_review._remaining_buy_quantity(
+        action, report, snapshot, orders, None
+    ) == 200
+
+    orders.append({
+        "order_id": "SIM-3", "dealt_qty": "300", "dealt_avg_price": "10",
+    })
+    assert trend_review._remaining_buy_quantity(
+        action, report, snapshot, orders, None
+    ) == 0
+
+
 def frozen_evidence() -> dict[str, object]:
     return {
         "market": "CN",
@@ -386,6 +420,183 @@ def test_different_evidence_never_replaces_existing_file(tmp_path: Path) -> None
     assert first["path"] != second["path"]
     assert Path(first["path"]).exists()
     assert Path(second["path"]).exists()
+
+
+def test_planning_snapshot_keeps_completed_market_evidence_on_retry(
+    tmp_path: Path,
+) -> None:
+    account = AccountSnapshot(
+        source_date="2026-07-16",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        positions=(),
+        exceptions=(),
+        position_count=0,
+    )
+    strategy = trend_strategy_snapshot("CN", "oldsha", (622466, 697199))
+    candidate = CandidateInput(
+        tm_id=1,
+        symbol="600001",
+        exchange="SH",
+        name="首轮候选",
+        asset="A股",
+        industry="行业",
+        as_of_date="2026-07-16",
+        tradable=True,
+        amount=Decimal("2"),
+        right_side=True,
+        days=3,
+        strength=Decimal("90"),
+        danger=False,
+        close=Decimal("10"),
+        atr=Decimal("0.5"),
+        industry_tm_id=700001,
+        industry_temperature="热",
+        temperature_prev="温",
+        temperature_curr="热",
+        phase="立夏",
+        global_strength=Decimal("90"),
+        market_cap=Decimal("100"),
+    )
+    changed_candidate = replace(
+        candidate,
+        symbol="600002",
+        name="重试候选",
+        close=Decimal("20"),
+        global_strength=Decimal("99"),
+    )
+    first = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=account,
+        candidates=(candidate,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state={"schema_version": 1, "positions": {}},
+        api_facts=("frozen-api",),
+        metadata={"market": "CN", "marker": "first"},
+        market="CN",
+        process_version="oldsha",
+        candidate_pool_ids=(622466, 697199),
+        strategy_snapshot=strategy,
+    )
+    second = replace(
+        first,
+        candidates=(changed_candidate,),
+        api_facts=("changed-api-fact",),
+        metadata={**first.metadata, "marker": "second"},
+    )
+
+    first_kwargs = {
+        "data_dir": tmp_path,
+        "candidates": (candidate,),
+        "holding_snapshots": {},
+        "bars_by_symbol": {},
+        "prior_state": {"schema_version": 1, "positions": {}},
+        "watch_events": (),
+        "query": {"candidate_fact": "first"},
+        "responses": {"snapshots": [{"tmId": 1, "fact": "first"}]},
+        "candidate_pool_ids": (622466, 697199),
+        "lot_sizes": {},
+        "price_fx_to_account_currency": Decimal("1"),
+        "previous_attention_rows": (),
+        "option_attention_broker_label": None,
+    }
+    second_kwargs = {
+        **first_kwargs,
+        "candidates": (changed_candidate,),
+        "query": {"candidate_fact": "changed"},
+        "responses": {"snapshots": [{"tmId": 2, "fact": "changed"}]},
+    }
+    trend_review.freeze_report_evidence(report=first, **first_kwargs)
+    planning_path = trend_review.planning_snapshot_path(
+        tmp_path, market="CN", target_date="2026-07-17"
+    )
+    first_manifest = trend_review.read_planning_snapshot(
+        planning_path, data_dir=tmp_path
+    )
+    first_market = first_manifest["components"]["market"]
+    assert isinstance(first_market, dict)
+    first_market_path = Path(first_market["path"])
+    first_market_content = first_market_path.read_bytes()
+    trend_review.freeze_report_evidence(report=second, **second_kwargs)
+
+    planning = trend_review.read_planning_snapshot(planning_path, data_dir=tmp_path)
+    after_market = planning["components"]["market"]
+    assert after_market == first_market
+    assert after_market["path"] == first_market["path"]
+    assert after_market["sha256"] == first_market["sha256"]
+    assert Path(after_market["path"]).read_bytes() == first_market_content
+    evidence_ref = planning["evidence"]
+    assert isinstance(evidence_ref, dict)
+    evidence = json.loads(Path(evidence_ref["path"]).read_text(encoding="utf-8"))
+
+    rebuilt = trend_review.rebuild_trend_report_from_evidence(evidence)
+
+    assert rebuilt["metadata"]["marker"] == "first"
+    assert rebuilt["signal_snapshots"]["candidates"][0]["symbol"] == "600001"
+    assert rebuilt["api_facts"] == ["frozen-api"]
+    assert evidence["query"]["candidate_fact"] == "first"
+    assert evidence["responses"]["snapshots"] == [{"tmId": 1, "fact": "first"}]
+
+
+def test_read_planning_snapshot_rejects_component_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    report = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=AccountSnapshot(
+            source_date="2026-07-16",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="CN",
+        process_version="oldsha",
+        candidate_pool_ids=(622466, 697199),
+        strategy_snapshot=trend_strategy_snapshot("CN", "oldsha", (622466, 697199)),
+    )
+    trend_review.freeze_report_evidence(
+        data_dir=tmp_path,
+        report=report,
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state={"schema_version": 1, "positions": {}},
+        watch_events=(),
+        query={},
+        responses={},
+        candidate_pool_ids=(622466, 697199),
+        lot_sizes={},
+        price_fx_to_account_currency=Decimal("1"),
+        previous_attention_rows=(),
+        option_attention_broker_label=None,
+    )
+    planning_path = trend_review.planning_snapshot_path(
+        tmp_path, market="CN", target_date="2026-07-17"
+    )
+    manifest = json.loads(planning_path.read_text(encoding="utf-8"))
+    market_component = manifest["components"]["market"]
+    simulated_component = manifest["components"]["simulated_account"]
+    simulated_component.update(
+        path=market_component["path"],
+        sha256=market_component["sha256"],
+        status="complete",
+    )
+    planning_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="planning snapshot component is invalid"):
+        trend_review.read_planning_snapshot(planning_path, data_dir=tmp_path)
 
 
 def test_rebuild_marks_missing_original_input_instead_of_guessing() -> None:
@@ -712,6 +923,93 @@ def test_risk_version_rebuild_uses_frozen_drawdown_decision_after_live_state_cha
         match="missing original input: drawdown_summary",
     ):
         trend_review.rebuild_trend_report_from_evidence(missing)
+
+
+def test_cn_v15_round_trip_preserves_frozen_drawdown_decision(
+    tmp_path: Path,
+) -> None:
+    allocation = _allocation_v2_ref(allocation_date="2026-07-16")
+    body = json.dumps(
+        allocation["snapshot"], ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n"
+    daily_path = tmp_path / "trend_allocation/daily/2026-07-16.json"
+    daily_path.parent.mkdir(parents=True)
+    daily_path.write_text(body, encoding="utf-8")
+    allocation["sha256"] = hashlib.sha256(body.encode()).hexdigest()
+    snapshot = live_trend_strategy_snapshot(
+        "CN", "oldsha", (622466, 697199), strategy_version="v15",
+        allocation=allocation,
+    )
+    drawdown = {
+        "schema_version": "open_trader.strategy_drawdown.v1",
+        "market": "CN",
+        "strategy_id": snapshot["strategy_id"],
+        "strategy_version": "v15",
+        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v15|v15",
+        "state_status": "ok",
+        "status": "active",
+        "status_label": "纪律内",
+        "entry_allowed": True,
+        "current_equity": "100000",
+        "high_water_mark": "100000",
+        "drawdown_pct": "0",
+        "drawdown_limit_pct": "0.05",
+        "pause_reason": "",
+        "paused_at": None,
+        "observed_at": "2026-07-16T17:00:00+08:00",
+        "bootstrap_event": None,
+        "recovery_event": None,
+    }
+    report = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=AccountSnapshot(
+            "2026-07-16", True, Decimal("100000"), Decimal("100000"), (), (),
+        ),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        market="CN",
+        process_version="oldsha",
+        strategy_snapshot=snapshot,
+        metadata={"market": "CN", "broker": "eastmoney", "process_version": "oldsha"},
+        candidate_pool_ids=(622466, 697199),
+        drawdown_summary=drawdown,
+        allocation_reference=allocation,
+    )
+    source = _report_payload(report)
+    frozen = trend_review.freeze_report_evidence(
+        data_dir=tmp_path,
+        report=report,
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state={"schema_version": 1, "positions": {}},
+        watch_events=(),
+        query={"component_pool_ids": [622466, 697199]},
+        responses={},
+        candidate_pool_ids=(622466, 697199),
+        lot_sizes={},
+        price_fx_to_account_currency=Decimal("1"),
+        previous_attention_rows=(),
+        option_attention_broker_label=None,
+    )
+    evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
+
+    rebuilt = trend_review.rebuild_trend_report_from_evidence(evidence)
+    corrected_path = trend_review.replay_trend_evidence(
+        Path(frozen["path"]),
+        tmp_path,
+        fixed_process_version="fixedsha",
+        rebuild=trend_review.rebuild_trend_report_from_evidence,
+        replayed_at="2026-07-17T09:00:00+08:00",
+    )
+    corrected = json.loads(corrected_path.read_text(encoding="utf-8"))["corrected_report"]
+
+    assert rebuilt == source
+    assert rebuilt["drawdown_summary"] == drawdown
+    assert corrected["drawdown_summary"] == drawdown
 
 
 def test_v1_rebuild_keeps_legacy_nominal_sizing_without_v2_risk_fields() -> None:
@@ -1228,6 +1526,65 @@ class FakeTrendSimClient:
         return {"orders": self.orders}
 
 
+class BlockingSharedSimState:
+    def __init__(self) -> None:
+        self.lock = Lock()
+        self.orders: list[dict[str, object]] = []
+        self.requests: list[dict[str, object]] = []
+        self.first_entered = Event()
+        self.release_first = Event()
+
+
+class BlockingSharedSimClient:
+    def __init__(
+        self,
+        state: BlockingSharedSimState,
+        *,
+        positions: list[dict[str, object]] | None = None,
+    ) -> None:
+        self.state = state
+        self.positions = positions or []
+
+    def account_snapshot(self) -> dict[str, object]:
+        return {
+            "acc_id": 101,
+            "net_value": "100000",
+            "cash": "100000",
+            "positions": self.positions,
+        }
+
+    def list_orders(self, **_kwargs: object) -> dict[str, object]:
+        with self.state.lock:
+            return {"orders": [dict(order) for order in self.state.orders]}
+
+    def place_order(self, request: dict[str, object]) -> dict[str, object]:
+        with self.state.lock:
+            self.state.requests.append(dict(request))
+            first = len(self.state.requests) == 1
+            order_id = f"SIM-{len(self.state.requests)}"
+        if first:
+            self.state.first_entered.set()
+            if not self.state.release_first.wait(timeout=5):
+                raise AssertionError("test did not release the first order")
+        order = {
+            **request,
+            "order_id": order_id,
+            "account_id": 101,
+            "code": request["futu_code"],
+            "trd_side": str(request["side"]).upper(),
+            "dealt_qty": "0",
+            "order_status": "SUBMITTED",
+        }
+        with self.state.lock:
+            self.state.orders.append(order)
+        return {
+            "futu_order_id": order_id,
+            "status": "SUBMITTED",
+            "order_status": "SUBMITTED",
+            "dealt_qty": "0",
+        }
+
+
 def relative_rotation_pair(
     *, index: int = 0, sell: str = "WEAK", buy: str = "STRONG",
 ) -> dict[str, object]:
@@ -1300,6 +1657,3540 @@ def full_rotation_positions() -> list[dict[str, object]]:
             for index in range(1, 10)
         ],
     ]
+
+
+def v2_report_with_actions(actions: list[dict[str, object]]) -> dict[str, object]:
+    report = report_with_actions(actions)
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+        "strategy_version": "v15",
+    }
+    report["allocation"] = {
+        "version": 2,
+        "markets": {"CN": {"position_limit": 10}},
+    }
+    return report
+
+
+def v2_relative_rotation_report(
+    *, pairs: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    report = relative_rotation_report(pairs=pairs)
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+        "strategy_version": "v15",
+    }
+    report["allocation"] = {
+        "version": 2,
+        "markets": {"CN": {"position_limit": 10}},
+    }
+    return report
+
+
+def test_v2_buy_fifo_deduplicates_sources_and_freezes_basis(tmp_path: Path) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600003", "futu_symbol": "SH.600003",
+            "global_strength": "95", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 100, "atr": "0.5",
+        },
+        {
+            "action": "BUY", "symbol": "600004", "futu_symbol": "SH.600004",
+            "global_strength": "94", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 100, "atr": "0.5",
+        },
+    ])
+    report["strategy_judgments"]["simulate_rotation_pairs"] = [
+        relative_rotation_pair(buy="600003"),
+        relative_rotation_pair(index=1, buy="600005"),
+    ]
+
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        pre_sell_position_count=1,
+        held_symbols=("600005",),
+        pending_symbols=("SH.PENDING",),
+    )
+
+    assert [item["futu_symbol"] for item in entries] == [
+        "SH.600003", "SH.600004",
+    ]
+    assert len({item["futu_symbol"] for item in entries}) == len(entries)
+    assert {
+        owner["source"]
+        for owner in entries[0]["owners"]
+    } == {"formal", "rotation"}
+
+    first = trend_review._freeze_buy_basis(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        snapshot={"net_value": "100000"},
+    )
+    replay = trend_review._freeze_buy_basis(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        snapshot={"net_value": "120000"},
+    )
+    assert first == replay
+    assert first is not None and first["target_amount"] == "4000.00"
+
+
+def test_v2_buy_fifo_uses_report_frozen_entries_and_seat_count(tmp_path: Path) -> None:
+    report = v2_report_with_actions([])
+    frozen = [
+        {
+            "source": "formal",
+            "futu_symbol": "SH.600003",
+            "symbol": "600003",
+            "global_strength": "95",
+        },
+    ]
+    report["strategy_judgments"]["simulated_buy_fifo"] = frozen
+    report["strategy_judgments"]["planned_new_seats"] = 0
+
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        pre_sell_position_count=99,
+        held_symbols=("600003",),
+        pending_symbols=("SH.PENDING",),
+    )
+
+    assert entries == frozen
+    assert getattr(entries, "planned_new_seats") == 0
+
+
+def test_v2_buy_fifo_keeps_grandfathered_target_count_on_replay(tmp_path: Path) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600003", "futu_symbol": "SH.600003",
+            "global_strength": "95", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 100, "atr": "0.5",
+        },
+    ])
+
+    trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        pre_sell_position_count=12,
+    )
+    trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        pre_sell_position_count=11,
+    )
+
+    fifo_path = next(
+        (tmp_path / "trend_review/ledgers/CN/buy_fifo/2026-07-20").glob("*.json")
+    )
+    assert json.loads(fifo_path.read_text(encoding="utf-8"))["target_position_count"] == 12
+
+
+def test_reverse_overlap_replay_repairs_missing_formal_owner_without_submit(
+    tmp_path: Path,
+) -> None:
+    pair = relative_rotation_pair()
+    pair.update({"buy_futu_symbol": "SH.600003", "buy_symbol": "600003"})
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600003", "futu_symbol": "SH.600003",
+            "global_strength": "95", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 100, "atr": "0.5",
+        },
+    ])
+    report["risk_summary"] = {"normal_cost_rate": "0.001"}
+    report["metadata"]["simulate_acc_id"] = 101
+    report["strategy_judgments"]["simulate_rotation_pairs"] = [pair]
+    execution_date = "2026-07-20"
+    report_sha = trend_review._report_hash(report)
+    pair_key = trend_review._rotation_pair_key(
+        "CN", 101, execution_date, report_sha, 0
+    )
+    root = tmp_path / "trend_review/ledgers/CN/rotations" / execution_date / pair_key
+    order = {
+        "order_id": "SIM-1",
+        "code": "SH.600003",
+        "trd_side": "BUY",
+        "remark": f"rotation:CN:{execution_date}:{pair_key[:16]}:B:1",
+        "qty": "100",
+        "dealt_qty": "100",
+        "dealt_avg_price": "10",
+        "order_status": "FILLED_ALL",
+    }
+    evidence = {
+        "schema_version": "open_trader.trend_review.rotation.v1",
+        "market": "CN",
+        "account_id": 101,
+        "execution_date": execution_date,
+        "report_sha256": report_sha,
+        "pair_index": 0,
+        "pair_key": pair_key,
+        "sell_symbol": pair["sell_symbol"],
+        "sell_futu_symbol": pair["sell_futu_symbol"],
+        "buy_symbol": "600003",
+        "buy_futu_symbol": "SH.600003",
+    }
+    request = {
+        "market": "CN", "futu_code": "SH.600003", "side": "BUY",
+        "order_type": "MARKET", "price": "0", "qty": "100",
+        "remark": order["remark"],
+    }
+    trend_review._write_rotation_fact(
+        root,
+        "buy-filled",
+        {
+            **evidence, "kind": "buy_fill", "status": "filled",
+            "target_qty": "100", "filled_qty": "100", "order_id": "SIM-1",
+            "order": order, "request": request,
+            "strategy_snapshot": report["strategy_snapshot"],
+            "recorded_at": "2026-07-20T09:31:00+08:00",
+        },
+    )
+    trend_review._write_rotation_fact(
+        root,
+        "terminal",
+        {
+            **evidence, "kind": "terminal", "status": "complete",
+            "reason": "buy_filled", "recorded_at": "2026-07-20T09:31:00+08:00",
+        },
+    )
+
+    class ReplayClient:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "available_cash": "90000",
+                "positions": [{"code": "SH.600003", "qty": "100"}],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": [order]}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(request)
+            raise AssertionError("reverse owner replay submitted a duplicate order")
+
+    client = ReplayClient()
+    artifacts = trend_review.reconcile_deduplicated_buy_owners(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date=execution_date,
+        entry={
+            "source": "formal",
+            "futu_symbol": "SH.600003",
+            "owners": [
+                {"source": "formal", "action_index": 0, "futu_symbol": "SH.600003"},
+                {"source": "rotation", "pair_index": 0, "futu_symbol": "SH.600003", "pair": pair},
+            ],
+        },
+        client=client,
+        recorded_at="2026-07-20T09:32:00+08:00",
+    )
+
+    assert artifacts
+    assert client.requests == []
+    action_root = tmp_path / "trend_review/ledgers/CN/actions/2026-07-20"
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in action_root.glob("*/*.json")
+    ]
+    assert any(
+        event.get("status") == "filled"
+        and event.get("action_index") == 0
+        and event.get("order_ids") == ["SIM-1"]
+        and not event.get("pair_key")
+        for event in events
+    )
+
+
+def test_reverse_overlap_terminal_partial_replay_repairs_formal_owner(
+    tmp_path: Path,
+) -> None:
+    pair = relative_rotation_pair(buy="600003")
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600003", "futu_symbol": "SH.600003",
+            "global_strength": "95", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 400, "atr": "0.5",
+            "target_amount": "4000", "planned_stop_risk": "1000",
+        },
+    ])
+    report["metadata"]["simulate_acc_id"] = 101
+    report["strategy_judgments"]["simulate_rotation_pairs"] = [pair]
+    execution_date = "2026-07-20"
+    report_sha = trend_review._report_hash(report)
+    pair_key = trend_review._rotation_pair_key(
+        "CN", 101, execution_date, report_sha, 0
+    )
+    root = tmp_path / "trend_review/ledgers/CN/rotations" / execution_date / pair_key
+    order = {
+        "order_id": "SIM-1", "code": "SH.600003", "trd_side": "BUY",
+        "remark": f"rotation:CN:{execution_date}:{pair_key[:16]}:B:1",
+        "qty": "400", "dealt_qty": "200", "dealt_avg_price": "20",
+        "order_status": "CANCELLED_PART",
+    }
+    request = {
+        "market": "CN", "futu_code": "SH.600003", "side": "BUY",
+        "order_type": "MARKET", "price": "0", "qty": "400",
+        "remark": order["remark"],
+    }
+    evidence = {
+        "schema_version": "open_trader.trend_review.rotation.v1",
+        "market": "CN", "account_id": 101, "execution_date": execution_date,
+        "report_sha256": report_sha, "pair_index": 0, "pair_key": pair_key,
+        "sell_symbol": pair["sell_symbol"], "sell_futu_symbol": pair["sell_futu_symbol"],
+        "buy_symbol": "600003", "buy_futu_symbol": "SH.600003",
+    }
+    trend_review._write_rotation_fact(
+        root,
+        "buy-terminal-partial",
+        {
+            **evidence, "kind": "buy_terminal_partial", "status": "terminal_partial",
+            "target_qty": "400", "filled_qty": "200", "order_id": "SIM-1",
+            "order": order, "request": request,
+            "strategy_snapshot": report["strategy_snapshot"],
+            "recorded_at": "2026-07-20T09:31:00+08:00",
+        },
+    )
+    trend_review._write_rotation_fact(
+        root,
+        "terminal",
+        {
+            **evidence, "kind": "terminal", "status": "terminal_partial",
+            "reason": "buy_terminal_partial_no_safe_residual",
+            "recorded_at": "2026-07-20T09:31:00+08:00",
+        },
+    )
+
+    class ReplayClient:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101, "net_value": "100000", "available_cash": "90000",
+                "positions": [{"code": "SH.600003", "qty": "200"}],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": [order]}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(request)
+            raise AssertionError("reverse terminal-partial replay submitted a duplicate")
+
+    client = ReplayClient()
+    artifacts = trend_review.reconcile_deduplicated_buy_owners(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date=execution_date,
+        entry={
+            "source": "formal", "futu_symbol": "SH.600003",
+            "owners": [
+                {"source": "formal", "action_index": 0, "futu_symbol": "SH.600003"},
+                {"source": "rotation", "pair_index": 0, "futu_symbol": "SH.600003", "pair": pair},
+            ],
+        },
+        client=client,
+        recorded_at="2026-07-20T09:32:00+08:00",
+    )
+
+    assert artifacts
+    assert client.requests == []
+    action_root = (
+        tmp_path / "trend_review/ledgers/CN/actions" / execution_date
+        / trend_review.trend_action_key("CN", execution_date, "SH.600003", "buy")
+    )
+    events = [json.loads(path.read_text(encoding="utf-8")) for path in action_root.glob("*.json")]
+    assert any(
+        event.get("status") == "terminal_partial"
+        and event.get("action_index") == 0
+        and event.get("order_ids") == ["SIM-1"]
+        and not event.get("pair_key")
+        for event in events
+    )
+    assert any(
+        event.get("status") == "terminal_partial" and event.get("pair_key")
+        for event in events
+    )
+
+
+def test_v2_rejected_buy_advances_but_unproven_buy_stops_fifo(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600001", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 100, "atr": "0.5",
+        },
+        {
+            "action": "BUY", "symbol": "600002", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 100, "atr": "0.5",
+        },
+    ])
+
+    class RejectedThenSubmitted(FakeTrendSimClient):
+        rejected = False
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(request)
+            order_id = f"SIM-{len(self.requests)}"
+            if not self.rejected:
+                self.rejected = True
+                return {
+                    "futu_order_id": order_id,
+                    "status": "REJECTED",
+                    "order_status": "REJECTED",
+                }
+            self.orders.append({
+                **request,
+                "order_id": order_id,
+                "code": request["futu_code"],
+                "trd_side": str(request["side"]).upper(),
+                "dealt_qty": "0",
+                "order_status": "SUBMITTED",
+            })
+            return {"futu_order_id": order_id, "status": "submitted"}
+
+    client = RejectedThenSubmitted()
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+        buy_symbols=("SH.600001",),
+    )
+
+    assert result["buy_fifo_blocked"] is False
+    assert [item["futu_code"] for item in client.requests] == ["SH.600001"]
+
+    client.requests.clear()
+    client.orders.clear()
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:32:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+        buy_symbols=("SH.600002",),
+    )
+    assert result["buy_fifo_blocked"] is True
+
+
+def test_v2_same_execution_replay_does_not_resubmit_immediate_rejection(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600001", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 100, "atr": "0.5",
+        },
+    ])
+
+    class ImmediateReject(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(request)
+            order_id = f"SIM-{len(self.requests)}"
+            self.orders.append({
+                **request,
+                "order_id": order_id,
+                "order_status": "REJECTED",
+                "dealt_qty": "0",
+            })
+            return {
+                "futu_order_id": order_id,
+                "status": "REJECTED",
+                "order_status": "REJECTED",
+            }
+
+    client = ImmediateReject()
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": TEST_QUOTE_PRICES,
+        "execution_id": "manual-execution-1",
+        "request_path": str(tmp_path / "request.json"),
+        "account_id": 101,
+    }
+
+    first = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+    second = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:32:00+08:00"
+    )
+
+    assert first["terminal_rejected"] is True
+    assert second["terminal_rejected"] is True
+    assert len(client.requests) == 1
+
+
+def test_v2_distinct_execution_retries_after_rejection(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600001", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 100, "atr": "0.5",
+        },
+    ])
+
+    class RejectThenSubmit(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(request)
+            order_id = f"SIM-{len(self.requests)}"
+            if len(self.requests) == 1:
+                status = "REJECTED"
+                self.orders.append({
+                    **request, "order_id": order_id,
+                    "order_status": status, "dealt_qty": "0",
+                })
+            else:
+                status = "SUBMITTED"
+                self.orders.append({
+                    **request, "order_id": order_id,
+                    "order_status": status, "dealt_qty": "0",
+                })
+            return {
+                "futu_order_id": order_id,
+                "status": status,
+                "order_status": status,
+            }
+
+    client = RejectThenSubmit()
+    common = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": TEST_QUOTE_PRICES,
+        "request_path": str(tmp_path / "request.json"),
+        "account_id": 101,
+    }
+    first = trend_review.execute_trend_review_open(
+        **common,
+        execution_id="manual-execution-1",
+        now="2026-07-20T09:31:00+08:00",
+    )
+    second = trend_review.execute_trend_review_open(
+        **common,
+        execution_id="manual-execution-2",
+        now="2026-07-20T09:32:00+08:00",
+    )
+
+    assert first["terminal_rejected"] is True
+    assert second["seat_consumed"] is True
+    assert len(client.requests) == 2
+
+
+def test_manual_action_attribution_keeps_execution_identity_and_broker_order(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600001", "futu_symbol": "SH.600001",
+            "target_weight": "0.04", "lot_size": 100,
+            "estimated_shares": 100, "atr": "0.5",
+        },
+    ])
+    client = FakeTrendSimClient()
+    execution_id = "manual-execution-1"
+    request_path = str(tmp_path / "request.json")
+
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+        execution_id=execution_id,
+        request_path=request_path,
+        account_id=101,
+    )
+
+    action_root = (
+        tmp_path / "trend_review/ledgers/CN/actions/2026-07-20"
+        / trend_review.trend_action_key(
+            "CN", "2026-07-20", "SH.600001", "buy", execution_id=execution_id
+        )
+    )
+    events = [json.loads(path.read_text(encoding="utf-8")) for path in action_root.glob("*.json")]
+    assert events
+    event = next(item for item in events if item.get("status") == "submitted")
+    assert event["account_id"] == 101
+    assert event["execution_id"] == execution_id
+    assert event["request_path"] == request_path
+    assert event["symbol"] == "600001"
+    assert event["attempt"] == 1
+    assert event["broker_order_id"] == "SIM-1"
+
+
+def test_rotation_action_attribution_keeps_execution_identity_and_broker_order(
+    tmp_path: Path,
+) -> None:
+    execution_id = "manual-execution-1"
+    path = trend_review._write_rotation_action_event_once(
+        data_dir=tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        report_sha="a" * 64,
+        pair_index=0,
+        pair_key="b" * 64,
+        symbol="STRONG",
+        futu_code="SH.STRONG",
+        side="buy",
+        order_id="BROKER-1",
+        filled_qty="100",
+        strategy_snapshot={"strategy_id": "strategy", "strategy_version": "v15"},
+        recorded_at="2026-07-20T09:31:00+08:00",
+        execution_id=execution_id,
+        request_path=str(tmp_path / "request.json"),
+        account_id=101,
+    )
+
+    assert path is not None
+    event = json.loads(path.read_text(encoding="utf-8"))
+    assert event["execution_id"] == execution_id
+    assert event["request_path"] == str(tmp_path / "request.json")
+    assert event["account_id"] == 101
+    assert event["symbol"] == "STRONG"
+    assert event["action_index"] == 0
+    assert event["broker_order_id"] == "BROKER-1"
+
+
+def test_v2_buy_residual_ignores_live_cash_nav_and_price(tmp_path: Path) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600001", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 400, "atr": "0.5",
+        },
+    ])
+    client = FakeTrendSimClient(
+        nav="0", cash="0", positions=[{"code": "SH.600001", "qty": "100"}],
+    )
+    client.orders = [{
+        "order_id": "PRIOR-FILL",
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": "100",
+        "dealt_qty": "100",
+        "order_status": "FILLED_ALL",
+    }]
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices={},
+    )
+
+    assert result["submitted_count"] == 1
+    assert client.requests[0]["qty"] == "300"
+    assert client.requests[0]["order_type"] == "MARKET"
+
+
+def test_v2_formal_buy_recomputes_zero_residual_inside_symbol_lock(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600001", "futu_symbol": "SH.600001",
+            "target_weight": "0.04", "lot_size": 100,
+            "estimated_shares": 100, "atr": "0.5",
+        },
+    ])
+
+    class TargetReachedInsideLock(FakeTrendSimClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.snapshot_positions = [
+                [], [], [{"code": "SH.600001", "qty": "100"}],
+            ]
+            self.snapshot_index = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            positions = self.snapshot_positions[
+                min(self.snapshot_index, len(self.snapshot_positions) - 1)
+            ]
+            self.snapshot_index += 1
+            return {**super().account_snapshot(), "positions": positions}
+
+    client = TargetReachedInsideLock()
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices={},
+    )
+
+    intents = list(
+        (tmp_path / "trend_review/ledgers/CN/open/2026-07-20").glob(
+            "*-intent.json"
+        )
+    )
+    assert (client.requests, result["submitted_count"], intents) == ([], 0, [])
+
+
+def test_v2_formal_buy_partial_retry_recomputes_zero_residual_inside_symbol_lock(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600001", "futu_symbol": "SH.600001",
+            "target_weight": "0.04", "lot_size": 100,
+            "estimated_shares": 400, "atr": "0.5",
+        },
+    ])
+
+    class SnapshotRace(FakeTrendSimClient):
+        snapshots: list[list[dict[str, object]]]
+
+        def account_snapshot(self) -> dict[str, object]:
+            positions = self.snapshots.pop(0) if self.snapshots else []
+            return {**super().account_snapshot(), "positions": positions}
+
+    client = SnapshotRace()
+    client.snapshots = [[], [], []]
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices={},
+    )
+    client.orders[0].update({
+        "dealt_qty": "200",
+        "dealt_avg_price": "10",
+        "order_status": "CANCELLED_PART",
+    })
+    client.snapshots = [[], [], []]
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:32:00+08:00",
+        quote_prices={},
+    )
+    client.snapshots = [
+        [{"code": "SH.600001", "qty": "300"}],
+        [{"code": "SH.600001", "qty": "300"}],
+        [{"code": "SH.600001", "qty": "400"}],
+    ]
+    retry = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:33:00+08:00",
+        quote_prices={},
+    )
+
+    assert (len(client.requests), retry["submitted_count"]) == (1, 0)
+
+
+def test_v2_formal_sell_recomputes_safe_residual_inside_symbol_lock(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "SELL_ALL", "symbol": "600001",
+            "futu_symbol": "SH.600001",
+        },
+    ])
+
+    class FewerSharesInsideLock(FakeTrendSimClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.snapshot_positions = [
+                [{"code": "SH.600001", "qty": "100", "can_sell_qty": "100"}],
+                [{"code": "SH.600001", "qty": "60", "can_sell_qty": "60"}],
+            ]
+            self.snapshot_index = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            positions = self.snapshot_positions[
+                min(self.snapshot_index, len(self.snapshot_positions) - 1)
+            ]
+            self.snapshot_index += 1
+            return {**super().account_snapshot(), "positions": positions}
+
+    client = FewerSharesInsideLock()
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices={},
+    )
+
+    assert (
+        result["submitted_count"],
+        [(request["side"], request["order_type"], request["qty"]) for request in client.requests],
+    ) == (1, [("sell", "MARKET", "60")])
+
+
+def test_v2_rotation_sell_recomputes_safe_residual_inside_symbol_lock(
+    tmp_path: Path,
+) -> None:
+    report = relative_rotation_report()
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+        "strategy_version": "v15",
+    }
+    report["allocation"] = {
+        "version": 2,
+        "markets": {"CN": {"position_limit": 10}},
+    }
+
+    class FewerSharesInsideLock(FakeTrendSimClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.snapshot_positions = [
+                [{"code": "SH.WEAK", "qty": "100", "can_sell_qty": "100"}],
+                [{"code": "SH.WEAK", "qty": "60", "can_sell_qty": "60"}],
+            ]
+            self.snapshot_index = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            positions = self.snapshot_positions[
+                min(self.snapshot_index, len(self.snapshot_positions) - 1)
+            ]
+            self.snapshot_index += 1
+            return {**super().account_snapshot(), "positions": positions}
+
+    client = FewerSharesInsideLock()
+    result = trend_review.execute_relative_rotations(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T10:30:00+08:00",
+        quote_prices={},
+        _phase="sell",
+    )
+
+    assert (
+        result["submitted_count"],
+        [(request["side"], request["order_type"], request["qty"]) for request in client.requests],
+    ) == (1, [("SELL", "MARKET", "60")])
+
+
+def test_v2_buy_same_account_symbol_order_blocks_submission(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600001", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 500, "atr": "0.5",
+        },
+    ])
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "100"}],
+    )
+    client.orders = [{
+        "order_id": "RESERVED-1",
+        "account_id": 101,
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": "200",
+        "dealt_qty": "0",
+        "order_status": "SUBMITTED",
+    }, {
+        "order_id": "RESERVED-1",
+        "account_id": 101,
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": "200",
+        "dealt_qty": "0",
+        "order_status": "SUBMITTED",
+    }, {
+        "order_id": "OTHER-SYMBOL",
+        "account_id": 101,
+        "code": "SH.600002",
+        "trd_side": "BUY",
+        "qty": "100",
+        "dealt_qty": "0",
+        "order_status": "SUBMITTED",
+    }, {
+        "order_id": "OTHER-ACCOUNT",
+        "account_id": 202,
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": "100",
+        "dealt_qty": "0",
+        "order_status": "SUBMITTED",
+    }]
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices={"SH.600001": Decimal("10")},
+    )
+
+    assert result["submitted_count"] == 0
+    assert client.requests == []
+
+
+def test_v2_serialization_lock_is_account_and_symbol_scoped(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {"action": "SELL_ALL", "symbol": symbol}
+        for symbol in ("600001", "600002", "600003")
+    ])
+    client = FakeTrendSimClient(
+        positions=[
+            {"code": "SH.600001", "qty": "100", "can_sell_qty": "100"},
+            {"code": "SH.600002", "qty": "100", "can_sell_qty": "100"},
+            {"code": "SH.600003", "qty": "100", "can_sell_qty": "100"},
+        ],
+    )
+    client.orders = [{
+        "order_id": "EXTERNAL-1",
+        "account_id": 101,
+        "remark": "external-buy",
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": "100",
+        "dealt_qty": "0",
+        "order_status": "SUBMITTED",
+    }, {
+        "order_id": "OTHER-ACCOUNT",
+        "account_id": 202,
+        "remark": "external-buy-other-account",
+        "code": "SH.600003",
+        "trd_side": "BUY",
+        "qty": "100",
+        "dealt_qty": "0",
+        "order_status": "SUBMITTED",
+    }]
+
+    trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+
+    assert [request["futu_code"] for request in client.requests] == [
+        "SH.600002", "SH.600003",
+    ]
+    assert all(request["futu_code"] != "SH.600001" for request in client.requests)
+
+
+def test_simulated_order_lock_serializes_formal_and_rotation_by_account_symbol(
+    tmp_path: Path,
+) -> None:
+    owner_entered = Event()
+    release_owner = Event()
+    same_symbol_entered = Event()
+    other_symbol_entered = Event()
+    other_account_entered = Event()
+
+    def hold(account_id: int, futu_code: str, entered: Event) -> None:
+        with trend_review._simulated_order_lock(
+            tmp_path, "cn", account_id, futu_code
+        ):
+            entered.set()
+            if entered is owner_entered:
+                release_owner.wait(timeout=5)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        owner = pool.submit(hold, 101, "SH.600001", owner_entered)
+        assert owner_entered.wait(timeout=2)
+        same_symbol = pool.submit(hold, 101, "SH.600001", same_symbol_entered)
+        other_symbol = pool.submit(hold, 101, "SH.600002", other_symbol_entered)
+        other_account = pool.submit(hold, 202, "SH.600001", other_account_entered)
+
+        assert other_symbol_entered.wait(timeout=2)
+        assert other_account_entered.wait(timeout=2)
+        assert not same_symbol_entered.wait(timeout=0.1)
+        release_owner.set()
+
+        owner.result(timeout=2)
+        same_symbol.result(timeout=2)
+        other_symbol.result(timeout=2)
+        other_account.result(timeout=2)
+    assert same_symbol_entered.is_set()
+
+
+def test_simulated_order_lock_serializes_formal_opposite_directions(
+    tmp_path: Path,
+) -> None:
+    state = BlockingSharedSimState()
+    buy_client = BlockingSharedSimClient(state)
+    sell_client = BlockingSharedSimClient(
+        state,
+        positions=[{"code": "SH.600001", "qty": "100", "can_sell_qty": "100"}],
+    )
+    buy_report = v2_report_with_actions([{
+        "action": "BUY", "symbol": "600001", "futu_symbol": "SH.600001",
+        "target_weight": "0.04",
+        "lot_size": 100, "estimated_shares": 100, "atr": "0.5",
+    }])
+    sell_report = v2_report_with_actions([{
+        "action": "SELL_ALL", "symbol": "600001", "futu_symbol": "SH.600001",
+    }])
+    for report in (buy_report, sell_report):
+        report["metadata"]["simulate_acc_id"] = 101
+    trend_review._ensure_discipline_account(
+        tmp_path, "CN", buy_client.account_snapshot()
+    )
+
+    def run(report: dict[str, object], client: BlockingSharedSimClient) -> object:
+        return trend_review.execute_trend_review_open(
+            data_dir=tmp_path,
+            report=report,
+            client=client,
+            market="CN",
+            execution_date="2026-07-20",
+            now="2026-07-20T09:31:00+08:00",
+            quote_prices=TEST_QUOTE_PRICES,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(run, buy_report, buy_client)
+        second = pool.submit(run, sell_report, sell_client)
+        assert state.first_entered.wait(timeout=2)
+        with state.lock:
+            assert len(state.requests) == 1
+        state.release_first.set()
+        first.result(timeout=2)
+        second.result(timeout=2)
+
+    assert len(state.requests) == 1
+
+
+def test_simulated_order_lock_serializes_formal_and_rotation(
+    tmp_path: Path,
+) -> None:
+    state = BlockingSharedSimState()
+    positions = full_rotation_positions()
+    positions[0] = {
+        **positions[0],
+        "code": "SH.600001",
+    }
+    formal_client = BlockingSharedSimClient(state, positions=positions)
+    rotation_client = BlockingSharedSimClient(state, positions=positions)
+    formal_report = v2_report_with_actions([{
+        "action": "SELL_ALL", "symbol": "600001", "futu_symbol": "SH.600001",
+    }])
+    formal_report["metadata"]["simulate_acc_id"] = 101
+    rotation_report = relative_rotation_report(
+        pairs=[relative_rotation_pair(sell="600001", buy="STRONG")]
+    )
+    rotation_report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+        "strategy_version": "v15",
+    }
+    rotation_report["allocation"] = {
+        "version": 2,
+        "markets": {"CN": {"position_limit": 10}},
+    }
+    trend_review._ensure_discipline_account(
+        tmp_path, "CN", formal_client.account_snapshot()
+    )
+
+    def run_formal() -> object:
+        return trend_review.execute_trend_review_open(
+            data_dir=tmp_path,
+            report=formal_report,
+            client=formal_client,
+            market="CN",
+            execution_date="2026-07-20",
+            now="2026-07-20T09:31:00+08:00",
+            quote_prices=TEST_QUOTE_PRICES,
+        )
+
+    def run_rotation() -> object:
+        return trend_review.execute_relative_rotations(
+            data_dir=tmp_path,
+            report=rotation_report,
+            client=rotation_client,
+            market="CN",
+            execution_date="2026-07-20",
+            now="2026-07-20T10:30:00+08:00",
+            quote_prices={"SH.STRONG": Decimal("10")},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(run_formal)
+        second = pool.submit(run_rotation)
+        assert state.first_entered.wait(timeout=2)
+        with state.lock:
+            assert len(state.requests) == 1
+        state.release_first.set()
+        first.result(timeout=2)
+        second.result(timeout=2)
+
+    assert len(state.requests) == 1
+
+
+def test_simulated_order_lock_releases_after_exception(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="boom"):
+        with trend_review._simulated_order_lock(tmp_path, "CN", 101, "600001"):
+            raise RuntimeError("boom")
+
+    with trend_review._simulated_order_lock(tmp_path, "cn", "101", "SH.600001"):
+        pass
+
+
+def test_v2_zero_fill_terminal_rejection_releases_seat_and_continues_fifo(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600001", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 100, "atr": "0.5",
+        },
+        {
+            "action": "BUY", "symbol": "600002", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 100, "atr": "0.5",
+        },
+    ])
+
+    class RejectFirst(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(request)
+            order_id = f"SIM-{len(self.requests)}"
+            status = "REJECTED" if len(self.requests) == 1 else "SUBMITTED"
+            self.orders.append({
+                **request,
+                "order_id": order_id,
+                "code": request["futu_code"],
+                "trd_side": request["side"],
+                "dealt_qty": "0",
+                "order_status": status,
+            })
+            return {
+                "futu_order_id": order_id,
+                "status": status,
+                "order_status": status,
+                "dealt_qty": "0",
+            }
+
+    client = RejectFirst()
+    first = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+        buy_symbols=("SH.600001",),
+    )
+    second = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:32:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+        buy_symbols=("SH.600002",),
+    )
+
+    assert first["status"] == "terminal_rejected"
+    assert first["submitted_count"] == 0
+    assert first["seat_consumed"] is False
+    assert second["submitted_count"] == 1
+    assert [request["futu_code"] for request in client.requests] == [
+        "SH.600001", "SH.600002",
+    ]
+    result = json.loads(Path(first["artifact_paths"][0]).read_text(encoding="utf-8"))
+    assert result["response"]["futu_order_id"] == "SIM-1"
+    failed_event = next(
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-20/*/*.json"
+        )
+        if json.loads(path.read_text(encoding="utf-8")).get("status") == "failed"
+    )
+    assert failed_event["filled_qty"] == "0"
+    assert failed_event["broker_order_id"] == "SIM-1"
+
+
+def test_v2_positive_partial_cancel_consumes_buy_seat(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600001", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 100, "atr": "0.5",
+        },
+    ])
+
+    class PartialCancel(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(request)
+            order_id = "SIM-PARTIAL"
+            self.orders.append({
+                **request,
+                "order_id": order_id,
+                "code": request["futu_code"],
+                "trd_side": request["side"],
+                "dealt_qty": "50",
+                "order_status": "CANCELLED_PART",
+            })
+            return {
+                "futu_order_id": order_id,
+                "status": "CANCELLED_PART",
+                "order_status": "CANCELLED_PART",
+                "dealt_qty": "50",
+            }
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=PartialCancel(),
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+
+    assert result["terminal_rejected"] is False
+    assert result["submitted_count"] == 1
+    assert result["seat_consumed"] is True
+    blocked_intent = (
+        tmp_path / "trend_review/ledgers/CN/open" / "2026-07-20"
+        / f"{trend_review.trend_action_key('CN', '2026-07-20', 'SH.600001', 'sell')}-intent.json"
+    )
+    assert not blocked_intent.exists()
+
+
+def test_v2_unknown_symbol_skips_only_that_symbol_and_later_symbols_continue(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": symbol, "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 100, "atr": "0.5",
+        }
+        for symbol in ("600001", "600002")
+    ])
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "100"}],
+    )
+    client.orders = [{
+        "order_id": "UNKNOWN-1",
+        "account_id": 101,
+        "remark": "external-unknown",
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": "100",
+        "dealt_qty": "0",
+        "order_status": "UNKNOWN",
+    }]
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+
+    assert result["submitted_count"] == 1
+    assert [request["futu_code"] for request in client.requests] == [
+        "SH.600002",
+    ]
+
+
+def test_v2_active_buy_skips_only_that_symbol_and_later_symbols_continue(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": symbol, "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 100, "atr": "0.5",
+        }
+        for symbol in ("600001", "600002")
+    ])
+    client = FakeTrendSimClient()
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+
+    assert result["submitted_count"] == 2
+    assert [request["futu_code"] for request in client.requests] == [
+        "SH.600001", "SH.600002",
+    ]
+
+
+def test_v2_sell_all_uses_sellable_long_residual_without_shorting(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {"action": "SELL_ALL", "symbol": "600001"},
+    ])
+    client = FakeTrendSimClient(
+        positions=[{
+            "code": "SH.600001", "qty": "500", "can_sell_qty": "400",
+        }],
+    )
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+
+    assert result["submitted_count"] == 1
+    assert client.requests[0]["qty"] == "400"
+
+
+def test_v2_sell_all_same_account_symbol_order_blocks_submission(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {"action": "SELL_ALL", "symbol": "600001"},
+    ])
+    client = FakeTrendSimClient(
+        positions=[{
+            "code": "SH.600001", "qty": "500", "can_sell_qty": "400",
+        }],
+    )
+    client.orders = [{
+        "order_id": "RESERVED-1",
+        "account_id": 101,
+        "code": "600001",
+        "trd_side": "SELL",
+        "qty": "200",
+        "dealt_qty": "50",
+        "order_status": "SUBMITTED",
+    }, {
+        "order_id": "RESERVED-1",
+        "account_id": 101,
+        "code": "600001",
+        "trd_side": "SELL",
+        "qty": "200",
+        "dealt_qty": "50",
+        "order_status": "SUBMITTED",
+    }, {
+        "order_id": "OTHER-SYMBOL",
+        "account_id": 101,
+        "code": "SH.600002",
+        "trd_side": "SELL",
+        "qty": "100",
+        "dealt_qty": "0",
+        "order_status": "SUBMITTED",
+    }, {
+        "order_id": "OTHER-ACCOUNT",
+        "account_id": 202,
+        "code": "SH.600001",
+        "trd_side": "SELL",
+        "qty": "100",
+        "dealt_qty": "0",
+        "order_status": "SUBMITTED",
+    }]
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+
+    assert result["submitted_count"] == 0
+    assert client.requests == []
+
+
+def test_v2_terminal_partial_waits_for_newer_holdings_snapshot(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600001", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 400, "atr": "0.5",
+        },
+    ])
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "100"}],
+    )
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {"SH.600001": Decimal("10")},
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+    client.orders = [{
+        "order_id": "SIM-1",
+        "remark": client.requests[0]["remark"],
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": client.requests[0]["qty"],
+        "dealt_qty": "200",
+        "dealt_avg_price": "10",
+        "order_status": "CANCELLED_PART",
+    }]
+
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:32:00+08:00"
+    )
+    assert len(client.requests) == 1
+    assert not list(
+        (tmp_path / "trend_review/ledgers/CN/open/2026-07-20").glob(
+            "*-attempt-2-intent.json"
+        )
+    )
+    action_root = (
+        tmp_path / "trend_review/ledgers/CN/actions/2026-07-20"
+        / trend_review.trend_action_key("CN", "2026-07-20", "SH.600001", "buy")
+    )
+    terminal_event = next(
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in action_root.glob("*.json")
+        if json.loads(path.read_text(encoding="utf-8")).get("status")
+        == "terminal_partial"
+    )
+    assert terminal_event["terminal_fill_qty"] == "200"
+
+    client.positions = [{"code": "SH.600001", "qty": "300"}]
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:33:00+08:00"
+    )
+
+    assert len(client.requests) == 2
+    assert client.requests[-1]["qty"] == "100"
+
+
+def test_v2_sell_all_terminal_partial_waits_for_newer_holdings_snapshot(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {"action": "SELL_ALL", "symbol": "600001"},
+    ])
+
+    class TimestampedClient(FakeTrendSimClient):
+        snapshot_at = "2026-07-20T09:31:00+08:00"
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                **super().account_snapshot(),
+                "snapshot_at": self.snapshot_at,
+            }
+
+    client = TimestampedClient(
+        positions=[{"code": "SH.600001", "qty": "100", "can_sell_qty": "100"}],
+    )
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {},
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+    client.orders[0].update({
+        "dealt_qty": "40",
+        "dealt_avg_price": "10",
+        "order_status": "CANCELLED_PART",
+    })
+
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:32:00+08:00"
+    )
+    assert len(client.requests) == 1
+
+    client.positions = [{"code": "SH.600001", "qty": "60", "can_sell_qty": "60"}]
+    client.snapshot_at = "2026-07-20T09:33:00+08:00"
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:33:00+08:00"
+    )
+
+    assert len(client.requests) == 2
+    assert client.requests[-1]["qty"] == "60"
+
+
+def test_v2_partial_reconciliation_uses_controller_observation_time_only(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600001", "futu_symbol": "SH.600001",
+            "target_weight": "0.04", "lot_size": 100,
+            "estimated_shares": 400, "atr": "0.5",
+        },
+    ])
+
+    class ObservationTimestampClient:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+            self.orders: list[dict[str, object]] = []
+            self.snapshots = [
+                *[("100", "2026-08-18T09:30:00+08:00", "2026-08-18T09:30:00+08:00")] * 3,
+                *[("100", "2026-08-18T09:31:00+08:00", "2026-08-18T09:31:00+08:00")] * 2,
+                *[("300", "2026-08-18T09:30:59+08:00", "2099-01-01T00:00:00+08:00")] * 3,
+                *[("300", "2026-08-18T09:32:00+08:00", "2026-08-18T09:32:00+08:00")] * 3,
+                *[("300", "2026-08-18T09:33:00+08:00", "2026-08-18T09:33:00+08:00")] * 2,
+            ]
+            self.snapshot_index = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            quantity, observed_at, updated_time = self.snapshots[
+                min(self.snapshot_index, len(self.snapshots) - 1)
+            ]
+            self.snapshot_index += 1
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "cash": "100000",
+                "positions": [{"code": "SH.600001", "qty": quantity}],
+                "controller_observed_at": observed_at,
+                "updated_time": updated_time,
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": self.orders}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(dict(request))
+            order_id = f"SIM-{len(self.requests)}"
+            partial = len(self.requests) == 1
+            status = "CANCELLED_PART" if partial else "SUBMITTED"
+            filled = "200" if partial else "0"
+            order = {
+                **request,
+                "order_id": order_id,
+                "code": request["futu_code"],
+                "trd_side": "BUY",
+                "dealt_qty": filled,
+                "dealt_avg_price": "10" if partial else "",
+                "order_status": status,
+            }
+            self.orders.append(order)
+            return {
+                "futu_order_id": order_id,
+                "status": status,
+                "order_status": status,
+                "dealt_qty": filled,
+            }
+
+    client = ObservationTimestampClient()
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-08-18",
+        "quote_prices": {},
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-08-18T09:30:00+08:00"
+    )
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-08-18T09:31:00+08:00"
+    )
+    first_replay = trend_review.execute_trend_review_open(
+        **arguments, now="2026-08-18T09:31:30+08:00"
+    )
+    second_replay = trend_review.execute_trend_review_open(
+        **arguments, now="2026-08-18T09:32:00+08:00"
+    )
+    final_replay = trend_review.execute_trend_review_open(
+        **arguments, now="2026-08-18T09:33:00+08:00"
+    )
+
+    observation_paths = (
+        tmp_path / "trend_review/ledgers/CN/open/2026-08-18"
+    ).glob("*-observation-*.json")
+    raw_timestamps = {
+        json.loads(path.read_text(encoding="utf-8")).get("updated_time")
+        for path in observation_paths
+    }
+    assert (
+        first_replay["status"] in {"pending", "uncertain"},
+        bool(first_replay["artifact_paths"]),
+        "2099-01-01T00:00:00+08:00" in raw_timestamps,
+        first_replay["submitted_count"],
+        second_replay["submitted_count"],
+        final_replay["submitted_count"],
+        [request["qty"] for request in client.requests],
+    ) == (True, True, True, 0, 1, 0, ["300", "100"])
+
+
+def _run_v2_cross_execution_terminal_replay(
+    tmp_path: Path, *, action_name: str, current_observed_at: str | None,
+) -> tuple[int, str, bool, list[Path], str | None]:
+    action = (
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+        }
+        if action_name == "BUY"
+        else {"action": "SELL_ALL", "symbol": "600001"}
+    )
+    report = v2_report_with_actions([action])
+    revised_report = copy.deepcopy(report)
+    revised_report["strategy_judgments"]["formal_actions"] = [
+        {
+            "action": "BUY",
+            "symbol": "600002",
+            "futu_symbol": "SH.600002",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": False,
+        },
+        action,
+    ]
+    side = "buy" if action_name == "BUY" else "sell"
+    broker_side = "BUY" if action_name == "BUY" else "SELL"
+
+    class TerminalClient(FakeTrendSimClient):
+        def __init__(self) -> None:
+            super().__init__(
+                positions=(
+                    [{"code": "SH.600001", "qty": "100", "can_sell_qty": "100"}]
+                    if action_name == "SELL_ALL" else None
+                )
+            )
+
+        def account_snapshot(self) -> dict[str, object]:
+            snapshot = super().account_snapshot()
+            if self.current_observed_at is not None:
+                snapshot["controller_observed_at"] = self.current_observed_at
+            return snapshot
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(dict(request))
+            order = {
+                **request,
+                "order_id": "SIM-FILLED",
+                "code": request["futu_code"],
+                "trd_side": broker_side,
+                "dealt_qty": "100",
+                "dealt_avg_price": "10",
+                "order_status": "FILLED_ALL",
+                "updated_time": "2099-01-01T00:00:00+08:00",
+            }
+            self.orders.append(order)
+            return {
+                "futu_order_id": "SIM-FILLED",
+                "status": "FILLED_ALL",
+                "order_status": "FILLED_ALL",
+                "dealt_qty": "100",
+            }
+
+    client = TerminalClient()
+    client.current_observed_at = "2026-07-20T09:30:00+08:00"
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": TEST_QUOTE_PRICES,
+        "account_id": 101,
+    }
+    trend_review.execute_trend_review_open(
+        **arguments,
+        now="2026-07-20T09:31:00+08:00",
+        execution_id="execution-a",
+        request_path=str(tmp_path / "execution-a.json"),
+    )
+    client.current_observed_at = current_observed_at
+    second = trend_review.execute_trend_review_open(
+        **{**arguments, "report": revised_report},
+        now="2026-07-20T09:32:00+08:00",
+        execution_id="execution-b",
+        request_path=str(tmp_path / "execution-b.json"),
+    )
+
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", side, execution_id="execution-b"
+    )
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (
+            tmp_path / "trend_review/ledgers/CN/actions/2026-07-20" / action_key
+        ).glob("*.json")
+    ]
+    first_action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", side, execution_id="execution-a"
+    )
+    first_result = json.loads(
+        (
+            tmp_path / "trend_review/ledgers/CN/open/2026-07-20"
+            / f"{first_action_key}-result.json"
+        ).read_text(encoding="utf-8")
+    )
+    return (
+        len(client.requests),
+        second["status"],
+        any(
+            event.get("status") == "pending"
+            and event.get("reason") == "holdings_snapshot_not_newer"
+            for event in events
+        ),
+        list(
+            (tmp_path / "trend_review/ledgers/CN/open/2026-07-20").glob(
+                f"{action_key}*-intent.json"
+            )
+        ),
+        first_result.get("controller_observed_at"),
+    )
+
+
+def test_v2_completed_buy_blocks_new_execution_until_newer_holdings_snapshot(
+    tmp_path: Path,
+) -> None:
+    assert {
+        label: _run_v2_cross_execution_terminal_replay(
+            tmp_path / label,
+            action_name="BUY",
+            current_observed_at=observed_at,
+        )
+        for label, observed_at in {
+            "aware-newer-than-pre-submit": "2026-07-20T09:30:30+08:00",
+            "aware-newer-but-stale-after-fill": "2026-07-20T09:31:30+08:00",
+            "missing": None,
+            "naive": "2026-07-20T09:30:30",
+        }.items()
+    } == {
+        "aware-newer-than-pre-submit": (
+            1, "pending", True, [], "2026-07-20T09:31:00+08:00"
+        ),
+        "aware-newer-but-stale-after-fill": (
+            1, "pending", True, [], "2026-07-20T09:31:00+08:00"
+        ),
+        "missing": (1, "pending", True, [], "2026-07-20T09:31:00+08:00"),
+        "naive": (1, "pending", True, [], "2026-07-20T09:31:00+08:00"),
+    }
+
+
+def test_v2_completed_sell_blocks_new_execution_until_newer_holdings_snapshot(
+    tmp_path: Path,
+) -> None:
+    assert {
+        label: _run_v2_cross_execution_terminal_replay(
+            tmp_path / label,
+            action_name="SELL_ALL",
+            current_observed_at=observed_at,
+        )
+        for label, observed_at in {
+            "aware-newer-than-pre-submit": "2026-07-20T09:30:30+08:00",
+            "missing": None,
+            "naive": "2026-07-20T09:30:30",
+        }.items()
+    } == {
+        "aware-newer-than-pre-submit": (
+            1, "pending", True, [], "2026-07-20T09:31:00+08:00"
+        ),
+        "missing": (1, "pending", True, [], "2026-07-20T09:31:00+08:00"),
+        "naive": (1, "pending", True, [], "2026-07-20T09:31:00+08:00"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("label", "legs"),
+    [
+        (
+            "buy-sell-buy",
+            [
+                ("BUY", 0, "2026-07-20T09:31:00+08:00"),
+                ("SELL_ALL", 100, "2026-07-20T09:32:00+08:00"),
+                ("BUY", 0, "2026-07-20T09:33:00+08:00"),
+            ],
+        ),
+        (
+            "sell-buy-sell",
+            [
+                ("SELL_ALL", 100, "2026-07-20T09:31:00+08:00"),
+                ("BUY", 0, "2026-07-20T09:32:00+08:00"),
+                ("SELL_ALL", 100, "2026-07-20T09:33:00+08:00"),
+            ],
+        ),
+    ],
+)
+def test_v2_cross_execution_terminal_fill_proof_allows_round_trips(
+    tmp_path: Path,
+    label: str,
+    legs: list[tuple[str, int, str]],
+) -> None:
+    class FilledRoundTripClient(FakeTrendSimClient):
+        def __init__(self) -> None:
+            super().__init__(positions=[])
+            self.controller_observed_at = "2026-07-20T09:30:00+08:00"
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                **super().account_snapshot(),
+                "controller_observed_at": self.controller_observed_at,
+            }
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(dict(request))
+            order_id = f"SIM-{len(self.requests)}"
+            filled = str(request["qty"])
+            order = {
+                **request,
+                "account_id": 101,
+                "order_id": order_id,
+                "code": request["futu_code"],
+                "trd_side": str(request["side"]).upper(),
+                "dealt_qty": filled,
+                "order_status": "FILLED_ALL",
+            }
+            self.orders.append(order)
+            return {
+                "futu_order_id": order_id,
+                "status": "FILLED_ALL",
+                "order_status": "FILLED_ALL",
+                "dealt_qty": filled,
+            }
+
+    client = FilledRoundTripClient()
+    results: list[dict[str, object]] = []
+    for index, (action_name, holding_qty, observed_at) in enumerate(legs):
+        client.positions = (
+            [{
+                "code": "SH.600001",
+                "qty": str(holding_qty),
+                "can_sell_qty": str(holding_qty),
+            }]
+            if holding_qty
+            else []
+        )
+        client.controller_observed_at = observed_at
+        action = (
+            {
+                "action": "BUY",
+                "symbol": "600001",
+                "futu_symbol": "SH.600001",
+                "target_weight": "0.04",
+                "lot_size": 100,
+                "estimated_shares": 100,
+                "atr": "0.5",
+            }
+            if action_name == "BUY"
+            else {
+                "action": "SELL_ALL",
+                "symbol": "600001",
+                "futu_symbol": "SH.600001",
+            }
+        )
+        results.append(
+            trend_review.execute_trend_review_open(
+                data_dir=tmp_path / label,
+                report=v2_report_with_actions([action]),
+                client=client,
+                market="CN",
+                execution_date="2026-07-20",
+                now=observed_at,
+                quote_prices=TEST_QUOTE_PRICES,
+                execution_id=f"execution-{index}",
+                request_path=str(tmp_path / label / f"execution-{index}.json"),
+                account_id=101,
+            )
+        )
+
+    proof_paths = list(
+        (tmp_path / label)
+        .glob("trend_review/ledgers/CN/actions/2026-07-20/*/*reconciliation*.json")
+    )
+    proof_payloads = [
+        json.loads(path.read_text(encoding="utf-8")) for path in proof_paths
+    ]
+    assert (
+        [(request["side"], request["qty"]) for request in client.requests],
+        [result["submitted_count"] for result in results],
+        len(proof_payloads),
+        sorted(
+            (payload["side"], payload["dealt_qty"], payload["pre_submit_holding_qty"])
+            for payload in proof_payloads
+        ),
+    ) == (
+        [
+            ("buy", "100"),
+            ("sell", "100"),
+            ("buy", "100"),
+        ]
+        if label == "buy-sell-buy"
+        else [
+            ("sell", "100"),
+            ("buy", "100"),
+            ("sell", "100"),
+        ],
+        [1, 1, 1],
+        2,
+        [("buy", "100", "0"), ("sell", "100", "100")],
+    )
+
+
+@pytest.mark.parametrize("action_name", ["BUY", "SELL_ALL"])
+def test_v2_prior_day_unresolved_symbol_blocks_new_execution(
+    tmp_path: Path,
+    action_name: str,
+) -> None:
+    symbols = ("600001", "600002")
+    actions = [
+        (
+            {
+                "action": "BUY",
+                "symbol": symbol,
+                "target_weight": "0.04",
+                "lot_size": 100,
+                "estimated_shares": 100,
+                "atr": "0.5",
+            }
+            if action_name == "BUY"
+            else {"action": "SELL_ALL", "symbol": symbol}
+        )
+        for symbol in symbols
+    ]
+    prior_report = v2_report_with_actions([actions[0]])
+    later_report = v2_report_with_actions(actions)
+
+    class DateAwareClient(FakeTrendSimClient):
+        def __init__(self) -> None:
+            super().__init__(
+                positions=(
+                    [
+                        {
+                            "code": f"SH.{symbol}",
+                            "qty": "100",
+                            "can_sell_qty": "100",
+                        }
+                        for symbol in symbols
+                    ]
+                    if action_name == "SELL_ALL"
+                    else []
+                )
+            )
+            self.account_id = 101
+            self.execution_date = "2026-07-19"
+
+        def account_snapshot(self) -> dict[str, object]:
+            observed_at = (
+                "2026-07-19T09:31:00+08:00"
+                if self.execution_date == "2026-07-19"
+                else "2026-07-20T09:31:30+08:00"
+            )
+            return {
+                **super().account_snapshot(),
+                "acc_id": self.account_id,
+                "controller_observed_at": observed_at,
+            }
+
+        def list_orders(self, **kwargs: object) -> dict[str, object]:
+            start = str(kwargs.get("start") or "")
+            end = str(kwargs.get("end") or "")
+            return {
+                "orders": [
+                    order
+                    for order in self.orders
+                    if start <= str(order.get("execution_date") or "") <= end
+                    and str(order.get("account_id") or "") == str(self.account_id)
+                ]
+            }
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update(
+                {
+                    "account_id": self.account_id,
+                    "execution_date": self.execution_date,
+                }
+            )
+            return response
+
+        def close(self) -> None:
+            pass
+
+    client = DateAwareClient()
+    other_client = DateAwareClient()
+
+    def execute(
+        execution_date: str,
+        execution_id: str,
+        selected_report: dict[str, object],
+        *,
+        account_id: int = 101,
+        data_dir: Path = tmp_path,
+        selected_client: DateAwareClient = client,
+    ) -> dict[str, object]:
+        selected_client.execution_date = execution_date
+        selected_client.account_id = account_id
+        now = (
+            "2026-07-19T09:31:00+08:00"
+            if execution_date == "2026-07-19"
+            else "2026-07-20T09:31:00+08:00"
+        )
+        return trend_review.execute_trend_review_open(
+            data_dir=data_dir,
+            report=selected_report,
+            client=selected_client,
+            market="CN",
+            execution_date=execution_date,
+            now=now,
+            quote_prices={
+                "SH.600001": Decimal("10"),
+                "SH.600002": Decimal("10"),
+            },
+            execution_id=execution_id,
+            account_id=account_id,
+        )
+
+    prior = execute("2026-07-19", "prior-day", prior_report)
+    later_same_account = execute("2026-07-20", "later-same-account", later_report)
+    later_other_account = execute(
+        "2026-07-20",
+        "later-other-account",
+        later_report,
+        account_id=202,
+        data_dir=tmp_path / "other-account",
+        selected_client=other_client,
+    )
+
+    assert (
+        prior["submitted_count"],
+        later_same_account["submitted_count"],
+        later_other_account["submitted_count"],
+        [request["futu_code"] for request in client.requests],
+    ) == (1, 1, 2, ["SH.600001", "SH.600002"])
+    assert [request["futu_code"] for request in other_client.requests] == [
+        "SH.600001", "SH.600002"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("action_name", "active_symbol", "target_symbol"),
+    [
+        ("BUY", "US.B", "US.BRK.B"),
+        ("BUY", "US.BRK.B", "US.B"),
+        ("SELL_ALL", "US.B", "US.BRK.B"),
+        ("SELL_ALL", "US.BRK.B", "US.B"),
+    ],
+)
+def test_v2_dotted_us_symbols_are_distinct_for_order_serialization(
+    tmp_path: Path,
+    action_name: str,
+    active_symbol: str,
+    target_symbol: str,
+) -> None:
+    def report_for(symbol: str) -> dict[str, object]:
+        action = (
+            {
+                "action": "BUY",
+                "symbol": symbol,
+                "target_weight": "0.04",
+                "lot_size": 1,
+                "estimated_shares": 10,
+                "atr": "0.5",
+            }
+            if action_name == "BUY"
+            else {"action": "SELL_ALL", "symbol": symbol}
+        )
+        result = v2_report_with_actions([action])
+        result["metadata"]["market"] = "US"  # type: ignore[index]
+        result["allocation"] = {  # type: ignore[index]
+            "version": 2,
+            "markets": {"US": {"position_limit": 10}},
+        }
+        result["strategy_snapshot"]["strategy_id"] = (  # type: ignore[index]
+            "trend_animals_warm_to_hot/US/v15"
+        )
+        return result
+
+    class UsClient(FakeTrendSimClient):
+        def __init__(self) -> None:
+            super().__init__(
+                positions=(
+                    [
+                        {"code": active_symbol, "qty": "10", "can_sell_qty": "10"},
+                        {"code": target_symbol, "qty": "10", "can_sell_qty": "10"},
+                    ]
+                    if action_name == "SELL_ALL"
+                    else []
+                )
+            )
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {**super().account_snapshot(), "acc_id": 101}
+
+        def close(self) -> None:
+            pass
+
+    client = UsClient()
+
+    def execute(symbol: str, execution_id: str) -> dict[str, object]:
+        return trend_review.execute_trend_review_open(
+            data_dir=tmp_path,
+            report=report_for(symbol),
+            client=client,
+            market="US",
+            execution_date="2026-07-20",
+            now="2026-07-20T22:31:00+08:00",
+            quote_prices={
+                "US.B": Decimal("10"),
+                "US.BRK.B": Decimal("10"),
+            },
+            execution_id=execution_id,
+            account_id=101,
+        )
+
+    first = execute(active_symbol, "active-owner")
+    second = execute(target_symbol, "target-owner")
+
+    assert first["status"] == "submitted"
+    assert second["submitted_count"] == 1
+    assert [request["futu_code"] for request in client.requests] == [
+        active_symbol, target_symbol
+    ]
+
+
+def test_v2_unresolved_formal_buy_blocks_new_execution_owner(
+    tmp_path: Path,
+) -> None:
+    action = {
+        "action": "BUY",
+        "symbol": "600001",
+        "futu_symbol": "SH.600001",
+        "target_weight": "0.04",
+        "lot_size": 100,
+        "estimated_shares": 100,
+        "atr": "0.5",
+    }
+    report = v2_report_with_actions([action])
+    revised = copy.deepcopy(report)
+    revised["strategy_judgments"]["formal_actions"] = [
+        {**action, "symbol": "600002", "futu_symbol": "SH.600002", "executable": False},
+        action,
+    ]
+    client = FakeTrendSimClient(fail_orders=1)
+    common = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": TEST_QUOTE_PRICES,
+    }
+
+    first = trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:31:00+08:00",
+        execution_id="execution-a",
+        request_path=str(tmp_path / "execution-a.json"),
+    )
+    client.fail_orders = 0
+    second = trend_review.execute_trend_review_open(
+        **{**common, "report": revised},
+        now="2026-07-20T09:32:00+08:00",
+        execution_id="execution-b",
+        request_path=str(tmp_path / "execution-b.json"),
+    )
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy", execution_id="execution-b"
+    )
+
+    assert (
+        first["status"],
+        len(client.requests),
+        second["status"],
+        list((tmp_path / "trend_review/ledgers/CN/open/2026-07-20").glob(
+            f"{action_key}-intent.json"
+        )),
+    ) == ("uncertain", 1, "pending", [])
+
+
+def test_v2_unresolved_formal_sell_blocks_new_execution_owner(
+    tmp_path: Path,
+) -> None:
+    action = {"action": "SELL_ALL", "symbol": "600001"}
+    report = v2_report_with_actions([action])
+    revised = copy.deepcopy(report)
+    revised["strategy_judgments"]["formal_actions"] = [
+        {
+            "action": "BUY",
+            "symbol": "600002",
+            "futu_symbol": "SH.600002",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": False,
+        },
+        action,
+    ]
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "100", "can_sell_qty": "100"}],
+        fail_orders=1,
+    )
+    common = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {},
+    }
+
+    first = trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:31:00+08:00",
+        execution_id="execution-a",
+        request_path=str(tmp_path / "execution-a.json"),
+    )
+    client.fail_orders = 0
+    second = trend_review.execute_trend_review_open(
+        **{**common, "report": revised},
+        now="2026-07-20T09:32:00+08:00",
+        execution_id="execution-b",
+        request_path=str(tmp_path / "execution-b.json"),
+    )
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "sell", execution_id="execution-b"
+    )
+
+    assert (
+        first["status"],
+        len(client.requests),
+        second["status"],
+        list((tmp_path / "trend_review/ledgers/CN/open/2026-07-20").glob(
+            f"{action_key}-intent.json"
+        )),
+    ) == ("sell_failed", 1, "pending", [])
+
+
+def test_v2_unresolved_formal_owner_blocks_opposite_direction(
+    tmp_path: Path,
+) -> None:
+    buy_action = {
+        "action": "BUY",
+        "symbol": "600001",
+        "futu_symbol": "SH.600001",
+        "target_weight": "0.04",
+        "lot_size": 100,
+        "estimated_shares": 100,
+        "atr": "0.5",
+    }
+    first_report = v2_report_with_actions([buy_action])
+    second_report = v2_report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600002",
+            "futu_symbol": "SH.600002",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": False,
+        },
+        {"action": "SELL_ALL", "symbol": "600001"},
+    ])
+    client = FakeTrendSimClient(fail_orders=1)
+    common = {
+        "data_dir": tmp_path,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": TEST_QUOTE_PRICES,
+    }
+
+    first = trend_review.execute_trend_review_open(
+        **common,
+        report=first_report,
+        now="2026-07-20T09:31:00+08:00",
+        execution_id="execution-a",
+        request_path=str(tmp_path / "execution-a.json"),
+    )
+    client.fail_orders = 0
+    client.positions = [{
+        "code": "SH.600001", "qty": "100", "can_sell_qty": "100",
+    }]
+    second = trend_review.execute_trend_review_open(
+        **common,
+        report=second_report,
+        now="2026-07-20T09:32:00+08:00",
+        execution_id="execution-b",
+        request_path=str(tmp_path / "execution-b.json"),
+    )
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "sell", execution_id="execution-b"
+    )
+
+    assert (
+        first["status"],
+        len(client.requests),
+        second["status"],
+        list((tmp_path / "trend_review/ledgers/CN/open/2026-07-20").glob(
+            f"{action_key}-intent.json"
+        )),
+    ) == ("uncertain", 1, "pending", [])
+
+
+def test_v2_unresolved_rotation_owner_blocks_opposite_phase(
+    tmp_path: Path,
+) -> None:
+    sell_report = v2_relative_rotation_report(
+        pairs=[relative_rotation_pair(sell="WEAK", buy="STRONG")]
+    )
+    buy_report = v2_relative_rotation_report(
+        pairs=[relative_rotation_pair(sell="OTHER", buy="WEAK")]
+    )
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.WEAK", "qty": "1000", "can_sell_qty": "1000"}],
+        fail_orders=1,
+    )
+    common = {
+        "data_dir": tmp_path,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {"SH.WEAK": Decimal("10")},
+    }
+
+    first = trend_review.execute_relative_rotations(
+        **common,
+        report=sell_report,
+        now="2026-07-20T09:31:00+08:00",
+        _phase="sell",
+        execution_id="execution-a",
+        request_path=str(tmp_path / "execution-a.json"),
+    )
+    client.fail_orders = 0
+    client.positions = []
+    second = trend_review.execute_relative_rotations(
+        **common,
+        report=buy_report,
+        now="2026-07-20T09:32:00+08:00",
+        _phase="buy",
+        execution_id="execution-b",
+        request_path=str(tmp_path / "execution-b.json"),
+    )
+
+    assert (
+        first["status"],
+        len(client.requests),
+        second["status"],
+        list(
+            (tmp_path / "trend_review/ledgers/CN/rotations/2026-07-20").glob(
+                "*/buy-attempt-1-intent.json"
+            )
+        ),
+    ) == ("uncertain", 1, "uncertain", [])
+
+
+def test_v2_terminal_zero_fill_allows_later_explicit_execution(
+    tmp_path: Path,
+) -> None:
+    action = {
+        "action": "BUY",
+        "symbol": "600001",
+        "futu_symbol": "SH.600001",
+        "target_weight": "0.04",
+        "lot_size": 100,
+        "estimated_shares": 100,
+        "atr": "0.5",
+    }
+    first_report = v2_report_with_actions([action])
+    second_report = v2_report_with_actions([
+        {**action, "symbol": "600002", "futu_symbol": "SH.600002", "executable": False},
+        action,
+    ])
+
+    class RejectThenSubmit(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(dict(request))
+            order_id = f"SIM-{len(self.requests)}"
+            rejected = len(self.requests) == 1
+            status = "REJECTED" if rejected else "SUBMITTED"
+            response = {
+                "futu_order_id": order_id,
+                "status": status,
+                "order_status": status,
+                "dealt_qty": "0",
+            }
+            self.orders.append({
+                **request,
+                "order_id": order_id,
+                "code": request["futu_code"],
+                "trd_side": request["side"],
+                "dealt_qty": "0",
+                "order_status": status,
+            })
+            return response
+
+    client = RejectThenSubmit()
+    common = {
+        "data_dir": tmp_path,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": TEST_QUOTE_PRICES,
+    }
+
+    first = trend_review.execute_trend_review_open(
+        **common,
+        report=first_report,
+        now="2026-07-20T09:31:00+08:00",
+        execution_id="execution-a",
+        request_path=str(tmp_path / "execution-a.json"),
+    )
+    second = trend_review.execute_trend_review_open(
+        **common,
+        report=second_report,
+        now="2026-07-20T09:32:00+08:00",
+        execution_id="execution-b",
+        request_path=str(tmp_path / "execution-b.json"),
+    )
+
+    assert (first["status"], len(client.requests), second["submitted_count"]) == (
+        "terminal_rejected", 2, 1
+    )
+
+
+def test_v2_async_terminal_formal_buy_event_blocks_new_execution(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+        }
+    ])
+    revised_report = copy.deepcopy(report)
+    revised_report["strategy_judgments"]["formal_actions"] = [
+        {
+            "action": "BUY",
+            "symbol": "600002",
+            "futu_symbol": "SH.600002",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": False,
+        },
+        revised_report["strategy_judgments"]["formal_actions"][0],
+    ]
+
+    class AsyncTerminal(FakeTrendSimClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.controller_observed_at = "2026-07-20T09:31:30+08:00"
+
+        def account_snapshot(self) -> dict[str, object]:
+            snapshot = super().account_snapshot()
+            snapshot["controller_observed_at"] = self.controller_observed_at
+            return snapshot
+
+    client = AsyncTerminal()
+    common = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": TEST_QUOTE_PRICES,
+        "account_id": 101,
+    }
+    trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:31:00+08:00",
+        execution_id="execution-a",
+        request_path=str(tmp_path / "execution-a.json"),
+    )
+    client.orders[0].update({
+        "dealt_qty": "100",
+        "dealt_avg_price": "10",
+        "order_status": "FILLED_ALL",
+    })
+    trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:32:00+08:00",
+        execution_id="execution-a",
+        request_path=str(tmp_path / "execution-a.json"),
+    )
+
+    second = trend_review.execute_trend_review_open(
+        **{**common, "report": revised_report},
+        now="2026-07-20T09:33:00+08:00",
+        execution_id="execution-b",
+        request_path=str(tmp_path / "execution-b.json"),
+    )
+    client.positions = [{"code": "SH.600001", "qty": "100"}]
+    client.controller_observed_at = "2026-07-20T09:33:30+08:00"
+    third = trend_review.execute_trend_review_open(
+        **{**common, "report": revised_report},
+        now="2026-07-20T09:34:00+08:00",
+        execution_id="execution-c",
+        request_path=str(tmp_path / "execution-c.json"),
+    )
+
+    assert (len(client.requests), second["status"], third["status"]) == (
+        1,
+        "pending",
+        "unchanged",
+    )
+
+
+def test_v2_async_terminal_formal_sell_event_blocks_new_execution(
+    tmp_path: Path,
+) -> None:
+    action = {
+        "action": "SELL_ALL",
+        "symbol": "600001",
+    }
+    report = v2_report_with_actions([action])
+    revised_report = copy.deepcopy(report)
+    revised_report["strategy_judgments"]["formal_actions"] = [
+        {
+            "action": "BUY",
+            "symbol": "600002",
+            "futu_symbol": "SH.600002",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": False,
+        },
+        action,
+    ]
+
+    class AsyncTerminal(FakeTrendSimClient):
+        def __init__(self) -> None:
+            super().__init__(
+                positions=[{
+                    "code": "SH.600001",
+                    "qty": "100",
+                    "can_sell_qty": "100",
+                }]
+            )
+            self.controller_observed_at = "2026-07-20T09:31:30+08:00"
+
+        def account_snapshot(self) -> dict[str, object]:
+            snapshot = super().account_snapshot()
+            snapshot["controller_observed_at"] = self.controller_observed_at
+            return snapshot
+
+    client = AsyncTerminal()
+    common = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {},
+        "account_id": 101,
+    }
+    trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:31:00+08:00",
+        execution_id="execution-a",
+        request_path=str(tmp_path / "execution-a.json"),
+    )
+    client.orders[0].update({
+        "dealt_qty": "100",
+        "dealt_avg_price": "10",
+        "order_status": "FILLED_ALL",
+    })
+    client.positions = []
+    client.controller_observed_at = "2026-07-20T09:32:30+08:00"
+    trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:32:00+08:00",
+        execution_id="execution-a",
+        request_path=str(tmp_path / "execution-a.json"),
+    )
+    client.positions = [{
+        "code": "SH.600001",
+        "qty": "100",
+        "can_sell_qty": "100",
+    }]
+    client.controller_observed_at = "2026-07-20T09:31:30+08:00"
+
+    second = trend_review.execute_trend_review_open(
+        **{**common, "report": revised_report},
+        now="2026-07-20T09:33:00+08:00",
+        execution_id="execution-b",
+        request_path=str(tmp_path / "execution-b.json"),
+    )
+
+    assert (len(client.requests), second["status"]) == (1, "pending")
+
+
+def test_v2_async_terminal_rotation_buy_blocks_new_execution(
+    tmp_path: Path,
+) -> None:
+    report = v2_relative_rotation_report()
+    revised_report = copy.deepcopy(report)
+    revised_report["revision"] = 1
+
+    class AsyncTerminal(FakeTrendSimClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.controller_observed_at = "2026-07-20T09:31:30+08:00"
+
+        def account_snapshot(self) -> dict[str, object]:
+            snapshot = super().account_snapshot()
+            snapshot["controller_observed_at"] = self.controller_observed_at
+            return snapshot
+
+    client = AsyncTerminal()
+    common = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "now": "2026-07-20T09:31:00+08:00",
+        "quote_prices": {},
+        "_phase": "buy",
+        "execution_id": "execution-a",
+        "request_path": str(tmp_path / "execution-a.json"),
+    }
+    trend_review.execute_relative_rotations(**common)
+    client.orders[0].update({
+        "dealt_qty": "600",
+        "dealt_avg_price": "10",
+        "order_status": "FILLED_ALL",
+    })
+    trend_review.execute_relative_rotations(
+        **{**common, "now": "2026-07-20T09:32:00+08:00"}
+    )
+    client.controller_observed_at = "2026-07-20T09:30:30+08:00"
+
+    second = trend_review.execute_relative_rotations(
+        **{
+            **common,
+            "report": revised_report,
+            "now": "2026-07-20T09:33:00+08:00",
+            "execution_id": "execution-b",
+            "request_path": str(tmp_path / "execution-b.json"),
+        }
+    )
+
+    assert (len(client.requests), second["status"]) == (1, "uncertain")
+
+
+def test_v2_async_terminal_rotation_sell_blocks_new_execution(
+    tmp_path: Path,
+) -> None:
+    report = v2_relative_rotation_report()
+    revised_report = copy.deepcopy(report)
+    revised_report["revision"] = 1
+
+    class AsyncTerminal(FakeTrendSimClient):
+        def __init__(self) -> None:
+            super().__init__(
+                positions=[{
+                    "code": "SH.WEAK",
+                    "qty": "1000",
+                    "can_sell_qty": "1000",
+                    "market_val": "7000",
+                }]
+            )
+            self.controller_observed_at = "2026-07-20T09:31:30+08:00"
+
+        def account_snapshot(self) -> dict[str, object]:
+            snapshot = super().account_snapshot()
+            snapshot["controller_observed_at"] = self.controller_observed_at
+            return snapshot
+
+    client = AsyncTerminal()
+    common = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "now": "2026-07-20T09:31:00+08:00",
+        "quote_prices": {},
+        "_phase": "sell",
+        "execution_id": "execution-a",
+        "request_path": str(tmp_path / "execution-a.json"),
+    }
+    trend_review.execute_relative_rotations(**common)
+    client.orders[0].update({
+        "dealt_qty": "1000",
+        "dealt_avg_price": "7",
+        "order_status": "FILLED_ALL",
+    })
+    client.positions = []
+    client.controller_observed_at = "2026-07-20T09:32:30+08:00"
+    trend_review.execute_relative_rotations(
+        **{**common, "now": "2026-07-20T09:32:00+08:00"}
+    )
+    client.positions = [{
+        "code": "SH.WEAK",
+        "qty": "1000",
+        "can_sell_qty": "1000",
+        "market_val": "7000",
+    }]
+    client.controller_observed_at = "2026-07-20T09:30:30+08:00"
+
+    second = trend_review.execute_relative_rotations(
+        **{
+            **common,
+            "report": revised_report,
+            "now": "2026-07-20T09:33:00+08:00",
+            "execution_id": "execution-b",
+            "request_path": str(tmp_path / "execution-b.json"),
+        }
+    )
+
+    assert (len(client.requests), second["status"]) == (1, "uncertain")
+
+
+@pytest.mark.parametrize("action_name", ["BUY", "SELL_ALL"])
+def test_v2_zero_fill_retries_only_after_fresh_reconciliation(
+    tmp_path: Path,
+    action_name: str,
+) -> None:
+    action = {
+        "action": action_name,
+        "symbol": "600001",
+        "target_weight": "0.04",
+        "lot_size": 100,
+        "estimated_shares": 400,
+        "atr": "0.5",
+    }
+    report = v2_report_with_actions([action])
+
+    class Retry(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(request)
+            order_id = f"SIM-{len(self.requests)}"
+            filled = len(self.requests) > 1
+            self.orders.append({
+                **request,
+                "order_id": order_id,
+                "account_id": 101,
+                "code": request["futu_code"],
+                "trd_side": str(request["side"]).upper(),
+                "dealt_qty": request["qty"] if filled else "0",
+                "dealt_avg_price": "10" if filled else "",
+                "order_status": "FILLED_ALL" if filled else "REJECTED",
+            })
+            if filled and action_name == "SELL_ALL":
+                self.positions = []
+            return {
+                "futu_order_id": order_id,
+                "status": "FILLED" if filled else "REJECTED",
+                "order_status": "FILLED_ALL" if filled else "REJECTED",
+            }
+
+    positions = (
+        []
+        if action_name == "BUY"
+        else [{"code": "SH.600001", "qty": "400", "can_sell_qty": "400"}]
+    )
+    client = Retry(positions=positions)
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {},
+    }
+
+    trend_review.execute_trend_review_open(
+        **arguments,
+        now="2026-07-20T09:31:00+08:00",
+        execution_id="scheduled-execution-1",
+        request_path=str(tmp_path / "scheduled-request.json"),
+        account_id=101,
+    )
+    assert len(client.requests) == 1
+
+    result = trend_review.execute_trend_review_open(
+        **arguments,
+        now="2026-07-20T09:32:00+08:00",
+        execution_id="scheduled-execution-1",
+        request_path=str(tmp_path / "scheduled-request.json"),
+        account_id=101,
+    )
+    assert len(client.requests) == 1
+    assert result["submitted_count"] == 0
+
+    result = trend_review.execute_trend_review_open(
+        **arguments,
+        now="2026-07-20T09:33:00+08:00",
+        execution_id="manual-execution-2",
+        request_path=str(tmp_path / "manual-request.json"),
+        account_id=101,
+    )
+    assert len(client.requests) == 2
+    assert result["submitted_count"] == 1
+
+
+def test_v2_async_terminal_zero_fill_releases_buy_seat(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600001", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 400, "atr": "0.5",
+        },
+    ])
+    client = FakeTrendSimClient()
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {"SH.600001": Decimal("10")},
+        "execution_id": "scheduled-execution-1",
+        "request_path": str(tmp_path / "scheduled-request.json"),
+        "account_id": 101,
+    }
+
+    first = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+    assert first["seat_consumed"] is True
+    client.orders[0]["order_status"] = "REJECTED"
+
+    second = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:32:00+08:00"
+    )
+
+    assert len(client.requests) == 1
+    assert second["terminal_rejected"] is True
+    assert second["seat_release_proven"] is True
+    assert second["seat_consumed"] is False
+
+
+def test_v2_crash_recovered_terminal_zero_fill_releases_buy_seat(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600001", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 400, "atr": "0.5",
+        },
+    ])
+    client = FakeTrendSimClient(fail_orders=1, accepted_before_failure=True)
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {"SH.600001": Decimal("10")},
+        "execution_id": "scheduled-execution-1",
+        "request_path": str(tmp_path / "scheduled-request.json"),
+        "account_id": 101,
+    }
+
+    first = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+    assert first["seat_consumed"] is True
+    client.orders[0]["order_status"] = "REJECTED"
+
+    second = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:32:00+08:00"
+    )
+
+    assert len(client.requests) == 1
+    assert second["terminal_rejected"] is True
+    assert second["seat_release_proven"] is True
+    assert second["seat_consumed"] is False
+
+
+def test_v2_rotation_terminal_partial_defers_residual_until_newer_snapshot(
+    tmp_path: Path,
+) -> None:
+    pair = relative_rotation_pair()
+    pair.update({
+        "target_weight": "0.06",
+        "target_amount": "6000",
+        "estimated_shares": 600,
+        "lot_size": 1,
+        "atr": "0.1",
+    })
+    report = v2_report_with_actions([])
+    report["risk_summary"] = {
+        "normal_cost_rate": "0.001",
+        "portfolio_remaining_risk": "4000",
+    }
+    report["strategy_judgments"]["simulate_rotation_pairs"] = [pair]
+
+    class AdversePartial(FakeTrendSimClient):
+        buy_attempts = 0
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": (
+                    "200" if request["side"] == "BUY" and self.buy_attempts == 0
+                    else request["qty"]
+                ),
+                "dealt_avg_price": "15",
+                "order_status": (
+                    "CANCELLED_PART"
+                    if request["side"] == "BUY" and self.buy_attempts == 0
+                    else "FILLED_ALL"
+                ),
+            })
+            if request["side"] == "SELL":
+                self.positions = [
+                    item for item in self.positions
+                    if item["code"] != request["futu_code"]
+                ]
+                self.cash = "7000"
+            elif request["side"] == "BUY":
+                if self.buy_attempts == 0:
+                    self.positions.append({
+                        "code": request["futu_code"], "qty": "200",
+                    })
+                self.buy_attempts += 1
+            return response
+
+    client = AdversePartial(cash="0", positions=full_rotation_positions())
+    first = trend_review.execute_relative_rotations(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T10:30:00+08:00",
+        quote_prices={},
+    )
+
+    buy_requests = [
+        request for request in client.requests if request["side"] == "BUY"
+    ]
+    assert [request["qty"] for request in buy_requests] == ["600"]
+    assert first["status"] == "complete"
+
+    second = trend_review.execute_relative_rotations(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T10:31:00+08:00",
+        quote_prices={},
+    )
+    buy_requests = [
+        request for request in client.requests if request["side"] == "BUY"
+    ]
+    assert [request["qty"] for request in buy_requests] == ["600", "400"]
+    assert second["status"] == "complete"
+
+
+def test_v2_rotation_terminal_partial_uses_refreshed_fill_state_once() -> None:
+    pair = relative_rotation_pair()
+    pair.update({"lot_size": 1, "target_amount": "6000"})
+    report = v2_report_with_actions([])
+    report["risk_summary"] = {
+        "normal_cost_rate": "0.001",
+        "portfolio_remaining_risk": "4000",
+    }
+    pair_key = "a" * 64
+    order = {
+        "order_id": "SIM-1",
+        "code": "SH.STRONG",
+        "trd_side": "BUY",
+        "remark": f"rotation:CN:2026-07-20:{pair_key[:16]}:B:1",
+        "qty": "399",
+        "dealt_qty": "200",
+        "dealt_avg_price": "15",
+        "order_status": "CANCELLED_PART",
+    }
+
+    residual = trend_review._rotation_terminal_partial_quantity(
+        pair=pair,
+        report=report,
+        snapshot={
+            "available_cash": "3997",
+            "positions": [{"code": "SH.STRONG", "qty": "200"}],
+        },
+        broker_orders=[order],
+        fill_order=order,
+        pair_key=pair_key,
+        market="CN",
+        execution_date="2026-07-20",
+        current_price=Decimal("10"),
+        frozen_quantity=Decimal("399"),
+        planned_risk_cap=Decimal("1000"),
+        target_amount_cap=Decimal("4000"),
+    )
+
+    assert residual == 66
+
+
+def test_v2_terminal_partial_with_zero_residual_is_durable_and_replay_safe(
+    tmp_path: Path,
+) -> None:
+    pair = relative_rotation_pair()
+    pair.update({"lot_size": 100, "target_amount": "6000"})
+    report = v2_report_with_actions([])
+    report["risk_summary"] = {
+        "normal_cost_rate": "0.001",
+        "portfolio_remaining_risk": "4000",
+    }
+
+    class ZeroResidual(FakeTrendSimClient):
+        def __init__(self) -> None:
+            super().__init__(nav="100000", cash="0", positions=full_rotation_positions())
+            self.buy_attempts = 0
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            if request["side"] == "SELL":
+                self.orders[-1].update({
+                    "dealt_qty": request["qty"],
+                    "dealt_avg_price": "7",
+                    "order_status": "FILLED_ALL",
+                })
+                self.positions = [
+                    item for item in self.positions
+                    if item["code"] != request["futu_code"]
+                ]
+                self.cash = "7000"
+            else:
+                self.buy_attempts += 1
+                self.orders[-1].update({
+                    "dealt_qty": "200",
+                    "dealt_avg_price": "20",
+                    "order_status": "CANCELLED_PART",
+                })
+                self.positions.append({"code": request["futu_code"], "qty": "200"})
+            return response
+
+    client = ZeroResidual()
+    report["strategy_judgments"]["simulate_rotation_pairs"] = [pair]
+    first = trend_review.execute_relative_rotations(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices={"SH.STRONG": Decimal("10")},
+        _phase="sell",
+    )
+    second = trend_review.execute_relative_rotations(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T10:30:00+08:00",
+        quote_prices={"SH.STRONG": Decimal("10")},
+        _phase="buy",
+    )
+
+    assert first["submitted_count"] == 1
+    assert second["submitted_count"] == 1
+    buy_orders = [order for order in client.orders if order.get("trd_side") == "BUY"]
+    assert len(buy_orders) == 1
+    terminal = next(
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (
+            tmp_path / "trend_review/ledgers/CN/rotations/2026-07-20"
+        ).glob("*/terminal.json")
+    )
+    assert terminal["status"] == "terminal_partial"
+
+
+def test_cn_v15_formal_terminal_partial_with_zero_residual_is_terminal(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600003", "futu_symbol": "SH.600003",
+            "global_strength": "95", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 400,
+            "target_amount": "4000", "planned_stop_risk": "1000", "atr": "0.5",
+        },
+    ])
+    report["risk_summary"] = {"normal_cost_rate": "0.001"}
+    client = FakeTrendSimClient()
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {"SH.600003": Decimal("10")},
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+    request = client.requests[0]
+    client.orders[0].update({
+        "dealt_qty": "200",
+        "dealt_avg_price": "20",
+        "order_status": "CANCELLED_PART",
+    })
+    client.positions = [{"code": "SH.600003", "qty": "200"}]
+
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:32:00+08:00"
+    )
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:33:00+08:00"
+    )
+
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-20/*/*.json"
+        )
+    ]
+    assert any(
+        event.get("status") == "terminal_partial"
+        and event.get("filled_qty") == "200"
+        and event.get("target_qty") == "400"
+        for event in events
+    )
+    assert len(client.requests) == 1
+
+
+def test_v2_sell_all_waits_for_sellable_holding_before_terminal_zero(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "SELL_ALL",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+        }
+    ])
+    client = FakeTrendSimClient(
+        positions=[
+            {"code": "SH.600001", "qty": "100", "can_sell_qty": "0"}
+        ]
+    )
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {},
+        "execution_id": "execution-a",
+        "request_path": str(tmp_path / "execution-a.json"),
+    }
+
+    first = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+    initial_request_count = len(client.requests)
+    initial_events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/actions/2026-07-20/*/*.json"
+        )
+    ]
+
+    client.positions = [
+        {"code": "SH.600001", "qty": "100", "can_sell_qty": "100"}
+    ]
+    later = trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:32:00+08:00"
+    )
+
+    assert (
+        first["status"],
+        first["submitted_count"],
+        initial_request_count,
+        any(event.get("reason") == "position_zero_confirmed" for event in initial_events),
+        later["submitted_count"],
+        len(client.requests),
+        client.requests[-1]["qty"] if client.requests else None,
+    ) == ("pending", 0, 0, False, 1, 1, "100")
+
+
+def test_v2_formal_terminal_partial_reconciles_rotation_owner(
+    tmp_path: Path,
+) -> None:
+    pair = relative_rotation_pair(buy="600003")
+    report = v2_report_with_actions([
+        {
+            "action": "BUY", "symbol": "600003", "futu_symbol": "SH.600003",
+            "global_strength": "95", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 400,
+            "target_amount": "4000", "planned_stop_risk": "1000", "atr": "0.5",
+        },
+    ])
+    report["risk_summary"] = {"normal_cost_rate": "0.001"}
+    report["metadata"]["simulate_acc_id"] = 101
+    report["strategy_judgments"]["simulate_rotation_pairs"] = [pair]
+    client = FakeTrendSimClient()
+    execution_date = "2026-07-20"
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": execution_date,
+        "quote_prices": {"SH.600003": Decimal("10")},
+    }
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:31:00+08:00"
+    )
+    client.orders[0].update({
+        "dealt_qty": "200",
+        "dealt_avg_price": "20",
+        "order_status": "CANCELLED_PART",
+    })
+    client.positions = [{"code": "SH.600003", "qty": "200"}]
+    trend_review.execute_trend_review_open(
+        **arguments, now="2026-07-20T09:32:00+08:00"
+    )
+
+    artifacts = trend_review.reconcile_deduplicated_buy_owners(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date=execution_date,
+        entry={
+            "source": "formal",
+            "futu_symbol": "SH.600003",
+            "owners": [
+                {"source": "formal", "action_index": 0, "futu_symbol": "SH.600003"},
+                {"source": "rotation", "pair_index": 0, "futu_symbol": "SH.600003", "pair": pair},
+            ],
+        },
+        client=client,
+        recorded_at="2026-07-20T09:33:00+08:00",
+    )
+
+    assert artifacts
+    assert len(client.requests) == 1
+    pair_root = next(
+        (tmp_path / "trend_review/ledgers/CN/rotations" / execution_date).glob("*/")
+    )
+    buy_event = json.loads(
+        (pair_root / "buy-terminal-partial-reconciled.json").read_text(encoding="utf-8")
+    )
+    terminal = json.loads(
+        (pair_root / "terminal.json").read_text(encoding="utf-8")
+    )
+    assert buy_event["status"] == "terminal_partial"
+    assert terminal["status"] == "terminal_partial"
+    assert any(
+        json.loads(path.read_text(encoding="utf-8")).get("status") == "terminal_partial"
+        and json.loads(path.read_text(encoding="utf-8")).get("pair_key")
+        for path in (
+            tmp_path / "trend_review/ledgers/CN/actions" / execution_date
+            / trend_review.trend_action_key("CN", execution_date, "SH.600003", "buy")
+        ).glob("*.json")
+    )
+    assert trend_review.relative_rotations_completed(
+        tmp_path, report=report, market="CN", execution_date=execution_date
+    )
+
+
+@pytest.mark.parametrize("strategy_version", ["v14", "v15"])
+def test_cn_v15_terminal_partial_keeps_planned_risk_residual_cap(
+    strategy_version: str,
+) -> None:
+    action = {
+        "lot_size": 100,
+        "estimated_shares": 400,
+        "target_amount": "10000",
+        "atr": "0.5",
+        "planned_stop_risk": "250",
+    }
+    report = {
+        "metadata": {"price_fx_to_account_currency": "1", "market": "CN"},
+        "risk_summary": {"normal_cost_rate": "0.001"},
+        "strategy_snapshot": {"strategy_version": strategy_version},
+    }
+    snapshot = {"available_cash": "100000"}
+    orders = [{
+        "order_id": "SIM-1",
+        "dealt_qty": "200",
+        "dealt_avg_price": "10",
+    }]
+
+    assert trend_review._remaining_buy_quantity(
+        action, report, snapshot, orders, Decimal("15")
+    ) == 0
+
+
+def test_v2_sell_failure_continues_sells_and_buys(tmp_path: Path) -> None:
+    report = v2_report_with_actions([
+        {"action": "SELL_ALL", "symbol": "600001"},
+        {"action": "SELL_ALL", "symbol": "600003"},
+        {
+            "action": "BUY", "symbol": "600002", "target_weight": "0.04",
+            "lot_size": 100, "estimated_shares": 100, "atr": "0.5",
+        },
+    ])
+    client = FakeTrendSimClient(
+        positions=[
+            {"code": "SH.600001", "qty": "100"},
+            {"code": "SH.600003", "qty": "100"},
+        ],
+        fail_orders=1,
+    )
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+    )
+
+    assert [item["side"] for item in client.requests] == ["sell", "sell", "buy"]
+    assert result["submitted_count"] == 2
+    assert client.requests[-1]["futu_code"] == "SH.600002"
+
+
+def test_v2_signal_rotation_overlap_releases_buy_capacity(tmp_path: Path) -> None:
+    report = v2_report_with_actions([
+        {"action": "SELL_ALL", "symbol": "600001"},
+    ])
+    report["strategy_judgments"]["simulate_rotation_pairs"] = [
+        relative_rotation_pair(sell="600001", buy="600006"),
+    ]
+    report["risk_summary"] = {
+        "normal_cost_rate": "0.001",
+        "portfolio_remaining_risk": "4000",
+    }
+
+    class Filled(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": request["qty"],
+                "dealt_avg_price": "10",
+                "order_status": "FILLED_ALL",
+            })
+            if str(request["side"]).upper() == "SELL":
+                self.positions = [
+                    item for item in self.positions
+                    if item["code"] != request["futu_code"]
+                ]
+                self.cash = str(Decimal(self.cash) + Decimal("7000"))
+            else:
+                self.positions.append({
+                    "code": request["futu_code"], "qty": request["qty"],
+                })
+            return response
+
+    positions = full_rotation_positions()
+    positions[0] = {**positions[0], "code": "SH.600001"}
+    client = Filled(cash="0", positions=positions)
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {"SH.600006": Decimal("10")},
+    }
+    trend_review.execute_trend_review_open(
+        **arguments,
+        now="2026-07-20T09:31:00+08:00",
+        include_buys=False,
+        include_sells=True,
+    )
+    trend_review.execute_trend_review_open(
+        **arguments,
+        now="2026-07-20T09:32:00+08:00",
+        include_buys=False,
+        include_sells=True,
+    )
+
+    result = trend_review.execute_relative_rotations(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:33:00+08:00",
+        quote_prices={"SH.600006": Decimal("10")},
+    )
+
+    assert any(request["futu_code"] == "SH.600006" for request in client.requests)
+    assert [request["side"] for request in client.requests].count("BUY") == 1
+    assert result["sell_phase"] == "complete"
+    assert result["status"] == "complete"
+
+
+def test_v2_active_formal_sell_owns_overlap_but_unrelated_rotation_continues(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "SELL_ALL",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+        },
+    ])
+    report["risk_summary"] = {
+        "normal_cost_rate": "0.001",
+        "portfolio_remaining_risk": "4000",
+    }
+    report["metadata"]["simulate_acc_id"] = 101
+    report["strategy_judgments"]["simulate_rotation_pairs"] = [
+        relative_rotation_pair(index=0, sell="600001", buy="STRONG"),
+        relative_rotation_pair(index=1, sell="HOLD1", buy="STRONG2"),
+    ]
+    positions = full_rotation_positions()
+    positions[0] = {**positions[0], "code": "SH.600001"}
+    client = FakeTrendSimClient(cash="0", positions=positions)
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {
+            "SH.STRONG": Decimal("10"),
+            "SH.STRONG2": Decimal("10"),
+        },
+    }
+
+    trend_review.execute_trend_review_open(
+        **arguments,
+        now="2026-07-20T09:31:00+08:00",
+        include_buys=False,
+        include_sells=True,
+    )
+    first_sell_phase = trend_review.execute_relative_rotations(
+        **arguments,
+        now="2026-07-20T09:32:00+08:00",
+        _phase="sell",
+    )
+
+    assert first_sell_phase["status"] == "uncertain"
+    assert [
+        (request["side"], request["futu_code"])
+        for request in client.requests
+    ] == [
+        ("sell", "SH.600001"),
+        ("SELL", "SH.HOLD1"),
+    ]
+
+    client.orders[0].update({
+        "dealt_qty": "1000",
+        "dealt_avg_price": "7",
+        "order_status": "FILLED_ALL",
+    })
+    client.positions = [
+        position for position in client.positions if position["code"] != "SH.600001"
+    ]
+    trend_review.execute_trend_review_open(
+        **arguments,
+        now="2026-07-20T09:33:00+08:00",
+        include_buys=False,
+        include_sells=True,
+    )
+    second_sell_phase = trend_review.execute_relative_rotations(
+        **arguments,
+        now="2026-07-20T09:34:00+08:00",
+        _phase="sell",
+    )
+
+    assert second_sell_phase["status"] == "pending"
+    assert [
+        (request["side"], request["futu_code"])
+        for request in client.requests
+    ] == [
+        ("sell", "SH.600001"),
+        ("SELL", "SH.HOLD1"),
+    ]
+    rotation_sells = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/rotations/2026-07-20/*/sell-attempt-1-intent.json"
+        )
+    ]
+    assert [event["sell_futu_symbol"] for event in rotation_sells] == ["SH.HOLD1"]
 
 
 def test_relative_rotation_sells_full_market_then_refreshes_and_buys_market(
@@ -1383,6 +5274,939 @@ def test_relative_rotation_sells_full_market_then_refreshes_and_buys_market(
         trend_review._merge_rotation_orders(
             {"orders": [conflicting]}, tmp_path, "CN", "2026-07-20"
         )
+
+
+def test_v2_rotation_completes_all_sells_before_any_buy(
+    tmp_path: Path,
+) -> None:
+    pairs = [
+        relative_rotation_pair(index=0, sell="WEAK1", buy="STRONG1"),
+        relative_rotation_pair(index=1, sell="WEAK2", buy="STRONG2"),
+    ]
+    positions = [
+        {"code": "SH.WEAK1", "qty": "1000", "can_sell_qty": "1000", "market_val": "7000"},
+        {"code": "SH.WEAK2", "qty": "1000", "can_sell_qty": "1000", "market_val": "7000"},
+        *[
+            {"code": f"SH.HOLD{index}", "qty": "100", "can_sell_qty": "100", "market_val": "1000"}
+            for index in range(1, 9)
+        ],
+    ]
+
+    class FilledV2(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": request["qty"],
+                "dealt_avg_price": "10",
+                "order_status": "FILLED_ALL",
+            })
+            if request["side"] == "SELL":
+                self.positions = [
+                    item for item in self.positions
+                    if item["code"] != request["futu_code"]
+                ]
+                self.cash = str(Decimal(self.cash) + Decimal("7000"))
+            else:
+                self.positions.append({"code": request["futu_code"], "qty": request["qty"]})
+            return response
+
+    report = relative_rotation_report(pairs=pairs)
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+        "strategy_version": "v15",
+    }
+    report["allocation"] = {
+        "version": 2,
+        "markets": {"CN": {"position_limit": 10}},
+    }
+    client = FilledV2(cash="0", positions=positions)
+
+    result = trend_review.execute_relative_rotations(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T10:30:00+08:00",
+        quote_prices={
+            "SH.STRONG1": Decimal("10"),
+            "SH.STRONG2": Decimal("10"),
+        },
+    )
+
+    assert [request["side"] for request in client.requests] == [
+        "SELL", "SELL", "BUY", "BUY",
+    ]
+    assert result["sell_phase"] == "complete"
+    assert result["status"] == "complete"
+
+
+def test_v2_rotation_buy_uses_frozen_residual_without_sell_or_live_sizing(
+    tmp_path: Path,
+) -> None:
+    pair = relative_rotation_pair()
+    pair.update({"estimated_shares": 600, "lot_size": 100})
+    report = relative_rotation_report(pairs=[pair])
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+        "strategy_version": "v15",
+    }
+    report["allocation"] = {
+        "version": 2,
+        "markets": {"CN": {"position_limit": 10}},
+    }
+
+    class Filled(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": request["qty"],
+                "dealt_avg_price": "10",
+                "order_status": "FILLED_ALL",
+            })
+            return response
+
+    client = Filled(
+        nav="0",
+        cash="0",
+        positions=[{"code": "SH.STRONG", "qty": "100"}],
+    )
+    result = trend_review.execute_relative_rotations(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T10:30:00+08:00",
+        quote_prices={},
+        _phase="buy",
+    )
+
+    assert result["submitted_count"] == 1
+    assert client.requests == [{
+        "market": "CN",
+        "futu_code": "SH.STRONG",
+        "side": "BUY",
+        "order_type": "MARKET",
+        "price": "0",
+        "qty": "500",
+        "remark": client.requests[0]["remark"],
+    }]
+
+
+def test_v2_rotation_buy_persists_locked_pre_submit_baseline_for_reconciliation(
+    tmp_path: Path,
+) -> None:
+    report = v2_relative_rotation_report(pairs=[relative_rotation_pair()])
+
+    class TimestampedFilled(FakeTrendSimClient):
+        def __init__(self) -> None:
+            super().__init__(nav="0", cash="0")
+            self.controller_observed_at = "2026-07-20T10:30:00+08:00"
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                **super().account_snapshot(),
+                "controller_observed_at": self.controller_observed_at,
+            }
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": request["qty"],
+                "dealt_avg_price": "10",
+                "order_status": "FILLED_ALL",
+            })
+            return {
+                **response,
+                "dealt_qty": request["qty"],
+                "order_status": "FILLED_ALL",
+                "status": "FILLED_ALL",
+            }
+
+    client = TimestampedFilled()
+    common = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {},
+        "_phase": "buy",
+    }
+    trend_review.execute_relative_rotations(
+        **common,
+        now="2026-07-20T10:30:00+08:00",
+        execution_id="execution-a",
+    )
+    client.controller_observed_at = "2026-07-20T10:31:00+08:00"
+    second = trend_review.execute_relative_rotations(
+        **common,
+        now="2026-07-20T10:31:00+08:00",
+        execution_id="execution-b",
+    )
+
+    intents = list(
+        tmp_path.glob(
+            "trend_review/ledgers/CN/rotations/2026-07-20/*/buy-attempt-1-intent.json"
+        )
+    )
+    intent = json.loads(intents[0].read_text(encoding="utf-8")) if intents else {}
+    pending = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/rotations/2026-07-20/*/*.json"
+        )
+        if json.loads(path.read_text(encoding="utf-8")).get("kind") == "pending"
+    ]
+    assert (
+        len(client.requests),
+        [(request["side"], request["qty"]) for request in client.requests],
+        len(intents),
+        intent.get("pre_submit_holding_qty"),
+        second["status"],
+        any(
+            event.get("reason") == "holdings_snapshot_not_newer"
+            and event.get("cross_execution_block_reason")
+            == "terminal_fill_not_reconciled"
+            for event in pending
+        ),
+    ) == (1, [("BUY", "600")], 1, "0", "uncertain", True)
+
+
+def test_v2_rotation_buy_with_zero_locked_residual_creates_no_order(
+    tmp_path: Path,
+) -> None:
+    pair = relative_rotation_pair()
+    report = v2_relative_rotation_report(pairs=[pair])
+
+    class HoldingAppearsInsideLock(FakeTrendSimClient):
+        def __init__(self) -> None:
+            super().__init__(nav="0", cash="0")
+            self.snapshots = [
+                [],
+                [{"code": "SH.STRONG", "qty": "600"}],
+            ]
+
+        def account_snapshot(self) -> dict[str, object]:
+            positions = self.snapshots.pop(0) if self.snapshots else self.positions
+            return {**super().account_snapshot(), "positions": positions}
+
+    client = HoldingAppearsInsideLock()
+
+    result = trend_review.execute_relative_rotations(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T10:30:00+08:00",
+        quote_prices={},
+        _phase="buy",
+    )
+
+    assert (client.requests, result["submitted_count"]) == ([], 0)
+
+
+def test_v2_rotation_buy_zero_locked_residual_is_durable_complete(
+    tmp_path: Path,
+) -> None:
+    pair = relative_rotation_pair()
+    report = v2_relative_rotation_report(pairs=[pair])
+
+    class FilledSell(FakeTrendSimClient):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.buy_phase = False
+            self.buy_snapshot_index = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            if self.buy_phase:
+                positions = (
+                    [{"code": "SH.WEAK", "qty": "1000", "can_sell_qty": "1000"}]
+                    if self.buy_snapshot_index == 0
+                    else [{"code": "SH.STRONG", "qty": "600"}]
+                )
+                self.buy_snapshot_index += 1
+                return {
+                    "acc_id": 101,
+                    "net_value": self.nav,
+                    "cash": self.cash,
+                    "positions": positions,
+                }
+            return super().account_snapshot()
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            self.orders[-1].update({
+                "dealt_qty": request["qty"],
+                "dealt_avg_price": "7",
+                "order_status": "FILLED_ALL",
+            })
+            if request["side"] == "SELL":
+                self.positions = [
+                    {"code": "SH.STRONG", "qty": "600"},
+                ]
+            return response
+
+    client = FilledSell(
+        nav="100000",
+        cash="0",
+        positions=[
+            {
+                "code": "SH.WEAK",
+                "qty": "1000",
+                "can_sell_qty": "1000",
+            },
+        ],
+    )
+    common = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "now": "2026-07-20T10:30:00+08:00",
+        "quote_prices": {},
+    }
+    sell_result = trend_review.execute_relative_rotations(
+        **common,
+        _phase="sell",
+    )
+    client.buy_phase = True
+    buy_result = trend_review.execute_relative_rotations(
+        **common,
+        _phase="buy",
+    )
+    replay = trend_review.execute_relative_rotations(
+        **common,
+        _phase="buy",
+    )
+
+    terminals = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/rotations/2026-07-20/*/*.json"
+        )
+        if path.name == "terminal.json"
+    ]
+    assert (
+        sell_result["status"],
+        buy_result["status"],
+        replay["status"],
+        [
+            (request["futu_code"], request["side"], request["qty"])
+            for request in client.requests
+        ],
+        client.buy_snapshot_index,
+        len(terminals),
+        terminals[-1].get("reason") if terminals else None,
+        trend_review.relative_rotations_completed(
+            tmp_path,
+            report=report,
+            market="CN",
+            execution_date="2026-07-20",
+        ),
+    ) == (
+        "complete",
+        "complete",
+        "complete",
+        [("SH.WEAK", "SELL", "1000")],
+        3,
+        1,
+        "already_at_target",
+        True,
+    )
+
+
+def test_v2_rotation_sell_zero_locked_holding_is_durable_complete(
+    tmp_path: Path,
+) -> None:
+    pair = relative_rotation_pair()
+    report = v2_relative_rotation_report(pairs=[pair])
+
+    class TerminalPartialSell(FakeTrendSimClient):
+        def __init__(self) -> None:
+            super().__init__(nav="100000", cash="0")
+            self.phase = "buy"
+            self.snapshots: list[tuple[list[dict[str, object]], str]] = []
+
+        def set_snapshots(
+            self,
+            *snapshots: tuple[list[dict[str, object]], str],
+        ) -> None:
+            self.snapshots = list(snapshots)
+
+        def account_snapshot(self) -> dict[str, object]:
+            if self.phase == "buy":
+                positions = [
+                    {"code": "SH.WEAK", "qty": "130", "can_sell_qty": "130"},
+                    {"code": "SH.STRONG", "qty": "600"},
+                ]
+                observed_at = "2026-07-20T10:29:00+08:00"
+            else:
+                positions, clock = self.snapshots.pop(0)
+                observed_at = f"2026-07-20T{clock}:00+08:00"
+            return {
+                "acc_id": 101,
+                "net_value": self.nav,
+                "cash": self.cash,
+                "positions": positions,
+                "controller_observed_at": observed_at,
+            }
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            filled = "100" if sum(
+                request["side"] == "SELL" for request in self.requests
+            ) == 1 else "30"
+            self.orders[-1].update({
+                "dealt_qty": filled,
+                "dealt_avg_price": "7",
+                "order_status": "CANCELLED_PART",
+            })
+            return response
+
+    client = TerminalPartialSell()
+    common = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {},
+    }
+    buy_result = trend_review.execute_relative_rotations(
+        **common,
+        _phase="buy",
+        now="2026-07-20T10:29:00+08:00",
+    )
+    client.phase = "sell"
+    client.set_snapshots(
+        ([{"code": "SH.WEAK", "qty": "130", "can_sell_qty": "100"}], "10:30"),
+        ([{"code": "SH.WEAK", "qty": "130", "can_sell_qty": "100"}], "10:30"),
+    )
+    sell_first = trend_review.execute_relative_rotations(
+        **common,
+        _phase="sell",
+        now="2026-07-20T10:30:00+08:00",
+    )
+    client.set_snapshots(
+        ([{"code": "SH.WEAK", "qty": "30", "can_sell_qty": "30"}], "10:31"),
+        ([{"code": "SH.WEAK", "qty": "30", "can_sell_qty": "30"}], "10:31"),
+    )
+    sell_second = trend_review.execute_relative_rotations(
+        **common,
+        _phase="sell",
+        now="2026-07-20T10:31:00+08:00",
+    )
+    client.set_snapshots(
+        ([{"code": "SH.WEAK", "qty": "30", "can_sell_qty": "30"}], "10:32"),
+        ([{"code": "SH.WEAK", "qty": "30", "can_sell_qty": "30"}], "10:32"),
+    )
+    sell_third = trend_review.execute_relative_rotations(
+        **common,
+        _phase="sell",
+        now="2026-07-20T10:32:00+08:00",
+    )
+    client.set_snapshots(
+        ([{"code": "SH.WEAK", "qty": "30", "can_sell_qty": "0"}], "10:33"),
+        ([{"code": "SH.WEAK", "qty": "30", "can_sell_qty": "0"}], "10:33"),
+    )
+    sell_unsellable = trend_review.execute_relative_rotations(
+        **common,
+        _phase="sell",
+        now="2026-07-20T10:33:00+08:00",
+    )
+    client.set_snapshots(
+        ([{"code": "SH.WEAK", "qty": "30", "can_sell_qty": "30"}], "10:34"),
+        ([], "10:34"),
+    )
+    sell_zero = trend_review.execute_relative_rotations(
+        **common,
+        _phase="sell",
+        now="2026-07-20T10:34:00+08:00",
+    )
+    client.set_snapshots(([], "10:35"),)
+    replay = trend_review.execute_relative_rotations(
+        **common,
+        _phase="sell",
+        now="2026-07-20T10:35:00+08:00",
+    )
+
+    sell_terminals = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/rotations/2026-07-20/*/sell-terminal.json"
+        )
+    ]
+    assert (
+        buy_result["status"],
+        sell_first["status"],
+        sell_second["status"],
+        sell_third["status"],
+        sell_unsellable["status"],
+        sell_zero["status"],
+        replay["status"],
+        [request["qty"] for request in client.requests],
+        len(sell_terminals),
+        sell_terminals[-1].get("reason") if sell_terminals else None,
+        trend_review.relative_rotations_completed(
+            tmp_path,
+            report=report,
+            market="CN",
+            execution_date="2026-07-20",
+        ),
+    ) == (
+        "complete",
+        "uncertain",
+        "uncertain",
+        "uncertain",
+        "uncertain",
+        "complete",
+        "complete",
+        ["100", "30"],
+        1,
+        "position_zero_confirmed",
+        True,
+    )
+
+
+def test_v2_rotation_sell_initial_unsellable_holding_stays_pending_until_sellable(
+    tmp_path: Path,
+) -> None:
+    report = v2_relative_rotation_report(pairs=[relative_rotation_pair()])
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.WEAK", "qty": "130", "can_sell_qty": "0"}],
+    )
+    common = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {},
+        "_phase": "sell",
+    }
+
+    first = trend_review.execute_relative_rotations(
+        **common,
+        now="2026-07-20T09:31:00+08:00",
+    )
+    pending_events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in tmp_path.glob(
+            "trend_review/ledgers/CN/rotations/2026-07-20/*/*.json"
+        )
+        if path.name.startswith("pending")
+    ]
+
+    client.positions = [
+        {"code": "SH.WEAK", "qty": "130", "can_sell_qty": "130"}
+    ]
+    later = trend_review.execute_relative_rotations(
+        **common,
+        now="2026-07-20T09:32:00+08:00",
+    )
+
+    assert (
+        first["status"],
+        first["submitted_count"],
+        len(pending_events),
+        pending_events[0].get("reason") if pending_events else None,
+        later["submitted_count"],
+        [(request["side"], request["qty"]) for request in client.requests],
+    ) == (
+        "pending",
+        0,
+        1,
+        "sellable_quantity_zero",
+        1,
+        [("SELL", "130")],
+    )
+
+
+@pytest.mark.parametrize("status", ["SUBMITTED", "UNKNOWN"])
+def test_v2_rotation_buy_symbol_lock_does_not_block_later_symbol(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    pairs = [
+        relative_rotation_pair(index=0, buy="STRONG1"),
+        relative_rotation_pair(index=1, buy="STRONG2"),
+    ]
+    report = relative_rotation_report(pairs=pairs)
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+        "strategy_version": "v15",
+    }
+    report["allocation"] = {
+        "version": 2,
+        "markets": {"CN": {"position_limit": 10}},
+    }
+    client = FakeTrendSimClient(nav="0", cash="0")
+    client.orders = [{
+        "order_id": "LOCKED-1",
+        "account_id": 101,
+        "code": "SH.STRONG1",
+        "trd_side": "BUY",
+        "qty": "600",
+        "dealt_qty": "0",
+        "order_status": status,
+    }]
+
+    trend_review.execute_relative_rotations(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T10:30:00+08:00",
+        quote_prices={},
+        _phase="buy",
+    )
+
+    assert [request["futu_code"] for request in client.requests] == [
+        "SH.STRONG2",
+    ]
+
+
+def test_v2_rotation_zero_fill_retries_only_on_later_invocation(
+    tmp_path: Path,
+) -> None:
+    pair = relative_rotation_pair()
+    report = relative_rotation_report(pairs=[pair])
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+        "strategy_version": "v15",
+    }
+    report["allocation"] = {
+        "version": 2,
+        "markets": {"CN": {"position_limit": 10}},
+    }
+
+    class Retry(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(request)
+            order_id = f"SIM-{len(self.requests)}"
+            filled = len(self.requests) > 1
+            self.orders.append({
+                **request,
+                "order_id": order_id,
+                "code": request["futu_code"],
+                "trd_side": "BUY",
+                "dealt_qty": request["qty"] if filled else "0",
+                "dealt_avg_price": "10" if filled else "",
+                "order_status": "FILLED_ALL" if filled else "REJECTED",
+            })
+            return {
+                "futu_order_id": order_id,
+                "status": "FILLED" if filled else "REJECTED",
+                "order_status": "FILLED_ALL" if filled else "REJECTED",
+            }
+
+    client = Retry(nav="0", cash="0")
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {},
+        "_phase": "buy",
+    }
+
+    trend_review.execute_relative_rotations(
+        **arguments, now="2026-07-20T10:30:00+08:00"
+    )
+    assert len(client.requests) == 1
+
+    result = trend_review.execute_relative_rotations(
+        **arguments, now="2026-07-20T10:31:00+08:00"
+    )
+    assert len(client.requests) == 2
+    assert client.requests[1]["remark"].endswith(":B:2")
+    assert result["status"] == "complete"
+
+
+def test_v2_rotation_terminal_partial_retries_after_newer_snapshot(
+    tmp_path: Path,
+) -> None:
+    pair = relative_rotation_pair()
+    report = relative_rotation_report(pairs=[pair])
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+        "strategy_version": "v15",
+    }
+    report["allocation"] = {
+        "version": 2,
+        "markets": {"CN": {"position_limit": 10}},
+    }
+
+    class PartialThenRetry(FakeTrendSimClient):
+        snapshot_at = "2026-07-20T10:30:00+08:00"
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                **super().account_snapshot(),
+                "updated_at": self.snapshot_at,
+            }
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(request)
+            order_id = f"SIM-{len(self.requests)}"
+            if len(self.requests) == 1:
+                self.orders.append({
+                    **request,
+                    "order_id": order_id,
+                    "code": request["futu_code"],
+                    "trd_side": "BUY",
+                    "dealt_qty": "300",
+                    "dealt_avg_price": "10",
+                    "order_status": "CANCELLED_PART",
+                })
+                self.positions = [{"code": "SH.STRONG", "qty": "300"}]
+                return {
+                    "futu_order_id": order_id,
+                    "status": "CANCELLED_PART",
+                    "order_status": "CANCELLED_PART",
+                }
+            self.orders.append({
+                **request,
+                "order_id": order_id,
+                "code": request["futu_code"],
+                "trd_side": "BUY",
+                "dealt_qty": request["qty"],
+                "dealt_avg_price": "10",
+                "order_status": "FILLED_ALL",
+            })
+            return {
+                "futu_order_id": order_id,
+                "status": "FILLED",
+                "order_status": "FILLED_ALL",
+            }
+
+    client = PartialThenRetry(nav="0", cash="0")
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {},
+        "_phase": "buy",
+    }
+    trend_review.execute_relative_rotations(
+        **arguments, now="2026-07-20T10:30:00+08:00"
+    )
+    assert len(client.requests) == 1
+
+    client.snapshot_at = "2026-07-20T10:31:00+08:00"
+    result = trend_review.execute_relative_rotations(
+        **arguments, now="2026-07-20T10:31:00+08:00"
+    )
+    assert len(client.requests) == 2
+    assert client.requests[1]["qty"] == "300"
+    assert result["status"] == "complete"
+    rotation_root = next((
+        tmp_path / "trend_review/ledgers/CN/rotations/2026-07-20"
+    ).glob("*/"))
+    terminal = trend_review._rotation_terminal_event(
+        trend_review._rotation_events(rotation_root)
+    )
+    assert terminal is not None
+    assert terminal["status"] == "complete"
+    assert terminal["attempt"] == 2
+    assert trend_review.relative_rotations_completed(
+        tmp_path, report=report, market="CN", execution_date="2026-07-20"
+    )
+
+
+def test_v2_rotation_sell_partial_retries_only_safe_current_residual(
+    tmp_path: Path,
+) -> None:
+    pair = relative_rotation_pair()
+    report = relative_rotation_report(pairs=[pair])
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+        "strategy_version": "v15",
+    }
+    report["allocation"] = {
+        "version": 2,
+        "markets": {"CN": {"position_limit": 10}},
+    }
+
+    class PartialSellThenRetry(FakeTrendSimClient):
+        snapshot_at = "2026-07-20T10:30:00+08:00"
+        snapshot_positions: list[list[dict[str, object]]]
+
+        def account_snapshot(self) -> dict[str, object]:
+            positions = (
+                self.snapshot_positions.pop(0)
+                if self.snapshot_positions
+                else self.positions
+            )
+            return {
+                **super().account_snapshot(),
+                "positions": positions,
+                "updated_at": self.snapshot_at,
+            }
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(request)
+            order_id = f"SIM-{len(self.requests)}"
+            if len(self.requests) == 1:
+                filled = "40"
+                status = "CANCELLED_PART"
+            else:
+                filled = "10"
+                status = "CANCELLED_PART"
+            self.orders.append({
+                **request,
+                "order_id": order_id,
+                "code": request["futu_code"],
+                "trd_side": "SELL",
+                "dealt_qty": filled,
+                "dealt_avg_price": "7",
+                "order_status": status,
+            })
+            return {
+                "futu_order_id": order_id,
+                "status": status,
+                "order_status": status,
+                "dealt_qty": filled,
+            }
+
+    client = PartialSellThenRetry(
+        nav="100000", cash="0",
+        positions=[{"code": "SH.WEAK", "qty": "100", "can_sell_qty": "100"}],
+    )
+    arguments = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": {},
+        "_phase": "sell",
+    }
+    client.snapshot_positions = [
+        [{"code": "SH.WEAK", "qty": "100", "can_sell_qty": "100"}],
+        [{"code": "SH.WEAK", "qty": "100", "can_sell_qty": "100"}],
+    ]
+
+    first = trend_review.execute_relative_rotations(
+        **arguments, now="2026-07-20T10:30:00+08:00"
+    )
+    assert first["status"] == "uncertain"
+    assert [request["qty"] for request in client.requests] == ["100"]
+
+    client.snapshot_positions = [
+        [{"code": "SH.WEAK", "qty": "100", "can_sell_qty": "100"}],
+        [{"code": "SH.WEAK", "qty": "100", "can_sell_qty": "100"}],
+    ]
+    trend_review.execute_relative_rotations(
+        **arguments, now="2026-07-20T10:31:00+08:00"
+    )
+    assert [request["qty"] for request in client.requests] == ["100"]
+
+    client.snapshot_positions = [
+        [{"code": "SH.WEAK", "qty": "60", "can_sell_qty": "60"}],
+        [{"code": "SH.WEAK", "qty": "30", "can_sell_qty": "30"}],
+    ]
+    client.snapshot_at = "2026-07-20T10:32:00+08:00"
+    trend_review.execute_relative_rotations(
+        **arguments, now="2026-07-20T10:32:00+08:00"
+    )
+    assert [request["side"] for request in client.requests] == ["SELL", "SELL"]
+    assert [request["qty"] for request in client.requests] == ["100", "30"]
+
+    client.snapshot_positions = [
+        [{"code": "SH.WEAK", "qty": "30", "can_sell_qty": "30"}],
+        [{"code": "SH.WEAK", "qty": "0", "can_sell_qty": "0"}],
+    ]
+    replay = trend_review.execute_relative_rotations(
+        **arguments, now="2026-07-20T10:33:00+08:00"
+    )
+    assert (len(client.requests), replay["submitted_count"]) == (2, 0)
+
+
+@pytest.mark.parametrize("allocation_v2", [False, True])
+def test_v2_rotation_skips_unusable_fallback_and_continues(
+    tmp_path: Path, allocation_v2: bool,
+) -> None:
+    class FilledV2(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            accepted = request["side"] == "SELL" or request["futu_code"] == "SH.STRONG3"
+            self.orders[-1].update({
+                "dealt_qty": request["qty"] if accepted else "0",
+                "dealt_avg_price": "10",
+                "order_status": "FILLED_ALL" if accepted else "REJECTED",
+            })
+            if request["side"] == "SELL":
+                self.positions = [
+                    item for item in self.positions
+                    if item["code"] != request["futu_code"]
+                ]
+                self.cash = str(Decimal(self.cash) + Decimal("7000"))
+            elif accepted:
+                self.positions.append({"code": request["futu_code"], "qty": request["qty"]})
+            return response
+
+    report = relative_rotation_report(
+        pairs=[relative_rotation_pair(buy="STRONG1")],
+    )
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+        "strategy_version": "v15",
+    }
+    if allocation_v2:
+        report["allocation"] = {
+            "version": 2,
+            "markets": {"CN": {"position_limit": 10}},
+        }
+    report["metadata"].update({
+        "market": "CN",
+        "candidate_fallbacks": [
+            {
+                "symbol": "STRONG2", "name": "Strong 2", "futu_symbol": "SH.STRONG2",
+                "asset": "A股", "global_strength": "95", "atr": "0.1",
+            },
+            {
+                "symbol": "STRONG3", "name": "Strong 3", "futu_symbol": "SH.STRONG3",
+                "asset": "A股", "global_strength": "94", "atr": "0.1",
+            },
+        ],
+    })
+    report["signal_snapshots"] = {
+        "candidates": [
+            {"symbol": "STRONG2", "global_strength": "95"},
+            {"symbol": "STRONG3", "global_strength": "94"},
+        ],
+    }
+    client = FilledV2(cash="0", positions=full_rotation_positions())
+
+    result = trend_review.execute_relative_rotations(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T10:30:00+08:00",
+        quote_prices={
+            "SH.STRONG1": Decimal("10"),
+            "SH.STRONG3": Decimal("10"),
+        },
+    )
+
+    assert [request["futu_code"] for request in client.requests] == (
+        ["SH.WEAK", "SH.STRONG1"]
+        if allocation_v2
+        else ["SH.WEAK", "SH.STRONG1", "SH.STRONG3"]
+    )
+    assert result["fallbacks_used"] == ([] if allocation_v2 else ["STRONG3"])
+    assert result["status"] == "complete"
 
 
 def test_relative_rotation_named_pending_facts_are_replayed_and_idempotent(
@@ -1806,16 +6630,36 @@ def test_relative_rotation_sell_without_full_proof_never_buys(
     tmp_path: Path, status: str, filled: str,
 ) -> None:
     class SellOutcome(FakeTrendSimClient):
+        snapshot_at = "2026-07-20T10:30:00+08:00"
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                **super().account_snapshot(),
+                "updated_at": self.snapshot_at,
+            }
+
         def place_order(self, request: dict[str, object]) -> dict[str, object]:
             response = super().place_order(request)
             self.orders[-1].update({
                 "dealt_qty": filled, "dealt_avg_price": "7",
                 "order_status": status,
             })
+            if status == "FILLED_PART":
+                self.positions = [
+                    {
+                        **position,
+                        "qty": "900",
+                        "can_sell_qty": "900",
+                    }
+                    if position["code"] == "SH.WEAK"
+                    else position
+                    for position in self.positions
+                ]
             return response
 
     client = SellOutcome(cash="0", positions=full_rotation_positions())
     for minute in (30, 31):
+        client.snapshot_at = f"2026-07-20T10:{minute}:00+08:00"
         trend_review.execute_relative_rotations(
             data_dir=tmp_path, report=relative_rotation_report(), client=client,
             market="CN", execution_date="2026-07-20",
@@ -3693,12 +8537,21 @@ def test_execution_batch_keeps_first_report_sha(tmp_path: Path) -> None:
         market="CN",
         execution_date="2026-07-20",
         report_path=tmp_path / "2026-07-17-r1.json",
-        report=revised,
+        report=first,
         locked_at="2026-07-20T09:31:00+08:00",
     )
 
     assert repeated == locked
     assert repeated["report_sha256"] == trend_review._report_hash(first)
+    with pytest.raises(ValueError, match="different report SHA"):
+        trend_review.lock_trend_execution_batch(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-20",
+            report_path=tmp_path / "2026-07-17-r1.json",
+            report=revised,
+            locked_at="2026-07-20T09:32:00+08:00",
+        )
 
 
 def test_execution_batch_recovers_report_selected_by_legacy_intent(
@@ -3727,17 +8580,15 @@ def test_execution_batch_recovers_report_selected_by_legacy_intent(
         encoding="utf-8",
     )
 
-    locked = trend_review.lock_trend_execution_batch(
-        tmp_path,
-        market="CN",
-        execution_date="2026-07-20",
-        report_path=latest_path,
-        report=latest_report,
-        locked_at="2026-07-20T09:30:00+08:00",
-    )
-
-    assert locked["report_path"] == str(old_path)
-    assert locked["report_sha256"] == trend_review._report_hash(old_report)
+    with pytest.raises(ValueError, match="different report SHA"):
+        trend_review.lock_trend_execution_batch(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-20",
+            report_path=latest_path,
+            report=latest_report,
+            locked_at="2026-07-20T09:30:00+08:00",
+        )
 
 
 def test_execution_batch_blocks_when_legacy_report_is_missing(
@@ -9015,6 +13866,107 @@ def _allocation_ref(
     }
 
 
+def _allocation_v2_ref(
+    *, allocation_date: str = "2026-08-20", cn_score: str = "90",
+    hk_score: str = "80", us_score: str = "70",
+) -> dict[str, object]:
+    roots = {
+        "CN": {
+            "stock": {
+                "asset": "A股", "tm_id": 1,
+                "as_of_date": allocation_date, "global_strength": cn_score,
+            },
+            "etf": {
+                "asset": "ETF基金", "tm_id": 2,
+                "as_of_date": allocation_date, "global_strength": "60",
+            },
+        },
+        "HK": {
+            "stock": {
+                "asset": "港股", "tm_id": 3,
+                "as_of_date": allocation_date, "global_strength": hk_score,
+            },
+            "etf": {
+                "asset": "香港ETF", "tm_id": 4,
+                "as_of_date": allocation_date, "global_strength": "50",
+            },
+        },
+        "US": {
+            "stock": {
+                "asset": "美股", "tm_id": 5,
+                "as_of_date": allocation_date, "global_strength": us_score,
+            },
+            "etf": {
+                "asset": "美国ETF", "tm_id": 6,
+                "as_of_date": allocation_date, "global_strength": "40",
+            },
+        },
+    }
+    snapshot = build_allocation_snapshot(
+        allocation_date=allocation_date,
+        generated_at=f"{allocation_date}T16:20:00+08:00",
+        git_sha="a" * 40,
+        roots=roots,
+        previous=None,
+        version=2,
+    )
+    return {
+        "daily_path": f"data/trend_allocation/daily/{allocation_date}.json",
+        "sha256": "b" * 64,
+        "snapshot": snapshot,
+    }
+
+
+def test_projection_prefers_cn_v15_over_v14_history(
+    tmp_path: Path,
+) -> None:
+    snapshots = [
+        live_trend_strategy_snapshot(
+            "CN", "test-sha", (), strategy_version="v14",
+            allocation=_allocation_ref(
+                "CN", score="90", rank=1,
+                path="data/trend_allocation/daily/2026-08-19.json",
+            ),
+        ),
+        live_trend_strategy_snapshot(
+            "CN", "test-sha", (), strategy_version="v15",
+            allocation=_allocation_v2_ref(),
+        ),
+    ]
+    write_projection_strategy_facts(tmp_path, "CN", snapshots)
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["strategy_snapshot"]["strategy_version"] == "v15"
+
+
+def test_projection_accepts_v2_rank_limit_changes_but_rejects_immutable_drift(
+    tmp_path: Path,
+) -> None:
+    snapshots = [
+        live_trend_strategy_snapshot(
+            "CN", "test-sha", (), strategy_version="v15",
+            allocation=_allocation_v2_ref(cn_score="90", hk_score="80", us_score="70"),
+        ),
+        live_trend_strategy_snapshot(
+            "CN", "test-sha", (), strategy_version="v15",
+            allocation=_allocation_v2_ref(cn_score="75", hk_score="80", us_score="70"),
+        ),
+    ]
+    write_projection_strategy_facts(tmp_path, "CN", snapshots)
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+
+    assert projection["strategy_snapshot"]["strategy_version"] == "v15"
+    assert projection["strategy_snapshot"]["parameters"]["allocation_position_limit"] == 15
+
+    immutable = copy.deepcopy(snapshots[1])
+    immutable["parameters"]["drawdown_limit"] = "0.06"
+    assert trend_review._strategy_identity(immutable) != trend_review._strategy_identity(
+        snapshots[1]
+    )
+
+
 def test_projection_tolerates_daily_allocation_identity_changes(
     tmp_path: Path,
 ) -> None:
@@ -11686,3 +16638,480 @@ def test_projection_does_not_rebuild_actual_samples_from_legacy_fills(
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
     assert projection["sample_counts"]["actual"] is None
+
+
+def test_v2_unresolved_rotation_sell_does_not_block_unrelated_buy_symbol(
+    tmp_path: Path,
+) -> None:
+    rotation_report = v2_relative_rotation_report(
+        pairs=[relative_rotation_pair(sell="600001", buy="600002")]
+    )
+    formal_report = v2_report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600002",
+            "futu_symbol": "SH.600002",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 400,
+            "atr": "0.5",
+        }
+    ])
+    client = FakeTrendSimClient(
+        positions=[{"code": "SH.600001", "qty": "1000", "can_sell_qty": "1000"}],
+        fail_orders=1,
+    )
+
+    first = trend_review.execute_relative_rotations(
+        data_dir=tmp_path,
+        report=rotation_report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices={},
+        _phase="sell",
+        execution_id="execution-a",
+        request_path=str(tmp_path / "execution-a.json"),
+    )
+    client.fail_orders = 0
+    client.positions = []
+    second = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=formal_report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:32:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+        execution_id="execution-b",
+        request_path=str(tmp_path / "execution-b.json"),
+    )
+
+    assert (
+        first["status"],
+        second["submitted_count"],
+        len(client.requests),
+        client.requests[-1]["futu_code"],
+        client.requests[-1]["qty"],
+    ) == ("uncertain", 1, 2, "SH.600002", "400")
+
+
+def test_v2_execution_scoped_uncertain_action_can_be_resolved_and_retried(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 400,
+            "atr": "0.5",
+        }
+    ])
+    client = FakeTrendSimClient(fail_orders=1)
+    request_a = str(tmp_path / "execution-a.json")
+    common = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": TEST_QUOTE_PRICES,
+    }
+    first = trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:31:00+08:00",
+        execution_id="execution-a",
+        request_path=request_a,
+    )
+    client.fail_orders = 0
+    uncertain = trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:32:00+08:00",
+        execution_id="execution-a",
+        request_path=request_a,
+    )
+    resolution_path = trend_review.resolve_trend_action(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        symbol="600001",
+        side="buy",
+        resolution="authorize-retry",
+        actor="ray",
+        reason="broker confirmed no order",
+        resolved_at="2026-07-20T09:33:00+08:00",
+        execution_id="execution-a",
+        request_path=request_a,
+    )
+    resolution = json.loads(resolution_path.read_text(encoding="utf-8"))
+    with pytest.raises(ValueError, match="already resolved"):
+        trend_review.resolve_trend_action(
+            tmp_path,
+            market="CN",
+            execution_date="2026-07-20",
+            symbol="600001",
+            side="buy",
+            resolution="authorize-retry",
+            actor="ray",
+            reason="duplicate approval",
+            resolved_at="2026-07-20T09:34:00+08:00",
+            execution_id="execution-a",
+            request_path=request_a,
+        )
+    retried = trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:35:00+08:00",
+        execution_id="execution-b",
+        request_path=str(tmp_path / "execution-b.json"),
+    )
+
+    assert (
+        first["status"],
+        uncertain["status"],
+        resolution["execution_id"],
+        resolution["request_path"],
+        retried["submitted_count"],
+        len(client.requests),
+    ) == ("uncertain", "uncertain", "execution-a", request_a, 1, 2)
+
+
+def test_v2_zero_fill_resolution_does_not_clear_sibling_active_attempt(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 400,
+            "atr": "0.5",
+        }
+    ])
+
+    class TerminalZero(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(dict(request))
+            order_id = f"SIM-{len(self.requests)}"
+            self.orders.append({
+                **request,
+                "order_id": order_id,
+                "code": request["futu_code"],
+                "trd_side": "BUY",
+                "dealt_qty": "0",
+                "order_status": "REJECTED",
+            })
+            return {
+                "futu_order_id": order_id,
+                "status": "REJECTED",
+                "order_status": "REJECTED",
+                "dealt_qty": "0",
+            }
+
+    client = TerminalZero()
+    execution_id = "execution-a"
+    request_path = str(tmp_path / "execution-a.json")
+    first = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+        execution_id=execution_id,
+        request_path=request_path,
+    )
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy", execution_id=execution_id
+    )
+    request = {
+        "market": "CN",
+        "futu_code": "SH.600001",
+        "side": "buy",
+        "order_type": "MARKET",
+        "price": "0",
+        "qty": "400",
+        "remark": trend_review.trend_attempt_remark(
+            "CN", "2026-07-20", action_key, 2
+        ),
+    }
+    open_root = tmp_path / "trend_review/ledgers/CN/open/2026-07-20"
+    second_intent = open_root / f"{action_key}-attempt-2-intent.json"
+    second_result = open_root / f"{action_key}-attempt-2-result.json"
+    second_intent.write_text(json.dumps({
+        "market": "CN",
+        "date": "2026-07-20",
+        "report_sha256": "f" * 64,
+        "action_index": 0,
+        "attempt": 2,
+        "request": request,
+        "created_at": "2026-07-20T09:32:00+08:00",
+        "account_id": 101,
+        "execution_id": execution_id,
+        "request_path": request_path,
+    }), encoding="utf-8")
+    second_result.write_text(json.dumps({
+        "market": "CN",
+        "date": "2026-07-20",
+        "report_sha256": "f" * 64,
+        "action_index": 0,
+        "request": request,
+        "response": {
+            "order_id": "SIM-A2",
+            "code": "SH.600001",
+            "trd_side": "BUY",
+            "qty": "400",
+            "dealt_qty": "0",
+            "order_status": "SUBMITTED",
+        },
+        "submitted_at": "2026-07-20T09:32:00+08:00",
+        "account_id": 101,
+        "execution_id": execution_id,
+        "request_path": request_path,
+    }), encoding="utf-8")
+
+    blocked = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:33:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+        execution_id="execution-b",
+        request_path=str(tmp_path / "execution-b.json"),
+    )
+
+    assert (
+        first["status"],
+        blocked["status"],
+        blocked["submitted_count"],
+        len(client.requests),
+    ) == ("terminal_rejected", "pending", 0, 1)
+
+
+def test_v2_confirm_submitted_remains_blocking_until_terminal_evidence(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 400,
+            "atr": "0.5",
+        }
+    ])
+    client = FakeTrendSimClient(fail_orders=1)
+    request_a = str(tmp_path / "execution-a.json")
+    common = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": TEST_QUOTE_PRICES,
+    }
+
+    first = trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:31:00+08:00",
+        execution_id="execution-a",
+        request_path=request_a,
+    )
+    client.fail_orders = 0
+    uncertain = trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:32:00+08:00",
+        execution_id="execution-a",
+        request_path=request_a,
+    )
+    resolution_path = trend_review.resolve_trend_action(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        symbol="600001",
+        side="buy",
+        resolution="confirm-submitted",
+        actor="ray",
+        reason="broker order accepted outside the client response",
+        resolved_at="2026-07-20T09:33:00+08:00",
+        futu_order_id="BROKER-42",
+        execution_id="execution-a",
+        request_path=request_a,
+    )
+    blocked = trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:34:00+08:00",
+        execution_id="execution-b",
+        request_path=str(tmp_path / "execution-b.json"),
+    )
+
+    assert (
+        first["status"],
+        uncertain["status"],
+        json.loads(resolution_path.read_text(encoding="utf-8"))["futu_order_id"],
+        blocked["status"],
+        blocked["submitted_count"],
+        len(client.requests),
+    ) == ("uncertain", "uncertain", "BROKER-42", "pending", 0, 1)
+
+    client.orders = [{
+        "order_id": "BROKER-42",
+        "code": "SH.600002",
+        "trd_side": "BUY",
+        "qty": "400",
+        "dealt_qty": "0",
+        "order_status": "REJECTED",
+        "remark": "broker-generated-remark",
+        "account_id": 101,
+    }]
+    mismatch = trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:35:00+08:00",
+        execution_id="execution-a",
+        request_path=request_a,
+    )
+
+    client.orders = [{
+        "order_id": "BROKER-42",
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": "400",
+        "dealt_qty": "0",
+        "order_status": "REJECTED",
+        "remark": "broker-generated-remark",
+        "account_id": 101,
+    }]
+    terminal = trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:36:00+08:00",
+        execution_id="execution-a",
+        request_path=request_a,
+    )
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy", execution_id="execution-a"
+    )
+    action_events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (
+            tmp_path / "trend_review/ledgers/CN/actions/2026-07-20" / action_key
+        ).glob("*.json")
+    ]
+    reconciled_rejection = next(
+        event for event in action_events
+        if event.get("status") == "failed"
+        and event.get("reason") == "simulate buy order rejected: REJECTED"
+    )
+    reconciled_result = json.loads(
+        (
+            tmp_path
+            / "trend_review/ledgers/CN/open/2026-07-20"
+            / f"{action_key}-result.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert (
+        mismatch["submitted_count"],
+        len(client.requests),
+        mismatch["status"] in {"pending", "uncertain", "conflict"},
+        terminal["status"],
+        terminal["submitted_count"],
+        len(client.requests),
+        reconciled_rejection["target_qty"],
+        reconciled_result["response"]["order_id"],
+    ) == (0, 1, True, "unchanged", 0, 1, "400", "BROKER-42")
+
+
+def test_v2_confirm_submitted_rejects_terminal_evidence_without_account_identity(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 400,
+            "atr": "0.5",
+        }
+    ])
+    client = FakeTrendSimClient(fail_orders=1)
+    request_a = str(tmp_path / "execution-a.json")
+    common = {
+        "data_dir": tmp_path,
+        "report": report,
+        "client": client,
+        "market": "CN",
+        "execution_date": "2026-07-20",
+        "quote_prices": TEST_QUOTE_PRICES,
+    }
+
+    first = trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:31:00+08:00",
+        execution_id="execution-a",
+        request_path=request_a,
+    )
+    client.fail_orders = 0
+    trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:32:00+08:00",
+        execution_id="execution-a",
+        request_path=request_a,
+    )
+    trend_review.resolve_trend_action(
+        tmp_path,
+        market="CN",
+        execution_date="2026-07-20",
+        symbol="600001",
+        side="buy",
+        resolution="confirm-submitted",
+        actor="ray",
+        reason="broker order accepted outside the client response",
+        resolved_at="2026-07-20T09:33:00+08:00",
+        futu_order_id="BROKER-42",
+        execution_id="execution-a",
+        request_path=request_a,
+    )
+    client.orders = [{
+        "order_id": "BROKER-42",
+        "code": "SH.600001",
+        "trd_side": "BUY",
+        "qty": "400",
+        "dealt_qty": "0",
+        "order_status": "REJECTED",
+        "remark": "broker-generated-remark",
+    }]
+
+    blocked = trend_review.execute_trend_review_open(
+        **common,
+        now="2026-07-20T09:34:00+08:00",
+        execution_id="execution-a",
+        request_path=request_a,
+    )
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy", execution_id="execution-a"
+    )
+    result_path = (
+        tmp_path
+        / "trend_review/ledgers/CN/open/2026-07-20"
+        / f"{action_key}-result.json"
+    )
+
+    assert (
+        first["status"],
+        blocked["status"] in {"pending", "uncertain", "conflict"},
+        blocked["submitted_count"],
+        len(client.requests),
+        result_path.exists(),
+    ) == ("uncertain", True, 0, 1, False)

@@ -4408,6 +4408,7 @@ const TREND_REASON_LABELS = {
   net_return_unavailable: "净收益不可用",
   no_matching_opening_strategy_action: "无匹配开仓策略动作",
   scaled_entry_attribution_conflict: "加仓归属冲突",
+  relative_rotation: "相对强度替换",
 };
 
 const CURRENT_TREND_EXIT_DISCIPLINES = new Set(["CN:v9", "US:v6", "HK:v6"]);
@@ -4666,6 +4667,14 @@ function usesFinalPlanTrendAudit(report) {
   const version = String(report?.strategy_version || "");
   return (market === "CN" && ["v13", "v14"].includes(version))
     || (["HK", "US"].includes(market) && ["v11", "v12"].includes(version));
+}
+
+function usesV2TrendPlanLayout(report) {
+  const market = String(report?.market || "").toUpperCase();
+  const version = String(report?.strategy_version || "");
+  return (market === "CN" && version === "v15")
+    || (["HK", "US"].includes(market) && version === "v13")
+    || report?.allocation?.version === 2;
 }
 
 function renderCnTrendCell(label, value, ariaLabel = "", missingLabel = "—") {
@@ -4958,6 +4967,172 @@ function renderCnTrendTable(title, kind, headings, rows, note = "") {
   </section>`;
 }
 
+function trendV2PlanSymbol(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
+function trendV2PlanPairs(pairs) {
+  return cnTrendRows(pairs).filter((pair) => trendV2PlanSymbol(pair.sell_symbol || pair.buy_symbol));
+}
+
+function trendV2PlanSellRows(items, pairs, report) {
+  const rotationPairs = trendV2PlanPairs(pairs);
+  const rotationBySymbol = new Map(
+    rotationPairs.map((pair) => [trendV2PlanSymbol(pair.sell_symbol), pair]),
+  );
+  const rows = [];
+  const seen = new Set();
+  for (const item of cnTrendRows(items)) {
+    if (item.action && !["SELL_ALL", "SELL_PARTIAL"].includes(item.action)) continue;
+    const key = trendV2PlanSymbol(item.symbol || item.futu_symbol);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    rows.push({item, pair: rotationBySymbol.get(key) || null});
+  }
+  for (const pair of rotationPairs) {
+    const key = trendV2PlanSymbol(pair.sell_symbol);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    rows.push({
+      pair,
+      item: {
+        symbol: pair.sell_symbol,
+        name: pair.sell_name,
+        action: "SELL_ALL",
+        reason: "relative_rotation",
+        clearance_type: "轮换清仓",
+        global_strength: pair.sell_global_strength,
+        phase: pair.sell_phase,
+        temperature_prev: pair.sell_temperature_prev,
+        temperature_curr: pair.sell_temperature_curr,
+        close: pair.sell_close,
+        active_line: pair.sell_active_line,
+      },
+    });
+  }
+  return rows.map(({item, pair}) => {
+    const overlap = Boolean(pair && item.reason !== "relative_rotation");
+    const clearanceType = item.action === "SELL_PARTIAL"
+      ? "减仓"
+      : String(item.clearance_type || "").includes("轮换")
+        || item.reason === "relative_rotation" ? "轮换" : "清仓";
+    const clearanceDisplay = !item.action && item.clearance_type
+      ? `清仓（${formatPlain(item.clearance_type)}）`
+      : clearanceType;
+    const reason = trendReasonLabel(item, report);
+    const hint = [
+      ...((Array.isArray(item.entry_hints) ? item.entry_hints : []).map(formatPlain)),
+      ...(overlap || item.clearance_note === "同时符合轮换清仓" ? ["同时符合轮换清仓"] : []),
+    ].join("；") || null;
+    return `<tr class="cn-trend-card">
+      ${renderTrendCell("标的", trendIdentity(item))}
+      ${renderTrendCell("动作", trendSellActionLabel(item))}
+      ${renderTrendCell("卖出类型", clearanceDisplay)}
+      ${renderTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : null)}
+      ${renderTrendCell("温度变化", trendTemperature(item))}
+      ${renderTrendCell("节气", item.phase)}
+      ${renderTrendCell("个体全局强度", item.global_strength ?? item.individual_global_strength)}
+      ${renderTrendCell("触发原因", reason)}
+      ${renderTrendCell("活动保护线", hasValue(item.active_line) ? formatDisplayNumber(item.active_line) : null)}
+      ${renderTrendCell("持仓提示", hint)}
+    </tr>`;
+  });
+}
+
+function trendV2PlanBuyRows(items, pairs) {
+  const rows = [];
+  const seen = new Set();
+  for (const item of cnTrendRows(items)) {
+    const key = trendV2PlanSymbol(item.symbol || item.futu_symbol);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    rows.push(item);
+  }
+  for (const pair of trendV2PlanPairs(pairs)) {
+    const key = trendV2PlanSymbol(pair.buy_symbol);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    rows.push({
+      symbol: pair.buy_symbol,
+      name: pair.buy_name,
+      global_strength: pair.buy_global_strength,
+      target_amount: pair.target_amount,
+      estimated_shares: pair.estimated_shares,
+    });
+  }
+  return rows.map((item, index) => `<tr class="cn-trend-card">
+    ${renderTrendCell("序号", index + 1)}
+    ${renderTrendCell("标的", trendIdentity(item))}
+    ${renderTrendCell("个体全局强度", item.global_strength ?? item.individual_global_strength)}
+    ${renderTrendCell("4%目标金额", hasValue(item.target_amount) ? formatDisplayNumber(item.target_amount) : null)}
+    ${renderTrendCell("预计数量", hasValue(item.estimated_shares) ? `${formatDisplayNumber(item.estimated_shares)} 股` : null)}
+  </tr>`);
+}
+
+function trendV2PlanAvailability(report, account) {
+  const availability = report?.plan_availability;
+  const missing = {status: "unavailable", reason: "计划可用性数据缺失", executable: false};
+  const invalid = {status: "unavailable", reason: "计划可用性数据无效", executable: false};
+  if (availability == null) return missing;
+  if (typeof availability !== "object" || Array.isArray(availability)) return invalid;
+  const component = availability[account];
+  if (component == null) return missing;
+  if (typeof component !== "object" || Array.isArray(component)) return invalid;
+  if ((component.status !== "available" && component.status !== "unavailable")
+      || typeof component.reason !== "string"
+      || typeof component.executable !== "boolean") return invalid;
+  return component;
+}
+
+function renderTrendV2PlanTable(title, subtitle, kind, headings, rows, availability) {
+  const unavailable = availability?.status === "unavailable";
+  const renderedRows = unavailable ? [] : rows;
+  const reason = unavailable && typeof availability.reason === "string"
+    ? availability.reason.trim() : "";
+  const empty = unavailable
+    ? `<p>不可用${reason ? `：${escapeHtml(reason)}` : ""}</p>`
+    : renderedRows.length ? "" : "<p>无</p>";
+  return `<section class="trend-plan trend-plan-${escapeHtml(kind)}">
+    <header><h2>${escapeHtml(title)}</h2><p>${escapeHtml(subtitle)}</p></header>
+    <table class="cn-trend-table" data-legacy-label="清仓类型"><thead><tr>${headings.map((heading) => `<th scope="col">${escapeHtml(heading)}</th>`).join("")}</tr></thead><tbody>${renderedRows.join("")}</tbody></table>
+    ${empty}
+  </section>`;
+}
+
+function renderTrendV2Plans(report) {
+  const sellHeadings = [
+    "标的", "动作", "卖出类型", "执行参考价", "温度变化", "节气",
+    "个体全局强度", "触发原因", "活动保护线", "持仓提示",
+  ];
+  const buyHeadings = ["序号", "标的", "个体全局强度", "4%目标金额", "预计数量"];
+  return [
+    renderTrendV2PlanTable(
+      "模拟盘卖出计划", "趋势快照 + 模拟持仓快照", "sell",
+      sellHeadings,
+      trendV2PlanSellRows(report.sell_actions, report.simulate_rotation_pairs, report),
+      trendV2PlanAvailability(report, "simulated_account"),
+    ),
+    renderTrendV2PlanTable(
+      "实盘卖出计划", "趋势快照 + 实盘持仓快照", "sell",
+      sellHeadings,
+      trendV2PlanSellRows(report.real_position_actions, report.real_rotation_pairs, report),
+      trendV2PlanAvailability(report, "real_account"),
+    ),
+    renderTrendV2PlanTable(
+      "模拟盘买入计划", "趋势快照 + 模拟账户快照", "buy",
+      buyHeadings,
+      trendV2PlanBuyRows(report.buy_actions, report.simulate_rotation_pairs),
+      trendV2PlanAvailability(report, "simulated_account"),
+    ),
+    renderTrendV2PlanTable(
+      "实盘买入计划", "趋势快照 + 实盘账户快照", "buy",
+      buyHeadings,
+      trendV2PlanBuyRows(report.real_buy_actions, report.real_rotation_pairs),
+      trendV2PlanAvailability(report, "real_account"),
+    ),
+  ].join("");
+}
+
 function isCnTrendMobile() {
   return typeof window !== "undefined"
     && typeof window.matchMedia === "function"
@@ -5168,10 +5343,15 @@ function renderTrendSellOrHoldStage(title, items, kind, report) {
   }
   const action = { sell: trendSellActionLabel, review: () => "人工复核" }[kind] || (() => "继续持有");
   const reasonHeading = kind === "sell" ? "触发原因" : kind === "review" ? "复核原因" : "当前判断";
+  const showClearanceType = kind === "sell" && (
+    report?.allocation?.version === 2
+    || (Array.isArray(items) && items.some((item) => hasValue(item?.clearance_type)))
+  );
   const optionMarket = ["US", "HK"].includes(String(report?.market || "").toUpperCase());
   const headings = [
     "标的", "动作", "执行参考价", "温度变化", "节气", "强度",
     ...(kind === "hold" ? ["行业"] : []),
+    ...(showClearanceType ? ["清仓类型"] : []),
     reasonHeading, "活动保护线", "持仓提示",
   ];
   const rows = cnTrendRows(items).map((item) => `<tr class="cn-trend-card">
@@ -5182,6 +5362,7 @@ function renderTrendSellOrHoldStage(title, items, kind, report) {
     ${renderTrendCell("节气", item.phase)}
     ${renderTrendCell("强度", hasValue(item.strength) ? formatDisplayNumber(item.strength) : null)}
     ${kind === "hold" ? renderTrendCell("行业", item.industry) : ""}
+    ${showClearanceType ? renderTrendCell("清仓类型", item.clearance_type) : ""}
     ${renderTrendCell(reasonHeading, trendReasonLabel(item, report))}
     ${renderTrendCell("活动保护线", hasValue(item.active_line) ? formatDisplayNumber(item.active_line) : null)}
     ${renderTrendCell("持仓提示", trendHints(item))}
@@ -5513,7 +5694,7 @@ function renderTrendIndustryContext(report) {
     : [];
   const status = report?.industry_context_status && typeof report.industry_context_status === "object"
     ? report.industry_context_status : {};
-  if (usesFinalPlanTrendAudit(report)) {
+  if (usesFinalPlanTrendAudit(report) || usesV2TrendPlanLayout(report)) {
     const rows = contexts.map((context) => `<tr class="trend-industry-context-row${context.valid === false ? " invalid" : ""}">
       <th scope="row" data-label="行业"><strong>${escapeHtml(formatPlain(context.industry || "行业"))}</strong></th>
       <td data-label="当前温度">${escapeHtml(hasValue(context.temperature) ? formatPlain(context.temperature) : "数据未提供")}</td>
@@ -5820,6 +6001,7 @@ function renderTrendAllocation(report) {
   const markets = allocation?.markets;
   if (!allocation || typeof allocation !== "object" || !roots || !markets) return "";
   const currentMarket = String(report.market || "").toUpperCase();
+  const v2 = allocation.version === 2;
   const cards = [
     ["CN", "A股"], ["HK", "港股"], ["US", "美股"],
   ].sort(([left], [right]) => (
@@ -5830,17 +6012,21 @@ function renderTrendAllocation(report) {
     const stock = root.stock || {};
     const etf = root.etf || {};
     const current = market === currentMarket ? " · 当前报告" : "";
-    return `<article class="trend-allocation-card" data-market="${market}" data-current-report="${market === currentMarket}">
-      <header><h3>${escapeHtml(label)}</h3><span>第 ${escapeHtml(formatPlain(values.rank))} 名${current}</span></header>
-      <dl>
-        <div><dt>${escapeHtml(formatPlain(stock.asset))} 全局强度</dt><dd>${escapeHtml(formatDisplayNumber(stock.global_strength))}</dd></div>
+    const details = v2
+      ? `<div><dt>${escapeHtml(formatPlain(stock.asset))} 全局强度</dt><dd>${escapeHtml(formatDisplayNumber(stock.global_strength))}</dd></div>
+        <div aria-label="单仓基准 4%"><dt>单仓基准</dt><dd>4%</dd></div>
+        <div aria-label="持仓席位 ${escapeHtml(formatPlain(values.position_limit))}"><dt>持仓席位</dt><dd>${escapeHtml(formatPlain(values.position_limit))}</dd></div>
+        <div aria-label="席位名义仓位 ${escapeHtml(decimalAsPercent(values.nominal_weight, "-"))}"><dt>席位名义仓位</dt><dd>${escapeHtml(decimalAsPercent(values.nominal_weight, "-"))}</dd></div>`
+      : `<div><dt>${escapeHtml(formatPlain(stock.asset))} 全局强度</dt><dd>${escapeHtml(formatDisplayNumber(stock.global_strength))}</dd></div>
         <div><dt>${escapeHtml(formatPlain(etf.asset))} 全局强度</dt><dd>${escapeHtml(formatDisplayNumber(etf.global_strength))}</dd></div>
         <div><dt>市场分数</dt><dd>${escapeHtml(formatDisplayNumber(values.score))}</dd></div>
         <div><dt>分数来源</dt><dd>${escapeHtml(formatPlain(values.score_source))}</dd></div>
         <div aria-label="单仓基准 ${escapeHtml(decimalAsPercent(values.entry_weight, "-"))}"><dt>单仓基准</dt><dd>${escapeHtml(decimalAsPercent(values.entry_weight, "-"))}</dd></div>
-        <div aria-label="10 席位名义仓位 ${escapeHtml(decimalAsPercent(values.nominal_weight, "-"))}"><dt>10 席位名义仓位</dt><dd>${escapeHtml(decimalAsPercent(values.nominal_weight, "-"))}</dd></div>
-      </dl>
-      <p>来源 ${escapeHtml(formatPlain(stock.as_of_date))} / ${escapeHtml(formatPlain(etf.as_of_date))}</p>
+        <div aria-label="10 席位名义仓位 ${escapeHtml(decimalAsPercent(values.nominal_weight, "-"))}"><dt>10 席位名义仓位</dt><dd>${escapeHtml(decimalAsPercent(values.nominal_weight, "-"))}</dd></div>`;
+    return `<article class="trend-allocation-card" data-market="${market}" data-current-report="${market === currentMarket}">
+      <header><h3>${escapeHtml(label)}</h3><span>第 ${escapeHtml(formatPlain(values.rank))} 名${current}</span></header>
+      <dl>${details}</dl>
+      <p>来源 ${escapeHtml(formatPlain(stock.as_of_date))}${v2 ? "" : ` / ${escapeHtml(formatPlain(etf.as_of_date))}`}</p>
     </article>`;
   }).join("");
   const status = allocation.reused
@@ -5926,10 +6112,13 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const counts = report.counts || {};
   const audit = report.audit || {};
   const isCn = String(report.market || "").toUpperCase() === "CN";
+  const v2PlanLayout = usesV2TrendPlanLayout(report);
   const finalPlanAudit = usesFinalPlanTrendAudit(report);
   const sellOrHold = renderTrendSellOrHoldStage;
-  const buyStage = finalPlanAudit && !trendFinalPlanBuyActions(report).length
-    ? "" : renderTrendBuyStage(report);
+  const buyStage = v2PlanLayout
+    ? renderTrendV2Plans(report)
+    : finalPlanAudit && !trendFinalPlanBuyActions(report).length
+      ? "" : renderTrendBuyStage(report);
   const root = embedded ? "div" : "main";
   const identity = report.artifact && report.report_sha256 && report.strategy_version
     ? ` data-report-artifact="${escapeHtml(formatPlain(report.artifact))}" data-report-sha256="${escapeHtml(formatPlain(report.report_sha256))}" data-strategy-version="${escapeHtml(formatPlain(report.strategy_version))}"`
@@ -5944,7 +6133,9 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const batchError = report.execution_batch_blocking === true
     ? `<p class="trend-execution-batch-error">${escapeHtml(formatPlain(report.execution_batch_error || "执行批次无效，已阻止操作投影"))}</p>`
     : "";
-  const sellStage = sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell", report);
+  const sellStage = v2PlanLayout
+    ? ""
+    : sellOrHold("优先处理 · 卖出触发", report.sell_actions, "sell", report);
   const reviewStage = Array.isArray(report.review_actions) && report.review_actions.length
     ? sellOrHold("需要确认 · 人工复核", report.review_actions, "review", report)
     : "";
@@ -5953,7 +6144,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
   const industryContext = renderTrendIndustryContext(report);
   const riskSummary = renderTrendRiskSummary(report.risk_summary, report.drawdown_summary, report.report_date);
   const allocation = renderTrendAllocation(report);
-  const rotations = renderTrendRotations(report);
+  const rotations = v2PlanLayout ? "" : renderTrendRotations(report);
   const readinessBanner = renderTrendReadinessBanner(report);
   return `<${root} class="cn-trend-report"${identity}>
     <header class="trend-report-header">
@@ -5981,6 +6172,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
       </div>
     </header>
     ${readinessBanner}
+    ${renderTrendV2ExecutionStatus(report)}
     ${allocation}
     ${batchError}
     ${revisionAnomaly}
@@ -6012,6 +6204,24 @@ function renderTrendReadinessBanner(report) {
     return `<div class="trend-readiness-banner waiting" role="status"><strong>报告未就绪</strong><span>${escapeHtml(formatPlain(waiting))}</span></div>`;
   }
   return "";
+}
+
+function renderTrendV2ExecutionStatus(report) {
+  if (!usesV2TrendPlanLayout(report)) return "";
+  const batch = report.execution_batch && typeof report.execution_batch === "object"
+    ? report.execution_batch : {};
+  const status = report.execution_batch_blocking === true
+    ? report.execution_batch_error || "执行批次不可用"
+    : report.run_status || report.status_text || "未开始";
+  return `<details class="trend-execution-status" open>
+    <summary>报告与执行状态 <span>${escapeHtml(formatPlain(status))}</span></summary>
+    <dl>
+      <div><dt>报告 SHA</dt><dd>${escapeHtml(formatPlain(report.report_sha256 || "—"))}</dd></div>
+      <div><dt>执行日期</dt><dd>${escapeHtml(formatPlain(report.execution_date || report.report_date || "—"))}</dd></div>
+      <div><dt>执行状态</dt><dd>${escapeHtml(formatPlain(status))}</dd></div>
+      ${hasValue(batch.report_sha256) ? `<div><dt>执行批次 SHA</dt><dd>${escapeHtml(formatPlain(batch.report_sha256))}</dd></div>` : ""}
+    </dl>
+  </details>`;
 }
 
 function renderTrendControllerStatus(broker) {

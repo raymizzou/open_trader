@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -12,7 +13,7 @@ from time import sleep
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .account_http import fetch_account_snapshot
+from .account_http import AccountHttpError, fetch_account_snapshot
 from .a_share_trend import (
     A_SHARE_INDUSTRY_FIELDS,
     AShareTrendRunResult,
@@ -28,8 +29,10 @@ from .a_share_trend import (
     _component_api_facts,
     _final_pair_matches,
     _finalize_market_report,
+    _freeze_report_simulated_buy_plan,
     _holding_snapshot,
     _is_systemic_futu_error,
+    _json_value,
     _optional_int,
     _process_version,
     _remember_verified_symbol_row,
@@ -40,7 +43,9 @@ from .a_share_trend import (
     _report_payload,
     _row_tm_id,
     _transition_delivery_receipt,
+    _unavailable_account_snapshot,
     _unified_trend_unit_cost,
+    valid_frozen_report_contract,
     _uses_individual_global_ranking,
     _write_delivery_receipt,
     _freeze_receipt_report,
@@ -80,7 +85,15 @@ from .trend_animals import (
     TrendAnimalsNoCurrentRowsError,
 )
 from .trend_delivery import deliver_daily_trend_text, retry_daily_trend_text
-from .trend_review import freeze_report_evidence, rebuild_overheat_trim_projection
+from .trend_review import (
+    freeze_report_evidence,
+    freeze_trend_evidence,
+    planning_snapshot_path,
+    read_planning_snapshot,
+    rebuild_overheat_trim_projection,
+    rebuild_trend_report_from_evidence,
+    update_planning_snapshot_components,
+)
 from .strategy_drawdown import observe_strategy_equity
 
 
@@ -536,6 +549,417 @@ def _market_artifact_stem(
         number += 1
 
 
+def _load_market_planning_revision_source(
+    *, config: DailyPremarketConfig, paths: MarketTrendPaths, run_date: str
+) -> tuple[
+    Path,
+    dict[str, object],
+    Path,
+    dict[str, object],
+    dict[str, object],
+    str,
+] | None:
+    if not paths.reports.exists():
+        return None
+    expected_market = "US" if paths.root.name == "trend_us_futu" else "HK"
+    report_pattern = re.compile(
+        r"^(\d{4}-\d{2}-\d{2})(?:-r([1-9]\d*))?\.json$"
+    )
+    candidates: list[tuple[int, str, Path, dict[str, object], str]] = []
+    has_planning_report = False
+    for path in paths.reports.glob("*.json"):
+        filename_match = report_pattern.fullmatch(path.name)
+        if filename_match is None:
+            continue
+        try:
+            filename_as_of = date.fromisoformat(filename_match.group(1)).isoformat()
+        except ValueError:
+            continue
+        try:
+            source_payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(source_payload, dict):
+            continue
+        metadata = source_payload.get("metadata")
+        if (
+            not isinstance(metadata, Mapping)
+            or metadata.get("run_date") != run_date
+            or str(metadata.get("market") or "").upper() != expected_market
+        ):
+            continue
+        replay = source_payload.get("replay_evidence")
+        allocation = source_payload.get("allocation")
+        planning_era = (
+            isinstance(allocation, Mapping) and allocation.get("version") == 2
+        ) or (
+            isinstance(replay, Mapping) and "planning_path" in replay
+        )
+        if not planning_era:
+            continue
+        has_planning_report = True
+        execution_date = source_payload.get("execution_date")
+        as_of_date = source_payload.get("as_of_date")
+        if not isinstance(as_of_date, str):
+            continue
+        try:
+            if (
+                date.fromisoformat(as_of_date).isoformat() != as_of_date
+                or as_of_date != filename_as_of
+            ):
+                continue
+        except ValueError:
+            continue
+        try:
+            if (
+                not isinstance(execution_date, str)
+                or date.fromisoformat(execution_date).isoformat() != execution_date
+                or not valid_frozen_report_contract(source_payload)
+            ):
+                continue
+        except (KeyError, TypeError, ValueError):
+            continue
+        candidates.append(
+            (
+                int(filename_match.group(2) or 0),
+                path.name,
+                path,
+                source_payload,
+                as_of_date,
+            )
+        )
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    for _revision, _name, source_path, source_payload, as_of_date in candidates:
+        replay = source_payload.get("replay_evidence")
+        if not isinstance(replay, Mapping):
+            continue
+        planning_value = replay.get("planning_path")
+        if not isinstance(planning_value, str) or not planning_value:
+            continue
+        planning_path = Path(planning_value)
+        if not planning_path.is_absolute():
+            planning_path = config.data_dir / planning_path
+        try:
+            planning_path.resolve().relative_to(config.data_dir.resolve())
+            execution_date = str(source_payload["execution_date"])
+            if planning_path.resolve() != planning_snapshot_path(
+                config.data_dir,
+                market=expected_market,
+                target_date=execution_date,
+            ).resolve():
+                continue
+            planning_sha256 = replay.get("planning_sha256")
+            if not isinstance(planning_sha256, str) or re.fullmatch(
+                r"[0-9a-fA-F]{64}", planning_sha256
+            ) is None:
+                continue
+            planning_body = planning_path.read_bytes()
+            if hashlib.sha256(planning_body).hexdigest() != planning_sha256:
+                continue
+            planning = read_planning_snapshot(planning_path, data_dir=config.data_dir)
+        except OSError as exc:
+            continue
+        except ValueError:
+            continue
+        if (
+            planning.get("market") != expected_market
+            or planning.get("as_of_date") != as_of_date
+            or planning.get("target_date") != source_payload["execution_date"]
+        ):
+            continue
+        evidence_ref = planning.get("evidence")
+        if not isinstance(evidence_ref, Mapping):
+            continue
+        evidence_path = Path(str(evidence_ref.get("path") or ""))
+        if not evidence_path.is_absolute():
+            evidence_path = config.data_dir / evidence_path
+        try:
+            evidence_path.resolve().relative_to(config.data_dir.resolve())
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            continue
+        if not isinstance(evidence, dict):
+            continue
+        if hashlib.sha256(evidence_path.read_bytes()).hexdigest() != evidence_ref.get("sha256"):
+            continue
+        return source_path, source_payload, planning_path, planning, evidence, as_of_date
+    if has_planning_report:
+        raise ValueError("planning snapshot hash mismatch")
+    return None
+
+
+def _reuse_market_planning_revision(
+    *,
+    config: DailyPremarketConfig,
+    paths: MarketTrendPaths,
+    market: str,
+    run_date: str,
+    artifact_stem: str,
+    notifier: Notifier,
+    source_path: Path,
+    source_payload: Mapping[str, object],
+    planning_path: Path,
+    planning: Mapping[str, object],
+    evidence: dict[str, object],
+    account_factory: Callable[..., object] | None = None,
+    api_factory: Callable[..., object] = TrendAnimalsClient,
+    quote_factory: Callable[..., object] = FutuQuoteClient,
+) -> AShareTrendRunResult:
+    evidence["process_version"] = _process_version(config.repo)
+    inputs = evidence.get("rebuild_inputs")
+    if not isinstance(inputs, dict):
+        raise ValueError("planning snapshot evidence is invalid")
+    components = planning.get("components")
+    if not isinstance(components, Mapping):
+        raise ValueError("planning snapshot components are invalid")
+    updates: dict[str, tuple[str, object]] = {}
+    simulated_component = components.get("simulated_account")
+    if (
+        isinstance(simulated_component, Mapping)
+        and simulated_component.get("status") == "unavailable"
+    ):
+        try:
+            account = load_futu_simulate_trend_account(
+                host=config.futu_host,
+                port=config.futu_port,
+                simulate_acc_id=require_trend_review_config(config, market),
+                market=market,
+                expected_date=str(inputs["as_of_date"]),
+                account_factory=account_factory or FutuSimulateOrderExecutionClient,
+            )
+        except (FutuQuoteError, OSError, RuntimeError, ValueError):
+            account = None
+        if account is not None:
+            serialized_account = _json_value(asdict(account))
+            inputs["account"] = serialized_account
+            evidence["account"] = serialized_account
+            strategy = evidence.get("strategy_snapshot")
+            if isinstance(strategy, Mapping):
+                inputs["drawdown_summary"] = observe_strategy_equity(
+                    config.data_dir,
+                    market=market,
+                    strategy_id=str(strategy.get("strategy_id") or ""),
+                    strategy_version=str(strategy.get("strategy_version") or ""),
+                    current_equity=account.net_value,
+                    observed_at=datetime.now(SHANGHAI).isoformat(timespec="seconds"),
+                    entry_date=str(inputs["execution_date"]),
+                )
+            updates["simulated_account"] = (
+                "complete",
+                {
+                    "account": serialized_account,
+                    "account_input": inputs.get("account_input"),
+                },
+            )
+    real_component = components.get("real_account")
+    if (
+        isinstance(real_component, Mapping)
+        and real_component.get("status") == "unavailable"
+    ):
+        frozen_account_snapshot = inputs.get("account_snapshot")
+        if isinstance(frozen_account_snapshot, Mapping) and frozen_account_snapshot:
+            account_snapshot = frozen_account_snapshot
+        else:
+            try:
+                account_snapshot = fetch_account_snapshot()
+            except AccountHttpError:
+                account_snapshot = None
+        if account_snapshot is not None:
+            real_holdings = load_real_holding_input(
+                account_snapshot,
+                market,
+                state_path=paths.real_state,
+            )
+            real_snapshot_rows: dict[int, Mapping[str, object]] = {}
+            if real_holdings.status == "available" and real_holdings.positions:
+                api = None
+                quote = None
+                try:
+                    api = api_factory(
+                        api_key=config.trend_animals_api_key,
+                        cache_dir=config.data_dir / "trend_animals/cache",
+                    )
+                    quote = quote_factory(host=config.futu_host, port=config.futu_port)
+                    (
+                        real_holdings,
+                        real_snapshot_rows,
+                        _real_bars,
+                        _real_only_count,
+                    ) = enrich_real_holding_input(
+                        real_holdings,
+                        api=api,
+                        quote=quote,
+                        market=market,
+                        as_of_date=str(inputs["as_of_date"]),
+                        kline_start=(
+                            date.fromisoformat(str(inputs["as_of_date"]))
+                            - timedelta(days=90)
+                        ).isoformat(),
+                        existing_holding_ids={},
+                        existing_rows_by_tm_id={},
+                        existing_holding_snapshots={},
+                        existing_bars_by_symbol={},
+                    )
+                finally:
+                    for client in (quote, api):
+                        close = getattr(client, "close", None)
+                        if callable(close):
+                            close()
+            if real_holdings.status == "available":
+                frozen_account_input = inputs.get("account_input")
+                account_input = (
+                    dict(frozen_account_input)
+                    if isinstance(frozen_account_input, Mapping)
+                    else _account_input(account_snapshot)
+                )
+                inputs["account_input"] = account_input
+                inputs["real_holdings"] = _json_value(asdict(real_holdings))
+                responses = evidence.get("responses")
+                if isinstance(responses, dict):
+                    responses["real_snapshots"] = list(real_snapshot_rows.values())
+                updates["real_account"] = (
+                    "complete",
+                    {
+                        "real_holdings": real_holdings,
+                        "account_input": account_input,
+                    },
+                )
+    evidence_reference: Mapping[str, str] | None = None
+    planning_reference = None
+    if updates:
+        recovered_report = rebuild_trend_report_from_evidence(
+            evidence,
+            _return_report=True,
+            _recompute_account_components=tuple(updates),
+        )
+        if "simulated_account" in updates:
+            recovered_report = _freeze_report_simulated_buy_plan(
+                recovered_report, config.data_dir  # type: ignore[arg-type]
+            )
+        recovered_judgments = _report_payload(recovered_report)["strategy_judgments"]
+        if isinstance(recovered_judgments, Mapping):
+            for component, fields in (
+                (
+                    "simulated_account",
+                    ("simulate_rotation_pairs", "simulate_rotation_comparisons"),
+                ),
+                (
+                    "real_account",
+                    ("real_rotation_pairs", "real_rotation_comparisons"),
+                ),
+            ):
+                if component in updates:
+                    for field in fields:
+                        if field in recovered_judgments:
+                            inputs[field] = recovered_judgments[field]
+            if (
+                "simulated_account" in updates
+                and "planned_new_seats" in recovered_judgments
+            ):
+                inputs["simulated_buy_fifo"] = recovered_judgments[
+                    "simulated_buy_fifo"
+                ]
+                inputs["planned_new_seats"] = recovered_judgments[
+                    "planned_new_seats"
+                ]
+        evidence_reference = freeze_trend_evidence(config.data_dir, evidence)
+        evidence = json.loads(
+            Path(str(evidence_reference["path"])).read_text(encoding="utf-8")
+        )
+        planning_reference = update_planning_snapshot_components(
+            data_dir=config.data_dir,
+            planning_path=planning_path,
+            evidence=evidence,
+            evidence_reference=evidence_reference,
+            updates=updates,
+        )
+    rebuilt = rebuild_trend_report_from_evidence(evidence)
+    replay = source_payload.get("replay_evidence")
+    if isinstance(replay, Mapping):
+        rebuilt["replay_evidence"] = dict(replay)
+        if planning_reference is not None:
+            assert evidence_reference is not None
+            rebuilt["replay_evidence"].update(
+                {
+                    "path": str(
+                        Path(str(evidence_reference["path"])).relative_to(
+                            config.data_dir
+                        )
+                    ),
+                    "sha256": evidence_reference["sha256"],
+                    "planning_path": str(
+                        Path(planning_reference["path"]).relative_to(config.data_dir)
+                    ),
+                    "planning_sha256": planning_reference["sha256"],
+                }
+            )
+    rebuilt_report = rebuild_trend_report_from_evidence(
+        evidence, _return_report=True
+    )
+    markdown = render_markdown(rebuilt_report)  # type: ignore[arg-type]
+    protection_state = rebuilt_report.protection_state
+    if not isinstance(protection_state, Mapping):
+        raise ValueError("rebuilt report protection state is invalid")
+    real_protection_state = rebuilt_report.real_protection_state
+    report_json = json.dumps(
+        rebuilt, ensure_ascii=False, indent=2, sort_keys=True
+    ) + "\n"
+    receipt_path = _market_receipt_path(paths, artifact_stem)
+    receipt = _write_delivery_receipt(
+        receipt_path,
+        status="prepared",
+        generated_at=str(rebuilt.get("generated_at") or ""),
+        artifact_stem=artifact_stem,
+        markdown=markdown,
+        report_json=report_json,
+        protection_state=dict(protection_state),
+        real_protection_state=(
+            dict(real_protection_state)
+            if isinstance(real_protection_state, Mapping)
+            else None
+        ),
+    )
+    write_protection_state(paths.state, protection_state)
+    if isinstance(real_protection_state, Mapping):
+        write_protection_state(paths.real_state, real_protection_state)
+    receipt = _transition_delivery_receipt(
+        receipt_path, receipt, status="pending", delivery_status="pending"
+    )
+    delivery_status = _deliver_market_daily_text(
+        paths=paths,
+        market=market,
+        run_date=run_date,
+        notifier=notifier,
+        payload=json.loads(str(receipt["report_json"])),
+    )
+    receipt = _transition_delivery_receipt(
+        receipt_path,
+        receipt,
+        status=(
+            "sent" if delivery_status in {"sent", "sent_prior_message"}
+            else delivery_status
+        ),
+        delivery_status=delivery_status,
+    )
+    markdown_path, json_path = _freeze_receipt_report(
+        receipt=receipt,
+        reports_dir=paths.reports,
+        artifact_stem=artifact_stem,
+    )
+    _write_frozen_industry_context_history(
+        receipt=receipt,
+        history_root=paths.root.parent / "trend_industry_context",
+        market=market,
+    )
+    send_notification_with_results(
+        notifier,
+        f"{market} 趋势计划已生成",
+        f"数据日 {run_date}；报告 {markdown_path}",
+        channels={"macos"},
+    )
+    return AShareTrendRunResult("generated", markdown_path, json_path)
+
+
 def _deliver_market_daily_text(
     *,
     paths: MarketTrendPaths,
@@ -671,6 +1095,24 @@ def _attempt_market_report(
                 ledger_path=paths.root / "daily_delivery" / f"{run_date}.json",
             )
             return AShareTrendRunResult("existing", base_markdown, base_json)
+        planning_snapshot_path_value = planning_snapshot_path(
+            config.data_dir, market=market, target_date=execution_date
+        )
+        planning_snapshot_exists = planning_snapshot_path_value.exists()
+        planning_simulated_account_complete = False
+        if planning_snapshot_exists:
+            planning_snapshot = read_planning_snapshot(
+                planning_snapshot_path_value, data_dir=config.data_dir
+            )
+            planning_components = planning_snapshot.get("components")
+            if not isinstance(planning_components, Mapping):
+                raise ValueError("planning snapshot components are invalid")
+            simulated_component = planning_components.get("simulated_account")
+            if not isinstance(simulated_component, Mapping):
+                raise ValueError("planning snapshot components are invalid")
+            planning_simulated_account_complete = (
+                simulated_component.get("status") == "complete"
+            )
 
         api = api_factory(
             api_key=config.trend_animals_api_key,
@@ -693,14 +1135,20 @@ def _attempt_market_report(
         )
         managed = _managed_symbols(prior_state, configured, market)
         simulate_acc_id = require_trend_review_config(config, market)
-        account = load_futu_simulate_trend_account(
-            host=config.futu_host,
-            port=config.futu_port,
-            simulate_acc_id=simulate_acc_id,
-            market=market,
-            expected_date=as_of_date,
-            account_factory=account_factory or FutuSimulateOrderExecutionClient,
-        )
+        try:
+            account = load_futu_simulate_trend_account(
+                host=config.futu_host,
+                port=config.futu_port,
+                simulate_acc_id=simulate_acc_id,
+                market=market,
+                expected_date=as_of_date,
+                account_factory=account_factory or FutuSimulateOrderExecutionClient,
+            )
+        except (FutuQuoteError, OSError, RuntimeError, ValueError) as exc:
+            account = _unavailable_account_snapshot(
+                source_date=as_of_date,
+                reason=f"模拟盘账户事实不可用：{exc}",
+            )
         real_holdings = load_real_holding_input(
             account_snapshot,
             market,
@@ -1196,14 +1644,19 @@ def _attempt_market_report(
             else f"Kelly 模拟闭环统计不可用，使用固定风险仓位：{kelly_evidence.reason}"
         )
         generated_at = datetime.now(SHANGHAI).isoformat(timespec="seconds")
-        drawdown_summary = observe_strategy_equity(
-            config.data_dir,
-            market=market,
-            strategy_id=str(strategy_snapshot["strategy_id"]),
-            strategy_version=str(strategy_snapshot["strategy_version"]),
-            current_equity=account.net_value,
-            observed_at=generated_at,
-            entry_date=execution_date,
+        drawdown_summary = (
+            observe_strategy_equity(
+                config.data_dir,
+                market=market,
+                strategy_id=str(strategy_snapshot["strategy_id"]),
+                strategy_version=str(strategy_snapshot["strategy_version"]),
+                current_equity=account.net_value,
+                observed_at=generated_at,
+                entry_date=execution_date,
+            )
+            if account.status == "available"
+            and not planning_simulated_account_complete
+            else None
         )
         report = build_report(
             as_of_date=as_of_date,
@@ -1289,10 +1742,14 @@ def _attempt_market_report(
             ),
             real_holdings=real_holdings,
             allocation_reference=allocation_reference,
-            account_input=_account_input(account_snapshot),
+            account_input=(
+                _account_input(account_snapshot) if account_snapshot else None
+            ),
         )
         report = _finalize_market_report(report, managed_symbols=sorted(managed))
         report = freeze_report_rotation_pairs(report, config.data_dir)
+        if not planning_simulated_account_complete:
+            report = _freeze_report_simulated_buy_plan(report, config.data_dir)
         previous_attention_rows = _previous_attention_rows(
             paths, current_as_of_date=as_of_date, market=market
         )
@@ -1371,12 +1828,24 @@ def _attempt_market_report(
             kelly_rounds=kelly_rounds,
             kelly_data_reason=kelly_data_reason,
             real_holdings_input=real_holdings,
+            account_snapshot=account_snapshot,
         )
+        if planning_snapshot_exists:
+            frozen_evidence = json.loads(
+                Path(str(evidence["path"])).read_text(encoding="utf-8")
+            )
+            report = rebuild_trend_report_from_evidence(
+                frozen_evidence, _return_report=True
+            )
         report = replace(
             report,
             replay_evidence={
                 "path": str(Path(evidence["path"]).relative_to(config.data_dir)),
                 "sha256": evidence["sha256"],
+                "planning_path": str(
+                    Path(evidence["planning_path"]).relative_to(config.data_dir)
+                ),
+                "planning_sha256": evidence["planning_sha256"],
             },
         )
         payload = _report_payload(report)
@@ -1473,7 +1942,57 @@ def run_market_trend_report(
         raise ValueError(f"Trend Animals {market} tmId list is required")
     with RunLock(paths.report_lock):
         report_dependencies = dict(attempt_dependencies)
-        report_dependencies["account_snapshot"] = fetch_account_snapshot()
+        if revision:
+            source = _load_market_planning_revision_source(
+                config=config, paths=paths, run_date=run_date
+            )
+            if source is not None:
+                (
+                    source_path,
+                    source_payload,
+                    planning_path,
+                    planning,
+                    evidence,
+                    validated_as_of_date,
+                ) = source
+                artifact_stem = _market_artifact_stem(
+                    paths,
+                    as_of_date=validated_as_of_date,
+                    revision=True,
+                )
+                account_factory = report_dependencies.get("account_factory")
+                return _reuse_market_planning_revision(
+                    config=config,
+                    paths=paths,
+                    market=market,
+                    run_date=run_date,
+                    artifact_stem=artifact_stem,
+                    notifier=notifier,
+                    source_path=source_path,
+                    source_payload=source_payload,
+                    planning_path=planning_path,
+                    planning=planning,
+                    evidence=evidence,
+                    account_factory=(
+                        account_factory
+                        if callable(account_factory)
+                        else None
+                    ),
+                    api_factory=(
+                        report_dependencies.get("api_factory")
+                        if callable(report_dependencies.get("api_factory"))
+                        else TrendAnimalsClient
+                    ),
+                    quote_factory=(
+                        report_dependencies.get("quote_factory")
+                        if callable(report_dependencies.get("quote_factory"))
+                        else FutuQuoteClient
+                    ),
+                )
+        try:
+            report_dependencies["account_snapshot"] = fetch_account_snapshot()
+        except AccountHttpError:
+            report_dependencies["account_snapshot"] = {}
         if allocation_reference is not None:
             report_dependencies["allocation_reference"] = allocation_reference
         return _run_market_trend_retry(

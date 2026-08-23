@@ -140,6 +140,7 @@ from .trend_review import (
     resolve_trend_action,
 )
 from .trend_market_controller import (
+    execute_simulated_trend_report,
     load_trend_market_status,
     run_trend_market_controller,
 )
@@ -420,6 +421,21 @@ def build_parser() -> argparse.ArgumentParser:
     trend_market_resolve.add_argument("--reason", required=True)
     trend_market_resolve.add_argument("--futu-order-id")
     trend_market_resolve.add_argument(
+        "--config", type=Path, default=Path("config/daily_premarket.env")
+    )
+    trend_market_execute_sim = trend_market_commands.add_parser(
+        "execute-sim", help="Execute one exact report in the Futu simulation account"
+    )
+    trend_market_execute_sim.add_argument(
+        "--market", choices=("CN", "HK", "US"), required=True
+    )
+    trend_market_execute_sim.add_argument(
+        "--execution-date", type=canonical_date, required=True
+    )
+    trend_market_execute_sim.add_argument("--report-sha", required=True)
+    trend_market_execute_sim.add_argument("--actor", required=True)
+    trend_market_execute_sim.add_argument("--reason", required=True)
+    trend_market_execute_sim.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
 
@@ -1858,12 +1874,16 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 2
+        elif args.trend_market_command == "execute-sim":
+            if not str(args.actor or "").strip() or not str(args.reason or "").strip():
+                print("execute-sim requires --actor and --reason", file=sys.stderr)
+                return 2
         try:
             config = load_env_config(args.config, dry_run=False)
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             print(str(exc), file=sys.stderr)
             return 1
-        if args.trend_market_command in {"run", "resolve"}:
+        if args.trend_market_command in {"run", "resolve", "execute-sim"}:
             try:
                 require_trend_executor(config, hostname_fn=socket.gethostname)
             except ValueError as exc:
@@ -1881,6 +1901,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
             elif args.trend_market_command == "status":
                 result = load_trend_market_status(config, args.market)
+            elif args.trend_market_command == "execute-sim":
+                result = execute_simulated_trend_report(
+                    config,
+                    args.market,
+                    args.execution_date,
+                    args.report_sha,
+                    actor=args.actor,
+                    reason=args.reason,
+                )
             else:
                 artifact = resolve_trend_action(
                     config.data_dir,
