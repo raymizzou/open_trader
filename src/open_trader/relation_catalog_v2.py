@@ -658,6 +658,7 @@ class RelationCatalogV2:
                     approved_version_fields[identity] = version_fields
 
             compile_failed = False
+            compiled: tuple | None = None
             if new_generation:
                 # Full compile precheck over the prospective ACTIVE set. The
                 # rows mirror what the compile seam consumes for a live
@@ -673,7 +674,7 @@ class RelationCatalogV2:
                     for identity, version_fields in approved_version_fields.items()
                 }
                 try:
-                    relation_generation_problem(rows)
+                    compiled = relation_generation_problem(rows)
                 except ValueError:
                     # Fail closed: block every identity that was not already
                     # in the previous generation; members of the previous
@@ -691,10 +692,92 @@ class RelationCatalogV2:
                     self.store["approved"] = approved_before
                     for version_id, status in status_before.items():
                         versions[version_id]["status"] = status
+            event_gate_blocked = False
+            if not compile_failed and new_generation:
+                # Issue #102: single venue and one event_identity_basis per
+                # compiled component, computed with the solver's own merge
+                # rule (build_relation_components) over the compiled product
+                # the compile precheck already produced. New identities in a
+                # violating component are blocked with the precise cause and
+                # their per-identity approval/status mutations are rolled
+                # back (the pre-call snapshot convention of the compile
+                # precheck); previous members stay ACTIVE and clean
+                # components in the same batch publish normally.
+                _, components = compiled
+                contract_info: dict[str, list[tuple[str, str | None]]] = {}
+                for _, version_fields in approved_version_fields.items():
+                    for endpoint in version_fields["endpoints"]:
+                        contract_id = str(endpoint["contract_id"])
+                        basis = endpoint.get("event_identity_basis")
+                        if not isinstance(basis, str):
+                            basis = None
+                        contract_info.setdefault(contract_id, []).append(
+                            (str(endpoint["venue"]), basis)
+                        )
+                previous_ids = set(previous_generation)
+                version_by_identity = {
+                    identity: version_id for identity, version_id, _ in entries
+                }
+                for component in components:
+                    component_contracts = set(component.contract_ids)
+                    venues: set[str] = set()
+                    bases: set[str] = set()
+                    missing: set[str] = set()
+                    for contract_id in component_contracts:
+                        infos = contract_info.get(contract_id)
+                        if not infos:
+                            missing.add(contract_id)
+                            continue
+                        for venue, basis in infos:
+                            venues.add(venue)
+                            if basis is None:
+                                missing.add(contract_id)
+                            else:
+                                bases.add(basis)
+                    reason = None
+                    detail = ""
+                    if missing:
+                        reason = "ACTIVATION_BLOCKED_EVENT_IDENTITY_MISSING"
+                        detail = (
+                            f"{reason}: contracts without event_identity_basis "
+                            f"{json.dumps(sorted(missing))}"
+                        )
+                    elif len(venues) > 1 or len(bases) > 1:
+                        reason = "ACTIVATION_BLOCKED_CROSS_EVENT"
+                        detail = (
+                            f"{reason}: component contracts "
+                            f"{json.dumps(sorted(component_contracts))} venues "
+                            f"{json.dumps(sorted(venues))} bases "
+                            f"{json.dumps(sorted(map(str, bases)))}"
+                        )
+                    if reason is None:
+                        continue
+                    for identity, version_fields in approved_version_fields.items():
+                        if identity in previous_ids:
+                            continue
+                        if not (
+                            {str(endpoint["contract_id"]) for endpoint in version_fields["endpoints"]}
+                            & component_contracts
+                        ):
+                            continue
+                        blocked.append({
+                            "identity": identity,
+                            "reason": reason,
+                            "detail": detail,
+                        })
+                        event_gate_blocked = True
+                        new_generation.pop(identity, None)
+                        if identity in approved_before:
+                            self.store.setdefault("approved", {})[identity] = approved_before[identity]
+                        else:
+                            self.store.setdefault("approved", {}).pop(identity, None)
+                        versions[version_by_identity[identity]]["status"] = (
+                            status_before[version_by_identity[identity]]
+                        )
             if not compile_failed:
                 self.store["generation"] = new_generation
             return {
-                "status": "ACTIVATION_BLOCKED_INCONSISTENT" if inconsistent else "ACTIVE",
+                "status": "ACTIVATION_BLOCKED_INCONSISTENT" if (inconsistent or event_gate_blocked) else "ACTIVE",
                 "blocked": blocked,
             }
 

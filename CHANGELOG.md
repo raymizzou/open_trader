@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-23
+
+- #102 关系目录激活门升级为「分量级同事件校验」：激活（`RelationCatalogV2.replace` 批量发布）在编译预检成功之后，对 prospective generation（既有 ACTIVE + 本批新关系）的编译产物按求解器同口径合并规则（`build_relation_components`：settlement_observation_key 指纹相同自动合并 + 显式 relation + forbidden 组合）计算分量，断言每个分量内全部合约单一 venue 且 `event_identity_basis` 唯一（逐字节）。违规分量中本批新 identity 落新 blocked cause `ACTIVATION_BLOCKED_CROSS_EVENT`，诊断写明冲突合约与双方 basis/venue；已激活身份留任，store 回滚到调用前快照（沿用编译预检惯例），干净分量照常发布。`event_identity_basis` 正式化为事件身份字段并保留进 v2 存储（`_converted` 不再丢弃），且纳入版本指纹（同关系重新上报不同 basis → 新 PENDING 版本，旧 ACTIVE 留任供求解）。升级前的存量版本若参与激活且某合约无 basis → 该分量落新 cause `ACTIVATION_BLOCKED_EVENT_IDENTITY_MISSING`（同样「新挡旧留、回滚」）。生产 generation 当前为 0、无存量 ACTIVE，无需数据迁移。v1 schema 必填集合、`_EXCLUDED_FIELDS` 均未改动。验证：新增 12 个验收/回归用例（含跨批连坐、跨 venue、NegRisk 放行、标题相似不误并）；聚焦 5 套件全绿；`make test` 退出码 0。dashboard 六态映射识别两个新 blocked cause；补同批连坐用例。
+
 ## 2026-08-20
 
 - 调整项目协作流程：开发与评审固定在隔离 worktree，运行时验收仅在合入 local `main` 后按适用范围执行；本次仅 docs/config，验证范围为 `git diff --check`、role/config probes 与 review，不涉及 tests、acceptance、deploy 或 push。

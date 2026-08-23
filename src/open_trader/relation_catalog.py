@@ -53,7 +53,12 @@ _REASONS = frozenset({
 })
 _COMPLETENESS = frozenset({"COMPLETE", "INCOMPLETE"})
 _RELATION_TYPES = frozenset({"IMPLIES", "MUTUALLY_EXCLUSIVE", "EXACTLY_ONE"})
-_ACTIVATION_BLOCKED = frozenset({"ACTIVATION_BLOCKED_INCONSISTENT", "UNSUPPORTED_SIZE"})
+_ACTIVATION_BLOCKED = frozenset({
+    "ACTIVATION_BLOCKED_INCONSISTENT",
+    "UNSUPPORTED_SIZE",
+    "ACTIVATION_BLOCKED_CROSS_EVENT",
+    "ACTIVATION_BLOCKED_EVENT_IDENTITY_MISSING",
+})
 _GROUP_BUDGET = 10
 
 #: The six-state review vocabulary shared by the catalog views, counts, and UI.
@@ -559,6 +564,7 @@ class RelationCatalog:
                 "title": market["title"],
                 "market_date": market["market_date"],
                 "expires_at": market["expires_at"],
+                "event_identity_basis": market["event_identity_basis"],
                 "settlement_observation_key": market["settlement_observation_key"],
                 "settlement_rules": market["settlement_rules"],
                 "cancellation_rules": market["cancellation_rules"],
@@ -982,12 +988,19 @@ class RelationCatalog:
         # candidate, which the activation gate must not see as a
         # previously-existing member.
         activation = self._activate(relation_version_id)
-        return {
+        result = {
             "version_id": relation_version_id,
             "identity": identity,
             "status": "APPROVED",
             "activation": activation,
         }
+        if activation != "ACTIVE":
+            result["activation_diagnostic"] = str(
+                self._versions()[relation_version_id].get(
+                    "activation_diagnostic", activation
+                )
+            )
+        return result
 
     def _activate(self, relation_version_id: str) -> str:
         """Publish the v2 generation for one approved version, or record why not."""
@@ -1000,13 +1013,24 @@ class RelationCatalog:
         change_set = self._generation_change_set(relation_version_id)
         result = self._catalog.replace(change_set, actor="system", git_sha="")
         activation = "ACTIVE"
+        diagnostic = ""
         if result["status"] != "ACTIVE":
             blocked = {
-                str(item["identity"]): str(item["reason"])
+                str(item["identity"]): item
                 for item in result["blocked"]
             }
-            reason = blocked.get(str(record["identity"]), "ACTIVATION_BLOCKED_INCONSISTENT")
-            activation = "UNSUPPORTED_SIZE" if reason == "UNSUPPORTED_SIZE" else "ACTIVATION_BLOCKED_INCONSISTENT"
+            entry = blocked.get(str(record["identity"]))
+            reason = str(entry["reason"]) if entry else "ACTIVATION_BLOCKED_INCONSISTENT"
+            if reason == "UNSUPPORTED_SIZE":
+                activation = "UNSUPPORTED_SIZE"
+            elif reason in {
+                "ACTIVATION_BLOCKED_CROSS_EVENT",
+                "ACTIVATION_BLOCKED_EVENT_IDENTITY_MISSING",
+            }:
+                activation = reason
+                diagnostic = str(entry.get("detail", ""))
+            else:
+                activation = "ACTIVATION_BLOCKED_INCONSISTENT"
         updated = dict(self._versions()[relation_version_id])
         updated["activation_status"] = activation
         if activation != "ACTIVE":
@@ -1014,7 +1038,7 @@ class RelationCatalog:
             # v2 replace() rolls a blocked candidate back to PENDING, so the
             # approval must be re-recorded here for the review-state mapping.
             updated["status"] = "APPROVED"
-            updated["activation_diagnostic"] = activation
+            updated["activation_diagnostic"] = diagnostic or activation
         self._store_write({relation_version_id: updated})
         if activation == "ACTIVE":
             superseded_id = previous_generation.get(identity, {}).get("version_id")

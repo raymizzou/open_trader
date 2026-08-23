@@ -13,7 +13,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from open_trader.relation_catalog import RelationCatalog
 from open_trader.relation_catalog_v2 import RelationCatalogV2, SqliteCatalogStore
+from test_relation_catalog import discovery
 from test_relation_catalog_v2 import _endpoint, _payload
 
 
@@ -25,6 +27,40 @@ def _approve(catalog: RelationCatalogV2, payload: dict[str, object]) -> dict[str
     result = catalog.ingest(payload)
     catalog.approve(result["version_id"], actor="auditor", git_sha="a" * 40)
     return result
+
+
+# Issue #102: the facade keeps event_identity_basis in the stored v2 payload,
+# and legacy rows without a basis survive the SQLite round-trip byte-identical.
+
+def test_sqlite_converted_payload_keeps_event_identity_basis(tmp_path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    version_id = catalog.ingest(discovery())["version_id"]
+
+    reopened = RelationCatalog(tmp_path)
+    stored = reopened._versions()[version_id]["payload"]
+    assert all(
+        str(endpoint["event_identity_basis"]) == "event-a"
+        for endpoint in stored["endpoints"]
+    )
+    assert json.dumps(stored, sort_keys=True) == json.dumps(
+        catalog._versions()[version_id]["payload"], sort_keys=True
+    )
+
+
+def test_sqlite_legacy_row_without_basis_round_trips_byte_identical(tmp_path) -> None:
+    db_path = str(tmp_path / "catalog.db")
+    catalog = _catalog(db_path)
+    legacy = _payload()  # pre-#102 rows never carried event_identity_basis
+    result = _approve(catalog, legacy)
+    record = catalog.store["versions"][result["version_id"]]
+
+    reopened = _catalog(db_path)
+    record_again = reopened.store["versions"][result["version_id"]]
+    assert json.dumps(record_again["payload"], sort_keys=True) == json.dumps(
+        record["payload"], sort_keys=True
+    )
+    assert record_again["version_fp"] == record["version_fp"]
+    assert record_again["identity"] == record["identity"]
 
 
 def test_sqlite_reopen_preserves_state(tmp_path) -> None:

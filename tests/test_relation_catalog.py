@@ -15,7 +15,9 @@ from open_trader.relation_catalog import (
     _derive_statement,
     _threshold_complete_model,
     _threshold_discovery_payload,
+    default_catalog_path,
 )
+from open_trader.relation_catalog_v2 import RelationCatalogV2, SqliteCatalogStore
 from open_trader.prediction_n_leg import (
     OBSERVATION_SCHEMA_V1,
     PROBLEM_SCHEMA_V1,
@@ -33,7 +35,6 @@ from open_trader.prediction_n_leg import (
     TerminalStateSet,
     canonical_payload,
 )
-from open_trader.relation_catalog_v2 import SqliteCatalogStore
 from test_prediction_arbitrage import threshold_relation
 
 
@@ -46,7 +47,7 @@ def compiled_problem(
     *,
     as_of: str = "2026-08-15T00:00:00Z",
     release_at: str = "2026-12-31T17:00:00Z",
-    rule: str = "rules-issue-99",
+    rule: str | dict[str, str] = "rules-issue-99",
     problem_id: str = "issue-99",
 ) -> dict[str, object]:
     """A canonical compiled problem over ``contract_ids`` with per-contract sides.
@@ -54,22 +55,26 @@ def compiled_problem(
     Mirrors ``_threshold_complete_model``: one EXACTLY_ONE constraint over the
     contracts, NORMAL_YES/NORMAL_NO/VOID atoms per contract releasing at
     ``release_at``, and a BUY_YES/BUY_NO action per contract at
-    ``polymarket:{contract_id}``.
+    ``polymarket:{contract_id}``. ``rule`` may be a shared string or a
+    per-contract dict, so tests can give each contract its own settlement
+    observation key (disjoint observations within one explicit relation).
     """
     as_of_dt = datetime.fromisoformat(as_of.replace("Z", "+00:00")).astimezone(UTC)
     release_dt = datetime.fromisoformat(release_at.replace("Z", "+00:00")).astimezone(UTC)
-    key = SettlementObservationKey(
-        OBSERVATION_SCHEMA_V1,
-        "oracle-issue-99",
-        "indicator-issue-99",
-        as_of_dt,
-        as_of_dt,
-        "UTC",
-        rule,
-    )
+    shared_rule = rule[contract_ids[0]] if isinstance(rule, dict) else rule
     actions: list[CandidateAction] = []
     states: list[TerminalStateSet] = []
     for contract_id in contract_ids:
+        contract_rule = rule[contract_id] if isinstance(rule, dict) else rule
+        key = SettlementObservationKey(
+            OBSERVATION_SCHEMA_V1,
+            "oracle-issue-99",
+            "indicator-issue-99",
+            as_of_dt,
+            as_of_dt,
+            "UTC",
+            contract_rule,
+        )
         side = ActionSide(sides[contract_id])
         action_id = f"polymarket:{contract_id}"
         yes_payout = 1 if side == ActionSide.BUY_YES else 0
@@ -94,18 +99,18 @@ def compiled_problem(
         states.append(TerminalStateSet(
             contract_id,
             key,
-            rule,
+            contract_rule,
             (
                 TerminalAtom(
-                    f"{contract_id}:NORMAL_YES", TerminalKind.NORMAL_YES, rule,
+                    f"{contract_id}:NORMAL_YES", TerminalKind.NORMAL_YES, contract_rule,
                     (ActionPayout(action_id, yes_payout),), release_dt,
                 ),
                 TerminalAtom(
-                    f"{contract_id}:NORMAL_NO", TerminalKind.NORMAL_NO, rule,
+                    f"{contract_id}:NORMAL_NO", TerminalKind.NORMAL_NO, contract_rule,
                     (ActionPayout(action_id, no_payout),), release_dt,
                 ),
                 TerminalAtom(
-                    f"{contract_id}:VOID", TerminalKind.VOID, rule,
+                    f"{contract_id}:VOID", TerminalKind.VOID, contract_rule,
                     (ActionPayout(action_id, 0),), release_dt,
                 ),
             ),
@@ -123,7 +128,7 @@ def compiled_problem(
                     f"exactly-one:{':'.join(contract_ids)}",
                     RelationKind.EXACTLY_ONE,
                     tuple(contract_ids),
-                    rule,
+                    shared_rule,
                 ),
             ),
             (),
@@ -140,12 +145,15 @@ def compiled_relation_discovery(
     relation_type: str = "EXACTLY_ONE",
     as_of: str = "2026-08-15T00:00:00Z",
     release: str = "2026-12-31T17:00:00Z",
+    rule: str | dict[str, str] = "rules-issue-99",
 ) -> dict[str, object]:
     """A facade discovery payload carrying a compiled problem over contracts."""
     payload = discovery(
         relation_type=relation_type,
         n=len(contract_ids),
-        problem=compiled_problem(contract_ids, sides, as_of=as_of, release_at=release),
+        problem=compiled_problem(
+            contract_ids, sides, as_of=as_of, release_at=release, rule=rule
+        ),
     )
     for index, contract_id in enumerate(contract_ids):
         payload["markets"][index]["contract_id"] = contract_id
@@ -968,3 +976,280 @@ def test_activation_gate_accepts_compile_compatible_candidate(tmp_path: Path) ->
     generation = catalog.current_generation()
     assert len(generation) == 2
     assert all(row["activation"] == "ACTIVE" for row in generation.values())
+
+
+# Issue #102: same-event activation gate (facade level).
+
+def _legacy_v2_payload() -> dict[str, object]:
+    """A stored v2 payload as written before issue #102: no event_identity_basis."""
+    return {
+        "relation_type": "EXACTLY_ONE",
+        "endpoints": [
+            {
+                "venue": "polymarket", "contract_id": f"condition-{letter}",
+                "title": f"Market {letter}",
+                "market_date": "2026-08-15T00:00:00Z",
+                "expires_at": "2026-12-31T17:00:00Z",
+                "settlement_observation_key": "btc-usd",
+                "settlement_rules": "official index",
+                "cancellation_rules": "void refunds",
+            }
+            for letter in ("a", "b")
+        ],
+        "terminal_states": ["NORMAL_YES", "NORMAL_NO", "VOID"],
+        "payouts": {
+            f"condition-{letter}": {"NORMAL_YES": 1, "NORMAL_NO": 0, "VOID": 0}
+            for letter in ("a", "b")
+        },
+        "capital_release": "2026-12-31T17:00:00Z",
+        "discovery_source": "exchange_metadata",
+        "discovered_at": "2026-08-15T02:32:00Z",
+        "problem": compiled_problem(
+            ["condition-a", "condition-b"],
+            {"condition-a": "BUY_YES", "condition-b": "BUY_YES"},
+        ),
+    }
+
+
+def test_activation_blocks_legacy_version_without_event_identity_basis(
+    tmp_path: Path,
+) -> None:
+    default_catalog_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    store = SqliteCatalogStore(str(default_catalog_path(tmp_path)))
+    legacy_id = RelationCatalogV2(store).ingest(_legacy_v2_payload())["version_id"]
+
+    catalog = RelationCatalog(tmp_path)
+    result = catalog.approve(legacy_id, {"version_id": legacy_id}, actor="op", git_sha="sha")
+    assert result["activation"] == "ACTIVATION_BLOCKED_EVENT_IDENTITY_MISSING"
+    assert result["activation_diagnostic"].startswith(
+        "ACTIVATION_BLOCKED_EVENT_IDENTITY_MISSING"
+    )
+    assert "condition-a" in result["activation_diagnostic"]
+    assert "condition-b" in result["activation_diagnostic"]
+    assert catalog.current_generation() == {}
+
+
+def test_activation_gate_blocks_cross_event_observation_join(tmp_path: Path) -> None:
+    """Two legal relations whose contracts share one settlement observation
+    key are merged by the solver into one component; a second event_identity
+    basis inside that component blocks only the new identity."""
+    catalog = RelationCatalog(tmp_path)
+    first = compiled_relation_discovery(
+        ["condition-a", "condition-b"],
+        {"condition-a": "BUY_YES", "condition-b": "BUY_YES"},
+    )
+    for market in first["markets"]:
+        market["event_identity_basis"] = "E1"
+    second = compiled_relation_discovery(
+        ["condition-c", "condition-d"],
+        {"condition-c": "BUY_YES", "condition-d": "BUY_YES"},
+    )
+    for market in second["markets"]:
+        market["event_identity_basis"] = "E2"
+
+    first_id = catalog.ingest(first)["version_id"]
+    assert catalog.approve(first_id, {"version_id": first_id}, actor="op", git_sha="sha")["activation"] == "ACTIVE"
+    before = dict(catalog.current_generation())
+    assert len(before) == 1
+
+    second_id = catalog.ingest(second)["version_id"]
+    blocked = catalog.approve(second_id, {"version_id": second_id}, actor="op", git_sha="sha")
+    assert blocked["activation"] == "ACTIVATION_BLOCKED_CROSS_EVENT"
+    assert "E1" in blocked["activation_diagnostic"]
+    assert "E2" in blocked["activation_diagnostic"]
+    assert catalog.current_generation() == before  # store rolled back
+    rows = {row["version_id"]: row for row in catalog.review_rows()}
+    assert rows[second_id]["activation"] == "ACTIVATION_BLOCKED_CROSS_EVENT"
+    assert rows[second_id]["status"] == "APPROVED"
+
+
+def test_activation_gate_blocks_every_new_relation_in_the_violating_component(
+    tmp_path: Path,
+) -> None:
+    """Cross-batch joint blocking: two later relations that land in the same
+    violating component are each blocked, while a clean component's relation
+    activates normally."""
+    catalog = RelationCatalog(tmp_path)
+    active = compiled_relation_discovery(
+        ["condition-a", "condition-b"],
+        {"condition-a": "BUY_YES", "condition-b": "BUY_YES"},
+    )
+    for market in active["markets"]:
+        market["event_identity_basis"] = "E1"
+    active_id = catalog.ingest(active)["version_id"]
+    assert catalog.approve(active_id, {"version_id": active_id}, actor="op", git_sha="sha")["activation"] == "ACTIVE"
+
+    r1 = compiled_relation_discovery(
+        ["condition-x", "condition-y"],
+        {"condition-x": "BUY_YES", "condition-y": "BUY_YES"},
+    )
+    for market in r1["markets"]:
+        market["event_identity_basis"] = "E2"
+    r1_id = catalog.ingest(r1)["version_id"]
+    first_blocked = catalog.approve(r1_id, {"version_id": r1_id}, actor="op", git_sha="sha")
+    assert first_blocked["activation"] == "ACTIVATION_BLOCKED_CROSS_EVENT"
+
+    r2 = compiled_relation_discovery(
+        ["condition-y", "condition-z"],
+        {"condition-y": "BUY_YES", "condition-z": "BUY_YES"},
+    )
+    for market in r2["markets"]:
+        market["event_identity_basis"] = "E2"
+    r2_id = catalog.ingest(r2)["version_id"]
+    second_blocked = catalog.approve(r2_id, {"version_id": r2_id}, actor="op", git_sha="sha")
+    assert second_blocked["activation"] == "ACTIVATION_BLOCKED_CROSS_EVENT"
+
+    clean = compiled_relation_discovery(
+        ["condition-m", "condition-n"],
+        {"condition-m": "BUY_YES", "condition-n": "BUY_YES"},
+        rule="rules-clean",
+    )
+    for market in clean["markets"]:
+        market["event_identity_basis"] = "E3"
+    clean_id = catalog.ingest(clean)["version_id"]
+    result = catalog.approve(clean_id, {"version_id": clean_id}, actor="op", git_sha="sha")
+    assert result["activation"] == "ACTIVE"
+    generation = catalog.current_generation()
+    assert len(generation) == 2  # only the first active and the clean relation
+    active_row = next(row for row in catalog.review_rows() if row["version_id"] == active_id)
+    clean_row = next(row for row in catalog.review_rows() if row["version_id"] == clean_id)
+    assert set(generation) == {active_row["identity"], clean_row["identity"]}
+    rows = {row["version_id"]: row for row in catalog.review_rows()}
+    for blocked_id in (r1_id, r2_id):
+        assert rows[blocked_id]["activation"] == "ACTIVATION_BLOCKED_CROSS_EVENT"
+        assert rows[blocked_id]["status"] == "APPROVED"
+        assert rows[blocked_id]["identity"] not in generation
+
+
+def test_activation_gate_allows_same_observation_relations_with_one_basis(
+    tmp_path: Path,
+) -> None:
+    """Legal pass: two relations observing the same event (identical settlement
+    observation key) merge into one component; a single shared event_identity
+    basis keeps the component legal, so both activate."""
+    catalog = RelationCatalog(tmp_path)
+    first = compiled_relation_discovery(
+        ["condition-a", "condition-b"],
+        {"condition-a": "BUY_YES", "condition-b": "BUY_YES"},
+    )
+    for market in first["markets"]:
+        market["event_identity_basis"] = "E1"
+    second = compiled_relation_discovery(
+        ["condition-c", "condition-d"],
+        {"condition-c": "BUY_YES", "condition-d": "BUY_YES"},
+    )
+    for market in second["markets"]:
+        market["event_identity_basis"] = "E1"
+
+    first_id = catalog.ingest(first)["version_id"]
+    assert catalog.approve(first_id, {"version_id": first_id}, actor="op", git_sha="sha")["activation"] == "ACTIVE"
+    second_id = catalog.ingest(second)["version_id"]
+    assert catalog.approve(second_id, {"version_id": second_id}, actor="op", git_sha="sha")["activation"] == "ACTIVE"
+    generation = catalog.current_generation()
+    rows = {row["version_id"]: row for row in catalog.review_rows()}
+    assert set(generation) == {rows[first_id]["identity"], rows[second_id]["identity"]}
+    assert rows[first_id]["activation"] == "ACTIVE"
+    assert rows[second_id]["activation"] == "ACTIVE"
+
+
+def test_activation_gate_allows_negrisk_component_with_distinct_observation_keys(
+    tmp_path: Path,
+) -> None:
+    """Legal pass: a NegRisk-shaped component of three contracts, each with its
+    own settlement observation key, joined by the explicit EXACTLY_ONE relation
+    and sharing one event_identity basis, activates."""
+    catalog = RelationCatalog(tmp_path)
+    negrisk = compiled_relation_discovery(
+        ["condition-n1", "condition-n2", "condition-n3"],
+        {
+            "condition-n1": "BUY_YES",
+            "condition-n2": "BUY_YES",
+            "condition-n3": "BUY_YES",
+        },
+        rule={
+            "condition-n1": "negrisk-observer-a",
+            "condition-n2": "negrisk-observer-b",
+            "condition-n3": "negrisk-observer-c",
+        },
+    )
+    for market in negrisk["markets"]:
+        market["event_identity_basis"] = "E1"
+    version_id = catalog.ingest(negrisk)["version_id"]
+    result = catalog.approve(version_id, {"version_id": version_id}, actor="op", git_sha="sha")
+    assert result["activation"] == "ACTIVE"
+    generation = catalog.current_generation()
+    assert len(generation) == 1
+    rows = {row["version_id"]: row for row in catalog.review_rows()}
+    assert rows[version_id]["identity"] in generation
+
+
+def test_activation_gate_blocks_component_with_multiple_venues(
+    tmp_path: Path,
+) -> None:
+    """The venue check runs inside the same component check: two relations
+    joined by one settlement observation key but traded on different venues
+    block the new identity; the already-active one stays."""
+    catalog = RelationCatalog(tmp_path)
+    first = compiled_relation_discovery(
+        ["condition-a", "condition-b"],
+        {"condition-a": "BUY_YES", "condition-b": "BUY_YES"},
+    )
+    for market in first["markets"]:
+        market["event_identity_basis"] = "E1"
+    second = compiled_relation_discovery(
+        ["condition-c", "condition-d"],
+        {"condition-c": "BUY_YES", "condition-d": "BUY_YES"},
+    )
+    for market in second["markets"]:
+        market["event_identity_basis"] = "E1"
+        market["venue"] = "Predict.fun"
+
+    first_id = catalog.ingest(first)["version_id"]
+    assert catalog.approve(first_id, {"version_id": first_id}, actor="op", git_sha="sha")["activation"] == "ACTIVE"
+    before = dict(catalog.current_generation())
+    assert len(before) == 1
+
+    second_id = catalog.ingest(second)["version_id"]
+    blocked = catalog.approve(second_id, {"version_id": second_id}, actor="op", git_sha="sha")
+    assert blocked["activation"] == "ACTIVATION_BLOCKED_CROSS_EVENT"
+    # venues are stored casefolded by the v2 conversion (_converted)
+    assert "polymarket" in blocked["activation_diagnostic"]
+    assert "predict.fun" in blocked["activation_diagnostic"]
+    assert catalog.current_generation() == before  # rollback: only the first stays
+    rows = {row["version_id"]: row for row in catalog.review_rows()}
+    assert rows[second_id]["activation"] == "ACTIVATION_BLOCKED_CROSS_EVENT"
+    assert rows[second_id]["status"] == "APPROVED"
+
+
+def test_activation_gate_keeps_similar_title_relations_in_separate_components(
+    tmp_path: Path,
+) -> None:
+    """Similar titles never merge components: relations that share no
+    observation key and no event_identity basis each activate independently."""
+    catalog = RelationCatalog(tmp_path)
+    title = "Will Bitcoin trade above $100,000 before December 31, 2026?"
+    first = compiled_relation_discovery(
+        ["condition-a", "condition-b"],
+        {"condition-a": "BUY_YES", "condition-b": "BUY_YES"},
+    )
+    for market in first["markets"]:
+        market["event_identity_basis"] = "E1"
+        market["title"] = title
+    second = compiled_relation_discovery(
+        ["condition-c", "condition-d"],
+        {"condition-c": "BUY_YES", "condition-d": "BUY_YES"},
+        rule="rules-other-event",
+    )
+    for market in second["markets"]:
+        market["event_identity_basis"] = "E2"
+        market["title"] = title
+
+    first_id = catalog.ingest(first)["version_id"]
+    assert catalog.approve(first_id, {"version_id": first_id}, actor="op", git_sha="sha")["activation"] == "ACTIVE"
+    second_id = catalog.ingest(second)["version_id"]
+    assert catalog.approve(second_id, {"version_id": second_id}, actor="op", git_sha="sha")["activation"] == "ACTIVE"
+    generation = catalog.current_generation()
+    rows = {row["version_id"]: row for row in catalog.review_rows()}
+    assert set(generation) == {rows[first_id]["identity"], rows[second_id]["identity"]}
+    assert rows[first_id]["activation"] == "ACTIVE"
+    assert rows[second_id]["activation"] == "ACTIVE"

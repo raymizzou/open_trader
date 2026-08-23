@@ -4008,7 +4008,7 @@ function relationReviewStateKey(item) {
   if (status === "PENDING") return "PENDING_APPROVAL";
   if (status !== "APPROVED") return "";
   if (activation === "ACTIVE") return "ACTIVATED";
-  if (activation === "ACTIVATION_BLOCKED_INCONSISTENT" || activation === "UNSUPPORTED_SIZE") return "ACTIVATION_BLOCKED";
+  if (activation.startsWith("ACTIVATION_BLOCKED") || activation === "UNSUPPORTED_SIZE") return "ACTIVATION_BLOCKED";
   if (activation === "SUPERSEDED") return "SOURCE_CHANGED_REAPPROVAL";
   const compiled = Array.isArray(item?.model?.terminal_states) && item.model.terminal_states.length > 0;
   return compiled ? "COMPILED_PENDING_ACTIVATION" : "APPROVED_MODEL_INCOMPLETE";

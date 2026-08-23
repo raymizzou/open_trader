@@ -104,6 +104,7 @@ def _payload_with_problem(
     venues: list[str] | None = None,
     as_of: str = "2026-08-15T00:00:00Z",
     release: str = "2026-12-31T17:00:00Z",
+    rule: str = "rules-issue-99",
     **overrides: object,
 ) -> dict[str, object]:
     """Payload over ``contract_ids`` carrying a compiled problem."""
@@ -115,7 +116,9 @@ def _payload_with_problem(
             for index in range(len(contract_ids))
         ],
         capital_release=release,
-        problem=compiled_problem(contract_ids, sides, as_of=as_of, release_at=release),
+        problem=compiled_problem(
+            contract_ids, sides, as_of=as_of, release_at=release, rule=rule
+        ),
         **overrides,
     )
 
@@ -232,6 +235,50 @@ def test_version_ignores_discovered_at_change(store) -> None:
     assert _ingest(catalog, discovered_at="2026-08-15T00:00:00Z")["version_id"] == _ingest(
         catalog, discovered_at="2026-08-15T12:00:00Z"
     )["version_id"]
+
+
+# Issue #102: event_identity_basis participates in the version fingerprint.
+
+def test_version_bumps_when_event_identity_basis_is_added(store) -> None:
+    """A payload whose endpoints carry a basis must fingerprint differently
+    from the identical payload without one (legacy rows stay distinct)."""
+    catalog = _catalog(store)
+    endpoints = [_endpoint("polymarket", "cA"), _endpoint("predict.fun", "cB")]
+    without_basis = _ingest(catalog, endpoints=endpoints)["version_id"]
+    with_basis = _ingest(
+        catalog,
+        endpoints=[
+            _endpoint("polymarket", "cA", event_identity_basis="event-1"),
+            _endpoint("predict.fun", "cB", event_identity_basis="event-1"),
+        ],
+    )["version_id"]
+    assert without_basis != with_basis
+
+
+def test_version_bumps_on_event_identity_basis_change(store) -> None:
+    """Re-reporting the same relation with a different basis makes a new
+    version; the previously active version stays in the generation."""
+    catalog = _catalog(store)
+    e1 = _payload(
+        endpoints=[
+            _endpoint("polymarket", "cA", event_identity_basis="E1"),
+            _endpoint("predict.fun", "cB", event_identity_basis="E1"),
+        ]
+    )
+    first = _approve(catalog, e1)
+    assert catalog.current_generation()[first["identity"]]["status"] == "ACTIVE"
+    e9 = _payload(
+        endpoints=[
+            _endpoint("polymarket", "cA", event_identity_basis="E9"),
+            _endpoint("predict.fun", "cB", event_identity_basis="E9"),
+        ]
+    )
+    second = catalog.ingest(e9)
+    assert second["version_id"] != first["version_id"]
+    assert second["status"] == "PENDING"
+    generation = catalog.current_generation()
+    assert generation[first["identity"]]["version_id"] == first["version_id"]
+    assert generation[first["identity"]]["status"] == "ACTIVE"
 
 
 def test_version_bumps_on_market_identity_change(store) -> None:
@@ -392,8 +439,10 @@ def test_group_over_budget_blocked_other_groups_unaffected(store) -> None:
     small = _payload_with_problem(
         ["cZ", "cW"],
         {"cZ": "BUY_YES", "cW": "BUY_YES"},
-        venues=["polymarket", "predict.fun"],
+        venues=["polymarket", "polymarket"],
     )
+    for endpoint in small["endpoints"]:
+        endpoint["event_identity_basis"] = "event-1"
     big_identity = catalog.ingest(oversized[0])["identity"]
     small_identity = catalog.ingest(small)["identity"]
     result = catalog.replace(oversized + [small], actor="auditor", git_sha="a" * 40)
@@ -447,11 +496,87 @@ def test_replace_accepts_compile_compatible_generation(store) -> None:
     catalog = _catalog(store)
     first = _payload_with_problem(["cA", "cB"], {"cA": "BUY_YES", "cB": "BUY_YES"})
     second = _payload_with_problem(["cA", "cC"], {"cA": "BUY_YES", "cC": "BUY_YES"})
+    for payload in (first, second):
+        for endpoint in payload["endpoints"]:
+            endpoint["event_identity_basis"] = "event-1"
     result = catalog.replace([first, second], actor="auditor", git_sha="a" * 40)
     assert result["status"] == "ACTIVE"
     generation = catalog.current_generation()
     assert len(generation) == 2
     assert all(entry["status"] == "ACTIVE" for entry in generation.values())
+
+
+# Issue #102: single venue and one event_identity_basis per compiled component.
+
+def test_replace_blocks_missing_basis_component_and_activates_clean_component(store) -> None:
+    """A pre-upgrade row without event_identity_basis fails closed inside its
+    component; a clean component in the same batch is unaffected."""
+    catalog = _catalog(store)
+    legacy = _payload_with_problem(
+        ["cA", "cB"], {"cA": "BUY_YES", "cB": "BUY_YES"}, rule="rules-legacy"
+    )  # endpoints carry no event_identity_basis, as before issue #102
+    clean = _payload_with_problem(
+        ["cX", "cY"], {"cX": "BUY_YES", "cY": "BUY_YES"}, rule="rules-clean"
+    )
+    for endpoint in clean["endpoints"]:
+        endpoint["event_identity_basis"] = "event-1"
+    legacy_identity = _canonicalize(legacy)[0]
+    clean_identity = _canonicalize(clean)[0]
+
+    result = catalog.replace([legacy, clean], actor="auditor", git_sha="a" * 40)
+    blocked = {entry["identity"]: entry["reason"] for entry in result["blocked"]}
+    assert blocked[legacy_identity] == "ACTIVATION_BLOCKED_EVENT_IDENTITY_MISSING"
+    assert clean_identity not in blocked
+    generation = catalog.current_generation()
+    assert generation[clean_identity]["status"] == "ACTIVE"
+    assert legacy_identity not in generation
+
+
+def test_replace_blocks_same_batch_cross_event_component_and_activates_clean_component(store) -> None:
+    """Two new relations in one replace batch land in one compiled component
+    with two event bases (they share contract cY); both are blocked with the
+    CROSS_EVENT cause, their approvals and version statuses roll back to the
+    pre-call snapshot, and a clean component in the same batch still publishes
+    ACTIVE (T5: same-batch collateral blocking)."""
+    catalog = _catalog(store)
+    first = _payload_with_problem(
+        ["cX", "cY"], {"cX": "BUY_YES", "cY": "BUY_YES"}, rule="rules-shared"
+    )  # both endpoints carry event_identity_basis E2
+    second = _payload_with_problem(
+        ["cY", "cW"], {"cY": "BUY_YES", "cW": "BUY_YES"}, rule="rules-shared"
+    )  # shares contract cY with first; both endpoints carry basis E3
+    clean = _payload_with_problem(
+        ["cA", "cB"], {"cA": "BUY_YES", "cB": "BUY_YES"}, rule="rules-clean"
+    )  # disjoint component, consistent basis
+    for endpoint in first["endpoints"]:
+        endpoint["event_identity_basis"] = "E2"
+    for endpoint in second["endpoints"]:
+        endpoint["event_identity_basis"] = "E3"
+    for endpoint in clean["endpoints"]:
+        endpoint["event_identity_basis"] = "event-1"
+    first_identity = _canonicalize(first)[0]
+    second_identity = _canonicalize(second)[0]
+    clean_identity = _canonicalize(clean)[0]
+
+    result = catalog.replace([first, second, clean], actor="auditor", git_sha="a" * 40)
+    assert result["status"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+    blocked = {entry["identity"]: entry for entry in result["blocked"]}
+    assert set(blocked) == {first_identity, second_identity}
+    for entry in (blocked[first_identity], blocked[second_identity]):
+        assert entry["reason"] == "ACTIVATION_BLOCKED_CROSS_EVENT"
+        # diagnosis names both conflicting event bases of the shared component
+        assert "E2" in entry["detail"]
+        assert "E3" in entry["detail"]
+    # per-identity approval and version status rolled back to the pre-call
+    # snapshot: only the clean relation stays approved, its versions PENDING
+    assert set(catalog.store["approved"]) == {clean_identity}
+    versions = catalog.store["versions"]
+    for identity in (first_identity, second_identity):
+        matching = [record for record in versions.values() if record["identity"] == identity]
+        assert [record["status"] for record in matching] == ["PENDING"]
+    generation = catalog.current_generation()
+    assert set(generation) == {clean_identity}
+    assert generation[clean_identity]["status"] == "ACTIVE"
 
 
 # Decision 7: monitor admission is the only seam.
