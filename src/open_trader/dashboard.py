@@ -2426,6 +2426,54 @@ def _valid_v2_risk_items(
     summary_new_risk = _dashboard_risk_decimal(summary.get("new_planned_risk"))
     if summary_new_risk != new_planned_risk:
         return False
+    planned_risk = _dashboard_risk_decimal(summary.get("portfolio_planned_risk"))
+    if (
+        summary.get("status") == "active"
+        and planned_risk is not None
+        and portfolio_limit is not None
+        and planned_risk > portfolio_limit
+    ):
+        existing_risk = _dashboard_risk_decimal(
+            summary.get("existing_planned_risk")
+        )
+        remaining_capacity = max(
+            Decimal("0"),
+            portfolio_limit - (existing_risk or Decimal("0")),
+        )
+        overflow = max(Decimal("0"), planned_risk - portfolio_limit)
+        evidenced_risk = Decimal("0")
+        for item in buys:
+            executable = item.get("executable")
+            if not isinstance(executable, bool):
+                return False
+            if not executable:
+                continue
+            item_risk = _dashboard_risk_decimal(item.get("planned_stop_risk"))
+            if item_risk is None:
+                continue
+            if item_risk > remaining_capacity:
+                if (
+                    item.get("estimated_shares") != item.get("lot_size")
+                    or not isinstance(item.get("sizing_note"), str)
+                    or "一手超过组合剩余风险" not in item["sizing_note"]
+                ):
+                    return False
+                evidenced_risk += item_risk
+            remaining_capacity = max(
+                Decimal("0"),
+                remaining_capacity - item_risk,
+            )
+        if (
+            summary.get("status_label") != "含最小一手额外风险"
+            or summary_new_risk <= 0
+            or evidenced_risk < overflow
+        ):
+            return False
+    elif (
+        summary.get("status") == "active"
+        and summary.get("status_label") == "含最小一手额外风险"
+    ):
+        return False
     allowed_constraints = {
         "名义仓位上限",
         "单笔风险上限",

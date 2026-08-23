@@ -2517,6 +2517,200 @@ def test_dashboard_current_trend_risk_audit_requires_final_plan_rows() -> None:
     assert not dashboard_module._valid_trend_risk_summary(payload)
 
 
+def test_dashboard_current_trend_risk_accepts_supported_minimum_lot_overflow() -> None:
+    payload = _valid_v4_dashboard_trend_payload()
+    summary = payload["risk_summary"]
+    judgments = payload["strategy_judgments"]
+    assert isinstance(summary, dict) and isinstance(judgments, dict)
+    summary.update({
+        "status": "active",
+        "status_label": "含最小一手额外风险",
+        "existing_planned_risk": "4000",
+        "new_planned_risk": "303",
+        "portfolio_planned_risk": "4303",
+        "portfolio_planned_risk_pct": "0.04303",
+        "portfolio_remaining_risk": "0",
+        "portfolio_remaining_risk_pct": "0",
+    })
+    buy = judgments["formal_actions"][0]
+    assert isinstance(buy, dict)
+    buy.update({
+        "estimated_shares": 100,
+        "lot_size": 100,
+        "sizing_note": "一手超过组合剩余风险",
+        "executable": True,
+    })
+
+    assert dashboard_module._valid_trend_risk_summary(payload)
+
+    buy["sizing_note"] = ""
+    assert not dashboard_module._valid_trend_risk_summary(payload)
+    buy["sizing_note"] = "一手超过组合剩余风险"
+    buy["estimated_shares"] = 200
+    assert not dashboard_module._valid_trend_risk_summary(payload)
+
+
+def test_dashboard_accepts_paused_existing_risk_above_limit_without_overflow_evidence() -> None:
+    payload = _valid_v4_dashboard_trend_payload()
+    summary = payload["risk_summary"]
+    judgments = payload["strategy_judgments"]
+    assert isinstance(summary, dict) and isinstance(judgments, dict)
+    judgments["formal_actions"] = []
+    summary.update({
+        "status": "paused",
+        "status_label": "组合风险已满",
+        "pause_reason": "组合风险已达到上限，暂停新开仓",
+        "existing_planned_risk": "4001",
+        "new_planned_risk": "0",
+        "portfolio_planned_risk": "4001",
+        "portfolio_planned_risk_pct": "0.04001",
+        "portfolio_remaining_risk": "0",
+        "portfolio_remaining_risk_pct": "0",
+    })
+
+    assert dashboard_module._valid_trend_risk_summary(payload)
+
+
+def test_dashboard_rejects_missing_or_non_boolean_minimum_lot_executable() -> None:
+    for executable in ("missing", None, "yes", 1):
+        payload = _valid_v4_dashboard_trend_payload()
+        summary = payload["risk_summary"]
+        judgments = payload["strategy_judgments"]
+        assert isinstance(summary, dict) and isinstance(judgments, dict)
+        summary.update({
+            "status": "active",
+            "status_label": "含最小一手额外风险",
+            "existing_planned_risk": "4000",
+            "new_planned_risk": "303",
+            "portfolio_planned_risk": "4303",
+            "portfolio_planned_risk_pct": "0.04303",
+            "portfolio_remaining_risk": "0",
+            "portfolio_remaining_risk_pct": "0",
+        })
+        buy = judgments["formal_actions"][0]
+        assert isinstance(buy, dict)
+        buy.update({
+            "estimated_shares": 100,
+            "lot_size": 100,
+            "sizing_note": "一手超过组合剩余风险",
+        })
+        if executable == "missing":
+            buy.pop("executable", None)
+        else:
+            buy["executable"] = executable
+
+        assert not dashboard_module._valid_trend_risk_summary(payload)
+
+
+def test_dashboard_rejects_minimum_lot_evidence_that_does_not_cover_total_overflow() -> None:
+    payload = _valid_v4_dashboard_trend_payload()
+    summary = payload["risk_summary"]
+    judgments = payload["strategy_judgments"]
+    assert isinstance(summary, dict) and isinstance(judgments, dict)
+    summary.update({
+        "status": "active",
+        "status_label": "含最小一手额外风险",
+        "existing_planned_risk": "4040",
+        "new_planned_risk": "101",
+        "portfolio_planned_risk": "4141",
+        "portfolio_planned_risk_pct": "0.04141",
+        "portfolio_remaining_risk": "0",
+        "portfolio_remaining_risk_pct": "0",
+    })
+    buy = judgments["formal_actions"][0]
+    assert isinstance(buy, dict)
+    buy.update({
+        "estimated_shares": 100,
+        "lot_size": 100,
+        "planned_stop_risk": "101",
+        "planned_stop_risk_pct": "0.00101",
+        "normal_cost": "1",
+        "sizing_note": "一手超过组合剩余风险",
+        "decisive_constraint": "组合剩余风险",
+        "executable": True,
+    })
+
+    assert not dashboard_module._valid_trend_risk_summary(payload)
+
+
+def test_dashboard_rejects_minimum_lot_note_moved_before_the_overflowing_buy() -> None:
+    payload = _valid_v4_dashboard_trend_payload()
+    summary = payload["risk_summary"]
+    judgments = payload["strategy_judgments"]
+    assert isinstance(summary, dict) and isinstance(judgments, dict)
+    summary.update({
+        "status": "active",
+        "status_label": "含最小一手额外风险",
+        "existing_planned_risk": "3500",
+        "new_planned_risk": "606",
+        "portfolio_planned_risk": "4106",
+        "portfolio_planned_risk_pct": "0.04106",
+        "portfolio_remaining_risk": "0",
+        "portfolio_remaining_risk_pct": "0",
+    })
+    base_buy = judgments["formal_actions"][0]
+    assert isinstance(base_buy, dict)
+    first = {
+        **base_buy,
+        "symbol": "600001",
+        "estimated_shares": 100,
+        "lot_size": 100,
+        "planned_stop_risk": "303",
+        "planned_stop_risk_pct": "0.00303",
+        "normal_cost": "3",
+        "sizing_note": "一手超过组合剩余风险",
+        "decisive_constraint": "组合剩余风险",
+        "executable": True,
+    }
+    second = {
+        **first,
+        "symbol": "600003",
+        "sizing_note": "",
+    }
+    judgments["formal_actions"] = [first, second]
+
+    assert not dashboard_module._valid_trend_risk_summary(payload)
+
+
+def test_dashboard_accepts_note_on_the_ordered_buy_that_exceeds_remaining_capacity() -> None:
+    payload = _valid_v4_dashboard_trend_payload()
+    summary = payload["risk_summary"]
+    judgments = payload["strategy_judgments"]
+    assert isinstance(summary, dict) and isinstance(judgments, dict)
+    summary.update({
+        "status": "active",
+        "status_label": "含最小一手额外风险",
+        "existing_planned_risk": "3500",
+        "new_planned_risk": "606",
+        "portfolio_planned_risk": "4106",
+        "portfolio_planned_risk_pct": "0.04106",
+        "portfolio_remaining_risk": "0",
+        "portfolio_remaining_risk_pct": "0",
+    })
+    base_buy = judgments["formal_actions"][0]
+    assert isinstance(base_buy, dict)
+    first = {
+        **base_buy,
+        "symbol": "600001",
+        "estimated_shares": 100,
+        "lot_size": 100,
+        "planned_stop_risk": "303",
+        "planned_stop_risk_pct": "0.00303",
+        "normal_cost": "3",
+        "sizing_note": "",
+        "decisive_constraint": "组合剩余风险",
+        "executable": True,
+    }
+    second = {
+        **first,
+        "symbol": "600003",
+        "sizing_note": "一手超过组合剩余风险",
+    }
+    judgments["formal_actions"] = [first, second]
+
+    assert dashboard_module._valid_trend_risk_summary(payload)
+
+
 def test_dashboard_individual_global_context_mode_requires_current_only_facts() -> None:
     payload = _dashboard_frozen_report_payload()
     snapshot = payload["strategy_snapshot"]

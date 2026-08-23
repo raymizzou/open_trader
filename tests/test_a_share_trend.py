@@ -5135,7 +5135,7 @@ def test_full_existing_portfolio_risk_lists_one_lot_with_note_but_no_pause() -> 
         prior_state={
             "positions": {
                 "600001": {
-                    "initial_line": "9", "active_line": "9", "atr14": "0.5",
+                    "initial_line": "9.01", "active_line": "9.01", "atr14": "0.5",
                     "position_started_for": "2026-07-01", "updated_for": "2026-07-13",
                 }
             }
@@ -5151,9 +5151,21 @@ def test_full_existing_portfolio_risk_lists_one_lot_with_note_but_no_pause() -> 
     assert action.estimated_shares == action.lot_size == 100
     assert action.executable is True
     assert action.sizing_note == "一手超过组合剩余风险"
+    assert action.planned_stop_risk == Decimal("101")
+    assert built.risk_summary["existing_planned_risk"] == Decimal("4000")
+    assert built.risk_summary["portfolio_risk_limit"] == Decimal("4000")
+    assert built.risk_summary["new_planned_risk"] == action.planned_stop_risk
+    assert (
+        built.risk_summary["portfolio_planned_risk"]
+        - built.risk_summary["portfolio_risk_limit"]
+        == action.planned_stop_risk
+    )
     assert built.risk_summary["status"] == "active"
+    assert built.risk_summary["status_label"] == "含最小一手额外风险"
     assert built.risk_summary["portfolio_remaining_risk"] == Decimal("0")
     assert built.risk_skips == ()
+    payload = trend_module._report_payload(built)
+    assert payload["risk_summary"]["status_label"] == "含最小一手额外风险"
 
 
 def test_v7_drawdown_pause_blocks_only_entries_and_keeps_sell_and_hold() -> None:
@@ -8444,6 +8456,365 @@ def test_v2_report_rejects_active_state_over_portfolio_risk_limit() -> None:
 
     with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
         trend_module._report_payload(replace(built, risk_summary=summary))
+
+
+def test_report_serializes_paused_existing_risk_above_limit_without_overflow_evidence() -> None:
+    built = report()
+    summary = copy.deepcopy(built.risk_summary)
+    summary.update({
+        "status": "paused",
+        "status_label": "组合风险已满",
+        "pause_reason": "组合风险已达到上限，暂停新开仓",
+        "portfolio_risk_limit": Decimal("4000"),
+        "single_entry_risk_limit": Decimal("400"),
+        "abnormal_loss_buffer": Decimal("1000"),
+        "existing_planned_risk": Decimal("4001"),
+        "new_planned_risk": Decimal("0"),
+        "portfolio_planned_risk": Decimal("4001"),
+        "portfolio_planned_risk_pct": Decimal("0.04001"),
+        "portfolio_remaining_risk": Decimal("0"),
+        "portfolio_remaining_risk_pct": Decimal("0"),
+    })
+    account_snapshot = replace(built.account, net_value=Decimal("100000"))
+
+    payload = trend_module._report_payload(
+        replace(built, account=account_snapshot, risk_summary=summary)
+    )
+
+    assert payload["risk_summary"]["status"] == "paused"
+    assert payload["risk_summary"]["status_label"] == "组合风险已满"
+    assert not any(
+        action.get("action") == "BUY"
+        for action in payload["strategy_judgments"]["formal_actions"]
+    )
+
+
+def test_report_rejects_non_string_active_risk_status_label() -> None:
+    built = report()
+    summary = copy.deepcopy(built.risk_summary)
+    summary["status_label"] = []
+
+    with pytest.raises(ValueError) as exc_info:
+        trend_module._report_payload(replace(built, risk_summary=summary))
+    assert str(exc_info.value) == "strategy snapshot does not match report actions"
+
+
+def test_report_rejects_minimum_lot_evidence_that_does_not_cover_total_overflow() -> None:
+    built = report(candidates=(candidate("600001"),))
+    action = replace(
+        built.buy_actions[0],
+        estimated_shares=100,
+        lot_size=100,
+        planned_stop_risk=Decimal("101"),
+        planned_stop_risk_pct=Decimal("0.00101"),
+        normal_cost=Decimal("1"),
+        sizing_note="一手超过组合剩余风险",
+        decisive_constraint="组合剩余风险",
+    )
+    summary = copy.deepcopy(built.risk_summary)
+    summary.update({
+        "portfolio_risk_limit": Decimal("4000"),
+        "single_entry_risk_limit": Decimal("400"),
+        "abnormal_loss_buffer": Decimal("1000"),
+        "existing_planned_risk": Decimal("4040"),
+        "new_planned_risk": Decimal("101"),
+        "portfolio_planned_risk": Decimal("4141"),
+        "portfolio_planned_risk_pct": Decimal("0.04141"),
+        "portfolio_remaining_risk": Decimal("0"),
+        "portfolio_remaining_risk_pct": Decimal("0"),
+        "status": "active",
+        "status_label": "含最小一手额外风险",
+        "pause_reason": "",
+    })
+    account_snapshot = replace(
+        built.account,
+        net_value=Decimal("100000"),
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        trend_module._report_payload(
+            replace(
+                built,
+                account=account_snapshot,
+                buy_actions=(action,),
+                risk_summary=summary,
+            )
+        )
+    assert str(exc_info.value) == "strategy snapshot does not match report actions"
+
+
+def test_report_rejects_minimum_lot_note_moved_before_the_overflowing_buy() -> None:
+    built = report(candidates=(candidate("600001"), candidate("600002")))
+    first, second = built.buy_actions
+    first = replace(
+        first,
+        estimated_shares=100,
+        lot_size=100,
+        planned_stop_risk=Decimal("303"),
+        planned_stop_risk_pct=Decimal("0.00303"),
+        normal_cost=Decimal("3"),
+        sizing_note="一手超过组合剩余风险",
+        decisive_constraint="组合剩余风险",
+    )
+    second = replace(
+        second,
+        estimated_shares=100,
+        lot_size=100,
+        planned_stop_risk=Decimal("303"),
+        planned_stop_risk_pct=Decimal("0.00303"),
+        normal_cost=Decimal("3"),
+        sizing_note="",
+        decisive_constraint="组合剩余风险",
+    )
+    summary = copy.deepcopy(built.risk_summary)
+    summary.update({
+        "portfolio_risk_limit": Decimal("4000"),
+        "single_entry_risk_limit": Decimal("400"),
+        "abnormal_loss_buffer": Decimal("1000"),
+        "existing_planned_risk": Decimal("3500"),
+        "new_planned_risk": Decimal("606"),
+        "portfolio_planned_risk": Decimal("4106"),
+        "portfolio_planned_risk_pct": Decimal("0.04106"),
+        "portfolio_remaining_risk": Decimal("0"),
+        "portfolio_remaining_risk_pct": Decimal("0"),
+        "status": "active",
+        "status_label": "含最小一手额外风险",
+        "pause_reason": "",
+    })
+    account_snapshot = replace(
+        built.account,
+        net_value=Decimal("100000"),
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        trend_module._report_payload(
+            replace(
+                built,
+                account=account_snapshot,
+                buy_actions=(first, second),
+                risk_summary=summary,
+            )
+        )
+    assert str(exc_info.value) == "strategy snapshot does not match report actions"
+
+
+def test_report_serializes_minimum_lot_overflow_when_existing_risk_equals_limit() -> None:
+    built = report(candidates=(candidate("600001"),))
+    action = replace(
+        built.buy_actions[0],
+        estimated_shares=100,
+        lot_size=100,
+        planned_stop_risk=Decimal("101"),
+        planned_stop_risk_pct=Decimal("0.00101"),
+        normal_cost=Decimal("1"),
+        sizing_note="一手超过组合剩余风险",
+        decisive_constraint="组合剩余风险",
+    )
+    summary = copy.deepcopy(built.risk_summary)
+    summary.update({
+        "portfolio_risk_limit": Decimal("4000"),
+        "single_entry_risk_limit": Decimal("400"),
+        "abnormal_loss_buffer": Decimal("1000"),
+        "existing_planned_risk": Decimal("4000"),
+        "new_planned_risk": Decimal("101"),
+        "portfolio_planned_risk": Decimal("4101"),
+        "portfolio_planned_risk_pct": Decimal("0.04101"),
+        "portfolio_remaining_risk": Decimal("0"),
+        "portfolio_remaining_risk_pct": Decimal("0"),
+        "status": "active",
+        "status_label": "含最小一手额外风险",
+        "pause_reason": "",
+    })
+    payload = trend_module._report_payload(
+        replace(
+            built,
+            account=replace(built.account, net_value=Decimal("100000")),
+            buy_actions=(action,),
+            risk_summary=summary,
+        )
+    )
+
+    assert payload["risk_summary"]["status_label"] == "含最小一手额外风险"
+
+
+@pytest.mark.parametrize(
+    ("estimated_shares", "lot_size"),
+    [(True, True), ("100", "100")],
+)
+def test_report_rejects_non_integer_minimum_lot_quantities(
+    estimated_shares: object,
+    lot_size: object,
+) -> None:
+    built = report(candidates=(candidate("600001"),))
+    action = replace(
+        built.buy_actions[0],
+        estimated_shares=estimated_shares,
+        lot_size=lot_size,
+        planned_stop_risk=Decimal("101"),
+        planned_stop_risk_pct=Decimal("0.00101"),
+        normal_cost=Decimal("1"),
+        sizing_note="一手超过组合剩余风险",
+        decisive_constraint="组合剩余风险",
+        executable=True,
+    )
+    summary = copy.deepcopy(built.risk_summary)
+    summary.update({
+        "portfolio_risk_limit": Decimal("4000"),
+        "single_entry_risk_limit": Decimal("400"),
+        "abnormal_loss_buffer": Decimal("1000"),
+        "existing_planned_risk": Decimal("4000"),
+        "new_planned_risk": Decimal("101"),
+        "portfolio_planned_risk": Decimal("4101"),
+        "portfolio_planned_risk_pct": Decimal("0.04101"),
+        "portfolio_remaining_risk": Decimal("0"),
+        "portfolio_remaining_risk_pct": Decimal("0"),
+        "status": "active",
+        "status_label": "含最小一手额外风险",
+        "pause_reason": "",
+    })
+
+    with pytest.raises(ValueError) as exc_info:
+        trend_module._report_payload(
+            replace(
+                built,
+                account=replace(built.account, net_value=Decimal("100000")),
+                buy_actions=(action,),
+                risk_summary=summary,
+            )
+        )
+    assert str(exc_info.value) == "strategy snapshot does not match report actions"
+
+
+def test_report_serializes_note_on_the_ordered_buy_that_exceeds_remaining_capacity() -> None:
+    built = report(candidates=(candidate("600001"), candidate("600002")))
+    first, second = built.buy_actions
+    first = replace(
+        first,
+        estimated_shares=100,
+        lot_size=100,
+        planned_stop_risk=Decimal("303"),
+        planned_stop_risk_pct=Decimal("0.00303"),
+        normal_cost=Decimal("3"),
+        sizing_note="",
+        decisive_constraint="组合剩余风险",
+    )
+    second = replace(
+        second,
+        estimated_shares=100,
+        lot_size=100,
+        planned_stop_risk=Decimal("303"),
+        planned_stop_risk_pct=Decimal("0.00303"),
+        normal_cost=Decimal("3"),
+        sizing_note="一手超过组合剩余风险",
+        decisive_constraint="组合剩余风险",
+    )
+    summary = copy.deepcopy(built.risk_summary)
+    summary.update({
+        "portfolio_risk_limit": Decimal("4000"),
+        "single_entry_risk_limit": Decimal("400"),
+        "abnormal_loss_buffer": Decimal("1000"),
+        "existing_planned_risk": Decimal("3500"),
+        "new_planned_risk": Decimal("606"),
+        "portfolio_planned_risk": Decimal("4106"),
+        "portfolio_planned_risk_pct": Decimal("0.04106"),
+        "portfolio_remaining_risk": Decimal("0"),
+        "portfolio_remaining_risk_pct": Decimal("0"),
+        "status": "active",
+        "status_label": "含最小一手额外风险",
+        "pause_reason": "",
+    })
+    payload = trend_module._report_payload(
+        replace(
+            built,
+            account=replace(built.account, net_value=Decimal("100000")),
+            buy_actions=(first, second),
+            risk_summary=summary,
+        )
+    )
+
+    assert payload["risk_summary"]["status_label"] == "含最小一手额外风险"
+
+
+def test_report_rejects_non_string_minimum_lot_sizing_note() -> None:
+    built = report(candidates=(candidate("600001"),))
+    action = replace(
+        built.buy_actions[0],
+        estimated_shares=100,
+        lot_size=100,
+        planned_stop_risk=Decimal("101"),
+        planned_stop_risk_pct=Decimal("0.00101"),
+        normal_cost=Decimal("1"),
+        sizing_note="一手超过组合剩余风险",
+        decisive_constraint="组合剩余风险",
+    )
+    action = replace(action, sizing_note=None)
+    summary = copy.deepcopy(built.risk_summary)
+    summary.update({
+        "portfolio_risk_limit": Decimal("4000"),
+        "single_entry_risk_limit": Decimal("400"),
+        "abnormal_loss_buffer": Decimal("1000"),
+        "existing_planned_risk": Decimal("4000"),
+        "new_planned_risk": Decimal("101"),
+        "portfolio_planned_risk": Decimal("4101"),
+        "portfolio_planned_risk_pct": Decimal("0.04101"),
+        "portfolio_remaining_risk": Decimal("0"),
+        "portfolio_remaining_risk_pct": Decimal("0"),
+        "status": "active",
+        "status_label": "含最小一手额外风险",
+        "pause_reason": "",
+    })
+
+    with pytest.raises(ValueError) as exc_info:
+        trend_module._report_payload(
+            replace(
+                built,
+                account=replace(built.account, net_value=Decimal("100000")),
+                buy_actions=(action,),
+                risk_summary=summary,
+            )
+        )
+    assert str(exc_info.value) == "strategy snapshot does not match report actions"
+
+
+def test_report_rejects_non_boolean_minimum_lot_executable() -> None:
+    built = report(candidates=(candidate("600001"),))
+    action = replace(
+        built.buy_actions[0],
+        estimated_shares=100,
+        lot_size=100,
+        planned_stop_risk=Decimal("101"),
+        planned_stop_risk_pct=Decimal("0.00101"),
+        normal_cost=Decimal("1"),
+        sizing_note="一手超过组合剩余风险",
+        decisive_constraint="组合剩余风险",
+    )
+    action = replace(action, executable="yes")
+    summary = copy.deepcopy(built.risk_summary)
+    summary.update({
+        "portfolio_risk_limit": Decimal("4000"),
+        "single_entry_risk_limit": Decimal("400"),
+        "abnormal_loss_buffer": Decimal("1000"),
+        "existing_planned_risk": Decimal("4000"),
+        "new_planned_risk": Decimal("101"),
+        "portfolio_planned_risk": Decimal("4101"),
+        "portfolio_planned_risk_pct": Decimal("0.04101"),
+        "portfolio_remaining_risk": Decimal("0"),
+        "portfolio_remaining_risk_pct": Decimal("0"),
+        "status": "active",
+        "status_label": "含最小一手额外风险",
+        "pause_reason": "",
+    })
+
+    with pytest.raises(ValueError) as exc_info:
+        trend_module._report_payload(
+            replace(
+                built,
+                account=replace(built.account, net_value=Decimal("100000")),
+                buy_actions=(action,),
+                risk_summary=summary,
+            )
+        )
+    assert str(exc_info.value) == "strategy snapshot does not match report actions"
 
 
 def test_v2_report_rejects_risk_amounts_scaled_away_from_account_nav() -> None:

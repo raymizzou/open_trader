@@ -369,11 +369,18 @@ def valid_v2_risk_contract(
 
     status = summary.get("status")
     pause_reason = summary.get("pause_reason")
+    status_label = summary.get("status_label")
     data_defect = bool(summary.get("data_defect_reason"))
     if status == "active":
         if (
-            summary.get("status_label") != "风险预算内"
+            not isinstance(status_label, str)
+            or status_label not in {"风险预算内", "含最小一手额外风险"}
             or pause_reason != ""
+            or status_label == "含最小一手额外风险"
+            and (
+                values["new_planned_risk"] is None
+                or values["new_planned_risk"] <= 0
+            )
             or (
                 not data_defect
                 and any(
@@ -436,9 +443,18 @@ def valid_v2_risk_contract(
     ):
         return False
     if planned is None:
-        return planned_pct is None and remaining is None and remaining_pct is None
-    if status == "active" and planned > portfolio_limit:
-        return False
+        return (
+            (status == "paused" or status_label == "风险预算内")
+            and planned_pct is None
+            and remaining is None
+            and remaining_pct is None
+        )
+    if status == "active":
+        if planned > portfolio_limit:
+            if status_label != "含最小一手额外风险":
+                return False
+        elif status_label != "风险预算内":
+            return False
     expected_remaining = max(Decimal("0"), portfolio_limit - planned)
     return (
         planned_pct == planned / nav
@@ -4876,6 +4892,12 @@ def _risk_summary(
             if pause_reason == "组合正常计划风险已达到净值 4%"
             else "暂停新开仓"
             if pause_reason
+            else "含最小一手额外风险"
+            if (
+                planned_risk is not None
+                and portfolio_limit is not None
+                and planned_risk > portfolio_limit
+            )
             else "风险预算内"
         ),
         "pause_reason": pause_reason,
@@ -8081,7 +8103,11 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
                 ):
                     raise ValueError("strategy snapshot does not match report actions")
             elif (
-                action.estimated_shares <= 0
+                isinstance(action.estimated_shares, bool)
+                or not isinstance(action.estimated_shares, int)
+                or isinstance(action.lot_size, bool)
+                or not isinstance(action.lot_size, int)
+                or action.estimated_shares <= 0
                 or action.lot_size <= 0
                 or action.estimated_shares % action.lot_size != 0
                 or not action.planned_stop_risk.is_finite()
@@ -8112,6 +8138,52 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         if _nonnegative_risk_decimal(
             report.risk_summary.get("new_planned_risk")
         ) != new_planned_risk:
+            raise ValueError("strategy snapshot does not match report actions")
+        planned_risk = _nonnegative_risk_decimal(
+            report.risk_summary.get("portfolio_planned_risk")
+        )
+        status_label = report.risk_summary.get("status_label")
+        if (
+            report.risk_summary.get("status") == "active"
+            and planned_risk is not None
+            and planned_risk > portfolio_limit
+        ):
+            existing_risk = _nonnegative_risk_decimal(
+                report.risk_summary.get("existing_planned_risk")
+            )
+            remaining_capacity = max(
+                Decimal("0"),
+                portfolio_limit - (existing_risk or Decimal("0")),
+            )
+            overflow = max(Decimal("0"), planned_risk - portfolio_limit)
+            evidenced_risk = Decimal("0")
+            for action in report.buy_actions:
+                if not isinstance(action.executable, bool):
+                    raise ValueError("strategy snapshot does not match report actions")
+                if not action.executable:
+                    continue
+                if action.planned_stop_risk > remaining_capacity:
+                    if (
+                        action.estimated_shares != action.lot_size
+                        or not isinstance(action.sizing_note, str)
+                        or "一手超过组合剩余风险" not in action.sizing_note
+                    ):
+                        raise ValueError("strategy snapshot does not match report actions")
+                    evidenced_risk += action.planned_stop_risk
+                remaining_capacity = max(
+                    Decimal("0"),
+                    remaining_capacity - action.planned_stop_risk,
+                )
+            if (
+                status_label != "含最小一手额外风险"
+                or new_planned_risk <= 0
+                or evidenced_risk < overflow
+            ):
+                raise ValueError("strategy snapshot does not match report actions")
+        elif (
+            report.risk_summary.get("status") == "active"
+            and status_label == "含最小一手额外风险"
+        ):
             raise ValueError("strategy snapshot does not match report actions")
     if version in {
         "v4", "v5", "v6", "v7", "v8", "v9", "v10",
