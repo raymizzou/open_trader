@@ -76,6 +76,7 @@ DISABLED_WORKFLOW_PROCESS_PATTERN = re.compile(
 TREND_SIMULATE_MARKETS = {
     broker: market for broker, (market, _currency) in TREND_SIMULATE_BROKERS.items()
 }
+FUTU_US_HISTORY_CUTOVER_DATE = "2026-08-20"
 TREND_ACCEPTED_STRATEGY_VERSIONS = {
     "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15"}),
     "US": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"}),
@@ -1685,6 +1686,12 @@ def _validate_history_projection(
     ] = {}
     protection_actions: set[tuple[str, str, str]] = set()
     for event_date, _, event_path, event in _action_events(data_dir, market):
+        if (
+            broker == "futu"
+            and market == "US"
+            and event_date < FUTU_US_HISTORY_CUTOVER_DATE
+        ):
+            continue
         report_hash = str(event.get("report_sha256") or "").strip().lower()
         if len(report_hash) == 64:
             action = (

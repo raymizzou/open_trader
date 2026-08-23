@@ -7911,22 +7911,36 @@ def _write_acceptance_history_artifact(
 
 def _write_acceptance_action(
     data_dir: Path, *, report_sha256: str, symbol: str = "NDAQ",
+    event_date: str = "2026-08-20",
 ) -> dict[str, str]:
     event = {
-        "date": "2026-07-17",
+        "date": event_date,
         "market": "US",
         "symbol": symbol,
         "side": "buy",
         "status": "missed",
-        "recorded_at": "2026-07-18T08:27:12+08:00",
+        "recorded_at": f"{event_date}T08:27:12+08:00",
         "report_sha256": report_sha256,
     }
     path = (
-        data_dir / "trend_review/ledgers/US/actions/2026-07-17/action/event.json"
+        data_dir
+        / f"trend_review/ledgers/US/actions/{event_date}/action/event.json"
     )
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(event), encoding="utf-8")
     return event
+
+
+def test_acceptance_futu_history_ignores_pre_cutover(
+    tmp_path: Path,
+) -> None:
+    _write_acceptance_action(
+        tmp_path / "data", report_sha256="f" * 64, event_date="2026-08-19"
+    )
+
+    assert dashboard_acceptance._validate_history_projection(
+        tmp_path / "data", tmp_path / "reports", "futu", [], {}
+    ) == []
 
 
 def test_acceptance_rejects_history_that_drops_ledger_referenced_old_action(
@@ -7934,16 +7948,18 @@ def test_acceptance_rejects_history_that_drops_ledger_referenced_old_action(
 ) -> None:
     reports_dir = tmp_path / "reports"
     _, old_hash = _write_acceptance_history_artifact(
-        reports_dir, "old.json", execution_date="2026-07-17", symbol="NDAQ"
+        reports_dir, "old.json", execution_date="2026-08-20", symbol="NDAQ"
     )
     _write_acceptance_history_artifact(
-        reports_dir, "new.json", execution_date="2026-07-20", symbol="AAPL"
+        reports_dir, "new.json", execution_date="2026-08-21", symbol="AAPL"
     )
-    _write_acceptance_action(tmp_path / "data", report_sha256=old_hash)
+    _write_acceptance_action(
+        tmp_path / "data", report_sha256=old_hash, event_date="2026-08-20"
+    )
     history = [{
         "available": True,
         "artifact": "new.json",
-        "execution_date": "2026-07-20",
+        "execution_date": "2026-08-21",
         "strategy_version": "v1",
     }]
 
@@ -8009,12 +8025,14 @@ def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(
 ) -> None:
     reports_dir = tmp_path / "reports"
     _, old_hash = _write_acceptance_history_artifact(
-        reports_dir, "old.json", execution_date="2026-07-17", symbol="NDAQ"
+        reports_dir, "old.json", execution_date="2026-08-20", symbol="NDAQ"
     )
     _write_acceptance_history_artifact(
-        reports_dir, "new.json", execution_date="2026-07-20", symbol="AAPL"
+        reports_dir, "new.json", execution_date="2026-08-21", symbol="AAPL"
     )
-    event = _write_acceptance_action(tmp_path / "data", report_sha256=old_hash)
+    event = _write_acceptance_action(
+        tmp_path / "data", report_sha256=old_hash, event_date="2026-08-20"
+    )
     history = [
         {
             "available": True,
@@ -8023,7 +8041,7 @@ def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(
             "strategy_version": "v1",
         }
         for artifact, execution_date in (
-            ("new.json", "2026-07-20"), ("old.json", "2026-07-17")
+            ("new.json", "2026-08-21"), ("old.json", "2026-08-20")
         )
     ]
     exact = {
@@ -8031,7 +8049,7 @@ def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(
             "artifact": "old.json",
             "report_sha256": old_hash,
             "strategy_version": "v1",
-            "report_date": "2026-07-17",
+            "report_date": "2026-08-20",
             "audit": {"artifact": "old.json"},
             "strategy_parameter_rows": [{
                 "group": "退出保护",
@@ -8063,24 +8081,24 @@ def test_acceptance_allows_exact_history_to_lag_a_duplicate_terminal_event(
 ) -> None:
     reports_dir = tmp_path / "reports"
     _, old_hash = _write_acceptance_history_artifact(
-        reports_dir, "old.json", execution_date="2026-07-17", symbol="NDAQ"
+        reports_dir, "old.json", execution_date="2026-08-20", symbol="NDAQ"
     )
     projected_event = _write_acceptance_action(
-        tmp_path / "data", report_sha256=old_hash
+        tmp_path / "data", report_sha256=old_hash, event_date="2026-08-20"
     )
     newer_event = {
         **projected_event,
-        "recorded_at": "2026-07-18T08:27:19+08:00",
+        "recorded_at": "2026-08-20T08:27:19+08:00",
     }
     newer_path = (
         tmp_path
-        / "data/trend_review/ledgers/US/actions/2026-07-17/action/newer.json"
+        / "data/trend_review/ledgers/US/actions/2026-08-20/action/newer.json"
     )
     newer_path.write_text(json.dumps(newer_event), encoding="utf-8")
     history = [{
         "available": True,
         "artifact": "old.json",
-        "execution_date": "2026-07-17",
+        "execution_date": "2026-08-20",
         "strategy_version": "v1",
     }]
     exact = {
@@ -8088,7 +8106,7 @@ def test_acceptance_allows_exact_history_to_lag_a_duplicate_terminal_event(
             "artifact": "old.json",
             "report_sha256": old_hash,
             "strategy_version": "v1",
-            "report_date": "2026-07-17",
+            "report_date": "2026-08-20",
             "audit": {"artifact": "old.json"},
             "buy_actions": [{
                 "symbol": "NDAQ",
