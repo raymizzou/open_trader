@@ -39,6 +39,14 @@ acceptance:
 	cd "$(REPOSITORY_ROOT)" && \
 		PYTHONSAFEPATH=1 PYTHONPATH="$(WORKTREE_ROOT):$(WORKTREE_ROOT)/src" \
 		"$(PYTHON_BIN)" -m pytest "$(WORKTREE_ROOT)/tests" -q
+	@test "$$(git -C "$(WORKTREE_ROOT)" branch --show-current)" = main
+	@test -z "$$(git -C "$(WORKTREE_ROOT)" status --porcelain)"
+	@cd "$(WORKTREE_ROOT)" && scripts/install_account_release.sh --dry-run --repo-root "$(WORKTREE_ROOT)" --python "$(PYTHON_BIN)"
+	@cd "$(WORKTREE_ROOT)" && scripts/install_dashboard_launchd.sh --dry-run --repo-root "$(WORKTREE_ROOT)"
+	@cd "$(WORKTREE_ROOT)" && scripts/install_daily_premarket_launchd.sh --dry-run --config "$(WORKTREE_ROOT)/config/daily_premarket.env" --trend-only --market all
+	@cd "$(WORKTREE_ROOT)" && scripts/install_account_release.sh --repo-root "$(WORKTREE_ROOT)" --python "$(PYTHON_BIN)" --evidence-out "$(WORKTREE_ROOT)/logs/account_release/acceptance.json"
+	@cd "$(WORKTREE_ROOT)" && scripts/install_dashboard_launchd.sh --repo-root "$(WORKTREE_ROOT)"
+	@cd "$(WORKTREE_ROOT)" && scripts/install_daily_premarket_launchd.sh --config "$(WORKTREE_ROOT)/config/daily_premarket.env" --trend-only --market all
 	@status=0; \
 	cd "$(WORKTREE_ROOT)" && \
 	umask 077; \

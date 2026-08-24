@@ -6,6 +6,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-08-24
 
 - 趋势报告移动端：执行状态摘要保持触控目标，375px 控制器卡片约束在报告范围内。验证：Case 1/2 聚焦测试 2 passed；完整 make test 7225 passed、3 skipped、1 xfailed（退出码 0）；尚未运行 acceptance/deploy/push。
+- `make acceptance` 在离线 pytest 通过后先确认当前 checkout 为干净 `main`，再按 Account → Dashboard → 全市场 Trend 顺序 dry-run 并刷新本地 launchd runtime，避免旧 SHA 进入 live 验收。验证：聚焦 `test_make_acceptance_refreshes_main_runtime_after_tests_before_live_checks` 1 passed；完整 `make test` 7226 passed、3 skipped、1 xfailed（退出码 0）；尚未运行 acceptance/deploy/push。
 
 ## 2026-08-23
 

@@ -286,6 +286,49 @@ def test_make_acceptance_wires_prediction_registry_before_dashboard_verifier() -
     assert '--config "$(REPOSITORY_ROOT)/config/prediction_arbitrage.json"' in makefile
 
 
+def test_make_acceptance_refreshes_main_runtime_after_tests_before_live_checks() -> None:
+    repo_root = Path(__file__).parents[1]
+    plan = subprocess.run(
+        ["make", "-n", "acceptance"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    pytest_python = re.search(r'(?m)^\s*"([^"]+)" -m pytest\b', plan).group(1)
+    plan_lines = [line.strip() for line in plan.splitlines() if line.strip()]
+    pytest_position = next(
+        position for position, line in enumerate(plan_lines) if "-m pytest" in line
+    )
+    expected_lines = [
+        f'test "$(git -C "{repo_root}" branch --show-current)" = main',
+        f'test -z "$(git -C "{repo_root}" status --porcelain)"',
+        f'cd "{repo_root}" && scripts/install_account_release.sh --dry-run --repo-root "{repo_root}" --python "{pytest_python}"',
+        f'cd "{repo_root}" && scripts/install_dashboard_launchd.sh --dry-run --repo-root "{repo_root}"',
+        f'cd "{repo_root}" && scripts/install_daily_premarket_launchd.sh --dry-run --config "{repo_root}/config/daily_premarket.env" --trend-only --market all',
+        f'cd "{repo_root}" && scripts/install_account_release.sh --repo-root "{repo_root}" --python "{pytest_python}" --evidence-out "{repo_root}/logs/account_release/acceptance.json"',
+        f'cd "{repo_root}" && scripts/install_dashboard_launchd.sh --repo-root "{repo_root}"',
+        f'cd "{repo_root}" && scripts/install_daily_premarket_launchd.sh --config "{repo_root}/config/daily_premarket.env" --trend-only --market all',
+    ]
+    matched_lines = [
+        (position, line)
+        for position, line in enumerate(plan_lines)
+        if line in expected_lines
+    ]
+    live_positions = [
+        next(position for position, line in enumerate(plan_lines) if marker in line)
+        for marker in ("npm exec playwright", "open_trader.dashboard_acceptance")
+    ]
+
+    assert (
+        [line for _, line in matched_lines] == expected_lines
+        and all(plan_lines.count(line) == 1 for line in expected_lines)
+        and pytest_position < matched_lines[0][0]
+        and matched_lines[-1][0] < min(live_positions)
+    )
+
+
 def test_prediction_payload_validation_fails_closed_for_stale_actionable_rows() -> None:
     payload = {
         "status": "degraded",
