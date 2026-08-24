@@ -1230,17 +1230,3 @@ def test_direct_runner_with_arbitrary_handoff_without_pipeline_nonce_is_blocked(
 
     assert result == 2
     assert "BLOCKED: Playwright browser nonce unavailable" in capsys.readouterr().out
-
-
-def test_make_acceptance_passes_playwright_handoff_before_live_registry() -> None:
-    makefile = Path(__file__).parents[1].joinpath("Makefile").read_text(encoding="utf-8")
-    playwright = makefile.index("npm exec playwright test")
-    registry = makefile.index("prediction_arbitrage_acceptance")
-
-    assert playwright < registry
-    assert "--browser-ready" not in makefile
-    assert "PREDICTION_ACCEPTANCE_BROWSER_HANDOFF" in makefile[:registry]
-    assert "PREDICTION_ACCEPTANCE_BROWSER_NONCE" in makefile[:registry]
-    assert "PREDICTION_ACCEPTANCE_REVIEW_URL" in makefile[:registry]
-    assert "PREDICTION_ACCEPTANCE_BROWSER_NONCE_FILE" in makefile
-    assert "--browser-handoff" in makefile[registry:]

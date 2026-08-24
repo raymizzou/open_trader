@@ -278,12 +278,31 @@ def test_prediction_live_acceptance_reports_authenticated_no_submit_evidence() -
     assert all(row.detail for row in live)
 
 
-def test_make_acceptance_wires_prediction_registry_before_dashboard_verifier() -> None:
-    makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
-    registry = "open_trader.prediction_arbitrage_acceptance"
-    assert registry in makefile
-    assert makefile.index(registry) < makefile.index("open_trader.dashboard_acceptance")
-    assert '--config "$(REPOSITORY_ROOT)/config/prediction_arbitrage.json"' in makefile
+def test_make_acceptance_excludes_external_prediction_live_registry() -> None:
+    repo_root = Path(__file__).parents[1]
+    plan = subprocess.run(
+        ["make", "-n", "acceptance"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    normalized = " ".join(re.sub(r"\\\s*\n", " ", plan).split())
+    playwright = "npm exec playwright test tests/e2e/prediction-market.spec.ts --project=chromium"
+    dashboard = "open_trader.dashboard_acceptance"
+    forbidden = (
+        "open_trader.prediction_arbitrage_acceptance",
+        "SKIP_POLYMARKET_LIVE",
+        "PREDICTION_ACCEPTANCE_BROWSER_HANDOFF",
+        "PREDICTION_ACCEPTANCE_BROWSER_NONCE",
+        "PREDICTION_ACCEPTANCE_BROWSER_NONCE_FILE",
+        "PREDICTION_ACCEPTANCE_REVIEW_URL",
+        "config/prediction_arbitrage.json",
+    )
+
+    assert playwright in normalized
+    assert normalized.index(playwright) < normalized.index(dashboard)
+    assert all(token not in normalized for token in forbidden)
 
 
 def test_make_acceptance_refreshes_main_runtime_after_tests_before_live_checks() -> None:

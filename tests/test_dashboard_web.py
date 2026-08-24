@@ -49,9 +49,8 @@ def test_acceptance_gate_runs_prediction_playwright() -> None:
 
     acceptance = makefile.split("\nacceptance:\n", 1)[1]
     playwright_index = acceptance.index("npm exec playwright test")
-    live_index = acceptance.index("prediction_arbitrage_acceptance")
-    assert playwright_index < live_index
-    assert playwright_index < acceptance.index("ifeq ($(SKIP_POLYMARKET_LIVE),1)")
+    dashboard_index = acceptance.index("open_trader.dashboard_acceptance")
+    assert playwright_index < dashboard_index
 
 
 def _controller_status(*, heartbeat_at: str) -> dict[str, object]:
