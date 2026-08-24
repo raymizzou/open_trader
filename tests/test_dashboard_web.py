@@ -7134,6 +7134,33 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_execution_status_summary_is_a_mobile_touch_target() -> None:
+    from playwright import sync_api as playwright_api
+    rendered = json.loads(run_dashboard_js(r'''
+const report = {
+  available:true, market:"US", broker:"futu", broker_label:"富途", market_label:"美股",
+  strategy_version:"v13", allocation:{version:2}, report_date:"2026-08-20",
+  counts:{}, audit:{}, sell_actions:[], buy_actions:[], hold_actions:[], review_actions:[],
+};
+console.log(JSON.stringify(renderTrendReportWorkspace(report)));
+'''))
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    errors: list[str] = []
+    with playwright_api.sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel="chrome", headless=True)
+        for width in (375, 760):
+            page = browser.new_page(viewport={"width": width, "height": 844})
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.set_content(f"<style>{css}</style>{rendered}")
+            summary = page.locator(".trend-execution-status > summary")
+            assert summary.count() == 1
+            assert summary.is_visible()
+            assert (summary.bounding_box() or {})["height"] >= 44
+            page.close()
+        assert errors == []
+        browser.close()
+
+
 def test_dashboard_controller_card_is_responsive_at_375px() -> None:
     playwright_api = pytest.importorskip("playwright.sync_api")
     rendered = json.loads(run_dashboard_js(r'''
@@ -7147,7 +7174,9 @@ state.dashboard={trend_controllers:{futu:{effective_mode:"execute",executor_host
   blocker:"controller heartbeat is stale after an intentionally long diagnostic message",
   next_check_at:"2026-07-21T09:31:05+08:00",reason:"controller heartbeat is stale"}}};
 console.log(JSON.stringify(renderTrendReportWorkspace({available:true,market:"US",broker:"futu",
-  broker_label:"富途",market_label:"美股",counts:{},audit:{},sell_actions:[],buy_actions:[],
+  broker_label:"富途",market_label:"美股",strategy_version:"v13",allocation:{version:2},
+  report_sha256:"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+  counts:{},audit:{},sell_actions:[],buy_actions:[],
   hold_actions:[],review_actions:[]})));
 '''))
     css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
@@ -7176,6 +7205,15 @@ console.log(JSON.stringify(renderTrendReportWorkspace({available:true,market:"US
         assert page.locator(".trend-controller-status dl").evaluate(
             "node => getComputedStyle(node).gridTemplateColumns.split(' ').length"
         ) == 1
+        report_box = page.locator(".cn-trend-report").bounding_box()
+        controller_box = page.locator(".trend-controller-status").bounding_box()
+        assert (
+            report_box is not None
+            and controller_box is not None
+            and controller_box["x"] >= report_box["x"] - 1
+            and controller_box["x"] + controller_box["width"]
+            <= report_box["x"] + report_box["width"] + 1
+        )
         assert page.locator(".trend-controller-status").evaluate(
             "node => node.scrollWidth <= node.clientWidth"
         )

@@ -2011,6 +2011,7 @@ table {
 
 .cn-trend-report {
   border-left: 3px solid var(--accent);
+  grid-template-columns: minmax(0, 1fr);
   padding-left: 12px;
 }
 
@@ -2378,7 +2379,8 @@ table {
 
 .trend-discipline-workspace > summary,
 .trend-controller-status > summary,
-.trend-risk-summary > summary {
+.trend-risk-summary > summary,
+.trend-execution-status > summary {
   align-items: center;
   cursor: pointer;
   display: grid;
@@ -2390,13 +2392,15 @@ table {
 
 .trend-discipline-workspace > summary::marker,
 .trend-controller-status > summary::marker,
-.trend-risk-summary > summary::marker {
+.trend-risk-summary > summary::marker,
+.trend-execution-status > summary::marker {
   color: var(--accent);
 }
 
 .trend-discipline-workspace > summary span,
 .trend-controller-status > summary span,
-.trend-risk-summary > summary span {
+.trend-risk-summary > summary span,
+.trend-execution-status > summary span {
   color: var(--muted);
   font-weight: 400;
   overflow-wrap: anywhere;
@@ -2415,7 +2419,8 @@ table {
 
 .trend-discipline-workspace > summary:focus-visible,
 .trend-controller-status > summary:focus-visible,
-.trend-risk-summary > summary:focus-visible {
+.trend-risk-summary > summary:focus-visible,
+.trend-execution-status > summary:focus-visible {
   outline: 3px solid var(--accent);
   outline-offset: -3px;
 }
@@ -5497,7 +5502,8 @@ table {
 
   .trend-discipline-workspace > summary,
   .trend-controller-status > summary,
-  .trend-risk-summary > summary {
+  .trend-risk-summary > summary,
+  .trend-execution-status > summary {
     grid-template-columns: minmax(0, 1fr) auto;
   }
 
@@ -5510,7 +5516,8 @@ table {
 
   .trend-discipline-workspace > summary span,
   .trend-controller-status > summary span,
-  .trend-risk-summary > summary span {
+  .trend-risk-summary > summary span,
+  .trend-execution-status > summary span {
     grid-column: 1;
     grid-row: 2;
   }

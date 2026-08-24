@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-24
+
+- 趋势报告移动端：执行状态摘要保持触控目标，375px 控制器卡片约束在报告范围内。验证：Case 1/2 聚焦测试 2 passed；完整 make test 7225 passed、3 skipped、1 xfailed（退出码 0）；尚未运行 acceptance/deploy/push。
+
 ## 2026-08-23
 
 - 趋势报告允许在一手动作证据完整覆盖溢出的前提下，序列化/展示生效最小交易单位超过剩余 4% 风险预算；缺少该证据或证据被篡改的超预算报告仍拒绝。验证：scope/invariant 回归 17 passed；聚焦报告/看板测试 813 passed；完整套件 7224 passed、3 skipped、1 xfailed（退出码 0）；尚未运行 acceptance/deploy/push。
