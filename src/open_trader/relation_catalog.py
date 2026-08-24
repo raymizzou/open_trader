@@ -52,7 +52,9 @@ _REASONS = frozenset({
     "model_incomplete_or_wrong", "identity_mismatch", "rules_changed", "other",
 })
 _COMPLETENESS = frozenset({"COMPLETE", "INCOMPLETE"})
-_RELATION_TYPES = frozenset({"IMPLIES", "MUTUALLY_EXCLUSIVE", "EXACTLY_ONE"})
+_RELATION_TYPES = frozenset({
+    "IMPLIES", "MUTUALLY_EXCLUSIVE", "EXACTLY_ONE", "NATIVE_COMPLEMENT",
+})
 _ACTIVATION_BLOCKED = frozenset({
     "ACTIVATION_BLOCKED_INCONSISTENT",
     "UNSUPPORTED_SIZE",
@@ -537,6 +539,232 @@ def _threshold_discovery_payload(
     }
 
 
+def _mechanical_complete_model(relation: object) -> dict[str, object] | None:
+    """Deterministically compile a COMPLETE mechanical model, or None when facts are missing.
+
+    The official codecs are the per-market YES/NO token pair
+    (NATIVE_COMPLEMENT, two endpoints sharing one observation key) and the
+    negRisk mutually exhaustive group (EXACTLY_ONE, one BUY_YES contract per
+    market). Both compile to one EXACTLY_ONE constraint over terminal-state
+    sets with the five terminal kinds per contract.
+    """
+    relation_type = str(getattr(relation, "relation_type"))
+    event_id = str(getattr(relation, "event_id") or "").strip()
+    if not event_id:
+        return None
+    if relation_type == "NATIVE_COMPLEMENT":
+        market = getattr(relation, "market")
+        tokens = (getattr(market, "yes_token_id"), getattr(market, "no_token_id"))
+        sides = (ActionSide.BUY_YES, ActionSide.BUY_NO)
+        facts = [
+            (
+                str(token),
+                str(getattr(market, "condition_id")),
+                side,
+                str(getattr(market, "resolution_source") or ""),
+                str(getattr(market, "end_date") or ""),
+                str(getattr(market, "rules_hash") or ""),
+            )
+            for token, side in zip(tokens, sides, strict=True)
+        ]
+    elif relation_type == "EXACTLY_ONE":
+        facts = [
+            (
+                str(getattr(market, "condition_id")),
+                str(getattr(market, "condition_id")),
+                ActionSide.BUY_YES,
+                str(getattr(market, "resolution_source") or ""),
+                str(getattr(market, "end_date") or ""),
+                str(getattr(market, "rules_hash") or ""),
+            )
+            for market in getattr(relation, "markets")
+        ]
+    else:
+        return None
+    if not all(fact.strip() for contract in facts for fact in contract):
+        return None
+    try:
+        release_dates = [_utc(fact[4]) for fact in facts]
+    except (TypeError, ValueError):
+        return None
+    actions: list[CandidateAction] = []
+    states: list[TerminalStateSet] = []
+    payouts: dict[str, dict[str, int]] = {}
+    for (contract_id, condition_id, side, source, end_date, rules_hash), release_at in zip(
+        facts, release_dates, strict=True
+    ):
+        key = SettlementObservationKey(
+            OBSERVATION_SCHEMA_V1,
+            source,
+            condition_id,
+            release_at,
+            release_at,
+            "UTC",
+            rules_hash,
+        )
+        action_id = f"polymarket:{contract_id}"
+        actions.append(CandidateAction(
+            action_id,
+            venue_id="polymarket",
+            account_id="catalog-v2",
+            chain_id="polymarket",
+            market_contract_id=contract_id,
+            settlement_observation_key=key,
+            side=side,
+            lot_step_units=1,
+            quantity_scale=1,
+            min_quantity_lots=1,
+            max_quantity_lots=1,
+            settlement_asset_id="USD",
+            valuation_unit_id="USD",
+            asset_valuation_rule_id="usd-1:1-v1",
+            cost_slices=(ExecutableCostSlice(1, 1, 0),),
+        ))
+        # Token-level contract semantics: NORMAL_YES on an endpoint means that
+        # endpoint's own contract settles (pays one lot) and NORMAL_NO pays
+        # zero, identically for the YES token and the NO token of a complement
+        # pair.  Every real settlement state of the pair then pays exactly one
+        # lot in total (one lot per token).  The negRisk group endpoints are
+        # all BUY_YES and keep the same mapping.
+        yes_payout = 1
+        no_payout = 0
+        payouts[contract_id] = {
+            "NORMAL_YES": yes_payout,
+            "NORMAL_NO": no_payout,
+            "VOID": 0,
+            "REFUND": 0,
+            "SPLIT": 0,
+        }
+        states.append(TerminalStateSet(
+            contract_id,
+            key,
+            rules_hash,
+            (
+                TerminalAtom(
+                    f"{contract_id}:NORMAL_YES", TerminalKind.NORMAL_YES, rules_hash,
+                    (ActionPayout(action_id, yes_payout),), release_at,
+                ),
+                TerminalAtom(
+                    f"{contract_id}:NORMAL_NO", TerminalKind.NORMAL_NO, rules_hash,
+                    (ActionPayout(action_id, no_payout),), release_at,
+                ),
+                TerminalAtom(
+                    f"{contract_id}:VOID", TerminalKind.VOID, rules_hash,
+                    (ActionPayout(action_id, 0),), release_at,
+                ),
+                TerminalAtom(
+                    f"{contract_id}:REFUND", TerminalKind.REFUND, rules_hash,
+                    (ActionPayout(action_id, 0),), release_at,
+                ),
+                TerminalAtom(
+                    f"{contract_id}:SPLIT", TerminalKind.SPLIT, rules_hash,
+                    (ActionPayout(action_id, 0),), release_at,
+                ),
+            ),
+        ))
+    rule_digest = _digest({
+        "relation_type": relation_type,
+        "event_id": event_id,
+        "contracts": [
+            (fact[0], fact[1], fact[3], fact[4], fact[5]) for fact in facts
+        ],
+    })
+    sorted_contracts = sorted(fact[0] for fact in facts)
+    problem = ArbitrageProblem(
+        PROBLEM_SCHEMA_V1,
+        f"mechanical:{rule_digest}",
+        min(release_dates),
+        "USD",
+        tuple(actions),
+        tuple(states),
+        ConstraintModel(
+            (
+                RelationConstraint(
+                    f"exactly-one:{':'.join(sorted_contracts)}",
+                    RelationKind.EXACTLY_ONE,
+                    tuple(sorted_contracts),
+                    rule_digest,
+                ),
+            ),
+            (),
+        ),
+        (),
+    )
+    capital_release = max(release_dates)
+    return {
+        "completeness": "COMPLETE",
+        "terminal_states": ["NORMAL_YES", "NORMAL_NO", "VOID", "REFUND", "SPLIT"],
+        "payouts": payouts,
+        "capital_release": capital_release.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+        "problem": canonical_payload(problem),
+    }
+
+
+def _mechanical_discovery_payload(
+    relation: object, model: dict[str, object]
+) -> dict[str, object]:
+    """One official YES/NO pair or negRisk group as a v1 discovery payload."""
+    relation_type = str(getattr(relation, "relation_type"))
+    event_id = _string(getattr(relation, "event_id"), "event_id")
+    if relation_type == "NATIVE_COMPLEMENT":
+        market = getattr(relation, "market")
+        condition_id = _string(getattr(market, "condition_id"), "condition_id")
+        source = _string(
+            getattr(market, "resolution_source") or getattr(market, "condition_id"),
+            "resolution_source",
+        )
+        end_date = _string(getattr(market, "end_date"), "end_date")
+        rules = _string(getattr(market, "rules"), "rules")
+        rules_hash = _string(getattr(market, "rules_hash"), "rules_hash")
+        markets = []
+        for token_id in (
+            getattr(market, "yes_token_id"),
+            getattr(market, "no_token_id"),
+        ):
+            markets.append({
+                "venue": "Polymarket",
+                "contract_id": _string(token_id, "token_id"),
+                "title": _string(getattr(market, "question"), "question"),
+                "market_date": end_date,
+                "expires_at": end_date,
+                "event_identity_basis": event_id,
+                "settlement_observation_key": f"{condition_id}|{source}|{end_date}|{rules_hash}",
+                "settlement_rules": rules,
+                "cancellation_rules": "not supplied by mechanical discovery",
+            })
+    elif relation_type == "EXACTLY_ONE":
+        markets = []
+        for market in getattr(relation, "markets"):
+            condition_id = _string(getattr(market, "condition_id"), "condition_id")
+            source = _string(
+                getattr(market, "resolution_source") or getattr(market, "condition_id"),
+                "resolution_source",
+            )
+            end_date = _string(getattr(market, "end_date"), "end_date")
+            rules = _string(getattr(market, "rules"), "rules")
+            rules_hash = _string(getattr(market, "rules_hash"), "rules_hash")
+            markets.append({
+                "venue": "Polymarket",
+                "contract_id": condition_id,
+                "title": _string(getattr(market, "question"), "question"),
+                "market_date": end_date,
+                "expires_at": end_date,
+                "event_identity_basis": event_id,
+                "settlement_observation_key": f"{condition_id}|{source}|{end_date}|{rules_hash}",
+                "settlement_rules": rules,
+                "cancellation_rules": "not supplied by mechanical discovery",
+            })
+    else:
+        raise ValueError("mechanical relation_type is invalid")
+    return {
+        "discovery_source": "VENUE_METADATA", "discovered_at": _now(),
+        "relation_type": relation_type,
+        "semantics": {"statement": "exactly one of the mechanically bound contracts resolves YES"},
+        "source_evidence": [{"event_id": event_id, "relation_type": relation_type}],
+        "model": model, "markets": markets,
+    }
+
+
 def default_catalog_path(data_dir: Path) -> Path:
     """The conventional v2 catalog SQLite path under one data directory."""
     return Path(data_dir) / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
@@ -646,6 +874,23 @@ class RelationCatalog:
     def threshold_relation_identity(self, relation: object) -> str:
         """Catalog identity for one threshold relation, via the ingest codec path."""
         payload = _threshold_discovery_payload(
+            relation, {"completeness": "INCOMPLETE"}
+        )
+        return str(_canonicalize(self._converted(payload))[0])
+
+    def ingest_mechanical_relation(self, relation: object, *, git_sha: str = "") -> dict[str, object]:
+        """Adapt one official YES/NO pair or negRisk group (VENUE_METADATA) once."""
+        enriched = _mechanical_complete_model(relation)
+        model: dict[str, object] = (
+            enriched if enriched is not None else {"completeness": "INCOMPLETE"}
+        )
+        return self.ingest(
+            _mechanical_discovery_payload(relation, model), git_sha=git_sha
+        )
+
+    def mechanical_relation_identity(self, relation: object) -> str:
+        """Catalog identity for one mechanical relation, via the ingest codec path."""
+        payload = _mechanical_discovery_payload(
             relation, {"completeness": "INCOMPLETE"}
         )
         return str(_canonicalize(self._converted(payload))[0])

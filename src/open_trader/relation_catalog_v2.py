@@ -21,7 +21,9 @@ from datetime import datetime, timezone
 from .prediction_monitor_selection import relation_generation_problem
 
 ALLOWED_VENUES = frozenset({"polymarket", "predict.fun"})
-RELATION_TYPES = frozenset({"IMPLIES", "MUTUALLY_EXCLUSIVE", "EXACTLY_ONE"})
+RELATION_TYPES = frozenset({
+    "IMPLIES", "MUTUALLY_EXCLUSIVE", "EXACTLY_ONE", "NATIVE_COMPLEMENT",
+})
 GROUP_BUDGET = 7  # ponytail: #49 scale_16 per-group endpoint ceiling
 
 
@@ -55,11 +57,18 @@ def _canonicalize(payload: object) -> tuple[str, dict]:
     endpoints = payload.get("endpoints")
     if not isinstance(endpoints, list) or len(endpoints) < 2:
         raise ValueError("endpoints must contain at least two endpoints")
-    if relation_type == "IMPLIES" and len(endpoints) != 2:
-        raise ValueError("IMPLIES requires exactly two endpoints")
+    if relation_type in {"IMPLIES", "NATIVE_COMPLEMENT"} and len(endpoints) != 2:
+        raise ValueError(f"{relation_type} requires exactly two endpoints")
 
     sigs = [_canonical_endpoint(endpoint) for endpoint in endpoints]
-    ordered = sigs if relation_type == "IMPLIES" else sorted(sigs)
+    if relation_type == "IMPLIES":
+        ordered = sigs
+    elif relation_type == "NATIVE_COMPLEMENT":
+        # Identity orders the token-level endpoints by contract_id only, so
+        # the identity reads NATIVE_COMPLEMENT|polymarket:<sorted token>.
+        ordered = sorted(sigs, key=lambda sig: sig.split(":", 1)[-1])
+    else:
+        ordered = sorted(sigs)
     identity = relation_type + "|" + "|".join(ordered)
 
     by_sig = {sig: endpoint for sig, endpoint in zip(sigs, endpoints)}
@@ -940,6 +949,8 @@ def _relation_holds(entry: tuple[str, str, dict], mask: int, index: dict[str, in
         return not values[0] or values[1]
     if relation_type == "MUTUALLY_EXCLUSIVE":
         return sum(values) <= 1
+    if relation_type == "NATIVE_COMPLEMENT":
+        return sum(values) == 1
     return sum(values) == 1  # EXACTLY_ONE
 
 

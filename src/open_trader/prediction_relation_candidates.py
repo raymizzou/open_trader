@@ -218,3 +218,72 @@ def prepare_relation_candidates(
         "version_ids": [version_id for item in prepared for version_id in item["version_ids"]],
         "fingerprint": prepared[-1]["fingerprint"] if prepared else None,
     }
+
+
+def prepare_mechanical_relation_candidates(
+    catalog: object | None,
+    complements: Sequence[object],
+    groups: Sequence[object],
+    *,
+    max_components: int = 1,
+) -> dict[str, object]:
+    """Ingest at most ``max_components`` mechanical relations as PENDING versions.
+
+    A relation whose identity already holds a PENDING/APPROVED catalog version
+    is skipped, so a re-scan never re-ingests an already-prepared relation;
+    the catalog itself is the prepared-set source.
+    """
+    prepared_identities: set[str] | None = None
+    derive = getattr(catalog, "prepared_relation_identities", None)
+    if catalog is not None and callable(derive):
+        prepared_identities = set(derive())
+    ordered: list[tuple[str, object]] = [
+        (str(getattr(relation, "relation_type")), relation)
+        for relation in complements
+    ]
+    ordered.extend(
+        (str(getattr(relation, "relation_type")), relation) for relation in groups
+    )
+    ordered.sort(key=lambda item: str(getattr(item[1], "event_id")))
+    prepared: list[dict[str, object]] = []
+    skipped = 0
+    for relation_type, relation in ordered:
+        identity = (
+            str(catalog.mechanical_relation_identity(relation))
+            if catalog is not None
+            else ""
+        )
+        if prepared_identities is not None and identity in prepared_identities:
+            skipped += 1
+            continue
+        if len(prepared) >= max_components:
+            break
+        version_ids: list[str] = []
+        if catalog is not None:
+            version_ids.append(
+                str(catalog.ingest_mechanical_relation(relation)["version_id"])
+            )
+        prepared.append(
+            {
+                "status": "PREPARED",
+                "event_id": str(getattr(relation, "event_id")),
+                "relation_type": relation_type,
+                "fingerprint": identity,
+                "version_ids": version_ids,
+            }
+        )
+
+    if prepared:
+        status = "PREPARED"
+    elif skipped:
+        status = "SKIPPED"
+    else:
+        status = "EMPTY"
+    return {
+        "status": status,
+        "prepared": len(prepared),
+        "skipped": skipped,
+        "components": prepared,
+        "version_ids": [version_id for item in prepared for version_id in item["version_ids"]],
+        "fingerprint": prepared[-1]["fingerprint"] if prepared else None,
+    }

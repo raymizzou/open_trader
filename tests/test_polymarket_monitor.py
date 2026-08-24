@@ -1097,7 +1097,7 @@ def test_full_scan_consumes_every_paginator_page_and_publishes_once(
     assert monitor.snapshot()["relation_discovery"]["catalog"]["status"] == "healthy"
 
 
-def test_full_scan_saves_discovery_but_does_not_grow_v2_catalog(
+def test_full_scan_saves_discovery_and_prepares_one_mechanical_candidate(
     tmp_path: Path,
 ) -> None:
     setup_public([threshold_event()])
@@ -1115,7 +1115,12 @@ def test_full_scan_saves_discovery_but_does_not_grow_v2_catalog(
     state = monitor._store.load_relation_state()
     assert state is not None
     assert state["relations"]
-    assert catalog.review_rows() == []
+    rows = catalog.review_rows()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["relation_type"] == "NATIVE_COMPLEMENT"
+    assert row["discovery_source"] == "VENUE_METADATA"
+    assert row["status"] == "PENDING"
     assert catalog.current_generation() == {}
 
 

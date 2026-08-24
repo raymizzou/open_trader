@@ -276,6 +276,66 @@ class ThresholdRelation:
 
 
 @dataclass(frozen=True, slots=True)
+class NativeComplementMarket:
+    """One official binary market whose YES/NO token pair forms a complement."""
+
+    event_id: str
+    market_id: str
+    condition_id: str
+    question: str
+    rules: str
+    resolution_source: str
+    end_date: str
+    yes_token_id: str
+    no_token_id: str
+    rules_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class NativeComplementRelation:
+    """Official YES/NO token pair of one market (NATIVE_COMPLEMENT codec)."""
+
+    event_id: str
+    market: NativeComplementMarket
+    relation_type: str = "NATIVE_COMPLEMENT"
+
+
+@dataclass(frozen=True, slots=True)
+class NegriskGroupMarket:
+    """One market inside a negRisk mutually exclusive group."""
+
+    event_id: str
+    market_id: str
+    condition_id: str
+    question: str
+    rules: str
+    resolution_source: str
+    end_date: str
+    rules_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class NegriskGroupRelation:
+    """The negRisk mutually exhaustive market set of one event (EXACTLY_ONE)."""
+
+    event_id: str
+    markets: tuple[NegriskGroupMarket, ...]
+    relation_type: str = "EXACTLY_ONE"
+
+
+@dataclass(frozen=True, slots=True)
+class MechanicalRelationDiscoveryResult:
+    """Official mechanical relations derived from one snapshot, no LLM."""
+
+    complements: tuple[NativeComplementRelation, ...]
+    groups: tuple[NegriskGroupRelation, ...]
+    events_seen: int
+    events_eligible: int
+    markets_seen: int
+    rejection_counts: Mapping[str, int]
+
+
+@dataclass(frozen=True, slots=True)
 class ThresholdRelationDiscoveryResult:
     relations: tuple[ThresholdRelation, ...]
     events_seen: int
@@ -799,6 +859,218 @@ def discover_threshold_relations(
     events: Sequence[object],
 ) -> tuple[ThresholdRelation, ...]:
     return discover_threshold_relation_catalog(events).relations
+
+
+_MECHANICAL_GROUP_BUDGET = 7  # matches the v2 activation-gate per-group ceiling
+
+
+def _end_date_parseable(value: str) -> bool:
+    """True when the value parses as a timezone-aware ISO timestamp.
+
+    The COMPLETE mechanical compiler requires every endpoint endDate to become
+    a release timestamp with an explicit timezone; an endDate that cannot
+    parse -- or parses without a timezone -- must fail closed at discovery
+    instead of crashing identity/preparation on every later round.
+    """
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    return parsed.tzinfo is not None
+
+
+def discover_mechanical_relation_catalog(
+    events: Sequence[object],
+) -> MechanicalRelationDiscoveryResult:
+    """Derive the official mechanical relations from one snapshot, no LLM.
+
+    Complement codec: every eligible official binary market with YES/NO
+    outcome tokens yields one NATIVE_COMPLEMENT relation. Group codec: a
+    negRisk event with an official event id yields one EXACTLY_ONE relation
+    over its normalized markets, unless the group exceeds the catalog group
+    budget or any member market fails to parse (fail closed: no group over a
+    proper subset). Event eligibility mirrors ``_eligible_event`` except that
+    negRisk events are deliberately NOT excluded (they are the group codec's
+    input).
+    """
+    complements: list[NativeComplementRelation] = []
+    groups: list[NegriskGroupRelation] = []
+    events_seen = 0
+    events_eligible = 0
+    markets_seen = 0
+    rejection_counts = {
+        "event_ineligible": 0,
+        "complement_unparseable": 0,
+        "duplicate_condition": 0,
+        "duplicate_token": 0,
+        "group_ineligible": 0,
+        "group_member_unparseable": 0,
+        "group_too_large": 0,
+    }
+    for raw_event in events:
+        events_seen += 1
+        event = _json_model(raw_event)
+        raw_markets = _items(_value(event, "markets", default=()))
+        markets_seen += len(raw_markets)
+        event_id = _text(_value(event, "id", "event_id", "eventId", default=""))
+        if (
+            not event_id
+            or _nested(event, "state", "active", default=True) is False
+            or _nested(event, "state", "closed", default=False) is True
+            or _nested(event, "state", "ended", default=False) is True
+        ):
+            rejection_counts["event_ineligible"] += 1
+            continue
+        events_eligible += 1
+        seen_conditions: set[str] = set()
+        seen_token_pairs: set[tuple[str, str]] = set()
+        for raw_market in raw_markets:
+            market = _json_model(raw_market)
+            market_id = _text(
+                _value(market, "id", "market_id", "marketId", default="")
+            )
+            condition_id = _text(
+                _value(market, "conditionId", "condition_id", default="")
+            )
+            question = _text(_value(market, "question", default=""))
+            rules = _text(_value(market, "description", "rules", default=""))
+            source = _text(
+                _nested(
+                    market,
+                    "resolution",
+                    "resolutionSource",
+                    "resolution_source",
+                    "source",
+                    default="",
+                )
+            )
+            end_date = _text(
+                _nested(market, "state", "endDate", "end_date", default="")
+            )
+            tokens = _outcome_tokens(market)
+            if (
+                not market_id
+                or not condition_id
+                or not question
+                or not rules
+                or not end_date
+                or not _end_date_parseable(end_date)
+                or not source
+                or tokens is None
+            ):
+                rejection_counts["complement_unparseable"] += 1
+                continue
+            token_pair = (tokens["yes"], tokens["no"])
+            if condition_id in seen_conditions:
+                rejection_counts["duplicate_condition"] += 1
+                continue
+            seen_conditions.add(condition_id)
+            if token_pair in seen_token_pairs:
+                rejection_counts["duplicate_token"] += 1
+                continue
+            seen_token_pairs.add(token_pair)
+            complements.append(
+                NativeComplementRelation(
+                    event_id=event_id,
+                    market=NativeComplementMarket(
+                        event_id=event_id,
+                        market_id=market_id,
+                        condition_id=condition_id,
+                        question=question,
+                        rules=rules,
+                        resolution_source=source,
+                        end_date=end_date,
+                        yes_token_id=tokens["yes"],
+                        no_token_id=tokens["no"],
+                        rules_hash=_hash(_normalized(rules)),
+                    ),
+                )
+            )
+        neg_risk = (
+            _nested(event, "trading", "negRisk", "neg_risk", default=False) is True
+            or _nested(event, "state", "negRisk", "neg_risk", default=False) is True
+        )
+        if not neg_risk:
+            rejection_counts["group_ineligible"] += 1
+            continue
+        group_markets: list[NegriskGroupMarket] = []
+        group_conditions: set[str] = set()
+        group_unparseable = False
+        for raw_market in raw_markets:
+            market = _json_model(raw_market)
+            condition_id = _text(
+                _value(market, "conditionId", "condition_id", default="")
+            )
+            question = _text(_value(market, "question", default=""))
+            rules = _text(_value(market, "description", "rules", default=""))
+            source = _text(
+                _nested(
+                    market,
+                    "resolution",
+                    "resolutionSource",
+                    "resolution_source",
+                    "source",
+                    default="",
+                )
+            )
+            end_date = _text(
+                _nested(market, "state", "endDate", "end_date", default="")
+            )
+            if (
+                not condition_id
+                or not question
+                or not rules
+                or not end_date
+                or not _end_date_parseable(end_date)
+                or not source
+            ):
+                rejection_counts["group_member_unparseable"] += 1
+                group_unparseable = True
+                continue
+            if condition_id in group_conditions:
+                rejection_counts["duplicate_condition"] += 1
+                continue
+            group_conditions.add(condition_id)
+            group_markets.append(
+                NegriskGroupMarket(
+                    event_id=event_id,
+                    market_id=_text(
+                        _value(market, "id", "market_id", "marketId", default="")
+                    ),
+                    condition_id=condition_id,
+                    question=question,
+                    rules=rules,
+                    resolution_source=source,
+                    end_date=end_date,
+                    rules_hash=_hash(_normalized(rules)),
+                )
+            )
+        if group_unparseable:
+            # Fail closed: the official guarantee is exactly one YES across
+            # the whole negRisk event set, so an event with an unparseable
+            # member must not yield a group over the remaining subset (which
+            # would also let dropped members bypass the group budget).
+            continue
+        if len(group_markets) > _MECHANICAL_GROUP_BUDGET:
+            rejection_counts["group_too_large"] += 1
+            continue
+        if len(group_markets) >= 2:
+            groups.append(
+                NegriskGroupRelation(
+                    event_id=event_id,
+                    markets=tuple(
+                        sorted(group_markets, key=lambda item: item.condition_id)
+                    ),
+                )
+            )
+    return MechanicalRelationDiscoveryResult(
+        complements=tuple(complements),
+        groups=tuple(groups),
+        events_seen=events_seen,
+        events_eligible=events_eligible,
+        markets_seen=markets_seen,
+        rejection_counts=rejection_counts,
+    )
 
 
 def _market_payload(market: ThresholdMarket) -> dict[str, object]:

@@ -1804,6 +1804,37 @@ class PolymarketMonitor:
                         scope="full",
                         reason=type(exc).__name__,
                     )
+            if self._relation_catalog is not None:
+                try:
+                    from .polymarket_relation_discovery import (
+                        discover_mechanical_relation_catalog,
+                    )
+                    from .prediction_relation_candidates import (
+                        prepare_mechanical_relation_candidates,
+                    )
+
+                    mechanical_result = discover_mechanical_relation_catalog(events)
+                    mechanical_report = prepare_mechanical_relation_candidates(
+                        self._relation_catalog,
+                        mechanical_result.complements,
+                        mechanical_result.groups,
+                        max_components=1,
+                    )
+                    self._log_relation_scan(
+                        phase="mechanical_candidate_prepared",
+                        status=str(mechanical_report.get("status")),
+                        scope="full",
+                        prepared=int(mechanical_report.get("prepared", 0)),
+                        skipped=int(mechanical_report.get("skipped", 0)),
+                        fingerprint=mechanical_report.get("fingerprint"),
+                    )
+                except Exception as exc:
+                    self._log_relation_scan(
+                        phase="mechanical_candidate_prepared",
+                        status="failed",
+                        scope="full",
+                        reason=type(exc).__name__,
+                    )
             self._invalidate_rule_cache()
             # A completed catalog scan is a fresh episode boundary.  Even an
             # unchanged relation gets one new chance after a prior mismatch.

@@ -16,6 +16,7 @@ from open_trader.polymarket_relation_discovery import (
     ThresholdBuyLeg,
     ThresholdMarket,
     ThresholdRelation,
+    discover_mechanical_relation_catalog,
     discover_threshold_relations,
     threshold_relation_payload,
 )
@@ -268,16 +269,97 @@ def test_monitor_full_scan_auto_prepares_at_most_one_candidate(tmp_path: Path) -
 
     monitor = make_monitor()
     asyncio.run(monitor._run_full_relation_scan(FakeClient([threshold_event()])))
-    assert monitor._relation_catalog.pending_count() == 3
+    # The three threshold markets also yield three mechanical complement
+    # candidates (issue-103 hook, one prepared per scan), so the pending
+    # count grows by one complement per scan until all three are pending.
+    assert monitor._relation_catalog.pending_count() == 4
 
     asyncio.run(monitor._run_full_relation_scan(FakeClient([threshold_event()])))
-    assert monitor._relation_catalog.pending_count() == 3
+    assert monitor._relation_catalog.pending_count() == 5
 
     # A restarted service builds a fresh monitor and catalog over the same
     # data dir; its next full scan must not add new PENDING versions.
     restarted = make_monitor()
     asyncio.run(restarted._run_full_relation_scan(FakeClient([threshold_event()])))
-    assert restarted._relation_catalog.pending_count() == 3
+    assert restarted._relation_catalog.pending_count() == 6
+    asyncio.run(restarted._run_full_relation_scan(FakeClient([threshold_event()])))
+    assert restarted._relation_catalog.pending_count() == 6
+
+
+def mechanical_only_event() -> SimpleNamespace:
+    """One official market with YES/NO tokens but no threshold question."""
+    return SimpleNamespace(
+        id="mechanical-event",
+        title="Which outcome resolves?",
+        state=SimpleNamespace(active=True, closed=False, ended=False),
+        markets=[
+            SimpleNamespace(
+                id="market-1",
+                conditionId="condition-1",
+                question="Will the candidate win?",
+                description="official index",
+                resolutionSource="Binance",
+                endDate="2026-12-31T17:00:00Z",
+                outcomes=[
+                    SimpleNamespace(label="YES", token_id="yes-1"),
+                    SimpleNamespace(label="NO", token_id="no-1"),
+                ],
+            )
+        ],
+    )
+
+
+def make_mechanical_monitor(data_dir: Path) -> PolymarketMonitor:
+    return PolymarketMonitor(
+        store=PredictionArbitrageStore(data_dir),
+        trading=SimpleNamespace(),
+        public_client_factory=FakeClient,
+        relation_discovery=discover_threshold_relations,
+        relation_catalog=RelationCatalog(data_dir),
+    )
+
+
+# Issue #103 D1/D2: the full scan prepares at most one mechanical component
+# per round and logs phase="mechanical_candidate_prepared"; re-scans skip the
+# already-PENDING identity instead of adding a new version.
+
+def test_monitor_full_scan_prepares_one_mechanical_component_with_log(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    monitor = make_mechanical_monitor(data_dir)
+    asyncio.run(monitor._run_full_relation_scan(FakeClient([mechanical_only_event()])))
+    assert monitor._relation_catalog.pending_count() == 1
+    prepared_logs = [
+        entry
+        for entry in monitor._relation_scan_logs
+        if entry.get("phase") == "mechanical_candidate_prepared"
+    ]
+    assert prepared_logs
+    assert prepared_logs[-1]["status"] == "PREPARED"
+    assert int(prepared_logs[-1]["prepared"]) == 1
+
+
+def test_monitor_rescan_skips_pending_mechanical_identity(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    monitor = make_mechanical_monitor(data_dir)
+    asyncio.run(monitor._run_full_relation_scan(FakeClient([mechanical_only_event()])))
+    assert monitor._relation_catalog.pending_count() == 1
+
+    asyncio.run(monitor._run_full_relation_scan(FakeClient([mechanical_only_event()])))
+    assert monitor._relation_catalog.pending_count() == 1
+    (row,) = monitor._relation_catalog.review_rows()
+    assert row["occurrence_count"] == 1
+
+    # Re-ingesting the identical relation dedups by version id: no new
+    # version, only the occurrence count increments.
+    (complement,) = discover_mechanical_relation_catalog(
+        [mechanical_only_event()]
+    ).complements
+    reingested = monitor._relation_catalog.ingest_mechanical_relation(complement)
+    assert reingested["created"] is False
+    assert reingested["occurrence_count"] == 2
+    assert monitor._relation_catalog.pending_count() == 1
 
 
 def test_cli_relation_candidates_dry_run_and_apply(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
