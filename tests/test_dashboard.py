@@ -4342,6 +4342,66 @@ def test_dashboard_projects_exact_version_api_stats_into_risk_summary(
     assert trade_stats["actual"]["eligible_sample_count"] == 0
 
 
+def test_dashboard_futu_trade_stats_ignore_retired_tiger_actual_source(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    payload = copy.deepcopy(_valid_v2_dashboard_trend_payload())
+    metadata = payload["metadata"]
+    strategy_snapshot = payload["strategy_snapshot"]
+    assert isinstance(metadata, dict) and isinstance(strategy_snapshot, dict)
+    metadata.update({"market": "US", "broker": "futu"})
+    strategy_snapshot.update({
+        "strategy_id": "trend_animals_warm_to_hot/US/v2",
+    })
+    report_path = config.reports_dir / "trend_us_futu/2026-07-15.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    stats = build_trend_api_stats_payload(
+        [],
+        strategy_versions=[{
+            "market": "US",
+            "strategy_id": "trend_animals_warm_to_hot/US/v2",
+            "strategy_version": "v2",
+        }],
+        generated_at="2026-07-20T12:00:00+08:00",
+        statistics_cutoff_at="2026-07-20T11:59:59+08:00",
+    )
+    stats["sources"] = [
+        {
+            "source": "actual",
+            "source_id": "actual:futu:futu_main",
+            "broker": "futu",
+            "account_id": "futu_main",
+            "market": "US",
+            "orders_seen": 0,
+            "fill_count": 0,
+            "statistics_cutoff_at": "2026-07-17T16:00:00-04:00",
+            "status": "available",
+        },
+        {
+            "source": "actual",
+            "source_id": "actual:tiger:tiger_main",
+            "broker": "tiger",
+            "account_id": "tiger_main",
+            "market": "US",
+            "orders_seen": 0,
+            "fill_count": 0,
+            "statistics_cutoff_at": "2026-07-16T16:00:00-04:00",
+            "status": "available",
+        },
+    ]
+    write_trend_api_stats(config.data_dir, stats)
+
+    trend_report = load_dashboard_state(config).to_dict()["trend_reports"]["futu"]
+    trade_stats = trend_report["risk_summary"]["trade_stats"]
+
+    assert trade_stats["available"] is True
+    assert trade_stats["actual_broker"] == "futu"
+    assert trade_stats["statistics_cutoff_at"] == "2026-07-17T16:00:00-04:00"
+
+
 def test_dashboard_api_stats_projection_fails_closed_for_malformed_artifact(
     tmp_path: Path,
 ) -> None:

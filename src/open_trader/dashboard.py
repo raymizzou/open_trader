@@ -3307,16 +3307,13 @@ def _project_trend_trade_stats(
     by_source = {str(stat["source"]): stat for stat in matching}
     if len(matching) != 2 or set(by_source) != {"simulation", "actual"}:
         return unavailable
+    actual_broker = TREND_ACTUAL_BROKERS[market]
     actual_sources = [
         source
         for source in payload["sources"]
         if source["source"] == "actual" and source["market"] == market
+        and source["broker"] == actual_broker
     ]
-    actual_broker = (
-        str(actual_sources[0]["broker"])
-        if len(actual_sources) == 1
-        else {"CN": "eastmoney", "HK": "phillips", "US": "futu"}[market]
-    )
     def compact(source: str) -> dict[str, Any]:
         stat = by_source[source]
         return {

@@ -596,6 +596,8 @@ def _run_acceptance_main_with_reports(
     cutover_errors: dict[str, list[str]] | None = None,
     legacy_payload: dict[str, object] | None = None,
     legacy_check: object | None = None,
+    initial_account_snapshot_503: bool = False,
+    sleep_calls: list[float] | None = None,
 ) -> tuple[int, dict[str, object], list[Path | None]]:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
@@ -747,11 +749,14 @@ def _run_acceptance_main_with_reports(
         "cash_balances": [],
         "errors": [],
     }
-    snapshots = iter((
+    snapshot_sequence = [
         (200, account_snapshot, '"account"'),
         (200, account_snapshot, '"account"'),
         (304, None, '"account"'),
-    ))
+    ]
+    if initial_account_snapshot_503:
+        snapshot_sequence.insert(0, (503, None, None))
+    snapshots = iter(snapshot_sequence)
     monkeypatch.setattr(
         dashboard_acceptance,
         "_fetch_account_snapshot",
@@ -798,11 +803,12 @@ def _run_acceptance_main_with_reports(
         return health[url]
 
     monkeypatch.setattr(dashboard_acceptance, "_fetch_json_path", health_payload)
-    monkeypatch.setattr(
-        dashboard_acceptance.time,
-        "sleep",
-        lambda seconds: pytest.fail(f"acceptance slept for {seconds} seconds"),
-    )
+    def record_sleep(seconds: float) -> None:
+        if sleep_calls is None:
+            pytest.fail(f"acceptance slept for {seconds} seconds")
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(dashboard_acceptance.time, "sleep", record_sleep)
     monkeypatch.setattr(
         dashboard_acceptance, "validate_dashboard_payload", lambda *args, **kwargs: []
     )
@@ -859,6 +865,29 @@ def _run_acceptance_main_with_reports(
     ])
     result = json.loads(capsys.readouterr().out)
     return status, result, browser_reports
+
+
+def test_acceptance_main_retries_initial_transient_account_snapshot_503(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    sleep_calls: list[float] = []
+
+    status, result, _ = _run_acceptance_main_with_reports(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        [reports, reports],
+        initial_account_snapshot_503=True,
+        sleep_calls=sleep_calls,
+    )
+
+    assert status == 0
+    assert result["status"] == "PASS"
+    assert sleep_calls == [5]
 
 
 def test_acceptance_main_passes_external_api_reports_dir_to_browser_check(

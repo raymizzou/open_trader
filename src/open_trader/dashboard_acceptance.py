@@ -1004,6 +1004,19 @@ def _fetch_account_snapshot(
         raise
 
 
+def _fetch_account_snapshot_with_retry(
+    url: str, *, etag: str | None = None,
+) -> tuple[int, dict[str, Any] | None, str | None]:
+    result = (503, None, None)
+    for attempt in range(ACCOUNT_SNAPSHOT_REFRESH_ATTEMPTS):
+        result = _fetch_account_snapshot(url, etag=etag)
+        if result[0] != 503:
+            return result
+        if attempt + 1 < ACCOUNT_SNAPSHOT_REFRESH_ATTEMPTS:
+            time.sleep(ACCOUNT_SNAPSHOT_REFRESH_RETRY_SECONDS)
+    return result
+
+
 def _account_snapshot_refresh_errors(
     url: str,
     previous: Mapping[str, Any],
@@ -6178,7 +6191,7 @@ def main(argv: list[str] | None = None) -> int:
         errors.extend(_legacy_cutover_errors(legacy_payload, args.legacy_url))
         errors.extend(_published_trend_account_input_errors(first, first_reports_dir))
         account_snapshot_status, account_snapshot, account_snapshot_etag = (
-            _fetch_account_snapshot(args.account_url)
+            _fetch_account_snapshot_with_retry(args.account_url)
         )
         if account_snapshot_status != 200 or account_snapshot is None:
             errors.append(f"Account API snapshot HTTP {account_snapshot_status}")
@@ -6224,7 +6237,9 @@ def main(argv: list[str] | None = None) -> int:
             first_reports_dir,
         )
         errors.extend(history_errors)
-        snapshot_status, snapshot, snapshot_etag = _fetch_account_snapshot(args.url)
+        snapshot_status, snapshot, snapshot_etag = _fetch_account_snapshot_with_retry(
+            args.url
+        )
         if snapshot_status != 200 or snapshot is None:
             errors.append(f"Gateway Account snapshot HTTP {snapshot_status}")
         else:
@@ -6233,7 +6248,7 @@ def main(argv: list[str] | None = None) -> int:
                 errors.append("Gateway Account snapshot 缺少 ETag")
             else:
                 conditional_status, conditional_snapshot, conditional_etag = (
-                    _fetch_account_snapshot(args.url, etag=snapshot_etag)
+                    _fetch_account_snapshot_with_retry(args.url, etag=snapshot_etag)
                 )
                 if conditional_status == 304:
                     if conditional_snapshot is not None or conditional_etag != snapshot_etag:
