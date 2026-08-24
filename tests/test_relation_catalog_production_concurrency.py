@@ -27,6 +27,7 @@ from open_trader.prediction_monitor_selection_driver import (
 )
 from open_trader.relation_catalog import RelationCatalog
 from open_trader.prediction_solver_verified import VerificationStatus
+from test_relation_catalog import compiled_relation_discovery
 from test_prediction_arbitrage import threshold_relation
 
 
@@ -59,11 +60,6 @@ def _distinct_relation(tag: str) -> object:
     )
 
 
-@pytest.mark.xfail(
-    reason="issue #94: pre-existing catalog approved-version loss race (~50%); "
-    "remove once #94 is fixed",
-    strict=False,
-)
 def test_concurrent_resolver_driver_review_and_prepare_share_one_catalog(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -76,6 +72,7 @@ def test_concurrent_resolver_driver_review_and_prepare_share_one_catalog(
             SimpleNamespace(
                 status=VerificationStatus.QUALIFIED_VERIFIED,
                 initial_verified_profit=1,
+                solution=None,
             )
             for _ in args[1]
         )
@@ -177,3 +174,171 @@ def test_concurrent_resolver_driver_review_and_prepare_share_one_catalog(
         )
         assert row is not None
         assert row["status"] in {"APPROVED", "PENDING"}
+
+
+def test_concurrent_over_budget_approvals_preserve_committed_generation(
+    tmp_path: Path,
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+    for index in range(6):
+        left = f"condition-{index}"
+        right = f"condition-{index + 1}"
+        discovery = compiled_relation_discovery(
+            [left, right],
+            {left: "BUY_YES", right: "BUY_YES"},
+            relation_type="IMPLIES",
+        )
+        version_id = catalog.ingest(discovery)["version_id"]
+        result = catalog.approve(
+            version_id,
+            {"version_id": version_id},
+            actor="concurrency-test",
+            git_sha="a" * 40,
+        )
+        assert result["activation"] == "ACTIVE"
+
+    before = catalog.current_generation()
+    assert len(before) == 6
+
+    candidate_ids = []
+    for right in ("condition-7", "condition-8"):
+        discovery = compiled_relation_discovery(
+            ["condition-6", right],
+            {"condition-6": "BUY_YES", right: "BUY_YES"},
+            relation_type="IMPLIES",
+        )
+        candidate_ids.append(catalog.ingest(discovery)["version_id"])
+
+    barrier = threading.Barrier(2)
+
+    def approve(version_id: str) -> dict[str, object]:
+        barrier.wait()
+        return catalog.approve(
+            version_id,
+            {"version_id": version_id},
+            actor="concurrency-test",
+            git_sha="a" * 40,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(approve, candidate_ids))
+
+    assert [result["activation"] for result in results] == [
+        "UNSUPPORTED_SIZE",
+        "UNSUPPORTED_SIZE",
+    ]
+    reopened = RelationCatalog(tmp_path)
+    assert reopened.current_generation() == before
+    rows = {row["version_id"]: row for row in reopened.review_rows()}
+    for version_id in candidate_ids:
+        assert rows[version_id]["status"] == "APPROVED"
+        assert rows[version_id]["activation"] == "UNSUPPORTED_SIZE"
+
+
+def test_stale_snapshot_block_preserves_newer_same_identity_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+    actor = "concurrency-test"
+    git_sha = "a" * 40
+
+    original_discovery = compiled_relation_discovery(
+        ["condition-a", "condition-b"],
+        {"condition-a": "BUY_YES", "condition-b": "BUY_YES"},
+        relation_type="IMPLIES",
+        rule="rules-original",
+    )
+    original = catalog.ingest(original_discovery)
+    original_id = str(original["version_id"])
+    assert catalog.approve(
+        original_id,
+        {"version_id": original_id},
+        actor=actor,
+        git_sha=git_sha,
+    )["activation"] == "ACTIVE"
+
+    replacement_discovery = compiled_relation_discovery(
+        ["condition-a", "condition-b"],
+        {"condition-a": "BUY_YES", "condition-b": "BUY_YES"},
+        relation_type="IMPLIES",
+        rule="rules-original",
+    )
+    replacement_discovery["discovery_source"] = "replacement-source"
+    replacement = catalog.ingest(replacement_discovery)
+    replacement_id = str(replacement["version_id"])
+    replacement_approval = catalog.approve(
+        replacement_id,
+        {"version_id": replacement_id},
+        actor=actor,
+        git_sha=git_sha,
+    )
+    assert replacement_approval["status"] == "APPROVED"
+    assert replacement_approval["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+
+    stale_discovery = compiled_relation_discovery(
+        ["condition-x", "condition-y"],
+        {"condition-x": "BUY_YES", "condition-y": "BUY_YES"},
+        relation_type="IMPLIES",
+        rule="rules-stale",
+    )
+    stale = catalog.ingest(stale_discovery)
+    stale_id = str(stale["version_id"])
+
+    paused = threading.Event()
+    release = threading.Event()
+    pause_once = True
+    pause_lock = threading.Lock()
+    original_replace = catalog._catalog.replace
+
+    def paused_replace(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal pause_once
+        with pause_lock:
+            should_pause = pause_once
+            pause_once = False
+        if should_pause:
+            paused.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("stale approval did not receive release")
+        return original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(catalog._catalog, "replace", paused_replace)
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(
+        catalog.approve,
+        stale_id,
+        {"version_id": stale_id},
+        actor=actor,
+        git_sha=git_sha,
+    )
+    try:
+        assert paused.wait(timeout=5)
+        result = catalog.replace(
+            {"version_id": original_id},
+            {"version_id": replacement_id},
+            reason="rules_changed",
+            actor=actor,
+            git_sha=git_sha,
+        )
+        assert result == {
+            "revoked_version_id": original_id,
+            "activated_version_id": replacement_id,
+        }
+        frozen = catalog.current_generation()
+        assert len(frozen) == 1
+        frozen_entry = frozen[str(original["identity"])]
+        assert frozen_entry["version_id"] == replacement_id
+    finally:
+        release.set()
+        try:
+            stale_result = future.result(timeout=5)
+        finally:
+            pool.shutdown(wait=True)
+
+    assert stale_result["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+    reopened = RelationCatalog(tmp_path)
+    assert reopened.current_generation() == frozen
+    rows = {str(row["version_id"]): row for row in reopened.review_rows()}
+    assert rows[replacement_id]["activation"] == "ACTIVE"
+    assert rows[original_id]["activation"] == "SUPERSEDED"
+    assert rows[stale_id]["status"] == "APPROVED"
+    assert rows[stale_id]["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT"

@@ -1011,7 +1011,12 @@ class RelationCatalog:
         identity = str(record["identity"])
         previous_generation = self._current_generation()
         change_set = self._generation_change_set(relation_version_id)
-        result = self._catalog.replace(change_set, actor="system", git_sha="")
+        result = self._catalog.replace(
+            change_set,
+            actor="system",
+            git_sha="",
+            preserve_existing=True,
+        )
         activation = "ACTIVE"
         diagnostic = ""
         if result["status"] != "ACTIVE":

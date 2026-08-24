@@ -585,7 +585,14 @@ class RelationCatalogV2:
             self.store.setdefault("causes", {})[(identity, "revoked", version_id)] = True
             return {"version_id": version_id, "identity": identity, "status": "UNKNOWN"}
 
-    def replace(self, change_set: list, *, actor: str, git_sha: str) -> dict:
+    def replace(
+        self,
+        change_set: list,
+        *,
+        actor: str,
+        git_sha: str,
+        preserve_existing: bool = False,
+    ) -> dict:
         """Atomically publish a generation; fail closed on a non-compiling set.
 
         Beyond the per-component ``_satisfiable``/``GROUP_BUDGET`` checks, the
@@ -617,13 +624,45 @@ class RelationCatalogV2:
                     }
                 entries.append((identity, version_id, version_fields))
 
+            if preserve_existing:
+                incoming_versions = {
+                    identity: version_id for identity, version_id, _ in entries
+                }
+                preserve_blocked: list[dict[str, str]] = []
+                for identity, generation_entry in previous_generation.items():
+                    incoming_version_id = incoming_versions.get(identity)
+                    if incoming_version_id is not None:
+                        if incoming_version_id == generation_entry["version_id"]:
+                            continue
+                        preserve_blocked.append(
+                            {
+                                "identity": identity,
+                                "reason": "ACTIVATION_BLOCKED_INCONSISTENT",
+                            }
+                        )
+                        entries = [entry for entry in entries if entry[0] != identity]
+                        version_id = generation_entry["version_id"]
+                        version = versions[version_id]
+                        stored_identity, version_fields = _canonicalize(version["payload"])
+                        entries.append((stored_identity, version_id, version_fields))
+                        continue
+                    version_id = generation_entry["version_id"]
+                    version = versions[version_id]
+                    stored_identity, version_fields = _canonicalize(version["payload"])
+                    entries.append((stored_identity, version_id, version_fields))
+                if preserve_blocked:
+                    return {
+                        "status": "ACTIVATION_BLOCKED_INCONSISTENT",
+                        "blocked": preserve_blocked,
+                    }
+
             approved_before = dict(self.store.get("approved", {}))
             status_before = {
                 version_id: versions[version_id]["status"]
                 for _, version_id, _ in entries
             }
             new_generation: dict[str, dict] = {}
-            blocked: list[dict[str, str]] = []
+            blocked: list[dict[str, str]] = preserve_blocked if preserve_existing else []
             inconsistent = False
             approved_version_fields: dict[str, dict] = {}
             for component in _relation_groups(entries):
@@ -632,18 +671,24 @@ class RelationCatalogV2:
                     for entry in component
                     for contract in _entry_contracts(entry)
                 }
+                reason = None
                 if len(contracts) > GROUP_BUDGET:
-                    blocked.extend(
-                        {"identity": identity, "reason": "UNSUPPORTED_SIZE"}
-                        for identity, _, _ in component
-                    )
-                    continue
-                if not _satisfiable(component):
+                    reason = "UNSUPPORTED_SIZE"
+                elif not _satisfiable(component):
+                    reason = "ACTIVATION_BLOCKED_INCONSISTENT"
                     inconsistent = True
-                    blocked.extend(
-                        {"identity": identity, "reason": "ACTIVATION_BLOCKED_INCONSISTENT"}
-                        for identity, _, _ in component
-                    )
+                if reason is not None:
+                    for identity, version_id, version_fields in component:
+                        previous = previous_generation.get(identity)
+                        if (
+                            preserve_existing
+                            and previous is not None
+                            and previous["version_id"] == version_id
+                        ):
+                            new_generation[identity] = previous
+                            approved_version_fields[identity] = version_fields
+                        else:
+                            blocked.append({"identity": identity, "reason": reason})
                     continue
                 approved = self.store.setdefault("approved", {})
                 for identity, version_id, version_fields in component:
@@ -777,7 +822,11 @@ class RelationCatalogV2:
             if not compile_failed:
                 self.store["generation"] = new_generation
             return {
-                "status": "ACTIVATION_BLOCKED_INCONSISTENT" if (inconsistent or event_gate_blocked) else "ACTIVE",
+                "status": (
+                    "ACTIVATION_BLOCKED_INCONSISTENT"
+                    if (inconsistent or event_gate_blocked or (preserve_existing and blocked))
+                    else "ACTIVE"
+                ),
                 "blocked": blocked,
             }
 
