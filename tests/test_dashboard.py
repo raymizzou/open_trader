@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import csv
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -1204,6 +1204,32 @@ def test_v2_dashboard_plan_projection_ignores_execution_progress() -> None:
     assert sells == []
     assert rotation_sells == []
     assert rotation_buys == []
+
+
+def test_current_nominal_rotation_projection_without_top_level_allocation_version_stays_v2() -> None:
+    payload = {
+        "metadata": {"market": "CN"},
+        "strategy_snapshot": {"strategy_version": "v16"},
+        "allocation": {"markets": {"CN": {"position_limit": 20}}},
+        "strategy_judgments": {
+            "formal_actions": [],
+            "holding_decisions": [],
+            "top10_candidates": [],
+            "simulate_rotation_pairs": [{
+                "execution_mode": "automatic",
+                "sell_symbol": "600002",
+                "buy_symbol": "600003",
+            }],
+        },
+    }
+
+    assert dashboard_module._project_rotation_execution_actions(
+        payload,
+        {
+            ("600002", "sell"): {"status": "filled"},
+            ("600003", "buy"): {"status": "filled"},
+        },
+    ) == ([], [])
 
 
 def test_dashboard_real_buy_projection_keeps_global_strength() -> None:
@@ -3560,6 +3586,42 @@ def test_dashboard_projects_only_valid_frozen_allocation_contract(
     )["eastmoney"]["available"] is False
 
 
+def test_dashboard_projects_markerless_current_nominal_allocation_as_v2(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    path = config.reports_dir / "trend_a_share/2026-07-15.json"
+    path.parent.mkdir(parents=True)
+    payload = _current_nominal_dashboard_payload()
+    allocation = payload["allocation"]
+    assert isinstance(allocation, dict)
+    del allocation["version"]
+
+    projected = dashboard_module._project_broker_trend_report(
+        selected=(
+            path,
+            payload,
+            date(2026, 7, 15),
+            date(2026, 7, 14),
+            date(2026, 7, 15),
+            datetime.fromisoformat("2026-07-15T20:00:00+08:00"),
+        ),
+        data_dir=config.data_dir,
+        reports_dir=path.parent,
+        broker="eastmoney",
+        market="CN",
+        market_label="A股",
+        broker_label="东方财富",
+        buy_window="09:30–10:00",
+        report_date="2026-07-15",
+    )
+
+    assert (
+        projected["allocation"]["version"],
+        "version" in payload["allocation"],
+    ) == (2, False)
+
+
 def test_dashboard_projects_frozen_rotation_comparisons_and_signal_strengths(
     tmp_path: Path,
 ) -> None:
@@ -3993,6 +4055,1837 @@ def _valid_v6_dashboard_trend_payload() -> dict[str, object]:
         "strategy_version": "v6",
     })
     return payload
+
+
+def _current_nominal_dashboard_payload(
+    *,
+    market: str = "CN",
+    available_cash: Decimal = Decimal("100000"),
+    allocation_rank: int = 1,
+    candidates: tuple[trend_module.CandidateInput, ...] | None = None,
+    lot_sizes: dict[str, int] | None = None,
+    account: trend_module.AccountSnapshot | None = None,
+    holding_snapshots: dict[str, trend_module.HoldingSnapshot | None] | None = None,
+    bars_by_symbol: dict[str, list[trend_module.DailyKlineBar] | None] | None = None,
+    real_holdings: trend_module.RealHoldingInput | None = None,
+    kelly_rounds: tuple[trend_module.TrendKellyRound, ...] = (),
+) -> dict[str, object]:
+    cn_strength, hk_strength, us_strength = "100", "80", "70"
+    if allocation_rank == 2:
+        cn_strength, hk_strength, us_strength = "80", "100", "70"
+    allocation_snapshot = build_allocation_snapshot(
+        allocation_date="2026-07-14",
+        generated_at="2026-07-14T16:20:00+08:00",
+        git_sha="a" * 40,
+        roots={
+            "CN": {
+                "stock": {
+                    "asset": "A股", "tm_id": 1,
+                    "as_of_date": "2026-07-14", "global_strength": cn_strength,
+                },
+                "etf": {
+                    "asset": "ETF基金", "tm_id": 2,
+                    "as_of_date": "2026-07-14", "global_strength": "60",
+                },
+            },
+            "HK": {
+                "stock": {
+                    "asset": "港股", "tm_id": 3,
+                    "as_of_date": "2026-07-14", "global_strength": hk_strength,
+                },
+                "etf": {
+                    "asset": "香港ETF", "tm_id": 4,
+                    "as_of_date": "2026-07-14", "global_strength": "50",
+                },
+            },
+            "US": {
+                "stock": {
+                    "asset": "美股", "tm_id": 5,
+                    "as_of_date": "2026-07-14", "global_strength": us_strength,
+                },
+                "etf": {
+                    "asset": "美国ETF", "tm_id": 6,
+                    "as_of_date": "2026-07-14", "global_strength": "40",
+                },
+            },
+        },
+        previous=None,
+        version=2,
+    )
+    allocation = {
+        "daily_path": "data/trend_allocation/daily/2026-07-14.json",
+        "sha256": "b" * 64,
+        "snapshot": allocation_snapshot,
+    }
+    if candidates is None:
+        candidates = (
+            trend_module.CandidateInput(
+                tm_id=1,
+                symbol="600001",
+                exchange="SH",
+                name="股票600001",
+                asset="A股",
+                industry="电力",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("2"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("10"),
+                atr=Decimal("10"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("10"),
+                market_cap=Decimal("100"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("100"),
+            ),
+        )
+    strategy = trend_module.live_trend_strategy_snapshot(
+        market, "abc123", (1,), allocation=allocation,
+    )
+    report = trend_module.build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        generated_at="2026-07-15T20:00:00+08:00",
+        account=trend_module.AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=available_cash,
+            positions=(),
+            exceptions=(),
+        ) if account is None else account,
+        candidates=candidates,
+        holding_snapshots={} if holding_snapshots is None else holding_snapshots,
+        bars_by_symbol={} if bars_by_symbol is None else bars_by_symbol,
+        market=market,
+        metadata={
+            "market": market,
+            "broker": {"CN": "eastmoney", "HK": "phillips", "US": "futu"}[market],
+        },
+        lot_sizes=lot_sizes,
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        real_holdings=real_holdings,
+        kelly_rounds=kelly_rounds,
+        drawdown_summary={
+            "schema_version": "open_trader.strategy_drawdown.v1",
+            "market": market,
+            "strategy_id": strategy["strategy_id"],
+            "strategy_version": strategy["strategy_version"],
+            "kelly_sample_key": (
+                f"{market}|{strategy['strategy_id']}|{strategy['strategy_version']}"
+            ),
+            "state_status": "ok",
+            "status": "active",
+            "status_label": "纪律内",
+            "entry_allowed": True,
+            "current_equity": "100000",
+            "high_water_mark": "100000",
+            "drawdown_pct": "0",
+            "drawdown_limit_pct": "0.05",
+            "pause_reason": "",
+            "paused_at": None,
+            "observed_at": "2026-07-14T18:00:00+08:00",
+            "bootstrap_event": None,
+            "recovery_event": None,
+        },
+        account_input={
+            "snapshot_generation": "sha256:" + "a" * 64,
+            "account_generation": "sha256:" + "b" * 64,
+            "status": "healthy",
+        },
+    )
+    payload = trend_module._report_payload(report)
+    if market != "CN":
+        payload["option_attention"] = []
+    return payload
+
+
+def test_dashboard_accepts_current_nominal_report_with_audit_only_stop_risk() -> None:
+    payload = _current_nominal_dashboard_payload()
+
+    assert dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    ) is not None
+
+
+def test_dashboard_accepts_current_nominal_report_without_top_level_allocation_version() -> None:
+    payload = _current_nominal_dashboard_payload()
+    assert dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    ) is not None
+
+    markerless = copy.deepcopy(payload)
+    allocation = markerless.get("allocation")
+    assert isinstance(allocation, dict)
+    del allocation["version"]
+
+    assert dashboard_module._valid_trend_report_payload(
+        markerless, market="CN", broker="eastmoney",
+    ) is not None
+
+
+def test_dashboard_markerless_current_independently_rejects_formal_audit_tamper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _current_nominal_dashboard_payload()
+    allocation = payload.get("allocation")
+    assert isinstance(allocation, dict)
+    del allocation["version"]
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+
+    baseline = dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    )
+    tampered = copy.deepcopy(payload)
+    buy = next(
+        item
+        for item in tampered["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    buy["normal_cost"] = "3"
+
+    assert (
+        baseline is not None,
+        dashboard_module._valid_trend_report_payload(
+            tampered, market="CN", broker="eastmoney",
+        ),
+    ) == (True, None)
+
+
+def test_dashboard_markerless_current_independently_rejects_coherent_three_percent_tamper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _current_nominal_dashboard_payload(
+        candidates=(
+            trend_module.CandidateInput(
+                tm_id=1,
+                symbol="600001",
+                exchange="SH",
+                name="股票600001",
+                asset="A股",
+                industry="电力",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("2"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("9"),
+                atr=Decimal("0.5"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("9"),
+                market_cap=Decimal("100"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("100"),
+            ),
+        ),
+    )
+    allocation = payload.get("allocation")
+    assert isinstance(allocation, dict)
+    del allocation["version"]
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+
+    baseline = dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    )
+    tampered = copy.deepcopy(payload)
+    buy = next(
+        item
+        for item in tampered["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    buy.update(
+        {
+            "target_weight": "0.03",
+            "target_amount": "3000.00",
+            "estimated_shares": 300,
+            "estimated_initial_line": "8.0",
+            "normal_cost": "2.700",
+            "planned_stop_risk": "302.700",
+            "planned_stop_risk_pct": "0.003027",
+        }
+    )
+    tampered["risk_summary"].update(
+        {
+            "new_planned_risk": "302.700",
+            "portfolio_planned_risk": "302.700",
+            "portfolio_planned_risk_pct": "0.003027",
+            "portfolio_remaining_risk": "3697.300",
+            "portfolio_remaining_risk_pct": "0.036973",
+        }
+    )
+
+    assert (
+        baseline is not None,
+        dashboard_module._valid_trend_report_payload(
+            tampered, market="CN", broker="eastmoney",
+        ) is None,
+    ) == (True, True)
+
+
+def test_dashboard_independently_rejects_current_nominal_non_boolean_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _current_nominal_dashboard_payload()
+    buy = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    buy["executable"] = "false"
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+
+    assert dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    ) is None
+
+
+def test_dashboard_independently_rejects_cash_insufficient_current_nominal_executable_buy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _current_nominal_dashboard_payload(available_cash=Decimal("100"))
+    candidate = payload["signal_snapshots"]["candidates"][0]
+    candidate["atr"] = "0.5"
+    buy = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    buy.update(
+        {
+            "atr": "0.5",
+            "estimated_initial_line": "9.0",
+            "planned_stop_risk": "101.000",
+            "planned_stop_risk_pct": "0.00101",
+            "sizing_note": "现金不足一手（需约 1001.00，可用 100.00）",
+        }
+    )
+    tampered = copy.deepcopy(payload)
+    tampered_buy = next(
+        item
+        for item in tampered["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    tampered_buy["executable"] = True
+    tampered["risk_summary"].update(
+        {
+            "new_planned_risk": "101.000",
+            "portfolio_planned_risk": "101.000",
+            "portfolio_planned_risk_pct": "0.00101",
+            "portfolio_remaining_risk": "3899.000",
+            "portfolio_remaining_risk_pct": "0.03899",
+            "pending_entries_note": "",
+        }
+    )
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+
+    assert (
+        dashboard_module._valid_trend_report_payload(
+            payload, market="CN", broker="eastmoney",
+        ) is not None,
+        dashboard_module._valid_trend_report_payload(
+            tampered, market="CN", broker="eastmoney",
+        ),
+    ) == (True, None)
+
+
+@pytest.mark.parametrize("executable_variant", ["missing", "string_false"])
+def test_dashboard_independently_rejects_sub_limit_missing_or_non_boolean_executable(
+    executable_variant: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _current_nominal_dashboard_payload(available_cash=Decimal("100"))
+    candidate = payload["signal_snapshots"]["candidates"][0]
+    candidate["atr"] = "0.5"
+    buy = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    buy.update(
+        {
+            "atr": "0.5",
+            "estimated_initial_line": "9.0",
+            "planned_stop_risk": "101.000",
+            "planned_stop_risk_pct": "0.00101",
+            "sizing_note": "现金不足一手（需约 1001.00，可用 100.00）",
+        }
+    )
+    payload["risk_summary"].update(
+        {
+            "new_planned_risk": "101.000",
+            "portfolio_planned_risk": "101.000",
+            "portfolio_planned_risk_pct": "0.00101",
+            "portfolio_remaining_risk": "3899.000",
+            "portfolio_remaining_risk_pct": "0.03899",
+            "pending_entries_note": "",
+        }
+    )
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+    if executable_variant == "missing":
+        buy.pop("executable")
+    else:
+        buy["executable"] = "false"
+
+    assert dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    ) is None
+
+
+def test_dashboard_independently_rejects_gross_forced_sale_cash_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    position = trend_module.AccountPosition(
+        "600001",
+        "股票600001",
+        "stock",
+        Decimal("100"),
+        Decimal("9"),
+        Decimal("1000"),
+    )
+    payload = _current_nominal_dashboard_payload(
+        available_cash=Decimal("1"),
+        account=trend_module.AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("1"),
+            positions=(position,),
+            exceptions=(),
+            position_count=1,
+        ),
+        candidates=(
+            trend_module.CandidateInput(
+                tm_id=1,
+                symbol="600999",
+                exchange="SH",
+                name="股票600999",
+                asset="A股",
+                industry="电力",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("2"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("10"),
+                atr=Decimal("0.5"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("10"),
+                market_cap=Decimal("100"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("100"),
+            ),
+        ),
+        holding_snapshots={
+            "600001": trend_module.HoldingSnapshot(
+                tm_id=600001,
+                symbol="600001",
+                exchange="SH",
+                name="股票600001",
+                as_of_date="2026-07-14",
+                right_side=True,
+                danger=True,
+                boiling=False,
+                champagne=False,
+                asset="A股",
+                industry="电力",
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("10"),
+                market_cap=Decimal("100"),
+                strength=Decimal("96"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+    assert dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    ) is not None
+
+    tampered = copy.deepcopy(payload)
+    buy = next(
+        item
+        for item in tampered["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    buy["executable"] = True
+    tampered["risk_summary"].update(
+        {
+            "new_planned_risk": "101.000",
+            "portfolio_planned_risk": "101.000",
+            "portfolio_planned_risk_pct": "0.00101",
+            "portfolio_remaining_risk": "3899.000",
+            "portfolio_remaining_risk_pct": "0.03899",
+            "pending_entries_note": "",
+        }
+    )
+
+    assert dashboard_module._valid_trend_report_payload(
+        tampered, market="CN", broker="eastmoney",
+    ) is None
+
+
+def test_dashboard_current_nominal_real_formal_buy_uses_available_cash_plus_net_forced_sale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    position = trend_module.AccountPosition(
+        "600001",
+        "股票600001",
+        "stock",
+        Decimal("100"),
+        Decimal("9"),
+        Decimal("1000"),
+    )
+    payload = _current_nominal_dashboard_payload(
+        candidates=(
+            trend_module.CandidateInput(
+                tm_id=1,
+                symbol="600999",
+                exchange="SH",
+                name="股票600999",
+                asset="A股",
+                industry="电力",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("2"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("10"),
+                atr=Decimal("0.5"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("10"),
+                market_cap=Decimal("100"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("100"),
+            ),
+        ),
+        real_holdings=trend_module.RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "eastmoney"},
+            positions=(position,),
+            holding_snapshots={
+                "600001": trend_module.HoldingSnapshot(
+                    tm_id=600001,
+                    symbol="600001",
+                    exchange="SH",
+                    name="股票600001",
+                    as_of_date="2026-07-14",
+                    right_side=True,
+                    danger=True,
+                    boiling=False,
+                    champagne=False,
+                    asset="A股",
+                    industry="电力",
+                    industry_tm_id=700001,
+                    industry_temperature="热",
+                    filter_price=Decimal("10"),
+                    market_cap=Decimal("100"),
+                    strength=Decimal("96"),
+                    temperature_prev="温",
+                    temperature_curr="热",
+                    phase="立夏",
+                ),
+            },
+            bars_by_symbol={},
+            prior_state=None,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("2"),
+            position_count=1,
+        ),
+    )
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+    real_action = payload["strategy_judgments"]["real_buy_actions"][0]
+
+    assert (
+        real_action["executable"],
+        real_action["estimated_shares"],
+        dashboard_module._valid_trend_report_payload(
+            payload, market="CN", broker="eastmoney",
+        ) is not None,
+    ) == (True, 100, True)
+
+
+def test_dashboard_independently_rejects_duplicate_current_nominal_candidate_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _current_nominal_dashboard_payload(
+        candidates=(
+            trend_module.CandidateInput(
+                tm_id=1,
+                symbol="600001",
+                exchange="SH",
+                name="股票600001",
+                asset="A股",
+                industry="电力",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("2"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("10"),
+                atr=Decimal("0.5"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("10"),
+                market_cap=Decimal("100"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("100"),
+            ),
+        ),
+    )
+    tampered = copy.deepcopy(payload)
+    candidates = tampered["signal_snapshots"]["candidates"]
+    duplicate = copy.deepcopy(candidates[0])
+    duplicate["close"] = "20"
+    candidates.append(duplicate)
+    tampered_buy = next(
+        item
+        for item in tampered["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    tampered_buy.update(
+        {
+            "close": "20",
+            "estimated_shares": 200,
+            "estimated_initial_line": "19.0",
+            "normal_cost": "4.000",
+            "planned_stop_risk": "204.000",
+            "planned_stop_risk_pct": "0.00204",
+        }
+    )
+    tampered["risk_summary"].update(
+        {
+            "new_planned_risk": "204.000",
+            "portfolio_planned_risk": "204.000",
+            "portfolio_planned_risk_pct": "0.00204",
+            "portfolio_remaining_risk": "3796.000",
+            "portfolio_remaining_risk_pct": "0.03796",
+        }
+    )
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+
+    assert (
+        dashboard_module._valid_trend_report_payload(
+            payload, market="CN", broker="eastmoney",
+        ) is not None,
+        dashboard_module._valid_trend_report_payload(
+            tampered, market="CN", broker="eastmoney",
+        ),
+    ) == (True, None)
+
+
+def test_dashboard_independently_rejects_data_missing_target_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _current_nominal_dashboard_payload(
+        market="HK",
+        candidates=(
+            trend_module.CandidateInput(
+                tm_id=1,
+                symbol="0001",
+                exchange="HK",
+                name="股票0001",
+                asset="港股",
+                industry="银行",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("3"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("50"),
+                atr=Decimal("0.5"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("50"),
+                market_cap=Decimal("200"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("100"),
+            ),
+        ),
+    )
+    buy = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    assert (
+        Decimal(str(buy["target_amount"])),
+        buy["lot_size"],
+        buy["estimated_shares"],
+    ) == (Decimal("4000"), 0, 0)
+
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+    buy["target_amount"] = "1996"
+
+    assert dashboard_module._valid_trend_report_payload(
+        payload, market="HK", broker="phillips",
+    ) is None
+
+
+def test_dashboard_rejects_coherent_current_nominal_price_tamper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _current_nominal_dashboard_payload(
+        candidates=(
+            trend_module.CandidateInput(
+                tm_id=1,
+                symbol="600001",
+                exchange="SH",
+                name="股票600001",
+                asset="A股",
+                industry="电力",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("2"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("10"),
+                atr=Decimal("1"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("10"),
+                market_cap=Decimal("100"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("100"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+    assert dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    ) is not None
+
+    action = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    action.update(
+        {
+            "target_amount": "4000",
+            "estimated_shares": 200,
+            "close": "20",
+            "atr": "1",
+            "estimated_initial_line": "18",
+            "normal_cost": "4",
+            "planned_stop_risk": "404",
+            "planned_stop_risk_pct": "0.00404",
+        }
+    )
+    payload["risk_summary"].update(
+        {
+            "new_planned_risk": "404",
+            "portfolio_planned_risk": "404",
+            "portfolio_planned_risk_pct": "0.00404",
+            "portfolio_remaining_risk": "3596",
+            "portfolio_remaining_risk_pct": "0.03596",
+            "status_label": "风险预算内",
+        }
+    )
+
+    assert dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    ) is None
+
+
+def test_dashboard_independently_rejects_current_nominal_initial_line_tamper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _current_nominal_dashboard_payload(
+        candidates=(
+            trend_module.CandidateInput(
+                tm_id=1,
+                symbol="600001",
+                exchange="SH",
+                name="股票600001",
+                asset="A股",
+                industry="电力",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("2"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("10"),
+                atr=Decimal("0.5"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("10"),
+                market_cap=Decimal("100"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("100"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+    before = dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    )
+    action = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    action["estimated_initial_line"] = "999999"
+    after = dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    )
+
+    assert (before is not None, after is None) == (True, True)
+
+
+def test_dashboard_independently_rejects_coherent_current_nominal_audit_risk_tamper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _current_nominal_dashboard_payload(
+        candidates=(
+            trend_module.CandidateInput(
+                tm_id=1,
+                symbol="600001",
+                exchange="SH",
+                name="股票600001",
+                asset="A股",
+                industry="电力",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("2"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("10"),
+                atr=Decimal("10"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("10"),
+                market_cap=Decimal("100"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("100"),
+            ),
+        ),
+    )
+    assert dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    ) is not None
+
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+    tampered = copy.deepcopy(payload)
+    action = next(
+        item
+        for item in tampered["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    action.update(
+        {
+            "normal_cost": "1",
+            "planned_stop_risk": "8001",
+            "planned_stop_risk_pct": "0.08001",
+        }
+    )
+    tampered["risk_summary"].update(
+        {
+            "new_planned_risk": "8001",
+            "portfolio_planned_risk": "8001",
+            "portfolio_planned_risk_pct": "0.08001",
+            "portfolio_remaining_risk": "0",
+            "portfolio_remaining_risk_pct": "0",
+            "status_label": "计划止损风险仅审计，不参与买入数量",
+        }
+    )
+
+    assert dashboard_module._valid_trend_report_payload(
+        tampered, market="CN", broker="eastmoney",
+    ) is None
+
+
+def test_dashboard_accepts_current_nominal_cost_limited_cash_boundary() -> None:
+    payload = _current_nominal_dashboard_payload(
+        market="US",
+        available_cash=Decimal("4000"),
+        candidates=(
+            trend_module.CandidateInput(
+                tm_id=1,
+                symbol="AAPL",
+                exchange="US",
+                name="股票AAPL",
+                asset="美股",
+                industry="科技",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("2"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("100"),
+                atr=Decimal("0.5"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("100"),
+                market_cap=Decimal("100"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("100"),
+            ),
+        ),
+    )
+    action = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+
+    assert (
+        dashboard_module._valid_trend_report_payload(
+            payload, market="US", broker="futu",
+        ) is not None,
+        Decimal(str(action["target_amount"])),
+        action["estimated_shares"],
+    ) == (True, Decimal("4000"), 39)
+
+
+def test_dashboard_accepts_current_nominal_target_with_minimum_lot_fallback() -> None:
+    payload = _current_nominal_dashboard_payload(
+        market="HK",
+        candidates=(
+            trend_module.CandidateInput(
+                tm_id=1,
+                symbol="0001",
+                exchange="HK",
+                name="股票0001",
+                asset="港股",
+                industry="银行",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("3"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("50"),
+                atr=Decimal("0.5"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("50"),
+                market_cap=Decimal("200"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("100"),
+            ),
+        ),
+        lot_sizes={"0001": 100},
+    )
+    action = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+
+    assert (
+        dashboard_module._valid_trend_report_payload(
+            payload, market="HK", broker="phillips",
+        ) is not None,
+        Decimal(str(action["target_amount"])),
+        action["estimated_shares"],
+    ) == (True, Decimal("4000"), 100)
+
+
+def test_dashboard_accepts_current_nominal_sequential_cash_limited_buys() -> None:
+    payload = _current_nominal_dashboard_payload(
+        market="US",
+        available_cash=Decimal("6000"),
+        candidates=tuple(
+            trend_module.CandidateInput(
+                tm_id=index,
+                symbol=symbol,
+                exchange="US",
+                name=f"股票{symbol}",
+                asset="美股",
+                industry="科技",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("2"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("100"),
+                atr=Decimal("0.5"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("100"),
+                market_cap=Decimal("100"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal(strength),
+            )
+            for index, (symbol, strength) in enumerate(
+                (("AAPL", "100"), ("MSFT", "99")),
+                1,
+            )
+        ),
+    )
+    buys = [
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    ]
+
+    assert (
+        dashboard_module._valid_trend_report_payload(
+            payload, market="US", broker="futu",
+        ) is not None,
+        [
+            (Decimal(str(item["target_amount"])), item["estimated_shares"])
+            for item in buys
+        ],
+    ) == (True, [(Decimal("4000"), 40), (Decimal("4000"), 19)])
+
+
+def test_dashboard_independently_rejects_cash_limited_target_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _current_nominal_dashboard_payload(
+        market="US",
+        available_cash=Decimal("6000"),
+        candidates=tuple(
+            trend_module.CandidateInput(
+                tm_id=index,
+                symbol=symbol,
+                exchange="US",
+                name=f"股票{symbol}",
+                asset="美股",
+                industry="科技",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("2"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("100"),
+                atr=Decimal("0.5"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("100"),
+                market_cap=Decimal("100"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal(strength),
+            )
+            for index, (symbol, strength) in enumerate(
+                (("AAPL", "100"), ("MSFT", "99")),
+                1,
+            )
+        ),
+    )
+    buys = [
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    ]
+    assert (
+        Decimal(str(buys[1]["target_amount"])),
+        buys[1]["estimated_shares"],
+    ) == (Decimal("4000"), 19)
+
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+    buys[1]["target_amount"] = "1996"
+
+    assert dashboard_module._valid_trend_report_payload(
+        payload, market="US", broker="futu",
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["real_buy_actions", "simulate_rotation_pairs", "real_rotation_pairs"],
+)
+@pytest.mark.parametrize("markerless", [False, True])
+def test_dashboard_independently_rejects_falsified_current_nominal_real_and_rotation_quantities(
+    field: str,
+    markerless: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if field == "real_buy_actions":
+        payload = _current_nominal_dashboard_payload(
+            market="US",
+            real_holdings=trend_module.RealHoldingInput(
+                status="available",
+                reason="",
+                source={"broker": "tiger"},
+                positions=(),
+                holding_snapshots={},
+                bars_by_symbol={},
+                prior_state=None,
+                net_value=Decimal("50000"),
+                available_cash=Decimal("50000"),
+            ),
+            candidates=(
+                trend_module.CandidateInput(
+                    tm_id=1,
+                    symbol="AAPL",
+                    exchange="US",
+                    name="股票AAPL",
+                    asset="美股",
+                    industry="科技",
+                    as_of_date="2026-07-14",
+                    tradable=True,
+                    amount=Decimal("2"),
+                    right_side=True,
+                    days=3,
+                    strength=Decimal("96"),
+                    danger=False,
+                    close=Decimal("125"),
+                    atr=Decimal("0.5"),
+                    industry_tm_id=700001,
+                    industry_temperature="热",
+                    filter_price=Decimal("125"),
+                    market_cap=Decimal("100"),
+                    temperature_prev="温",
+                    temperature_curr="热",
+                    phase="立夏",
+                    global_strength=Decimal("100"),
+                ),
+            ),
+        )
+        broker = "futu"
+    else:
+        positions = tuple(
+            trend_module.AccountPosition(
+                f"600{index:03d}",
+                f"股票600{index:03d}",
+                "stock",
+                Decimal("100"),
+                Decimal("10"),
+                Decimal("1000"),
+            )
+            for index in range(15)
+        )
+        snapshots = {
+            position.symbol: trend_module.HoldingSnapshot(
+                tm_id=int(position.symbol),
+                symbol=position.symbol,
+                exchange="SH",
+                name=position.name,
+                as_of_date="2026-07-14",
+                right_side=True,
+                danger=False,
+                boiling=False,
+                champagne=False,
+                asset="A股",
+                industry="电力",
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("10"),
+                market_cap=Decimal("100"),
+                strength=Decimal("70"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("70"),
+            )
+            for position in positions
+        }
+        bars_by_symbol = {
+            position.symbol: [
+                trend_module.DailyKlineBar(
+                    date=(
+                        datetime.fromisoformat("2026-07-14")
+                        - timedelta(days=14 - index)
+                    ).date().isoformat(),
+                    open=10,
+                    high=11,
+                    low=9,
+                    close=10,
+                    volume=100,
+                )
+                for index in range(15)
+            ]
+            for position in positions
+        }
+        real_holdings = trend_module.RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "eastmoney"},
+            positions=positions,
+            holding_snapshots=snapshots,
+            bars_by_symbol=bars_by_symbol,
+            prior_state=None,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            position_count=15,
+        ) if field == "real_rotation_pairs" else None
+        payload = _current_nominal_dashboard_payload(
+            allocation_rank=2,
+            account=trend_module.AccountSnapshot(
+                source_date="2026-07-14",
+                fresh=True,
+                net_value=Decimal("100000"),
+                available_cash=Decimal("100000"),
+                positions=positions if field == "simulate_rotation_pairs" else (),
+                exceptions=(),
+                position_count=15 if field == "simulate_rotation_pairs" else 0,
+            ),
+            holding_snapshots=snapshots if field == "simulate_rotation_pairs" else {},
+            bars_by_symbol=bars_by_symbol if field == "simulate_rotation_pairs" else {},
+            real_holdings=real_holdings,
+            candidates=(
+                trend_module.CandidateInput(
+                    tm_id=600999,
+                    symbol="600999",
+                    exchange="SH",
+                    name="股票600999",
+                    asset="A股",
+                    industry="电力",
+                    as_of_date="2026-07-14",
+                    tradable=True,
+                    amount=Decimal("2"),
+                    right_side=True,
+                    days=3,
+                    strength=Decimal("96"),
+                    danger=False,
+                    close=Decimal("10"),
+                    atr=Decimal("0.5"),
+                    industry_tm_id=700001,
+                    industry_temperature="热",
+                    filter_price=Decimal("10"),
+                    market_cap=Decimal("100"),
+                    temperature_prev="温",
+                    temperature_curr="热",
+                    phase="立夏",
+                    global_strength=Decimal("100"),
+                ),
+            ),
+        )
+        broker = "eastmoney"
+
+    if markerless:
+        allocation = payload.get("allocation")
+        assert isinstance(allocation, dict)
+        del allocation["version"]
+    before = dashboard_module._valid_trend_report_payload(
+        payload, market="US" if field == "real_buy_actions" else "CN", broker=broker,
+    )
+    assert before is not None
+    item = payload["strategy_judgments"][field][0]
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+    if field == "real_buy_actions":
+        item.update(
+            {
+                "target_amount": "40000",
+                "estimated_shares": 320,
+                "planned_stop_risk": "360",
+                "planned_stop_risk_pct": "0.0072",
+                "normal_cost": "40",
+            }
+        )
+    else:
+        item.update({"target_amount": "40000", "estimated_shares": 4000})
+    after = dashboard_module._valid_trend_report_payload(
+        payload, market="US" if field == "real_buy_actions" else "CN", broker=broker,
+    )
+
+    assert (before is not None, after is None) == (True, True)
+
+
+def test_dashboard_current_nominal_real_rotation_uses_available_cash_plus_net_sale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    positions = tuple(
+        trend_module.AccountPosition(
+            f"600{index:03d}",
+            f"股票600{index:03d}",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("1000"),
+        )
+        for index in range(15)
+    )
+    snapshots = {
+        position.symbol: trend_module.HoldingSnapshot(
+            tm_id=int(position.symbol),
+            symbol=position.symbol,
+            exchange="SH",
+            name=position.name,
+            as_of_date="2026-07-14",
+            right_side=True,
+            danger=False,
+            boiling=False,
+            champagne=False,
+            asset="A股",
+            industry="电力",
+            industry_tm_id=700001,
+            industry_temperature="热",
+            filter_price=Decimal("10"),
+            market_cap=Decimal("100"),
+            strength=Decimal("70"),
+            temperature_prev="温",
+            temperature_curr="热",
+            phase="立夏",
+            global_strength=Decimal("70"),
+        )
+        for position in positions
+    }
+    bars_by_symbol = {
+        position.symbol: [
+            trend_module.DailyKlineBar(
+                date=(
+                    datetime.fromisoformat("2026-07-14")
+                    - timedelta(days=14 - index)
+                ).date().isoformat(),
+                open=10,
+                high=11,
+                low=9,
+                close=10,
+                volume=100,
+            )
+            for index in range(15)
+        ]
+        for position in positions
+    }
+    payload = _current_nominal_dashboard_payload(
+        allocation_rank=2,
+        real_holdings=trend_module.RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "eastmoney"},
+            positions=positions,
+            holding_snapshots=snapshots,
+            bars_by_symbol=bars_by_symbol,
+            prior_state=None,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("2"),
+            position_count=15,
+        ),
+        candidates=(
+            trend_module.CandidateInput(
+                tm_id=600999,
+                symbol="600999",
+                exchange="SH",
+                name="股票600999",
+                asset="A股",
+                industry="电力",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("2"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("10"),
+                atr=Decimal("0.5"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("10"),
+                market_cap=Decimal("100"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("100"),
+            ),
+        ),
+    )
+    pair = payload["strategy_judgments"]["real_rotation_pairs"][0]
+    sell_symbol = pair["sell_symbol"]
+    assert (pair["estimated_shares"], pair["target_amount"]) == (100, "4000.00")
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+    baseline = dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    )
+    assert baseline is not None
+
+    short_cash = copy.deepcopy(payload)
+    short_cash["plan_availability"]["real_account"]["available_cash"] = "0"
+    missing_sale_value = copy.deepcopy(payload)
+    real_signal = missing_sale_value["signal_snapshots"]["real_holdings"][sell_symbol]
+    assert isinstance(real_signal, dict)
+    del real_signal["market_value"]
+
+    assert (
+        True,
+        dashboard_module._valid_trend_report_payload(
+            short_cash, market="CN", broker="eastmoney",
+        ) is None,
+        dashboard_module._valid_trend_report_payload(
+            missing_sale_value, market="CN", broker="eastmoney",
+        ) is None,
+    ) == (True, True, True)
+
+
+def test_dashboard_current_nominal_real_rotation_accepts_missing_unused_sale_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    positions = tuple(
+        trend_module.AccountPosition(
+            f"600{index:03d}",
+            f"股票600{index:03d}",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("1000"),
+        )
+        for index in range(15)
+    )
+    snapshots = {
+        position.symbol: trend_module.HoldingSnapshot(
+            tm_id=int(position.symbol),
+            symbol=position.symbol,
+            exchange="SH",
+            name=position.name,
+            as_of_date="2026-07-14",
+            right_side=True,
+            danger=False,
+            boiling=False,
+            champagne=False,
+            asset="A股",
+            industry="电力",
+            industry_tm_id=700001,
+            industry_temperature="热",
+            filter_price=Decimal("10"),
+            market_cap=Decimal("100"),
+            strength=Decimal("70"),
+            temperature_prev="温",
+            temperature_curr="热",
+            phase="立夏",
+            global_strength=Decimal("70"),
+        )
+        for position in positions
+    }
+    bars_by_symbol = {
+        position.symbol: [
+            trend_module.DailyKlineBar(
+                date=(
+                    datetime.fromisoformat("2026-07-14")
+                    - timedelta(days=14 - index)
+                ).date().isoformat(),
+                open=10,
+                high=11,
+                low=9,
+                close=10,
+                volume=100,
+            )
+            for index in range(15)
+        ]
+        for position in positions
+    }
+    payload = _current_nominal_dashboard_payload(
+        allocation_rank=2,
+        real_holdings=trend_module.RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "eastmoney"},
+            positions=positions,
+            holding_snapshots=snapshots,
+            bars_by_symbol=bars_by_symbol,
+            prior_state=None,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            position_count=15,
+        ),
+        candidates=(
+            trend_module.CandidateInput(
+                tm_id=600999,
+                symbol="600999",
+                exchange="SH",
+                name="股票600999",
+                asset="A股",
+                industry="电力",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("2"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("10"),
+                atr=Decimal("0.5"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("10"),
+                market_cap=Decimal("100"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("100"),
+            ),
+        ),
+    )
+    pair = payload["strategy_judgments"]["real_rotation_pairs"][0]
+    sell_symbol = pair["sell_symbol"]
+    real_signal = payload["signal_snapshots"]["real_holdings"][sell_symbol]
+    assert isinstance(real_signal, dict)
+    del real_signal["market_value"]
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+
+    assert dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    ) is not None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("atr", "999"),
+        ("close", "999"),
+        ("estimated_initial_line", "999999"),
+        ("normal_cost", "1"),
+        ("planned_stop_risk", "401"),
+        ("planned_stop_risk_pct", "0.00401"),
+    ],
+)
+def test_dashboard_independently_rejects_current_nominal_rotation_audit_tamper(
+    field: str,
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    positions = tuple(
+        trend_module.AccountPosition(
+            f"600{index:03d}",
+            f"股票600{index:03d}",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("1000"),
+        )
+        for index in range(15)
+    )
+    snapshots = {
+        position.symbol: trend_module.HoldingSnapshot(
+            tm_id=int(position.symbol),
+            symbol=position.symbol,
+            exchange="SH",
+            name=position.name,
+            as_of_date="2026-07-14",
+            right_side=True,
+            danger=False,
+            boiling=False,
+            champagne=False,
+            asset="A股",
+            industry="电力",
+            industry_tm_id=700001,
+            industry_temperature="热",
+            filter_price=Decimal("10"),
+            market_cap=Decimal("100"),
+            strength=Decimal("70"),
+            temperature_prev="温",
+            temperature_curr="热",
+            phase="立夏",
+            global_strength=Decimal("70"),
+        )
+        for position in positions
+    }
+    bars_by_symbol = {
+        position.symbol: [
+            trend_module.DailyKlineBar(
+                date=(
+                    datetime.fromisoformat("2026-07-14")
+                    - timedelta(days=14 - index)
+                ).date().isoformat(),
+                open=10,
+                high=11,
+                low=9,
+                close=10,
+                volume=100,
+            )
+            for index in range(15)
+        ]
+        for position in positions
+    }
+    payload = _current_nominal_dashboard_payload(
+        allocation_rank=2,
+        account=trend_module.AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=positions,
+            exceptions=(),
+            position_count=15,
+        ),
+        holding_snapshots=snapshots,
+        bars_by_symbol=bars_by_symbol,
+        candidates=(
+            trend_module.CandidateInput(
+                tm_id=600999,
+                symbol="600999",
+                exchange="SH",
+                name="股票600999",
+                asset="A股",
+                industry="电力",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("2"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("10"),
+                atr=Decimal("0.5"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("10"),
+                market_cap=Decimal("100"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("100"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        dashboard_module,
+        "valid_frozen_report_contract",
+        lambda _payload: True,
+    )
+    before = dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    )
+    pair = payload["strategy_judgments"]["simulate_rotation_pairs"][0]
+    pair[field] = value
+    after = dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    )
+
+    assert (before is not None, after is None) == (True, True)
+
+
+def test_dashboard_current_nominal_sizing_is_independent_from_core_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _current_nominal_dashboard_payload()
+    monkeypatch.setattr(
+        dashboard_module,
+        "_expected_nominal_sizing",
+        lambda **_kwargs: (
+            Decimal("999999"),
+            999999,
+            Decimal("999999"),
+        ),
+        raising=False,
+    )
+
+    assert dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    ) is not None
+
+
+def test_dashboard_accepts_current_nominal_real_buy_with_frozen_kelly_cap() -> None:
+    kelly_rounds = tuple(
+        trend_module.TrendKellyRound(
+            round_id=f"round-{index:03d}",
+            source="simulation",
+            market="US",
+            strategy_id="trend_animals_warm_to_hot/US/v14",
+            opening_strategy_version="v14",
+            closed_at=f"2026-07-{index // 24 + 1:02d}T{index % 24:02d}:00:00+00:00",
+            net_return=Decimal(net_return),
+            costs_complete=True,
+            attribution_status="attributed",
+            kelly_eligible=True,
+        )
+        for index, net_return in enumerate(["0.10"] * 15 + ["-0.099"] * 15)
+    )
+
+    payload = _current_nominal_dashboard_payload(
+        market="US",
+        allocation_rank=2,
+        candidates=(
+            trend_module.CandidateInput(
+                tm_id=1,
+                symbol="AAPL",
+                exchange="US",
+                name="股票AAPL",
+                asset="美股",
+                industry="科技",
+                as_of_date="2026-07-14",
+                tradable=True,
+                amount=Decimal("2"),
+                right_side=True,
+                days=3,
+                strength=Decimal("96"),
+                danger=False,
+                close=Decimal("100"),
+                atr=Decimal("0.5"),
+                industry_tm_id=700001,
+                industry_temperature="热",
+                filter_price=Decimal("100"),
+                market_cap=Decimal("100"),
+                temperature_prev="温",
+                temperature_curr="热",
+                phase="立夏",
+                global_strength=Decimal("100"),
+            ),
+        ),
+        real_holdings=trend_module.RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "tiger"},
+            positions=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            prior_state=None,
+            net_value=Decimal("50000"),
+            available_cash=Decimal("50000"),
+        ),
+        kelly_rounds=kelly_rounds,
+    )
+    action = payload["strategy_judgments"]["real_buy_actions"][0]
+
+    assert (
+        dashboard_module._valid_trend_report_payload(
+            payload, market="US", broker="futu",
+        ) is not None,
+        Decimal(str(action["target_weight"])),
+        Decimal(str(action["target_amount"])),
+        action["estimated_shares"],
+    ) == (True, Decimal("0.012626"), Decimal("631.30"), 6)
+
+
+def test_dashboard_rejects_current_nominal_quantity_not_anchored_to_nav_target() -> None:
+    payload = _current_nominal_dashboard_payload()
+    action = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    action.update(
+        {
+            "close": "100",
+            "atr": "100",
+            "estimated_initial_line": "-100",
+            "target_amount": "40000",
+            "estimated_shares": 400,
+            "planned_stop_risk": "80040",
+            "planned_stop_risk_pct": "0.8004",
+            "normal_cost": "40",
+        }
+    )
+    payload["risk_summary"].update(
+        {
+            "new_planned_risk": "80040",
+            "portfolio_planned_risk": "80040",
+            "portfolio_planned_risk_pct": "0.8004",
+            "portfolio_remaining_risk": "0",
+            "portfolio_remaining_risk_pct": "0",
+            "status_label": "计划止损风险仅审计，不参与买入数量",
+        }
+    )
+
+    assert dashboard_module._valid_trend_report_payload(
+        payload, market="CN", broker="eastmoney",
+    ) is None
 
 
 def test_dashboard_accepts_cn_v6_risk_and_drawdown_contract() -> None:

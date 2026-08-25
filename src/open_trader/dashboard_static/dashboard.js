@@ -4672,8 +4672,8 @@ function usesFinalPlanTrendAudit(report) {
 function usesV2TrendPlanLayout(report) {
   const market = String(report?.market || "").toUpperCase();
   const version = String(report?.strategy_version || "");
-  return (market === "CN" && version === "v15")
-    || (["HK", "US"].includes(market) && version === "v13")
+  return (market === "CN" && ["v15", "v16"].includes(version))
+    || (["HK", "US"].includes(market) && ["v13", "v14"].includes(version))
     || report?.allocation?.version === 2;
 }
 

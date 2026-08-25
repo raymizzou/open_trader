@@ -307,6 +307,52 @@ def test_cn_historical_and_current_snapshots_normalize_without_cross_version_rew
     ] == "v4"
 
 
+def test_current_nominal_versions_preserve_allocation_v2_during_normalization() -> None:
+    allocation = _allocation_v2_ref()
+    observed: dict[str, tuple[str, str, int]] = {}
+    for market, expected_version, expected_limit in (
+        ("CN", "v16", 20),
+        ("HK", "v14", 15),
+        ("US", "v14", 10),
+    ):
+        snapshot = live_trend_strategy_snapshot(
+            market, "abc123", (), allocation=allocation,
+        )
+        normalized = trend_review.normalize_trend_strategy_snapshot(
+            snapshot, market,
+        )
+        observed[market] = (
+            str(normalized["strategy_version"]),
+            str(normalized["strategy_id"]),
+            int(normalized["parameters"]["allocation_position_limit"]),
+        )
+
+    assert observed == {
+        "CN": ("v16", "trend_animals_warm_to_hot/CN/v16", 20),
+        "HK": ("v14", "trend_animals_warm_to_hot/HK/v14", 15),
+        "US": ("v14", "trend_animals_warm_to_hot/US/v14", 10),
+    }
+
+
+@pytest.mark.parametrize(
+    ("market", "version"),
+    [("CN", "v16"), ("HK", "v14"), ("US", "v14")],
+)
+def test_current_nominal_versions_use_staged_rotation_without_top_level_allocation_version(
+    market: str, version: str,
+) -> None:
+    report = {
+        "metadata": {"market": market},
+        "strategy_snapshot": {"strategy_version": version},
+        "allocation": {"markets": {market: {"position_limit": 20}}},
+    }
+
+    assert (
+        trend_review._v2_execution_report(report, market),
+        trend_review._uses_staged_rotation_execution(report, market),
+    ) == (True, True)
+
+
 @pytest.mark.parametrize("strategy_version", ["v8", "v9"])
 def test_risk_aware_buy_completion_accepts_current_and_legacy_versions(
     strategy_version: str,
@@ -361,6 +407,174 @@ def test_v2_buy_completion_uses_unique_fills_and_floors_report_residual() -> Non
     assert trend_review._remaining_buy_quantity(
         action, report, snapshot, orders, None
     ) == 0
+
+
+@pytest.mark.parametrize(
+    ("market", "version", "futu_code", "lot_size", "quantity", "price"),
+    [
+        ("CN", "v16", "SH.600001", 100, 400, "1000"),
+        ("HK", "v14", "HK.00001", 100, 400, "1000"),
+        ("US", "v14", "US.AAPL", 1, 40, "10000"),
+    ],
+)
+def test_current_nominal_markerless_buy_completion_uses_frozen_quantity(
+    market: str,
+    version: str,
+    futu_code: str,
+    lot_size: int,
+    quantity: int,
+    price: str,
+) -> None:
+    report = {
+        "metadata": {
+            "market": market,
+            "price_fx_to_account_currency": "1",
+        },
+        "strategy_snapshot": {
+            "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+            "strategy_version": version,
+        },
+        "allocation": {"markets": {market: {"position_limit": 15}}},
+    }
+    action = {
+        "lot_size": lot_size,
+        "estimated_shares": quantity,
+        "target_amount": "4000",
+        "atr": "0.5",
+        "planned_stop_risk": "400",
+        "futu_symbol": futu_code,
+    }
+    snapshot = {
+        "acc_id": 101,
+        "available_cash": "1",
+        "positions": [],
+    }
+
+    assert trend_review._remaining_buy_quantity(
+        action,
+        report,
+        snapshot,
+        (),
+        Decimal(price),
+        futu_code=futu_code,
+        reservation_orders=(),
+    ) == quantity
+
+
+def test_current_nominal_markerless_open_executes_frozen_quantity_without_quote_repricing(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600003",
+            "futu_symbol": "SH.600003",
+            "target_weight": "0.04",
+            "close": "10",
+            "lot_size": 100,
+            "estimated_shares": 400,
+            "atr": "0.5",
+            "executable": True,
+        },
+    ])
+    report["metadata"] = {
+        **report["metadata"],
+        "market": "CN",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    }
+    allocation = report.get("allocation")
+    assert isinstance(allocation, dict)
+    del allocation["version"]
+    report["risk_summary"] = {"normal_cost_rate": "0.001"}
+    client = FakeTrendSimClient(cash="100000")
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices={},
+    )
+
+    assert (
+        [(request["futu_code"], request["qty"]) for request in client.requests],
+        result["status"],
+        list(tmp_path.glob("trend_review/ledgers/CN/buy_basis/**/*.json")),
+    ) == ([ ("SH.600003", "400") ], "submitted", [])
+
+
+def test_current_nominal_markerless_rotation_rejection_does_not_substitute(
+    tmp_path: Path,
+) -> None:
+    class RejectStrong1(FakeTrendSimClient):
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            response = super().place_order(request)
+            accepted = request["side"] == "SELL" or request["futu_code"] == "SH.STRONG3"
+            self.orders[-1].update({
+                "dealt_qty": request["qty"] if accepted else "0",
+                "dealt_avg_price": "10",
+                "order_status": "FILLED_ALL" if accepted else "REJECTED",
+            })
+            if request["side"] == "SELL":
+                self.positions = [
+                    item for item in self.positions
+                    if item["code"] != request["futu_code"]
+                ]
+                self.cash = str(Decimal(self.cash) + Decimal("7000"))
+            elif accepted:
+                self.positions.append({"code": request["futu_code"], "qty": request["qty"]})
+            return response
+
+    report = relative_rotation_report(
+        pairs=[relative_rotation_pair(buy="STRONG1")],
+    )
+    report["metadata"].update({
+        "market": "CN",
+        "candidate_fallbacks": [
+            {
+                "symbol": "STRONG2", "name": "Strong 2", "futu_symbol": "SH.STRONG2",
+                "asset": "A股", "global_strength": "95", "atr": "0.1",
+            },
+            {
+                "symbol": "STRONG3", "name": "Strong 3", "futu_symbol": "SH.STRONG3",
+                "asset": "A股", "global_strength": "94", "atr": "0.1",
+            },
+        ],
+    })
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    }
+    report["signal_snapshots"] = {
+        "candidates": [
+            {"symbol": "STRONG2", "global_strength": "95"},
+            {"symbol": "STRONG3", "global_strength": "94"},
+        ],
+    }
+    client = RejectStrong1(cash="0", positions=full_rotation_positions())
+
+    result = trend_review.execute_relative_rotations(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T10:30:00+08:00",
+        quote_prices={
+            "SH.STRONG1": Decimal("10"),
+            "SH.STRONG3": Decimal("10"),
+        },
+    )
+
+    assert (
+        [request["futu_code"] for request in client.requests],
+        result["fallbacks_used"],
+    ) == (["SH.WEAK", "SH.STRONG1"], [])
 
 
 def frozen_evidence() -> dict[str, object]:
@@ -653,6 +867,149 @@ def test_rebuild_uses_only_frozen_inputs_and_fixed_process_version() -> None:
     assert rebuilt["process_version"] == "newsha"
     assert rebuilt["strategy_snapshot"]["process_version"] == "newsha"
     assert rebuilt["account"]["net_value"] == "100000"
+
+
+@pytest.mark.parametrize("missing_field", ["kelly_rounds", "kelly_data_reason"])
+def test_cn_v16_rebuild_requires_frozen_kelly_evidence(
+    tmp_path: Path, missing_field: str,
+) -> None:
+    allocation = _allocation_v2_ref(allocation_date="2026-07-16")
+    body = json.dumps(
+        allocation["snapshot"], ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n"
+    daily_path = tmp_path / "trend_allocation/daily/2026-07-16.json"
+    daily_path.parent.mkdir(parents=True)
+    daily_path.write_text(body, encoding="utf-8")
+    allocation["sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    strategy = live_trend_strategy_snapshot(
+        "CN", "oldsha", (622466, 697199), strategy_version="v16",
+        allocation=allocation, execution_date="2026-07-17",
+    )
+    candidate = CandidateInput(
+        tm_id=1,
+        symbol="600001",
+        exchange="SH",
+        name="候选",
+        asset="A股",
+        industry="电力",
+        as_of_date="2026-07-16",
+        tradable=True,
+        amount=Decimal("2"),
+        right_side=True,
+        days=3,
+        strength=Decimal("96"),
+        danger=False,
+        close=Decimal("10"),
+        atr=Decimal("0.5"),
+        industry_tm_id=700001,
+        industry_temperature="热",
+        filter_price=Decimal("10"),
+        market_cap=Decimal("100"),
+        temperature_prev="温",
+        temperature_curr="热",
+        phase="立夏",
+        global_strength=Decimal("96"),
+    )
+    rounds = trend_kelly_rounds_from_payload({
+        "schema_version": "open_trader.trend_api_stats.v1",
+        "rounds": [
+            {
+                "round_id": f"v16-round-{index:02d}",
+                "source": "simulation",
+                "market": "CN",
+                "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+                "opening_strategy_version": "v16",
+                "closed_at": f"2026-07-{index + 1:02d}T00:00:00+00:00",
+                "net_return": "0.10" if index < 15 else "-0.099",
+                "costs_complete": True,
+                "attribution_status": "attributed",
+                "kelly_eligible": True,
+            }
+            for index in range(30)
+        ],
+    })
+    drawdown = {
+        "schema_version": "open_trader.strategy_drawdown.v1",
+        "market": "CN",
+        "strategy_id": strategy["strategy_id"],
+        "strategy_version": "v16",
+        "kelly_sample_key": "CN|trend_animals_warm_to_hot/CN/v16|v16",
+        "state_status": "ok",
+        "status": "active",
+        "status_label": "纪律内",
+        "entry_allowed": True,
+        "current_equity": "100000",
+        "high_water_mark": "100000",
+        "drawdown_pct": "0",
+        "drawdown_limit_pct": "0.05",
+        "pause_reason": "",
+        "paused_at": None,
+        "observed_at": "2026-07-16T18:00:00+08:00",
+        "bootstrap_event": None,
+        "recovery_event": None,
+    }
+    report = build_report(
+        as_of_date="2026-07-16",
+        execution_date="2026-07-17",
+        account=AccountSnapshot(
+            "2026-07-16", True, Decimal("100000"), Decimal("100000"), (), (),
+        ),
+        candidates=(candidate,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        generated_at="2026-07-16T17:00:00+08:00",
+        metadata={
+            "market": "CN", "broker": "eastmoney", "process_version": "oldsha",
+        },
+        market="CN",
+        process_version="oldsha",
+        candidate_pool_ids=(622466, 697199),
+        strategy_snapshot=strategy,
+        kelly_rounds=rounds,
+        drawdown_summary=drawdown,
+        allocation_reference=allocation,
+    )
+    source = _report_payload(report)
+    frozen = trend_review.freeze_report_evidence(
+        data_dir=tmp_path,
+        report=report,
+        candidates=(candidate,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state={"schema_version": 1, "positions": {}},
+        watch_events=[],
+        query={"component_pool_ids": [622466, 697199]},
+        responses={},
+        candidate_pool_ids=(622466, 697199),
+        lot_sizes={"600001": 100},
+        price_fx_to_account_currency=Decimal("1"),
+        previous_attention_rows=[],
+        option_attention_broker_label=None,
+        kelly_rounds=rounds,
+        kelly_data_reason="",
+    )
+    evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
+    rebuilt = trend_review.rebuild_trend_report_from_evidence(evidence)
+    action = next(
+        item
+        for item in rebuilt["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    assert (
+        rebuilt["risk_summary"]["kelly_cap"],
+        action["target_amount"],
+        action["estimated_shares"],
+    ) == ("0.012626", "1262.60", 100)
+    assert rebuilt == source
+
+    missing = copy.deepcopy(evidence)
+    del missing["rebuild_inputs"][missing_field]
+    with pytest.raises(
+        trend_review.TrendReplayIncompleteError,
+        match=f"missing original input: {missing_field}",
+    ):
+        trend_review.rebuild_trend_report_from_evidence(missing)
 
 
 def test_rebuild_uses_frozen_allocation_daily_bytes_not_latest_pointer(
@@ -1685,6 +2042,820 @@ def v2_relative_rotation_report(
         "markets": {"CN": {"position_limit": 10}},
     }
     return report
+
+
+@pytest.mark.parametrize(
+    ("market", "version", "symbol", "futu_symbol"),
+    [
+        ("CN", "v16", "600003", "SH.600003"),
+        ("HK", "v14", "3033.HK", "HK.03033"),
+        ("US", "v14", "NDAQ", "US.NDAQ"),
+    ],
+)
+def test_current_nominal_versions_freeze_fifo_without_top_level_allocation_version(
+    tmp_path: Path,
+    market: str,
+    version: str,
+    symbol: str,
+    futu_symbol: str,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": symbol,
+            "futu_symbol": futu_symbol,
+            "global_strength": "95",
+            "target_weight": "0.04",
+            "close": "10",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": True,
+        }
+    ])
+    report["account"] = {
+        **report["account"],
+        "available_cash": "100000",
+    }
+    report["risk_summary"] = {"normal_cost_rate": "0.001"}
+    report["metadata"] = {
+        **report["metadata"],
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+        "strategy_version": version,
+    }
+    report["allocation"] = {
+        "markets": {market: {"position_limit": 10}},
+    }
+
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market=market,
+        execution_date="2026-07-20",
+    )
+
+    assert (
+        len(entries),
+        entries[0]["futu_symbol"] if entries else None,
+        getattr(entries, "target_position_count", None),
+    ) == (1, futu_symbol, 10)
+
+
+def test_current_nominal_fifo_consumes_cash_in_global_strength_order_across_formal_and_rotation(
+    tmp_path: Path,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "global_strength": "90",
+            "target_weight": "0.04",
+            "close": "10",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": True,
+        },
+    ])
+    pair = relative_rotation_pair()
+    pair.update({
+        "buy_futu_symbol": "SH.STRONG",
+        "buy_global_strength": "100",
+        "close": "10",
+        "estimated_shares": 100,
+        "lot_size": 100,
+    })
+    report["account"] = {
+        **report["account"],
+        "available_cash": "1001",
+        "positions": [],
+    }
+    report["risk_summary"] = {"normal_cost_rate": "0.001"}
+    report["metadata"] = {
+        "market": "CN",
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
+        "price_fx_to_account_currency": "1",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    }
+    report["strategy_judgments"]["simulate_rotation_pairs"] = [pair]
+    report["allocation"] = {"markets": {"CN": {"position_limit": 10}}}
+
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        persist=False,
+    )
+
+    assert [
+        (entry["source"], entry["futu_symbol"], entry["global_strength"])
+        for entry in entries
+    ] == [("rotation", "SH.STRONG", "100")]
+
+
+@pytest.mark.parametrize(
+    "mutation_id",
+    [
+        "missing_close",
+        "non_integer_shares",
+        "zero_lot",
+        "invalid_available_cash",
+        "invalid_fx",
+    ],
+)
+def test_current_nominal_fifo_fails_closed_on_malformed_cash_or_sizing_facts(
+    tmp_path: Path,
+    mutation_id: str,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "global_strength": "100",
+            "target_weight": "0.04",
+            "close": "10",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": True,
+        },
+    ])
+    report["account"] = {
+        **report["account"],
+        "available_cash": "1001",
+        "positions": [],
+    }
+    report["risk_summary"] = {"normal_cost_rate": "0.001"}
+    report["metadata"] = {
+        "market": "CN",
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
+        "price_fx_to_account_currency": "1",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    }
+    report["allocation"] = {"markets": {"CN": {"position_limit": 10}}}
+    action = report["strategy_judgments"]["formal_actions"][0]
+    if mutation_id == "missing_close":
+        action.pop("close")
+    elif mutation_id == "non_integer_shares":
+        action["estimated_shares"] = "100"
+    elif mutation_id == "zero_lot":
+        action["lot_size"] = 0
+    elif mutation_id == "invalid_available_cash":
+        report["account"]["available_cash"] = "bad"
+    elif mutation_id == "invalid_fx":
+        report["metadata"]["price_fx_to_account_currency"] = "bad"
+
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        persist=False,
+    )
+
+    assert entries == []
+
+
+@pytest.mark.parametrize(
+    ("market", "version", "symbol", "futu_symbol", "lot_size", "estimated_shares"),
+    [
+        ("CN", "v15", "600003", "SH.600003", 100, 400),
+        ("HK", "v13", "3033.HK", "HK.03033", 100, 400),
+        ("US", "v13", "NDAQ", "US.NDAQ", 1, 40),
+    ],
+)
+def test_legacy_markerless_fifo_keeps_missing_executable_compatibility(
+    tmp_path: Path,
+    market: str,
+    version: str,
+    symbol: str,
+    futu_symbol: str,
+    lot_size: int,
+    estimated_shares: int,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": symbol,
+            "futu_symbol": futu_symbol,
+            "global_strength": "95",
+            "target_weight": "0.04",
+            "target_amount": "4000",
+            "close": "10",
+            "lot_size": lot_size,
+            "estimated_shares": estimated_shares,
+            "atr": "0.5",
+            "normal_cost": "1",
+        },
+    ])
+    report["metadata"] = {
+        "market": market,
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+        "strategy_version": version,
+    }
+    report["allocation"] = {
+        "markets": {market: {"position_limit": 10}},
+    }
+
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market=market,
+        execution_date="2026-07-20",
+        persist=False,
+    )
+
+    assert (
+        len(entries),
+        entries[0]["action"]["estimated_shares"] if entries else None,
+    ) == (1, estimated_shares)
+
+
+@pytest.mark.parametrize(
+    ("market", "version", "symbol", "futu_symbol", "lot_size", "estimated_shares"),
+    [
+        ("CN", "v15", "600003", "SH.600003", 100, 400),
+        ("HK", "v13", "3033.HK", "HK.03033", 100, 400),
+        ("US", "v13", "NDAQ", "US.NDAQ", 1, 40),
+    ],
+)
+def test_legacy_markerless_allocation_v2_versions_keep_frozen_buy_quantity(
+    market: str,
+    version: str,
+    symbol: str,
+    futu_symbol: str,
+    lot_size: int,
+    estimated_shares: int,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": symbol,
+            "futu_symbol": futu_symbol,
+            "global_strength": "95",
+            "target_weight": "0.04",
+            "target_amount": "4000",
+            "close": "10",
+            "lot_size": lot_size,
+            "estimated_shares": estimated_shares,
+            "atr": "0.5",
+            "normal_cost": "1",
+        },
+    ])
+    report["metadata"] = {
+        "market": market,
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+        "strategy_version": version,
+    }
+    report["allocation"] = {
+        "markets": {market: {"position_limit": 10}},
+    }
+    action = report["strategy_judgments"]["formal_actions"][0]
+
+    remaining = trend_review._remaining_buy_quantity(
+        action,
+        report,
+        {"acc_id": 101, "available_cash": "1", "positions": []},
+        [],
+        Decimal("1000"),
+    )
+
+    assert (
+        trend_review._v2_execution_report(report, market),
+        remaining,
+    ) == (True, estimated_shares)
+
+
+def test_current_nominal_fifo_excludes_missing_executable_formal_buy(
+    tmp_path: Path,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "global_strength": "100",
+            "target_weight": "0.04",
+            "target_amount": "4000",
+            "close": "10",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "normal_cost": "1",
+        },
+    ])
+    report["account"] = {
+        **report["account"],
+        "available_cash": "100000",
+    }
+    report["risk_summary"] = {"normal_cost_rate": "0.001"}
+    report["metadata"] = {
+        "market": "CN",
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
+        "price_fx_to_account_currency": "1",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    }
+    report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
+
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        persist=False,
+    )
+
+    assert entries == []
+
+
+def test_current_nominal_fifo_uses_paired_sale_proceeds_for_automatic_rotation(
+    tmp_path: Path,
+) -> None:
+    pair = relative_rotation_pair()
+    pair.update({
+        "buy_futu_symbol": "SH.STRONG",
+        "sell_futu_symbol": "SH.WEAK",
+        "target_weight": "0.04",
+        "target_amount": "1001",
+        "estimated_shares": 100,
+        "lot_size": 100,
+        "atr": "0.5",
+        "close": "10",
+    })
+    report = relative_rotation_report(pairs=[pair])
+    report["account"] = {
+        "available_cash": "0",
+        "positions": [{"symbol": "WEAK", "market_value": "1003"}],
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    }
+    report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
+
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        persist=False,
+    )
+
+    assert (
+        len(entries),
+        entries[0]["pair"]["estimated_shares"] if entries else None,
+    ) == (1, 100)
+
+
+def test_current_nominal_fifo_excludes_cash_insufficient_automatic_rotation(
+    tmp_path: Path,
+) -> None:
+    pair = relative_rotation_pair()
+    pair.update({
+        "buy_futu_symbol": "SH.STRONG",
+        "sell_futu_symbol": "SH.WEAK",
+        "target_weight": "0.04",
+        "target_amount": "1001",
+        "estimated_shares": 100,
+        "lot_size": 100,
+        "atr": "0.5",
+        "close": "10",
+    })
+    report = relative_rotation_report(pairs=[pair])
+    report["account"] = {
+        "available_cash": "0",
+        "positions": [{"symbol": "WEAK", "market_value": "1000"}],
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    }
+    report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
+
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        persist=False,
+    )
+
+    assert entries == []
+
+
+def test_current_nominal_fifo_uses_strategy_cost_rate_when_risk_summary_cost_missing(
+    tmp_path: Path,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "global_strength": "100",
+            "target_weight": "0.04",
+            "target_amount": "1001",
+            "close": "10",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": True,
+        },
+    ])
+    report["account"] = {
+        **report["account"],
+        "available_cash": "1000",
+        "positions": [],
+    }
+    report["risk_summary"] = {}
+    report["metadata"] = {
+        "market": "CN",
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
+        "price_fx_to_account_currency": "1",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+        "parameters": {"normal_cost_rate": "0.001"},
+    }
+    report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
+
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        persist=False,
+    )
+
+    assert entries == []
+
+
+def test_current_nominal_fifo_fails_closed_when_normal_cost_rate_unavailable(
+    tmp_path: Path,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "global_strength": "100",
+            "target_weight": "0.04",
+            "target_amount": "1000",
+            "close": "10",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": True,
+        },
+    ])
+    report["account"] = {
+        **report["account"],
+        "available_cash": "100000",
+        "positions": [],
+    }
+    report["risk_summary"] = {}
+    report["metadata"] = {
+        "market": "CN",
+        "price_fx_to_account_currency": "1",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    }
+    report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
+
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        persist=False,
+    )
+
+    assert entries == []
+
+
+def test_current_nominal_open_does_not_submit_missing_executable_buy(
+    tmp_path: Path,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "global_strength": "100",
+            "target_weight": "0.04",
+            "target_amount": "4000",
+            "close": "10",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "normal_cost": "1",
+        },
+    ])
+    report["account"] = {
+        **report["account"],
+        "available_cash": "100000",
+    }
+    report["risk_summary"] = {"normal_cost_rate": "0.001"}
+    report["metadata"] = {
+        "market": "CN",
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
+        "price_fx_to_account_currency": "1",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    }
+    report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
+    client = FakeTrendSimClient()
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+        buy_symbols=("SH.600001",),
+    )
+
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy"
+    )
+    action_root = tmp_path / "trend_review/ledgers/CN/actions/2026-07-20" / action_key
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in action_root.glob("*.json")
+    ]
+
+    assert (
+        len(client.requests),
+        result["submitted_count"],
+        [(event.get("status"), event.get("reason")) for event in events],
+    ) == (0, 0, [("pending", "waiting_for_cash_or_slot")])
+
+
+def test_current_nominal_fifo_excludes_non_executable_formal_buy(
+    tmp_path: Path,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "global_strength": "100",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": False,
+        },
+    ])
+    report["account"] = {
+        **report["account"],
+        "available_cash": "0",
+    }
+    report["metadata"] = {
+        "market": "CN",
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    }
+    report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
+
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        persist=False,
+    )
+
+    assert entries == []
+
+
+def test_current_nominal_fifo_excludes_cash_insufficient_executable_buy(
+    tmp_path: Path,
+) -> None:
+    report = v2_report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "global_strength": "100",
+            "target_weight": "0.04",
+            "target_amount": "4000",
+            "close": "10",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "normal_cost": "1",
+            "executable": True,
+        },
+    ])
+    report["account"] = {
+        **report["account"],
+        "net_value": "100000",
+        "available_cash": "100",
+        "positions": [],
+    }
+    report["risk_summary"] = {"normal_cost_rate": "0.001"}
+    report["metadata"] = {
+        **report["metadata"],
+        "market": "CN",
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
+        "price_fx_to_account_currency": "1",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    }
+    report["allocation"] = {
+        "version": 2,
+        "markets": {"CN": {"position_limit": 20}},
+    }
+
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        persist=False,
+    )
+
+    assert entries == []
+
+
+def test_current_nominal_fifo_excludes_malformed_executable_formal_buy(
+    tmp_path: Path,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "global_strength": "100",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": "false",
+        },
+    ])
+    report["account"] = {
+        **report["account"],
+        "available_cash": "0",
+    }
+    report["metadata"] = {
+        "market": "CN",
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    }
+    report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
+
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        persist=False,
+    )
+
+    assert entries == []
+
+
+def test_current_nominal_fifo_authorization_cannot_override_non_executable_buy(
+    tmp_path: Path,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": False,
+        },
+    ])
+    report["metadata"] = {
+        "market": "CN",
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    }
+    report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
+    client = FakeTrendSimClient(cash="0")
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+        buy_symbols=("SH.600001",),
+    )
+
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy"
+    )
+    action_root = tmp_path / "trend_review/ledgers/CN/actions/2026-07-20" / action_key
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in action_root.glob("*.json")
+    ]
+
+    assert (
+        len(client.requests),
+        result["submitted_count"],
+        [(event.get("status"), event.get("reason")) for event in events],
+    ) == (0, 0, [("pending", "waiting_for_cash_or_slot")])
+
+
+def test_current_nominal_fifo_authorization_cannot_override_malformed_executable(
+    tmp_path: Path,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "target_weight": "0.04",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": "false",
+        },
+    ])
+    report["metadata"] = {
+        "market": "CN",
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    }
+    report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
+    client = FakeTrendSimClient(cash="0")
+
+    result = trend_review.execute_trend_review_open(
+        data_dir=tmp_path,
+        report=report,
+        client=client,
+        market="CN",
+        execution_date="2026-07-20",
+        now="2026-07-20T09:31:00+08:00",
+        quote_prices=TEST_QUOTE_PRICES,
+        buy_symbols=("SH.600001",),
+    )
+
+    action_key = trend_review.trend_action_key(
+        "CN", "2026-07-20", "SH.600001", "buy"
+    )
+    action_root = tmp_path / "trend_review/ledgers/CN/actions/2026-07-20" / action_key
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in action_root.glob("*.json")
+    ]
+
+    assert (
+        len(client.requests),
+        result["submitted_count"],
+        [(event.get("status"), event.get("reason")) for event in events],
+    ) == (0, 0, [("pending", "waiting_for_cash_or_slot")])
 
 
 def test_v2_buy_fifo_deduplicates_sources_and_freezes_basis(tmp_path: Path) -> None:
@@ -4969,9 +6140,12 @@ def test_v2_formal_terminal_partial_reconciles_rotation_owner(
     )
 
 
-@pytest.mark.parametrize("strategy_version", ["v14", "v15"])
+@pytest.mark.parametrize(
+    ("strategy_version", "expected_remaining"),
+    [("v14", 0), ("v15", 200)],
+)
 def test_cn_v15_terminal_partial_keeps_planned_risk_residual_cap(
-    strategy_version: str,
+    strategy_version: str, expected_remaining: int,
 ) -> None:
     action = {
         "lot_size": 100,
@@ -4994,7 +6168,7 @@ def test_cn_v15_terminal_partial_keeps_planned_risk_residual_cap(
 
     assert trend_review._remaining_buy_quantity(
         action, report, snapshot, orders, Decimal("15")
-    ) == 0
+    ) == expected_remaining
 
 
 def test_v2_sell_failure_continues_sells_and_buys(tmp_path: Path) -> None:
@@ -6200,12 +7374,10 @@ def test_v2_rotation_skips_unusable_fallback_and_continues(
         },
     )
 
-    assert [request["futu_code"] for request in client.requests] == (
-        ["SH.WEAK", "SH.STRONG1"]
-        if allocation_v2
-        else ["SH.WEAK", "SH.STRONG1", "SH.STRONG3"]
-    )
-    assert result["fallbacks_used"] == ([] if allocation_v2 else ["STRONG3"])
+    assert [request["futu_code"] for request in client.requests] == [
+        "SH.WEAK", "SH.STRONG1"
+    ]
+    assert result["fallbacks_used"] == []
     assert result["status"] == "complete"
 
 
@@ -13938,6 +15110,43 @@ def test_projection_prefers_cn_v15_over_v14_history(
     projection = trend_review.build_trend_review_projection(tmp_path, "CN")
 
     assert projection["strategy_snapshot"]["strategy_version"] == "v15"
+
+
+def test_review_projection_prefers_current_cn_v16_strategy_facts(
+    tmp_path: Path,
+) -> None:
+    v16 = live_trend_strategy_snapshot(
+        "CN", "test-sha", (), strategy_version="v16",
+        allocation=_allocation_v2_ref(),
+    )
+    only_v16_root = tmp_path / "only-v16"
+    write_projection_strategy_facts(only_v16_root, "CN", [v16])
+    only_v16 = trend_review.build_trend_review_projection(only_v16_root, "CN")
+
+    v15 = live_trend_strategy_snapshot(
+        "CN", "test-sha", (), strategy_version="v15",
+        allocation=_allocation_v2_ref(),
+    )
+    mixed_root = tmp_path / "v15-v16"
+    write_projection_strategy_facts(mixed_root, "CN", [v15, v16])
+    mixed = trend_review.build_trend_review_projection(mixed_root, "CN")
+
+    assert (
+        {
+            "only_v16": {
+                "strategy_id": only_v16["strategy_snapshot"]["strategy_id"],
+                "strategy_version": only_v16["strategy_snapshot"]["strategy_version"],
+            },
+            "mixed": mixed["strategy_snapshot"]["strategy_version"],
+        }
+        == {
+            "only_v16": {
+                "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+                "strategy_version": "v16",
+            },
+            "mixed": "v16",
+        }
+    )
 
 
 def test_projection_accepts_v2_rank_limit_changes_but_rejects_immutable_drift(

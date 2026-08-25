@@ -43,7 +43,10 @@ from .trend_simulate_positions import (
     _reports_by_hash,
 )
 from .trend_review import _protection_event_identity, _report_hash
-from .strategy_drawdown import valid_strategy_parameter_audit_identity
+from .strategy_drawdown import (
+    is_allocation_v2_version,
+    valid_strategy_parameter_audit_identity,
+)
 
 
 SESSION_LABELS = ("夜盘", "盘前", "盘中", "盘后")
@@ -78,9 +81,9 @@ TREND_SIMULATE_MARKETS = {
 }
 FUTU_US_HISTORY_CUTOVER_DATE = "2026-08-20"
 TREND_ACCEPTED_STRATEGY_VERSIONS = {
-    "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15"}),
-    "US": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"}),
-    "HK": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"}),
+    "CN": frozenset({"v4", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16"}),
+    "US": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14"}),
+    "HK": frozenset({"v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14"}),
 }
 # Simulate positions are a stable contract; their served copy can lag one
 # publication behind the live Futu snapshot, so convergence is bounded.
@@ -2770,8 +2773,7 @@ def _is_v2_trend_report(report: Mapping[str, Any]) -> bool:
     version = str(report.get("strategy_version") or "")
     allocation = report.get("allocation")
     return (
-        (market == "CN" and version == "v15")
-        or (market in {"HK", "US"} and version == "v13")
+        is_allocation_v2_version(market, version)
         or (isinstance(allocation, Mapping) and allocation.get("version") == 2)
     )
 
@@ -3355,18 +3357,21 @@ def _trend_action_reason_label(
         ("CN", "v13"),
         ("CN", "v14"),
         ("CN", "v15"),
+        ("CN", "v16"),
         ("US", "v6"),
         ("US", "v7"),
         ("US", "v10"),
         ("US", "v11"),
         ("US", "v12"),
         ("US", "v13"),
+        ("US", "v14"),
         ("HK", "v6"),
         ("HK", "v7"),
         ("HK", "v10"),
         ("HK", "v11"),
         ("HK", "v12"),
         ("HK", "v13"),
+        ("HK", "v14"),
     }:
         try:
             initial = Decimal(str(item.get("initial_line")))

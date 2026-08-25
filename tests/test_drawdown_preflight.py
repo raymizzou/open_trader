@@ -243,6 +243,67 @@ def test_current_v2_versions_inherit_paused_predecessor_state(
     assert result["markets"][0]["entry_allowed"] is False
 
 
+def test_current_nominal_versions_use_explicit_predecessor_drawdown_transition(
+    tmp_path: Path,
+) -> None:
+    observed: dict[str, tuple[str, str]] = {}
+    for market, current_version, predecessor_version in (
+        ("CN", "v16", "v15"),
+        ("HK", "v14", "v13"),
+        ("US", "v14", "v13"),
+    ):
+        root = tmp_path / market
+        data_dir = root / "data"
+        predecessor_id = (
+            f"trend_animals_warm_to_hot/{market}/{predecessor_version}"
+        )
+        current_id = f"trend_animals_warm_to_hot/{market}/{current_version}"
+        parameters = {"drawdown_limit": "0.05", "market": market}
+        automatic_bootstrap_strategy_drawdown(
+            data_dir,
+            market=market,
+            strategy_id=predecessor_id,
+            strategy_version=predecessor_version,
+            parameters=parameters,
+            baseline_equity=Decimal("100"),
+            source_date="2026-08-20",
+            accepted_git_sha="a" * 40,
+            actor="acceptance",
+            occurred_at="2026-08-20T08:00:00+08:00",
+            reason="first_activation",
+            entry_eligible_from="2026-08-21",
+        )
+        observe_strategy_equity(
+            data_dir,
+            market=market,
+            strategy_id=predecessor_id,
+            strategy_version=predecessor_version,
+            current_equity=Decimal("94"),
+            observed_at="2026-08-20T17:00:00+08:00",
+        )
+        item = replace(
+            market_input(market),
+            baseline_equity=None,
+            strategy_snapshot={
+                "strategy_id": current_id,
+                "strategy_version": current_version,
+                "parameters": parameters,
+            },
+        )
+        result = run_preflight(root, {market: item})
+        market_result = result["markets"][0]
+        observed[market] = (
+            str(market_result["status"]),
+            str(market_result.get("high_water_mark")),
+        )
+
+    assert observed == {
+        "CN": ("bootstrapped", "100"),
+        "HK": ("bootstrapped", "100"),
+        "US": ("bootstrapped", "100"),
+    }
+
+
 def test_missing_approved_predecessor_fails_closed_without_writing_state(
     tmp_path: Path,
 ) -> None:

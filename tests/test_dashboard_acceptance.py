@@ -53,6 +53,20 @@ def test_dashboard_acceptance_allows_current_market_versions() -> None:
 
 @pytest.mark.parametrize(
     ("market", "version"),
+    [("CN", "v16"), ("HK", "v14"), ("US", "v14")],
+)
+def test_current_nominal_versions_without_top_level_allocation_version_are_v2(
+    market: str, version: str,
+) -> None:
+    assert dashboard_acceptance._is_v2_trend_report({
+        "market": market,
+        "strategy_version": version,
+        "allocation": {"markets": {market: {"position_limit": 20}}},
+    }) is True
+
+
+@pytest.mark.parametrize(
+    ("market", "version"),
     [("CN", "v13"), ("HK", "v11"), ("US", "v11")],
 )
 def test_protection_reason_label_accepts_current_rank_versions(
@@ -2257,9 +2271,30 @@ def integrated_v4_payload(
         buy = {
             "action": "BUY",
             "symbol": {"CN": "600001", "HK": "00700", "US": "AAPL"}[market],
-            "target_weight": position_weight,
-            "estimated_shares": lot_size * 3,
+            **(
+                {
+                    "target_weight": "0.01",
+                    "target_amount": "1000",
+                    "executable": True,
+                    "estimated_shares": 100,
+                    "estimated_initial_line": "9",
+                    "planned_stop_risk": "101",
+                    "planned_stop_risk_pct": "0.00101",
+                    "normal_cost": "1",
+                    "decisive_constraint": "Kelly 上限",
+                }
+                if current_live_versions
+                else {
+                    "target_weight": position_weight,
+                    "estimated_shares": lot_size * 3,
+                }
+            ),
             "lot_size": lot_size,
+            **(
+                {"close": "10", "atr": "0.5"}
+                if current_live_versions
+                else {}
+            ),
         }
         frozen = {
             "execution_date": "2026-07-20",
@@ -2316,6 +2351,19 @@ def integrated_v4_payload(
                     "real_rotation_comparisons": [],
                 } if current_live_versions else {}),
             },
+            **(
+                {
+                    "signal_snapshots": {
+                        "candidates": [{
+                            "symbol": buy["symbol"],
+                            "close": buy["close"],
+                            "atr": buy["atr"],
+                        }],
+                    },
+                }
+                if current_live_versions
+                else {}
+            ),
             "risk_summary": risk_summary,
             "drawdown_summary": {
                 "state_status": "ok",

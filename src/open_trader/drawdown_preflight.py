@@ -37,6 +37,7 @@ APPROVED_DRAWDOWN_PREDECESSORS = {
     ("CN", "v13"): ("trend_animals_warm_to_hot/CN/v12", "v12"),
     ("CN", "v14"): ("trend_animals_warm_to_hot/CN/v13", "v13"),
     ("CN", "v15"): ("trend_animals_warm_to_hot/CN/v14", "v14"),
+    ("CN", "v16"): ("trend_animals_warm_to_hot/CN/v15", "v15"),
     ("US", "v6"): ("trend_animals_warm_to_hot/US/v5", "v5"),
     ("US", "v7"): ("trend_animals_warm_to_hot/US/v6", "v6"),
     ("US", "v8"): ("trend_animals_warm_to_hot/US/v7", "v7"),
@@ -45,6 +46,7 @@ APPROVED_DRAWDOWN_PREDECESSORS = {
     ("US", "v11"): ("trend_animals_warm_to_hot/US/v10", "v10"),
     ("US", "v12"): ("trend_animals_warm_to_hot/US/v11", "v11"),
     ("US", "v13"): ("trend_animals_warm_to_hot/US/v12", "v12"),
+    ("US", "v14"): ("trend_animals_warm_to_hot/US/v13", "v13"),
     ("HK", "v6"): ("trend_animals_warm_to_hot/HK/v5", "v5"),
     ("HK", "v7"): ("trend_animals_warm_to_hot/HK/v6", "v6"),
     ("HK", "v8"): ("trend_animals_warm_to_hot/HK/v7", "v7"),
@@ -53,6 +55,7 @@ APPROVED_DRAWDOWN_PREDECESSORS = {
     ("HK", "v11"): ("trend_animals_warm_to_hot/HK/v10", "v10"),
     ("HK", "v12"): ("trend_animals_warm_to_hot/HK/v11", "v11"),
     ("HK", "v13"): ("trend_animals_warm_to_hot/HK/v12", "v12"),
+    ("HK", "v14"): ("trend_animals_warm_to_hot/HK/v13", "v13"),
 }
 _DRAWDOWN_FAILURE_LABELS = {
     "baseline_unavailable": "历史基线不可用",

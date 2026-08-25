@@ -33,7 +33,9 @@ from .parsers.base import detect_asset_class
 from .strategy_drawdown import (
     ALLOCATION_DYNAMIC_PARAMETER_NAMES,
     ALLOCATION_PROJECTION_VERSIONS,
+    ALLOCATION_V2_VERSION_SETS,
     DRAWDOWN_LIMIT,
+    is_allocation_v2_version,
     observe_strategy_equity,
     valid_drawdown_decision,
 )
@@ -156,24 +158,26 @@ LEGACY_CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.02")}
 CN_TARGET_WEIGHTS = {"热": Decimal("0.04"), "沸": Decimal("0.04")}
 CURRENT_TREND_STRATEGY_VERSIONS = {"CN": "v10", "US": "v8", "HK": "v8"}
 V2_ALLOCATION_VERSIONS = {"CN": "v15", "US": "v13", "HK": "v13"}
+CURRENT_NOMINAL_ALLOCATION_VERSIONS = dict(ALLOCATION_PROJECTION_VERSIONS)
 V1_ALLOCATION_VERSIONS = {"CN": "v14", "US": "v12", "HK": "v12"}
 ALLOCATION_REPORT_VERSIONS = {
-    "CN": frozenset({"v11", "v12", "v13", "v14", "v15"}),
-    "HK": frozenset({"v9", "v10", "v11", "v12", "v13"}),
-    "US": frozenset({"v9", "v10", "v11", "v12", "v13"}),
+    "CN": frozenset({"v11", "v12", "v13", "v14", "v15", "v16"}),
+    "HK": frozenset({"v9", "v10", "v11", "v12", "v13", "v14"}),
+    "US": frozenset({"v9", "v10", "v11", "v12", "v13", "v14"}),
 }
 INDIVIDUAL_GLOBAL_RANKING_VERSIONS = frozenset({
     ("CN", "v13"), ("CN", "v14"), ("CN", "v15"),
-    ("HK", "v11"), ("HK", "v12"), ("HK", "v13"),
-    ("US", "v11"), ("US", "v12"), ("US", "v13"),
+    ("CN", "v16"),
+    ("HK", "v11"), ("HK", "v12"), ("HK", "v13"), ("HK", "v14"),
+    ("US", "v11"), ("US", "v12"), ("US", "v13"), ("US", "v14"),
 })
 # 最终计划买入名单语义（全部趋势候选列入、仓位约束转为 sizing_note 提示）仅对
 # 这些版本生效；更早版本（CN v13、HK/US v11 及之前）保持原有 risk_skip 剔除路径，
 # 保证存量证据回放决策不变。
 FINAL_PLAN_TREND_VERSIONS = frozenset({
-    ("CN", "v14"), ("CN", "v15"),
-    ("HK", "v12"), ("HK", "v13"),
-    ("US", "v12"), ("US", "v13"),
+    ("CN", "v14"), ("CN", "v15"), ("CN", "v16"),
+    ("HK", "v12"), ("HK", "v13"), ("HK", "v14"),
+    ("US", "v12"), ("US", "v13"), ("US", "v14"),
 })
 CURRENT_TREND_EFFECTIVE_FROM = "2026-07-27"
 CURRENT_ENTRY_DISCIPLINES = frozenset({
@@ -183,12 +187,14 @@ CURRENT_ENTRY_DISCIPLINES = frozenset({
     ("US", "v11"),
     ("US", "v12"),
     ("US", "v13"),
+    ("US", "v14"),
     ("HK", "v8"),
     ("HK", "v9"),
     ("HK", "v10"),
     ("HK", "v11"),
     ("HK", "v12"),
     ("HK", "v13"),
+    ("HK", "v14"),
 })
 CURRENT_EXIT_DISCIPLINES = frozenset({
     ("CN", "v9"),
@@ -198,6 +204,7 @@ CURRENT_EXIT_DISCIPLINES = frozenset({
     ("CN", "v13"),
     ("CN", "v14"),
     ("CN", "v15"),
+    ("CN", "v16"),
     ("US", "v6"),
     ("US", "v7"),
     ("US", "v8"),
@@ -206,6 +213,7 @@ CURRENT_EXIT_DISCIPLINES = frozenset({
     ("US", "v11"),
     ("US", "v12"),
     ("US", "v13"),
+    ("US", "v14"),
     ("HK", "v6"),
     ("HK", "v7"),
     ("HK", "v8"),
@@ -214,6 +222,7 @@ CURRENT_EXIT_DISCIPLINES = frozenset({
     ("HK", "v11"),
     ("HK", "v12"),
     ("HK", "v13"),
+    ("HK", "v14"),
 })
 REAL_HOLDING_TREND_EXCLUDED_SYMBOLS = frozenset({"US.AGRZ"})
 OVERHEAT_PARAMETER_NAMES = frozenset({
@@ -246,6 +255,7 @@ RISK_BUDGET_DISCLAIMER = "5% 是风险预算目标，不是最大损失保证。
 PORTFOLIO_REMAINING_RISK_NOTE = (
     "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。"
 )
+STOP_RISK_AUDIT_ONLY_LABEL = "计划止损风险仅审计，不参与买入数量"
 KELLY_STRATEGY_PARAMETERS = {
     "kelly_sample_minimum": KELLY_MINIMUM_SAMPLES,
     "kelly_rolling_window": KELLY_ROLLING_SAMPLES,
@@ -1045,15 +1055,34 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
     if availability is not None:
         if not isinstance(availability, Mapping):
             return False
-        for value in availability.values():
+        for account_name, value in availability.items():
             if not isinstance(value, Mapping) or value.get("status") not in {
                 "available", "unavailable"
+            }:
+                return False
+            if set(value) - {
+                "status", "reason", "executable", "net_value", "available_cash",
             }:
                 return False
             if not isinstance(value.get("reason", ""), str) or not isinstance(
                 value.get("executable"), bool
             ):
                 return False
+            for field in ("net_value", "available_cash"):
+                if field not in value:
+                    continue
+                try:
+                    parsed = Decimal(str(value[field]))
+                except (InvalidOperation, TypeError, ValueError):
+                    return False
+                if not parsed.is_finite() or (
+                    parsed < 0
+                    and not (
+                        account_name == "real_account"
+                        and field == "available_cash"
+                    )
+                ):
+                    return False
         if "account_input" not in payload:
             real_account = availability.get("real_account")
             if not isinstance(real_account, Mapping) or real_account.get(
@@ -1110,7 +1139,7 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
         ):
             return False
         return True
-    if not valid_frozen_allocation(allocation):
+    if not isinstance(allocation, Mapping):
         return False
     market_value = strategy_snapshot.get("market") if isinstance(
         strategy_snapshot, Mapping
@@ -1137,14 +1166,31 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
     market = snapshot_market or metadata_market_text
     if market is None:
         return False
+    allocation_for_validation = allocation
+    if (
+        "version" not in allocation
+        and isinstance(strategy_snapshot, Mapping)
+        and strategy_snapshot.get("strategy_version")
+        == CURRENT_NOMINAL_ALLOCATION_VERSIONS[market]
+    ):
+        allocation_for_validation = {**allocation, "version": 2}
+    if not valid_frozen_allocation(allocation_for_validation):
+        return False
     allocation_markets = allocation.get("markets")
     allocation_market = (
         allocation_markets.get(market)
         if isinstance(allocation_markets, Mapping)
         else None
     )
-    allocation_version = V2_ALLOCATION_VERSIONS[market]
+    allocation_v2_versions = ALLOCATION_V2_VERSION_SETS[market]
     allocation_snapshot_version = allocation.get("version", 1)
+    if (
+        "version" not in allocation
+        and isinstance(strategy_snapshot, Mapping)
+        and strategy_snapshot.get("strategy_version")
+        == CURRENT_NOMINAL_ALLOCATION_VERSIONS[market]
+    ):
+        allocation_snapshot_version = 2
     if (
         not isinstance(strategy_snapshot, Mapping)
         or strategy_snapshot.get("strategy_version") not in ALLOCATION_REPORT_VERSIONS[market]
@@ -1157,9 +1203,9 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
         or not isinstance(allocation_snapshot_version, int)
         or allocation_snapshot_version not in {1, 2}
         or allocation_snapshot_version == 2
-        and strategy_snapshot.get("strategy_version") != allocation_version
+        and strategy_snapshot.get("strategy_version") not in allocation_v2_versions
         or allocation_snapshot_version == 1
-        and strategy_snapshot.get("strategy_version") == allocation_version
+        and strategy_snapshot.get("strategy_version") in allocation_v2_versions
         or allocation_snapshot_version == 2
         and parameters.get("allocation_position_limit")
         != allocation_market.get("position_limit")
@@ -1240,11 +1286,673 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
     real_holding_signals = (
         real_holding_signals if isinstance(real_holding_signals, Mapping) else {}
     )
-    candidate_signals = {
+    serialized_allocation_version = allocation.get("version")
+    explicit_v2 = allocation_snapshot_version == 2 and (
+        serialized_allocation_version == 2 or "account_input" in payload
+    ) and not (
+        isinstance(availability, Mapping)
+        and isinstance(availability.get("simulated_account"), Mapping)
+        and availability["simulated_account"].get("status") != "available"
+    )
+    raw_candidate_signals = signal_snapshots.get("candidates")
+    if (
+        _uses_current_nominal_allocation(market, strategy_version)
+        and isinstance(raw_candidate_signals, list)
+    ):
+        seen_candidate_symbols: set[str] = set()
+        for frozen_candidate in raw_candidate_signals:
+            if not isinstance(frozen_candidate, Mapping):
+                continue
+            symbol = frozen_candidate.get("symbol")
+            if not isinstance(symbol, str):
+                continue
+            if symbol in seen_candidate_symbols:
+                return False
+            seen_candidate_symbols.add(symbol)
+    frozen_candidate_signals = {
         str(item.get("symbol")): item
-        for item in candidates
+        for item in signal_snapshots.get("candidates", [])
         if isinstance(item, Mapping) and isinstance(item.get("symbol"), str)
     }
+    candidate_signals = (
+        frozen_candidate_signals
+        if _uses_current_nominal_allocation(market, strategy_version)
+        else {
+            str(item.get("symbol")): item
+            for item in candidates
+            if isinstance(item, Mapping) and isinstance(item.get("symbol"), str)
+        }
+    )
+    formal_actions = judgments.get("formal_actions")
+    if _uses_current_nominal_allocation(market, strategy_version) and isinstance(
+        formal_actions, list
+    ):
+        data_missing_notes = {
+            "每手股数未知，无法定量",
+            "候选价格或活动保护线缺失",
+        }
+        simulated_buys = [
+            item
+            for item in formal_actions
+            if isinstance(item, Mapping) and item.get("action") == "BUY"
+        ]
+        simulated_nav: Decimal | None = None
+        simulated_remaining_cash: Decimal | None = None
+        normal_cost_rate: Decimal | None = None
+        price_fx: Decimal | None = None
+        protection_multiple: Decimal | None = None
+        risk_summary: Mapping[str, object] | None = None
+        if explicit_v2 and simulated_buys:
+            account = payload.get("account")
+            account_positions = (
+                account.get("positions") if isinstance(account, Mapping) else None
+            )
+            if (
+                not isinstance(account, Mapping)
+                or not isinstance(account_positions, list)
+            ):
+                return False
+            sell_symbols = {
+                item.get("symbol")
+                for item in holdings
+                if isinstance(item, Mapping) and item.get("action") == "SELL_ALL"
+            }
+            try:
+                simulated_nav = Decimal(str(account["net_value"]))
+                simulated_remaining_cash = Decimal(str(account["available_cash"]))
+                normal_cost_rate = Decimal(
+                    str(parameters.get("normal_cost_rate", NORMAL_COST_RATE))
+                )
+                simulated_remaining_cash += sum(
+                    (
+                        Decimal(str(position["market_value"]))
+                        * max(Decimal("0"), Decimal("1") - normal_cost_rate)
+                        for position in account_positions
+                        if isinstance(position, Mapping)
+                        and position.get("symbol") in sell_symbols
+                    ),
+                    Decimal("0"),
+                )
+                price_fx = Decimal(
+                    str((metadata or {}).get("price_fx_to_account_currency", "1"))
+                )
+                protection_multiple = Decimal(
+                    str(parameters["initial_protection_atr_multiple"])
+                )
+            except (InvalidOperation, KeyError, TypeError, ValueError):
+                return False
+            risk_summary = payload.get("risk_summary")
+            if not isinstance(risk_summary, Mapping):
+                return False
+        for item in formal_actions:
+            if not isinstance(item, Mapping) or item.get("action") != "BUY":
+                continue
+            if "executable" not in item or not isinstance(item.get("executable"), bool):
+                return False
+            candidate = frozen_candidate_signals.get(str(item.get("symbol")))
+            if not isinstance(candidate, Mapping):
+                return False
+            try:
+                if (
+                    _decimal(item.get("close")) != _decimal(candidate.get("close"))
+                    or _decimal(item.get("atr")) != _decimal(candidate.get("atr"))
+                ):
+                    return False
+                if (
+                    explicit_v2
+                    and protection_multiple is not None
+                    and _decimal(item.get("estimated_initial_line"))
+                    != _decimal(candidate.get("close"))
+                    - protection_multiple * _decimal(candidate.get("atr"))
+                ):
+                    return False
+            except ValueError:
+                return False
+            try:
+                target_weight = _decimal(item.get("target_weight"))
+                target_amount = _decimal(item.get("target_amount"))
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+            if (
+                not target_weight.is_finite()
+                or target_weight <= 0
+                or target_weight > 1
+            ):
+                return False
+            raw_lot_size = item.get("lot_size")
+            raw_shares = item.get("estimated_shares")
+            data_missing = (
+                raw_shares == 0
+                and raw_lot_size == 0
+                and item.get("sizing_note") in data_missing_notes
+            )
+            if data_missing:
+                if (
+                    isinstance(raw_lot_size, bool)
+                    or not isinstance(raw_lot_size, int)
+                    or isinstance(raw_shares, bool)
+                    or not isinstance(raw_shares, int)
+                    or (
+                        item.get("executable") is not None
+                        and item.get("executable") is not False
+                    )
+                    or not target_amount.is_finite()
+                    or target_amount < 0
+                ):
+                    return False
+                if explicit_v2:
+                    if simulated_nav is None or not isinstance(risk_summary, Mapping):
+                        return False
+                    try:
+                        target = parameters.get("target_weight")
+                        weight = Decimal(
+                            str(
+                                target.get(item.get("temperature_curr"))
+                                if isinstance(target, Mapping)
+                                else target
+                            )
+                        )
+                        if strategy_version in {
+                            "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                            "v11", "v12", "v13", "v14", "v15", "v16",
+                        } and risk_summary.get("kelly_phase") not in {
+                            None, "cold_start", "unavailable",
+                        }:
+                            cap = _nonnegative_risk_decimal(
+                                risk_summary.get("kelly_cap")
+                            )
+                            if cap is None:
+                                return False
+                            weight = min(weight, cap)
+                        expected_amount = (
+                            simulated_nav * weight
+                        ).quantize(Decimal("0.01"))
+                    except (InvalidOperation, TypeError, ValueError, ArithmeticError):
+                        return False
+                    if target_weight != weight or target_amount != expected_amount:
+                        return False
+                continue
+            if (
+                not target_amount.is_finite()
+                or target_amount <= 0
+                or isinstance(raw_lot_size, bool)
+                or not isinstance(raw_lot_size, int)
+                or raw_lot_size <= 0
+                or isinstance(raw_shares, bool)
+                or not isinstance(raw_shares, int)
+                or raw_shares <= 0
+                or raw_shares % raw_lot_size
+            ):
+                return False
+            if not explicit_v2:
+                continue
+            if simulated_nav is None or simulated_remaining_cash is None:
+                return False
+            try:
+                target = parameters.get("target_weight")
+                weight = Decimal(
+                    str(
+                        target.get(item.get("temperature_curr"))
+                        if isinstance(target, Mapping)
+                        else target
+                    )
+                )
+                if strategy_version in {
+                    "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                    "v11", "v12", "v13", "v14", "v15", "v16",
+                } and risk_summary.get("kelly_phase") not in {
+                    None, "cold_start", "unavailable",
+                }:
+                    cap = _nonnegative_risk_decimal(risk_summary.get("kelly_cap"))
+                    if cap is None:
+                        return False
+                    weight = min(weight, cap)
+                lot_size = raw_lot_size
+                shares = raw_shares
+                expected_amount, expected_shares, expected_cash_required = (
+                    _expected_nominal_sizing(
+                        net_value=simulated_nav,
+                        available_cash=simulated_remaining_cash,
+                        weight=weight,
+                        close=_decimal(candidate.get("close")),
+                        lot_size=lot_size,
+                        price_fx=price_fx,
+                        normal_cost_rate=normal_cost_rate,
+                    )
+                )
+                expected_cost = (
+                    Decimal(expected_shares)
+                    * _decimal(candidate.get("close"))
+                    * price_fx
+                    * normal_cost_rate
+                )
+                expected_risk = Decimal(expected_shares) * (
+                    max(
+                        Decimal("0"),
+                        _decimal(candidate.get("close"))
+                        - (
+                            _decimal(candidate.get("close"))
+                            - protection_multiple * _decimal(candidate.get("atr"))
+                        ),
+                    )
+                    * price_fx
+                ) + expected_cost
+                actual_cost = _decimal(item.get("normal_cost"))
+                actual_risk = _decimal(item.get("planned_stop_risk"))
+                actual_risk_pct = _decimal(item.get("planned_stop_risk_pct"))
+            except (InvalidOperation, KeyError, TypeError, ValueError, ArithmeticError):
+                return False
+            if (
+                target_weight != weight
+                or isinstance(shares, bool)
+                or not isinstance(shares, int)
+                or shares != expected_shares
+                or target_amount != expected_amount
+                or actual_cost != expected_cost
+                or actual_risk != expected_risk
+                or actual_risk_pct != expected_risk / simulated_nav
+            ):
+                return False
+            if item.get("executable") is True:
+                if expected_cash_required > simulated_remaining_cash:
+                    return False
+                simulated_remaining_cash -= expected_cash_required
+    if (
+        _uses_current_nominal_allocation(market, strategy_version)
+        and isinstance(real_buy_actions, list)
+        and real_buy_actions
+    ):
+        real_plan = availability.get("real_account") if isinstance(availability, Mapping) else None
+        if (
+            not isinstance(real_plan, Mapping)
+            or real_plan.get("status") != "available"
+            or real_plan.get("executable") is not False
+            or "net_value" not in real_plan
+            or "available_cash" not in real_plan
+        ):
+            return False
+        try:
+            real_nav = Decimal(str(real_plan["net_value"]))
+            real_remaining_cash = Decimal(str(real_plan["available_cash"]))
+            normal_cost_rate = Decimal(
+                str(parameters.get("normal_cost_rate", NORMAL_COST_RATE))
+            )
+            price_fx = Decimal(
+                str((metadata or {}).get("price_fx_to_account_currency", "1"))
+            )
+            protection_multiple = Decimal(
+                str(parameters["initial_protection_atr_multiple"])
+            )
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            return False
+        if (
+            not real_nav.is_finite()
+            or real_nav <= 0
+            or not real_remaining_cash.is_finite()
+            or real_remaining_cash < 0
+            or not normal_cost_rate.is_finite()
+            or normal_cost_rate < 0
+            or not price_fx.is_finite()
+            or price_fx <= 0
+        ):
+            return False
+        target = parameters.get("target_weight")
+        real_risk_summary = payload.get("risk_summary")
+        if not isinstance(real_risk_summary, Mapping):
+            return False
+        if not isinstance(real_holdings, list):
+            return False
+        real_sell_symbols = {
+            item.get("symbol")
+            for item in real_holdings
+            if isinstance(item, Mapping) and item.get("action") == "SELL_ALL"
+        }
+        if not isinstance(real_holding_signals, Mapping):
+            return False
+        position_market_values: dict[str, Decimal] = {}
+        for symbol, signal in real_holding_signals.items():
+            if (
+                not isinstance(symbol, str)
+                or not symbol.strip()
+                or not isinstance(signal, Mapping)
+                or signal.get("symbol") != symbol
+            ):
+                return False
+            if "market_value" in signal:
+                try:
+                    market_value = Decimal(str(signal["market_value"]))
+                except (InvalidOperation, TypeError, ValueError):
+                    return False
+                if (
+                    not market_value.is_finite()
+                    or market_value <= 0
+                    or symbol in position_market_values
+                ):
+                    return False
+                position_market_values[symbol] = market_value
+        sale_factor = max(Decimal("0"), Decimal("1") - normal_cost_rate)
+        for symbol in real_sell_symbols:
+            market_value = position_market_values.get(symbol)
+            if market_value is None:
+                return False
+            real_remaining_cash += market_value * sale_factor
+        for item in real_buy_actions:
+            if not isinstance(item, Mapping):
+                return False
+            if "executable" in item and not isinstance(item.get("executable"), bool):
+                return False
+            candidate = candidate_signals.get(str(item.get("symbol")))
+            if not isinstance(candidate, Mapping):
+                return False
+            try:
+                candidate_close = Decimal(str(candidate["close"]))
+                candidate_atr = Decimal(str(candidate["atr"]))
+                weight = Decimal(
+                    str(
+                        target.get(item.get("temperature_curr"))
+                        if isinstance(target, Mapping)
+                        else target
+                    )
+                )
+                if strategy_version in {
+                    "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                    "v11", "v12", "v13", "v14", "v15", "v16",
+                } and real_risk_summary.get("kelly_phase") not in {
+                    None, "cold_start", "unavailable",
+                }:
+                    cap = _nonnegative_risk_decimal(
+                        real_risk_summary.get("kelly_cap")
+                    )
+                    if cap is None:
+                        return False
+                    weight = min(weight, cap)
+                lot_size = int(item["lot_size"])
+                shares = item["estimated_shares"]
+                expected_amount, expected_shares, expected_cash_required = (
+                    _expected_nominal_sizing(
+                        net_value=real_nav,
+                        available_cash=real_remaining_cash,
+                        weight=weight,
+                        close=candidate_close,
+                        lot_size=lot_size,
+                        price_fx=price_fx,
+                        normal_cost_rate=normal_cost_rate,
+                    )
+                )
+                expected_cost = (
+                    Decimal(expected_shares)
+                    * candidate_close
+                    * price_fx
+                    * normal_cost_rate
+                )
+                expected_risk = Decimal(expected_shares) * (
+                    max(
+                        Decimal("0"),
+                        candidate_close
+                        - (
+                            candidate_close
+                            - protection_multiple * candidate_atr
+                        ),
+                    )
+                    * price_fx
+                ) + expected_cost
+                actual_cost = _decimal(item.get("normal_cost"))
+                actual_risk = _decimal(item.get("planned_stop_risk"))
+                actual_risk_pct = _decimal(item.get("planned_stop_risk_pct"))
+            except (InvalidOperation, KeyError, TypeError, ValueError, ArithmeticError):
+                return False
+            if (
+                item.get("action") != "BUY"
+                or item.get("target_weight") != format(weight, "f")
+                or candidate_close <= 0
+                or not candidate_close.is_finite()
+                or candidate_atr <= 0
+                or not candidate_atr.is_finite()
+                or not isinstance(lot_size, int)
+                or isinstance(item.get("lot_size"), bool)
+                or lot_size <= 0
+                or isinstance(shares, bool)
+                or not isinstance(shares, int)
+                or shares != expected_shares
+                or _decimal(item.get("target_amount")) != expected_amount
+                or _decimal(item.get("close")) != candidate_close
+                or actual_cost != expected_cost
+                or actual_risk != expected_risk
+                or actual_risk_pct != expected_risk / real_nav
+            ):
+                return False
+            if item.get("executable") is True:
+                if expected_cash_required > real_remaining_cash:
+                    return False
+                real_remaining_cash -= expected_cash_required
+    if _uses_current_nominal_allocation(market, strategy_version):
+        target = parameters.get("target_weight")
+        try:
+            normal_cost_rate = Decimal(
+                str(parameters.get("normal_cost_rate", NORMAL_COST_RATE))
+            )
+            price_fx = Decimal(
+                str((metadata or {}).get("price_fx_to_account_currency", "1"))
+            )
+            protection_multiple = Decimal(
+                str(parameters["initial_protection_atr_multiple"])
+            )
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+        for pair_field, execution_mode in (
+            ("simulate_rotation_pairs", "automatic"),
+            ("real_rotation_pairs", "manual"),
+        ):
+            pairs = judgments.get(pair_field)
+            if not isinstance(pairs, list) or not pairs:
+                continue
+            if execution_mode == "automatic":
+                try:
+                    rotation_nav = Decimal(str(payload["account"]["net_value"]))
+                    rotation_cash = Decimal(
+                        str(payload["account"]["available_cash"])
+                    )
+                except (KeyError, InvalidOperation, TypeError, ValueError):
+                    return False
+                sell_symbols = {
+                    str(item.get("symbol"))
+                    for item in holdings
+                    if isinstance(item, Mapping) and item.get("action") == "SELL_ALL"
+                }
+                account_positions = payload.get("account", {}).get("positions", [])
+                if not isinstance(account_positions, list):
+                    return False
+                position_market_values: dict[str, Decimal] = {}
+                for position in account_positions:
+                    if not isinstance(position, Mapping):
+                        return False
+                    symbol = position.get("symbol")
+                    if not isinstance(symbol, str) or not symbol.strip():
+                        return False
+                    try:
+                        market_value = Decimal(str(position["market_value"]))
+                    except (KeyError, InvalidOperation, TypeError, ValueError):
+                        return False
+                    if not market_value.is_finite() or market_value < 0:
+                        return False
+                    if symbol in position_market_values:
+                        return False
+                    position_market_values[symbol] = market_value
+                sale_factor = max(Decimal("0"), Decimal("1") - normal_cost_rate)
+                for symbol in sell_symbols:
+                    market_value = position_market_values.get(symbol)
+                    if market_value is None or market_value <= 0:
+                        return False
+                    rotation_cash += market_value * sale_factor
+            else:
+                real_plan = availability.get("real_account") if isinstance(availability, Mapping) else None
+                if (
+                    not isinstance(real_plan, Mapping)
+                    or real_plan.get("status") != "available"
+                    or real_plan.get("executable") is not False
+                ):
+                    return False
+                try:
+                    rotation_nav = Decimal(str(real_plan["net_value"]))
+                    rotation_cash = Decimal(str(real_plan["available_cash"]))
+                except (KeyError, InvalidOperation, TypeError, ValueError):
+                    return False
+                real_sell_symbols = {
+                    str(item.get("symbol"))
+                    for item in real_holdings
+                    if isinstance(item, Mapping) and item.get("action") == "SELL_ALL"
+                }
+                if not isinstance(real_holding_signals, Mapping):
+                    return False
+                position_market_values: dict[str, Decimal] = {}
+                for symbol, signal in real_holding_signals.items():
+                    if (
+                        not isinstance(symbol, str)
+                        or not symbol.strip()
+                        or not isinstance(signal, Mapping)
+                        or signal.get("symbol") != symbol
+                    ):
+                        return False
+                    if "market_value" in signal:
+                        try:
+                            market_value = Decimal(str(signal["market_value"]))
+                        except (InvalidOperation, TypeError, ValueError):
+                            return False
+                        if (
+                            not market_value.is_finite()
+                            or market_value <= 0
+                            or symbol in position_market_values
+                        ):
+                            return False
+                        position_market_values[symbol] = market_value
+                sale_factor = max(Decimal("0"), Decimal("1") - normal_cost_rate)
+                for symbol in real_sell_symbols:
+                    market_value = position_market_values.get(symbol)
+                    if market_value is not None:
+                        rotation_cash += market_value * sale_factor
+            if (
+                not rotation_nav.is_finite()
+                or rotation_nav <= 0
+                or not rotation_cash.is_finite()
+                or rotation_cash < 0
+                or not price_fx.is_finite()
+                or price_fx <= 0
+                or not normal_cost_rate.is_finite()
+                or normal_cost_rate < 0
+            ):
+                return False
+            for pair in sorted(
+                (item for item in pairs if isinstance(item, Mapping)),
+                key=lambda item: item.get("pair_index", -1),
+            ):
+                candidate = candidate_signals.get(str(pair.get("buy_symbol")))
+                if not isinstance(candidate, Mapping):
+                    return False
+                if execution_mode == "automatic":
+                    sell_symbol = pair.get("sell_symbol")
+                    if not isinstance(sell_symbol, str) or not sell_symbol.strip():
+                        return False
+                    if sell_symbol not in sell_symbols:
+                        market_value = position_market_values.get(sell_symbol)
+                        if market_value is None or market_value <= 0:
+                            return False
+                        rotation_cash += market_value * sale_factor
+                else:
+                    sell_symbol = pair.get("sell_symbol")
+                    if not isinstance(sell_symbol, str) or not sell_symbol.strip():
+                        return False
+                    if sell_symbol not in real_sell_symbols:
+                        market_value = position_market_values.get(sell_symbol)
+                        if market_value is not None:
+                            rotation_cash += market_value * sale_factor
+                try:
+                    candidate_close = Decimal(str(candidate["close"]))
+                    weight = Decimal(
+                        str(
+                            target.get("热")
+                            if isinstance(target, Mapping)
+                            else target
+                        )
+                    )
+                    if (
+                        explicit_v2
+                        and strategy_version in {
+                            "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                            "v11", "v12", "v13", "v14", "v15", "v16",
+                        }
+                        and isinstance(payload.get("risk_summary"), Mapping)
+                        and payload["risk_summary"].get("kelly_phase") not in {
+                            None, "cold_start", "unavailable",
+                        }
+                    ):
+                        cap = _nonnegative_risk_decimal(
+                            payload["risk_summary"].get("kelly_cap")
+                        )
+                        if cap is None:
+                            return False
+                        weight = min(weight, cap)
+                    lot_size = int(pair["lot_size"])
+                    shares = pair["estimated_shares"]
+                    expected_amount, expected_shares, expected_cash_required = (
+                        _expected_nominal_sizing(
+                            net_value=rotation_nav,
+                            available_cash=rotation_cash,
+                            weight=weight,
+                            close=candidate_close,
+                            lot_size=lot_size,
+                            price_fx=price_fx,
+                            normal_cost_rate=normal_cost_rate,
+                        )
+                    )
+                    if explicit_v2:
+                        pair_atr = Decimal(str(pair["atr"]))
+                        candidate_atr = Decimal(str(candidate["atr"]))
+                        expected_initial_line = (
+                            candidate_close - protection_multiple * candidate_atr
+                        )
+                        expected_cost = (
+                            Decimal(expected_shares)
+                            * candidate_close
+                            * price_fx
+                            * normal_cost_rate
+                        )
+                        expected_risk = (
+                            Decimal(expected_shares)
+                            * protection_multiple
+                            * candidate_atr
+                            * price_fx
+                            + expected_cost
+                        )
+                except (InvalidOperation, KeyError, TypeError, ValueError, ArithmeticError):
+                    return False
+                if (
+                    pair.get("execution_mode") != execution_mode
+                    or not candidate_close.is_finite()
+                    or candidate_close <= 0
+                    or weight <= 0
+                    or weight > 1
+                    or lot_size <= 0
+                    or isinstance(shares, bool)
+                    or not isinstance(shares, int)
+                    or shares != expected_shares
+                    or _decimal(pair.get("target_weight")) != weight
+                    or _decimal(pair.get("target_amount")) != expected_amount
+                    or explicit_v2
+                    and (
+                        pair_atr != candidate_atr
+                        or _decimal(pair.get("close")) != candidate_close
+                        or _decimal(pair.get("estimated_initial_line"))
+                        != expected_initial_line
+                        or _decimal(pair.get("normal_cost")) != expected_cost
+                        or _decimal(pair.get("planned_stop_risk")) != expected_risk
+                        or _decimal(pair.get("planned_stop_risk_pct"))
+                        != expected_risk / rotation_nav
+                    )
+                ):
+                    return False
+                if expected_cash_required > rotation_cash:
+                    return False
+                rotation_cash -= expected_cash_required
     current_allocation_version = ALLOCATION_PROJECTION_VERSIONS[market]
     require_comparisons = strategy_version == current_allocation_version
     max_rotation_pairs = (
@@ -1450,7 +2158,7 @@ def live_trend_strategy_snapshot(
     if market not in {"CN", "US", "HK"}:
         raise ValueError(f"unsupported trend review market: {market}")
     allocation_market = _allocation_market_for(allocation, market)
-    allocation_version = ALLOCATION_PROJECTION_VERSIONS[market]
+    allocation_version = CURRENT_NOMINAL_ALLOCATION_VERSIONS[market]
     if strategy_version is not None:
         version = strategy_version
     elif allocation_market is not None:
@@ -1469,7 +2177,7 @@ def live_trend_strategy_snapshot(
         version = "v4"
     if allocation_market is not None:
         allocation_snapshot_version = allocation_market.get("allocation_version")
-        if version == allocation_version:
+        if version in ALLOCATION_V2_VERSION_SETS[market]:
             if allocation_snapshot_version != 2:
                 raise ValueError("current strategy requires allocation version 2")
         elif version in ALLOCATION_REPORT_VERSIONS[market]:
@@ -1481,11 +2189,11 @@ def live_trend_strategy_snapshot(
         version
         not in {
             "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
-            "v15",
+            "v15", "v16",
         }
         or version in {"v5", "v11"} and market == "CN"
-        or version == "v14" and market != "CN"
         or version == "v15" and market != "CN"
+        or version == "v16" and market != "CN"
         or version == allocation_version and allocation_market is None
     ):
         raise ValueError("unsupported live trend strategy version")
@@ -1568,7 +2276,7 @@ def live_trend_strategy_snapshot(
                     "右侧天数存在、ATR14 可计算"
                 )
     if market == "CN" and version in {
-        "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+        "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16",
     }:
         parameters.pop("max_filter_price", None)
         parameters["allowed_industry_temperatures"] = ["温", "热", "沸"]
@@ -1576,7 +2284,7 @@ def live_trend_strategy_snapshot(
         for row in rows:
             if row["name"] == "行业温度":
                 row["value"] = "温、热或沸"
-    if market == "CN" and version in {"v9", "v10", "v11", "v12", "v13", "v14", "v15"}:
+    if market == "CN" and version in {"v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16"}:
         parameters["allowed_assets"] = ["A股", "ETF基金"]
         for row in rows:
             if row["name"] == "交易市场":
@@ -1834,8 +2542,11 @@ def live_trend_strategy_snapshot(
         for row in rows:
             if row["name"] == "退出条件":
                 row["value"] = "危险信号、离开趋势右侧、温度转平或触发保护线时全部卖出"
-    if market == "CN" and version in {"v14", "v15"} or (
-        market in {"US", "HK"} and version in {"v12", "v13"}
+    current_nominal = _uses_current_nominal_allocation(market, version)
+    if (
+        market == "CN" and version in {"v14", "v15"}
+        or market in {"US", "HK"} and version in {"v12", "v13"}
+        or current_nominal
     ):
         quantity_rule_text = {
             "CN": "100 股整数倍",
@@ -1846,8 +2557,14 @@ def live_trend_strategy_snapshot(
             if row["name"] == "买入数量":
                 row["value"] = (
                     f"使用已有现金，按{quantity_rule_text}向下取整；"
-                    "最小一手不因名义仓位、单笔风险、组合剩余风险、Kelly 或现金上限被排除，"
-                    "仅以额外风险提示标注；现金不足、席位已满等待条件条目同样列入计划"
+                    + (
+                        f"{STOP_RISK_AUDIT_ONLY_LABEL}"
+                        if current_nominal
+                        else (
+                            "最小一手不因名义仓位、单笔风险、组合剩余风险、Kelly 或现金上限被排除，"
+                            "仅以额外风险提示标注；现金不足、席位已满等待条件条目同样列入计划"
+                        )
+                    )
                 )
     parameters.update(
         {
@@ -1932,15 +2649,15 @@ def _expected_report_strategy_snapshot(
     allocation = None
     if (
         (market.upper(), requested_version) in {
-            ("CN", "v11"), ("CN", "v12"), ("CN", "v13"), ("CN", "v14"), ("CN", "v15"),
-            ("HK", "v9"), ("HK", "v10"), ("HK", "v11"), ("HK", "v12"), ("HK", "v13"),
-            ("US", "v9"), ("US", "v10"), ("US", "v11"), ("US", "v12"), ("US", "v13"),
+            ("CN", "v11"), ("CN", "v12"), ("CN", "v13"), ("CN", "v14"), ("CN", "v15"), ("CN", "v16"),
+            ("HK", "v9"), ("HK", "v10"), ("HK", "v11"), ("HK", "v12"), ("HK", "v13"), ("HK", "v14"),
+            ("US", "v9"), ("US", "v10"), ("US", "v11"), ("US", "v12"), ("US", "v13"), ("US", "v14"),
         }
         and isinstance(parameters, Mapping)
     ):
         allocation_version = (
             2
-            if requested_version == V2_ALLOCATION_VERSIONS[market.upper()]
+            if requested_version in ALLOCATION_V2_VERSION_SETS[market.upper()]
             or "allocation_position_limit" in parameters
             else 1
         )
@@ -1966,7 +2683,7 @@ def _expected_report_strategy_snapshot(
             },
         }
     if requested_version in {
-        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16",
     }:
         return live_trend_strategy_snapshot(
             market,
@@ -2226,6 +2943,11 @@ class RotationPair:
     sell_compared_strength: Decimal | None = None
     buy_compared_strength: Decimal | None = None
     threshold: Decimal = Decimal("20")
+    close: Decimal | None = None
+    estimated_initial_line: Decimal | None = None
+    normal_cost: Decimal | None = None
+    planned_stop_risk: Decimal | None = None
+    planned_stop_risk_pct: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -3285,7 +4007,7 @@ def _candidate_reasons(
     if shared_discipline:
         allowed_assets = (
             {"A股", "ETF基金"}
-            if strategy_version in {"v9", "v10", "v11", "v12", "v13", "v14", "v15"}
+            if strategy_version in {"v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16"}
             else {"A股"}
         )
         if market == "CN" and item.asset not in allowed_assets:
@@ -3370,7 +4092,61 @@ def _uses_individual_global_ranking(
 
 
 def _uses_v2_allocation_behavior(market: str, strategy_version: str | None) -> bool:
-    return V2_ALLOCATION_VERSIONS.get(market.upper()) == strategy_version
+    return is_allocation_v2_version(market, strategy_version)
+
+
+def _uses_current_nominal_allocation(
+    market: str, strategy_version: str | None,
+) -> bool:
+    return CURRENT_NOMINAL_ALLOCATION_VERSIONS.get(market.upper()) == strategy_version
+
+
+def _expected_nominal_sizing(
+    *,
+    net_value: Decimal,
+    available_cash: Decimal,
+    weight: Decimal,
+    close: Decimal,
+    lot_size: int,
+    price_fx: Decimal,
+    normal_cost_rate: Decimal,
+) -> tuple[Decimal, int, Decimal]:
+    if (
+        not net_value.is_finite()
+        or net_value <= 0
+        or not available_cash.is_finite()
+        or available_cash < 0
+        or not weight.is_finite()
+        or weight <= 0
+        or not close.is_finite()
+        or close <= 0
+        or not isinstance(lot_size, int)
+        or isinstance(lot_size, bool)
+        or lot_size <= 0
+        or not price_fx.is_finite()
+        or price_fx <= 0
+        or not normal_cost_rate.is_finite()
+        or normal_cost_rate < 0
+    ):
+        raise ValueError("nominal sizing inputs are invalid")
+    target_amount = (net_value * weight).quantize(Decimal("0.01"))
+    sizing_budget = min(
+        target_amount,
+        available_cash / (Decimal("1") + normal_cost_rate),
+    )
+    unit_notional = close * price_fx
+    shares = _floor_to_lot(sizing_budget / unit_notional, lot_size)
+    if shares <= 0:
+        shares = lot_size
+    cash_required = (
+        Decimal(shares) * unit_notional * (Decimal("1") + normal_cost_rate)
+    )
+    while shares > lot_size and cash_required > available_cash:
+        shares -= lot_size
+        cash_required = (
+            Decimal(shares) * unit_notional * (Decimal("1") + normal_cost_rate)
+        )
+    return target_amount, shares, cash_required
 
 
 def _candidate_global_sort_key(item: CandidateInput) -> tuple[object, ...]:
@@ -3891,6 +4667,7 @@ def _plan_account_rotation_pairs(
     use_final_plan_semantics: bool = True,
     use_global_strength: bool = False,
     position_limit: int = POSITION_LIMIT,
+    use_nominal_sizing: bool = False,
 ) -> tuple[tuple[RotationPair, ...], tuple[RotationComparison, ...]]:
     """Pair first, then reuse ordinary entry sizing with each sell's proceeds."""
     positions_by_symbol = {item.symbol: item for item in account.positions}
@@ -3989,6 +4766,7 @@ def _plan_account_rotation_pairs(
             portfolio_risk_unavailable_reason=portfolio_reason,
             kelly_state=kelly_state,
             use_final_plan_semantics=use_final_plan_semantics,
+            use_nominal_sizing=use_nominal_sizing,
         )
         if not actions or actions[0].estimated_shares == 0 or not actions[0].executable:
             # 数据缺失类买入（每手未知/价格保护线缺失）与普通 blocked 一样不生成
@@ -4031,6 +4809,17 @@ def _plan_account_rotation_pairs(
                 estimated_shares=action.estimated_shares,
                 lot_size=action.lot_size,
                 atr=action.atr,
+                **(
+                    {
+                        "close": action.close,
+                        "estimated_initial_line": action.estimated_initial_line,
+                        "normal_cost": action.normal_cost,
+                        "planned_stop_risk": action.planned_stop_risk,
+                        "planned_stop_risk_pct": action.planned_stop_risk_pct,
+                    }
+                    if use_nominal_sizing
+                    else {}
+                ),
             )
         )
     return tuple(selected), tuple(
@@ -4125,6 +4914,11 @@ def freeze_report_rotation_pairs(report: TrendReport, data_dir: Path) -> TrendRe
             "target_amount",
             "atr",
             "threshold",
+            "close",
+            "estimated_initial_line",
+            "normal_cost",
+            "planned_stop_risk",
+            "planned_stop_risk_pct",
         }
         return tuple(
             RotationPair(
@@ -4872,6 +5666,7 @@ def _risk_summary(
     pending_entries: int = 0,
     data_defect_reason: str = "",
     use_final_plan_semantics: bool = True,
+    audit_only_stop_risk: bool = False,
 ) -> dict[str, object]:
     valid_nav = net_value.is_finite() and net_value > 0
     portfolio_limit = net_value * PORTFOLIO_RISK_LIMIT if valid_nav else None
@@ -4892,6 +5687,11 @@ def _risk_summary(
             if pause_reason == "组合正常计划风险已达到净值 4%"
             else "暂停新开仓"
             if pause_reason
+            else STOP_RISK_AUDIT_ONLY_LABEL
+            if audit_only_stop_risk
+            and planned_risk is not None
+            and portfolio_limit is not None
+            and planned_risk > portfolio_limit
             else "含最小一手额外风险"
             if (
                 planned_risk is not None
@@ -5029,6 +5829,7 @@ def _plan_buy_actions(
     use_final_plan_semantics: bool = True,
     position_limit: int = POSITION_LIMIT,
     configured_position_limit: int | None = None,
+    use_nominal_sizing: bool = False,
 ) -> tuple[list[BuyAction], list[dict[str, object]], dict[str, object]]:
     configured_limit = (
         configured_position_limit
@@ -5101,6 +5902,7 @@ def _plan_buy_actions(
             kelly_state=kelly_state,
             data_defect_reason=critical_data_reason,
             use_final_plan_semantics=use_final_plan_semantics,
+            audit_only_stop_risk=use_nominal_sizing,
         )
 
     if (
@@ -5127,6 +5929,7 @@ def _plan_buy_actions(
             pause_reason=pause_reason,
             kelly_state=kelly_state,
             use_final_plan_semantics=use_final_plan_semantics,
+            audit_only_stop_risk=use_nominal_sizing,
         )
     if (
         portfolio_planned_risk is not None
@@ -5155,6 +5958,7 @@ def _plan_buy_actions(
             pause_reason=pause_reason,
             kelly_state=kelly_state,
             use_final_plan_semantics=use_final_plan_semantics,
+            audit_only_stop_risk=use_nominal_sizing,
         )
     if not portfolio_risk_unavailable_reason:
         portfolio_risk_unavailable_reason = "持仓计划风险缺失"
@@ -5185,8 +5989,12 @@ def _plan_buy_actions(
         weight = entry_weight(item)
         if weight is None:
             continue
-        base_amount = min(net_value * weight, remaining_cash).quantize(
-            Decimal("0.01")
+        base_amount = (
+            (net_value * weight).quantize(Decimal("0.01"))
+            if use_nominal_sizing
+            else min(net_value * weight, remaining_cash).quantize(
+                Decimal("0.01")
+            )
         )
         slot_full = slots == 0
         if not use_final_plan_semantics and slot_full:
@@ -5274,6 +6082,35 @@ def _plan_buy_actions(
             lot_size=Decimal(lot_size),
             normal_cost_rate=normal_cost_rate,
         )
+        risk_sized = sized
+        if use_nominal_sizing:
+            unit_notional = item.close * price_fx_to_account_currency
+            nominal_quantity = _floor_to_lot(
+                base_amount / unit_notional,
+                lot_size,
+            )
+            nominal_unit_risk = (
+                max(Decimal("0"), item.close - protection_line)
+                * price_fx_to_account_currency
+                + unit_notional * normal_cost_rate
+            )
+            nominal_risk = Decimal(nominal_quantity) * nominal_unit_risk
+            sized = size_entry_by_risk(
+                entry_price=item.close,
+                protection_line=protection_line,
+                fx_to_account_currency=price_fx_to_account_currency,
+                portfolio_nav=net_value,
+                nominal_weight_limit=weight,
+                single_entry_risk_limit=max(single_entry_limit, nominal_risk),
+                portfolio_remaining_risk=(
+                    max(remaining_risk or Decimal("0"), nominal_risk)
+                    if remaining_risk is not None
+                    else None
+                ),
+                available_cash=remaining_cash,
+                lot_size=Decimal(lot_size),
+                normal_cost_rate=normal_cost_rate,
+            )
         quantity = int(sized.final_quantity)
         if not use_final_plan_semantics and sized.exceeded_limits:
             # 旧语义下任意上限低于一手的候选按原剔除路径处理（对应原
@@ -5295,7 +6132,11 @@ def _plan_buy_actions(
             )
             continue
         notes: list[str] = []
-        for limit_name in sized.exceeded_limits:
+        for limit_name in (
+            risk_sized.exceeded_limits
+            if use_nominal_sizing
+            else sized.exceeded_limits
+        ):
             if limit_name == "现金":
                 # 现金超限只保留专属模板「现金不足一手（需约 X，可用 Y）」，
                 # 不叠加「一手超过现金」文案。
@@ -5323,9 +6164,13 @@ def _plan_buy_actions(
         executable = not slot_full and not cash_short
         if not use_final_plan_semantics:
             executable = True
-        target_amount = max(
-            base_amount,
-            quantity * item.close * price_fx_to_account_currency,
+        target_amount = (
+            base_amount
+            if use_nominal_sizing
+            else max(
+                base_amount,
+                quantity * item.close * price_fx_to_account_currency,
+            )
         ).quantize(Decimal("0.01"))
         actions.append(
             BuyAction(
@@ -5405,6 +6250,7 @@ def _plan_buy_actions(
         pending_entries=pending_entries,
         data_defect_reason="；".join(defect_reasons),
         use_final_plan_semantics=use_final_plan_semantics,
+        audit_only_stop_risk=use_nominal_sizing,
     )
 
 
@@ -5982,7 +6828,7 @@ def build_report(
                 key: Decimal(str(raw_cn_weights))
                 for key in ("热", "沸")
             }
-            if market == "CN" and snapshot_version in {"v11", "v12", "v13", "v14", "v15"}
+            if market == "CN" and snapshot_version in {"v11", "v12", "v13", "v14", "v15", "v16"}
             else CN_TARGET_WEIGHTS
         )
     except (InvalidOperation, KeyError, ValueError):
@@ -6005,7 +6851,7 @@ def build_report(
         )
         if snapshot_version in {
             "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            "v11", "v12", "v13", "v14", "v15",
+            "v11", "v12", "v13", "v14", "v15", "v16",
         } and kelly_data_reason
         else calculate_trend_kelly(
             kelly_rounds,
@@ -6015,7 +6861,7 @@ def build_report(
         )
         if snapshot_version in {
             "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            "v11", "v12", "v13", "v14", "v15",
+            "v11", "v12", "v13", "v14", "v15", "v16",
         }
         else None
     )
@@ -6133,6 +6979,11 @@ def build_report(
     post_sell_cash = account.available_cash + sum(
         (
             position.market_value
+            * (
+                max(Decimal("0"), Decimal("1") - normal_cost_rate)
+                if _uses_current_nominal_allocation(market, snapshot_version)
+                else Decimal("1")
+            )
             for position in account.positions
             if position.symbol in sell_symbols
         ),
@@ -6207,10 +7058,13 @@ def build_report(
             portfolio_risk_unavailable_reason=portfolio_risk_unavailable_reason,
             kelly_state=kelly_state,
             use_final_plan_semantics=use_final_plan_semantics,
+            use_nominal_sizing=_uses_current_nominal_allocation(
+                market, snapshot_version
+            ),
         )
         if account_available and snapshot_version in {
             "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            "v11", "v12", "v13", "v14", "v15",
+            "v11", "v12", "v13", "v14", "v15", "v16",
         } and (
             not valid_drawdown_decision(
                 drawdown_summary,
@@ -6256,6 +7110,9 @@ def build_report(
                         risk_summary.get("data_defect_reason") or ""
                     ),
                     use_final_plan_semantics=use_final_plan_semantics,
+                    audit_only_stop_risk=_uses_current_nominal_allocation(
+                        market, snapshot_version
+                    ),
                 )
     if symbol_mapping_required:
         missing_mapping = {
@@ -6312,6 +7169,9 @@ def build_report(
                     risk_summary.get("data_defect_reason") or ""
                 ),
                 use_final_plan_semantics=use_final_plan_semantics,
+                audit_only_stop_risk=_uses_current_nominal_allocation(
+                    market, snapshot_version
+                ),
             )
 
     if (
@@ -6358,6 +7218,11 @@ def build_report(
         real_post_sell_cash = real_account.available_cash + sum(
             (
                 position.market_value
+                * (
+                    max(Decimal("0"), Decimal("1") - normal_cost_rate)
+                    if _uses_current_nominal_allocation(market, snapshot_version)
+                    else Decimal("1")
+                )
                 for position in real_account.positions
                 if position.symbol in real_sell_symbols
             ),
@@ -6397,6 +7262,9 @@ def build_report(
             use_final_plan_semantics=(
                 market.upper(), snapshot_version
             ) in FINAL_PLAN_TREND_VERSIONS,
+            use_nominal_sizing=_uses_current_nominal_allocation(
+                market, snapshot_version
+            ),
         )
         if symbol_mapping_required:
             real_buy_actions = [
@@ -6406,7 +7274,7 @@ def build_report(
     drawdown_pause_reason = ""
     if account_available and snapshot_version in {
         "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14", "v15",
+        "v11", "v12", "v13", "v14", "v15", "v16",
     } and (
         not valid_drawdown_decision(
             drawdown_summary,
@@ -6436,11 +7304,21 @@ def build_report(
         else (
             V1_ALLOCATION_VERSIONS[market]
             if allocation_market.get("allocation_version") == 1
-            else V2_ALLOCATION_VERSIONS[market]
+            else snapshot_version
         )
     )
+    rotation_versions = (
+        {V1_ALLOCATION_VERSIONS[market]}
+        if allocation_market is None
+        or allocation_market.get("allocation_version") == 1
+        else {
+            V2_ALLOCATION_VERSIONS[market],
+            CURRENT_NOMINAL_ALLOCATION_VERSIONS[market],
+        }
+    )
     rotation_enabled = (
-        snapshot_version == rotation_version
+        snapshot_version in rotation_versions
+        and snapshot_version == rotation_version
         and isinstance(allocation_sha256, str)
         and len(allocation_sha256) == 64
         and all(character in "0123456789abcdef" for character in allocation_sha256)
@@ -6473,6 +7351,9 @@ def build_report(
             use_final_plan_semantics=use_final_plan_semantics,
             use_global_strength=_uses_v2_allocation_behavior(market, snapshot_version),
             position_limit=position_limit,
+            use_nominal_sizing=_uses_current_nominal_allocation(
+                market, snapshot_version
+            ),
         )
         simulate_rotation_pairs = tuple(
             replace(
@@ -6533,10 +7414,15 @@ def build_report(
                 critical_data_reason=critical_data_reason,
                 require_mapping=symbol_mapping_required,
                 excluded_sell_symbols=tuple(real_blocked_symbols),
-                cash_unconstrained=True,
+                cash_unconstrained=not _uses_current_nominal_allocation(
+                    market, snapshot_version
+                ),
                 use_final_plan_semantics=use_final_plan_semantics,
                 use_global_strength=_uses_v2_allocation_behavior(market, snapshot_version),
                 position_limit=position_limit,
+                use_nominal_sizing=_uses_current_nominal_allocation(
+                    market, snapshot_version
+                ),
             )
             real_rotation_pairs = tuple(
                 replace(
@@ -6582,10 +7468,17 @@ def build_report(
     }
     real_holding_signals = {
         position.symbol: (
-            _holding_signal(
-                real_holdings.holding_snapshots[position.symbol],
-                market=market,
-            )
+            {
+                **_holding_signal(
+                    real_holdings.holding_snapshots[position.symbol],
+                    market=market,
+                ),
+                **(
+                    {"market_value": position.market_value}
+                    if _uses_current_nominal_allocation(market, snapshot_version)
+                    else {}
+                ),
+            }
             if real_holdings.holding_snapshots.get(position.symbol) is not None
             else None
         )
@@ -6737,6 +7630,16 @@ def build_report(
                     else real_holdings.reason
                 ),
                 "executable": False,
+                **(
+                    {
+                        "net_value": real_holdings.net_value,
+                        "available_cash": real_holdings.available_cash,
+                    }
+                    if real_holdings is not None
+                    and real_holdings.status == "available"
+                    and _uses_current_nominal_allocation(market, snapshot_version)
+                    else {}
+                ),
             },
         },
     )
@@ -7600,7 +8503,7 @@ def render_markdown(report: TrendReport) -> str:
         )
     if report.strategy_snapshot.get("strategy_version") in {
         "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14", "v15",
+            "v11", "v12", "v13", "v14", "v15", "v16",
     }:
         phase = {
             "cold_start": "冷启动",
@@ -8014,7 +8917,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
     version = snapshot.get("strategy_version")
     if version not in {
         "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14", "v15",
+        "v11", "v12", "v13", "v14", "v15", "v16",
     }:
         raise ValueError("strategy snapshot does not match report actions")
     expected_snapshot = _expected_report_strategy_snapshot(
@@ -8048,7 +8951,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         raise ValueError("strategy snapshot does not match report actions")
     if version in {
         "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14", "v15",
+        "v11", "v12", "v13", "v14", "v15", "v16",
     }:
         valid_contract = {
             "v2": valid_v2_risk_contract,
@@ -8065,10 +8968,21 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             "v13": valid_v4_risk_contract,
             "v14": valid_v4_risk_contract,
             "v15": valid_v4_risk_contract,
+            "v16": valid_v4_risk_contract,
         }[version]
+        contract_summary = report.risk_summary
+        if (
+            _uses_current_nominal_allocation(market, version)
+            and report.risk_summary.get("status_label")
+            == STOP_RISK_AUDIT_ONLY_LABEL
+        ):
+            contract_summary = {
+                **report.risk_summary,
+                "status_label": "含最小一手额外风险",
+            }
         if not valid_contract(
             parameters,
-            report.risk_summary,
+            contract_summary,
             expected_nav=report.account.net_value,
         ):
             raise ValueError("strategy snapshot does not match report actions")
@@ -8120,7 +9034,8 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
                 or action.planned_stop_risk_pct
                 != action.planned_stop_risk / nav
                 or (
-                    action.planned_stop_risk > nav * SINGLE_ENTRY_RISK_LIMIT
+                    not _uses_current_nominal_allocation(market, version)
+                    and action.planned_stop_risk > nav * SINGLE_ENTRY_RISK_LIMIT
                     and action.estimated_shares != action.lot_size
                 )
                 or not action.normal_cost.is_finite()
@@ -8166,6 +9081,10 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
                 if not action.executable:
                     continue
                 if action.planned_stop_risk > remaining_capacity:
+                    if _uses_current_nominal_allocation(market, version):
+                        evidenced_risk += action.planned_stop_risk
+                        remaining_capacity = Decimal("0")
+                        continue
                     if (
                         action.estimated_shares != action.lot_size
                         or not isinstance(action.sizing_note, str)
@@ -8178,7 +9097,12 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
                     remaining_capacity - action.planned_stop_risk,
                 )
             if (
-                status_label != "含最小一手额外风险"
+                status_label
+                != (
+                    STOP_RISK_AUDIT_ONLY_LABEL
+                    if _uses_current_nominal_allocation(market, version)
+                    else "含最小一手额外风险"
+                )
                 or new_planned_risk <= 0
                 or evidenced_risk < overflow
             ):
@@ -8186,11 +9110,12 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         elif (
             report.risk_summary.get("status") == "active"
             and status_label == "含最小一手额外风险"
+            and not _uses_current_nominal_allocation(market, version)
         ):
             raise ValueError("strategy snapshot does not match report actions")
     if version in {
         "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14", "v15",
+        "v11", "v12", "v13", "v14", "v15", "v16",
     }:
         if (
             not valid_drawdown_decision(
@@ -8218,6 +9143,32 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         protection_multiple = Decimal(str(parameters["initial_protection_atr_multiple"]))
     except (InvalidOperation, KeyError, ValueError):
         raise ValueError("strategy snapshot does not match report actions") from None
+    candidate_signals = {
+        str(item.get("symbol")): item
+        for item in report.signal_snapshots.get("candidates", [])
+        if isinstance(item, Mapping) and isinstance(item.get("symbol"), str)
+    }
+    if _uses_current_nominal_allocation(market, version):
+        try:
+            normal_cost_rate = Decimal(str(parameters["normal_cost_rate"]))
+        except (InvalidOperation, KeyError, ValueError):
+            raise ValueError("strategy snapshot does not match report actions") from None
+    nominal_remaining_cash = report.account.available_cash + sum(
+        (
+            position.market_value
+            * (
+                max(Decimal("0"), Decimal("1") - normal_cost_rate)
+                if _uses_current_nominal_allocation(market, version)
+                else Decimal("1")
+            )
+            for position in report.account.positions
+            if any(
+                holding.symbol == position.symbol and holding.action == "SELL_ALL"
+                for holding in report.holdings
+            )
+        ),
+        Decimal("0"),
+    )
     for action in report.buy_actions:
         target = parameters.get("target_weight")
         nominal_weight = (
@@ -8228,7 +9179,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         expected_weight = Decimal(str(nominal_weight))
         if version in {
             "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14", "v15",
+            "v11", "v12", "v13", "v14", "v15", "v16",
         } and report.risk_summary.get("kelly_phase") not in {
             "cold_start", "unavailable",
         }:
@@ -8241,6 +9192,50 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             action.estimated_shares == 0
             and action.sizing_note in data_missing_notes
         )
+        if _uses_current_nominal_allocation(market, version) and not data_missing:
+            candidate = candidate_signals.get(action.symbol)
+            try:
+                candidate_close = Decimal(str(candidate["close"])) if isinstance(
+                    candidate, Mapping
+                ) else None
+                candidate_atr = Decimal(str(candidate["atr"])) if isinstance(
+                    candidate, Mapping
+                ) else None
+            except (InvalidOperation, TypeError, ValueError):
+                raise ValueError(
+                    "strategy snapshot does not match report actions"
+                ) from None
+            if candidate_close != action.close or candidate_atr != action.atr:
+                raise ValueError("strategy snapshot does not match report actions")
+        if _uses_current_nominal_allocation(market, version) and not data_missing:
+            try:
+                price_fx = Decimal(
+                    str(report.metadata.get("price_fx_to_account_currency", "1"))
+                )
+                expected_amount, expected_shares, expected_cash_required = (
+                    _expected_nominal_sizing(
+                        net_value=report.account.net_value,
+                        available_cash=nominal_remaining_cash,
+                        weight=expected_weight,
+                        close=action.close,
+                        lot_size=action.lot_size,
+                        price_fx=price_fx,
+                        normal_cost_rate=normal_cost_rate,
+                    )
+                )
+            except (InvalidOperation, TypeError, ValueError, ArithmeticError):
+                raise ValueError(
+                    "strategy snapshot does not match report actions"
+                ) from None
+            if (
+                not price_fx.is_finite()
+                or price_fx <= 0
+                or action.target_amount != expected_amount
+                or action.estimated_shares != expected_shares
+            ):
+                raise ValueError("strategy snapshot does not match report actions")
+            if action.executable:
+                nominal_remaining_cash -= expected_cash_required
         if (
             action.target_weight != expected_weight
             or action.estimated_initial_line
@@ -8274,11 +9269,29 @@ def _report_payload(
         else f"{report.execution_date} regular session"
     )
     current_v2 = _uses_v2_allocation_behavior(market, report.strategy_snapshot.get("strategy_version"))
+    current_nominal = _uses_current_nominal_allocation(
+        market, report.strategy_snapshot.get("strategy_version")
+    )
+    rotation_audit_fields = (
+        "close",
+        "estimated_initial_line",
+        "normal_cost",
+        "planned_stop_risk",
+        "planned_stop_risk_pct",
+    )
     rotation_sell_symbols = {
         pair.sell_symbol
         for pair in report.simulate_rotation_pairs
         if pair.execution_mode == "automatic"
     }
+
+    def serialized_rotation_pair(pair: RotationPair) -> dict[str, object]:
+        value = _json_value(asdict(pair))
+        assert isinstance(value, dict)
+        if not current_nominal:
+            for key in rotation_audit_fields:
+                value.pop(key, None)
+        return value
 
     def serialized_holding(item: HoldingDecision) -> dict[str, object]:
         value = _json_value(asdict(item))
@@ -8345,10 +9358,12 @@ def _report_payload(
     ):
         strategy_judgments.update(
             simulate_rotation_pairs=[
-                _json_value(asdict(pair)) for pair in report.simulate_rotation_pairs
+                serialized_rotation_pair(pair)
+                for pair in report.simulate_rotation_pairs
             ],
             real_rotation_pairs=[
-                _json_value(asdict(pair)) for pair in report.real_rotation_pairs
+                serialized_rotation_pair(pair)
+                for pair in report.real_rotation_pairs
             ],
             simulate_rotation_comparisons=[
                 _json_value(asdict(item))
@@ -8509,15 +9524,22 @@ def _freeze_report_simulated_buy_plan(
         for pair in report.simulate_rotation_pairs
         if pair.execution_mode == "automatic" and pair.sell_futu_symbol.strip()
     )
+    planned_new_seats = getattr(entries, "planned_new_seats", None)
+    if planned_new_seats is None:
+        planned_new_seats = (
+            _projected_simulated_buy_seats(
+                market=market,
+                target_position_count=target_position_count,
+                held_symbols=held_symbols,
+                full_exit_symbols=full_exit_symbols,
+            )
+            if entries
+            else 0
+        )
     return replace(
         report,
         simulated_buy_fifo=tuple(dict(entry) for entry in entries),
-        planned_new_seats=_projected_simulated_buy_seats(
-            market=market,
-            target_position_count=target_position_count,
-            held_symbols=held_symbols,
-            full_exit_symbols=full_exit_symbols,
-        ) if entries else 0,
+        planned_new_seats=planned_new_seats,
     )
 
 

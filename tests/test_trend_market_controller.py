@@ -1958,17 +1958,53 @@ def write_v2_controller_report(
     report["metadata"] = {**report["metadata"], "simulate_acc_id": 101}
     judgments = report["strategy_judgments"]
     assert isinstance(judgments, dict)
+    formal_actions: list[dict[str, object]] = []
+    for action in actions or []:
+        normalized = dict(action)
+        if action.get("action") == "BUY":
+            normalized.update({"close": "10", "atr": "0.5"})
+            if "executable" not in normalized:
+                try:
+                    shares = Decimal(str(normalized["estimated_shares"]))
+                    lot = Decimal(str(normalized["lot_size"]))
+                    atr = Decimal(str(normalized["atr"]))
+                    normalized["executable"] = (
+                        all(
+                            value.is_finite() and value > 0
+                            for value in (shares, lot, atr)
+                        )
+                        and shares % lot == 0
+                    )
+                except (ArithmeticError, KeyError, TypeError, ValueError):
+                    normalized["executable"] = False
+        formal_actions.append(normalized)
     judgments.update({
-        "formal_actions": actions or [],
+        "formal_actions": formal_actions,
         "holding_decisions": (
             [{"symbol": "600001"}] if positions else []
         ),
-        "top10_candidates": [{"symbol": "600002"}],
+        "top10_candidates": [
+            {
+                "symbol": "600002",
+                **({"close": "10"} if real_rotation else {}),
+            }
+        ],
         "simulate_rotation_pairs": [],
         "simulate_rotation_comparisons": [],
         "real_rotation_pairs": [],
         "real_rotation_comparisons": [],
     })
+    candidate_symbols = {
+        str(item.get("symbol") or "")
+        for item in [*judgments["top10_candidates"], *formal_actions]
+        if isinstance(item, dict) and item.get("symbol")
+    }
+    report["signal_snapshots"] = {
+        "candidates": [
+            {"symbol": symbol, "close": "10", "atr": "0.5"}
+            for symbol in sorted(candidate_symbols)
+        ]
+    }
     frozen_fifo = [
         {
             "source": "formal",
@@ -1987,8 +2023,9 @@ def write_v2_controller_report(
                 ),
             }],
         }
-        for action_index, action in enumerate(actions or [])
+        for action_index, action in enumerate(formal_actions)
         if isinstance(action, dict) and action.get("action") == "BUY"
+        and action.get("executable") is True
     ]
     judgments["simulated_buy_fifo"] = frozen_fifo
     judgments["planned_new_seats"] = 0
@@ -2085,6 +2122,7 @@ def write_v2_controller_report(
         "roots": allocation_snapshot["roots"],
         "markets": allocation_snapshot["markets"],
     }
+    del report["allocation"]["version"]
     if frozen_fifo:
         full_exit_symbols = {
             physical_symbol(
@@ -2119,6 +2157,11 @@ def write_v2_controller_report(
             "status": "available" if real_rotation else "unavailable",
             "reason": "" if real_rotation else "real account is informational",
             "executable": False,
+            **(
+                {"net_value": "100000", "available_cash": "100000"}
+                if real_rotation
+                else {}
+            ),
         },
     }
     path = config.reports_dir / "trend_a_share/2026-07-19.json"
@@ -6122,7 +6165,7 @@ def test_later_revision_does_not_change_locked_batch(
     assert len(notifications) == 1
 
 
-def test_locked_report_selects_first_valid_report_before_batch_exists(
+def test_locked_report_selects_latest_valid_report_before_batch_exists(
     tmp_path: Path,
 ) -> None:
     config = controller_config(tmp_path)
@@ -6136,8 +6179,41 @@ def test_locked_report_selects_first_valid_report_before_batch_exists(
         NOW,
     )
 
-    assert selected_path == base_path
-    assert selected_report["generated_at"] == "2026-07-17T18:00:00+08:00"
+    assert selected_path == revision_path
+    assert selected_report["generated_at"] == "2026-07-17T18:01:00+08:00"
+
+
+def test_scheduled_execution_without_batch_uses_latest_valid_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    base_path, _ = write_report(config)
+    revision_path, revision_report = write_report(config, revision=1)
+    patch_cycle(monkeypatch, active_cn_cycle())
+    monkeypatch.setattr(
+        controller,
+        "_load_latest_valid_report",
+        lambda *_args: (revision_path, revision_report),
+    )
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    batch_path = (
+        config.data_dir
+        / "trend_review/ledgers/CN/batches/2026-07-20.json"
+    )
+    batch = json.loads(batch_path.read_text(encoding="utf-8"))
+    assert batch["report_path"] == str(revision_path)
+    expected_sha = hashlib.sha256(
+        json.dumps(
+            revision_report,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    ).hexdigest()
+    assert batch["report_sha256"] == expected_sha
+    assert base_path != revision_path
 
 
 def test_manual_revision_sha_executes_without_replacing_locked_batch(
@@ -7787,20 +7863,23 @@ def test_revision_targets_invalid_historical_cycle_then_recovers_next_revision(
     assert completion["report_sha256"] == _report_hash(
         json.loads(completed_report.read_text(encoding="utf-8"))
     )
-    assert not controller._batch_path(
+    batch_path = controller._batch_path(
         config, historical.market, historical.execution_date
-    ).exists()
+    )
+    batch = json.loads(batch_path.read_text(encoding="utf-8"))
+    assert batch["report_path"] == str(completed_report)
+    assert batch["report_sha256"] == completion["report_sha256"]
     assert not list(config.data_dir.glob("trend_review/ledgers/CN/actions/**/*.json"))
-    assert controller._execution_completed(config, historical) is False
+    assert controller._execution_completed(config, historical) is True
     selected = controller._cycle_to_reconcile(config, current, NOW)
     assert (
         selected.market,
         selected.as_of_date,
         selected.execution_date,
     ) == (
-        historical.market,
-        historical.as_of_date,
-        historical.execution_date,
+        current.market,
+        current.as_of_date,
+        current.execution_date,
     )
 
 
@@ -8015,7 +8094,7 @@ def test_revision_replaces_invalid_frozen_report_before_execution(
         invalid_path.read_bytes()
     ).hexdigest()
     assert request["baseline_revision"] == 0
-    assert executed == []
+    assert executed == [revision_path]
     assert completion["request_path"] == str(request_path)
     assert completion["request_sha256"] == hashlib.sha256(
         request_path.read_bytes()
@@ -9564,7 +9643,20 @@ def test_scheduled_terminal_rejection_replay_recovers_notification_via_public_or
         },
     )
     report["risk_summary"] = {"normal_cost_rate": "0.001"}
-    report["strategy_judgments"]["formal_actions"][0]["planned_stop_risk"] = "4000"  # type: ignore[index]
+    report["strategy_judgments"]["formal_actions"][0].update({  # type: ignore[index]
+        "estimated_initial_line": "9",
+        "normal_cost": "4",
+        "planned_stop_risk": "404",
+        "planned_stop_risk_pct": "0.00404",
+    })
+    report["strategy_judgments"]["formal_actions"][0].update({  # type: ignore[index]
+        "close": "10",
+        "atr": "0.5",
+        "executable": True,
+    })
+    report["signal_snapshots"] = {
+        "candidates": [{"symbol": "600001", "close": "10", "atr": "0.5"}],
+    }
     report["strategy_judgments"].update({  # type: ignore[union-attr]
         "simulate_rotation_pairs": [],
         "real_rotation_pairs": [],
@@ -10173,6 +10265,123 @@ def test_mixed_v2_execution_stages_sells_before_formal_and_rotation_buys(
         ("rotation", "buy"),
         ("ordinary", {"include_buys": True, "include_sells": False}),
     ]
+
+
+def test_current_nominal_report_without_top_level_allocation_version_uses_staged_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    report_path = tmp_path / "locked.json"
+    report = {
+        "as_of_date": "2026-07-17",
+        "allocation": {"markets": {"CN": {"position_limit": 20}}},
+        "strategy_snapshot": {"strategy_version": "v16"},
+        "strategy_judgments": {
+            "formal_actions": [{
+                "action": "BUY",
+                "symbol": "600001",
+                "futu_symbol": "SH.600001",
+                "global_strength": "80",
+                "estimated_shares": 100,
+                "lot_size": 100,
+                "atr": "0.5",
+            }],
+            "simulate_rotation_pairs": [{
+                "pair_index": 0,
+                "buy_futu_symbol": "SH.ROTATION",
+                "buy_global_strength": "90",
+            }],
+        },
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    calls: list[tuple[str, object]] = []
+
+    class Client:
+        def close(self) -> None:
+            pass
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "_revision_state", lambda *_args: (None, None))
+    monkeypatch.setattr(
+        controller,
+        "lock_trend_execution_batch",
+        lambda *_args, **_kwargs: {
+            "report_path": str(report_path), "report_sha256": _report_hash(report),
+        },
+    )
+    monkeypatch.setattr(controller, "_valid_report", lambda *_args: True)
+    monkeypatch.setattr(controller, "record_trend_review_missed_buys", lambda **_kwargs: 0)
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args, **_kwargs: Client())
+    monkeypatch.setattr(controller, "_execution_completed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        controller,
+        "execute_trend_review_open",
+        lambda **kwargs: calls.append(("ordinary", {
+            "include_buys": kwargs.get("include_buys"),
+            "include_sells": kwargs.get("include_sells"),
+        })) or {
+            "status": (
+                "uncertain" if kwargs.get("include_sells") else "unchanged"
+            ),
+            "submitted_count": 0, "artifact_paths": [],
+        },
+    )
+    monkeypatch.setattr(
+        controller,
+        "execute_relative_rotations",
+        lambda **kwargs: calls.append(("rotation", kwargs.get("_phase"))) or {
+            "status": (
+                "pending" if kwargs.get("_phase") == "sell" else "complete"
+            ),
+            "submitted_count": 0, "artifact_paths": [],
+        },
+    )
+    monkeypatch.setattr(controller, "_execution_completed", lambda *_args, **_kwargs: False)
+
+    controller._execute_locked_report(
+        config, "CN", "2026-07-20", report_path, report, quote_client=Quote()
+    )
+
+    assert calls == [
+        ("ordinary", {"include_buys": False, "include_sells": True}),
+        ("rotation", "sell"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("market", "version", "broker"),
+    [("CN", "v16", "eastmoney"), ("HK", "v14", "phillips"), ("US", "v14", "futu")],
+)
+def test_current_nominal_report_without_top_level_version_requires_v2_plan_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    market: str,
+    version: str,
+    broker: str,
+) -> None:
+    config = controller_config(tmp_path)
+    report = valid_cn_report(as_of_date="2026-07-17", execution_date="2026-07-20")
+    report["metadata"] = {"market": market, "broker": broker}
+    report["strategy_snapshot"] = {
+        **report["strategy_snapshot"],
+        "strategy_id": f"trend_animals_warm_to_hot/{market}/{version}",
+        "strategy_version": version,
+    }
+    report_path = controller._report_dir(config, market) / "2026-07-17.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    monkeypatch.setattr(controller, "valid_frozen_report_contract", lambda _payload: True)
+
+    assert controller._valid_report(
+        config, market, "2026-07-20", report_path, report
+    ) is False
 
 
 def test_v2_formal_only_execution_uses_fifo_and_dynamic_position_cap(
@@ -11139,8 +11348,8 @@ def test_revision_request_waits_for_report_freeze_before_capturing_baseline(
         run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
 
         assert generated == [(cycle.report_run_date, True)]
-        assert executed == [report_path]
         revision_path = config.reports_dir / "trend_a_share/2026-07-17-r1.json"
+        assert executed == [revision_path]
         revision_report = json.loads(revision_path.read_text(encoding="utf-8"))
         _, completion_path = controller._revision_paths(
             config, cycle.market, cycle.as_of_date
@@ -11198,8 +11407,8 @@ def test_revision_requested_without_baseline_requires_r1_not_r0(
     )
     completion = json.loads(completion_path.read_text(encoding="utf-8"))
     assert generated == [(cycle.report_run_date, True)]
-    assert executed == [r0_path]
     r1_path = config.reports_dir / "trend_a_share/2026-07-17-r1.json"
+    assert executed == [r1_path]
     r1 = json.loads(r1_path.read_text(encoding="utf-8"))
     assert completion["request_path"] == str(request_path)
     assert completion["request_sha256"] == hashlib.sha256(
@@ -11357,8 +11566,8 @@ def test_pending_revision_does_not_accept_newer_report_without_receipt(
     run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
 
     assert generated == [(cycle.report_run_date, True)]
-    assert executed == [base_path]
     r2_path = config.reports_dir / "trend_a_share/2026-07-17-r2.json"
+    assert executed == [r2_path]
     r2 = json.loads(r2_path.read_text(encoding="utf-8"))
     _, completion_path = controller._revision_paths(
         config, cycle.market, cycle.as_of_date

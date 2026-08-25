@@ -7133,6 +7133,36 @@ console.log("ok");
     assert "ok" in output
 
 
+def test_dashboard_markerless_current_nominal_versions_render_v2_plan_layout() -> None:
+    output = run_dashboard_js(r'''
+const base = (market) => ({
+  available:true,
+  market,
+  broker:market === "CN" ? "eastmoney" : market === "HK" ? "phillips" : "futu",
+  broker_label:market === "CN" ? "东方财富" : market === "HK" ? "辉立" : "富途",
+  market_label:market === "CN" ? "A股" : market === "HK" ? "港股" : "美股",
+  strategy_version:market === "CN" ? "v16" : "v14",
+  allocation:{daily_path:"data/trend_allocation/daily/2026-08-20.json",sha256:"a".repeat(64),markets:{}},
+  plan_availability:{
+    simulated_account:{status:"available",reason:"",executable:false},
+    real_account:{status:"available",reason:"",executable:false},
+  },
+  sell_actions:[],real_position_actions:[],buy_actions:[],real_buy_actions:[],
+  simulate_rotation_pairs:[],real_rotation_pairs:[],counts:{},audit:{},
+});
+for (const market of ["CN", "HK", "US"]) {
+  const html = renderTrendReportWorkspace(base(market));
+  for (const title of ["模拟盘卖出计划", "实盘卖出计划", "模拟盘买入计划", "实盘买入计划"]) {
+    if (!html.includes(`<h2>${title}</h2>`)) throw new Error(market + " " + html);
+  }
+  if (html.includes("优先处理 · 卖出触发")) throw new Error(market + " legacy layout");
+}
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
 def test_dashboard_execution_status_summary_is_a_mobile_touch_target() -> None:
     from playwright import sync_api as playwright_api
     rendered = json.loads(run_dashboard_js(r'''

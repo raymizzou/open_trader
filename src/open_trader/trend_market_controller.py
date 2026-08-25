@@ -62,6 +62,7 @@ from .opend_incident import (
     record_opend_failure,
     record_opend_health,
 )
+from .strategy_drawdown import is_allocation_v2_version
 from .trend_api_stats import (
     STATISTICS_CYCLE_SCHEMA,
     FutuActualFillClient,
@@ -561,9 +562,7 @@ def _valid_report(
             isinstance(allocation, Mapping)
             and allocation.get("version", 1) == 2
         )
-        or (market, strategy_version) in {
-            ("CN", "v15"), ("HK", "v13"), ("US", "v13"),
-        }
+        or is_allocation_v2_version(market, strategy_version)
     )
     simulated_plan = (
         payload.get("plan_availability", {}).get("simulated_account")
@@ -1201,37 +1200,6 @@ def _load_cycle_report(
     if latest is None or latest[1].get("as_of_date") != cycle.as_of_date:
         return None
     return latest
-
-
-def _load_first_valid_report(
-    config: DailyPremarketConfig, cycle: ControllerCycle
-) -> tuple[Path, dict[str, object]] | None:
-    paths = sorted(
-        (
-            path
-            for path in _report_dir(config, cycle.market).glob(
-                f"{cycle.as_of_date}*.json"
-            )
-            if (match := REPORT_STEM.fullmatch(path.stem)) is not None
-            and match.group("date") == cycle.as_of_date
-        ),
-        key=_report_order,
-    )
-    for path in paths:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ValueError(
-                f"invalid frozen trend report: {path}; run --revision"
-            ) from exc
-        if not _valid_report(
-            config, cycle.market, cycle.execution_date, path, payload
-        ):
-            raise ValueError(
-                f"invalid frozen trend report: {path}; run --revision"
-            )
-        return path, payload
-    return None
 
 
 def _delivery_receipt_path(
@@ -1879,9 +1847,7 @@ def _execute_locked_report(
             (
                 isinstance(allocation, Mapping)
                 and allocation.get("version", 1) == 2
-                or (market, strategy_version) in {
-                    ("CN", "v15"), ("HK", "v13"), ("US", "v13"),
-                }
+                or is_allocation_v2_version(market, strategy_version)
             )
         )
         if staged_rotation_batch:
@@ -4050,7 +4016,7 @@ def _locked_report(
 ) -> tuple[Path, dict[str, object]]:
     batch_path = _batch_path(config, cycle.market, cycle.execution_date)
     if not batch_path.exists():
-        return _load_first_valid_report(config, cycle) or latest
+        return latest
     batch = _read_json(batch_path, "trend execution batch")
     path = Path(str(batch.get("report_path") or ""))
     report = _read_json(path, "locked trend report")

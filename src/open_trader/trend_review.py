@@ -22,6 +22,7 @@ from .strategy_drawdown import (
     ALLOCATION_DYNAMIC_PARAMETER_NAMES,
     ALLOCATION_PROJECTION_VERSIONS,
     ALLOCATION_V2_DYNAMIC_PARAMETER_NAMES,
+    is_allocation_v2_version,
 )
 from .trend_kelly import trend_kelly_identity_matches
 
@@ -114,7 +115,7 @@ PROTECTION_STATE_ROOTS = {
 TREND_STRATEGY_VERSIONS = frozenset(
     {
         "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14", "v15",
+        "v11", "v12", "v13", "v14", "v15", "v16",
     }
 )
 
@@ -6284,9 +6285,7 @@ def _uses_staged_rotation_execution(
         return True
     snapshot = report.get("strategy_snapshot")
     version = snapshot.get("strategy_version") if isinstance(snapshot, Mapping) else None
-    return (market, str(version or "")) in {
-        ("CN", "v15"), ("HK", "v13"), ("US", "v13"),
-    }
+    return is_allocation_v2_version(market, version)
 
 
 def _continuous_session_open(market: str, current: datetime) -> bool:
@@ -8425,11 +8424,7 @@ def _execute_relative_rotations_phase(
                     attempt += 1
                     continue
                 if _phase == "buy":
-                    allocation = report.get("allocation")
-                    allocation_v2 = (
-                        isinstance(allocation, Mapping)
-                        and allocation.get("version") == 2
-                    )
+                    allocation_v2 = _v2_execution_report(report, market)
                     if allocation_v2:
                         fallback = None
                     else:
@@ -10191,11 +10186,13 @@ def _remaining_buy_quantity(
     frozen_quantity = _required_decimal(
         action.get("estimated_shares"), "estimated shares"
     )
-    allocation = report.get("allocation")
-    allocation_v2 = (
-        isinstance(allocation, Mapping)
-        and allocation.get("version") == 2
+    metadata = report.get("metadata")
+    market = (
+        str(metadata.get("market") or "").upper()
+        if isinstance(metadata, Mapping)
+        else ""
     )
+    allocation_v2 = _v2_execution_report(report, market)
     if (
         lot_size <= 0
         or frozen_quantity <= 0
@@ -10357,9 +10354,7 @@ def _v2_execution_report(report: Mapping[str, object], market: str) -> bool:
         return True
     strategy = report.get("strategy_snapshot")
     version = str(strategy.get("strategy_version") or "") if isinstance(strategy, Mapping) else ""
-    return (str(market).upper(), version) in {
-        ("CN", "v15"), ("HK", "v13"), ("US", "v13"),
-    }
+    return is_allocation_v2_version(str(market).upper(), version)
 
 
 def _buy_basis_path(
@@ -10511,6 +10506,111 @@ def freeze_simulated_buy_fifo(
         for value in (*held_symbols, *pending_symbols)
         if normalize_code(value)
     }
+    strategy_snapshot = report.get("strategy_snapshot")
+    current_nominal = (
+        isinstance(strategy_snapshot, Mapping)
+        and str(strategy_snapshot.get("strategy_version") or "")
+        == ALLOCATION_PROJECTION_VERSIONS.get(market)
+    )
+    cash_remaining: Decimal | None = None
+    cash_fx = Decimal("1")
+    cash_cost_rate = Decimal("0")
+    credited_sell_keys: set[str] = set()
+    positions: list[object] | None = None
+    if current_nominal:
+        account = report.get("account")
+        risk_summary = report.get("risk_summary")
+        metadata = report.get("metadata")
+        strategy_parameters = (
+            strategy_snapshot.get("parameters")
+            if isinstance(strategy_snapshot, Mapping)
+            else None
+        )
+        try:
+            cash_remaining = Decimal(str(account["available_cash"])) if isinstance(
+                account, Mapping
+            ) else None
+            cash_fx = Decimal(
+                str(
+                    metadata.get("price_fx_to_account_currency", "1")
+                    if isinstance(metadata, Mapping)
+                    else "1"
+                )
+            )
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            return []
+        for raw_rate in (
+            risk_summary.get("normal_cost_rate")
+            if isinstance(risk_summary, Mapping)
+            else None,
+            strategy_parameters.get("normal_cost_rate")
+            if isinstance(strategy_parameters, Mapping)
+            else None,
+        ):
+            try:
+                candidate_rate = Decimal(str(raw_rate))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if candidate_rate.is_finite() and candidate_rate >= 0:
+                cash_cost_rate = candidate_rate
+                break
+        else:
+            return []
+        if (
+            cash_remaining is None
+            or not cash_remaining.is_finite()
+            or cash_remaining < 0
+            or not cash_fx.is_finite()
+            or cash_fx <= 0
+            or not cash_cost_rate.is_finite()
+            or cash_cost_rate < 0
+        ):
+            return []
+        if cash_remaining is not None:
+            holdings = judgments.get("holding_decisions")
+            holding_items = holdings if isinstance(holdings, list) else ()
+            positions = account.get("positions") if isinstance(account, Mapping) else None
+            sell_symbols = {
+                str(item.get("symbol") or "").strip().upper()
+                for item in holding_items
+                if isinstance(item, Mapping) and item.get("action") == "SELL_ALL"
+            }
+            if isinstance(positions, list):
+                for position in positions:
+                    if not isinstance(position, Mapping):
+                        continue
+                    position_keys = {
+                        key
+                        for value in (
+                            position.get("futu_symbol"),
+                            position.get("code"),
+                            position.get("symbol"),
+                        )
+                        if value not in (None, "")
+                        for key in (
+                            str(value).strip().upper(),
+                            normalize_code(value),
+                        )
+                        if key
+                    }
+                    if not position_keys & sell_symbols and not any(
+                        normalize_code(item.get("futu_symbol") or item.get("symbol"))
+                        in position_keys
+                        for item in holding_items
+                        if isinstance(item, Mapping) and item.get("action") == "SELL_ALL"
+                    ):
+                        continue
+                    try:
+                        proceeds = Decimal(str(
+                            position.get("market_value", position.get("market_val"))
+                        ))
+                    except (InvalidOperation, KeyError, TypeError, ValueError):
+                        continue
+                    if proceeds.is_finite() and proceeds >= 0:
+                        cash_remaining += proceeds * max(
+                            Decimal("0"), Decimal("1") - cash_cost_rate
+                        )
+                        credited_sell_keys.update(position_keys)
     by_code: dict[str, dict[str, object]] = {}
 
     def add_owner(
@@ -10556,7 +10656,19 @@ def freeze_simulated_buy_fifo(
             })
 
     for action_index, action in enumerate(judgments.get("formal_actions", [])):
-        if not isinstance(action, Mapping) or action.get("action") != "BUY":
+        if (
+            not isinstance(action, Mapping)
+            or action.get("action") != "BUY"
+            or (
+                current_nominal
+                and action.get("executable") is not True
+            )
+            or (
+                not current_nominal
+                and "executable" in action
+                and action.get("executable") is not True
+            )
+        ):
             continue
         try:
             code = trend_action_futu_symbol(report, action, market).strip().upper()
@@ -10615,6 +10727,90 @@ def freeze_simulated_buy_fifo(
             str(item.get("symbol") or item.get("futu_symbol") or ""),
         ),
     )
+    if current_nominal and cash_remaining is not None:
+        eligible_entries: list[dict[str, object]] = []
+        for entry in entries:
+            source = entry.get("source")
+            payload = entry.get("action") if source == "formal" else entry.get("pair")
+            try:
+                close = Decimal(str(payload["close"])) if isinstance(payload, Mapping) else None
+                shares = payload.get("estimated_shares") if isinstance(payload, Mapping) else None
+                lot_size = payload.get("lot_size") if isinstance(payload, Mapping) else None
+                if (
+                    close is None
+                    or isinstance(shares, bool)
+                    or not isinstance(shares, int)
+                    or shares <= 0
+                    or isinstance(lot_size, bool)
+                    or not isinstance(lot_size, int)
+                    or lot_size <= 0
+                    or shares % lot_size
+                    or not close.is_finite()
+                    or close <= 0
+                ):
+                    raise ValueError
+                required_cash = (
+                    Decimal(shares)
+                    * close
+                    * cash_fx
+                    * (Decimal("1") + cash_cost_rate)
+                )
+            except (InvalidOperation, KeyError, TypeError, ValueError, ArithmeticError):
+                required_cash = None
+            if required_cash is None:
+                continue
+            if required_cash is not None and source == "rotation":
+                sell_keys = {
+                    key
+                    for value in (
+                        payload.get("sell_futu_symbol") if isinstance(payload, Mapping) else None,
+                        payload.get("sell_symbol") if isinstance(payload, Mapping) else None,
+                    )
+                    if value not in (None, "")
+                    for key in (
+                        str(value).strip().upper(),
+                        normalize_code(value),
+                    )
+                    if key
+                }
+                if isinstance(positions, list) and sell_keys.isdisjoint(credited_sell_keys):
+                    for position in positions:
+                        if not isinstance(position, Mapping):
+                            continue
+                        position_keys = {
+                            key
+                            for value in (
+                                position.get("futu_symbol"),
+                                position.get("code"),
+                                position.get("symbol"),
+                            )
+                            if value not in (None, "")
+                            for key in (
+                                str(value).strip().upper(),
+                                normalize_code(value),
+                            )
+                            if key
+                        }
+                        if sell_keys.isdisjoint(position_keys):
+                            continue
+                        try:
+                            proceeds = Decimal(str(
+                                position.get("market_value", position.get("market_val"))
+                            ))
+                        except (InvalidOperation, KeyError, TypeError, ValueError):
+                            continue
+                        if proceeds.is_finite() and proceeds >= 0:
+                            cash_remaining += proceeds * max(
+                                Decimal("0"), Decimal("1") - cash_cost_rate
+                            )
+                            credited_sell_keys.update(position_keys)
+                        break
+            if required_cash is not None and required_cash > cash_remaining:
+                continue
+            if required_cash is not None:
+                cash_remaining -= required_cash
+            eligible_entries.append(entry)
+        entries = eligible_entries
     position_limit = 10
     allocation = report.get("allocation")
     if isinstance(allocation, Mapping):
@@ -10847,17 +11043,13 @@ def execute_trend_review_open(
             event_account_id = int(snapshot_account_id)
         except (TypeError, ValueError):
             event_account_id = None
-    allocation = report.get("allocation")
-    allocation_v2 = (
-        isinstance(allocation, Mapping)
-        and allocation.get("version") == 2
-    )
-    if not allocation_v2:
+    v2_execution = _v2_execution_report(report, market)
+    current_nominal = strategy_version == ALLOCATION_PROJECTION_VERSIONS.get(market)
+    if not v2_execution:
         nav = _required_decimal(snapshot.get("net_value"), "simulate net value")
         if nav <= 0:
             raise TrendReviewAccountStateError("simulate net value must be positive")
     report_sha = _report_hash(report)
-    v2_execution = _v2_execution_report(report, market)
     allowed_buy_symbols = {
         str(value).strip().upper() for value in (buy_symbols or ()) if str(value).strip()
     }
@@ -10918,7 +11110,7 @@ def execute_trend_review_open(
                 raise TrendReviewAccountStateError("simulate account snapshot is invalid")
             _ensure_discipline_account(data_dir, market, refreshed)
             snapshot = refreshed
-            if not allocation_v2:
+            if not v2_execution:
                 buy_basis = _freeze_buy_basis(
                     data_dir=data_dir,
                     report=report,
@@ -11392,8 +11584,13 @@ def execute_trend_review_open(
                 buy_window_event = ("missed", "buy_window_closed")
         if (
             action_name == "BUY"
-            and action.get("executable") is False
-            and not (v2_execution and allowed_buy_symbols)
+            and (
+                current_nominal
+                and action.get("executable") is not True
+                or not current_nominal
+                and "executable" in action
+                and action.get("executable") is not True
+            )
         ):
             # 待现金/席位条目：不真实下单、不记 missed；仅记一条说明性 pending 事件。
             _write_action_status_once(
@@ -12290,7 +12487,7 @@ def execute_trend_review_open(
                 )
                 attempt = latest_attempt + 1
                 if action_name == "BUY":
-                    if not allocation_v2 and futu_code not in quote_prices:
+                    if not v2_execution and futu_code not in quote_prices:
                         _write_action_status_once(
                             data_dir=data_dir,
                             market=market,
@@ -12331,7 +12528,7 @@ def execute_trend_review_open(
                                 residual_matches,
                                 (
                                     None
-                                    if allocation_v2
+                                    if v2_execution
                                     else _required_decimal(
                                         quote_prices.get(futu_code), "current quote price"
                                     )
@@ -12487,7 +12684,7 @@ def execute_trend_review_open(
         else:
             listed_orders: list[Mapping[str, object]] | None = None
             if action_name == "BUY":
-                if not allocation_v2 and futu_code not in quote_prices:
+                if not v2_execution and futu_code not in quote_prices:
                     _write_action_status_once(
                         data_dir=data_dir,
                         market=market,
@@ -12514,7 +12711,7 @@ def execute_trend_review_open(
                     (),
                     (
                         None
-                        if allocation_v2
+                        if v2_execution
                         else _required_decimal(
                             quote_prices.get(futu_code), "current quote price"
                         )
@@ -13284,7 +13481,6 @@ def normalize_trend_strategy_snapshot(
             raise ValueError("strategy snapshot is unavailable")
         from .a_share_trend import (
             ALLOCATION_REPORT_VERSIONS,
-            V2_ALLOCATION_VERSIONS,
             live_trend_strategy_snapshot,
             trend_strategy_snapshot,
         )
@@ -13292,9 +13488,7 @@ def normalize_trend_strategy_snapshot(
         version = str(snapshot.get("strategy_version") or "")
         allocation = None
         if version in ALLOCATION_REPORT_VERSIONS.get(market, ()):
-            allocation_version = (
-                2 if version == V2_ALLOCATION_VERSIONS[market] else 1
-            )
+            allocation_version = 2 if is_allocation_v2_version(market, version) else 1
             allocation_market = {
                 "rank": parameters.get("allocation_rank"),
                 "score": parameters.get("allocation_score"),
@@ -13318,7 +13512,7 @@ def normalize_trend_strategy_snapshot(
             }
         if version in {
             "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            "v11", "v12", "v13", "v14", "v15",
+            "v11", "v12", "v13", "v14", "v15", "v16",
         }:
             expected_snapshot = live_trend_strategy_snapshot(
                 market,
@@ -13386,7 +13580,7 @@ def _strategy_identity(snapshot: Mapping[str, object]) -> bytes:
         version = str(snapshot.get("strategy_version") or "")
         dynamic_names = (
             ALLOCATION_V2_DYNAMIC_PARAMETER_NAMES
-            if ALLOCATION_PROJECTION_VERSIONS.get(market) == version
+            if is_allocation_v2_version(market, version)
             else ALLOCATION_DYNAMIC_PARAMETER_NAMES
         )
         for name in dynamic_names:
@@ -14379,7 +14573,7 @@ def build_trend_review_projection(
         for fact in effective_facts
         if fact_identity(fact)[2] in {
             "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            "v11", "v12", "v13", "v14", "v15",
+            "v11", "v12", "v13", "v14", "v15", "v16",
         }
     ]
     target_candidates = live_facts or effective_facts
@@ -14788,7 +14982,7 @@ def rebuild_trend_report_from_evidence(
         required.add("normal_cost_rate")
     if strategy_version in {
         "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14", "v15",
+        "v11", "v12", "v13", "v14", "v15", "v16",
     }:
         required.update({"kelly_rounds", "kelly_data_reason"})
     if strategy_version in {
@@ -15177,7 +15371,7 @@ def rebuild_trend_report_from_evidence(
     normal_cost_rate = decimal_or_none(inputs.get("normal_cost_rate"))
     if strategy_version in {
         "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14", "v15",
+        "v11", "v12", "v13", "v14", "v15", "v16",
     } and (
         normal_cost_rate is None
         or not normal_cost_rate.is_finite()
@@ -15307,7 +15501,7 @@ def rebuild_trend_report_from_evidence(
             inputs["drawdown_summary"]
             if strategy_version in {
                 "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-                "v11", "v12", "v13", "v14", "v15",
+                "v11", "v12", "v13", "v14", "v15", "v16",
             }
             and isinstance(inputs.get("drawdown_summary"), Mapping)
             else None

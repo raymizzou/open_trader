@@ -1928,7 +1928,7 @@ def test_freeze_report_plans_seats_from_projected_full_exits(
     if formal_action == "SELL_ALL":
         unlock_live_drawdown(
             tmp_path / "data",
-            strategy_version="v15",
+            strategy_version="v16",
         )
     else:
         unlock_live_drawdown(
@@ -2497,6 +2497,2747 @@ def active_drawdown_for(
         "bootstrap_event": None,
         "recovery_event": None,
     }
+
+
+def current_nominal_allocation(market: str) -> dict[str, object]:
+    base = allocation_for(market, rank=2, entry_weight="0.04")
+    return {
+        "daily_path": base["daily_path"],
+        "sha256": base["sha256"],
+        "snapshot": build_allocation_snapshot(
+            allocation_date="2026-08-03",
+            generated_at="2026-08-03T16:18:00+08:00",
+            git_sha="a" * 40,
+            roots=base["snapshot"]["roots"],
+            previous=None,
+            version=2,
+        ),
+    }
+
+
+def current_nominal_strategy(
+    market: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    allocation = current_nominal_allocation(market)
+    return (
+        trend_module.live_trend_strategy_snapshot(
+            market, "abc123", (1,), allocation=allocation,
+        ),
+        allocation,
+    )
+
+
+def test_previous_versions_keep_stop_risk_limited_replay() -> None:
+    expected: dict[str, int] = {}
+    for market, version, symbol, asset, exchange, close, atr, lot_size in (
+        ("CN", "v15", "600001", "A股", "SH", "10", "10", 100),
+        ("HK", "v13", "0001", "港股", "HK", "10", "10", 100),
+        ("US", "v13", "AAPL", "美股", "US", "100", "100", 1),
+    ):
+        base = allocation_for(
+            market,
+            rank=2,
+            entry_weight="0.04",
+        )
+        allocation_snapshot = build_allocation_snapshot(
+            allocation_date="2026-08-03",
+            generated_at="2026-08-03T16:18:00+08:00",
+            git_sha="a" * 40,
+            roots=base["snapshot"]["roots"],
+            previous=None,
+            version=2,
+        )
+        allocation = {
+            "daily_path": base["daily_path"],
+            "sha256": base["sha256"],
+            "snapshot": allocation_snapshot,
+        }
+        strategy = trend_module.live_trend_strategy_snapshot(
+            market,
+            "abc123",
+            (1,),
+            strategy_version=version,
+            allocation=allocation,
+        )
+        item = replace(
+            candidate(
+                symbol,
+                exchange=exchange,
+                asset=asset,
+                close=close,
+                atr=atr,
+                market_cap="200" if market == "HK" else "100",
+                amount="3" if market == "HK" else "2",
+                global_strength="100",
+            ),
+            as_of_date="2026-08-03",
+        )
+        built = build_report(
+            as_of_date="2026-08-03",
+            execution_date="2026-08-04",
+            market=market,
+            account=AccountSnapshot(
+                source_date="2026-08-03",
+                fresh=True,
+                net_value=Decimal("100000"),
+                available_cash=Decimal("100000"),
+                positions=(),
+                exceptions=(),
+            ),
+            candidates=(item,),
+            holding_snapshots={},
+            bars_by_symbol={},
+            lot_sizes={symbol: lot_size} if market == "HK" else None,
+            strategy_snapshot=strategy,
+            allocation_reference=allocation,
+            drawdown_summary=active_drawdown_for(
+                strategy,
+                equity="100000",
+            ),
+        )
+        expected[market] = built.buy_actions[0].estimated_shares
+
+    assert expected == {"CN": 100, "HK": 100, "US": 1}
+
+
+def test_allocation_v2_selects_current_nominal_strategy_versions() -> None:
+    versions: dict[str, str] = {}
+    for market, expected_version in (
+        ("CN", "v16"),
+        ("HK", "v14"),
+        ("US", "v14"),
+    ):
+        base = allocation_for(
+            market,
+            rank=2,
+            entry_weight="0.04",
+        )
+        allocation_snapshot = build_allocation_snapshot(
+            allocation_date="2026-08-03",
+            generated_at="2026-08-03T16:18:00+08:00",
+            git_sha="a" * 40,
+            roots=base["snapshot"]["roots"],
+            previous=None,
+            version=2,
+        )
+        snapshot = trend_module.live_trend_strategy_snapshot(
+            market,
+            "abc123",
+            (1,),
+            allocation={
+                "daily_path": base["daily_path"],
+                "sha256": base["sha256"],
+                "snapshot": allocation_snapshot,
+            },
+        )
+        versions[market] = str(snapshot["strategy_version"])
+        assert snapshot["strategy_id"] == (
+            f"trend_animals_warm_to_hot/{market}/{expected_version}"
+        )
+
+    assert versions == {"CN": "v16", "HK": "v14", "US": "v14"}
+
+
+@pytest.mark.parametrize(
+    ("market", "version", "symbol", "asset", "exchange", "close", "lot_size"),
+    [
+        ("CN", "v16", "600001", "A股", "SH", "10", 100),
+        ("HK", "v14", "0001", "港股", "HK", "10", 100),
+        ("US", "v14", "AAPL", "美股", "US", "100", 1),
+    ],
+)
+def test_current_nominal_contract_accepts_missing_top_level_allocation_version(
+    market: str,
+    version: str,
+    symbol: str,
+    asset: str,
+    exchange: str,
+    close: str,
+    lot_size: int,
+) -> None:
+    strategy, allocation = current_nominal_strategy(market)
+    assert strategy["strategy_version"] == version
+    built = build_report(
+        as_of_date="2026-08-03",
+        execution_date="2026-08-04",
+        market=market,
+        account=AccountSnapshot(
+            source_date="2026-08-03",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            candidate(
+                symbol,
+                exchange=exchange,
+                asset=asset,
+                close=close,
+                atr="0.5",
+                market_cap="200" if market == "HK" else "100",
+                amount="3" if market == "HK" else "2",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        lot_sizes={symbol: lot_size} if market == "HK" else None,
+        metadata={"market": market},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    assert trend_module.valid_frozen_report_contract(payload) is True
+
+    markerless = copy.deepcopy(payload)
+    markerless_allocation = markerless.get("allocation")
+    assert isinstance(markerless_allocation, dict)
+    del markerless_allocation["version"]
+
+    assert (
+        trend_module.valid_frozen_report_contract(markerless),
+        payload,
+    ) == (True, trend_module._report_payload(built))
+
+
+def test_current_nominal_contract_accepts_data_missing_buy_action() -> None:
+    strategy, allocation = current_nominal_strategy("HK")
+    hk_candidate = replace(
+        candidate(
+            "0001",
+            asset="港股",
+            exchange="HK",
+            close="50",
+            atr="0.5",
+            market_cap="200",
+            amount="3",
+            global_strength="100",
+        ),
+        as_of_date="2026-08-03",
+    )
+    built = build_report(
+        as_of_date="2026-08-03",
+        execution_date="2026-08-04",
+        market="HK",
+        account=AccountSnapshot(
+            source_date="2026-08-03",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(hk_candidate,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "HK"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    payload = trend_module._report_payload(built)
+    buy = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+
+    assert (
+        Decimal(str(buy["target_amount"])),
+        buy["lot_size"],
+        buy["estimated_shares"],
+        buy["executable"],
+        buy["sizing_note"],
+        trend_module.valid_frozen_report_contract(payload),
+    ) == (
+        Decimal("4000"),
+        0,
+        0,
+        False,
+        "每手股数未知，无法定量",
+        True,
+    )
+
+
+def test_current_nominal_contract_rejects_non_boolean_executable() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    built = build_report(
+        as_of_date="2026-08-03",
+        execution_date="2026-08-04",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-08-03",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            replace(
+                candidate("600001", global_strength="100"),
+                as_of_date="2026-08-03",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    buy = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    buy["executable"] = "false"
+
+    assert trend_module.valid_frozen_report_contract(payload) is False
+
+
+def test_current_nominal_contract_rejects_data_missing_target_rewrite() -> None:
+    strategy, allocation = current_nominal_strategy("HK")
+    built = build_report(
+        as_of_date="2026-08-03",
+        execution_date="2026-08-04",
+        market="HK",
+        account=AccountSnapshot(
+            source_date="2026-08-03",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            replace(
+                candidate(
+                    "0001",
+                    asset="港股",
+                    exchange="HK",
+                    close="50",
+                    atr="0.5",
+                    market_cap="200",
+                    amount="3",
+                    global_strength="100",
+                ),
+                as_of_date="2026-08-03",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "HK"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    buy = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    assert (
+        Decimal(str(buy["target_amount"])),
+        buy["lot_size"],
+        buy["estimated_shares"],
+        trend_module.valid_frozen_report_contract(payload),
+    ) == (Decimal("4000"), 0, 0, True)
+
+    buy["target_amount"] = "1996"
+
+    assert trend_module.valid_frozen_report_contract(payload) is False
+
+
+def test_current_nominal_markerless_contract_rejects_non_lot_frozen_quantity() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    cn_candidate = replace(
+        candidate(
+            "600001",
+            asset="A股",
+            exchange="SH",
+            close="10",
+            atr="0.5",
+            market_cap="100",
+            amount="2",
+            global_strength="100",
+        ),
+        as_of_date="2026-08-03",
+    )
+    built = build_report(
+        as_of_date="2026-08-03",
+        execution_date="2026-08-04",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-08-03",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(cn_candidate,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    markerless_allocation = payload["allocation"]
+    assert isinstance(markerless_allocation, dict)
+    del markerless_allocation["version"]
+    buy = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    buy["estimated_shares"] = 101
+
+    assert trend_module.valid_frozen_report_contract(payload) is False
+
+
+def test_current_nominal_markerless_contract_rejects_coherent_three_percent_tamper() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    built = build_report(
+        as_of_date="2026-08-03",
+        execution_date="2026-08-04",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-08-03",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            replace(
+                candidate(
+                    "600001",
+                    close="9",
+                    atr="0.5",
+                    global_strength="100",
+                ),
+                as_of_date="2026-08-03",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    markerless = trend_module._report_payload(built)
+    allocation_payload = markerless["allocation"]
+    assert isinstance(allocation_payload, dict)
+    del allocation_payload["version"]
+    tampered = copy.deepcopy(markerless)
+    buy = next(
+        item
+        for item in tampered["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    buy.update(
+        {
+            "target_weight": "0.03",
+            "target_amount": "3000.00",
+            "estimated_shares": 300,
+            "estimated_initial_line": "8.0",
+            "normal_cost": "2.700",
+            "planned_stop_risk": "302.700",
+            "planned_stop_risk_pct": "0.003027",
+        }
+    )
+    tampered["risk_summary"].update(
+        {
+            "new_planned_risk": "302.700",
+            "portfolio_planned_risk": "302.700",
+            "portfolio_planned_risk_pct": "0.003027",
+            "portfolio_remaining_risk": "3697.300",
+            "portfolio_remaining_risk_pct": "0.036973",
+        }
+    )
+
+    assert (
+        trend_module.valid_frozen_report_contract(markerless),
+        trend_module.valid_frozen_report_contract(tampered),
+    ) == (True, False)
+
+
+def test_current_nominal_sell_only_report_freezes_zero_buy_seats(tmp_path: Path) -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    position = AccountPosition(
+        "600001",
+        "股票600001",
+        "stock",
+        Decimal("100"),
+        Decimal("9"),
+        Decimal("1000"),
+    )
+    built = build_report(
+        as_of_date="2026-08-03",
+        execution_date="2026-08-04",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-08-03",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(position,),
+            exceptions=(),
+            position_count=1,
+        ),
+        candidates=(),
+        holding_snapshots={
+            "600001": replace(
+                holding("600001", danger=True),
+                as_of_date="2026-08-03",
+            ),
+        },
+        bars_by_symbol={},
+        metadata={"market": "CN"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    frozen = trend_module._freeze_report_simulated_buy_plan(
+        built, tmp_path / "data"
+    )
+    payload = trend_module._report_payload(frozen)
+    judgments = payload["strategy_judgments"]
+
+    assert (
+        judgments["simulated_buy_fifo"],
+        judgments["planned_new_seats"],
+        trend_module.valid_frozen_report_contract(payload),
+    ) == ([], 0, True)
+
+
+def test_current_nominal_formal_buy_uses_net_forced_sale_proceeds() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    position = AccountPosition(
+        "600001",
+        "股票600001",
+        "stock",
+        Decimal("100"),
+        Decimal("9"),
+        Decimal("1000"),
+    )
+    built = build_report(
+        as_of_date="2026-08-03",
+        execution_date="2026-08-04",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-08-03",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("1"),
+            positions=(position,),
+            exceptions=(),
+            position_count=1,
+        ),
+        candidates=(
+            replace(
+                candidate(
+                    "600999",
+                    close="10",
+                    atr="0.5",
+                    global_strength="100",
+                ),
+                as_of_date="2026-08-03",
+            ),
+        ),
+        holding_snapshots={
+            "600001": replace(
+                holding("600001", danger=True),
+                as_of_date="2026-08-03",
+            ),
+        },
+        bars_by_symbol={},
+        metadata={
+            "market": "CN",
+            "price_fx_to_account_currency": "1",
+        },
+        normal_cost_rate=Decimal("0.001"),
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    action = built.buy_actions[0]
+
+    assert (
+        action.target_amount,
+        action.estimated_shares,
+        action.executable,
+    ) == (Decimal("4000"), 100, False)
+
+
+def test_current_nominal_core_accepts_real_formal_buy_funded_by_net_forced_sale() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    position = AccountPosition(
+        "600001",
+        "股票600001",
+        "stock",
+        Decimal("100"),
+        Decimal("9"),
+        Decimal("1000"),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(candidate("600999", close="10", atr="0.5", global_strength="100"),),
+        holding_snapshots={},
+        bars_by_symbol={},
+        normal_cost_rate=Decimal("0.001"),
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "eastmoney"},
+            positions=(position,),
+            holding_snapshots={"600001": holding("600001", danger=True)},
+            bars_by_symbol={"600001": bars()},
+            prior_state=None,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("2"),
+            position_count=1,
+        ),
+    )
+    payload = trend_module._report_payload(built)
+    real_action = payload["strategy_judgments"]["real_buy_actions"][0]
+
+    assert (
+        real_action["executable"],
+        real_action["estimated_shares"],
+        trend_module.valid_frozen_report_contract(payload),
+    ) == (True, 100, True)
+
+
+def test_current_nominal_contract_rejects_gross_forced_sale_cash_authorization() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    position = AccountPosition(
+        "600001",
+        "股票600001",
+        "stock",
+        Decimal("100"),
+        Decimal("9"),
+        Decimal("1000"),
+    )
+    built = build_report(
+        as_of_date="2026-08-03",
+        execution_date="2026-08-04",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-08-03",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("1"),
+            positions=(position,),
+            exceptions=(),
+            position_count=1,
+        ),
+        candidates=(
+            replace(
+                candidate(
+                    "600999",
+                    close="10",
+                    atr="0.5",
+                    global_strength="100",
+                ),
+                as_of_date="2026-08-03",
+            ),
+        ),
+        holding_snapshots={
+            "600001": replace(
+                holding("600001", danger=True),
+                as_of_date="2026-08-03",
+            ),
+        },
+        bars_by_symbol={},
+        metadata={
+            "market": "CN",
+            "price_fx_to_account_currency": "1",
+        },
+        normal_cost_rate=Decimal("0.001"),
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    tampered = copy.deepcopy(payload)
+    buy = next(
+        item
+        for item in tampered["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    buy["executable"] = True
+    tampered["risk_summary"].update(
+        {
+            "new_planned_risk": "101.000",
+            "portfolio_planned_risk": "101.000",
+            "portfolio_planned_risk_pct": "0.00101",
+            "portfolio_remaining_risk": "3899.000",
+            "portfolio_remaining_risk_pct": "0.03899",
+            "pending_entries_note": "",
+        }
+    )
+
+    assert (
+        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(tampered),
+    ) == (True, False)
+
+
+@pytest.mark.parametrize(
+    ("market", "strategy_version", "lot_rule"),
+    [
+        ("CN", "v16", "100 股整数倍"),
+        ("HK", "v14", "Futu 每标的整手"),
+        ("US", "v14", "1 股整数倍"),
+    ],
+)
+def test_current_nominal_strategy_snapshot_describes_audit_only_stop_risk(
+    market: str,
+    strategy_version: str,
+    lot_rule: str,
+) -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        market,
+        "abc123",
+        (),
+        strategy_version=strategy_version,
+        allocation=current_nominal_allocation(market),
+    )
+    buy_quantity = next(
+        row["value"]
+        for row in snapshot["parameter_rows"]
+        if row["name"] == "买入数量"
+    )
+
+    assert (
+        lot_rule in buy_quantity,
+        "计划止损风险仅审计，不参与买入数量" in buy_quantity,
+        "最小一手不因" not in buy_quantity,
+        "仅以额外风险提示标注" not in buy_quantity,
+    ) == (True, True, True, True)
+
+
+def test_current_nominal_contract_allows_zero_nav_real_account_without_real_actions() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=account(),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="676549.55"),
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "eastmoney"},
+            positions=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            prior_state=None,
+            net_value=Decimal("0"),
+            available_cash=Decimal("0"),
+        ),
+    )
+
+    payload = trend_module._report_payload(built)
+    real_account = payload["plan_availability"]["real_account"]
+
+    assert (
+        real_account["status"],
+        real_account["executable"],
+        real_account["net_value"],
+        real_account["available_cash"],
+        payload["strategy_judgments"]["real_buy_actions"],
+        payload["strategy_judgments"]["real_rotation_pairs"],
+    ) == ("available", False, "0", "0", [], [])
+
+
+def test_current_nominal_versions_ignore_stop_risk_when_sizing_four_percent_target() -> None:
+    observed: dict[str, tuple[Decimal, int]] = {}
+    for market, symbol, asset, exchange, close, atr, lot_size in (
+        ("CN", "600001", "A股", "SH", "10", "10", 100),
+        ("HK", "0001", "港股", "HK", "10", "10", 100),
+        ("US", "AAPL", "美股", "US", "100", "100", 1),
+    ):
+        strategy, allocation = current_nominal_strategy(market)
+        built = build_report(
+            as_of_date="2026-07-14",
+            execution_date="2026-07-15",
+            market=market,
+            account=AccountSnapshot(
+                source_date="2026-07-14",
+                fresh=True,
+                net_value=Decimal("100000"),
+                available_cash=Decimal("100000"),
+                positions=(),
+                exceptions=(),
+            ),
+            candidates=(
+                    candidate(
+                        symbol,
+                        asset=asset,
+                        exchange=exchange,
+                        close=close,
+                        atr=atr,
+                        market_cap="200" if market == "HK" else "100",
+                        amount="3" if market == "HK" else "2",
+                        global_strength="100",
+                    ),
+            ),
+            holding_snapshots={},
+            bars_by_symbol={},
+            lot_sizes={symbol: lot_size} if market == "HK" else None,
+            strategy_snapshot=strategy,
+            allocation_reference=allocation,
+            drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        )
+        action = built.buy_actions[0]
+        observed[market] = (action.target_amount, action.estimated_shares)
+
+    assert observed == {
+        "CN": (Decimal("4000"), 400),
+        "HK": (Decimal("4000"), 400),
+        "US": (Decimal("4000"), 40),
+    }
+
+
+def test_current_nominal_validator_rejects_coherent_action_price_tamper() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            candidate(
+                "600001",
+                close="10",
+                atr="1",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    action = built.buy_actions[0]
+    tampered = replace(
+        built,
+        buy_actions=(
+            replace(
+                action,
+                target_amount=Decimal("4000"),
+                estimated_shares=200,
+                close=Decimal("20"),
+                atr=Decimal("1"),
+                estimated_initial_line=Decimal("18"),
+                normal_cost=Decimal("4"),
+                planned_stop_risk=Decimal("404"),
+                planned_stop_risk_pct=Decimal("0.00404"),
+            ),
+        ),
+        risk_summary={
+            **built.risk_summary,
+            "new_planned_risk": Decimal("404"),
+            "portfolio_planned_risk": Decimal("404"),
+            "portfolio_planned_risk_pct": Decimal("0.00404"),
+            "portfolio_remaining_risk": Decimal("3596"),
+            "portfolio_remaining_risk_pct": Decimal("0.03596"),
+            "status_label": "风险预算内",
+        },
+    )
+
+    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+        trend_module._report_payload(tampered)
+
+
+def test_current_nominal_contract_rejects_initial_line_tamper() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            candidate("600001", close="10", atr="0.5", global_strength="100"),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    tampered = copy.deepcopy(payload)
+    action = next(
+        item
+        for item in tampered["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    action["estimated_initial_line"] = "999999"
+
+    assert (
+        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(tampered),
+    ) == (True, False)
+
+
+def test_current_nominal_validator_accepts_cost_limited_cash_boundary() -> None:
+    strategy, allocation = current_nominal_strategy("US")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="US",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("4000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            candidate(
+                "AAPL",
+                asset="美股",
+                exchange="US",
+                close="100",
+                atr="0.5",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        normal_cost_rate=Decimal("0.001"),
+        metadata={"market": "US", "broker": "futu"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    payload = trend_module._report_payload(built)
+    action = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+
+    assert (
+        Decimal(str(action["target_amount"])),
+        action["estimated_shares"],
+        Decimal(str(action["normal_cost"])),
+        action["executable"],
+    ) == (Decimal("4000"), 39, Decimal("3.9"), True)
+
+
+def test_current_nominal_contract_rejects_cash_insufficient_executable_buy() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    built = build_report(
+        as_of_date="2026-08-03",
+        execution_date="2026-08-04",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-08-03",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            replace(
+                candidate("600001", close="10", atr="0.5", global_strength="100"),
+                as_of_date="2026-08-03",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    action = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    tampered = copy.deepcopy(payload)
+    tampered_action = next(
+        item
+        for item in tampered["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    tampered_action["executable"] = True
+    tampered["risk_summary"].update(
+        {
+            "new_planned_risk": "101.000",
+            "portfolio_planned_risk": "101.000",
+            "portfolio_planned_risk_pct": "0.00101",
+            "portfolio_remaining_risk": "3899.000",
+            "portfolio_remaining_risk_pct": "0.03899",
+            "pending_entries_note": "",
+        }
+    )
+
+    assert (
+        action["target_amount"],
+        action["estimated_shares"],
+        action["executable"],
+        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(tampered),
+    ) == ("4000.00", 100, False, True, False)
+
+
+def test_current_nominal_contract_rejects_missing_formal_buy_executable() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    built = build_report(
+        as_of_date="2026-08-03",
+        execution_date="2026-08-04",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-08-03",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            replace(
+                candidate("600001", close="10", atr="0.5", global_strength="100"),
+                as_of_date="2026-08-03",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    tampered = copy.deepcopy(payload)
+    action = next(
+        item
+        for item in tampered["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    del action["executable"]
+
+    original_action = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    assert (
+        original_action["executable"],
+        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(tampered),
+    ) == (False, True, False)
+
+
+def test_current_nominal_contract_rejects_duplicate_frozen_candidate_symbol() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    built = build_report(
+        as_of_date="2026-08-03",
+        execution_date="2026-08-04",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-08-03",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            replace(
+                candidate("600001", close="10", atr="0.5", global_strength="100"),
+                as_of_date="2026-08-03",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    tampered = copy.deepcopy(payload)
+    candidates = tampered["signal_snapshots"]["candidates"]
+    duplicate = copy.deepcopy(candidates[0])
+    duplicate["close"] = "20"
+    candidates.append(duplicate)
+    action = next(
+        item
+        for item in tampered["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    action.update(
+        {
+            "close": "20",
+            "estimated_shares": 200,
+            "estimated_initial_line": "19",
+            "normal_cost": "4.000",
+            "planned_stop_risk": "204.000",
+            "planned_stop_risk_pct": "0.00204",
+        }
+    )
+    tampered["risk_summary"].update(
+        {
+            "new_planned_risk": "204.000",
+            "portfolio_planned_risk": "204.000",
+            "portfolio_planned_risk_pct": "0.00204",
+            "portfolio_remaining_risk": "3796.000",
+            "portfolio_remaining_risk_pct": "0.03796",
+        }
+    )
+
+    assert (
+        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(tampered),
+    ) == (True, False)
+
+
+def test_current_nominal_contract_rejects_non_boolean_real_buy_executable() -> None:
+    strategy, allocation = current_nominal_strategy("US")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="US",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            candidate(
+                "AAPL",
+                asset="美股",
+                exchange="US",
+                close="100",
+                atr="0.5",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        normal_cost_rate=Decimal("0.001"),
+        metadata={"market": "US", "broker": "futu"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "tiger"},
+            positions=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            prior_state=None,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("4000"),
+        ),
+    )
+    payload = trend_module._report_payload(built)
+    tampered = copy.deepcopy(payload)
+    real_action = tampered["strategy_judgments"]["real_buy_actions"][0]
+    real_action["executable"] = "false"
+
+    assert (
+        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(tampered),
+    ) == (True, False)
+
+
+def test_current_nominal_real_validator_accepts_cost_limited_cash_boundary() -> None:
+    strategy, allocation = current_nominal_strategy("US")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="US",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            candidate(
+                "AAPL",
+                asset="美股",
+                exchange="US",
+                close="100",
+                atr="0.5",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        normal_cost_rate=Decimal("0.001"),
+        metadata={"market": "US", "broker": "futu"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "tiger"},
+            positions=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            prior_state=None,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("4000"),
+        ),
+    )
+
+    payload = trend_module._report_payload(built)
+    action = payload["strategy_judgments"]["real_buy_actions"][0]
+    real_account = payload["plan_availability"]["real_account"]
+
+    assert (
+        Decimal(str(action["target_amount"])),
+        action["estimated_shares"],
+        Decimal(str(action["normal_cost"])),
+        real_account["executable"],
+    ) == (Decimal("4000"), 39, Decimal("3.9"), False)
+
+
+def test_current_nominal_contract_rejects_cash_insufficient_executable_real_buy() -> None:
+    strategy, allocation = current_nominal_strategy("US")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="US",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            candidate(
+                "AAPL",
+                asset="美股",
+                exchange="US",
+                close="100",
+                atr="0.5",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        normal_cost_rate=Decimal("0.001"),
+        metadata={"market": "US", "broker": "futu"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "tiger"},
+            positions=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            prior_state=None,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("50"),
+        ),
+    )
+    payload = trend_module._report_payload(built)
+    tampered = copy.deepcopy(payload)
+    real_action = tampered["strategy_judgments"]["real_buy_actions"][0]
+    real_action["executable"] = True
+
+    original_action = payload["strategy_judgments"]["real_buy_actions"][0]
+    assert (
+        original_action["executable"],
+        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(tampered),
+    ) == (False, True, False)
+
+
+def test_current_nominal_rotation_validator_accepts_cost_limited_cash_boundary() -> None:
+    strategy, allocation = current_nominal_strategy("US")
+    positions = tuple(
+        AccountPosition(
+            "OLD",
+            "股票OLD",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("1000"),
+        )
+        for _ in range(1)
+    )
+    holding_snapshots = {
+        "OLD": holding(
+            "OLD",
+            asset="美股",
+            danger=True,
+            strength="70",
+            global_strength="70",
+        ),
+    }
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="US",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("3001"),
+            positions=positions,
+            exceptions=(),
+            position_count=15,
+        ),
+        candidates=(
+            candidate(
+                "AAPL",
+                asset="美股",
+                exchange="US",
+                close="100",
+                atr="0.5",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots=holding_snapshots,
+        bars_by_symbol={"OLD": bars()},
+        normal_cost_rate=Decimal("0.001"),
+        metadata={"market": "US", "broker": "futu"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    payload = trend_module._report_payload(built)
+    assert trend_module.valid_frozen_report_contract(payload)
+    pair = payload["strategy_judgments"]["simulate_rotation_pairs"][0]
+
+    assert (
+        Decimal(str(pair["target_amount"])),
+        pair["estimated_shares"],
+    ) == (Decimal("4000"), 39)
+
+
+def test_current_nominal_core_real_rotation_uses_available_cash_plus_net_sale() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    positions = tuple(
+        AccountPosition(
+            f"600{index:03d}",
+            f"股票600{index:03d}",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("1000"),
+        )
+        for index in range(15)
+    )
+    holding_snapshots = {
+        position.symbol: holding(
+            position.symbol,
+            strength="70",
+            global_strength="70",
+        )
+        for position in positions
+    }
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(candidate("600999", close="10", atr="0.5", global_strength="100"),),
+        holding_snapshots={},
+        bars_by_symbol={},
+        normal_cost_rate=Decimal("0.001"),
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "eastmoney"},
+            positions=positions,
+            holding_snapshots=holding_snapshots,
+            bars_by_symbol={position.symbol: bars() for position in positions},
+            prior_state=None,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("2"),
+            position_count=15,
+        ),
+    )
+    payload = trend_module._report_payload(built)
+    pair = payload["strategy_judgments"]["real_rotation_pairs"][0]
+    sell_symbol = pair["sell_symbol"]
+
+    short_cash = copy.deepcopy(payload)
+    short_cash["plan_availability"]["real_account"]["available_cash"] = "0"
+    missing_sale_value = copy.deepcopy(payload)
+    real_signal = missing_sale_value["signal_snapshots"]["real_holdings"][sell_symbol]
+    assert isinstance(real_signal, dict)
+    del real_signal["market_value"]
+
+    assert (
+        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(short_cash),
+        trend_module.valid_frozen_report_contract(missing_sale_value),
+    ) == (True, False, False)
+
+
+def test_current_nominal_core_real_rotation_accepts_missing_unused_sale_value() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    positions = tuple(
+        AccountPosition(
+            f"600{index:03d}",
+            f"股票600{index:03d}",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("1000"),
+        )
+        for index in range(15)
+    )
+    holding_snapshots = {
+        position.symbol: holding(
+            position.symbol,
+            strength="70",
+            global_strength="70",
+        )
+        for position in positions
+    }
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(candidate("600999", close="10", atr="0.5", global_strength="100"),),
+        holding_snapshots={},
+        bars_by_symbol={},
+        normal_cost_rate=Decimal("0.001"),
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "eastmoney"},
+            positions=positions,
+            holding_snapshots=holding_snapshots,
+            bars_by_symbol={position.symbol: bars() for position in positions},
+            prior_state=None,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            position_count=15,
+        ),
+    )
+    payload = trend_module._report_payload(built)
+    pair = payload["strategy_judgments"]["real_rotation_pairs"][0]
+    sell_symbol = pair["sell_symbol"]
+
+    missing_sale_value = copy.deepcopy(payload)
+    real_signal = missing_sale_value["signal_snapshots"]["real_holdings"][sell_symbol]
+    assert isinstance(real_signal, dict)
+    del real_signal["market_value"]
+
+    assert trend_module.valid_frozen_report_contract(missing_sale_value) is True
+
+
+def test_current_nominal_contract_rejects_cash_insufficient_automatic_rotation() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    held_symbols = ("600000", *(f"600{index:03d}" for index in range(2, 16)))
+    positions = tuple(
+        AccountPosition(
+            symbol,
+            f"股票{symbol}",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("1000"),
+        )
+        for symbol in held_symbols
+    )
+    holding_snapshots = {
+        symbol: holding(
+            symbol,
+            danger=symbol == "600000",
+            strength="70",
+            global_strength="70",
+        )
+        for symbol in held_symbols
+    }
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("2"),
+            positions=positions,
+            exceptions=(),
+            position_count=15,
+        ),
+        candidates=(
+            candidate(
+                "600001",
+                close="10",
+                atr="0.5",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots=holding_snapshots,
+        bars_by_symbol={symbol: bars() for symbol in held_symbols},
+        normal_cost_rate=Decimal("0.001"),
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    payload["strategy_judgments"]["formal_actions"] = []
+    tampered = copy.deepcopy(payload)
+    tampered["account"]["available_cash"] = "0"
+
+    assert (
+        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(tampered),
+    ) == (True, False)
+
+
+def test_current_nominal_rotation_validator_applies_frozen_kelly_cap() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    positions = tuple(
+        AccountPosition(
+            f"600{index:03d}",
+            f"股票600{index:03d}",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("1000"),
+        )
+        for index in range(15)
+    )
+    holding_snapshots = {
+        position.symbol: holding(
+            position.symbol,
+            strength="70",
+            global_strength="70",
+        )
+        for position in positions
+    }
+    kelly_rounds = tuple(
+        replace(
+            item,
+            market="CN",
+            strategy_id="trend_animals_warm_to_hot/CN/v16",
+            opening_strategy_version="v16",
+        )
+        for item in _trend_kelly_rounds(*(["0.10"] * 15 + ["-0.099"] * 15))
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=positions,
+            exceptions=(),
+            position_count=15,
+        ),
+        candidates=(candidate("600999", close="10", atr="0.5", global_strength="100"),),
+        holding_snapshots=holding_snapshots,
+        bars_by_symbol={position.symbol: bars() for position in positions},
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        kelly_rounds=kelly_rounds,
+    )
+
+    payload = trend_module._report_payload(built)
+    pair = payload["strategy_judgments"]["simulate_rotation_pairs"][0]
+
+    assert (
+        built.risk_summary["kelly_cap"],
+        Decimal(str(pair["target_weight"])),
+        Decimal(str(pair["target_amount"])),
+        pair["estimated_shares"],
+        trend_module.valid_frozen_report_contract(payload),
+    ) == (
+        Decimal("0.012626"),
+        Decimal("0.012626"),
+        Decimal("1262.60"),
+        100,
+        True,
+    )
+
+
+def test_current_nominal_real_validator_applies_frozen_kelly_cap() -> None:
+    strategy, allocation = current_nominal_strategy("US")
+    kelly_rounds = tuple(
+        replace(
+            item,
+            market="US",
+            strategy_id="trend_animals_warm_to_hot/US/v14",
+            opening_strategy_version="v14",
+        )
+        for item in _trend_kelly_rounds(*(["0.10"] * 15 + ["-0.099"] * 15))
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="US",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            candidate(
+                "AAPL",
+                asset="美股",
+                exchange="US",
+                close="100",
+                atr="0.5",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "US", "broker": "tiger"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "tiger"},
+            positions=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            prior_state=None,
+            net_value=Decimal("50000"),
+            available_cash=Decimal("50000"),
+        ),
+        kelly_rounds=kelly_rounds,
+    )
+
+    payload = trend_module._report_payload(built)
+    action = payload["strategy_judgments"]["real_buy_actions"][0]
+
+    assert (
+        Decimal(str(action["target_weight"])),
+        Decimal(str(action["target_amount"])),
+        action["estimated_shares"],
+        trend_module.valid_frozen_report_contract(payload),
+    ) == (Decimal("0.012626"), Decimal("631.30"), 6, True)
+
+
+def test_current_nominal_contract_rejects_coherent_audit_risk_tamper() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(candidate("600001", close="10", atr="10", global_strength="100"),),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    tampered = copy.deepcopy(payload)
+    action = next(
+        item
+        for item in tampered["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    action.update(
+        {
+            "normal_cost": "1",
+            "planned_stop_risk": "8001",
+            "planned_stop_risk_pct": "0.08001",
+        }
+    )
+    tampered["risk_summary"].update(
+        {
+            "new_planned_risk": "8001",
+            "portfolio_planned_risk": "8001",
+            "portfolio_planned_risk_pct": "0.08001",
+            "portfolio_remaining_risk": "0",
+            "portfolio_remaining_risk_pct": "0",
+            "status_label": "计划止损风险仅审计，不参与买入数量",
+        }
+    )
+
+    assert (
+        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(tampered),
+    ) == (True, False)
+
+
+def test_current_nominal_rotation_validator_includes_paired_sell_proceeds() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    positions = tuple(
+        AccountPosition(
+            f"600{index:03d}",
+            f"股票600{index:03d}",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("5000") if index == 0 else Decimal("1000"),
+        )
+        for index in range(15)
+    )
+    holding_snapshots = {
+        position.symbol: holding(
+            position.symbol,
+            strength="70",
+            global_strength="70",
+        )
+        for position in positions
+    }
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("0"),
+            positions=positions,
+            exceptions=(),
+            position_count=15,
+        ),
+        candidates=(candidate("600999", close="10", atr="0.5", global_strength="100"),),
+        holding_snapshots=holding_snapshots,
+        bars_by_symbol={position.symbol: bars() for position in positions},
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    payload = trend_module._report_payload(built)
+    pair = payload["strategy_judgments"]["simulate_rotation_pairs"][0]
+
+    assert (
+        Decimal(str(pair["target_amount"])),
+        pair["estimated_shares"],
+        trend_module.valid_frozen_report_contract(payload),
+    ) == (Decimal("4000"), 400, True)
+
+
+def test_current_nominal_real_plan_validates_beyond_display_candidate_limit() -> None:
+    strategy, allocation = current_nominal_strategy("US")
+    candidates = tuple(
+        candidate(
+            f"SYM{index:02d}",
+            asset="美股",
+            exchange="US",
+            close="100",
+            atr="0.5",
+            global_strength=str(100 - index),
+        )
+        for index in range(16)
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="US",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=candidates,
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "US", "broker": "futu"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "tiger"},
+            positions=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            prior_state=None,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+        ),
+    )
+
+    payload = trend_module._report_payload(built)
+
+    assert (
+        len(payload["strategy_judgments"]["top10_candidates"]),
+        len(payload["signal_snapshots"]["candidates"]),
+        len(payload["strategy_judgments"]["real_buy_actions"]),
+        payload["strategy_judgments"]["real_buy_actions"][-1]["symbol"],
+    ) == (15, 16, 16, "SYM15")
+
+
+@pytest.mark.parametrize(
+    ("market", "strategy_version"),
+    [("CN", "v15"), ("HK", "v13"), ("US", "v13")],
+)
+def test_previous_allocation_versions_keep_real_account_availability_shape(
+    market: str, strategy_version: str,
+) -> None:
+    strategy = trend_module.live_trend_strategy_snapshot(
+        market,
+        "abc123",
+        (1,),
+        strategy_version=strategy_version,
+        allocation=current_nominal_allocation(market),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market=market,
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={
+            "market": market,
+            "broker": {"CN": "eastmoney", "HK": "phillips", "US": "futu"}[market],
+        },
+        strategy_snapshot=strategy,
+        allocation_reference=current_nominal_allocation(market),
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "historical"},
+            positions=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            prior_state=None,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("4000"),
+        ),
+    )
+
+    payload = trend_module._report_payload(built)
+
+    assert payload["plan_availability"]["real_account"] == {
+        "status": "available",
+        "reason": "",
+        "executable": False,
+    }
+
+
+def test_current_nominal_validator_keeps_nominal_target_with_minimum_lot_fallback() -> None:
+    strategy, allocation = current_nominal_strategy("HK")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="HK",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            candidate(
+                "0001",
+                asset="港股",
+                exchange="HK",
+                close="50",
+                amount="3",
+                market_cap="200",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        lot_sizes={"0001": 100},
+        metadata={"market": "HK", "broker": "phillips"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    payload = trend_module._report_payload(built)
+    action = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+
+    assert (
+        Decimal(str(action["target_amount"])),
+        action["estimated_shares"],
+    ) == (Decimal("4000"), 100)
+
+
+def test_us_current_nominal_version_real_plan_uses_real_nav_four_percent_target() -> None:
+    strategy, allocation = current_nominal_strategy("US")
+    simulated = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        positions=(),
+        exceptions=(),
+    )
+    real = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "tiger"},
+        positions=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state=None,
+        net_value=Decimal("50000"),
+        available_cash=Decimal("50000"),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="US",
+        account=simulated,
+        candidates=(
+            candidate(
+                "AAPL",
+                asset="美股",
+                exchange="US",
+                close="125",
+                atr="0.5",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "US", "broker": "tiger"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        real_holdings=real,
+    )
+
+    assert (
+        built.buy_actions[0].target_amount,
+        built.buy_actions[0].estimated_shares,
+        built.real_buy_actions[0].target_amount,
+        built.real_buy_actions[0].estimated_shares,
+    ) == (Decimal("4000"), 32, Decimal("2000"), 16)
+
+
+def test_current_nominal_validator_rejects_falsified_real_plan_amount_and_quantity() -> None:
+    strategy, allocation = current_nominal_strategy("US")
+    simulated = AccountSnapshot(
+        source_date="2026-07-14",
+        fresh=True,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        positions=(),
+        exceptions=(),
+    )
+    real = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "tiger"},
+        positions=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state=None,
+        net_value=Decimal("50000"),
+        available_cash=Decimal("50000"),
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="US",
+        account=simulated,
+        candidates=(
+            candidate(
+                "AAPL",
+                asset="美股",
+                exchange="US",
+                close="125",
+                atr="0.5",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "US", "broker": "tiger"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        real_holdings=real,
+    )
+    trend_module._report_payload(built)
+
+    action = built.real_buy_actions[0]
+    tampered = replace(
+        built,
+        real_buy_actions=(
+            replace(
+                action,
+                target_amount=Decimal("40000"),
+                estimated_shares=320,
+                planned_stop_risk=Decimal("360"),
+                planned_stop_risk_pct=Decimal("0.0072"),
+                normal_cost=Decimal("40"),
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="frozen report contract is invalid"):
+        trend_module._report_payload(tampered)
+
+
+def test_current_nominal_validator_accepts_sequential_cash_limited_buys() -> None:
+    strategy, allocation = current_nominal_strategy("US")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="US",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("6000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            candidate(
+                "AAPL",
+                asset="美股",
+                exchange="US",
+                close="100",
+                global_strength="100",
+            ),
+            candidate(
+                "MSFT",
+                asset="美股",
+                exchange="US",
+                close="100",
+                global_strength="99",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        normal_cost_rate=Decimal("0.001"),
+        metadata={"market": "US", "broker": "futu"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    payload = trend_module._report_payload(built)
+    buys = [
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    ]
+
+    assert [
+        (Decimal(str(item["target_amount"])), item["estimated_shares"])
+        for item in buys
+    ] == [(Decimal("4000"), 40), (Decimal("4000"), 19)]
+
+
+def test_current_nominal_validator_rejects_cash_limited_target_rewrite() -> None:
+    strategy, allocation = current_nominal_strategy("US")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="US",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("6000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            candidate(
+                "AAPL",
+                asset="美股",
+                exchange="US",
+                close="100",
+                global_strength="100",
+            ),
+            candidate(
+                "MSFT",
+                asset="美股",
+                exchange="US",
+                close="100",
+                global_strength="99",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        normal_cost_rate=Decimal("0.001"),
+        metadata={"market": "US", "broker": "futu"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    buys = [
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    ]
+    assert (
+        Decimal(str(buys[1]["target_amount"])),
+        buys[1]["estimated_shares"],
+    ) == (Decimal("4000"), 19)
+
+    buys[1]["target_amount"] = "1996"
+
+    assert trend_module.valid_frozen_report_contract(payload) is False
+
+
+@pytest.mark.parametrize("mode", ["automatic", "manual"])
+def test_current_nominal_validator_rejects_falsified_rotation_amount_and_quantity(
+    mode: str,
+) -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    positions = tuple(
+        AccountPosition(
+            f"600{index:03d}",
+            f"股票600{index:03d}",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("1000"),
+        )
+        for index in range(15)
+    )
+    holding_snapshots = {
+        position.symbol: holding(
+            position.symbol,
+            strength="70",
+            global_strength="70",
+        )
+        for position in positions
+    }
+    real_holdings = (
+        RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "eastmoney"},
+            positions=positions,
+            holding_snapshots=holding_snapshots,
+            bars_by_symbol={position.symbol: bars() for position in positions},
+            prior_state=None,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            position_count=15,
+        )
+        if mode == "manual"
+        else None
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=positions if mode == "automatic" else (),
+            exceptions=(),
+            position_count=15 if mode == "automatic" else 0,
+        ),
+        candidates=(
+            candidate("600999", close="10", atr="0.5", global_strength="100"),
+        ),
+        holding_snapshots=holding_snapshots if mode == "automatic" else {},
+        bars_by_symbol={
+            position.symbol: bars() for position in positions
+        } if mode == "automatic" else {},
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        real_holdings=real_holdings,
+    )
+    payload = trend_module._report_payload(built)
+    pair = (
+        built.simulate_rotation_pairs[0]
+        if mode == "automatic"
+        else built.real_rotation_pairs[0]
+    )
+    assert (
+        trend_module.valid_frozen_report_contract(payload),
+        pair.target_amount,
+        pair.estimated_shares,
+    ) == (True, Decimal("4000"), 400)
+
+    tampered_pair = replace(
+        pair,
+        target_amount=Decimal("40000"),
+        estimated_shares=4000,
+    )
+    tampered = replace(
+        built,
+        simulate_rotation_pairs=(
+            (tampered_pair,)
+            if mode == "automatic"
+            else built.simulate_rotation_pairs
+        ),
+        real_rotation_pairs=(
+            (tampered_pair,)
+            if mode == "manual"
+            else built.real_rotation_pairs
+        ),
+    )
+
+    with pytest.raises(ValueError, match="frozen report contract is invalid"):
+        trend_module._report_payload(tampered)
+
+
+def test_current_nominal_real_rotation_blocks_when_carried_cash_is_negative() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    positions = tuple(
+        AccountPosition(
+            f"600{index:03d}",
+            f"股票600{index:03d}",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("1000"),
+        )
+        for index in range(15)
+    )
+    holding_snapshots = {
+        position.symbol: holding(
+            position.symbol,
+            strength="70",
+            global_strength="70",
+        )
+        for position in positions
+    }
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+            position_count=0,
+        ),
+        candidates=(
+            candidate("600999", close="10", atr="0.5", global_strength="100"),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "eastmoney"},
+            positions=positions,
+            holding_snapshots=holding_snapshots,
+            bars_by_symbol={position.symbol: bars() for position in positions},
+            prior_state=None,
+            net_value=Decimal("50000"),
+            available_cash=Decimal("-5000"),
+            position_count=15,
+        ),
+    )
+
+    payload = trend_module._report_payload(built)
+    real_account = payload["plan_availability"]["real_account"]
+    judgments = payload["strategy_judgments"]
+
+    assert (
+        trend_module.valid_frozen_report_contract(payload),
+        real_account["available_cash"],
+        real_account["executable"],
+        judgments["real_rotation_pairs"],
+        [item["outcome"] for item in judgments["real_rotation_comparisons"]],
+    ) == (True, "-5000", False, [], ["sizing_blocked"])
+
+
+def test_report_serializes_audit_only_stop_risk_overflow_for_current_nominal_versions() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            candidate(
+                "600001",
+                close="10",
+                atr="10",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    action = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+
+    assert {
+        "target_amount": Decimal(str(action["target_amount"])),
+        "estimated_shares": action["estimated_shares"],
+        "planned_stop_risk": Decimal(str(action["planned_stop_risk"])),
+        "normal_cost": Decimal(str(action["normal_cost"])),
+        "status_label": payload["risk_summary"]["status_label"],
+    } == {
+        "target_amount": Decimal("4000"),
+        "estimated_shares": 400,
+        "planned_stop_risk": Decimal("8004"),
+        "normal_cost": Decimal("4"),
+        "status_label": "计划止损风险仅审计，不参与买入数量",
+    }
+
+
+def test_current_nominal_rotation_buy_keeps_rotation_and_uses_four_percent_target() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    positions = tuple(
+        AccountPosition(
+            f"600{index:03d}",
+            f"股票600{index:03d}",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("1000"),
+        )
+        for index in range(15)
+    )
+    holding_snapshots = {
+        position.symbol: holding(
+            position.symbol,
+            strength="70",
+            global_strength="70",
+        )
+        for position in positions
+    }
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=positions,
+            exceptions=(),
+            position_count=15,
+        ),
+        candidates=(
+            candidate(
+                "600999",
+                close="10",
+                atr="0.5",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots=holding_snapshots,
+        bars_by_symbol={position.symbol: bars() for position in positions},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    assert [
+        (pair.sell_symbol, pair.buy_symbol, pair.target_amount, pair.estimated_shares)
+        for pair in built.simulate_rotation_pairs
+    ] == [("600000", "600999", Decimal("4000"), 400)]
+
+
+def test_current_nominal_rotation_serializes_exact_audit_fields_without_changing_legacy_shape() -> None:
+    positions = tuple(
+        AccountPosition(
+            f"600{index:03d}",
+            f"股票600{index:03d}",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("1000"),
+        )
+        for index in range(15)
+    )
+    holding_snapshots = {
+        position.symbol: holding(
+            position.symbol,
+            strength="70",
+            global_strength="70",
+        )
+        for position in positions
+    }
+    allocation = current_nominal_allocation("CN")
+
+    def build_rotation_report(strategy: dict[str, object]) -> dict[str, object]:
+        return trend_module._report_payload(
+            build_report(
+                as_of_date="2026-07-14",
+                execution_date="2026-07-15",
+                market="CN",
+                account=AccountSnapshot(
+                    source_date="2026-07-14",
+                    fresh=True,
+                    net_value=Decimal("100000"),
+                    available_cash=Decimal("100000"),
+                    positions=positions,
+                    exceptions=(),
+                    position_count=15,
+                ),
+                candidates=(
+                    candidate(
+                        "600999",
+                        close="10",
+                        atr="0.5",
+                        global_strength="100",
+                    ),
+                ),
+                holding_snapshots=holding_snapshots,
+                bars_by_symbol={position.symbol: bars() for position in positions},
+                metadata={"market": "CN", "broker": "eastmoney"},
+                strategy_snapshot=strategy,
+                allocation_reference=allocation,
+                drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+            )
+        )
+
+    current_strategy, _ = current_nominal_strategy("CN")
+    current_pair = build_rotation_report(current_strategy)[
+        "strategy_judgments"
+    ]["simulate_rotation_pairs"][0]
+    legacy_strategy = trend_module.live_trend_strategy_snapshot(
+        "CN",
+        "abc123",
+        (1,),
+        strategy_version="v15",
+        allocation=allocation,
+    )
+    legacy_pair = build_rotation_report(legacy_strategy)[
+        "strategy_judgments"
+    ]["simulate_rotation_pairs"][0]
+    audit_fields = {
+        "close",
+        "estimated_initial_line",
+        "normal_cost",
+        "planned_stop_risk",
+        "planned_stop_risk_pct",
+    }
+
+    assert (
+        {
+            field: Decimal(str(current_pair.get(field)))
+            for field in (*audit_fields, "atr")
+        },
+        audit_fields & legacy_pair.keys(),
+    ) == (
+        {
+            "close": Decimal("10"),
+            "atr": Decimal("0.5"),
+            "estimated_initial_line": Decimal("9"),
+            "normal_cost": Decimal("4"),
+            "planned_stop_risk": Decimal("404"),
+            "planned_stop_risk_pct": Decimal("0.00404"),
+        },
+        set(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("atr", "999"),
+        ("close", "999"),
+        ("estimated_initial_line", "999999"),
+        ("normal_cost", "1"),
+        ("planned_stop_risk", "401"),
+        ("planned_stop_risk_pct", "0.00401"),
+    ],
+)
+def test_current_nominal_contract_rejects_rotation_audit_tamper(
+    field: str,
+    value: str,
+) -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    positions = tuple(
+        AccountPosition(
+            f"600{index:03d}",
+            f"股票600{index:03d}",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("1000"),
+        )
+        for index in range(15)
+    )
+    holding_snapshots = {
+        position.symbol: holding(
+            position.symbol,
+            strength="70",
+            global_strength="70",
+        )
+        for position in positions
+    }
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=positions,
+            exceptions=(),
+            position_count=15,
+        ),
+        candidates=(
+            candidate("600999", close="10", atr="0.5", global_strength="100"),
+        ),
+        holding_snapshots=holding_snapshots,
+        bars_by_symbol={position.symbol: bars() for position in positions},
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    tampered = copy.deepcopy(payload)
+    tampered["strategy_judgments"]["simulate_rotation_pairs"][0][field] = value
+
+    assert (
+        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(tampered),
+    ) == (True, False)
+
+
+def test_current_nominal_portfolio_overflow_uses_audit_only_label() -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            candidate(
+                "600001",
+                close="10",
+                atr="10",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+
+    assert (
+        built.buy_actions[0].estimated_shares,
+        built.risk_summary["status_label"],
+        "最小一手" in str(built.risk_summary["status_label"]),
+    ) == (400, "计划止损风险仅审计，不参与买入数量", False)
+
+
+def test_current_nominal_validator_rejects_falsified_target_amount_even_when_quantity_matches() -> None:
+    strategy, allocation = current_nominal_strategy("US")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="US",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            candidate(
+                "AAPL",
+                asset="美股",
+                exchange="US",
+                close="100",
+                atr="100",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "US", "broker": "tiger"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    action = built.buy_actions[0]
+    falsified = replace(
+        action,
+        target_amount=Decimal("40000"),
+        estimated_shares=400,
+        planned_stop_risk=Decimal("80040"),
+        planned_stop_risk_pct=Decimal("0.8004"),
+        normal_cost=Decimal("40"),
+    )
+    tampered = replace(
+        built,
+        buy_actions=(falsified,),
+        risk_summary={
+            **built.risk_summary,
+            "new_planned_risk": Decimal("80040"),
+            "portfolio_planned_risk": Decimal("80040"),
+            "portfolio_planned_risk_pct": Decimal("0.8004"),
+            "portfolio_remaining_risk": Decimal("0"),
+            "portfolio_remaining_risk_pct": Decimal("0"),
+            "status_label": "计划止损风险仅审计，不参与买入数量",
+        },
+    )
+
+    with pytest.raises(ValueError, match="strategy snapshot does not match report actions"):
+        trend_module.validate_report_strategy_snapshot(tampered)
 
 
 @pytest.mark.parametrize(
@@ -9630,7 +12371,7 @@ def test_planning_crash_retry_recovers_simulated_plan_for_controller(
 ) -> None:
     config = trend_config(tmp_path)
     allocation = _write_cn_v2_allocation(config)
-    unlock_live_drawdown(config.data_dir, strategy_version="v15")
+    unlock_live_drawdown(config.data_dir, strategy_version="v16")
 
     class MappingReadyApi(ReadyApi):
         def remember_symbol_row(self, **_kwargs: object) -> None:
@@ -9849,7 +12590,7 @@ def test_real_plan_recovery_after_receipt_collision_matches_fresh_control(
 
     recovery_config = trend_config(tmp_path / "recovery")
     allocation = _write_cn_v2_allocation(recovery_config)
-    unlock_live_drawdown(recovery_config.data_dir, strategy_version="v15")
+    unlock_live_drawdown(recovery_config.data_dir, strategy_version="v16")
     receipt_path = recovery_config.data_dir / (
         "trend_a_share/delivery/2026-07-14.json"
     )
@@ -9913,7 +12654,7 @@ def test_real_plan_recovery_after_receipt_collision_matches_fresh_control(
     control_root = tmp_path / "control"
     control_config = trend_config(control_root)
     control_allocation = _write_cn_v2_allocation(control_config)
-    unlock_live_drawdown(control_config.data_dir, strategy_version="v15")
+    unlock_live_drawdown(control_config.data_dir, strategy_version="v16")
     monkeypatch.setattr(
         trend_module,
         "fetch_account_snapshot",
@@ -9958,7 +12699,7 @@ def test_planning_crash_retry_keeps_frozen_drawdown_state(
 ) -> None:
     config = trend_config(tmp_path)
     allocation = _write_cn_v2_allocation(config)
-    unlock_live_drawdown(config.data_dir, strategy_version="v15")
+    unlock_live_drawdown(config.data_dir, strategy_version="v16")
     api_instances = [ReadyApi([]), ReadyApi([])]
     equity_values = iter(("100000", "90000"))
 
@@ -11788,7 +14529,7 @@ def test_report_runner_freezes_simulated_buy_plan_in_report_evidence(
     tmp_path: Path,
 ) -> None:
     config = trend_config(tmp_path)
-    unlock_live_drawdown(config.data_dir, strategy_version="v15")
+    unlock_live_drawdown(config.data_dir, strategy_version="v16")
     account_calls = 0
 
     class RecoveringAccount:

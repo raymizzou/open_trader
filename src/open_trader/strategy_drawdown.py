@@ -19,7 +19,22 @@ DRAWDOWN_LIMIT = Decimal("0.05")
 OVERHEAT_TRIM_COMPATIBILITY_REVISION = "trend_overheat_trim_v1"
 UNIFIED_TREND_V5_COMPATIBILITY_REVISION = "unified_trend_v5_v1"
 ALLOCATION_PROJECTION_COMPATIBILITY_REVISION = "allocation_projection_v1"
-ALLOCATION_PROJECTION_VERSIONS = {"CN": "v15", "HK": "v13", "US": "v13"}
+ALLOCATION_PROJECTION_VERSIONS = {"CN": "v16", "HK": "v14", "US": "v14"}
+# Historical v2 reports remain frozen while current nominal reports start a
+# distinct strategy identity.
+ALLOCATION_V2_VERSION_SETS = {
+    "CN": frozenset({"v15", "v16"}),
+    "HK": frozenset({"v13", "v14"}),
+    "US": frozenset({"v13", "v14"}),
+}
+
+
+def is_allocation_v2_version(market: str, strategy_version: object) -> bool:
+    return str(strategy_version or "") in ALLOCATION_V2_VERSION_SETS.get(
+        str(market).upper(), ()
+    )
+
+
 # Keep the immediately preceding allocation-era reports readable while the
 # current version owns new state and parameter transitions.
 LEGACY_ALLOCATION_PROJECTION_VERSIONS = {"CN": "v14", "HK": "v12", "US": "v12"}

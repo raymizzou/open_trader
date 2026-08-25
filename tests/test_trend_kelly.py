@@ -356,6 +356,46 @@ def test_current_strategy_versions_use_exact_inherited_kelly_samples(
     )
 
 
+def test_current_nominal_versions_do_not_borrow_previous_kelly_samples() -> None:
+    observed: dict[str, tuple[int, int, str, bool]] = {}
+    for market, current_version, predecessor_version in (
+        ("CN", "v16", "v15"),
+        ("HK", "v14", "v13"),
+        ("US", "v14", "v13"),
+    ):
+        predecessor_id = (
+            f"trend_animals_warm_to_hot/{market}/{predecessor_version}"
+        )
+        current_id = f"trend_animals_warm_to_hot/{market}/{current_version}"
+        state = calculate_trend_kelly(
+            [
+                _round(
+                    index,
+                    "0.10",
+                    market=market,
+                    strategy_id=predecessor_id,
+                    version=predecessor_version,
+                )
+                for index in range(30)
+            ],
+            market=market,
+            strategy_id=current_id,
+            opening_strategy_version=current_version,
+        )
+        observed[market] = (
+            state.eligible_sample_count,
+            state.selected_sample_count,
+            state.phase,
+            state.enabled,
+        )
+
+    assert observed == {
+        "CN": (0, 0, "cold_start", False),
+        "HK": (0, 0, "cold_start", False),
+        "US": (0, 0, "cold_start", False),
+    }
+
+
 @pytest.mark.parametrize(
     ("market", "predecessor_version", "current_version"),
     [("CN", "v14", "v15"), ("HK", "v12", "v13"), ("US", "v12", "v13")],

@@ -1673,7 +1673,7 @@ def test_market_planning_crash_retry_recovers_simulated_plan_for_controller(
     tmp_path: Path,
     market: str,
 ) -> None:
-    unlock_live_drawdown(tmp_path / "data", market, version="v13")
+    unlock_live_drawdown(tmp_path / "data", market, version="v14")
     cfg, payload = _run_market_crash_retry(
         tmp_path, market, (None, "100000"), eligible_owner=False
     )

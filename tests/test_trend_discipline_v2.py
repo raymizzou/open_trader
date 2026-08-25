@@ -78,7 +78,7 @@ def test_v2_allocation_roundtrip_selects_current_strategy_identity_and_limit() -
         },
     )
 
-    assert strategy["strategy_version"] == "v13"
+    assert strategy["strategy_version"] == "v14"
     assert strategy["parameters"]["allocation_position_limit"] == 20
     assert strategy["parameters"]["target_weight"] == "0.04"
 

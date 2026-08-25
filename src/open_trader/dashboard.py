@@ -17,6 +17,8 @@ from zoneinfo import ZoneInfo
 from .a_share_trend import (
     ACTION_LABELS,
     CNY_PER_LOCAL_CURRENCY,
+    CURRENT_NOMINAL_ALLOCATION_VERSIONS,
+    NORMAL_COST_RATE,
     NON_REALTIME_ACCOUNT_WARNING,
     PORTFOLIO_RISK_LIMIT,
     REASON_LABELS,
@@ -85,7 +87,7 @@ from .trend_review import (
     _validate_rotation_event,
 )
 from .trend_market_controller import _valid_status
-from .strategy_drawdown import valid_drawdown_decision
+from .strategy_drawdown import is_allocation_v2_version, valid_drawdown_decision
 from .trend_api_stats import (
     load_trend_api_stats,
     read_trend_api_stats_snapshot,
@@ -137,12 +139,15 @@ CURRENT_FINAL_PLAN_TREND_VERSIONS = frozenset({
     ("CN", "v13"),
     ("CN", "v14"),
     ("CN", "v15"),
+    ("CN", "v16"),
     ("HK", "v11"),
     ("HK", "v12"),
     ("HK", "v13"),
+    ("HK", "v14"),
     ("US", "v11"),
     ("US", "v12"),
     ("US", "v13"),
+    ("US", "v14"),
 })
 TREND_ACTUAL_BROKERS = {
     market: broker for broker, (market, *_rest) in TREND_REPORT_SOURCES.items()
@@ -1375,9 +1380,7 @@ def _is_trend_discipline_v2_payload(
         return True
     snapshot = payload.get("strategy_snapshot")
     version = snapshot.get("strategy_version") if isinstance(snapshot, Mapping) else None
-    return (market.upper(), str(version or "")) in {
-        ("CN", "v15"), ("HK", "v13"), ("US", "v13"),
-    }
+    return is_allocation_v2_version(market, version)
 
 
 def _project_trend_plan_availability(
@@ -1642,12 +1645,19 @@ def _project_rotation_execution_actions(
         if isinstance(metadata, Mapping)
         else "CN"
     )
+    allocation = payload.get("allocation")
+    snapshot = payload.get("strategy_snapshot")
+    strategy_version = (
+        snapshot.get("strategy_version")
+        if isinstance(snapshot, Mapping)
+        else None
+    )
     v2_report = _is_trend_discipline_v2_payload(payload, market)
-    if (
-        v2_report
-        and isinstance(payload.get("allocation"), Mapping)
-        and payload["allocation"].get("version") == 2
-    ):
+    suppress_legacy_projection = (
+        isinstance(allocation, Mapping)
+        and allocation.get("version") == 2
+    ) or CURRENT_NOMINAL_ALLOCATION_VERSIONS.get(market) == strategy_version
+    if suppress_legacy_projection:
         return [], []
     sell_actions: list[dict[str, Any]] = []
     buy_actions: list[dict[str, Any]] = []
@@ -2209,8 +2219,20 @@ def _valid_current_trend_risk_contract(
     if not isinstance(risk_skips, list):
         return False
     summary = payload.get("risk_summary")
+    snapshot = payload.get("strategy_snapshot")
+    contract_summary = summary
+    if (
+        isinstance(snapshot, dict)
+        and str(snapshot.get("strategy_version") or "")
+        in {"v14", "v16"}
+        and summary.get("status_label") == "计划止损风险仅审计，不参与买入数量"
+    ):
+        contract_summary = {
+            **summary,
+            "status_label": "含最小一手额外风险",
+        }
     if not isinstance(summary, dict) or not valid_v4_risk_contract(
-        parameters, summary, expected_nav=expected_nav
+        parameters, contract_summary, expected_nav=expected_nav
     ):
         return False
     if not isinstance(parameters, Mapping):
@@ -2277,7 +2299,9 @@ def _valid_current_trend_risk_contract(
         payload,
         risk_judgments,
         summary,
-        strategy_version="v10",
+        strategy_version=str(
+            snapshot.get("strategy_version") or "v10"
+        ) if isinstance(snapshot, dict) else "v10",
     ):
         return False
     snapshot = payload.get("strategy_snapshot")
@@ -2313,6 +2337,54 @@ def _dashboard_risk_decimal(value: object) -> Decimal | None:
     return result if result.is_finite() and result >= 0 else None
 
 
+def _dashboard_expected_nominal_sizing(
+    *,
+    net_value: Decimal,
+    available_cash: Decimal,
+    weight: Decimal,
+    close: Decimal,
+    lot_size: int,
+    price_fx: Decimal,
+    normal_cost_rate: Decimal,
+) -> tuple[Decimal, int, Decimal]:
+    if (
+        not net_value.is_finite()
+        or net_value <= 0
+        or not available_cash.is_finite()
+        or available_cash < 0
+        or not weight.is_finite()
+        or weight <= 0
+        or not close.is_finite()
+        or close <= 0
+        or isinstance(lot_size, bool)
+        or not isinstance(lot_size, int)
+        or lot_size <= 0
+        or not price_fx.is_finite()
+        or price_fx <= 0
+        or not normal_cost_rate.is_finite()
+        or normal_cost_rate < 0
+    ):
+        raise ValueError("nominal sizing inputs are invalid")
+    target_amount = (net_value * weight).quantize(Decimal("0.01"))
+    sizing_budget = min(
+        target_amount,
+        available_cash / (Decimal("1") + normal_cost_rate),
+    )
+    unit_notional = close * price_fx
+    shares = int(sizing_budget / unit_notional / lot_size) * lot_size
+    if shares <= 0:
+        shares = lot_size
+    cash_required = (
+        Decimal(shares) * unit_notional * (Decimal("1") + normal_cost_rate)
+    )
+    while shares > lot_size and cash_required > available_cash:
+        shares -= lot_size
+        cash_required = (
+            Decimal(shares) * unit_notional * (Decimal("1") + normal_cost_rate)
+        )
+    return target_amount, shares, cash_required
+
+
 def _valid_v2_risk_items(
     payload: dict[str, Any],
     judgments: dict[str, Any],
@@ -2323,6 +2395,21 @@ def _valid_v2_risk_items(
     snapshot = payload.get("strategy_snapshot")
     parameters = snapshot.get("parameters") if isinstance(snapshot, dict) else None
     target_weight_limit = PORTFOLIO_RISK_LIMIT
+    market = str(
+        (payload.get("metadata") or {}).get("market")
+        if isinstance(payload.get("metadata"), dict)
+        else ""
+    ).upper()
+    metadata = payload.get("metadata")
+    current_nominal = (market, strategy_version) in {
+        ("CN", "v16"), ("HK", "v14"), ("US", "v14"),
+    }
+    allocation = payload.get("allocation")
+    explicit_v2 = (
+        current_nominal
+        and isinstance(allocation, dict)
+        and allocation.get("version") in {None, 2}
+    )
     configured_target = parameters.get("target_weight") if isinstance(parameters, dict) else None
     if configured_target is not None and not isinstance(configured_target, (dict, list)):
         configured_limit = _dashboard_risk_decimal(configured_target)
@@ -2340,6 +2427,79 @@ def _valid_v2_risk_items(
         for item in judgments["formal_actions"]
         if item.get("action") == "BUY"
     ]
+    signal_snapshots = payload.get("signal_snapshots")
+    frozen_candidates = (
+        signal_snapshots.get("candidates", [])
+        if isinstance(signal_snapshots, dict)
+        else []
+    )
+    if current_nominal:
+        frozen_candidate_symbols = [
+            item.get("symbol")
+            for item in frozen_candidates
+            if isinstance(item, Mapping) and isinstance(item.get("symbol"), str)
+        ]
+        if len(frozen_candidate_symbols) != len(set(frozen_candidate_symbols)):
+            return False
+    frozen_candidates_by_symbol = {
+        item.get("symbol"): item
+        for item in frozen_candidates
+        if isinstance(item, dict) and isinstance(item.get("symbol"), str)
+    }
+    frozen_real_holdings = (
+        signal_snapshots.get("real_holdings", {})
+        if isinstance(signal_snapshots, Mapping)
+        else {}
+    )
+    nominal_remaining_cash: Decimal | None = None
+    nominal_cost_rate = _dashboard_risk_decimal(summary.get("normal_cost_rate"))
+    nominal_nav: Decimal | None = None
+    protection_multiple: Decimal | None = None
+    if current_nominal:
+        account = payload.get("account")
+        if not isinstance(account, dict):
+            return False
+        nominal_nav = _dashboard_risk_decimal(account.get("net_value"))
+        protection_multiple = _dashboard_risk_decimal(
+            parameters.get("initial_protection_atr_multiple")
+            if isinstance(parameters, dict)
+            else None
+        )
+        nominal_cost_rate = _dashboard_risk_decimal(
+            parameters.get("normal_cost_rate", NORMAL_COST_RATE)
+            if isinstance(parameters, dict)
+            else NORMAL_COST_RATE
+        )
+        nominal_remaining_cash = _dashboard_risk_decimal(
+            account.get("available_cash")
+        )
+        if (
+            nominal_nav is None
+            or nominal_nav <= 0
+            or protection_multiple is None
+            or protection_multiple <= 0
+            or nominal_remaining_cash is None
+            or nominal_cost_rate is None
+        ):
+            return False
+        nominal_remaining_cash += sum(
+            (
+                (
+                    _dashboard_risk_decimal(position.get("market_value"))
+                    or Decimal("0")
+                )
+                * max(Decimal("0"), Decimal("1") - nominal_cost_rate)
+                for position in account.get("positions", [])
+                if isinstance(position, dict)
+                and any(
+                    holding.get("symbol") == position.get("symbol")
+                    and holding.get("action") == "SELL_ALL"
+                    for holding in judgments.get("holding_decisions", [])
+                    if isinstance(holding, dict)
+                )
+            ),
+            Decimal("0"),
+        )
     if (nav is None or summary.get("status") == "paused") and buys:
         return False
     new_planned_risk = Decimal("0")
@@ -2347,14 +2507,59 @@ def _valid_v2_risk_items(
         "名义仓位上限", "单笔风险上限", "组合剩余风险", "现金"
     }
     if strategy_version in {
-        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16",
     }:
         allowed_buy_constraints.add("Kelly 上限")
     data_missing_notes = {
         "每手股数未知，无法定量",
         "候选价格或活动保护线缺失",
     }
+
+    def nominal_weight(temperature: object) -> Decimal | None:
+        if not isinstance(parameters, dict):
+            return None
+        target = parameters.get("target_weight")
+        raw_weight = (
+            target.get(temperature)
+            if isinstance(target, dict) and isinstance(temperature, str)
+            else target
+        )
+        weight = _dashboard_risk_decimal(raw_weight)
+        if weight is None or weight <= 0:
+            return None
+        if (
+            explicit_v2
+            and strategy_version in {
+                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                "v11", "v12", "v13", "v14", "v15", "v16",
+            }
+            and summary.get("kelly_phase") not in {
+                None, "cold_start", "unavailable",
+            }
+        ):
+            cap = _dashboard_risk_decimal(summary.get("kelly_cap"))
+            if cap is None:
+                return None
+            weight = min(weight, cap)
+        return weight
+
+    def nominal_audit_values(
+        *,
+        shares: int,
+        close: Decimal,
+        atr: Decimal,
+        nav_value: Decimal,
+        price_fx: Decimal,
+        cost_rate: Decimal,
+        protection: Decimal,
+    ) -> tuple[Decimal, Decimal, Decimal]:
+        cost = Decimal(shares) * close * price_fx * cost_rate
+        risk = Decimal(shares) * max(Decimal("0"), protection * atr) * price_fx + cost
+        return cost, risk, risk / nav_value
+
     for item in buys:
+        if current_nominal and not isinstance(item.get("executable"), bool):
+            return False
         shares = item.get("estimated_shares")
         lot_size = item.get("lot_size")
         planned_risk = _dashboard_risk_decimal(item.get("planned_stop_risk"))
@@ -2362,13 +2567,106 @@ def _valid_v2_risk_items(
         normal_cost = _dashboard_risk_decimal(item.get("normal_cost"))
         target_weight = _dashboard_risk_decimal(item.get("target_weight"))
         target_amount = _dashboard_risk_decimal(item.get("target_amount"))
+        symbol = item.get("symbol")
         close = _dashboard_risk_decimal(item.get("close"))
+        atr = _dashboard_risk_decimal(item.get("atr"))
         sizing_note = item.get("sizing_note")
         data_missing = (
             shares == 0
             and isinstance(sizing_note, str)
             and sizing_note in data_missing_notes
         )
+        if current_nominal and target_weight != nominal_weight(
+            item.get("temperature_curr")
+        ):
+            return False
+        if current_nominal and not data_missing:
+            frozen_candidate = (
+                frozen_candidates_by_symbol.get(symbol)
+                if isinstance(symbol, str)
+                else None
+            )
+            frozen_close = (
+                _dashboard_risk_decimal(frozen_candidate.get("close"))
+                if isinstance(frozen_candidate, dict)
+                else None
+            )
+            frozen_atr = (
+                _dashboard_risk_decimal(frozen_candidate.get("atr"))
+                if isinstance(frozen_candidate, dict)
+                else None
+            )
+            if (
+                close is None
+                or close <= 0
+                or atr is None
+                or atr <= 0
+                or frozen_close is None
+                or frozen_close <= 0
+                or frozen_atr is None
+                or frozen_atr <= 0
+                or close != frozen_close
+                or atr != frozen_atr
+            ):
+                return False
+            try:
+                metadata = payload.get("metadata")
+                price_fx = _dashboard_risk_decimal(
+                    metadata.get("price_fx_to_account_currency", "1")
+                    if isinstance(metadata, dict)
+                    else "1"
+                )
+                if price_fx is None or nominal_remaining_cash is None or close is None:
+                    return False
+                expected_amount, expected_shares, expected_cash_required = (
+                    _dashboard_expected_nominal_sizing(
+                        net_value=nav,
+                        available_cash=nominal_remaining_cash,
+                        weight=target_weight,
+                        close=close,
+                        lot_size=lot_size,
+                        price_fx=price_fx,
+                        normal_cost_rate=nominal_cost_rate,
+                    )
+                )
+                if target_amount != expected_amount or shares != expected_shares:
+                    return False
+                if explicit_v2:
+                    try:
+                        actual_initial_line = Decimal(
+                            str(item.get("estimated_initial_line"))
+                        )
+                    except (InvalidOperation, TypeError, ValueError):
+                        return False
+                    if (
+                        not actual_initial_line.is_finite()
+                        or actual_initial_line
+                        != frozen_close - protection_multiple * frozen_atr
+                    ):
+                        return False
+                    expected_cost, expected_risk, expected_pct = (
+                        nominal_audit_values(
+                            shares=expected_shares,
+                            close=frozen_close,
+                            atr=frozen_atr,
+                            nav_value=nominal_nav,
+                            price_fx=price_fx,
+                            cost_rate=nominal_cost_rate,
+                            protection=protection_multiple,
+                        )
+                    )
+                    if (
+                        normal_cost != expected_cost
+                        or planned_risk != expected_risk
+                        or planned_pct != expected_pct
+                    ):
+                        return False
+                if item.get("executable") is True:
+                    if expected_cash_required > nominal_remaining_cash:
+                        return False
+                    nominal_remaining_cash -= expected_cash_required
+            except (ArithmeticError, InvalidOperation, TypeError, ValueError):
+                return False
         if (
             not isinstance(item.get("symbol"), str)
             or not item["symbol"].strip()
@@ -2380,7 +2678,7 @@ def _valid_v2_risk_items(
             or target_weight <= 0
             or target_weight > target_weight_limit
             or strategy_version in {
-                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16",
             }
             and summary.get("kelly_phase") != "cold_start"
             and target_weight
@@ -2389,6 +2687,15 @@ def _valid_v2_risk_items(
         ):
             return False
         if data_missing:
+            if explicit_v2:
+                if (
+                    nav is None
+                    or target_weight is None
+                    or target_amount is None
+                    or target_amount
+                    != (nav * target_weight).quantize(Decimal("0.01"))
+                ):
+                    return False
             if (
                 lot_size != 0
                 or planned_risk not in (Decimal("0"), None)
@@ -2415,13 +2722,428 @@ def _valid_v2_risk_items(
             or normal_cost > planned_risk
             or nav is None
             or planned_pct != planned_risk / nav
-            or planned_pct > SINGLE_ENTRY_RISK_LIMIT
+            or not current_nominal
+            and planned_pct > SINGLE_ENTRY_RISK_LIMIT
             and shares != lot_size
             or item.get("decisive_constraint") not in allowed_buy_constraints
         ):
             return False
         if item.get("executable") is not False:
             new_planned_risk += planned_risk
+
+    if explicit_v2:
+        real_buy_actions = judgments.get("real_buy_actions")
+        if real_buy_actions is not None:
+            if not isinstance(real_buy_actions, list):
+                return False
+            availability = payload.get("plan_availability")
+            real_plan = (
+                availability.get("real_account")
+                if isinstance(availability, Mapping)
+                else None
+            )
+            if (
+                not isinstance(real_plan, Mapping)
+                or real_plan.get("status") != "available"
+                or real_plan.get("executable") is not False
+            ):
+                return False
+            real_nav = _dashboard_risk_decimal(real_plan.get("net_value"))
+            real_remaining_cash = _dashboard_risk_decimal(
+                real_plan.get("available_cash")
+            )
+            price_fx = _dashboard_risk_decimal(
+                metadata.get("price_fx_to_account_currency", "1")
+                if isinstance(metadata, dict)
+                else "1"
+            )
+            if (
+                real_nav is None
+                or real_nav <= 0
+                or real_remaining_cash is None
+                or price_fx is None
+                or price_fx <= 0
+                or nominal_cost_rate is None
+                or protection_multiple is None
+            ):
+                return False
+            real_holdings = judgments.get("real_holding_decisions")
+            if not isinstance(real_holdings, list) or not isinstance(
+                frozen_real_holdings, Mapping
+            ):
+                return False
+            real_sell_symbols = {
+                item.get("symbol")
+                for item in real_holdings
+                if isinstance(item, Mapping) and item.get("action") == "SELL_ALL"
+            }
+            position_market_values: dict[str, Decimal] = {}
+            for symbol, signal in frozen_real_holdings.items():
+                if (
+                    not isinstance(symbol, str)
+                    or not symbol.strip()
+                    or not isinstance(signal, Mapping)
+                    or signal.get("symbol") != symbol
+                ):
+                    return False
+                if "market_value" in signal:
+                    market_value = _dashboard_risk_decimal(signal.get("market_value"))
+                    if (
+                        market_value is None
+                        or market_value <= 0
+                        or symbol in position_market_values
+                    ):
+                        return False
+                    position_market_values[symbol] = market_value
+            sale_factor = max(Decimal("0"), Decimal("1") - nominal_cost_rate)
+            for symbol in real_sell_symbols:
+                market_value = position_market_values.get(symbol)
+                if market_value is None:
+                    return False
+                real_remaining_cash += market_value * sale_factor
+            for item in real_buy_actions:
+                if not isinstance(item, Mapping) or item.get("action") != "BUY":
+                    return False
+                symbol = item.get("symbol")
+                candidate = (
+                    frozen_candidates_by_symbol.get(symbol)
+                    if isinstance(symbol, str)
+                    else None
+                )
+                if not isinstance(candidate, Mapping):
+                    return False
+                candidate_close = _dashboard_risk_decimal(candidate.get("close"))
+                candidate_atr = _dashboard_risk_decimal(candidate.get("atr"))
+                close = _dashboard_risk_decimal(item.get("close"))
+                atr = _dashboard_risk_decimal(item.get("atr"))
+                if (
+                    candidate_close is None
+                    or candidate_close <= 0
+                    or candidate_atr is None
+                    or candidate_atr <= 0
+                    or close != candidate_close
+                    or atr != candidate_atr
+                    or (
+                        market == "CN"
+                        and item.get("temperature_curr")
+                        != candidate.get("temperature_curr")
+                    )
+                ):
+                    return False
+                weight = nominal_weight(item.get("temperature_curr"))
+                target_amount = _dashboard_risk_decimal(item.get("target_amount"))
+                target_weight = _dashboard_risk_decimal(item.get("target_weight"))
+                normal_cost = _dashboard_risk_decimal(item.get("normal_cost"))
+                planned_risk = _dashboard_risk_decimal(
+                    item.get("planned_stop_risk")
+                )
+                planned_pct = _dashboard_risk_decimal(
+                    item.get("planned_stop_risk_pct")
+                )
+                lot_size = item.get("lot_size")
+                shares = item.get("estimated_shares")
+                if (
+                    weight is None
+                    or target_weight != weight
+                    or target_amount is None
+                    or isinstance(lot_size, bool)
+                    or not isinstance(lot_size, int)
+                    or lot_size <= 0
+                    or isinstance(shares, bool)
+                    or not isinstance(shares, int)
+                    or shares <= 0
+                    or not isinstance(item.get("executable"), bool)
+                ):
+                    return False
+                try:
+                    expected_amount, expected_shares, expected_cash_required = (
+                        _dashboard_expected_nominal_sizing(
+                            net_value=real_nav,
+                            available_cash=real_remaining_cash,
+                            weight=weight,
+                            close=candidate_close,
+                            lot_size=lot_size,
+                            price_fx=price_fx,
+                            normal_cost_rate=nominal_cost_rate,
+                        )
+                    )
+                    expected_cost, expected_risk, expected_pct = (
+                        nominal_audit_values(
+                            shares=expected_shares,
+                            close=candidate_close,
+                            atr=candidate_atr,
+                            nav_value=real_nav,
+                            price_fx=price_fx,
+                            cost_rate=nominal_cost_rate,
+                            protection=protection_multiple,
+                        )
+                    )
+                except (ArithmeticError, InvalidOperation, TypeError, ValueError):
+                    return False
+                if (
+                    target_amount != expected_amount
+                    or shares != expected_shares
+                    or normal_cost != expected_cost
+                    or planned_risk != expected_risk
+                    or planned_pct != expected_pct
+                    or item.get("executable") is True
+                    and expected_cash_required > real_remaining_cash
+                ):
+                    return False
+                if item.get("executable") is True:
+                    real_remaining_cash -= expected_cash_required
+
+        for pair_field, execution_mode in (
+            ("simulate_rotation_pairs", "automatic"),
+            ("real_rotation_pairs", "manual"),
+        ):
+            pairs = judgments.get(pair_field)
+            if pairs is None:
+                continue
+            if not isinstance(pairs, list) or not all(
+                isinstance(pair, Mapping) for pair in pairs
+            ):
+                return False
+            if not pairs:
+                continue
+            price_fx = _dashboard_risk_decimal(
+                metadata.get("price_fx_to_account_currency", "1")
+                if isinstance(metadata, dict)
+                else "1"
+            )
+            if price_fx is None or price_fx <= 0 or nominal_cost_rate is None:
+                return False
+            sell_symbols: set[str] = set()
+            position_market_values: dict[str, Decimal] = {}
+            sale_factor = max(Decimal("0"), Decimal("1") - nominal_cost_rate)
+            if execution_mode == "automatic":
+                account = payload.get("account")
+                account_positions = (
+                    account.get("positions")
+                    if isinstance(account, Mapping)
+                    else None
+                )
+                if not isinstance(account, Mapping) or not isinstance(
+                    account_positions, list
+                ):
+                    return False
+                rotation_nav = _dashboard_risk_decimal(account.get("net_value"))
+                rotation_cash = _dashboard_risk_decimal(
+                    account.get("available_cash")
+                )
+                sell_symbols = {
+                    item.get("symbol")
+                    for item in judgments.get("holding_decisions", [])
+                    if isinstance(item, Mapping)
+                    and item.get("action") == "SELL_ALL"
+                    and isinstance(item.get("symbol"), str)
+                }
+                for position in account_positions:
+                    if not isinstance(position, Mapping):
+                        return False
+                    symbol = position.get("symbol")
+                    market_value = _dashboard_risk_decimal(
+                        position.get("market_value")
+                    )
+                    if (
+                        not isinstance(symbol, str)
+                        or not symbol.strip()
+                        or market_value is None
+                        or symbol in position_market_values
+                    ):
+                        return False
+                    position_market_values[symbol] = market_value
+                if rotation_cash is not None:
+                    for symbol in sell_symbols:
+                        market_value = position_market_values.get(symbol)
+                        if market_value is None or market_value <= 0:
+                            return False
+                        rotation_cash += market_value * sale_factor
+            else:
+                availability = payload.get("plan_availability")
+                real_plan = (
+                    availability.get("real_account")
+                    if isinstance(availability, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(real_plan, Mapping)
+                    or real_plan.get("status") != "available"
+                    or real_plan.get("executable") is not False
+                ):
+                    return False
+                rotation_nav = _dashboard_risk_decimal(real_plan.get("net_value"))
+                rotation_cash = _dashboard_risk_decimal(
+                    real_plan.get("available_cash")
+                )
+                sell_symbols = {
+                    item.get("symbol")
+                    for item in judgments.get("real_holding_decisions", [])
+                    if isinstance(item, Mapping)
+                    and item.get("action") == "SELL_ALL"
+                    and isinstance(item.get("symbol"), str)
+                }
+                if not isinstance(frozen_real_holdings, Mapping):
+                    return False
+                for symbol, signal in frozen_real_holdings.items():
+                    if (
+                        not isinstance(symbol, str)
+                        or not symbol.strip()
+                        or not isinstance(signal, Mapping)
+                        or signal.get("symbol") != symbol
+                    ):
+                        return False
+                    if "market_value" in signal:
+                        market_value = _dashboard_risk_decimal(
+                            signal.get("market_value")
+                        )
+                        if market_value is None or market_value <= 0:
+                            return False
+                        if symbol in position_market_values:
+                            return False
+                        position_market_values[symbol] = market_value
+                real_holding_symbols = {
+                    item.get("symbol")
+                    for item in judgments.get("real_holding_decisions", [])
+                    if isinstance(item, Mapping) and isinstance(item.get("symbol"), str)
+                }
+                if rotation_cash is not None:
+                    for symbol in sell_symbols:
+                        market_value = position_market_values.get(symbol)
+                        if market_value is not None:
+                            rotation_cash += market_value * sale_factor
+            if (
+                rotation_nav is None
+                or rotation_nav <= 0
+                or rotation_cash is None
+                or rotation_cash < 0
+            ):
+                return False
+            if any(
+                isinstance(pair.get("pair_index"), bool)
+                or not isinstance(pair.get("pair_index"), int)
+                or pair.get("pair_index") < 0
+                for pair in pairs
+            ):
+                return False
+            seen_indices: set[int] = set()
+            for pair in sorted(
+                pairs, key=lambda item: item.get("pair_index", -1)
+            ):
+                pair_index = pair.get("pair_index")
+                sell_symbol = pair.get("sell_symbol")
+                buy_symbol = pair.get("buy_symbol")
+                if (
+                    isinstance(pair_index, bool)
+                    or not isinstance(pair_index, int)
+                    or pair_index < 0
+                    or pair_index in seen_indices
+                    or not isinstance(sell_symbol, str)
+                    or not sell_symbol.strip()
+                    or not isinstance(buy_symbol, str)
+                    or not buy_symbol.strip()
+                ):
+                    return False
+                candidate = frozen_candidates_by_symbol.get(buy_symbol)
+                candidate_close = (
+                    _dashboard_risk_decimal(candidate.get("close"))
+                    if isinstance(candidate, Mapping)
+                    else None
+                )
+                candidate_atr = (
+                    _dashboard_risk_decimal(candidate.get("atr"))
+                    if isinstance(candidate, Mapping)
+                    else None
+                )
+                if (
+                    candidate_close is None
+                    or candidate_close <= 0
+                    or candidate_atr is None
+                    or candidate_atr <= 0
+                    or _dashboard_risk_decimal(pair.get("atr"))
+                    != candidate_atr
+                    or pair.get("execution_mode") != execution_mode
+                ):
+                    return False
+                if execution_mode == "automatic" and sell_symbol not in sell_symbols:
+                    market_value = position_market_values.get(sell_symbol)
+                    if market_value is None or market_value <= 0:
+                        return False
+                    rotation_cash += market_value * sale_factor
+                elif execution_mode == "manual" and sell_symbol not in sell_symbols:
+                    market_value = position_market_values.get(sell_symbol)
+                    if market_value is not None:
+                        rotation_cash += market_value * sale_factor
+                weight = nominal_weight("热")
+                target_amount = _dashboard_risk_decimal(pair.get("target_amount"))
+                target_weight = _dashboard_risk_decimal(pair.get("target_weight"))
+                lot_size = pair.get("lot_size")
+                shares = pair.get("estimated_shares")
+                if (
+                    weight is None
+                    or target_weight != weight
+                    or target_amount is None
+                    or isinstance(lot_size, bool)
+                    or not isinstance(lot_size, int)
+                    or lot_size <= 0
+                    or isinstance(shares, bool)
+                    or not isinstance(shares, int)
+                    or shares <= 0
+                ):
+                    return False
+                try:
+                    expected_amount, expected_shares, expected_cash_required = (
+                        _dashboard_expected_nominal_sizing(
+                            net_value=rotation_nav,
+                            available_cash=rotation_cash,
+                            weight=weight,
+                            close=candidate_close,
+                            lot_size=lot_size,
+                            price_fx=price_fx,
+                            normal_cost_rate=nominal_cost_rate,
+                        )
+                    )
+                    if explicit_v2:
+                        pair_close = _dashboard_risk_decimal(pair.get("close"))
+                        pair_initial_line = Decimal(
+                            str(pair.get("estimated_initial_line"))
+                        )
+                        expected_cost, expected_risk, expected_pct = (
+                            nominal_audit_values(
+                                shares=expected_shares,
+                                close=candidate_close,
+                                atr=candidate_atr,
+                                nav_value=rotation_nav,
+                                price_fx=price_fx,
+                                cost_rate=nominal_cost_rate,
+                                protection=protection_multiple,
+                            )
+                        )
+                        if (
+                            pair_close != candidate_close
+                            or not pair_initial_line.is_finite()
+                            or pair_initial_line
+                            != candidate_close - protection_multiple * candidate_atr
+                            or _dashboard_risk_decimal(pair.get("normal_cost"))
+                            != expected_cost
+                            or _dashboard_risk_decimal(
+                                pair.get("planned_stop_risk")
+                            ) != expected_risk
+                            or _dashboard_risk_decimal(
+                                pair.get("planned_stop_risk_pct")
+                            ) != expected_pct
+                        ):
+                            return False
+                except (ArithmeticError, InvalidOperation, TypeError, ValueError):
+                    return False
+                if (
+                    target_amount != expected_amount
+                    or shares != expected_shares
+                    or expected_cash_required > rotation_cash
+                ):
+                    return False
+                rotation_cash -= expected_cash_required
+                seen_indices.add(pair_index)
 
     summary_new_risk = _dashboard_risk_decimal(summary.get("new_planned_risk"))
     if summary_new_risk != new_planned_risk:
@@ -2452,6 +3174,10 @@ def _valid_v2_risk_items(
             if item_risk is None:
                 continue
             if item_risk > remaining_capacity:
+                if current_nominal:
+                    evidenced_risk += item_risk
+                    remaining_capacity = Decimal("0")
+                    continue
                 if (
                     item.get("estimated_shares") != item.get("lot_size")
                     or not isinstance(item.get("sizing_note"), str)
@@ -2464,7 +3190,11 @@ def _valid_v2_risk_items(
                 remaining_capacity - item_risk,
             )
         if (
-            summary.get("status_label") != "含最小一手额外风险"
+            summary.get("status_label") != (
+                "计划止损风险仅审计，不参与买入数量"
+                if current_nominal
+                else "含最小一手额外风险"
+            )
             or summary_new_risk <= 0
             or evidenced_risk < overflow
         ):
@@ -2472,6 +3202,7 @@ def _valid_v2_risk_items(
     elif (
         summary.get("status") == "active"
         and summary.get("status_label") == "含最小一手额外风险"
+        and not current_nominal
     ):
         return False
     allowed_constraints = {
@@ -2484,11 +3215,11 @@ def _valid_v2_risk_items(
         "关键风险数据",
     }
     if strategy_version in {
-        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16",
     }:
         allowed_constraints.add("Kelly 上限")
     if strategy_version in {
-        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16",
     }:
         allowed_constraints.add("策略累计回撤")
     for item in judgments["risk_skips"]:
@@ -2498,7 +3229,7 @@ def _valid_v2_risk_items(
         target_amount = _dashboard_risk_decimal(target_amount_raw)
         zero_kelly_skip = (
             strategy_version in {
-                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16",
             }
             and summary.get("status") == "paused"
             and summary.get("kelly_cap") in {"0", "0.000000", 0}
@@ -3057,16 +3788,25 @@ def _project_broker_trend_report(
     if not isinstance(frozen_parameter_rows, list):
         frozen_parameter_rows = []
     allocation = payload.get("allocation")
+    projected_allocation = allocation
+    if (
+        isinstance(allocation, dict)
+        and "version" not in allocation
+        and isinstance(strategy_snapshot, dict)
+        and CURRENT_NOMINAL_ALLOCATION_VERSIONS.get(market)
+        == strategy_snapshot.get("strategy_version")
+    ):
+        projected_allocation = {**allocation, "version": 2}
     current_allocation_reference = (
         {
-            "daily_path": allocation["daily_path"],
-            "sha256": allocation["sha256"],
+            "daily_path": projected_allocation["daily_path"],
+            "sha256": projected_allocation["sha256"],
             "snapshot": {
-                "version": allocation.get("version", 1),
-                "markets": allocation["markets"],
+                "version": projected_allocation.get("version", 1),
+                "markets": projected_allocation["markets"],
             },
         }
-        if isinstance(allocation, dict)
+        if isinstance(projected_allocation, dict)
         else None
     )
     current_strategy_snapshot = (
@@ -3160,7 +3900,7 @@ def _project_broker_trend_report(
         "risk_summary": risk_summary,
         "drawdown_summary": payload.get("drawdown_summary", {}),
         "api_cost": frozen_api_cost,
-        "allocation": payload.get("allocation"),
+        "allocation": projected_allocation,
         "simulate_rotation_pairs": (
             copy.deepcopy(
                 payload["strategy_judgments"].get("simulate_rotation_pairs", [])
