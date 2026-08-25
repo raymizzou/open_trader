@@ -115,7 +115,7 @@ seed_prediction_route() {
 
 lint_plist() {
   local rendered="$1" temp
-  temp="$(mktemp "${TMPDIR:-/tmp}/open-trader-dashboard.XXXXXX.plist")"
+  temp="$(mktemp "${TMPDIR:-/tmp}/open-trader-dashboard.XXXXXX")"
   printf '%s\n' "$rendered" > "$temp"
   "$PLUTIL_BIN" -lint "$temp" >/dev/null
   rm -f "$temp"

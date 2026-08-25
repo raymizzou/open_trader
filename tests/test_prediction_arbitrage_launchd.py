@@ -45,6 +45,9 @@ def test_dashboard_launchd_dry_run_is_valid_and_has_no_side_effect(tmp_path: Pat
     agents.mkdir()
     runtime_root = tmp_path / "runtime"
     runtime_root.mkdir()
+    temp_dir = tmp_path / "tmp"
+    temp_dir.mkdir()
+    (temp_dir / "open-trader-dashboard.XXXXXX.plist").touch()
     result = subprocess.run(
         [
             str(INSTALLER),
@@ -61,7 +64,7 @@ def test_dashboard_launchd_dry_run_is_valid_and_has_no_side_effect(tmp_path: Pat
             sys.executable,
         ],
         cwd=ROOT,
-        env={**os.environ, "HOME": str(tmp_path)},
+        env={**os.environ, "HOME": str(tmp_path), "TMPDIR": str(temp_dir)},
         check=True,
         capture_output=True,
         text=True,
@@ -528,6 +531,9 @@ def test_cross_auto_status_fails_closed_for_semantically_invalid_state(
 
 
 def test_prediction_health_installer_defaults_to_service_port(tmp_path: Path) -> None:
+    temp_dir = tmp_path / "tmp"
+    temp_dir.mkdir()
+    (temp_dir / "open-trader-health.XXXXXX.plist").touch()
     result = subprocess.run(
         [
             str(HEALTH_INSTALLER),
@@ -538,7 +544,11 @@ def test_prediction_health_installer_defaults_to_service_port(tmp_path: Path) ->
             str(tmp_path),
         ],
         cwd=ROOT,
-        env={**os.environ, "OPEN_TRADER_HEALTH_URL": ""},
+        env={
+            **os.environ,
+            "OPEN_TRADER_HEALTH_URL": "",
+            "TMPDIR": str(temp_dir),
+        },
         check=True,
         capture_output=True,
         text=True,

@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-25
+
+- Launchd dry-run plist linting now uses unique BSD-compatible `mktemp` templates, and the mixed Prediction Service HTTP capacity test keeps admitted handlers alive for its bounded orchestration. Verification: approved launchd cases RED `5 failed` then GREEN `5 passed`; capacity case `1 passed` plus the exact 20-run loop `20/20 passed`; focused suites `316 passed, 1 warning`; full `make test` `7260 passed, 3 skipped, 1 warning` (exit 0). Acceptance/deploy/push were not run after this fix-forward.
+
 ## 2026-08-24
 
 - Dashboard launchd installation now stops the prior job before truncating candidate logs, preventing mixed-generation log freshness failures. Verification: approved Case 1 RED `4 failed in 5.65s` and GREEN `4 passed in 5.33s`; reviewer Case 2 RED `2 failed in 4.33s` (stdout/stderr truncation failures) and GREEN `2 passed in 2.34s`; focused suites `458 passed, 1 warning`; full `make test` `7260 passed, 3 skipped, 1 warning` (exit 0); acceptance/deploy/push not run after this fix.

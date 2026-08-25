@@ -142,7 +142,7 @@ PGREP_BIN="${PGREP_BIN:-pgrep}"
 
 lint_rendered() {
   local rendered="$1" temp_path
-  temp_path="$(mktemp "${TMPDIR:-/tmp}/open-trader-launchd.XXXXXX.plist")"
+  temp_path="$(mktemp "${TMPDIR:-/tmp}/open-trader-launchd.XXXXXX")"
   printf '%s\n' "$rendered" > "$temp_path"
   plutil -lint "$temp_path" >/dev/null
   rm -f "$temp_path"

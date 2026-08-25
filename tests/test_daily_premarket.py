@@ -4176,6 +4176,9 @@ def test_launchd_installer_default_renders_only_three_controllers(
     repo = _copy_launchd_installer_assets(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
+    temp_dir = tmp_path / "tmp"
+    temp_dir.mkdir()
+    (temp_dir / "open-trader-launchd.XXXXXX.plist").touch()
     (repo / "config/daily_premarket.env").write_text(
         "\n".join(
             [
@@ -4192,7 +4195,11 @@ def test_launchd_installer_default_renders_only_three_controllers(
         check=True,
         capture_output=True,
         encoding="utf-8",
-        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+        env={
+            "HOME": str(home),
+            "PATH": "/usr/bin:/bin",
+            "TMPDIR": str(temp_dir),
+        },
     )
 
     labels = {payload["Label"] for payload in _launchd_plists(result.stdout)}

@@ -385,7 +385,7 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
             counts["state"] += 1
             if counts["state"] == 4:
                 state_entered.set()
-        assert release_slots.acquire(timeout=10)
+        assert release_slots.acquire(timeout=60)
         return {"state": "blocked"}
 
     def blocked_preview(opportunity_id: str) -> dict[str, object]:
@@ -395,7 +395,7 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
                 preview_entered.set()
             if counts["preview"] == 5:
                 preview_reentered.set()
-        assert release_slots.acquire(timeout=10)
+        assert release_slots.acquire(timeout=60)
         return {
             "state": "previewed",
             "preview_id": "preview-1",

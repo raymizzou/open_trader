@@ -42,6 +42,9 @@ def test_account_api_installer_dry_run_defaults_to_shadow(tmp_path: Path) -> Non
     runtime = tmp_path / "runtime"
     agents = tmp_path / "LaunchAgents"
     agents.mkdir()
+    temp_dir = tmp_path / "tmp"
+    temp_dir.mkdir()
+    (temp_dir / "open-trader-account-api.XXXXXX.plist").touch()
 
     result = subprocess.run(
         [
@@ -52,6 +55,7 @@ def test_account_api_installer_dry_run_defaults_to_shadow(tmp_path: Path) -> Non
         check=True,
         capture_output=True,
         text=True,
+        env={**os.environ, "TMPDIR": str(temp_dir)},
     )
 
     payload = plistlib.loads(result.stdout.encode())

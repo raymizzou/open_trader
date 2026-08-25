@@ -60,7 +60,7 @@ render_plist() {
 
 lint_plist() {
   local temp
-  temp="$(mktemp "${TMPDIR:-/tmp}/open-trader-account-api.XXXXXX.plist")"
+  temp="$(mktemp "${TMPDIR:-/tmp}/open-trader-account-api.XXXXXX")"
   printf '%s\n' "$1" > "$temp"
   plutil -lint "$temp" >/dev/null
   rm -f "$temp"

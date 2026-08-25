@@ -39,6 +39,9 @@ def test_dry_run_renders_runtime_paths_without_tiger_secrets(tmp_path: Path) -> 
     runtime_root = tmp_path / "runtime"
     agents = tmp_path / "LaunchAgents"
     agents.mkdir()
+    temp_dir = tmp_path / "tmp"
+    temp_dir.mkdir()
+    (temp_dir / "open-trader-account-sync.XXXXXX.plist").touch()
 
     result = subprocess.run(
         [
@@ -54,6 +57,7 @@ def test_dry_run_renders_runtime_paths_without_tiger_secrets(tmp_path: Path) -> 
         check=True,
         capture_output=True,
         text=True,
+        env={**os.environ, "TMPDIR": str(temp_dir)},
     )
 
     payload = plistlib.loads(result.stdout.encode("utf-8"))
