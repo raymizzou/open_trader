@@ -5129,9 +5129,12 @@ def _plan_buy_actions(
             use_final_plan_semantics=use_final_plan_semantics,
         )
     if (
-        not use_final_plan_semantics
-        and portfolio_planned_risk is not None
-        and portfolio_planned_risk >= net_value * PORTFOLIO_RISK_LIMIT
+        portfolio_planned_risk is not None
+        and (
+            portfolio_planned_risk > net_value * PORTFOLIO_RISK_LIMIT
+            if use_final_plan_semantics
+            else portfolio_planned_risk >= net_value * PORTFOLIO_RISK_LIMIT
+        )
     ):
         pause_reason = "组合正常计划风险已达到净值 4%"
         skips = [

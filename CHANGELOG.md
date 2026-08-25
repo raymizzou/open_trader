@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-25
 
+- Trend reports now pause new entries when existing planned risk is already above 4%; exact equality retains minimum-lot behavior. Verification: approved Case 1 RED then GREEN; equality/validator/paused-payload boundaries `3 passed`; full `make test` `7261 passed, 3 skipped, 1 warning` (exit 0).
 - Launchd dry-run plist linting now uses unique BSD-compatible `mktemp` templates, and the mixed Prediction Service HTTP capacity test keeps admitted handlers alive for its bounded orchestration. Verification: approved launchd cases RED `5 failed` then GREEN `5 passed`; capacity case `1 passed` plus the exact 20-run loop `20/20 passed`; focused suites `316 passed, 1 warning`; full `make test` `7260 passed, 3 skipped, 1 warning` (exit 0). Acceptance/deploy/push were not run after this fix-forward.
 
 ## 2026-08-24

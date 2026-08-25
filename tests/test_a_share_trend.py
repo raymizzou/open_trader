@@ -5106,6 +5106,88 @@ def test_sell_all_releases_cash_slot_and_planned_risk_before_new_entries() -> No
     assert sold.buy_actions[0].decisive_constraint == "单笔风险上限"
 
 
+def test_existing_portfolio_risk_above_limit_pauses_new_minimum_lot_entries() -> None:
+    base_allocation = allocation_for("US", rank=1, entry_weight="0.06")
+    allocation = {
+        "daily_path": base_allocation["daily_path"],
+        "sha256": base_allocation["sha256"],
+        "snapshot": build_allocation_snapshot(
+            allocation_date="2026-08-03",
+            generated_at="2026-08-03T16:18:00+08:00",
+            git_sha="a" * 40,
+            roots=base_allocation["snapshot"]["roots"],
+            previous=None,
+            version=2,
+        ),
+    }
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "US", "abc123", (622460, 705013),
+        allocation=allocation,
+        execution_date="2026-07-15",
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("60000"),
+            positions=(
+                AccountPosition(
+                    "USOLD", "持仓", "stock", Decimal("4000"),
+                    Decimal("10"), Decimal("40000"),
+                ),
+            ),
+            exceptions=(),
+        ),
+        candidates=[
+            candidate(
+                "USNEW", exchange="US", asset="美股", global_strength="90",
+            )
+        ],
+        holding_snapshots={
+            "USOLD": replace(holding("USOLD", asset="美股"), exchange="US"),
+        },
+        bars_by_symbol={"USOLD": bars()},
+        prior_state={
+            "positions": {
+                "USOLD": {
+                    "initial_line": "9.00975",
+                    "active_line": "9.00975",
+                    "atr14": "0.5",
+                    "position_started_for": "2026-07-01",
+                    "updated_for": "2026-07-13",
+                }
+            }
+        },
+        market="US",
+        metadata={"market": "US", "broker": "futu"},
+        position_weight=Decimal("0.06"),
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        allocation_reference=allocation,
+    )
+
+    assert built.strategy_snapshot["strategy_version"] == "v13"
+    assert built.risk_summary["existing_planned_risk"] == Decimal("4001")
+    assert built.risk_summary["portfolio_risk_limit"] == Decimal("4000")
+    assert built.buy_actions == ()
+    assert built.risk_summary["new_planned_risk"] == Decimal("0")
+    assert built.risk_summary["status"] == "paused"
+    assert built.risk_summary["status_label"] == "组合风险已满"
+    assert built.risk_summary["pause_reason"] == "组合正常计划风险已达到净值 4%"
+    assert len(built.risk_skips) == 1
+    assert built.risk_skips[0]["symbol"] == "USNEW"
+    assert built.risk_skips[0]["reason"] == "组合正常计划风险已达到净值 4%"
+    assert built.risk_skips[0]["decisive_constraint"] == "组合剩余风险"
+    payload = trend_module._report_payload(built)
+    assert not any(
+        action.get("action") == "BUY"
+        for action in payload["strategy_judgments"]["formal_actions"]
+    )
+
+
 def test_full_existing_portfolio_risk_lists_one_lot_with_note_but_no_pause() -> None:
     allocation = allocation_for("CN", rank=1, entry_weight="0.06")
     strategy = trend_module.live_trend_strategy_snapshot(
