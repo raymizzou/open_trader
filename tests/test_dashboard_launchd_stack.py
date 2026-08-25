@@ -44,6 +44,7 @@ def _run_installer(
     *,
     mode: str = "stack",
     wait_seconds: int = 1,
+    blocked_log_path: str | None = None,
     **env_overrides: str,
 ) -> tuple[subprocess.CompletedProcess[str], list[str], Path]:
     agents = tmp_path / "LaunchAgents"
@@ -94,6 +95,9 @@ job_port() {
 }
 if [[ "$1" == "bootout" ]]; then
   if [[ "$label" != "${FAKE_STUCK_LABEL:-}" ]]; then
+    if [[ "$label" == "${FAKE_SHUTDOWN_LABEL:-}" && -f "$FAKE_LAUNCHD_STATE_DIR/$label" ]]; then
+      printf '%s\n' 'old process wrote during shutdown' >> "$FAKE_SHUTDOWN_LOG"
+    fi
     rm -f "$FAKE_LAUNCHD_STATE_DIR/$label"
     rm -f "$FAKE_LISTENER_STATE_DIR/$(job_port "$label")"
   elif [[ -n "${FAKE_DELAYED_STUCK_POLLS_FILE:-}" ]]; then
@@ -221,6 +225,8 @@ exit 0
         "CURL_BIN": str(curl),
         **env_overrides,
     }
+    if blocked_log_path is not None:
+        (repo / blocked_log_path).mkdir(parents=True)
     result = subprocess.run(
         [str(INSTALLER), "--mode", mode, *common_args[1:]],
         cwd=ROOT,
@@ -415,6 +421,86 @@ def test_fresh_stack_bootstraps_service_prediction_route(tmp_path: Path) -> None
         )
     )
     assert route["mode"] == "service"
+
+
+@pytest.mark.parametrize(
+    ("mode", "target", "log_path", "env_overrides"),
+    [
+        (
+            "stack",
+            LEGACY_LABEL,
+            "logs/legacy_dashboard/launchd.out.log",
+            {},
+        ),
+        (
+            "stack",
+            GATEWAY_LABEL,
+            "logs/frontend_gateway/launchd.out.log",
+            {},
+        ),
+        (
+            "single",
+            SINGLE_LABEL,
+            "logs/dashboard/launchd.out.log",
+            {
+                "FAKE_8766_PID": "4102",
+                "FAKE_8767_PID": "4103",
+                "FAKE_SINGLE_HEALTH": "1",
+            },
+        ),
+        (
+            "legacy",
+            LEGACY_LABEL,
+            "logs/legacy_dashboard/launchd.out.log",
+            {},
+        ),
+    ],
+)
+def test_installer_truncates_runtime_logs_after_stopping_previous_writer(
+    tmp_path: Path,
+    mode: str,
+    target: str,
+    log_path: str,
+    env_overrides: dict[str, str],
+) -> None:
+    result, _, _ = _run_installer(
+        tmp_path,
+        mode=mode,
+        FAKE_SHUTDOWN_LABEL=target,
+        FAKE_SHUTDOWN_LOG=str(tmp_path / "repo" / log_path),
+        **env_overrides,
+    )
+
+    log_contents = (tmp_path / "repo" / log_path).read_text(encoding="utf-8")
+    assert (result.returncode, "old process wrote during shutdown" in log_contents) == (
+        0,
+        False,
+    ), result.stderr
+
+
+@pytest.mark.parametrize(
+    "blocked_log_path",
+    [
+        "logs/legacy_dashboard/launchd.out.log",
+        "logs/legacy_dashboard/launchd.err.log",
+    ],
+)
+def test_installer_does_not_bootstrap_when_candidate_log_cannot_be_truncated(
+    tmp_path: Path, blocked_log_path: str
+) -> None:
+    result, calls, agents = _run_installer(
+        tmp_path,
+        blocked_log_path=blocked_log_path,
+    )
+    domain = f"gui/{os.getuid()}"
+    legacy_bootstrap = (
+        f"launchctl bootstrap {domain} {agents / f'{LEGACY_LABEL}.plist'}"
+    )
+
+    assert (result.returncode != 0, legacy_bootstrap in calls) == (True, False), (
+        result.stdout,
+        result.stderr,
+    )
 
 
 def test_unknown_mode_fails_without_side_effects(tmp_path: Path) -> None:

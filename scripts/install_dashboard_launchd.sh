@@ -237,8 +237,10 @@ bootstrap_agent() {
 }
 
 start_agent() {
-  local label="$1" plist="$2"
+  local label="$1" plist="$2" stdout_log="$3" stderr_log="$4"
   bootout_agent "$label" || return 1
+  : > "$stdout_log" || return 1
+  : > "$stderr_log" || return 1
   bootstrap_agent "$plist"
 }
 
@@ -251,9 +253,7 @@ install_single() {
   printf '%s\n' "$single_rendered" > "$SINGLE_PLIST"
   bootout_agent "$GATEWAY_LABEL"
   bootout_agent "$LEGACY_LABEL"
-  : > "$OUT_LOG"
-  : > "$ERR_LOG"
-  start_agent "$SINGLE_LABEL" "$SINGLE_PLIST"
+  start_agent "$SINGLE_LABEL" "$SINGLE_PLIST" "$OUT_LOG" "$ERR_LOG"
   wait_health "http://127.0.0.1:8766/healthz" "legacy_dashboard"
   wait_http "http://127.0.0.1:8766/"
   echo "installed launchd agent: $SINGLE_LABEL"
@@ -278,12 +278,8 @@ install_stack() {
   seed_prediction_route
   printf '%s\n' "$gateway_rendered" > "$GATEWAY_PLIST"
   printf '%s\n' "$legacy_rendered" > "$LEGACY_PLIST"
-  : > "$GATEWAY_OUT_LOG"
-  : > "$GATEWAY_ERR_LOG"
-  : > "$LEGACY_OUT_LOG"
-  : > "$LEGACY_ERR_LOG"
 
-  if ! start_agent "$LEGACY_LABEL" "$LEGACY_PLIST" || \
+  if ! start_agent "$LEGACY_LABEL" "$LEGACY_PLIST" "$LEGACY_OUT_LOG" "$LEGACY_ERR_LOG" || \
     ! wait_health "http://127.0.0.1:8767/healthz" "legacy_dashboard"; then
     echo "legacy dashboard failed readiness" >&2
     return 1
@@ -291,7 +287,7 @@ install_stack() {
 
   bootout_agent "$SINGLE_LABEL"
   bootout_agent "$GATEWAY_LABEL"
-  if ! start_agent "$GATEWAY_LABEL" "$GATEWAY_PLIST" || \
+  if ! start_agent "$GATEWAY_LABEL" "$GATEWAY_PLIST" "$GATEWAY_OUT_LOG" "$GATEWAY_ERR_LOG" || \
     ! wait_health "http://127.0.0.1:8766/healthz" "frontend_gateway" || \
     ! wait_http "http://127.0.0.1:8766/"; then
     echo "frontend gateway failed readiness" >&2
@@ -308,9 +304,7 @@ install_legacy() {
   ensure_port_owned 8767 "$LEGACY_LABEL"
   mkdir -p "$LAUNCH_AGENTS_DIR" "$REPO_ROOT/logs/legacy_dashboard" "$DATA_DIR" "$REPORTS_DIR"
   printf '%s\n' "$legacy_rendered" > "$LEGACY_PLIST"
-  : > "$LEGACY_OUT_LOG"
-  : > "$LEGACY_ERR_LOG"
-  start_agent "$LEGACY_LABEL" "$LEGACY_PLIST"
+  start_agent "$LEGACY_LABEL" "$LEGACY_PLIST" "$LEGACY_OUT_LOG" "$LEGACY_ERR_LOG"
   wait_health "http://127.0.0.1:8767/healthz" "legacy_dashboard"
   echo "installed launchd agent: $LEGACY_LABEL"
 }
