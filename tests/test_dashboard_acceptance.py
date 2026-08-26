@@ -8031,13 +8031,14 @@ def _write_acceptance_history_artifact(
     *,
     execution_date: str,
     symbol: str,
+    strategy_version: str = "v1",
 ) -> tuple[dict[str, object], str]:
     from open_trader.trend_review import _report_hash
 
     payload: dict[str, object] = {
         "execution_date": execution_date,
         "metadata": {"market": "US", "broker": "futu"},
-        "strategy_snapshot": {"strategy_version": "v1"},
+        "strategy_snapshot": {"strategy_version": strategy_version},
         "strategy_judgments": {
             "formal_actions": [{"action": "BUY", "symbol": symbol}],
         },
@@ -8213,6 +8214,87 @@ def test_acceptance_keeps_ledger_referenced_action_in_exact_historical_report(
     assert expectations[0]["strategy_parameter_rows"] == exact["old.json"][
         "strategy_parameter_rows"
     ]
+
+
+def test_acceptance_allows_v2_history_plan_without_row_execution_status(
+    tmp_path: Path,
+) -> None:
+    reports_dir = tmp_path / "reports"
+    _, report_hash = _write_acceptance_history_artifact(
+        reports_dir,
+        "v2.json",
+        execution_date="2026-08-20",
+        symbol="NDAQ",
+        strategy_version="v13",
+    )
+    event = _write_acceptance_action(
+        tmp_path / "data", report_sha256=report_hash, event_date="2026-08-20"
+    )
+    history = [{
+        "available": True,
+        "artifact": "v2.json",
+        "execution_date": "2026-08-20",
+        "strategy_version": "v13",
+    }]
+    exact = {
+        "v2.json": {
+            "artifact": "v2.json",
+            "report_sha256": report_hash,
+            "strategy_version": "v13",
+            "report_date": "2026-08-20",
+            "audit": {"artifact": "v2.json"},
+            "buy_actions": [{"symbol": "NDAQ"}],
+        }
+    }
+
+    expectations = dashboard_acceptance._validate_history_projection(
+        tmp_path / "data", reports_dir, "futu", history, exact
+    )
+
+    assert expectations == [{
+        **exact["v2.json"],
+        "symbol": "NDAQ",
+        "side": "buy",
+        "event": event,
+    }]
+
+
+def test_acceptance_rejects_legacy_history_without_row_execution_status(
+    tmp_path: Path,
+) -> None:
+    reports_dir = tmp_path / "reports"
+    _, report_hash = _write_acceptance_history_artifact(
+        reports_dir,
+        "legacy.json",
+        execution_date="2026-08-20",
+        symbol="NDAQ",
+    )
+    _write_acceptance_action(
+        tmp_path / "data", report_sha256=report_hash, event_date="2026-08-20"
+    )
+    history = [{
+        "available": True,
+        "artifact": "legacy.json",
+        "execution_date": "2026-08-20",
+        "strategy_version": "v1",
+    }]
+    exact = {
+        "legacy.json": {
+            "artifact": "legacy.json",
+            "report_sha256": report_hash,
+            "strategy_version": "v1",
+            "report_date": "2026-08-20",
+            "audit": {"artifact": "legacy.json"},
+            "buy_actions": [{"symbol": "NDAQ"}],
+        }
+    }
+
+    with pytest.raises(
+        AssertionError, match="历史报告动作 NDAQ 消失或执行状态不匹配"
+    ):
+        dashboard_acceptance._validate_history_projection(
+            tmp_path / "data", reports_dir, "futu", history, exact
+        )
 
 
 def test_acceptance_allows_exact_history_to_lag_a_duplicate_terminal_event(

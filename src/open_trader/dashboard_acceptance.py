@@ -1761,16 +1761,20 @@ def _validate_history_projection(
             ),
             None,
         )
-        execution = projected.get("execution") if isinstance(projected, Mapping) else None
-        assert (
-            isinstance(execution, Mapping)
-            and execution.get("status") == event.get("status")
-            and any(
-                execution.get("status") == observed.get("status")
-                and execution.get("updated_at") == observed.get("recorded_at")
-                for observed in events_by_action[(report_hash, symbol, side)]
-            )
+        assert isinstance(
+            projected, Mapping
         ), f"{artifact} 历史报告动作 {symbol} 消失或执行状态不匹配"
+        if not is_allocation_v2_version(market, report["strategy_version"]):
+            execution = projected.get("execution")
+            assert (
+                isinstance(execution, Mapping)
+                and execution.get("status") == event.get("status")
+                and any(
+                    execution.get("status") == observed.get("status")
+                    and execution.get("updated_at") == observed.get("recorded_at")
+                    for observed in events_by_action[(report_hash, symbol, side)]
+                )
+            ), f"{artifact} 历史报告动作 {symbol} 消失或执行状态不匹配"
         expectations.append({
             **exact,
             "symbol": symbol,
