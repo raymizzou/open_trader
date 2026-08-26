@@ -47,8 +47,13 @@ def _seed_previous_reports(config: SimpleNamespace) -> dict[Path, bytes]:
     for market, (directory, _version, _cost) in MARKETS.items():
         root = config.reports_dir / directory
         root.mkdir(parents=True, exist_ok=True)
+        report_date = (
+            (date.fromisoformat(config.run_date) - timedelta(days=1)).isoformat()
+            if market == "US"
+            else config.run_date
+        )
         for suffix, body in (("json", f"old-{market}-json\n"), ("md", f"old-{market}-md\n")):
-            path = root / f"{config.run_date}.{suffix}"
+            path = root / f"{report_date}.{suffix}"
             path.write_text(body, encoding="utf-8")
             previous[path] = path.read_bytes()
     return previous
@@ -127,7 +132,7 @@ def test_stage_calls_all_markets_with_revision_and_does_not_publish(
     assert not list(config.reports_dir.rglob("*-r*.json"))
 
 
-def test_stage_uses_latest_allocation_date_for_each_market_runner(
+def test_stage_uses_allocation_date_for_each_market_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import open_trader.futu_quote as futu_quote
@@ -180,7 +185,7 @@ def test_stage_uses_latest_allocation_date_for_each_market_runner(
     assert [(call["market"], call["run_date"]) for call in calls] == [
         ("CN", "2026-08-07"),
         ("HK", "2026-08-07"),
-        ("US", "2026-08-08"),
+        ("US", "2026-08-07"),
     ]
 
 
@@ -237,13 +242,14 @@ def test_publish_uses_immutable_pairs_and_records_hashes_and_costs(
     assert len(manifest["markets"]) == 3
     for market, record in manifest["markets"].items():
         directory, _version, cost = MARKETS[market]
-        json_path = config.reports_dir / directory / f"{config.run_date}-r1.json"
-        markdown_path = config.reports_dir / directory / f"{config.run_date}-r1.md"
+        report_date = "2026-08-06" if market == "US" else config.run_date
+        json_path = config.reports_dir / directory / f"{report_date}-r1.json"
+        markdown_path = config.reports_dir / directory / f"{report_date}-r1.md"
         assert json_path.exists() and markdown_path.exists()
         assert record["new_sha256"]["json"] == publisher._sha256(json_path.read_bytes())
         assert record["new_sha256"]["markdown"] == publisher._sha256(markdown_path.read_bytes())
-        assert record["old_sha256"]["json"] == publisher._sha256(previous[config.reports_dir / directory / f"{config.run_date}.json"])
-        assert record["old_sha256"]["markdown"] == publisher._sha256(previous[config.reports_dir / directory / f"{config.run_date}.md"])
+        assert record["old_sha256"]["json"] == publisher._sha256(previous[config.reports_dir / directory / f"{report_date}.json"])
+        assert record["old_sha256"]["markdown"] == publisher._sha256(previous[config.reports_dir / directory / f"{report_date}.md"])
         assert record["actual_api_cost"] == cost
 
 

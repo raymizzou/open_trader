@@ -374,11 +374,7 @@ def stage_and_publish(config: DailyPremarketConfig, *, publish: bool = False) ->
 
         allocation_date = _allocation_date(allocation_reference)
         for market in ("CN", "HK", "US"):
-            market_run_date = (
-                (date.fromisoformat(allocation_date) + timedelta(days=1)).isoformat()
-                if market == "US"
-                else allocation_date
-            )
+            market_run_date = allocation_date
             directory = stage_root / REPORT_DIRECTORIES[market]
             before = {
                 path: path.read_bytes()

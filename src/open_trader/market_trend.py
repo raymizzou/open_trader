@@ -269,7 +269,13 @@ def resolve_market_dates(quote: object, *, market: str, run_date: str) -> tuple[
         start=(run_day - timedelta(days=10)).isoformat(),
         end=(run_day + timedelta(days=14)).isoformat(),
     )
-    as_of_date = run_date if market == "HK" else (run_day - timedelta(days=1)).isoformat()
+    if market == "HK":
+        as_of_date = run_date
+    else:
+        prior_dates = [day for day in calendar if day < run_date]
+        if not prior_dates:
+            raise MarketHoliday(f"{market} has no completed trading session before {run_date}")
+        as_of_date = max(prior_dates)
     if as_of_date not in calendar:
         raise MarketHoliday(f"{market} signal date {as_of_date} is not a trading day")
     later = sorted(day for day in calendar if day > as_of_date)

@@ -135,6 +135,37 @@ def test_write_load_is_idempotent_and_reports_stale_metadata(tmp_path: Path) -> 
     }
 
 
+def test_v2_write_load_preserves_market_specific_latest_dates(tmp_path: Path) -> None:
+    roots = root_rows(cn=("70", "60"), hk=("80", "70"), us=("90", "80"))
+    for market in ("CN", "HK"):
+        for root in roots[market].values():
+            root["as_of_date"] = "2026-08-26"
+    for root in roots["US"].values():
+        root["as_of_date"] = "2026-08-25"
+    built = build_allocation_snapshot(
+        allocation_date="2026-08-26",
+        generated_at="2026-08-26T16:20:00+08:00",
+        git_sha="a" * 40,
+        roots=roots,
+        previous=None,
+        version=2,
+    )
+
+    write_allocation_snapshot(tmp_path, built)
+    loaded = load_allocation_reference(
+        tmp_path, allocation_date="2026-08-26", a_trading_days=["2026-08-26"]
+    )
+
+    assert loaded is not None
+    assert loaded["reused"] is False
+    assert loaded["stale_a_trading_days"] == 0
+    assert loaded["snapshot"] == built
+    assert {
+        market: loaded["snapshot"]["roots"][market]["stock"]["as_of_date"]
+        for market in ("CN", "HK", "US")
+    } == {"CN": "2026-08-26", "HK": "2026-08-26", "US": "2026-08-25"}
+
+
 def test_write_revisions_are_immutable_and_locked_batches_fail_closed(tmp_path: Path) -> None:
     first = snapshot()
     write_allocation_snapshot(tmp_path, first)

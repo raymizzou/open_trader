@@ -739,7 +739,6 @@ def _rank_markets_v2(
     previous: Mapping[str, object] | None,
 ) -> list[str]:
     stock_roots = {market: values["stock"] for market, values in roots.items()}
-    dates = {str(root["as_of_date"]) for root in stock_roots.values()}
     try:
         values = {
             market: Decimal(str(root["global_strength"]))
@@ -747,7 +746,7 @@ def _rank_markets_v2(
         }
     except (KeyError, InvalidOperation, ValueError):
         values = {}
-    if len(dates) != 1 or len(values) != len(ROOT_ASSETS):
+    if len(values) != len(ROOT_ASSETS):
         if previous is None:
             raise TrendAnimalsError(
                 "allocation stock-root ranking is unavailable without a previous snapshot"
@@ -768,17 +767,16 @@ def _rank_markets_v2(
 
 
 def _v2_ranking_fallback_required(roots: object) -> bool:
-    """Identify missing strengths or inconsistent stock dates before normalization."""
+    """Identify missing dates or invalid strengths before normalization."""
     if not isinstance(roots, Mapping) or set(roots) != set(ROOT_ASSETS):
         return True
-    stock_dates: list[str] = []
     for market in ROOT_ASSETS:
         market_roots = roots.get(market)
         if not isinstance(market_roots, Mapping):
             return True
         stock = market_roots.get("stock")
-        if isinstance(stock, Mapping) and isinstance(stock.get("as_of_date"), str):
-            stock_dates.append(str(stock["as_of_date"]))
+        if not isinstance(stock, Mapping) or not isinstance(stock.get("as_of_date"), str):
+            return True
         for role in ("stock", "etf"):
             root = market_roots.get(role)
             if not isinstance(root, Mapping):
@@ -792,7 +790,7 @@ def _v2_ranking_fallback_required(roots: object) -> bool:
                 return True
             if not parsed.is_finite():
                 return True
-    return len(stock_dates) != len(ROOT_ASSETS) or len(set(stock_dates)) != 1
+    return False
 
 
 def _previous_order(previous: Mapping[str, object]) -> list[str]:
@@ -870,8 +868,6 @@ def _validate_snapshot(snapshot: Mapping[str, object]) -> None:
         ranks.add(rank)
     if ranks != {1, 2, 3}:
         raise TrendAnimalsError("allocation market mapping is invalid")
-    if version == 2 and len({str(values["stock"]["as_of_date"]) for values in roots.values()}) != 1:
-        raise TrendAnimalsError("allocation stock-root dates are inconsistent")
     pairs = {
         market: (
             (Decimal(str(values["stock"]["global_strength"])),)

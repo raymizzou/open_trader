@@ -453,15 +453,23 @@ def test_resolve_market_dates_uses_same_day_hk_and_prior_day_us() -> None:
     )
 
 
-def test_resolve_market_dates_marks_missing_target_session_as_holiday() -> None:
+def test_resolve_market_dates_marks_missing_hk_target_session_as_holiday() -> None:
     class Quote:
         def get_trading_days(self, **kwargs: object) -> list[str]:
             return ["2026-07-10", "2026-07-13", "2026-07-16"]
 
     with pytest.raises(MarketHoliday):
         resolve_market_dates(Quote(), market="HK", run_date="2026-07-15")
-    with pytest.raises(MarketHoliday):
-        resolve_market_dates(Quote(), market="US", run_date="2026-07-15")
+
+
+def test_resolve_market_dates_uses_latest_prior_us_trading_session_across_closed_calendar_days() -> None:
+    class Quote:
+        def get_trading_days(self, **kwargs: object) -> list[str]:
+            return ["2026-08-07", "2026-08-10", "2026-08-11"]
+
+    assert resolve_market_dates(Quote(), market="US", run_date="2026-08-10") == (
+        "2026-08-07", "2026-08-10"
+    )
 
 
 @pytest.mark.parametrize(

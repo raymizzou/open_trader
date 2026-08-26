@@ -158,7 +158,48 @@ def test_strategy_identity_rejects_both_allocation_version_hybrids(
         )
 
 
-def test_v2_allocation_reuses_previous_order_for_ties_and_date_mismatch() -> None:
+def test_v2_allocation_ranks_market_specific_latest_dates() -> None:
+    previous_roots = _roots()
+    previous_roots["CN"]["stock"]["global_strength"] = "90"
+    previous_roots["HK"]["stock"]["global_strength"] = "80"
+    previous_roots["US"]["stock"]["global_strength"] = "70"
+    previous = build_allocation_snapshot(
+        allocation_date="2026-08-19",
+        generated_at="2026-08-19T16:20:00+08:00",
+        git_sha="a" * 40,
+        roots=previous_roots,
+        previous=None,
+        version=2,
+    )
+    roots = _roots()
+    roots["CN"]["stock"]["global_strength"] = "70"
+    roots["HK"]["stock"]["global_strength"] = "80"
+    roots["US"]["stock"]["global_strength"] = "90"
+    roots["US"]["stock"]["as_of_date"] = "2026-08-19"
+    current = build_allocation_snapshot(
+        allocation_date="2026-08-20",
+        generated_at="2026-08-20T16:20:00+08:00",
+        git_sha="a" * 40,
+        roots=roots,
+        previous=previous,
+        version=2,
+    )
+
+    assert current is not previous
+    assert current["allocation_date"] == "2026-08-20"
+    assert list(current["markets"]) == ["US", "HK", "CN"]
+    assert current["markets"] == {
+        "US": {"rank": 1, "score": "90", "score_source": "美股", "entry_weight": "0.04", "nominal_weight": "0.80", "position_limit": 20},
+        "HK": {"rank": 2, "score": "80", "score_source": "港股", "entry_weight": "0.04", "nominal_weight": "0.60", "position_limit": 15},
+        "CN": {"rank": 3, "score": "70", "score_source": "A股", "entry_weight": "0.04", "nominal_weight": "0.40", "position_limit": 10},
+    }
+    assert {
+        market: current["roots"][market]["stock"]["as_of_date"]
+        for market in ("CN", "HK", "US")
+    } == {"CN": "2026-08-20", "HK": "2026-08-20", "US": "2026-08-19"}
+
+
+def test_v2_allocation_reuses_previous_order_for_ties() -> None:
     previous = build_allocation_snapshot(
         allocation_date="2026-08-19",
         generated_at="2026-08-19T16:20:00+08:00",
@@ -170,7 +211,7 @@ def test_v2_allocation_reuses_previous_order_for_ties_and_date_mismatch() -> Non
     roots = _roots()
     roots["CN"]["stock"]["global_strength"] = "80"
     roots["HK"]["stock"]["global_strength"] = "80"
-    roots["US"]["stock"]["as_of_date"] = "2026-08-19"
+    roots["US"]["stock"]["global_strength"] = "70"
     current = build_allocation_snapshot(
         allocation_date="2026-08-20",
         generated_at="2026-08-20T16:20:00+08:00",
@@ -180,7 +221,7 @@ def test_v2_allocation_reuses_previous_order_for_ties_and_date_mismatch() -> Non
         version=2,
     )
 
-    assert list(current["markets"]) == list(previous["markets"])
+    assert list(current["markets"]) == ["HK", "CN", "US"]
 
 
 def test_v2_pure_tie_rejects_v1_predecessor() -> None:
