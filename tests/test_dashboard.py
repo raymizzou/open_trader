@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import csv
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -4207,12 +4208,255 @@ def _current_nominal_dashboard_payload(
     return payload
 
 
+def test_dashboard_accepts_current_four_percent_plan_with_unavailable_risk_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allocation_snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-03",
+        generated_at="2026-08-03T16:20:00+08:00",
+        git_sha="a" * 40,
+        roots={
+            "CN": {
+                "stock": {
+                    "asset": "A股", "tm_id": 1,
+                    "as_of_date": "2026-08-03", "global_strength": "90",
+                },
+                "etf": {
+                    "asset": "ETF基金", "tm_id": 2,
+                    "as_of_date": "2026-08-03", "global_strength": "80",
+                },
+            },
+            "HK": {
+                "stock": {
+                    "asset": "港股", "tm_id": 3,
+                    "as_of_date": "2026-08-03", "global_strength": "70",
+                },
+                "etf": {
+                    "asset": "香港ETF", "tm_id": 4,
+                    "as_of_date": "2026-08-03", "global_strength": "60",
+                },
+            },
+            "US": {
+                "stock": {
+                    "asset": "美股", "tm_id": 5,
+                    "as_of_date": "2026-08-03", "global_strength": "50",
+                },
+                "etf": {
+                    "asset": "美国ETF", "tm_id": 6,
+                    "as_of_date": "2026-08-03", "global_strength": "40",
+                },
+            },
+        },
+        previous=None,
+        version=2,
+    )
+    allocation = {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": "b" * 64,
+        "snapshot": allocation_snapshot,
+    }
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "HK", "abc123", (1,), allocation=allocation,
+    )
+    candidate_input = trend_module.CandidateInput(
+        tm_id=1,
+        symbol="0001",
+        exchange="HK",
+        name="股票0001",
+        asset="港股",
+        industry="电力",
+        as_of_date="2026-08-03",
+        tradable=True,
+        amount=Decimal("3"),
+        right_side=True,
+        days=3,
+        strength=Decimal("96"),
+        danger=False,
+        close=Decimal("10"),
+        atr=None,
+        industry_tm_id=700001,
+        industry_temperature="热",
+        filter_price=Decimal("10"),
+        market_cap=Decimal("200"),
+        temperature_prev="温",
+        temperature_curr="热",
+        phase="立夏",
+        global_strength=Decimal("100"),
+    )
+
+    def build(as_of_date: str, execution_date: str, generated_at: str) -> object:
+        return trend_module.build_report(
+            as_of_date=as_of_date,
+            execution_date=execution_date,
+            generated_at=generated_at,
+            market="HK",
+            account=trend_module.AccountSnapshot(
+                source_date=as_of_date,
+                fresh=True,
+                net_value=Decimal("1000"),
+                available_cash=Decimal("0"),
+                positions=(),
+                exceptions=(),
+            ),
+            candidates=(replace(candidate_input, as_of_date=as_of_date),),
+            holding_snapshots={},
+            bars_by_symbol={},
+            lot_sizes={"0001": 100},
+            metadata={"market": "HK", "broker": "phillips"},
+            strategy_snapshot=strategy,
+            allocation_reference=allocation,
+            real_holdings=trend_module.RealHoldingInput(
+                status="available",
+                reason="",
+                source={"broker": "phillips"},
+                positions=(),
+                holding_snapshots={},
+                bars_by_symbol={},
+                prior_state=None,
+                net_value=Decimal("1000"),
+                available_cash=Decimal("0"),
+                position_count=0,
+            ),
+            drawdown_summary={
+                "schema_version": "open_trader.strategy_drawdown.v1",
+                "market": "HK",
+                "strategy_id": strategy["strategy_id"],
+                "strategy_version": strategy["strategy_version"],
+                "kelly_sample_key": (
+                    f"HK|{strategy['strategy_id']}|{strategy['strategy_version']}"
+                ),
+                "state_status": "ok",
+                "status": "active",
+                "status_label": "纪律内",
+                "entry_allowed": True,
+                "current_equity": "1000",
+                "high_water_mark": "1000",
+                "drawdown_pct": "0",
+                "drawdown_limit_pct": "0.05",
+                "pause_reason": "",
+                "paused_at": None,
+                "observed_at": f"{as_of_date}T18:00:00+08:00",
+                "bootstrap_event": None,
+                "recovery_event": None,
+            },
+            account_input={
+                "snapshot_generation": "sha256:" + "a" * 64,
+                "account_generation": "sha256:" + "b" * 64,
+                "status": "healthy",
+            },
+        )
+
+    config = dashboard_config(tmp_path)
+    reports_dir = config.reports_dir / "trend_hk_phillips"
+    written_payloads: list[dict[str, object]] = []
+
+    def write(report: object) -> None:
+        _, json_path = trend_module.write_frozen_report(report, reports_dir)
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        payload["option_attention"] = []
+        json_path.write_text(json.dumps(payload), encoding="utf-8")
+        written_payloads.append(payload)
+
+    write(build("2026-08-02", "2026-08-03", "2026-08-03T18:00:00+08:00"))
+    write(build("2026-08-03", "2026-08-04", "2026-08-04T18:00:00+08:00"))
+    monkeypatch.setattr(
+        dashboard_module,
+        "_trend_market_date",
+        lambda _market, *, now=None: date(2026, 8, 4),
+    )
+
+    report = load_dashboard_state(config).to_dict()["trend_reports"]["phillips"]
+    action = report["buy_actions"][0]
+    latest_payload = written_payloads[-1]
+    real_action = latest_payload["strategy_judgments"]["real_buy_actions"][0]
+    real_plan = latest_payload["plan_availability"]["real_account"]
+
+    assert (
+        trend_module.valid_frozen_report_contract(latest_payload),
+        dashboard_module._valid_trend_report_payload(
+            latest_payload, market="HK", broker="phillips",
+        ) is not None,
+        report["available"],
+        report["artifact"],
+        report["data_status"],
+        action["target_amount"],
+        action["estimated_shares"],
+        action["executable"],
+        action["planned_stop_risk"],
+        action["planned_stop_risk_pct"],
+        action["estimated_initial_line"],
+        action["sizing_note"],
+        report["risk_summary"]["status_label"],
+        Decimal(str(real_action["target_amount"])),
+        real_action["estimated_shares"],
+        real_action["executable"],
+        real_action["atr"],
+        real_action["planned_stop_risk"],
+        real_action["planned_stop_risk_pct"],
+        real_action["estimated_initial_line"],
+        real_action["sizing_note"],
+        real_plan["executable"],
+    ) == (
+        True,
+        True,
+        True,
+        "2026-08-03.json",
+        "current",
+        "40.00",
+        100,
+        True,
+        "0",
+        "0",
+        "0",
+        "计划止损风险仅审计，不参与买入数量",
+        "计划止损风险仅审计，不参与买入数量",
+        Decimal("40.00"),
+        100,
+        True,
+        "0",
+        "0",
+        "0",
+        "0",
+        "计划止损风险仅审计，不参与买入数量",
+        False,
+    )
+
+
 def test_dashboard_accepts_current_nominal_report_with_audit_only_stop_risk() -> None:
     payload = _current_nominal_dashboard_payload()
 
     assert dashboard_module._valid_trend_report_payload(
         payload, market="CN", broker="eastmoney",
     ) is not None
+
+
+def test_dashboard_accepts_current_nominal_buy_when_drawdown_is_audit_only() -> None:
+    payload = _current_nominal_dashboard_payload()
+    drawdown = copy.deepcopy(payload["drawdown_summary"])
+    assert isinstance(drawdown, dict)
+    drawdown.update(
+        {
+            "state_status": "missing",
+            "status": "paused",
+            "status_label": "暂停新开仓",
+            "entry_allowed": False,
+            "high_water_mark": None,
+            "drawdown_pct": None,
+            "paused_at": None,
+            "bootstrap_event": None,
+            "recovery_event": None,
+            "pause_reason": "策略累计回撤状态缺失，暂停新开仓",
+        }
+    )
+    payload["drawdown_summary"] = drawdown
+
+    assert (
+        trend_module.valid_frozen_report_contract(payload),
+        dashboard_module._valid_trend_report_payload(
+            payload, market="CN", broker="eastmoney",
+        ) is not None,
+    ) == (True, True)
 
 
 def test_dashboard_accepts_current_nominal_report_without_top_level_allocation_version() -> None:
@@ -4363,57 +4607,24 @@ def test_dashboard_independently_rejects_current_nominal_non_boolean_executable(
     ) is None
 
 
-def test_dashboard_independently_rejects_cash_insufficient_current_nominal_executable_buy(
-    monkeypatch: pytest.MonkeyPatch,
+def test_dashboard_accepts_cash_insufficient_current_nominal_executable_buy_as_audit_only(
 ) -> None:
     payload = _current_nominal_dashboard_payload(available_cash=Decimal("100"))
-    candidate = payload["signal_snapshots"]["candidates"][0]
-    candidate["atr"] = "0.5"
     buy = next(
         item
         for item in payload["strategy_judgments"]["formal_actions"]
         if item["action"] == "BUY"
     )
-    buy.update(
-        {
-            "atr": "0.5",
-            "estimated_initial_line": "9.0",
-            "planned_stop_risk": "101.000",
-            "planned_stop_risk_pct": "0.00101",
-            "sizing_note": "现金不足一手（需约 1001.00，可用 100.00）",
-        }
-    )
-    tampered = copy.deepcopy(payload)
-    tampered_buy = next(
-        item
-        for item in tampered["strategy_judgments"]["formal_actions"]
-        if item["action"] == "BUY"
-    )
-    tampered_buy["executable"] = True
-    tampered["risk_summary"].update(
-        {
-            "new_planned_risk": "101.000",
-            "portfolio_planned_risk": "101.000",
-            "portfolio_planned_risk_pct": "0.00101",
-            "portfolio_remaining_risk": "3899.000",
-            "portfolio_remaining_risk_pct": "0.03899",
-            "pending_entries_note": "",
-        }
-    )
-    monkeypatch.setattr(
-        dashboard_module,
-        "valid_frozen_report_contract",
-        lambda _payload: True,
-    )
 
     assert (
+        trend_module.valid_frozen_report_contract(payload),
         dashboard_module._valid_trend_report_payload(
             payload, market="CN", broker="eastmoney",
         ) is not None,
-        dashboard_module._valid_trend_report_payload(
-            tampered, market="CN", broker="eastmoney",
-        ),
-    ) == (True, None)
+        Decimal(str(buy["target_amount"])),
+        buy["estimated_shares"],
+        buy["executable"],
+    ) == (True, True, Decimal("4000.00"), 400, True)
 
 
 @pytest.mark.parametrize("executable_variant", ["missing", "string_false"])
@@ -4463,8 +4674,7 @@ def test_dashboard_independently_rejects_sub_limit_missing_or_non_boolean_execut
     ) is None
 
 
-def test_dashboard_independently_rejects_gross_forced_sale_cash_authorization(
-    monkeypatch: pytest.MonkeyPatch,
+def test_dashboard_current_nominal_gross_forced_sale_cash_is_audit_only(
 ) -> None:
     position = trend_module.AccountPosition(
         "600001",
@@ -4536,40 +4746,19 @@ def test_dashboard_independently_rejects_gross_forced_sale_cash_authorization(
             ),
         },
     )
-    monkeypatch.setattr(
-        dashboard_module,
-        "valid_frozen_report_contract",
-        lambda _payload: True,
-    )
+    tampered = copy.deepcopy(payload)
+    tampered["account"]["available_cash"] = "0"
+
     assert dashboard_module._valid_trend_report_payload(
         payload, market="CN", broker="eastmoney",
     ) is not None
-
-    tampered = copy.deepcopy(payload)
-    buy = next(
-        item
-        for item in tampered["strategy_judgments"]["formal_actions"]
-        if item["action"] == "BUY"
-    )
-    buy["executable"] = True
-    tampered["risk_summary"].update(
-        {
-            "new_planned_risk": "101.000",
-            "portfolio_planned_risk": "101.000",
-            "portfolio_planned_risk_pct": "0.00101",
-            "portfolio_remaining_risk": "3899.000",
-            "portfolio_remaining_risk_pct": "0.03899",
-            "pending_entries_note": "",
-        }
-    )
-
+    assert trend_module.valid_frozen_report_contract(tampered)
     assert dashboard_module._valid_trend_report_payload(
         tampered, market="CN", broker="eastmoney",
-    ) is None
+    ) is not None
 
 
-def test_dashboard_current_nominal_real_formal_buy_uses_available_cash_plus_net_forced_sale(
-    monkeypatch: pytest.MonkeyPatch,
+def test_dashboard_current_nominal_real_formal_buy_uses_nominal_target_as_audit_only(
 ) -> None:
     position = trend_module.AccountPosition(
         "600001",
@@ -4642,20 +4831,18 @@ def test_dashboard_current_nominal_real_formal_buy_uses_available_cash_plus_net_
             position_count=1,
         ),
     )
-    monkeypatch.setattr(
-        dashboard_module,
-        "valid_frozen_report_contract",
-        lambda _payload: True,
-    )
     real_action = payload["strategy_judgments"]["real_buy_actions"][0]
+    real_plan = payload["plan_availability"]["real_account"]
 
     assert (
         real_action["executable"],
         real_action["estimated_shares"],
+        real_plan["executable"],
+        trend_module.valid_frozen_report_contract(payload),
         dashboard_module._valid_trend_report_payload(
             payload, market="CN", broker="eastmoney",
         ) is not None,
-    ) == (True, 100, True)
+    ) == (True, 400, False, True, True)
 
 
 def test_dashboard_independently_rejects_duplicate_current_nominal_candidate_symbol(
@@ -4988,7 +5175,7 @@ def test_dashboard_independently_rejects_coherent_current_nominal_audit_risk_tam
     ) is None
 
 
-def test_dashboard_accepts_current_nominal_cost_limited_cash_boundary() -> None:
+def test_dashboard_current_nominal_cost_limited_cash_boundary_is_audit_only() -> None:
     payload = _current_nominal_dashboard_payload(
         market="US",
         available_cash=Decimal("4000"),
@@ -5027,12 +5214,13 @@ def test_dashboard_accepts_current_nominal_cost_limited_cash_boundary() -> None:
     )
 
     assert (
+        trend_module.valid_frozen_report_contract(payload),
         dashboard_module._valid_trend_report_payload(
             payload, market="US", broker="futu",
         ) is not None,
         Decimal(str(action["target_amount"])),
         action["estimated_shares"],
-    ) == (True, Decimal("4000"), 39)
+    ) == (True, True, Decimal("4000"), 40)
 
 
 def test_dashboard_accepts_current_nominal_target_with_minimum_lot_fallback() -> None:
@@ -5082,7 +5270,7 @@ def test_dashboard_accepts_current_nominal_target_with_minimum_lot_fallback() ->
     ) == (True, Decimal("4000"), 100)
 
 
-def test_dashboard_accepts_current_nominal_sequential_cash_limited_buys() -> None:
+def test_dashboard_current_nominal_sequential_cash_limited_buys_are_audit_only() -> None:
     payload = _current_nominal_dashboard_payload(
         market="US",
         available_cash=Decimal("6000"),
@@ -5125,6 +5313,7 @@ def test_dashboard_accepts_current_nominal_sequential_cash_limited_buys() -> Non
     ]
 
     assert (
+        trend_module.valid_frozen_report_contract(payload),
         dashboard_module._valid_trend_report_payload(
             payload, market="US", broker="futu",
         ) is not None,
@@ -5132,11 +5321,10 @@ def test_dashboard_accepts_current_nominal_sequential_cash_limited_buys() -> Non
             (Decimal(str(item["target_amount"])), item["estimated_shares"])
             for item in buys
         ],
-    ) == (True, [(Decimal("4000"), 40), (Decimal("4000"), 19)])
+    ) == (True, True, [(Decimal("4000"), 40), (Decimal("4000"), 40)])
 
 
-def test_dashboard_independently_rejects_cash_limited_target_rewrite(
-    monkeypatch: pytest.MonkeyPatch,
+def test_dashboard_defers_current_nominal_target_rewrite_validation_to_frozen_contract(
 ) -> None:
     payload = _current_nominal_dashboard_payload(
         market="US",
@@ -5181,18 +5369,20 @@ def test_dashboard_independently_rejects_cash_limited_target_rewrite(
     assert (
         Decimal(str(buys[1]["target_amount"])),
         buys[1]["estimated_shares"],
-    ) == (Decimal("4000"), 19)
+    ) == (Decimal("4000"), 40)
 
-    monkeypatch.setattr(
-        dashboard_module,
-        "valid_frozen_report_contract",
-        lambda _payload: True,
+    baseline = dashboard_module._valid_trend_report_payload(
+        payload, market="US", broker="futu",
     )
     buys[1]["target_amount"] = "1996"
 
-    assert dashboard_module._valid_trend_report_payload(
-        payload, market="US", broker="futu",
-    ) is None
+    assert (
+        trend_module.valid_frozen_report_contract(payload),
+        baseline is not None,
+        dashboard_module._valid_trend_report_payload(
+            payload, market="US", broker="futu",
+        ),
+    ) == (False, True, None)
 
 
 @pytest.mark.parametrize(
@@ -5391,8 +5581,7 @@ def test_dashboard_independently_rejects_falsified_current_nominal_real_and_rota
     assert (before is not None, after is None) == (True, True)
 
 
-def test_dashboard_current_nominal_real_rotation_uses_available_cash_plus_net_sale(
-    monkeypatch: pytest.MonkeyPatch,
+def test_dashboard_current_nominal_real_rotation_uses_nominal_target_as_audit_only(
 ) -> None:
     positions = tuple(
         trend_module.AccountPosition(
@@ -5491,16 +5680,10 @@ def test_dashboard_current_nominal_real_rotation_uses_available_cash_plus_net_sa
     )
     pair = payload["strategy_judgments"]["real_rotation_pairs"][0]
     sell_symbol = pair["sell_symbol"]
-    assert (pair["estimated_shares"], pair["target_amount"]) == (100, "4000.00")
-    monkeypatch.setattr(
-        dashboard_module,
-        "valid_frozen_report_contract",
-        lambda _payload: True,
-    )
+    assert (pair["estimated_shares"], pair["target_amount"]) == (400, "4000.00")
     baseline = dashboard_module._valid_trend_report_payload(
         payload, market="CN", broker="eastmoney",
     )
-    assert baseline is not None
 
     short_cash = copy.deepcopy(payload)
     short_cash["plan_availability"]["real_account"]["available_cash"] = "0"
@@ -5510,14 +5693,15 @@ def test_dashboard_current_nominal_real_rotation_uses_available_cash_plus_net_sa
     del real_signal["market_value"]
 
     assert (
-        True,
+        trend_module.valid_frozen_report_contract(payload),
+        baseline is not None,
         dashboard_module._valid_trend_report_payload(
             short_cash, market="CN", broker="eastmoney",
-        ) is None,
+        ) is not None,
         dashboard_module._valid_trend_report_payload(
             missing_sale_value, market="CN", broker="eastmoney",
-        ) is None,
-    ) == (True, True, True)
+        ) is not None,
+    ) == (True, True, True, True)
 
 
 def test_dashboard_current_nominal_real_rotation_accepts_missing_unused_sale_value(
@@ -5781,7 +5965,7 @@ def test_dashboard_current_nominal_sizing_is_independent_from_core_helper(
     ) is not None
 
 
-def test_dashboard_accepts_current_nominal_real_buy_with_frozen_kelly_cap() -> None:
+def test_dashboard_current_nominal_real_buy_with_frozen_kelly_cap_is_audit_only() -> None:
     kelly_rounds = tuple(
         trend_module.TrendKellyRound(
             round_id=f"round-{index:03d}",
@@ -5844,13 +6028,14 @@ def test_dashboard_accepts_current_nominal_real_buy_with_frozen_kelly_cap() -> N
     action = payload["strategy_judgments"]["real_buy_actions"][0]
 
     assert (
+        trend_module.valid_frozen_report_contract(payload),
         dashboard_module._valid_trend_report_payload(
             payload, market="US", broker="futu",
         ) is not None,
         Decimal(str(action["target_weight"])),
         Decimal(str(action["target_amount"])),
         action["estimated_shares"],
-    ) == (True, Decimal("0.012626"), Decimal("631.30"), 6)
+    ) == (True, True, Decimal("0.04"), Decimal("2000.00"), 20)
 
 
 def test_dashboard_rejects_current_nominal_quantity_not_anchored_to_nav_target() -> None:

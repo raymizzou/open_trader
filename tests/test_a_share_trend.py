@@ -2058,11 +2058,15 @@ def test_rotation_cash_does_not_count_signal_sale_twice(tmp_path: Path) -> None:
         for item in payload["strategy_judgments"]["holding_decisions"]
         if item["symbol"] == "600001"
     )
+    payload_pairs = payload["strategy_judgments"]["simulate_rotation_pairs"]
+    evidence_pairs = evidence["rebuild_inputs"]["simulate_rotation_pairs"]
     assert (
         target["action"],
-        payload["strategy_judgments"]["simulate_rotation_pairs"],
-        evidence["rebuild_inputs"]["simulate_rotation_pairs"],
-    ) == ("SELL_ALL", [], [])
+        len(payload_pairs),
+        payload_pairs == evidence_pairs,
+        payload_pairs[0]["buy_symbol"],
+        payload_pairs[0]["estimated_shares"],
+    ) == ("SELL_ALL", 1, True, "600999", 400)
 
 
 def test_real_rotation_sizing_uses_net_value_when_cash_is_negative() -> None:
@@ -2524,6 +2528,190 @@ def current_nominal_strategy(
             market, "abc123", (1,), allocation=allocation,
         ),
         allocation,
+    )
+
+
+def test_current_versions_size_sim_and_real_from_own_nav_at_four_percent_without_policy_caps() -> None:
+    strategy, allocation = current_nominal_strategy("US")
+    candidate_input = replace(
+        candidate(
+            "AAPL",
+            exchange="US",
+            asset="美股",
+            close="25",
+            atr="0.5",
+            market_cap="200",
+            amount="3",
+            global_strength="100",
+        ),
+        as_of_date="2026-08-03",
+    )
+    kelly_rounds = tuple(
+        replace(
+            item,
+            strategy_id=str(strategy["strategy_id"]),
+            opening_strategy_version="v14",
+        )
+        for item in _trend_kelly_rounds(*(["-0.10"] * 30), market="US")
+    )
+    drawdown = active_drawdown_for(strategy, equity="100000")
+    drawdown.update(
+        {
+            "status": "paused",
+            "status_label": "暂停新开仓",
+            "entry_allowed": False,
+            "pause_reason": "旧回撤门槛",
+        }
+    )
+    built = build_report(
+        as_of_date="2026-08-03",
+        execution_date="2026-08-04",
+        market="US",
+        account=AccountSnapshot(
+            source_date="2026-08-03",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("0"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(candidate_input,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "US", "broker": "futu"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        kelly_rounds=kelly_rounds,
+        drawdown_summary=drawdown,
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "futu"},
+            positions=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            prior_state=None,
+            net_value=Decimal("50000"),
+            available_cash=Decimal("0"),
+        ),
+    )
+    payload = trend_module._report_payload(built)
+    simulated = next(
+        item
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    )
+    real = payload["strategy_judgments"]["real_buy_actions"][0]
+
+    assert (
+        Decimal(str(simulated["target_amount"])),
+        simulated["estimated_shares"],
+        Decimal(str(real["target_amount"])),
+        real["estimated_shares"],
+        simulated["executable"],
+    ) == (Decimal("4000"), 160, Decimal("2000"), 80, True)
+
+
+@pytest.mark.parametrize(
+    "atr_value", [None, Decimal("0"), Decimal("-0.5")],
+)
+def test_current_version_buys_one_minimum_lot_when_four_percent_is_too_small_and_atr_is_missing(
+    tmp_path: Path, atr_value: Decimal | None,
+) -> None:
+    strategy, allocation = current_nominal_strategy("HK")
+    candidate_input = replace(
+        candidate(
+            "0001",
+            exchange="HK",
+            asset="港股",
+            close="10",
+            atr=atr_value,
+            market_cap="200",
+            amount="3",
+            global_strength="100",
+        ),
+        as_of_date="2026-08-03",
+    )
+    built = build_report(
+        as_of_date="2026-08-03",
+        execution_date="2026-08-04",
+        market="HK",
+        account=AccountSnapshot(
+            source_date="2026-08-03",
+            fresh=True,
+            net_value=Decimal("1000"),
+            available_cash=Decimal("0"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(candidate_input,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        lot_sizes={"0001": 100},
+        metadata={"market": "HK", "broker": "phillips"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        real_holdings=RealHoldingInput(
+            status="available",
+            reason="",
+            source={"broker": "phillips"},
+            positions=(),
+            holding_snapshots={},
+            bars_by_symbol={},
+            prior_state=None,
+            net_value=Decimal("1000"),
+            available_cash=Decimal("0"),
+            position_count=0,
+        ),
+    )
+    markdown_path, json_path = write_frozen_report(built, tmp_path)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    action = payload["strategy_judgments"]["formal_actions"][0]
+    real_action = payload["strategy_judgments"]["real_buy_actions"][0]
+    real_plan = payload["plan_availability"]["real_account"]
+
+    assert (
+        markdown_path.exists(),
+        json_path.exists(),
+        Decimal(str(action["target_amount"])),
+        action["estimated_shares"],
+        action["executable"],
+        action["atr"],
+        action["planned_stop_risk"],
+        action["planned_stop_risk_pct"],
+        action["estimated_initial_line"],
+        action["sizing_note"],
+        Decimal(str(real_action["target_amount"])),
+        real_action["estimated_shares"],
+        real_action["executable"],
+        real_action["atr"],
+        real_action["planned_stop_risk"],
+        real_action["planned_stop_risk_pct"],
+        real_action["estimated_initial_line"],
+        real_action["sizing_note"],
+        real_plan["executable"],
+        trend_module.valid_frozen_report_contract(payload),
+    ) == (
+        True,
+        True,
+        Decimal("40.00"),
+        100,
+        True,
+        "0",
+        "0",
+        "0",
+        "0",
+        "计划止损风险仅审计，不参与买入数量",
+        Decimal("40.00"),
+        100,
+        True,
+        "0",
+        "0",
+        "0",
+        "0",
+        "计划止损风险仅审计，不参与买入数量",
+        False,
+        True,
     )
 
 
@@ -3022,7 +3210,7 @@ def test_current_nominal_sell_only_report_freezes_zero_buy_seats(tmp_path: Path)
     ) == ([], 0, True)
 
 
-def test_current_nominal_formal_buy_uses_net_forced_sale_proceeds() -> None:
+def test_current_nominal_formal_buy_uses_nominal_nav_target() -> None:
     strategy, allocation = current_nominal_strategy("CN")
     position = AccountPosition(
         "600001",
@@ -3078,10 +3266,10 @@ def test_current_nominal_formal_buy_uses_net_forced_sale_proceeds() -> None:
         action.target_amount,
         action.estimated_shares,
         action.executable,
-    ) == (Decimal("4000"), 100, False)
+    ) == (Decimal("4000"), 400, True)
 
 
-def test_current_nominal_core_accepts_real_formal_buy_funded_by_net_forced_sale() -> None:
+def test_current_nominal_core_accepts_real_formal_buy_with_cash_audit_only() -> None:
     strategy, allocation = current_nominal_strategy("CN")
     position = AccountPosition(
         "600001",
@@ -3131,10 +3319,10 @@ def test_current_nominal_core_accepts_real_formal_buy_funded_by_net_forced_sale(
         real_action["executable"],
         real_action["estimated_shares"],
         trend_module.valid_frozen_report_contract(payload),
-    ) == (True, 100, True)
+    ) == (True, 400, True)
 
 
-def test_current_nominal_contract_rejects_gross_forced_sale_cash_authorization() -> None:
+def test_current_nominal_contract_treats_cash_authorization_as_audit_only() -> None:
     strategy, allocation = current_nominal_strategy("CN")
     position = AccountPosition(
         "600001",
@@ -3206,7 +3394,7 @@ def test_current_nominal_contract_rejects_gross_forced_sale_cash_authorization()
     assert (
         trend_module.valid_frozen_report_contract(payload),
         trend_module.valid_frozen_report_contract(tampered),
-    ) == (True, False)
+    ) == (True, True)
 
 
 @pytest.mark.parametrize(
@@ -3431,7 +3619,7 @@ def test_current_nominal_contract_rejects_initial_line_tamper() -> None:
     ) == (True, False)
 
 
-def test_current_nominal_validator_accepts_cost_limited_cash_boundary() -> None:
+def test_current_nominal_validator_uses_nominal_target_beyond_cash_boundary() -> None:
     strategy, allocation = current_nominal_strategy("US")
     built = build_report(
         as_of_date="2026-07-14",
@@ -3476,10 +3664,10 @@ def test_current_nominal_validator_accepts_cost_limited_cash_boundary() -> None:
         action["estimated_shares"],
         Decimal(str(action["normal_cost"])),
         action["executable"],
-    ) == (Decimal("4000"), 39, Decimal("3.9"), True)
+    ) == (Decimal("4000"), 40, Decimal("4.000"), True)
 
 
-def test_current_nominal_contract_rejects_cash_insufficient_executable_buy() -> None:
+def test_current_nominal_contract_accepts_cash_insufficient_executable_buy_as_audit_only() -> None:
     strategy, allocation = current_nominal_strategy("CN")
     built = build_report(
         as_of_date="2026-08-03",
@@ -3536,7 +3724,7 @@ def test_current_nominal_contract_rejects_cash_insufficient_executable_buy() -> 
         action["executable"],
         trend_module.valid_frozen_report_contract(payload),
         trend_module.valid_frozen_report_contract(tampered),
-    ) == ("4000.00", 100, False, True, False)
+    ) == ("4000.00", 400, True, True, True)
 
 
 def test_current_nominal_contract_rejects_missing_formal_buy_executable() -> None:
@@ -3584,7 +3772,7 @@ def test_current_nominal_contract_rejects_missing_formal_buy_executable() -> Non
         original_action["executable"],
         trend_module.valid_frozen_report_contract(payload),
         trend_module.valid_frozen_report_contract(tampered),
-    ) == (False, True, False)
+    ) == (True, True, False)
 
 
 def test_current_nominal_contract_rejects_duplicate_frozen_candidate_symbol() -> None:
@@ -3705,7 +3893,7 @@ def test_current_nominal_contract_rejects_non_boolean_real_buy_executable() -> N
     ) == (True, False)
 
 
-def test_current_nominal_real_validator_accepts_cost_limited_cash_boundary() -> None:
+def test_current_nominal_real_validator_uses_nominal_target_beyond_cash_boundary() -> None:
     strategy, allocation = current_nominal_strategy("US")
     built = build_report(
         as_of_date="2026-07-14",
@@ -3758,10 +3946,10 @@ def test_current_nominal_real_validator_accepts_cost_limited_cash_boundary() -> 
         action["estimated_shares"],
         Decimal(str(action["normal_cost"])),
         real_account["executable"],
-    ) == (Decimal("4000"), 39, Decimal("3.9"), False)
+    ) == (Decimal("4000"), 40, Decimal("4.000"), False)
 
 
-def test_current_nominal_contract_rejects_cash_insufficient_executable_real_buy() -> None:
+def test_current_nominal_contract_accepts_cash_insufficient_executable_real_buy_as_audit_only() -> None:
     strategy, allocation = current_nominal_strategy("US")
     built = build_report(
         as_of_date="2026-07-14",
@@ -3814,10 +4002,10 @@ def test_current_nominal_contract_rejects_cash_insufficient_executable_real_buy(
         original_action["executable"],
         trend_module.valid_frozen_report_contract(payload),
         trend_module.valid_frozen_report_contract(tampered),
-    ) == (False, True, False)
+    ) == (True, True, True)
 
 
-def test_current_nominal_rotation_validator_accepts_cost_limited_cash_boundary() -> None:
+def test_current_nominal_rotation_validator_uses_nominal_target_beyond_cash_boundary() -> None:
     strategy, allocation = current_nominal_strategy("US")
     positions = tuple(
         AccountPosition(
@@ -3878,10 +4066,10 @@ def test_current_nominal_rotation_validator_accepts_cost_limited_cash_boundary()
     assert (
         Decimal(str(pair["target_amount"])),
         pair["estimated_shares"],
-    ) == (Decimal("4000"), 39)
+    ) == (Decimal("4000"), 40)
 
 
-def test_current_nominal_core_real_rotation_uses_available_cash_plus_net_sale() -> None:
+def test_current_nominal_core_real_rotation_contract_ignores_cash_audit() -> None:
     strategy, allocation = current_nominal_strategy("CN")
     positions = tuple(
         AccountPosition(
@@ -3950,7 +4138,7 @@ def test_current_nominal_core_real_rotation_uses_available_cash_plus_net_sale() 
         trend_module.valid_frozen_report_contract(payload),
         trend_module.valid_frozen_report_contract(short_cash),
         trend_module.valid_frozen_report_contract(missing_sale_value),
-    ) == (True, False, False)
+    ) == (True, True, True)
 
 
 def test_current_nominal_core_real_rotation_accepts_missing_unused_sale_value() -> None:
@@ -4019,7 +4207,7 @@ def test_current_nominal_core_real_rotation_accepts_missing_unused_sale_value() 
     assert trend_module.valid_frozen_report_contract(missing_sale_value) is True
 
 
-def test_current_nominal_contract_rejects_cash_insufficient_automatic_rotation() -> None:
+def test_current_nominal_contract_accepts_cash_insufficient_automatic_rotation_as_audit_only() -> None:
     strategy, allocation = current_nominal_strategy("CN")
     held_symbols = ("600000", *(f"600{index:03d}" for index in range(2, 16)))
     positions = tuple(
@@ -4079,10 +4267,10 @@ def test_current_nominal_contract_rejects_cash_insufficient_automatic_rotation()
     assert (
         trend_module.valid_frozen_report_contract(payload),
         trend_module.valid_frozen_report_contract(tampered),
-    ) == (True, False)
+    ) == (True, True)
 
 
-def test_current_nominal_rotation_validator_applies_frozen_kelly_cap() -> None:
+def test_current_nominal_rotation_validator_keeps_kelly_as_audit_only() -> None:
     strategy, allocation = current_nominal_strategy("CN")
     positions = tuple(
         AccountPosition(
@@ -4146,14 +4334,14 @@ def test_current_nominal_rotation_validator_applies_frozen_kelly_cap() -> None:
         trend_module.valid_frozen_report_contract(payload),
     ) == (
         Decimal("0.012626"),
-        Decimal("0.012626"),
-        Decimal("1262.60"),
-        100,
+        Decimal("0.04"),
+        Decimal("4000.00"),
+        400,
         True,
     )
 
 
-def test_current_nominal_real_validator_applies_frozen_kelly_cap() -> None:
+def test_current_nominal_real_validator_keeps_kelly_as_audit_only() -> None:
     strategy, allocation = current_nominal_strategy("US")
     kelly_rounds = tuple(
         replace(
@@ -4214,7 +4402,7 @@ def test_current_nominal_real_validator_applies_frozen_kelly_cap() -> None:
         Decimal(str(action["target_amount"])),
         action["estimated_shares"],
         trend_module.valid_frozen_report_contract(payload),
-    ) == (Decimal("0.012626"), Decimal("631.30"), 6, True)
+    ) == (Decimal("0.04"), Decimal("2000.00"), 20, True)
 
 
 def test_current_nominal_contract_rejects_coherent_audit_risk_tamper() -> None:
@@ -4601,7 +4789,7 @@ def test_current_nominal_validator_rejects_falsified_real_plan_amount_and_quanti
         trend_module._report_payload(tampered)
 
 
-def test_current_nominal_validator_accepts_sequential_cash_limited_buys() -> None:
+def test_current_nominal_validator_keeps_nominal_targets_for_sequential_buys() -> None:
     strategy, allocation = current_nominal_strategy("US")
     built = build_report(
         as_of_date="2026-07-14",
@@ -4650,10 +4838,10 @@ def test_current_nominal_validator_accepts_sequential_cash_limited_buys() -> Non
     assert [
         (Decimal(str(item["target_amount"])), item["estimated_shares"])
         for item in buys
-    ] == [(Decimal("4000"), 40), (Decimal("4000"), 19)]
+    ] == [(Decimal("4000"), 40), (Decimal("4000"), 40)]
 
 
-def test_current_nominal_validator_rejects_cash_limited_target_rewrite() -> None:
+def test_current_nominal_validator_rejects_target_rewrite_independent_of_cash() -> None:
     strategy, allocation = current_nominal_strategy("US")
     built = build_report(
         as_of_date="2026-07-14",
@@ -4700,7 +4888,7 @@ def test_current_nominal_validator_rejects_cash_limited_target_rewrite() -> None
     assert (
         Decimal(str(buys[1]["target_amount"])),
         buys[1]["estimated_shares"],
-    ) == (Decimal("4000"), 19)
+    ) == (Decimal("4000"), 40)
 
     buys[1]["target_amount"] = "1996"
 
@@ -7847,25 +8035,8 @@ def test_sell_all_releases_cash_slot_and_planned_risk_before_new_entries() -> No
     assert sold.buy_actions[0].decisive_constraint == "单笔风险上限"
 
 
-def test_existing_portfolio_risk_above_limit_pauses_new_minimum_lot_entries() -> None:
-    base_allocation = allocation_for("US", rank=1, entry_weight="0.06")
-    allocation = {
-        "daily_path": base_allocation["daily_path"],
-        "sha256": base_allocation["sha256"],
-        "snapshot": build_allocation_snapshot(
-            allocation_date="2026-08-03",
-            generated_at="2026-08-03T16:18:00+08:00",
-            git_sha="a" * 40,
-            roots=base_allocation["snapshot"]["roots"],
-            previous=None,
-            version=2,
-        ),
-    }
-    strategy = trend_module.live_trend_strategy_snapshot(
-        "US", "abc123", (622460, 705013),
-        allocation=allocation,
-        execution_date="2026-07-15",
-    )
+def test_current_nominal_existing_portfolio_risk_above_limit_is_audit_only() -> None:
+    strategy, allocation = current_nominal_strategy("US")
     built = build_report(
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
@@ -7884,7 +8055,12 @@ def test_existing_portfolio_risk_above_limit_pauses_new_minimum_lot_entries() ->
         ),
         candidates=[
             candidate(
-                "USNEW", exchange="US", asset="美股", global_strength="90",
+                "USNEW",
+                exchange="US",
+                asset="美股",
+                close="10",
+                atr="0.5",
+                global_strength="90",
             )
         ],
         holding_snapshots={
@@ -7904,29 +8080,52 @@ def test_existing_portfolio_risk_above_limit_pauses_new_minimum_lot_entries() ->
         },
         market="US",
         metadata={"market": "US", "broker": "futu"},
-        position_weight=Decimal("0.06"),
+        position_weight=Decimal("0.04"),
         strategy_snapshot=strategy,
         drawdown_summary=active_drawdown_for(strategy, equity="100000"),
         allocation_reference=allocation,
     )
 
-    assert built.strategy_snapshot["strategy_version"] == "v13"
+    assert built.strategy_snapshot["strategy_version"] == "v14"
     assert built.risk_summary["existing_planned_risk"] == Decimal("4001")
     assert built.risk_summary["portfolio_risk_limit"] == Decimal("4000")
-    assert built.buy_actions == ()
-    assert built.risk_summary["new_planned_risk"] == Decimal("0")
-    assert built.risk_summary["status"] == "paused"
-    assert built.risk_summary["status_label"] == "组合风险已满"
-    assert built.risk_summary["pause_reason"] == "组合正常计划风险已达到净值 4%"
-    assert len(built.risk_skips) == 1
-    assert built.risk_skips[0]["symbol"] == "USNEW"
-    assert built.risk_skips[0]["reason"] == "组合正常计划风险已达到净值 4%"
-    assert built.risk_skips[0]["decisive_constraint"] == "组合剩余风险"
-    payload = trend_module._report_payload(built)
-    assert not any(
-        action.get("action") == "BUY"
-        for action in payload["strategy_judgments"]["formal_actions"]
+    assert built.buy_actions
+    action = built.buy_actions[0]
+    assert (
+        action.symbol,
+        action.target_amount,
+        action.estimated_shares,
+        action.lot_size,
+        action.normal_cost,
+        action.planned_stop_risk,
+        action.executable,
+        built.risk_summary["new_planned_risk"],
+        built.risk_summary["portfolio_planned_risk"],
+        built.risk_summary["status"],
+        built.risk_summary["status_label"],
+        built.risk_summary["pause_reason"],
+        built.risk_skips,
+    ) == (
+        "USNEW",
+        Decimal("4000"),
+        400,
+        1,
+        Decimal("4"),
+        Decimal("404"),
+        True,
+        Decimal("404"),
+        Decimal("4405"),
+        "active",
+        "计划止损风险仅审计，不参与买入数量",
+        "",
+        (),
     )
+    payload = trend_module._report_payload(built)
+    assert [
+        (item["symbol"], item["action"], item["executable"])
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["action"] == "BUY"
+    ] == [("USNEW", "BUY", True)]
 
 
 def test_full_existing_portfolio_risk_lists_one_lot_with_note_but_no_pause() -> None:
@@ -8572,6 +8771,81 @@ def test_v2_report_uses_frozen_allocation_limit_in_full_seat_note(
 
     assert built.buy_actions[0].sizing_note == f"{position_limit} 个持仓席位已满"
     assert built.real_buy_actions[0].sizing_note == f"{position_limit} 个持仓席位已满"
+
+
+def test_current_nominal_report_keeps_buy_executable_when_report_time_slots_are_full(
+    tmp_path: Path,
+) -> None:
+    base = allocation_for("CN", rank=1, entry_weight="0.04")
+    allocation_snapshot = build_allocation_snapshot(
+        allocation_date="2026-07-14",
+        generated_at="2026-07-14T16:20:00+08:00",
+        git_sha="a" * 40,
+        roots=base["snapshot"]["roots"],
+        previous=None,
+        version=2,
+    )
+    allocation = {
+        "daily_path": "data/trend_allocation/daily/2026-07-14.json",
+        "sha256": base["sha256"],
+        "snapshot": allocation_snapshot,
+    }
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (1,), allocation=allocation,
+    )
+    positions = tuple(
+        AccountPosition(
+            f"HOLD{index}",
+            f"持仓{index}",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("1000"),
+        )
+        for index in range(20)
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=positions,
+            exceptions=(),
+            position_count=20,
+        ),
+        candidates=(
+            candidate(
+                "600001",
+                close="10",
+                atr="0.5",
+                global_strength="100",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN", "broker": "eastmoney"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    frozen = trend_module._freeze_report_simulated_buy_plan(
+        built, tmp_path / "data"
+    )
+    payload = trend_module._report_payload(frozen)
+    action = payload["strategy_judgments"]["formal_actions"][0]
+    fifo = payload["strategy_judgments"]["simulated_buy_fifo"]
+
+    assert (
+        action["executable"],
+        len(fifo),
+        fifo[0]["classification"],
+        payload["strategy_judgments"]["planned_new_seats"],
+        trend_module.valid_frozen_report_contract(payload),
+    ) == (True, 1, "NORMAL", 0, True)
 
 
 def test_unaffordable_candidate_lists_one_lot_without_consuming_cash_or_slot() -> None:

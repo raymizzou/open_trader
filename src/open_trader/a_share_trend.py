@@ -478,6 +478,7 @@ def valid_v3_risk_contract(
     summary: object,
     *,
     expected_nav: object,
+    allow_zero_kelly_audit: bool = False,
 ) -> bool:
     if not valid_v2_risk_contract(
         parameters, summary, expected_nav=expected_nav
@@ -553,8 +554,13 @@ def valid_v3_risk_contract(
         return (
             phase_valid
             and reason == "Kelly 上限为 0，仅暂停未来新开仓"
-            and summary.get("status") == "paused"
-            and summary.get("pause_reason") == reason
+            and (
+                summary.get("status") == "paused"
+                and summary.get("pause_reason") == reason
+                or allow_zero_kelly_audit
+                and summary.get("status") == "active"
+                and summary.get("pause_reason") == ""
+            )
         )
     return phase_valid and reason == ""
 
@@ -564,9 +570,15 @@ def valid_v4_risk_contract(
     summary: object,
     *,
     expected_nav: object,
+    allow_zero_kelly_audit: bool = False,
 ) -> bool:
     return (
-        valid_v3_risk_contract(parameters, summary, expected_nav=expected_nav)
+        valid_v3_risk_contract(
+            parameters,
+            summary,
+            expected_nav=expected_nav,
+            allow_zero_kelly_audit=allow_zero_kelly_audit,
+        )
         and isinstance(parameters, Mapping)
         and parameters.get("drawdown_limit") == str(DRAWDOWN_LIMIT)
         and parameters.get("drawdown_equity_source")
@@ -1393,13 +1405,42 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
             if not isinstance(candidate, Mapping):
                 return False
             try:
+                item_atr = _decimal(item.get("atr"))
+                candidate_atr = (
+                    _decimal(candidate.get("atr"))
+                    if candidate.get("atr") is not None
+                    else None
+                )
+                audit_unavailable = (
+                    _uses_current_nominal_allocation(market, strategy_version)
+                    and item.get("sizing_note") == STOP_RISK_AUDIT_ONLY_LABEL
+                    and item_atr == Decimal("0")
+                    and _decimal(item.get("estimated_initial_line"))
+                    == Decimal("0")
+                    and _decimal(item.get("planned_stop_risk")) == Decimal("0")
+                    and _decimal(item.get("planned_stop_risk_pct"))
+                    == Decimal("0")
+                )
                 if (
                     _decimal(item.get("close")) != _decimal(candidate.get("close"))
-                    or _decimal(item.get("atr")) != _decimal(candidate.get("atr"))
+                    or (
+                        audit_unavailable
+                        and candidate_atr is not None
+                        and candidate_atr > 0
+                    )
+                    or (
+                        not audit_unavailable
+                        and (
+                            candidate_atr is None
+                            or candidate_atr <= 0
+                            or item_atr != candidate_atr
+                        )
+                    )
                 ):
                     return False
                 if (
                     explicit_v2
+                    and not audit_unavailable
                     and protection_multiple is not None
                     and _decimal(item.get("estimated_initial_line"))
                     != _decimal(candidate.get("close"))
@@ -1452,18 +1493,6 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
                                 else target
                             )
                         )
-                        if strategy_version in {
-                            "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-                            "v11", "v12", "v13", "v14", "v15", "v16",
-                        } and risk_summary.get("kelly_phase") not in {
-                            None, "cold_start", "unavailable",
-                        }:
-                            cap = _nonnegative_risk_decimal(
-                                risk_summary.get("kelly_cap")
-                            )
-                            if cap is None:
-                                return False
-                            weight = min(weight, cap)
                         expected_amount = (
                             simulated_nav * weight
                         ).quantize(Decimal("0.01"))
@@ -1497,16 +1526,6 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
                         else target
                     )
                 )
-                if strategy_version in {
-                    "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-                    "v11", "v12", "v13", "v14", "v15", "v16",
-                } and risk_summary.get("kelly_phase") not in {
-                    None, "cold_start", "unavailable",
-                }:
-                    cap = _nonnegative_risk_decimal(risk_summary.get("kelly_cap"))
-                    if cap is None:
-                        return False
-                    weight = min(weight, cap)
                 lot_size = raw_lot_size
                 shares = raw_shares
                 expected_amount, expected_shares, expected_cash_required = (
@@ -1526,17 +1545,23 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
                     * price_fx
                     * normal_cost_rate
                 )
-                expected_risk = Decimal(expected_shares) * (
-                    max(
-                        Decimal("0"),
-                        _decimal(candidate.get("close"))
-                        - (
+                expected_risk = (
+                    Decimal("0")
+                    if audit_unavailable
+                    else Decimal(expected_shares)
+                    * (
+                        max(
+                            Decimal("0"),
                             _decimal(candidate.get("close"))
-                            - protection_multiple * _decimal(candidate.get("atr"))
-                        ),
+                            - (
+                                _decimal(candidate.get("close"))
+                                - protection_multiple * candidate_atr
+                            ),
+                        )
+                        * price_fx
                     )
-                    * price_fx
-                ) + expected_cost
+                    + expected_cost
+                )
                 actual_cost = _decimal(item.get("normal_cost"))
                 actual_risk = _decimal(item.get("planned_stop_risk"))
                 actual_risk_pct = _decimal(item.get("planned_stop_risk_pct"))
@@ -1553,10 +1578,6 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
                 or actual_risk_pct != expected_risk / simulated_nav
             ):
                 return False
-            if item.get("executable") is True:
-                if expected_cash_required > simulated_remaining_cash:
-                    return False
-                simulated_remaining_cash -= expected_cash_required
     if (
         _uses_current_nominal_allocation(market, strategy_version)
         and isinstance(real_buy_actions, list)
@@ -1646,7 +1667,20 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
                 return False
             try:
                 candidate_close = Decimal(str(candidate["close"]))
-                candidate_atr = Decimal(str(candidate["atr"]))
+                candidate_atr = (
+                    Decimal(str(candidate["atr"]))
+                    if candidate.get("atr") is not None
+                    else None
+                )
+                audit_unavailable = (
+                    item.get("sizing_note") == STOP_RISK_AUDIT_ONLY_LABEL
+                    and _decimal(item.get("atr")) == Decimal("0")
+                    and _decimal(item.get("estimated_initial_line"))
+                    == Decimal("0")
+                    and _decimal(item.get("planned_stop_risk")) == Decimal("0")
+                    and _decimal(item.get("planned_stop_risk_pct"))
+                    == Decimal("0")
+                )
                 weight = Decimal(
                     str(
                         target.get(item.get("temperature_curr"))
@@ -1654,18 +1688,6 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
                         else target
                     )
                 )
-                if strategy_version in {
-                    "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-                    "v11", "v12", "v13", "v14", "v15", "v16",
-                } and real_risk_summary.get("kelly_phase") not in {
-                    None, "cold_start", "unavailable",
-                }:
-                    cap = _nonnegative_risk_decimal(
-                        real_risk_summary.get("kelly_cap")
-                    )
-                    if cap is None:
-                        return False
-                    weight = min(weight, cap)
                 lot_size = int(item["lot_size"])
                 shares = item["estimated_shares"]
                 expected_amount, expected_shares, expected_cash_required = (
@@ -1685,17 +1707,21 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
                     * price_fx
                     * normal_cost_rate
                 )
-                expected_risk = Decimal(expected_shares) * (
-                    max(
-                        Decimal("0"),
-                        candidate_close
-                        - (
+                expected_risk = (
+                    Decimal("0")
+                    if audit_unavailable
+                    else Decimal(expected_shares) * (
+                        max(
+                            Decimal("0"),
                             candidate_close
-                            - protection_multiple * candidate_atr
-                        ),
-                    )
-                    * price_fx
-                ) + expected_cost
+                            - (
+                                candidate_close
+                                - protection_multiple * candidate_atr
+                            ),
+                        )
+                        * price_fx
+                    ) + expected_cost
+                )
                 actual_cost = _decimal(item.get("normal_cost"))
                 actual_risk = _decimal(item.get("planned_stop_risk"))
                 actual_risk_pct = _decimal(item.get("planned_stop_risk_pct"))
@@ -1706,8 +1732,17 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
                 or item.get("target_weight") != format(weight, "f")
                 or candidate_close <= 0
                 or not candidate_close.is_finite()
-                or candidate_atr <= 0
-                or not candidate_atr.is_finite()
+                or (
+                    audit_unavailable
+                    and candidate_atr is not None
+                    and candidate_atr > 0
+                )
+                or not audit_unavailable
+                and (
+                    candidate_atr is None
+                    or candidate_atr <= 0
+                    or not candidate_atr.is_finite()
+                )
                 or not isinstance(lot_size, int)
                 or isinstance(item.get("lot_size"), bool)
                 or lot_size <= 0
@@ -1721,10 +1756,6 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
                 or actual_risk_pct != expected_risk / real_nav
             ):
                 return False
-            if item.get("executable") is True:
-                if expected_cash_required > real_remaining_cash:
-                    return False
-                real_remaining_cash -= expected_cash_required
     if _uses_current_nominal_allocation(market, strategy_version):
         target = parameters.get("target_weight")
         try:
@@ -1874,23 +1905,6 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
                             else target
                         )
                     )
-                    if (
-                        explicit_v2
-                        and strategy_version in {
-                            "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-                            "v11", "v12", "v13", "v14", "v15", "v16",
-                        }
-                        and isinstance(payload.get("risk_summary"), Mapping)
-                        and payload["risk_summary"].get("kelly_phase") not in {
-                            None, "cold_start", "unavailable",
-                        }
-                    ):
-                        cap = _nonnegative_risk_decimal(
-                            payload["risk_summary"].get("kelly_cap")
-                        )
-                        if cap is None:
-                            return False
-                        weight = min(weight, cap)
                     lot_size = int(pair["lot_size"])
                     shares = pair["estimated_shares"]
                     expected_amount, expected_shares, expected_cash_required = (
@@ -1950,9 +1964,6 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
                     )
                 ):
                     return False
-                if expected_cash_required > rotation_cash:
-                    return False
-                rotation_cash -= expected_cash_required
     current_allocation_version = ALLOCATION_PROJECTION_VERSIONS[market]
     require_comparisons = strategy_version == current_allocation_version
     max_rotation_pairs = (
@@ -4069,7 +4080,9 @@ def _candidate_reasons(
         reasons.append("excluded_security")
     elif item.exchange not in ({"SH", "SZ"} if market == "CN" else {market}):
         reasons.append("unsupported_exchange")
-    if item.atr is None:
+    if item.atr is None and not _uses_current_nominal_allocation(
+        market, strategy_version
+    ):
         reasons.append("atr_unavailable")
     if expected_date is not None and item.as_of_date != expected_date:
         reasons.append("data_date_mismatch")
@@ -4130,10 +4143,7 @@ def _expected_nominal_sizing(
     ):
         raise ValueError("nominal sizing inputs are invalid")
     target_amount = (net_value * weight).quantize(Decimal("0.01"))
-    sizing_budget = min(
-        target_amount,
-        available_cash / (Decimal("1") + normal_cost_rate),
-    )
+    sizing_budget = target_amount
     unit_notional = close * price_fx
     shares = _floor_to_lot(sizing_budget / unit_notional, lot_size)
     if shares <= 0:
@@ -4141,11 +4151,6 @@ def _expected_nominal_sizing(
     cash_required = (
         Decimal(shares) * unit_notional * (Decimal("1") + normal_cost_rate)
     )
-    while shares > lot_size and cash_required > available_cash:
-        shares -= lot_size
-        cash_required = (
-            Decimal(shares) * unit_notional * (Decimal("1") + normal_cost_rate)
-        )
     return target_amount, shares, cash_required
 
 
@@ -5691,7 +5696,6 @@ def _risk_summary(
             if audit_only_stop_risk
             and planned_risk is not None
             and portfolio_limit is not None
-            and planned_risk > portfolio_limit
             else "含最小一手额外风险"
             if (
                 planned_risk is not None
@@ -5846,7 +5850,8 @@ def _plan_buy_actions(
             else position_weight
         )
         if (
-            nominal is not None
+            not use_nominal_sizing
+            and nominal is not None
             and kelly_state is not None
             and kelly_state.enabled
             and kelly_state.quarter_kelly_cap is not None
@@ -5906,7 +5911,8 @@ def _plan_buy_actions(
         )
 
     if (
-        kelly_state is not None
+        not use_nominal_sizing
+        and kelly_state is not None
         and kelly_state.enabled
         and kelly_state.quarter_kelly_cap == 0
     ):
@@ -5932,7 +5938,7 @@ def _plan_buy_actions(
             audit_only_stop_risk=use_nominal_sizing,
         )
     if (
-        portfolio_planned_risk is not None
+        not use_nominal_sizing and portfolio_planned_risk is not None
         and (
             portfolio_planned_risk > net_value * PORTFOLIO_RISK_LIMIT
             if use_final_plan_semantics
@@ -6008,14 +6014,17 @@ def _plan_buy_actions(
                 )
             )
             continue
-        if (
+        price_missing = (
             item.close is None
             or not item.close.is_finite()
             or item.close <= 0
-            or item.atr is None
+        )
+        atr_missing = (
+            item.atr is None
             or not item.atr.is_finite()
             or item.atr <= 0
-        ):
+        )
+        if price_missing or (atr_missing and not use_nominal_sizing):
             if use_final_plan_semantics:
                 actions.append(
                     _data_missing_buy_action(
@@ -6069,6 +6078,54 @@ def _plan_buy_actions(
                     )
                 )
             continue
+        if atr_missing:
+            unit_notional = item.close * price_fx_to_account_currency
+            quantity = _floor_to_lot(
+                base_amount / unit_notional,
+                lot_size,
+            )
+            if quantity <= 0:
+                quantity = lot_size
+            normal_cost = (
+                Decimal(quantity)
+                * unit_notional
+                * normal_cost_rate
+            )
+            executable = True if use_nominal_sizing else not slot_full
+            actions.append(
+                BuyAction(
+                    symbol=item.symbol,
+                    name=item.name,
+                    industry=item.industry,
+                    target_weight=weight,
+                    target_amount=base_amount,
+                    estimated_shares=int(quantity),
+                    lot_size=lot_size,
+                    filter_price=item.filter_price,
+                    close=item.close,
+                    market_cap=item.market_cap,
+                    industry_tm_id=item.industry_tm_id,
+                    industry_temperature=item.industry_temperature,
+                    temperature_prev=item.temperature_prev,
+                    temperature_curr=item.temperature_curr,
+                    phase=item.phase,
+                    strength=item.strength,
+                    global_strength=item.global_strength,
+                    amount=item.amount,
+                    atr=Decimal("0"),
+                    estimated_initial_line=Decimal("0"),
+                    planned_stop_risk=Decimal("0"),
+                    planned_stop_risk_pct=Decimal("0"),
+                    normal_cost=normal_cost,
+                    decisive_constraint="名义仓位上限",
+                    futu_symbol=item.futu_symbol,
+                    sizing_note=STOP_RISK_AUDIT_ONLY_LABEL,
+                    executable=executable,
+                )
+            )
+            if executable and not use_nominal_sizing:
+                slots -= 1
+            continue
         protection_line = item.close - INITIAL_PROTECTION_ATR_MULTIPLE * item.atr
         sized = size_entry_by_risk(
             entry_price=item.close,
@@ -6095,6 +6152,11 @@ def _plan_buy_actions(
                 + unit_notional * normal_cost_rate
             )
             nominal_risk = Decimal(nominal_quantity) * nominal_unit_risk
+            nominal_cash_required = (
+                Decimal(nominal_quantity)
+                * unit_notional
+                * (Decimal("1") + normal_cost_rate)
+            )
             sized = size_entry_by_risk(
                 entry_price=item.close,
                 protection_line=protection_line,
@@ -6107,7 +6169,7 @@ def _plan_buy_actions(
                     if remaining_risk is not None
                     else None
                 ),
-                available_cash=remaining_cash,
+                available_cash=max(remaining_cash, nominal_cash_required),
                 lot_size=Decimal(lot_size),
                 normal_cost_rate=normal_cost_rate,
             )
@@ -6155,13 +6217,17 @@ def _plan_buy_actions(
             )
         if slot_full:
             notes.append(f"{configured_limit} 个持仓席位已满")
-        cash_short = sized.cash_required > remaining_cash
+        cash_short = not use_nominal_sizing and sized.cash_required > remaining_cash
         if cash_short:
             notes.append(
                 f"现金不足一手（需约 {_money(sized.cash_required)}，"
                 f"可用 {_money(remaining_cash)}）"
             )
-        executable = not slot_full and not cash_short
+        executable = (
+            True
+            if use_nominal_sizing
+            else not slot_full and not cash_short
+        )
         if not use_final_plan_semantics:
             executable = True
         target_amount = (
@@ -6210,12 +6276,14 @@ def _plan_buy_actions(
             )
         )
         if executable:
-            remaining_cash -= sized.cash_required
+            if not use_nominal_sizing:
+                remaining_cash -= sized.cash_required
             if remaining_risk is not None:
                 remaining_risk = max(
                     Decimal("0"), remaining_risk - sized.planned_stop_risk
                 )
-            slots -= 1
+            if not use_nominal_sizing:
+                slots -= 1
 
     new_planned_risk = sum(
         (
@@ -7062,21 +7130,26 @@ def build_report(
                 market, snapshot_version
             ),
         )
-        if account_available and snapshot_version in {
-            "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            "v11", "v12", "v13", "v14", "v15", "v16",
-        } and (
-            not valid_drawdown_decision(
-                drawdown_summary,
-                expected_market=market,
-                expected_strategy_id=str(
-                    resolved_strategy_snapshot.get("strategy_id") or ""
-                ),
-                expected_strategy_version=snapshot_version,
-                expected_equity=account.net_value,
-                expected_entry_date=execution_date,
+        if (
+            account_available
+            and not _uses_current_nominal_allocation(market, snapshot_version)
+            and snapshot_version in {
+                "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                "v11", "v12", "v13", "v14", "v15", "v16",
+            }
+            and (
+                not valid_drawdown_decision(
+                    drawdown_summary,
+                    expected_market=market,
+                    expected_strategy_id=str(
+                        resolved_strategy_snapshot.get("strategy_id") or ""
+                    ),
+                    expected_strategy_version=snapshot_version,
+                    expected_equity=account.net_value,
+                    expected_entry_date=execution_date,
+                )
+                or drawdown_summary.get("entry_allowed") is not True
             )
-            or drawdown_summary.get("entry_allowed") is not True
         ):
             valid_summary = isinstance(drawdown_summary, Mapping)
             pause_reason = (
@@ -7272,19 +7345,24 @@ def build_report(
             ]
 
     drawdown_pause_reason = ""
-    if account_available and snapshot_version in {
-        "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14", "v15", "v16",
-    } and (
-        not valid_drawdown_decision(
-            drawdown_summary,
-            expected_market=market,
-            expected_strategy_id=str(resolved_strategy_snapshot.get("strategy_id") or ""),
-            expected_strategy_version=snapshot_version,
-            expected_equity=account.net_value,
-            expected_entry_date=execution_date,
+    if (
+        account_available
+        and not _uses_current_nominal_allocation(market, snapshot_version)
+        and snapshot_version in {
+            "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+            "v11", "v12", "v13", "v14", "v15", "v16",
+        }
+        and (
+            not valid_drawdown_decision(
+                drawdown_summary,
+                expected_market=market,
+                expected_strategy_id=str(resolved_strategy_snapshot.get("strategy_id") or ""),
+                expected_strategy_version=snapshot_version,
+                expected_equity=account.net_value,
+                expected_entry_date=execution_date,
+            )
+            or drawdown_summary.get("entry_allowed") is not True
         )
-        or drawdown_summary.get("entry_allowed") is not True
     ):
         drawdown_pause_reason = (
             str(drawdown_summary.get("pause_reason") or "")
@@ -8976,15 +9054,37 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             and report.risk_summary.get("status_label")
             == STOP_RISK_AUDIT_ONLY_LABEL
         ):
+            planned = _nonnegative_risk_decimal(
+                report.risk_summary.get("portfolio_planned_risk")
+            )
+            limit = _nonnegative_risk_decimal(
+                report.risk_summary.get("portfolio_risk_limit")
+            )
             contract_summary = {
                 **report.risk_summary,
-                "status_label": "含最小一手额外风险",
+                "status_label": (
+                    "含最小一手额外风险"
+                    if planned is not None
+                    and limit is not None
+                    and planned > limit
+                    else "风险预算内"
+                ),
             }
-        if not valid_contract(
-            parameters,
-            contract_summary,
-            expected_nav=report.account.net_value,
-        ):
+        contract_valid = (
+            valid_contract(
+                parameters,
+                contract_summary,
+                expected_nav=report.account.net_value,
+                allow_zero_kelly_audit=True,
+            )
+            if _uses_current_nominal_allocation(market, version)
+            else valid_contract(
+                parameters,
+                contract_summary,
+                expected_nav=report.account.net_value,
+            )
+        )
+        if not contract_valid:
             raise ValueError("strategy snapshot does not match report actions")
         if report.risk_summary.get("status") == "paused" and report.buy_actions:
             raise ValueError("strategy snapshot does not match report actions")
@@ -9010,6 +9110,14 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
                 action.estimated_shares == 0
                 and action.sizing_note in data_missing_notes
             )
+            audit_unavailable = (
+                _uses_current_nominal_allocation(market, version)
+                and action.sizing_note == STOP_RISK_AUDIT_ONLY_LABEL
+                and action.atr == Decimal("0")
+                and action.estimated_initial_line == Decimal("0")
+                and action.planned_stop_risk == Decimal("0")
+                and action.planned_stop_risk_pct == Decimal("0")
+            )
             if data_missing:
                 if (
                     action.lot_size != 0
@@ -9027,12 +9135,15 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
                 or action.estimated_shares <= 0
                 or action.lot_size <= 0
                 or action.estimated_shares % action.lot_size != 0
-                or not action.planned_stop_risk.is_finite()
-                or action.planned_stop_risk <= 0
-                or not action.planned_stop_risk_pct.is_finite()
-                or action.planned_stop_risk_pct <= 0
-                or action.planned_stop_risk_pct
-                != action.planned_stop_risk / nav
+                or not audit_unavailable
+                and (
+                    not action.planned_stop_risk.is_finite()
+                    or action.planned_stop_risk <= 0
+                    or not action.planned_stop_risk_pct.is_finite()
+                    or action.planned_stop_risk_pct <= 0
+                    or action.planned_stop_risk_pct
+                    != action.planned_stop_risk / nav
+                )
                 or (
                     not _uses_current_nominal_allocation(market, version)
                     and action.planned_stop_risk > nav * SINGLE_ENTRY_RISK_LIMIT
@@ -9040,7 +9151,8 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
                 )
                 or not action.normal_cost.is_finite()
                 or action.normal_cost <= 0
-                or action.normal_cost > action.planned_stop_risk
+                or not audit_unavailable
+                and action.normal_cost > action.planned_stop_risk
                 or action.decisive_constraint
                 not in {
                     "名义仓位上限",
@@ -9073,7 +9185,11 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
                 Decimal("0"),
                 portfolio_limit - (existing_risk or Decimal("0")),
             )
-            overflow = max(Decimal("0"), planned_risk - portfolio_limit)
+            overflow = (
+                max(Decimal("0"), new_planned_risk - remaining_capacity)
+                if _uses_current_nominal_allocation(market, version)
+                else max(Decimal("0"), planned_risk - portfolio_limit)
+            )
             evidenced_risk = Decimal("0")
             for action in report.buy_actions:
                 if not isinstance(action.executable, bool):
@@ -9116,7 +9232,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
     if version in {
         "v4", "v5", "v6", "v7", "v8", "v9", "v10",
         "v11", "v12", "v13", "v14", "v15", "v16",
-    }:
+    } and not _uses_current_nominal_allocation(market, version):
         if (
             not valid_drawdown_decision(
                 report.drawdown_summary,
@@ -9177,12 +9293,16 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             else target
         )
         expected_weight = Decimal(str(nominal_weight))
-        if version in {
-            "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            "v11", "v12", "v13", "v14", "v15", "v16",
-        } and report.risk_summary.get("kelly_phase") not in {
-            "cold_start", "unavailable",
-        }:
+        if (
+            not _uses_current_nominal_allocation(market, version)
+            and version in {
+                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                "v11", "v12", "v13", "v14", "v15", "v16",
+            }
+            and report.risk_summary.get("kelly_phase") not in {
+                "cold_start", "unavailable",
+            }
+        ):
             cap = _nonnegative_risk_decimal(report.risk_summary.get("kelly_cap"))
             if cap is None:
                 raise ValueError("strategy snapshot does not match report actions")
@@ -9192,20 +9312,48 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             action.estimated_shares == 0
             and action.sizing_note in data_missing_notes
         )
+        audit_unavailable = (
+            _uses_current_nominal_allocation(market, version)
+            and action.sizing_note == STOP_RISK_AUDIT_ONLY_LABEL
+            and action.atr == Decimal("0")
+            and action.estimated_initial_line == Decimal("0")
+            and action.planned_stop_risk == Decimal("0")
+            and action.planned_stop_risk_pct == Decimal("0")
+        )
         if _uses_current_nominal_allocation(market, version) and not data_missing:
             candidate = candidate_signals.get(action.symbol)
             try:
                 candidate_close = Decimal(str(candidate["close"])) if isinstance(
                     candidate, Mapping
                 ) else None
-                candidate_atr = Decimal(str(candidate["atr"])) if isinstance(
-                    candidate, Mapping
-                ) else None
+                candidate_atr_value = (
+                    candidate.get("atr") if isinstance(candidate, Mapping) else None
+                )
+                candidate_atr = (
+                    Decimal(str(candidate_atr_value))
+                    if candidate_atr_value is not None
+                    else None
+                )
             except (InvalidOperation, TypeError, ValueError):
                 raise ValueError(
                     "strategy snapshot does not match report actions"
                 ) from None
-            if candidate_close != action.close or candidate_atr != action.atr:
+            if (
+                candidate_close != action.close
+                or (
+                    audit_unavailable
+                    and candidate_atr is not None
+                    and candidate_atr > 0
+                )
+                or (
+                    not audit_unavailable
+                    and (
+                        candidate_atr is None
+                        or candidate_atr <= 0
+                        or candidate_atr != action.atr
+                    )
+                )
+            ):
                 raise ValueError("strategy snapshot does not match report actions")
         if _uses_current_nominal_allocation(market, version) and not data_missing:
             try:
@@ -9234,11 +9382,15 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
                 or action.estimated_shares != expected_shares
             ):
                 raise ValueError("strategy snapshot does not match report actions")
-            if action.executable:
+            if (
+                action.executable
+                and not _uses_current_nominal_allocation(market, version)
+            ):
                 nominal_remaining_cash -= expected_cash_required
         if (
             action.target_weight != expected_weight
-            or action.estimated_initial_line
+            or not audit_unavailable
+            and action.estimated_initial_line
             != action.close - protection_multiple * action.atr
             or not data_missing
             and (

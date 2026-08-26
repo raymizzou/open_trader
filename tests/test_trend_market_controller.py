@@ -6165,6 +6165,153 @@ def test_later_revision_does_not_change_locked_batch(
     assert len(notifications) == 1
 
 
+def test_current_controller_uses_latest_revision_each_round_and_ignores_old_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
+    )
+    cycle = ControllerCycle(
+        market="CN",
+        as_of_date="2026-07-19",
+        execution_date="2026-07-20",
+        report_run_date="2026-07-19",
+        session="morning",
+        market_open=True,
+        next_check_at=datetime.fromisoformat("2026-07-20T09:31:05+08:00"),
+    )
+    patch_cycle(monkeypatch, cycle)
+    buy = {
+        "action": "BUY",
+        "symbol": "600001",
+        "futu_symbol": "SH.600001",
+        "target_weight": "0.04",
+        "lot_size": 100,
+        "estimated_shares": 400,
+        "target_amount": "4000",
+        "atr": "0.5",
+    }
+    base_path, base_report = write_v2_controller_report(config, actions=[buy])
+    revision_reports: dict[int, tuple[Path, dict[str, object]]] = {}
+    for revision, generated_at in ((1, "2026-07-19T18:01:00+08:00"), (2, "2026-07-19T18:02:00+08:00")):
+        revision_report = json.loads(json.dumps(base_report))
+        revision_report["generated_at"] = generated_at
+        revision_path = (
+            config.reports_dir
+            / "trend_a_share"
+            / f"2026-07-19-r{revision}.json"
+        )
+        revision_path.write_text(json.dumps(revision_report), encoding="utf-8")
+        revision_reports[revision] = (revision_path, revision_report)
+        if revision == 2:
+            revision_path.unlink()
+
+    lock_trend_execution_batch(
+        config.data_dir,
+        market="CN",
+        execution_date=cycle.execution_date,
+        report_path=base_path,
+        report=base_report,
+        locked_at=NOW.isoformat(),
+    )
+
+    executed: list[str] = []
+
+    def canonical_sha(report: dict[str, object]) -> str:
+        body = (
+            json.dumps(
+                report,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        return hashlib.sha256(body).hexdigest()
+
+    def execute(
+        _config: DailyPremarketConfig,
+        _market: str,
+        _execution_date: str,
+        report_sha: str,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        executed.append(report_sha)
+        if len(executed) == 1:
+            revision_path, revision_report = revision_reports[2]
+            revision_path.write_text(
+                json.dumps(revision_report), encoding="utf-8"
+            )
+        return {"status": "submitted", "submitted_count": 1}
+
+    monkeypatch.setattr(controller, "execute_simulated_trend_report", execute)
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    assert executed == [
+        canonical_sha(revision_reports[1][1]),
+        canonical_sha(revision_reports[2][1]),
+    ]
+
+
+def test_current_controller_never_executes_legacy_strategy_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = controller_config(tmp_path)
+    cycle = replace(
+        active_cn_cycle(), as_of_date="2026-07-19", report_run_date="2026-07-19"
+    )
+    patch_cycle(monkeypatch, cycle)
+    report_path, report = write_v2_controller_report(config)
+    report["allocation"] = {**report["allocation"], "version": 2}
+    report["strategy_snapshot"] = {
+        **report["strategy_snapshot"],
+        "strategy_id": "trend_animals_warm_to_hot/CN/v15",
+        "strategy_version": "v15",
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    executed: list[str] = []
+
+    def execute(
+        _config: DailyPremarketConfig,
+        _market: str,
+        _execution_date: str,
+        report_sha: str,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        executed.append(report_sha)
+        return {"status": "submitted", "submitted_count": 1}
+
+    monkeypatch.setattr(controller, "execute_simulated_trend_report", execute)
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW
+    )
+
+    assert (
+        executed,
+        result["phase"],
+        result["blocker"],
+        report_path.exists(),
+        all(
+            legacy != current
+            for legacy, current in {
+                "CN": ("v15", "v16"),
+                "HK": ("v13", "v14"),
+                "US": ("v13", "v14"),
+            }.values()
+        ),
+    ) == (
+        [],
+        "blocked",
+        "no current executable report",
+        True,
+        True,
+    )
+
+
 def test_locked_report_selects_latest_valid_report_before_batch_exists(
     tmp_path: Path,
 ) -> None:
@@ -10824,7 +10971,7 @@ def test_v2_fifo_zero_fill_releases_seat_and_respects_frozen_budget(
     )
 
 
-def test_public_v2_fifo_rejection_with_inflight_order_does_not_complete_request(
+def test_public_v2_fifo_rejection_completes_request_with_broker_order_idempotency(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = replace(
@@ -10968,8 +11115,8 @@ def test_public_v2_fifo_rejection_with_inflight_order_does_not_complete_request(
         1,
         ["SH.600001", "SH.600002"],
         ["REJECTED", "SUBMITTED"],
-        False,
-        "submitted",
+        True,
+        "terminal_rejected",
         True,
         True,
         2,
@@ -11135,6 +11282,1219 @@ def test_v2_fifo_overlap_uses_one_buy_and_closes_both_logical_owners(
             next_check_at=NOW,
         ),
     ) is True
+
+
+def test_current_execution_submits_audit_only_missing_atr_buy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    action = {
+        "action": "BUY",
+        "symbol": "600001",
+        "futu_symbol": "SH.600001",
+        "global_strength": "100",
+        "target_weight": "0.04",
+        "target_amount": "4000",
+        "estimated_shares": 400,
+        "lot_size": 100,
+        "atr": "0",
+        "estimated_initial_line": "0",
+        "normal_cost": "4",
+        "planned_stop_risk": "0",
+        "planned_stop_risk_pct": "0",
+        "sizing_note": "计划止损风险仅审计，不参与买入数量",
+        "executable": True,
+    }
+    report_path, report = write_v2_controller_report(config, actions=[action])
+    formal_action = report["strategy_judgments"]["formal_actions"][0]
+    formal_action.update(
+        {
+            "atr": "0",
+            "estimated_initial_line": "0",
+            "normal_cost": "4",
+            "planned_stop_risk": "0",
+            "planned_stop_risk_pct": "0",
+            "sizing_note": "计划止损风险仅审计，不参与买入数量",
+            "executable": True,
+        }
+    )
+    candidate = next(
+        item
+        for item in report["signal_snapshots"]["candidates"]
+        if item["symbol"] == "600001"
+    )
+    candidate.pop("atr", None)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = _report_hash(report)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    class Client:
+        def __init__(self) -> None:
+            self.orders: list[dict[str, object]] = []
+            self.requests: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "cash": "100000",
+                "available_cash": "100000",
+                "positions": [],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": self.orders}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(dict(request))
+            order = {
+                **request,
+                "order_id": "SIM-1",
+                "futu_order_id": "SIM-1",
+                "code": request["futu_code"],
+                "trd_side": request["side"],
+                "order_status": "FILLED_ALL",
+                "status": "FILLED_ALL",
+                "dealt_qty": request["qty"],
+                "dealt_avg_price": "10",
+                "account_id": 101,
+            }
+            self.orders.append(order)
+            return {
+                "futu_order_id": "SIM-1",
+                "status": "FILLED_ALL",
+                "order_status": "FILLED_ALL",
+                "dealt_qty": request["qty"],
+            }
+
+        def close(self) -> None:
+            pass
+
+    client = Client()
+    controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="trend-market-controller",
+        reason="current audit-only missing ATR buy",
+        now=NOW,
+        quote_client=Quote(),
+        order_client=client,
+        scheduled=False,
+    )
+
+    assert (
+        [
+            (str(item["side"]).upper(), item["futu_code"], item["qty"])
+            for item in client.requests
+        ],
+        (config.data_dir / "trend_a_share/protection_state.json").exists(),
+    ) == ([
+        ("BUY", "SH.600001", "400"),
+    ], False)
+
+
+def test_current_execution_sells_then_replacement_then_normal_with_live_rank_seats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=123,
+        trend_executor_host=socket.gethostname(),
+        notifiers=("macos",),
+    )
+    positions = [
+        {
+            "symbol": "WEAK" if index == 0 else f"HOLD{index}",
+            "futu_symbol": "SH.WEAK" if index == 0 else f"SH.HOLD{index}",
+            "name": "Weak" if index == 0 else f"Hold {index}",
+            "asset_class": "stock",
+            "quantity": "1000" if index == 0 else "100",
+            "market_value": "7000" if index == 0 else "1000",
+            "avg_cost_price": "10",
+        }
+        for index in range(13)
+    ]
+    actions = [
+        {
+            "action": "BUY",
+            "symbol": "000001",
+            "futu_symbol": "SH.NORMAL1",
+            "global_strength": "90",
+            "target_weight": "0.04",
+            "target_amount": "4000",
+            "estimated_shares": 400,
+            "lot_size": 100,
+            "atr": "0.5",
+        },
+        {
+            "action": "BUY",
+            "symbol": "000002",
+            "futu_symbol": "SH.NORMAL2",
+            "global_strength": "80",
+            "target_weight": "0.04",
+            "target_amount": "4000",
+            "estimated_shares": 400,
+            "lot_size": 100,
+            "atr": "0.5",
+        },
+    ]
+    report_path, report = write_v2_controller_report(
+        config, positions=positions, actions=actions,
+    )
+    report["metadata"] = {
+        **report["metadata"],  # type: ignore[dict-item]
+        "simulate_acc_id": 123,
+    }
+    roots = {
+        market: {
+            "stock": {
+                "asset": stock,
+                "tm_id": index * 10,
+                "as_of_date": "2026-08-03",
+                "global_strength": stock_strength,
+            },
+            "etf": {
+                "asset": etf,
+                "tm_id": index * 10 + 1,
+                "as_of_date": "2026-08-03",
+                "global_strength": etf_strength,
+            },
+        }
+        for index, (market, stock, etf, stock_strength, etf_strength) in enumerate(
+            (
+                ("CN", "A股", "ETF基金", "70", "60"),
+                ("HK", "港股", "香港ETF", "90", "80"),
+                ("US", "美股", "美国ETF", "50", "40"),
+            ),
+            1,
+        )
+    }
+    allocation_snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-03",
+        generated_at="2026-08-03T16:18:00+08:00",
+        git_sha="a" * 40,
+        roots=roots,
+        previous=None,
+        version=2,
+    )
+    daily_path = config.data_dir / "trend_allocation/daily/2026-08-03.json"
+    daily_path.parent.mkdir(parents=True, exist_ok=True)
+    allocation_body = (
+        json.dumps(
+            allocation_snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    daily_path.write_text(allocation_body, encoding="utf-8")
+    report["allocation"] = {
+        "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+        "sha256": hashlib.sha256(allocation_body.encode()).hexdigest(),
+        "allocation_date": "2026-08-03",
+        "generated_at": "2026-08-03T16:18:00+08:00",
+        "reused": False,
+        "stale_a_trading_days": 0,
+        "failure_reason": "",
+        "roots": allocation_snapshot["roots"],
+        "markets": allocation_snapshot["markets"],
+    }
+    report["strategy_snapshot"] = a_share_trend.live_trend_strategy_snapshot(
+        "CN",
+        "test-sha",
+        (622466, 697199),
+        allocation={
+            "daily_path": report["allocation"]["daily_path"],  # type: ignore[index]
+            "sha256": report["allocation"]["sha256"],  # type: ignore[index]
+            "snapshot": allocation_snapshot,
+        },
+    )
+    report["strategy_judgments"]["holding_decisions"] = [{  # type: ignore[index]
+        "symbol": "WEAK", "action": "SELL_ALL",
+    }]
+    report["signal_snapshots"] = {
+        "candidates": [
+            {"symbol": "000001", "close": "10", "atr": "0.5"},
+            {"symbol": "000002", "close": "10", "atr": "0.5"},
+            {"symbol": "REPLACE", "close": "10", "atr": "0.5"},
+        ],
+    }
+    pair = {
+        "pair_index": 0,
+        "sell_symbol": "WEAK",
+        "sell_name": "Weak",
+        "sell_futu_symbol": "SH.WEAK",
+        "sell_global_strength": "10",
+        "buy_symbol": "REPLACE",
+        "buy_name": "Replace",
+        "buy_futu_symbol": "SH.REPLACE",
+        "buy_global_strength": "90",
+        "sell_asset": "A股",
+        "buy_asset": "A股",
+        "sell_compared_strength": "10",
+        "buy_compared_strength": "90",
+        "strength_gap": "80",
+        "strength_basis": "global",
+        "threshold": "20",
+        "target_weight": "0.04",
+        "target_amount": "4000",
+        "estimated_shares": 400,
+        "lot_size": 100,
+        "atr": "0.5",
+        "close": "10",
+        "execution_date": "2026-07-20",
+        "execution_mode": "automatic",
+        "reason": "relative_rotation",
+    }
+    comparison = {
+        **{
+            key: pair[key]
+            for key in (
+                "pair_index", "sell_symbol", "sell_name", "sell_asset",
+                "sell_global_strength", "sell_compared_strength",
+                "buy_symbol", "buy_name", "buy_asset", "buy_global_strength",
+                "buy_compared_strength", "strength_gap", "strength_basis",
+                "threshold", "reason",
+            )
+        },
+        "outcome": "planned",
+    }
+    judgments = report["strategy_judgments"]
+    judgments.update({  # type: ignore[union-attr]
+        "simulate_rotation_pairs": [pair],
+        "simulate_rotation_comparisons": [comparison],
+        "real_rotation_pairs": [],
+        "real_rotation_comparisons": [],
+    })
+    judgments.pop("simulated_buy_fifo", None)
+    judgments.pop("planned_new_seats", None)
+    fifo = controller.freeze_simulated_buy_fifo(
+        data_dir=config.data_dir,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        pre_sell_position_count=13,
+        held_symbols=[item["futu_symbol"] for item in positions],  # type: ignore[index]
+        persist=False,
+    )
+    judgments["simulated_buy_fifo"] = fifo  # type: ignore[index]
+    judgments["planned_new_seats"] = 3  # type: ignore[index]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = _report_hash(report)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+    macos = RecordingMacOS()
+    monkeypatch.setattr(
+        controller,
+        "build_notifier",
+        lambda _config: CompositeNotifier([macos]),
+    )
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    class Client:
+        def __init__(self) -> None:
+            self.orders: list[dict[str, object]] = []
+            self.requests: list[tuple[str, str]] = []
+            self._aliases = {
+                "SZ.000001": "SH.NORMAL1",
+                "SZ.000002": "SH.NORMAL2",
+            }
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 123,
+                "net_value": "100000",
+                "cash": "0",
+                "available_cash": "0",
+                "positions": [
+                    {
+                        "code": "SH.WEAK" if index == 0 else f"SH.HOLD{index}",
+                        "qty": "1000" if index == 0 else "100",
+                        "can_sell_qty": "1000" if index == 0 else "100",
+                        "market_val": "7000" if index == 0 else "1000",
+                    }
+                    for index in range(13)
+                ],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": self.orders}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            side = str(request["side"]).upper()
+            code = str(request["futu_code"])
+            self.requests.append((side, self._aliases.get(code, code)))
+            order_id = f"SIM-{len(self.orders) + 1}"
+            status = "REJECTED" if side == "SELL" else "SUBMITTED"
+            order = {
+                **request,
+                "order_id": order_id,
+                "code": code,
+                "trd_side": side,
+                "dealt_qty": "0",
+                "order_status": status,
+                "reason": "broker rejected sell" if side == "SELL" else "",
+                "account_id": 123,
+            }
+            self.orders.append(order)
+            return {
+                "futu_order_id": order_id,
+                "status": status,
+                "order_status": status,
+                "dealt_qty": "0",
+                "reason": "broker rejected sell" if side == "SELL" else "",
+            }
+
+        def close(self) -> None:
+            pass
+
+    client = Client()
+    controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="trend-market-controller",
+        reason="current buy engine",
+        now=NOW,
+        quote_client=Quote(),
+        order_client=client,
+        scheduled=False,
+    )
+    records = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in config.data_dir.glob(
+            "trend_review/ledgers/CN/rotations/2026-07-20/**/*.json"
+        )
+    ]
+    record_text = json.dumps(records, ensure_ascii=False)
+    request_codes = [code for _, code in client.requests]
+    assert (
+        client.requests,
+        "SH.NORMAL2" in request_codes,
+        13 + 1 + 1,
+        any(
+            value in record_text
+            for value in ("CN", "123", "SH.WEAK", "SELL", "1000", "broker rejected sell")
+        ),
+        client.requests.index(("BUY", "SH.REPLACE")) > client.requests.index(("SELL", "SH.WEAK")),
+        [code for side, code in client.requests if side == "BUY"] == [
+            "SH.REPLACE", "SH.NORMAL1",
+        ],
+    ) == (
+        [
+            ("SELL", "SH.WEAK"),
+            ("BUY", "SH.REPLACE"),
+            ("BUY", "SH.NORMAL1"),
+        ],
+        False,
+        15,
+        True,
+        True,
+        True,
+    )
+
+
+def test_current_execution_uses_live_symbol_idempotency_across_rounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=123,
+        trend_executor_host=socket.gethostname(),
+        notifiers=("macos",),
+    )
+    positions = [
+        {
+            "symbol": symbol,
+            "futu_symbol": futu_symbol,
+            "name": symbol,
+            "asset_class": "stock",
+            "quantity": quantity,
+            "market_value": "1000",
+            "avg_cost_price": "10",
+        }
+        for symbol, futu_symbol, quantity in (
+            ("HELD", "SH.600001", "100"),
+            ("PARTIAL", "SH.600005", "50"),
+        )
+    ]
+    actions = [
+        {
+            "action": "BUY",
+            "symbol": symbol,
+            "futu_symbol": futu_symbol,
+            "global_strength": strength,
+            "target_weight": "0.04",
+            "target_amount": "4000",
+            "estimated_shares": 400,
+            "lot_size": 100,
+            "atr": "0.5",
+        }
+        for symbol, futu_symbol, strength in (
+            ("600001", "SH.600001", "100"),
+            ("600002", "SH.600002", "95"),
+            ("600003", "SH.600003", "90"),
+            ("600004", "SH.600004", "85"),
+            ("600005", "SH.600005", "80"),
+        )
+    ]
+    report_path, report = write_v2_controller_report(
+        config, positions=[], actions=actions,
+    )
+    report["metadata"] = {
+        **report["metadata"],  # type: ignore[dict-item]
+        "simulate_acc_id": 123,
+    }
+    report["account"]["positions"].append({  # type: ignore[index]
+        "symbol": "ABSENT",
+        "futu_symbol": "SH.ABSENT",
+        "name": "Absent",
+        "asset_class": "stock",
+        "quantity": "0",
+        "market_value": "1000",
+        "avg_cost_price": "10",
+    })
+    report["strategy_judgments"]["holding_decisions"] = [{  # type: ignore[index]
+        "symbol": "ABSENT", "action": "SELL_ALL",
+    }]
+    pair = {
+        "pair_index": 0,
+        "sell_symbol": "ABSENT",
+        "sell_name": "Absent",
+        "sell_futu_symbol": "SH.ABSENT",
+        "sell_global_strength": "10",
+        "buy_symbol": "600003",
+        "buy_name": "Overlap",
+        "buy_futu_symbol": "SH.600003",
+        "buy_global_strength": "90",
+        "sell_asset": "A股",
+        "buy_asset": "A股",
+        "sell_compared_strength": "10",
+        "buy_compared_strength": "90",
+        "strength_gap": "80",
+        "strength_basis": "global",
+        "threshold": "20",
+        "target_weight": "0.04",
+        "target_amount": "4000",
+        "estimated_shares": 400,
+        "lot_size": 100,
+        "atr": "0.5",
+        "close": "10",
+        "execution_date": "2026-07-20",
+        "execution_mode": "automatic",
+        "reason": "relative_rotation",
+    }
+    comparison = {
+        **{
+            key: pair[key]
+            for key in (
+                    "pair_index", "sell_symbol", "sell_name", "sell_asset",
+                    "sell_global_strength", "sell_compared_strength",
+                    "buy_symbol", "buy_name", "buy_asset", "buy_global_strength",
+                "buy_compared_strength", "strength_gap", "strength_basis",
+                "threshold", "reason",
+            )
+        },
+        "outcome": "planned",
+    }
+    judgments = report["strategy_judgments"]
+    judgments.update({  # type: ignore[union-attr]
+        "simulate_rotation_pairs": [pair],
+        "simulate_rotation_comparisons": [comparison],
+        "real_rotation_pairs": [],
+        "real_rotation_comparisons": [],
+    })
+    judgments.pop("simulated_buy_fifo", None)
+    judgments.pop("planned_new_seats", None)
+    fifo = controller.freeze_simulated_buy_fifo(
+        data_dir=config.data_dir,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        pre_sell_position_count=0,
+        persist=False,
+    )
+    judgments["simulated_buy_fifo"] = fifo  # type: ignore[index]
+    judgments["planned_new_seats"] = 20  # type: ignore[index]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = _report_hash(report)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+    macos = RecordingMacOS()
+    monkeypatch.setattr(
+        controller,
+        "build_notifier",
+        lambda _config: CompositeNotifier([macos]),
+    )
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    class Client:
+        def __init__(self) -> None:
+            self.orders: list[dict[str, object]] = [{
+                "order_id": "SIM-PENDING",
+                "futu_code": "SH.600002",
+                "code": "SH.600002",
+                "side": "BUY",
+                "trd_side": "BUY",
+                "qty": "100",
+                "dealt_qty": "0",
+                "order_status": "SUBMITTED",
+                "status": "SUBMITTED",
+                "account_id": 123,
+            }]
+            self.requests: list[tuple[str, str]] = []
+            self.aliases = {
+                "SH.600001": "SH.HELD",
+                "SH.600002": "SH.PENDING",
+                "SH.600003": "SH.OVERLAP",
+                "SH.600004": "SH.RETRY",
+                "SH.600005": "SH.PARTIAL",
+            }
+            self.boundary_counts: list[tuple[int, int]] = []
+            self.snapshot_calls = 0
+            self.list_order_calls = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            self.snapshot_calls += 1
+            return {
+                "acc_id": 123,
+                "net_value": "100000",
+                "cash": "0",
+                "available_cash": "0",
+                "positions": [
+                    {
+                        "code": futu_symbol,
+                        "qty": quantity,
+                        "can_sell_qty": quantity,
+                        "market_val": "1000",
+                    }
+                    for futu_symbol, quantity in (
+                        ("SH.600001", "100"),
+                        ("SH.600005", "50"),
+                    )
+                ],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            self.list_order_calls += 1
+            return {"orders": self.orders}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            side = str(request["side"]).upper()
+            code = str(request["futu_code"]).upper()
+            self.boundary_counts.append(
+                (self.snapshot_calls, self.list_order_calls)
+            )
+            self.requests.append((side, self.aliases.get(code, code)))
+            attempt = sum(
+                request_side == side
+                and request_code == self.aliases.get(code, code)
+                for request_side, request_code in self.requests
+            )
+            status = (
+                "REJECTED"
+                if code == "SH.600004" and attempt == 1
+                else "SUBMITTED"
+            )
+            order_id = f"SIM-{len(self.orders) + 1}"
+            order = {
+                **request,
+                "order_id": order_id,
+                "futu_code": code,
+                "code": code,
+                "side": side,
+                "trd_side": side,
+                "qty": request.get("qty", "100"),
+                "dealt_qty": "0",
+                "order_status": status,
+                "status": status,
+                "account_id": 123,
+            }
+            self.orders.append(order)
+            return {
+                "futu_order_id": order_id,
+                "status": status,
+                "order_status": status,
+                "dealt_qty": "0",
+                "reason": "" if status == "SUBMITTED" else "retry rejected",
+            }
+
+        def close(self) -> None:
+            pass
+
+    client = Client()
+    controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="trend-market-controller",
+        reason="current symbol idempotency round 1",
+        now=NOW,
+        quote_client=Quote(),
+        order_client=client,
+        scheduled=False,
+    )
+    first_requests = list(client.requests)
+    first_boundaries = list(client.boundary_counts)
+    controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="trend-market-controller",
+        reason="current symbol idempotency round 2",
+        now=NOW,
+        quote_client=Quote(),
+        order_client=client,
+        scheduled=False,
+    )
+    second_requests = client.requests[len(first_requests):]
+    second_boundaries = client.boundary_counts[len(first_boundaries):]
+    assert (
+        first_requests,
+        second_requests,
+        client.requests.count(("BUY", "SH.OVERLAP")),
+        all(
+            snapshot_calls > 0 and order_calls > 0
+            for snapshot_calls, order_calls in client.boundary_counts
+        ),
+        all(
+            later[0] > earlier[0] and later[1] > earlier[1]
+            for earlier, later in zip(
+                client.boundary_counts, client.boundary_counts[1:]
+            )
+        ),
+    ) == (
+        [
+            ("BUY", "SH.OVERLAP"),
+            ("BUY", "SH.RETRY"),
+        ],
+        [("BUY", "SH.RETRY")],
+        1,
+        True,
+        True,
+    )
+
+
+def test_current_execution_uses_live_capacity_when_frozen_planned_seats_are_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    positions = [
+        {
+            "symbol": f"HOLD{index}",
+            "futu_symbol": f"SH.HOLD{index}",
+            "name": f"Hold {index}",
+            "asset_class": "stock",
+            "quantity": "100",
+            "market_value": "1000",
+            "avg_cost_price": "10",
+        }
+        for index in range(20)
+    ]
+    live_positions = positions[:14]
+    action = {
+        "action": "BUY",
+        "symbol": "600001",
+        "futu_symbol": "SH.600001",
+        "global_strength": "100",
+        "target_weight": "0.04",
+        "target_amount": "4000",
+        "estimated_shares": 400,
+        "lot_size": 100,
+        "atr": "0.5",
+    }
+    report_path, report = write_v2_controller_report(
+        config, positions=positions, actions=[action],
+    )
+    report["strategy_judgments"]["planned_new_seats"] = 0
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = _report_hash(report)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    class Client:
+        def __init__(self) -> None:
+            self.orders: list[dict[str, object]] = []
+            self.requests: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "cash": "100000",
+                "available_cash": "100000",
+                "positions": [
+                    {
+                        "code": position["futu_symbol"],
+                        "qty": position["quantity"],
+                        "can_sell_qty": position["quantity"],
+                        "market_val": position["market_value"],
+                    }
+                    for position in live_positions
+                ],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": self.orders}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(dict(request))
+            order = {
+                **request,
+                "order_id": "SIM-1",
+                "futu_order_id": "SIM-1",
+                "code": request["futu_code"],
+                "trd_side": request["side"],
+                "order_status": "FILLED_ALL",
+                "status": "FILLED_ALL",
+                "dealt_qty": request["qty"],
+                "dealt_avg_price": "10",
+                "account_id": 101,
+            }
+            self.orders.append(order)
+            return {
+                "futu_order_id": "SIM-1",
+                "status": "FILLED_ALL",
+                "order_status": "FILLED_ALL",
+                "dealt_qty": request["qty"],
+            }
+
+        def close(self) -> None:
+            pass
+
+    client = Client()
+    controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="trend-market-controller",
+        reason="current live capacity with frozen zero seats",
+        now=NOW,
+        quote_client=Quote(),
+        order_client=client,
+        scheduled=False,
+    )
+
+    assert (
+        report["strategy_judgments"]["planned_new_seats"],
+        [
+            (str(item["side"]).upper(), item["futu_code"], item["qty"])
+            for item in client.requests
+        ],
+    ) == (0, [("BUY", "SH.600001", "400")])
+
+
+@pytest.mark.parametrize("failure_source", ["holdings", "orders"])
+def test_current_execution_fails_closed_and_notifies_when_live_occupancy_refresh_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_source: str,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    positions = [
+        {
+            "symbol": f"HOLD{index}",
+            "futu_symbol": f"SH.HOLD{index}",
+            "name": f"Hold {index}",
+            "asset_class": "stock",
+            "quantity": "100",
+            "market_value": "1000",
+            "avg_cost_price": "10",
+        }
+        for index in range(20)
+    ]
+    live_positions = positions[:14]
+    actions = [
+        {
+            "action": "BUY",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+            "global_strength": "100",
+            "target_weight": "0.04",
+            "target_amount": "4000",
+            "estimated_shares": 400,
+            "lot_size": 100,
+            "atr": "0.5",
+        },
+        {
+            "action": "BUY",
+            "symbol": "600002",
+            "futu_symbol": "SH.600002",
+            "global_strength": "99",
+            "target_weight": "0.04",
+            "target_amount": "4000",
+            "estimated_shares": 400,
+            "lot_size": 100,
+            "atr": "0.5",
+        },
+    ]
+    report_path, report = write_v2_controller_report(
+        config, positions=positions, actions=actions,
+    )
+    report["strategy_judgments"]["planned_new_seats"] = 0
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    report_sha = _report_hash(report)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+    notifications: list[tuple[str, str, object]] = []
+
+    def notify(title: str, message: str, key: object) -> bool:
+        notifications.append((title, message, key))
+        return True
+
+    monkeypatch.setattr(controller, "_notify_once", notify)
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    class Client:
+        def __init__(self) -> None:
+            self.orders: list[dict[str, object]] = []
+            self.requests: list[dict[str, object]] = []
+            self.snapshot_calls = 0
+            self.list_order_calls = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            self.snapshot_calls += 1
+            if failure_source == "holdings" and self.snapshot_calls == 4:
+                raise RuntimeError("live holdings refresh unavailable")
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "cash": "100000",
+                "available_cash": "100000",
+                "positions": [
+                    {
+                        "code": position["futu_symbol"],
+                        "qty": position["quantity"],
+                        "can_sell_qty": position["quantity"],
+                        "market_val": position["market_value"],
+                    }
+                    for position in live_positions
+                ],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            self.list_order_calls += 1
+            if failure_source == "orders" and self.list_order_calls == 2:
+                raise RuntimeError("live orders refresh unavailable")
+            return {"orders": self.orders}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(dict(request))
+            order = {
+                **request,
+                "order_id": "SIM-1",
+                "futu_order_id": "SIM-1",
+                "code": request["futu_code"],
+                "trd_side": request["side"],
+                "order_status": "FILLED_ALL",
+                "status": "FILLED_ALL",
+                "dealt_qty": request["qty"],
+                "dealt_avg_price": "10",
+                "account_id": 101,
+            }
+            self.orders.append(order)
+            return {
+                "futu_order_id": "SIM-1",
+                "status": "FILLED_ALL",
+                "order_status": "FILLED_ALL",
+                "dealt_qty": request["qty"],
+            }
+
+        def close(self) -> None:
+            pass
+
+    client = Client()
+    result = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="trend-market-controller",
+        reason="current live occupancy refresh unavailable",
+        now=NOW,
+        quote_client=Quote(),
+        order_client=client,
+        scheduled=False,
+    )
+
+    assert (
+        client.requests,
+        result["submitted_count"],
+        result["status"],
+        [
+            (title, message, key[3:5])
+            for title, message, key in notifications
+        ],
+    ) == (
+        [],
+        0,
+        "live_occupancy_unavailable",
+        [
+            (
+                "CN 趋势买入暂缓",
+                "无法刷新持仓或未终态买单，已跳过本轮买入",
+                ("buy_occupancy", "unavailable"),
+            ),
+        ],
+    )
+
+
+def test_current_execution_caps_sells_to_live_sellable_quantity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    positions = [
+        {
+            "symbol": symbol,
+            "futu_symbol": futu_symbol,
+            "name": symbol,
+            "asset_class": "stock",
+            "quantity": quantity,
+            "market_value": market_value,
+            "avg_cost_price": "10",
+        }
+        for symbol, futu_symbol, quantity, market_value in (
+            ("600001", "SH.600001", "100", "1000"),
+            ("600002", "SH.600002", "200", "2000"),
+            ("600003", "SH.600003", "100", "1000"),
+        )
+    ]
+    actions = [
+        {
+            "action": "SELL_ALL",
+            "symbol": "600001",
+            "futu_symbol": "SH.600001",
+        },
+        {
+            "action": "SELL_PARTIAL",
+            "symbol": "600002",
+            "futu_symbol": "SH.600002",
+            "reason": "overheat_take_profit",
+            "target_fraction": "0.30",
+            "lot_size": 10,
+            "estimated_shares": 100,
+            "position_started_for": "2026-07-01",
+            "overheat_signals": ["boiling"],
+        },
+        {
+            "action": "SELL_ALL",
+            "symbol": "600003",
+            "futu_symbol": "SH.600003",
+        },
+    ]
+    report_path, report = write_v2_controller_report(
+        config, positions=positions, actions=actions,
+    )
+    report_sha = _report_hash(report)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+
+    class Client:
+        def __init__(self) -> None:
+            self.orders: list[dict[str, object]] = [{
+                "order_id": "CROSS-DAY-600003",
+                "futu_code": "SH.600003",
+                "code": "SH.600003",
+                "side": "SELL",
+                "trd_side": "SELL",
+                "qty": "100",
+                "dealt_qty": "0",
+                "order_status": "SUBMITTED",
+                "status": "SUBMITTED",
+                "account_id": 101,
+            }]
+            self.requests: list[tuple[str, str, str]] = []
+            self.boundary_counts: list[tuple[int, int]] = []
+            self.snapshot_calls = 0
+            self.list_order_calls = 0
+
+        def account_snapshot(self) -> dict[str, object]:
+            self.snapshot_calls += 1
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "cash": "100000",
+                "available_cash": "100000",
+                "positions": [
+                    {
+                        "code": futu_code,
+                        "qty": quantity,
+                        "can_sell_qty": can_sell_qty,
+                        "market_val": market_value,
+                    }
+                    for futu_code, quantity, can_sell_qty, market_value in (
+                        ("SH.600001", "100", "70", "1000"),
+                        ("SH.600002", "200", "60", "2000"),
+                        ("SH.600003", "100", "100", "1000"),
+                    )
+                ],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            self.list_order_calls += 1
+            return {"orders": self.orders}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            side = str(request["side"]).upper()
+            code = str(request["futu_code"])
+            qty = str(request["qty"])
+            self.boundary_counts.append(
+                (self.snapshot_calls, self.list_order_calls)
+            )
+            self.requests.append((side, code, qty))
+            order_id = f"SIM-{len(self.orders) + 1}"
+            self.orders.append({
+                **request,
+                "order_id": order_id,
+                "code": code,
+                "trd_side": side,
+                "order_status": "FILLED_ALL",
+                "status": "FILLED_ALL",
+                "dealt_qty": qty,
+                "dealt_avg_price": "10",
+                "account_id": 101,
+            })
+            return {
+                "futu_order_id": order_id,
+                "status": "FILLED_ALL",
+                "order_status": "FILLED_ALL",
+                "dealt_qty": qty,
+            }
+
+        def close(self) -> None:
+            pass
+
+    client = Client()
+    controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        "2026-07-20",
+        report_sha,
+        actor="trend-market-controller",
+        reason="current live sellable quantities",
+        now=NOW,
+        order_client=client,
+        scheduled=False,
+    )
+
+    assert (
+        client.requests,
+        all(
+            snapshot_calls > 0 and order_calls > 0
+            for snapshot_calls, order_calls in client.boundary_counts
+        ),
+        any(code == "SH.600003" for _, code, _ in client.requests),
+        report_path.exists(),
+    ) == (
+        [
+            ("SELL", "SH.600001", "70"),
+            ("SELL", "SH.600002", "60"),
+        ],
+        True,
+        False,
+        True,
+    )
 
 
 def test_execute_locked_report_runs_rotations_when_buys_are_pending_only(

@@ -1000,7 +1000,7 @@ def test_cn_v16_rebuild_requires_frozen_kelly_evidence(
         rebuilt["risk_summary"]["kelly_cap"],
         action["target_amount"],
         action["estimated_shares"],
-    ) == ("0.012626", "1262.60", 100)
+    ) == ("0.012626", "4000.00", 400)
     assert rebuilt == source
 
     missing = copy.deepcopy(evidence)
@@ -2104,7 +2104,59 @@ def test_current_nominal_versions_freeze_fifo_without_top_level_allocation_versi
     ) == (1, futu_symbol, 10)
 
 
-def test_current_nominal_fifo_consumes_cash_in_global_strength_order_across_formal_and_rotation(
+def test_current_buy_fifo_marks_rotation_overlap_as_replacement_without_cash_filter(
+    tmp_path: Path,
+) -> None:
+    report = report_with_actions([
+        {
+            "action": "BUY",
+            "symbol": "600003",
+            "futu_symbol": "SH.600003",
+            "global_strength": "95",
+            "target_weight": "0.04",
+            "close": "10",
+            "lot_size": 100,
+            "estimated_shares": 100,
+            "atr": "0.5",
+            "executable": True,
+        },
+    ])
+    report["account"] = {
+        **report["account"],
+        "available_cash": "0",
+    }
+    report["risk_summary"] = {"normal_cost_rate": "0.001"}
+    report["metadata"] = {
+        **report["metadata"],
+        "market": "CN",
+        "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
+    }
+    report["strategy_snapshot"] = {
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    }
+    report["allocation"] = {"markets": {"CN": {"position_limit": 10}}}
+    report["strategy_judgments"]["simulate_rotation_pairs"] = [
+        relative_rotation_pair(buy="600003"),
+    ]
+
+    entries = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=report,
+        market="CN",
+        execution_date="2026-07-20",
+        persist=False,
+    )
+
+    assert (
+        len(entries),
+        entries[0]["futu_symbol"] if entries else None,
+        entries[0]["classification"] if entries else None,
+        entries[0]["action"]["estimated_shares"] if entries else None,
+    ) == (1, "SH.600003", "REPLACEMENT", 100)
+
+
+def test_current_nominal_fifo_keeps_formal_and_rotation_when_cash_is_insufficient(
     tmp_path: Path,
 ) -> None:
     report = report_with_actions([
@@ -2158,7 +2210,10 @@ def test_current_nominal_fifo_consumes_cash_in_global_strength_order_across_form
     assert [
         (entry["source"], entry["futu_symbol"], entry["global_strength"])
         for entry in entries
-    ] == [("rotation", "SH.STRONG", "100")]
+    ] == [
+        ("rotation", "SH.STRONG", "100"),
+        ("formal", "SH.600001", "90"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -2171,7 +2226,7 @@ def test_current_nominal_fifo_consumes_cash_in_global_strength_order_across_form
         "invalid_fx",
     ],
 )
-def test_current_nominal_fifo_fails_closed_on_malformed_cash_or_sizing_facts(
+def test_current_nominal_fifo_ignores_cash_facts_but_rejects_malformed_sizing(
     tmp_path: Path,
     mutation_id: str,
 ) -> None:
@@ -2225,7 +2280,9 @@ def test_current_nominal_fifo_fails_closed_on_malformed_cash_or_sizing_facts(
         persist=False,
     )
 
-    assert entries == []
+    assert len(entries) == (
+        0 if mutation_id in {"missing_close", "non_integer_shares", "zero_lot"} else 1
+    )
 
 
 @pytest.mark.parametrize(
@@ -2428,7 +2485,7 @@ def test_current_nominal_fifo_uses_paired_sale_proceeds_for_automatic_rotation(
     ) == (1, 100)
 
 
-def test_current_nominal_fifo_excludes_cash_insufficient_automatic_rotation(
+def test_current_nominal_fifo_keeps_cash_insufficient_automatic_rotation(
     tmp_path: Path,
 ) -> None:
     pair = relative_rotation_pair()
@@ -2461,10 +2518,10 @@ def test_current_nominal_fifo_excludes_cash_insufficient_automatic_rotation(
         persist=False,
     )
 
-    assert entries == []
+    assert len(entries) == 1
 
 
-def test_current_nominal_fifo_uses_strategy_cost_rate_when_risk_summary_cost_missing(
+def test_current_nominal_fifo_ignores_missing_cash_cost_facts(
     tmp_path: Path,
 ) -> None:
     report = report_with_actions([
@@ -2508,10 +2565,10 @@ def test_current_nominal_fifo_uses_strategy_cost_rate_when_risk_summary_cost_mis
         persist=False,
     )
 
-    assert entries == []
+    assert len(entries) == 1
 
 
-def test_current_nominal_fifo_fails_closed_when_normal_cost_rate_unavailable(
+def test_current_nominal_fifo_ignores_unavailable_cash_cost_facts(
     tmp_path: Path,
 ) -> None:
     report = report_with_actions([
@@ -2553,7 +2610,7 @@ def test_current_nominal_fifo_fails_closed_when_normal_cost_rate_unavailable(
         persist=False,
     )
 
-    assert entries == []
+    assert len(entries) == 1
 
 
 def test_current_nominal_open_does_not_submit_missing_executable_buy(
@@ -2659,7 +2716,7 @@ def test_current_nominal_fifo_excludes_non_executable_formal_buy(
     assert entries == []
 
 
-def test_current_nominal_fifo_excludes_cash_insufficient_executable_buy(
+def test_current_nominal_fifo_keeps_cash_insufficient_executable_buy(
     tmp_path: Path,
 ) -> None:
     report = v2_report_with_actions([
@@ -2708,7 +2765,7 @@ def test_current_nominal_fifo_excludes_cash_insufficient_executable_buy(
         persist=False,
     )
 
-    assert entries == []
+    assert len(entries) == 1
 
 
 def test_current_nominal_fifo_excludes_malformed_executable_formal_buy(

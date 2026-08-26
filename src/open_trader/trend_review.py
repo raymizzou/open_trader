@@ -10512,105 +10512,6 @@ def freeze_simulated_buy_fifo(
         and str(strategy_snapshot.get("strategy_version") or "")
         == ALLOCATION_PROJECTION_VERSIONS.get(market)
     )
-    cash_remaining: Decimal | None = None
-    cash_fx = Decimal("1")
-    cash_cost_rate = Decimal("0")
-    credited_sell_keys: set[str] = set()
-    positions: list[object] | None = None
-    if current_nominal:
-        account = report.get("account")
-        risk_summary = report.get("risk_summary")
-        metadata = report.get("metadata")
-        strategy_parameters = (
-            strategy_snapshot.get("parameters")
-            if isinstance(strategy_snapshot, Mapping)
-            else None
-        )
-        try:
-            cash_remaining = Decimal(str(account["available_cash"])) if isinstance(
-                account, Mapping
-            ) else None
-            cash_fx = Decimal(
-                str(
-                    metadata.get("price_fx_to_account_currency", "1")
-                    if isinstance(metadata, Mapping)
-                    else "1"
-                )
-            )
-        except (InvalidOperation, KeyError, TypeError, ValueError):
-            return []
-        for raw_rate in (
-            risk_summary.get("normal_cost_rate")
-            if isinstance(risk_summary, Mapping)
-            else None,
-            strategy_parameters.get("normal_cost_rate")
-            if isinstance(strategy_parameters, Mapping)
-            else None,
-        ):
-            try:
-                candidate_rate = Decimal(str(raw_rate))
-            except (InvalidOperation, TypeError, ValueError):
-                continue
-            if candidate_rate.is_finite() and candidate_rate >= 0:
-                cash_cost_rate = candidate_rate
-                break
-        else:
-            return []
-        if (
-            cash_remaining is None
-            or not cash_remaining.is_finite()
-            or cash_remaining < 0
-            or not cash_fx.is_finite()
-            or cash_fx <= 0
-            or not cash_cost_rate.is_finite()
-            or cash_cost_rate < 0
-        ):
-            return []
-        if cash_remaining is not None:
-            holdings = judgments.get("holding_decisions")
-            holding_items = holdings if isinstance(holdings, list) else ()
-            positions = account.get("positions") if isinstance(account, Mapping) else None
-            sell_symbols = {
-                str(item.get("symbol") or "").strip().upper()
-                for item in holding_items
-                if isinstance(item, Mapping) and item.get("action") == "SELL_ALL"
-            }
-            if isinstance(positions, list):
-                for position in positions:
-                    if not isinstance(position, Mapping):
-                        continue
-                    position_keys = {
-                        key
-                        for value in (
-                            position.get("futu_symbol"),
-                            position.get("code"),
-                            position.get("symbol"),
-                        )
-                        if value not in (None, "")
-                        for key in (
-                            str(value).strip().upper(),
-                            normalize_code(value),
-                        )
-                        if key
-                    }
-                    if not position_keys & sell_symbols and not any(
-                        normalize_code(item.get("futu_symbol") or item.get("symbol"))
-                        in position_keys
-                        for item in holding_items
-                        if isinstance(item, Mapping) and item.get("action") == "SELL_ALL"
-                    ):
-                        continue
-                    try:
-                        proceeds = Decimal(str(
-                            position.get("market_value", position.get("market_val"))
-                        ))
-                    except (InvalidOperation, KeyError, TypeError, ValueError):
-                        continue
-                    if proceeds.is_finite() and proceeds >= 0:
-                        cash_remaining += proceeds * max(
-                            Decimal("0"), Decimal("1") - cash_cost_rate
-                        )
-                        credited_sell_keys.update(position_keys)
     by_code: dict[str, dict[str, object]] = {}
 
     def add_owner(
@@ -10630,6 +10531,15 @@ def freeze_simulated_buy_fifo(
                 "symbol": symbol,
                 "global_strength": strength,
                 **payload,
+                **(
+                    {
+                        "classification": (
+                            "REPLACEMENT" if source == "rotation" else "NORMAL"
+                        )
+                    }
+                    if current_nominal
+                    else {}
+                ),
                 "owners": [dict(owner)],
             }
             return
@@ -10647,6 +10557,8 @@ def freeze_simulated_buy_fifo(
             if isinstance(item, Mapping)
         ):
             owners.append(dict(owner))
+        if current_nominal and source == "rotation":
+            prior["classification"] = "REPLACEMENT"
         if parse_strength(strength) > parse_strength(prior.get("global_strength")):
             prior.update({
                 "source": source,
@@ -10723,11 +10635,12 @@ def freeze_simulated_buy_fifo(
     entries = sorted(
         by_code.values(),
         key=lambda item: (
+            item.get("classification") != "REPLACEMENT" if current_nominal else False,
             -parse_strength(item.get("global_strength")),
             str(item.get("symbol") or item.get("futu_symbol") or ""),
         ),
     )
-    if current_nominal and cash_remaining is not None:
+    if current_nominal:
         eligible_entries: list[dict[str, object]] = []
         for entry in entries:
             source = entry.get("source")
@@ -10749,66 +10662,8 @@ def freeze_simulated_buy_fifo(
                     or close <= 0
                 ):
                     raise ValueError
-                required_cash = (
-                    Decimal(shares)
-                    * close
-                    * cash_fx
-                    * (Decimal("1") + cash_cost_rate)
-                )
             except (InvalidOperation, KeyError, TypeError, ValueError, ArithmeticError):
-                required_cash = None
-            if required_cash is None:
                 continue
-            if required_cash is not None and source == "rotation":
-                sell_keys = {
-                    key
-                    for value in (
-                        payload.get("sell_futu_symbol") if isinstance(payload, Mapping) else None,
-                        payload.get("sell_symbol") if isinstance(payload, Mapping) else None,
-                    )
-                    if value not in (None, "")
-                    for key in (
-                        str(value).strip().upper(),
-                        normalize_code(value),
-                    )
-                    if key
-                }
-                if isinstance(positions, list) and sell_keys.isdisjoint(credited_sell_keys):
-                    for position in positions:
-                        if not isinstance(position, Mapping):
-                            continue
-                        position_keys = {
-                            key
-                            for value in (
-                                position.get("futu_symbol"),
-                                position.get("code"),
-                                position.get("symbol"),
-                            )
-                            if value not in (None, "")
-                            for key in (
-                                str(value).strip().upper(),
-                                normalize_code(value),
-                            )
-                            if key
-                        }
-                        if sell_keys.isdisjoint(position_keys):
-                            continue
-                        try:
-                            proceeds = Decimal(str(
-                                position.get("market_value", position.get("market_val"))
-                            ))
-                        except (InvalidOperation, KeyError, TypeError, ValueError):
-                            continue
-                        if proceeds.is_finite() and proceeds >= 0:
-                            cash_remaining += proceeds * max(
-                                Decimal("0"), Decimal("1") - cash_cost_rate
-                            )
-                            credited_sell_keys.update(position_keys)
-                        break
-            if required_cash is not None and required_cash > cash_remaining:
-                continue
-            if required_cash is not None:
-                cash_remaining -= required_cash
             eligible_entries.append(entry)
         entries = eligible_entries
     position_limit = 10
@@ -10883,6 +10738,9 @@ def _preflight_open_actions(
     )
     if not strategy_version:
         raise ValueError("trend report strategy version is unavailable")
+    current_nominal = strategy_version == ALLOCATION_PROJECTION_VERSIONS.get(
+        _market(market)
+    )
 
     validated: list[Mapping[str, object]] = []
     sell_actions_by_symbol: set[str] = set()
@@ -10919,9 +10777,26 @@ def _preflight_open_actions(
             )
             if data_missing:
                 continue
+            try:
+                audit_unavailable = (
+                    current_nominal
+                    and action.get("sizing_note")
+                    == "计划止损风险仅审计，不参与买入数量"
+                    and atr == 0
+                    and all(
+                        _required_decimal(action.get(field), field) == 0
+                        for field in (
+                            "estimated_initial_line",
+                            "planned_stop_risk",
+                            "planned_stop_risk_pct",
+                        )
+                    )
+                )
+            except (TypeError, ValueError):
+                audit_unavailable = False
             if (
                 target_weight <= 0
-                or atr <= 0
+                or atr <= 0 and not audit_unavailable
                 or lot_size <= 0
                 or quantity <= 0
                 or quantity != quantity.to_integral_value()
@@ -12265,7 +12140,11 @@ def execute_trend_review_open(
                     else None
                 )
                 protection_fact = {}
-                if action_name == "BUY" and average_price is not None:
+                if (
+                    action_name == "BUY"
+                    and average_price is not None
+                    and _required_decimal(action.get("atr"), "action ATR") > 0
+                ):
                     protection_fact = {
                         "active_protection_line": format(
                             average_price

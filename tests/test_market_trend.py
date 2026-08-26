@@ -851,6 +851,209 @@ def test_market_report_failure_carries_waiting_gap_at_deadline(
     assert result.waiting_reason == "美股 2026-07-14 → 2026-07-15"
 
 
+@pytest.mark.parametrize(
+    "missing_fact", ["positive_price", "lot_size", "symbol_mapping"]
+)
+def test_current_version_report_is_atomic_when_any_buy_quantity_input_is_missing(
+    tmp_path: Path, missing_fact: str,
+) -> None:
+    cfg = config(tmp_path)
+    allocation = _write_market_v2_allocation(cfg)
+    as_of_date = "2026-07-15"
+    execution_date = "2026-07-16"
+    symbols = ("00001", "00002")
+    wire_symbols = ("0001.HK", "0002.HK")
+    fact_labels = {
+        "positive_price": "价格",
+        "lot_size": "每手股数",
+        "symbol_mapping": "趋势代码映射",
+    }
+
+    def candidate_row(index: int, expected_date: str) -> dict[str, object]:
+        return {
+            "tmId": index,
+            "tickerName": f"测试买入{index}",
+            "tickerSymbol": wire_symbols[index - 1],
+            "asset": "港股",
+            "asOfDate": expected_date,
+            "tradableFlag": True,
+            "industryTmId": 700001,
+            "industryName": "科技",
+            "priceIndex": "10",
+            "marketCap": "200",
+            "amount1d": "3",
+            "isTrendRightSide": True,
+            "trendTemperaturePrev": "温",
+            "trendTemperatureCurr": "热",
+            "daysSinceTrendEntry": 3,
+            "gainSinceEntry": "0.1",
+            "trendPhasePrev": "谷雨",
+            "trendPhaseCurr": "立夏",
+            "trendStrengthLocalCurr": str(98 - index),
+            "trendStrengthLocalChange": "1",
+            "trendStrengthGlobalCurr": str(98 - index),
+            "trendStrengthLocalPrevWeek": "97",
+            "trendStrengthLocalPrevMonth": "95",
+            "stopwinFlagByDangerSignal": False,
+            "stopwinFlagByBoilingTemperature": False,
+            "stopwinFlagByPopChampagne": False,
+            "tickerLabels": "成交主力",
+        }
+
+    class Api:
+        paid_cache_events: tuple[dict[str, object], ...] = ()
+        ignored_stale_components: tuple[object, ...] = ()
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": asset, "asOfDate": as_of_date}
+                for asset in MARKET_UPDATE_ASSETS["HK"]
+            ]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str,
+        ) -> list[dict[str, object]]:
+            assert tm_id == 622494
+            return [
+                {
+                    "tmId": index,
+                    "tickerSymbol": wire_symbols[index - 1],
+                    "asOfDate": expected_date,
+                }
+                for index in (1, 2)
+            ]
+
+        def get_favorites_tickers(self) -> list[dict[str, object]]:
+            return []
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            fields = tuple(dict.fromkeys(
+                (
+                    *UNIFIED_TREND_FIELDS,
+                    *A_SHARE_INDUSTRY_FIELDS,
+                    *INDUSTRY_MEMBER_FIELDS,
+                    *INDUSTRY_STATE_FIELDS,
+                )
+            ))
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in fields
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            fields = tuple(kwargs["fields"])
+            expected_date = str(kwargs["expected_date"])
+            tm_ids = [int(item) for item in kwargs["tm_ids"]]  # type: ignore[union-attr]
+            if fields == A_SHARE_INDUSTRY_FIELDS:
+                return [{
+                    "tmId": tm_id,
+                    "asOfDate": expected_date,
+                    "trendTemperatureCurr": "热",
+                } for tm_id in tm_ids]
+            return [candidate_row(tm_id, expected_date) for tm_id in tm_ids]
+
+        def remember_symbol_row(self, **kwargs: object) -> None:
+            row = kwargs["row"]
+            if (
+                missing_fact == "symbol_mapping"
+                and isinstance(row, dict)
+                and row.get("tmId") == 2
+            ):
+                raise TrendAnimalsError("symbol mapping unavailable")
+
+        def symbol_mapping(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return [as_of_date, execution_date]
+
+        def get_daily_kline(
+            self, symbol: str, **_kwargs: object,
+        ) -> list[DailyKlineBar]:
+            if missing_fact == "positive_price" and symbol.endswith("00002"):
+                return []
+            end = datetime.fromisoformat(as_of_date)
+            return [
+                DailyKlineBar(
+                    date=(end - timedelta(days=14 - index)).date().isoformat(),
+                    open=10,
+                    high=10.1,
+                    low=9.9,
+                    close=10,
+                    volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def get_lot_sizes(self, requested: list[str]) -> dict[str, int]:
+            if missing_fact == "lot_size":
+                return {requested[0]: 100}
+            return {item: 100 for item in requested}
+
+        def close(self) -> None:
+            pass
+
+    class Account:
+        def __init__(self, **kwargs: object) -> None:
+            self.acc_id = int(kwargs["simulate_acc_id"])
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": self.acc_id,
+                "net_value": "100000",
+                "cash": "100000",
+                "positions": [],
+            }
+
+        def close(self) -> None:
+            pass
+
+    notifier = RecordingFeishu()
+    result = run_market_trend_report(
+        config=cfg,
+        market="HK",
+        run_date="2026-07-15",
+        allocation_reference=allocation,
+        notifier=notifier,
+        api_factory=Api,
+        quote_factory=Quote,
+        account_factory=Account,
+        now_fn=lambda: datetime(2026, 7, 15, 19, tzinfo=SHANGHAI),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    paths = market_paths(cfg.data_dir, cfg.reports_dir, "HK")
+    expected_reason = f"港股买入 {symbols[1]} 缺少{fact_labels[missing_fact]}"
+    assert (
+        result.status,
+        len(list(paths.reports.glob("*.json"))),
+        len(list(paths.reports.glob("*.md"))),
+        len(notifier.messages),
+        notifier.messages[0][0],
+        expected_reason in notifier.messages[0][1],
+    ) == (
+        "failed",
+        0,
+        0,
+        1,
+        "【需处理｜辉立｜港股趋势报告生成失败｜2026-07-15】",
+        True,
+    )
+
+
 def test_hk_report_uses_simulation_holdings_when_actual_statement_is_stale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

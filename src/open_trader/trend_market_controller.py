@@ -17,6 +17,7 @@ from time import sleep
 from zoneinfo import ZoneInfo
 
 from .a_share_trend import (
+    STOP_RISK_AUDIT_ONLY_LABEL,
     _process_version,
     load_futu_simulate_trend_account,
     read_delivery_receipt,
@@ -62,7 +63,10 @@ from .opend_incident import (
     record_opend_failure,
     record_opend_health,
 )
-from .strategy_drawdown import is_allocation_v2_version
+from .strategy_drawdown import (
+    ALLOCATION_PROJECTION_VERSIONS,
+    is_allocation_v2_version,
+)
 from .trend_api_stats import (
     STATISTICS_CYCLE_SCHEMA,
     FutuActualFillClient,
@@ -93,6 +97,7 @@ from .trend_review import (
     record_trend_review_missed_buys,
     refresh_long_term_benchmark,
     relative_rotations_completed,
+    TERMINAL_ORDER_STATUSES,
     trend_action_futu_symbol,
 )
 from .trend_statement_consumer import consume_accepted_statement_facts
@@ -885,11 +890,31 @@ def _valid_report(
             lot = int(action.get("lot_size") or 0)
         except (InvalidOperation, TypeError, ValueError):
             return False
+        try:
+            audit_unavailable = (
+                strategy_version == ALLOCATION_PROJECTION_VERSIONS.get(market)
+                and action.get("sizing_note")
+                == STOP_RISK_AUDIT_ONLY_LABEL
+                and atr == 0
+                and all(
+                    Decimal(str(action.get(field))) == 0
+                    for field in (
+                        "estimated_initial_line",
+                        "planned_stop_risk",
+                        "planned_stop_risk_pct",
+                    )
+                )
+            )
+        except (InvalidOperation, TypeError, ValueError):
+            audit_unavailable = False
         if (
             not all(
                 item.is_finite() and item > 0
-                for item in (weight, quantity, amount, atr)
+                for item in (weight, quantity, amount)
             )
+            or not atr.is_finite()
+            or atr < 0
+            or atr == 0 and not audit_unavailable
             or lot <= 0
             or quantity != quantity.to_integral_value()
             or quantity % lot
@@ -1850,6 +1875,9 @@ def _execute_locked_report(
                 or is_allocation_v2_version(market, strategy_version)
             )
         )
+        current_nominal = (
+            strategy_version == ALLOCATION_PROJECTION_VERSIONS.get(market)
+        )
         if staged_rotation_batch:
             def snapshot_position_count(snapshot: object) -> int | None:
                 if not isinstance(snapshot, Mapping):
@@ -1955,11 +1983,7 @@ def _execute_locked_report(
                         post_sell_snapshot = None
                 held_codes = snapshot_codes(post_sell_snapshot)
                 order_reader = getattr(client, "list_orders", None)
-                terminal_buy_statuses = {
-                    "FILLED", "FILLED_ALL", "CANCELLED", "CANCELLED_ALL",
-                    "CANCELLED_PART", "FAILED", "SUBMIT_FAILED", "TIMEOUT",
-                    "DISABLED", "DELETED", "REJECTED",
-                }
+                terminal_buy_statuses = TERMINAL_ORDER_STATUSES
 
                 def listed_buy_orders() -> list[Mapping[str, object]] | None:
                     if not callable(order_reader):
@@ -1970,6 +1994,8 @@ def _execute_locked_report(
                     except Exception:
                         return None
                     if not isinstance(orders, list):
+                        return None
+                    if any(not isinstance(order, Mapping) for order in orders):
                         return None
                     return [
                         order for order in orders if isinstance(order, Mapping)
@@ -2093,6 +2119,82 @@ def _execute_locked_report(
                         if frozen_buy_plan
                         else set()
                     )
+                    current_round_buy_codes: set[str] = set()
+
+                    def live_buy_occupancy() -> set[str] | None:
+                        occupancy: set[str] = set()
+                        if not callable(snapshot_reader):
+                            return None
+                        try:
+                            current_snapshot = snapshot_reader()
+                        except Exception:
+                            return None
+                        if not isinstance(current_snapshot, Mapping):
+                            return None
+                        raw_positions = current_snapshot.get("positions")
+                        if not isinstance(raw_positions, list):
+                            return None
+                        for position in raw_positions:
+                            if not isinstance(position, Mapping):
+                                return None
+                            try:
+                                quantity = Decimal(
+                                    str(
+                                        position.get(
+                                            "qty", position.get("quantity", "0")
+                                        )
+                                    )
+                                )
+                            except (InvalidOperation, TypeError, ValueError):
+                                return None
+                            if not quantity.is_finite() or quantity < 0:
+                                return None
+                            if quantity > 0 and not str(
+                                position.get("code")
+                                or position.get("futu_code")
+                                or position.get("symbol")
+                                or ""
+                            ).strip():
+                                return None
+                        for raw_code in snapshot_codes(current_snapshot):
+                            code = _normalize_futu_symbol(market, raw_code)
+                            if code:
+                                occupancy.add(code)
+                        current_orders = listed_buy_orders()
+                        if current_orders is None:
+                            return None
+                        for order in current_orders:
+                            side = str(
+                                order.get("side") or order.get("trd_side") or ""
+                            ).upper()
+                            status = str(
+                                order.get("order_status") or order.get("status") or ""
+                            ).upper()
+                            if not side or not status:
+                                return None
+                            if side not in {"BUY", "BUY_BACK"}:
+                                continue
+                            if status in terminal_buy_statuses:
+                                continue
+                            code = _normalize_futu_symbol(
+                                market,
+                                order.get("futu_code") or order.get("code") or "",
+                            )
+                            if not code:
+                                return None
+                            occupancy.add(code)
+                        occupancy.update(current_round_buy_codes)
+                        return occupancy
+
+                    def buy_submission_accepted(result: Mapping[str, object]) -> bool:
+                        try:
+                            submitted_count = int(result.get("submitted_count") or 0)
+                        except (TypeError, ValueError):
+                            submitted_count = 0
+                        return (
+                            submitted_count > 0
+                            and result.get("terminal_rejected") is not True
+                        )
 
                     def attempt_consumes_seat(
                         code: str,
@@ -2233,7 +2335,11 @@ def _execute_locked_report(
                             and not (frozen_buy_plan and existing_code)
                         ):
                             continue
-                        if not existing_code and len(consumed_seat_codes) >= planned_new_seats:
+                        if (
+                            not current_nominal
+                            and not existing_code
+                            and len(consumed_seat_codes) >= planned_new_seats
+                        ):
                             continue
                         owners = entry.get("owners")
                         has_formal_owner = (
@@ -2244,6 +2350,59 @@ def _execute_locked_report(
                                 for owner in owners
                             )
                         )
+                        is_replacement = (
+                            current_nominal
+                            and (
+                                entry.get("classification") == "REPLACEMENT"
+                                or entry.get("source") == "rotation"
+                            )
+                        )
+                        live_occupancy = live_buy_occupancy()
+                        if live_occupancy is None:
+                            if current_nominal:
+                                ordinary_buy = merge_result(
+                                    ordinary_buy,
+                                    {
+                                        "status": "live_occupancy_unavailable",
+                                        "submitted_count": 0,
+                                        "artifact_paths": [],
+                                        "failure_details": [
+                                            {
+                                                "reason": "live_buy_occupancy_unavailable"
+                                            }
+                                        ],
+                                    },
+                                )
+                                try:
+                                    _notify_once(
+                                        f"{market} 趋势买入暂缓",
+                                        "无法刷新持仓或未终态买单，已跳过本轮买入",
+                                        (
+                                            config,
+                                            market,
+                                            execution_date,
+                                            "buy_occupancy",
+                                            "unavailable",
+                                            now,
+                                        ),
+                                    )
+                                except Exception:
+                                    pass
+                                break
+                            live_occupancy = set()
+                        normalized_code = _normalize_futu_symbol(market, code)
+                        if (
+                            current_nominal
+                            and normalized_code
+                            and normalized_code in live_occupancy
+                        ):
+                            continue
+                        if (
+                            current_nominal
+                            and not is_replacement
+                            and len(live_occupancy) >= position_limit
+                        ):
+                            continue
                         if has_formal_owner or entry.get("source") != "rotation":
                             owner_artifacts = (
                                 reconcile_deduplicated_buy_owners(
@@ -2328,6 +2487,12 @@ def _execute_locked_report(
                                 account_id=account_id,
                             )
                             rotation_buy = merge_result(rotation_buy, result)
+                        if (
+                            current_nominal
+                            and buy_submission_accepted(result)
+                            and normalized_code
+                        ):
+                            current_round_buy_codes.add(normalized_code)
                         if not existing_code and attempt_consumes_seat(code, result):
                             consumed_seat_codes.add(code)
                     rotation = merge_result(rotation, rotation_buy)
@@ -4014,6 +4179,19 @@ def _locked_report(
     latest: tuple[Path, dict[str, object]],
     now: datetime,
 ) -> tuple[Path, dict[str, object]]:
+    strategy_snapshot = latest[1].get("strategy_snapshot")
+    strategy_version = (
+        strategy_snapshot.get("strategy_version")
+        if isinstance(strategy_snapshot, Mapping)
+        else None
+    )
+    allocation = latest[1].get("allocation")
+    if (
+        isinstance(allocation, Mapping)
+        and allocation.get("version", 1) == 2
+        or is_allocation_v2_version(cycle.market, strategy_version)
+    ):
+        return latest
     batch_path = _batch_path(config, cycle.market, cycle.execution_date)
     if not batch_path.exists():
         return latest
@@ -4912,6 +5090,16 @@ def run_trend_market_controller(
                         work_cycle = report_cycle
                         report_target = None
 
+                latest_strategy_snapshot = (
+                    latest[1].get("strategy_snapshot")
+                    if latest is not None
+                    else None
+                )
+                latest_strategy_version = (
+                    latest_strategy_snapshot.get("strategy_version")
+                    if isinstance(latest_strategy_snapshot, Mapping)
+                    else None
+                )
                 blocker = report_blocker or blocker
                 operation_delayed = (
                     operation_retry_after is not None
@@ -4928,6 +5116,26 @@ def run_trend_market_controller(
                     phase = "recovering_report"
                 elif latest is None:
                     phase = "recovering_report"
+                elif (
+                    _execution_due(work_cycle, now)
+                    and is_allocation_v2_version(
+                        market, latest_strategy_version
+                    )
+                    and (
+                        latest_strategy_version
+                        != ALLOCATION_PROJECTION_VERSIONS.get(market)
+                    )
+                ):
+                    last_success = {
+                        "status": "non_executable",
+                        "market": market,
+                        "date": work_cycle.execution_date,
+                        "report_path": str(latest[0]),
+                        "strategy_version": latest_strategy_version,
+                    }
+                    blocker = "no current executable report"
+                    phase = "blocked"
+                    report_target = None
                 elif _execution_due(work_cycle, now):
                     judgments = latest[1].get("strategy_judgments")
                     formal_actions = (

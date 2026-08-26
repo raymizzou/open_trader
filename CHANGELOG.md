@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-26
+
+- Trend 当前 CN v16 / HK v14 / US v14 按自有账户 NAV × 4% 记录名义数量（不足一手保留最小一手），每轮只选最新同日修订；实时执行检查重复标的、动态替换席位并按可卖数量封顶卖出，实盘计划保持只读不自动提交。验证：受影响 Trend/Dashboard/acceptance 套件 2107 passed；全量 make test 7427 passed、3 skipped（exit 0）。
+
 ## 2026-08-25
 
 - Trend reports now pause new entries when existing planned risk is already above 4%; exact equality retains minimum-lot behavior. Verification: approved Case 1 RED then GREEN; equality/validator/paused-payload boundaries `3 passed`; full `make test` `7261 passed, 3 skipped, 1 warning` (exit 0).

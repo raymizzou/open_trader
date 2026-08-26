@@ -23,6 +23,7 @@ from .a_share_trend import (
     PORTFOLIO_RISK_LIMIT,
     REASON_LABELS,
     SINGLE_ENTRY_RISK_LIMIT,
+    STOP_RISK_AUDIT_ONLY_LABEL,
     TREND_API_COST_UNIT,
     live_trend_strategy_snapshot,
     trend_api_cost_label,
@@ -2225,11 +2226,17 @@ def _valid_current_trend_risk_contract(
         isinstance(snapshot, dict)
         and str(snapshot.get("strategy_version") or "")
         in {"v14", "v16"}
-        and summary.get("status_label") == "计划止损风险仅审计，不参与买入数量"
+        and summary.get("status_label") == STOP_RISK_AUDIT_ONLY_LABEL
     ):
+        planned = _dashboard_risk_decimal(summary.get("portfolio_planned_risk"))
+        limit = _dashboard_risk_decimal(summary.get("portfolio_risk_limit"))
         contract_summary = {
             **summary,
-            "status_label": "含最小一手额外风险",
+            "status_label": (
+                "含最小一手额外风险"
+                if planned is not None and limit is not None and planned > limit
+                else "风险预算内"
+            ),
         }
     if not isinstance(summary, dict) or not valid_v4_risk_contract(
         parameters, contract_summary, expected_nav=expected_nav
@@ -2310,6 +2317,11 @@ def _valid_current_trend_risk_contract(
     formal_actions = judgments.get("formal_actions")
     market = metadata.get("market") if isinstance(metadata, dict) else ""
     strategy_id = snapshot.get("strategy_id") if isinstance(snapshot, dict) else ""
+    current_nominal = (
+        isinstance(snapshot, dict)
+        and CURRENT_NOMINAL_ALLOCATION_VERSIONS.get(str(market).upper())
+        == str(snapshot.get("strategy_version") or "")
+    )
     return valid_drawdown_decision(
         drawdown,
         expected_market=str(market),
@@ -2318,6 +2330,8 @@ def _valid_current_trend_risk_contract(
         expected_equity=expected_nav,
         expected_entry_date=str(payload.get("execution_date") or ""),
     ) and (
+        current_nominal
+        or
         drawdown.get("entry_allowed") is True
         or isinstance(formal_actions, list)
         and not any(
@@ -2340,7 +2354,6 @@ def _dashboard_risk_decimal(value: object) -> Decimal | None:
 def _dashboard_expected_nominal_sizing(
     *,
     net_value: Decimal,
-    available_cash: Decimal,
     weight: Decimal,
     close: Decimal,
     lot_size: int,
@@ -2350,8 +2363,6 @@ def _dashboard_expected_nominal_sizing(
     if (
         not net_value.is_finite()
         or net_value <= 0
-        or not available_cash.is_finite()
-        or available_cash < 0
         or not weight.is_finite()
         or weight <= 0
         or not close.is_finite()
@@ -2366,22 +2377,13 @@ def _dashboard_expected_nominal_sizing(
     ):
         raise ValueError("nominal sizing inputs are invalid")
     target_amount = (net_value * weight).quantize(Decimal("0.01"))
-    sizing_budget = min(
-        target_amount,
-        available_cash / (Decimal("1") + normal_cost_rate),
-    )
     unit_notional = close * price_fx
-    shares = int(sizing_budget / unit_notional / lot_size) * lot_size
+    shares = int(target_amount / unit_notional / lot_size) * lot_size
     if shares <= 0:
         shares = lot_size
     cash_required = (
         Decimal(shares) * unit_notional * (Decimal("1") + normal_cost_rate)
     )
-    while shares > lot_size and cash_required > available_cash:
-        shares -= lot_size
-        cash_required = (
-            Decimal(shares) * unit_notional * (Decimal("1") + normal_cost_rate)
-        )
     return target_amount, shares, cash_required
 
 
@@ -2529,6 +2531,7 @@ def _valid_v2_risk_items(
             return None
         if (
             explicit_v2
+            and not current_nominal
             and strategy_version in {
                 "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
                 "v11", "v12", "v13", "v14", "v15", "v16",
@@ -2576,6 +2579,15 @@ def _valid_v2_risk_items(
             and isinstance(sizing_note, str)
             and sizing_note in data_missing_notes
         )
+        audit_unavailable = (
+            current_nominal
+            and sizing_note == STOP_RISK_AUDIT_ONLY_LABEL
+            and atr == Decimal("0")
+            and _dashboard_risk_decimal(item.get("estimated_initial_line"))
+            == Decimal("0")
+            and planned_risk == Decimal("0")
+            and planned_pct == Decimal("0")
+        )
         if current_nominal and target_weight != nominal_weight(
             item.get("temperature_curr")
         ):
@@ -2596,7 +2608,17 @@ def _valid_v2_risk_items(
                 if isinstance(frozen_candidate, dict)
                 else None
             )
-            if (
+            if audit_unavailable:
+                if (
+                    close is None
+                    or close <= 0
+                    or frozen_close is None
+                    or frozen_close <= 0
+                    or frozen_atr is not None
+                    or close != frozen_close
+                ):
+                    return False
+            elif (
                 close is None
                 or close <= 0
                 or atr is None
@@ -2621,7 +2643,6 @@ def _valid_v2_risk_items(
                 expected_amount, expected_shares, expected_cash_required = (
                     _dashboard_expected_nominal_sizing(
                         net_value=nav,
-                        available_cash=nominal_remaining_cash,
                         weight=target_weight,
                         close=close,
                         lot_size=lot_size,
@@ -2631,7 +2652,7 @@ def _valid_v2_risk_items(
                 )
                 if target_amount != expected_amount or shares != expected_shares:
                     return False
-                if explicit_v2:
+                if explicit_v2 and not audit_unavailable:
                     try:
                         actual_initial_line = Decimal(
                             str(item.get("estimated_initial_line"))
@@ -2661,7 +2682,11 @@ def _valid_v2_risk_items(
                         or planned_pct != expected_pct
                     ):
                         return False
-                if item.get("executable") is True:
+                if (
+                    item.get("executable") is True
+                    and not current_nominal
+                    and not audit_unavailable
+                ):
                     if expected_cash_required > nominal_remaining_cash:
                         return False
                     nominal_remaining_cash -= expected_cash_required
@@ -2677,7 +2702,8 @@ def _valid_v2_risk_items(
             or target_weight is None
             or target_weight <= 0
             or target_weight > target_weight_limit
-            or strategy_version in {
+            or not current_nominal
+            and strategy_version in {
                 "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16",
             }
             and summary.get("kelly_phase") != "cold_start"
@@ -2711,17 +2737,20 @@ def _valid_v2_risk_items(
             shares <= 0
             or lot_size <= 0
             or shares % lot_size != 0
-            or planned_risk is None
-            or planned_risk <= 0
-            or planned_pct is None
-            or planned_pct <= 0
             or normal_cost is None
             or normal_cost <= 0
             or close is None
             or close <= 0
-            or normal_cost > planned_risk
             or nav is None
-            or planned_pct != planned_risk / nav
+            or not audit_unavailable
+            and (
+                planned_risk is None
+                or planned_risk <= 0
+                or planned_pct is None
+                or planned_pct <= 0
+                or normal_cost > planned_risk
+                or planned_pct != planned_risk / nav
+            )
             or not current_nominal
             and planned_pct > SINGLE_ENTRY_RISK_LIMIT
             and shares != lot_size
@@ -2816,13 +2845,25 @@ def _valid_v2_risk_items(
                 candidate_atr = _dashboard_risk_decimal(candidate.get("atr"))
                 close = _dashboard_risk_decimal(item.get("close"))
                 atr = _dashboard_risk_decimal(item.get("atr"))
+                audit_unavailable = (
+                    current_nominal
+                    and item.get("sizing_note") == STOP_RISK_AUDIT_ONLY_LABEL
+                    and atr == Decimal("0")
+                    and _dashboard_risk_decimal(
+                        item.get("estimated_initial_line")
+                    ) == Decimal("0")
+                    and _dashboard_risk_decimal(item.get("planned_stop_risk"))
+                    == Decimal("0")
+                    and _dashboard_risk_decimal(item.get("planned_stop_risk_pct"))
+                    == Decimal("0")
+                )
                 if (
                     candidate_close is None
                     or candidate_close <= 0
-                    or candidate_atr is None
-                    or candidate_atr <= 0
+                    or not audit_unavailable
+                    and (candidate_atr is None or candidate_atr <= 0)
                     or close != candidate_close
-                    or atr != candidate_atr
+                    or not audit_unavailable and atr != candidate_atr
                     or (
                         market == "CN"
                         and item.get("temperature_curr")
@@ -2859,7 +2900,6 @@ def _valid_v2_risk_items(
                     expected_amount, expected_shares, expected_cash_required = (
                         _dashboard_expected_nominal_sizing(
                             net_value=real_nav,
-                            available_cash=real_remaining_cash,
                             weight=weight,
                             close=candidate_close,
                             lot_size=lot_size,
@@ -2867,17 +2907,27 @@ def _valid_v2_risk_items(
                             normal_cost_rate=nominal_cost_rate,
                         )
                     )
-                    expected_cost, expected_risk, expected_pct = (
-                        nominal_audit_values(
-                            shares=expected_shares,
-                            close=candidate_close,
-                            atr=candidate_atr,
-                            nav_value=real_nav,
-                            price_fx=price_fx,
-                            cost_rate=nominal_cost_rate,
-                            protection=protection_multiple,
+                    if audit_unavailable:
+                        expected_cost = (
+                            Decimal(expected_shares)
+                            * candidate_close
+                            * price_fx
+                            * nominal_cost_rate
                         )
-                    )
+                        expected_risk = Decimal("0")
+                        expected_pct = Decimal("0")
+                    else:
+                        expected_cost, expected_risk, expected_pct = (
+                            nominal_audit_values(
+                                shares=expected_shares,
+                                close=candidate_close,
+                                atr=candidate_atr,
+                                nav_value=real_nav,
+                                price_fx=price_fx,
+                                cost_rate=nominal_cost_rate,
+                                protection=protection_multiple,
+                            )
+                        )
                 except (ArithmeticError, InvalidOperation, TypeError, ValueError):
                     return False
                 if (
@@ -2886,11 +2936,12 @@ def _valid_v2_risk_items(
                     or normal_cost != expected_cost
                     or planned_risk != expected_risk
                     or planned_pct != expected_pct
-                    or item.get("executable") is True
+                    or not current_nominal
+                    and item.get("executable") is True
                     and expected_cash_required > real_remaining_cash
                 ):
                     return False
-                if item.get("executable") is True:
+                if item.get("executable") is True and not current_nominal:
                     real_remaining_cash -= expected_cash_required
 
         for pair_field, execution_mode in (
@@ -3095,7 +3146,6 @@ def _valid_v2_risk_items(
                     expected_amount, expected_shares, expected_cash_required = (
                         _dashboard_expected_nominal_sizing(
                             net_value=rotation_nav,
-                            available_cash=rotation_cash,
                             weight=weight,
                             close=candidate_close,
                             lot_size=lot_size,
@@ -3139,10 +3189,12 @@ def _valid_v2_risk_items(
                 if (
                     target_amount != expected_amount
                     or shares != expected_shares
-                    or expected_cash_required > rotation_cash
+                    or not current_nominal
+                    and expected_cash_required > rotation_cash
                 ):
                     return False
-                rotation_cash -= expected_cash_required
+                if not current_nominal:
+                    rotation_cash -= expected_cash_required
                 seen_indices.add(pair_index)
 
     summary_new_risk = _dashboard_risk_decimal(summary.get("new_planned_risk"))
@@ -3191,7 +3243,7 @@ def _valid_v2_risk_items(
             )
         if (
             summary.get("status_label") != (
-                "计划止损风险仅审计，不参与买入数量"
+                STOP_RISK_AUDIT_ONLY_LABEL
                 if current_nominal
                 else "含最小一手额外风险"
             )

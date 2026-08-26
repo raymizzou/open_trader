@@ -2273,15 +2273,15 @@ def integrated_v4_payload(
             "symbol": {"CN": "600001", "HK": "00700", "US": "AAPL"}[market],
             **(
                 {
-                    "target_weight": "0.01",
-                    "target_amount": "1000",
+                    "target_weight": position_weight,
+                    "target_amount": "4000",
                     "executable": True,
-                    "estimated_shares": 100,
+                    "estimated_shares": 400,
                     "estimated_initial_line": "9",
-                    "planned_stop_risk": "101",
-                    "planned_stop_risk_pct": "0.00101",
-                    "normal_cost": "1",
-                    "decisive_constraint": "Kelly 上限",
+                    "planned_stop_risk": "404",
+                    "planned_stop_risk_pct": "0.00404",
+                    "normal_cost": "4",
+                    "decisive_constraint": "名义仓位上限",
                 }
                 if current_live_versions
                 else {

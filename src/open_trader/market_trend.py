@@ -37,6 +37,7 @@ from .a_share_trend import (
     _process_version,
     _remember_verified_symbol_row,
     _supports_symbol_mapping_contract,
+    _uses_current_nominal_allocation,
     _uses_shared_entry_discipline,
     read_delivery_receipt,
     _redact_api_key,
@@ -128,6 +129,79 @@ REPORT_REVISION = re.compile(r"-r(\d+)\.json$")
 
 class MarketHoliday(RuntimeError):
     pass
+
+
+class _CurrentBuyInputError(ValueError):
+    pass
+
+
+def _validate_current_buy_inputs(report: Any, *, market: str) -> None:
+    strategy_snapshot = getattr(report, "strategy_snapshot", {})
+    version = (
+        str(strategy_snapshot.get("strategy_version") or "")
+        if isinstance(strategy_snapshot, Mapping)
+        else ""
+    )
+    if not _uses_current_nominal_allocation(market, version):
+        return
+
+    market_label = MARKET_NOTIFICATION_LABELS[market][1]
+    candidates = getattr(report, "candidates", ())
+    for candidate in candidates:
+        symbol = str(getattr(candidate, "symbol", "") or "")
+        close = getattr(candidate, "close", None)
+        if (
+            close is None
+            or not isinstance(close, Decimal)
+            or not close.is_finite()
+            or close <= 0
+        ):
+            raise _CurrentBuyInputError(f"{market_label}买入 {symbol} 缺少价格")
+
+    actions = (
+        *getattr(report, "buy_actions", ()),
+        *getattr(report, "real_buy_actions", ()),
+    )
+    for action in actions:
+        symbol = str(getattr(action, "symbol", "") or "")
+        note = str(getattr(action, "sizing_note", "") or "")
+        lot_size = getattr(action, "lot_size", 0)
+        shares = getattr(action, "estimated_shares", 0)
+        if note == "每手股数未知，无法定量" or (
+            isinstance(lot_size, int) and lot_size <= 0
+        ):
+            raise _CurrentBuyInputError(
+                f"{market_label}买入 {symbol} 缺少每手股数"
+            )
+        if (
+            isinstance(shares, int)
+            and shares <= 0
+            and note != "候选价格或活动保护线缺失"
+        ):
+            raise _CurrentBuyInputError(f"{market_label}买入 {symbol} 缺少数量")
+
+    for skip in getattr(report, "risk_skips", ()):
+        if (
+            isinstance(skip, Mapping)
+            and skip.get("reason") == "symbol_mapping_unavailable"
+        ):
+            symbol = str(skip.get("symbol") or "")
+            raise _CurrentBuyInputError(
+                f"{market_label}买入 {symbol} 缺少趋势代码映射"
+            )
+
+    metadata = getattr(report, "metadata", {})
+    mapping_required = (
+        isinstance(metadata, Mapping)
+        and metadata.get("symbol_mapping_schema") == TREND_SYMBOL_MAPPING_SCHEMA
+    )
+    if mapping_required:
+        for action in actions:
+            if not getattr(action, "futu_symbol", None):
+                symbol = str(getattr(action, "symbol", "") or "")
+                raise _CurrentBuyInputError(
+                    f"{market_label}买入 {symbol} 缺少趋势代码映射"
+                )
 
 
 @dataclass(frozen=True)
@@ -1748,6 +1822,7 @@ def _attempt_market_report(
         )
         report = _finalize_market_report(report, managed_symbols=sorted(managed))
         report = freeze_report_rotation_pairs(report, config.data_dir)
+        _validate_current_buy_inputs(report, market=market)
         if not planning_simulated_account_complete:
             report = _freeze_report_simulated_buy_plan(report, config.data_dir)
         previous_attention_rows = _previous_attention_rows(
@@ -2029,8 +2104,10 @@ def _run_market_trend_retry(
     )
     last_error = "Trend Animals update status is not ready"
     waiting_gap: str | None = None
+    input_failure_reason: str | None = None
     _write_log(paths.log, {"event": "start", "market": market, "run_date": run_date})
     while True:
+        input_failure_reason = None
         try:
             result = attempt_fn(
                 config=config,
@@ -2049,6 +2126,9 @@ def _run_market_trend_retry(
                 return result
             if result.status == "waiting" and result.waiting_reason:
                 waiting_gap = result.waiting_reason
+        except _CurrentBuyInputError as exc:
+            last_error = _redact_api_key(exc, config.trend_animals_api_key)
+            input_failure_reason = last_error
         except Exception as exc:
             last_error = _redact_api_key(exc, config.trend_animals_api_key)
         now = now_fn().astimezone(SHANGHAI)
@@ -2071,7 +2151,7 @@ def _run_market_trend_retry(
                 reason=(
                     "趋势数据在截止时间前仍未更新"
                     if "not ready" in last_error.lower()
-                    else "趋势报告生成失败，需检查运行日志"
+                    else input_failure_reason or "趋势报告生成失败，需检查运行日志"
                 ),
                 recovery_action=recovery_action,
             )
