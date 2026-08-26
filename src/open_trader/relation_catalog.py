@@ -1184,68 +1184,225 @@ class RelationCatalog:
             raise RelationConflictError("relation version changed; refresh before deciding")
 
     def approve(self, relation_version_id: str, expected: Mapping[str, object], *, actor: str, git_sha: str) -> dict[str, object]:
+        """Approve one relation version in one write transaction.
+
+        Conflicts still raise (ValueError / RelationConflictError); the
+        judgment chain, return shape and exception types are unchanged.
+        """
+        return self._approve_many([{
+            "version_id": relation_version_id,
+            "expected": expected,
+        }], actor=actor, git_sha=git_sha, raise_on_conflict=True)["results"][0]
+
+    def approve_many(self, items: list[Mapping[str, object]], *, actor: str, git_sha: str) -> dict[str, object]:
+        """Approve many relation versions in one write transaction.
+
+        Each item is a ``{"version_id": str}`` mapping judged in list order
+        with the exact single-approve chain; per-entry conflicts become that
+        entry's ``error`` result and the batch continues. Infrastructure
+        failures roll the whole batch back.
+        """
+        return self._approve_many(list(items), actor=actor, git_sha=git_sha)
+
+    def _approve_many(self, items: list[Mapping[str, object]], *, actor: str, git_sha: str, raise_on_conflict: bool = False) -> dict[str, object]:
+        """Run one approve batch inside a single write transaction."""
+        begin = getattr(self._store, "begin_write", None)
+        if begin is None:
+            outcome = self._approve_many_locked(
+                items, actor=actor, git_sha=git_sha, raise_on_conflict=raise_on_conflict
+            )
+            # Review R2: this transaction bypasses v2's ``_write``, so the
+            # generation bump is composed at the v2 layer instead ("every
+            # write transaction +1", symmetric with ingest/reject/revoke).
+            self._catalog.bump_generation()
+        else:
+            begin()
+            try:
+                outcome = self._approve_many_locked(
+                    items, actor=actor, git_sha=git_sha, raise_on_conflict=raise_on_conflict
+                )
+                self._catalog.bump_generation()
+                self._store.commit_write()
+            except BaseException:
+                self._store.rollback_write()
+                # Review R1: batch-internal index increments from the failed
+                # transaction must not survive; the next activation rebuilds.
+                self._catalog._invalidate_contract_index()
+                raise
+        token = outcome.pop("_token")
+        approved_new = outcome.pop("_approved_new", [])
+        self._catalog._sync_contract_index(token, approved_new)
+        results = outcome["results"]
+        counts = {
+            "total": len(results),
+            "active": sum(1 for result in results if result.get("activation") == "ACTIVE"),
+            "blocked": sum(
+                1 for result in results
+                if result.get("activation") is not None and result.get("activation") != "ACTIVE"
+            ),
+            "error": sum(1 for result in results if "error" in result),
+        }
+        return {"results": results, "counts": counts}
+
+    def _approve_many_locked(self, items: list[Mapping[str, object]], *, actor: str, git_sha: str, raise_on_conflict: bool = False) -> dict[str, object]:
+        """Core approve_many; the caller holds one write transaction.
+
+        Per item the exact single-approve judgment chain runs in order:
+        version existence, expected, PENDING, latest, model completeness,
+        generation membership, then activation. Conflicts become ``error``
+        results unless ``raise_on_conflict`` (the single-approve mode);
+        activatable entries are published in one v2 ``_activate_many_locked``
+        call and their review-state bookkeeping (APPROVED / activation /
+        SUPERSEDED of a superseded previous version) is recorded here.
+        """
         versions = self._versions()
-        if relation_version_id not in versions:
-            raise ValueError("relation version not found")
-        self._require_expected(relation_version_id, expected)
-        if versions[relation_version_id].get("status") != "PENDING":
-            raise RelationConflictError("relation version is no longer pending")
-        record = versions[relation_version_id]
-        identity = str(record["identity"])
-        latest = self._store.get("latest", {})
-        if latest.get(identity) != relation_version_id:
-            raise RelationConflictError("relation version changed; refresh before deciding")
-        if "terminal_states" not in record["payload"]:
-            self._store_write({
-                relation_version_id: {
+        previous_generation = dict(self._store.get("generation", {}))
+        results: list[dict[str, object] | None] = [None] * len(items)
+        activatable: list[tuple[int, str, str]] = []
+        batch_processed: set[str] = set()
+        for index, item in enumerate(items):
+            version_id = str(item["version_id"])
+            record = versions.get(version_id)
+            if record is None:
+                if raise_on_conflict:
+                    raise ValueError("relation version not found")
+                results[index] = {
+                    "version_id": version_id,
+                    "error": "relation version not found",
+                }
+                continue
+            identity = str(record["identity"])
+            expected = item.get("expected", {"version_id": version_id})
+            self._require_expected(version_id, expected)
+            if record.get("status") != "PENDING":
+                if raise_on_conflict:
+                    raise RelationConflictError("relation version is no longer pending")
+                results[index] = {
+                    "version_id": version_id,
+                    "identity": identity,
+                    "error": "relation version is no longer pending",
+                }
+                continue
+            if version_id in batch_processed:
+                # Review R1: a version judged earlier in this same batch is no
+                # longer pending from this batch's point of view; mirror the
+                # sequential second approve instead of re-judging it (the
+                # activatable entries only flip to APPROVED after the whole
+                # loop, so the stored status cannot catch them here).
+                if raise_on_conflict:
+                    raise RelationConflictError("relation version is no longer pending")
+                results[index] = {
+                    "version_id": version_id,
+                    "identity": identity,
+                    "error": "relation version is no longer pending",
+                }
+                continue
+            latest = self._store.get("latest", {})
+            if latest.get(identity) != version_id:
+                if raise_on_conflict:
+                    raise RelationConflictError("relation version changed; refresh before deciding")
+                results[index] = {
+                    "version_id": version_id,
+                    "identity": identity,
+                    "error": "relation version changed; refresh before deciding",
+                }
+                continue
+            batch_processed.add(version_id)
+            if "terminal_states" not in record["payload"]:
+                self._store.setdefault("versions", {})[version_id] = {
                     **record,
                     "status": "APPROVED",
                     "activation_status": "INCOMPLETE",
                     "activation_diagnostic": "INCOMPLETE_MODEL",
                 }
-            })
-            return {
-                "version_id": relation_version_id,
-                "identity": identity,
-                "status": "APPROVED",
-                "activation": "INCOMPLETE",
-            }
-        if any(
-            gen_identity == identity
-            for gen_identity in self._current_generation()
-        ):
-            self._store_write({
-                relation_version_id: {
+                results[index] = {
+                    "version_id": version_id,
+                    "identity": identity,
+                    "status": "APPROVED",
+                    "activation": "INCOMPLETE",
+                }
+                continue
+            if identity in previous_generation:
+                self._store.setdefault("versions", {})[version_id] = {
                     **record,
                     "status": "APPROVED",
                     "activation_status": "ACTIVATION_BLOCKED_INCONSISTENT",
                     "activation_diagnostic": "ACTIVATION_BLOCKED_INCONSISTENT",
                 }
-            })
-            return {
-                "version_id": relation_version_id,
+                results[index] = {
+                    "version_id": version_id,
+                    "identity": identity,
+                    "status": "APPROVED",
+                    "activation": "ACTIVATION_BLOCKED_INCONSISTENT",
+                }
+                continue
+            activatable.append((index, identity, version_id))
+        if activatable:
+            activate_result = self._catalog._activate_many_locked(
+                [versions[version_id]["payload"] for _, _, version_id in activatable],
+                actor=actor,
+                git_sha=git_sha,
+            )
+            token = activate_result["_token"]
+            approved_new = activate_result["_approved_new"]
+            by_identity = activate_result["results"]
+        else:
+            token = self._catalog._index_token()
+            approved_new = []
+            by_identity = {}
+        for index, identity, version_id in activatable:
+            entry = by_identity[identity]
+            if entry["status"] == "APPROVED":
+                activation = "ACTIVE"
+                diagnostic = ""
+            else:
+                reason = str(entry["reason"])
+                diagnostic = str(entry.get("detail", ""))
+                if reason == "UNSUPPORTED_SIZE":
+                    activation = "UNSUPPORTED_SIZE"
+                elif reason in {
+                    "ACTIVATION_BLOCKED_CROSS_EVENT",
+                    "ACTIVATION_BLOCKED_EVENT_IDENTITY_MISSING",
+                }:
+                    activation = reason
+                else:
+                    activation = "ACTIVATION_BLOCKED_INCONSISTENT"
+            updated = {
+                **versions[version_id],
+                "activation_status": activation,
+            }
+            if activation != "ACTIVE":
+                # The operator approved this version; it simply could not
+                # publish. The v2 activation call rolls a blocked candidate
+                # back to PENDING, so the approval is re-recorded here for the
+                # review-state mapping.
+                updated["status"] = "APPROVED"
+                updated["activation_diagnostic"] = diagnostic or activation
+            self._store.setdefault("versions", {})[version_id] = updated
+            result: dict[str, object] = {
+                "version_id": version_id,
                 "identity": identity,
                 "status": "APPROVED",
-                "activation": "ACTIVATION_BLOCKED_INCONSISTENT",
+                "activation": activation,
             }
-        # Activation is published by _activate's v2 replace(); calling v2
-        # approve() first would pre-pollute the store generation with this
-        # candidate, which the activation gate must not see as a
-        # previously-existing member.
-        activation = self._activate(relation_version_id)
-        result = {
-            "version_id": relation_version_id,
-            "identity": identity,
-            "status": "APPROVED",
-            "activation": activation,
-        }
-        if activation != "ACTIVE":
-            result["activation_diagnostic"] = str(
-                self._versions()[relation_version_id].get(
-                    "activation_diagnostic", activation
+            if activation != "ACTIVE":
+                result["activation_diagnostic"] = str(
+                    versions[version_id].get("activation_diagnostic", activation)
                 )
-            )
-        return result
+            results[index] = result
+            if activation == "ACTIVE":
+                superseded_id = previous_generation.get(identity, {}).get("version_id")
+                if superseded_id and superseded_id != version_id:
+                    old_record = versions[superseded_id]
+                    self._store.setdefault("versions", {})[superseded_id] = {
+                        **old_record,
+                        "activation_status": "SUPERSEDED",
+                    }
+        return {
+            "results": [result for result in results if result is not None],
+            "_token": token,
+            "_approved_new": approved_new,
+        }
 
     def _activate(self, relation_version_id: str) -> str:
         """Publish the v2 generation for one approved version, or record why not."""

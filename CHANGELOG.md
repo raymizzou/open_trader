@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-27
+
+- 关系审批路径（#98）：v2 目录持久层改为脏行落盘 + generation 快照增量编码（delta/1000 次锚点，仅成员变化时追加），激活校验改为增量——GROUP_BUDGET/可满足性按合约分量、#102 事件门按编译终态观察键分量、新增全局陈旧资本释放与估值单位守卫；facade 新增单事务批量 `approve_many`（逐条独立结果，条目冲突不中断），单条 `approve` 统一为一笔原子写事务；新增 `POST /api/prediction-arbitrage/relations/approve-batch`（confirm 必填、空 items 400、shadow 403 沿用）。#94 并发回归按新语义重写：并发较新版本不被陈旧审批回退的性质保留，合约不相交的陈旧候选现在合法激活。基准：10k 激活态单条 approve 中位 25.05ms（p95 39.5ms）、10k 条批量 5.34s（脚本 `scripts/benchmark_relation_activation.py`，阈值 50ms/60s 内）。验证：关系目录聚焦套件 155 passed；10k 规模正确性批量测试通过（批量 7.2s、只断言正确性）；增量/全量 oracle 一致性矩阵（500+ 步、含观察键与陈旧形状）全等；全量 `make test` 7447 passed、3 skipped（exit 0，worktree 环境补 gitignored `data/trend_review` 软链后）；acceptance/deploy/push 尚未运行。
+
 ## 2026-08-26
 
 - Trend Allocation v2 now preserves and ranks each market using its own latest completed-session date; the no-submit three-market regeneration helper passes the allocation date to all runners, and US latest-session resolution now skips weekends/market holidays to select the prior completed session. Verification: focused allocation/discipline/regeneration/market-date suite `143 passed`.

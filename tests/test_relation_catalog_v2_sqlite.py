@@ -285,3 +285,213 @@ def test_sqlite_thread_local_mixed_reads_and_writes(tmp_path) -> None:
         if isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
     ]
     assert locked == write_errors
+
+
+# Issue #98 slice S1: incremental persistence. T1.1 pins the generation
+# snapshot encoding: rows append only on membership change, as deltas between
+# anchor rows; legacy full-snapshot rows (no "kind") read back as anchors.
+
+def _generation_rows(db_path: str) -> list[dict[str, object]]:
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT members FROM catalog_v2_generations ORDER BY generation_id ASC"
+        ).fetchall()
+    return [json.loads(row[0]) for row in rows]
+
+
+def _decode_latest(rows: list[dict[str, object]]) -> dict[str, dict[str, str]]:
+    """Reconstruct the latest generation from raw rows: last anchor + later deltas."""
+    generation: dict[str, dict[str, str]] = {}
+    deltas: list[dict[str, object]] = []
+    for data in reversed(rows):
+        if isinstance(data, dict) and data.get("kind") == "delta":
+            deltas.append(data)
+            continue
+        if isinstance(data, dict) and data.get("kind") == "anchor":
+            generation = dict(data["members"])  # type: ignore[arg-type]
+        elif isinstance(data, dict):
+            generation = dict(data)
+        break
+    for delta in reversed(deltas):
+        for identity, entry in (delta.get("added") or {}).items():
+            generation[str(identity)] = entry
+        for identity in delta.get("removed") or []:
+            generation.pop(str(identity), None)
+    return generation
+
+
+def _generation_entry(identity: str, version_id: str) -> dict[str, str]:
+    return {"version_id": version_id, "status": "ACTIVE"}
+
+
+def test_sqlite_generations_append_only_on_membership_change(
+    tmp_path, monkeypatch
+) -> None:
+    """T1.1: ingest/reject append nothing; each approve appends one delta;
+    the anchor-interval threshold (injectable constant) emits anchor rows."""
+    db_path = str(tmp_path / "catalog.db")
+    catalog = _catalog(db_path)
+
+    # ingest + reject never change generation membership: no rows at all
+    ingested = catalog.ingest(_payload(discovery_source="llm"))
+    catalog.reject(
+        ingested["version_id"], reason="bad source", actor="auditor", git_sha="a" * 40
+    )
+    assert _generation_rows(db_path) == []
+
+    # every approve changes membership -> exactly one row per approve
+    monkeypatch.setattr(SqliteCatalogStore, "_ANCHOR_EVERY", 3)
+    payloads = [
+        _payload(
+            relation_type="EXACTLY_ONE",
+            endpoints=[
+                _endpoint("polymarket", f"inc-{i}-A"),
+                _endpoint("predict.fun", f"inc-{i}-B"),
+            ],
+        )
+        for i in range(5)
+    ]
+    results = [_approve(catalog, payload) for payload in payloads]
+    expected = {
+        result["identity"]: _generation_entry(result["identity"], result["version_id"])
+        for result in results
+    }
+    rows = _generation_rows(db_path)
+    assert len(rows) == len(payloads)
+    assert [data.get("kind") for data in rows] == [
+        "delta", "delta", "anchor", "delta", "delta",
+    ]
+    assert rows[2] == {
+        "kind": "anchor",
+        "members": {
+            results[i]["identity"]: expected[results[i]["identity"]]
+            for i in range(3)
+        },
+    }
+
+    # a reject-only transaction after the anchors appends nothing
+    rejected = catalog.ingest(_payload(discovery_source="llm"))
+    catalog.reject(
+        rejected["version_id"], reason="bad source", actor="auditor", git_sha="a" * 40
+    )
+    assert len(_generation_rows(db_path)) == len(payloads)
+
+    # anchor + replay reconstruction matches the online generation
+    assert _decode_latest(_generation_rows(db_path)) == catalog.store["generation"]
+    assert catalog.store["generation"] == expected
+
+    # re-approving the same identity (no membership change) appends nothing
+    _approve(catalog, payloads[0])
+    assert len(_generation_rows(db_path)) == len(payloads)
+
+
+def test_sqlite_legacy_generation_row_reads_as_anchor(tmp_path, monkeypatch) -> None:
+    """T1.1: pre-S1 full-snapshot rows (no ``kind``) decode as anchors and
+    later delta rows replay on top of them."""
+    db_path = str(tmp_path / "catalog.db")
+    catalog = _catalog(db_path)
+    first = _approve(catalog, _payload())
+
+    # rewrite the generations table into legacy format: full snapshot, no kind
+    legacy_members = {
+        first["identity"]: _generation_entry(first["identity"], first["version_id"])
+    }
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM catalog_v2_generations")
+        conn.execute(
+            "INSERT INTO catalog_v2_generations (members, created_at) VALUES (?, ?)",
+            (json.dumps(legacy_members, sort_keys=True), "2026-08-15T00:00:00+00:00"),
+        )
+
+    reopened = _catalog(db_path)
+    assert reopened.store["generation"] == legacy_members
+
+    # a later delta appends after the legacy anchor and replays on reopen
+    monkeypatch.setattr(SqliteCatalogStore, "_ANCHOR_EVERY", 1000)
+    second = _approve(
+        reopened,
+        _payload(endpoints=[_endpoint("polymarket", "cZ"), _endpoint("predict.fun", "cW")]),
+    )
+    assert reopened.store["generation"] == {
+        first["identity"]: legacy_members[first["identity"]],
+        second["identity"]: _generation_entry(second["identity"], second["version_id"]),
+    }
+
+
+# T1.3: only rows touched by a write transaction produce SQL; untouched
+# version rows keep their stored updated_at, touched rows get a new one.
+
+def test_sqlite_reject_only_transaction_rewrites_only_dirty_rows(tmp_path) -> None:
+    db_path = str(tmp_path / "catalog.db")
+    catalog = _catalog(db_path)
+    keep = _approve(catalog, _payload())
+    touched = _approve(
+        catalog,
+        _payload(endpoints=[_endpoint("polymarket", "cZ"), _endpoint("predict.fun", "cW")]),
+    )
+    with sqlite3.connect(db_path) as conn:
+        keep_ts = conn.execute(
+            "SELECT updated_at FROM catalog_v2_versions WHERE version_id = ?",
+            (keep["version_id"],),
+        ).fetchone()[0]
+        touched_ts = conn.execute(
+            "SELECT updated_at FROM catalog_v2_versions WHERE version_id = ?",
+            (touched["version_id"],),
+        ).fetchone()[0]
+
+    catalog.reject(
+        touched["version_id"], reason="bad source", actor="auditor", git_sha="a" * 40
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        keep_after = conn.execute(
+            "SELECT updated_at FROM catalog_v2_versions WHERE version_id = ?",
+            (keep["version_id"],),
+        ).fetchone()[0]
+        touched_after = conn.execute(
+            "SELECT updated_at FROM catalog_v2_versions WHERE version_id = ?",
+            (touched["version_id"],),
+        ).fetchone()[0]
+    assert keep_after == keep_ts
+    assert touched_after != touched_ts
+
+
+# T1.2: a mixed incremental write history reopens per-key identical, including
+# meta columns, occurrence_count, and activation markers.
+
+def test_sqlite_incremental_writes_reopen_equivalent(tmp_path) -> None:
+    db_path = str(tmp_path / "catalog.db")
+    catalog = _catalog(db_path)
+    first = _approve(catalog, _payload())
+    catalog.ingest(_payload())  # occurrence_count -> 2 for the first version
+    candidate = catalog.ingest(
+        _payload(endpoints=[_endpoint("polymarket", "cZ"), _endpoint("predict.fun", "cW")])
+    )
+    rejected = catalog.ingest(_payload(discovery_source="llm"))
+    catalog.reject(
+        rejected["version_id"], reason="bad source", actor="auditor", git_sha="a" * 40
+    )
+    catalog.revoke(candidate["version_id"], actor="auditor", git_sha="a" * 40)
+
+    # meta field and activation marker via the store's public write transaction
+    store = catalog.store
+    store.begin_write()
+    store["versions"][rejected["version_id"]]["custom_flag"] = "meta-value"
+    store["versions"][candidate["version_id"]]["activation_status"] = "SUPERSEDED"
+    store.commit_write()
+
+    online = {
+        "versions": catalog.store["versions"],
+        "approved": catalog.store["approved"],
+        "generation": catalog.store["generation"],
+        "causes": catalog.store["causes"],
+        "latest": catalog.store["latest"],
+        "generation_number": catalog.store["generation_number"],
+    }
+    reopened = _catalog(db_path)
+    assert reopened.store["versions"] == online["versions"]
+    assert reopened.store["approved"] == online["approved"]
+    assert reopened.store["generation"] == online["generation"]
+    assert reopened.store["causes"] == online["causes"]
+    assert reopened.store["latest"] == online["latest"]
+    assert reopened.store["generation_number"] == online["generation_number"]

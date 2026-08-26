@@ -14,7 +14,7 @@ from open_trader.prediction_n_leg_oracle import build_relation_components
 from open_trader.prediction_service import create_prediction_server
 from open_trader.relation_catalog import RelationCatalog
 from test_prediction_arbitrage import threshold_relation
-from test_relation_catalog import compiled_problem
+from test_relation_catalog import compiled_problem, compiled_relation_discovery
 
 
 def discovery(*, title: str = "Will Bitcoin trade above $100,000 before December 31, 2026?", complete: bool = True) -> dict[str, object]:
@@ -313,3 +313,159 @@ def test_threshold_relation_fingerprint_is_stable_across_discovery_times(tmp_pat
     assert first["version_id"] == second["version_id"]
     assert second["occurrence_count"] == 2
     assert [row["version_id"] for row in catalog.review_rows()] == [first["version_id"]]
+
+
+def _distinct_discovery(prefix: str, *, complete: bool) -> dict[str, object]:
+    payload = discovery(complete=complete)
+    payload["markets"][0]["contract_id"] = f"condition-a-{prefix}"
+    payload["markets"][1]["contract_id"] = f"condition-b-{prefix}"
+    return payload
+
+
+def test_approve_batch_mixed_pending_matches_single_approve_shapes_and_counts(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    batch_active = catalog.ingest(_distinct_discovery("batch-active", complete=True))["version_id"]
+    batch_incomplete = catalog.ingest(_distinct_discovery("batch-incomplete", complete=False))["version_id"]
+    single_active = catalog.ingest(_distinct_discovery("single-active", complete=True))["version_id"]
+    single_incomplete = catalog.ingest(_distinct_discovery("single-incomplete", complete=False))["version_id"]
+    with running(catalog) as base:
+        status, one = response(mutation(base, f"/api/prediction-arbitrage/relations/{single_active}/approve", {"version_id": single_active, "confirm": True}))
+        assert status == 200
+        status, other = response(mutation(base, f"/api/prediction-arbitrage/relations/{single_incomplete}/approve", {"version_id": single_incomplete, "confirm": True}))
+        assert status == 200
+        status, batch = response(mutation(base, "/api/prediction-arbitrage/relations/approve-batch", {"items": [{"version_id": batch_active}, {"version_id": batch_incomplete}], "confirm": True}))
+        assert status == 200
+        assert set(batch["results"][0]) == set(one)
+        assert set(batch["results"][1]) == set(other)
+        assert batch["results"][0] == {
+            "version_id": batch_active,
+            "identity": catalog.detail(batch_active)["identity"],
+            "status": one["status"],
+            "activation": one["activation"],
+        }
+        assert batch["results"][1] == {
+            "version_id": batch_incomplete,
+            "identity": catalog.detail(batch_incomplete)["identity"],
+            "status": other["status"],
+            "activation": other["activation"],
+        }
+        assert batch["counts"] == {"total": 2, "active": 1, "blocked": 1, "error": 0}
+        status, again = response(mutation(base, f"/api/prediction-arbitrage/relations/{batch_active}/approve", {"version_id": batch_active, "confirm": True}))
+    assert status == 409
+    assert "no longer pending" in again["message"]
+
+
+def test_approve_batch_rejects_invalid_payloads(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    version_id = catalog.ingest(discovery())["version_id"]
+    cases = [
+        {"items": [{"version_id": version_id}]},
+        {"items": [{"version_id": version_id}], "confirm": False},
+        {"items": [], "confirm": True},
+        {"items": [{}], "confirm": True},
+        {"items": [{"version_id": version_id, "extra": 1}], "confirm": True},
+        {"items": [{"version_id": 123}], "confirm": True},
+        {"items": "not-a-list", "confirm": True},
+    ]
+    with running(catalog) as base:
+        for payload in cases:
+            status, denied = response(mutation(base, "/api/prediction-arbitrage/relations/approve-batch", payload))
+            assert status == 400, payload
+            assert "message" in denied
+
+
+def test_approve_batch_is_read_only_in_shadow_mode(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    version_id = catalog.ingest(discovery())["version_id"]
+    runtime = _Runtime(catalog)
+    runtime.mode = "shadow"
+    server = create_prediction_server(
+        runtime=runtime,  # type: ignore[arg-type]
+        port=0,
+        session_token="session-token",
+        csrf_token="csrf-token",
+        runtime_metadata={"git_sha": "abc123"},
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        base = f"http://{host}:{port}"
+        status, denied = response(mutation(base, "/api/prediction-arbitrage/relations/approve-batch", {"items": [{"version_id": version_id}], "confirm": True}))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 403
+    assert denied["code"] == "shadow_read_only"
+
+
+def test_approve_batch_reports_entry_level_errors_and_continues(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    good = catalog.ingest(_distinct_discovery("batch-good", complete=True))["version_id"]
+    consumed = catalog.ingest(_distinct_discovery("batch-consumed", complete=True))["version_id"]
+    catalog.approve(consumed, {"version_id": consumed}, actor="operator", git_sha="sha")
+    missing = "v-" + "0" * 64
+    with running(catalog) as base:
+        status, batch = response(mutation(base, "/api/prediction-arbitrage/relations/approve-batch", {"items": [{"version_id": good}, {"version_id": consumed}, {"version_id": missing}], "confirm": True}))
+    assert status == 200
+    assert batch["counts"] == {"total": 3, "active": 1, "blocked": 0, "error": 2}
+    assert batch["results"][0]["version_id"] == good
+    assert batch["results"][0]["activation"] == "ACTIVE"
+    assert batch["results"][1] == {
+        "version_id": consumed,
+        "identity": catalog.detail(consumed)["identity"],
+        "error": "relation version is no longer pending",
+    }
+    assert batch["results"][2] == {
+        "version_id": missing,
+        "error": "relation version not found",
+    }
+    rows = {str(row["version_id"]): row for row in catalog.review_rows()}
+    assert rows[good]["status"] == "APPROVED"
+    assert rows[good]["activation"] == "ACTIVE"
+
+
+def test_relation_catalog_naive_as_of_approve_returns_json_blocked(
+    tmp_path: Path,
+) -> None:
+    """R2.1: a candidate whose as_of is present but timezone-less (naive) must
+    be blocked ACTIVATION_BLOCKED_INCONSISTENT through the HTTP layer with a
+    normal JSON response — never a TypeError that breaks the HTTP error
+    contract — and the catalog keeps serving later approvals."""
+    catalog = RelationCatalog(tmp_path)
+
+    def payload(tag: str, *, naive: bool = False) -> dict[str, object]:
+        result = compiled_relation_discovery(
+            [f"http-{tag}-a", f"http-{tag}-b"],
+            {f"http-{tag}-a": "BUY_YES", f"http-{tag}-b": "BUY_YES"},
+            rule=f"rules-http-{tag}",
+        )
+        for market in result["markets"]:
+            market["event_identity_basis"] = "event-a"
+        if naive:
+            result["model"]["problem"]["as_of"] = "2029-01-01T00:00:00"
+        return result
+
+    good_id = catalog.ingest(payload("good"))["version_id"]
+    naive_id = catalog.ingest(payload("naive", naive=True))["version_id"]
+    with running(catalog) as base:
+        status, approved = response(
+            mutation(
+                base,
+                f"/api/prediction-arbitrage/relations/{good_id}/approve",
+                {"version_id": good_id, "confirm": True},
+            )
+        )
+        assert status == 200
+        assert approved["activation"] == "ACTIVE"
+        status, blocked = response(
+            mutation(
+                base,
+                f"/api/prediction-arbitrage/relations/{naive_id}/approve",
+                {"version_id": naive_id, "confirm": True},
+            )
+        )
+    assert status == 200
+    assert blocked["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT"

@@ -543,6 +543,20 @@ def create_prediction_server(
                         active = self._relation_expected(_object_value(payload, "active"))
                         candidate = self._relation_expected(_object_value(payload, "candidate"))
                         result = catalog.replace(active, candidate, reason=self._required_string(payload, "reason"), note=self._optional_string(payload, "note"), actor=actor, git_sha=git_sha)
+                    elif path == relation_prefix + "/approve-batch":
+                        self._require_schema(payload, {"items", "confirm"})
+                        if payload.get("confirm") is not True:
+                            raise ValueError("confirm must be true")
+                        items = payload.get("items")
+                        if not isinstance(items, list) or not items:
+                            raise ValueError("items must be a non-empty list")
+                        for item in items:
+                            if not isinstance(item, dict) or set(item) != {"version_id"}:
+                                raise ValueError("each item must contain exactly version_id")
+                            version_id = item.get("version_id")
+                            if not isinstance(version_id, str) or not version_id.strip():
+                                raise ValueError("version_id is required")
+                        result = catalog.approve_many(items, actor=actor, git_sha=git_sha)
                     else:
                         suffixes = {"/approve", "/reject", "/revoke"}
                         suffix = next((item for item in suffixes if path.endswith(item)), "")

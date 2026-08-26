@@ -12,6 +12,7 @@ import pytest
 import open_trader.cli as cli
 from open_trader.relation_catalog import (
     RelationCatalog,
+    RelationConflictError,
     _derive_statement,
     _threshold_complete_model,
     _threshold_discovery_payload,
@@ -1253,3 +1254,376 @@ def test_activation_gate_keeps_similar_title_relations_in_separate_components(
     assert set(generation) == {rows[first_id]["identity"], rows[second_id]["identity"]}
     assert rows[first_id]["activation"] == "ACTIVE"
     assert rows[second_id]["activation"] == "ACTIVE"
+
+
+# -- issue #98 S3: approve_many batch confirmation -------------------------
+
+
+def _issue98_fixture(catalog: RelationCatalog) -> dict[str, object]:
+    """Ingest the six T3.1 relations and approve case 3's old version first.
+
+    Each case gets its own rule (distinct observation key) so the compile
+    seam never merges relations that do not share contracts, keeping the
+    single-approve path's per-component judgments identical to the batch
+    path's affected-component judgments. Case 6 ingests v1 then v2 of one
+    identity, so v2 is the latest version and only v2 can pass the chain.
+    """
+    normal = compiled_relation_discovery(
+        ["s3-a", "s3-b"],
+        {"s3-a": "BUY_YES", "s3-b": "BUY_YES"},
+    )
+    for market in normal["markets"]:
+        market["event_identity_basis"] = "E1"
+    normal_id = catalog.ingest(normal)["version_id"]
+
+    incomplete_id = catalog.ingest(
+        _unique_discovery("i2", completeness="INCOMPLETE")
+    )["version_id"]
+
+    old = compiled_relation_discovery(
+        ["s3-c", "s3-d"],
+        {"s3-c": "BUY_YES", "s3-d": "BUY_YES"},
+        rule="rules-s3c",
+    )
+    for market in old["markets"]:
+        market["event_identity_basis"] = "E3"
+    old_id = catalog.ingest(old)["version_id"]
+    assert catalog.approve(
+        old_id, {"version_id": old_id}, actor="op", git_sha="sha"
+    )["activation"] == "ACTIVE"
+    drifted = dict(old)
+    drifted["markets"] = [dict(market) for market in old["markets"]]
+    drifted["markets"][0]["title"] = "Market 0 (edited)"
+    drifted_id = catalog.ingest(drifted)["version_id"]
+
+    oversized = compiled_relation_discovery(
+        [f"s3-e{i}" for i in range(8)],
+        {f"s3-e{i}": "BUY_YES" for i in range(8)},
+        rule="rules-s3e",
+    )
+    for market in oversized["markets"]:
+        market["event_identity_basis"] = "E4"
+    oversized_id = catalog.ingest(oversized)["version_id"]
+
+    cross = compiled_relation_discovery(
+        ["s3-f", "s3-g"],
+        {"s3-f": "BUY_YES", "s3-g": "BUY_YES"},
+        rule="rules-s3f",
+    )
+    cross["markets"][0]["event_identity_basis"] = "E5a"
+    cross["markets"][1]["event_identity_basis"] = "E5b"
+    cross_id = catalog.ingest(cross)["version_id"]
+
+    base = compiled_relation_discovery(
+        ["s3-h", "s3-i"],
+        {"s3-h": "BUY_YES", "s3-i": "BUY_YES"},
+        rule="rules-s3h",
+    )
+    for market in base["markets"]:
+        market["event_identity_basis"] = "E6"
+    v1_id = catalog.ingest(base)["version_id"]
+    newer = dict(base)
+    newer["markets"] = [dict(market) for market in base["markets"]]
+    newer["markets"][0]["title"] = "Market 0 (edited)"
+    v2_id = catalog.ingest(newer)["version_id"]
+
+    versions = catalog._versions()
+    return {
+        "normal": (normal_id, str(versions[normal_id]["identity"])),
+        "incomplete": (incomplete_id, str(versions[incomplete_id]["identity"])),
+        "old": (old_id, str(versions[old_id]["identity"])),
+        "drifted": (drifted_id, str(versions[drifted_id]["identity"])),
+        "oversized": (oversized_id, str(versions[oversized_id]["identity"])),
+        "cross": (cross_id, str(versions[cross_id]["identity"])),
+        "v1": (v1_id, str(versions[v1_id]["identity"])),
+        "v2": (v2_id, str(versions[v2_id]["identity"])),
+        "batch": [
+            normal_id,
+            incomplete_id,
+            drifted_id,
+            oversized_id,
+            cross_id,
+            v1_id,
+            v2_id,
+        ],
+    }
+
+
+def test_approve_many_matches_single_approve_chain(tmp_path: Path) -> None:
+    """T3.1: approve_many over a mixed batch is per-item identical to the
+    single-approve worked example (returns, conflict error messages) and
+    leaves the full store state (versions, generation, approved, latest)
+    identical."""
+    catalog_a = RelationCatalog(tmp_path / "a")
+    catalog_b = RelationCatalog(tmp_path / "b")
+    fx_a = _issue98_fixture(catalog_a)
+    fx_b = _issue98_fixture(catalog_b)
+
+    # Path A: one single approve per batch item; conflicts recorded as
+    # exceptions (with the identity the batch error entry also carries).
+    path_a: list[dict[str, object]] = []
+    for version_id in fx_a["batch"]:
+        try:
+            result = catalog_a.approve(
+                version_id, {"version_id": version_id}, actor="op", git_sha="sha"
+            )
+        except ValueError as exc:
+            identity = fx_a["v1"][1] if version_id == fx_a["v1"][0] else None
+            path_a.append({
+                "version_id": version_id,
+                **({"identity": identity} if identity is not None else {}),
+                "error": str(exc),
+            })
+        else:
+            path_a.append(result)
+
+    outcome = catalog_b.approve_many(
+        [{"version_id": version_id} for version_id in fx_b["batch"]],
+        actor="op",
+        git_sha="sha",
+    )
+    assert outcome["counts"] == {"total": 7, "active": 2, "blocked": 4, "error": 1}
+    assert outcome["results"] == path_a
+
+    # Spot-check the two hard semantic cases: the stale same-identity version
+    # errors with the single-approve message and the latest one activates.
+    assert outcome["results"][5] == {
+        "version_id": fx_b["v1"][0],
+        "identity": fx_b["v1"][1],
+        "error": "relation version changed; refresh before deciding",
+    }
+    assert outcome["results"][6] == {
+        "version_id": fx_b["v2"][0],
+        "identity": fx_b["v2"][1],
+        "status": "APPROVED",
+        "activation": "ACTIVE",
+    }
+
+    def snapshot(catalog: RelationCatalog) -> dict[str, object]:
+        versions = {
+            version_id: {
+                key: value
+                for key, value in record.items()
+                if key not in {"created_at", "updated_at"}
+            }
+            for version_id, record in catalog._store["versions"].items()
+        }
+        return {
+            "versions": versions,
+            "generation": catalog.current_generation(),
+            "approved": dict(catalog._store["approved"]),
+            "latest": dict(catalog._store["latest"]),
+        }
+
+    assert snapshot(catalog_a) == snapshot(catalog_b)
+
+
+def test_approve_many_conflicts_do_not_interrupt_batch(tmp_path: Path) -> None:
+    """T3.2: not-pending and missing-version entries become per-entry error
+    results, the remaining entries still take effect, and counts are exact."""
+    catalog = RelationCatalog(tmp_path)
+    active = compiled_relation_discovery(
+        ["t32-a", "t32-b"],
+        {"t32-a": "BUY_YES", "t32-b": "BUY_YES"},
+    )
+    for market in active["markets"]:
+        market["event_identity_basis"] = "E1"
+    active_id = catalog.ingest(active)["version_id"]
+
+    stale = compiled_relation_discovery(
+        ["t32-c", "t32-d"],
+        {"t32-c": "BUY_YES", "t32-d": "BUY_YES"},
+        rule="rules-t32",
+    )
+    for market in stale["markets"]:
+        market["event_identity_basis"] = "E2"
+    stale_id = catalog.ingest(stale)["version_id"]
+    assert catalog.approve(
+        stale_id, {"version_id": stale_id}, actor="op", git_sha="sha"
+    )["activation"] == "ACTIVE"
+
+    incomplete_id = catalog.ingest(
+        _unique_discovery("t32i", completeness="INCOMPLETE")
+    )["version_id"]
+    missing_id = "v-" + "0" * 64
+
+    outcome = catalog.approve_many(
+        [
+            {"version_id": active_id},
+            {"version_id": stale_id},
+            {"version_id": missing_id},
+            {"version_id": incomplete_id},
+        ],
+        actor="op",
+        git_sha="sha",
+    )
+    assert outcome["counts"] == {"total": 4, "active": 1, "blocked": 1, "error": 2}
+
+    by_id = {result["version_id"]: result for result in outcome["results"]}
+    assert by_id[active_id]["activation"] == "ACTIVE"
+    assert by_id[active_id]["status"] == "APPROVED"
+    assert by_id[stale_id] == {
+        "version_id": stale_id,
+        "identity": str(catalog._versions()[stale_id]["identity"]),
+        "error": "relation version is no longer pending",
+    }
+    assert by_id[missing_id] == {
+        "version_id": missing_id,
+        "error": "relation version not found",
+    }
+    assert by_id[incomplete_id]["activation"] == "INCOMPLETE"
+
+    generation = catalog.current_generation()
+    assert set(generation) == {
+        str(catalog._versions()[active_id]["identity"]),
+        str(catalog._versions()[stale_id]["identity"]),
+    }
+    rows = {row["version_id"]: row for row in catalog.review_rows()}
+    assert rows[active_id]["activation"] == "ACTIVE"
+    assert rows[active_id]["status"] == "APPROVED"
+    assert rows[incomplete_id]["activation"] == "INCOMPLETE"
+    assert rows[stale_id]["activation"] == "ACTIVE"  # untouched by the batch
+
+
+def test_r14_approve_many_batch_internal_visibility_matches_sequential_approve(tmp_path: Path) -> None:
+    """R1.4 (review round 1): the R1.1-R1.3 shapes through the facade —
+    the unsat triple, the globally stale pair and the valuation-unit conflict
+    — judged by one ``approve_many`` batch are per-item identical to
+    sequential single ``approve`` calls, and the final store state is
+    identical (the batch must see earlier batch members)."""
+
+    def discovery(contracts: list[str], relation_type: str, *, rule: str, **kwargs: object) -> dict[str, object]:
+        payload = compiled_relation_discovery(
+            contracts,
+            {contract: "BUY_YES" for contract in contracts},
+            relation_type=relation_type,
+            rule=rule,
+            **kwargs,
+        )
+        for market in payload["markets"]:
+            market["event_identity_basis"] = "E1"
+        return payload
+
+    # The facade identity normalizes IMPLIES endpoints by contract id, so a
+    # reversed IMPLIES is not representable; the unsat triple is three
+    # EXACTLY_ONE relations over a contract triangle (pairwise satisfiable,
+    # jointly unsatisfiable).
+    unsat_triple = [
+        discovery(["r14-a", "r14-b"], "EXACTLY_ONE", rule="rules-r14"),
+        discovery(["r14-b", "r14-c"], "EXACTLY_ONE", rule="rules-r14"),
+        discovery(["r14-a", "r14-c"], "EXACTLY_ONE", rule="rules-r14"),
+    ]
+    stale_pair = [
+        discovery(
+            ["r14-e-a", "r14-e-b"], "EXACTLY_ONE",
+            rule="rules-r14-early",
+            as_of="2026-08-15T00:00:00Z",
+            release="2027-12-31T17:00:00Z",
+        ),
+        discovery(
+            ["r14-l-a", "r14-l-b"], "EXACTLY_ONE",
+            rule="rules-r14-late",
+            as_of="2028-06-01T00:00:00Z",
+            release="2028-08-01T17:00:00Z",
+        ),
+    ]
+    usd = discovery(["r14-u-a", "r14-u-b"], "EXACTLY_ONE", rule="rules-r14-usd")
+    eur = discovery(["r14-u-c", "r14-u-d"], "EXACTLY_ONE", rule="rules-r14-eur")
+    eur["model"]["problem"]["valuation_unit_id"] = "EUR"
+    for action in eur["model"]["problem"]["actions"]:
+        action["valuation_unit_id"] = "EUR"
+    unit_conflict = [usd, eur]
+
+    for label, shape in (
+        ("unsat_triple", unsat_triple),
+        ("stale_pair", stale_pair),
+        ("unit_conflict", unit_conflict),
+    ):
+        batched = RelationCatalog(tmp_path / f"batch-{label}")
+        sequential = RelationCatalog(tmp_path / f"seq-{label}")
+        batch_ids = [batched.ingest(payload)["version_id"] for payload in shape]
+        seq_ids = [sequential.ingest(payload)["version_id"] for payload in shape]
+
+        outcome = batched.approve_many(
+            [{"version_id": version_id} for version_id in batch_ids],
+            actor="op",
+            git_sha="sha",
+        )
+        per_item = [
+            sequential.approve(version_id, {"version_id": version_id}, actor="op", git_sha="sha")
+            for version_id in seq_ids
+        ]
+
+        assert outcome["results"] == per_item, label
+        assert outcome["counts"] == {
+            "total": len(shape),
+            "active": sum(1 for result in per_item if result["activation"] == "ACTIVE"),
+            "blocked": sum(
+                1 for result in per_item
+                if result.get("activation") not in (None, "ACTIVE")
+            ),
+            "error": 0,
+        }, label
+        assert per_item[-1]["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT", label
+
+        def snapshot(catalog: RelationCatalog) -> dict[str, object]:
+            versions = {
+                version_id: {
+                    key: value
+                    for key, value in record.items()
+                    if key not in {"created_at", "updated_at"}
+                }
+                for version_id, record in catalog._store["versions"].items()
+            }
+            return {
+                "versions": versions,
+                "generation": catalog.current_generation(),
+                "approved": dict(catalog._store["approved"]),
+            }
+
+        assert snapshot(batched) == snapshot(sequential), label
+
+
+def test_r15_duplicate_version_in_batch_is_entry_conflict(tmp_path: Path) -> None:
+    """R1.5 (review round 1): the same version_id twice in one approve_many
+    batch takes effect once; the second occurrence is a per-entry conflict
+    with the single-approve message (the pre-fix batch crashed with an
+    uncaught KeyError('reason')), counts are exact, and the sequential
+    control (first approve ACTIVE, second raises RelationConflictError) is
+    equivalent."""
+    payload = compiled_relation_discovery(
+        ["r15-a", "r15-b"],
+        {"r15-a": "BUY_YES", "r15-b": "BUY_YES"},
+        rule="rules-r15",
+    )
+    for market in payload["markets"]:
+        market["event_identity_basis"] = "E1"
+    batched = RelationCatalog(tmp_path / "batch")
+    sequential = RelationCatalog(tmp_path / "control")
+    batch_id = batched.ingest(payload)["version_id"]
+    control_id = sequential.ingest(payload)["version_id"]
+
+    outcome = batched.approve_many(
+        [{"version_id": batch_id}, {"version_id": batch_id}],
+        actor="op",
+        git_sha="sha",
+    )
+    assert outcome["counts"] == {"total": 2, "active": 1, "blocked": 0, "error": 1}
+    assert outcome["results"][0]["activation"] == "ACTIVE"
+    assert outcome["results"][0]["status"] == "APPROVED"
+    assert outcome["results"][1] == {
+        "version_id": batch_id,
+        "identity": str(batched._versions()[batch_id]["identity"]),
+        "error": "relation version is no longer pending",
+    }
+
+    first = sequential.approve(
+        control_id, {"version_id": control_id}, actor="op", git_sha="sha"
+    )
+    assert first["activation"] == "ACTIVE"
+    with pytest.raises(
+        RelationConflictError, match="relation version is no longer pending"
+    ):
+        sequential.approve(control_id, {"version_id": control_id}, actor="op", git_sha="sha")
+
+    assert batched.current_generation() == sequential.current_generation()

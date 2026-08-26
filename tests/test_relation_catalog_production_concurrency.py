@@ -238,6 +238,26 @@ def test_concurrent_over_budget_approvals_preserve_committed_generation(
 def test_stale_snapshot_block_preserves_newer_same_identity_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """#98 incremental activation rewrote the #94 stale-approval interleaving.
+
+    Scenario (unchanged): original (condition-a->b) is ACTIVE, the replacement
+    (same identity, different version) is approved and recorded
+    APPROVED/ACTIVATION_BLOCKED_INCONSISTENT, and a contract-disjoint stale
+    approval (condition-x->y) is in flight when the main thread's facade
+    ``catalog.replace(original -> replacement)`` commits first.
+
+    Behavior change from #98's single-transaction incremental activation: the
+    stale approval no longer revalidates the whole prospective ACTIVE set, so
+    it now activates (ACTIVE) instead of being refused with
+    ACTIVATION_BLOCKED_INCONSISTENT; that incidental refusal was a byproduct
+    of the old full-batch validation. The no-rollback property (the newer
+    replacement version is never rolled back by the stale approval) is
+    guaranteed by the new construction: the approval holds one write
+    transaction (BEGIN IMMEDIATE) from judgment to commit, so a concurrent
+    change-set cannot interleave between its snapshot and its commit. The
+    seam pauses the in-flight approval before it takes that write
+    transaction, letting the change-set land first.
+    """
     catalog = RelationCatalog(tmp_path)
     actor = "concurrency-test"
     git_sha = "a" * 40
@@ -288,9 +308,9 @@ def test_stale_snapshot_block_preserves_newer_same_identity_version(
     release = threading.Event()
     pause_once = True
     pause_lock = threading.Lock()
-    original_replace = catalog._catalog.replace
+    original_begin_write = type(catalog._store).begin_write
 
-    def paused_replace(*args: object, **kwargs: object) -> dict[str, object]:
+    def paused_begin_write(*args: object, **kwargs: object) -> None:
         nonlocal pause_once
         with pause_lock:
             should_pause = pause_once
@@ -299,9 +319,9 @@ def test_stale_snapshot_block_preserves_newer_same_identity_version(
             paused.set()
             if not release.wait(timeout=5):
                 raise AssertionError("stale approval did not receive release")
-        return original_replace(*args, **kwargs)
+        original_begin_write(*args, **kwargs)
 
-    monkeypatch.setattr(catalog._catalog, "replace", paused_replace)
+    monkeypatch.setattr(type(catalog._store), "begin_write", paused_begin_write)
     pool = ThreadPoolExecutor(max_workers=1)
     future = pool.submit(
         catalog.approve,
@@ -323,10 +343,8 @@ def test_stale_snapshot_block_preserves_newer_same_identity_version(
             "revoked_version_id": original_id,
             "activated_version_id": replacement_id,
         }
-        frozen = catalog.current_generation()
-        assert len(frozen) == 1
-        frozen_entry = frozen[str(original["identity"])]
-        assert frozen_entry["version_id"] == replacement_id
+        after_replace = catalog.current_generation()
+        assert after_replace[str(original["identity"])]["version_id"] == replacement_id
     finally:
         release.set()
         try:
@@ -334,11 +352,21 @@ def test_stale_snapshot_block_preserves_newer_same_identity_version(
         finally:
             pool.shutdown(wait=True)
 
-    assert stale_result["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+    assert stale_result["activation"] == "ACTIVE"
+    # The facade current_generation() hydration re-reads version rows through
+    # bare store access that repopulates the store's thread-local snapshot
+    # cache after the v2 read context exits (and nothing clears it), so the
+    # next current_generation() on this thread would skip a fresh load and
+    # reuse the pre-worker-commit snapshot. Drop the cached snapshot so the
+    # frozen view is read from the committed state.
+    catalog._store.end_read()
+    frozen = catalog.current_generation()
+    assert len(frozen) == 2
+    assert frozen[str(original["identity"])]["version_id"] == replacement_id
     reopened = RelationCatalog(tmp_path)
     assert reopened.current_generation() == frozen
     rows = {str(row["version_id"]): row for row in reopened.review_rows()}
     assert rows[replacement_id]["activation"] == "ACTIVE"
     assert rows[original_id]["activation"] == "SUPERSEDED"
     assert rows[stale_id]["status"] == "APPROVED"
-    assert rows[stale_id]["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+    assert rows[stale_id]["activation"] == "ACTIVE"
