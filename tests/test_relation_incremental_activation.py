@@ -681,6 +681,7 @@ def test_activate_many_survives_unrelated_active_payload_tamper(tmp_path) -> Non
         catalog.current_generation()
 
 
+@pytest.mark.pressure
 def test_10k_independent_relations_single_batch_activation(tmp_path, monkeypatch) -> None:
     """T5.1: 10,000 mutually independent relations publish in ONE S3 facade
     ``approve_many`` batch against a 10,000-relation ACTIVE baseline.

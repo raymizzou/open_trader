@@ -357,6 +357,56 @@ def test_make_acceptance_refreshes_main_runtime_after_tests_before_live_checks()
     )
 
 
+def test_default_gates_exclude_pressure_suite_and_keep_explicit_pressure_target() -> None:
+    repo_root = Path(__file__).parents[1]
+    plans = {
+        target: subprocess.run(
+            ["make", "-n", target],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        for target in ("test", "acceptance", "test-pressure")
+    }
+    normalized = {
+        target: " ".join(re.sub(r"\\\s*\n", " ", plan).split())
+        for target, plan in plans.items()
+    }
+
+    collection = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "-m",
+            "pressure",
+            "tests/test_relation_incremental_activation.py",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    collected = [
+        line
+        for line in collection.stdout.splitlines()
+        if line.startswith("tests/test_relation_incremental_activation.py::")
+    ]
+
+    assert (
+        all('-m "not pressure"' in normalized[target] for target in ("test", "acceptance"))
+        and '-m pressure' in normalized["test-pressure"]
+        and collected
+        == [
+            "tests/test_relation_incremental_activation.py::"
+            "test_10k_independent_relations_single_batch_activation"
+        ]
+    )
+
+
 def test_prediction_payload_validation_fails_closed_for_stale_actionable_rows() -> None:
     payload = {
         "status": "degraded",

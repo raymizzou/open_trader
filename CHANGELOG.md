@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-28
+
+- Routine `make test` and `make acceptance` gates now exclude registered pressure cases; `make test-pressure` retains the 10k relation check.
+
 ## 2026-08-27
 
 - CN 趋势 v17 现纳入官方 A 股、ETF 与 REITs 温转热池；运行不查询收藏夹，REITs 沿用现有入场纪律、名义仓位与跨资产轮换。版本升级默认继承上一版本 Kelly 样本与最新市场回撤状态，缺少历史回撤基线时安全跳过；Dashboard 当前报告按 canonical v17 与结构化 v2 计划校验，历史冻结报告保持可读。验证：CN v17/REITs 与回撤、Kelly、Dashboard 聚焦用例 14 passed。

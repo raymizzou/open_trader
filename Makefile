@@ -1,4 +1,4 @@
-.PHONY: acceptance test prediction-solver-envs prediction-solver-quick prediction-solver-full-macos prediction-solver-full-linux prediction-solver-report prediction-solver-verify-report
+.PHONY: acceptance test test-pressure prediction-solver-envs prediction-solver-quick prediction-solver-full-macos prediction-solver-full-linux prediction-solver-report prediction-solver-verify-report
 
 WORKTREE_ROOT := $(CURDIR)
 REPOSITORY_ROOT := $(shell git rev-parse --path-format=absolute --git-common-dir)/..
@@ -11,7 +11,10 @@ LEGACY_DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/legacy_dashboard/launchd.out.log
 ACCOUNT_API_URL ?= http://127.0.0.1:8768
 ACCOUNT_API_LOG ?= $(WORKTREE_ROOT)/logs/account_api/launchd.out.log
 test:
-	"$(PYTHON_BIN)" -m pytest -q
+	"$(PYTHON_BIN)" -m pytest -q -m "not pressure"
+
+test-pressure:
+	"$(PYTHON_BIN)" -m pytest -q -m pressure
 
 prediction-solver-envs:
 	PYTHON_BIN="$(PYTHON_BIN)" ./scripts/build_prediction_solver_envs.sh
@@ -34,7 +37,7 @@ prediction-solver-verify-report:
 acceptance:
 	cd "$(REPOSITORY_ROOT)" && \
 		PYTHONSAFEPATH=1 PYTHONPATH="$(WORKTREE_ROOT):$(WORKTREE_ROOT)/src" \
-		"$(PYTHON_BIN)" -m pytest "$(WORKTREE_ROOT)/tests" -q
+		"$(PYTHON_BIN)" -m pytest "$(WORKTREE_ROOT)/tests" -q -m "not pressure"
 	@test "$$(git -C "$(WORKTREE_ROOT)" branch --show-current)" = main
 	@test -z "$$(git -C "$(WORKTREE_ROOT)" status --porcelain)"
 	@cd "$(WORKTREE_ROOT)" && scripts/install_account_release.sh --dry-run --repo-root "$(WORKTREE_ROOT)" --python "$(PYTHON_BIN)"

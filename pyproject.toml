@@ -42,3 +42,6 @@ open_trader = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "pressure: tests intentionally excluded from routine gates",
+]
