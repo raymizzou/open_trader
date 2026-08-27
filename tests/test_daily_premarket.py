@@ -120,6 +120,32 @@ def test_load_env_config_parses_required_values_and_executor_host(
     assert config.trend_executor_host == "ray-mac"
 
 
+def test_load_env_config_defaults_missing_reits_pool_to_official_id(
+    tmp_path: Path,
+) -> None:
+    env = tmp_path / "daily.env"
+    env.write_text(
+        "\n".join(
+            [
+                f"OPEN_TRADER_REPO={tmp_path}",
+                f"OPEN_TRADER_PYTHON={tmp_path / '.venv/bin/python'}",
+                "OPEN_TRADER_TIMEZONE=Asia/Shanghai",
+                "OPEN_TRADER_DEADLINE=21:10",
+                "OPEN_TRADER_FUTU_HOST=127.0.0.1",
+                "OPEN_TRADER_FUTU_PORT=11111",
+                "DEEPSEEK_API_KEY=secret",
+                "TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID=622466",
+                "TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID=697199",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_env_config(env)
+
+    assert config.trend_animals_reits_tm_id == 622482
+
+
 def test_load_env_config_defaults_executor_host_to_empty(tmp_path: Path) -> None:
     env = tmp_path / "daily.env"
     env.write_text(

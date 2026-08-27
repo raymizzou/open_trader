@@ -542,6 +542,37 @@ def test_search_exact_symbol_uses_one_exact_query_and_persists_returned_code(
     assert cached_transport.calls == []
 
 
+def test_resolve_ticker_identity_accepts_cn_reit(tmp_path: Path) -> None:
+    transport = FakeTransport(
+        {
+            "searchTicker": success(
+                [{
+                    "tmId": 180502,
+                    "tickerSymbol": "180502.SZ",
+                    "asset": "REITs",
+                }]
+            )
+        }
+    )
+    client = TrendAnimalsClient(
+        api_key="secret-value", cache_dir=tmp_path, transport=transport
+    )
+
+    resolved = client.search_exact_symbol(
+        "SZ.180502",
+        market="CN",
+        expected_date="2026-08-27",
+    )
+    mapping = client.symbol_mapping("SZ.180502", market="CN")
+
+    assert mapping is not None
+    assert (resolved, mapping.trend_animals_symbol, mapping.asset) == (
+        180502,
+        "180502.SZ",
+        "REITs",
+    )
+
+
 def test_search_exact_symbol_ignores_same_code_crypto_asset(tmp_path: Path) -> None:
     transport = FakeTransport(
         {

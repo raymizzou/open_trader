@@ -33,10 +33,10 @@ from .parsers.base import detect_asset_class
 from .strategy_drawdown import (
     ALLOCATION_DYNAMIC_PARAMETER_NAMES,
     ALLOCATION_PROJECTION_VERSIONS,
-    ALLOCATION_V2_VERSION_SETS,
     DRAWDOWN_LIMIT,
     is_allocation_v2_version,
     observe_strategy_equity,
+    uses_nominal_allocation_behavior,
     valid_drawdown_decision,
 )
 from .trend_kelly import (
@@ -45,8 +45,10 @@ from .trend_kelly import (
     KELLY_ROLLING_SAMPLES,
     TrendKellyRound,
     TrendKellyState,
+    TREND_KELLY_SAMPLE_IDENTITIES,
     calculate_trend_kelly,
     load_trend_kelly_evidence,
+    trend_kelly_sample_identities,
 )
 from .trend_industry_context import (
     IndustryContext,
@@ -1195,7 +1197,6 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
         if isinstance(allocation_markets, Mapping)
         else None
     )
-    allocation_v2_versions = ALLOCATION_V2_VERSION_SETS[market]
     allocation_snapshot_version = allocation.get("version", 1)
     if (
         "version" not in allocation
@@ -1206,7 +1207,9 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
         allocation_snapshot_version = 2
     if (
         not isinstance(strategy_snapshot, Mapping)
-        or strategy_snapshot.get("strategy_version") not in ALLOCATION_REPORT_VERSIONS[market]
+        or not _is_allocation_report_version(
+            market, strategy_snapshot.get("strategy_version")
+        )
         or strategy_snapshot.get("strategy_id")
         != f"trend_animals_warm_to_hot/{market}/{strategy_snapshot.get('strategy_version')}"
         or snapshot_market is None
@@ -1216,9 +1219,13 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
         or not isinstance(allocation_snapshot_version, int)
         or allocation_snapshot_version not in {1, 2}
         or allocation_snapshot_version == 2
-        and strategy_snapshot.get("strategy_version") not in allocation_v2_versions
+        and not is_allocation_v2_version(
+            market, strategy_snapshot.get("strategy_version")
+        )
         or allocation_snapshot_version == 1
-        and strategy_snapshot.get("strategy_version") in allocation_v2_versions
+        and is_allocation_v2_version(
+            market, strategy_snapshot.get("strategy_version")
+        )
         or allocation_snapshot_version == 2
         and parameters.get("allocation_position_limit")
         != allocation_market.get("position_limit")
@@ -2189,10 +2196,10 @@ def live_trend_strategy_snapshot(
         version = "v4"
     if allocation_market is not None:
         allocation_snapshot_version = allocation_market.get("allocation_version")
-        if version in ALLOCATION_V2_VERSION_SETS[market]:
+        if is_allocation_v2_version(market, version):
             if allocation_snapshot_version != 2:
                 raise ValueError("current strategy requires allocation version 2")
-        elif version in ALLOCATION_REPORT_VERSIONS[market]:
+        elif _is_allocation_report_version(market, version):
             if allocation_snapshot_version != 1:
                 raise ValueError("legacy strategy requires allocation version 1")
         else:
@@ -2201,7 +2208,7 @@ def live_trend_strategy_snapshot(
         version
         not in {
             "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
-            "v15", "v16",
+            "v15", "v16", "v17",
         }
         or version in {"v5", "v11"} and market == "CN"
         or version == "v15" and market != "CN"
@@ -2287,9 +2294,12 @@ def live_trend_strategy_snapshot(
                     "趋势右侧、可交易、无危险信号、日期一致、非当前持仓、"
                     "右侧天数存在、ATR14 可计算"
                 )
-    if market == "CN" and version in {
-        "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16",
-    }:
+    if market == "CN" and (
+        version in {
+            "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16",
+        }
+        or _uses_current_nominal_allocation(market, version)
+    ):
         parameters.pop("max_filter_price", None)
         parameters["allowed_industry_temperatures"] = ["温", "热", "沸"]
         rows = [row for row in rows if row["name"] != "筛选价格"]
@@ -2301,6 +2311,11 @@ def live_trend_strategy_snapshot(
         for row in rows:
             if row["name"] == "交易市场":
                 row["value"] = "沪深 A 股及境内 ETF；排除北交所、ST、*ST 和退市标记"
+    if market == "CN" and version == "v17":
+        parameters["allowed_assets"] = ["A股", "ETF基金", "REITs"]
+        for row in rows:
+            if row["name"] == "交易市场":
+                row["value"] = "沪深 A 股、境内 ETF 及 REITs；排除北交所、ST、*ST 和退市标记"
     if market == "CN" and version == "v7":
         parameters["kelly_sample_inherits"] = [{
             "market": "CN",
@@ -2520,7 +2535,23 @@ def live_trend_strategy_snapshot(
                 *(("v12",) if version == "v13" else ()),
             )
         ]
-    current_discipline = (market, version) in CURRENT_EXIT_DISCIPLINES
+    target_identity = (
+        market,
+        f"trend_animals_warm_to_hot/{market}/{version}",
+        version,
+    )
+    if target_identity not in TREND_KELLY_SAMPLE_IDENTITIES:
+        effective_identities = trend_kelly_sample_identities(target_identity)
+        if len(effective_identities) > 1:
+            parameters["kelly_sample_inherits"] = [
+                {
+                    "market": item[0],
+                    "strategy_id": item[1],
+                    "opening_strategy_version": item[2],
+                }
+                for item in sorted(effective_identities, key=lambda item: item[2])
+            ]
+    current_discipline = _uses_current_exit_discipline(market, version)
     if current_discipline:
         for name in OVERHEAT_PARAMETER_NAMES:
             parameters.pop(name, None)
@@ -2585,7 +2616,7 @@ def live_trend_strategy_snapshot(
             "drawdown_unlock": "manual_same_version_rebase",
         }
     )
-    if allocation_market is not None and version in ALLOCATION_REPORT_VERSIONS[market]:
+    if allocation_market is not None and _is_allocation_report_version(market, version):
         parameters.update(
             {
                 "allocation_snapshot_path": allocation_market["daily_path"],
@@ -2659,17 +2690,12 @@ def _expected_report_strategy_snapshot(
     )
     parameters = supplied.get("parameters") if supplied is not None else None
     allocation = None
-    if (
-        (market.upper(), requested_version) in {
-            ("CN", "v11"), ("CN", "v12"), ("CN", "v13"), ("CN", "v14"), ("CN", "v15"), ("CN", "v16"),
-            ("HK", "v9"), ("HK", "v10"), ("HK", "v11"), ("HK", "v12"), ("HK", "v13"), ("HK", "v14"),
-            ("US", "v9"), ("US", "v10"), ("US", "v11"), ("US", "v12"), ("US", "v13"), ("US", "v14"),
-        }
-        and isinstance(parameters, Mapping)
+    if _is_allocation_report_version(market, requested_version) and isinstance(
+        parameters, Mapping
     ):
         allocation_version = (
             2
-            if requested_version in ALLOCATION_V2_VERSION_SETS[market.upper()]
+            if is_allocation_v2_version(market, requested_version)
             or "allocation_position_limit" in parameters
             else 1
         )
@@ -2695,7 +2721,7 @@ def _expected_report_strategy_snapshot(
             },
         }
     if requested_version in {
-        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16",
+        "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17",
     }:
         return live_trend_strategy_snapshot(
             market,
@@ -4018,9 +4044,15 @@ def _candidate_reasons(
     )
     if shared_discipline:
         allowed_assets = (
-            {"A股", "ETF基金"}
-            if strategy_version in {"v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16"}
-            else {"A股"}
+            {"A股", "ETF基金", "REITs"}
+            if strategy_version == "v17"
+            else (
+                {"A股", "ETF基金"}
+                if strategy_version in {
+                    "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16",
+                }
+                else {"A股"}
+            )
         )
         if market == "CN" and item.asset not in allowed_assets:
             reasons.append("a_share_only")
@@ -4102,7 +4134,39 @@ def _candidate_sort_key(item: CandidateInput) -> tuple[Decimal, int, Decimal, st
 def _uses_individual_global_ranking(
     market: str, strategy_version: str | None,
 ) -> bool:
-    return (market.upper(), strategy_version) in INDIVIDUAL_GLOBAL_RANKING_VERSIONS
+    return (
+        (market.upper(), strategy_version) in INDIVIDUAL_GLOBAL_RANKING_VERSIONS
+        or _uses_current_nominal_allocation(market, strategy_version)
+    )
+
+
+def _is_allocation_report_version(
+    market: str, strategy_version: object,
+) -> bool:
+    normalized_market = market.upper()
+    version = str(strategy_version or "")
+    return (
+        version in ALLOCATION_REPORT_VERSIONS.get(normalized_market, ())
+        or CURRENT_NOMINAL_ALLOCATION_VERSIONS.get(normalized_market) == version
+    )
+
+
+def _uses_final_plan_trend(
+    market: str, strategy_version: str | None,
+) -> bool:
+    return (
+        (market.upper(), strategy_version) in FINAL_PLAN_TREND_VERSIONS
+        or _uses_current_nominal_allocation(market, strategy_version)
+    )
+
+
+def _uses_current_exit_discipline(
+    market: str, strategy_version: str | None,
+) -> bool:
+    return (
+        (market.upper(), strategy_version) in CURRENT_EXIT_DISCIPLINES
+        or _uses_current_nominal_allocation(market, strategy_version)
+    )
 
 
 def _uses_v2_allocation_behavior(market: str, strategy_version: str | None) -> bool:
@@ -4112,7 +4176,7 @@ def _uses_v2_allocation_behavior(market: str, strategy_version: str | None) -> b
 def _uses_current_nominal_allocation(
     market: str, strategy_version: str | None,
 ) -> bool:
-    return CURRENT_NOMINAL_ALLOCATION_VERSIONS.get(market.upper()) == strategy_version
+    return uses_nominal_allocation_behavior(market, strategy_version)
 
 
 def _expected_nominal_sizing(
@@ -6872,9 +6936,7 @@ def build_report(
         raw_limit = snapshot_parameters.get("allocation_position_limit")
         if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0:
             position_limit = raw_limit
-    current_exit_discipline = (
-        market.upper(), snapshot_version
-    ) in CURRENT_EXIT_DISCIPLINES
+    current_exit_discipline = _uses_current_exit_discipline(market, snapshot_version)
     snapshot_parameters = resolved_strategy_snapshot.get("parameters")
     cny_per_local_currency = CNY_PER_LOCAL_CURRENCY.get(market, Decimal("1"))
     if isinstance(snapshot_parameters, Mapping):
@@ -6897,7 +6959,12 @@ def build_report(
                 key: Decimal(str(raw_cn_weights))
                 for key in ("热", "沸")
             }
-            if market == "CN" and snapshot_version in {"v11", "v12", "v13", "v14", "v15", "v16"}
+            if market == "CN" and (
+                snapshot_version in {
+                    "v11", "v12", "v13", "v14", "v15", "v16",
+                }
+                or _uses_current_nominal_allocation(market, snapshot_version)
+            )
             else CN_TARGET_WEIGHTS
         )
     except (InvalidOperation, KeyError, ValueError):
@@ -6918,20 +6985,26 @@ def build_report(
             last_closed_at="",
             selected_round_ids=(),
         )
-        if snapshot_version in {
-            "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            "v11", "v12", "v13", "v14", "v15", "v16",
-        } and kelly_data_reason
+        if (
+            snapshot_version in {
+                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                "v11", "v12", "v13", "v14", "v15", "v16",
+            }
+            or _uses_current_nominal_allocation(market, snapshot_version)
+        ) and kelly_data_reason
         else calculate_trend_kelly(
             kelly_rounds,
             market=market,
             strategy_id=str(resolved_strategy_snapshot.get("strategy_id") or ""),
             opening_strategy_version=snapshot_version,
         )
-        if snapshot_version in {
-            "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            "v11", "v12", "v13", "v14", "v15", "v16",
-        }
+        if (
+            snapshot_version in {
+                "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                "v11", "v12", "v13", "v14", "v15", "v16",
+            }
+            or _uses_current_nominal_allocation(market, snapshot_version)
+        )
         else None
     )
     held_symbols = {position.symbol for position in account.positions}
@@ -7092,9 +7165,7 @@ def build_report(
         risk_skips: list[dict[str, object]] = []
         risk_summary: dict[str, object] = {}
     else:
-        use_final_plan_semantics = (
-            market.upper(), snapshot_version
-        ) in FINAL_PLAN_TREND_VERSIONS
+        use_final_plan_semantics = _uses_final_plan_trend(market, snapshot_version)
         (
             existing_planned_risk,
             inferred_critical_data_reason,
@@ -7333,9 +7404,9 @@ def build_report(
             critical_data_reason=real_account_reason,
             portfolio_risk_unavailable_reason=real_portfolio_reason,
             kelly_state=kelly_state,
-            use_final_plan_semantics=(
-                market.upper(), snapshot_version
-            ) in FINAL_PLAN_TREND_VERSIONS,
+            use_final_plan_semantics=_uses_final_plan_trend(
+                market, snapshot_version
+            ),
             use_nominal_sizing=_uses_current_nominal_allocation(
                 market, snapshot_version
             ),
@@ -8154,7 +8225,7 @@ def render_trend_feishu_text(
         if isinstance(strategy_snapshot, Mapping)
         else ""
     )
-    current_exit_discipline = (market, strategy_version) in CURRENT_EXIT_DISCIPLINES
+    current_exit_discipline = _uses_current_exit_discipline(market, strategy_version)
     judgments = payload.get("strategy_judgments")
     judgments = judgments if isinstance(judgments, dict) else {}
     holdings = [
@@ -8526,7 +8597,7 @@ def _rotation_comparison_markdown_lines(
 def render_markdown(report: TrendReport) -> str:
     market = str(report.metadata.get("market") or "CN").upper()
     strategy_version = str(report.strategy_snapshot.get("strategy_version") or "")
-    current_exit_discipline = (market, strategy_version) in CURRENT_EXIT_DISCIPLINES
+    current_exit_discipline = _uses_current_exit_discipline(market, strategy_version)
     market_label = {"CN": "A股", "US": "美股", "HK": "港股"}.get(market, market)
     account_currency = str(report.metadata.get("account_currency") or "")
     currency = (
@@ -8585,10 +8656,15 @@ def render_markdown(report: TrendReport) -> str:
                 report.allocation, execution_date=report.execution_date
             )
         )
-    if report.strategy_snapshot.get("strategy_version") in {
-        "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+    if (
+        report.strategy_snapshot.get("strategy_version") in {
+            "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
             "v11", "v12", "v13", "v14", "v15", "v16",
-    }:
+        }
+        or _uses_current_nominal_allocation(
+            market, report.strategy_snapshot.get("strategy_version")
+        )
+    ):
         phase = {
             "cold_start": "冷启动",
             "active_all_samples": "全样本启用",
@@ -8999,10 +9075,13 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
     ):
         raise ValueError("strategy snapshot does not match report actions")
     version = snapshot.get("strategy_version")
-    if version not in {
-        "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14", "v15", "v16",
-    }:
+    if (
+        version not in {
+            "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+            "v11", "v12", "v13", "v14", "v15", "v16",
+        }
+        and not _uses_current_nominal_allocation(market, version)
+    ):
         raise ValueError("strategy snapshot does not match report actions")
     expected_snapshot = _expected_report_strategy_snapshot(
         market,
@@ -9033,10 +9112,13 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
         or parameters.get("full_exit_precedes_partial_exit") is not True
     ):
         raise ValueError("strategy snapshot does not match report actions")
-    if version in {
-        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14", "v15", "v16",
-    }:
+    if (
+        version in {
+            "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+            "v11", "v12", "v13", "v14", "v15", "v16",
+        }
+        or _uses_current_nominal_allocation(market, version)
+    ):
         valid_contract = {
             "v2": valid_v2_risk_contract,
             "v3": valid_v3_risk_contract,
@@ -9053,6 +9135,7 @@ def validate_report_strategy_snapshot(report: TrendReport) -> None:
             "v14": valid_v4_risk_contract,
             "v15": valid_v4_risk_contract,
             "v16": valid_v4_risk_contract,
+            "v17": valid_v4_risk_contract,
         }[version]
         contract_summary = report.risk_summary
         if (
@@ -10865,7 +10948,7 @@ def _updates_gap(
     dates = {
         row.get("asset"): _status_date(row)
         for row in rows
-        if row.get("asset") in {"A股", "ETF基金"}
+        if row.get("asset") in {"A股", "ETF基金", "REITs"}
     }
     gaps = [
         (
@@ -10873,7 +10956,7 @@ def _updates_gap(
             if dates.get(asset)
             else f"{asset} 数据缺失 → {run_date}"
         )
-        for asset in ("A股", "ETF基金")
+        for asset in ("A股", "ETF基金", "REITs")
         if dates.get(asset) != run_date
     ]
     return "，".join(gaps) if gaps else None
@@ -11310,6 +11393,7 @@ def _attempt_report(
         candidate_pool_ids = (
             config.trend_animals_a_share_tm_id,
             config.trend_animals_etf_tm_id,
+            config.trend_animals_reits_tm_id,
         )
         allocation_market = _allocation_market_for(allocation_reference, "CN")
         strategy_snapshot = live_trend_strategy_snapshot(
@@ -11331,10 +11415,7 @@ def _attempt_report(
             for row in rows:
                 component_pools[_row_tm_id(row)].add(str(tm_id))
         component_ids = {_row_tm_id(row) for row in component_rows}
-        get_favorites = getattr(api, "get_favorites_tickers", None)
-        favorite_rows = get_favorites() if callable(get_favorites) else []
-        favorite_ids = favorite_candidate_ids(favorite_rows, market="CN")
-        candidate_ids = component_ids | favorite_ids
+        candidate_ids = component_ids
 
         simulate_acc_id = require_trend_review_config(config, "CN")
         try:
@@ -11787,7 +11868,6 @@ def _attempt_report(
             watch_events=watch_events,
             api_facts=(
                 f"getUpdateStatus rows={len(update_rows)}",
-                f"getFavoritesTicker securities={len(favorite_ids)}",
                 *_component_api_facts(api, len(component_rows)),
                 *snapshot_api_facts,
                 *legacy_industry_api_facts,
@@ -11864,7 +11944,6 @@ def _attempt_report(
             watch_events=watch_events,
             query={
                 "component_pool_ids": list(candidate_pool_ids),
-                "favorite_ids": sorted(favorite_ids),
                 **(
                     {
                         "holding_snapshot_fields": list(fields),
@@ -11890,7 +11969,6 @@ def _attempt_report(
             responses={
                 "update_status": update_rows,
                 "components": component_rows,
-                "favorites": favorite_rows,
                 "snapshots": snapshot_rows,
                 "real_snapshots": list(real_snapshot_rows.values()),
                 "industries": industry_rows,
@@ -12034,6 +12112,8 @@ def run_a_share_trend_report(
         raise ValueError("TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID must be 622466")
     if config.trend_animals_etf_tm_id != 697199:
         raise ValueError("TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID must be 697199")
+    if config.trend_animals_reits_tm_id != 622482:
+        raise ValueError("TREND_ANIMALS_WARM_TO_HOT_REITS_TM_ID must be 622482")
     report_dir = config.reports_dir / "trend_a_share"
     base_markdown = report_dir / f"{run_date}.md"
     base_json = report_dir / f"{run_date}.json"

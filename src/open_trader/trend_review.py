@@ -23,6 +23,7 @@ from .strategy_drawdown import (
     ALLOCATION_PROJECTION_VERSIONS,
     ALLOCATION_V2_DYNAMIC_PARAMETER_NAMES,
     is_allocation_v2_version,
+    uses_nominal_allocation_behavior,
 )
 from .trend_kelly import trend_kelly_identity_matches
 
@@ -118,6 +119,14 @@ TREND_STRATEGY_VERSIONS = frozenset(
         "v11", "v12", "v13", "v14", "v15", "v16",
     }
 )
+
+
+def _is_known_trend_strategy_version(market: str, strategy_version: object) -> bool:
+    version = str(strategy_version or "")
+    return (
+        version in TREND_STRATEGY_VERSIONS
+        or ALLOCATION_PROJECTION_VERSIONS.get(_market(market)) == version
+    )
 
 
 class TrendReplayIncompleteError(ValueError):
@@ -10521,10 +10530,8 @@ def freeze_simulated_buy_fifo(
         if normalize_code(value)
     }
     strategy_snapshot = report.get("strategy_snapshot")
-    current_nominal = (
-        isinstance(strategy_snapshot, Mapping)
-        and str(strategy_snapshot.get("strategy_version") or "")
-        == ALLOCATION_PROJECTION_VERSIONS.get(market)
+    current_nominal = isinstance(strategy_snapshot, Mapping) and uses_nominal_allocation_behavior(
+        market, strategy_snapshot.get("strategy_version")
     )
     by_code: dict[str, dict[str, object]] = {}
 
@@ -10752,9 +10759,7 @@ def _preflight_open_actions(
     )
     if not strategy_version:
         raise ValueError("trend report strategy version is unavailable")
-    current_nominal = strategy_version == ALLOCATION_PROJECTION_VERSIONS.get(
-        _market(market)
-    )
+    current_nominal = uses_nominal_allocation_behavior(market, strategy_version)
 
     validated: list[Mapping[str, object]] = []
     sell_actions_by_symbol: set[str] = set()
@@ -10933,7 +10938,7 @@ def execute_trend_review_open(
         except (TypeError, ValueError):
             event_account_id = None
     v2_execution = _v2_execution_report(report, market)
-    current_nominal = strategy_version == ALLOCATION_PROJECTION_VERSIONS.get(market)
+    current_nominal = uses_nominal_allocation_behavior(market, strategy_version)
     if not v2_execution:
         nav = _required_decimal(snapshot.get("net_value"), "simulate net value")
         if nav <= 0:
@@ -13380,7 +13385,10 @@ def normalize_trend_strategy_snapshot(
 
         version = str(snapshot.get("strategy_version") or "")
         allocation = None
-        if version in ALLOCATION_REPORT_VERSIONS.get(market, ()):
+        if (
+            version in ALLOCATION_REPORT_VERSIONS.get(market, ())
+            or ALLOCATION_PROJECTION_VERSIONS.get(market) == version
+        ):
             allocation_version = 2 if is_allocation_v2_version(market, version) else 1
             allocation_market = {
                 "rank": parameters.get("allocation_rank"),
@@ -13403,9 +13411,8 @@ def normalize_trend_strategy_snapshot(
                     },
                 },
             }
-        if version in {
-            "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            "v11", "v12", "v13", "v14", "v15", "v16",
+        if _is_known_trend_strategy_version(market, version) and version not in {
+            "v1", "v2", "v3",
         }:
             expected_snapshot = live_trend_strategy_snapshot(
                 market,
@@ -14411,9 +14418,9 @@ def build_trend_review_projection(
         fact: Mapping[str, object],
     ) -> Mapping[str, object] | None:
         snapshot = fact.get("strategy_snapshot")
-        if not isinstance(snapshot, Mapping) or snapshot.get(
-            "strategy_version"
-        ) not in TREND_STRATEGY_VERSIONS:
+        if not isinstance(snapshot, Mapping) or not _is_known_trend_strategy_version(
+            market, snapshot.get("strategy_version")
+        ):
             return None
         try:
             return normalize_trend_strategy_snapshot(snapshot, market)
@@ -14464,10 +14471,14 @@ def build_trend_review_projection(
     live_facts = [
         fact
         for fact in effective_facts
-        if fact_identity(fact)[2] in {
-            "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-            "v11", "v12", "v13", "v14", "v15", "v16",
-        }
+        if (
+            fact_identity(fact)[2] in {
+                "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                "v11", "v12", "v13", "v14", "v15", "v16",
+            }
+            or ALLOCATION_PROJECTION_VERSIONS.get(market)
+            == fact_identity(fact)[2]
+        )
     ]
     target_candidates = live_facts or effective_facts
     if target_candidates:
@@ -14854,6 +14865,8 @@ def rebuild_trend_report_from_evidence(
             "missing original input: strategy_snapshot"
         )
     strategy_version = str(snapshot.get("strategy_version") or "")
+    market = str(inputs.get("market") or "").upper()
+    current_nominal = uses_nominal_allocation_behavior(market, strategy_version)
     required = {
         "as_of_date",
         "execution_date",
@@ -14871,17 +14884,17 @@ def rebuild_trend_report_from_evidence(
     if strategy_version in {
         "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
         "v11", "v12", "v13", "v14", "v15",
-    }:
+    } or current_nominal:
         required.add("normal_cost_rate")
     if strategy_version in {
         "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
         "v11", "v12", "v13", "v14", "v15", "v16",
-    }:
+    } or current_nominal:
         required.update({"kelly_rounds", "kelly_data_reason"})
     if strategy_version in {
         "v4", "v5", "v6", "v7", "v8", "v9", "v10",
         "v11", "v12", "v13", "v14", "v15",
-    }:
+    } or current_nominal:
         required.add("drawdown_summary")
     missing = sorted(required - inputs.keys())
     if missing:
@@ -15262,10 +15275,13 @@ def rebuild_trend_report_from_evidence(
             "invalid original input: price_fx_to_account_currency"
         )
     normal_cost_rate = decimal_or_none(inputs.get("normal_cost_rate"))
-    if strategy_version in {
-        "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-        "v11", "v12", "v13", "v14", "v15", "v16",
-    } and (
+    if (
+        strategy_version in {
+            "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+            "v11", "v12", "v13", "v14", "v15", "v16",
+        }
+        or current_nominal
+    ) and (
         normal_cost_rate is None
         or not normal_cost_rate.is_finite()
         or normal_cost_rate < 0
@@ -15392,10 +15408,13 @@ def rebuild_trend_report_from_evidence(
         critical_data_reason=critical_data_reason,
         drawdown_summary=(
             inputs["drawdown_summary"]
-            if strategy_version in {
-                "v4", "v5", "v6", "v7", "v8", "v9", "v10",
-                "v11", "v12", "v13", "v14", "v15", "v16",
-            }
+            if (
+                strategy_version in {
+                    "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+                    "v11", "v12", "v13", "v14", "v15", "v16",
+                }
+                or current_nominal
+            )
             and isinstance(inputs.get("drawdown_summary"), Mapping)
             else None
         ),

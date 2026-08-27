@@ -7141,8 +7141,8 @@ const base = (market) => ({
   broker:market === "CN" ? "eastmoney" : market === "HK" ? "phillips" : "futu",
   broker_label:market === "CN" ? "东方财富" : market === "HK" ? "辉立" : "富途",
   market_label:market === "CN" ? "A股" : market === "HK" ? "港股" : "美股",
-  strategy_version:market === "CN" ? "v16" : "v14",
-  allocation:{daily_path:"data/trend_allocation/daily/2026-08-20.json",sha256:"a".repeat(64),markets:{}},
+  strategy_version:market === "CN" ? "v17" : "v14",
+  allocation:{version:2,daily_path:"data/trend_allocation/daily/2026-08-20.json",sha256:"a".repeat(64),markets:{}},
   plan_availability:{
     simulated_account:{status:"available",reason:"",executable:false},
     real_account:{status:"available",reason:"",executable:false},
@@ -7156,6 +7156,40 @@ for (const market of ["CN", "HK", "US"]) {
     if (!html.includes(`<h2>${title}</h2>`)) throw new Error(market + " " + html);
   }
   if (html.includes("优先处理 · 卖出触发")) throw new Error(market + " legacy layout");
+}
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def test_dashboard_renders_cn_v17_allocation_v2_plan_as_staged_buy_and_rotation() -> None:
+    output = run_dashboard_js(r'''
+const report = {
+  available:true,
+  market:"CN",
+  broker:"eastmoney",
+  broker_label:"东方财富",
+  market_label:"A股",
+  strategy_version:"v17",
+  allocation:{version:2,daily_path:"data/trend_allocation/daily/2026-08-20.json",sha256:"a".repeat(64),markets:{}},
+  plan_availability:{
+    simulated_account:{status:"available",reason:"",executable:false},
+    real_account:{status:"available",reason:"",executable:false},
+  },
+  sell_actions:[],real_position_actions:[],
+  buy_actions:[{symbol:"180501",name:"REIT 180501",global_strength:"96",target_amount:"4000.00",estimated_shares:400}],
+  real_buy_actions:[],
+  simulate_rotation_pairs:[{sell_symbol:"600001",sell_name:"股票600001",sell_global_strength:"60",sell_phase:"立夏",sell_temperature_prev:"热",sell_temperature_curr:"热",sell_close:"10",sell_active_line:"9",buy_symbol:"180502",buy_name:"REIT 180502",buy_global_strength:"90",target_amount:"4000.00",estimated_shares:400}],
+  real_rotation_pairs:[],counts:{buy:2,sell:1},audit:{},
+};
+const html = renderTrendReportWorkspace(report);
+for (const title of ["模拟盘卖出计划", "实盘卖出计划", "模拟盘买入计划", "实盘买入计划"]) {
+  if (!html.includes(`<h2>${title}</h2>`)) throw new Error(html);
+}
+if (html.includes("优先处理 · 卖出触发")) throw new Error(html);
+for (const symbol of ["180501", "600001", "180502"]) {
+  if (!html.includes(symbol)) throw new Error(html);
 }
 console.log("ok");
 ''')

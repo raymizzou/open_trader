@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-27
 
+- CN 趋势 v17 现纳入官方 A 股、ETF 与 REITs 温转热池；运行不查询收藏夹，REITs 沿用现有入场纪律、名义仓位与跨资产轮换。版本升级默认继承上一版本 Kelly 样本与最新市场回撤状态，缺少历史回撤基线时安全跳过；Dashboard 当前报告按 canonical v17 与结构化 v2 计划校验，历史冻结报告保持可读。验证：CN v17/REITs 与回撤、Kelly、Dashboard 聚焦用例 14 passed。
 - Dashboard 现允许当前 CN v16/HK v14/US v14 报告在既有计划止损风险超过组合审计上限时继续选中；止损风险仍仅作审计。
 - 修复 Dashboard 分离趋势报告验收误报：`计划止损风险仅审计，不参与买入数量` 现在允许展示，不再被误判为持仓或执行信息；其余禁用文案校验保持不变。验证：回归用例 RED 后 GREEN（`1 passed, 1 warning`），Dashboard 审计-only UI 回归 `1 passed`；`make test` `7460 passed, 3 skipped, 1 warning`（exit 0）。
 - 趋势当前报告修订现在从冻结事实刷新显式变更的 allocation，并同步替换 planning manifest 中的 content-addressed market component；当前 CN/HK/US 执行继续只取最新报告，Dashboard 风险校验按生成器的 Decimal 运算顺序计算。验证：控制器回归 `3 passed in 5.65s`，修订 manifest 聚焦 `5 passed in 0.92s`，legacy fixture 聚焦 `6 passed in 0.60s`；`make test` `7459 passed, 3 skipped, 1 warning in 714.02s`（exit 0）。

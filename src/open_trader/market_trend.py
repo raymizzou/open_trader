@@ -38,6 +38,7 @@ from .a_share_trend import (
     _remember_verified_symbol_row,
     _supports_symbol_mapping_contract,
     _uses_current_nominal_allocation,
+    uses_nominal_allocation_behavior,
     _uses_shared_entry_discipline,
     read_delivery_receipt,
     _redact_api_key,
@@ -144,7 +145,7 @@ def _validate_current_buy_inputs(report: Any, *, market: str) -> None:
         if isinstance(strategy_snapshot, Mapping)
         else ""
     )
-    if not _uses_current_nominal_allocation(market, version):
+    if not uses_nominal_allocation_behavior(market, version):
         return
 
     market_label = MARKET_NOTIFICATION_LABELS[market][1]

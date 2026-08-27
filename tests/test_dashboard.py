@@ -1210,7 +1210,7 @@ def test_v2_dashboard_plan_projection_ignores_execution_progress() -> None:
 def test_current_nominal_rotation_projection_without_top_level_allocation_version_stays_v2() -> None:
     payload = {
         "metadata": {"market": "CN"},
-        "strategy_snapshot": {"strategy_version": "v16"},
+        "strategy_snapshot": {"strategy_version": "v17"},
         "allocation": {"markets": {"CN": {"position_limit": 20}}},
         "strategy_judgments": {
             "formal_actions": [],
@@ -4061,6 +4061,7 @@ def _valid_v6_dashboard_trend_payload() -> dict[str, object]:
 def _current_nominal_dashboard_payload(
     *,
     market: str = "CN",
+    strategy_version: str | None = None,
     available_cash: Decimal = Decimal("100000"),
     allocation_rank: int = 1,
     candidates: tuple[trend_module.CandidateInput, ...] | None = None,
@@ -4147,7 +4148,11 @@ def _current_nominal_dashboard_payload(
             ),
         )
     strategy = trend_module.live_trend_strategy_snapshot(
-        market, "abc123", (1,), allocation=allocation,
+        market,
+        "abc123",
+        (1,),
+        strategy_version=strategy_version,
+        allocation=allocation,
     )
     report = trend_module.build_report(
         as_of_date="2026-07-14",
@@ -4206,6 +4211,32 @@ def _current_nominal_dashboard_payload(
     if market != "CN":
         payload["option_attention"] = []
     return payload
+
+
+def test_dashboard_preserves_frozen_cn_v16_audit_only_nominal_sizing() -> None:
+    payload = _current_nominal_dashboard_payload(strategy_version="v16")
+    judgments = payload["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    buy = next(
+        item for item in judgments["formal_actions"]
+        if isinstance(item, dict) and item.get("action") == "BUY"
+    )
+
+    assert (
+        buy["target_amount"],
+        buy["estimated_shares"],
+        buy["sizing_note"],
+        payload["risk_summary"]["status_label"],
+        dashboard_module._valid_trend_report_payload(
+            payload, market="CN", broker="eastmoney"
+        ) is not None,
+    ) == (
+        "4000.00",
+        400,
+        "一手超过单笔风险上限",
+        "计划止损风险仅审计，不参与买入数量",
+        True,
+    )
 
 
 def test_dashboard_loads_current_us_v14_report_with_fractional_atr_precision(

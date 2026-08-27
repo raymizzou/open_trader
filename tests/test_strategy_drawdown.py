@@ -20,9 +20,33 @@ from open_trader.strategy_drawdown import (
     observe_strategy_equity,
     recover_strategy_drawdown_state,
     strategy_parameter_hash,
+    uses_nominal_allocation_behavior,
     valid_drawdown_decision,
     valid_strategy_parameter_audit_identity,
 )
+
+
+def test_nominal_allocation_behavior_preserves_rollout_history_and_current_version() -> None:
+    cases = (
+        ("CN", "v15", False),
+        ("CN", "v16", True),
+        ("CN", "v17", True),
+        ("CN", "v18", False),
+        ("HK", "v13", False),
+        ("HK", "v14", True),
+        ("HK", "v15", False),
+        ("US", "v13", False),
+        ("US", "v14", True),
+        ("US", "v15", False),
+        ("CN", "", False),
+        ("CN", "version-17", False),
+        ("CN", "vX", False),
+    )
+
+    assert [
+        uses_nominal_allocation_behavior(market, version)
+        for market, version, _expected in cases
+    ] == [expected for _market, _version, expected in cases]
 
 
 @pytest.mark.parametrize("market,version", [("CN", "v13"), ("HK", "v11"), ("US", "v11")])

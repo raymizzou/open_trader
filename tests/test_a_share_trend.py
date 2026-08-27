@@ -1928,7 +1928,7 @@ def test_freeze_report_plans_seats_from_projected_full_exits(
     if formal_action == "SELL_ALL":
         unlock_live_drawdown(
             tmp_path / "data",
-            strategy_version="v16",
+            strategy_version="v17",
         )
     else:
         unlock_live_drawdown(
@@ -2791,7 +2791,7 @@ def test_previous_versions_keep_stop_risk_limited_replay() -> None:
 def test_allocation_v2_selects_current_nominal_strategy_versions() -> None:
     versions: dict[str, str] = {}
     for market, expected_version in (
-        ("CN", "v16"),
+        ("CN", "v17"),
         ("HK", "v14"),
         ("US", "v14"),
     ):
@@ -2823,13 +2823,13 @@ def test_allocation_v2_selects_current_nominal_strategy_versions() -> None:
             f"trend_animals_warm_to_hot/{market}/{expected_version}"
         )
 
-    assert versions == {"CN": "v16", "HK": "v14", "US": "v14"}
+    assert versions == {"CN": "v17", "HK": "v14", "US": "v14"}
 
 
 @pytest.mark.parametrize(
     ("market", "version", "symbol", "asset", "exchange", "close", "lot_size"),
     [
-        ("CN", "v16", "600001", "A股", "SH", "10", 100),
+        ("CN", "v17", "600001", "A股", "SH", "10", 100),
         ("HK", "v14", "0001", "港股", "HK", "10", 100),
         ("US", "v14", "AAPL", "美股", "US", "100", 1),
     ],
@@ -3400,7 +3400,7 @@ def test_current_nominal_contract_treats_cash_authorization_as_audit_only() -> N
 @pytest.mark.parametrize(
     ("market", "strategy_version", "lot_rule"),
     [
-        ("CN", "v16", "100 股整数倍"),
+        ("CN", "v17", "100 股整数倍"),
         ("HK", "v14", "Futu 每标的整手"),
         ("US", "v14", "1 股整数倍"),
     ],
@@ -12359,7 +12359,11 @@ class ReadyApi:
     def get_update_status(self) -> list[dict[str, object]]:
         self.calls.append("api.update_status")
         date = "2026-07-14" if self.ready else "2026-07-13"
-        return [{"asset": "A股", "asOfDate": date}, {"asset": "ETF基金", "asOfDate": date}]
+        return [
+            {"asset": "A股", "asOfDate": date},
+            {"asset": "ETF基金", "asOfDate": date},
+            {"asset": "REITs", "asOfDate": date},
+        ]
 
     def get_account_balance(self) -> dict[str, object]:
         self.balance_calls += 1
@@ -12370,6 +12374,8 @@ class ReadyApi:
         self.calls.append(f"api.components.{tm_id}")
         if tm_id in self.component_rows:
             return self.component_rows[tm_id]
+        if tm_id == 622482:
+            return []
         if tm_id == 700001:
             return [
                 {"tmId": member_id, "tickerSymbol": f"60000{member_id}.SH", "asOfDate": expected_date}
@@ -12526,7 +12532,7 @@ def test_report_runner_fetches_unique_industries_in_one_batch(tmp_path: Path) ->
     assert payload["api_cost"]["estimate_complete"] is False
     evidence_path = trend_config(tmp_path).data_dir / payload["replay_evidence"]["path"]
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-    assert evidence["query"]["component_pool_ids"] == [622466, 697199]
+    assert evidence["query"]["component_pool_ids"] == [622466, 697199, 622482]
     assert evidence["responses"]["snapshots"]
     assert evidence["rebuild_inputs"]["candidates"]
 
@@ -12645,7 +12651,7 @@ def test_planning_crash_retry_recovers_simulated_plan_for_controller(
 ) -> None:
     config = trend_config(tmp_path)
     allocation = _write_cn_v2_allocation(config)
-    unlock_live_drawdown(config.data_dir, strategy_version="v16")
+    unlock_live_drawdown(config.data_dir, strategy_version="v17")
 
     class MappingReadyApi(ReadyApi):
         def remember_symbol_row(self, **_kwargs: object) -> None:
@@ -13180,6 +13186,7 @@ def test_current_cn_runner_ledger_excludes_real_only_candidates(
             return [
                 {"asset": "A股", "asOfDate": "2026-07-14"},
                 {"asset": "ETF基金", "asOfDate": "2026-07-14"},
+                {"asset": "REITs", "asOfDate": "2026-07-14"},
             ]
 
         def get_account_balance(self) -> dict[str, object]:
@@ -13188,6 +13195,8 @@ def test_current_cn_runner_ledger_excludes_real_only_candidates(
         def get_components(
             self, *, tm_id: int, expected_date: str,
         ) -> list[dict[str, object]]:
+            if tm_id == 622482:
+                return []
             if tm_id not in {622466, 697199}:
                 industry_component_calls.append(tm_id)
             return [
@@ -13376,6 +13385,7 @@ def test_a_share_updates_gap_reports_stale_assets() -> None:
     stale = [
         {"asset": "A股", "asOfDate": "2026-07-13"},
         {"asset": "ETF基金", "asOfDate": "2026-07-14"},
+        {"asset": "REITs", "asOfDate": "2026-07-14"},
     ]
     assert trend_module._updates_gap(stale, "2026-07-14") == (
         "A股 2026-07-13 → 2026-07-14"
@@ -13384,6 +13394,7 @@ def test_a_share_updates_gap_reports_stale_assets() -> None:
     ready = [
         {"asset": "A股", "asOfDate": "2026-07-14"},
         {"asset": "ETF基金", "asOfDate": "2026-07-14"},
+        {"asset": "REITs", "asOfDate": "2026-07-14"},
     ]
     assert trend_module._updates_gap(ready, "2026-07-14") is None
     assert trend_module._updates_ready(ready, "2026-07-14") is True
@@ -14238,7 +14249,7 @@ def test_cn_revision_refreshes_changed_allocation_from_frozen_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = trend_config(tmp_path)
-    unlock_live_drawdown(config.data_dir, strategy_version="v16")
+    unlock_live_drawdown(config.data_dir, strategy_version="v17")
     held_codes = tuple(f"SH.{index:06d}" for index in range(100, 110))
     real_snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)
     real_snapshot["positions"] = [
@@ -14322,7 +14333,7 @@ def test_cn_revision_refreshes_changed_allocation_from_frozen_inputs(
     base_evidence_path = config.data_dir / base_payload["replay_evidence"]["path"]
     base_evidence_bytes = base_evidence_path.read_bytes()
     base_judgments = base_payload["strategy_judgments"]
-    assert base_payload["strategy_snapshot"]["strategy_version"] == "v16"
+    assert base_payload["strategy_snapshot"]["strategy_version"] == "v17"
     assert base_payload["strategy_snapshot"]["parameters"]["allocation_position_limit"] == 20
     assert base_judgments["formal_actions"]
     assert [
@@ -14377,7 +14388,7 @@ def test_cn_revision_refreshes_changed_allocation_from_frozen_inputs(
         ),
         revised_payload["strategy_judgments"]["planned_new_seats"],
     ) == (
-        "v16",
+        "v17",
         allocation_b["daily_path"],
         allocation_b["sha256"],
         3,
@@ -15246,13 +15257,22 @@ def test_report_runner_failure_owns_day_at_inclusive_1900_deadline(tmp_path: Pat
     macos = RecordingMacOS()
     notifier = CompositeNotifier([feishu, macos])
     config = trend_config(tmp_path)
+
+    class StaleMarketApi(ReadyApi):
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": "A股", "asOfDate": "2026-07-13"},
+                {"asset": "ETF基金", "asOfDate": "2026-07-13"},
+                {"asset": "REITs", "asOfDate": "2026-07-14"},
+            ]
+
     times = iter([
         datetime(2026, 7, 14, 17, 50, tzinfo=SHANGHAI),
         datetime(2026, 7, 14, 19, 0, tzinfo=SHANGHAI),
     ])
     result = run_a_share_trend_report(
         config=config, run_date="2026-07-14", now_fn=lambda: next(times),
-        sleep_fn=sleeps.append, api_factory=lambda **kwargs: ReadyApi(calls, ready=False),
+        sleep_fn=sleeps.append, api_factory=lambda **kwargs: StaleMarketApi(calls),
         quote_factory=lambda **kwargs: ReadyQuote(calls), notifier=notifier,
     )
     assert result.status == "failed"
@@ -16798,3 +16818,299 @@ def test_staggered_planning_revisions_recover_remaining_account_component(
     assert simulation_calls == 2
     assert real_snapshot_calls == 3
     assert api_calls == initial_api_calls
+
+
+def test_cn_runner_uses_three_official_warm_to_hot_pools_and_ignores_favorites(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        trend_config(tmp_path),
+        trend_animals_reits_tm_id=622482,
+    )
+    allocation = _write_cn_v2_allocation(config)
+    component_requests: list[int] = []
+
+    class V17Api(ReadyApi):
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": "A股", "asOfDate": "2026-07-14"},
+                {"asset": "ETF基金", "asOfDate": "2026-07-14"},
+                {"asset": "REITs", "asOfDate": "2026-07-14"},
+            ]
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str,
+        ) -> list[dict[str, object]]:
+            component_requests.append(tm_id)
+            rows = {
+                622466: (1, "000001.SH"),
+                697199: (2, "000002.SH"),
+                622482: (3, "180502.SZ"),
+            }
+            component_id, symbol = rows[tm_id]
+            return [{
+                "tmId": component_id,
+                "tickerSymbol": symbol,
+                "asOfDate": expected_date,
+            }]
+
+        def get_favorites_tickers(self) -> list[dict[str, object]]:
+            raise AssertionError("favorites must not be called")
+
+    api = V17Api(
+        [],
+        snapshot_symbols={
+            1: "000001",
+            2: "000002",
+            3: "180502",
+            999: "600999",
+        },
+        snapshot_overrides={
+            3: {"tickerSymbol": "180502.SZ", "asset": "REITs"},
+            999: {"tickerSymbol": "600999.SH", "asset": "A股"},
+        },
+    )
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        allocation_reference=allocation,
+        api_factory=lambda **_kwargs: api,
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+
+    assert result.json_path is not None
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    evidence = json.loads(
+        (config.data_dir / payload["replay_evidence"]["path"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    candidate_tm_ids = {
+        item["tm_id"] for item in payload["signal_snapshots"]["candidates"]
+    }
+    assert (
+        component_requests,
+        payload["strategy_snapshot"]["parameters"]["candidate_pool_ids"],
+        evidence["query"]["component_pool_ids"],
+        candidate_tm_ids,
+        999 in candidate_tm_ids,
+    ) == (
+        [622466, 697199, 622482],
+        [622466, 697199, 622482],
+        [622466, 697199, 622482],
+        {1, 2, 3},
+        False,
+    )
+
+
+def test_cn_v16_candidate_rejects_reits_as_historical_asset() -> None:
+    item = candidate(
+        "180502",
+        tm_id=180502,
+        exchange="SZ",
+        asset="REITs",
+    )
+
+    decision = build_candidate_list(
+        [item],
+        held_symbols=set(),
+        market="CN",
+        strategy_version="v16",
+    )
+
+    assert decision.excluded["180502"] == ["a_share_only"]
+
+
+def test_cn_v17_reit_uses_same_entry_discipline_and_nominal_sizing() -> None:
+    allocation = current_nominal_allocation("CN")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN",
+        "cn-v17",
+        (622466, 697199, 622482),
+        allocation=allocation,
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=[
+            candidate(
+                "180502",
+                tm_id=180502,
+                exchange="SZ",
+                asset="REITs",
+                name="REIT 180502",
+                close="10",
+                amount="2",
+                market_cap="100",
+                temperature_prev="温",
+                temperature_curr="热",
+                global_strength="96",
+            ),
+            candidate(
+                "180503",
+                tm_id=180503,
+                exchange="SZ",
+                asset="REITs",
+                name="REIT 180503",
+                close="10",
+                amount="2",
+                market_cap="100",
+                temperature_prev="热",
+                temperature_curr="热",
+                global_strength="96",
+            ),
+        ],
+        holding_snapshots={},
+        bars_by_symbol={},
+        strategy_snapshot=strategy,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+        allocation_reference=allocation,
+        position_weight=Decimal("0.04"),
+    )
+
+    action = built.buy_actions[0]
+    assert (
+        strategy["strategy_version"],
+        action.symbol,
+        action.target_weight,
+        action.target_amount,
+        action.estimated_shares,
+        action.lot_size,
+        built.excluded["180503"],
+    ) == (
+        "v17",
+        "180502",
+        Decimal("0.04"),
+        Decimal("4000.00"),
+        400,
+        100,
+        ["temperature_transition_not_entry"],
+    )
+
+
+def test_cn_v17_reit_can_enter_cross_asset_rotation() -> None:
+    allocation = current_nominal_allocation("CN")
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN",
+        "cn-v17",
+        (622466, 697199, 622482),
+        allocation=allocation,
+    )
+    positions = tuple(
+        AccountPosition(
+            f"600{index:03d}",
+            f"股票600{index:03d}",
+            "stock",
+            Decimal("100"),
+            Decimal("10"),
+            Decimal("1000"),
+        )
+        for index in range(15)
+    )
+    holding_snapshots = {
+        position.symbol: holding(
+            position.symbol,
+            asset="A股",
+            strength="70",
+            global_strength="60",
+        )
+        for position in positions
+    }
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-07-14",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=positions,
+            exceptions=(),
+            position_count=15,
+        ),
+        candidates=(
+            candidate(
+                "180502",
+                tm_id=180502,
+                exchange="SZ",
+                asset="REITs",
+                strength="95",
+                global_strength="90",
+            ),
+        ),
+        holding_snapshots=holding_snapshots,
+        bars_by_symbol={position.symbol: bars() for position in positions},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    pair = payload["strategy_judgments"]["simulate_rotation_pairs"][0]
+
+    assert (
+        pair["sell_symbol"],
+        pair["buy_symbol"],
+        pair["strength_basis"],
+        Decimal(str(pair["strength_gap"])),
+        Decimal(str(pair["target_weight"])),
+        Decimal(str(pair["target_amount"])),
+        pair["estimated_shares"],
+    ) == (
+        "600000",
+        "180502",
+        "global",
+        Decimal("30"),
+        Decimal("0.04"),
+        Decimal("4000"),
+        400,
+    )
+
+
+def test_cn_runner_reports_reit_update_gap_at_deadline(tmp_path: Path) -> None:
+    class StaleReitApi(ReadyApi):
+        def get_update_status(self) -> list[dict[str, object]]:
+            return [
+                {"asset": "A股", "asOfDate": "2026-07-14"},
+                {"asset": "ETF基金", "asOfDate": "2026-07-14"},
+                {"asset": "REITs", "asOfDate": "2026-07-13"},
+            ]
+
+    config = trend_config(tmp_path)
+    now_values = iter(
+        (
+            datetime(2026, 7, 14, 17, 50, tzinfo=SHANGHAI),
+            datetime(2026, 7, 14, 19, 0, tzinfo=SHANGHAI),
+        )
+    )
+    sleeps: list[float] = []
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        now_fn=lambda: next(now_values),
+        sleep_fn=sleeps.append,
+        api_factory=lambda **_kwargs: StaleReitApi([]),
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+
+    assert (
+        result.status,
+        result.waiting_reason,
+        sleeps,
+        list((config.reports_dir / "trend_a_share").glob("*")),
+    ) == (
+        "failed",
+        "REITs 2026-07-13 → 2026-07-14",
+        [600],
+        [],
+    )

@@ -47,6 +47,9 @@ CN_V14_KELLY_IDENTITY: TrendKellyIdentity = (
 CN_V15_KELLY_IDENTITY: TrendKellyIdentity = (
     "CN", "trend_animals_warm_to_hot/CN/v15", "v15",
 )
+CN_V16_KELLY_IDENTITY: TrendKellyIdentity = (
+    "CN", "trend_animals_warm_to_hot/CN/v16", "v16",
+)
 US_V4_KELLY_IDENTITY: TrendKellyIdentity = (
     "US", "trend_animals_warm_to_hot/US/v4", "v4",
 )
@@ -106,6 +109,12 @@ HK_V12_KELLY_IDENTITY: TrendKellyIdentity = (
 )
 HK_V13_KELLY_IDENTITY: TrendKellyIdentity = (
     "HK", "trend_animals_warm_to_hot/HK/v13", "v13",
+)
+HK_V14_KELLY_IDENTITY: TrendKellyIdentity = (
+    "HK", "trend_animals_warm_to_hot/HK/v14", "v14",
+)
+US_V14_KELLY_IDENTITY: TrendKellyIdentity = (
+    "US", "trend_animals_warm_to_hot/US/v14", "v14",
 )
 TREND_KELLY_SAMPLE_IDENTITIES: dict[
     TrendKellyIdentity, frozenset[TrendKellyIdentity]
@@ -342,16 +351,55 @@ class TrendKellyState:
     selected_round_ids: tuple[str, ...]
 
 
+def _previous_trend_kelly_identity(
+    target_identity: TrendKellyIdentity,
+) -> TrendKellyIdentity | None:
+    market, strategy_id, version = target_identity
+    if (
+        not version.startswith("v")
+        or not version[1:].isdigit()
+        or strategy_id != f"trend_animals_warm_to_hot/{market}/{version}"
+    ):
+        return None
+    version_number = int(version[1:])
+    if version_number <= 1:
+        return None
+    previous_version = f"v{version_number - 1}"
+    return (
+        market,
+        f"trend_animals_warm_to_hot/{market}/{previous_version}",
+        previous_version,
+    )
+
+
+def trend_kelly_sample_identities(
+    target_identity: TrendKellyIdentity,
+) -> frozenset[TrendKellyIdentity]:
+    declared = TREND_KELLY_SAMPLE_IDENTITIES.get(target_identity)
+    if declared is not None:
+        return frozenset({*declared, target_identity})
+    previous = _previous_trend_kelly_identity(target_identity)
+    if previous is None:
+        return frozenset({target_identity})
+    declared_versions = [
+        int(identity[2][1:])
+        for identity in TREND_KELLY_SAMPLE_IDENTITIES
+        if identity[0] == target_identity[0]
+        and identity[2].startswith("v")
+        and identity[2][1:].isdigit()
+    ]
+    if not declared_versions or int(target_identity[2][1:]) <= max(declared_versions):
+        return frozenset({target_identity})
+    return frozenset(
+        {*trend_kelly_sample_identities(previous), target_identity}
+    )
+
+
 def trend_kelly_identity_matches(
     sample_identity: TrendKellyIdentity,
     target_identity: TrendKellyIdentity,
 ) -> bool:
-    if sample_identity == target_identity:
-        return True
-    inherited = TREND_KELLY_SAMPLE_IDENTITIES.get(target_identity)
-    if inherited is not None:
-        return sample_identity in inherited
-    return sample_identity == target_identity
+    return sample_identity in trend_kelly_sample_identities(target_identity)
 
 
 def load_trend_kelly_rounds(data_dir: Path) -> tuple[TrendKellyRound, ...]:

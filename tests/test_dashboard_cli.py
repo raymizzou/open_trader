@@ -27,7 +27,7 @@ def test_dashboard_parser_defaults() -> None:
     assert args.public_url == ""
 
 
-def test_dashboard_main_delegates_to_server(
+def test_dashboard_main_delegates_to_server_with_all_three_cn_candidate_pools(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -51,6 +51,7 @@ def test_dashboard_main_delegates_to_server(
         "OPEN_TRADER_TREND_EXECUTOR_HOST=ray-mac\n"
         "TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID=622466\n"
         "TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID=697199\n"
+        "TREND_ANIMALS_WARM_TO_HOT_REITS_TM_ID=622482\n"
         "TREND_ANIMALS_WARM_TO_HOT_US_TM_IDS=622460,705013\n"
         "TREND_ANIMALS_WARM_TO_HOT_HK_TM_IDS=622494,707617\n",
         encoding="utf-8",
@@ -95,12 +96,41 @@ def test_dashboard_main_delegates_to_server(
     assert config.futu_host == "192.0.2.10"
     assert config.futu_port == 22222
     assert config.trend_executor_host == "ray-mac"
-    assert config.trend_cn_candidate_pool_ids == (622466, 697199)
+    assert config.trend_cn_candidate_pool_ids == (622466, 697199, 622482)
     assert config.trend_us_candidate_pool_ids == (622460, 705013)
     assert config.trend_hk_candidate_pool_ids == (622494, 707617)
-    assert config.trend_candidate_pool_ids("CN") == (622466, 697199)
+    assert config.trend_candidate_pool_ids("CN") == (622466, 697199, 622482)
     assert config.trend_candidate_pool_ids("US") == (622460, 705013)
     assert config.trend_candidate_pool_ids("HK") == (622494, 707617)
+
+
+def test_dashboard_main_defaults_missing_reits_pool_to_official_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_serve_dashboard(
+        config: DashboardConfig,
+        *,
+        host: str,
+        port: int,
+        public_url: str,
+    ) -> None:
+        captured["config"] = config
+
+    monkeypatch.setattr(cli, "serve_dashboard", fake_serve_dashboard)
+    config_path = tmp_path / "dashboard.env"
+    config_path.write_text(
+        "TREND_ANIMALS_WARM_TO_HOT_A_SHARE_TM_ID=622466\n"
+        "TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID=697199\n",
+        encoding="utf-8",
+    )
+
+    assert cli.main(["dashboard", "--config", str(config_path)]) == 0
+    config = captured["config"]
+    assert isinstance(config, DashboardConfig)
+    assert config.trend_cn_candidate_pool_ids == (622466, 697199, 622482)
 
 
 def test_dashboard_help_includes_expected_options(

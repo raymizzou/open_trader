@@ -2818,9 +2818,14 @@ def main(argv: list[str] | None = None) -> int:
             trend_etf_tm_id = _optional_positive_tm_id(
                 config_values, "TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID"
             )
+            trend_reits_tm_id = _optional_positive_tm_id(
+                config_values,
+                "TREND_ANIMALS_WARM_TO_HOT_REITS_TM_ID",
+                default=622482,
+            )
             trend_cn_candidate_pool_ids = (
-                (trend_a_share_tm_id, trend_etf_tm_id)
-                if trend_a_share_tm_id and trend_etf_tm_id
+                (trend_a_share_tm_id, trend_etf_tm_id, trend_reits_tm_id)
+                if trend_a_share_tm_id and trend_etf_tm_id and trend_reits_tm_id
                 else ()
             )
             trend_us_candidate_pool_ids = _positive_tm_ids(

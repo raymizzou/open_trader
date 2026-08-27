@@ -104,6 +104,7 @@ class DailyPremarketConfig:
     trend_animals_api_key: str = ""
     trend_animals_a_share_tm_id: int = 0
     trend_animals_etf_tm_id: int = 0
+    trend_animals_reits_tm_id: int = 622482
     trend_animals_us_tm_ids: tuple[int, ...] = ()
     trend_animals_hk_tm_ids: tuple[int, ...] = ()
     trend_us_symbols: tuple[str, ...] = ()
@@ -227,6 +228,10 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         values,
         "TREND_ANIMALS_WARM_TO_HOT_ETF_TM_ID",
     )
+    trend_reits_tm_id = _optional_positive_tm_id(
+        values,
+        "TREND_ANIMALS_WARM_TO_HOT_REITS_TM_ID", default=622482,
+    )
     trend_us_tm_ids = _positive_tm_ids(
         values.get("TREND_ANIMALS_WARM_TO_HOT_US_TM_IDS", "")
     )
@@ -293,6 +298,7 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
         trend_animals_api_key=values.get("TREND_ANIMALS_API_KEY", ""),
         trend_animals_a_share_tm_id=trend_a_share_tm_id,
         trend_animals_etf_tm_id=trend_etf_tm_id,
+        trend_animals_reits_tm_id=trend_reits_tm_id,
         trend_animals_us_tm_ids=trend_us_tm_ids,
         trend_animals_hk_tm_ids=trend_hk_tm_ids,
         trend_us_symbols=_symbol_config(
@@ -308,8 +314,10 @@ def load_env_config(path: Path, *, dry_run: bool = False) -> DailyPremarketConfi
     )
 
 
-def _optional_positive_tm_id(values: dict[str, str], key: str) -> int:
-    raw = values.get(key, "0") or "0"
+def _optional_positive_tm_id(
+    values: dict[str, str], key: str, *, default: int = 0,
+) -> int:
+    raw = (values[key] or "0") if key in values else str(default)
     try:
         value = int(raw)
     except ValueError:

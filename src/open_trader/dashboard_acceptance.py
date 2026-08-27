@@ -44,6 +44,7 @@ from .trend_simulate_positions import (
 )
 from .trend_review import _protection_event_identity, _report_hash
 from .strategy_drawdown import (
+    ALLOCATION_PROJECTION_VERSIONS,
     is_allocation_v2_version,
     valid_strategy_parameter_audit_identity,
 )
@@ -745,9 +746,6 @@ def validate_integrated_candidate(
                 f"{broker} {market} 趋势报告不可用"
             )
             expected_version = str(report.get("strategy_version") or "")
-            assert expected_version in TREND_ACCEPTED_STRATEGY_VERSIONS[market], (
-                f"{broker} 趋势策略版本不在兼容白名单"
-            )
             assert report.get("broker") == broker and report.get("market") == market, (
                 f"{broker} 三市场报告身份不匹配"
             )
@@ -771,6 +769,15 @@ def validate_integrated_candidate(
             assert valid_frozen_report_contract(frozen), (
                 f"{broker} 冻结报告契约无效"
             )
+            allocation = frozen.get("allocation")
+            if isinstance(allocation, Mapping):
+                assert expected_version == ALLOCATION_PROJECTION_VERSIONS[market], (
+                    f"{broker} 实盘趋势策略版本不是当前版本"
+                )
+            else:
+                assert expected_version in TREND_ACCEPTED_STRATEGY_VERSIONS[market], (
+                    f"{broker} 历史趋势策略版本不在兼容白名单"
+                )
             assert report.get("report_sha256") == _report_hash(frozen), (
                 f"{broker} 报告哈希与冻结产物不一致"
             )

@@ -46,11 +46,6 @@ from open_trader.trend_allocation import build_allocation_snapshot
 MISSING_FRESH = object()
 
 
-def test_dashboard_acceptance_allows_current_market_versions() -> None:
-    for market, version in ALLOCATION_PROJECTION_VERSIONS.items():
-        assert version in dashboard_acceptance.TREND_ACCEPTED_STRATEGY_VERSIONS[market]
-
-
 @pytest.mark.parametrize(
     ("market", "version"),
     [("CN", "v16"), ("HK", "v14"), ("US", "v14")],
@@ -2484,6 +2479,56 @@ def test_acceptance_validates_current_live_strategy_versions(
         reports_dir=reports_dir,
         account_ids=account_ids,
     ) == []
+
+
+def test_live_acceptance_uses_canonical_current_version_without_whitelist(
+    tmp_path: Path,
+) -> None:
+    from open_trader.trend_review import _report_hash
+
+    payload, reports_dir, account_ids = integrated_v4_payload(
+        tmp_path, current_live_versions=True
+    )
+    current_errors = dashboard_acceptance.validate_integrated_candidate(
+        payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+
+    stale_payload = copy.deepcopy(payload)
+    stale_report = stale_payload["trend_reports"]["eastmoney"]  # type: ignore[index]
+    assert isinstance(stale_report, dict)
+    artifact = reports_dir / "trend_a_share" / stale_report["artifact"]
+    frozen = json.loads(artifact.read_text(encoding="utf-8"))
+    stale_snapshot = dict(frozen["strategy_snapshot"])
+    stale_snapshot.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+    })
+    frozen["strategy_snapshot"] = stale_snapshot
+    bootstrap = frozen["drawdown_summary"]["bootstrap_event"]
+    bootstrap.update({
+        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+        "strategy_version": "v16",
+        "parameter_hash": strategy_parameter_hash(stale_snapshot["parameters"]),
+    })
+    artifact.write_text(json.dumps(frozen), encoding="utf-8")
+    stale_report.update({
+        "strategy_version": "v16",
+        "report_sha256": _report_hash(frozen),
+        "drawdown_summary": frozen["drawdown_summary"],
+    })
+    stale_errors = dashboard_acceptance.validate_integrated_candidate(
+        stale_payload,
+        expected_root=tmp_path,
+        expected_sha="candidate-sha",
+        reports_dir=reports_dir,
+        account_ids=account_ids,
+    )
+
+    assert (current_errors, bool(stale_errors)) == ([], True)
 
 
 @pytest.mark.parametrize(

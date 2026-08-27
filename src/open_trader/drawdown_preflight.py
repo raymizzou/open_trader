@@ -29,34 +29,6 @@ MARKET_TIMEZONES = {
     "HK": ZoneInfo("Asia/Hong_Kong"),
     "US": ZoneInfo("America/New_York"),
 }
-APPROVED_DRAWDOWN_PREDECESSORS = {
-    ("CN", "v9"): ("trend_animals_warm_to_hot/CN/v8", "v8"),
-    ("CN", "v10"): ("trend_animals_warm_to_hot/CN/v9", "v9"),
-    ("CN", "v11"): ("trend_animals_warm_to_hot/CN/v10", "v10"),
-    ("CN", "v12"): ("trend_animals_warm_to_hot/CN/v11", "v11"),
-    ("CN", "v13"): ("trend_animals_warm_to_hot/CN/v12", "v12"),
-    ("CN", "v14"): ("trend_animals_warm_to_hot/CN/v13", "v13"),
-    ("CN", "v15"): ("trend_animals_warm_to_hot/CN/v14", "v14"),
-    ("CN", "v16"): ("trend_animals_warm_to_hot/CN/v15", "v15"),
-    ("US", "v6"): ("trend_animals_warm_to_hot/US/v5", "v5"),
-    ("US", "v7"): ("trend_animals_warm_to_hot/US/v6", "v6"),
-    ("US", "v8"): ("trend_animals_warm_to_hot/US/v7", "v7"),
-    ("US", "v9"): ("trend_animals_warm_to_hot/US/v8", "v8"),
-    ("US", "v10"): ("trend_animals_warm_to_hot/US/v9", "v9"),
-    ("US", "v11"): ("trend_animals_warm_to_hot/US/v10", "v10"),
-    ("US", "v12"): ("trend_animals_warm_to_hot/US/v11", "v11"),
-    ("US", "v13"): ("trend_animals_warm_to_hot/US/v12", "v12"),
-    ("US", "v14"): ("trend_animals_warm_to_hot/US/v13", "v13"),
-    ("HK", "v6"): ("trend_animals_warm_to_hot/HK/v5", "v5"),
-    ("HK", "v7"): ("trend_animals_warm_to_hot/HK/v6", "v6"),
-    ("HK", "v8"): ("trend_animals_warm_to_hot/HK/v7", "v7"),
-    ("HK", "v9"): ("trend_animals_warm_to_hot/HK/v8", "v8"),
-    ("HK", "v10"): ("trend_animals_warm_to_hot/HK/v9", "v9"),
-    ("HK", "v11"): ("trend_animals_warm_to_hot/HK/v10", "v10"),
-    ("HK", "v12"): ("trend_animals_warm_to_hot/HK/v11", "v11"),
-    ("HK", "v13"): ("trend_animals_warm_to_hot/HK/v12", "v12"),
-    ("HK", "v14"): ("trend_animals_warm_to_hot/HK/v13", "v13"),
-}
 _DRAWDOWN_FAILURE_LABELS = {
     "baseline_unavailable": "历史基线不可用",
     "parameter_mismatch": "策略参数与已登记版本不一致",
@@ -190,6 +162,37 @@ def load_frozen_baseline(
     return FrozenBaselineLookup(status="missing")
 
 
+def _latest_market_predecessor(
+    data_dir: Path, market: str,
+) -> tuple[str, str] | None:
+    path = data_dir / "trend_drawdown" / "state.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    records = payload.get("records") if isinstance(payload, Mapping) else None
+    candidates = [
+        record
+        for record in records or ()
+        if isinstance(record, Mapping)
+        and str(record.get("market") or "").upper() == market
+    ]
+    if not candidates:
+        return None
+    latest = max(
+        candidates,
+        key=lambda record: (
+            str(record.get("updated_at") or ""),
+            str(record.get("strategy_version") or ""),
+        ),
+    )
+    strategy_id = str(latest.get("strategy_id") or "")
+    strategy_version = str(latest.get("strategy_version") or "")
+    if not strategy_id or not strategy_version:
+        return None
+    return strategy_id, strategy_version
+
+
 def run_drawdown_preflight(
     *,
     data_dir: Path,
@@ -257,13 +260,15 @@ def run_drawdown_preflight(
             if first_activation or not any(row[0] == market for row in existing_keys)
             else "new_strategy_version"
         )
-        approved_predecessor = (
-            reason == "new_strategy_version"
-            and (market, strategy_version) in APPROVED_DRAWDOWN_PREDECESSORS
+        predecessor = (
+            _latest_market_predecessor(data_dir, market)
+            if reason == "new_strategy_version"
+            else None
         )
+        approved_predecessor = predecessor is not None
         if not was_present and (
             item.source_date is None or item.entry_eligible_from is None
-        ):
+        ) and not (item.baseline_equity is None and predecessor is None):
             results.append({
                 "market": market,
                 "status": "failed",
@@ -277,6 +282,14 @@ def run_drawdown_preflight(
             and baseline_equity is None
             and not approved_predecessor
         ):
+            if item.source_date is None or item.entry_eligible_from is None:
+                results.append({
+                    "market": market,
+                    "status": "skipped",
+                    "reason": "baseline_missing",
+                    "source_date": item.source_date,
+                })
+                continue
             assert item.source_date is not None
             baseline = load_frozen_baseline(
                 reports_dir,
@@ -317,11 +330,7 @@ def run_drawdown_preflight(
                 reason=reason,
                 entry_eligible_from=item.entry_eligible_from,
                 entry_date=_market_date(market, occurred_at),
-                inherit_from=(
-                    APPROVED_DRAWDOWN_PREDECESSORS.get((market, strategy_version))
-                    if reason == "new_strategy_version"
-                    else None
-                ),
+                inherit_from=predecessor,
             )
         except (OSError, ValueError) as exc:
             error = str(exc)

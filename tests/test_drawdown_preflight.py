@@ -304,62 +304,96 @@ def test_current_nominal_versions_use_explicit_predecessor_drawdown_transition(
     }
 
 
-def test_missing_approved_predecessor_fails_closed_without_writing_state(
+def test_bugfix_upgrade_inherits_latest_market_drawdown_without_version_table(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / "data"
+    parameters = {"drawdown_limit": "0.05", "market": "CN"}
     automatic_bootstrap_strategy_drawdown(
         data_dir,
         market="CN",
-        strategy_id="trend_animals_warm_to_hot/CN/v8",
-        strategy_version="v8",
-        parameters={"drawdown_limit": "0.05", "market": "CN"},
+        strategy_id="trend_animals_warm_to_hot/CN/v16",
+        strategy_version="v16",
+        parameters=parameters,
         baseline_equity=Decimal("100"),
-        source_date="2026-07-17",
+        source_date="2026-08-20",
         accepted_git_sha="a" * 40,
         actor="acceptance",
-        occurred_at="2026-07-18T08:00:00+08:00",
+        occurred_at="2026-08-20T08:00:00+08:00",
         reason="first_activation",
-        entry_eligible_from="2026-07-20",
+        entry_eligible_from="2026-08-21",
     )
-    state_path = data_dir / "trend_drawdown/state.json"
-    before = state_path.read_bytes()
+    observe_strategy_equity(
+        data_dir,
+        market="CN",
+        strategy_id="trend_animals_warm_to_hot/CN/v16",
+        strategy_version="v16",
+        current_equity=Decimal("94"),
+        observed_at="2026-08-20T17:00:00+08:00",
+    )
 
-    target = replace(
-        market_input("CN"),
-        baseline_equity=None,
-        strategy_snapshot={
-            "strategy_id": "trend_animals_warm_to_hot/CN/v10",
-            "strategy_version": "v10",
-            "parameters": {"drawdown_limit": "0.05", "market": "CN"},
-        },
-    )
-    notifier = RecordingNotifier()
     result = run_preflight(
         tmp_path,
-        {"CN": target},
-        notifier=notifier,
+        {
+            "CN": replace(
+                market_input("CN"),
+                baseline_equity=None,
+                strategy_snapshot={
+                    "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+                    "strategy_version": "v17",
+                    "parameters": parameters,
+                },
+            ),
+        },
+    )
+    state = json.loads(
+        (data_dir / "trend_drawdown/state.json").read_text(encoding="utf-8")
+    )
+    target = next(
+        record
+        for record in state["records"]
+        if record["strategy_version"] == "v17"
     )
 
-    assert result["status"] == "failed"
-    assert result["markets"][0]["status"] == "failed"
     assert (
-        "approved predecessor drawdown state is unavailable"
-        in result["markets"][0]["error"]
+        result["status"],
+        result["markets"][0]["status"],
+        result["markets"][0]["high_water_mark"],
+        result["markets"][0]["entry_allowed"],
+        target["current_equity"],
+        target["paused"],
+    ) == ("ready", "bootstrapped", "100", False, "94", True)
+
+
+def test_missing_previous_drawdown_does_not_block_bugfix_upgrade(
+    tmp_path: Path,
+) -> None:
+    result = run_preflight(
+        tmp_path,
+        {
+            "CN": replace(
+                market_input("CN"),
+                baseline_equity=None,
+                source_date=None,
+                entry_eligible_from=None,
+                strategy_snapshot={
+                    "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+                    "strategy_version": "v17",
+                    "parameters": {
+                        "drawdown_limit": "0.05",
+                        "market": "CN",
+                    },
+                },
+            ),
+        },
     )
-    assert state_path.read_bytes() == before
-    assert notifier.calls == [(
-        "【需处理｜系统｜累计回撤状态阻断】",
-        "\n".join([
-            "发生：累计回撤状态未通过部署预检",
-            "影响：CN v10 暂停新开仓；卖出和保护线继续运行",
-            "现在做：让 Codex 检查回撤预检并重新部署；不要手动解除限制",
-            "",
-            "明细：",
-            "- CN v10：回撤预检失败",
-        ]),
-    )]
-    assert "approved predecessor drawdown state is unavailable" not in notifier.calls[0][1]
+
+    assert (
+        result["status"],
+        result["markets"][0]["status"],
+        result["markets"][0]["reason"],
+        (tmp_path / "data/trend_drawdown/state.json").exists(),
+    ) == ("ready", "skipped", "baseline_missing", False)
 
 
 def test_first_activation_without_matching_baseline_is_skipped(

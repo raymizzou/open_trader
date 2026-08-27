@@ -269,6 +269,95 @@ def test_cn_v8_kelly_inherits_only_v4_v7_v8() -> None:
     assert state.selected_round_ids == ("round-001", "round-002", "round-003")
 
 
+def test_bugfix_version_inherits_previous_sample_generation_by_default() -> None:
+    previous = (
+        "CN",
+        "trend_animals_warm_to_hot/CN/v16",
+        "v16",
+    )
+    target = (
+        "CN",
+        "trend_animals_warm_to_hot/CN/v17",
+        "v17",
+    )
+    rounds = [
+        _round(
+            index,
+            "0.10",
+            market=previous[0],
+            strategy_id=previous[1],
+            version=previous[2],
+        )
+        for index in range(30)
+    ]
+    state = calculate_trend_kelly(
+        rounds,
+        market=target[0],
+        strategy_id=target[1],
+        opening_strategy_version=target[2],
+    )
+    snapshot = live_trend_strategy_snapshot(
+        "CN",
+        "abc123",
+        (622466, 697199, 622482),
+        strategy_version="v17",
+        allocation={
+            "daily_path": "data/trend_allocation/daily/2026-08-03.json",
+            "sha256": "b" * 64,
+            "snapshot": {
+                "version": 2,
+                "markets": {
+                    "CN": {
+                        "rank": 2,
+                        "score": "70",
+                        "score_source": "A股",
+                        "entry_weight": "0.04",
+                        "nominal_weight": "0.60",
+                        "position_limit": 15,
+                    },
+                },
+            },
+        },
+    )
+    declared = {
+        (
+            item["market"],
+            item["strategy_id"],
+            item["opening_strategy_version"],
+        )
+        for item in snapshot["parameters"]["kelly_sample_inherits"]
+    }
+
+    assert (
+        state.phase,
+        state.eligible_sample_count,
+        state.selected_sample_count,
+        state.selected_round_ids,
+        trend_kelly_identity_matches(previous, target),
+        trend_kelly_identity_matches(target, previous),
+        declared,
+    ) == (
+        "active_all_samples",
+        30,
+        30,
+        tuple(f"round-{index:03d}" for index in range(30)),
+        True,
+        False,
+        {
+            ("CN", "trend_animals_warm_to_hot/CN/v4", "v4"),
+            ("CN", "trend_animals_warm_to_hot/CN/v7", "v7"),
+            ("CN", "trend_animals_warm_to_hot/CN/v8", "v8"),
+            ("CN", "trend_animals_warm_to_hot/CN/v9", "v9"),
+            ("CN", "trend_animals_warm_to_hot/CN/v10", "v10"),
+            ("CN", "trend_animals_warm_to_hot/CN/v11", "v11"),
+            ("CN", "trend_animals_warm_to_hot/CN/v14", "v14"),
+            ("CN", "trend_animals_warm_to_hot/CN/v15", "v15"),
+            previous,
+            target,
+        },
+    )
+
+
 @pytest.mark.parametrize(
     ("market", "pools"),
     [("US", (622460,)), ("HK", (622494,))],
@@ -356,17 +445,19 @@ def test_current_strategy_versions_use_exact_inherited_kelly_samples(
     )
 
 
-def test_current_nominal_versions_do_not_borrow_previous_kelly_samples() -> None:
-    observed: dict[str, tuple[int, int, str, bool]] = {}
+def test_current_nominal_versions_inherit_previous_kelly_samples_by_default() -> None:
+    observed: dict[str, tuple[int, int, str, bool, bool, bool]] = {}
     for market, current_version, predecessor_version in (
-        ("CN", "v16", "v15"),
+        ("CN", "v17", "v16"),
         ("HK", "v14", "v13"),
         ("US", "v14", "v13"),
     ):
         predecessor_id = (
             f"trend_animals_warm_to_hot/{market}/{predecessor_version}"
         )
+        predecessor = (market, predecessor_id, predecessor_version)
         current_id = f"trend_animals_warm_to_hot/{market}/{current_version}"
+        current = (market, current_id, current_version)
         state = calculate_trend_kelly(
             [
                 _round(
@@ -387,12 +478,14 @@ def test_current_nominal_versions_do_not_borrow_previous_kelly_samples() -> None
             state.selected_sample_count,
             state.phase,
             state.enabled,
+            trend_kelly_identity_matches(predecessor, current),
+            trend_kelly_identity_matches(current, predecessor),
         )
 
     assert observed == {
-        "CN": (0, 0, "cold_start", False),
-        "HK": (0, 0, "cold_start", False),
-        "US": (0, 0, "cold_start", False),
+        "CN": (30, 30, "active_all_samples", True, True, False),
+        "HK": (30, 30, "active_all_samples", True, True, False),
+        "US": (30, 30, "active_all_samples", True, True, False),
     }
 
 

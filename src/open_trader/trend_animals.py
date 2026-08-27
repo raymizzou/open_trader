@@ -21,7 +21,7 @@ from .futu_symbols import (
 BASE_URL = "https://www.trendtrader.cn/apiData/data"
 MAX_REQUEST_URL_LENGTH = 3_500
 SEARCH_ASSETS_BY_MARKET = {
-    "CN": frozenset({"A股", "ETF基金"}),
+    "CN": frozenset({"A股", "ETF基金", "REITs"}),
     "HK": frozenset({"港股", "香港ETF"}),
     "US": frozenset({"美股", "美国ETF"}),
 }

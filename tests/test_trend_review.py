@@ -311,7 +311,7 @@ def test_current_nominal_versions_preserve_allocation_v2_during_normalization() 
     allocation = _allocation_v2_ref()
     observed: dict[str, tuple[str, str, int]] = {}
     for market, expected_version, expected_limit in (
-        ("CN", "v16", 20),
+        ("CN", "v17", 20),
         ("HK", "v14", 15),
         ("US", "v14", 10),
     ):
@@ -328,7 +328,7 @@ def test_current_nominal_versions_preserve_allocation_v2_during_normalization() 
         )
 
     assert observed == {
-        "CN": ("v16", "trend_animals_warm_to_hot/CN/v16", 20),
+        "CN": ("v17", "trend_animals_warm_to_hot/CN/v17", 20),
         "HK": ("v14", "trend_animals_warm_to_hot/HK/v14", 15),
         "US": ("v14", "trend_animals_warm_to_hot/US/v14", 10),
     }
@@ -336,7 +336,7 @@ def test_current_nominal_versions_preserve_allocation_v2_during_normalization() 
 
 @pytest.mark.parametrize(
     ("market", "version"),
-    [("CN", "v16"), ("HK", "v14"), ("US", "v14")],
+    [("CN", "v17"), ("HK", "v14"), ("US", "v14")],
 )
 def test_current_nominal_versions_use_staged_rotation_without_top_level_allocation_version(
     market: str, version: str,
@@ -412,7 +412,7 @@ def test_v2_buy_completion_uses_unique_fills_and_floors_report_residual() -> Non
 @pytest.mark.parametrize(
     ("market", "version", "futu_code", "lot_size", "quantity", "price"),
     [
-        ("CN", "v16", "SH.600001", 100, 400, "1000"),
+        ("CN", "v17", "SH.600001", 100, 400, "1000"),
         ("HK", "v14", "HK.00001", 100, 400, "1000"),
         ("US", "v14", "US.AAPL", 1, 40, "10000"),
     ],
@@ -482,8 +482,8 @@ def test_current_nominal_markerless_open_executes_frozen_quantity_without_quote_
         "market": "CN",
     }
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
     }
     allocation = report.get("allocation")
     assert isinstance(allocation, dict)
@@ -547,8 +547,8 @@ def test_current_nominal_markerless_rotation_rejection_does_not_substitute(
         ],
     })
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
     }
     report["signal_snapshots"] = {
         "candidates": [
@@ -2047,7 +2047,7 @@ def v2_relative_rotation_report(
 @pytest.mark.parametrize(
     ("market", "version", "symbol", "futu_symbol"),
     [
-        ("CN", "v16", "600003", "SH.600003"),
+        ("CN", "v17", "600003", "SH.600003"),
         ("HK", "v14", "3033.HK", "HK.03033"),
         ("US", "v14", "NDAQ", "US.NDAQ"),
     ],
@@ -2132,8 +2132,8 @@ def test_current_buy_fifo_marks_rotation_overlap_as_replacement_without_cash_fil
         "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
     }
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
     }
     report["allocation"] = {"markets": {"CN": {"position_limit": 10}}}
     report["strategy_judgments"]["simulate_rotation_pairs"] = [
@@ -2193,8 +2193,8 @@ def test_current_nominal_fifo_keeps_formal_and_rotation_when_cash_is_insufficien
         "price_fx_to_account_currency": "1",
     }
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
     }
     report["strategy_judgments"]["simulate_rotation_pairs"] = [pair]
     report["allocation"] = {"markets": {"CN": {"position_limit": 10}}}
@@ -2256,8 +2256,8 @@ def test_current_nominal_fifo_ignores_cash_facts_but_rejects_malformed_sizing(
         "price_fx_to_account_currency": "1",
     }
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
     }
     report["allocation"] = {"markets": {"CN": {"position_limit": 10}}}
     action = report["strategy_judgments"]["formal_actions"][0]
@@ -2430,8 +2430,8 @@ def test_current_nominal_fifo_excludes_missing_executable_formal_buy(
         "price_fx_to_account_currency": "1",
     }
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
     }
     report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
 
@@ -2466,8 +2466,8 @@ def test_current_nominal_fifo_uses_paired_sale_proceeds_for_automatic_rotation(
         "positions": [{"symbol": "WEAK", "market_value": "1003"}],
     }
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
     }
     report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
 
@@ -2505,8 +2505,8 @@ def test_current_nominal_fifo_keeps_cash_insufficient_automatic_rotation(
         "positions": [{"symbol": "WEAK", "market_value": "1000"}],
     }
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
     }
     report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
 
@@ -2551,8 +2551,8 @@ def test_current_nominal_fifo_ignores_missing_cash_cost_facts(
         "price_fx_to_account_currency": "1",
     }
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
         "parameters": {"normal_cost_rate": "0.001"},
     }
     report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
@@ -2597,8 +2597,8 @@ def test_current_nominal_fifo_ignores_unavailable_cash_cost_facts(
         "price_fx_to_account_currency": "1",
     }
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
     }
     report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
 
@@ -2642,8 +2642,8 @@ def test_current_nominal_open_does_not_submit_missing_executable_buy(
         "price_fx_to_account_currency": "1",
     }
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
     }
     report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
     client = FakeTrendSimClient()
@@ -2700,8 +2700,8 @@ def test_current_nominal_fifo_excludes_non_executable_formal_buy(
         "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
     }
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
     }
     report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
 
@@ -2749,8 +2749,8 @@ def test_current_nominal_fifo_keeps_cash_insufficient_executable_buy(
         "price_fx_to_account_currency": "1",
     }
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
     }
     report["allocation"] = {
         "version": 2,
@@ -2793,8 +2793,8 @@ def test_current_nominal_fifo_excludes_malformed_executable_formal_buy(
         "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
     }
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
     }
     report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
 
@@ -2829,8 +2829,8 @@ def test_current_nominal_fifo_authorization_cannot_override_non_executable_buy(
         "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
     }
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
     }
     report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
     client = FakeTrendSimClient(cash="0")
@@ -2882,8 +2882,8 @@ def test_current_nominal_fifo_authorization_cannot_override_malformed_executable
         "symbol_mapping_schema": "open_trader.trend_symbol_mapping.v1",
     }
     report["strategy_snapshot"] = {
-        "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-        "strategy_version": "v16",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
     }
     report["allocation"] = {"markets": {"CN": {"position_limit": 20}}}
     client = FakeTrendSimClient(cash="0")
@@ -15169,40 +15169,118 @@ def test_projection_prefers_cn_v15_over_v14_history(
     assert projection["strategy_snapshot"]["strategy_version"] == "v15"
 
 
-def test_review_projection_prefers_current_cn_v16_strategy_facts(
+def test_review_projection_prefers_current_cn_v17_strategy_facts(
     tmp_path: Path,
 ) -> None:
-    v16 = live_trend_strategy_snapshot(
-        "CN", "test-sha", (), strategy_version="v16",
+    v17 = live_trend_strategy_snapshot(
+        "CN", "test-sha", (), strategy_version="v17",
         allocation=_allocation_v2_ref(),
     )
-    only_v16_root = tmp_path / "only-v16"
-    write_projection_strategy_facts(only_v16_root, "CN", [v16])
-    only_v16 = trend_review.build_trend_review_projection(only_v16_root, "CN")
+    only_v17_root = tmp_path / "only-v17"
+    write_projection_strategy_facts(only_v17_root, "CN", [v17])
+    only_v17 = trend_review.build_trend_review_projection(only_v17_root, "CN")
 
     v15 = live_trend_strategy_snapshot(
         "CN", "test-sha", (), strategy_version="v15",
         allocation=_allocation_v2_ref(),
     )
-    mixed_root = tmp_path / "v15-v16"
-    write_projection_strategy_facts(mixed_root, "CN", [v15, v16])
+    mixed_root = tmp_path / "v15-v17"
+    write_projection_strategy_facts(mixed_root, "CN", [v15, v17])
     mixed = trend_review.build_trend_review_projection(mixed_root, "CN")
 
     assert (
         {
-            "only_v16": {
-                "strategy_id": only_v16["strategy_snapshot"]["strategy_id"],
-                "strategy_version": only_v16["strategy_snapshot"]["strategy_version"],
+            "only_v17": {
+                "strategy_id": only_v17["strategy_snapshot"]["strategy_id"],
+                "strategy_version": only_v17["strategy_snapshot"]["strategy_version"],
             },
             "mixed": mixed["strategy_snapshot"]["strategy_version"],
         }
         == {
-            "only_v16": {
-                "strategy_id": "trend_animals_warm_to_hot/CN/v16",
-                "strategy_version": "v16",
+            "only_v17": {
+                "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+                "strategy_version": "v17",
             },
-            "mixed": "v16",
+            "mixed": "v17",
         }
+    )
+
+
+def test_cn_v17_review_reuses_v16_bugfix_sample_generation(
+    tmp_path: Path,
+) -> None:
+    snapshot = live_trend_strategy_snapshot(
+        "CN",
+        "test-sha",
+        (622466, 697199, 622482),
+        strategy_version="v17",
+        allocation=_allocation_v2_ref(),
+    )
+    start = date(2026, 7, 27)
+    for index in range(2):
+        trading_date = (start + timedelta(days=index)).isoformat()
+        trend_review.freeze_discipline_fact(
+            tmp_path,
+            "CN",
+            trading_date,
+            "100000",
+            [],
+            snapshot,
+        )
+        trend_review.freeze_benchmark_fact(
+            tmp_path,
+            "CN",
+            trading_date,
+            {
+                "date": trading_date,
+                "close": str(1000 + index),
+                "source_id": "CSI_500_PRICE",
+                "futu_symbol": "SH.000905",
+            },
+        )
+    rates = tmp_path / "rates/DGS3MO.csv"
+    rates.parent.mkdir(parents=True)
+    rates.write_text("DATE,DGS3MO\n2026-07-15,4.0\n", encoding="utf-8")
+    fills = [
+        projection_stats_fill(
+            f"V16-{index:02d}",
+            source="simulation",
+            broker="futu",
+            account_id="101",
+            market="CN",
+            strategy_version="v16",
+            side=side,
+            filled_at=(
+                f"2026-08-{1 + index // 10:02d}T"
+                f"{10 + index % 10:02d}:00:00+08:00"
+            ),
+        )
+        for index in range(30)
+        for side in ("buy", "sell")
+    ]
+    write_projection_stats(
+        tmp_path,
+        fills,
+        market="CN",
+        strategy_version="v17",
+        simulation_cutoff="2026-08-24T16:00:00+08:00",
+    )
+
+    projection = trend_review.build_trend_review_projection(tmp_path, "CN")
+    discipline = projection["sample_details"]["discipline"]
+
+    assert (
+        projection["strategy_snapshot"]["strategy_version"],
+        projection["sample_counts"]["discipline"],
+        discipline["available"],
+        discipline["eligible_sample_count"],
+        discipline["statistics_cutoff_at"],
+    ) == (
+        "v17",
+        30,
+        True,
+        30,
+        "2026-08-24T16:00:00+08:00",
     )
 
 

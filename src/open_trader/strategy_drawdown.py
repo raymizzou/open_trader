@@ -19,7 +19,11 @@ DRAWDOWN_LIMIT = Decimal("0.05")
 OVERHEAT_TRIM_COMPATIBILITY_REVISION = "trend_overheat_trim_v1"
 UNIFIED_TREND_V5_COMPATIBILITY_REVISION = "unified_trend_v5_v1"
 ALLOCATION_PROJECTION_COMPATIBILITY_REVISION = "allocation_projection_v1"
-ALLOCATION_PROJECTION_VERSIONS = {"CN": "v16", "HK": "v14", "US": "v14"}
+ALLOCATION_PROJECTION_VERSIONS = {"CN": "v17", "HK": "v14", "US": "v14"}
+# Nominal sizing and audit-only stop-risk behavior is a rollout compatibility
+# rule.  It is independent from the single current-version selector above so
+# historical reports keep the behavior they were generated with.
+NOMINAL_ALLOCATION_ROLLOUT_VERSIONS = {"CN": "v16", "HK": "v14", "US": "v14"}
 # Historical v2 reports remain frozen while current nominal reports start a
 # distinct strategy identity.
 ALLOCATION_V2_VERSION_SETS = {
@@ -30,8 +34,33 @@ ALLOCATION_V2_VERSION_SETS = {
 
 
 def is_allocation_v2_version(market: str, strategy_version: object) -> bool:
-    return str(strategy_version or "") in ALLOCATION_V2_VERSION_SETS.get(
-        str(market).upper(), ()
+    normalized_market = str(market).upper()
+    version = str(strategy_version or "")
+    return (
+        version in ALLOCATION_V2_VERSION_SETS.get(normalized_market, ())
+        or ALLOCATION_PROJECTION_VERSIONS.get(normalized_market) == version
+    )
+
+
+def uses_nominal_allocation_behavior(market: str, strategy_version: object) -> bool:
+    """Return whether a strategy version has nominal allocation semantics."""
+    normalized_market = str(market).upper()
+    threshold = NOMINAL_ALLOCATION_ROLLOUT_VERSIONS.get(normalized_market)
+    current = ALLOCATION_PROJECTION_VERSIONS.get(normalized_market)
+    version = str(strategy_version or "")
+    version_match = re.fullmatch(r"v([1-9][0-9]*)", version)
+    threshold_match = re.fullmatch(r"v([1-9][0-9]*)", str(threshold or ""))
+    current_match = re.fullmatch(r"v([1-9][0-9]*)", str(current or ""))
+    if (
+        version_match is None
+        or threshold_match is None
+        or current_match is None
+    ):
+        return False
+    return (
+        int(threshold_match.group(1))
+        <= int(version_match.group(1))
+        <= int(current_match.group(1))
     )
 
 

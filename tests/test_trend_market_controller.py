@@ -6905,7 +6905,7 @@ def test_current_controller_never_executes_legacy_strategy_report(
         all(
             legacy != current
             for legacy, current in {
-                "CN": ("v15", "v16"),
+                "CN": ("v15", "v17"),
                 "HK": ("v13", "v14"),
                 "US": ("v13", "v14"),
             }.values()
@@ -10525,7 +10525,7 @@ def test_current_nominal_report_without_top_level_allocation_version_uses_staged
     report = {
         "as_of_date": "2026-07-17",
         "allocation": {"markets": {"CN": {"position_limit": 20}}},
-        "strategy_snapshot": {"strategy_version": "v16"},
+        "strategy_snapshot": {"strategy_version": "v17"},
         "strategy_judgments": {
             "formal_actions": [{
                 "action": "BUY",
@@ -10607,7 +10607,7 @@ def test_current_nominal_report_without_top_level_allocation_version_uses_staged
 
 @pytest.mark.parametrize(
     ("market", "version", "broker"),
-    [("CN", "v16", "eastmoney"), ("HK", "v14", "phillips"), ("US", "v14", "futu")],
+    [("CN", "v17", "eastmoney"), ("HK", "v14", "phillips"), ("US", "v14", "futu")],
 )
 def test_current_nominal_report_without_top_level_version_requires_v2_plan_contract(
     tmp_path: Path,

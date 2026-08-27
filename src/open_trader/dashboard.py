@@ -27,6 +27,7 @@ from .a_share_trend import (
     TREND_API_COST_UNIT,
     live_trend_strategy_snapshot,
     trend_api_cost_label,
+    uses_nominal_allocation_behavior,
     valid_serialized_account,
     valid_frozen_report_contract,
     valid_v2_risk_contract,
@@ -1788,7 +1789,10 @@ def _is_current_final_plan_payload(payload: Mapping[str, object]) -> bool:
     version = str(
         snapshot.get("strategy_version") if isinstance(snapshot, Mapping) else ""
     )
-    return (market, version) in CURRENT_FINAL_PLAN_TREND_VERSIONS
+    return (
+        (market, version) in CURRENT_FINAL_PLAN_TREND_VERSIONS
+        or CURRENT_NOMINAL_ALLOCATION_VERSIONS.get(market) == version
+    )
 
 
 def _valid_current_candidate_signal(value: object) -> bool:
@@ -2224,8 +2228,10 @@ def _valid_current_trend_risk_contract(
     contract_summary = summary
     if (
         isinstance(snapshot, dict)
-        and str(snapshot.get("strategy_version") or "")
-        in {"v14", "v16"}
+        and uses_nominal_allocation_behavior(
+            str((payload.get("metadata") or {}).get("market") or "").upper(),
+            snapshot.get("strategy_version"),
+        )
         and summary.get("status_label") == STOP_RISK_AUDIT_ONLY_LABEL
     ):
         planned = _dashboard_risk_decimal(summary.get("portfolio_planned_risk"))
@@ -2403,9 +2409,7 @@ def _valid_v2_risk_items(
         else ""
     ).upper()
     metadata = payload.get("metadata")
-    current_nominal = (market, strategy_version) in {
-        ("CN", "v16"), ("HK", "v14"), ("US", "v14"),
-    }
+    current_nominal = uses_nominal_allocation_behavior(market, strategy_version)
     allocation = payload.get("allocation")
     explicit_v2 = (
         current_nominal
