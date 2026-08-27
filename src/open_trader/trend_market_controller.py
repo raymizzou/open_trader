@@ -4582,9 +4582,7 @@ def run_trend_market_controller(
 
     if revision:
         current_cycle = _derive_cycle(config, market, initial_now)
-        revision_cycle = _cycle_to_reconcile(
-            config, current_cycle, initial_now
-        )
+        revision_cycle = current_cycle
         _request_revision(config, revision_cycle, initial_now)
 
     lock_path = config.data_dir / "runs" / f".trend_market_controller.{market}.lock"
@@ -4632,7 +4630,6 @@ def run_trend_market_controller(
     benchmark_failures = 0
     benchmark_retry_after: datetime | None = None
     last_success: object = None
-    completed_execution_dates: set[str] = set()
     quote_client: object | None = None
     account_client: object | None = None
 
@@ -4847,6 +4844,17 @@ def run_trend_market_controller(
                     return status_payload
                 sleep_fn(5)
                 continue
+            if (
+                report_target is not None
+                and (
+                    report_target.cycle.as_of_date != cycle.as_of_date
+                    or report_target.cycle.execution_date != cycle.execution_date
+                )
+            ):
+                if future is not None:
+                    future.cancel()
+                future = None
+                report_target = None
             with suppress(OpenDIncidentStateError):
                 record_opend_health(config.data_dir, market, now)
             cycle_failures = 0
@@ -4874,15 +4882,6 @@ def run_trend_market_controller(
             work_cycle = report_target.cycle if report_target else cycle
             latest: tuple[Path, dict[str, object]] | None = None
             try:
-                if report_target is None:
-                    work_cycle = _cycle_to_reconcile(
-                        config,
-                        cycle,
-                        now,
-                        quote_client=shared_quote(),
-                        completed_execution_dates=completed_execution_dates,
-                        progress=reconciliation_progress,
-                    )
                 request, completion = _revision_state(
                     config,
                     market,

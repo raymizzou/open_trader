@@ -1305,7 +1305,6 @@ def test_controller_reuses_quote_and_account_clients_across_loops(
     write_report(config)
     quote_clients: list[object] = []
     account_clients: list[object] = []
-    reconciliation_progress_calls: list[None] = []
 
     class Quote:
         closed = False
@@ -1360,14 +1359,6 @@ def test_controller_reuses_quote_and_account_clients_across_loops(
         else pytest.fail("controller did not borrow its account client"),
     )
     monkeypatch.setattr(controller, "_run_protection_pass", protect)
-    def reconcile(*_args: object, **kwargs: object) -> ControllerCycle:
-        progress = kwargs.get("progress")
-        assert callable(progress)
-        progress()
-        reconciliation_progress_calls.append(None)
-        return active_cn_cycle()
-
-    monkeypatch.setattr(controller, "_cycle_to_reconcile", reconcile)
     monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
     monkeypatch.setattr(controller, "_close_completed", lambda *_args: True)
     monkeypatch.setattr(
@@ -1402,7 +1393,6 @@ def test_controller_reuses_quote_and_account_clients_across_loops(
     assert len(account_clients) == 1
     assert quote_clients[0].closed is True
     assert account_clients[0].closed is True
-    assert reconciliation_progress_calls == [None, None]
 
 
 def test_new_order_client_does_not_construct_trade_context_when_gate_fails(
@@ -2168,6 +2158,298 @@ def write_v2_controller_report(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report), encoding="utf-8")
     return path, report
+
+
+def test_current_cycle_ignores_unfinished_legacy_execution_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
+    )
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-07-19", "2026-07-20", "2026-07-21"]
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(controller, "FutuQuoteClient", Quote)
+    monkeypatch.setattr(
+        controller,
+        "_run_protection_pass",
+        lambda *_args, **_kwargs: protection_success(),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda *_args, **_kwargs: {"status": "completed"},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_long_term_benchmark",
+        lambda *_args, **_kwargs: {"status": "completed"},
+    )
+
+    def capture_close(
+        config: DailyPremarketConfig,
+        market: str,
+        trading_date: str,
+        **_kwargs: object,
+    ) -> None:
+        path = (
+            config.data_dir
+            / "trend_review"
+            / "daily"
+            / market
+            / f"{trading_date}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+        projection = config.data_dir / f"latest/trend_review_{market.lower()}.json"
+        projection.parent.mkdir(parents=True, exist_ok=True)
+        projection.write_text(
+            json.dumps({"schema_version": "open_trader.trend_review.projection.v5"}),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(controller, "_capture_close", capture_close)
+    _current_path, current_report = write_v2_controller_report(config)
+
+    legacy_path = config.reports_dir / "trend_a_share/2026-07-18.json"
+    legacy_report = valid_cn_report(
+        as_of_date="2026-07-18", execution_date="2026-07-19", buy=True
+    )
+    legacy_report["metadata"]["simulate_acc_id"] = 101  # type: ignore[index]
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(json.dumps(legacy_report), encoding="utf-8")
+    lock_trend_execution_batch(
+        config.data_dir,
+        market="CN",
+        execution_date="2026-07-19",
+        report_path=legacy_path,
+        report=legacy_report,
+        locked_at=NOW.isoformat(),
+    )
+    legacy_batch_path = (
+        config.data_dir
+        / "trend_review/ledgers/CN/batches/2026-07-19.json"
+    )
+    legacy_batch_bytes = legacy_batch_path.read_bytes()
+    current_report_bytes = (
+        json.dumps(
+            current_report,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode()
+    expected_sha = hashlib.sha256(current_report_bytes).hexdigest()
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW
+    )
+
+    last_success = result["last_success"]
+    assert isinstance(last_success, dict)
+    assert (
+        last_success["date"],
+        last_success["report_sha256"],
+    ) == ("2026-07-20", expected_sha)
+    assert (
+        config.data_dir / "trend_review/ledgers/CN/batches/2026-07-20.json"
+    ).exists()
+    assert list(
+        (
+            config.data_dir
+            / "trend_controller/CN/simulation_requests/completions/2026-07-20"
+        ).glob("*.json")
+    )
+    assert legacy_batch_path.read_bytes() == legacy_batch_bytes
+
+
+def test_current_cycle_failure_never_falls_back_to_legacy_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
+    )
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    buy = {
+        "action": "BUY",
+        "symbol": "600001",
+        "futu_symbol": "SH.600001",
+        "target_weight": "0.04",
+        "lot_size": 100,
+        "estimated_shares": 100,
+        "target_amount": "1000",
+        "atr": "0.5",
+    }
+    _current_path, current_report = write_v2_controller_report(
+        config, actions=[buy]
+    )
+
+    legacy_path = config.reports_dir / "trend_a_share/2026-07-18.json"
+    legacy_report = valid_cn_report(
+        as_of_date="2026-07-18", execution_date="2026-07-19", buy=True
+    )
+    legacy_report["metadata"]["simulate_acc_id"] = 101  # type: ignore[index]
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(json.dumps(legacy_report), encoding="utf-8")
+    lock_trend_execution_batch(
+        config.data_dir,
+        market="CN",
+        execution_date="2026-07-19",
+        report_path=legacy_path,
+        report=legacy_report,
+        locked_at=NOW.isoformat(),
+    )
+    legacy_batch_path = (
+        config.data_dir
+        / "trend_review/ledgers/CN/batches/2026-07-19.json"
+    )
+    legacy_batch_bytes = legacy_batch_path.read_bytes()
+    current_report_bytes = (
+        json.dumps(
+            current_report,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode()
+    expected_sha = hashlib.sha256(current_report_bytes).hexdigest()
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-07-19", "2026-07-20", "2026-07-21"]
+
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    class Account:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "cash": "100000",
+                "available_cash": "100000",
+                "positions": [],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": []}
+
+        def place_order(self, _request: dict[str, object]) -> dict[str, object]:
+            return {
+                "futu_order_id": "REJECTED",
+                "status": "REJECTED",
+                "order_status": "REJECTED",
+                "dealt_qty": "0",
+            }
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(controller, "FutuQuoteClient", Quote)
+    monkeypatch.setattr(controller, "FutuSimulateOrderExecutionClient", Account)
+    monkeypatch.setattr(
+        controller,
+        "_run_protection_pass",
+        lambda *_args, **_kwargs: protection_success(),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda *_args, **_kwargs: {"status": "completed"},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_long_term_benchmark",
+        lambda *_args, **_kwargs: {"status": "completed"},
+    )
+
+    def capture_close(
+        config: DailyPremarketConfig,
+        market: str,
+        trading_date: str,
+        **_kwargs: object,
+    ) -> None:
+        path = (
+            config.data_dir
+            / "trend_review"
+            / "daily"
+            / market
+            / f"{trading_date}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+        projection = (
+            config.data_dir
+            / f"latest/trend_review_{market.lower()}.json"
+        )
+        projection.parent.mkdir(parents=True, exist_ok=True)
+        projection.write_text(
+            json.dumps(
+                {"schema_version": "open_trader.trend_review.projection.v5"}
+            ),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(controller, "_capture_close", capture_close)
+
+    result = run_trend_market_controller(
+        config, "CN", once=True, now_fn=lambda: NOW
+    )
+
+    assert result["phase"] == "terminal_rejected"
+    assert result["blocker"] == "terminal_rejected"
+    last_success = result["last_success"]
+    assert isinstance(last_success, dict)
+    assert (
+        last_success["date"],
+        last_success["report_sha256"],
+    ) == ("2026-07-20", expected_sha)
+    current_action_events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (
+            config.data_dir / "trend_review/ledgers/CN/actions/2026-07-20"
+        ).glob("*/*.json")
+    ]
+    assert any(
+        event.get("reason") == "broker_order_no_progress"
+        for event in current_action_events
+    )
+    assert not (
+        config.data_dir / "trend_review/ledgers/CN/actions/2026-07-19"
+    ).exists()
+    assert legacy_batch_path.read_bytes() == legacy_batch_bytes
 
 
 def partial_sell_action(symbol: str = "600001") -> dict[str, object]:
@@ -4613,53 +4895,6 @@ def test_report_retry_keeps_statistics_bound_to_natural_cycle(
     assert statistics_cycles == [cycle]
 
 
-def test_historical_work_cycle_does_not_attempt_statistics(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = controller_config(tmp_path)
-    current = replace(
-        active_cn_cycle(),
-        as_of_date="2026-07-20",
-        execution_date="2026-07-21",
-        report_run_date="2026-07-20",
-    )
-    historical = active_cn_cycle()
-    patch_cycle(monkeypatch, current)
-    monkeypatch.setattr(
-        controller,
-        "_derive_cycle",
-        lambda *_args, **_kwargs: current,
-    )
-    monkeypatch.setattr(
-        controller,
-        "_cycle_to_reconcile",
-        lambda *_args, **_kwargs: historical,
-    )
-    monkeypatch.setattr(
-        controller,
-        "_run_cycle_statistics",
-        lambda *_args: pytest.fail("historical work cycle attempted statistics"),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        controller,
-        "_load_cycle_report",
-        lambda *_args: write_report(config),
-    )
-    monkeypatch.setattr(
-        controller,
-        "consume_accepted_statement_facts",
-        lambda **_kwargs: {"status": "waiting_for_promotion"},
-    )
-    monkeypatch.setattr(controller, "_execution_due", lambda *_args: False)
-
-    result = run_trend_market_controller(
-        config, "CN", once=True, now_fn=lambda: NOW
-    )
-
-    assert result["phase"] == "monitoring"
-
-
 def test_failed_statistics_due_does_not_run_during_report_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5376,32 +5611,41 @@ def test_close_review_recovery_completes_once_after_backoff(
     }
 
 
-def test_failed_report_keeps_same_logical_dates_after_cycle_advances(
+def test_failed_report_retry_uses_current_cycle_after_cycle_advances(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = controller_config(tmp_path)
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
-    patch_controller_quote(monkeypatch)
-    active = active_cn_cycle()
-    closed = ControllerCycle(
-        market="CN",
-        as_of_date="2026-07-20",
-        execution_date="2026-07-21",
-        report_run_date="2026-07-20",
-        session="closed",
-        market_open=False,
-        next_check_at=datetime.fromisoformat("2026-07-20T15:01:05+08:00"),
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return [
+                "2026-07-17",
+                "2026-07-20",
+                "2026-07-21",
+                "2026-07-22",
+            ]
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(controller, "FutuQuoteClient", Quote)
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda *_args, **_kwargs: {"status": "completed"},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_long_term_benchmark",
+        lambda *_args, **_kwargs: {"status": "completed"},
     )
     before_close = datetime.fromisoformat("2026-07-20T14:59:00+08:00")
     after_close = datetime.fromisoformat("2026-07-20T15:01:00+08:00")
     times = iter((before_close, before_close, after_close, after_close))
-    monkeypatch.setattr(
-        controller,
-        "_derive_cycle",
-        lambda _config, _market, now, **_kwargs: (
-            active if now < after_close else closed
-        ),
-    )
     calls: list[str] = []
     failed = threading.Event()
     retried = threading.Event()
@@ -5461,7 +5705,10 @@ def test_failed_report_keeps_same_logical_dates_after_cycle_advances(
             sleep_fn=advance,
         )
 
-    assert calls == ["2026-07-17", "2026-07-17"]
+    assert calls == ["2026-07-17", "2026-07-20"]
+    assert not (
+        config.data_dir / "trend_review/ledgers/CN/batches/2026-07-20.json"
+    ).exists()
 
 
 def test_frozen_delivery_failure_retries_delivery_without_rebuilding(
@@ -5683,47 +5930,6 @@ def test_controller_process_version_is_fixed_across_status_updates(
     assert load_trend_market_status(config, "CN", now=NOW)["git_sha"] == (
         "start-sha"
     )
-
-
-def test_final_cycle_status_does_not_regress_reconciliation_heartbeat(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = controller_config(tmp_path)
-    report = write_report(config)
-    patch_cycle(monkeypatch, active_cn_cycle())
-    delayed = NOW + timedelta(minutes=1)
-    times = iter((NOW, NOW, delayed, delayed))
-
-    def reconcile(
-        _config: DailyPremarketConfig,
-        cycle: ControllerCycle,
-        _now: datetime,
-        **kwargs: object,
-    ) -> ControllerCycle:
-        progress = kwargs.get("progress")
-        assert callable(progress)
-        progress()
-        return cycle
-
-    monkeypatch.setattr(controller, "_cycle_to_reconcile", reconcile)
-    monkeypatch.setattr(
-        controller, "_load_latest_valid_report", lambda *_args: report
-    )
-    monkeypatch.setattr(
-        controller,
-        "_execute_locked_report",
-        lambda *_args, **_kwargs: {"status": "unchanged", "submitted_count": 0},
-    )
-
-    result = run_trend_market_controller(
-        config,
-        "CN",
-        once=True,
-        now_fn=lambda: next(times),
-    )
-
-    assert result["phase"] == "monitoring"
-    assert result["heartbeat_at"] == delayed.isoformat(timespec="seconds")
 
 
 def test_heartbeat_refreshes_before_each_calendar_call(
@@ -6041,68 +6247,103 @@ def test_controller_directionless_abnormal_execution_uses_batch_failure(
     assert feishu == ["【需处理｜东方财富｜A股批次执行失败｜2026-07-20】"]
 
 
-def test_report_future_keeps_its_execution_date_when_cycle_advances(
+def test_report_future_crossing_cycle_never_executes_old_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = controller_config(tmp_path)
+    config = replace(
+        controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
+    )
     monkeypatch.setattr(socket, "gethostname", lambda: "executor")
-    patch_controller_quote(monkeypatch)
-    active = ControllerCycle(
-        **{
-            **active_cn_cycle().__dict__,
-            "session": "afternoon",
-        }
-    )
-    closed = ControllerCycle(
-        market="CN",
-        as_of_date="2026-07-20",
-        execution_date="2026-07-21",
-        report_run_date="2026-07-20",
-        session="closed",
-        market_open=False,
-        next_check_at=datetime.fromisoformat("2026-07-20T15:01:05+08:00"),
-    )
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return [
+                "2026-07-17",
+                "2026-07-20",
+                "2026-07-21",
+                "2026-07-22",
+            ]
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(controller, "FutuQuoteClient", Quote)
     before_close = datetime.fromisoformat("2026-07-20T14:59:00+08:00")
     after_close = datetime.fromisoformat("2026-07-20T15:01:00+08:00")
-    times = iter((before_close, before_close, after_close, after_close))
-    monkeypatch.setattr(
-        controller,
-        "_derive_cycle",
-        lambda _config, _market, now, **_kwargs: (
-            active if now < after_close else closed
-        ),
+    execution_open = datetime.fromisoformat("2026-07-21T09:31:00+08:00")
+    times = iter(
+        (before_close, before_close, after_close, execution_open, execution_open)
     )
     release = threading.Event()
-    generated = threading.Event()
-    reports: dict[str, tuple[Path, dict[str, object]]] = {}
+    current_started = threading.Event()
+    current_release = threading.Event()
+    old_generated = threading.Event()
+    current_generated = threading.Event()
+    runs: list[str] = []
 
-    def generate(*_args: object) -> None:
-        assert release.wait(timeout=1)
-        reports["2026-07-20"] = write_report(config, buy=True)
-        generated.set()
+    def write_generated_report(report_run_date: str) -> None:
+        execution_date = {
+            "2026-07-17": "2026-07-20",
+            "2026-07-20": "2026-07-21",
+        }[report_run_date]
+        report = valid_cn_report(
+            as_of_date=report_run_date,
+            execution_date=execution_date,
+        )
+        metadata = report["metadata"]
+        assert isinstance(metadata, dict)
+        metadata["simulate_acc_id"] = 101
+        path = (
+            config.reports_dir
+            / "trend_a_share"
+            / f"{report_run_date}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report), encoding="utf-8")
+
+    def generate(
+        _config: DailyPremarketConfig,
+        _market: str,
+        report_run_date: str,
+        _revision: object,
+    ) -> None:
+        runs.append(report_run_date)
+        if report_run_date == "2026-07-17":
+            assert release.wait(timeout=1)
+            write_generated_report(report_run_date)
+            old_generated.set()
+            return
+        current_started.set()
+        assert current_release.wait(timeout=1)
+        write_generated_report(report_run_date)
+        current_generated.set()
 
     monkeypatch.setattr(controller, "_generate_report", generate)
     monkeypatch.setattr(
         controller,
-        "_load_latest_valid_report",
-        lambda _config, _market, execution_date: reports.get(execution_date),
+        "_run_protection_pass",
+        lambda *_args, **_kwargs: protection_success(),
     )
-    monkeypatch.setattr(
-        controller, "_run_protection_pass", lambda *_args, **_kwargs: None
-    )
-    executed: list[str] = []
     monkeypatch.setattr(
         controller,
-        "_execute_locked_report",
-        lambda _config, _market, execution_date, _path, _report, **_kwargs: executed.append(
-            execution_date
-        )
-        or {"status": "missed_window", "submitted_count": 0},
+        "_run_cycle_statistics",
+        lambda *_args, **_kwargs: {"status": "completed"},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_long_term_benchmark",
+        lambda *_args, **_kwargs: {"status": "completed"},
     )
     monkeypatch.setattr(
         controller, "_capture_close", lambda *_args, **_kwargs: None
     )
     monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
+    current_batch_path = (
+        config.data_dir / "trend_review/ledgers/CN/batches/2026-07-21.json"
+    )
     sleeps = 0
 
     def advance(_seconds: float) -> None:
@@ -6110,8 +6351,17 @@ def test_report_future_keeps_its_execution_date_when_cycle_advances(
         sleeps += 1
         if sleeps == 1:
             release.set()
-            assert generated.wait(timeout=1)
+            assert old_generated.wait(timeout=1)
             return
+        if sleeps == 2:
+            assert current_started.wait(timeout=1)
+            return
+        if sleeps == 3:
+            assert not current_batch_path.exists()
+            current_release.set()
+            return
+        assert current_generated.wait(timeout=1)
+        assert current_batch_path.exists()
         raise RuntimeError("stop controller test")
 
     with pytest.raises(RuntimeError, match="stop controller test"):
@@ -6122,7 +6372,159 @@ def test_report_future_keeps_its_execution_date_when_cycle_advances(
             sleep_fn=advance,
         )
 
-    assert executed == ["2026-07-20"]
+    assert runs == ["2026-07-17", "2026-07-20"]
+    old_batch_path = (
+        config.data_dir / "trend_review/ledgers/CN/batches/2026-07-20.json"
+    )
+    assert not old_batch_path.exists()
+    assert not list(
+        (
+            config.data_dir
+            / "trend_controller/CN/simulation_requests/2026-07-20"
+        ).glob("*.json")
+    )
+    assert not list(
+        (
+            config.data_dir
+            / "trend_controller/CN/simulation_requests/completions/2026-07-20"
+        ).glob("*.json")
+    )
+    assert current_batch_path.exists()
+    assert list(
+        (
+            config.data_dir
+            / "trend_controller/CN/simulation_requests/2026-07-21"
+        ).glob("*.json")
+    )
+    assert list(
+        (
+            config.data_dir
+            / "trend_controller/CN/simulation_requests/completions/2026-07-21"
+        ).glob("*.json")
+    )
+
+
+def test_same_logical_cycle_keeps_inflight_report_when_next_check_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        controller_config(tmp_path), trend_review_cn_simulate_acc_id=101
+    )
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-07-17", "2026-07-20", "2026-07-21"]
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(controller, "FutuQuoteClient", Quote)
+    monkeypatch.setattr(
+        controller,
+        "_run_protection_pass",
+        lambda *_args, **_kwargs: protection_success(),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda *_args, **_kwargs: {"status": "completed"},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_long_term_benchmark",
+        lambda *_args, **_kwargs: {"status": "completed"},
+    )
+
+    def capture_close(
+        config: DailyPremarketConfig,
+        market: str,
+        trading_date: str,
+        **_kwargs: object,
+    ) -> None:
+        path = (
+            config.data_dir
+            / "trend_review"
+            / "daily"
+            / market
+            / f"{trading_date}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+        projection = config.data_dir / f"latest/trend_review_{market.lower()}.json"
+        projection.parent.mkdir(parents=True, exist_ok=True)
+        projection.write_text(
+            json.dumps({"schema_version": "open_trader.trend_review.projection.v5"}),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(controller, "_capture_close", capture_close)
+
+    first_check = datetime.fromisoformat("2026-07-20T09:31:00+08:00")
+    next_check = datetime.fromisoformat("2026-07-20T09:32:00+08:00")
+    times = iter((first_check, first_check, next_check, next_check))
+    release = threading.Event()
+    started = threading.Event()
+    generated = threading.Event()
+    runs: list[str] = []
+
+    def generate(
+        _config: DailyPremarketConfig,
+        _market: str,
+        report_run_date: str,
+        _revision: object,
+    ) -> None:
+        runs.append(report_run_date)
+        started.set()
+        assert release.wait(timeout=1)
+        report = valid_cn_report(
+            as_of_date="2026-07-17", execution_date="2026-07-20"
+        )
+        metadata = report["metadata"]
+        assert isinstance(metadata, dict)
+        metadata["simulate_acc_id"] = 101
+        path = config.reports_dir / "trend_a_share/2026-07-17.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report), encoding="utf-8")
+        generated.set()
+
+    monkeypatch.setattr(controller, "_generate_report", generate)
+    current_batch_path = (
+        config.data_dir / "trend_review/ledgers/CN/batches/2026-07-20.json"
+    )
+    sleeps = 0
+
+    def advance(_seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 1:
+            assert started.wait(timeout=1)
+            return
+        if sleeps == 2:
+            release.set()
+            return
+        assert generated.wait(timeout=1)
+        assert current_batch_path.exists()
+        assert list(
+            (
+                config.data_dir
+                / "trend_controller/CN/simulation_requests/completions/2026-07-20"
+            ).glob("*.json")
+        )
+        raise RuntimeError("stop controller test")
+
+    with pytest.raises(RuntimeError, match="stop controller test"):
+        run_trend_market_controller(
+            config,
+            "CN",
+            now_fn=lambda: next(times),
+            sleep_fn=advance,
+        )
+
+    assert runs == ["2026-07-17"]
 
 
 def test_later_revision_does_not_change_locked_batch(
@@ -6874,386 +7276,6 @@ def test_stable_closed_restart_records_successful_reconciliation(
     }
 
 
-def test_restart_after_close_recovers_unlocked_prior_execution_before_next_cycle(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = controller_config(tmp_path)
-    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
-    patch_controller_quote(monkeypatch)
-    prior = active_cn_cycle()
-    current = ControllerCycle(
-        market="CN",
-        as_of_date="2026-07-20",
-        execution_date="2026-07-21",
-        report_run_date="2026-07-20",
-        session="closed",
-        market_open=False,
-        next_check_at=datetime.fromisoformat("2026-07-20T15:01:05+08:00"),
-    )
-    monkeypatch.setattr(
-        controller,
-        "_derive_cycle",
-        lambda _config, _market, now, **_kwargs: prior
-        if now.astimezone().hour < 15
-        else current,
-    )
-    prior_path, prior_report = write_report(config, buy=True)
-    current_path = config.reports_dir / "trend_a_share/2026-07-20.json"
-    current_report = valid_cn_report(
-        as_of_date="2026-07-20", execution_date="2026-07-21"
-    )
-    current_path.write_text(json.dumps(current_report), encoding="utf-8")
-    loads: list[str] = []
-
-    def load(
-        _config: DailyPremarketConfig, _market: str, execution_date: str
-    ) -> tuple[Path, dict[str, object]]:
-        loads.append(execution_date)
-        return (
-            (prior_path, prior_report)
-            if execution_date == "2026-07-20"
-            else (current_path, current_report)
-        )
-
-    monkeypatch.setattr(controller, "_load_latest_valid_report", load)
-    monkeypatch.setattr(
-        controller, "_run_protection_pass", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(
-        controller, "_capture_close", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
-
-    def execute(
-        _config: DailyPremarketConfig,
-        market: str,
-        execution_date: str,
-        path: Path,
-        report: dict[str, object],
-        **_kwargs: object,
-    ) -> dict[str, object]:
-        lock_trend_execution_batch(
-            config.data_dir,
-            market=market,
-            execution_date=execution_date,
-            report_path=path,
-            report=report,
-            locked_at=NOW.isoformat(),
-        )
-        action_key = trend_action_key(
-            market,
-            execution_date,
-            to_futu_symbol(market, "600001"),
-            "buy",
-        )
-        event = (
-            config.data_dir
-            / "trend_review"
-            / "ledgers"
-            / market
-            / "actions"
-            / execution_date
-            / action_key
-            / "missed.json"
-        )
-        event.parent.mkdir(parents=True, exist_ok=True)
-        event.write_text(
-                json.dumps({
-                    "market": market,
-                    "date": execution_date,
-                    "strategy_version": report["strategy_snapshot"][
-                        "strategy_version"
-                    ],
-                    "report_sha256": _report_hash(report),
-                    "action_index": 0,
-                    "symbol": "600001",
-                "futu_code": to_futu_symbol(market, "600001"),
-                "side": "buy",
-                "status": "missed",
-                "reason": "buy_window_closed",
-                "recorded_at": NOW.isoformat(),
-            }),
-            encoding="utf-8",
-        )
-        return {"status": "missed_window", "submitted_count": 0}
-
-    monkeypatch.setattr(controller, "_execute_locked_report", execute)
-    after_close = datetime.fromisoformat("2026-07-20T15:01:00+08:00")
-
-    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: after_close)
-    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: after_close)
-
-    assert loads == ["2026-07-20", "2026-07-21"]
-
-
-def test_restart_after_batch_lock_reconciles_prior_until_missed_fact(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = controller_config(tmp_path)
-    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
-    patch_controller_quote(monkeypatch)
-    prior = active_cn_cycle()
-    current = ControllerCycle(
-        market="CN",
-        as_of_date="2026-07-20",
-        execution_date="2026-07-21",
-        report_run_date="2026-07-20",
-        session="closed",
-        market_open=False,
-        next_check_at=datetime.fromisoformat("2026-07-20T15:01:05+08:00"),
-    )
-    monkeypatch.setattr(
-        controller,
-        "_derive_cycle",
-        lambda _config, _market, now, **_kwargs: prior
-        if now.date().isoformat() == prior.execution_date
-        and now.hour < 15
-        else current,
-    )
-    prior_path, prior_report = write_report(config, buy=True)
-    lock_trend_execution_batch(
-        config.data_dir,
-        market="CN",
-        execution_date=prior.execution_date,
-        report_path=prior_path,
-        report=prior_report,
-        locked_at=NOW.isoformat(),
-    )
-    current_path = config.reports_dir / "trend_a_share/2026-07-20.json"
-    current_report = valid_cn_report(
-        as_of_date="2026-07-20", execution_date="2026-07-21"
-    )
-    current_path.write_text(json.dumps(current_report), encoding="utf-8")
-    loads: list[str] = []
-
-    def load(
-        _config: DailyPremarketConfig, _market: str, execution_date: str
-    ) -> tuple[Path, dict[str, object]]:
-        loads.append(execution_date)
-        return (
-            (prior_path, prior_report)
-            if execution_date == prior.execution_date
-            else (current_path, current_report)
-        )
-
-    def execute(
-        _config: DailyPremarketConfig,
-        _market: str,
-        execution_date: str,
-        _path: Path,
-        _report: dict[str, object],
-        **_kwargs: object,
-    ) -> dict[str, object]:
-        assert execution_date == prior.execution_date
-        action_key = trend_action_key(
-            "CN",
-            prior.execution_date,
-            to_futu_symbol("CN", "600001"),
-            "buy",
-        )
-        event = (
-            config.data_dir
-            / "trend_review/ledgers/CN/actions"
-            / prior.execution_date
-            / action_key
-            / "missed.json"
-        )
-        event.parent.mkdir(parents=True, exist_ok=True)
-        event.write_text(
-                json.dumps({
-                    "market": "CN",
-                    "date": prior.execution_date,
-                    "strategy_version": prior_report["strategy_snapshot"][
-                        "strategy_version"
-                    ],
-                    "report_sha256": _report_hash(prior_report),
-                    "action_index": 0,
-                    "symbol": "600001",
-                "futu_code": to_futu_symbol("CN", "600001"),
-                "side": "buy",
-                "status": "missed",
-                "reason": "buy_window_closed",
-                "recorded_at": NOW.isoformat(),
-            }),
-            encoding="utf-8",
-        )
-        return {"status": "missed_window", "submitted_count": 0}
-
-    monkeypatch.setattr(controller, "_load_latest_valid_report", load)
-    monkeypatch.setattr(controller, "_execute_locked_report", execute)
-    monkeypatch.setattr(
-        controller, "_run_protection_pass", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(
-        controller, "_capture_close", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
-    after_close = datetime.fromisoformat("2026-07-20T15:01:00+08:00")
-
-    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: after_close)
-    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: after_close)
-
-    assert loads == [prior.execution_date, current.execution_date]
-
-
-def test_next_morning_reconciles_unfinished_prior_batch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = controller_config(tmp_path)
-    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
-    patch_controller_quote(monkeypatch)
-    prior = active_cn_cycle()
-    current = ControllerCycle(
-        market="CN",
-        as_of_date="2026-07-20",
-        execution_date="2026-07-21",
-        report_run_date="2026-07-20",
-        session="premarket",
-        market_open=False,
-        next_check_at=datetime.fromisoformat("2026-07-21T09:00:05+08:00"),
-    )
-    monkeypatch.setattr(
-        controller,
-        "_derive_cycle",
-        lambda _config, _market, now, **_kwargs: prior
-        if now.date().isoformat() == prior.execution_date
-        else current,
-    )
-    report_path, report = write_report(config, buy=True)
-    lock_trend_execution_batch(
-        config.data_dir,
-        market="CN",
-        execution_date=prior.execution_date,
-        report_path=report_path,
-        report=report,
-        locked_at=NOW.isoformat(),
-    )
-    executed: list[str] = []
-    monkeypatch.setattr(
-        controller,
-        "_execute_locked_report",
-        lambda _config, _market, execution_date, _path, _report, **_kwargs: executed.append(
-            execution_date
-        )
-        or {"status": "missed_window", "submitted_count": 0},
-    )
-    monkeypatch.setattr(
-        controller, "_run_protection_pass", lambda *_args, **_kwargs: None
-    )
-    captured: list[str] = []
-
-    def capture(
-        _config: DailyPremarketConfig,
-        market: str,
-        trading_date: str,
-        **_kwargs: object,
-    ) -> None:
-        captured.append(trading_date)
-        path = (
-            config.data_dir
-            / "trend_review"
-            / "daily"
-            / market
-            / f"{trading_date}.json"
-        )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}", encoding="utf-8")
-
-    monkeypatch.setattr(controller, "_capture_close", capture)
-    monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
-    next_morning = datetime.fromisoformat("2026-07-21T09:00:00+08:00")
-
-    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: next_morning)
-
-    assert executed == [prior.execution_date]
-    assert captured == []
-
-
-def test_weekend_reconciles_unfinished_prior_batch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = controller_config(tmp_path)
-    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
-    patch_controller_quote(monkeypatch)
-    prior = ControllerCycle(
-        market="CN",
-        as_of_date="2026-07-16",
-        execution_date="2026-07-17",
-        report_run_date="2026-07-16",
-        session="morning",
-        market_open=True,
-        next_check_at=datetime.fromisoformat("2026-07-17T09:31:05+08:00"),
-    )
-    current = ControllerCycle(
-        market="CN",
-        as_of_date="2026-07-17",
-        execution_date="2026-07-20",
-        report_run_date="2026-07-17",
-        session="holiday",
-        market_open=False,
-        next_check_at=datetime.fromisoformat("2026-07-18T09:00:05+08:00"),
-    )
-    monkeypatch.setattr(
-        controller,
-        "_derive_cycle",
-        lambda _config, _market, now, **_kwargs: prior
-        if now.date().isoformat() == prior.execution_date
-        else current,
-    )
-    report_path = config.reports_dir / "trend_a_share/2026-07-16.json"
-    report_path.parent.mkdir(parents=True)
-    report = valid_cn_report(
-        as_of_date=prior.as_of_date,
-        execution_date=prior.execution_date,
-        buy=True,
-    )
-    report_path.write_text(json.dumps(report), encoding="utf-8")
-    lock_trend_execution_batch(
-        config.data_dir,
-        market="CN",
-        execution_date=prior.execution_date,
-        report_path=report_path,
-        report=report,
-        locked_at=NOW.isoformat(),
-    )
-    executed: list[str] = []
-    monkeypatch.setattr(
-        controller,
-        "_execute_locked_report",
-        lambda _config, _market, execution_date, _path, _report, **_kwargs: executed.append(
-            execution_date
-        )
-        or {"status": "missed_window", "submitted_count": 0},
-    )
-    captured: list[str] = []
-
-    def capture(
-        _config: DailyPremarketConfig,
-        market: str,
-        trading_date: str,
-        **_kwargs: object,
-    ) -> None:
-        captured.append(trading_date)
-        path = (
-            config.data_dir
-            / "trend_review"
-            / "daily"
-            / market
-            / f"{trading_date}.json"
-        )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}", encoding="utf-8")
-
-    monkeypatch.setattr(controller, "_capture_close", capture)
-    monkeypatch.setattr(controller, "_notify_once", lambda *_args: True)
-    weekend = datetime.fromisoformat("2026-07-18T09:00:00+08:00")
-
-    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: weekend)
-
-    assert executed == [prior.execution_date]
-    assert captured == []
-
-
 def test_buy_without_terminal_event_remains_incomplete(
     tmp_path: Path,
 ) -> None:
@@ -7904,130 +7926,6 @@ def test_legacy_cutover_is_immutable_and_validates_operator_fields(
                 reason=str(changed.get("reason", "historical evidence unavailable")),
                 authorized_at=changed.get("authorized_at", other_at),
             )
-
-
-def test_revision_targets_invalid_historical_cycle_then_recovers_next_revision(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = controller_config(tmp_path)
-    patch_controller_quote(monkeypatch)
-    historical = active_cn_cycle()
-    current = ControllerCycle(
-        market="CN",
-        as_of_date="2026-07-20",
-        execution_date="2026-07-21",
-        report_run_date="2026-07-20",
-        session="morning",
-        market_open=True,
-        next_check_at=NOW + timedelta(seconds=5),
-    )
-    invalid_path, invalid = write_report(config, revision=2)
-    invalid["schema_version"] = 999
-    invalid_path.write_text(json.dumps(invalid), encoding="utf-8")
-    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
-    monkeypatch.setattr(
-        controller, "_derive_cycle", lambda *_args, **_kwargs: current
-    )
-    monkeypatch.setattr(
-        controller,
-        "_run_protection_pass",
-        lambda *_args, **_kwargs: protection_success(),
-    )
-
-    blocked = run_trend_market_controller(
-        config, "CN", once=True, now_fn=lambda: NOW
-    )
-    assert blocked["phase"] == "blocked"
-    assert "run --revision" in str(blocked["blocker"])
-
-    controller_lock = config.data_dir / "runs/.trend_market_controller.CN.lock"
-    with RunLock(controller_lock):
-        requested = run_trend_market_controller(
-            config, "CN", revision=True, once=True, now_fn=lambda: NOW
-        )
-
-    historical_request, historical_completion = controller._revision_paths(
-        config, historical.market, historical.as_of_date
-    )
-    current_request, _ = controller._revision_paths(
-        config, current.market, current.as_of_date
-    )
-    request = json.loads(historical_request.read_text(encoding="utf-8"))
-    assert requested["phase"] == "revision_requested"
-    assert request["execution_date"] == historical.execution_date
-    assert request["baseline_report_path"] == str(invalid_path)
-    assert request["baseline_revision"] == 2
-    assert not current_request.exists()
-
-    generated: list[tuple[str, bool]] = []
-    generated_ready = threading.Event()
-
-    def generate(
-        _config: DailyPremarketConfig,
-        _market: str,
-        run_date: str,
-        revision: bool,
-    ) -> None:
-        generated.append((run_date, revision))
-        r3_path, r3 = write_report(config, revision=3)
-        write_report_delivery_receipt(config, r3_path, r3, status="sent")
-        generated_ready.set()
-
-    def capture_close(
-        _config: DailyPremarketConfig,
-        market: str,
-        trading_date: str,
-        **_kwargs: object,
-    ) -> None:
-        fact = controller._close_path(config, market, trading_date)
-        fact.parent.mkdir(parents=True, exist_ok=True)
-        fact.write_text("{}", encoding="utf-8")
-
-    monkeypatch.setattr(controller, "_generate_report", generate)
-    monkeypatch.setattr(controller, "_capture_close", capture_close)
-
-    def stop_after_reconcile(_seconds: float) -> None:
-        if historical_completion.exists():
-            raise RuntimeError("historical revision completed")
-        assert generated_ready.wait(timeout=1)
-
-    with pytest.raises(RuntimeError, match="historical revision completed"):
-        run_trend_market_controller(
-            config,
-            "CN",
-            once=False,
-            now_fn=lambda: NOW,
-            sleep_fn=stop_after_reconcile,
-        )
-
-    completion = json.loads(historical_completion.read_text(encoding="utf-8"))
-    completed_report = Path(str(completion["report_path"]))
-    assert generated == [(historical.report_run_date, True)]
-    assert completed_report.name == "2026-07-17-r3.json"
-    assert completion["request_sha256"] == hashlib.sha256(
-        historical_request.read_bytes()
-    ).hexdigest()
-    assert completion["report_sha256"] == _report_hash(
-        json.loads(completed_report.read_text(encoding="utf-8"))
-    )
-    batch_path = controller._batch_path(
-        config, historical.market, historical.execution_date
-    )
-    batch = json.loads(batch_path.read_text(encoding="utf-8"))
-    assert batch["report_path"] == str(completed_report)
-    assert batch["report_sha256"] == completion["report_sha256"]
-    assert not list(config.data_dir.glob("trend_review/ledgers/CN/actions/**/*.json"))
-    assert controller._execution_completed(config, historical) is True
-    selected = controller._cycle_to_reconcile(config, current, NOW)
-    assert (
-        selected.market,
-        selected.as_of_date,
-        selected.execution_date,
-    ) == (
-        current.market,
-        current.as_of_date,
-        current.execution_date,
-    )
 
 
 def test_explicit_revision_request_is_durable_while_controller_lock_is_held(
