@@ -6918,6 +6918,163 @@ def test_check_account_holdings_ignores_membership_warning_with_visible_rows() -
     assert page.selected_brokers == ["futu", "tiger", "phillips", "eastmoney"]
 
 
+def test_separated_current_report_allows_audit_only_stop_risk_label(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    payload, _reports_dir, _account_ids = integrated_v4_payload(
+        tmp_path, current_live_versions=True,
+    )
+
+    class Count:
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+        def count(self) -> int:
+            return self.value
+
+    class Clickable:
+        def click(self) -> None:
+            pass
+
+    class ReportRoot:
+        def __init__(self, page: "Page", broker: str) -> None:
+            self.page = page
+            self.broker = broker
+
+        def wait_for(self) -> None:
+            pass
+
+        def inner_text(self) -> str:
+            return self.page.report_texts[self.broker]
+
+        def locator(self, selector: str) -> Count:
+            assert selector == ".cn-trend-execution"
+            return Count(0)
+
+    class ReviewRoot:
+        def __init__(self, page: "Page", broker: str) -> None:
+            self.page = page
+            self.broker = broker
+
+        def wait_for(self) -> None:
+            pass
+
+        def count(self) -> int:
+            return 1
+
+        def inner_text(self) -> str:
+            review = self.page.reviews[self.broker]
+            return f"{review['market_label']}趋势复盘"
+
+    class ReviewDisclosure:
+        def __init__(self, page: "Page", broker: str) -> None:
+            self.page = page
+            self.broker = broker
+
+        def count(self) -> int:
+            return 1
+
+        def get_attribute(self, name: str) -> None:
+            assert name == "open"
+            return None
+
+        def locator(self, selector: str) -> object:
+            if selector == ":scope > summary":
+                return Clickable()
+            if selector == ".trend-review":
+                return ReviewRoot(self.page, self.broker)
+            raise AssertionError(f"unexpected disclosure selector: {selector}")
+
+    class Panel:
+        def __init__(self, page: "Page", broker: str) -> None:
+            self.page = page
+            self.broker = broker
+
+        def locator(self, selector: str) -> object:
+            if selector == ".cn-trend-report":
+                return ReportRoot(self.page, self.broker)
+            if selector == "details.trend-review-disclosure":
+                return ReviewDisclosure(self.page, self.broker)
+            raise AssertionError(f"unexpected panel selector: {selector}")
+
+    class ViewTab:
+        def __init__(self, page: "Page", broker: str, view: str) -> None:
+            self.page = page
+            self.broker = broker
+            self.view = view
+
+        def click(self) -> None:
+            self.page.account_views[self.broker] = self.view
+
+    class Section:
+        def __init__(self, page: "Page", broker: str) -> None:
+            self.page = page
+            self.broker = broker
+
+        def count(self) -> int:
+            return 1
+
+        def locator(self, selector: str) -> object:
+            if selector == f"#account-{self.broker}-view-panel":
+                return Panel(self.page, self.broker)
+            if selector == '[data-account-view="report"]':
+                return ViewTab(self.page, self.broker, "report")
+            if selector == '[data-account-view="real"]':
+                return ViewTab(self.page, self.broker, "real")
+            raise AssertionError(f"unexpected section selector: {selector}")
+
+    class BrokerTab:
+        def __init__(self, page: "Page", broker: str) -> None:
+            self.page = page
+            self.broker = broker
+
+        def count(self) -> int:
+            return 1
+
+        def click(self) -> None:
+            self.page.selected = self.broker
+
+        def get_attribute(self, name: str) -> str:
+            assert name == "aria-selected"
+            return str(self.page.selected == self.broker).lower()
+
+    class Page:
+        def __init__(self) -> None:
+            self.selected = ""
+            self.account_views = {
+                broker: "real" for broker in dashboard_acceptance.TREND_SIMULATE_MARKETS
+            }
+            self.reviews = payload["trend_reviews"]
+            self.report_texts = {
+                broker: trend_workspace_text(broker)
+                for broker in dashboard_acceptance.TREND_SIMULATE_MARKETS
+            }
+
+        def locator(self, selector: str) -> object:
+            match = re.fullmatch(r'#account-tabs \[data-broker="(\w+)"\]', selector)
+            if match:
+                return BrokerTab(self, match.group(1))
+            match = re.fullmatch(r"#account-(\w+):visible", selector)
+            if match:
+                assert self.selected == match.group(1)
+                return Section(self, match.group(1))
+            if selector == ".account-section:visible":
+                return Count(1)
+            raise AssertionError(f"unexpected page selector: {selector}")
+
+    monkeypatch.setattr(
+        dashboard_acceptance,
+        "_check_integrated_trend_ui",
+        lambda _report_root, _report, _broker: None,
+    )
+    page = Page()
+    page.report_texts["phillips"] += " 计划止损风险仅审计，不参与买入数量"
+
+    dashboard_acceptance._check_separated_trend_report_views(page, payload)
+
+    assert page.account_views["phillips"] == "real"
+
+
 @pytest.mark.parametrize(
     ("broker", "width", "count"),
     [

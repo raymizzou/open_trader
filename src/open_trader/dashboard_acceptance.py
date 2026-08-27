@@ -220,7 +220,7 @@ REMOVED_TREND_EXECUTION_LABELS = (
     "未完成", "早期版本已执行", "不足整手，未下单",
 )
 REMOVED_TREND_REPORT_POSITION_LABELS = (
-    "允许 · 建议", "计划止损风险", "正常成本", "决定性约束",
+    "允许 · 建议", "正常成本", "决定性约束",
     "模拟盘执行状态", "实盘执行辅助",
 )
 

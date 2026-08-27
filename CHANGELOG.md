@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-27
 
+- 修复 Dashboard 分离趋势报告验收误报：`计划止损风险仅审计，不参与买入数量` 现在允许展示，不再被误判为持仓或执行信息；其余禁用文案校验保持不变。验证：回归用例 RED 后 GREEN（`1 passed, 1 warning`），Dashboard 审计-only UI 回归 `1 passed`；`make test` `7460 passed, 3 skipped, 1 warning`（exit 0）。
 - 趋势当前报告修订现在从冻结事实刷新显式变更的 allocation，并同步替换 planning manifest 中的 content-addressed market component；当前 CN/HK/US 执行继续只取最新报告，Dashboard 风险校验按生成器的 Decimal 运算顺序计算。验证：控制器回归 `3 passed in 5.65s`，修订 manifest 聚焦 `5 passed in 0.92s`，legacy fixture 聚焦 `6 passed in 0.60s`；`make test` `7459 passed, 3 skipped, 1 warning in 714.02s`（exit 0）。
 - 趋势控制器现在只执行当前派生周期的最新有效 CN/HK/US 报告；历史报告与未完成历史批次仅供审计，不再执行、阻塞或回退；跨周期的在途报告生成结果会被丢弃，当前周期重新生成。验证：当前规则/客户端/修订聚焦 `5 passed`，legacy snapshot 聚焦 `6 passed`，全量 `make test` `7453 passed, 3 skipped, 1 warning`（exit 0）。
 - 关系审批路径（#98）：v2 目录持久层改为脏行落盘 + generation 快照增量编码（delta/1000 次锚点，仅成员变化时追加），激活校验改为增量——GROUP_BUDGET/可满足性按合约分量、#102 事件门按编译终态观察键分量、新增全局陈旧资本释放与估值单位守卫；facade 新增单事务批量 `approve_many`（逐条独立结果，条目冲突不中断），单条 `approve` 统一为一笔原子写事务；新增 `POST /api/prediction-arbitrage/relations/approve-batch`（confirm 必填、空 items 400、shadow 403 沿用）。#94 并发回归按新语义重写：并发较新版本不被陈旧审批回退的性质保留，合约不相交的陈旧候选现在合法激活。基准：10k 激活态单条 approve 中位 25.05ms（p95 39.5ms）、10k 条批量 5.34s（脚本 `scripts/benchmark_relation_activation.py`，阈值 50ms/60s 内）。验证：关系目录聚焦套件 155 passed；10k 规模正确性批量测试通过（批量 7.2s、只断言正确性）；增量/全量 oracle 一致性矩阵（500+ 步、含观察键与陈旧形状）全等；全量 `make test` 7447 passed、3 skipped（exit 0，worktree 环境补 gitignored `data/trend_review` 软链后）；acceptance/deploy/push 尚未运行。
