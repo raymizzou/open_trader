@@ -3253,7 +3253,7 @@ def _valid_v2_risk_items(
                 else "含最小一手额外风险"
             )
             or summary_new_risk <= 0
-            or evidenced_risk < overflow
+            or not current_nominal and evidenced_risk < overflow
         ):
             return False
     elif (

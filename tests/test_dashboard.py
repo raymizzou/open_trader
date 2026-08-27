@@ -4262,6 +4262,65 @@ def test_dashboard_loads_current_us_v14_report_with_fractional_atr_precision(
     ) == (True, "2026-07-15.json", "v14")
 
 
+def test_dashboard_loads_current_us_v14_when_existing_stop_risk_already_exceeds_audit_limit(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    reports_dir = config.reports_dir / "trend_us_futu"
+    reports_dir.mkdir(parents=True)
+    candidate = trend_module.CandidateInput(
+        tm_id=5,
+        symbol="AAPL",
+        exchange="US",
+        name="Apple",
+        asset="美股",
+        industry="Technology",
+        as_of_date="2026-07-14",
+        tradable=True,
+        amount=Decimal("2"),
+        right_side=True,
+        days=3,
+        strength=Decimal("96"),
+        danger=False,
+        close=Decimal("125"),
+        atr=Decimal("0.5"),
+        industry_tm_id=700001,
+        industry_temperature="热",
+        filter_price=Decimal("125"),
+        market_cap=Decimal("100"),
+        temperature_prev="温",
+        temperature_curr="热",
+        phase="立夏",
+        global_strength=Decimal("70"),
+    )
+    payload = _current_nominal_dashboard_payload(
+        market="US", candidates=(candidate,), lot_sizes={"AAPL": 1},
+    )
+    summary = payload["risk_summary"]
+    assert isinstance(summary, dict)
+    summary.update({
+        "portfolio_risk_limit": "4000.00",
+        "existing_planned_risk": "5000.00",
+        "new_planned_risk": "36.000",
+        "portfolio_planned_risk": "5036.000",
+        "portfolio_planned_risk_pct": "0.05036",
+        "portfolio_remaining_risk": "0",
+        "portfolio_remaining_risk_pct": "0",
+        "status_label": "计划止损风险仅审计，不参与买入数量",
+    })
+
+    assert trend_module.valid_frozen_report_contract(payload) is True
+    (reports_dir / "2026-07-15.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+    report = load_dashboard_state(config).to_dict()["trend_reports"]["futu"]
+
+    assert (
+        report.get("available"), report.get("artifact"), report.get("strategy_version")
+    ) == (True, "2026-07-15.json", "v14")
+
+
 def test_dashboard_accepts_current_four_percent_plan_with_unavailable_risk_audit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

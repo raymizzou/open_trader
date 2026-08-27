@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-27
 
+- Dashboard 现允许当前 CN v16/HK v14/US v14 报告在既有计划止损风险超过组合审计上限时继续选中；止损风险仍仅作审计。
 - 修复 Dashboard 分离趋势报告验收误报：`计划止损风险仅审计，不参与买入数量` 现在允许展示，不再被误判为持仓或执行信息；其余禁用文案校验保持不变。验证：回归用例 RED 后 GREEN（`1 passed, 1 warning`），Dashboard 审计-only UI 回归 `1 passed`；`make test` `7460 passed, 3 skipped, 1 warning`（exit 0）。
 - 趋势当前报告修订现在从冻结事实刷新显式变更的 allocation，并同步替换 planning manifest 中的 content-addressed market component；当前 CN/HK/US 执行继续只取最新报告，Dashboard 风险校验按生成器的 Decimal 运算顺序计算。验证：控制器回归 `3 passed in 5.65s`，修订 manifest 聚焦 `5 passed in 0.92s`，legacy fixture 聚焦 `6 passed in 0.60s`；`make test` `7459 passed, 3 skipped, 1 warning in 714.02s`（exit 0）。
 - 趋势控制器现在只执行当前派生周期的最新有效 CN/HK/US 报告；历史报告与未完成历史批次仅供审计，不再执行、阻塞或回退；跨周期的在途报告生成结果会被丢弃，当前周期重新生成。验证：当前规则/客户端/修订聚焦 `5 passed`，legacy snapshot 聚焦 `6 passed`，全量 `make test` `7453 passed, 3 skipped, 1 warning`（exit 0）。
