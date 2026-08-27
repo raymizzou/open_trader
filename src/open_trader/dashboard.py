@@ -2557,7 +2557,12 @@ def _valid_v2_risk_items(
         protection: Decimal,
     ) -> tuple[Decimal, Decimal, Decimal]:
         cost = Decimal(shares) * close * price_fx * cost_rate
-        risk = Decimal(shares) * max(Decimal("0"), protection * atr) * price_fx + cost
+        risk = (
+            Decimal(shares)
+            * max(Decimal("0"), close - (close - protection * atr))
+            * price_fx
+            + cost
+        )
         return cost, risk, risk / nav_value
 
     for item in buys:

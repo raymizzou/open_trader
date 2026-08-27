@@ -3773,6 +3773,419 @@ def test_market_planning_revision_fills_unavailable_account_components(
     )
 
 
+@pytest.mark.parametrize("market", ["HK", "US"])
+def test_market_revision_refreshes_changed_allocation_from_frozen_inputs(
+    tmp_path: Path,
+    market: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = config(tmp_path)
+    run_date = "2026-07-15"
+    as_of_date = run_date if market == "HK" else "2026-07-14"
+    execution_date = "2026-07-16" if market == "HK" else run_date
+    candidate_symbol = "02800" if market == "HK" else "VIXY"
+    candidate_wire_symbol = "2800.HK" if market == "HK" else "VIXY.US"
+    candidate_asset = "港股" if market == "HK" else "美股"
+    held_codes = tuple(
+        f"{market}.{index:05d}" if market == "HK" else f"US.A{index}"
+        for index in range(100, 110)
+    )
+    holding_ids = {
+        code.split(".", 1)[1]: 100 + offset
+        for offset, code in enumerate(held_codes)
+    }
+
+    def write_allocation(rank: int, stem: str) -> dict[str, object]:
+        source = copy.deepcopy(allocation_reference_for_runner())
+        strengths = {1: ("90", "80"), 2: ("70", "60"), 3: ("50", "40")}
+        ranks = {market: rank}
+        remaining = iter(sorted({1, 2, 3} - {rank}))
+        for other in ("CN", "HK", "US"):
+            if other != market:
+                ranks[other] = next(remaining)
+        roots = source["snapshot"]["roots"]
+        for item, item_rank in ranks.items():
+            roots[item]["stock"]["global_strength"] = strengths[item_rank][0]  # type: ignore[index]
+            roots[item]["etf"]["global_strength"] = strengths[item_rank][1]  # type: ignore[index]
+        snapshot = build_allocation_snapshot(
+            allocation_date="2026-08-03",
+            generated_at="2026-08-03T16:18:00+08:00",
+            git_sha="a" * 40,
+            roots=roots,  # type: ignore[arg-type]
+            previous=None,
+            version=2,
+        )
+        path = cfg.data_dir / f"trend_allocation/daily/{stem}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = json.dumps(snapshot, ensure_ascii=False, sort_keys=True) + "\n"
+        path.write_text(body, encoding="utf-8")
+        return {
+            "daily_path": f"data/trend_allocation/daily/{stem}.json",
+            "sha256": hashlib.sha256(body.encode()).hexdigest(),
+            "snapshot": snapshot,
+        }
+
+    allocation_a = write_allocation(1, "2026-08-03")
+    allocation_b = write_allocation(3, "2026-08-03-r1")
+    calls: list[str] = []
+
+    broker = "phillips" if market == "HK" else "futu"
+    currency = "HKD" if market == "HK" else "USD"
+    real_snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)
+    real_snapshot["positions"] = [
+        {
+            "instrument_id": f"{broker}:{market}:{index:05d}" if market == "HK" else f"{broker}:{market}:A{index}",
+            "broker": broker,
+            "market": market,
+            "asset_class": "stock",
+            "symbol": f"{index:05d}" if market == "HK" else f"A{index}",
+            "name": f"持仓{index:05d}" if market == "HK" else f"持仓A{index}",
+            "currency": currency,
+            "quantity": "10",
+            "cost_price": "10",
+            "market_value": "100",
+        }
+        for index in range(100, 110)
+    ]
+    real_snapshot["cash_balances"] = [{
+        "broker": broker,
+        "account_alias": f"{broker}_main",
+        "currency": currency,
+        "cash_balance": "99000",
+        "available_balance": "99000",
+    }]
+    monkeypatch.setattr(
+        market_trend,
+        "fetch_account_snapshot",
+        lambda: copy.deepcopy(real_snapshot),
+        raising=False,
+    )
+
+    class Api:
+        ignored_stale_components: tuple[object, ...] = ()
+
+        def __init__(self, **_kwargs: object) -> None:
+            calls.append("api.init")
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            calls.append("api.update")
+            return [
+                {"asset": asset, "asOfDate": as_of_date}
+                for asset in MARKET_UPDATE_ASSETS[market]
+            ]
+
+        def get_account_balance(self) -> dict[str, object]:
+            calls.append("api.balance")
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str,
+        ) -> list[dict[str, object]]:
+            calls.append(f"api.components.{tm_id}")
+            pool_id = 622494 if market == "HK" else 622460
+            assert tm_id == pool_id
+            return [{
+                "tmId": 1,
+                "tickerSymbol": candidate_wire_symbol,
+                "asOfDate": expected_date,
+            }]
+
+        def get_favorites_tickers(self) -> list[dict[str, object]]:
+            return []
+
+        def search_exact_symbol(
+            self, symbol: str, *, market: str, expected_date: str,
+        ) -> int:
+            calls.append(f"api.search.{symbol}")
+            assert expected_date == as_of_date
+            return holding_ids[symbol]
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "field": field,
+                    "priceCost": (
+                        "0.071" if field == "tickerName"
+                        else "0.004"
+                        if field in {"TrendRightSideCountRatio", "TrendRightSideMktCapRatio"}
+                        else "0"
+                    ),
+                }
+                for field in tuple(dict.fromkeys(
+                    (*UNIFIED_TREND_FIELDS, *A_SHARE_INDUSTRY_FIELDS,
+                     *INDUSTRY_MEMBER_FIELDS, *INDUSTRY_STATE_FIELDS)
+                ))
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            fields = tuple(kwargs["fields"])
+            expected_date = str(kwargs["expected_date"])
+            tm_ids = [int(item) for item in kwargs["tm_ids"]]  # type: ignore[union-attr]
+            calls.append(f"api.snapshots.{len(tm_ids)}")
+            if fields == A_SHARE_INDUSTRY_FIELDS:
+                return [{
+                    "tmId": tm_id,
+                    "asOfDate": expected_date,
+                    "trendTemperatureCurr": "热",
+                } for tm_id in tm_ids]
+            if fields == INDUSTRY_MEMBER_FIELDS:
+                return [{
+                    "tmId": tm_id,
+                    "asOfDate": expected_date,
+                    "tradableFlag": True,
+                    "isTrendRightSide": True,
+                } for tm_id in tm_ids]
+            if fields == INDUSTRY_STATE_FIELDS:
+                return [{
+                    "tmId": tm_id,
+                    "asOfDate": expected_date,
+                    "trendTemperatureCurr": "热",
+                    "trendStrengthLocalCurr": "92",
+                    "TrendRightSideCountRatio": "0.191",
+                    "TrendRightSideMktCapRatio": "0.650",
+                } for tm_id in tm_ids]
+            rows: list[dict[str, object]] = []
+            for tm_id in tm_ids:
+                if tm_id == 1:
+                    symbol = candidate_symbol
+                    wire_symbol = candidate_wire_symbol
+                    name = f"候选{candidate_symbol}"
+                    asset = candidate_asset
+                else:
+                    symbol = next(
+                        value for value, value_id in holding_ids.items()
+                        if value_id == tm_id
+                    )
+                    wire_symbol = (
+                        f"{int(symbol):04d}.HK"
+                        if market == "HK"
+                        else f"{symbol}.{market}"
+                    )
+                    name = f"持仓{symbol}"
+                    asset = candidate_asset
+                rows.append({
+                    "tmId": tm_id,
+                    "tickerName": name,
+                    "tickerSymbol": wire_symbol,
+                    "asset": asset,
+                    "asOfDate": expected_date,
+                    "tradableFlag": True,
+                    "industryName": "科技",
+                    "industryTmId": 700001,
+                    "priceIndex": "10",
+                    "marketCap": "200",
+                    "amount1d": "3",
+                    "isTrendRightSide": True,
+                    "trendTemperaturePrev": "温",
+                    "trendTemperatureCurr": "热",
+                    "daysSinceTrendEntry": 3,
+                    "trendPhasePrev": "谷雨",
+                    "trendPhaseCurr": "立夏",
+                    "trendStrengthLocalCurr": "98",
+                    "trendStrengthGlobalCurr": "98",
+                    "trendStrengthLocalChange": "1",
+                    "trendStrengthLocalPrevWeek": "97",
+                    "trendStrengthLocalPrevMonth": "95",
+                    "stopwinFlagByDangerSignal": False,
+                    "stopwinFlagByBoilingTemperature": False,
+                    "stopwinFlagByPopChampagne": False,
+                })
+            return rows
+
+        def remember_symbol_row(self, **_kwargs: object) -> None:
+            pass
+
+        def symbol_mapping(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return [as_of_date, execution_date]
+
+        def get_daily_kline(
+            self, *_args: object, **_kwargs: object,
+        ) -> list[DailyKlineBar]:
+            end = datetime.fromisoformat(as_of_date)
+            return [
+                DailyKlineBar(
+                    date=(end - timedelta(days=14 - index)).date().isoformat(),
+                    open=10,
+                    high=10.1,
+                    low=9.9,
+                    close=10,
+                    volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def get_lot_sizes(self, symbols: list[str]) -> dict[str, int]:
+            return {symbol: 100 if market == "HK" else 1 for symbol in symbols}
+
+        def close(self) -> None:
+            pass
+
+    first = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        allocation_reference=allocation_a,
+        notifier=NullNotifier(),
+        api_factory=Api,
+        quote_factory=Quote,
+        account_factory=simulation_account_with_positions(*held_codes),
+        now_fn=lambda: datetime(2026, 7, 15, 19, tzinfo=SHANGHAI),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert first.status == "generated", first.waiting_reason
+    assert first.json_path is not None
+    base_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
+    base_report_bytes = first.json_path.read_bytes()
+    base_evidence_path = cfg.data_dir / base_payload["replay_evidence"]["path"]
+    base_evidence_bytes = base_evidence_path.read_bytes()
+    base_strategy = base_payload["strategy_snapshot"]
+    base_judgments = base_payload["strategy_judgments"]
+    assert (
+        base_strategy["strategy_version"],
+        base_strategy["parameters"]["allocation_position_limit"],
+        base_judgments["planned_new_seats"],
+    ) == ("v14", 20, 10)
+    assert [
+        (
+            action["symbol"],
+            action["target_amount"],
+            action["estimated_shares"],
+            action["executable"],
+        )
+        for action in base_judgments["real_buy_actions"]
+    ] == [(candidate_symbol, "4000.00", 400, True)]
+
+    def forbidden(**_kwargs: object) -> object:
+        raise AssertionError("allocation revision must use frozen inputs")
+
+    revised = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        revision=True,
+        allocation_reference=allocation_b,
+        notifier=NullNotifier(),
+        api_factory=forbidden,
+        quote_factory=forbidden,
+    )
+
+    assert revised.status == "generated"
+    assert revised.json_path is not None
+    revised_payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
+    revised_strategy = revised_payload["strategy_snapshot"]
+    revised_parameters = revised_strategy["parameters"]
+    revised_judgments = revised_payload["strategy_judgments"]
+    assert (
+        revised_strategy["strategy_version"],
+        revised_parameters["allocation_snapshot_path"],
+        revised_parameters["allocation_snapshot_sha256"],
+        revised_parameters["allocation_rank"],
+        revised_parameters["allocation_score"],
+        revised_parameters["allocation_score_source"],
+        revised_parameters["target_weight"],
+        revised_parameters["nominal_weight"],
+        revised_parameters["allocation_position_limit"],
+        revised_judgments["planned_new_seats"],
+        tuple(action["symbol"] for action in revised_judgments["formal_actions"]),
+    ) == (
+        "v14",
+        allocation_b["daily_path"],
+        allocation_b["sha256"],
+        3,
+        "50",
+        "美股" if market == "US" else "港股",
+        "0.04",
+        "0.40",
+        10,
+        0,
+        (candidate_symbol,),
+    )
+    planning_path = cfg.data_dir / revised_payload["replay_evidence"]["planning_path"]
+    planning_manifest = json.loads(planning_path.read_text(encoding="utf-8"))
+    market_component = planning_manifest["components"]["market"]
+    market_value = json.loads(
+        Path(market_component["path"]).read_text(encoding="utf-8")
+    )["value"]
+    assert (
+        market_value["allocation"]["reference"]["sha256"],
+        market_value["planned_new_seats"],
+        market_value["simulated_buy_fifo"],
+    ) == (
+        allocation_b["sha256"],
+        revised_payload["strategy_judgments"]["planned_new_seats"],
+        revised_payload["strategy_judgments"]["simulated_buy_fifo"],
+    )
+    revised_evidence_path = cfg.data_dir / revised_payload["replay_evidence"]["path"]
+    revised_evidence = json.loads(revised_evidence_path.read_text(encoding="utf-8"))
+    base_evidence = json.loads(base_evidence_bytes)
+    assert revised_evidence["rebuild_inputs"]["candidates"] == base_evidence[
+        "rebuild_inputs"
+    ]["candidates"]
+    assert first.json_path.read_bytes() == base_report_bytes
+    assert base_evidence_path.read_bytes() == base_evidence_bytes
+    assert revised_judgments["real_rotation_pairs"] == []
+    assert trend_module.valid_frozen_report_contract(revised_payload) is True
+    assert [
+        (
+            action["symbol"],
+            action["target_amount"],
+            action["estimated_shares"],
+            action["executable"],
+        )
+        for action in revised_judgments["real_buy_actions"]
+    ] == [(candidate_symbol, "4000.00", 400, False)]
+
+    allocation_b_status_only = {
+        **allocation_b,
+        "failure_reason": "status-only transport warning",
+    }
+    status_only = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date=run_date,
+        revision=True,
+        allocation_reference=allocation_b_status_only,
+        notifier=NullNotifier(),
+        api_factory=forbidden,
+        quote_factory=forbidden,
+    )
+    assert status_only.status == "generated"
+    assert status_only.json_path is not None
+    status_only_payload = json.loads(status_only.json_path.read_text(encoding="utf-8"))
+    assert (
+        status_only_payload["replay_evidence"]["path"],
+        status_only_payload["replay_evidence"]["sha256"],
+        status_only_payload["replay_evidence"]["planning_path"],
+        status_only_payload["replay_evidence"]["planning_sha256"],
+        status_only_payload["strategy_snapshot"],
+        status_only_payload["strategy_judgments"]["simulated_buy_fifo"],
+        status_only_payload["strategy_judgments"]["planned_new_seats"],
+        status_only_payload["strategy_judgments"]["simulate_rotation_pairs"],
+        status_only_payload["strategy_judgments"]["simulate_rotation_comparisons"],
+        status_only_payload["strategy_judgments"]["real_rotation_pairs"],
+        status_only_payload["strategy_judgments"]["real_rotation_comparisons"],
+    ) == (
+        revised_payload["replay_evidence"]["path"],
+        revised_payload["replay_evidence"]["sha256"],
+        revised_payload["replay_evidence"]["planning_path"],
+        revised_payload["replay_evidence"]["planning_sha256"],
+        revised_payload["strategy_snapshot"],
+        revised_payload["strategy_judgments"]["simulated_buy_fifo"],
+        revised_payload["strategy_judgments"]["planned_new_seats"],
+        revised_payload["strategy_judgments"]["simulate_rotation_pairs"],
+        revised_payload["strategy_judgments"]["simulate_rotation_comparisons"],
+        revised_payload["strategy_judgments"]["real_rotation_pairs"],
+        revised_payload["strategy_judgments"]["real_rotation_comparisons"],
+    )
+
+
 @pytest.mark.parametrize(
     ("market", "run_date", "as_of_date", "execution_date"),
     [

@@ -14233,6 +14233,255 @@ def test_report_revision_reuses_target_day_frozen_components(
     assert revised_payload["execution_date"] == "2026-07-15"
 
 
+def test_cn_revision_refreshes_changed_allocation_from_frozen_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = trend_config(tmp_path)
+    unlock_live_drawdown(config.data_dir, strategy_version="v16")
+    held_codes = tuple(f"SH.{index:06d}" for index in range(100, 110))
+    real_snapshot = copy.deepcopy(ACCOUNT_SNAPSHOT)
+    real_snapshot["positions"] = [
+        {
+            "instrument_id": f"eastmoney:CN:{index:06d}",
+            "broker": "eastmoney",
+            "market": "CN",
+            "asset_class": "stock",
+            "symbol": f"{index:06d}",
+            "name": f"持仓{index:06d}",
+            "currency": "CNY",
+            "quantity": "10",
+            "cost_price": "10",
+            "market_value": "100",
+        }
+        for index in range(100, 110)
+    ]
+    real_snapshot["cash_balances"] = [{
+        "broker": "eastmoney",
+        "account_alias": "eastmoney_main",
+        "currency": "CNY",
+        "cash_balance": "99000",
+        "available_balance": "99000",
+    }]
+    monkeypatch.setattr(
+        trend_module,
+        "fetch_account_snapshot",
+        lambda: copy.deepcopy(real_snapshot),
+        raising=False,
+    )
+
+    def write_allocation(rank: int, stem: str) -> dict[str, object]:
+        source = allocation_for("CN", rank=rank, entry_weight="0.04")
+        snapshot = build_allocation_snapshot(
+            allocation_date="2026-08-03",
+            generated_at="2026-08-03T16:18:00+08:00",
+            git_sha="a" * 40,
+            roots=source["snapshot"]["roots"],  # type: ignore[index]
+            previous=None,
+            version=2,
+        )
+        path = config.data_dir / f"trend_allocation/daily/{stem}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = json.dumps(snapshot, ensure_ascii=False, sort_keys=True) + "\n"
+        path.write_text(body, encoding="utf-8")
+        return {
+            "daily_path": f"data/trend_allocation/daily/{stem}.json",
+            "sha256": hashlib.sha256(body.encode()).hexdigest(),
+            "snapshot": snapshot,
+        }
+
+    allocation_a = write_allocation(1, "2026-08-03")
+    allocation_b = write_allocation(3, "2026-08-03-r1")
+    calls: list[str] = []
+    first = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        allocation_reference=allocation_a,
+        api_factory=lambda **_kwargs: ReadyApi(
+            calls,
+            snapshot_overrides={
+                1: {"trendStrengthGlobalCurr": "96"},
+                2: {"trendStrengthGlobalCurr": "95"},
+                **{
+                    index: {
+                        "tickerSymbol": f"{index:06d}.SZ",
+                        "trendStrengthGlobalCurr": "96",
+                    }
+                    for index in range(100, 110)
+                },
+            },
+        ),
+        quote_factory=lambda **_kwargs: ReadyQuote(calls),
+        account_factory=simulation_account_with_positions(*held_codes),
+        notifier=RecordingFeishu(),
+    )
+    assert first.status == "generated"
+    assert first.json_path is not None
+    base_report_bytes = first.json_path.read_bytes()
+    base_payload = json.loads(base_report_bytes)
+    base_evidence_path = config.data_dir / base_payload["replay_evidence"]["path"]
+    base_evidence_bytes = base_evidence_path.read_bytes()
+    base_judgments = base_payload["strategy_judgments"]
+    assert base_payload["strategy_snapshot"]["strategy_version"] == "v16"
+    assert base_payload["strategy_snapshot"]["parameters"]["allocation_position_limit"] == 20
+    assert base_judgments["formal_actions"]
+    assert [
+        (
+            action["symbol"],
+            action["target_amount"],
+            action["estimated_shares"],
+            action["executable"],
+        )
+        for action in base_judgments["real_buy_actions"]
+    ] == [
+        ("000001", "4000.00", 400, True),
+        ("000002", "4000.00", 400, True),
+    ]
+
+    def forbidden(**_kwargs: object) -> object:
+        raise AssertionError("allocation revision must use frozen inputs")
+
+    revised = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        revision=True,
+        allocation_reference=allocation_b,
+        api_factory=forbidden,
+        quote_factory=forbidden,
+        notifier=RecordingFeishu(),
+    )
+
+    assert revised.status == "generated"
+    assert revised.json_path is not None
+    revised_payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
+    revised_strategy = revised_payload["strategy_snapshot"]
+    revised_parameters = revised_strategy["parameters"]
+    assert (
+        revised_strategy["strategy_version"],
+        revised_parameters["allocation_snapshot_path"],
+        revised_parameters["allocation_snapshot_sha256"],
+        revised_parameters["allocation_rank"],
+        revised_parameters["allocation_score"],
+        revised_parameters["allocation_score_source"],
+        revised_parameters["target_weight"],
+        revised_parameters["nominal_weight"],
+        revised_parameters["allocation_position_limit"],
+        tuple(
+            (
+                action["symbol"],
+                action["estimated_shares"],
+                action["target_amount"],
+                action["sizing_note"],
+            )
+            for action in revised_payload["strategy_judgments"]["formal_actions"]
+        ),
+        revised_payload["strategy_judgments"]["planned_new_seats"],
+    ) == (
+        "v16",
+        allocation_b["daily_path"],
+        allocation_b["sha256"],
+        3,
+        "50",
+        "A股",
+        "0.04",
+        "0.40",
+        10,
+        (
+            (
+                "000001",
+                400,
+                "4000.00",
+                "组合剩余风险不可用（000100 活动保护线缺失）；10 个持仓席位已满",
+            ),
+            (
+                "000002",
+                400,
+                "4000.00",
+                "组合剩余风险不可用（000100 活动保护线缺失）；10 个持仓席位已满",
+            ),
+        ),
+        0,
+    )
+    planning_path = config.data_dir / revised_payload["replay_evidence"]["planning_path"]
+    planning_manifest = json.loads(planning_path.read_text(encoding="utf-8"))
+    market_component = planning_manifest["components"]["market"]
+    market_value = json.loads(
+        Path(market_component["path"]).read_text(encoding="utf-8")
+    )["value"]
+    assert (
+        market_value["allocation"]["reference"]["sha256"],
+        market_value["planned_new_seats"],
+        market_value["simulated_buy_fifo"],
+    ) == (
+        allocation_b["sha256"],
+        revised_payload["strategy_judgments"]["planned_new_seats"],
+        revised_payload["strategy_judgments"]["simulated_buy_fifo"],
+    )
+    revised_evidence_path = config.data_dir / revised_payload["replay_evidence"]["path"]
+    revised_evidence = json.loads(revised_evidence_path.read_text(encoding="utf-8"))
+    assert revised_evidence["rebuild_inputs"]["candidates"] == json.loads(
+        base_evidence_bytes
+    )["rebuild_inputs"]["candidates"]
+    assert first.json_path.read_bytes() == base_report_bytes
+    assert base_evidence_path.read_bytes() == base_evidence_bytes
+    assert revised_payload["strategy_judgments"]["real_rotation_pairs"] == []
+    assert trend_module.valid_frozen_report_contract(revised_payload) is True
+    assert [
+        (
+            action["symbol"],
+            action["target_amount"],
+            action["estimated_shares"],
+            action["executable"],
+        )
+        for action in revised_payload["strategy_judgments"]["real_buy_actions"]
+    ] == [
+        ("000001", "4000.00", 400, False),
+        ("000002", "4000.00", 400, False),
+    ]
+
+    allocation_b_status_only = {
+        **allocation_b,
+        "failure_reason": "status-only transport warning",
+    }
+    status_only = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        revision=True,
+        allocation_reference=allocation_b_status_only,
+        api_factory=forbidden,
+        quote_factory=forbidden,
+        notifier=RecordingFeishu(),
+    )
+    assert status_only.status == "generated"
+    assert status_only.json_path is not None
+    status_only_payload = json.loads(status_only.json_path.read_text(encoding="utf-8"))
+    assert (
+        status_only_payload["replay_evidence"]["path"],
+        status_only_payload["replay_evidence"]["sha256"],
+        status_only_payload["replay_evidence"]["planning_path"],
+        status_only_payload["replay_evidence"]["planning_sha256"],
+        status_only_payload["strategy_snapshot"],
+        status_only_payload["strategy_judgments"]["simulated_buy_fifo"],
+        status_only_payload["strategy_judgments"]["planned_new_seats"],
+        status_only_payload["strategy_judgments"]["simulate_rotation_pairs"],
+        status_only_payload["strategy_judgments"]["simulate_rotation_comparisons"],
+        status_only_payload["strategy_judgments"]["real_rotation_pairs"],
+        status_only_payload["strategy_judgments"]["real_rotation_comparisons"],
+    ) == (
+        revised_payload["replay_evidence"]["path"],
+        revised_payload["replay_evidence"]["sha256"],
+        revised_payload["replay_evidence"]["planning_path"],
+        revised_payload["replay_evidence"]["planning_sha256"],
+        revised_payload["strategy_snapshot"],
+        revised_payload["strategy_judgments"]["simulated_buy_fifo"],
+        revised_payload["strategy_judgments"]["planned_new_seats"],
+        revised_payload["strategy_judgments"]["simulate_rotation_pairs"],
+        revised_payload["strategy_judgments"]["simulate_rotation_comparisons"],
+        revised_payload["strategy_judgments"]["real_rotation_pairs"],
+        revised_payload["strategy_judgments"]["real_rotation_comparisons"],
+    )
+
+
 def test_report_revision_rejects_changed_planning_manifest(tmp_path: Path) -> None:
     config = trend_config(tmp_path)
     first = run_a_share_trend_report(

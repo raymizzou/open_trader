@@ -2160,6 +2160,47 @@ def write_v2_controller_report(
     return path, report
 
 
+def test_execution_completed_rejects_unbound_request_completion(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host=socket.gethostname(),
+    )
+    _report_path, report = write_v2_controller_report(config)
+    _report_path.write_bytes(controller._canonical_json_bytes(report))
+    result = controller.execute_simulated_trend_report(
+        config,
+        "CN",
+        report["execution_date"],
+        _report_hash(report),
+        actor="test",
+        reason="completion binding",
+        now=NOW,
+    )
+    execution_id = str(result["execution_id"])
+    cycle = active_cn_cycle()
+    completion_path = controller._request_completion_path(
+        config, cycle.market, cycle.execution_date, execution_id
+    )
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    wrong_path = str(tmp_path / "unbound-request.json")
+    wrong_sha = "0" * 64
+    completion["request_path"] = wrong_path
+    completion["request"]["report_sha256"] = wrong_sha
+    completion["result"]["request_path"] = wrong_path
+    completion["result"]["report_sha256"] = wrong_sha
+    completion_path.write_text(json.dumps(completion), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid simulation request completion"):
+        controller._execution_completed(
+            config,
+            cycle,
+            execution_id=execution_id,
+        )
+
+
 def test_current_cycle_ignores_unfinished_legacy_execution_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2218,7 +2259,7 @@ def test_current_cycle_ignores_unfinished_legacy_execution_batch(
         )
 
     monkeypatch.setattr(controller, "_capture_close", capture_close)
-    _current_path, current_report = write_v2_controller_report(config)
+    current_path, current_report = write_v2_controller_report(config)
 
     legacy_path = config.reports_dir / "trend_a_share/2026-07-18.json"
     legacy_report = valid_cn_report(
@@ -2262,15 +2303,22 @@ def test_current_cycle_ignores_unfinished_legacy_execution_batch(
         last_success["date"],
         last_success["report_sha256"],
     ) == ("2026-07-20", expected_sha)
-    assert (
+    current_batch_path = (
         config.data_dir / "trend_review/ledgers/CN/batches/2026-07-20.json"
-    ).exists()
-    assert list(
+    )
+    request_batches = list(
         (
             config.data_dir
-            / "trend_controller/CN/simulation_requests/completions/2026-07-20"
+            / "trend_review/ledgers/CN/batches/requests/2026-07-20"
         ).glob("*.json")
     )
+    assert not current_batch_path.exists()
+    assert len(request_batches) == 1
+    request_batch = json.loads(request_batches[0].read_text(encoding="utf-8"))
+    assert (
+        request_batch["report_sha256"],
+        request_batch["report_path"],
+    ) == (expected_sha, str(current_path))
     assert legacy_batch_path.read_bytes() == legacy_batch_bytes
 
 
@@ -6655,6 +6703,163 @@ def test_current_controller_uses_latest_revision_each_round_and_ignores_old_batc
         canonical_sha(revision_reports[1][1]),
         canonical_sha(revision_reports[2][1]),
     ]
+
+
+def test_current_revision_executes_when_earlier_same_cycle_batch_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(
+        controller_config(tmp_path),
+        trend_review_cn_simulate_acc_id=101,
+        trend_executor_host="executor",
+    )
+    cycle = ControllerCycle(
+        market="CN",
+        as_of_date="2026-07-19",
+        execution_date="2026-07-20",
+        report_run_date="2026-07-19",
+        session="morning",
+        market_open=True,
+        next_check_at=datetime.fromisoformat("2026-07-20T09:31:05+08:00"),
+    )
+    patch_cycle(monkeypatch, cycle)
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_statistics",
+        lambda *_args, **_kwargs: {"status": "completed"},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_cycle_long_term_benchmark",
+        lambda *_args, **_kwargs: {"status": "completed"},
+    )
+
+    base_buy = {
+        "action": "BUY",
+        "symbol": "600001",
+        "futu_symbol": "SH.600001",
+        "target_weight": "0.04",
+        "lot_size": 100,
+        "estimated_shares": 100,
+        "target_amount": "1000",
+        "atr": "0.5",
+    }
+    latest_buy = {
+        **base_buy,
+        "symbol": "600002",
+        "futu_symbol": "SH.600002",
+        "estimated_shares": 200,
+        "target_amount": "2000",
+    }
+    base_path, base_report = write_v2_controller_report(
+        config, actions=[base_buy]
+    )
+    base_bytes = base_path.read_bytes()
+    _, latest_report = write_v2_controller_report(
+        config, actions=[latest_buy]
+    )
+    latest_bytes = base_path.read_bytes()
+    base_path.write_bytes(base_bytes)
+    latest_path = base_path.with_name("2026-07-19-r1.json")
+    latest_path.write_bytes(latest_bytes)
+    latest_report = json.loads(latest_bytes)
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return NOW if tz is None else NOW.astimezone(tz)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(controller, "datetime", FixedDateTime)
+    lock_trend_execution_batch(
+        config.data_dir,
+        market="CN",
+        execution_date=cycle.execution_date,
+        report_path=base_path,
+        report=base_report,
+        locked_at=NOW.isoformat(),
+    )
+    shared_batch_path = (
+        config.data_dir / "trend_review/ledgers/CN/batches/2026-07-20.json"
+    )
+    shared_batch_bytes = shared_batch_path.read_bytes()
+
+    class Quote:
+        def get_snapshots(self, symbols: list[str]) -> dict[str, object]:
+            return {
+                symbol: SimpleNamespace(last_price=Decimal("10"))
+                for symbol in symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    class Broker:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+
+        def account_snapshot(self) -> dict[str, object]:
+            return {
+                "acc_id": 101,
+                "net_value": "100000",
+                "cash": "100000",
+                "available_cash": "100000",
+                "positions": [],
+            }
+
+        def list_orders(self, **_kwargs: object) -> dict[str, object]:
+            return {"orders": []}
+
+        def place_order(self, request: dict[str, object]) -> dict[str, object]:
+            self.requests.append(dict(request))
+            return {"futu_order_id": "SIM-1"}
+
+        def close(self) -> None:
+            pass
+
+    quote = Quote()
+    broker = Broker()
+    monkeypatch.setattr(controller, "FutuQuoteClient", lambda **_kwargs: quote)
+    monkeypatch.setattr(controller, "_new_order_client", lambda *_args: broker)
+
+    run_trend_market_controller(config, "CN", once=True, now_fn=lambda: NOW)
+
+    report_body = (
+        json.dumps(
+            latest_report,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    expected_latest_sha = hashlib.sha256(report_body).hexdigest()
+    requests = list(
+        (
+            config.data_dir
+            / "trend_controller/CN/simulation_requests/2026-07-20"
+        ).glob("*.json")
+    )
+    request_batches = list(
+        (
+            config.data_dir
+            / "trend_review/ledgers/CN/batches/requests/2026-07-20"
+        ).glob("*.json")
+    )
+    request = json.loads(requests[0].read_text(encoding="utf-8"))
+    request_batch = json.loads(request_batches[0].read_text(encoding="utf-8"))
+
+    assert (
+        [request["futu_code"] for request in broker.requests],
+        shared_batch_path.read_bytes(),
+        request["report_sha256"],
+        request_batch["report_sha256"],
+        request["report_path"],
+    ) == (
+        ["SH.600002"],
+        shared_batch_bytes,
+        expected_latest_sha,
+        expected_latest_sha,
+        str(latest_path),
+    )
 
 
 def test_current_controller_never_executes_legacy_strategy_report(

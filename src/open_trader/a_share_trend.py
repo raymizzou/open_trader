@@ -74,6 +74,7 @@ from .trend_review import (
     freeze_report_evidence,
     freeze_trend_evidence,
     normalize_trend_strategy_snapshot,
+    _planning_market_component_value,
     planning_snapshot_path,
     read_planning_snapshot,
     rebuild_trend_report_from_evidence,
@@ -7339,6 +7340,11 @@ def build_report(
                 market, snapshot_version
             ),
         )
+        if real_post_sell_count >= position_limit:
+            real_buy_actions = [
+                replace(action, executable=False)
+                for action in real_buy_actions
+            ]
         if symbol_mapping_required:
             real_buy_actions = [
                 action for action in real_buy_actions if action.futu_symbol
@@ -10517,6 +10523,7 @@ def _reuse_planning_revision(
     account_factory: Callable[..., object] | None = None,
     api_factory: Callable[..., object] = TrendAnimalsClient,
     quote_factory: Callable[..., object] = FutuQuoteClient,
+    allocation_reference: Mapping[str, object] | None = None,
 ) -> AShareTrendRunResult | None:
     loaded = _load_planning_revision_source(
         config=config, report_dir=report_dir, run_date=run_date
@@ -10531,6 +10538,57 @@ def _reuse_planning_revision(
     components = planning.get("components")
     if not isinstance(components, Mapping):
         raise ValueError("planning snapshot components are invalid")
+    allocation_changed = False
+    if allocation_reference is not None:
+        frozen_reference = freeze_allocation_reference(allocation_reference)
+        if frozen_reference is None:
+            raise ValueError("allocation reference is invalid")
+        allocation_path = config.data_dir / Path(
+            str(frozen_reference["daily_path"])
+        ).relative_to("data")
+        allocation_body = allocation_path.read_bytes()
+        if hashlib.sha256(allocation_body).hexdigest() != frozen_reference["sha256"]:
+            raise ValueError("frozen allocation evidence hash mismatch")
+        allocation_snapshot = json.loads(allocation_body.decode("utf-8"))
+        if not isinstance(allocation_snapshot, Mapping):
+            raise ValueError("allocation reference is invalid")
+        new_allocation = {
+            "reference": frozen_reference,
+            "daily_json": allocation_body.decode("utf-8"),
+        }
+        existing_allocation = inputs.get("allocation")
+        existing_reference = (
+            existing_allocation.get("reference")
+            if isinstance(existing_allocation, Mapping)
+            else None
+        )
+        allocation_changed = not (
+            isinstance(existing_reference, Mapping)
+            and existing_reference.get("sha256") == frozen_reference["sha256"]
+        )
+        if allocation_changed:
+            inputs["allocation"] = new_allocation
+            allocation_for_snapshot = {
+                **dict(frozen_reference),
+                "snapshot": allocation_snapshot,
+            }
+            candidate_pool_ids = inputs.get("candidate_pool_ids")
+            if not isinstance(candidate_pool_ids, list):
+                raise ValueError("planning snapshot evidence is invalid")
+            evidence["strategy_snapshot"] = live_trend_strategy_snapshot(
+                "CN",
+                str(evidence["process_version"]),
+                tuple(int(item) for item in candidate_pool_ids),
+                normal_cost_rate=Decimal(str(inputs["normal_cost_rate"])),
+                allocation=allocation_for_snapshot,
+            )
+            allocation_market = _allocation_market_for(
+                allocation_for_snapshot, "CN"
+            )
+            if allocation_market is None:
+                raise ValueError("allocation reference is invalid")
+            inputs["position_weight"] = allocation_market["entry_weight"]
+            inputs["position_weight_source"] = "trend_allocation_rank"
     updates: dict[str, tuple[str, object]] = {}
     simulated_component = components.get("simulated_account")
     if (
@@ -10643,13 +10701,16 @@ def _reuse_planning_revision(
                 )
     evidence_reference: Mapping[str, str] | None = None
     planning_reference = None
-    if updates:
+    recompute_components = set(updates)
+    if allocation_changed:
+        recompute_components.update({"simulated_account", "real_account"})
+    if recompute_components:
         recovered_report = rebuild_trend_report_from_evidence(
             evidence,
             _return_report=True,
-            _recompute_account_components=tuple(updates),
+            _recompute_account_components=tuple(sorted(recompute_components)),
         )
-        if "simulated_account" in updates:
+        if "simulated_account" in recompute_components:
             recovered_report = _freeze_report_simulated_buy_plan(
                 recovered_report, config.data_dir  # type: ignore[arg-type]
             )
@@ -10665,12 +10726,12 @@ def _reuse_planning_revision(
                     ("real_rotation_pairs", "real_rotation_comparisons"),
                 ),
             ):
-                if component in updates:
+                if component in updates or allocation_changed:
                     for field in fields:
                         if field in recovered_judgments:
                             inputs[field] = recovered_judgments[field]
             if (
-                "simulated_account" in updates
+                "simulated_account" in recompute_components
                 and "planned_new_seats" in recovered_judgments
             ):
                 inputs["simulated_buy_fifo"] = recovered_judgments[
@@ -10679,6 +10740,11 @@ def _reuse_planning_revision(
                 inputs["planned_new_seats"] = recovered_judgments[
                     "planned_new_seats"
                 ]
+        if allocation_changed:
+            updates["market"] = (
+                "complete",
+                _planning_market_component_value(inputs),
+            )
         evidence_reference = freeze_trend_evidence(config.data_dir, evidence)
         evidence = json.loads(
             Path(str(evidence_reference["path"])).read_text(encoding="utf-8")
@@ -10695,6 +10761,7 @@ def _reuse_planning_revision(
             evidence=evidence,
             evidence_reference=evidence_reference,
             updates=updates,
+            replace_completed=("market",) if allocation_changed else (),
         )
     rebuilt = rebuild_trend_report_from_evidence(evidence)
     replay = source_payload.get("replay_evidence")
@@ -11987,6 +12054,7 @@ def run_a_share_trend_report(
                 account_factory=account_factory,
                 api_factory=api_factory,
                 quote_factory=quote_factory,
+                allocation_reference=allocation_reference,
             )
             if reused is not None:
                 return reused

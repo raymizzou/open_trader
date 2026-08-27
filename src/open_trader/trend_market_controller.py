@@ -1004,6 +1004,12 @@ def execute_simulated_trend_report(
     report_path, report = matches[0]
     if not _valid_report(config, market, execution_date, report_path, report):
         raise ValueError(f"invalid frozen trend report: {report_path}")
+    strategy_snapshot = report.get("strategy_snapshot")
+    current_nominal = (
+        isinstance(strategy_snapshot, Mapping)
+        and str(strategy_snapshot.get("strategy_version") or "")
+        == ALLOCATION_PROJECTION_VERSIONS.get(market)
+    )
     account_id = require_trend_review_config(config, market)
     requested_at = _localized(now or datetime.now(TIMEZONES[market]), config.timezone)
     execution_id = _simulation_execution_id(
@@ -1108,7 +1114,7 @@ def execute_simulated_trend_report(
                 requested_at.isoformat(timespec="seconds"),
             )
         return reconciled
-    if request_reused and scheduled:
+    if request_reused and scheduled and not current_nominal:
         cycle = ControllerCycle(
             market=market,
             as_of_date=str(report.get("as_of_date") or execution_date),
@@ -1149,7 +1155,7 @@ def execute_simulated_trend_report(
         allow_new_buys=allow_new_buys,
         quote_client=quote_client,
         order_client=order_client,
-        scheduled=scheduled,
+        scheduled=scheduled and not current_nominal,
         execution_id=execution_id,
         request_path=request_path,
         account_id=account_id,
@@ -4259,6 +4265,114 @@ def _execution_completed(
 ) -> bool:
     if _legacy_cycle_cutover(config, cycle):
         return True
+    if execution_id is not None:
+        completion_path = _request_completion_path(
+            config, cycle.market, cycle.execution_date, execution_id
+        )
+        if completion_path.exists():
+            try:
+                completion = _read_json(
+                    completion_path, "simulation request completion"
+                )
+                request_path = (
+                    _controller_root(config, cycle.market)
+                    / "simulation_requests"
+                    / cycle.execution_date
+                    / f"{execution_id}.json"
+                )
+                request = _read_json(request_path, "simulation request")
+                stored_request = completion.get("request")
+                result = completion.get("result")
+                report_path_value = request.get("report_path")
+                report_sha = request.get("report_sha256")
+                actor = request.get("actor")
+                reason = request.get("reason")
+                if not isinstance(report_path_value, str) or not report_path_value:
+                    raise ValueError
+                if not isinstance(report_sha, str) or len(report_sha) != 64:
+                    raise ValueError
+                if any(
+                    character not in "0123456789abcdef"
+                    for character in report_sha
+                ):
+                    raise ValueError
+                if not isinstance(actor, str) or not actor:
+                    raise ValueError
+                if not isinstance(reason, str) or not reason:
+                    raise ValueError
+                account_id = request.get("account_id")
+                configured_account_id = getattr(
+                    config,
+                    f"trend_review_{cycle.market.lower()}_simulate_acc_id",
+                    0,
+                )
+                report_path = Path(report_path_value)
+                report = _read_json(report_path, "trend report")
+                expected_request_path = str(request_path)
+                expected_result_identity = {
+                    "market": cycle.market,
+                    "date": cycle.execution_date,
+                    "account_id": account_id,
+                    "execution_id": execution_id,
+                    "request_path": expected_request_path,
+                    "report_sha256": report_sha,
+                    "actor": actor,
+                    "reason": reason,
+                }
+                expected_execution_ids = {
+                    _simulation_execution_id(
+                        account_id,
+                        cycle.market,
+                        cycle.execution_date,
+                        report_sha,
+                        actor,
+                        reason,
+                        scheduled=scheduled,
+                    )
+                    for scheduled in (False, True)
+                }
+                if (
+                    completion.get("schema_version")
+                    != "open_trader.trend_controller.simulation_completion.v1"
+                    or completion.get("execution_id") != execution_id
+                    or completion.get("request_path") != expected_request_path
+                    or request.get("schema_version")
+                    != "open_trader.trend_controller.simulation_request.v1"
+                    or request.get("execution_id") != execution_id
+                    or request.get("account_type") != "futu_simulate"
+                    or request.get("market") != cycle.market
+                    or request.get("execution_date") != cycle.execution_date
+                    or not isinstance(account_id, int)
+                    or isinstance(account_id, bool)
+                    or account_id <= 0
+                    or account_id != configured_account_id
+                    or report_path.resolve().parent
+                    != _report_dir(config, cycle.market).resolve()
+                    or not report_path.exists()
+                    or _report_hash(report) != report_sha
+                    or not _valid_report(
+                        config,
+                        cycle.market,
+                        cycle.execution_date,
+                        report_path,
+                        report,
+                    )
+                    or execution_id not in expected_execution_ids
+                    or not isinstance(stored_request, Mapping)
+                    or dict(stored_request) != request
+                    or not isinstance(result, Mapping)
+                    or any(
+                        result.get(key) != value
+                        for key, value in expected_result_identity.items()
+                    )
+                    or not _request_result_is_terminal(result)
+                ):
+                    raise ValueError
+            except (OSError, RuntimeError, TypeError, ValueError):
+                raise ValueError(
+                    f"invalid simulation request completion: {completion_path}"
+                ) from None
+            return True
     batch_path = _batch_path(config, cycle.market, cycle.execution_date)
     if not batch_path.exists():
         return False
@@ -5148,6 +5262,14 @@ def run_trend_market_controller(
                         else None
                     )
                     selected = _locked_report(config, work_cycle, latest, now)
+                    selected_strategy_snapshot = selected[1].get("strategy_snapshot")
+                    selected_current_nominal = (
+                        isinstance(selected_strategy_snapshot, Mapping)
+                        and str(
+                            selected_strategy_snapshot.get("strategy_version") or ""
+                        )
+                        == ALLOCATION_PROJECTION_VERSIONS.get(market)
+                    )
                     configured_account_id = getattr(
                         config,
                         f"trend_review_{market.lower()}_simulate_acc_id",
@@ -5167,6 +5289,8 @@ def run_trend_market_controller(
                         else None
                     )
                     if (
+                        not selected_current_nominal
+                        and
                         _execution_completed(
                             config,
                             work_cycle,

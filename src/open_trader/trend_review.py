@@ -1420,6 +1420,53 @@ def _planning_component_reference(
     return {"path": str(path), "sha256": digest, "status": status}
 
 
+_PLANNING_MARKET_INPUT_KEYS = (
+    "candidates",
+    "holding_snapshots",
+    "bars_by_symbol",
+    "prior_state",
+    "watch_events",
+    "api_facts",
+    "data_sources",
+    "estimated_api_cost",
+    "actual_api_cost",
+    "industry_contexts",
+    "industry_context_status",
+    "estimated_api_cost_complete",
+    "market",
+    "lot_sizes",
+    "position_weight",
+    "position_weight_source",
+    "price_fx_to_account_currency",
+    "normal_cost_rate",
+    "option_attention",
+    "candidate_pool_ids",
+    "generated_at",
+    "metadata",
+    "managed_symbols",
+    "kelly_rounds",
+    "kelly_data_reason",
+    "drawdown_summary",
+    "simulate_rotation_pairs",
+    "simulate_rotation_comparisons",
+    "real_rotation_pairs",
+    "real_rotation_comparisons",
+    "simulated_buy_fifo",
+    "planned_new_seats",
+    "allocation",
+)
+
+
+def _planning_market_component_value(
+    inputs: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        key: inputs[key]
+        for key in _PLANNING_MARKET_INPUT_KEYS
+        if key in inputs
+    }
+
+
 def freeze_planning_snapshot(
     *,
     data_dir: Path,
@@ -1447,45 +1494,7 @@ def freeze_planning_snapshot(
             target_date=target_date,
             component="market",
             status="complete",
-            value={
-                key: inputs[key]
-                for key in (
-                    "candidates",
-                    "holding_snapshots",
-                    "bars_by_symbol",
-                    "prior_state",
-                    "watch_events",
-                    "api_facts",
-                    "data_sources",
-                    "estimated_api_cost",
-                    "actual_api_cost",
-                    "industry_contexts",
-                    "industry_context_status",
-                    "estimated_api_cost_complete",
-                    "market",
-                    "lot_sizes",
-                    "position_weight",
-                    "position_weight_source",
-                    "price_fx_to_account_currency",
-                    "normal_cost_rate",
-                    "option_attention",
-                    "candidate_pool_ids",
-                    "generated_at",
-                    "metadata",
-                    "managed_symbols",
-                    "kelly_rounds",
-                    "kelly_data_reason",
-                    "drawdown_summary",
-                    "simulate_rotation_pairs",
-                    "simulate_rotation_comparisons",
-                    "real_rotation_pairs",
-                    "real_rotation_comparisons",
-                    "simulated_buy_fifo",
-                    "planned_new_seats",
-                    "allocation",
-                )
-                if key in inputs
-            },
+            value=_planning_market_component_value(inputs),
         ),
         "simulated_account": _planning_component_reference(
             data_dir=data_dir,
@@ -1623,6 +1632,7 @@ def update_planning_snapshot_components(
     evidence: Mapping[str, object],
     evidence_reference: Mapping[str, str],
     updates: Mapping[str, tuple[str, object]],
+    replace_completed: Sequence[str] = (),
 ) -> dict[str, str]:
     """Fill only unavailable target-day components and keep completed pointers."""
     manifest = read_planning_snapshot(planning_path, data_dir=data_dir)
@@ -1632,10 +1642,14 @@ def update_planning_snapshot_components(
     if not isinstance(components, Mapping):
         raise ValueError("planning snapshot components are invalid")
     merged = {str(key): dict(value) for key, value in components.items() if isinstance(value, Mapping)}
+    replace_completed_set = set(replace_completed)
     for name, (status, value) in updates.items():
         if name not in merged or status not in {"complete", "unavailable"}:
             raise ValueError("planning snapshot component is invalid")
-        if merged[name].get("status") == "complete":
+        if (
+            merged[name].get("status") == "complete"
+            and name not in replace_completed_set
+        ):
             continue
         merged[name] = _planning_component_reference(
             data_dir=data_dir,

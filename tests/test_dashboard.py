@@ -4208,6 +4208,60 @@ def _current_nominal_dashboard_payload(
     return payload
 
 
+def test_dashboard_loads_current_us_v14_report_with_fractional_atr_precision(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    reports_dir = config.reports_dir / "trend_us_futu"
+    reports_dir.mkdir(parents=True)
+    candidate = trend_module.CandidateInput(
+        tm_id=5,
+        symbol="AAPL",
+        exchange="US",
+        name="Apple",
+        asset="美股",
+        industry="Technology",
+        as_of_date="2026-07-14",
+        tradable=True,
+        amount=Decimal("2"),
+        right_side=True,
+        days=3,
+        strength=Decimal("96"),
+        danger=False,
+        close=Decimal("147.75"),
+        atr=Decimal("7.887585714285714285714285714"),
+        industry_tm_id=700001,
+        industry_temperature="热",
+        filter_price=Decimal("147.75"),
+        market_cap=Decimal("100"),
+        temperature_prev="温",
+        temperature_curr="热",
+        phase="立夏",
+        global_strength=Decimal("70"),
+    )
+    latest = _current_nominal_dashboard_payload(
+        market="US", candidates=(candidate,), lot_sizes={"AAPL": 1},
+    )
+    older = _current_nominal_dashboard_payload(
+        market="US",
+        candidates=(replace(candidate, atr=Decimal("1")),),
+        lot_sizes={"AAPL": 1},
+    )
+    older["generated_at"] = "2026-07-15T19:00:00+08:00"
+    (reports_dir / "2026-07-14.json").write_text(
+        json.dumps(older), encoding="utf-8"
+    )
+    (reports_dir / "2026-07-15.json").write_text(
+        json.dumps(latest), encoding="utf-8"
+    )
+
+    report = load_dashboard_state(config).to_dict()["trend_reports"]["futu"]
+
+    assert (
+        report["available"], report["artifact"], report["strategy_version"]
+    ) == (True, "2026-07-15.json", "v14")
+
+
 def test_dashboard_accepts_current_four_percent_plan_with_unavailable_risk_audit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
