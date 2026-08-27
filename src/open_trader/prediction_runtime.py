@@ -44,6 +44,11 @@ from .prediction_arbitrage_store import (
     PredictionArbitrageStore,
     read_minimum_reader_generation,
 )
+from .relation_auto_confirm import (
+    RelationAutoConfirmRunner,
+    load_auto_confirm_policy_file,
+    run_relation_lifecycle,
+)
 from .prediction_live_resolver import PredictionLiveResolver
 from .prediction_monitor_selection import MonitorSelectionStore
 from .prediction_monitor_selection_driver import PredictionMonitorSelectionDriver
@@ -467,6 +472,43 @@ class PredictionRuntime:
             self.stop()
         return failure
 
+    def _wire_relation_lifecycle(self) -> None:
+        """Hook the #96 governance pass onto the monitor's full-scan boundary.
+
+        The policy lives next to the prediction config; a missing file means
+        the feature is off and no runner is exposed (the HTTP round endpoint
+        then reports unavailability instead of pretending to run zero tiers).
+        A file that parses to at least one tier entry always instantiates the
+        runner — even when zero tiers are enabled or every tier failed its own
+        validation — so round reports surface ``configuration_errors`` and an
+        operator typo can never silently disable auto-confirm. The catalog
+        object is owned by this process only — governance writes go through
+        it, never around it.
+        """
+        policy_path = self._prediction_config_path.parent / "relation_auto_confirm.json"
+        policy = load_auto_confirm_policy_file(policy_path)
+        if not policy.tiers:
+            return
+        assert self.relation_catalog is not None
+        assert self.monitor is not None
+        git_sha = self._git_sha
+        runner = RelationAutoConfirmRunner(
+            self.relation_catalog,
+            policy=policy,
+            notifier=self._notifier,
+        )
+        self.relation_auto_confirm_runner = runner
+
+        def observe() -> dict[str, object]:
+            return run_relation_lifecycle(
+                self.relation_catalog,
+                runner,
+                actor_expire="lifecycle:expire",
+                git_sha=git_sha,
+            )
+
+        self.monitor.set_relation_lifecycle_observer(observe)
+
     def start(self) -> None:
         if self._state != "NEW":
             raise RuntimeError(f"prediction runtime cannot start from {self._state}")
@@ -515,6 +557,7 @@ class PredictionRuntime:
                 title_translator=title_translator,
                 relation_catalog=self.relation_catalog,
             )
+            self._wire_relation_lifecycle()
             self.execution = PredictionExecutionService(
                 store=self.store,
                 monitor=self.monitor,

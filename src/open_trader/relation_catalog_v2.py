@@ -960,6 +960,78 @@ class RelationCatalogV2:
             self.store.setdefault("causes", {})[(identity, "revoked", version_id)] = True
             return {"version_id": version_id, "identity": identity, "status": "UNKNOWN"}
 
+    def expire_members(
+        self,
+        identities: list[str],
+        *,
+        actor: str,
+        git_sha: str,
+    ) -> dict:
+        """Remove generation members whose facts expired (#96), never via revoke.
+
+        Expiry is its own lifecycle outcome: each member's version record is
+        marked ``EXPIRED`` (with the rotating actor/sha recorded on it), a
+        cause ledger entry keyed under producer ``expired`` — distinct from
+        ``revoked`` — poisons exactly that identity, and the identity leaves
+        the stored generation so the next published set is prospective
+        without it. An unknown identity raises after earlier members of the
+        same call were already mutated inside this transaction; the caller's
+        rollback discards all of them.
+        """
+        with self._write():
+            return self._expire_members_locked(
+                identities, actor=actor, git_sha=git_sha
+            )
+
+    def _expire_members_locked(
+        self,
+        identities: list[str],
+        *,
+        actor: str,
+        git_sha: str,
+    ) -> dict:
+        """Core expire_members assuming the caller holds one write transaction.
+
+        Composable seam for the facade's ``expire_stale_members`` rotation:
+        the facade embeds the drops and its APPROVED+blocked review-state
+        reset in one store transaction of its own (mirroring
+        ``_activate_many_locked``/``revoke_locked``), so a failure after the
+        drops are applied rolls all of it back instead of committing expiry
+        while losing the reset. Same mutation contract as above; like the
+        facade-held callers, this seam does not bump or commit — callers
+        compose ``bump_generation`` once per transaction.
+        """
+        generation = self.store.setdefault("generation", {})
+        versions = self.store.setdefault("versions", {})
+        expired: list[dict] = []
+        for identity in identities:
+            entry = generation.get(str(identity))
+            if entry is None:
+                raise ValueError(f"identity is not a generation member: {identity}")
+            version_id = str(entry["version_id"])
+            record = versions[version_id]
+            record["status"] = "EXPIRED"
+            record["activation_status"] = "EXPIRED"
+            record["expire_actor"] = actor
+            record["expire_git_sha"] = git_sha
+            self.store.setdefault("causes", {})[(str(identity), "expired", version_id)] = True
+            generation.pop(str(identity))
+            expired.append({"identity": str(identity), "version_id": version_id})
+        return {"expired": len(expired), "members": expired}
+
+    def revoke_locked(self, version_ids: list[str], *, actor: str, git_sha: str) -> dict:
+        """Core revoke of many ACTIVE versions assuming the caller holds one
+        write transaction (composable seam for the facade's batch shape)."""
+        versions = self.store.setdefault("versions", {})
+        revoked: list[dict] = []
+        for version_id in version_ids:
+            if version_id not in versions:
+                raise ValueError(f"unknown version: {version_id}")
+            identity = versions[version_id]["identity"]
+            self.store.setdefault("causes", {})[(identity, "revoked", version_id)] = True
+            revoked.append({"version_id": version_id, "identity": identity})
+        return {"revoked": len(revoked), "members": revoked}
+
     def replace(
         self,
         change_set: list,

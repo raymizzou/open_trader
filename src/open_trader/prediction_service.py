@@ -557,6 +557,36 @@ def create_prediction_server(
                             if not isinstance(version_id, str) or not version_id.strip():
                                 raise ValueError("version_id is required")
                         result = catalog.approve_many(items, actor=actor, git_sha=git_sha)
+                    elif path == relation_prefix + "/revoke-batch":
+                        if set(payload) - {"items", "reason", "note", "confirm"} or not {"items", "reason", "confirm"} <= set(payload):
+                            raise ValueError("prediction request fields are invalid")
+                        if payload.get("confirm") is not True:
+                            raise ValueError("confirm must be true")
+                        items = payload.get("items")
+                        if not isinstance(items, list) or not items:
+                            raise ValueError("items must be a non-empty list")
+                        for item in items:
+                            if not isinstance(item, dict) or set(item) != {"version_id"}:
+                                raise ValueError("each item must contain exactly version_id")
+                            version_id = item.get("version_id")
+                            if not isinstance(version_id, str) or not version_id.strip():
+                                raise ValueError("version_id is required")
+                        result = catalog.revoke_many(
+                            items,
+                            reason=self._required_string(payload, "reason"),
+                            note=self._optional_string(payload, "note"),
+                            actor=actor,
+                            git_sha=git_sha,
+                        )
+                    elif path == relation_prefix + "/auto-confirm-round":
+                        self._require_confirm(payload)
+                        runner = getattr(runtime, "relation_auto_confirm_runner", None)
+                        if runner is None:
+                            raise RuntimeError("relation auto-confirm is unavailable")
+                        result = runner.run_round(git_sha=git_sha)
+                    elif path == relation_prefix + "/stale-reject":
+                        self._require_confirm(payload)
+                        result = catalog.reject_stale_pending(actor=actor, git_sha=git_sha)
                     else:
                         suffixes = {"/approve", "/reject", "/revoke"}
                         suffix = next((item for item in suffixes if path.endswith(item)), "")

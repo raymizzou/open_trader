@@ -93,8 +93,8 @@ def review_state(record: Mapping[str, object]) -> str | None:
     """Map one stored version record onto the six-state review vocabulary.
 
     ``PENDING`` versions are awaiting approval; ``APPROVED`` versions split by
-    activation status and compiled-model presence; ``REJECTED``/``REVOKED``
-    versions map to ``None`` (history only).
+    activation status and compiled-model presence; ``REJECTED``/``REVOKED``/
+    ``EXPIRED`` versions map to ``None`` (history only).
     """
 
     status = str(record.get("status") or "")
@@ -825,14 +825,55 @@ class RelationCatalog:
 
 
     def ingest(self, discovery: Mapping[str, object], *, git_sha: str = "") -> dict[str, object]:
-        payload = self._converted(discovery)
-        result = self._catalog.ingest(payload)
+        return self._ingest_converted(self._converted(discovery), git_sha=git_sha)
+
+    def _ingest_converted(self, converted: dict[str, object], *, git_sha: str) -> dict[str, object]:
+        blocked = self._intake_blocked_result(converted, git_sha=git_sha)
+        if blocked is not None:
+            return blocked
+        result = self._catalog.ingest(converted)
         return {
             "created": int(result["occurrence_count"]) == 1,
             "version_id": str(result["version_id"]),
             "identity": str(result["identity"]),
             "status": str(result["status"]),
             "occurrence_count": int(result["occurrence_count"]),
+        }
+
+    def _intake_blocked_result(self, converted: Mapping[str, object], *, git_sha: str) -> dict[str, object] | None:
+        """The drop result when an identity's ``latest`` version is terminal.
+
+        Issue #96 queue governance: an identity whose latest version record is
+        REVOKED or EXPIRED cannot re-enter review through discovery; the
+        re-listed market arrives under a new identity instead. The audit row
+        (action ``intake-rejected``, actor ``intake-guard``) is written before
+        anything else so a write failure aborts with zero data changes.
+        """
+        identity = _canonicalize(converted)[0]
+        latest_id = self._store.get("latest", {}).get(identity)
+        if latest_id is None:
+            return None
+        record = self._versions().get(str(latest_id))
+        if record is None or str(record.get("status")) not in {"REVOKED", "EXPIRED"}:
+            return None
+        status = str(record.get("status"))
+        write_audit = getattr(self._store, "write_audit", None)
+        if callable(write_audit):
+            write_audit(
+                action="intake-rejected",
+                identity=str(identity),
+                version_id=str(latest_id),
+                actor="intake-guard",
+                git_sha=git_sha,
+                note=f"latest version is {status}; discovery dropped",
+            )
+        return {
+            "created": False,
+            "version_id": str(latest_id),
+            "identity": str(identity),
+            "status": status,
+            "occurrence_count": int(record.get("occurrence_count", 0)),
+            "intake_rejected": True,
         }
 
     def ingest_controlled(self, discovery: Mapping[str, object], *, git_sha: str = "") -> dict[str, object]:
@@ -1041,7 +1082,7 @@ class RelationCatalog:
         )
         if view == "approved_active":
             return status == "APPROVED" and active
-        return status in {"REJECTED", "REVOKED"} or activation == "SUPERSEDED"
+        return status in {"REJECTED", "REVOKED", "EXPIRED"} or activation == "SUPERSEDED"
 
     def pending_count(self) -> int:
         return sum(
@@ -1167,6 +1208,71 @@ class RelationCatalog:
             "remaining": remaining,
         }
 
+    def reject_stale_pending(self, *, actor: str, git_sha: str, limit: int = 100) -> dict[str, object]:
+        """Bounded exit for PENDING versions no longer ``latest`` (#96).
+
+        A version becomes a zombie when a newer ingest moved ``latest``
+        elsewhere and the newer lineage was itself REVOKED/EXPIRED or
+        superseded: ``reject`` refuses non-latest versions, so zombies would
+        otherwise sit in the pending view forever. Each selected version is
+        rejected through one v2 ``reject_many`` transaction and recorded
+        REJECTED / ``STALE_NON_LATEST``, leaving the pending view; latest
+        PENDING versions are never touched. Apply is bounded by ``limit``
+        versions per run in deterministic ``version_id`` order and reruns
+        until the report is empty. Audit rows (action ``stale-non-latest``)
+        are written before the rejection so a failure leaves an intent record
+        instead of silent drift.
+        """
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        latest = self._store.get("latest", {})
+        matches = sorted(
+            (version_id, str(record["identity"]))
+            for version_id, record in self._versions().items()
+            if record.get("status") == "PENDING"
+            and latest.get(str(record["identity"])) != version_id
+        )[:limit]
+        if not matches:
+            return {"applied": 0, "rejected": []}
+        write_audit = getattr(self._store, "write_audit", None)
+        if callable(write_audit):
+            for version_id, identity in matches:
+                write_audit(
+                    action="stale-non-latest",
+                    identity=identity,
+                    version_id=version_id,
+                    actor=actor,
+                    git_sha=git_sha,
+                    note="non-latest PENDING zombie exited by reject_stale_pending",
+                )
+        self._catalog.reject_many(
+            [version_id for version_id, _ in matches],
+            reason="other",
+            note="issue-96 stale non-latest pending exit",
+            actor=actor,
+            git_sha=git_sha,
+        )
+        self._store_write({
+            version_id: {
+                **self._versions()[version_id],
+                "activation_status": "REJECTED",
+                "activation_diagnostic": "STALE_NON_LATEST",
+            }
+            for version_id, _ in matches
+        })
+        return {
+            "applied": len(matches),
+            "rejected": [
+                {
+                    "version_id": version_id,
+                    "identity": identity,
+                    "status": "REJECTED",
+                    "activation_diagnostic": "STALE_NON_LATEST",
+                }
+                for version_id, identity in matches
+            ],
+        }
+
     def detail(self, relation_version_id: str) -> dict[str, object]:
         versions = self._versions()
         if relation_version_id not in versions:
@@ -1233,6 +1339,7 @@ class RelationCatalog:
         approved_new = outcome.pop("_approved_new", [])
         self._catalog._sync_contract_index(token, approved_new)
         results = outcome["results"]
+        self._write_approval_outcome_audits(results, actor=actor, git_sha=git_sha)
         counts = {
             "total": len(results),
             "active": sum(1 for result in results if result.get("activation") == "ACTIVE"),
@@ -1243,6 +1350,48 @@ class RelationCatalog:
             "error": sum(1 for result in results if "error" in result),
         }
         return {"results": results, "counts": counts}
+
+    def _write_approval_outcome_audits(
+        self,
+        results: list[dict[str, object]],
+        *,
+        actor: str,
+        git_sha: str,
+    ) -> None:
+        """One audit row per non-active ``approve_many`` outcome (#96).
+
+        Blocked approvals (including model-incomplete) and per-entry errors
+        previously vanished into the return payload; operators need them in
+        ``catalog_v2_audit`` too. Runs strictly after the batch transaction
+        commits: the audit writer uses its own connection and must never
+        contend with the held write lock. A crashed or rolled-back batch
+        writes nothing.
+        """
+        write_audit = getattr(self._store, "write_audit", None)
+        if not callable(write_audit):
+            return
+        for result in results:
+            if "error" in result:
+                write_audit(
+                    action="approve-error",
+                    identity=str(result.get("identity", "")),
+                    version_id=str(result.get("version_id", "")),
+                    actor=actor,
+                    git_sha=git_sha,
+                    note=str(result["error"]),
+                )
+            elif result.get("activation") is not None and result.get("activation") != "ACTIVE":
+                write_audit(
+                    action="approve-blocked",
+                    identity=str(result.get("identity", "")),
+                    version_id=str(result.get("version_id", "")),
+                    actor=actor,
+                    git_sha=git_sha,
+                    note=str(
+                        result.get("activation_diagnostic")
+                        or f"activation {result.get('activation')}"
+                    ),
+                )
 
     def _approve_many_locked(self, items: list[Mapping[str, object]], *, actor: str, git_sha: str, raise_on_conflict: bool = False) -> dict[str, object]:
         """Core approve_many; the caller holds one write transaction.
@@ -1526,6 +1675,118 @@ class RelationCatalog:
             "status": "REVOKED",
         }
 
+    def revoke_many(
+        self,
+        items: Sequence[Mapping[str, object]],
+        *,
+        reason: str,
+        note: str = "",
+        actor: str,
+        git_sha: str,
+    ) -> dict[str, object]:
+        """Revoke many ACTIVE versions in one write transaction (#96).
+
+        Mirrors ``approve_many``'s batch shape: per-item judgment in list
+        order — existence, generation membership with the exact active
+        version — with conflicts becoming that entry's ``error`` result while
+        the batch continues; infrastructure failures roll everything back.
+        Only currently-published members are revocable here (the HTTP
+        rollback path); historical rows stay untouched. Cause-ledger marks
+        are written through v2 ``revoke_locked`` so downstream component
+        semantics match single ``revoke`` exactly.
+        """
+        if reason not in _REASONS or len(note) > 1000:
+            raise ValueError("relation decision reason or note is invalid")
+        begin = getattr(self._store, "begin_write", None)
+        if begin is None:
+            outcome = self._revoke_many_locked(
+                list(items), reason=reason, note=note, actor=actor, git_sha=git_sha
+            )
+            self._catalog.bump_generation()
+            return outcome
+        begin()
+        try:
+            outcome = self._revoke_many_locked(
+                list(items), reason=reason, note=note, actor=actor, git_sha=git_sha
+            )
+            self._catalog.bump_generation()
+            self._store.commit_write()
+        except BaseException:
+            self._store.rollback_write()
+            self._catalog._invalidate_contract_index()
+            raise
+        return outcome
+
+    def _revoke_many_locked(
+        self,
+        items: list[Mapping[str, object]],
+        *,
+        reason: str,
+        note: str,
+        actor: str,
+        git_sha: str,
+    ) -> dict[str, object]:
+        """Core revoke_many; the caller holds one write transaction."""
+        results: list[dict[str, object]] = []
+        eligible: list[tuple[str, str]] = []
+        processed: set[str] = set()
+        generation = self._current_generation()
+        for item in items:
+            version_id = str(item["version_id"])
+            record = self._versions().get(version_id)
+            if record is None:
+                results.append({
+                    "version_id": version_id,
+                    "error": "relation version not found",
+                })
+                continue
+            identity = str(record["identity"])
+            entry = generation.get(identity)
+            if entry is None or entry.get("version_id") != version_id:
+                results.append({
+                    "version_id": version_id,
+                    "identity": identity,
+                    "error": "relation version is not active",
+                })
+                continue
+            if version_id in processed:
+                results.append({
+                    "version_id": version_id,
+                    "identity": identity,
+                    "error": "relation version is no longer active",
+                })
+                continue
+            processed.add(version_id)
+            eligible.append((identity, version_id))
+        if eligible:
+            self._catalog.revoke_locked(
+                [version_id for _, version_id in eligible], actor=actor, git_sha=git_sha
+            )
+        updates: dict[str, dict[str, object]] = {}
+        for identity, version_id in eligible:
+            results.append({
+                "version_id": version_id,
+                "identity": identity,
+                "status": "REVOKED",
+            })
+            updates[version_id] = {
+                **self._versions()[version_id],
+                "status": "REVOKED",
+                "activation_status": "REVOKED",
+                "revoke_reason": reason,
+                "revoke_note": note,
+            }
+        if updates:
+            self._store.setdefault("versions", {}).update(updates)
+        return {
+            "results": results,
+            "counts": {
+                "total": len(results),
+                "revoked": len(eligible),
+                "error": sum(1 for result in results if "error" in result),
+            },
+        }
+
     def replace(self, active_expected: Mapping[str, object], candidate_expected: Mapping[str, object], *, reason: str, note: str = "", actor: str, git_sha: str) -> dict[str, object]:
         """Atomically revoke one current fact while publishing its replacement."""
         if reason not in _REASONS or len(note) > 1000:
@@ -1691,6 +1952,112 @@ class RelationCatalog:
                 identity for identity in generation if identity not in drop_set
             ),
             "status": "ACTIVE",
+        }
+
+    def expire_stale_members(self, *, now: str, actor: str, git_sha: str) -> dict[str, object]:
+        """Rotate the ACTIVE generation past its expired members (#96).
+
+        ACTIVE members whose model ``capital_release`` is strictly before
+        ``now`` leave the generation automatically with their own ``EXPIRED``
+        lifecycle semantics — status and activation both ``EXPIRED``, a
+        cause-ledger producer distinct from revoke, one ``expired`` audit row
+        per member carrying the rotating actor and sha — and the remaining
+        member set is republished as a new generation through v2
+        ``expire_members``. Idempotent: with nothing stale nothing is audited,
+        mutated, or republished.
+
+        Approval bookkeeping reset: a candidate the operator approved while
+        the stale timeline held the generation was recorded APPROVED /
+        ``ACTIVATION_BLOCKED_INCONSISTENT`` purely as review-state bookkeeping
+        (v2 keeps blocked candidates PENDING); once expiry removes the shared
+        deadline those verdicts no longer describe any possible compile, so
+        such non-generation records return to PENDING and re-enter the queue.
+
+        The drops/EXPIRED marks and that reset commit together in ONE write
+        transaction (the same begin/commit discipline as ``approve_many``/
+        ``revoke_many``, through v2 ``_expire_members_locked``): a lost or
+        busy-blocked second commit can never leave expiry applied while the
+        reset is gone forever. Audit intent rows are written beforehand on
+        their own connection so an audit failure aborts with zero data
+        changes, mirroring ``rebuild_generation``.
+        """
+        now_ts = _timestamp(now, "now")
+        versions = self._versions()
+        stale: list[tuple[str, str]] = []
+        for identity, entry in self._current_generation().items():
+            version_id = str(entry["version_id"])
+            if str(versions[version_id].get("status")) in {"REVOKED", "EXPIRED", "REJECTED"}:
+                continue  # terminal record kept its cause-ledger history: never re-expire
+            release = str(versions[version_id]["payload"].get("capital_release") or "").strip()
+            try:
+                expired = bool(release) and _utc(release) < _utc(now_ts)
+            except ValueError:
+                continue  # an unparseable release date is never proof of expiry
+            if expired:
+                stale.append((identity, version_id))
+        if not stale:
+            return {"dropped": [], "reset_pending": []}
+        stale.sort()
+        write_audit = getattr(self._store, "write_audit", None)
+        if callable(write_audit):
+            for identity, version_id in stale:
+                write_audit(
+                    action="expired",
+                    identity=identity,
+                    version_id=version_id,
+                    actor=actor,
+                    git_sha=git_sha,
+                    note=(
+                        f"capital_release "
+                        f"{versions[version_id]['payload'].get('capital_release')} before {now_ts}"
+                    ),
+                )
+        begin = getattr(self._store, "begin_write", None)
+        if begin is None:
+            outcome = self._expire_locked(stale, actor=actor, git_sha=git_sha)
+            self._catalog.bump_generation()
+            return outcome
+        begin()
+        try:
+            outcome = self._expire_locked(stale, actor=actor, git_sha=git_sha)
+            self._catalog.bump_generation()
+            self._store.commit_write()
+        except BaseException:
+            self._store.rollback_write()
+            self._catalog._invalidate_contract_index()
+            raise
+        return outcome
+
+    def _expire_locked(self, stale: list[tuple[str, str]], *, actor: str, git_sha: str) -> dict[str, object]:
+        """Core expiry rotation; the caller holds one write transaction."""
+        self._catalog._expire_members_locked(
+            [identity for identity, _ in stale], actor=actor, git_sha=git_sha
+        )
+        remaining = set(self._current_generation())
+        versions = self._versions()
+        updates: dict[str, dict[str, object]] = {}
+        for version_id, record in versions.items():
+            if (
+                record.get("status") == "APPROVED"
+                and record.get("activation_status") == "ACTIVATION_BLOCKED_INCONSISTENT"
+                and str(record["identity"]) not in remaining
+            ):
+                updates[version_id] = {
+                    **record,
+                    "status": "PENDING",
+                    "activation_status": "PENDING",
+                    "activation_diagnostic": "",
+                }
+        self._store.setdefault("versions", {}).update(updates)
+        return {
+            "dropped": [
+                {"identity": identity, "version_id": version_id}
+                for identity, version_id in stale
+            ],
+            "reset_pending": [
+                {"identity": str(record["identity"]), "version_id": version_id}
+                for version_id, record in updates.items()
+            ],
         }
 
     def current_generation(self) -> dict[str, object]:

@@ -154,6 +154,10 @@ def prepare_relation_candidates(
     A component whose member identities all already hold PENDING/APPROVED
     catalog versions is skipped, so restarting the process never re-ingests an
     already-prepared component; the catalog itself is the prepared-set source.
+    An ingest dropped by the catalog's intake guard (an identity whose latest
+    version is REVOKED/EXPIRED) is likewise counted skipped and reported
+    without a PREPARED entry, so a rediscovery can never consume this scan's
+    per-scan budget.
     """
     prepared_identities: set[str] | None = None
     derive = getattr(catalog, "prepared_relation_identities", None)
@@ -184,11 +188,20 @@ def prepare_relation_candidates(
         if len(prepared) >= max_components:
             break
         version_ids: list[str] = []
+        intake_rejected = False
         if catalog is not None:
             for relation in component.relations:
-                version_ids.append(
-                    str(catalog.ingest_threshold_relation(relation)["version_id"])
-                )
+                result = catalog.ingest_threshold_relation(relation)
+                if result.get("intake_rejected"):
+                    intake_rejected = True
+                    break
+                version_ids.append(str(result["version_id"]))
+        if intake_rejected:
+            # The guard fired mid-component: nothing PREPARED happened here,
+            # so count the candidate skipped and move on to the next one
+            # instead of starving it behind a blocked rediscovery.
+            skipped += 1
+            continue
         prepared.append(
             {
                 "status": "PREPARED",
@@ -231,7 +244,9 @@ def prepare_mechanical_relation_candidates(
 
     A relation whose identity already holds a PENDING/APPROVED catalog version
     is skipped, so a re-scan never re-ingests an already-prepared relation;
-    the catalog itself is the prepared-set source.
+    the catalog itself is the prepared-set source. An ingest dropped by the
+    intake guard (identity latest REVOKED/EXPIRED) is likewise counted skipped
+    and never reported PREPARED, so it cannot consume this scan's budget.
     """
     prepared_identities: set[str] | None = None
     derive = getattr(catalog, "prepared_relation_identities", None)
@@ -260,9 +275,14 @@ def prepare_mechanical_relation_candidates(
             break
         version_ids: list[str] = []
         if catalog is not None:
-            version_ids.append(
-                str(catalog.ingest_mechanical_relation(relation)["version_id"])
-            )
+            result = catalog.ingest_mechanical_relation(relation)
+            if result.get("intake_rejected"):
+                # Guarded rediscovery (latest version terminal): count the
+                # candidate skipped and let fresher candidates behind it keep
+                # their slot instead of re-reporting it PREPARED each scan.
+                skipped += 1
+                continue
+            version_ids.append(str(result["version_id"]))
         prepared.append(
             {
                 "status": "PREPARED",

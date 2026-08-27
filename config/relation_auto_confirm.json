@@ -1,0 +1,13 @@
+{
+  "tiers": [
+    {
+      "name": "tier1-venue-metadata",
+      "mode": "active",
+      "max_per_round": 100,
+      "match": [
+        {"discovery_source": "VENUE_METADATA", "relation_type": "NATIVE_COMPLEMENT"},
+        {"discovery_source": "VENUE_METADATA", "relation_type": "EXACTLY_ONE"}
+      ]
+    }
+  ]
+}

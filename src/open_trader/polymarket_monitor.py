@@ -346,6 +346,7 @@ class PolymarketMonitor:
         self._failure_observer: Callable[
             [Mapping[str, object]], Mapping[str, object] | object
         ] | None = None
+        self._relation_lifecycle_observer: Callable[[], object] | None = None
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -560,6 +561,12 @@ class PolymarketMonitor:
         observer: Callable[[Mapping[str, object]], Mapping[str, object] | object],
     ) -> None:
         self._failure_observer = observer
+
+    def set_relation_lifecycle_observer(
+        self, observer: Callable[[], object]
+    ) -> None:
+        """Register the post-full-scan governance pass (#96 expire + confirm)."""
+        self._relation_lifecycle_observer = observer
 
     def start(self) -> None:
         with self._lock:
@@ -1885,6 +1892,26 @@ class PolymarketMonitor:
                 event_count=len(events),
                 relation_count=len(relations),
             )
+            lifecycle_observer = self._relation_lifecycle_observer
+            if lifecycle_observer is not None:
+                # Governance never breaks the scan loop: coordinator failures
+                # are reported as scan-log entries, not raised (#96).
+                try:
+                    lifecycle_report = lifecycle_observer()
+                except Exception as exc:
+                    self._log_relation_scan(
+                        phase="lifecycle",
+                        status="failed",
+                        scope="full",
+                        reason=type(exc).__name__,
+                    )
+                else:
+                    self._log_relation_scan(
+                        phase="lifecycle",
+                        status="completed",
+                        scope="full",
+                        report=lifecycle_report,
+                    )
         except Exception as exc:
             completed = self._now()
             self._catalog_scan_duration_seconds = max(
