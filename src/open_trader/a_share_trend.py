@@ -10614,10 +10614,38 @@ def _reuse_planning_revision(
     if loaded is None:
         return None
     source_payload, planning, evidence = loaded
-    evidence["process_version"] = _process_version(config.repo)
     inputs = evidence.get("rebuild_inputs")
     if not isinstance(inputs, dict):
         raise ValueError("planning snapshot evidence is invalid")
+    strategy = evidence.get("strategy_snapshot")
+    parameters = strategy.get("parameters") if isinstance(strategy, Mapping) else None
+    current_candidate_pool_ids = (
+        config.trend_animals_a_share_tm_id,
+        config.trend_animals_etf_tm_id,
+        config.trend_animals_reits_tm_id,
+    )
+    frozen_candidate_pool_ids = inputs.get("candidate_pool_ids")
+    strategy_candidate_pool_ids = (
+        parameters.get("candidate_pool_ids")
+        if isinstance(parameters, Mapping)
+        else None
+    )
+    if (
+        isinstance(inputs.get("allocation"), Mapping)
+        and (
+            not isinstance(strategy, Mapping)
+            or strategy.get("strategy_version")
+            != CURRENT_NOMINAL_ALLOCATION_VERSIONS["CN"]
+            or not isinstance(frozen_candidate_pool_ids, Sequence)
+            or isinstance(frozen_candidate_pool_ids, (str, bytes))
+            or tuple(frozen_candidate_pool_ids) != current_candidate_pool_ids
+            or not isinstance(strategy_candidate_pool_ids, Sequence)
+            or isinstance(strategy_candidate_pool_ids, (str, bytes))
+            or tuple(strategy_candidate_pool_ids) != current_candidate_pool_ids
+        )
+    ):
+        return None
+    evidence["process_version"] = _process_version(config.repo)
     components = planning.get("components")
     if not isinstance(components, Mapping):
         raise ValueError("planning snapshot components are invalid")

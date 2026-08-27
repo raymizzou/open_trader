@@ -1275,6 +1275,33 @@ def freeze_report_evidence(
     }
 
 
+def _planning_identity(
+    evidence: Mapping[str, object],
+) -> tuple[object, tuple[object, ...], tuple[object, ...]] | None:
+    strategy = evidence.get("strategy_snapshot")
+    inputs = evidence.get("rebuild_inputs")
+    parameters = strategy.get("parameters") if isinstance(strategy, Mapping) else None
+    strategy_pool_ids = (
+        parameters.get("candidate_pool_ids")
+        if isinstance(parameters, Mapping)
+        else None
+    )
+    input_pool_ids = inputs.get("candidate_pool_ids") if isinstance(inputs, Mapping) else None
+    if (
+        not isinstance(strategy, Mapping)
+        or not isinstance(strategy_pool_ids, Sequence)
+        or isinstance(strategy_pool_ids, (str, bytes))
+        or not isinstance(input_pool_ids, Sequence)
+        or isinstance(input_pool_ids, (str, bytes))
+    ):
+        return None
+    return (
+        strategy.get("strategy_version"),
+        tuple(strategy_pool_ids),
+        tuple(input_pool_ids),
+    )
+
+
 def _merge_planning_evidence(
     data_dir: Path, report: object, evidence: Mapping[str, object]
 ) -> dict[str, object]:
@@ -1306,6 +1333,13 @@ def _merge_planning_evidence(
         current_inputs, Mapping
     ) or not isinstance(frozen_inputs, dict):
         raise ValueError("planning snapshot components are invalid")
+
+    if (
+        _planning_identity(frozen) is not None
+        and _planning_identity(evidence) is not None
+        and _planning_identity(frozen) != _planning_identity(evidence)
+    ):
+        return dict(evidence)
 
     merged = copy.deepcopy(frozen)
     merged_inputs = merged["rebuild_inputs"]
@@ -1551,14 +1585,33 @@ def freeze_planning_snapshot(
         old_components = existing.get("components")
         if not isinstance(old_components, Mapping):
             raise ValueError("planning snapshot components are invalid")
-        for name, old_value in old_components.items():
-            if not isinstance(old_value, Mapping) or name not in components:
-                raise ValueError("planning snapshot components are invalid")
-            if old_value.get("status") == components[name].get("status") or (
-                old_value.get("status") == "complete"
-                and components[name].get("status") != "complete"
-            ):
-                components[name] = dict(old_value)
+        existing_evidence_ref = existing.get("evidence")
+        if not isinstance(existing_evidence_ref, Mapping):
+            raise ValueError("planning snapshot evidence is invalid")
+        existing_evidence_path = Path(str(existing_evidence_ref.get("path") or ""))
+        if not existing_evidence_path.is_absolute():
+            existing_evidence_path = data_dir / existing_evidence_path
+        try:
+            existing_evidence = json.loads(
+                existing_evidence_path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("planning snapshot evidence is invalid") from exc
+        identity_changed = (
+            isinstance(existing_evidence, Mapping)
+            and _planning_identity(existing_evidence) is not None
+            and _planning_identity(evidence) is not None
+            and _planning_identity(existing_evidence) != _planning_identity(evidence)
+        )
+        if not identity_changed:
+            for name, old_value in old_components.items():
+                if not isinstance(old_value, Mapping) or name not in components:
+                    raise ValueError("planning snapshot components are invalid")
+                if old_value.get("status") == components[name].get("status") or (
+                    old_value.get("status") == "complete"
+                    and components[name].get("status") != "complete"
+                ):
+                    components[name] = dict(old_value)
     manifest = {
         "schema_version": PLANNING_SNAPSHOT_SCHEMA_VERSION,
         "market": market,

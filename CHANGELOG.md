@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-28
 
+- CN 报告修订现在检测冻结 V16/旧候选池身份漂移，并在同一 allocation 引用下重捕 V17 官方三池；旧报告与证据保持不可变。验证：V17 修订回归及四项不变量 `4 passed`。
 - Routine `make test` and `make acceptance` gates now exclude registered pressure cases; `make test-pressure` retains the 10k relation check.
 
 ## 2026-08-27

@@ -14244,6 +14244,93 @@ def test_report_revision_reuses_target_day_frozen_components(
     assert revised_payload["execution_date"] == "2026-07-15"
 
 
+def test_cn_v17_revision_recaptures_when_frozen_v16_strategy_is_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = trend_config(tmp_path)
+    allocation = _write_cn_v2_allocation(config)
+    initial_calls: list[str] = []
+    monkeypatch.setitem(
+        trend_module.CURRENT_NOMINAL_ALLOCATION_VERSIONS, "CN", "v16"
+    )
+    first = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        allocation_reference=allocation,
+        api_factory=lambda **_kwargs: ReadyApi(initial_calls),
+        quote_factory=lambda **_kwargs: ReadyQuote(initial_calls),
+        notifier=RecordingFeishu(),
+    )
+    assert first.status == "generated"
+    assert first.json_path is not None
+    first_payload = json.loads(first.json_path.read_text(encoding="utf-8"))
+    first_report_bytes = first.json_path.read_bytes()
+    first_evidence_path = config.data_dir / first_payload["replay_evidence"]["path"]
+    first_evidence_bytes = first_evidence_path.read_bytes()
+    planning_path = config.data_dir / first_payload["replay_evidence"]["planning_path"]
+    initial_planning = json.loads(planning_path.read_text(encoding="utf-8"))
+    initial_market_component = initial_planning["components"]["market"]
+
+    monkeypatch.setitem(
+        trend_module.CURRENT_NOMINAL_ALLOCATION_VERSIONS, "CN", "v17"
+    )
+    revision_calls: list[str] = []
+    revised = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        revision=True,
+        allocation_reference=allocation,
+        api_factory=lambda **_kwargs: ReadyApi(revision_calls),
+        quote_factory=lambda **_kwargs: ReadyQuote(revision_calls),
+        notifier=RecordingFeishu(),
+    )
+
+    assert revised.status == "generated"
+    assert revised.json_path is not None
+    revised_payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
+    revised_evidence_path = config.data_dir / revised_payload["replay_evidence"]["path"]
+    revised_evidence = json.loads(revised_evidence_path.read_text(encoding="utf-8"))
+    planning = json.loads(planning_path.read_text(encoding="utf-8"))
+    planning_evidence = json.loads(
+        Path(planning["evidence"]["path"]).read_text(encoding="utf-8")
+    )
+    revised_market_component = planning["components"]["market"]
+    revised_market_value = json.loads(
+        Path(revised_market_component["path"]).read_text(encoding="utf-8")
+    )["value"]
+    component_pool_ids = [622466, 697199, 622482]
+    assert revised_market_component != initial_market_component
+    assert revised_market_value["candidate_pool_ids"] == [622466, 697199, 622482]
+    assert (
+        revised.json_path.name,
+        revised_payload["strategy_snapshot"]["strategy_id"],
+        revised_payload["strategy_snapshot"]["strategy_version"],
+        revised_payload["strategy_snapshot"]["parameters"]["candidate_pool_ids"],
+        revised_evidence["rebuild_inputs"]["candidate_pool_ids"],
+        planning_evidence["strategy_snapshot"]["strategy_version"],
+        planning_evidence["query"]["component_pool_ids"],
+        {
+            int(call.rsplit(".", 1)[1])
+            for call in revision_calls
+            if call.startswith("api.components.")
+        },
+        first.json_path.read_bytes(),
+        first_evidence_path.read_bytes(),
+    ) == (
+        "2026-07-14-r1.json",
+        "trend_animals_warm_to_hot/CN/v17",
+        "v17",
+        component_pool_ids,
+        component_pool_ids,
+        "v17",
+        component_pool_ids,
+        set(component_pool_ids),
+        first_report_bytes,
+        first_evidence_bytes,
+    )
+
+
 def test_cn_revision_refreshes_changed_allocation_from_frozen_inputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
