@@ -16991,6 +16991,112 @@ def test_cn_runner_uses_three_official_warm_to_hot_pools_and_ignores_favorites(
     )
 
 
+def test_cn_v17_report_accepts_ready_empty_reits_pool(tmp_path: Path) -> None:
+    config = replace(
+        trend_config(tmp_path),
+        trend_animals_reits_tm_id=622482,
+    )
+    allocation = _write_cn_v2_allocation(config)
+    component_calls: list[int] = []
+
+    class EmptyReitsApi(ReadyApi):
+        def get_components(
+            self, *, tm_id: int, expected_date: str,
+        ) -> list[dict[str, object]]:
+            component_calls.append(tm_id)
+            if tm_id == 622482:
+                raise TrendAnimalsNoCurrentRowsError(
+                    "getComponentTicker tmId=622482 returned no current-date rows"
+                )
+            return super().get_components(tm_id=tm_id, expected_date=expected_date)
+
+    api = EmptyReitsApi([])
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        allocation_reference=allocation,
+        api_factory=lambda **_kwargs: api,
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+
+    assert result.status == "generated"
+    assert result.json_path is not None
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    evidence = json.loads(
+        (config.data_dir / payload["replay_evidence"]["path"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    candidate_tm_ids = {
+        item["tm_id"] for item in payload["signal_snapshots"]["candidates"]
+    }
+    action_symbols = {
+        item["symbol"] for item in payload["strategy_judgments"]["formal_actions"]
+    }
+    assert (
+        payload["strategy_snapshot"]["strategy_id"],
+        payload["strategy_snapshot"]["strategy_version"],
+        payload["strategy_snapshot"]["parameters"]["candidate_pool_ids"],
+        evidence["query"]["component_pool_ids"],
+        component_calls,
+        {item["tmId"] for item in evidence["responses"]["components"]},
+        candidate_tm_ids,
+        action_symbols <= {"000001", "000002"},
+        api.ignored_stale_components,
+        trend_module.valid_frozen_report_contract(payload),
+    ) == (
+        "trend_animals_warm_to_hot/CN/v17",
+        "v17",
+        [622466, 697199, 622482],
+        [622466, 697199, 622482],
+        [622466, 697199, 622482],
+        {1, 2},
+        {1, 2},
+        True,
+        (),
+        True,
+    )
+
+
+def test_cn_v17_report_rejects_stale_only_reits_pool(tmp_path: Path) -> None:
+    config = replace(
+        trend_config(tmp_path),
+        trend_animals_reits_tm_id=622482,
+    )
+    allocation = _write_cn_v2_allocation(config)
+
+    class StaleOnlyReitsApi(ReadyApi):
+        def get_components(
+            self, *, tm_id: int, expected_date: str,
+        ) -> list[dict[str, object]]:
+            if tm_id == 622482:
+                self.ignored_stale_components = (
+                    {"tickerSymbol": "180502.SZ", "asOfDate": "2026-07-13"},
+                )
+                raise TrendAnimalsNoCurrentRowsError(
+                    "getComponentTicker tmId=622482 returned no current-date rows"
+                )
+            return super().get_components(tm_id=tm_id, expected_date=expected_date)
+
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        now_fn=lambda: datetime(2026, 7, 14, 19, 0, tzinfo=SHANGHAI),
+        allocation_reference=allocation,
+        api_factory=lambda **_kwargs: StaleOnlyReitsApi([]),
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+
+    assert (
+        result.status,
+        result.report_path,
+        result.json_path,
+        list((config.reports_dir / "trend_a_share").glob("*")),
+    ) == ("failed", None, None, [])
+
+
 def test_cn_v16_candidate_rejects_reits_as_historical_asset() -> None:
     item = candidate(
         "180502",

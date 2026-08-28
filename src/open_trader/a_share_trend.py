@@ -11438,7 +11438,19 @@ def _attempt_report(
         component_rows = []
         component_pools: defaultdict[int, set[str]] = defaultdict(set)
         for tm_id in candidate_pool_ids:
-            rows = api.get_components(tm_id=tm_id, expected_date=run_date)
+            ignored_stale_count = len(
+                getattr(api, "ignored_stale_components", ())
+            )
+            try:
+                rows = api.get_components(tm_id=tm_id, expected_date=run_date)
+            except TrendAnimalsNoCurrentRowsError:
+                if (
+                    tm_id != config.trend_animals_reits_tm_id
+                    or len(getattr(api, "ignored_stale_components", ()))
+                    != ignored_stale_count
+                ):
+                    raise
+                rows = []
             component_rows.extend(rows)
             for row in rows:
                 component_pools[_row_tm_id(row)].add(str(tm_id))

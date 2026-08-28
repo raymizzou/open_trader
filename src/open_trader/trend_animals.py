@@ -509,12 +509,12 @@ class TrendAnimalsClient:
                 f"{endpoint} returned data for {safe_actual!r}; "
                 f"expected {self._redact(expected_date)}"
             )
+        self._ignored_stale_components.extend(ignored_rows)
         if ignore_older and not current_rows:
             tm_id = self._redact(str(params.get("tmId", "")))
             raise TrendAnimalsNoCurrentRowsError(
                 f"{endpoint} tmId={tm_id} returned no current-date rows"
             )
-        self._ignored_stale_components.extend(ignored_rows)
         if cached is None and not ignored_rows:
             self._write_cache(cache_path, current_rows)
         return current_rows
