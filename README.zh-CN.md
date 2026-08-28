@@ -486,7 +486,9 @@ curl -sS http://127.0.0.1:8766/api/dashboard | head -c 500
 ps aux | rg 'open_trader dashboard'
 ```
 
-Dashboard 行为改动部署后必须运行统一验收门：
+Dashboard 行为改动不再在每次任务的本地合并或完成路径中同步运行统一验收门。
+完整验收由 `Open Trader acceptance guardian` cron job 在 clean local `main` 上每两小时
+定期执行；结果只适用于运行开始时的精确 Git SHA。现有完整验收命令仍为：
 
 ```bash
 make acceptance
@@ -494,8 +496,9 @@ make acceptance
 
 它会运行全量测试，并检查真实 API 数据、一次真实账户与行情刷新、运行目录与
 Git SHA、错误日志，以及系统 Chrome 中的桌面和移动端 `A 股` / `东方财富`
-筛选流程。只有 `PASS` 可以标记为完成；`FAIL` 必须修复，浏览器不可用则
-返回 `BLOCKED`，不能用 curl 或单元测试替代。
+筛选流程。它不是合并到本地 `main` 或描述仓库改动完成的前置条件；但部署某个
+精确 SHA 仍必须先取得该 SHA 的 `PASS`，并获得显式部署授权。`FAIL` 或 `BLOCKED`
+会阻止 push/部署，不能用 curl 或单元测试替代。
 
 也可以用结构化检查确认 API 和 SOXX 决策事实是否存在：
 

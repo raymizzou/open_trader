@@ -37,33 +37,49 @@ merge first and add the log afterward.
 
 ## Acceptance and Deployment
 
-Never run `make acceptance` in a feature worktree. After worktree tests and
-review pass, merge to local `main`, then run `make acceptance` from local `main`
-only for Dashboard, Prediction, Trend, or another change covered by the runtime
-acceptance suite. Pure docs/config, test-only, and unrelated changes do not run
-acceptance.
+The synchronous local-main merge/completion path does not run `make acceptance`.
+Focused checks, `make test` for code/test changes, staged independent review, the
+dated `CHANGELOG.md`, any required rebase/reverification, and `--ff-only` remain
+the local merge gates. `make acceptance` is not a prerequisite for merging to
+local `main` or describing the repository change as complete.
 
-Acceptance results are authoritative:
+A bounded `Open Trader acceptance guardian` cron job runs the existing full
+`make acceptance` command on clean local `main` every two hours. It remains
+runtime-mutating: it may install/restart local Account, Dashboard, and Trend
+`launchd` services and perform the controlled Account outage check.
 
-- `PASS`: only then may a covered runtime task be described as accepted or
-  complete.
-- `FAIL`: do not push, deploy, or claim completion. Diagnose, present the exact
-  repair plan, obtain user approval, and use a fresh fix-forward worker from
-  merged `main`.
-- `BLOCKED`: do not push, deploy, or claim completion; report the blocker and do not substitute other evidence.
+Each result applies only to the exact start SHA. `PASS` may be silent. If the
+SHA changes during the run, the result is stale and forbids repair from that
+run.
+`FAIL` or `BLOCKED` for the current SHA is reported to Feishu and blocks
+push/deploy, but does not roll back or block later local-main development.
 
-For `PASS` on a Dashboard or other reviewable runtime task, redeploy the exact
-accepted local SHA and verify the new PID, cwd, SHA, fresh logs, and HTTP 200
-from the review URL. An exact-SHA restart needs no second acceptance run when
-source and data are unchanged.
+Standing automated repair authorization is narrow and belongs exclusively to
+the `Open Trader acceptance guardian` cron job. A deterministic, reproducible,
+repository-owned acceptance regression may be repaired from current clean local
+`main` in a fresh isolated worktree, using the existing failing public seam as
+RED and adding at most a narrow regression when needed. The cron job must use
+the smallest fix, may not weaken tests or add skips/xfails, must run focused
+verification and `make test`, update `CHANGELOG.md`, obtain independent staged
+review, rebase and reverify if `main` moved, merge with `--ff-only` to local
+`main`, and rerun acceptance. It stops and reports without edits for
+business-rule or architecture decisions, external credentials/services/market/
+browser/data blockers, dirty/non-main state, a changed SHA, non-reproducible
+failures, or any repair requiring test weakening or scope expansion.
+
+Runtime deployment requires `PASS` for the exact SHA plus explicit user
+authorization. Redeploy that exact local SHA and verify the new PID, cwd, SHA,
+fresh logs, and HTTP 200 from the review URL. An exact-SHA restart needs no
+second acceptance run when source and data are unchanged.
 
 Local merge, remote push, and remote deployment are separate actions. Never
-push or remotely deploy without explicit user authorization.
+automate remote push or deployment; both still require explicit user
+authorization.
 
 Screenshots remain optional unless explicitly requested.
 
 ## Cleanup
 
-Clean up the task branch, worktree, and brief only after applicable acceptance
-and deployment are complete and the user confirms. Never delete a dirty
-worktree.
+Normal task cleanup does not wait for the periodic acceptance cycle. Clean up
+the task branch, worktree, and brief only after local merge, user confirmation,
+and a clean worktree. Never delete a dirty worktree.
