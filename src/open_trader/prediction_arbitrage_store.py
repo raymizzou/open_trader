@@ -35,6 +35,7 @@ _TERMINAL_EXECUTION_STATES = (
     "neutralized_incident",
     "directional_incident",
     "merge_incident",
+    "submit_failed_cleared",
 )
 
 _NOTIFICATION_KINDS = {
@@ -498,7 +499,7 @@ class PredictionArbitrageStore:
             ON executions(singleton)
             WHERE state NOT IN (
                 'both_rejected', 'complete', 'holding_to_resolution', 'neutralized_incident',
-                'directional_incident', 'merge_incident'
+                'directional_incident', 'merge_incident', 'submit_failed_cleared'
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS one_execution_per_idempotency_key

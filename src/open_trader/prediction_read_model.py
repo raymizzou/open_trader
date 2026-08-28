@@ -1413,6 +1413,61 @@ def _prediction_venues_payload(
     ]
 
 
+def _prediction_last_execution(store: PredictionArbitrageStore | None) -> object | None:
+    """Summarize the newest execution row for banner and history surfaces."""
+
+    if store is None:
+        return None
+    histories = getattr(store, "histories", None)
+    if not callable(histories):
+        return None
+    try:
+        rows = histories("executions")
+    except Exception:
+        return None
+    if not isinstance(rows, (list, tuple)) or not rows:
+        return None
+    row = _prediction_safe_value(rows[0])
+    if not isinstance(row, Mapping):
+        return None
+    summary: dict[str, object] = {
+        "state": row.get("state"),
+        "updated_at": row.get("updated_at"),
+        "event_title": _prediction_first(
+            row, "event_title", "question", "title", "market_title"
+        ),
+    }
+    evidence = row.get("evidence")
+    phases = (
+        [item for item in evidence if isinstance(item, Mapping)]
+        if isinstance(evidence, (list, tuple))
+        else []
+    )
+    for phase in reversed(phases):
+        if any(
+            key in phase
+            for key in ("post_error_code", "post_error_type", "post_error_message")
+        ):
+            for key in ("post_error_code", "post_error_type", "post_error_message"):
+                if key in phase:
+                    summary[key] = phase[key]
+            break
+    for phase in phases:
+        if str(phase.get("phase", "")) == "zero_landing_self_clear":
+            summary["zero_landing"] = {
+                key: phase[key]
+                for key in (
+                    "open_orders",
+                    "leg_positions",
+                    "balance_before",
+                    "balance_after",
+                )
+                if key in phase
+            }
+            break
+    return summary
+
+
 def prediction_state_payload(
     *,
     store: PredictionArbitrageStore | None,
@@ -1794,6 +1849,7 @@ def prediction_state_payload(
         "auto_eat_stats": auto_eat_stats,
         "llm_usage_24h": llm_usage_24h,
         "cross_auto": cross_auto,
+        "last_execution": _prediction_last_execution(store),
         "current_execution": current_execution,
         "breaker": {
             "open": breaker_open,

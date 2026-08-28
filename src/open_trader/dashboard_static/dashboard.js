@@ -2129,6 +2129,12 @@ function predictionIncidentStatusLabel(value) {
   return labels[raw] || raw;
 }
 
+function predictionExecutionStatusLabel(value) {
+  const raw = String(value || "").trim();
+  if (raw === "submit_failed_cleared") return "下单失败 · 已核实无成交，自动恢复";
+  return raw;
+}
+
 function predictionGeoblockLabel(value) {
   const raw = String(value || "").trim().toLowerCase();
   if (["allowed", "allow", "ok", "ready", "pass"].includes(raw)) return "允许交易";
@@ -2814,6 +2820,14 @@ function predictionExecutionProgress(execution) {
   }).join("")}</div>`;
 }
 
+function predictionExecutionUpdatedRecently(value, maxAgeSeconds, now = Date.now()) {
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return false;
+  const ageMs = Number(now) - timestamp;
+  if (!Number.isFinite(ageMs) || ageMs < 0) return false;
+  return ageMs <= maxAgeSeconds * 1000;
+}
+
 function predictionExecutionAlert(payload, strategy = "yes_no") {
   const execution = payload?.current_execution;
   const incident = payload?.breaker?.incident;
@@ -2841,6 +2855,33 @@ function predictionExecutionAlert(payload, strategy = "yes_no") {
       return `<section class="pm-alert success" role="status" aria-live="polite"><div class="pm-alert-body"><strong>交易已完成，详情数据未返回</strong><p>请在“交易与合并”历史中查看后台保存的最终记录。</p></div></section>`;
     }
     return `<section class="pm-alert success" role="status" aria-live="polite"><div class="pm-alert-body"><strong>两腿已成交并自动合并</strong><p>买入 ${escapeHtml(predictionValue(execution.quantity))} 组实际成本 ${escapeHtml(predictionMoney(execution.actual_cost))}，合并收回 ${escapeHtml(predictionMoney(execution.merge_value))}，本次已实现净利润 <b>${escapeHtml(predictionSignedMoney(profit))}</b>。</p></div><span class="pm-pill action">已完成 · ${escapeHtml(predictionValue(execution.completed_at))}</span></section>`;
+  }
+  const lastExecution = payload?.last_execution;
+  if (
+    lastExecution
+    && String(lastExecution.state || "").trim() === "submit_failed_cleared"
+    && predictionExecutionUpdatedRecently(lastExecution.updated_at, 600)
+  ) {
+    const zero = lastExecution.zero_landing && typeof lastExecution.zero_landing === "object"
+      ? lastExecution.zero_landing
+      : {};
+    const reason = [
+      [lastExecution.post_error_code, lastExecution.post_error_type]
+        .filter((value) => predictionHasValue(value))
+        .join("｜"),
+      lastExecution.post_error_message,
+    ].filter((value) => predictionHasValue(value)).join("：");
+    const balanceProven = predictionHasValue(zero.balance_before)
+      && predictionHasValue(zero.balance_after);
+    const proofLine = balanceProven
+      ? `自证依据：挂单空 · 两腿无持仓 · 余额未变（${zero.balance_before} → ${zero.balance_after}）`
+      : "自证依据：挂单空 · 两腿无持仓";
+    const body = [
+      reason ? `<p>原因 ${escapeHtml(reason)}</p>` : "",
+      `<small>${escapeHtml(proofLine)}</small>`,
+      "<small>系统已自动恢复，下一个机会照常参与，无需处理。</small>",
+    ].join("");
+    return `<section class="pm-alert info" role="status" aria-live="polite"><div class="pm-alert-body"><strong>上一笔下单失败 · 已核实无成交</strong>${body}</div><span class="pm-pill watch">已自动恢复</span></section>`;
   }
   if (execution && status === "holding_to_resolution") {
     const cross = predictionIsCrossVenue(execution);
@@ -3424,7 +3465,7 @@ function predictionHistoryContent(payload, kind) {
     return `<table class="pm-table pm-signal-table"><thead><tr><th>出现时间（HKT）</th><th>标的</th><th>24h 成交量</th><th>资金占用</th><th>净回报</th><th>操作</th></tr></thead><tbody>${displayRows.map((row) => `<tr class="${row.actionable_now === true && !closed(row) ? "pm-signal-live" : ""}"><td data-label="出现时间（HKT）">${escapeHtml(predictionHktTimestamp(row.occurred_at))}<small class="pm-relative-age">${escapeHtml(predictionRelativeAge(row.occurred_at))}</small></td><td data-label="标的" class="pm-title-cell">${title(row)}</td><td data-label="24h 成交量">${escapeHtml(predictionVolume(row.volume_24h, "-"))}</td><td data-label="资金占用">${capitalUsage(row)}</td><td data-label="净回报">${netReturn(row)}</td><td data-label="操作" class="pm-signal-operation">${operation(row)}</td></tr>`).join("")}</tbody></table>`;
   }
   if (kind === "executions") {
-    return `<table class="pm-table"><thead><tr><th>完成时间</th><th>市场</th><th>数量</th><th>实际成本</th><th>合并收回</th><th>已实现</th></tr></thead><tbody>${displayRows.map((row) => { const quantity = predictionValue(row.quantity); const quantityLabel = quantity === "-" || quantity.includes("组") ? quantity : `${quantity} 组`; const holding = row.state === "holding_to_resolution"; const legs = predictionVenueLegLabels(row.legs); const state = predictionValue(row.status ?? row.state, "-"); const lifecycle = Array.isArray(row.lifecycle) ? `<details class="pm-lifecycle"><summary>生命周期回执</summary>${row.lifecycle.map((item) => `<div><span>${escapeHtml(predictionValue(item.phase, "阶段"))}</span><strong>${escapeHtml(predictionValue(item.receipt, "-"))}</strong><small>${escapeHtml(predictionValue(item.status, "-"))}</small></div>`).join("")}</details>` : ""; return `<tr><td data-label="完成时间">${escapeHtml(predictionValue(row.completed_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}${legs ? `<small class="pm-signal-legs">${escapeHtml(legs)}</small>` : ""}<small>状态 ${escapeHtml(state)}</small>${lifecycle}</td><td data-label="数量">${escapeHtml(quantityLabel)}</td><td data-label="实际成本">${escapeHtml(predictionMoney(row.actual_cost))}</td><td data-label="合并收回">${holding ? "待兑付（不 merge）" : escapeHtml(predictionMoney(row.merge_value))}</td><td data-label="已实现" class="pm-positive"><strong>${holding ? "待兑付" : escapeHtml(predictionSignedMoney(row.realized_profit))}</strong></td></tr>`; }).join("")}</tbody></table>`;
+    return `<table class="pm-table"><thead><tr><th>完成时间</th><th>市场</th><th>数量</th><th>实际成本</th><th>合并收回</th><th>已实现</th></tr></thead><tbody>${displayRows.map((row) => { const quantity = predictionValue(row.quantity); const quantityLabel = quantity === "-" || quantity.includes("组") ? quantity : `${quantity} 组`; const holding = row.state === "holding_to_resolution"; const legs = predictionVenueLegLabels(row.legs); const state = predictionValue(row.status ?? row.state, "-"); const lifecycle = Array.isArray(row.lifecycle) ? `<details class="pm-lifecycle"><summary>生命周期回执</summary>${row.lifecycle.map((item) => `<div><span>${escapeHtml(predictionValue(item.phase, "阶段"))}</span><strong>${escapeHtml(predictionValue(item.receipt, "-"))}</strong><small>${escapeHtml(predictionValue(item.status, "-"))}</small></div>`).join("")}</details>` : ""; return `<tr><td data-label="完成时间">${escapeHtml(predictionValue(row.completed_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}${legs ? `<small class="pm-signal-legs">${escapeHtml(legs)}</small>` : ""}<small>状态 ${escapeHtml(predictionExecutionStatusLabel(state))}</small>${lifecycle}</td><td data-label="数量">${escapeHtml(quantityLabel)}</td><td data-label="实际成本">${escapeHtml(predictionMoney(row.actual_cost))}</td><td data-label="合并收回">${holding ? "待兑付（不 merge）" : escapeHtml(predictionMoney(row.merge_value))}</td><td data-label="已实现" class="pm-positive"><strong>${holding ? "待兑付" : escapeHtml(predictionSignedMoney(row.realized_profit))}</strong></td></tr>`; }).join("")}</tbody></table>`;
   }
   return `<table class="pm-table"><thead><tr><th>发生时间</th><th>市场</th><th>原因</th><th>自动处置</th><th>损失</th><th>状态</th></tr></thead><tbody>${displayRows.map((row) => { const legs = predictionVenueLegLabels(row.legs); return `<tr><td data-label="发生时间">${escapeHtml(predictionValue(row.happened_at))}</td><td data-label="市场">${escapeHtml(predictionValue(row.event_title))}${legs ? `<small class="pm-signal-legs">${escapeHtml(legs)}</small>` : ""}</td><td data-label="原因">${escapeHtml(predictionIncidentReasonLabel(row.reason))}</td><td data-label="自动处置">${escapeHtml(predictionValue(row.remediation))}</td><td data-label="损失" class="pm-tone-danger"><strong>${escapeHtml(predictionSignedMoney(row.loss))}</strong></td><td data-label="状态">${escapeHtml(predictionIncidentStatusLabel(row.status))}</td></tr>`; }).join("")}</tbody></table>`;
 }

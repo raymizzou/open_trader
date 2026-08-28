@@ -373,6 +373,19 @@ def _safe_error_code(exc: BaseException) -> str:
     return "sdk_error"
 
 
+def _submit_error_detail(exc: BaseException) -> dict[str, str]:
+    """Redacted observable facts about a submit exception; never credentials."""
+
+    message = " ".join(str(exc).split())
+    if len(message) > 500:
+        message = message[:500] + "…"
+    return {
+        "error_code": _safe_error_code(exc),
+        "error_type": type(exc).__name__,
+        "message": message,
+    }
+
+
 def _collect(value: object) -> tuple[object, ...]:
     if value is None:
         return ()
@@ -510,6 +523,12 @@ class PolymarketTradingClient:
         self._readiness_key: tuple[PairIntent, Decimal] | None = None
         self._threshold_readiness_key: ThresholdHedgeIntent | None = None
         self._cross_leg_readiness_key: object | None = None
+        self._last_submit_error: dict[str, str] | None = None
+
+    def last_submit_error(self) -> dict[str, str] | None:
+        """Redacted detail of the most recent submit exception, if any."""
+
+        return self._last_submit_error
 
     @classmethod
     def from_keychain(
@@ -1208,6 +1227,7 @@ class PolymarketTradingClient:
     def submit_pair_once(
         self, intent: PairIntent, *, tick_size: Decimal = DEFAULT_TICK_SIZE
     ) -> PairSubmission:
+        self._last_submit_error = None
         if self._readiness_key != (intent, tick_size):
             return self._blocked_pair("preflight_required")
         signer_match, wallet_match = self._identity_summary()
@@ -1229,8 +1249,9 @@ class PolymarketTradingClient:
             return self._blocked_pair(error_code)
         try:
             responses = tuple(self._client.post_orders((yes, no)))
-        except Exception:
+        except Exception as exc:
             # A POST may have reached the venue; never retry or claim rejection.
+            self._last_submit_error = _submit_error_detail(exc)
             return self._ambiguous_pair()
         if len(responses) != 2:
             return self._ambiguous_pair()
@@ -1521,6 +1542,7 @@ class PolymarketTradingClient:
     def submit_threshold_hedge_once(
         self, intent: ThresholdHedgeIntent
     ) -> ThresholdHedgeSubmission:
+        self._last_submit_error = None
         if self._threshold_readiness_key != intent:
             return self._blocked_threshold(intent, "preflight_required")
         signer_match, wallet_match = self._identity_summary()
@@ -1542,7 +1564,8 @@ class PolymarketTradingClient:
             return self._blocked_threshold(intent, error_code)
         try:
             responses = tuple(self._client.post_orders((signed_a, signed_b)))
-        except Exception:
+        except Exception as exc:
+            self._last_submit_error = _submit_error_detail(exc)
             return self._ambiguous_threshold(intent)
         if len(responses) != 2:
             return self._ambiguous_threshold(intent)

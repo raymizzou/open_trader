@@ -29,6 +29,7 @@ from .polymarket_trading import (
     PolymarketTradingClient,
     ThresholdHedgeSubmission,
     ThresholdLegResult,
+    _submit_error_detail,
 )
 from .prediction_arbitrage import (
     MAX_CROSS_UNSETTLED_PRINCIPAL,
@@ -260,6 +261,7 @@ class PredictionExecutionService:
         self._sleep = time.sleep
         self._predict_snapshot_lock = threading.RLock()
         self._predict_snapshot_cache: dict[str, object] | None = None
+        self._last_zero_landing_summary: dict[str, object] | None = None
 
     def set_cross_venue_monitor(self, monitor: object) -> None:
         self._cross_venue_monitor = monitor
@@ -2380,18 +2382,25 @@ class PredictionExecutionService:
                         self._preflight_error_code(result) or "preflight_failed",
                     )
                     return
+            submit_error: dict[str, str] | None = None
             submit = getattr(self._trading, "submit_pair_once", None)
             try:
                 submission = _call(submit, intent, tick_size=tick_size)
-            except Exception:
+            except Exception as exc:
+                submit_error = _submit_error_detail(exc)
                 submission = self._ambiguous_submission()
             yes, no = self._submission_legs(submission)
             self._store.record_leg(execution_id, self._leg_payload(yes))
             self._store.record_leg(execution_id, self._leg_payload(no))
+            post_error = self._resolved_post_error(submit_error)
             self._transition(
                 execution_id,
                 "reconciling",
-                {"phase": "reconciling", "post_attempted": True},
+                {
+                    "phase": "reconciling",
+                    "post_attempted": True,
+                    **post_error,
+                },
             )
             if self._both_rejected(yes, no):
                 self._transition(
@@ -2408,7 +2417,12 @@ class PredictionExecutionService:
                 no=no,
             )
             if known is None:
-                self._finish_incident(execution_id, "reconciliation_timeout")
+                self._resolve_submit_unknown(
+                    execution_id,
+                    account=account,
+                    token_ids=(intent.yes_token_id, intent.no_token_id),
+                    post_error=post_error,
+                )
                 return
             yes_quantity, no_quantity, execution_proof = known
             if yes_quantity > 0 and no_quantity <= 0:
@@ -3736,9 +3750,11 @@ class PredictionExecutionService:
         if not callable(submit):
             self._finish_rejected(execution_id, "threshold_submission_unavailable")
             return
+        submit_error: dict[str, str] | None = None
         try:
             submission = _call(submit, intent)
-        except Exception:
+        except Exception as exc:
+            submit_error = _submit_error_detail(exc)
             submission = self._ambiguous_threshold_submission(intent)
         leg_a, leg_b = self._threshold_submission_legs(submission, intent)
         self._store.record_leg(execution_id, self._threshold_leg_payload(leg_a))
@@ -3748,10 +3764,15 @@ class PredictionExecutionService:
                 self._notify_threshold_submitted(leg, result)
             elif not self._threshold_ambiguous(result):
                 self._notify_threshold_rejected(leg, result)
+        post_error = self._resolved_post_error(submit_error)
         self._transition(
             execution_id,
             "reconciling",
-            {"phase": "reconciling", "post_attempted": True},
+            {
+                "phase": "reconciling",
+                "post_attempted": True,
+                **post_error,
+            },
         )
         if self._threshold_both_rejected(leg_a, leg_b):
             self._transition(
@@ -3764,7 +3785,12 @@ class PredictionExecutionService:
             intent, since=submitted_at, leg_a=leg_a, leg_b=leg_b
         )
         if known is None:
-            self._finish_incident(execution_id, "reconciliation_timeout")
+            self._resolve_submit_unknown(
+                execution_id,
+                account=account,
+                token_ids=(intent.leg_a.token_id, intent.leg_b.token_id),
+                post_error=post_error,
+            )
             return
         quantity_a, quantity_b, proof = known
         if quantity_a > 0:
@@ -4382,6 +4408,149 @@ class PredictionExecutionService:
         if not self._snapshot_collections_valid(snapshot):
             return None
         return snapshot
+
+    def _resolved_post_error(
+        self, submit_error: Mapping[str, str] | None
+    ) -> dict[str, str]:
+        """Prefer the client's redacted submit-error detail, else our own."""
+
+        detail: Mapping[str, object] | None = submit_error
+        reader = getattr(self._trading, "last_submit_error", None)
+        if callable(reader):
+            try:
+                client_detail = reader()
+            except Exception:
+                client_detail = None
+            if isinstance(client_detail, Mapping) and any(client_detail.values()):
+                detail = client_detail
+        if not isinstance(detail, Mapping):
+            return {}
+        resolved = {
+            key: str(detail.get(key, "")) for key in ("error_code", "error_type", "message")
+        }
+        if not any(resolved.values()):
+            return {}
+        return {
+            "post_error_code": resolved["error_code"],
+            "post_error_type": resolved["error_type"],
+            "post_error_message": resolved["message"],
+        }
+
+    def _zero_landing_check(
+        self,
+        pre_account: Mapping[str, object],
+        token_ids: tuple[str, ...],
+    ) -> tuple[bool, dict[str, object]]:
+        """One shared account read feeding both self-clear and incident evidence."""
+
+        tokens = {str(token).strip() for token in token_ids if str(token).strip()}
+        after = self._fresh_account_snapshot()
+        if after is None:
+            self._last_zero_landing_summary = {"available": False}
+            return False, self._last_zero_landing_summary
+        open_orders = self._order_ids(after.get("open_order_ids"))
+        positions = after.get("positions")
+        leg_hits: list[object] = []
+        if isinstance(positions, (list, tuple)):
+            for item in positions:
+                if not isinstance(item, Mapping):
+                    continue
+                token = item.get("token_id", item.get("tokenId", item.get("asset_id", "")))
+                if isinstance(token, str) and token.strip() in tokens:
+                    leg_hits.append(self._safe_mapping(item))
+        balance_before = _decimal(pre_account.get("p_usd_balance"))
+        balance_after = _decimal(after.get("p_usd_balance"))
+        summary: dict[str, object] = {
+            "open_orders": "empty" if not open_orders else list(open_orders),
+            "leg_positions": "empty" if not leg_hits else leg_hits,
+            "balance_before": (
+                "" if balance_before is None else format(balance_before, "f")
+            ),
+            "balance_after": (
+                "" if balance_after is None else format(balance_after, "f")
+            ),
+            "checked_at": after.get("checked_at"),
+        }
+        self._last_zero_landing_summary = summary
+        cleared = (
+            not open_orders
+            and not leg_hits
+            and balance_before is not None
+            and balance_after is not None
+            and balance_before == balance_after
+        )
+        return cleared, summary
+
+    def _zero_landing_self_clear(
+        self,
+        execution_id: str,
+        *,
+        pre_account: Mapping[str, object],
+        token_ids: tuple[str, ...],
+        post_error: Mapping[str, str] | None = None,
+    ) -> bool:
+        cleared, summary = self._zero_landing_check(pre_account, token_ids)
+        if not cleared:
+            return False
+        evidence: dict[str, object] = {
+            "phase": "zero_landing_self_clear",
+            **dict(post_error or {}),
+            "open_orders": "empty",
+            "leg_positions": "empty",
+            "balance_before": summary.get("balance_before", ""),
+            "balance_after": summary.get("balance_after", ""),
+            "checked_at": summary.get("checked_at"),
+        }
+        # Proven zero landing: recover without the breaker or an incident row.
+        self._transition(execution_id, "submit_failed_cleared", evidence)
+        self._notify_submit_failed_self_cleared(post_error or {}, summary)
+        return True
+
+    def _resolve_submit_unknown(
+        self,
+        execution_id: str,
+        *,
+        account: Mapping[str, object],
+        token_ids: tuple[str, ...],
+        post_error: Mapping[str, str],
+    ) -> None:
+        if self._zero_landing_self_clear(
+            execution_id,
+            pre_account=account,
+            token_ids=token_ids,
+            post_error=post_error,
+        ):
+            return
+        self._finish_incident(
+            execution_id,
+            "reconciliation_timeout",
+            zero_landing_check=self._last_zero_landing_summary or {"available": False},
+        )
+
+    def _notify_submit_failed_self_cleared(
+        self,
+        post_error: Mapping[str, str],
+        summary: Mapping[str, object],
+    ) -> None:
+        try:
+            reason = ""
+            if any(post_error.values()):
+                reason = (
+                    f"原因：{post_error.get('post_error_code', '')}"
+                    f"｜{post_error.get('post_error_type', '')}"
+                    f"：{post_error.get('post_error_message', '')}\n"
+                )
+            message = (
+                reason
+                + "自证：挂单空 · 两腿无持仓 · 余额未变"
+                f"（{summary.get('balance_before', '')} → {summary.get('balance_after', '')}）\n"
+                "系统已自动恢复，无需处理。"
+            )
+            self._deliver_feishu_notification(
+                "预测套利单提交失败（已自证零落地）", message
+            )
+        except Exception:
+            return
 
     def n_leg_account_view(self) -> object | None:
         """Read-only #52 account seam in integer micro-USDC; None fails closed."""
@@ -6132,14 +6301,18 @@ class PredictionExecutionService:
         state: str = "directional_incident",
         incident_id: str | None = None,
         notify: bool = True,
+        zero_landing_check: Mapping[str, object] | None = None,
     ) -> None:
         self._breaker_open = True
         if incident_id is None:
+            evidence: dict[str, object] = {"phase": "incident", "reason": reason}
+            if zero_landing_check is not None:
+                evidence["zero_landing_check"] = dict(zero_landing_check)
             incident_id = self._record_incident(
                 execution_id,
                 reason,
                 state=state,
-                evidence={"phase": "incident", "reason": reason},
+                evidence=evidence,
                 notify=notify,
             )
         payload = {

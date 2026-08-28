@@ -5736,3 +5736,604 @@ def test_one_leg_neutralization_does_not_mark_first_live_order_validated(tmp_pat
     assert final["state"] == "neutralized_incident"
     runtime = store.load_runtime() or {}
     assert runtime.get("first_live_order") != "validated"
+
+
+class SubmitFailureThresholdTrading(ThresholdTrading):
+    """Threshold venue whose POST raises and whose reconcile never confirms.
+
+    Post-submit account reads reflect ``open_order_ids`` / ``positions`` /
+    ``balance_after_submit``, mirroring a POST that may have reached the
+    venue; pre-submit reads stay clean.
+    """
+
+    def __init__(
+        self,
+        *,
+        submit_error: Exception,
+        open_order_ids: tuple[str, ...] = (),
+        positions: tuple[dict[str, str], ...] = (),
+        post_balance: Decimal = Decimal("60.402411"),
+        balance_after_submit: Decimal | None = None,
+    ) -> None:
+        super().__init__()
+        self.submit_error = submit_error
+        self.open_order_ids = open_order_ids
+        self.positions = positions
+        self.post_balance = post_balance
+        self.balance_after_submit = balance_after_submit
+
+    def account_snapshot(self) -> AccountSnapshot:
+        if self.threshold_submit_calls > 0:
+            return AccountSnapshot(
+                wallet_address="0x" + "1" * 40,
+                p_usd_balance=self.balance_after_submit or self.post_balance,
+                p_usd_allowance=Decimal("65"),
+                open_order_ids=self.open_order_ids,
+                positions=self.positions,  # type: ignore[arg-type]
+                checked_at=datetime.now(UTC),
+            )
+        return AccountSnapshot(
+            wallet_address="0x" + "1" * 40,
+            p_usd_balance=self.post_balance,
+            p_usd_allowance=Decimal("65"),
+            open_order_ids=(),
+            positions=(),  # type: ignore[arg-type]
+            checked_at=datetime.now(UTC),
+        )
+
+    def submit_threshold_hedge_once(
+        self, intent: ThresholdHedgeIntent
+    ) -> ThresholdHedgeSubmission:
+        self.threshold_submit_calls += 1
+        raise self.submit_error
+
+    def reconcile_threshold_hedge(
+        self,
+        *,
+        intent: ThresholdHedgeIntent,
+        since: datetime,
+        leg_a: ThresholdLegResult,
+        leg_b: ThresholdLegResult,
+    ) -> dict[str, object]:
+        del intent, since, leg_a, leg_b
+        self.threshold_reconcile_calls += 1
+        return {
+            "status": "pending",
+            "leg_a_quantity": Decimal("0"),
+            "leg_b_quantity": Decimal("0"),
+        }
+
+
+SELF_CLEAR_WAIT_STATES = {
+    "submit_failed_cleared",
+    "both_rejected",
+    "complete",
+    "holding_to_resolution",
+    "neutralized_incident",
+    "directional_incident",
+    "merge_incident",
+}
+
+
+def wait_for_submit_outcome(service: object, execution_id: str, timeout: float = 5.0):
+    deadline = time.monotonic() + timeout
+    payload = service.execution(execution_id)  # type: ignore[attr-defined]
+    while time.monotonic() < deadline:
+        payload = service.execution(execution_id)  # type: ignore[attr-defined]
+        if payload.get("state") in SELF_CLEAR_WAIT_STATES:
+            return payload
+        time.sleep(0.01)
+    return payload
+
+
+def submit_failure_threshold_fixture(
+    tmp_path: Path,
+    trading: SubmitFailureThresholdTrading,
+    *,
+    monitor: ThresholdMonitor | None = None,
+):
+    store = PredictionArbitrageStore(tmp_path / "data")
+    monitor = monitor or ThresholdMonitor(_threshold_intent())
+    macos = ChannelNotifier("macos")
+    feishu = ChannelNotifier("feishu")
+    service = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=trading,
+        notifier=CompositeTestNotifier(macos, feishu),
+        lock_path=tmp_path / "execution.lock",
+    )
+    assert service.reconcile_startup()["state"] == "ready"
+    service._sleep = lambda _: None  # type: ignore[attr-defined]
+    service._clock = iter(float(index) for index in range(200)).__next__  # type: ignore[attr-defined]
+    service.test_notifiers = (macos, feishu)  # type: ignore[attr-defined]
+    return service, trading, store
+
+
+def test_threshold_submit_failure_self_clears_when_zero_landing(tmp_path: Path) -> None:
+    trading = SubmitFailureThresholdTrading(
+        submit_error=RuntimeError("connection reset by peer")
+    )
+    service, _trading, store = submit_failure_threshold_fixture(tmp_path, trading)
+    feishu = service.test_notifiers[1]  # type: ignore[attr-defined]
+    store.set_validation_mode("auto")
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+    execution_id = str(result.get("execution_id") or "")
+    assert execution_id
+    final = wait_for_submit_outcome(service, execution_id)
+
+    assert final["state"] == "submit_failed_cleared"
+    evidence = final["evidence"]
+    reconciling = next(
+        item for item in evidence if item.get("phase") == "reconciling"
+    )
+    assert reconciling["post_error_type"] == "RuntimeError"
+    assert "connection reset" in reconciling["post_error_message"]
+    assert reconciling["post_error_code"] == "sdk_error"
+    cleared = next(
+        item for item in evidence if item.get("phase") == "zero_landing_self_clear"
+    )
+    assert cleared["balance_before"] == "60.402411"
+    assert cleared["balance_after"] == "60.402411"
+    assert cleared["open_orders"] == "empty"
+    assert cleared["leg_positions"] == "empty"
+    assert store.histories("incidents") == []
+    assert store.active_execution() is None
+    assert service._breaker_is_open() is False
+    notified = [
+        message
+        for title, message in feishu.messages
+        if title == "预测套利单提交失败（已自证零落地）"
+    ]
+    assert len(notified) == 1
+    assert "connection reset" in notified[0]
+    assert "60.402411" in notified[0]
+
+
+class AmbiguousNoDetailThresholdTrading(SubmitFailureThresholdTrading):
+    """Mirrors the real client's ambiguous path with no error detail: the POST
+    outcome is unclear, ``last_submit_error`` is absent entirely, and the
+    zero-landing self-clear must still produce an intact Feishu message."""
+
+    def submit_threshold_hedge_once(
+        self, intent: ThresholdHedgeIntent
+    ) -> ThresholdHedgeSubmission:
+        self.threshold_submit_calls += 1
+        return ThresholdHedgeSubmission(
+            leg_a=ThresholdLegResult(
+                "A", intent.leg_a.outcome, intent.leg_a.condition_id,
+                intent.leg_a.token_id, False, "ambiguous", "", Decimal("0"),
+                (), "ambiguous",
+            ),
+            leg_b=ThresholdLegResult(
+                "B", intent.leg_b.outcome, intent.leg_b.condition_id,
+                intent.leg_b.token_id, False, "ambiguous", "", Decimal("0"),
+                (), "ambiguous",
+            ),
+        )
+
+
+def test_threshold_submit_failure_self_clears_without_post_error_detail(
+    tmp_path: Path,
+) -> None:
+    trading = AmbiguousNoDetailThresholdTrading(
+        submit_error=RuntimeError("connection reset by peer")
+    )
+    service, _trading, store = submit_failure_threshold_fixture(tmp_path, trading)
+    feishu = service.test_notifiers[1]  # type: ignore[attr-defined]
+    store.set_validation_mode("auto")
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+    execution_id = str(result.get("execution_id") or "")
+    assert execution_id
+    final = wait_for_submit_outcome(service, execution_id)
+
+    assert final["state"] == "submit_failed_cleared"
+    notified = [
+        message
+        for title, message in feishu.messages
+        if title == "预测套利单提交失败（已自证零落地）"
+    ]
+    assert len(notified) == 1
+    assert "｜：" not in notified[0]
+    assert "原因：" not in notified[0]
+    assert "挂单空" in notified[0]
+    assert "两腿无持仓" in notified[0]
+    assert "余额未变" in notified[0]
+    assert "60.402411" in notified[0]
+
+
+def test_threshold_submit_failure_incident_records_open_orders(tmp_path: Path) -> None:
+    trading = SubmitFailureThresholdTrading(
+        submit_error=RuntimeError("connection reset by peer"),
+        open_order_ids=("open-order",),
+    )
+    service, _trading, store = submit_failure_threshold_fixture(tmp_path, trading)
+    store.set_validation_mode("auto")
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+    execution_id = str(result.get("execution_id") or "")
+    assert execution_id
+    final = wait_for_submit_outcome(service, execution_id)
+
+    assert final["state"] == "directional_incident"
+    incidents = store.histories("incidents")
+    assert len(incidents) == 1
+    assert service._breaker_is_open() is True
+    check = incidents[0]["zero_landing_check"]
+    assert check["open_orders"] == ["open-order"]
+    assert incidents[0]["reason"] == "reconciliation_timeout"
+
+
+def test_threshold_submit_failure_incident_records_leg_position_hit(
+    tmp_path: Path,
+) -> None:
+    trading = SubmitFailureThresholdTrading(
+        submit_error=RuntimeError("connection reset by peer"),
+        positions=(
+            {"condition_id": "condition-a", "token_id": "a-token", "size": "20"},
+        ),
+    )
+    service, _trading, store = submit_failure_threshold_fixture(tmp_path, trading)
+    store.set_validation_mode("auto")
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+    execution_id = str(result.get("execution_id") or "")
+    assert execution_id
+    final = wait_for_submit_outcome(service, execution_id)
+
+    assert final["state"] == "directional_incident"
+    incidents = store.histories("incidents")
+    assert len(incidents) == 1
+    assert service._breaker_is_open() is True
+    check = incidents[0]["zero_landing_check"]
+    assert check["leg_positions"] == [
+        {"condition_id": "condition-a", "token_id": "a-token", "size": "20"}
+    ]
+
+
+@pytest.mark.parametrize("spelling", ["tokenId", "asset_id"])
+def test_threshold_submit_failure_incident_records_leg_position_hit_production_spelling(
+    tmp_path: Path,
+    spelling: str,
+) -> None:
+    position = {spelling: "a-token", "size": "20", "condition_id": "condition-a"}
+    trading = SubmitFailureThresholdTrading(
+        submit_error=RuntimeError("connection reset by peer"),
+        positions=(position,),
+    )
+    service, _trading, store = submit_failure_threshold_fixture(tmp_path, trading)
+    store.set_validation_mode("auto")
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+    execution_id = str(result.get("execution_id") or "")
+    assert execution_id
+    final = wait_for_submit_outcome(service, execution_id)
+
+    assert final["state"] == "directional_incident"
+    incidents = store.histories("incidents")
+    assert len(incidents) == 1
+    assert service._breaker_is_open() is True
+    check = incidents[0]["zero_landing_check"]
+    assert check["leg_positions"] != "empty"
+    assert check["leg_positions"] == [
+        {spelling: "a-token", "size": "20", "condition_id": "condition-a"}
+    ]
+
+
+def test_threshold_submit_failure_incident_records_balance_change(
+    tmp_path: Path,
+) -> None:
+    trading = SubmitFailureThresholdTrading(
+        submit_error=RuntimeError("connection reset by peer"),
+        balance_after_submit=Decimal("56.006931"),
+    )
+    service, _trading, store = submit_failure_threshold_fixture(tmp_path, trading)
+    store.set_validation_mode("auto")
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+    execution_id = str(result.get("execution_id") or "")
+    assert execution_id
+    final = wait_for_submit_outcome(service, execution_id)
+
+    assert final["state"] == "directional_incident"
+    incidents = store.histories("incidents")
+    assert len(incidents) == 1
+    assert service._breaker_is_open() is True
+    check = incidents[0]["zero_landing_check"]
+    assert check["balance_before"] == "60.402411"
+    assert check["balance_after"] == "56.006931"
+    assert check["open_orders"] == "empty"
+    assert check["leg_positions"] == "empty"
+
+
+class HistoricalAmbiguousThresholdTrading(SubmitFailureThresholdTrading):
+    """Mirrors the real client: swallows the POST error, returns ambiguous legs,
+    and exposes the redacted detail through ``last_submit_error()``."""
+
+    def __init__(self, *, submit_error: Exception, **kwargs: object) -> None:
+        super().__init__(submit_error=submit_error, **kwargs)  # type: ignore[arg-type]
+        self._last_submit_error = {
+            "error_code": "sdk_error",
+            "error_type": "RuntimeError",
+            "message": " ".join(str(submit_error).split()),
+        }
+
+    def last_submit_error(self) -> dict[str, str]:
+        return self._last_submit_error
+
+    def submit_threshold_hedge_once(
+        self, intent: ThresholdHedgeIntent
+    ) -> ThresholdHedgeSubmission:
+        self.threshold_submit_calls += 1
+        return ThresholdHedgeSubmission(
+            leg_a=ThresholdLegResult(
+                "A", intent.leg_a.outcome, intent.leg_a.condition_id,
+                intent.leg_a.token_id, False, "ambiguous", "", Decimal("0"),
+                (), "ambiguous",
+            ),
+            leg_b=ThresholdLegResult(
+                "B", intent.leg_b.outcome, intent.leg_b.condition_id,
+                intent.leg_b.token_id, False, "ambiguous", "", Decimal("0"),
+                (), "ambiguous",
+            ),
+        )
+
+
+def test_threshold_history_replay_2026_08_27_self_clears(tmp_path: Path) -> None:
+    leg_a_condition = (
+        "0xa3c4c50ef08e35deb221e810780838522464e4d447042612a3dbaad0f24f59f7"
+    )
+    leg_a_token = (
+        "84697593422779375783940783015799975248196355365309636525906338458618413560726"
+    )
+    leg_b_condition = (
+        "0xc6f05d324b9c9acfdc7d4d9ae319e27cb6925f307a79d74974de5753d4a54636"
+    )
+    leg_b_token = (
+        "56746635119811017277725675273483130849153613669769236625752470444200639593180"
+    )
+    replay_intent = ThresholdHedgeIntent(
+        relation_id="relation-replay-0827",
+        event_id="event-replay-0827",
+        relation="B_IMPLIES_A",
+        leg_a=ThresholdHedgeLeg(
+            label="A", condition_id=leg_a_condition,
+            market_id="market-replay-a", outcome="YES",
+            token_id=leg_a_token, quantity=Decimal("20"),
+            max_price=Decimal("0.47"), max_cost=Decimal("9.40"),
+            tick_size=Decimal("0.01"),
+        ),
+        leg_b=ThresholdHedgeLeg(
+            label="B", condition_id=leg_b_condition,
+            market_id="market-replay-b", outcome="NO",
+            token_id=leg_b_token, quantity=Decimal("20"),
+            max_price=Decimal("0.53"), max_cost=Decimal("10.60"),
+            tick_size=Decimal("0.01"),
+        ),
+        quantity=Decimal("20"), maximum_fee=Decimal("0.02"),
+        total_max_cost=Decimal("20.00"), minimum_payout=Decimal("20"),
+        minimum_profit=Decimal("9.60"), net_edge=Decimal("0.48"),
+    )
+    trading = HistoricalAmbiguousThresholdTrading(
+        submit_error=RuntimeError("connection reset by peer"),
+        post_balance=Decimal("56.006931"),
+    )
+    monitor = ThresholdMonitor(replay_intent)
+    service, _trading, store = submit_failure_threshold_fixture(
+        tmp_path, trading, monitor=monitor
+    )
+
+    preview = service.preview("threshold-opp-1")
+    execution = service.confirm(str(preview["id"]), "replay-0827")
+    final = wait_for_submit_outcome(service, str(execution["execution_id"]))
+
+    assert final["state"] == "submit_failed_cleared"
+    evidence = final["evidence"]
+    reconciling = next(
+        item for item in evidence if item.get("phase") == "reconciling"
+    )
+    assert reconciling["post_error_type"] == "RuntimeError"
+    assert "connection reset" in reconciling["post_error_message"]
+    assert reconciling["post_error_code"] == "sdk_error"
+    cleared = next(
+        item for item in evidence if item.get("phase") == "zero_landing_self_clear"
+    )
+    assert cleared["balance_before"] == "56.006931"
+    assert cleared["balance_after"] == "56.006931"
+    assert cleared["open_orders"] == "empty"
+    assert cleared["leg_positions"] == "empty"
+    assert store.histories("incidents") == []
+    assert store.active_execution() is None
+    assert service._breaker_is_open() is False
+
+
+class SubmitFailurePairTrading(FakeTrading):
+    """Pair venue whose POST raises and whose reconcile never confirms.
+
+    Post-submit account reads reflect the injected anomalies; pre-submit
+    reads stay clean so startup reconciliation passes.
+    """
+
+    def __init__(
+        self,
+        *,
+        submit_error: Exception,
+        open_order_ids: tuple[str, ...] = (),
+        positions: tuple[dict[str, str], ...] = (),
+        post_balance: Decimal = Decimal("60.402411"),
+        balance_after_submit: Decimal | None = None,
+    ) -> None:
+        super().__init__(result="ambiguous")
+        self.submit_error = submit_error
+        self.pair_open_order_ids = open_order_ids
+        self.pair_positions = positions
+        self.pair_post_balance = post_balance
+        self.pair_balance_after_submit = balance_after_submit
+
+    def account_snapshot(self) -> AccountSnapshot:
+        if self.batch_calls > 0:
+            return AccountSnapshot(
+                wallet_address="0x" + "1" * 40,
+                p_usd_balance=self.pair_balance_after_submit or self.pair_post_balance,
+                p_usd_allowance=Decimal("65"),
+                open_order_ids=self.pair_open_order_ids,
+                positions=self.pair_positions,  # type: ignore[arg-type]
+                checked_at=datetime.now(UTC),
+            )
+        return AccountSnapshot(
+            wallet_address="0x" + "1" * 40,
+            p_usd_balance=self.pair_post_balance,
+            p_usd_allowance=Decimal("65"),
+            open_order_ids=(),
+            positions=(),  # type: ignore[arg-type]
+            checked_at=datetime.now(UTC),
+        )
+
+    def submit_pair_once(
+        self, intent: PairIntent, *, tick_size: Decimal = Decimal("0.01")
+    ) -> PairSubmission:
+        self.batch_calls += 1
+        raise self.submit_error
+
+
+def pair_submit_failure_fixture(
+    tmp_path: Path, trading: SubmitFailurePairTrading
+):
+    store = PredictionArbitrageStore(tmp_path / "data")
+    monitor = FakeMonitor(_intent())
+    macos = ChannelNotifier("macos")
+    feishu = ChannelNotifier("feishu")
+    service = PredictionExecutionService(
+        store=store,
+        monitor=monitor,
+        trading=trading,
+        notifier=CompositeTestNotifier(macos, feishu),
+        lock_path=tmp_path / "execution.lock",
+    )
+    assert service.reconcile_startup()["state"] == "ready"
+    service._sleep = lambda _: None  # type: ignore[attr-defined]
+    service._clock = iter(float(index) for index in range(200)).__next__  # type: ignore[attr-defined]
+    service.test_notifiers = (macos, feishu)  # type: ignore[attr-defined]
+    return service, trading, store
+
+
+def test_pair_submit_failure_self_clears_when_zero_landing(tmp_path: Path) -> None:
+    trading = SubmitFailurePairTrading(
+        submit_error=RuntimeError("connection reset by peer")
+    )
+    service, _trading, store = pair_submit_failure_fixture(tmp_path, trading)
+    feishu = service.test_notifiers[1]  # type: ignore[attr-defined]
+
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "pair-self-clear")
+    final = wait_for_submit_outcome(service, str(execution["execution_id"]))
+
+    assert final["state"] == "submit_failed_cleared"
+    evidence = final["evidence"]
+    reconciling = next(
+        item for item in evidence if item.get("phase") == "reconciling"
+    )
+    assert reconciling["post_error_type"] == "RuntimeError"
+    assert "connection reset" in reconciling["post_error_message"]
+    assert reconciling["post_error_code"] == "sdk_error"
+    cleared = next(
+        item for item in evidence if item.get("phase") == "zero_landing_self_clear"
+    )
+    assert cleared["balance_before"] == "60.402411"
+    assert cleared["balance_after"] == "60.402411"
+    assert cleared["open_orders"] == "empty"
+    assert cleared["leg_positions"] == "empty"
+    assert store.histories("incidents") == []
+    assert store.active_execution() is None
+    assert service._breaker_is_open() is False
+    notified = [
+        message
+        for title, message in feishu.messages
+        if title == "预测套利单提交失败（已自证零落地）"
+    ]
+    assert len(notified) == 1
+    assert "connection reset" in notified[0]
+    assert "60.402411" in notified[0]
+
+
+def test_pair_submit_failure_incident_records_balance_change(tmp_path: Path) -> None:
+    trading = SubmitFailurePairTrading(
+        submit_error=RuntimeError("connection reset by peer"),
+        balance_after_submit=Decimal("56.006931"),
+    )
+    service, _trading, store = pair_submit_failure_fixture(tmp_path, trading)
+
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "pair-balance-change")
+    final = wait_for_submit_outcome(service, str(execution["execution_id"]))
+
+    assert final["state"] == "directional_incident"
+    incidents = store.histories("incidents")
+    assert len(incidents) == 1
+    assert service._breaker_is_open() is True
+    check = incidents[0]["zero_landing_check"]
+    assert check["balance_before"] == "60.402411"
+    assert check["balance_after"] == "56.006931"
+
+
+def test_read_model_last_execution_exposes_submit_failure_summary(
+    tmp_path: Path,
+) -> None:
+    from open_trader.prediction_read_model import prediction_state_payload
+
+    trading = SubmitFailureThresholdTrading(
+        submit_error=RuntimeError("connection reset by peer")
+    )
+    service, _trading, store = submit_failure_threshold_fixture(tmp_path, trading)
+    store.set_validation_mode("auto")
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+    execution_id = str(result.get("execution_id") or "")
+    assert execution_id
+    wait_for_submit_outcome(service, execution_id)
+
+    payload = prediction_state_payload(
+        store=store,
+        monitor=ThresholdMonitor(_threshold_intent()),
+        execution=service,
+        csrf_token="",
+    )
+    last_execution = payload["last_execution"]
+    assert last_execution is not None
+    assert last_execution["state"] == "submit_failed_cleared"
+    assert last_execution["post_error_code"] == "sdk_error"
+    assert last_execution["post_error_type"] == "RuntimeError"
+    assert "connection reset" in last_execution["post_error_message"]
+    assert last_execution["zero_landing"] == {
+        "open_orders": "empty",
+        "leg_positions": "empty",
+        "balance_before": "60.402411",
+        "balance_after": "60.402411",
+    }
+    assert set(last_execution) <= {
+        "state",
+        "updated_at",
+        "event_title",
+        "post_error_code",
+        "post_error_type",
+        "post_error_message",
+        "zero_landing",
+    }
+    assert payload["current_execution"] is None
+
+    empty_payload = prediction_state_payload(
+        store=PredictionArbitrageStore(tmp_path / "empty"),
+        monitor=ThresholdMonitor(_threshold_intent()),
+        execution=service,
+        csrf_token="",
+    )
+    assert empty_payload["last_execution"] is None

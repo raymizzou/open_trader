@@ -245,6 +245,7 @@ def frozen_prediction_state() -> dict[str, object]:
   },
   "csrf_token": "fixed-csrf",
   "current_execution": null,
+  "last_execution": {"event_title": "Same venue question", "state": "complete", "updated_at": "2026-08-10T01:03:04Z"},
   "event_count": 2,
   "events": [
     {"event_id": "cross-event-1", "market_type": "cross_venue_yes_no", "wallet": "0x2222…2222"},

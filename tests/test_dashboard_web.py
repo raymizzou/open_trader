@@ -3591,6 +3591,52 @@ console.log(JSON.stringify({
     assert "当前盘口暂不可交易" in rendered["storeAlert"]
 
 
+def test_prediction_submit_failed_cleared_status_and_alert_render() -> None:
+    output = run_dashboard_js(r'''
+const base = {
+  status:"healthy", stale:false,
+  health:{status:"healthy",degraded_reasons:[]},
+  breaker:{open:false},
+};
+const lastExecution = (minutesAgo) => ({
+  state:"submit_failed_cleared",
+  updated_at:new Date(Date.now() - minutesAgo * 60 * 1000).toISOString(),
+  event_title:"Fed cuts",
+  post_error_code:"sdk_error",
+  post_error_type:"RuntimeError",
+  post_error_message:"connection reset by peer",
+  zero_landing:{
+    open_orders:"empty", leg_positions:"empty",
+    balance_before:"60.402411", balance_after:"60.402411",
+  },
+});
+const recent = {...base, last_execution:lastExecution(1)};
+const stale = {...base, last_execution:lastExecution(11)};
+console.log(JSON.stringify({
+  clearedLabel:predictionExecutionStatusLabel("submit_failed_cleared"),
+  completeLabel:predictionExecutionStatusLabel("complete"),
+  emptyLabel:predictionExecutionStatusLabel(""),
+  recentAlert:predictionExecutionAlert(recent),
+  staleAlert:predictionExecutionAlert(stale),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert (
+        rendered["clearedLabel"] == "下单失败 · 已核实无成交，自动恢复"
+    )
+    assert rendered["completeLabel"] == "complete"
+    assert rendered["emptyLabel"] == ""
+    assert "上一笔下单失败 · 已核实无成交" in rendered["recentAlert"]
+    assert "已自动恢复" in rendered["recentAlert"]
+    assert "原因 sdk_error｜RuntimeError：connection reset by peer" in rendered["recentAlert"]
+    assert "余额未变（60.402411 → 60.402411）" in rendered["recentAlert"]
+    assert rendered["recentAlert"].count('role="status" aria-live="polite"') == 1
+    assert 'class="pm-pill watch">已自动恢复</span>' in rendered["recentAlert"]
+    assert "已核实无成交" not in rendered["staleAlert"]
+    assert "已自动恢复" not in rendered["staleAlert"]
+
+
 def test_prediction_market_incomplete_opportunity_stays_visible_but_cannot_trade() -> None:
     output = run_dashboard_js(r'''
 const payload = {

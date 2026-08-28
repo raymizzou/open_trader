@@ -983,6 +983,76 @@ def test_threshold_post_exception_is_ambiguous_without_retry(
     assert "signature-sentinel" not in repr(result)
 
 
+def test_threshold_post_exception_records_last_submit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeClient()
+    fake.post_error = RuntimeError("signature-sentinel")
+    adapter, _ = make_adapter(fake)
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+
+    assert adapter.no_submit_threshold_preflight(threshold_intent())["result"] == "PASS"
+    result = adapter.submit_threshold_hedge_once(threshold_intent())
+
+    assert result.leg_a.status == "ambiguous"
+    assert result.leg_b.status == "ambiguous"
+    detail = adapter.last_submit_error()
+    assert detail is not None
+    assert detail["error_type"] == "RuntimeError"
+    assert "signature-sentinel" in detail["message"]
+    assert detail["error_code"] in polymarket_trading._SAFE_ERROR_CODES
+
+
+def test_pair_post_exception_records_last_submit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeClient()
+    fake.post_error = RuntimeError("signature-sentinel")
+    adapter, _ = make_adapter(fake)
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+
+    assert adapter.no_submit_preflight(intent())["result"] == "PASS"
+    result = adapter.submit_pair_once(intent())
+
+    assert result.yes.status == "ambiguous"
+    assert result.no.status == "ambiguous"
+    detail = adapter.last_submit_error()
+    assert detail is not None
+    assert detail["error_type"] == "RuntimeError"
+    assert "signature-sentinel" in detail["message"]
+    assert detail["error_code"] in polymarket_trading._SAFE_ERROR_CODES
+
+
+def test_last_submit_error_resets_on_next_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeClient()
+    adapter, _ = make_adapter(fake)
+    monkeypatch.setattr(
+        "open_trader.polymarket_trading.urlopen",
+        lambda *args, **kwargs: FakeResponse({"blocked": False}),
+    )
+
+    assert adapter.no_submit_threshold_preflight(threshold_intent())["result"] == "PASS"
+    assert adapter.last_submit_error() is None
+
+    fake.post_error = RuntimeError("signature-sentinel")
+    adapter.submit_threshold_hedge_once(threshold_intent())
+    assert adapter.last_submit_error() is not None
+
+    fake.post_error = None
+    assert adapter.no_submit_threshold_preflight(threshold_intent())["result"] == "PASS"
+    result = adapter.submit_threshold_hedge_once(threshold_intent())
+    assert result.leg_a.accepted is True
+    assert adapter.last_submit_error() is None
+
+
 def test_cross_leg_preflight_signs_once_then_posts_one_order_with_leg_facts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
