@@ -813,11 +813,44 @@ def _prediction_capital_usage(
     }
 
 
+def _prediction_n_leg_balance_snapshot(
+    *,
+    readiness: Mapping[str, object],
+    execution: object | None,
+) -> dict[str, dict[str, str]]:
+    """Per-venue decimal-string balances from state already in the payload.
+
+    Venues without a readable available+allowance pair are omitted so the
+    projection treats them as funding-UNKNOWN.  No new network requests: the
+    polymarket values come from the monitor readiness entry and the
+    predict.fun values from the execution-side cache read.
+    """
+    snapshot: dict[str, dict[str, str]] = {}
+    p_usd = readiness.get("p_usd_balance", readiness.get("balance"))
+    p_usd_allowance = readiness.get("p_usd_allowance", readiness.get("allowance"))
+    if p_usd not in (None, "") and p_usd_allowance not in (None, ""):
+        snapshot["polymarket"] = {
+            "available": str(p_usd),
+            "allowance": str(p_usd_allowance),
+        }
+    predict_account = _prediction_predict_account_snapshot(execution)
+    predict_available = predict_account.get("available_usdt")
+    predict_allowance = predict_account.get("allowance")
+    if predict_available not in (None, "") and predict_allowance not in (None, ""):
+        snapshot["predict.fun"] = {
+            "available": str(predict_available),
+            "allowance": str(predict_allowance),
+        }
+    return snapshot
+
+
 def _prediction_n_leg_solution_projection(
     solutions: Sequence[Mapping[str, object]],
     *,
     n_leg: Mapping[str, object] | None,
     total_unsettled_capital_units: object,
+    now: object | None = None,
+    balance_snapshot: Mapping[str, Mapping[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     """Project serialized #84 solutions into dashboard n_leg_solutions."""
     if not solutions:
@@ -833,6 +866,13 @@ def _prediction_n_leg_solution_projection(
     contract_scopes = n_leg.get("execution_scopes")
     if not isinstance(contract_scopes, Mapping):
         contract_scopes = {}
+    # The mode contract may carry the {version, policy} wrapper; unwrap it.
+    qualification_policy = n_leg.get("qualification_policy")
+    if (
+        isinstance(qualification_policy, Mapping)
+        and isinstance(qualification_policy.get("policy"), Mapping)
+    ):
+        qualification_policy = qualification_policy["policy"]
     try:
         max_units = int(
             (n_leg.get("safety_config") or {}).get("max_total_unsettled_capital_units") or 0
@@ -868,6 +908,9 @@ def _prediction_n_leg_solution_projection(
                 max_total_unsettled_capital_units=max_units,
                 total_unsettled_capital_units=current_units,
                 legs=entry.get("legs"),
+                now=now,
+                qualification_policy=qualification_policy,
+                balance_snapshot=balance_snapshot,
             )
         except Exception:
             item = None
@@ -1698,6 +1741,10 @@ def prediction_state_payload(
         n_leg_solutions,
         n_leg=n_leg,
         total_unsettled_capital_units=cross_unsettled_current,
+        now=datetime.now(UTC),
+        balance_snapshot=_prediction_n_leg_balance_snapshot(
+            readiness=readiness, execution=execution
+        ),
     )
     if n_leg_projections:
         by_component = {

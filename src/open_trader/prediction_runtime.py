@@ -52,6 +52,7 @@ from .relation_auto_confirm import (
 from .prediction_live_resolver import PredictionLiveResolver
 from .prediction_monitor_selection import MonitorSelectionStore
 from .prediction_monitor_selection_driver import PredictionMonitorSelectionDriver
+from .prediction_n_leg_mode import ensure_same_event_same_venue_scope
 from .prediction_predict_snapshot_refresher import PredictAccountSnapshotRefresher
 from .prediction_read_only import (
     PolymarketReadOnlyGuard,
@@ -530,6 +531,13 @@ class PredictionRuntime:
                     )
             self.solver_server = self._solver_server_factory()
             self.store = PredictionArbitrageStore(self._data_dir)
+            # #104: idempotent startup seed; failures are logged inside and
+            # never block startup.
+            if ensure_same_event_same_venue_scope(self.store):
+                logger.info(
+                    "prediction_n_leg_scope_seed scope=SAME_EVENT_SAME_VENUE pid=%s",
+                    os.getpid(),
+                )
             self.relation_catalog = RelationCatalog(self._data_dir)
             trading_config = load_trading_config(self._prediction_config_path)
             apply_safety_policy = getattr(self.store, "apply_safety_policy", None)

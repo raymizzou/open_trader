@@ -10,6 +10,7 @@ from open_trader.prediction_n_leg_mode import (
     DEFAULT_QUALIFICATION_POLICY,
     DEFAULT_SAFETY_CONFIG,
     NLegVersionConflict,
+    ensure_same_event_same_venue_scope,
     n_leg_enforce_auto_scope_versions,
     n_leg_mode_contract,
     n_leg_order_readiness,
@@ -399,6 +400,141 @@ def test_enforce_auto_scope_versions_downgrades_on_drift(tmp_path: Path) -> None
         "scope_ids": ["s1"],
     }
     assert n_leg_mode_contract(store)["mode"] == "MANUAL"
+
+
+def test_ensure_same_event_same_venue_scope_is_idempotent(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    assert ensure_same_event_same_venue_scope(store) is True
+
+    scope = n_leg_mode_contract(store)["execution_scopes"]["SAME_EVENT_SAME_VENUE"]
+    assert scope["capability"] == "OBSERVE_ONLY"
+    assert scope["scope_version"] == 1
+    assert scope["members"] == {
+        "relation_type": "complement",
+        "same_event": True,
+        "same_venue": True,
+        "venues": ["polymarket"],
+    }
+    event = store.latest_control_event(
+        "n_leg_upsert_scope", "n_leg_execution_scopes/SAME_EVENT_SAME_VENUE"
+    )
+    assert event is not None
+    assert event["outcome"] == "succeeded"
+
+    with sqlite3.connect(_db_path(tmp_path)) as connection:
+        before = connection.execute(
+            "SELECT COUNT(*) FROM control_events WHERE action='n_leg_upsert_scope'"
+        ).fetchone()[0]
+
+    assert ensure_same_event_same_venue_scope(store) is False
+
+    scope = n_leg_mode_contract(store)["execution_scopes"]["SAME_EVENT_SAME_VENUE"]
+    assert scope["scope_version"] == 1
+    with sqlite3.connect(_db_path(tmp_path)) as connection:
+        after = connection.execute(
+            "SELECT COUNT(*) FROM control_events WHERE action='n_leg_upsert_scope'"
+        ).fetchone()[0]
+    assert before == 1
+    assert after == 1
+
+
+def test_n_leg_solution_projection_passes_policy_and_balances(tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from open_trader.prediction_market_solution import MarketSolution
+    from open_trader.prediction_n_leg import (
+        ActionQuantity,
+        canonical_payload,
+        fingerprint,
+    )
+    from open_trader.prediction_read_model import _prediction_n_leg_solution_projection
+
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    market = canonical_payload(
+        MarketSolution(
+            component_id="c1",
+            structure_fingerprint="sha256:struct",
+            quote_fingerprint="sha256:quote",
+            quantities=(ActionQuantity("a-yes", 2), ActionQuantity("a-no", 2)),
+            guaranteed_profit_units=1_500_000,
+            bounded_cost_units=98_500_000,
+            bounded_payout_units=100_000_000,
+            capital_release_at=now + timedelta(days=30),
+            global_search_closed=True,
+            verification_fingerprint="sha256:verify",
+        )
+    )
+    execution = {
+        "market_solution_fingerprint": fingerprint(canonical_payload(market)),
+        "quantities": market["quantities"],
+        "capital_use_units": 98_500_000,
+        "reason": "EXECUTABLE",
+        "order_ready": False,
+        "partial_fill_proof": "PARTIAL_FILL_SAFE",
+    }
+    policy = dict(DEFAULT_QUALIFICATION_POLICY)
+    policy["min_net_margin"] = "0.02"
+    n_leg = {
+        "schema_version": "open_trader.prediction_n_leg.mode_contract.v1",
+        "contract_generation": 1,
+        "mode": "MANUAL",
+        "qualification_policy_version": 2,
+        "qualification_policy": {"version": 2, "policy": policy},
+        "safety_config_version": 1,
+        "safety_config": DEFAULT_SAFETY_CONFIG,
+        "execution_scopes": {
+            "s1": {"scope_id": "s1", "capability": "MANUAL_CANARY", "scope_version": 1},
+        },
+        "enabled_execution_scope_version": [{"scope_id": "s1", "scope_version": 1}],
+        "execution_gates": {
+            "breaker_open": False,
+            "incident_active": False,
+            "batch_active": False,
+        },
+    }
+
+    items = _prediction_n_leg_solution_projection(
+        [
+            {
+                "component_id": "c1",
+                "scope_id": "s1",
+                "market": market,
+                "execution": execution,
+                "legs": [
+                    {
+                        "action_id": "a-yes",
+                        "venue": "polymarket",
+                        "max_cost": "50.00",
+                    },
+                    {
+                        "action_id": "a-no",
+                        "venue": "predict.fun",
+                        "max_cost": "48.50",
+                    },
+                ],
+            }
+        ],
+        n_leg=n_leg,
+        total_unsettled_capital_units=0,
+        now=now,
+        balance_snapshot={
+            "polymarket": {"available": "100.00", "allowance": "100.00"},
+            "predict.fun": {"available": "100.00", "allowance": "100.00"},
+        },
+    )
+
+    assert len(items) == 1
+    item = items[0]
+    # The 1.5% margin fails the contract's 2% floor: policy comes from the
+    # contract, not from hardcoded defaults.
+    assert item["qualification"]["policy"]["min_net_margin"] == "0.02"
+    assert item["qualification"]["status"] == "NOT_QUALIFIED"
+    checks = {row["key"]: row for row in item["qualification"]["checks"]}
+    assert checks["net_margin"]["passed"] is False
+    assert item["funding"]["status"] == "SUFFICIENT"
+    assert set(item["funding"]["venues"]) == {"polymarket", "predict.fun"}
+    assert item["execution"]["reason"] == "MANUAL_CANARY"
 
 
 def test_invalid_policy_and_safety_payloads_fail_closed(tmp_path: Path) -> None:

@@ -7,12 +7,23 @@ submission stays outside this module until the #60 owner cutover.
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal, InvalidOperation
 from typing import Mapping
 
 
+logger = logging.getLogger(__name__)
+
 SCHEMA_VERSION = "open_trader.prediction_n_leg.mode_contract.v1"
 CAPABILITIES = ("OBSERVE_ONLY", "MANUAL_CANARY", "AUTO_ELIGIBLE")
+
+SAME_EVENT_SAME_VENUE_SCOPE_ID = "SAME_EVENT_SAME_VENUE"
+SAME_EVENT_SAME_VENUE_MEMBERS = {
+    "relation_type": "complement",
+    "same_event": True,
+    "same_venue": True,
+    "venues": ["polymarket"],
+}
 
 DEFAULT_QUALIFICATION_POLICY = {
     "min_profit_usd": "1.00",
@@ -485,6 +496,32 @@ def n_leg_update_safety_config(
         },
     )
     return n_leg_mode_contract(store)
+
+
+def ensure_same_event_same_venue_scope(store: object) -> bool:
+    """#104 startup seed: register SAME_EVENT_SAME_VENUE exactly once.
+
+    Writes the scope (capability pinned to ``OBSERVE_ONLY``) only when the
+    store has no such scope yet; an existing scope is skipped entirely so the
+    stored version is never bumped.  Any failure is logged and reported as
+    ``False`` instead of blocking startup.  Returns ``True`` only when the
+    scope was newly written.
+    """
+    try:
+        if store.n_leg_scope(SAME_EVENT_SAME_VENUE_SCOPE_ID) is not None:
+            return False
+        n_leg_upsert_scope(
+            store,
+            scope_id=SAME_EVENT_SAME_VENUE_SCOPE_ID,
+            capability="OBSERVE_ONLY",
+            members=dict(SAME_EVENT_SAME_VENUE_MEMBERS),
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "n_leg_scope_seed scope=%s state=failed", SAME_EVENT_SAME_VENUE_SCOPE_ID
+        )
+        return False
 
 
 def n_leg_upsert_scope(
