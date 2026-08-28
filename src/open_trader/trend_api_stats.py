@@ -198,6 +198,11 @@ class FutuActualFillClient:
         fee_order_ids: list[str] = []
         account_id = str(self.account["acc_id"])
         for order in orders:
+            code = str(order.get("code") or "").strip().upper()
+            if not _is_futu_stock_class_code(code, self.trd_market):
+                # Only stock-class fills enter trend statistics; option and
+                # other derivative fills are account exceptions, not fills.
+                continue
             dealt_quantity = _required_decimal(
                 order.get("dealt_qty"), "Futu order dealt quantity"
             )
@@ -210,11 +215,6 @@ class FutuActualFillClient:
             )
             if dealt_price <= 0:
                 raise ValueError("Futu dealt average price must be positive")
-            code = str(order.get("code") or "").strip().upper()
-            if not _is_futu_stock_class_code(code, self.trd_market):
-                # Only stock-class fills enter trend statistics; option and
-                # other derivative fills are account exceptions, not fills.
-                continue
             order_id = str(order["order_id"]).strip()
             fill = _normalized_futu_fill(
                 {

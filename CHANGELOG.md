@@ -6,8 +6,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-08-28
 
 - CN V17 now accepts a current/ready official REIT warm-to-hot pool with zero rows while rejecting stale-only REIT data; A-share and ETF empty/stale behavior remains fail-closed. Its public strategy snapshot/report source label now names A-share, ETF fund components, and REITs while CN V16 remains unchanged. Verification: source-label regression RED then GREEN; focused empty/stale pool and Trend Animals checks pass.
-- 将完整 `make acceptance` 从每次本地合并/完成路径移至 clean `main` 上每两小时一次的 `Open Trader acceptance guardian`；结果按起始 SHA 绑定，`FAIL`/`BLOCKED` 仍阻止 push/部署，精确 SHA 部署仍需 `PASS` 与显式授权。验证：仅文档/配置变更；staged scope/diff 检查通过；未运行 tests 或 acceptance。
-- CN 报告修订现在检测冻结 V16/旧候选池身份漂移，并在同一 allocation 引用下重捕 V17 官方三池；旧报告与证据保持不可变。验证：V17 修订回归及四项不变量 `4 passed`。
+- 将 `make acceptance` 收敛为合并后的 clean `main` 一次 runtime-only 验证；合并前由 worktree `make test` 与当前工件只读/临时副本 preflight 负责，验收失败先完成一次全量只读错误及下游依赖审计，再批量 fix-forward，不在单个修复之间重复验收。结果按起始 SHA 绑定，精确 SHA 部署仍需 `PASS` 与显式授权，push/部署仍需显式授权。
+- CN V17 报告修订现在保留旧两来源标签的精确回放，同时在版本/标签变更时重捕官方三池、回撤、FIFO 与席位，并同步冻结 evidence/planning/replay 引用；共享 allocation-v2 冻结契约和 staged publisher 拒绝控制器不可执行的计划。Futu 实盘统计先排除 option 等非股票成交，再执行股票数量/价格校验；零价股票仍失败。验证：V17 lineage、staging、Futu filtering 聚焦用例及 `make test` 通过。
 - Routine `make test` and `make acceptance` gates now exclude registered pressure cases; `make test-pressure` retains the 10k relation check.
 
 ## 2026-08-27

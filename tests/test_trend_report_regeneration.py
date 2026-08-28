@@ -3,12 +3,17 @@ from __future__ import annotations
 import importlib.util
 import json
 from datetime import date, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from open_trader import a_share_trend as trend_module
+from open_trader import trend_review
+from open_trader.a_share_trend import AccountSnapshot, CandidateInput
 from open_trader.notifications import NullNotifier
+from open_trader.trend_allocation import build_allocation_snapshot
 
 
 SCRIPT_PATH = (
@@ -100,6 +105,138 @@ def _fake_generator(calls: list[dict[str, object]], market: str):
         )
 
     return generate
+
+
+def _current_cn_v2_payload(tmp_path: Path) -> dict[str, object]:
+    roots = {
+        "CN": {
+            "stock": {"asset": "A股", "tm_id": 10, "as_of_date": "2026-08-07", "global_strength": "70"},
+            "etf": {"asset": "ETF基金", "tm_id": 11, "as_of_date": "2026-08-07", "global_strength": "60"},
+        },
+        "HK": {
+            "stock": {"asset": "港股", "tm_id": 20, "as_of_date": "2026-08-07", "global_strength": "90"},
+            "etf": {"asset": "香港ETF", "tm_id": 21, "as_of_date": "2026-08-07", "global_strength": "80"},
+        },
+        "US": {
+            "stock": {"asset": "美股", "tm_id": 30, "as_of_date": "2026-08-07", "global_strength": "50"},
+            "etf": {"asset": "美国ETF", "tm_id": 31, "as_of_date": "2026-08-07", "global_strength": "40"},
+        },
+    }
+    allocation_snapshot = build_allocation_snapshot(
+        allocation_date="2026-08-07",
+        generated_at="2026-08-07T16:18:00+08:00",
+        git_sha="a" * 40,
+        roots=roots,
+        previous=None,
+        version=2,
+    )
+    allocation = {
+        "daily_path": "data/trend_allocation/daily/2026-08-07.json",
+        "sha256": "b" * 64,
+        "snapshot": allocation_snapshot,
+    }
+    strategy = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (10, 11, 12), allocation=allocation
+    )
+    candidate = CandidateInput(
+        tm_id=600001,
+        symbol="600001",
+        exchange="SH",
+        name="股票600001",
+        asset="A股",
+        industry="电力",
+        as_of_date="2026-08-07",
+        tradable=True,
+        amount=Decimal("2"),
+        right_side=True,
+        days=3,
+        strength=Decimal("96"),
+        danger=False,
+        close=Decimal("10"),
+        atr=Decimal("0.5"),
+        industry_tm_id=700001,
+        industry_temperature="热",
+        filter_price=Decimal("10"),
+        market_cap=Decimal("100"),
+        temperature_prev="温",
+        temperature_curr="热",
+        phase="立夏",
+        global_strength=Decimal("100"),
+    )
+    report = trend_module.build_report(
+        as_of_date="2026-08-07",
+        execution_date="2026-08-08",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-08-07",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(candidate,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        account_input={
+            "snapshot_generation": "sha256:" + "a" * 64,
+            "account_generation": "sha256:" + "b" * 64,
+            "status": "healthy",
+        },
+    )
+    payload = trend_module._report_payload(report)
+    judgments = payload["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    judgments["simulated_buy_fifo"] = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path / "fifo",
+        report=payload,
+        market="CN",
+        execution_date="2026-08-08",
+        persist=False,
+    )
+    judgments["planned_new_seats"] = 1
+    return payload
+
+
+def test_stage_rejects_current_report_that_controller_cannot_execute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    previous = _seed_previous_reports(config)
+
+    def invalid_cn_generator(*, config, run_date, **_kwargs):
+        payload = _current_cn_v2_payload(tmp_path)
+        judgments = payload["strategy_judgments"]
+        assert isinstance(judgments, dict)
+        del judgments["simulated_buy_fifo"]
+        del judgments["planned_new_seats"]
+        root = config.reports_dir / "trend_a_share"
+        root.mkdir(parents=True, exist_ok=True)
+        json_path = root / f"{run_date}-r1.json"
+        markdown_path = root / f"{run_date}-r1.md"
+        json_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        markdown_path.write_text("# CN revision\n", encoding="utf-8")
+        return SimpleNamespace(
+            status="generated", report_path=markdown_path, json_path=json_path
+        )
+
+    monkeypatch.setattr(publisher, "run_a_share_trend_report", invalid_cn_generator)
+    monkeypatch.setattr(
+        publisher,
+        "run_market_trend_report",
+        lambda **kwargs: _fake_generator([], kwargs["market"])(**kwargs),
+    )
+
+    with pytest.raises(ValueError, match="invalid staged trend report contract"):
+        publisher.stage_and_publish(config, publish=False)
+
+    assert (
+        {path: path.read_bytes() for path in previous},
+        list(config.reports_dir.rglob("*-r*.json")),
+    ) == (previous, [])
 
 
 def test_stage_calls_all_markets_with_revision_and_does_not_publish(

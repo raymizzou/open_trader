@@ -314,7 +314,7 @@ def test_make_acceptance_excludes_external_prediction_live_registry() -> None:
     assert all(token not in normalized for token in forbidden)
 
 
-def test_make_acceptance_refreshes_main_runtime_after_tests_before_live_checks() -> None:
+def test_make_acceptance_refreshes_main_runtime_without_repeating_full_suite() -> None:
     repo_root = Path(__file__).parents[1]
     plan = subprocess.run(
         ["make", "-n", "acceptance"],
@@ -324,11 +324,8 @@ def test_make_acceptance_refreshes_main_runtime_after_tests_before_live_checks()
         text=True,
     ).stdout
 
-    pytest_python = re.search(r'(?m)^\s*"([^"]+)" -m pytest\b', plan).group(1)
+    pytest_python = re.search(r'--python "([^"]+)"', plan).group(1)
     plan_lines = [line.strip() for line in plan.splitlines() if line.strip()]
-    pytest_position = next(
-        position for position, line in enumerate(plan_lines) if "-m pytest" in line
-    )
     expected_lines = [
         f'test "$(git -C "{repo_root}" branch --show-current)" = main',
         f'test -z "$(git -C "{repo_root}" status --porcelain)"',
@@ -352,12 +349,21 @@ def test_make_acceptance_refreshes_main_runtime_after_tests_before_live_checks()
     assert (
         [line for _, line in matched_lines] == expected_lines
         and all(plan_lines.count(line) == 1 for line in expected_lines)
-        and pytest_position < matched_lines[0][0]
         and matched_lines[-1][0] < min(live_positions)
+        and not any(
+            re.search(r"(?:^|\s)-m\s+[\"']?pytest[\"']?(?=\s|$)", line)
+            for line in plan_lines
+        )
+        and all(
+            next(position for position, line in enumerate(plan_lines) if line == expected)
+            < next(position for position, line in enumerate(plan_lines) if marker in line)
+            for expected in expected_lines[:3]
+            for marker in ("npm exec playwright", "open_trader.dashboard_acceptance")
+        )
     )
 
 
-def test_default_gates_exclude_pressure_suite_and_keep_explicit_pressure_target() -> None:
+def test_default_gates_run_full_suite_once_before_merge_and_keep_explicit_pressure_target() -> None:
     repo_root = Path(__file__).parents[1]
     plans = {
         target: subprocess.run(
@@ -397,7 +403,11 @@ def test_default_gates_exclude_pressure_suite_and_keep_explicit_pressure_target(
     ]
 
     assert (
-        all('-m "not pressure"' in normalized[target] for target in ("test", "acceptance"))
+        '-m "not pressure"' in normalized["test"]
+        and not re.search(
+            r"(?:^|\s)-m\s+[\"']?pytest[\"']?(?=\s|$)",
+            normalized["acceptance"],
+        )
         and '-m pressure' in normalized["test-pressure"]
         and collected
         == [
@@ -472,8 +482,6 @@ def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
     assert "WORKTREE_ROOT := $(CURDIR)" in makefile
     assert "REPOSITORY_ROOT :=" in makefile
     assert "PYTHONSAFEPATH=1" in makefile
-    assert 'PYTHONPATH="$(WORKTREE_ROOT):$(WORKTREE_ROOT)/src"' in makefile
-    assert '"$(WORKTREE_ROOT)/tests" -q' in makefile
     assert 'DASHBOARD_URL ?= http://127.0.0.1:8766' in makefile
     assert (
         'DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/frontend_gateway/launchd.out.log'

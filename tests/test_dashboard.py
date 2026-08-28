@@ -4207,6 +4207,7 @@ def _current_nominal_dashboard_payload(
             "status": "healthy",
         },
     )
+    report = trend_module._freeze_report_simulated_buy_plan(report, Path())
     payload = trend_module._report_payload(report)
     if market != "CN":
         payload["option_attention"] = []
@@ -4496,6 +4497,7 @@ def test_dashboard_accepts_current_four_percent_plan_with_unavailable_risk_audit
     written_payloads: list[dict[str, object]] = []
 
     def write(report: object) -> None:
+        report = trend_module._freeze_report_simulated_buy_plan(report, tmp_path)
         _, json_path = trend_module.write_frozen_report(report, reports_dir)
         payload = json.loads(json_path.read_text(encoding="utf-8"))
         payload["option_attention"] = []

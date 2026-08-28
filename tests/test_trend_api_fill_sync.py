@@ -219,7 +219,7 @@ def test_futu_real_adapter_reads_stock_fills_skips_option_and_zero_fill_rows() -
                 "order_id": "o2", "code": "US.VIXY260821C22000", "trd_side": "BUY",
                 "currency": "USD", "create_time": "2026-08-18 09:35:00",
                 "updated_time": "2026-08-18 09:36:00", "dealt_qty": "1",
-                "dealt_avg_price": "0.5",
+                "dealt_avg_price": "0",
             },
             {
                 "order_id": "o3", "code": "US.BBB", "trd_side": "BUY",
@@ -284,6 +284,28 @@ def test_futu_real_adapter_reads_stock_fills_skips_option_and_zero_fill_rows() -
     }]
     assert result["account_id"] == "201"
     assert result["source_id"] == "actual:futu:201"
+
+
+def test_futu_real_adapter_rejects_zero_price_stock() -> None:
+    context = FakeFutuRealContext(
+        accounts=[{
+            "acc_id": 201, "acc_index": 0, "trd_env": "REAL", "acc_status": "ACTIVE",
+        }],
+        order_rows=[{
+            "order_id": "o1", "code": "US.AAA", "trd_side": "BUY",
+            "currency": "USD", "create_time": "2026-08-18 09:30:00",
+            "updated_time": "2026-08-18 09:31:00", "dealt_qty": "2",
+            "dealt_avg_price": "0",
+        }],
+    )
+    client = _futu_actual_client(context)
+
+    with pytest.raises(ValueError, match="Futu dealt average price must be positive"):
+        client.fetch_fills(
+            start="2026-08-18",
+            end="2026-08-18",
+            attributions_by_order={},
+        )
 
 
 def test_futu_real_adapter_records_explicit_fee_degradation_when_fee_query_fails() -> None:

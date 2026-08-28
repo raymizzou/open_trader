@@ -77,6 +77,7 @@ from .trend_review import (
     freeze_trend_evidence,
     normalize_trend_strategy_snapshot,
     _planning_market_component_value,
+    planning_evidence_reusable,
     planning_snapshot_path,
     read_planning_snapshot,
     rebuild_trend_report_from_evidence,
@@ -1060,7 +1061,11 @@ def _valid_rotation_comparison(
     return True
 
 
-def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
+def valid_frozen_report_contract(
+    payload: Mapping[str, object],
+    *,
+    _allow_unfrozen_simulated_plan: bool = False,
+) -> bool:
     """Validate the allocation-era fields once for every frozen-report reader."""
     if "account_input" in payload and not _valid_account_input(
         payload.get("account_input")
@@ -1314,6 +1319,28 @@ def valid_frozen_report_contract(payload: Mapping[str, object]) -> bool:
         and isinstance(availability.get("simulated_account"), Mapping)
         and availability["simulated_account"].get("status") != "available"
     )
+    if explicit_v2 and isinstance(availability, Mapping):
+        simulated_plan = availability.get("simulated_account")
+        if (
+            isinstance(simulated_plan, Mapping)
+            and simulated_plan.get("status") == "available"
+            and simulated_plan.get("executable") is True
+        ):
+            simulated_buy_fifo = judgments.get("simulated_buy_fifo")
+            planned_new_seats = judgments.get("planned_new_seats")
+            if (
+                not _allow_unfrozen_simulated_plan
+                and (
+                    not isinstance(simulated_buy_fifo, list)
+                    or not all(
+                        isinstance(entry, Mapping) for entry in simulated_buy_fifo
+                    )
+                    or isinstance(planned_new_seats, bool)
+                    or not isinstance(planned_new_seats, int)
+                    or planned_new_seats < 0
+                )
+            ):
+                return False
     raw_candidate_signals = signal_snapshots.get("candidates")
     if (
         _uses_current_nominal_allocation(market, strategy_version)
@@ -9718,7 +9745,10 @@ def _report_payload(
     )
     if not formal_actions and not simulated_unavailable:
         payload["no_action"] = NO_ACTION_TEXT
-    if not valid_frozen_report_contract(payload):
+    if not valid_frozen_report_contract(
+        payload,
+        _allow_unfrozen_simulated_plan=report.planned_new_seats is None,
+    ):
         raise ValueError("frozen report contract is invalid")
     return payload
 
@@ -9913,11 +9943,14 @@ def write_frozen_report(
         ) as handle:
             handle.write(render_markdown(report))
             markdown_temp = Path(handle.name)
+        payload = _report_payload(report)
+        if not valid_frozen_report_contract(payload):
+            raise ValueError("frozen report contract is invalid")
         with NamedTemporaryFile(
             "w", encoding="utf-8", delete=False, dir=reports_dir
         ) as handle:
             json.dump(
-                _report_payload(report),
+                payload,
                 handle,
                 ensure_ascii=False,
                 indent=2,
@@ -10620,38 +10653,80 @@ def _reuse_planning_revision(
     if not isinstance(inputs, dict):
         raise ValueError("planning snapshot evidence is invalid")
     strategy = evidence.get("strategy_snapshot")
-    parameters = strategy.get("parameters") if isinstance(strategy, Mapping) else None
     current_candidate_pool_ids = (
         config.trend_animals_a_share_tm_id,
         config.trend_animals_etf_tm_id,
         config.trend_animals_reits_tm_id,
     )
-    frozen_candidate_pool_ids = inputs.get("candidate_pool_ids")
-    strategy_candidate_pool_ids = (
-        parameters.get("candidate_pool_ids")
-        if isinstance(parameters, Mapping)
-        else None
-    )
-    if (
-        isinstance(inputs.get("allocation"), Mapping)
-        and (
-            not isinstance(strategy, Mapping)
-            or strategy.get("strategy_version")
-            != CURRENT_NOMINAL_ALLOCATION_VERSIONS["CN"]
-            or not isinstance(frozen_candidate_pool_ids, Sequence)
-            or isinstance(frozen_candidate_pool_ids, (str, bytes))
-            or tuple(frozen_candidate_pool_ids) != current_candidate_pool_ids
-            or not isinstance(strategy_candidate_pool_ids, Sequence)
-            or isinstance(strategy_candidate_pool_ids, (str, bytes))
-            or tuple(strategy_candidate_pool_ids) != current_candidate_pool_ids
-        )
-    ):
-        return None
     evidence["process_version"] = _process_version(config.repo)
     components = planning.get("components")
     if not isinstance(components, Mapping):
         raise ValueError("planning snapshot components are invalid")
+
+    def stored_allocation() -> Mapping[str, object] | None:
+        frozen = inputs.get("allocation")
+        if not isinstance(frozen, Mapping):
+            return None
+        reference = frozen.get("reference")
+        daily_json = frozen.get("daily_json")
+        if not isinstance(reference, Mapping) or not isinstance(daily_json, str):
+            return None
+        try:
+            snapshot = json.loads(daily_json)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(snapshot, Mapping):
+            return None
+        return {**dict(reference), "snapshot": snapshot}
+
+    frozen_allocation = stored_allocation()
+    expected_strategy: Mapping[str, object] | None = None
+    if isinstance(inputs.get("allocation"), Mapping) and frozen_allocation is not None:
+        try:
+            expected_strategy = live_trend_strategy_snapshot(
+                "CN",
+                str(evidence["process_version"]),
+                current_candidate_pool_ids,
+                normal_cost_rate=Decimal(str(inputs["normal_cost_rate"])),
+                allocation=frozen_allocation,
+            )
+        except (InvalidOperation, TypeError, ValueError):
+            expected_strategy = None
+
+    strategy_refresh = False
+    simulated_component = components.get("simulated_account")
+    if expected_strategy is not None:
+        expected_evidence = {
+            "strategy_snapshot": expected_strategy,
+            "rebuild_inputs": {"candidate_pool_ids": list(current_candidate_pool_ids)},
+        }
+        reusable = planning_evidence_reusable(
+            evidence,
+            expected_evidence=expected_evidence,
+            require_simulated_plan=(
+                isinstance(simulated_component, Mapping)
+                and simulated_component.get("status") == "complete"
+            ),
+        )
+        if not reusable:
+            if not isinstance(strategy, Mapping):
+                raise ValueError("planning snapshot evidence is invalid")
+            if strategy.get("strategy_version") != expected_strategy.get(
+                "strategy_version"
+            ):
+                return None
+            try:
+                normalize_trend_strategy_snapshot(
+                    strategy,
+                    "CN",
+                    expected_snapshot=expected_strategy,
+                )
+            except ValueError:
+                raise
+            else:
+                strategy_refresh = True
     allocation_changed = False
+    allocation_for_snapshot: Mapping[str, object] | None = None
     if allocation_reference is not None:
         frozen_reference = freeze_allocation_reference(allocation_reference)
         if frozen_reference is None:
@@ -10669,6 +10744,10 @@ def _reuse_planning_revision(
             "reference": frozen_reference,
             "daily_json": allocation_body.decode("utf-8"),
         }
+        allocation_for_snapshot = {
+            **dict(frozen_reference),
+            "snapshot": allocation_snapshot,
+        }
         existing_allocation = inputs.get("allocation")
         existing_reference = (
             existing_allocation.get("reference")
@@ -10681,10 +10760,6 @@ def _reuse_planning_revision(
         )
         if allocation_changed:
             inputs["allocation"] = new_allocation
-            allocation_for_snapshot = {
-                **dict(frozen_reference),
-                "snapshot": allocation_snapshot,
-            }
             candidate_pool_ids = inputs.get("candidate_pool_ids")
             if not isinstance(candidate_pool_ids, list):
                 raise ValueError("planning snapshot evidence is invalid")
@@ -10702,8 +10777,44 @@ def _reuse_planning_revision(
                 raise ValueError("allocation reference is invalid")
             inputs["position_weight"] = allocation_market["entry_weight"]
             inputs["position_weight_source"] = "trend_allocation_rank"
+    if strategy_refresh:
+        if allocation_for_snapshot is None:
+            allocation_for_snapshot = frozen_allocation
+        if allocation_for_snapshot is None:
+            raise ValueError("planning snapshot evidence is invalid")
+        inputs["candidate_pool_ids"] = list(current_candidate_pool_ids)
+        refreshed_strategy = live_trend_strategy_snapshot(
+            "CN",
+            str(evidence["process_version"]),
+            current_candidate_pool_ids,
+            normal_cost_rate=Decimal(str(inputs["normal_cost_rate"])),
+            allocation=allocation_for_snapshot,
+        )
+        evidence["strategy_snapshot"] = refreshed_strategy
+        strategy = refreshed_strategy
+        account_input = inputs.get("account")
+        if (
+            isinstance(account_input, Mapping)
+            and account_input.get("status") == "available"
+            and account_input.get("fresh") is True
+        ):
+            try:
+                inputs["drawdown_summary"] = observe_strategy_equity(
+                    config.data_dir,
+                    market="CN",
+                    strategy_id=str(refreshed_strategy.get("strategy_id") or ""),
+                    strategy_version=str(
+                        refreshed_strategy.get("strategy_version") or ""
+                    ),
+                    current_equity=Decimal(str(account_input["net_value"])),
+                    observed_at=datetime.now(SHANGHAI).isoformat(timespec="seconds"),
+                    entry_date=str(inputs["execution_date"]),
+                )
+            except (KeyError, InvalidOperation, TypeError, ValueError):
+                inputs["drawdown_summary"] = None
+        else:
+            inputs["drawdown_summary"] = None
     updates: dict[str, tuple[str, object]] = {}
-    simulated_component = components.get("simulated_account")
     if (
         isinstance(simulated_component, Mapping)
         and simulated_component.get("status") == "unavailable"
@@ -10734,10 +10845,21 @@ def _reuse_planning_revision(
                     observed_at=datetime.now(SHANGHAI).isoformat(timespec="seconds"),
                     entry_date=str(inputs["execution_date"]),
                 )
-            updates["simulated_account"] = (
-                "complete",
-                {"account": serialized_account, "account_input": inputs.get("account_input")},
-            )
+                updates["simulated_account"] = (
+                    "complete",
+                    {"account": serialized_account, "account_input": inputs.get("account_input")},
+                )
+    if strategy_refresh and "simulated_account" not in updates:
+        updates["simulated_account"] = (
+            "complete"
+            if isinstance(simulated_component, Mapping)
+            and simulated_component.get("status") == "complete"
+            else "unavailable",
+            {
+                "account": inputs.get("account"),
+                "account_input": inputs.get("account_input"),
+            },
+        )
     real_component = components.get("real_account")
     if (
         isinstance(real_component, Mapping)
@@ -10815,6 +10937,8 @@ def _reuse_planning_revision(
     evidence_reference: Mapping[str, str] | None = None
     planning_reference = None
     recompute_components = set(updates)
+    if strategy_refresh:
+        recompute_components.add("simulated_account")
     if allocation_changed:
         recompute_components.update({"simulated_account", "real_account"})
     if recompute_components:
@@ -10853,7 +10977,7 @@ def _reuse_planning_revision(
                 inputs["planned_new_seats"] = recovered_judgments[
                     "planned_new_seats"
                 ]
-        if allocation_changed:
+        if strategy_refresh or allocation_changed:
             updates["market"] = (
                 "complete",
                 _planning_market_component_value(inputs),
@@ -10874,7 +10998,14 @@ def _reuse_planning_revision(
             evidence=evidence,
             evidence_reference=evidence_reference,
             updates=updates,
-            replace_completed=("market",) if allocation_changed else (),
+            replace_completed=tuple(
+                name
+                for name, changed in (
+                    ("market", strategy_refresh or allocation_changed),
+                    ("simulated_account", strategy_refresh),
+                )
+                if changed
+            ),
         )
     rebuilt = rebuild_trend_report_from_evidence(evidence)
     replay = source_payload.get("replay_evidence")
@@ -10907,6 +11038,8 @@ def _reuse_planning_revision(
     report_json = json.dumps(
         rebuilt, ensure_ascii=False, indent=2, sort_keys=True
     ) + "\n"
+    if not valid_frozen_report_contract(rebuilt):
+        raise ValueError("frozen report contract is invalid")
     receipt_path = _receipt_path(config.data_dir, artifact_stem)
     receipt = _write_delivery_receipt(
         receipt_path,
@@ -11394,6 +11527,8 @@ def _attempt_report(
         )
         planning_snapshot_exists = planning_snapshot_path_value.exists()
         planning_simulated_account_complete = False
+        planning_snapshot: dict[str, object] | None = None
+        simulated_component: Mapping[str, object] | None = None
         if planning_snapshot_exists:
             planning_snapshot = read_planning_snapshot(
                 planning_snapshot_path_value, data_dir=config.data_dir
@@ -11401,12 +11536,10 @@ def _attempt_report(
             planning_components = planning_snapshot.get("components")
             if not isinstance(planning_components, Mapping):
                 raise ValueError("planning snapshot components are invalid")
-            simulated_component = planning_components.get("simulated_account")
-            if not isinstance(simulated_component, Mapping):
+            candidate_simulated_component = planning_components.get("simulated_account")
+            if not isinstance(candidate_simulated_component, Mapping):
                 raise ValueError("planning snapshot components are invalid")
-            planning_simulated_account_complete = (
-                simulated_component.get("status") == "complete"
-            )
+            simulated_component = candidate_simulated_component
 
         api = api_factory(
             api_key=config.trend_animals_api_key,
@@ -11433,6 +11566,34 @@ def _attempt_report(
             execution_date=execution_date,
             allocation=allocation_reference,
         )
+        if (
+            planning_snapshot is not None
+            and isinstance(simulated_component, Mapping)
+            and simulated_component.get("status") == "complete"
+        ):
+            evidence_ref = planning_snapshot.get("evidence")
+            if not isinstance(evidence_ref, Mapping):
+                raise ValueError("planning snapshot evidence is invalid")
+            evidence_path = Path(str(evidence_ref.get("path") or ""))
+            if not evidence_path.is_absolute():
+                evidence_path = config.data_dir / evidence_path
+            try:
+                planning_evidence = json.loads(
+                    evidence_path.read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise ValueError("planning snapshot evidence is invalid") from exc
+            if isinstance(planning_evidence, Mapping):
+                planning_simulated_account_complete = planning_evidence_reusable(
+                    planning_evidence,
+                    expected_evidence={
+                        "strategy_snapshot": strategy_snapshot,
+                        "rebuild_inputs": {
+                            "candidate_pool_ids": list(candidate_pool_ids)
+                        },
+                    },
+                    require_simulated_plan=True,
+                )
         strategy_version = str(strategy_snapshot["strategy_version"])
         individual_global_ranking = _uses_individual_global_ranking(
             "CN", strategy_version
@@ -12063,6 +12224,8 @@ def _attempt_report(
         )
         receipt_path = _receipt_path(config.data_dir, artifact_stem)
         payload = _report_payload(report)
+        if not valid_frozen_report_contract(payload):
+            raise ValueError("frozen report contract is invalid")
         receipt = _write_delivery_receipt(
             receipt_path,
             status="prepared",

@@ -2664,6 +2664,7 @@ def test_current_version_buys_one_minimum_lot_when_four_percent_is_too_small_and
             position_count=0,
         ),
     )
+    built = trend_module._freeze_report_simulated_buy_plan(built, tmp_path)
     markdown_path, json_path = write_frozen_report(built, tmp_path)
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     action = payload["strategy_judgments"]["formal_actions"][0]
@@ -2878,7 +2879,9 @@ def test_current_nominal_contract_accepts_missing_top_level_allocation_version(
         drawdown_summary=active_drawdown_for(strategy, equity="100000"),
     )
     payload = trend_module._report_payload(built)
-    assert trend_module.valid_frozen_report_contract(payload) is True
+    assert trend_module.valid_frozen_report_contract(
+        payload, _allow_unfrozen_simulated_plan=True
+    ) is True
 
     markerless = copy.deepcopy(payload)
     markerless_allocation = markerless.get("allocation")
@@ -2886,9 +2889,89 @@ def test_current_nominal_contract_accepts_missing_top_level_allocation_version(
     del markerless_allocation["version"]
 
     assert (
-        trend_module.valid_frozen_report_contract(markerless),
+        trend_module.valid_frozen_report_contract(
+            markerless, _allow_unfrozen_simulated_plan=True
+        ),
         payload,
     ) == (True, trend_module._report_payload(built))
+
+
+def test_current_v2_frozen_contract_rejects_executable_plan_without_fifo(
+    tmp_path: Path,
+) -> None:
+    strategy, allocation = current_nominal_strategy("CN")
+    built = build_report(
+        as_of_date="2026-08-03",
+        execution_date="2026-08-04",
+        market="CN",
+        account=AccountSnapshot(
+            source_date="2026-08-03",
+            fresh=True,
+            net_value=Decimal("100000"),
+            available_cash=Decimal("100000"),
+            positions=(),
+            exceptions=(),
+        ),
+        candidates=(
+            replace(
+                candidate(
+                    "600001",
+                    global_strength="100",
+                    close="10",
+                    atr="0.5",
+                ),
+                as_of_date="2026-08-03",
+            ),
+        ),
+        holding_snapshots={},
+        bars_by_symbol={},
+        metadata={"market": "CN"},
+        strategy_snapshot=strategy,
+        allocation_reference=allocation,
+        drawdown_summary=active_drawdown_for(strategy, equity="100000"),
+    )
+    payload = trend_module._report_payload(built)
+    judgments = payload["strategy_judgments"]
+    assert isinstance(judgments, dict)
+    simulated_buy_fifo = trend_review.freeze_simulated_buy_fifo(
+        data_dir=tmp_path,
+        report=payload,
+        market="CN",
+        execution_date="2026-08-04",
+        persist=False,
+    )
+    valid_payload = copy.deepcopy(payload)
+    valid_judgments = valid_payload["strategy_judgments"]
+    assert isinstance(valid_judgments, dict)
+    valid_judgments["simulated_buy_fifo"] = copy.deepcopy(simulated_buy_fifo)
+    valid_judgments["planned_new_seats"] = 1
+    assert trend_module.valid_frozen_report_contract(valid_payload) is True
+
+    missing_fifo = copy.deepcopy(valid_payload)
+    missing_fifo_judgments = missing_fifo["strategy_judgments"]
+    assert isinstance(missing_fifo_judgments, dict)
+    missing_fifo_judgments.pop("simulated_buy_fifo")
+    assert trend_module.valid_frozen_report_contract(missing_fifo) is False
+
+    missing_seats = copy.deepcopy(valid_payload)
+    missing_seats_judgments = missing_seats["strategy_judgments"]
+    assert isinstance(missing_seats_judgments, dict)
+    missing_seats_judgments.pop("planned_new_seats")
+    assert trend_module.valid_frozen_report_contract(missing_seats) is False
+
+    missing_both = copy.deepcopy(valid_payload)
+    missing_both_judgments = missing_both["strategy_judgments"]
+    assert isinstance(missing_both_judgments, dict)
+    missing_both_judgments.pop("simulated_buy_fifo")
+    missing_both_judgments.pop("planned_new_seats")
+    assert trend_module.valid_frozen_report_contract(missing_both) is False
+
+    for invalid_seats in (True, -1, None):
+        invalid_seats_payload = copy.deepcopy(valid_payload)
+        invalid_seats_judgments = invalid_seats_payload["strategy_judgments"]
+        assert isinstance(invalid_seats_judgments, dict)
+        invalid_seats_judgments["planned_new_seats"] = invalid_seats
+        assert trend_module.valid_frozen_report_contract(invalid_seats_payload) is False
 
 
 def test_current_nominal_contract_accepts_data_missing_buy_action() -> None:
@@ -2940,7 +3023,9 @@ def test_current_nominal_contract_accepts_data_missing_buy_action() -> None:
         buy["estimated_shares"],
         buy["executable"],
         buy["sizing_note"],
-        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (
         Decimal("4000"),
         0,
@@ -3035,12 +3120,16 @@ def test_current_nominal_contract_rejects_data_missing_target_rewrite() -> None:
         Decimal(str(buy["target_amount"])),
         buy["lot_size"],
         buy["estimated_shares"],
-        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (Decimal("4000"), 0, 0, True)
 
     buy["target_amount"] = "1996"
 
-    assert trend_module.valid_frozen_report_contract(payload) is False
+    assert trend_module.valid_frozen_report_contract(
+        payload, _allow_unfrozen_simulated_plan=True
+    ) is False
 
 
 def test_current_nominal_markerless_contract_rejects_non_lot_frozen_quantity() -> None:
@@ -3156,8 +3245,12 @@ def test_current_nominal_markerless_contract_rejects_coherent_three_percent_tamp
     )
 
     assert (
-        trend_module.valid_frozen_report_contract(markerless),
-        trend_module.valid_frozen_report_contract(tampered),
+        trend_module.valid_frozen_report_contract(
+            markerless, _allow_unfrozen_simulated_plan=True
+        ),
+        trend_module.valid_frozen_report_contract(
+            tampered, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (True, False)
 
 
@@ -3318,7 +3411,9 @@ def test_current_nominal_core_accepts_real_formal_buy_with_cash_audit_only() -> 
     assert (
         real_action["executable"],
         real_action["estimated_shares"],
-        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (True, 400, True)
 
 
@@ -3392,8 +3487,12 @@ def test_current_nominal_contract_treats_cash_authorization_as_audit_only() -> N
     )
 
     assert (
-        trend_module.valid_frozen_report_contract(payload),
-        trend_module.valid_frozen_report_contract(tampered),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
+        trend_module.valid_frozen_report_contract(
+            tampered, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (True, True)
 
 
@@ -3614,8 +3713,12 @@ def test_current_nominal_contract_rejects_initial_line_tamper() -> None:
     action["estimated_initial_line"] = "999999"
 
     assert (
-        trend_module.valid_frozen_report_contract(payload),
-        trend_module.valid_frozen_report_contract(tampered),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
+        trend_module.valid_frozen_report_contract(
+            tampered, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (True, False)
 
 
@@ -3722,8 +3825,12 @@ def test_current_nominal_contract_accepts_cash_insufficient_executable_buy_as_au
         action["target_amount"],
         action["estimated_shares"],
         action["executable"],
-        trend_module.valid_frozen_report_contract(payload),
-        trend_module.valid_frozen_report_contract(tampered),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
+        trend_module.valid_frozen_report_contract(
+            tampered, _allow_unfrozen_simulated_plan=True
+        ),
     ) == ("4000.00", 400, True, True, True)
 
 
@@ -3770,8 +3877,12 @@ def test_current_nominal_contract_rejects_missing_formal_buy_executable() -> Non
     )
     assert (
         original_action["executable"],
-        trend_module.valid_frozen_report_contract(payload),
-        trend_module.valid_frozen_report_contract(tampered),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
+        trend_module.valid_frozen_report_contract(
+            tampered, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (True, True, False)
 
 
@@ -3834,8 +3945,12 @@ def test_current_nominal_contract_rejects_duplicate_frozen_candidate_symbol() ->
     )
 
     assert (
-        trend_module.valid_frozen_report_contract(payload),
-        trend_module.valid_frozen_report_contract(tampered),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
+        trend_module.valid_frozen_report_contract(
+            tampered, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (True, False)
 
 
@@ -3888,8 +4003,12 @@ def test_current_nominal_contract_rejects_non_boolean_real_buy_executable() -> N
     real_action["executable"] = "false"
 
     assert (
-        trend_module.valid_frozen_report_contract(payload),
-        trend_module.valid_frozen_report_contract(tampered),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
+        trend_module.valid_frozen_report_contract(
+            tampered, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (True, False)
 
 
@@ -4000,8 +4119,12 @@ def test_current_nominal_contract_accepts_cash_insufficient_executable_real_buy_
     original_action = payload["strategy_judgments"]["real_buy_actions"][0]
     assert (
         original_action["executable"],
-        trend_module.valid_frozen_report_contract(payload),
-        trend_module.valid_frozen_report_contract(tampered),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
+        trend_module.valid_frozen_report_contract(
+            tampered, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (True, True, True)
 
 
@@ -4060,7 +4183,9 @@ def test_current_nominal_rotation_validator_uses_nominal_target_beyond_cash_boun
     )
 
     payload = trend_module._report_payload(built)
-    assert trend_module.valid_frozen_report_contract(payload)
+    assert trend_module.valid_frozen_report_contract(
+        payload, _allow_unfrozen_simulated_plan=True
+    )
     pair = payload["strategy_judgments"]["simulate_rotation_pairs"][0]
 
     assert (
@@ -4135,9 +4260,15 @@ def test_current_nominal_core_real_rotation_contract_ignores_cash_audit() -> Non
     del real_signal["market_value"]
 
     assert (
-        trend_module.valid_frozen_report_contract(payload),
-        trend_module.valid_frozen_report_contract(short_cash),
-        trend_module.valid_frozen_report_contract(missing_sale_value),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
+        trend_module.valid_frozen_report_contract(
+            short_cash, _allow_unfrozen_simulated_plan=True
+        ),
+        trend_module.valid_frozen_report_contract(
+            missing_sale_value, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (True, True, True)
 
 
@@ -4204,7 +4335,9 @@ def test_current_nominal_core_real_rotation_accepts_missing_unused_sale_value() 
     assert isinstance(real_signal, dict)
     del real_signal["market_value"]
 
-    assert trend_module.valid_frozen_report_contract(missing_sale_value) is True
+    assert trend_module.valid_frozen_report_contract(
+        missing_sale_value, _allow_unfrozen_simulated_plan=True
+    ) is True
 
 
 def test_current_nominal_contract_accepts_cash_insufficient_automatic_rotation_as_audit_only() -> None:
@@ -4265,8 +4398,12 @@ def test_current_nominal_contract_accepts_cash_insufficient_automatic_rotation_a
     tampered["account"]["available_cash"] = "0"
 
     assert (
-        trend_module.valid_frozen_report_contract(payload),
-        trend_module.valid_frozen_report_contract(tampered),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
+        trend_module.valid_frozen_report_contract(
+            tampered, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (True, True)
 
 
@@ -4331,7 +4468,9 @@ def test_current_nominal_rotation_validator_keeps_kelly_as_audit_only() -> None:
         Decimal(str(pair["target_weight"])),
         Decimal(str(pair["target_amount"])),
         pair["estimated_shares"],
-        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (
         Decimal("0.012626"),
         Decimal("0.04"),
@@ -4401,7 +4540,9 @@ def test_current_nominal_real_validator_keeps_kelly_as_audit_only() -> None:
         Decimal(str(action["target_weight"])),
         Decimal(str(action["target_amount"])),
         action["estimated_shares"],
-        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (Decimal("0.04"), Decimal("2000.00"), 20, True)
 
 
@@ -4453,8 +4594,12 @@ def test_current_nominal_contract_rejects_coherent_audit_risk_tamper() -> None:
     )
 
     assert (
-        trend_module.valid_frozen_report_contract(payload),
-        trend_module.valid_frozen_report_contract(tampered),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
+        trend_module.valid_frozen_report_contract(
+            tampered, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (True, False)
 
 
@@ -4507,7 +4652,9 @@ def test_current_nominal_rotation_validator_includes_paired_sell_proceeds() -> N
     assert (
         Decimal(str(pair["target_amount"])),
         pair["estimated_shares"],
-        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (Decimal("4000"), 400, True)
 
 
@@ -4968,7 +5115,9 @@ def test_current_nominal_validator_rejects_falsified_rotation_amount_and_quantit
         else built.real_rotation_pairs[0]
     )
     assert (
-        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
         pair.target_amount,
         pair.estimated_shares,
     ) == (True, Decimal("4000"), 400)
@@ -5058,7 +5207,9 @@ def test_current_nominal_real_rotation_blocks_when_carried_cash_is_negative() ->
     judgments = payload["strategy_judgments"]
 
     assert (
-        trend_module.valid_frozen_report_contract(payload),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
         real_account["available_cash"],
         real_account["executable"],
         judgments["real_rotation_pairs"],
@@ -5329,8 +5480,12 @@ def test_current_nominal_contract_rejects_rotation_audit_tamper(
     tampered["strategy_judgments"]["simulate_rotation_pairs"][0][field] = value
 
     assert (
-        trend_module.valid_frozen_report_contract(payload),
-        trend_module.valid_frozen_report_contract(tampered),
+        trend_module.valid_frozen_report_contract(
+            payload, _allow_unfrozen_simulated_plan=True
+        ),
+        trend_module.valid_frozen_report_contract(
+            tampered, _allow_unfrozen_simulated_plan=True
+        ),
     ) == (True, False)
 
 
@@ -14342,6 +14497,236 @@ def test_cn_v17_revision_recaptures_when_frozen_v16_strategy_is_stale(
         set(component_pool_ids),
         first_report_bytes,
         first_evidence_bytes,
+    )
+    drawdown_summary = revised_payload["drawdown_summary"]
+    assert isinstance(drawdown_summary, dict)
+    assert (
+        revised_payload["strategy_judgments"]["simulated_buy_fifo"],
+        revised_payload["strategy_judgments"]["planned_new_seats"],
+        drawdown_summary["strategy_id"],
+        trend_module.valid_frozen_report_contract(revised_payload),
+        trend_market_controller._valid_report(
+            config,
+            "CN",
+            revised_payload["execution_date"],
+            revised.json_path,
+            revised_payload,
+        ),
+    ) == (
+        [],
+        0,
+        "trend_animals_warm_to_hot/CN/v17",
+        True,
+        True,
+    )
+
+
+def test_cn_v17_revision_recaptures_completed_plan_across_version_and_label_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = trend_config(tmp_path)
+    allocation = _write_cn_v2_allocation(config)
+    component_rows = {
+        622466: [
+            {"tmId": 600508, "tickerSymbol": "600508.SH", "asOfDate": "2026-07-14"},
+            {"tmId": 600985, "tickerSymbol": "600985.SH", "asOfDate": "2026-07-14"},
+        ],
+        697199: [
+            {"tmId": 600095, "tickerSymbol": "600095.SH", "asOfDate": "2026-07-14"},
+            {"tmId": 601666, "tickerSymbol": "601666.SH", "asOfDate": "2026-07-14"},
+        ],
+        622482: [],
+    }
+    snapshot_overrides = {
+        600508: {"trendStrengthGlobalCurr": "99"},
+        600985: {"trendStrengthGlobalCurr": "98"},
+        600095: {"trendStrengthGlobalCurr": "97"},
+        601666: {"trendStrengthGlobalCurr": "96"},
+    }
+
+    def api_factory(**_kwargs: object) -> ReadyApi:
+        return ReadyApi(
+            [],
+            component_rows=component_rows,
+            snapshot_overrides=snapshot_overrides,
+        )
+
+    held_codes = tuple(f"SH.{index:06d}" for index in range(100, 108))
+    account_factory = simulation_account_with_positions(*held_codes)
+    monkeypatch.setitem(
+        trend_module.CURRENT_NOMINAL_ALLOCATION_VERSIONS, "CN", "v16"
+    )
+    base = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        allocation_reference=allocation,
+        api_factory=api_factory,
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        account_factory=account_factory,
+        notifier=RecordingFeishu(),
+    )
+    assert base.status == "generated"
+    assert base.json_path is not None
+    base_payload = json.loads(base.json_path.read_text(encoding="utf-8"))
+    base_report_bytes = base.json_path.read_bytes()
+    base_evidence_path = config.data_dir / base_payload["replay_evidence"]["path"]
+    base_evidence_bytes = base_evidence_path.read_bytes()
+    planning_path = config.data_dir / base_payload["replay_evidence"]["planning_path"]
+    initial_planning = json.loads(planning_path.read_text(encoding="utf-8"))
+    initial_components = copy.deepcopy(initial_planning["components"])
+    initial_evidence = json.loads(base_evidence_path.read_text(encoding="utf-8"))
+    initial_inputs = initial_evidence["rebuild_inputs"]
+    expected_fifo = [
+        "SH.600508",
+        "SH.600985",
+        "SH.600095",
+        "SH.601666",
+    ]
+    assert [
+        entry["futu_symbol"] for entry in initial_inputs["simulated_buy_fifo"]
+    ] == expected_fifo
+    assert initial_inputs["planned_new_seats"] == 2
+
+    monkeypatch.setitem(
+        trend_module.CURRENT_NOMINAL_ALLOCATION_VERSIONS, "CN", "v17"
+    )
+    process_version = str(base_payload["strategy_snapshot"]["process_version"])
+    current_snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN",
+        process_version,
+        (622466, 697199, 622482),
+        strategy_version="v17",
+        allocation=allocation,
+    )
+    old_snapshot = copy.deepcopy(current_snapshot)
+    old_row = next(
+        row
+        for row in old_snapshot["parameter_rows"]
+        if row["name"] == "趋势动物组合"
+    )
+    old_row["value"] = "温转热（A 股）、温转热（ETF 基金个股）"
+    old_evidence = copy.deepcopy(initial_evidence)
+    old_evidence["strategy_snapshot"] = old_snapshot
+    old_evidence["process_version"] = process_version
+    old_evidence_inputs = old_evidence["rebuild_inputs"]
+    old_evidence_inputs["simulated_buy_fifo"] = list(
+        reversed(old_evidence_inputs["simulated_buy_fifo"])
+    )
+    old_evidence_ref = trend_review.freeze_trend_evidence(
+        config.data_dir, old_evidence
+    )
+    old_planning = copy.deepcopy(initial_planning)
+    old_planning["evidence"] = old_evidence_ref
+    planning_body = json.dumps(
+        old_planning,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode() + b"\n"
+    planning_path.write_bytes(planning_body)
+    old_r1_payload = copy.deepcopy(base_payload)
+    old_r1_payload["strategy_snapshot"] = old_snapshot
+    old_r1_payload["strategy_judgments"]["simulated_buy_fifo"] = old_evidence_inputs[
+        "simulated_buy_fifo"
+    ]
+    old_r1_payload["replay_evidence"] = {
+        "path": str(Path(old_evidence_ref["path"]).relative_to(config.data_dir)),
+        "sha256": old_evidence_ref["sha256"],
+        "planning_path": str(planning_path.relative_to(config.data_dir)),
+        "planning_sha256": hashlib.sha256(planning_body).hexdigest(),
+    }
+    old_r1_path = config.reports_dir / "trend_a_share/2026-07-14-r1.json"
+    old_r1_path.parent.mkdir(parents=True, exist_ok=True)
+    old_r1_path.write_text(
+        json.dumps(old_r1_payload, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    (config.reports_dir / "trend_a_share/2026-07-14-r1.md").write_bytes(
+        base.report_path.read_bytes()  # type: ignore[union-attr]
+    )
+    old_r1_bytes = old_r1_path.read_bytes()
+    assert trend_module.valid_frozen_report_contract(old_r1_payload) is True
+
+    revised = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        revision=True,
+        allocation_reference=allocation,
+        api_factory=api_factory,
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        account_factory=account_factory,
+        notifier=RecordingFeishu(),
+    )
+    assert revised.status == "generated"
+    assert revised.json_path is not None
+    assert revised.json_path.name == "2026-07-14-r2.json"
+    payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
+    evidence_path = config.data_dir / payload["replay_evidence"]["path"]
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    planning = json.loads(planning_path.read_text(encoding="utf-8"))
+    planning_evidence_path = Path(planning["evidence"]["path"])
+    if not planning_evidence_path.is_absolute():
+        planning_evidence_path = config.data_dir / planning_evidence_path
+    planning_evidence = json.loads(planning_evidence_path.read_text(encoding="utf-8"))
+    strategy = payload["strategy_snapshot"]
+    source_row = next(
+        row for row in strategy["parameter_rows"] if row["name"] == "趋势动物组合"
+    )
+    fifo = [
+        entry["futu_symbol"]
+        for entry in payload["strategy_judgments"]["simulated_buy_fifo"]
+    ]
+    evidence_fifo = [
+        entry["futu_symbol"]
+        for entry in evidence["rebuild_inputs"]["simulated_buy_fifo"]
+    ]
+    replayed = trend_review.rebuild_trend_report_from_evidence(evidence)
+    replay_matches = replayed["strategy_judgments"] == payload["strategy_judgments"]
+    assert (
+        strategy["strategy_version"],
+        strategy["parameters"]["candidate_pool_ids"],
+        source_row["value"],
+        payload["drawdown_summary"]["strategy_id"],
+        fifo,
+        payload["strategy_judgments"]["planned_new_seats"],
+        evidence_fifo,
+        evidence["rebuild_inputs"]["planned_new_seats"],
+        replay_matches,
+        (config.data_dir / payload["replay_evidence"]["path"]).resolve()
+        == planning_evidence_path.resolve(),
+        payload["replay_evidence"]["sha256"]
+        == planning["evidence"]["sha256"],
+        planning["components"]["market"] != initial_components["market"],
+        planning["components"]["simulated_account"]
+        != initial_components["simulated_account"],
+        trend_module.valid_frozen_report_contract(payload),
+        trend_market_controller._valid_report(
+            config, "CN", payload["execution_date"], revised.json_path, payload
+        ),
+        base.json_path.read_bytes() == base_report_bytes,
+        base_evidence_path.read_bytes() == base_evidence_bytes,
+        old_r1_path.read_bytes() == old_r1_bytes,
+    ) == (
+        "v17",
+        [622466, 697199, 622482],
+        "温转热（A 股）、温转热（ETF 基金个股）、温转热（REITs）",
+        "trend_animals_warm_to_hot/CN/v17",
+        expected_fifo,
+        2,
+        expected_fifo,
+        2,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
     )
 
 

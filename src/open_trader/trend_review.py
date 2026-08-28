@@ -24,6 +24,7 @@ from .strategy_drawdown import (
     ALLOCATION_V2_DYNAMIC_PARAMETER_NAMES,
     is_allocation_v2_version,
     uses_nominal_allocation_behavior,
+    valid_drawdown_decision,
 )
 from .trend_kelly import trend_kelly_identity_matches
 
@@ -1295,11 +1296,69 @@ def _planning_identity(
         or isinstance(input_pool_ids, (str, bytes))
     ):
         return None
+    try:
+        strategy_identity = _strategy_identity(strategy)
+    except (KeyError, TypeError, ValueError):
+        return None
     return (
-        strategy.get("strategy_version"),
+        strategy_identity,
         tuple(strategy_pool_ids),
         tuple(input_pool_ids),
     )
+
+
+def _complete_simulated_plan(evidence: Mapping[str, object]) -> bool:
+    strategy = evidence.get("strategy_snapshot")
+    inputs = evidence.get("rebuild_inputs")
+    if not isinstance(strategy, Mapping) or not isinstance(inputs, Mapping):
+        return False
+    market = str(strategy.get("market") or inputs.get("market") or "").upper()
+    version = str(strategy.get("strategy_version") or "")
+    if not uses_nominal_allocation_behavior(market, version):
+        return True
+    drawdown = inputs.get("drawdown_summary")
+    account = inputs.get("account")
+    fifo = inputs.get("simulated_buy_fifo")
+    seats = inputs.get("planned_new_seats")
+    if (
+        not isinstance(drawdown, Mapping)
+        or not isinstance(account, Mapping)
+        or not isinstance(fifo, list)
+        or not all(isinstance(entry, Mapping) for entry in fifo)
+        or isinstance(seats, bool)
+        or not isinstance(seats, int)
+        or seats < 0
+    ):
+        return False
+    try:
+        drawdown_valid = valid_drawdown_decision(
+            drawdown,
+            expected_market=market,
+            expected_strategy_id=str(strategy.get("strategy_id") or ""),
+            expected_strategy_version=version,
+            expected_equity=account["net_value"],
+            expected_entry_date=str(inputs["execution_date"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    return drawdown_valid
+
+
+def planning_evidence_reusable(
+    evidence: Mapping[str, object],
+    *,
+    expected_evidence: Mapping[str, object] | None = None,
+    require_simulated_plan: bool = False,
+) -> bool:
+    """Return whether frozen planning facts may be reused for the current run."""
+    identity = _planning_identity(evidence)
+    if identity is None:
+        return False
+    if expected_evidence is not None:
+        expected_identity = _planning_identity(expected_evidence)
+        if expected_identity is None or identity != expected_identity:
+            return False
+    return not require_simulated_plan or _complete_simulated_plan(evidence)
 
 
 def _merge_planning_evidence(
@@ -1334,10 +1393,15 @@ def _merge_planning_evidence(
     ) or not isinstance(frozen_inputs, dict):
         raise ValueError("planning snapshot components are invalid")
 
-    if (
-        _planning_identity(frozen) is not None
-        and _planning_identity(evidence) is not None
-        and _planning_identity(frozen) != _planning_identity(evidence)
+    simulated_component = old_components.get("simulated_account")
+    require_simulated_plan = (
+        isinstance(simulated_component, Mapping)
+        and simulated_component.get("status") == "complete"
+    )
+    if not planning_evidence_reusable(
+        frozen,
+        expected_evidence=evidence,
+        require_simulated_plan=require_simulated_plan,
     ):
         return dict(evidence)
 
@@ -1349,7 +1413,6 @@ def _merge_planning_evidence(
         getattr(current_account, "status", "available") == "available"
         and getattr(current_account, "fresh", False) is True
     )
-    simulated_component = old_components.get("simulated_account")
     if (
         isinstance(simulated_component, Mapping)
         and simulated_component.get("status") == "unavailable"
@@ -1530,6 +1593,18 @@ def freeze_planning_snapshot(
     real_status = "complete" if real_status == "available" else real_status
     inputs = evidence["rebuild_inputs"]
     assert isinstance(inputs, Mapping)
+    simulated_value = {
+        "account": inputs.get("account"),
+        "account_input": inputs.get("account_input"),
+    }
+    strategy_snapshot = getattr(report, "strategy_snapshot", None)
+    if isinstance(strategy_snapshot, Mapping):
+        try:
+            simulated_value["strategy_identity_sha256"] = hashlib.sha256(
+                _strategy_identity(strategy_snapshot)
+            ).hexdigest()
+        except (KeyError, TypeError, ValueError):
+            pass
     components = {
         "market": _planning_component_reference(
             data_dir=data_dir,
@@ -1545,10 +1620,7 @@ def freeze_planning_snapshot(
             target_date=target_date,
             component="simulated_account",
             status=account_status,
-            value={
-                "account": inputs.get("account"),
-                "account_input": inputs.get("account_input"),
-            },
+            value=simulated_value,
         ),
         "real_account": _planning_component_reference(
             data_dir=data_dir,
@@ -1713,6 +1785,18 @@ def update_planning_snapshot_components(
             and name not in replace_completed_set
         ):
             continue
+        if name == "simulated_account" and isinstance(value, Mapping):
+            strategy_snapshot = evidence.get("strategy_snapshot")
+            if isinstance(strategy_snapshot, Mapping):
+                try:
+                    value = {
+                        **dict(value),
+                        "strategy_identity_sha256": hashlib.sha256(
+                            _strategy_identity(strategy_snapshot)
+                        ).hexdigest(),
+                    }
+                except (KeyError, TypeError, ValueError):
+                    pass
         merged[name] = _planning_component_reference(
             data_dir=data_dir,
             market=market,
@@ -13401,6 +13485,14 @@ def _legacy_strategy_snapshot_variants(
     mapped_feature = copy.deepcopy(feature)
     mapped_feature["effective_from"] = effective_from
     variants.append(mapped_feature)
+    if market == "CN" and expected.get("strategy_version") == "v17":
+        old_source = copy.deepcopy(dict(expected))
+        old_rows = old_source.get("parameter_rows")
+        if isinstance(old_rows, list):
+            for row in old_rows:
+                if isinstance(row, dict) and row.get("name") == "趋势动物组合":
+                    row["value"] = "温转热（A 股）、温转热（ETF 基金个股）"
+            variants.append(old_source)
     return tuple(variants)
 
 

@@ -35,9 +35,6 @@ prediction-solver-verify-report:
 	PYTHONSAFEPATH=1 PYTHONPATH="$(WORKTREE_ROOT)/src" "$(PYTHON_BIN)" -m open_trader prediction-solver-benchmark verify-report
 
 acceptance:
-	cd "$(REPOSITORY_ROOT)" && \
-		PYTHONSAFEPATH=1 PYTHONPATH="$(WORKTREE_ROOT):$(WORKTREE_ROOT)/src" \
-		"$(PYTHON_BIN)" -m pytest "$(WORKTREE_ROOT)/tests" -q -m "not pressure"
 	@test "$$(git -C "$(WORKTREE_ROOT)" branch --show-current)" = main
 	@test -z "$$(git -C "$(WORKTREE_ROOT)" status --porcelain)"
 	@cd "$(WORKTREE_ROOT)" && scripts/install_account_release.sh --dry-run --repo-root "$(WORKTREE_ROOT)" --python "$(PYTHON_BIN)"

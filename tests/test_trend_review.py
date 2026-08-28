@@ -334,6 +334,41 @@ def test_current_nominal_versions_preserve_allocation_v2_during_normalization() 
     }
 
 
+def test_cn_v17_old_source_label_normalizes_exactly_without_mutating_evidence() -> None:
+    current = live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199, 622482),
+        allocation=_allocation_v2_ref(),
+    )
+    old = copy.deepcopy(current)
+    rows = old["parameter_rows"]
+    assert isinstance(rows, list)
+    for row in rows:
+        if row["name"] == "趋势动物组合":
+            row["value"] = "温转热（A 股）、温转热（ETF 基金个股）"
+    original = json.dumps(
+        old, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+
+    normalized = trend_review.normalize_trend_strategy_snapshot(
+        old, "CN", expected_snapshot=current
+    )
+
+    assert normalized == current
+    assert json.dumps(
+        old, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode() == original
+
+    drifted = copy.deepcopy(old)
+    drifted["parameters"]["nominal_weight"] = "0.05"
+    with pytest.raises(
+        ValueError,
+        match="strategy snapshot does not match current or known legacy rules",
+    ):
+        trend_review.normalize_trend_strategy_snapshot(
+            drifted, "CN", expected_snapshot=current
+        )
+
+
 @pytest.mark.parametrize(
     ("market", "version"),
     [("CN", "v17"), ("HK", "v14"), ("US", "v14")],
