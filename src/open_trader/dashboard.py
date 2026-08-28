@@ -1166,7 +1166,7 @@ def _latest_valid_report_payload(
     reports_dir: Path, *, market: str, broker: str
 ) -> tuple[Path, dict[str, Any], date, date, date, datetime] | None:
     matches: list[
-        tuple[date, datetime, date, str, Path, dict[str, Any], date]
+        tuple[date, datetime, date, int, str, Path, dict[str, Any], date]
     ] = []
     for path in reports_dir.glob("*.json"):
         try:
@@ -1181,11 +1181,16 @@ def _latest_valid_report_payload(
         if chronology is None:
             continue
         execution_date, as_of_date, freshness_date, generated_at = chronology
+        revision_match = re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}-r(\d+)", path.stem
+        )
+        revision = int(revision_match.group(1)) if revision_match else 0
         matches.append(
             (
                 freshness_date,
                 generated_at,
                 execution_date,
+                revision,
                 path.name,
                 path,
                 payload,
@@ -1194,8 +1199,17 @@ def _latest_valid_report_payload(
         )
     if not matches:
         return None
-    freshness_date, generated_at, execution_date, _, path, payload, as_of_date = max(
-        matches, key=lambda item: item[:4]
+    (
+        freshness_date,
+        generated_at,
+        execution_date,
+        _,
+        _,
+        path,
+        payload,
+        as_of_date,
+    ) = max(
+        matches, key=lambda item: item[:5]
     )
     return path, payload, execution_date, as_of_date, freshness_date, generated_at
 

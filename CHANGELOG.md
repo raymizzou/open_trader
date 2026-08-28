@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-28
 
+- Dashboard 当前趋势报告选择现在按 canonical 文件名的数字修订号排序，同一新鲜度、生成时间和执行日下 `-r2` 优先于 `-r1` 与基础报告；非 canonical 历史工件仍按文件名兜底。验证：回归用例 RED（错误选中基础报告）后 GREEN（`1 passed`），Dashboard 聚焦模块 `716 passed`；首次 `make test` 为 `7498 passed, 6 failed, 3 skipped, 1 deselected`，六个失败均由缺失的 ignored 历史快照导致；精确恢复快照后，中断重跑已通过其中 1 个，`PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest -q --lf` 再通过其余 `5 passed in 0.48s`，未再次运行完整套件。
 - 修复 CN V17 回撤预检使用官方 A 股、ETF、REITs 三池身份，并将 `kelly_sample_inherits` 从回撤身份哈希中排除而保留审计 lineage；真实回撤参数漂移仍要求升版。验证：两个 acceptance exact cases `2 passed`，直接受影响套件 `86 passed`。
 - 修复 CN V17 报告在回撤基准后置 bootstrap 后的生命周期：普通崩溃重试与显式 revision 均从新 `ok` 决策重建 FIFO/席位并更新 planning/replay 引用，已 `ok` 冻结事实保持不变。验证：生命周期五用例 `5 passed`，受影响模块 `1329 passed`。
 - CN V17 now accepts a current/ready official REIT warm-to-hot pool with zero rows while rejecting stale-only REIT data; A-share and ETF empty/stale behavior remains fail-closed. Its public strategy snapshot/report source label now names A-share, ETF fund components, and REITs while CN V16 remains unchanged. Verification: source-label regression RED then GREEN; focused empty/stale pool and Trend Animals checks pass.

@@ -6914,6 +6914,31 @@ def test_dashboard_trend_report_ranks_revisions_by_generated_instant(
     assert report["buy_actions"][0]["symbol"] == "LATER"
 
 
+def test_dashboard_selects_highest_same_timestamp_report_revision(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    reports_dir = config.reports_dir / "trend_a_share"
+    reports_dir.mkdir(parents=True)
+    payload = _dashboard_frozen_report_payload()
+    for artifact in (
+        "2026-07-15.json",
+        "2026-07-15-r1.json",
+        "2026-07-15-r2.json",
+    ):
+        (reports_dir / artifact).write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+    report = dashboard_module._load_trend_reports(
+        config.data_dir,
+        config.reports_dir,
+        today=date(2026, 7, 15),
+    )["eastmoney"]
+
+    assert report["artifact"] == "2026-07-15-r2.json"
+
+
 def _write_valid_us_trend_report(
     reports_dir: Path,
     *,
