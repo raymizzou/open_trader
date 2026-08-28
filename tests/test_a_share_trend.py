@@ -5848,6 +5848,20 @@ def test_live_cn_v6_strategy_snapshot_remains_historical() -> None:
     ]
 
 
+def test_cn_v17_strategy_snapshot_names_all_three_official_candidate_sources() -> None:
+    snapshot = trend_module.live_trend_strategy_snapshot(
+        "CN", "abc123", (622466, 697199, 622482),
+        allocation=current_nominal_allocation("CN"),
+    )
+
+    source_row = next(
+        row
+        for row in snapshot["parameter_rows"]
+        if row["group"] == "候选来源" and row["name"] == "趋势动物组合"
+    )
+    assert source_row["value"] == "温转热（A 股）、温转热（ETF 基金个股）、温转热（REITs）"
+
+
 def test_live_cn_strategy_snapshot_defaults_to_v10_with_all_approved_inheritance() -> None:
     snapshot = trend_module.live_trend_strategy_snapshot(
         "CN", "abc123", (622466, 697199)

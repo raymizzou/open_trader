@@ -5,7 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-28
 
-- CN V17 now accepts a current/ready official REIT warm-to-hot pool with zero rows while rejecting stale-only REIT data; A-share and ETF empty/stale behavior remains fail-closed. Verification: focused empty/stale pool and Trend Animals checks pass.
+- CN V17 now accepts a current/ready official REIT warm-to-hot pool with zero rows while rejecting stale-only REIT data; A-share and ETF empty/stale behavior remains fail-closed. Its public strategy snapshot/report source label now names A-share, ETF fund components, and REITs while CN V16 remains unchanged. Verification: source-label regression RED then GREEN; focused empty/stale pool and Trend Animals checks pass.
 - 将完整 `make acceptance` 从每次本地合并/完成路径移至 clean `main` 上每两小时一次的 `Open Trader acceptance guardian`；结果按起始 SHA 绑定，`FAIL`/`BLOCKED` 仍阻止 push/部署，精确 SHA 部署仍需 `PASS` 与显式授权。验证：仅文档/配置变更；staged scope/diff 检查通过；未运行 tests 或 acceptance。
 - CN 报告修订现在检测冻结 V16/旧候选池身份漂移，并在同一 allocation 引用下重捕 V17 官方三池；旧报告与证据保持不可变。验证：V17 修订回归及四项不变量 `4 passed`。
 - Routine `make test` and `make acceptance` gates now exclude registered pressure cases; `make test-pressure` retains the 10k relation check.

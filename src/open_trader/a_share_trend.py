@@ -2316,6 +2316,8 @@ def live_trend_strategy_snapshot(
         for row in rows:
             if row["name"] == "交易市场":
                 row["value"] = "沪深 A 股、境内 ETF 及 REITs；排除北交所、ST、*ST 和退市标记"
+            if row["name"] == "趋势动物组合":
+                row["value"] = "温转热（A 股）、温转热（ETF 基金个股）、温转热（REITs）"
     if market == "CN" and version == "v7":
         parameters["kelly_sample_inherits"] = [{
             "market": "CN",
