@@ -448,6 +448,7 @@ def _canonical_parameter_hash(parameters: Mapping[str, object]) -> str:
 
 def strategy_parameter_hash(parameters: Mapping[str, object]) -> str:
     identity, _allocation_parameters = _strategy_parameter_identity(parameters)
+    identity.pop("kelly_sample_inherits", None)
     return _canonical_parameter_hash(identity)
 
 
@@ -470,12 +471,38 @@ def valid_strategy_parameter_audit_identity(
         return False
     old_hash = bootstrap_event.get("parameter_hash")
     if parameter_compatibility_event is not None:
+        if not isinstance(parameter_compatibility_event, dict):
+            return False
+        compatibility_revision = parameter_compatibility_event.get(
+            "compatibility_revision"
+        )
+        compatibility_hash_matches = (
+            parameter_compatibility_event.get("new_parameter_hash") == current_hash
+        )
+        if (
+            not compatibility_hash_matches
+            and compatibility_revision
+            in {
+                UNIFIED_TREND_V5_COMPATIBILITY_REVISION,
+                ALLOCATION_PROJECTION_COMPATIBILITY_REVISION,
+            }
+        ):
+            try:
+                audit_identity, _allocation_parameters = _strategy_parameter_identity(
+                    parameters
+                )
+                compatibility_hash_matches = (
+                    parameter_compatibility_event.get("new_parameter_hash")
+                    == _canonical_parameter_hash(audit_identity)
+                )
+            except (TypeError, ValueError):
+                compatibility_hash_matches = False
         common = (
             isinstance(parameter_compatibility_event, dict)
             and _valid_parameter_compatibility_event(parameter_compatibility_event)
             and _record_key(parameter_compatibility_event) == key
             and parameter_compatibility_event.get("old_parameter_hash") == old_hash
-            and parameter_compatibility_event.get("new_parameter_hash") == current_hash
+            and compatibility_hash_matches
         )
         if not common:
             return False
@@ -589,9 +616,18 @@ def automatic_bootstrap_strategy_drawdown(
                 if compatibility_revision is None:
                     raise ValueError("strategy parameters changed without a version bump")
                 assert isinstance(old_hash, str)
+                compatibility_hash = parameter_hash
+                if compatibility_revision in {
+                    UNIFIED_TREND_V5_COMPATIBILITY_REVISION,
+                    ALLOCATION_PROJECTION_COMPATIBILITY_REVISION,
+                }:
+                    audit_identity, _allocation_parameters = _strategy_parameter_identity(
+                        parameters
+                    )
+                    compatibility_hash = _canonical_parameter_hash(audit_identity)
                 compatibility_event = {
                     "event_id": _parameter_compatibility_event_id(
-                        key, old_hash, parameter_hash, compatibility_revision
+                        key, old_hash, compatibility_hash, compatibility_revision
                     ),
                     "event_type": "parameter_compatibility",
                     "market": key[0],
@@ -600,7 +636,7 @@ def automatic_bootstrap_strategy_drawdown(
                     "actor": actor.strip(),
                     "occurred_at": occurred_at,
                     "old_parameter_hash": old_hash,
-                    "new_parameter_hash": parameter_hash,
+                    "new_parameter_hash": compatibility_hash,
                     "compatibility_revision": compatibility_revision,
                     "accepted_git_sha": accepted_git_sha,
                 }
@@ -1230,7 +1266,7 @@ def _approved_unified_trend_v5_transition(
         and key[1] == f"trend_animals_warm_to_hot/{key[0]}/v5"
         and key[2] == "v5"
         and old_hash == expected[0]
-        and strategy_parameter_hash(parameters) == expected[1]
+        and _canonical_parameter_hash(parameters) == expected[1]
     )
 
 

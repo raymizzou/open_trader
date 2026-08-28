@@ -164,6 +164,7 @@ def test_trend_drawdown_preflight_cli_bootstraps_all_markets_independently(
         timezone="Asia/Shanghai",
         trend_animals_a_share_tm_id=622466,
         trend_animals_etf_tm_id=697199,
+        trend_animals_reits_tm_id=622482,
         trend_animals_us_tm_ids=(622460,),
         trend_animals_hk_tm_ids=(622494,),
     )
@@ -272,6 +273,7 @@ def test_trend_drawdown_preflight_uses_entry_date_for_market_strategy(
         timezone="Asia/Shanghai",
         trend_animals_a_share_tm_id=622466,
         trend_animals_etf_tm_id=697199,
+        trend_animals_reits_tm_id=622482,
         trend_animals_us_tm_ids=(622460,),
         trend_animals_hk_tm_ids=(622494,),
     )
@@ -356,6 +358,7 @@ def test_trend_drawdown_preflight_uses_current_terminal_allocation(
         timezone="Asia/Shanghai",
         trend_animals_a_share_tm_id=622466,
         trend_animals_etf_tm_id=697199,
+        trend_animals_reits_tm_id=622482,
         trend_animals_us_tm_ids=(622460,),
         trend_animals_hk_tm_ids=(622494,),
     )
@@ -367,7 +370,7 @@ def test_trend_drawdown_preflight_uses_current_terminal_allocation(
         "sha256": "a" * 64,
         "snapshot": {"markets": {}},
     }
-    seen: list[object] = []
+    seen: list[tuple[str, tuple[int, ...], object]] = []
 
     class Quote:
         def __init__(self, **_: object) -> None:
@@ -385,7 +388,7 @@ def test_trend_drawdown_preflight_uses_current_terminal_allocation(
         pool_ids: tuple[int, ...],
         **kwargs: object,
     ) -> dict[str, object]:
-        seen.append(kwargs.get("allocation"))
+        seen.append((market, pool_ids, kwargs.get("allocation")))
         return {
             "strategy_id": f"trend_animals_warm_to_hot/{market}/current",
             "strategy_version": "current",
@@ -423,7 +426,11 @@ def test_trend_drawdown_preflight_uses_current_terminal_allocation(
         "--repo", str(tmp_path),
         "--actor", "pytest",
     ]) == 0
-    assert seen == [allocation, allocation, allocation]
+    assert seen == [
+        ("CN", (622466, 697199, 622482), allocation),
+        ("HK", (622494,), allocation),
+        ("US", (622460,), allocation),
+    ]
 
 
 def test_trend_drawdown_preflight_reuses_latest_allocation_on_weekend(
@@ -437,6 +444,7 @@ def test_trend_drawdown_preflight_reuses_latest_allocation_on_weekend(
         timezone="Asia/Shanghai",
         trend_animals_a_share_tm_id=622466,
         trend_animals_etf_tm_id=697199,
+        trend_animals_reits_tm_id=622482,
         trend_animals_us_tm_ids=(622460,),
         trend_animals_hk_tm_ids=(622494,),
     )
@@ -517,6 +525,7 @@ def test_trend_drawdown_preflight_skips_missing_frozen_baseline_without_live_nav
         futu_port=11111,
         trend_animals_a_share_tm_id=622466,
         trend_animals_etf_tm_id=697199,
+        trend_animals_reits_tm_id=622482,
         trend_animals_us_tm_ids=(622460,),
         trend_animals_hk_tm_ids=(622494,),
     )
@@ -584,6 +593,7 @@ def test_trend_drawdown_preflight_blocks_when_futu_calendar_is_unavailable(
         futu_port=11111,
         trend_animals_a_share_tm_id=622466,
         trend_animals_etf_tm_id=697199,
+        trend_animals_reits_tm_id=622482,
         trend_animals_us_tm_ids=(622460,),
         trend_animals_hk_tm_ids=(622494,),
     )
@@ -654,6 +664,7 @@ def test_trend_drawdown_preflight_does_not_relabel_calendar_programmer_errors(
         data_dir=tmp_path / "data", reports_dir=tmp_path / "reports",
         futu_host="127.0.0.1", futu_port=11111,
         trend_animals_a_share_tm_id=622466, trend_animals_etf_tm_id=697199,
+        trend_animals_reits_tm_id=622482,
         trend_animals_us_tm_ids=(622460,), trend_animals_hk_tm_ids=(622494,),
     )
     if terminal_allocation:
@@ -710,6 +721,7 @@ def test_trend_drawdown_preflight_reuses_existing_audited_state_without_new_base
         futu_port=11111,
         trend_animals_a_share_tm_id=622466,
         trend_animals_etf_tm_id=697199,
+        trend_animals_reits_tm_id=622482,
         trend_animals_us_tm_ids=(622460,),
         trend_animals_hk_tm_ids=(622494,),
     )

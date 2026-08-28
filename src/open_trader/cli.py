@@ -2005,6 +2005,7 @@ def main(argv: list[str] | None = None) -> int:
                     "CN": (
                         config.trend_animals_a_share_tm_id,
                         config.trend_animals_etf_tm_id,
+                        config.trend_animals_reits_tm_id,
                     ),
                     "HK": config.trend_animals_hk_tm_ids,
                     "US": config.trend_animals_us_tm_ids,

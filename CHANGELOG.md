@@ -5,6 +5,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 
 ## 2026-08-28
 
+- 修复 CN V17 回撤预检使用官方 A 股、ETF、REITs 三池身份，并将 `kelly_sample_inherits` 从回撤身份哈希中排除而保留审计 lineage；真实回撤参数漂移仍要求升版。验证：两个 acceptance exact cases `2 passed`，直接受影响套件 `86 passed`。
 - CN V17 now accepts a current/ready official REIT warm-to-hot pool with zero rows while rejecting stale-only REIT data; A-share and ETF empty/stale behavior remains fail-closed. Its public strategy snapshot/report source label now names A-share, ETF fund components, and REITs while CN V16 remains unchanged. Verification: source-label regression RED then GREEN; focused empty/stale pool and Trend Animals checks pass.
 - 将 `make acceptance` 收敛为合并后的 clean `main` 一次 runtime-only 验证；合并前由 worktree `make test` 与当前工件只读/临时副本 preflight 负责，验收失败先完成一次全量只读错误及下游依赖审计，再批量 fix-forward，不在单个修复之间重复验收。结果按起始 SHA 绑定，精确 SHA 部署仍需 `PASS` 与显式授权，push/部署仍需显式授权。
 - CN V17 报告修订现在保留旧两来源标签的精确回放，同时在版本/标签变更时重捕官方三池、回撤、FIFO 与席位，并同步冻结 evidence/planning/replay 引用；共享 allocation-v2 冻结契约和 staged publisher 拒绝控制器不可执行的计划。Futu 实盘统计先排除 option 等非股票成交，再执行股票数量/价格校验；零价股票仍失败。验证：V17 lineage、staging、Futu filtering 聚焦用例及 `make test` 通过。

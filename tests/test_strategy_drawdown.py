@@ -187,6 +187,88 @@ def test_parameter_hash_is_canonical() -> None:
     assert len(strategy_parameter_hash({"limit": "0.05"})) == 64
 
 
+def test_bugfix_kelly_sample_inheritance_preserves_drawdown_identity(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    request = {
+        "market": "CN",
+        "strategy_id": "trend_animals_warm_to_hot/CN/v17",
+        "strategy_version": "v17",
+        "parameters": {"drawdown_limit": "0.05"},
+        "baseline_equity": Decimal("100"),
+        "source_date": "2026-08-03",
+        "accepted_git_sha": "a" * 40,
+        "actor": "pytest",
+        "occurred_at": "2026-08-03T08:00:00+08:00",
+        "reason": "first_activation",
+        "entry_eligible_from": "2026-08-04",
+    }
+    automatic_bootstrap_strategy_drawdown(data_dir, **request)
+    observe_strategy_equity(
+        data_dir,
+        market=request["market"],
+        strategy_id=request["strategy_id"],
+        strategy_version=request["strategy_version"],
+        current_equity=Decimal("94"),
+        observed_at="2026-08-03T15:00:00+08:00",
+    )
+
+    parameters_with_lineage = {
+        **request["parameters"],
+        "kelly_sample_inherits": [{
+            "market": "CN",
+            "strategy_id": "trend_animals_warm_to_hot/CN/v16",
+            "opening_strategy_version": "v16",
+        }],
+    }
+    before_hash = strategy_parameter_hash(request["parameters"])
+    assert strategy_parameter_hash(parameters_with_lineage) == before_hash
+    state_path = data_dir / "trend_drawdown/state.json"
+    before_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+    decision = automatic_bootstrap_strategy_drawdown(
+        data_dir,
+        **{
+            **request,
+            "parameters": parameters_with_lineage,
+            "baseline_equity": None,
+            "source_date": None,
+            "occurred_at": "2026-08-03T16:00:00+08:00",
+            "entry_eligible_from": None,
+            "reason": "new_strategy_version",
+        },
+    )
+
+    assert decision["high_water_mark"] == "100"
+    assert decision["current_equity"] == "94"
+    assert decision["status"] == "paused"
+    assert decision["entry_allowed"] is False
+    after_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert [event["event_type"] for event in after_state["audit_events"]] == [
+        "automatic_bootstrap"
+    ]
+    assert after_state["audit_events"] == before_state["audit_events"]
+
+    changed_parameters = {**parameters_with_lineage, "drawdown_limit": "0.06"}
+    assert strategy_parameter_hash(changed_parameters) != before_hash
+    with pytest.raises(
+        ValueError, match="strategy parameters changed without a version bump"
+    ):
+        automatic_bootstrap_strategy_drawdown(
+            data_dir,
+            **{
+                **request,
+                "parameters": changed_parameters,
+                "baseline_equity": None,
+                "source_date": None,
+                "occurred_at": "2026-08-03T16:01:00+08:00",
+                "entry_eligible_from": None,
+                "reason": "new_strategy_version",
+            },
+        )
+
+
 @pytest.mark.parametrize(
     ("market", "version", "predecessor"),
     [
