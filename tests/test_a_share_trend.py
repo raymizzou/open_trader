@@ -13213,6 +13213,125 @@ def test_planning_crash_retry_keeps_frozen_drawdown_state(
     ) == ("100000", "100000", "100000", "100000")
 
 
+def test_cn_v17_retry_refreshes_missing_drawdown_after_bootstrap(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    allocation = _write_cn_v2_allocation(config)
+    api_instances = [ReadyApi([]), ReadyApi([])]
+    receipt_path = config.data_dir / "trend_a_share/delivery/2026-07-14.json"
+    collision_created = False
+
+    def account_factory(**_kwargs: object) -> DefaultSimAccountClient:
+        nonlocal collision_created
+        if not collision_created:
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            receipt_path.mkdir()
+            collision_created = True
+        return DefaultSimAccountClient(simulate_acc_id=101)
+
+    with pytest.raises(OSError):
+        run_a_share_trend_report(
+            config=config,
+            run_date="2026-07-14",
+            allocation_reference=allocation,
+            api_factory=lambda **_kwargs: api_instances.pop(0),
+            quote_factory=lambda **_kwargs: ReadyQuote([]),
+            account_factory=account_factory,
+            notifier=RecordingFeishu(),
+        )
+
+    planning_path = config.data_dir / "trend_review/planning/CN/2026-07-15.json"
+    first_manifest = json.loads(planning_path.read_text(encoding="utf-8"))
+    first_evidence_path = Path(first_manifest["evidence"]["path"])
+    first_evidence = json.loads(first_evidence_path.read_text(encoding="utf-8"))
+    first_inputs = first_evidence["rebuild_inputs"]
+    assert (
+        first_inputs["drawdown_summary"]["state_status"],
+        first_inputs["drawdown_summary"]["bootstrap_event"],
+    ) == ("missing", None)
+
+    strategy = first_evidence["strategy_snapshot"]
+    automatic_bootstrap_strategy_drawdown(
+        config.data_dir,
+        market="CN",
+        strategy_id=str(strategy["strategy_id"]),
+        strategy_version=str(strategy["strategy_version"]),
+        parameters=strategy["parameters"],
+        baseline_equity=Decimal(str(first_inputs["account"]["net_value"])),
+        source_date=str(first_inputs["as_of_date"]),
+        accepted_git_sha="b" * 40,
+        actor="pytest",
+        occurred_at="2026-07-14T18:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from=str(first_inputs["execution_date"]),
+    )
+    state = json.loads(
+        (config.data_dir / "trend_drawdown/state.json").read_text(encoding="utf-8")
+    )
+    expected_record = next(
+        record
+        for record in state["records"]
+        if (
+            record["market"] == "CN"
+            and record["strategy_id"] == strategy["strategy_id"]
+            and record["strategy_version"] == strategy["strategy_version"]
+        )
+    )
+    expected_event = next(
+        event
+        for event in state["audit_events"]
+        if (
+            event["event_type"] == "automatic_bootstrap"
+            and event["market"] == "CN"
+            and event["strategy_id"] == strategy["strategy_id"]
+            and event["strategy_version"] == strategy["strategy_version"]
+        )
+    )
+    receipt_path.rmdir()
+    recovered = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        allocation_reference=allocation,
+        api_factory=lambda **_kwargs: api_instances.pop(0),
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        account_factory=account_factory,
+        notifier=RecordingFeishu(),
+    )
+    assert recovered.status == "generated"
+    payload = json.loads(recovered.json_path.read_text(encoding="utf-8"))
+    drawdown = payload["drawdown_summary"]
+    evidence_path = Path(payload["replay_evidence"]["path"])
+    if not evidence_path.is_absolute():
+        evidence_path = config.data_dir / evidence_path
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    updated_manifest = json.loads(planning_path.read_text(encoding="utf-8"))
+    updated_evidence = json.loads(
+        Path(updated_manifest["evidence"]["path"]).read_text(encoding="utf-8")
+    )
+    assert (
+        drawdown["state_status"],
+        drawdown["bootstrap_event"],
+        drawdown["current_equity"],
+        drawdown["high_water_mark"],
+        trend_module.valid_frozen_report_contract(payload),
+        evidence["rebuild_inputs"]["drawdown_summary"],
+        updated_evidence["rebuild_inputs"]["drawdown_summary"],
+        payload["replay_evidence"]["path"],
+        payload["replay_evidence"]["planning_path"],
+    ) == (
+        "ok",
+        expected_event,
+        expected_record["current_equity"],
+        expected_record["high_water_mark"],
+        True,
+        drawdown,
+        drawdown,
+        str(evidence_path.relative_to(config.data_dir)),
+        str(planning_path.relative_to(config.data_dir)),
+    )
+
+
 def test_empty_v2_buy_fifo_is_controller_accepted_noop(tmp_path: Path) -> None:
     config = trend_config(tmp_path)
     allocation = _write_cn_v2_allocation(config)
@@ -14411,6 +14530,136 @@ def test_report_revision_reuses_target_day_frozen_components(
     assert evidence_path.read_bytes() == frozen_evidence
     revised_payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
     assert revised_payload["execution_date"] == "2026-07-15"
+
+
+def test_cn_v17_revision_refreshes_missing_drawdown_after_bootstrap(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    allocation = _write_cn_v2_allocation(config)
+    base = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        allocation_reference=allocation,
+        api_factory=lambda **_kwargs: ReadyApi([]),
+        quote_factory=lambda **_kwargs: ReadyQuote([]),
+        notifier=RecordingFeishu(),
+    )
+    assert base.status == "generated"
+    assert base.json_path is not None
+    base_report_bytes = base.json_path.read_bytes()
+    base_payload = json.loads(base_report_bytes)
+    assert base_payload["drawdown_summary"]["state_status"] == "missing"
+    base_evidence_path = config.data_dir / base_payload["replay_evidence"]["path"]
+    base_evidence_bytes = base_evidence_path.read_bytes()
+    base_evidence = json.loads(base_evidence_bytes)
+    base_inputs = base_evidence["rebuild_inputs"]
+    planning_path = config.data_dir / base_payload["replay_evidence"]["planning_path"]
+
+    strategy = base_evidence["strategy_snapshot"]
+    automatic_bootstrap_strategy_drawdown(
+        config.data_dir,
+        market="CN",
+        strategy_id=str(strategy["strategy_id"]),
+        strategy_version=str(strategy["strategy_version"]),
+        parameters=strategy["parameters"],
+        baseline_equity=Decimal(str(base_inputs["account"]["net_value"])),
+        source_date=str(base_inputs["as_of_date"]),
+        accepted_git_sha="c" * 40,
+        actor="pytest",
+        occurred_at="2026-07-14T18:00:00+08:00",
+        reason="first_activation",
+        entry_eligible_from=str(base_inputs["execution_date"]),
+    )
+    state = json.loads(
+        (config.data_dir / "trend_drawdown/state.json").read_text(encoding="utf-8")
+    )
+    expected_record = next(
+        record
+        for record in state["records"]
+        if (
+            record["market"] == "CN"
+            and record["strategy_id"] == strategy["strategy_id"]
+            and record["strategy_version"] == strategy["strategy_version"]
+        )
+    )
+    expected_event = next(
+        event
+        for event in state["audit_events"]
+        if (
+            event["event_type"] == "automatic_bootstrap"
+            and event["market"] == "CN"
+            and event["strategy_id"] == strategy["strategy_id"]
+            and event["strategy_version"] == strategy["strategy_version"]
+        )
+    )
+
+    def forbidden(**_kwargs: object) -> object:
+        raise AssertionError("revision must reuse frozen paid/account facts")
+
+    revised = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        revision=True,
+        allocation_reference=allocation,
+        api_factory=forbidden,
+        quote_factory=forbidden,
+        account_factory=forbidden,
+        notifier=RecordingFeishu(),
+    )
+    assert revised.status == "generated"
+    assert revised.json_path is not None
+    revised_payload = json.loads(revised.json_path.read_text(encoding="utf-8"))
+    revised_drawdown = revised_payload["drawdown_summary"]
+    revised_evidence_path = config.data_dir / revised_payload["replay_evidence"]["path"]
+    revised_evidence = json.loads(revised_evidence_path.read_text(encoding="utf-8"))
+    updated_planning = json.loads(planning_path.read_text(encoding="utf-8"))
+    updated_planning_evidence_path = Path(updated_planning["evidence"]["path"])
+    if not updated_planning_evidence_path.is_absolute():
+        updated_planning_evidence_path = config.data_dir / updated_planning_evidence_path
+    updated_planning_evidence = json.loads(
+        updated_planning_evidence_path.read_text(encoding="utf-8")
+    )
+    judgments = revised_payload["strategy_judgments"]
+    assert (
+        revised.json_path.name,
+        revised_drawdown["state_status"],
+        revised_drawdown["bootstrap_event"],
+        revised_drawdown["current_equity"],
+        revised_drawdown["high_water_mark"],
+        trend_module.valid_frozen_report_contract(revised_payload),
+        isinstance(judgments.get("simulated_buy_fifo"), list),
+        isinstance(judgments.get("planned_new_seats"), int),
+        revised_payload["replay_evidence"]["path"]
+        != base_payload["replay_evidence"]["path"],
+        updated_planning_evidence_path.resolve() == revised_evidence_path.resolve(),
+        revised_payload["replay_evidence"]["sha256"]
+        == updated_planning["evidence"]["sha256"],
+        revised_payload["replay_evidence"]["planning_sha256"]
+        == hashlib.sha256(planning_path.read_bytes()).hexdigest(),
+        revised_evidence["rebuild_inputs"]["drawdown_summary"] == revised_drawdown,
+        updated_planning_evidence["rebuild_inputs"]["drawdown_summary"]
+        == revised_drawdown,
+        base.json_path.read_bytes() == base_report_bytes,
+        base_evidence_path.read_bytes() == base_evidence_bytes,
+    ) == (
+        "2026-07-14-r1.json",
+        "ok",
+        expected_event,
+        expected_record["current_equity"],
+        expected_record["high_water_mark"],
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+    )
 
 
 def test_cn_v17_revision_recaptures_when_frozen_v16_strategy_is_stale(

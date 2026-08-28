@@ -1358,6 +1358,27 @@ def planning_evidence_reusable(
         expected_identity = _planning_identity(expected_evidence)
         if expected_identity is None or identity != expected_identity:
             return False
+        expected_inputs = expected_evidence.get("rebuild_inputs")
+        frozen_inputs = evidence.get("rebuild_inputs")
+        expected_drawdown = (
+            expected_inputs.get("drawdown_summary")
+            if isinstance(expected_inputs, Mapping)
+            else None
+        )
+        frozen_drawdown = (
+            frozen_inputs.get("drawdown_summary")
+            if isinstance(frozen_inputs, Mapping)
+            else None
+        )
+        if (
+            isinstance(expected_drawdown, Mapping)
+            and expected_drawdown.get("state_status") == "ok"
+            and (
+                not isinstance(frozen_drawdown, Mapping)
+                or frozen_drawdown.get("state_status") != "ok"
+            )
+        ):
+            return False
     return not require_simulated_plan or _complete_simulated_plan(evidence)
 
 

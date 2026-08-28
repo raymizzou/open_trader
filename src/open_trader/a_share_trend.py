@@ -10694,6 +10694,7 @@ def _reuse_planning_revision(
             expected_strategy = None
 
     strategy_refresh = False
+    drawdown_refresh = False
     simulated_component = components.get("simulated_account")
     if expected_strategy is not None:
         expected_evidence = {
@@ -10814,7 +10815,46 @@ def _reuse_planning_revision(
                 inputs["drawdown_summary"] = None
         else:
             inputs["drawdown_summary"] = None
+    frozen_account = inputs.get("account")
+    frozen_drawdown = inputs.get("drawdown_summary")
+    if (
+        (
+            not isinstance(frozen_drawdown, Mapping)
+            or frozen_drawdown.get("state_status") != "ok"
+        )
+        and isinstance(frozen_account, Mapping)
+        and frozen_account.get("status") == "available"
+        and frozen_account.get("fresh") is True
+    ):
+        strategy = evidence.get("strategy_snapshot")
+        if isinstance(strategy, Mapping):
+            try:
+                refreshed_drawdown = observe_strategy_equity(
+                    config.data_dir,
+                    market="CN",
+                    strategy_id=str(strategy.get("strategy_id") or ""),
+                    strategy_version=str(strategy.get("strategy_version") or ""),
+                    current_equity=Decimal(str(frozen_account["net_value"])),
+                    observed_at=datetime.now(SHANGHAI).isoformat(timespec="seconds"),
+                    entry_date=str(inputs["execution_date"]),
+                )
+            except (KeyError, InvalidOperation, TypeError, ValueError):
+                refreshed_drawdown = None
+            if (
+                isinstance(refreshed_drawdown, Mapping)
+                and refreshed_drawdown.get("state_status") == "ok"
+            ):
+                inputs["drawdown_summary"] = refreshed_drawdown
+                drawdown_refresh = True
     updates: dict[str, tuple[str, object]] = {}
+    if drawdown_refresh:
+        updates["simulated_account"] = (
+            "complete",
+            {
+                "account": inputs.get("account"),
+                "account_input": inputs.get("account_input"),
+            },
+        )
     if (
         isinstance(simulated_component, Mapping)
         and simulated_component.get("status") == "unavailable"
@@ -10939,6 +10979,8 @@ def _reuse_planning_revision(
     recompute_components = set(updates)
     if strategy_refresh:
         recompute_components.add("simulated_account")
+    if drawdown_refresh:
+        recompute_components.add("simulated_account")
     if allocation_changed:
         recompute_components.update({"simulated_account", "real_account"})
     if recompute_components:
@@ -10977,7 +11019,7 @@ def _reuse_planning_revision(
                 inputs["planned_new_seats"] = recovered_judgments[
                     "planned_new_seats"
                 ]
-        if strategy_refresh or allocation_changed:
+        if strategy_refresh or allocation_changed or drawdown_refresh:
             updates["market"] = (
                 "complete",
                 _planning_market_component_value(inputs),
@@ -11001,8 +11043,11 @@ def _reuse_planning_revision(
             replace_completed=tuple(
                 name
                 for name, changed in (
-                    ("market", strategy_refresh or allocation_changed),
-                    ("simulated_account", strategy_refresh),
+                    (
+                        "market",
+                        strategy_refresh or allocation_changed or drawdown_refresh,
+                    ),
+                    ("simulated_account", strategy_refresh or drawdown_refresh),
                 )
                 if changed
             ),
@@ -11527,6 +11572,7 @@ def _attempt_report(
         )
         planning_snapshot_exists = planning_snapshot_path_value.exists()
         planning_simulated_account_complete = False
+        planning_drawdown_refresh = False
         planning_snapshot: dict[str, object] | None = None
         simulated_component: Mapping[str, object] | None = None
         if planning_snapshot_exists:
@@ -11594,6 +11640,18 @@ def _attempt_report(
                     },
                     require_simulated_plan=True,
                 )
+                planning_inputs = planning_evidence.get("rebuild_inputs")
+                planning_drawdown = (
+                    planning_inputs.get("drawdown_summary")
+                    if isinstance(planning_inputs, Mapping)
+                    else None
+                )
+                planning_drawdown_refresh = not (
+                    isinstance(planning_drawdown, Mapping)
+                    and planning_drawdown.get("state_status") == "ok"
+                )
+                if planning_drawdown_refresh:
+                    planning_simulated_account_complete = False
         strategy_version = str(strategy_snapshot["strategy_version"])
         individual_global_ranking = _uses_individual_global_ranking(
             "CN", strategy_version
