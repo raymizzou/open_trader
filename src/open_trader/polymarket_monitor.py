@@ -33,6 +33,7 @@ from .prediction_arbitrage import (
 from .prediction_arbitrage_store import PredictionArbitrageStore
 from .prediction_title_translation import cached_prediction_title_zh
 from .polymarket_relation_discovery import (
+    LLM_CIRCUIT_COOLDOWN_SECONDS,
     PositiveEdgeDepth,
     RelationValidation,
     ThresholdHedgeIntent,
@@ -74,10 +75,20 @@ RELATION_ACTIVITY_MIN_EDGE = Decimal("-0.05")
 RELATION_APR_TARGET_LIMIT = 100
 RELATION_APR_PREWARM_LIMIT = 100
 RELATION_VALIDATION_RETRY_SECONDS = 60 * 60
+RELATION_VALIDATION_TRANSIENT_RETRY_SECONDS = LLM_CIRCUIT_COOLDOWN_SECONDS
 RELATION_RESCAN_MIN_INTERVAL_SECONDS = 2.0
 MONITOR_THREAD_MAX_CONSECUTIVE_CRASHES = 10
 MONITOR_THREAD_CRASH_NOTIFY_INTERVAL_SECONDS = 300.0
 MONITOR_THREAD_BACKOFF_MAX_SECONDS = 60.0
+
+
+def relation_validation_retry_delay(reason_codes: Sequence[str]) -> timedelta:
+    """Retry budget/no-balance losses after a full hour, others at cooldown."""
+
+    for code in reason_codes:
+        if str(code).endswith(("_BUDGET_EXHAUSTED", "_NO_BALANCE")):
+            return timedelta(seconds=RELATION_VALIDATION_RETRY_SECONDS)
+    return timedelta(seconds=RELATION_VALIDATION_TRANSIENT_RETRY_SECONDS)
 
 
 def _value(value: object, *names: str, default: object = None) -> object:
@@ -3244,8 +3255,8 @@ class PolymarketMonitor:
                 status = str(getattr(validation, "status", "llm_unavailable"))
                 self._codex_statuses[relation_id] = status
                 if status == "llm_unavailable":
-                    self._codex_retry_at[relation_id] = self._now() + timedelta(
-                        seconds=RELATION_VALIDATION_RETRY_SECONDS
+                    self._codex_retry_at[relation_id] = self._now() + relation_validation_retry_delay(
+                        getattr(validation, "reason_codes", ())
                     )
                     self._schedule_llm_failure_notification(validation)
                 else:

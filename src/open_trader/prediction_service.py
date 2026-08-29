@@ -244,6 +244,7 @@ def _llm_provider_payload(runtime: PredictionRuntime) -> dict[str, object]:
         "schema_version": "open_trader.prediction_service.llm_provider.v1",
         "selected": str(info.get("selected", "")),
         "default": str(info.get("default", "")),
+        "fallback": str(info.get("fallback", "")),
         "providers": providers,
     }
 

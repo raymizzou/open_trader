@@ -832,6 +832,7 @@ def test_current_provider_prefers_store_row_over_env_and_defaults(
         "models": dict(env_default.models),
         "default": "codex",
         "configured": {"codex": True, "deepseek": False, "zhipu": False},
+        "fallback": "",
     }
 
     with pytest.raises(ValueError, match="invalid llm provider"):
@@ -1484,7 +1485,10 @@ def test_unavailable_results_are_not_cached(
     db = codex_store(tmp_path)
     provider = (reason or "CODEX").split("_")[0].lower()
     validator = LlmRelationValidator(
-        db, default_provider=provider, completers=all_providers(complete)
+        db,
+        default_provider=provider,
+        completers=all_providers(complete),
+        output_retries=0,
     )
 
     first = validator.validate(threshold_relation())
@@ -1560,6 +1564,17 @@ def test_llm_approve_must_pass_deterministic_post_validation(
     assert validator.store.llm_usage_24h()["cache_hits"] == 0
 
 
+def test_parse_structured_strips_markdown_code_fences() -> None:
+    from open_trader.polymarket_relation_discovery import _parse_structured
+
+    fenced = "```json\n{}\n```".format(json.dumps(codex_result()))
+    assert _parse_structured(fenced) == codex_result()
+    bare = json.dumps(codex_result())
+    assert _parse_structured(bare) == codex_result()
+    assert _parse_structured("not json") is None
+    assert _parse_structured("```json\nnot json\n```") is None
+
+
 def test_structured_result_violation_classifies_schema_deviations() -> None:
     from open_trader.polymarket_relation_discovery import (
         _relation_audit_prompt,
@@ -1615,6 +1630,291 @@ def test_output_invalid_logs_violation_and_raw_head(
     assert "provider=codex" in record.message
     assert "violation=top_level_keys" in record.message
     assert "unexpected" in record.message
+
+
+def scripted_completer(
+    responses: list[LlmCompletion],
+) -> tuple[object, list[tuple[str, str]]]:
+    """Completer returning pre-scripted completions in call order."""
+
+    calls: list[tuple[str, str]] = []
+
+    def complete(system: str, user: str) -> LlmCompletion:
+        calls.append((system, user))
+        index = min(len(calls) - 1, len(responses) - 1)
+        return responses[index]
+
+    return complete, calls
+
+
+def invalid_proof_result() -> dict[str, object]:
+    value = codex_result()
+    value["proof"]["excluded_state"] = "A=YES,B=YES"
+    return value
+
+
+def test_output_invalid_retry_recovers_on_second_attempt(tmp_path: Path) -> None:
+    from open_trader.polymarket_relation_discovery import (
+        _canonical_json,
+        _relation_payload,
+    )
+
+    relation = threshold_relation()
+    complete, calls = scripted_completer(
+        [
+            LlmCompletion('{"unexpected": true}', None, dict(DEFAULT_USAGE)),
+            LlmCompletion(json.dumps(codex_result()), None, dict(DEFAULT_USAGE)),
+        ]
+    )
+    db = codex_store(tmp_path)
+    validator = LlmRelationValidator(
+        db, default_provider="codex", completers=all_providers(complete)
+    )
+
+    result = validator.validate(relation)
+
+    assert result.status == "approved"
+    assert result.provider == "codex"
+    assert len(calls) == 2
+    assert calls[0][1] == calls[1][1] == _canonical_json(_relation_payload(relation))
+    by_provider = db.llm_usage_24h_by_provider()["codex"]
+    assert by_provider["failures"] == 1
+    assert by_provider["violations"] == {"top_level_keys": 1}
+    assert by_provider["successes"] == 1
+    assert db.llm_usage_24h()["invalid_outputs"] == 1
+
+    cached = validator.validate(relation)
+
+    assert cached.status == "approved"
+    assert cached.cached is True
+    assert len(calls) == 2  # the completer is not called again on a cache hit
+
+
+def test_output_invalid_exhausts_retries_without_caching(tmp_path: Path) -> None:
+    from open_trader.polymarket_relation_discovery import (
+        _structured_result_violation,
+    )
+
+    assert (
+        _structured_result_violation(invalid_proof_result())
+        == "proof_excluded_state"
+    )
+    relation = threshold_relation()
+    complete, calls = scripted_completer(
+        [LlmCompletion(json.dumps(invalid_proof_result()), None, dict(DEFAULT_USAGE))]
+    )
+    db = codex_store(tmp_path)
+    validator = LlmRelationValidator(
+        db, default_provider="codex", completers=all_providers(complete)
+    )
+
+    first = validator.validate(relation)
+
+    assert first.status == "llm_unavailable"
+    assert first.reason_codes == ("CODEX_OUTPUT_INVALID",)
+    assert first.provider == "codex"
+    assert len(calls) == 3  # 1 + 2 retries within one validate
+    assert (
+        db.llm_usage_24h_by_provider()["codex"]["violations"]
+        == {"proof_excluded_state": 3}
+    )
+    assert db.load_llm_cache(relation_llm_cache_key(relation)) is None
+
+    # llm_unavailable verdicts are never cached: a second validator on the
+    # same store (fresh per-instance breakers) really calls the completer
+    # again instead of restoring a verdict.
+    retried = LlmRelationValidator(
+        db, default_provider="codex", completers=all_providers(complete)
+    )
+    second = retried.validate(relation)
+
+    assert second.status == "llm_unavailable"
+    assert second.reason_codes == ("CODEX_OUTPUT_INVALID",)
+    assert len(calls) == 6
+
+
+def test_output_repair_directive_is_appended_after_first_retry(
+    tmp_path: Path,
+) -> None:
+    from open_trader.polymarket_relation_discovery import (
+        _canonical_json,
+        _relation_payload,
+    )
+
+    relation = threshold_relation()
+    complete, calls = scripted_completer(
+        [LlmCompletion(json.dumps(invalid_proof_result()), None, dict(DEFAULT_USAGE))]
+    )
+    validator = LlmRelationValidator(
+        codex_store(tmp_path),
+        default_provider="codex",
+        completers=all_providers(complete),
+    )
+
+    validator.validate(relation)
+
+    assert len(calls) == 3
+    original_user = _canonical_json(_relation_payload(relation))
+    assert calls[0][1] == original_user
+    assert calls[1][1] == original_user
+    assert calls[2][1].startswith(original_user)
+    assert "proof_excluded_state" in calls[2][1]
+
+
+def test_output_retries_stop_at_the_shared_call_budget(tmp_path: Path) -> None:
+    relation = threshold_relation()
+    complete, calls = scripted_completer(
+        [LlmCompletion(json.dumps(invalid_proof_result()), None, dict(DEFAULT_USAGE))]
+    )
+    validator = LlmRelationValidator(
+        codex_store(tmp_path),
+        default_provider="codex",
+        completers=all_providers(complete),
+        output_retries=2,
+        max_llm_calls=2,
+    )
+
+    result = validator.validate(relation)
+
+    assert result.status == "llm_unavailable"
+    assert result.reason_codes == ("CODEX_BUDGET_EXHAUSTED",)
+    assert len(calls) == 2
+
+
+def test_fallback_provider_takes_over_after_output_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relation = threshold_relation()
+    deepseek, deepseek_calls = make_completer(
+        content=json.dumps(invalid_proof_result())
+    )
+    zhipu, zhipu_calls = make_completer(codex_result())
+    db = codex_store(tmp_path)
+    monkeypatch.setenv("ZHIPU_API_KEY", "x")
+    validator = LlmRelationValidator(
+        db,
+        default_provider="deepseek",
+        completers={"codex": zhipu, "deepseek": deepseek, "zhipu": zhipu},
+        fallback_provider="zhipu",
+        output_retries=0,
+    )
+
+    result = validator.validate(relation)
+
+    assert result.status == "approved"
+    assert result.provider == "zhipu"
+    assert len(deepseek_calls) == 1
+    assert len(zhipu_calls) == 1
+    assert db.get_llm_provider() == "zhipu"
+    event = db.latest_control_event("set_llm_provider", "llm_provider_selection")
+    assert event is not None
+    assert event["payload"]["source"] == "auto_failover"
+    assert event["payload"]["trigger"] == "DEEPSEEK_OUTPUT_INVALID"
+    assert event["payload"]["violation"] == "proof_excluded_state"
+
+    cached = validator.validate(relation)
+
+    assert cached.status == "approved"
+    assert cached.cached is True
+    assert len(zhipu_calls) == 1  # the zhipu completer is not called again
+
+
+@pytest.mark.parametrize(
+    ("fallback_kwargs", "credential_env"),
+    [
+        ({}, None),  # fallback not configured
+        ({"fallback_provider": "deepseek"}, None),  # fallback == selected engine
+        ({"fallback_provider": "zhipu"}, "ZHIPU_API_KEY"),  # credentials missing
+    ],
+)
+def test_fallback_stays_disabled_without_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fallback_kwargs: dict[str, str],
+    credential_env: str | None,
+) -> None:
+    relation = threshold_relation()
+    deepseek, deepseek_calls = make_completer(
+        content=json.dumps(invalid_proof_result())
+    )
+    zhipu, zhipu_calls = make_completer(codex_result())
+    db = codex_store(tmp_path)
+    if credential_env:
+        monkeypatch.delenv(credential_env, raising=False)
+    validator = LlmRelationValidator(
+        db,
+        default_provider="deepseek",
+        completers={"codex": zhipu, "deepseek": deepseek, "zhipu": zhipu},
+        output_retries=0,
+        **fallback_kwargs,
+    )
+
+    result = validator.validate(relation)
+
+    assert result.status == "llm_unavailable"
+    assert result.reason_codes == ("DEEPSEEK_OUTPUT_INVALID",)
+    assert all("ZHIPU" not in code for code in result.reason_codes)
+    assert len(deepseek_calls) == 1
+    assert zhipu_calls == []
+    assert db.get_llm_provider() == "deepseek"
+    assert (
+        db.latest_control_event("set_llm_provider", "llm_provider_selection")
+        is None
+    )
+
+
+def test_fallback_failure_keeps_both_reason_codes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relation = threshold_relation()
+    deepseek, deepseek_calls = make_completer(
+        content=json.dumps(invalid_proof_result())
+    )
+    zhipu, zhipu_calls = make_completer(reason="ZHIPU_TIMEOUT")
+    db = codex_store(tmp_path)
+    monkeypatch.setenv("ZHIPU_API_KEY", "x")
+    validator = LlmRelationValidator(
+        db,
+        default_provider="deepseek",
+        completers={"codex": zhipu, "deepseek": deepseek, "zhipu": zhipu},
+        fallback_provider="zhipu",
+    )
+
+    result = validator.validate(relation)
+
+    assert result.status == "llm_unavailable"
+    assert result.reason_codes == ("DEEPSEEK_OUTPUT_INVALID", "ZHIPU_TIMEOUT")
+    by_provider = db.llm_usage_24h_by_provider()
+    assert by_provider["zhipu"]["failure_reasons"] == {"ZHIPU_TIMEOUT": 1}
+    assert db.get_llm_provider() == "deepseek"
+
+
+def test_cache_hit_does_not_consume_budget_or_fallback_attempts(
+    tmp_path: Path,
+) -> None:
+    relation = threshold_relation()
+    complete, calls = make_completer()
+    db = codex_store(tmp_path)
+    seeded = LlmRelationValidator(
+        db, default_provider="codex", completers=all_providers(complete)
+    )
+    assert seeded.validate(relation).status == "approved"
+
+    validator = LlmRelationValidator(
+        db,
+        default_provider="codex",
+        completers=all_providers(complete),
+        max_llm_calls=0,
+        fallback_provider="zhipu",
+    )
+
+    cached = validator.validate(relation)
+
+    assert cached.status == "approved"
+    assert cached.cached is True
+    assert cached.provider == "codex"
+    assert len(calls) == 1  # only the seeding call
+    assert validator.llm_calls == 0
 
 
 def test_relation_prompt_states_output_contract() -> None:

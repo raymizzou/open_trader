@@ -23,7 +23,12 @@ from open_trader.polymarket_relation_discovery import (
     threshold_relation_payload,
 )
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
-from open_trader.polymarket_monitor import PolymarketMonitor, _relation_fingerprint
+from open_trader.polymarket_monitor import (
+    RELATION_VALIDATION_RETRY_SECONDS,
+    PolymarketMonitor,
+    _relation_fingerprint,
+    relation_validation_retry_delay,
+)
 from open_trader.relation_catalog import RelationCatalog
 
 
@@ -2949,12 +2954,46 @@ def test_codex_worker_queues_negative_two_percent_pool_relation(
     assert monitor._codex_statuses[relation_id] == "approved"
 
 
+@pytest.mark.parametrize(
+    ("reason_codes", "expected"),
+    [
+        (("CODEX_BUDGET_EXHAUSTED",), timedelta(hours=1)),
+        (("ZHIPU_NO_BALANCE",), timedelta(hours=1)),
+        (("DEEPSEEK_OUTPUT_INVALID",), timedelta(seconds=300)),
+        (("CODEX_CIRCUIT_OPEN",), timedelta(seconds=300)),
+        (("CODEX_TIMEOUT",), timedelta(seconds=300)),
+        ((), timedelta(seconds=300)),
+    ],
+)
+def test_relation_validation_retry_delay_reclassifies_transient_failures(
+    reason_codes: tuple[str, ...], expected: timedelta
+) -> None:
+    from open_trader.polymarket_relation_discovery import (
+        LLM_CIRCUIT_COOLDOWN_SECONDS,
+    )
+
+    assert relation_validation_retry_delay(reason_codes) == expected
+    if reason_codes and (
+        reason_codes[0].endswith("_BUDGET_EXHAUSTED")
+        or reason_codes[0].endswith("_NO_BALANCE")
+    ):
+        assert relation_validation_retry_delay(reason_codes) == timedelta(
+            seconds=RELATION_VALIDATION_RETRY_SECONDS
+        )
+    else:
+        assert relation_validation_retry_delay(reason_codes) == timedelta(
+            seconds=LLM_CIRCUIT_COOLDOWN_SECONDS
+        )
+
+
 def test_transient_codex_failure_retries_once_at_the_retry_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import open_trader.polymarket_monitor as monitor_module
 
-    monkeypatch.setattr(monitor_module, "RELATION_VALIDATION_RETRY_SECONDS", 60)
+    monkeypatch.setattr(
+        monitor_module, "RELATION_VALIDATION_TRANSIENT_RETRY_SECONDS", 60
+    )
     setup_public([threshold_event()])
     setup_threshold_books(low_ask="0.50", high_no_ask="0.51")
     now = [NOW]

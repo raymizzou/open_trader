@@ -113,6 +113,14 @@ def deepseek_reasoning_effort() -> str | None:
     return os.environ.get("OPEN_TRADER_DEEPSEEK_REASONING_EFFORT", "max") or None
 
 
+def zhipu_base_url() -> str:
+    """Zhipu OpenAI-compatible endpoint; the coding channel is env-selectable."""
+
+    return (
+        os.environ.get("OPEN_TRADER_ZHIPU_BASE_URL", "").strip() or ZHIPU_BASE_URL
+    )
+
+
 def zhipu_validation_timeout() -> float:
     """Validation timeout for glm-5 thinking audits (P95≈93s measured)."""
 
@@ -135,6 +143,7 @@ REASON_SUMMARIES = {
     "CONNECTION_FAILED": "{label} 网络连接失败，当前不可下单。",
     "AUTH_FAILED": "{label} 认证失败，当前不可下单。",
     "RATE_LIMITED": "{label} 限流，当前不可下单。",
+    "NO_BALANCE": "{label} 账户余额不足，请充值或切换引擎。",
     "HTTP_ERROR": "{label} API 请求失败，当前不可下单。",
 }
 
@@ -274,8 +283,30 @@ def _api_usage(response: object) -> dict[str, int]:
     )
 
 
+def _error_body_indicates_no_balance(body: object) -> bool:
+    """Match provider insufficient-balance payloads (e.g. Zhipu error 1113)."""
+
+    if not isinstance(body, Mapping):
+        return False
+    error = body.get("error")
+    if not isinstance(error, Mapping):
+        return False
+    if str(error.get("code")) == "1113":
+        return True
+    message = error.get("message")
+    if not isinstance(message, str):
+        return False
+    lowered = message.lower()
+    return "余额不足" in lowered or "insufficient balance" in lowered
+
+
 def _http_failure_reason(prefix: str, exc: BaseException) -> str:
     status = getattr(exc, "status_code", None)
+    if (
+        status in (429, 402)
+        and _error_body_indicates_no_balance(getattr(exc, "body", None))
+    ):
+        return f"{prefix}_NO_BALANCE"
     if status in (401, 403):
         return f"{prefix}_AUTH_FAILED"
     if status == 429:
@@ -360,7 +391,7 @@ def zhipu_completion(
 
         client = OpenAI(
             api_key=api_key,
-            base_url=ZHIPU_BASE_URL,
+            base_url=zhipu_base_url(),
             timeout=timeout_seconds,
         )
 

@@ -1608,11 +1608,32 @@ def _structured_result_violation(value: object) -> str | None:
 
 
 def _parse_structured(content: str) -> Mapping[str, object] | None:
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
     try:
-        result = json.loads(content)
+        result = json.loads(text)
     except json.JSONDecodeError:
         return None
     return result if isinstance(result, Mapping) else None
+
+
+def output_repair_directive(violation: str) -> str:
+    """Targeted repair instruction appended to a retry's user payload."""
+
+    return (
+        f"你上一次的输出违反了输出契约中的对应约束（violation={violation}）。"
+        "请重新输出符合 OUTPUT CONTRACT 的完整 JSON 单一对象："
+        "只输出一个顶层 JSON 对象，不带代码围栏或任何解释文字，"
+        "并修正上述违规。不要重述市场数据，直接给出修正后的结构化结果。"
+    )
 
 
 class _ProviderCircuitBreaker:
@@ -1747,6 +1768,8 @@ class LlmRelationValidator:
         prompt_version: str = RELATION_PROMPT_VERSION,
         default_provider: str | None = None,
         max_llm_calls: int | None = None,
+        output_retries: int | None = None,
+        fallback_provider: str | None = None,
     ) -> None:
         if (
             max_llm_calls is not None
@@ -1757,6 +1780,17 @@ class LlmRelationValidator:
             )
         ):
             raise ValueError("max_llm_calls must be a non-negative integer")
+        if output_retries is None:
+            output_retries = 2
+            env_retries = os.environ.get("OPEN_TRADER_LLM_OUTPUT_RETRIES")
+            if env_retries is not None and env_retries.strip():
+                output_retries = int(env_retries)
+        if (
+            isinstance(output_retries, bool)
+            or not isinstance(output_retries, int)
+            or output_retries < 0
+        ):
+            raise ValueError("output_retries must be a non-negative integer")
         self.store = store
         resolved_models = provider_models()
         for provider, model in (models or {}).items():
@@ -1780,11 +1814,23 @@ class LlmRelationValidator:
         self.timeout_seconds = timeout_seconds
         self.prompt_version = prompt_version
         self.max_llm_calls = max_llm_calls
+        self._output_retries = output_retries
         self.llm_calls = 0
         self.llm_successes = 0
         self._default_provider = resolve_provider(
             default_provider
             or os.environ.get("OPEN_TRADER_PREDICTION_LLM_PROVIDER")
+        )
+        raw_fallback = (
+            fallback_provider
+            if fallback_provider is not None
+            else os.environ.get("OPEN_TRADER_PREDICTION_LLM_FALLBACK_PROVIDER")
+        )
+        fallback_candidate = str(raw_fallback or "").strip().lower()
+        self._fallback_provider = (
+            fallback_candidate
+            if fallback_candidate in PROVIDER_IDS
+            else None
         )
         self._breakers = {
             provider: _ProviderCircuitBreaker() for provider in PROVIDER_IDS
@@ -1805,6 +1851,7 @@ class LlmRelationValidator:
             "models": dict(self.models),
             "default": self._default_provider,
             "configured": provider_credentials_configured(),
+            "fallback": self._fallback_provider or "",
         }
 
     def cached_validation(self, relation: ThresholdRelation) -> RelationValidation | None:
@@ -2049,6 +2096,130 @@ class LlmRelationValidator:
                 result[k] = v
         return result
 
+    def _fail_over(
+        self,
+        relation: ThresholdRelation,
+        cache_key: str,
+        *,
+        primary_provider: str,
+        primary_reason: str,
+        violation: str | None,
+        model: str,
+    ) -> RelationValidation:
+        """Try the configured fallback engine once; else keep the primary loss."""
+
+        fallback = self._fallback_provider
+        credentials = provider_credentials_configured()
+        if (
+            not fallback
+            or fallback == primary_provider
+            or not credentials.get(fallback, False)
+            or self._breakers[fallback].disabled(time.monotonic())
+            or (
+                self.max_llm_calls is not None
+                and self.llm_calls >= self.max_llm_calls
+            )
+        ):
+            return self._validation(
+                relation=relation,
+                cache_key=cache_key,
+                structured=None,
+                status="llm_unavailable",
+                reason=primary_reason,
+                model=model,
+                provider=primary_provider,
+            )
+        fallback_model = self.models[fallback]
+        self.llm_calls += 1
+        completion = self.completers[fallback](
+            _relation_audit_prompt(),
+            _canonical_json(_relation_payload(relation)),
+        )
+        structured = (
+            _parse_structured(completion.content)
+            if completion.content is not None
+            else None
+        )
+        if structured is not None and _valid_structured_result(structured):
+            assert isinstance(structured, Mapping)
+            self._breakers[fallback].record_success()
+            self.llm_successes += 1
+            self.store.record_llm_call(
+                status="success",
+                usage={**completion.usage, "provider": fallback},
+            )
+            try:
+                self.store.set_llm_provider(
+                    fallback,
+                    audit={
+                        "source": "auto_failover",
+                        "trigger": primary_reason,
+                        "violation": violation,
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "auto failover could not persist the provider switch to %s",
+                    fallback,
+                    exc_info=True,
+                )
+            validation = self._validated(
+                relation,
+                cache_key,
+                structured,
+                cached=False,
+                model=fallback_model,
+                provider=fallback,
+            )
+            if validation.status in {"approved", "llm_rejected"}:
+                self.store.save_llm_cache(
+                    cache_key,
+                    {
+                        "provider": fallback,
+                        "model": fallback_model,
+                        "prompt_version": self.prompt_version,
+                        "structured_result": structured,
+                    },
+                )
+            return validation
+        if completion.content is None:
+            self._breakers[fallback].record_failure(time.monotonic())
+            self.store.record_llm_call(
+                status="failed",
+                usage={**completion.usage, "provider": fallback},
+                reason=completion.reason,
+            )
+            fallback_reason = completion.reason or f"{fallback.upper()}_FAILED"
+        else:
+            fallback_violation = (
+                "not_json"
+                if structured is None
+                else _structured_result_violation(structured)
+            )
+            logger.warning(
+                "llm_output_invalid provider=%s violation=%s raw_head=%r",
+                fallback,
+                fallback_violation,
+                (completion.content or "")[:1200],
+            )
+            self._breakers[fallback].record_failure(time.monotonic())
+            self.store.record_llm_call(
+                status="failed",
+                usage={**completion.usage, "provider": fallback},
+                violation=fallback_violation,
+            )
+            fallback_reason = f"{fallback.upper()}_OUTPUT_INVALID"
+        return self._validation(
+            relation=relation,
+            cache_key=cache_key,
+            structured=None,
+            status="llm_unavailable",
+            reason=fallback_reason,
+            reasons=(primary_reason, fallback_reason),
+            model=model,
+            provider=primary_provider,
+        )
+
     def validate(self, relation: ThresholdRelation) -> RelationValidation:
         provider = self.current_provider()
         model = self.models[provider]
@@ -2058,98 +2229,110 @@ class LlmRelationValidator:
         cached = self._cached_validation(relation, cache_key)
         if cached is not None:
             return cached
-        if (
-            self.max_llm_calls is not None
-            and self.llm_calls >= self.max_llm_calls
-        ):
-            return self._validation(
-                relation=relation,
-                cache_key=cache_key,
-                structured=None,
-                status="llm_unavailable",
-                reason=f"{provider.upper()}_BUDGET_EXHAUSTED",
-                model=model,
-                provider=provider,
-            )
         breaker = self._breakers[provider]
-        if breaker.disabled(time.monotonic()):
-            return self._validation(
-                relation=relation,
-                cache_key=cache_key,
-                structured=None,
-                status="llm_unavailable",
-                reason=f"{provider.upper()}_CIRCUIT_OPEN",
-                model=model,
-                provider=provider,
+        attempts = 1 + self._output_retries
+        violation: str | None = None
+        for attempt in range(attempts):
+            if (
+                self.max_llm_calls is not None
+                and self.llm_calls >= self.max_llm_calls
+            ):
+                return self._validation(
+                    relation=relation,
+                    cache_key=cache_key,
+                    structured=None,
+                    status="llm_unavailable",
+                    reason=f"{provider.upper()}_BUDGET_EXHAUSTED",
+                    model=model,
+                    provider=provider,
+                )
+            if attempt == 0 and breaker.disabled(time.monotonic()):
+                return self._fail_over(
+                    relation,
+                    cache_key,
+                    primary_provider=provider,
+                    primary_reason=f"{provider.upper()}_CIRCUIT_OPEN",
+                    violation=None,
+                    model=model,
+                )
+            user_payload = _canonical_json(_relation_payload(relation))
+            if attempt >= 2 and violation is not None:
+                user_payload += "\n\n" + output_repair_directive(violation)
+            self.llm_calls += 1
+            completion = self.completers[provider](
+                _relation_audit_prompt(),
+                user_payload,
             )
-        self.llm_calls += 1
-        completion = self.completers[provider](
-            _relation_audit_prompt(),
-            _canonical_json(_relation_payload(relation)),
-        )
-        if completion.content is None:
-            breaker.record_failure(time.monotonic())
+            if completion.content is None:
+                breaker.record_failure(time.monotonic())
+                self.store.record_llm_call(
+                    status="failed",
+                    usage={**completion.usage, "provider": provider},
+                    reason=completion.reason,
+                )
+                return self._fail_over(
+                    relation,
+                    cache_key,
+                    primary_provider=provider,
+                    primary_reason=completion.reason
+                    or f"{provider.upper()}_FAILED",
+                    violation=None,
+                    model=model,
+                )
+            structured = _parse_structured(completion.content)
+            if not _valid_structured_result(structured):
+                violation = (
+                    "not_json"
+                    if structured is None
+                    else _structured_result_violation(structured)
+                )
+                logger.warning(
+                    "llm_output_invalid provider=%s violation=%s raw_head=%r",
+                    provider,
+                    violation,
+                    (completion.content or "")[:1200],
+                )
+                breaker.record_failure(time.monotonic())
+                self.store.record_llm_call(
+                    status="failed",
+                    usage={**completion.usage, "provider": provider},
+                    violation=violation,
+                )
+                continue
+            assert isinstance(structured, Mapping)
+            breaker.record_success()
+            self.llm_successes += 1
             self.store.record_llm_call(
-                status="failed",
+                status="success",
                 usage={**completion.usage, "provider": provider},
             )
-            return self._validation(
-                relation=relation,
-                cache_key=cache_key,
-                structured=None,
-                status="llm_unavailable",
-                reason=completion.reason or f"{provider.upper()}_FAILED",
+            validation = self._validated(
+                relation,
+                cache_key,
+                structured,
+                cached=False,
                 model=model,
                 provider=provider,
             )
-        structured = _parse_structured(completion.content)
-        if not _valid_structured_result(structured):
-            logger.warning(
-                "llm_output_invalid provider=%s violation=%s raw_head=%r",
-                provider,
-                _structured_result_violation(structured),
-                (completion.content or "")[:1200],
-            )
-            breaker.record_failure(time.monotonic())
-            self.store.record_llm_call(
-                status="failed",
-                usage={**completion.usage, "provider": provider},
-            )
-            return self._validation(
-                relation=relation,
-                cache_key=cache_key,
-                structured=None,
-                status="llm_unavailable",
-                reason=f"{provider.upper()}_OUTPUT_INVALID",
-                model=model,
-                provider=provider,
-            )
-        assert isinstance(structured, Mapping)
-        breaker.record_success()
-        self.llm_successes += 1
-        self.store.record_llm_call(
-            status="success",
-            usage={**completion.usage, "provider": provider},
-        )
-        validation = self._validated(
+            if validation.status in {"approved", "llm_rejected"}:
+                self.store.save_llm_cache(
+                    cache_key,
+                    {
+                        "provider": provider,
+                        "model": model,
+                        "prompt_version": self.prompt_version,
+                        "structured_result": structured,
+                    },
+                )
+            return validation
+        return self._fail_over(
             relation,
             cache_key,
-            structured,
-            cached=False,
+            primary_provider=provider,
+            primary_reason=f"{provider.upper()}_OUTPUT_INVALID",
+            violation=violation,
             model=model,
-            provider=provider,
         )
-        if validation.status in {"approved", "llm_rejected"}:
-            self.store.save_llm_cache(
-                cache_key,
-                {
-                    "provider": provider,
-                    "model": model,
-                    "prompt_version": self.prompt_version,
-                    "structured_result": structured,
-                },
-            )
-        return validation
 
 
 def _fee_rate(market: ThresholdMarket) -> Decimal | None:

@@ -26,6 +26,7 @@ from open_trader.llm_providers import (
     resolve_provider,
     title_completers,
     validation_completers,
+    zhipu_base_url,
     zhipu_completion,
     zhipu_validation_timeout,
 )
@@ -333,9 +334,12 @@ def test_codex_completion_failures_never_raise(
 
 
 class _FakeApiError(Exception):
-    def __init__(self, status_code: int | None = None) -> None:
+    def __init__(
+        self, status_code: int | None = None, body: object | None = None
+    ) -> None:
         super().__init__(f"status {status_code}")
         self.status_code = status_code
+        self.body = body
 
 
 class _FakeConnectionError(Exception):
@@ -567,6 +571,43 @@ def test_zhipu_completion_success_passes_thinking_body(
     }
 
 
+def test_zhipu_base_url_defaults_to_standard_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPEN_TRADER_ZHIPU_BASE_URL", raising=False)
+    assert zhipu_base_url() == llm_providers.ZHIPU_BASE_URL
+
+    monkeypatch.setenv(
+        "OPEN_TRADER_ZHIPU_BASE_URL",
+        "https://open.bigmodel.cn/api/coding/paas/v4",
+    )
+    assert zhipu_base_url() == "https://open.bigmodel.cn/api/coding/paas/v4"
+
+
+def test_zhipu_completion_uses_configured_base_url(
+    fake_openai: type[FakeOpenAI], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZHIPU_API_KEY", "zhipu-test")
+    monkeypatch.setenv(
+        "OPEN_TRADER_ZHIPU_BASE_URL",
+        "https://open.bigmodel.cn/api/coding/paas/v4",
+    )
+    fake_openai.responses.append(_api_response('{"ok": true}'))
+
+    zhipu_completion("sys", "user", model="glm-5")
+    assert (
+        fake_openai.init_kwargs[0]["base_url"]
+        == "https://open.bigmodel.cn/api/coding/paas/v4"
+    )
+
+    monkeypatch.delenv("OPEN_TRADER_ZHIPU_BASE_URL")
+    fake_openai.init_kwargs = []
+    fake_openai.responses.append(_api_response('{"ok": true}'))
+
+    zhipu_completion("sys", "user", model="glm-5")
+    assert fake_openai.init_kwargs[0]["base_url"] == llm_providers.ZHIPU_BASE_URL
+
+
 def test_zhipu_completion_default_body_enables_thinking(
     fake_openai: type[FakeOpenAI], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -601,6 +642,48 @@ def test_zhipu_completion_retries_empty_and_maps_failures(
     fake_openai.error = TimeoutError("timed out")
     timed_out = zhipu_completion("sys", "user", model="glm-5")
     assert timed_out.reason == "ZHIPU_TIMEOUT"
+
+
+def test_zhipu_no_balance_body_classifies_insufficient_balance(
+    fake_openai: type[FakeOpenAI], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZHIPU_API_KEY", "zhipu-test")
+
+    fake_openai.error = _FakeApiError(
+        429, body={"error": {"code": "1113", "message": "x"}}
+    )
+    assert zhipu_completion("sys", "user", model="glm-5").reason == "ZHIPU_NO_BALANCE"
+
+    fake_openai.error = _FakeApiError(429)
+    assert zhipu_completion("sys", "user", model="glm-5").reason == "ZHIPU_RATE_LIMITED"
+
+
+def test_deepseek_no_balance_body_classifies_insufficient_balance(
+    fake_openai: type[FakeOpenAI], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+
+    fake_openai.error = _FakeApiError(
+        429,
+        body={"error": {"code": None, "message": "Insufficient Balance (api key: x)"}},
+    )
+    assert (
+        deepseek_completion("sys", "user", model="deepseek-v4-flash").reason
+        == "DEEPSEEK_NO_BALANCE"
+    )
+
+    fake_openai.error = _FakeApiError(401)
+    assert (
+        deepseek_completion("sys", "user", model="deepseek-v4-flash").reason
+        == "DEEPSEEK_AUTH_FAILED"
+    )
+
+
+def test_no_balance_reason_summary_mentions_recharge() -> None:
+    summary = reason_summary("ZHIPU_NO_BALANCE")
+    assert summary is not None
+    assert "余额不足" in summary
+    assert reason_summary("ZHIPU_RATE_LIMITED") == "智谱 GLM 限流，当前不可下单。"
 
 
 def test_validation_completers_cover_all_providers(

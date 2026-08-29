@@ -2062,8 +2062,20 @@ class PredictionArbitrageStore:
         return result
 
     @staticmethod
+    def _llm_usage_label(value: object, name: str) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip() or len(value) > 64:
+            raise ValueError(
+                f"{name} must be a non-empty string of at most 64 characters"
+            )
+        return value
+
+    @staticmethod
     def _llm_usage_payload(
         usage: Mapping[str, object],
+        violation: str | None = None,
+        reason: str | None = None,
     ) -> dict[str, object]:
         payload: dict[str, object] = {}
         for field in (
@@ -2080,14 +2092,27 @@ class PredictionArbitrageStore:
         if not isinstance(provider, str) or not provider.strip():
             raise ValueError("provider must be a non-empty string")
         payload["provider"] = provider.strip()
+        violation_label = PredictionArbitrageStore._llm_usage_label(
+            violation, "violation"
+        )
+        if violation_label is not None:
+            payload["violation"] = violation_label
+        reason_label = PredictionArbitrageStore._llm_usage_label(reason, "reason")
+        if reason_label is not None:
+            payload["reason"] = reason_label
         return payload
 
     def record_llm_call(
-        self, *, status: str, usage: Mapping[str, object]
+        self,
+        *,
+        status: str,
+        usage: Mapping[str, object],
+        violation: str | None = None,
+        reason: str | None = None,
     ) -> None:
         if status not in {"success", "failed"}:
             raise ValueError("unsupported llm call status")
-        payload = self._llm_usage_payload(usage)
+        payload = self._llm_usage_payload(usage, violation, reason)
         with self._transaction() as connection:
             connection.execute(
                 """
@@ -2135,7 +2160,8 @@ class PredictionArbitrageStore:
                     COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.input_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS input_tokens,
                     COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.cached_input_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS cached_input_tokens,
                     COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.output_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS output_tokens,
-                    COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.reasoning_output_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS reasoning_output_tokens
+                    COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.reasoning_output_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS reasoning_output_tokens,
+                    COALESCE(SUM(CASE WHEN kind='call' AND status='failed' AND json_extract(payload, '$.violation') IS NOT NULL THEN 1 ELSE 0 END), 0) AS invalid_outputs
                 FROM llm_usage
                 WHERE created_at >= ?
                 """,
@@ -2155,6 +2181,8 @@ class PredictionArbitrageStore:
                 "reasoning_output_tokens",
             )
         }
+        if int(row["invalid_outputs"]):
+            result["invalid_outputs"] = int(row["invalid_outputs"])
         cache_hits, _ = self._cache_hit_snapshot()
         result["cache_hits"] = cache_hits
         return result
@@ -2175,11 +2203,40 @@ class PredictionArbitrageStore:
                     COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.input_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS input_tokens,
                     COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.cached_input_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS cached_input_tokens,
                     COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.output_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS output_tokens,
-                    COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.reasoning_output_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS reasoning_output_tokens
+                    COALESCE(SUM(CASE WHEN kind='call' THEN CAST(COALESCE(json_extract(payload, '$.reasoning_output_tokens'), 0) AS INTEGER) ELSE 0 END), 0) AS reasoning_output_tokens,
+                    COALESCE(SUM(CASE WHEN kind='call' AND status='failed' AND json_extract(payload, '$.violation') IS NOT NULL THEN 1 ELSE 0 END), 0) AS invalid_outputs
                 FROM llm_usage
                 WHERE created_at >= ?
                 GROUP BY provider
                 ORDER BY provider
+                """,
+                (cutoff,),
+            ).fetchall()
+            violation_rows = connection.execute(
+                """
+                SELECT
+                    COALESCE(json_extract(payload, '$.provider'), 'codex') AS provider,
+                    json_extract(payload, '$.violation') AS label,
+                    COUNT(*) AS hits
+                FROM llm_usage
+                WHERE created_at >= ?
+                  AND kind='call' AND status='failed'
+                  AND json_extract(payload, '$.violation') IS NOT NULL
+                GROUP BY provider, label
+                """,
+                (cutoff,),
+            ).fetchall()
+            reason_rows = connection.execute(
+                """
+                SELECT
+                    COALESCE(json_extract(payload, '$.provider'), 'codex') AS provider,
+                    json_extract(payload, '$.reason') AS label,
+                    COUNT(*) AS hits
+                FROM llm_usage
+                WHERE created_at >= ?
+                  AND kind='call' AND status='failed'
+                  AND json_extract(payload, '$.reason') IS NOT NULL
+                GROUP BY provider, label
                 """,
                 (cutoff,),
             ).fetchall()
@@ -2193,10 +2250,22 @@ class PredictionArbitrageStore:
             "output_tokens",
             "reasoning_output_tokens",
         )
-        result = {
-            str(row["provider"]): {field: int(row[field]) for field in fields}
-            for row in rows
-        }
+        result: dict[str, dict[str, int]] = {}
+        for row in rows:
+            counts = {field: int(row[field]) for field in fields}
+            if int(row["invalid_outputs"]):
+                counts["invalid_outputs"] = int(row["invalid_outputs"])
+            result[str(row["provider"])] = counts
+        for row in violation_rows:
+            violations = result.setdefault(str(row["provider"]), {}).setdefault(
+                "violations", {}
+            )
+            violations[str(row["label"])] = int(row["hits"])
+        for row in reason_rows:
+            failure_reasons = result.setdefault(str(row["provider"]), {}).setdefault(
+                "failure_reasons", {}
+            )
+            failure_reasons[str(row["label"])] = int(row["hits"])
         _, memory_hits = self._cache_hit_snapshot()
         for provider, count in memory_hits.items():
             counts = result.setdefault(provider, {field: 0 for field in fields})

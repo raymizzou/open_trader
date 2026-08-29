@@ -1259,6 +1259,30 @@ def test_llm_provider_get_reports_selection_and_provider_cards(
     assert handler_errors == []
 
 
+def test_llm_provider_get_reports_fallback_key_and_usage_passthrough(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OPEN_TRADER_PREDICTION_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("OPEN_TRADER_PREDICTION_LLM_FALLBACK_PROVIDER", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+    store = PredictionArbitrageStore(tmp_path / "data")
+    store.record_llm_call(
+        status="success",
+        usage={"provider": "zhipu", "input_tokens": 7, "output_tokens": 3},
+    )
+    runtime = _ProviderRuntime(store)
+    with _provider_server(runtime) as (base, _runtime, handler_errors):
+        status, payload = _response(base + "/api/prediction-arbitrage/llm-provider")
+
+    assert status == 200
+    assert "fallback" in payload
+    assert payload["fallback"] == ""
+    by_provider = {item["provider"]: item for item in payload["providers"]}
+    assert by_provider["zhipu"]["usage_24h"] == store.llm_usage_24h_by_provider()["zhipu"]
+    assert handler_errors == []
+
+
 def test_llm_provider_post_switches_engine_without_handler_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

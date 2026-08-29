@@ -2121,6 +2121,59 @@ def test_llm_usage_24h_breaks_down_by_provider(tmp_path: Path) -> None:
     assert db.llm_usage_24h()["cache_hits"] == 1
 
 
+def test_llm_usage_24h_aggregates_violations_and_failure_reasons(
+    tmp_path: Path,
+) -> None:
+    db = store(tmp_path)
+    db.record_llm_call(
+        status="failed",
+        usage={
+            "provider": "deepseek",
+            "input_tokens": 100,
+            "cached_input_tokens": 60,
+            "output_tokens": 20,
+            "reasoning_output_tokens": 5,
+        },
+        violation="proof_excluded_state",
+    )
+    db.record_llm_call(
+        status="success",
+        usage={"provider": "deepseek", "input_tokens": 10},
+    )
+    db.record_llm_call(
+        status="failed",
+        usage={"provider": "deepseek"},
+        reason="DEEPSEEK_TIMEOUT",
+    )
+
+    by_provider = db.llm_usage_24h_by_provider()
+    assert by_provider["deepseek"]["invalid_outputs"] == 1
+    assert by_provider["deepseek"]["violations"] == {"proof_excluded_state": 1}
+    assert by_provider["deepseek"]["failure_reasons"] == {"DEEPSEEK_TIMEOUT": 1}
+    assert by_provider["deepseek"]["failures"] == 2
+    assert db.llm_usage_24h()["invalid_outputs"] == 1
+
+    # Legacy-style calls without the new keyword arguments keep working.
+    db.record_llm_call(status="success", usage={"provider": "codex"})
+    assert db.llm_usage_24h()["calls"] == 4
+
+
+@pytest.mark.parametrize(
+    "label", ["", " ", "x" * 65, "y" * 65]
+)
+@pytest.mark.parametrize("field", ["violation", "reason"])
+def test_record_llm_call_rejects_invalid_violation_and_reason(
+    tmp_path: Path, field: str, label: str
+) -> None:
+    db = store(tmp_path)
+    with pytest.raises(ValueError):
+        db.record_llm_call(
+            status="failed",
+            usage={"provider": "codex"},
+            **{field: label},
+        )
+
+
 def test_llm_usage_window_includes_exact_boundary_and_excludes_older(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
