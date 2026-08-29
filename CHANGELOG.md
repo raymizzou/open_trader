@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-29
+
+- 预测套利监控线程自愈与通知模板重设计（Ticket 02）：修复自动吃单任务回收路径吞不掉 `asyncio.CancelledError` 的缺陷（同类隐患 `_poll_relation_validation` 一并修复），该缺陷曾杀死整个 monitor 线程、launchd 进程存活但关系扫描静默停转 37 小时；monitor 线程新增监督器——崩溃自动重启（退避 1/2/4/… 封顶 60 秒），连续 10 次崩溃后放弃并发明确终态告警（不受限流），恢复判定为重启后首次 universe 刷新成功；外部真实取消（stop/超时）与 `SystemExit`/`KeyboardInterrupt` 原样重抛不算崩溃；重启时清理指向已死事件循环的任务引用与 universe 重试状态；崩溃通知 300 秒限流（只限通知不限重启），文案带「连续第 N 次 · 累计 M 次」；崩溃/放弃/恢复均经既有 failure observer 通道发飞书（`component="monitor_thread"`），通知失败只记诊断绝不杀死监督器；`snapshot()` 新增 `thread` 键（status/连续崩溃/重启/最近崩溃与恢复时间/停摆秒数），读模型 state payload 透传该键（非 Mapping 时给 `{}`）。飞书通知模板重设计：健康检查改为 PASS/WARN/FAIL 三态中文模板（标题带北京时间与失败项数，正文列中文检查项、阈值与 Dashboard/PID/版本短 SHA，`HealthReport` 新增 `checked_at` 字段并 additive 输出 JSON）；执行服务 LLM 校验不可用与行情刷新重试耗尽两分支文案按新模板重写；健康检查新增「监控线程」检查项（running=PASS，gave_up/缺失=FAIL）。验证：T1–T8/T10–T12、HT1–HT4、ET1–ET3 共 18 条批准用例逐条红绿；聚焦 `tests/test_polymarket_monitor.py tests/test_prediction_arbitrage_health.py tests/test_prediction_arbitrage_execution.py` 459 passed；`tests/test_prediction_read_model.py` 21 passed（含冻结 fixture 经批准的 `"thread": {}` 增补）；全量 `make test` 7550 passed、3 skipped、1 deselected（exit 0）。
+
 ## 2026-08-28
 
 - Dashboard 当前趋势报告选择现在按 canonical 文件名的数字修订号排序，同一新鲜度、生成时间和执行日下 `-r2` 优先于 `-r1` 与基础报告；非 canonical 历史工件仍按文件名兜底。验证：回归用例 RED（错误选中基础报告）后 GREEN（`1 passed`），Dashboard 聚焦模块 `716 passed`；首次 `make test` 为 `7498 passed, 6 failed, 3 skipped, 1 deselected`，六个失败均由缺失的 ignored 历史快照导致；精确恢复快照后，中断重跑已通过其中 1 个，`PYTHONPATH=src /Users/ray/projects/open_trader/.venv/bin/python -m pytest -q --lf` 再通过其余 `5 passed in 0.48s`，未再次运行完整套件。

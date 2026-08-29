@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,7 @@ def base_state(**overrides: object) -> dict[str, object]:
         },
         "readiness": {"ready": True},
         "llm_usage_24h": {"calls": 10, "successes": 10},
+        "thread": {"status": "running"},
     }
     payload.update(overrides)
     return payload
@@ -228,17 +230,22 @@ def test_notify_unconfigured_warns() -> None:
     assert run_check(notify_configured=False).status == "WARN"
 
 
-def test_format_pass_is_single_line() -> None:
+def test_format_pass_uses_three_line_readable_template() -> None:
     text = format_report(run_check())
-    assert text.startswith("PASS · heartbeat 0.5s")
-    assert "\n" not in text
+    lines = text.splitlines()
+    assert lines[0].startswith("心跳 ")
+    assert "行情刷新" in lines[0]
+    assert "LLM 校验 24h：" in lines[1]
+    assert lines[2].startswith("PID 42 · 版本 ")
 
 
 def test_format_fail_lists_checks() -> None:
     report = run_check(llm=(10, 0))
     text = format_report(report)
-    assert text.startswith("FAIL · heartbeat")
-    assert "- FAIL llm: 0/10" in text
+    assert text.startswith("· LLM 校验：24h 0/10 成功")
+    assert "窗口内无成功的 LLM 校验" in text
+    assert "其余 " in text
+    assert "- FAIL llm:" not in text
 
 
 def test_report_to_dict_is_jsonable() -> None:
@@ -246,6 +253,7 @@ def test_report_to_dict_is_jsonable() -> None:
 
     data = report_to_dict(run_check())
     assert data["status"] == "PASS"
+    assert "url" not in data["summary"]
     assert json.dumps(data)
 
 
@@ -257,8 +265,8 @@ def test_send_report_calls_notifier() -> None:
             calls.append((title, message))
 
     assert send_report(FakeNotifier(), run_check()) is True
-    assert calls[0][0] == "[预测套利健康检查] PASS"
-    assert calls[0][1].startswith("PASS ·")
+    assert calls[0][0].startswith("✅ 预测套利正常（")
+    assert calls[0][1].startswith("心跳 ")
 
 
 def test_send_report_returns_false_on_failure() -> None:
@@ -305,3 +313,114 @@ def test_production_consumers_do_not_open_prediction_sqlite_directly() -> None:
         text = (root / path).read_text(encoding="utf-8")
         assert "PredictionArbitrageStore(" not in text
         assert "prediction_arbitrage.sqlite3" not in text
+
+
+_LONG_SHA = "abc1234def5678"
+
+
+def run_check_with_sha(sha: str):
+    process = {
+        "schema_version": "open_trader.prediction_service.health.v1",
+        "module": "prediction_service",
+        "status": "running",
+        "mode": "production",
+        "production_owner": True,
+        "mutations": "enabled",
+        "source_state": "clean",
+        "pid": 42,
+        "cwd": "/srv/open_trader",
+        "git_sha": sha,
+    }
+    return run_check(process=process)
+
+
+class RecordingNotifier:
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
+    def notify(self, title: str, message: str) -> None:
+        self.messages.append((title, message))
+
+
+def test_format_pass_uses_readable_template() -> None:
+    report = run_check_with_sha(_LONG_SHA)
+    notifier = RecordingNotifier()
+
+    assert send_report(notifier, report) is True
+    title, body = notifier.messages[0]
+    assert title.startswith("✅ 预测套利正常（")
+    assert title.endswith("）")
+    assert re.fullmatch(r"\d{2}:\d{2}", title[len("✅ 预测套利正常（"):-1])
+    assert "心跳" in body
+    assert "行情刷新" in body
+    assert "LLM 校验 24h" in body
+    assert not re.search(r"\d+\.\d{3,}s", body)
+    assert _LONG_SHA[:7] in body
+    assert _LONG_SHA not in body
+
+
+def test_format_fail_lists_chinese_checks_with_thresholds() -> None:
+    report = run_check(
+        payload=base_state(
+            health={
+                "status": "healthy",
+                "heartbeat_age_seconds": 0.5,
+                "universe_age_seconds": 301.0,
+                "universe_retry_exhausted": False,
+            },
+            llm_usage_24h={"calls": 10, "successes": 0},
+        )
+    )
+    assert report.status == "FAIL"
+    notifier = RecordingNotifier()
+
+    assert send_report(notifier, report) is True
+    title, body = notifier.messages[0]
+    assert "2 项失败需处理" in title
+    assert "行情刷新" in body
+    assert "300 秒" in body
+    assert "LLM 校验" in body
+    assert "FAIL llm:" not in body
+    assert "PASS ·" not in body
+
+
+def test_send_report_delivers_new_title_and_survives_broken_notifier() -> None:
+    passing = RecordingNotifier()
+    assert send_report(passing, run_check()) is True
+    pass_title, pass_body = passing.messages[0]
+    assert pass_title.startswith("✅ 预测套利正常（")
+    assert "心跳" in pass_body
+
+    failing = RecordingNotifier()
+    assert send_report(failing, run_check(llm=(10, 0))) is True
+    fail_title, fail_body = failing.messages[0]
+    assert fail_title.startswith("❌ 预测套利异常：1 项失败需处理（")
+    assert fail_body.startswith("· LLM 校验：")
+
+    class BrokenNotifier:
+        def notify(self, title: str, message: str) -> None:
+            raise RuntimeError("boom")
+
+    assert send_report(BrokenNotifier(), run_check()) is False
+
+
+def test_health_check_thread_item_three_states() -> None:
+    running = run_check()
+    checks = {check.name: check for check in running.checks}
+    assert checks["thread"].status == "PASS"
+    assert running.status == "PASS"
+
+    gave_up = run_check(payload=base_state(thread={"status": "gave_up"}))
+    checks = {check.name: check for check in gave_up.checks}
+    assert checks["thread"].status == "FAIL"
+    assert "监控线程已停止重启" in checks["thread"].reason
+    assert gave_up.status == "FAIL"
+
+    missing_payload = {
+        key: value for key, value in base_state().items() if key != "thread"
+    }
+    missing = run_check(payload=missing_payload)
+    checks = {check.name: check for check in missing.checks}
+    assert checks["thread"].status == "FAIL"
+    assert "监控线程状态缺失" in checks["thread"].reason
+    assert missing.status == "FAIL"

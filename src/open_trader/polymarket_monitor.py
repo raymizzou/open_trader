@@ -75,6 +75,9 @@ RELATION_APR_TARGET_LIMIT = 100
 RELATION_APR_PREWARM_LIMIT = 100
 RELATION_VALIDATION_RETRY_SECONDS = 60 * 60
 RELATION_RESCAN_MIN_INTERVAL_SECONDS = 2.0
+MONITOR_THREAD_MAX_CONSECUTIVE_CRASHES = 10
+MONITOR_THREAD_CRASH_NOTIFY_INTERVAL_SECONDS = 300.0
+MONITOR_THREAD_BACKOFF_MAX_SECONDS = 60.0
 
 
 def _value(value: object, *names: str, default: object = None) -> object:
@@ -454,6 +457,16 @@ class PolymarketMonitor:
         self._universe_failure_notification_task: asyncio.Task[object] | None = None
         self._relations_failed = False
         self._stream_message_at: datetime | None = None
+        self._thread_status = "running"
+        self._thread_consecutive_crashes = 0
+        self._thread_restarts = 0
+        self._thread_last_crash_at: datetime | None = None
+        self._thread_last_crash_error_type: str | None = None
+        self._thread_last_recovery_at: datetime | None = None
+        self._thread_last_downtime_seconds: float | None = None
+        self._thread_recovery_pending = False
+        self._thread_last_crash_notified_at: datetime | None = None
+        self._thread_notification_task: asyncio.Task[object] | None = None
         self._diagnostics: dict[str, object] = {
             "malformed_events": 0,
             "malformed_markets": 0,
@@ -492,11 +505,13 @@ class PolymarketMonitor:
         task = self._auto_eat_task
         if task is None or not task.done():
             return
+        self._auto_eat_task = None
         try:
             task.result()
+        except asyncio.CancelledError:
+            return
         except Exception:
-            pass
-        self._auto_eat_task = None
+            return
 
     def set_cross_venue_tokens(self, token_ids: Sequence[str]) -> None:
         """Replace the externally requested token set and force a fresh subscription."""
@@ -568,6 +583,18 @@ class PolymarketMonitor:
         """Register the post-full-scan governance pass (#96 expire + confirm)."""
         self._relation_lifecycle_observer = observer
 
+    def _reset_thread_state(self) -> None:
+        self._thread_status = "running"
+        self._thread_consecutive_crashes = 0
+        self._thread_restarts = 0
+        self._thread_last_crash_at = None
+        self._thread_last_crash_error_type = None
+        self._thread_last_recovery_at = None
+        self._thread_last_downtime_seconds = None
+        self._thread_recovery_pending = False
+        self._thread_last_crash_notified_at = None
+        self._thread_notification_task = None
+
     def start(self) -> None:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
@@ -577,6 +604,7 @@ class PolymarketMonitor:
             if self._thread is not None and self._thread.is_alive():
                 return
             self._stop_event.clear()
+            self._reset_thread_state()
             self._thread = threading.Thread(
                 target=lambda: asyncio.run(self.run_forever()),
                 name="polymarket-monitor",
@@ -664,6 +692,23 @@ class PolymarketMonitor:
                 "heartbeat_at": self._heartbeat_at,
                 "universe_refreshed_at": self._universe_at,
                 "readiness": copy.deepcopy(self._readiness),
+                "thread": {
+                    "status": self._thread_status,
+                    "consecutive_crashes": self._thread_consecutive_crashes,
+                    "restarts": self._thread_restarts,
+                    "last_crash_at": (
+                        self._thread_last_crash_at.isoformat()
+                        if self._thread_last_crash_at is not None
+                        else None
+                    ),
+                    "last_crash_error_type": self._thread_last_crash_error_type,
+                    "last_recovery_at": (
+                        self._thread_last_recovery_at.isoformat()
+                        if self._thread_last_recovery_at is not None
+                        else None
+                    ),
+                    "last_downtime_seconds": self._thread_last_downtime_seconds,
+                },
                 "relation_discovery": {
                     **relation_health,
                     "catalog": catalog,
@@ -978,6 +1023,105 @@ class PolymarketMonitor:
         return market_row
 
     async def run_forever(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                await self._run_forever_once()
+                return
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except BaseException as exc:
+                current = asyncio.current_task()
+                if (
+                    isinstance(exc, asyncio.CancelledError)
+                    and current is not None
+                    and current.cancelling() > 0
+                ):
+                    raise
+                self._thread_consecutive_crashes += 1
+                self._thread_restarts += 1
+                self._thread_last_crash_at = self._now()
+                self._thread_last_crash_error_type = type(exc).__name__
+                self._thread_recovery_pending = True
+                if (
+                    self._thread_consecutive_crashes
+                    >= MONITOR_THREAD_MAX_CONSECUTIVE_CRASHES
+                ):
+                    observer = self._failure_observer
+                    if observer is not None:
+                        try:
+                            await asyncio.to_thread(
+                                observer,
+                                {
+                                    "component": "monitor_thread",
+                                    "event": "gave_up",
+                                    "error_type": self._thread_last_crash_error_type,
+                                    "crashed_at": self._thread_last_crash_at.isoformat(),
+                                    "consecutive": self._thread_consecutive_crashes,
+                                    "restarts": self._thread_restarts,
+                                },
+                            )
+                        except Exception as notify_exc:
+                            self._diagnostics["thread_notification_error"] = type(
+                                notify_exc
+                            ).__name__
+                    self._thread_status = "gave_up"
+                    return
+                delay = min(
+                    2 ** (self._thread_consecutive_crashes - 1),
+                    MONITOR_THREAD_BACKOFF_MAX_SECONDS,
+                )
+                observer = self._failure_observer
+                notified_at = self._thread_last_crash_notified_at
+                rate_limited = (
+                    notified_at is not None
+                    and (self._now() - notified_at).total_seconds()
+                    < MONITOR_THREAD_CRASH_NOTIFY_INTERVAL_SECONDS
+                )
+                if observer is not None and not rate_limited:
+                    self._thread_last_crash_notified_at = self._now()
+                    try:
+                        await asyncio.to_thread(
+                            observer,
+                            {
+                                "component": "monitor_thread",
+                                "event": "crashed",
+                                "error_type": self._thread_last_crash_error_type,
+                                "crashed_at": self._thread_last_crash_at.isoformat(),
+                                "consecutive": self._thread_consecutive_crashes,
+                                "restarts": self._thread_restarts,
+                                "retry_in_seconds": int(delay),
+                            },
+                        )
+                    except Exception as notify_exc:
+                        self._diagnostics["thread_notification_error"] = type(
+                            notify_exc
+                        ).__name__
+                await asyncio.to_thread(self._stop_event.wait, delay)
+                if self._stop_event.is_set():
+                    return
+                self._reset_dead_loop_state()
+
+    def _reset_dead_loop_state(self) -> None:
+        for task_name in (
+            "_full_scan_task",
+            "_activity_scan_task",
+            "_codex_task",
+            "_notification_task",
+            "_universe_failure_notification_task",
+            "_llm_failure_notification_task",
+            "_title_translation_task",
+            "_auto_eat_task",
+        ):
+            setattr(self, task_name, None)
+        self._codex_relation_id = None
+        self._notification_signal_id = None
+        self._universe_refresh_attempts = 0
+        self._universe_failed = False
+        self._universe_retry_exhausted = False
+        self._catalog_scan_started_at = None
+        self._activity_scan_started_at = None
+
+    async def _run_forever_once(self) -> None:
         self._ensure_title_translation_worker()
         if not self._catalog_loaded:
             self._load_relation_catalog()
@@ -999,6 +1143,7 @@ class PolymarketMonitor:
                 self._reap_notification_task()
                 self._reap_universe_failure_notification_task()
                 self._reap_llm_failure_notification_task()
+                self._reap_thread_notification_task()
                 self._maintain_open_signals()
                 await self._poll_relation_validation(client)
                 current = time.monotonic()
@@ -1058,7 +1203,9 @@ class PolymarketMonitor:
                 "_codex_task",
                 "_notification_task",
                 "_universe_failure_notification_task",
+                "_llm_failure_notification_task",
                 "_title_translation_task",
+                "_auto_eat_task",
             ):
                 task = getattr(self, task_name)
                 setattr(self, task_name, None)
@@ -1103,7 +1250,52 @@ class PolymarketMonitor:
         self._universe_failed = False
         self._universe_refresh_attempts = 0
         self._universe_retry_exhausted = False
+        if self._thread_recovery_pending:
+            self._thread_recovery_pending = False
+            self._thread_consecutive_crashes = 0
+            recovered_at = self._now()
+            self._thread_last_recovery_at = recovered_at
+            self._thread_last_downtime_seconds = (
+                (recovered_at - self._thread_last_crash_at).total_seconds()
+                if self._thread_last_crash_at is not None
+                else None
+            )
+            self._schedule_thread_recovery_notification(recovered_at)
         return self._monotonic() + UNIVERSE_REFRESH_SECONDS, True
+
+    def _schedule_thread_recovery_notification(self, recovered_at: datetime) -> None:
+        observer = self._failure_observer
+        if observer is None:
+            return
+        crashed_at = self._thread_last_crash_at
+        self._thread_notification_task = asyncio.create_task(
+            asyncio.to_thread(
+                observer,
+                {
+                    "component": "monitor_thread",
+                    "event": "recovered",
+                    "crashed_at": (
+                        crashed_at.isoformat() if crashed_at is not None else None
+                    ),
+                    "recovered_at": recovered_at.isoformat(),
+                    "downtime_seconds": self._thread_last_downtime_seconds,
+                    "restarts": self._thread_restarts,
+                },
+            )
+        )
+
+    def _reap_thread_notification_task(self) -> None:
+        task = self._thread_notification_task
+        if task is None or not task.done():
+            return
+        self._thread_notification_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            self._diagnostics["thread_notification_error"] = type(exc).__name__
+            return
 
     def _schedule_universe_failure_notification(self, exc: BaseException) -> None:
         observer = self._failure_observer
@@ -3044,6 +3236,8 @@ class PolymarketMonitor:
             if relation_id is not None:
                 try:
                     validation = task.result()
+                except asyncio.CancelledError:
+                    validation = self._codex_unavailable()
                 except Exception:
                     validation = self._codex_unavailable()
                 self._codex_validations[relation_id] = validation

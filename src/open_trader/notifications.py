@@ -8,7 +8,7 @@ import shlex
 import subprocess
 import urllib.error
 import urllib.request
-from datetime import datetime, time
+from datetime import UTC, datetime, time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Protocol
@@ -17,6 +17,28 @@ from zoneinfo import ZoneInfo
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 HONG_KONG = ZoneInfo("Asia/Hong_Kong")
+
+
+def beijing_clock(value: object, *, seconds: bool = False) -> str | None:
+    """Render a datetime/ISO timestamp as a Beijing clock string, or None."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment.astimezone(SHANGHAI).strftime("%H:%M:%S" if seconds else "%H:%M")
 
 
 class NotificationError(RuntimeError):

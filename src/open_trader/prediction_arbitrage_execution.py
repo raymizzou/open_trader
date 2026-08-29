@@ -20,6 +20,7 @@ from typing import Any, Mapping
 from .daily_premarket import send_notification_with_results
 from .notifications import (
     Notifier,
+    beijing_clock,
     render_prediction_opportunity_notification,
     render_yes_no_signal_notification,
 )
@@ -1345,24 +1346,32 @@ class PredictionExecutionService:
     def notify_monitor_failure(
         self, failure: Mapping[str, object]
     ) -> dict[str, object]:
-        """Alert operators once when universe refresh retries are exhausted."""
+        """Alert operators when monitor threads or refresh loops break."""
 
-        if failure.get("component") == "llm_validation":
+        component = failure.get("component")
+        if component == "monitor_thread":
+            return self._notify_monitor_thread_event(failure)
+
+        if component == "llm_validation":
             reason_codes = failure.get("reason_codes") or []
-            reason_text = " · ".join(
+            reason_text = "、".join(
                 str(code) for code in reason_codes if str(code).strip()
-            ) or "未知原因"
-            summary = str(failure.get("summary") or "").strip()
+            )
+            summary = str(failure.get("summary") or "").strip() or (
+                "当前选中的 LLM 校验引擎不可用，无法校验新关系"
+            )
+            body = summary if not reason_text else f"{summary}（{reason_text}）"
             message = "\n".join(
                 (
-                    summary
-                    or "当前选中的 LLM 校验引擎不可用，无法校验新关系。",
-                    f"原因：{reason_text}",
+                    f"{body}。",
+                    "引擎恢复后自动重新校验，可在看板一键切换引擎。",
                     f"Dashboard：{self._dashboard_url}",
-                    "期间不自动下单；引擎恢复后自动重新校验，可在看板一键切换引擎。",
                 )
             )
-            if self._deliver_feishu_notification("预测市场 LLM 校验不可用", message):
+            now_clock = beijing_clock(datetime.now(UTC)) or "未知"
+            if self._deliver_feishu_notification(
+                f"⚠️ LLM 校验不可用，暂停自动下单（{now_clock}）", message
+            ):
                 return {"state": "sent"}
             return {"state": "failed", "reason": "notification_failed"}
 
@@ -1372,17 +1381,103 @@ class PredictionExecutionService:
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", raw_error_type)
             else "unknown_error"
         )
-        last_success_at = failure.get("last_success_at")
+        last_success_clock = beijing_clock(failure.get("last_success_at"))
+        attempts = failure.get("attempts")
+        attempts_text = (
+            str(attempts)
+            if isinstance(attempts, int) and not isinstance(attempts, bool)
+            else "5"
+        )
         message = "\n".join(
             (
-                "监控市场连续 5 次刷新失败，自动重试已停止。",
-                f"最后错误：{error_type}",
-                f"上次成功刷新：{last_success_at or '从未成功'}",
-                f"Dashboard：{self._dashboard_url}",
-                "请重启承载预测监控的 Dashboard 服务，并检查 Polymarket 连接。",
+                f"连续 {attempts_text} 次刷新失败，自动重试已停止。",
+                f"最后错误 {error_type} · 上次成功刷新 {last_success_clock or '从未成功'}",
+                "请重启 Dashboard 服务并检查 Polymarket 连接。",
             )
         )
-        if self._deliver_feishu_notification("预测市场监控需要人工干预", message):
+        now_clock = beijing_clock(datetime.now(UTC)) or "未知"
+        if self._deliver_feishu_notification(
+            f"❌ 行情刷新连续失败，需人工干预（{now_clock}）", message
+        ):
+            return {"state": "sent"}
+        return {"state": "failed", "reason": "notification_failed"}
+
+    def _notify_monitor_thread_event(
+        self, failure: Mapping[str, object]
+    ) -> dict[str, object]:
+        raw_error_type = str(failure.get("error_type") or "")
+        error_type = (
+            raw_error_type
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", raw_error_type)
+            else "unknown_error"
+        )
+        crashed_clock_seconds = (
+            beijing_clock(failure.get("crashed_at"), seconds=True) or "未知"
+        )
+        crashed_clock = beijing_clock(failure.get("crashed_at")) or "未知"
+        recovered_clock_seconds = (
+            beijing_clock(failure.get("recovered_at"), seconds=True) or "未知"
+        )
+        recovered_clock = beijing_clock(failure.get("recovered_at")) or "未知"
+        now_clock = beijing_clock(datetime.now(UTC)) or "未知"
+        event = str(failure.get("event") or "crashed")
+        restarts = failure.get("restarts")
+        restarts_text = (
+            str(restarts)
+            if isinstance(restarts, int) and not isinstance(restarts, bool)
+            else "未知"
+        )
+        consecutive = failure.get("consecutive")
+        consecutive_text = (
+            str(consecutive)
+            if isinstance(consecutive, int) and not isinstance(consecutive, bool)
+            else "未知"
+        )
+        if event == "recovered":
+            downtime = failure.get("downtime_seconds")
+            try:
+                downtime_text = str(int(round(float(downtime))))
+            except (TypeError, ValueError):
+                downtime_text = "未知"
+            title = f"✅ 预测监控线程已自动恢复（{recovered_clock}）"
+            message = "\n".join(
+                (
+                    (
+                        f"{crashed_clock_seconds} 崩溃 → {recovered_clock_seconds} 恢复，"
+                        f"停摆 {downtime_text} 秒，累计重启 {restarts_text} 次。"
+                    ),
+                    "行情刷新已恢复正常。",
+                )
+            )
+        elif event == "gave_up":
+            title = f"❌ 预测监控线程已停止重启，等待人工处理（{crashed_clock}）"
+            message = "\n".join(
+                (
+                    "连续 10 次崩溃，已停止自动重启。",
+                    f"最后错误 {error_type} · 最后崩溃 {crashed_clock_seconds}",
+                    f"累计重启 {restarts_text} 次 · Dashboard：{self._dashboard_url}",
+                )
+            )
+        else:
+            retry_in_seconds = failure.get("retry_in_seconds")
+            retry_text = (
+                str(retry_in_seconds)
+                if isinstance(retry_in_seconds, int)
+                and not isinstance(retry_in_seconds, bool)
+                else "未知"
+            )
+            title = f"❌ 预测监控线程崩溃，将自动重启（{crashed_clock}）"
+            message = "\n".join(
+                (
+                    f"崩溃时间 {crashed_clock_seconds} · 错误 {error_type}",
+                    (
+                        f"连续第 {consecutive_text} 次 · 累计 {restarts_text} 次，"
+                        f"{retry_text} 秒后重试；期间行情扫描暂停，恢复后自动通知。"
+                    ),
+                    f"Dashboard：{self._dashboard_url}",
+                )
+            )
+        if self._deliver_feishu_notification(title, message):
             return {"state": "sent"}
         return {"state": "failed", "reason": "notification_failed"}
 

@@ -4812,3 +4812,503 @@ def test_threshold_row_exposes_theoretical_and_policy_depth(
     assert row["max_executable_cost"] >= row["policy_cost"]
     assert row["policy_quantity"] == row["quantity"]
     assert row["policy_cost"] == row["total_max_cost"]
+
+
+# ---------------------------------------------------------------------------
+# Monitor thread resilience (ticket 02)
+# ---------------------------------------------------------------------------
+
+
+def _auto_eat_signal_id(monitor: PolymarketMonitor) -> str:
+    return monitor._store.upsert_signal(
+        {
+            "market_id": "threshold:abc",
+            "event_id": "e1",
+            "question": "Q",
+            "started_at": NOW.isoformat(),
+            "first_positive_at": NOW.isoformat(),
+            "net_edge": Decimal("0.1"),
+            "estimated_profit": Decimal("1"),
+            "profit": Decimal("1"),
+            "market_type": "threshold_hedge",
+            "annualized_yield": Decimal("0.20"),
+            "eligibility_reason": "actionable",
+            "llm_status": "approved",
+            "rules_verified_at": NOW.isoformat(),
+        }
+    )
+
+
+def _auto_eat_opportunity() -> dict[str, object]:
+    return {
+        "market_type": "threshold_hedge",
+        "actionable": True,
+        "market_id": "threshold:abc",
+        "event_id": "e1",
+        "question": "Q",
+        "opportunity_id": "threshold:abc",
+        "rules_verified_at": NOW.isoformat(),
+        "relation_validation": {"status": "approved"},
+    }
+
+
+def _crash_injection(monitor: PolymarketMonitor, plan):
+    """Replace ``_refresh_universe_if_due`` with a scripted crash injector.
+
+    ``plan`` maps the call index (0-based) to True (raise RuntimeError) or
+    False (delegate to the real bound method).
+    """
+
+    original = monitor._refresh_universe_if_due
+    calls = {"count": 0}
+
+    async def injected(client, *, current, next_refresh):
+        index = calls["count"]
+        calls["count"] += 1
+        if plan(index):
+            raise RuntimeError("injected monitor crash")
+        return await original(client, current=current, next_refresh=next_refresh)
+
+    monitor._refresh_universe_if_due = injected
+    return calls
+
+
+async def _wait_until(predicate, *, timeout: float = 10.0) -> bool:
+    waited = 0.0
+    while waited < timeout:
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+        waited += 0.01
+    return bool(predicate())
+
+
+def test_reap_auto_eat_task_swallows_cancelled_task_and_reschedules(
+    tmp_path: Path,
+) -> None:
+    monitor = make_monitor(tmp_path)
+    calls: list[tuple[str, str]] = []
+    monitor.set_auto_eat_observer(
+        lambda opportunity_id, signal_id: calls.append((opportunity_id, signal_id))
+    )
+    signal_id = _auto_eat_signal_id(monitor)
+    opportunity = _auto_eat_opportunity()
+
+    async def run() -> None:
+        monitor._schedule_auto_eat(signal_id, opportunity)
+        task1 = monitor._auto_eat_task
+        assert task1 is not None
+        task1.cancel()
+        await asyncio.sleep(0)
+        monitor._schedule_auto_eat(signal_id, opportunity)
+        task2 = monitor._auto_eat_task
+        assert task2 is not task1
+        if task2 is not None:
+            await task2
+
+    asyncio.run(run())
+
+    assert ("threshold:abc", signal_id) in calls
+
+
+def test_run_forever_survives_cancelled_auto_eat_reap_and_scans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.polymarket_monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "MONITOR_THREAD_BACKOFF_MAX_SECONDS", 0.0)
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+    monitor._catalog_last_attempt_at = None
+    auto_eat_calls: list[tuple[str, str]] = []
+    monitor.set_auto_eat_observer(
+        lambda opportunity_id, signal_id: auto_eat_calls.append(
+            (opportunity_id, signal_id)
+        )
+    )
+    signal_id = _auto_eat_signal_id(monitor)
+    opportunity = _auto_eat_opportunity()
+
+    original_poll = monitor._poll_relation_validation
+    polls = {"count": 0}
+
+    async def poll_with_cancelled_auto_eat(client=None):
+        if polls["count"] == 0:
+            polls["count"] += 1
+            stale = asyncio.create_task(asyncio.sleep(0))
+            stale.cancel()
+            monitor._auto_eat_task = stale
+            await asyncio.sleep(0)
+            monitor._schedule_auto_eat(signal_id, opportunity)
+            return
+        return await original_poll(client)
+
+    monitor._poll_relation_validation = poll_with_cancelled_auto_eat
+
+    async def scenario() -> None:
+        task = asyncio.create_task(monitor.run_forever())
+        assert await _wait_until(
+            lambda: bool(monitor._store.relation_scan_history())
+        ), "relation scans never produced a record"
+        assert await _wait_until(lambda: bool(auto_eat_calls))
+        monitor._stop_event.set()
+        await asyncio.wait_for(task, timeout=10)
+
+    asyncio.run(scenario())
+
+    assert monitor.snapshot()["thread"]["restarts"] == 0
+
+
+def test_run_forever_restarts_after_crash_and_resumes_scanning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.polymarket_monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "MONITOR_THREAD_BACKOFF_MAX_SECONDS", 0.0)
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+    monitor._catalog_last_attempt_at = None
+    payloads: list[dict[str, object]] = []
+    monitor.set_failure_observer(lambda payload: payloads.append(dict(payload)))
+    _crash_injection(monitor, lambda index: index == 0)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(monitor.run_forever())
+        assert await _wait_until(
+            lambda: monitor.snapshot()["thread"]["restarts"] >= 1
+        ), "monitor thread never restarted after the injected crash"
+        assert await _wait_until(
+            lambda: any(payload.get("event") == "crashed" for payload in payloads)
+        ), "no crashed notification payload observed"
+        assert await _wait_until(
+            lambda: bool(monitor._store.relation_scan_history())
+        ), "no relation scan record after the restart"
+        monitor._stop_event.set()
+        await asyncio.wait_for(task, timeout=10)
+
+    asyncio.run(scenario())
+
+    crashed = [p for p in payloads if p.get("event") == "crashed"]
+    assert len(crashed) == 1
+    payload = crashed[0]
+    assert payload["component"] == "monitor_thread"
+    assert payload["error_type"] == "RuntimeError"
+    assert payload["crashed_at"]
+    assert monitor.snapshot()["thread"]["restarts"] == 1
+
+
+def test_recovery_notification_fires_after_universe_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.polymarket_monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "MONITOR_THREAD_BACKOFF_MAX_SECONDS", 0.0)
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+    payloads: list[dict[str, object]] = []
+    monitor.set_failure_observer(lambda payload: payloads.append(dict(payload)))
+    _crash_injection(monitor, lambda index: index == 0)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(monitor.run_forever())
+        assert await _wait_until(lambda: len(payloads) >= 2), (
+            f"expected crashed+recovered payloads, saw {payloads}"
+        )
+        monitor._stop_event.set()
+        await asyncio.wait_for(task, timeout=10)
+
+    asyncio.run(scenario())
+
+    assert [payload.get("event") for payload in payloads] == [
+        "crashed",
+        "recovered",
+    ]
+    crashed_at = datetime.fromisoformat(str(payloads[0]["crashed_at"]))
+    recovered_at = datetime.fromisoformat(str(payloads[1]["recovered_at"]))
+    assert recovered_at >= crashed_at
+    assert float(payloads[1]["downtime_seconds"]) >= 0
+    assert payloads[1]["component"] == "monitor_thread"
+    assert monitor.snapshot()["thread"]["consecutive_crashes"] == 0
+
+
+def test_run_forever_external_cancellation_is_not_a_crash(tmp_path: Path) -> None:
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+    payloads: list[dict[str, object]] = []
+    monitor.set_failure_observer(lambda payload: payloads.append(dict(payload)))
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(asyncio.wait_for(monitor.run_forever(), timeout=0.05))
+
+    assert payloads == []
+    assert monitor.snapshot()["thread"]["restarts"] == 0
+
+
+def test_supervisor_survives_failure_observer_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.polymarket_monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "MONITOR_THREAD_BACKOFF_MAX_SECONDS", 0.0)
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+
+    def broken_observer(payload):
+        raise RuntimeError("notification transport broken")
+
+    monitor.set_failure_observer(broken_observer)
+    _crash_injection(monitor, lambda index: index == 0)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(monitor.run_forever())
+        assert await _wait_until(
+            lambda: monitor.snapshot()["thread"]["restarts"] >= 1
+        ), "monitor thread never restarted after the injected crash"
+        assert await _wait_until(
+            lambda: bool(monitor._store.relation_scan_history())
+        ), "no relation scan record after the restart"
+        monitor._stop_event.set()
+        await asyncio.wait_for(task, timeout=10)
+        assert task.exception() is None
+
+    asyncio.run(scenario())
+
+    assert monitor.snapshot()["thread"]["restarts"] == 1
+    assert monitor._diagnostics["thread_notification_error"] == "RuntimeError"
+
+
+def test_supervisor_clears_stale_task_refs_from_dead_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.polymarket_monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "MONITOR_THREAD_BACKOFF_MAX_SECONDS", 0.0)
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+    monitor.set_failure_observer(lambda payload: None)
+
+    class UndyingTask:
+        def done(self) -> bool:
+            return False
+
+        def cancel(self) -> bool:
+            return False
+
+        def __await__(self):
+            return iter(())
+
+    fake_auto_eat = UndyingTask()
+    fake_full_scan = UndyingTask()
+    monitor._auto_eat_task = fake_auto_eat
+    monitor._full_scan_task = fake_full_scan
+
+    observed: list[tuple[object, object]] = []
+    original = monitor._refresh_universe_if_due
+    calls = {"count": 0}
+
+    async def injected(client, *, current, next_refresh):
+        index = calls["count"]
+        calls["count"] += 1
+        if index == 0:
+            raise RuntimeError("injected monitor crash")
+        observed.append((monitor._auto_eat_task, monitor._full_scan_task))
+        return await original(client, current=current, next_refresh=next_refresh)
+
+    monitor._refresh_universe_if_due = injected
+
+    async def schedule_again() -> None:
+        resumed: list[tuple[str, str]] = []
+        monitor.set_auto_eat_observer(
+            lambda opportunity_id, signal_id: resumed.append(
+                (opportunity_id, signal_id)
+            )
+        )
+        signal_id = _auto_eat_signal_id(monitor)
+        monitor._schedule_auto_eat(signal_id, _auto_eat_opportunity())
+        assert monitor._auto_eat_task is not None
+        assert monitor._auto_eat_task is not fake_auto_eat
+        task = monitor._auto_eat_task
+        if task is not None:
+            await task
+        assert resumed == [("threshold:abc", signal_id)]
+
+    async def scenario() -> None:
+        task = asyncio.create_task(monitor.run_forever())
+        assert await _wait_until(
+            lambda: monitor.snapshot()["thread"]["restarts"] >= 1
+        ), "monitor thread never restarted after the injected crash"
+        assert await _wait_until(lambda: bool(observed))
+        assert observed[0] == (None, None)
+        monitor._stop_event.set()
+        await asyncio.wait_for(task, timeout=10)
+        await schedule_again()
+
+    asyncio.run(scenario())
+
+
+def test_crash_notification_rate_limited(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.polymarket_monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "MONITOR_THREAD_BACKOFF_MAX_SECONDS", 0.0)
+    monkeypatch.setattr(
+        monitor_module, "MONITOR_THREAD_CRASH_NOTIFY_INTERVAL_SECONDS", 300.0
+    )
+    setup_public([threshold_event()])
+    clock_now = [NOW]
+    monitor = make_monitor(tmp_path, clock=lambda: clock_now[0])
+    payloads: list[dict[str, object]] = []
+    monitor.set_failure_observer(lambda payload: payloads.append(dict(payload)))
+    _crash_injection(monitor, lambda index: index in (0, 1))
+
+    async def scenario() -> None:
+        task = asyncio.create_task(monitor.run_forever())
+        assert await _wait_until(
+            lambda: monitor.snapshot()["thread"]["restarts"] >= 1
+        ), "first crash never recorded"
+        clock_now[0] = NOW + timedelta(seconds=60)
+        assert await _wait_until(
+            lambda: monitor.snapshot()["thread"]["restarts"] >= 2
+        ), "second crash never recorded"
+        monitor._stop_event.set()
+        await asyncio.wait_for(task, timeout=10)
+
+    asyncio.run(scenario())
+
+    assert monitor.snapshot()["thread"]["restarts"] == 2
+    crashed = [p for p in payloads if p.get("event") == "crashed"]
+    assert len(crashed) == 1
+
+
+def test_supervisor_gives_up_after_ten_consecutive_crashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.polymarket_monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "MONITOR_THREAD_BACKOFF_MAX_SECONDS", 0.0)
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+    payloads: list[dict[str, object]] = []
+    monitor.set_failure_observer(lambda payload: payloads.append(dict(payload)))
+    _crash_injection(monitor, lambda index: True)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(monitor.run_forever())
+        await asyncio.wait_for(task, timeout=30)
+
+    asyncio.run(scenario())
+
+    gave_up = [p for p in payloads if p.get("event") == "gave_up"]
+    assert len(gave_up) == 1
+    assert gave_up[0]["component"] == "monitor_thread"
+    crashed = [p for p in payloads if p.get("event") == "crashed"]
+    assert len(crashed) <= 1
+    thread = monitor.snapshot()["thread"]
+    assert thread["status"] == "gave_up"
+    assert thread["consecutive_crashes"] == 10
+    assert thread["restarts"] == 10
+    assert "retry_in_seconds" not in gave_up[0]
+
+
+def test_consecutive_crash_counter_resets_on_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.polymarket_monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "MONITOR_THREAD_BACKOFF_MAX_SECONDS", 0.0)
+    monkeypatch.setattr(monitor_module, "UNIVERSE_REFRESH_SECONDS", 0)
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+    payloads: list[dict[str, object]] = []
+    monitor.set_failure_observer(lambda payload: payloads.append(dict(payload)))
+    original = monitor._refresh_universe_if_due
+    calls = {"count": 0}
+
+    async def injected(client, *, current, next_refresh):
+        index = calls["count"]
+        calls["count"] += 1
+        if index in (0, 1):
+            raise RuntimeError("injected monitor crash")
+        if index == 3:
+            # Crash a third time after the recovery and stop the loop so the
+            # consecutive counter is observed before any further recovery.
+            monitor._stop_event.set()
+            raise RuntimeError("injected monitor crash")
+        return await original(client, current=current, next_refresh=next_refresh)
+
+    monitor._refresh_universe_if_due = injected
+
+    async def scenario() -> None:
+        task = asyncio.create_task(monitor.run_forever())
+        assert await _wait_until(
+            lambda: calls["count"] >= 4
+        ), "injection never reached the post-recovery crash"
+        await asyncio.wait_for(task, timeout=10)
+
+    asyncio.run(scenario())
+
+    thread = monitor.snapshot()["thread"]
+    assert thread["status"] == "running"
+    assert thread["restarts"] == 3
+    assert thread["consecutive_crashes"] == 1
+    assert not any(p.get("event") == "gave_up" for p in payloads)
+
+
+def test_restart_resets_universe_retry_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import open_trader.polymarket_monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "MONITOR_THREAD_BACKOFF_MAX_SECONDS", 0.0)
+    setup_public([threshold_event()])
+    monitor = make_monitor(tmp_path)
+    monitor.set_failure_observer(lambda payload: None)
+    monitor._universe_refresh_attempts = 5
+    monitor._universe_failed = True
+    monitor._universe_retry_exhausted = True
+    monitor._universe_failure_notification_scheduled = True
+
+    observed: list[tuple[object, object, object, object]] = []
+    original = monitor._refresh_universe_if_due
+    calls = {"count": 0}
+
+    async def injected(client, *, current, next_refresh):
+        index = calls["count"]
+        calls["count"] += 1
+        if index == 0:
+            raise RuntimeError("injected monitor crash")
+        observed.append(
+            (
+                monitor._universe_refresh_attempts,
+                monitor._universe_failed,
+                monitor._universe_retry_exhausted,
+                monitor._universe_failure_notification_scheduled,
+            )
+        )
+        return await original(client, current=current, next_refresh=next_refresh)
+
+    monitor._refresh_universe_if_due = injected
+
+    async def scenario() -> None:
+        task = asyncio.create_task(monitor.run_forever())
+        assert await _wait_until(lambda: bool(observed))
+        monitor._stop_event.set()
+        await asyncio.wait_for(task, timeout=10)
+
+    asyncio.run(scenario())
+
+    assert observed[0] == (0, False, False, True)
+    assert monitor._universe_refresh_attempts == 0
+    assert monitor._universe_failed is False
+    assert monitor._universe_retry_exhausted is False
+    assert monitor._universe_failure_notification_scheduled is True

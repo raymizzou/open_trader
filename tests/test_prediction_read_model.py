@@ -380,6 +380,7 @@ def frozen_prediction_state() -> dict[str, object]:
   "signals_24h": 1,
   "stale": false,
   "status": "healthy",
+  "thread": {},
   "token_count": 2,
   "validation_mode": "observe_only",
   "venues": [
@@ -422,6 +423,44 @@ def test_shared_prediction_read_model_matches_frozen_payload(
     assert "0x2222222222222222222222222222222222222222" not in json.dumps(payload)
     assert payload["masked_wallet"] == "0x1111…1111"
     assert payload["venues"][1]["wallet"] == "0x2222…2222"
+
+
+def test_state_payload_exposes_monitor_thread_snapshot_additively() -> None:
+    class _ThreadMonitor(_Monitor):
+        def snapshot(self) -> dict[str, object]:
+            payload = dict(super().snapshot())
+            payload["thread"] = {"status": "running", "restarts": 2}
+            return payload
+
+    class _BadThreadMonitor(_Monitor):
+        def snapshot(self) -> dict[str, object]:
+            payload = dict(super().snapshot())
+            payload["thread"] = "corrupted"
+            return payload
+
+    threaded = prediction_state_payload(
+        store=_Store(),
+        monitor=_ThreadMonitor(),
+        execution=_Execution(),
+        csrf_token="fixed-csrf",
+    )
+    assert threaded["thread"] == {"status": "running", "restarts": 2}
+
+    corrupted = prediction_state_payload(
+        store=_Store(),
+        monitor=_BadThreadMonitor(),
+        execution=_Execution(),
+        csrf_token="fixed-csrf",
+    )
+    assert corrupted["thread"] == {}
+
+    plain = prediction_state_payload(
+        store=_Store(),
+        monitor=_Monitor(),
+        execution=_Execution(),
+        csrf_token="fixed-csrf",
+    )
+    assert plain["thread"] == {}
 
 
 def _nleg_cross_row(**overrides: object) -> dict[str, object]:

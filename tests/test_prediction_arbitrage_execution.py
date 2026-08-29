@@ -1001,14 +1001,13 @@ def test_notify_monitor_failure_uses_feishu_only_and_operator_copy(
     assert macos.calls == 0
     assert feishu.calls == 1
     title, message = feishu.messages[-1]
-    assert title == "预测市场监控需要人工干预"
+    assert title.startswith("❌ 行情刷新连续失败，需人工干预（")
+    assert title.endswith("）")
     assert "连续 5 次刷新失败" in message
     assert "自动重试已停止" in message
     assert "TransportError" in message
-    assert "2026-08-01T12:00:00+00:00" in message
-    assert "Dashboard：http://127.0.0.1:8766/" in message
-    assert "重启承载预测监控的 Dashboard 服务" in message
-    assert "Polymarket 连接" in message
+    assert "上次成功刷新 20:00" in message
+    assert "请重启 Dashboard 服务并检查 Polymarket 连接。" in message
 
 
 def test_notify_monitor_failure_sanitizes_error_and_reports_delivery_failure(
@@ -1053,10 +1052,10 @@ def test_notify_monitor_failure_llm_validation_uses_feishu_operator_copy(
     assert macos.calls == 0
     assert feishu.calls == 1
     title, message = feishu.messages[-1]
-    assert title == "预测市场 LLM 校验不可用"
-    assert "智谱 GLM 语义校验不可用" in message
-    assert "ZHIPU_HTTP_ERROR" in message
-    assert "期间不自动下单；引擎恢复后自动重新校验，可在看板一键切换引擎。" in message
+    assert title.startswith("⚠️ LLM 校验不可用，暂停自动下单（")
+    assert title.endswith("）")
+    assert "智谱 GLM 语义校验不可用，当前不可下单。（ZHIPU_HTTP_ERROR）。" in message
+    assert "引擎恢复后自动重新校验，可在看板一键切换引擎。" in message
     assert "Dashboard：http://127.0.0.1:8766/" in message
 
 
@@ -1072,9 +1071,123 @@ def test_notify_monitor_failure_llm_validation_defaults_operator_copy(
     assert result == {"state": "sent"}
     assert feishu.calls == 1
     title, message = feishu.messages[-1]
-    assert title == "预测市场 LLM 校验不可用"
+    assert title.startswith("⚠️ LLM 校验不可用，暂停自动下单（")
     assert "当前选中的 LLM 校验引擎不可用，无法校验新关系。" in message
-    assert "原因：未知原因" in message
+
+
+def test_notify_monitor_failure_universe_branch_restyled(tmp_path: Path) -> None:
+    service, _trading, _store, _monitor, _macos, feishu = (
+        standard_notification_fixture(tmp_path)
+    )
+
+    sent_result = service.notify_monitor_failure(
+        {
+            "attempts": 5,
+            "error_type": "TransportError",
+            "last_success_at": "2026-08-01T12:00:00+00:00",
+        }
+    )
+    never_result = service.notify_monitor_failure(
+        {
+            "attempts": 5,
+            "error_type": "TransportError",
+            "last_success_at": None,
+        }
+    )
+
+    assert sent_result == {"state": "sent"}
+    assert never_result == {"state": "sent"}
+    assert feishu.calls == 2
+    sent_title, sent_message = feishu.messages[0]
+    assert sent_title.startswith("❌ 行情刷新连续失败，需人工干预（")
+    assert "TransportError" in sent_message
+    assert "连续 5 次" in sent_message
+    never_title, never_message = feishu.messages[1]
+    assert never_title.startswith("❌ 行情刷新连续失败，需人工干预（")
+    assert "从未成功" in never_message
+
+
+def test_notify_monitor_failure_llm_branch_restyled(tmp_path: Path) -> None:
+    service, _trading, _store, _monitor, _macos, feishu = (
+        standard_notification_fixture(tmp_path)
+    )
+
+    result = service.notify_monitor_failure(
+        {
+            "component": "llm_validation",
+            "reason_codes": ["ZHIPU_HTTP_ERROR"],
+            "summary": "智谱 GLM 语义校验不可用，当前不可下单。",
+        }
+    )
+
+    assert result == {"state": "sent"}
+    assert feishu.calls == 1
+    title, message = feishu.messages[-1]
+    assert title.startswith("⚠️ LLM 校验不可用，暂停自动下单（")
+    assert "ZHIPU_HTTP_ERROR" in message
+    assert "Dashboard：http://127.0.0.1:8766/" in message
+
+
+def test_notify_monitor_thread_crashed_and_recovered_messages(
+    tmp_path: Path,
+) -> None:
+    service, _trading, _store, _monitor, _macos, feishu = (
+        standard_notification_fixture(tmp_path)
+    )
+
+    crashed_result = service.notify_monitor_failure(
+        {
+            "component": "monitor_thread",
+            "event": "crashed",
+            "error_type": "RuntimeError",
+            "crashed_at": "2026-08-29T06:30:00+00:00",
+            "consecutive": 2,
+            "restarts": 2,
+            "retry_in_seconds": 4,
+        }
+    )
+    recovered_result = service.notify_monitor_failure(
+        {
+            "component": "monitor_thread",
+            "event": "recovered",
+            "crashed_at": "2026-08-29T06:30:00+00:00",
+            "recovered_at": "2026-08-29T06:30:42+00:00",
+            "downtime_seconds": 42.0,
+            "restarts": 2,
+        }
+    )
+    gave_up_result = service.notify_monitor_failure(
+        {
+            "component": "monitor_thread",
+            "event": "gave_up",
+            "error_type": "RuntimeError",
+            "crashed_at": "2026-08-29T06:30:00+00:00",
+            "consecutive": 10,
+            "restarts": 10,
+        }
+    )
+
+    assert crashed_result == {"state": "sent"}
+    assert recovered_result == {"state": "sent"}
+    assert gave_up_result == {"state": "sent"}
+    assert feishu.calls == 3
+    crashed_title, crashed_message = feishu.messages[0]
+    assert crashed_title.startswith("❌ 预测监控线程崩溃，将自动重启（")
+    assert crashed_title.endswith("）")
+    assert "RuntimeError" in crashed_message
+    assert "连续第 2 次" in crashed_message
+    assert "累计 2 次" in crashed_message
+    assert "4 秒后重试" in crashed_message
+    assert "14:30" in crashed_message
+    recovered_title, recovered_message = feishu.messages[1]
+    assert recovered_title.startswith("✅ 预测监控线程已自动恢复（")
+    assert "14:30:00 崩溃 → 14:30:42 恢复" in recovered_message
+    assert "停摆" in recovered_message
+    gave_up_title, gave_up_message = feishu.messages[2]
+    assert "已停止重启" in gave_up_title
+    assert "连续 10 次崩溃" in gave_up_message
+    assert "RuntimeError" in gave_up_message
+    assert "累计重启 10 次" in gave_up_message
 
 
 def test_notify_ready_opportunity_standard_sends_feishu_observation_without_preflight(

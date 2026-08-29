@@ -1726,6 +1726,8 @@ def prediction_state_payload(
         health = {"status": status, "degraded_reasons": []}
     else:
         health = dict(health)
+    thread = safe_snapshot.get("thread")
+    thread = dict(thread) if isinstance(thread, Mapping) else {}
     degraded_reasons = health.get("degraded_reasons")
     failure_reason = (
         degraded_reasons[0]
@@ -1820,6 +1822,7 @@ def prediction_state_payload(
     result = {
         "status": status,
         "health": health,
+        "thread": thread,
         "failure_reason": failure_reason,
         "readiness": dict(readiness),
         "first_live_order": first_live_order,
