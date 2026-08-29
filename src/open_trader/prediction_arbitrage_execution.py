@@ -89,6 +89,25 @@ def _threshold_error_hint(code: str) -> str:
     return hint if hint is not None else "详见执行日志"
 
 
+_THRESHOLD_EVIDENCE_LABELS = (
+    ("signer_match", "签名者"),
+    ("wallet_match", "钱包"),
+    ("account_reads", "账户读取"),
+    ("geoblock", "地区限制"),
+    ("fok_pair_signed_not_submitted", "FOK 双腿签名"),
+    ("equal_requested_shares", "数量一致"),
+)
+
+_PREFLIGHT_EVIDENCE_PASS_VALUES = frozenset({"yes", "pass", "allowed"})
+
+
+def _preflight_evidence_mark(value: object) -> str:
+    text = str(value).strip().lower()
+    if text in _PREFLIGHT_EVIDENCE_PASS_VALUES:
+        return "✅"
+    return f"❌（{value}）"
+
+
 BOOK_FRESHNESS_SECONDS = Decimal("10")
 MAX_RECONCILIATION_SECONDS = 30
 TERMINAL_STATES = {
@@ -806,7 +825,11 @@ class PredictionExecutionService:
             return
 
     def _notify_threshold_order_failed(
-        self, execution_id: str, reason: str
+        self,
+        execution_id: str,
+        reason: str,
+        *,
+        preflight: Mapping[str, object] | None = None,
     ) -> None:
         payload = self._store.execution_payload(execution_id)
         if not isinstance(payload, Mapping) or not isinstance(
@@ -817,6 +840,14 @@ class PredictionExecutionService:
         try:
             title = "预测套利单提交失败"
             message = f"原因：{reason}\n{_threshold_error_hint(reason)}"
+            if preflight:
+                lines = [
+                    f"{label} {_preflight_evidence_mark(preflight[key])}"
+                    for key, label in _THRESHOLD_EVIDENCE_LABELS
+                    if key in preflight
+                ]
+                if lines:
+                    message = "\n".join([message, *lines])
             self._deliver_feishu_notification(title, message)
         except Exception:
             return
@@ -2470,11 +2501,24 @@ class PredictionExecutionService:
             submitted_at = _utc_now()
             preflight = getattr(self._trading, "no_submit_preflight", None)
             if callable(preflight):
-                result = _call(preflight, intent, tick_size=tick_size)
+                preflight_exc: Exception | None = None
+                try:
+                    result = _call(preflight, intent, tick_size=tick_size)
+                except Exception as exc:
+                    result, preflight_exc = None, exc
                 if not self._preflight_passed(result):
                     self._finish_rejected(
                         execution_id,
-                        self._preflight_error_code(result) or "preflight_failed",
+                        (
+                            self._preflight_error_code(result)
+                            or self._preflight_exception_code(preflight_exc)
+                            or "preflight_failed"
+                        ),
+                        extra_evidence={
+                            "preflight": self._preflight_failure_evidence(
+                                result, exception=preflight_exc
+                            )
+                        },
                     )
                     return
             submit_error: dict[str, str] | None = None
@@ -3831,14 +3875,24 @@ class PredictionExecutionService:
         if not callable(preflight):
             self._finish_rejected(execution_id, "threshold_preflight_unavailable")
             return
+        preflight_exc: Exception | None = None
         try:
             result = _call(preflight, intent)
-        except Exception:
-            result = None
+        except Exception as exc:
+            result, preflight_exc = None, exc
         if not self._preflight_passed(result):
             self._finish_rejected(
                 execution_id,
-                self._preflight_error_code(result) or "preflight_failed",
+                (
+                    self._preflight_error_code(result)
+                    or self._preflight_exception_code(preflight_exc)
+                    or "preflight_failed"
+                ),
+                extra_evidence={
+                    "preflight": self._preflight_failure_evidence(
+                        result, exception=preflight_exc
+                    )
+                },
             )
             return
         submit = getattr(self._trading, "submit_threshold_hedge_once", None)
@@ -6051,6 +6105,45 @@ class PredictionExecutionService:
         )
         return str(code).strip() if code else ""
 
+    _PREFLIGHT_EVIDENCE_KEYS = (
+        "signer_match",
+        "wallet_match",
+        "account_reads",
+        "geoblock",
+        "fok_pair_signed_not_submitted",
+        "equal_requested_shares",
+        "conditions",
+        "merge",
+        "error_code",
+        "result",
+        "posted",
+    )
+
+    @classmethod
+    def _preflight_failure_evidence(
+        cls, result: object, *, exception: BaseException | None = None
+    ) -> dict[str, object]:
+        if isinstance(result, Mapping):
+            evidence: dict[str, object] = {}
+            for key in cls._PREFLIGHT_EVIDENCE_KEYS:
+                if key in result:
+                    evidence[key] = result[key]
+            return cls._safe_mapping(evidence)
+        code = cls._preflight_exception_code(exception)
+        return {
+            "error_code": code or "preflight_failed",
+            "preflight_exception": True,
+        }
+
+    @staticmethod
+    def _preflight_exception_code(exception: BaseException | None) -> str:
+        if exception is None:
+            return ""
+        code = getattr(exception, "error_code", "")
+        if isinstance(code, str) and code.strip():
+            return code.strip()
+        return ""
+
     @staticmethod
     def _result_status(value: object) -> str:
         if isinstance(value, Mapping):
@@ -6268,9 +6361,27 @@ class PredictionExecutionService:
         proof = value.get("execution_proof")
         return isinstance(proof, Mapping) and proof.get("verified") is True
 
-    def _finish_rejected(self, execution_id: str, reason: str) -> None:
-        self._notify_threshold_order_failed(execution_id, reason)
-        self._transition(execution_id, "both_rejected", {"phase": "validation_rejected", "reason": reason})
+    def _finish_rejected(
+        self,
+        execution_id: str,
+        reason: str,
+        *,
+        extra_evidence: Mapping[str, object] | None = None,
+    ) -> None:
+        self._notify_threshold_order_failed(
+            execution_id,
+            reason,
+            preflight=extra_evidence.get("preflight") if extra_evidence else None,
+        )
+        self._transition(
+            execution_id,
+            "both_rejected",
+            {
+                "phase": "validation_rejected",
+                "reason": reason,
+                **(extra_evidence or {}),
+            },
+        )
 
     def _finish_cross_rejected(
         self,

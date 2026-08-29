@@ -2261,6 +2261,51 @@ def test_sensitive_ticks_signed_orders_and_secrets_never_reach_sqlite(tmp_path: 
         assert forbidden not in schema
 
 
+def test_preflight_status_key_survives_execution_evidence_sanitizer(
+    tmp_path: Path,
+) -> None:
+    db, execution = create_execution(tmp_path)
+    db.transition_execution(
+        execution["execution_id"],
+        state="both_rejected",
+        evidence={
+            "phase": "validation_rejected",
+            "reason": "account_insufficient",
+            "preflight": {
+                "signer_match": "yes",
+                "fok_pair_signed_not_submitted": "fail",
+                "error_code": "account_insufficient",
+            },
+        },
+    )
+
+    evidence = db.histories("executions")[0]["evidence"][-1]
+    assert evidence["preflight"]["fok_pair_signed_not_submitted"] == "fail"
+
+
+def test_signed_substring_keys_other_than_preflight_status_still_dropped(
+    tmp_path: Path,
+) -> None:
+    db, execution = create_execution(tmp_path)
+    db.transition_execution(
+        execution["execution_id"],
+        state="both_rejected",
+        evidence={
+            "phase": "validation_rejected",
+            "preflight": {
+                "signed_pair": "signed-payload-sentinel",
+                "signature": "signature-sentinel",
+                "fok_pair_signed_not_submitted": "fail",
+            },
+        },
+    )
+
+    preflight = db.histories("executions")[0]["evidence"][-1]["preflight"]
+    assert "signed_pair" not in preflight
+    assert "signature" not in preflight
+    assert preflight["fok_pair_signed_not_submitted"] == "fail"
+
+
 def test_decimal_strings_are_stored_without_exponents(tmp_path: Path) -> None:
     db = store(tmp_path)
     db.write_runtime({"amount": Decimal("1E+2"), "negative": Decimal("-0.50")})

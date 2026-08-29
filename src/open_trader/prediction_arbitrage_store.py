@@ -97,6 +97,14 @@ _PUBLIC_RELATION_TOKEN_FIELDS = frozenset(
         "polymarket_no_token_id",
     }
 )
+# Preflight 公开状态键：值只有 "pass"/"fail" 等短状态，名字含 "signed" 但
+# 不携带任何签名材料。精确匹配该键时仅豁免子串丢弃规则，其余过滤器语义
+# （token 名、sensitive 名、其他含 signed 子串的键）不变。
+_PUBLIC_PREFLIGHT_STATUS_FIELDS = frozenset(
+    {
+        "fok_pair_signed_not_submitted",
+    }
+)
 
 
 def _utc_now() -> str:
@@ -158,10 +166,14 @@ def _safe_value(
         )
         sensitive_name = normalized in {"auth", "authorization", "bearer"}
         public_token = normalized in _PUBLIC_RELATION_TOKEN_FIELDS
+        public_status = normalized in _PUBLIC_PREFLIGHT_STATUS_FIELDS
         if (
             (token_name and not (allow_public_token_ids and public_token))
             or sensitive_name
-            or any(part in normalized for part in _PRIVATE_FIELD_PARTS)
+            or (
+                any(part in normalized for part in _PRIVATE_FIELD_PARTS)
+                and not public_status
+            )
         ):
             return _DROPPED
     from decimal import Decimal

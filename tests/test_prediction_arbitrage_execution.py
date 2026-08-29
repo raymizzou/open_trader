@@ -24,6 +24,7 @@ from open_trader.polymarket_trading import (
     AccountSnapshot,
     LegResult,
     PairSubmission,
+    PolymarketTradingError,
     ThresholdHedgeSubmission,
     ThresholdLegResult,
 )
@@ -4416,6 +4417,310 @@ def test_preflight_error_code_extracts_from_mapping_object_and_missing() -> None
     assert (
         PredictionExecutionService._preflight_error_code({"result": "BLOCKED"}) == ""
     )
+
+
+def _pair_preflight_failure_shape(**overrides: object) -> dict[str, object]:
+    shape: dict[str, object] = {
+        "signer_match": "yes",
+        "wallet_match": "yes",
+        "posted": False,
+        "account_reads": "fail",
+        "fok_pair_signed_not_submitted": "fail",
+        "equal_requested_shares": "fail",
+        "error_code": "none",
+        "result": "BLOCKED",
+    }
+    shape.update(overrides)
+    return shape
+
+
+def test_pair_preflight_failure_records_auth_evidence(tmp_path: Path) -> None:
+    service, trading, _store, _monitor = execution_fixture(tmp_path)
+    trading.no_submit_preflight = (  # type: ignore[method-assign]
+        lambda intent, *, tick_size=Decimal("0.01"): _pair_preflight_failure_shape(
+            signer_match="no",
+            wallet_match="yes",
+            error_code="auth",
+        )
+    )
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "preflight-auth")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "both_rejected"
+    evidence = final["evidence"][-1]
+    assert evidence["reason"] == "auth"
+    assert evidence["preflight"]["error_code"] == "auth"
+    assert evidence["preflight"]["signer_match"] == "no"
+
+
+def test_pair_preflight_failure_records_geoblock_evidence(tmp_path: Path) -> None:
+    service, trading, _store, _monitor = execution_fixture(tmp_path)
+    trading.no_submit_preflight = (  # type: ignore[method-assign]
+        lambda intent, *, tick_size=Decimal("0.01"): _pair_preflight_failure_shape(
+            account_reads="pass",
+            geoblock="blocked",
+            error_code="geoblock_blocked",
+        )
+    )
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "preflight-geoblock")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "both_rejected"
+    evidence = final["evidence"][-1]
+    assert evidence["reason"] == "geoblock_blocked"
+    assert evidence["preflight"]["geoblock"] == "blocked"
+    assert evidence["preflight"]["account_reads"] == "pass"
+
+
+def test_pair_preflight_failure_records_account_read_error_evidence(
+    tmp_path: Path,
+) -> None:
+    service, trading, _store, _monitor = execution_fixture(tmp_path)
+    trading.no_submit_preflight = (  # type: ignore[method-assign]
+        lambda intent, *, tick_size=Decimal("0.01"): _pair_preflight_failure_shape(
+            error_code="network"
+        )
+    )
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "preflight-account-reads")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "both_rejected"
+    evidence = final["evidence"][-1]
+    assert evidence["reason"] == "network"
+    assert evidence["preflight"]["account_reads"] == "fail"
+    assert evidence["preflight"]["error_code"] == "network"
+
+
+def _threshold_preflight_failure_shape(**overrides: object) -> dict[str, object]:
+    shape: dict[str, object] = {
+        "signer_match": "yes",
+        "wallet_match": "yes",
+        "posted": False,
+        "account_reads": "fail",
+        "fok_pair_signed_not_submitted": "fail",
+        "equal_requested_shares": "fail",
+        "conditions": ["condition-a", "condition-b"],
+        "merge": "not_required",
+        "error_code": "none",
+        "result": "BLOCKED",
+    }
+    shape.update(overrides)
+    return shape
+
+
+def test_threshold_preflight_failure_records_intent_check_evidence(
+    tmp_path: Path,
+) -> None:
+    service, trading, store, _monitor = threshold_execution_fixture(tmp_path)
+    store.set_validation_mode("auto")
+    trading.threshold_preflight_result = _threshold_preflight_failure_shape(
+        account_reads="pass",
+        error_code="account_insufficient",
+    )
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+
+    assert result["state"] == "validating" or result.get("execution_id")
+    assert trading.threshold_submit_calls == 0
+    execution_id = str(result.get("execution_id") or "")
+    final = wait_until_terminal(service, execution_id)
+
+    assert final["state"] == "both_rejected"
+    evidence = final["evidence"][-1]
+    assert evidence["reason"] == "account_insufficient"
+    assert evidence["preflight"]["error_code"] == "account_insufficient"
+    assert evidence["preflight"]["fok_pair_signed_not_submitted"] == "fail"
+
+
+def test_threshold_preflight_failure_records_signing_error_evidence(
+    tmp_path: Path,
+) -> None:
+    service, trading, store, _monitor = threshold_execution_fixture(tmp_path)
+    store.set_validation_mode("auto")
+    trading.threshold_preflight_result = _threshold_preflight_failure_shape(
+        account_reads="pass",
+        geoblock="allowed",
+        error_code="order_shape_mismatch",
+    )
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+
+    assert result["state"] == "validating" or result.get("execution_id")
+    assert trading.threshold_submit_calls == 0
+    execution_id = str(result.get("execution_id") or "")
+    final = wait_until_terminal(service, execution_id)
+
+    assert final["state"] == "both_rejected"
+    evidence = final["evidence"][-1]
+    assert evidence["reason"] == "order_shape_mismatch"
+    assert evidence["preflight"]["error_code"] == "order_shape_mismatch"
+    assert evidence["preflight"]["account_reads"] == "pass"
+    assert evidence["preflight"]["geoblock"] == "allowed"
+    assert evidence["preflight"]["equal_requested_shares"] == "fail"
+
+
+def test_threshold_preflight_exception_with_code_records_minimal_evidence(
+    tmp_path: Path,
+) -> None:
+    service, trading, store, _monitor = threshold_execution_fixture(tmp_path)
+    store.set_validation_mode("auto")
+
+    def raising_preflight(intent: ThresholdHedgeIntent) -> dict[str, object]:
+        raise PolymarketTradingError("network")
+
+    trading.no_submit_threshold_preflight = raising_preflight  # type: ignore[method-assign]
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+
+    assert result["state"] == "validating" or result.get("execution_id")
+    assert trading.threshold_submit_calls == 0
+    execution_id = str(result.get("execution_id") or "")
+    final = wait_until_terminal(service, execution_id)
+
+    assert final["state"] == "both_rejected"
+    evidence = final["evidence"][-1]
+    assert evidence["reason"] == "network"
+    assert evidence["preflight"]["preflight_exception"] is True
+    assert evidence["preflight"]["error_code"] == "network"
+
+
+def test_threshold_preflight_exception_without_code_keeps_minimal_evidence(
+    tmp_path: Path,
+) -> None:
+    service, trading, store, _monitor = threshold_execution_fixture(tmp_path)
+    store.set_validation_mode("auto")
+
+    def raising_preflight(intent: ThresholdHedgeIntent) -> dict[str, object]:
+        raise RuntimeError("preflight exploded")
+
+    trading.no_submit_threshold_preflight = raising_preflight  # type: ignore[method-assign]
+    signal_id = _notification_signal(store)
+
+    result = service.auto_eat_threshold("threshold-opp-1", signal_id)
+
+    assert result["state"] == "validating" or result.get("execution_id")
+    assert trading.threshold_submit_calls == 0
+    execution_id = str(result.get("execution_id") or "")
+    final = wait_until_terminal(service, execution_id)
+
+    assert final["state"] == "both_rejected"
+    evidence = final["evidence"][-1]
+    assert evidence["reason"] == "preflight_failed"
+    preflight = evidence["preflight"]
+    assert isinstance(preflight, dict) and len(preflight) >= 1
+
+
+def test_threshold_preflight_failure_feishu_lists_subitem_lines(
+    tmp_path: Path,
+) -> None:
+    service, trading, store, _monitor = threshold_execution_fixture(tmp_path)
+    store.set_validation_mode("auto")
+    trading.threshold_preflight_result = _threshold_preflight_failure_shape(
+        account_reads="pass",
+        geoblock="allowed",
+        error_code="account_insufficient",
+    )
+    signal_id = _notification_signal(store)
+
+    service.auto_eat_threshold("threshold-opp-1", signal_id)
+
+    _macos, feishu = service.test_notifiers  # type: ignore[attr-defined]
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not any(
+        title == "预测套利单提交失败" for title, _ in feishu.messages
+    ):
+        time.sleep(0.05)
+    messages = [
+        message
+        for title, message in feishu.messages
+        if title == "预测套利单提交失败"
+    ]
+    assert messages
+    message = messages[0]
+    assert "原因：account_insufficient" in message
+    assert "账户余额或授权额度不足" in message
+    assert "签名者 ✅" in message
+    assert "钱包 ✅" in message
+    assert "账户读取 ✅" in message
+    assert "地区限制 ✅" in message
+    assert "FOK 双腿签名 ❌" in message
+    assert "数量一致 ❌" in message
+    assert "原因：preflight_failed" not in message
+
+
+def test_preflight_pass_path_records_no_preflight_evidence(tmp_path: Path) -> None:
+    service, trading, store, _monitor = execution_fixture(tmp_path)
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), "preflight-pass-pair")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "complete"
+    assert trading.preflight_calls == 1
+    assert all("preflight" not in entry for entry in final["evidence"])
+
+    threshold_service, threshold_trading, threshold_store, _ = (
+        threshold_execution_fixture(tmp_path / "threshold")
+    )
+    threshold_store.set_validation_mode("auto")
+    signal_id = _notification_signal(threshold_store)
+    threshold_result = threshold_service.auto_eat_threshold(
+        "threshold-opp-1", signal_id
+    )
+    assert threshold_result["state"] == "validating" or threshold_result.get(
+        "execution_id"
+    )
+    threshold_execution_id = str(threshold_result.get("execution_id") or "")
+    threshold_final = wait_until_terminal(
+        threshold_service, threshold_execution_id
+    )
+
+    assert threshold_final["state"] in {"complete", "holding_to_resolution"}
+    assert threshold_trading.threshold_preflight_calls == 1
+    assert all(
+        "preflight" not in entry for entry in threshold_final["evidence"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("scenario", "inject_failure"),
+    [
+        ("failed_result_with_error_code", False),
+        ("raising_preflight_without_code", True),
+    ],
+)
+def test_pair_historical_both_rejected_replay_records_preflight_evidence(
+    tmp_path: Path, scenario: str, inject_failure: bool
+) -> None:
+    service, trading, _store, _monitor = execution_fixture(tmp_path)
+    if inject_failure:
+        def raising_preflight(
+            intent: PairIntent, *, tick_size: Decimal = Decimal("0.01")
+        ) -> dict[str, object]:
+            raise RuntimeError("preflight exploded")
+
+        trading.no_submit_preflight = raising_preflight  # type: ignore[method-assign]
+    else:
+        trading.no_submit_preflight = (  # type: ignore[method-assign]
+            lambda intent, *, tick_size=Decimal("0.01"): _pair_preflight_failure_shape(
+                account_reads="pass",
+                geoblock="allowed",
+                error_code="account_insufficient",
+            )
+        )
+    preview = service.preview("opp-1")
+    execution = service.confirm(str(preview["id"]), f"spy-replay-{scenario}")
+    final = wait_until_terminal(service, str(execution["execution_id"]))
+
+    assert final["state"] == "both_rejected"
+    evidence = final["evidence"][-1]
+    preflight = evidence["preflight"]
+    assert isinstance(preflight, dict) and len(preflight) >= 1
 
 
 class PartialThresholdTrading(ThresholdTrading):
