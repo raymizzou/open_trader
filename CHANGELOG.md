@@ -30,6 +30,18 @@ operator-facing: what changed, which workflow is affected, and what was verified
   for the shared prediction-service logs, runs host tests and Playwright from
   the validated release root, blocks browser writes before navigation, and
   rechecks the unchanged submission markers after Playwright.
+- #108 post-merge Docker-context follow-up: stable-main `make acceptance` stopped
+  before tests when a cache-miss `pytest` fetch hit a PyPI TLS failure; production
+  was untouched. A separate read-only audit found `.code-review-graph`,
+  `.scratch`, and `.superpowers` entering the stable-checkout Docker context; the
+  follow-up adds only their exact `.dockerignore` entries, with Dockerfile and
+  dependency/download policy unchanged. Observed context fell from `288.31MB` to
+  `28.80MB`; a minimal Docker ignore-semantics probe passed and a generated
+  Candidate image proved all three `/workspace` paths absent. Final Candidate
+  PASS: backend `7597 passed, 4 skipped, 6 deselected, 1 warning`; portable
+  scenarios `61 passed, 3 deselected, 1 warning`. Host Readiness, Production
+  Smoke, migration, services, push, deploy, and any production mutation were not
+  run; the PyPI TLS issue was not fixed by this change.
 
 ## 2026-08-29
 

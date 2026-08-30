@@ -1,6 +1,9 @@
 .git
 .venv
 .worktrees
+.code-review-graph
+.scratch
+.superpowers
 .env
 **/.env
 **/.env.*
