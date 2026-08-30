@@ -478,6 +478,81 @@ def test_rlimit_as_lowers_an_infinite_soft_limit_to_the_requested_cap(monkeypatc
     assert calls == [(resource.RLIMIT_AS, (16_384, resource.RLIM_INFINITY))]
 
 
+def test_rlimit_as_platform_rejection_is_skipped_not_raised(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "open_trader.prediction_solver_worker.resource.getrlimit",
+        lambda _: (resource.RLIM_INFINITY, resource.RLIM_INFINITY),
+    )
+
+    def _reject(_kind: object, _limits: object) -> None:
+        raise ValueError("current limit exceeds maximum limit")
+
+    monkeypatch.setattr("open_trader.prediction_solver_worker.resource.setrlimit", _reject)
+
+    from open_trader.prediction_solver_worker import _apply_rlimit_as
+
+    _apply_rlimit_as(1 << 30)
+
+
+def test_rlimit_as_native_platform_rejection_is_skipped_not_raised() -> None:
+    from open_trader.prediction_solver_worker import _apply_rlimit_as
+
+    original = resource.getrlimit(resource.RLIMIT_AS)
+    try:
+        _apply_rlimit_as(1 << 30)
+    finally:
+        if resource.getrlimit(resource.RLIMIT_AS) != original:
+            resource.setrlimit(resource.RLIMIT_AS, original)
+
+
+def test_rlimit_as_platform_rejection_writes_a_stderr_diagnostic(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "open_trader.prediction_solver_worker.resource.getrlimit",
+        lambda _: (resource.RLIM_INFINITY, resource.RLIM_INFINITY),
+    )
+
+    def _reject(_kind: object, _limits: object) -> None:
+        raise ValueError("current limit exceeds maximum limit")
+
+    monkeypatch.setattr("open_trader.prediction_solver_worker.resource.setrlimit", _reject)
+    stderr = io.StringIO()
+    monkeypatch.setattr("open_trader.prediction_solver_worker.sys.stderr", stderr)
+
+    from open_trader.prediction_solver_worker import _apply_rlimit_as
+
+    _apply_rlimit_as(1 << 30)
+
+    diagnostic = stderr.getvalue()
+    assert "1073741824" in diagnostic
+    assert "current limit exceeds maximum limit" in diagnostic
+
+
+def test_rlimit_as_still_lowers_a_finite_soft_limit(monkeypatch) -> None:
+    calls: list[tuple[int, tuple[int, int]]] = []
+    monkeypatch.setattr(
+        "open_trader.prediction_solver_worker.resource.getrlimit",
+        lambda _: (4_096, resource.RLIM_INFINITY),
+    )
+    monkeypatch.setattr(
+        "open_trader.prediction_solver_worker.resource.setrlimit",
+        lambda kind, limits: calls.append((kind, limits)),
+    )
+
+    from open_trader.prediction_solver_worker import _apply_rlimit_as
+
+    _apply_rlimit_as(2_048)
+
+    assert calls == [(resource.RLIMIT_AS, (2_048, resource.RLIM_INFINITY))]
+
+
+@pytest.mark.parametrize("bad_limit", (0, -1, 1.5, "1024", True))
+def test_rlimit_as_still_rejects_invalid_memory_limits(bad_limit) -> None:
+    from open_trader.prediction_solver_worker import _apply_rlimit_as
+
+    with pytest.raises(ValueError):
+        _apply_rlimit_as(bad_limit)
+
+
 def test_rlimit_as_applies_before_test_mode_work_and_uses_the_stricter_cli_limit(monkeypatch) -> None:
     events: list[tuple[str, int | str]] = []
     request = decode_request_line(encode_request_line(_request("rlimit")))

@@ -11,7 +11,7 @@ import pytest
 from open_trader.prediction_n_leg import request_from_payload
 from open_trader.prediction_solver import BenchmarkLimits
 from open_trader.prediction_solver_server import SolverServerBusy, SolverServerOwner, SolverServerUnavailable
-from open_trader.prediction_solver_worker import WorkerCleanupError, WorkerOutcome, WorkerRequest
+from open_trader.prediction_solver_worker import WorkerCleanupError, WorkerHarness, WorkerOutcome, WorkerRequest
 
 
 def _request(request_id: str) -> WorkerRequest:
@@ -138,3 +138,31 @@ def test_cleanup_unproven_fail_closed_terminates_both_worker_threads() -> None:
         time.sleep(0.01)
     assert all(not thread.is_alive() for thread in server._threads)
     assert all(harness.closed for harness in _Harness.instances)
+
+
+def test_real_cp_sat_worker_survives_platform_memory_limit_rejection() -> None:
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "prediction_n_leg_v1.json").read_text(encoding="utf-8")
+    )
+    request = WorkerRequest(
+        "platform-memory-limit-e2e",
+        "cp_sat",
+        request_from_payload(fixture["cases"][0]["request"]),
+        BenchmarkLimits(5_000, 10_000, 1 << 30, 8),
+    )
+
+    server = SolverServerOwner(
+        [sys.executable, "-m", "open_trader.prediction_solver_worker", "--backend", "cp_sat"],
+        harness_factory=lambda command: WorkerHarness(
+            command, request_timeout_ms=60_000, startup_timeout_ms=30_000
+        ),
+    )
+    try:
+        outcome = server.submit(request).result(timeout=60)
+    finally:
+        server.close()
+
+    assert outcome.status == "OK"
+    assert outcome.termination == "COMPLETED"
+    assert outcome.cleanup_proven is True
+    assert outcome.response is not None

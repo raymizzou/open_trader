@@ -25,6 +25,7 @@ from open_trader.polymarket_relation_discovery import (
     NegriskGroupMarket,
     NegriskGroupRelation,
 )
+from open_trader.prediction_n_leg_mode import DEFAULT_QUALIFICATION_POLICY
 from open_trader.prediction_n_leg_validation import readonly_v2_relations
 from open_trader.relation_catalog import RelationCatalog
 
@@ -677,18 +678,6 @@ def test_fresh_replica_mode_end_to_end_pass_without_production_data(
         "open_trader.prediction_n_leg_validation.SolverServerOwner",
         FakeSolverServerOwner,
     )
-    # Disclosed B2 pattern: the mechanical codec always stores empty
-    # qualification_constraints, so the negative-proof PASS path needs the
-    # same min-profit injection the B2 red-green pair uses; applied right
-    # after the orchestrator's real activation, test-side only.
-    real_activate = orchestrator.activate_replica_catalog
-
-    def activate_then_qualify(replica_db: Path, group: object, **kwargs: object):
-        result = real_activate(replica_db, group, **kwargs)
-        add_min_profit_qualification(replica_db)
-        return result
-
-    monkeypatch.setattr(orchestrator, "activate_replica_catalog", activate_then_qualify)
 
     exit_code = orchestrator.main(
         [
@@ -1801,3 +1790,423 @@ def test_volume_case_probe_resolves_both_volume_semantics(
     except OSError:
         volume_folds = False
     assert real_probe(real_dir) is volume_folds
+
+
+# ---------------------------------------------------------------------------
+# Gap D (#71): the orchestrator converts the existing default qualification
+# policy into canonical solver constraints at replica-payload assembly, so the
+# mechanically derived relations carry the four read-model gates through the
+# compile chain and the harness's negative-proof path is reachable without any
+# test-side injection.
+# ---------------------------------------------------------------------------
+
+
+def _constraint(
+    constraints: list[dict[str, object]], constraint_id: str
+) -> dict[str, object]:
+    return next(
+        item
+        for item in constraints
+        if item["constraint_id"] == constraint_id
+    )
+
+
+def test_qualification_constraints_from_policy_default_policy_exact() -> None:
+    """D1: the default policy becomes exactly the four read-model gates.
+
+    Independent source of truth: ``DEFAULT_QUALIFICATION_POLICY``
+    ($1 / 1% / 15% / 30 days) in the scales the solver's
+    ``_qualification_formula`` consumes — micro-USD units for
+    GUARANTEED_PROFIT_UNITS ("1.00" -> 1_000_000, denominator 1), parts per
+    million for NET_MARGIN_PPM/ANNUALIZED_RETURN_PPM (the formula reads
+    threshold_numerator/threshold_denominator as PPM: profit*1e6*D >=
+    payout*N, so 1% is (10_000, 1), not (1, 100) which the same formula
+    would read as 1e-8) and seconds for MAX_CAPITAL_RELEASE_DELAY_SECONDS
+    (30 * 86400 = 2_592_000, comparison LESS_THAN_OR_EQUAL).
+    """
+
+    constraints = orchestrator.qualification_constraints_from_policy(
+        dict(DEFAULT_QUALIFICATION_POLICY)
+    )
+
+    assert len(constraints) == 4
+    assert {item["constraint_id"] for item in constraints} == {
+        "minimum-profit-usd",
+        "minimum-net-margin",
+        "minimum-annualized-return",
+        "maximum-release-delay",
+    }
+    assert all(item["rule_version"] == "v1" for item in constraints)
+
+    profit = _constraint(constraints, "minimum-profit-usd")
+    assert profit["metric"] == "GUARANTEED_PROFIT_UNITS"
+    assert profit["comparison"] == "GREATER_THAN_OR_EQUAL"
+    assert profit["threshold_numerator"] == 1_000_000
+    assert profit["threshold_denominator"] == 1
+
+    margin = _constraint(constraints, "minimum-net-margin")
+    assert margin["metric"] == "NET_MARGIN_PPM"
+    assert margin["comparison"] == "GREATER_THAN_OR_EQUAL"
+    assert margin["threshold_numerator"] == 10_000
+    assert margin["threshold_denominator"] == 1
+
+    annualized = _constraint(constraints, "minimum-annualized-return")
+    assert annualized["metric"] == "ANNUALIZED_RETURN_PPM"
+    assert annualized["comparison"] == "GREATER_THAN_OR_EQUAL"
+    assert annualized["threshold_numerator"] == 150_000
+    assert annualized["threshold_denominator"] == 1
+
+    delay = _constraint(constraints, "maximum-release-delay")
+    assert delay["metric"] == "MAX_CAPITAL_RELEASE_DELAY_SECONDS"
+    assert delay["comparison"] == "LESS_THAN_OR_EQUAL"
+    assert delay["threshold_numerator"] == 30 * 86_400
+    assert delay["threshold_denominator"] == 1
+
+
+def test_qualification_constraints_from_policy_custom_values_exact() -> None:
+    """D1: custom policy values convert one by one into the same gates."""
+
+    constraints = orchestrator.qualification_constraints_from_policy(
+        {
+            "min_profit_usd": "2.50",
+            "min_net_margin": "0.02",
+            "min_annualized_return": "0.20",
+            "max_capital_release_days": 45,
+        }
+    )
+
+    profit = _constraint(constraints, "minimum-profit-usd")
+    assert (profit["threshold_numerator"], profit["threshold_denominator"]) == (
+        2_500_000,
+        1,
+    )
+    margin = _constraint(constraints, "minimum-net-margin")
+    assert (margin["threshold_numerator"], margin["threshold_denominator"]) == (
+        20_000,
+        1,
+    )
+    annualized = _constraint(constraints, "minimum-annualized-return")
+    assert (
+        annualized["threshold_numerator"],
+        annualized["threshold_denominator"],
+    ) == (200_000, 1)
+    delay = _constraint(constraints, "maximum-release-delay")
+    assert (delay["threshold_numerator"], delay["threshold_denominator"]) == (
+        45 * 86_400,
+        1,
+    )
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        pytest.param(
+            {
+                "min_profit_usd": "1.00",
+                "min_net_margin": "0.01",
+                "min_annualized_return": "0.15",
+            },
+            id="missing-key",
+        ),
+        pytest.param(
+            {
+                "min_profit_usd": "1.00",
+                "min_net_margin": "0.01",
+                "min_annualized_return": "0.15",
+                "max_capital_release_days": 30,
+                "extra": 1,
+            },
+            id="extra-key",
+        ),
+        pytest.param(
+            {
+                "min_profit_usd": "-1.00",
+                "min_net_margin": "0.01",
+                "min_annualized_return": "0.15",
+                "max_capital_release_days": 30,
+            },
+            id="negative-money",
+        ),
+        pytest.param(
+            {
+                "min_profit_usd": "1.00 USD",
+                "min_net_margin": "0.01",
+                "min_annualized_return": "0.15",
+                "max_capital_release_days": 30,
+            },
+            id="non-decimal-money",
+        ),
+        pytest.param(
+            {
+                "min_profit_usd": "1.00",
+                "min_net_margin": "0.01",
+                "min_annualized_return": "0.15",
+                "max_capital_release_days": 0,
+            },
+            id="non-positive-days",
+        ),
+    ],
+)
+def test_qualification_constraints_from_policy_rejects_invalid(
+    policy: dict[str, object],
+) -> None:
+    """D1: the mode contract's validation rules reject bad policies."""
+
+    with pytest.raises(ValueError):
+        orchestrator.qualification_constraints_from_policy(policy)
+
+
+def test_fresh_replica_default_policy_wires_qualification_constraints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """D2: --fresh-replica + the default policy proves the negative for real.
+
+    Independent source of truth: the same scenario shape the retired
+    test-side min-profit injection used to paper over
+    (``add_min_profit_qualification``) — real codec-derived replica, three
+    0.50 no-arbitrage asks, in-process solver, expanded live budget.  With
+    the orchestrator wiring the four default-policy gates into the activated
+    payload, the exact oracle can prove the negative (live
+    NO_QUALIFIED_OPPORTUNITY -> PASS, exit 0, zero side effects); before the
+    wiring the empty qualification_constraints left that path unreachable and
+    this run failed instead.
+    """
+
+    import open_trader.prediction_n_leg_validation_books as books_module
+
+    production = seed_production_stand_in(tmp_path / "prod")
+    before = production.read_bytes()
+    work_dir = tmp_path / "work"
+    replica = replica_path(work_dir)
+    events_file = _write_events(tmp_path)
+
+    monkeypatch.setattr(books_module, "live_books", no_arb_real_books)
+    monkeypatch.setattr(
+        "open_trader.prediction_n_leg_validation.SolverServerOwner",
+        FakeSolverServerOwner,
+    )
+
+    exit_code = orchestrator.main(
+        [
+            "--production-db",
+            str(production),
+            "--work-dir",
+            str(work_dir),
+            "--fresh-replica",
+            "--events-json",
+            str(events_file),
+            "--live-max-joint-states",
+            "256",
+            "--live-max-quantity-vectors",
+            "64",
+        ]
+    )
+
+    assert exit_code == 0
+    report = json.loads((work_dir / "report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "PASS"
+    assert report["live"]["status"] == "PASS"
+    assert report["live"]["qualified_verified"] is False
+    assert report["live"]["legs"] == 0
+    assert report["live"]["execution_decision"] is None
+    assert report["live"]["fingerprints"]["negative_proof"]
+    assert report["live"]["zero_side_effects"]["submitted_orders"] == 0
+    assert report["live"]["zero_side_effects"]["mutation_attempts"] == 0
+
+    # The landed replica payload carries exactly the four default-policy
+    # gates in the readonly export's problem view (both payload copies hold
+    # them; this is the copy the harness compile seam decodes).
+    exported = readonly_v2_relations(replica)
+    active = [
+        row for row in exported["rows"].values() if row["activation"] == "ACTIVE"
+    ]
+    assert len(active) == 1
+    stored = (
+        active[0]["model"]["problem"]["qualification_constraints"]
+    )
+    assert {item["constraint_id"] for item in stored} == {
+        "minimum-profit-usd",
+        "minimum-net-margin",
+        "minimum-annualized-return",
+        "maximum-release-delay",
+    }
+    by_id = {item["constraint_id"]: item for item in stored}
+    assert by_id["minimum-profit-usd"]["threshold_numerator"] == 1_000_000
+    assert by_id["minimum-net-margin"]["threshold_numerator"] == 10_000
+    assert (
+        by_id["minimum-annualized-return"]["threshold_numerator"] == 150_000
+    )
+    assert (
+        by_id["maximum-release-delay"]["threshold_numerator"] == 30 * 86_400
+    )
+    assert all(item["rule_version"] == "v1" for item in stored)
+
+    # The orchestrator logs the policy summary and the constraint ids.
+    captured = capsys.readouterr()
+    assert "[nleg-no-submit] qualification policy" in captured.err
+    for constraint_id in (
+        "minimum-profit-usd",
+        "minimum-net-margin",
+        "minimum-annualized-return",
+        "maximum-release-delay",
+    ):
+        assert constraint_id in captured.err
+
+    sidecar = json.loads(
+        (work_dir / "report.production-checksum.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert sidecar["zero_production_write"] is True
+    assert production.read_bytes() == before
+
+
+def test_qualification_policy_flag_changes_replica_constraints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D3: an explicit --qualification-policy file drives the constraints.
+
+    Independent source of truth: the same exact-rational conversion the D1
+    tests pin ("2.50" USD -> 2_500_000 micro-units, "0.02" -> 20_000 PPM,
+    "0.20" -> 200_000 PPM, 45 days -> 3_888_000 seconds), exercised through
+    the CLI flag -> file -> activation seam; the harness itself is stubbed
+    because this slice pins the replica payload, not the live verdict.
+    """
+
+    import open_trader.prediction_n_leg_validation_books as books_module
+
+    production = seed_production_stand_in(tmp_path / "prod")
+    work_dir = tmp_path / "work"
+    replica = replica_path(work_dir)
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(
+        json.dumps(
+            {
+                "min_profit_usd": "2.50",
+                "min_net_margin": "0.02",
+                "min_annualized_return": "0.20",
+                "max_capital_release_days": 45,
+            }
+        ),
+        encoding="utf-8",
+    )
+    events_file = _write_events(tmp_path)
+    monkeypatch.setattr(books_module, "live_books", no_arb_real_books)
+    captured = _stub_harness(monkeypatch)
+
+    exit_code = orchestrator.main(
+        [
+            "--production-db",
+            str(production),
+            "--work-dir",
+            str(work_dir),
+            "--fresh-replica",
+            "--events-json",
+            str(events_file),
+            "--qualification-policy",
+            str(policy_file),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["argv"]  # the harness really ran
+    exported = readonly_v2_relations(replica)
+    active = [
+        row for row in exported["rows"].values() if row["activation"] == "ACTIVE"
+    ]
+    assert len(active) == 1
+    stored = {
+        item["constraint_id"]: item
+        for item in active[0]["model"]["problem"][
+            "qualification_constraints"
+        ]
+    }
+    profit = stored["minimum-profit-usd"]
+    assert (profit["threshold_numerator"], profit["threshold_denominator"]) == (
+        2_500_000,
+        1,
+    )
+    margin = stored["minimum-net-margin"]
+    assert (margin["threshold_numerator"], margin["threshold_denominator"]) == (
+        20_000,
+        1,
+    )
+    annualized = stored["minimum-annualized-return"]
+    assert (
+        annualized["threshold_numerator"],
+        annualized["threshold_denominator"],
+    ) == (200_000, 1)
+    delay = stored["maximum-release-delay"]
+    assert (delay["threshold_numerator"], delay["threshold_denominator"]) == (
+        45 * 86_400,
+        1,
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(None, id="missing-file"),
+        pytest.param("{not json", id="malformed-json"),
+        pytest.param(
+            json.dumps(
+                {
+                    "min_profit_usd": "-1.00",
+                    "min_net_margin": "0.01",
+                    "min_annualized_return": "0.15",
+                    "max_capital_release_days": 30,
+                }
+            ),
+            id="invalid-policy-fields",
+        ),
+        pytest.param(json.dumps(["not", "an", "object"]), id="non-object-json"),
+    ],
+)
+def test_qualification_policy_flag_refused_before_any_work(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    content: str | None,
+) -> None:
+    """D3: a bad --qualification-policy file is a pre-flight refusal (exit 2).
+
+    Independent source of truth: the orchestrator's established flag
+    validation contract — validation happens before any filesystem work, a
+    refusal carries the reason on stderr with exit 2, and the default work
+    directory is never created.  The refusal must be the flag's own
+    validation ("refusing: --qualification-policy: ..."), not an argparse
+    unknown-flag error.
+    """
+
+    production = seed_production_stand_in(tmp_path / "prod")
+    before = production.read_bytes()
+    work_dir = tmp_path / "work"
+    argv = [
+        "--production-db",
+        str(production),
+        "--work-dir",
+        str(work_dir),
+        "--fresh-replica",
+        "--events-json",
+        str(_write_events(tmp_path)),
+        "--qualification-policy",
+        str(tmp_path / "missing-policy.json"),
+    ]
+    policy_file = tmp_path / "bad-policy.json"
+    if content is not None:
+        policy_file.write_text(content, encoding="utf-8")
+        argv[argv.index("--qualification-policy") + 1] = str(policy_file)
+
+    with pytest.raises(SystemExit) as excinfo:
+        orchestrator.main(argv)
+
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert "refusing: --qualification-policy" in captured.err
+    # Refused at parse time: no work directory, no sidecar, production
+    # bytes untouched.
+    assert not work_dir.exists()
+    assert not (work_dir / "report.production-checksum.json").exists()
+    assert production.read_bytes() == before

@@ -16,7 +16,13 @@ production catalog:
 3. Activate the derived relation ONLY inside the replica (ingest -> approve
    -> activation through the existing v2-backed facade, which runs the v2
    batch activation core and records the activation bookkeeping) so
-   ``readonly_v2_relations`` sees it as ACTIVE.
+   ``readonly_v2_relations`` sees it as ACTIVE.  The qualification policy
+   (``--qualification-policy`` JSON file; default: the imported
+   ``prediction_n_leg_mode.DEFAULT_QUALIFICATION_POLICY``) is converted into
+   four canonical solver constraints (exact integer rationals) and stored
+   into both copies of the activated problem, so the harness's
+   NO_QUALIFIED_OPPORTUNITY negative-proof path is reachable without any
+   test-side injection.
 4. Invoke the existing harness CLI (``prediction nleg-validate``) with the
    replica catalog, the read-only live book source, and the isolated data
    dir.
@@ -45,7 +51,8 @@ activation gate refuses — it never silently switches modes.
 Exit codes: 0 = report PASS, 1 = report FAIL, 2 = report BLOCKED or an
 orchestrator guard/step refusal — including the replica-ready verify step,
 a crashed harness call, and a harness call exiting via SystemExit (live
-budget flags < 1 are already rejected at parse time, before any work and
+budget flags < 1 and an unreadable/invalid --qualification-policy file are
+already rejected at parse time, before any work and
 before the default work directory's temp dir is created, which happens
 only after flag validation passes) — with the reason on stderr (and,
 whenever the before-checksum was taken, in the sidecar's ``failure``
@@ -60,12 +67,14 @@ import contextlib
 import hashlib
 import inspect
 import json
+import math
 import os
 import sqlite3
 import sys
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -84,6 +93,10 @@ from open_trader.polymarket_relation_discovery import (  # noqa: E402
     _text,
     _value,
     discover_mechanical_relation_catalog,
+)
+from open_trader.prediction_n_leg_mode import (  # noqa: E402
+    DEFAULT_QUALIFICATION_POLICY,
+    _validated_policy,
 )
 from open_trader.prediction_n_leg_validation import (  # noqa: E402
     readonly_v2_relations,
@@ -114,6 +127,12 @@ RUN_DIR_NAME = "run"
 CHECKSUM_SIDECAR_SUFFIX = ".production-checksum.json"
 MIN_GROUP_MARKETS = 3
 AUTO_PICK_PAGE_SIZE = 100
+# Gap D: the canonical solver-constraint scales the policy thresholds are
+# converted into (micro-USD units and parts per million) and the uniform
+# rule version stamped onto every converted constraint.
+MICRO_UNITS_PER_DOLLAR = 1_000_000
+SECONDS_PER_DAY = 86_400
+QUALIFICATION_RULE_VERSION = "v1"
 
 
 def md5sum(path: str | Path) -> str:
@@ -248,12 +267,86 @@ def build_contract_token_map(
     return mapping
 
 
+def _exact_rational(amount: str, scale: int) -> tuple[int, int]:
+    """One decimal amount times *scale* as an exact reduced integer ratio."""
+
+    numerator, denominator = Decimal(amount).as_integer_ratio()
+    numerator *= scale
+    common = math.gcd(numerator, denominator)
+    return numerator // common, denominator // common
+
+
+def qualification_constraints_from_policy(
+    policy: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Convert one qualification policy into canonical solver constraints.
+
+    Gap D: the mechanical codec always compiles
+    ``qualification_constraints: []``, which leaves the harness's
+    NO_QUALIFIED_OPPORTUNITY negative-proof path unreachable.  This converts
+    the existing default qualification policy (single source of truth:
+    ``prediction_n_leg_mode.DEFAULT_QUALIFICATION_POLICY``; validation reuses
+    its ``_validated_policy`` rules rather than copying them) into exactly the
+    four read-model gates as exact integer rationals in the solver's
+    canonical scales (``prediction_solver._qualification_formula``):
+    micro-USD units for GUARANTEED_PROFIT_UNITS, parts per million for
+    NET_MARGIN_PPM/ANNUALIZED_RETURN_PPM, seconds for
+    MAX_CAPITAL_RELEASE_DELAY_SECONDS.  The payload dicts decode through the
+    canonical problem codec and ride ``_merge`` /
+    ``problem_for_component`` / ``build_solve_request`` unchanged.
+    """
+
+    validated = _validated_policy(policy)
+    profit = _exact_rational(validated["min_profit_usd"], MICRO_UNITS_PER_DOLLAR)
+    margin = _exact_rational(validated["min_net_margin"], MICRO_UNITS_PER_DOLLAR)
+    annualized = _exact_rational(
+        validated["min_annualized_return"], MICRO_UNITS_PER_DOLLAR
+    )
+    return [
+        {
+            "constraint_id": "minimum-profit-usd",
+            "rule_version": QUALIFICATION_RULE_VERSION,
+            "metric": "GUARANTEED_PROFIT_UNITS",
+            "comparison": "GREATER_THAN_OR_EQUAL",
+            "threshold_numerator": profit[0],
+            "threshold_denominator": profit[1],
+        },
+        {
+            "constraint_id": "minimum-net-margin",
+            "rule_version": QUALIFICATION_RULE_VERSION,
+            "metric": "NET_MARGIN_PPM",
+            "comparison": "GREATER_THAN_OR_EQUAL",
+            "threshold_numerator": margin[0],
+            "threshold_denominator": margin[1],
+        },
+        {
+            "constraint_id": "minimum-annualized-return",
+            "rule_version": QUALIFICATION_RULE_VERSION,
+            "metric": "ANNUALIZED_RETURN_PPM",
+            "comparison": "GREATER_THAN_OR_EQUAL",
+            "threshold_numerator": annualized[0],
+            "threshold_denominator": annualized[1],
+        },
+        {
+            "constraint_id": "maximum-release-delay",
+            "rule_version": QUALIFICATION_RULE_VERSION,
+            "metric": "MAX_CAPITAL_RELEASE_DELAY_SECONDS",
+            "comparison": "LESS_THAN_OR_EQUAL",
+            "threshold_numerator": (
+                validated["max_capital_release_days"] * SECONDS_PER_DAY
+            ),
+            "threshold_denominator": 1,
+        },
+    ]
+
+
 def activate_replica_catalog(
     replica_db: str | Path,
     group: NegriskGroupRelation,
     *,
     actor: str,
     git_sha: str,
+    qualification_constraints: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, object]:
     """Ingest, approve and activate one derived relation inside the replica.
 
@@ -263,6 +356,15 @@ def activate_replica_catalog(
     the top-level compile fields while ``readonly_v2_relations`` (the
     harness's export) reads the nested ``model`` shape.  No field is
     invented and the production database is never opened for writing.
+
+    ``qualification_constraints`` (gap D) are merged into BOTH copies of the
+    assembled problem at payload-assembly time — the same double-copy write
+    shape the retired test-side injection used — so the activated relation
+    carries the qualification policy through the compile chain
+    (``_merge``/``problem_for_component``/``build_solve_request``) into the
+    solver's ``_qualification_formula``.  The mechanical codec compiles the
+    problem with ``qualification_constraints: []``; wiring a policy over a
+    payload without a compiled problem is refused.
     """
 
     replica_db = Path(replica_db)
@@ -289,6 +391,22 @@ def activate_replica_catalog(
         group, _mechanical_complete_model(group)
     )
     converted = facade._converted(discovery_payload)
+    if qualification_constraints:
+        problem = converted.get("problem")
+        if not isinstance(problem, Mapping):
+            raise ValueError(
+                "cannot wire the qualification policy: the mechanical codec "
+                "produced no compiled problem"
+            )
+        converted = {
+            **converted,
+            "problem": {
+                **problem,
+                "qualification_constraints": [
+                    dict(item) for item in qualification_constraints
+                ],
+            },
+        }
     payload = {
         **converted,
         "model": {
@@ -524,6 +642,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "budget; default keeps the fixed validation budget value)"
         ),
     )
+    parser.add_argument(
+        "--qualification-policy",
+        type=Path,
+        default=None,
+        help=(
+            "Qualification policy JSON object file converted into the "
+            "replica problem's qualification_constraints at activation "
+            "(default: prediction_n_leg_mode.DEFAULT_QUALIFICATION_POLICY)"
+        ),
+    )
     parser.add_argument("--actor", default=DEFAULT_ACTOR)
     parser.add_argument("--git-sha", default=DEFAULT_ACTOR)
     args = parser.parse_args(argv)
@@ -538,6 +666,29 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     ):
         if value is not None and value < 1:
             parser.error(f"refusing: {flag_name} must be >= 1 (got {value})")
+    # Gap D: the qualification policy is validated and converted up front,
+    # same pre-flight refusal contract as the budget flags above — a bad
+    # file (missing, unreadable, malformed JSON, invalid policy fields)
+    # exits 2 before the checksum, before the default work directory's temp
+    # dir is created, and before any other filesystem work.  The default is
+    # the imported DEFAULT_QUALIFICATION_POLICY (single source of truth, no
+    # copied literal); --replica-ready never activates, so it never injects.
+    if args.qualification_policy is None:
+        policy = DEFAULT_QUALIFICATION_POLICY
+    else:
+        try:
+            policy = json.loads(
+                args.qualification_policy.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(f"refusing: --qualification-policy: {exc}")
+    try:
+        args.qualification_constraints = tuple(
+            qualification_constraints_from_policy(policy)
+        )
+    except ValueError as exc:
+        parser.error(f"refusing: --qualification-policy: {exc}")
+    args.qualification_policy_values = policy
     if args.work_dir is None:
         # Lazily created only after the flag validation above passed: an
         # eager argparse default called mkdtemp at parse time, creating (and
@@ -685,8 +836,19 @@ def main(argv: list[str] | None = None) -> int:
                 group,
                 actor=args.actor,
                 git_sha=args.git_sha,
+                qualification_constraints=args.qualification_constraints,
             )
             _log(f"activated in replica: {activated['identity']}")
+            _log(
+                "qualification policy "
+                + json.dumps(args.qualification_policy_values, sort_keys=True)
+                + " -> constraints ["
+                + ", ".join(
+                    str(item["constraint_id"])
+                    for item in args.qualification_constraints
+                )
+                + "]"
+            )
 
         # Explicit --book-source always passes through verbatim; the default
         # resolves to the contract-keyed wrapper when the derived group produced

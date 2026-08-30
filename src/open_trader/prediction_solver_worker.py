@@ -420,7 +420,14 @@ def _apply_rlimit_as(limit_bytes: int) -> None:
     if current_soft != resource.RLIM_INFINITY:
         target_soft = min(target_soft, current_soft)
     if current_soft != target_soft:
-        resource.setrlimit(resource.RLIMIT_AS, (target_soft, current_hard))
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (target_soft, current_hard))
+        except (ValueError, OSError) as exc:
+            print(
+                f"worker memory limit not applied: setrlimit(RLIMIT_AS, {target_soft}) rejected: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 class _PipeReader:
