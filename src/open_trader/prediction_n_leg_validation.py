@@ -120,6 +120,33 @@ VALIDATION_LIMITS = BenchmarkLimits(
     max_constraint_generation_rounds=3,
 )
 
+
+def live_budget_from_flags(
+    live_max_joint_states: int | None, live_max_quantity_vectors: int | None
+) -> OracleBudget:
+    """Assemble the live-path budget from the CLI budget flags.
+
+    ``None`` (flag absent) keeps the corresponding ``VALIDATION_BUDGET``
+    value and the support-recheck cap always stays the original constant, so
+    the default assembly is field-identical to ``VALIDATION_BUDGET``.  Only
+    the live path consumes this; the replay path keeps its
+    ``VALIDATION_BUDGET`` default and ``VALIDATION_LIMITS`` stay untouched.
+    """
+
+    return OracleBudget(
+        max_quantity_vectors=(
+            VALIDATION_BUDGET.max_quantity_vectors
+            if live_max_quantity_vectors is None
+            else live_max_quantity_vectors
+        ),
+        max_joint_states=(
+            VALIDATION_BUDGET.max_joint_states
+            if live_max_joint_states is None
+            else live_max_joint_states
+        ),
+        max_support_rechecks=VALIDATION_BUDGET.max_support_rechecks,
+    )
+
 _VALIDATION_ACCOUNT = AccountView(10**18, 10**18, 0)
 
 #: The validation harness proves every fixed solution with the #74 fill
@@ -1136,7 +1163,31 @@ def main(argv: list[str] | None = None) -> int:
         help="Isolated validation data dir (default: fresh temp dir)",
     )
     parser.add_argument("--report", type=Path, help="Write the JSON report to this path")
+    parser.add_argument(
+        "--live-max-joint-states",
+        type=int,
+        default=None,
+        help=(
+            "Live-path joint-state budget cap (default: keep the fixed "
+            "validation budget value); replay is unaffected"
+        ),
+    )
+    parser.add_argument(
+        "--live-max-quantity-vectors",
+        type=int,
+        default=None,
+        help=(
+            "Live-path quantity-vector budget cap (default: keep the fixed "
+            "validation budget value); replay is unaffected"
+        ),
+    )
     args = parser.parse_args(argv)
+    for flag_name, value in (
+        ("--live-max-joint-states", args.live_max_joint_states),
+        ("--live-max-quantity-vectors", args.live_max_quantity_vectors),
+    ):
+        if value is not None and value < 1:
+            parser.error(f"{flag_name} must be >= 1 (got {value})")
     replay = None
     if args.replay is not None:
         try:
@@ -1150,6 +1201,9 @@ def main(argv: list[str] | None = None) -> int:
             catalog["rows"],
             book_source=_book_source_from_flag(args.book_source),
             data_dir=args.data_dir,
+            budget=live_budget_from_flags(
+                args.live_max_joint_states, args.live_max_quantity_vectors
+            ),
             catalog=catalog,
         )
     except (OSError, ValueError) as exc:
