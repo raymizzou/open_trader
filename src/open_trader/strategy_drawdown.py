@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -889,12 +889,10 @@ def recover_strategy_drawdown_state(
             else:
                 raise ValueError("strategy drawdown state is already valid")
         snapshots_dir = path.parent / "snapshots"
-        candidates = sorted(
-            snapshots_dir.glob("*.json"),
-            key=lambda item: (item.stat().st_mtime_ns, item.name),
-            reverse=True,
-        )
-        for snapshot_path in candidates:
+        valid_candidates: list[
+            tuple[datetime | None, int, int, int, str, dict[str, object], str]
+        ] = []
+        for snapshot_path in snapshots_dir.glob("*.json"):
             try:
                 envelope = json.loads(snapshot_path.read_text(encoding="utf-8"))
                 if (
@@ -912,6 +910,58 @@ def recover_strategy_drawdown_state(
                 digest = hashlib.sha256(_state_bytes(state)).hexdigest()
                 if digest != envelope["state_sha256"]:
                     continue
+                records = state["records"]
+                events = state["audit_events"]
+                assert isinstance(records, list) and isinstance(events, list)
+                logical_timestamps = [
+                    datetime.fromisoformat(str(record["updated_at"]))
+                    for record in records
+                ] + [
+                    datetime.fromisoformat(str(event["occurred_at"]))
+                    for event in events
+                ]
+                try:
+                    snapshot_stat = snapshot_path.stat()
+                except OSError:
+                    filesystem_key = (0, 0, 0)
+                else:
+                    filesystem_key = (
+                        snapshot_stat.st_mtime_ns,
+                        snapshot_stat.st_ctime_ns,
+                        snapshot_stat.st_ino,
+                    )
+                valid_candidates.append(
+                    (
+                        max(logical_timestamps, default=None),
+                        *filesystem_key,
+                        snapshot_path.name,
+                        state,
+                        digest,
+                    )
+                )
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+                continue
+        valid_candidates.sort(
+            key=lambda candidate: (
+                candidate[0] is not None,
+                candidate[0] or datetime.min.replace(tzinfo=timezone.utc),
+                candidate[1],
+                candidate[2],
+                candidate[3],
+                candidate[4],
+            ),
+            reverse=True,
+        )
+        for (
+            _logical_timestamp,
+            _mtime_ns,
+            _ctime_ns,
+            _inode,
+            snapshot_name,
+            state,
+            digest,
+        ) in valid_candidates:
+            try:
                 records = state["records"]
                 events = state["audit_events"]
                 assert isinstance(records, list) and isinstance(events, list)
@@ -934,16 +984,16 @@ def recover_strategy_drawdown_state(
                         "strategy_version": key[2],
                         "actor": actor.strip(),
                         "occurred_at": occurred_at,
-                        "snapshot": snapshot_path.name,
+                        "snapshot": snapshot_name,
                         "state_sha256": digest,
                     })
                 _write_state(path, state)
                 return {
                     "status": "recovered",
-                    "snapshot": str(snapshot_path),
+                    "snapshot": str(snapshots_dir / snapshot_name),
                     "state_sha256": digest,
                 }
-            except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            except (OSError, UnicodeError, ValueError):
                 continue
         raise ValueError("no valid strategy drawdown snapshot is available")
 

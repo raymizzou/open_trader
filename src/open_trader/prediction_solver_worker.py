@@ -415,7 +415,7 @@ def _apply_rlimit_as(limit_bytes: int) -> None:
         return
     _positive_int(limit_bytes, "memory_limit_bytes")
     current_soft, current_hard = resource.getrlimit(resource.RLIMIT_AS)
-    hard_cap = current_hard
+    hard_cap = limit_bytes if current_hard == resource.RLIM_INFINITY else current_hard
     target_soft = min(limit_bytes, hard_cap)
     if current_soft != resource.RLIM_INFINITY:
         target_soft = min(target_soft, current_soft)

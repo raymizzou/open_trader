@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import replace
 from datetime import datetime
@@ -535,6 +536,12 @@ def test_state_loss_recovers_exact_snapshot_instead_of_rebasing(tmp_path: Path) 
         current_equity=Decimal("180"),
         observed_at="2026-07-19T16:00:00+08:00",
     )
+    snapshots = sorted((data_dir / "trend_drawdown/snapshots").glob("*.json"))
+    assert len(snapshots) == 2
+    same_mtime_ns = snapshots[0].stat().st_mtime_ns
+    for snapshot in snapshots:
+        os.utime(snapshot, ns=(same_mtime_ns, same_mtime_ns))
+    assert {snapshot.stat().st_mtime_ns for snapshot in snapshots} == {same_mtime_ns}
     state_path = data_dir / "trend_drawdown/state.json"
     expected = json.loads(state_path.read_bytes())
     state_path.unlink()

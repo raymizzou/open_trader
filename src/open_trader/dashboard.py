@@ -4178,12 +4178,30 @@ def _trend_action_executions(
         revision_key = max(
             revision_key, (revision.st_mtime_ns, revision.st_ctime_ns)
         )
+    child_signature: list[tuple[str, int, int, int, int]] = []
+    for child in root.glob("*/*.json"):
+        try:
+            child_stat = child.stat()
+            relative_name = str(child.relative_to(root))
+        except (OSError, ValueError):
+            continue
+        child_signature.append(
+            (
+                relative_name,
+                child_stat.st_ino,
+                child_stat.st_mtime_ns,
+                child_stat.st_ctime_ns,
+                child_stat.st_size,
+            )
+        )
+    child_signature.sort()
     cached = _trend_action_executions_cached(
         str(data_dir.resolve()),
         market,
         execution_date,
         report_sha256,
         *revision_key,
+        tuple(child_signature),
     )
     return copy.deepcopy(cached)
 
@@ -4264,8 +4282,9 @@ def _trend_action_executions_cached(
     report_sha256: str,
     root_mtime_ns: int,
     root_ctime_ns: int,
+    child_signature: tuple[tuple[str, int, int, int, int], ...],
 ) -> dict[tuple[str, str], dict[str, Any]]:
-    del root_mtime_ns, root_ctime_ns
+    del root_mtime_ns, root_ctime_ns, child_signature
     return _trend_action_executions_uncached(
         Path(data_dir),
         market=market,
@@ -4903,15 +4922,16 @@ def _latest_decision_plans_for_markets(
 def _load_decision_plans_file(path: Path) -> tuple[dict[str, Any], ...]:
     stat = path.stat()
     return _load_decision_plans_cached(
-        str(path.resolve()), stat.st_mtime_ns, stat.st_size
+        str(path.resolve()), stat.st_mtime_ns, stat.st_size,
+        stat.st_ino, stat.st_ctime_ns,
     )
 
 
 @lru_cache(maxsize=8)
 def _load_decision_plans_cached(
-    path: str, mtime_ns: int, size: int,
+    path: str, mtime_ns: int, size: int, inode: int, ctime_ns: int,
 ) -> tuple[dict[str, Any], ...]:
-    del mtime_ns, size
+    del mtime_ns, size, inode, ctime_ns
     return tuple(load_decision_plans(Path(path)))
 
 

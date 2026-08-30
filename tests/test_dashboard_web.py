@@ -35,22 +35,110 @@ from tests.test_dashboard import (
 )
 
 
-def test_acceptance_gate_runs_prediction_playwright() -> None:
+def test_acceptance_gate_is_backend_only_and_production_smoke_owns_playwright() -> None:
     makefile = (Path(__file__).resolve().parents[1] / "Makefile").read_text(
         encoding="utf-8"
     )
 
-    assert 'OPEN_TRADER_PYTHON="$(PYTHON_BIN)"' in makefile
     normalized = " ".join(re.sub(r"\\\s*\n", " ", makefile).split())
-    assert (
-        "npm exec playwright test tests/e2e/prediction-market.spec.ts "
-        "--project=chromium"
-    ) in normalized
+    acceptance_plan = subprocess.run(
+        ["make", "-n", "acceptance"],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    normalized_acceptance = " ".join(
+        re.sub(r"\\\s*\n", " ", acceptance_plan).split()
+    )
 
-    acceptance = makefile.split("\nacceptance:\n", 1)[1]
-    playwright_index = acceptance.index("npm exec playwright test")
-    dashboard_index = acceptance.index("open_trader.dashboard_acceptance")
-    assert playwright_index < dashboard_index
+    assert "acceptance: candidate-acceptance" in normalized
+    assert '-m "not pressure and not browser"' in normalized_acceptance
+    assert 'acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"' in normalized_acceptance
+    assert all(
+        token not in normalized_acceptance
+        for token in (
+            "playwright",
+            "dashboard_acceptance",
+            "launchd",
+            "launchctl",
+            "install_",
+            "outage",
+            "production",
+            "8766",
+            "8767",
+            "8768",
+            "8769",
+        )
+    )
+
+    production_smoke = makefile.split("\nproduction-smoke:\n", 1)[1]
+    assert 'PYTHONSAFEPATH=1 PYTHONPATH="$$expected_root:$$expected_root/src"' in production_smoke
+    assert 'pytest -q -m browser' in production_smoke
+    assert '$(REPOSITORY_ROOT)/node_modules/.bin/playwright" test tests/e2e/production-smoke.spec.ts' in production_smoke
+
+
+def test_production_smoke_blocks_unsafe_requests_and_rechecks_submission_state() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    makefile = (repo_root / "Makefile").read_text(encoding="utf-8")
+    production_smoke = makefile.split("\nproduction-smoke:\n", 1)[1]
+    normalized = " ".join(re.sub(r"\\\s*\n", " ", production_smoke).split())
+    smoke = (repo_root / "tests/e2e/production-smoke.spec.ts").read_text(
+        encoding="utf-8"
+    )
+    browser_position = normalized.index(
+        'playwright" test tests/e2e/production-smoke.spec.ts'
+    )
+    guard_start = smoke.find("page.route('**/*'")
+    goto_start = smoke.find("page.goto")
+    route_guard = smoke[guard_start:goto_start] if guard_start >= 0 and goto_start >= 0 else ""
+    post_browser_state = re.search(
+        r'(\w+)="\$\$\(curl -fsS --max-time 10 "http://127\.0\.0\.1:8769/api/prediction-arbitrage/state',
+        normalized[browser_position:],
+    )
+    post_browser_state_position = (
+        browser_position + post_browser_state.start()
+        if post_browser_state
+        else -1
+    )
+    post_browser_call = (
+        f'if submission_baseline_matches "$${post_browser_state.group(1)}"; then'
+        if post_browser_state
+        else ""
+    )
+    call_positions = [
+        match.start()
+        for match in re.finditer(r"\bsubmission_baseline_matches \"", normalized)
+    ]
+    post_browser_call_position = (
+        normalized.find(post_browser_call.removeprefix("if "), post_browser_state_position)
+        if post_browser_call
+        else -1
+    )
+    required = (
+        "page.route('**/*'" in smoke,
+        guard_start < goto_start,
+        all(method in route_guard for method in ("GET", "HEAD", "OPTIONS")),
+        "route.continue()" in route_guard,
+        "unsafeMethods.push(method)" in route_guard,
+        "route.abort('blockedbyclient')" in route_guard,
+        0 <= route_guard.find("route.continue()")
+        < route_guard.find("unsafeMethods.push(method)")
+        < route_guard.find("route.abort('blockedbyclient')"),
+        "expect(unsafeMethods).toEqual([])" in smoke,
+        "submission_baseline_matches()" in normalized,
+        len(call_positions) == 2,
+        call_positions[0] < browser_position < call_positions[1],
+        post_browser_state is not None,
+        post_browser_state_position >= browser_position,
+        post_browser_state_position < post_browser_call_position == call_positions[1],
+        'keys=("current_execution", "last_execution")' in normalized,
+        '("execution_id", "id", "status", "state", "result", "order_ids", "legs")'
+        in normalized,
+        "else echo \"submission baseline: BLOCKED\"; status=1; fi"
+        in normalized[call_positions[1]:],
+    )
+    assert all(required)
 
 
 def _controller_status(*, heartbeat_at: str) -> dict[str, object]:
@@ -725,7 +813,7 @@ def test_dashboard_uses_latest_action_event_across_timezone_offsets(
 
 
 def test_dashboard_refreshes_cached_execution_when_action_event_is_appended(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from open_trader.dashboard import _trend_action_executions
 
@@ -741,6 +829,15 @@ def test_dashboard_refreshes_cached_execution_when_action_event_is_appended(
         "status": "submitted",
         "recorded_at": "2026-08-04T09:30:00+08:00",
     }), encoding="utf-8")
+    stable_directory_stat = root.stat()
+    real_stat = Path.stat
+
+    def stable_directory_metadata(path: Path, *args: object, **kwargs: object) -> object:
+        if path in {root, root / "key"}:
+            return stable_directory_stat
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stable_directory_metadata)
     assert _trend_action_executions(
         tmp_path, market="HK", execution_date="2026-08-04",
         report_sha256="a" * 64,
@@ -7243,6 +7340,7 @@ console.log("ok");
     assert "ok" in output
 
 
+@pytest.mark.browser
 def test_dashboard_execution_status_summary_is_a_mobile_touch_target() -> None:
     from playwright import sync_api as playwright_api
     rendered = json.loads(run_dashboard_js(r'''
@@ -7270,6 +7368,7 @@ console.log(JSON.stringify(renderTrendReportWorkspace(report)));
         browser.close()
 
 
+@pytest.mark.browser
 def test_dashboard_controller_card_is_responsive_at_375px() -> None:
     playwright_api = pytest.importorskip("playwright.sync_api")
     rendered = json.loads(run_dashboard_js(r'''
@@ -8160,6 +8259,7 @@ console.log(JSON.stringify({
     assert "<main" not in rendered["embeddedReview"]
 
 
+@pytest.mark.browser
 def test_dashboard_account_view_dom_at_375px() -> None:
     playwright_api = pytest.importorskip("playwright.sync_api")
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
@@ -9451,6 +9551,7 @@ console.log("ok");
     assert "ok" in output
 
 
+@pytest.mark.browser
 def test_dashboard_risk_summary_and_candidate_cards_fit_375px() -> None:
     playwright_api = pytest.importorskip("playwright.sync_api")
     rendered = json.loads(run_dashboard_js(r'''

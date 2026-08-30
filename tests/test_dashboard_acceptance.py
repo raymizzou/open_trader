@@ -297,8 +297,6 @@ def test_make_acceptance_excludes_external_prediction_live_registry() -> None:
         text=True,
     ).stdout
     normalized = " ".join(re.sub(r"\\\s*\n", " ", plan).split())
-    playwright = "npm exec playwright test tests/e2e/prediction-market.spec.ts --project=chromium"
-    dashboard = "open_trader.dashboard_acceptance"
     forbidden = (
         "open_trader.prediction_arbitrage_acceptance",
         "SKIP_POLYMARKET_LIVE",
@@ -307,14 +305,23 @@ def test_make_acceptance_excludes_external_prediction_live_registry() -> None:
         "PREDICTION_ACCEPTANCE_BROWSER_NONCE_FILE",
         "PREDICTION_ACCEPTANCE_REVIEW_URL",
         "config/prediction_arbitrage.json",
+        "playwright",
+        "launchd",
+        "launchctl",
+        "install_",
+        "outage",
+        "8766",
+        "8767",
+        "8768",
+        "8769",
     )
 
-    assert playwright in normalized
-    assert normalized.index(playwright) < normalized.index(dashboard)
+    assert '-k "not LIVE"' in normalized
+    assert '-m "not pressure and not browser"' in normalized
     assert all(token not in normalized for token in forbidden)
 
 
-def test_make_acceptance_refreshes_main_runtime_without_repeating_full_suite() -> None:
+def test_make_acceptance_never_refreshes_or_mutates_runtime() -> None:
     repo_root = Path(__file__).parents[1]
     plan = subprocess.run(
         ["make", "-n", "acceptance"],
@@ -324,46 +331,35 @@ def test_make_acceptance_refreshes_main_runtime_without_repeating_full_suite() -
         text=True,
     ).stdout
 
-    pytest_python = re.search(r'--python "([^"]+)"', plan).group(1)
-    plan_lines = [line.strip() for line in plan.splitlines() if line.strip()]
-    expected_lines = [
-        f'test "$(git -C "{repo_root}" branch --show-current)" = main',
-        f'test -z "$(git -C "{repo_root}" status --porcelain)"',
-        f'cd "{repo_root}" && scripts/install_account_release.sh --dry-run --repo-root "{repo_root}" --python "{pytest_python}"',
-        f'cd "{repo_root}" && scripts/install_dashboard_launchd.sh --dry-run --repo-root "{repo_root}"',
-        f'cd "{repo_root}" && scripts/install_daily_premarket_launchd.sh --dry-run --config "{repo_root}/config/daily_premarket.env" --trend-only --market all',
-        f'cd "{repo_root}" && scripts/install_account_release.sh --repo-root "{repo_root}" --python "{pytest_python}" --evidence-out "{repo_root}/logs/account_release/acceptance.json"',
-        f'cd "{repo_root}" && scripts/install_dashboard_launchd.sh --repo-root "{repo_root}"',
-        f'cd "{repo_root}" && scripts/install_daily_premarket_launchd.sh --config "{repo_root}/config/daily_premarket.env" --trend-only --market all',
-    ]
-    matched_lines = [
-        (position, line)
-        for position, line in enumerate(plan_lines)
-        if line in expected_lines
-    ]
-    live_positions = [
-        next(position for position, line in enumerate(plan_lines) if marker in line)
-        for marker in ("npm exec playwright", "open_trader.dashboard_acceptance")
-    ]
+    normalized = " ".join(re.sub(r"\\\s*\n", " ", plan).split())
 
-    assert (
-        [line for _, line in matched_lines] == expected_lines
-        and all(plan_lines.count(line) == 1 for line in expected_lines)
-        and matched_lines[-1][0] < min(live_positions)
-        and not any(
-            re.search(r"(?:^|\s)-m\s+[\"']?pytest[\"']?(?=\s|$)", line)
-            for line in plan_lines
-        )
-        and all(
-            next(position for position, line in enumerate(plan_lines) if line == expected)
-            < next(position for position, line in enumerate(plan_lines) if marker in line)
-            for expected in expected_lines[:3]
-            for marker in ("npm exec playwright", "open_trader.dashboard_acceptance")
+    assert normalized.count("docker build") == 1
+    assert normalized.count("docker run") == 1
+    assert '-m "not pressure and not browser"' in normalized
+    assert 'acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"' in normalized
+    assert all(
+        token not in normalized
+        for token in (
+            "branch --show-current",
+            "git checkout",
+            "git worktree",
+            "launchd",
+            "launchctl",
+            "install_",
+            "outage",
+            "dashboard_acceptance",
+            "playwright",
+            "production",
+            "8766",
+            "8767",
+            "8768",
+            "8769",
+            "config/",
         )
     )
 
 
-def test_default_gates_run_full_suite_once_before_merge_and_keep_explicit_pressure_target() -> None:
+def test_default_gates_run_backend_suite_and_keep_explicit_pressure_and_browser_targets() -> None:
     repo_root = Path(__file__).parents[1]
     plans = {
         target: subprocess.run(
@@ -403,11 +399,10 @@ def test_default_gates_run_full_suite_once_before_merge_and_keep_explicit_pressu
     ]
 
     assert (
-        '-m "not pressure"' in normalized["test"]
-        and not re.search(
-            r"(?:^|\s)-m\s+[\"']?pytest[\"']?(?=\s|$)",
-            normalized["acceptance"],
-        )
+        '-m "not pressure and not browser"' in normalized["test"]
+        and '-m "not pressure and not browser"' in normalized["acceptance"]
+        and 'acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"'
+        in normalized["acceptance"]
         and '-m pressure' in normalized["test-pressure"]
         and collected
         == [
@@ -476,31 +471,34 @@ def serialized_trend_position() -> dict[str, object]:
     }
 
 
-def test_make_acceptance_allows_an_isolated_dashboard_url_and_log() -> None:
+def test_candidate_acceptance_owns_container_backend_gate() -> None:
     makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
 
     assert "WORKTREE_ROOT := $(CURDIR)" in makefile
     assert "REPOSITORY_ROOT :=" in makefile
-    assert "PYTHONSAFEPATH=1" in makefile
-    assert 'DASHBOARD_URL ?= http://127.0.0.1:8766' in makefile
-    assert (
-        'DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/frontend_gateway/launchd.out.log'
-        in makefile
-    )
-    assert 'LEGACY_DASHBOARD_URL ?= http://127.0.0.1:8767' in makefile
-    assert (
-        'LEGACY_DASHBOARD_LOG ?= $(WORKTREE_ROOT)/logs/legacy_dashboard/launchd.out.log'
-        in makefile
-    )
-    assert 'PYTHON_BIN ?=' in makefile
-    assert '"$(PYTHON_BIN)" -m pytest -q' in makefile
-    assert "acceptance: test" not in makefile
-    assert "EXPECTED_CN" not in makefile
-    assert '--url "$(DASHBOARD_URL)"' in makefile
-    assert '--log "$(DASHBOARD_LOG)"' in makefile
-    assert "--expected-cn" not in makefile
-    assert "WAIT_SECONDS" not in makefile
-    assert "--wait-seconds" not in makefile
+    assert "candidate-acceptance:" in makefile
+    assert "acceptance: candidate-acceptance" in makefile
+    candidate_recipe = makefile.split("candidate-acceptance:", 1)[1].split(
+        "test-pressure:", 1
+    )[0]
+    assert "BACKEND_PYTEST :=" in makefile
+    assert "$(DOCKER_RUN) $(BACKEND_PYTEST) $(TEST)" in makefile
+    assert candidate_recipe.count("$(DOCKER_BUILD)") == 1
+    assert candidate_recipe.count("$(DOCKER_RUN)") == 1
+    assert "$(MAKE) test" not in candidate_recipe
+    assert candidate_recipe.count("$(BACKEND_PYTEST)") == 2
+    assert "sh -c" in candidate_recipe
+    assert 'acceptance/test_prediction_arbitrage_scenarios.py -k "not LIVE"' in candidate_recipe
+    first_backend = candidate_recipe.index("$(BACKEND_PYTEST)")
+    separator = candidate_recipe.index("&&")
+    second_backend = candidate_recipe.rindex("$(BACKEND_PYTEST)")
+    assert first_backend < separator < second_backend
+    assert "--init" in makefile
+    assert "--network none" in makefile
+    assert "--cap-drop ALL" in makefile
+    assert "--security-opt no-new-privileges" in makefile
+    assert "OPEN_TRADER_SMOKE_URL" not in candidate_recipe
+    assert "launchd" not in candidate_recipe
 
 
 def test_browser_ignores_unattributed_http_errors_checked_by_response_handler() -> None:
@@ -1135,18 +1133,51 @@ def test_acceptance_rejects_listener_cwd_and_running_sha(
     assert any("运行 Git SHA" in error for error in errors)
 
 
-def test_make_acceptance_wires_gateway_and_legacy_runtime_logs() -> None:
+def test_production_smoke_checks_each_runtime_log_and_health_boundary() -> None:
     makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
 
-    assert "logs/frontend_gateway/launchd.out.log" in makefile
-    assert "LEGACY_DASHBOARD_URL ?= http://127.0.0.1:8767" in makefile
-    assert "logs/legacy_dashboard/launchd.out.log" in makefile
-    assert 'ACCOUNT_API_URL ?= http://127.0.0.1:8768' in makefile
-    assert 'ACCOUNT_API_LOG ?= $(WORKTREE_ROOT)/logs/account_api/launchd.out.log' in makefile
-    assert '--legacy-url "$(LEGACY_DASHBOARD_URL)"' in makefile
-    assert '--legacy-log "$(LEGACY_DASHBOARD_LOG)"' in makefile
-    assert '--account-url "$(ACCOUNT_API_URL)"' in makefile
-    assert '--account-log "$(ACCOUNT_API_LOG)"' in makefile
+    for log in (
+        "frontend_gateway/launchd.err.log",
+        "legacy_dashboard/launchd.err.log",
+        "account_api/launchd.err.log",
+        "prediction_service/launchd.err.log",
+    ):
+        assert f'logs/{log}' in makefile
+    assert 'check_health "gateway health"' in makefile
+    assert 'check_health "legacy health"' in makefile
+    assert 'check_health "account health"' in makefile
+    assert 'check_health "prediction health"' in makefile
+    assert 'OPEN_TRADER_SMOKE_URL="$(DASHBOARD_URL)"' in makefile
+    assert "PRE_DEPLOY_SUBMISSION_BASELINE" in makefile
+    assert "--legacy-url" not in makefile
+    assert "--legacy-log" not in makefile
+    assert "--account-log" not in makefile
+
+
+def test_production_smoke_binds_checks_to_release_and_runtime_roots() -> None:
+    makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
+    production_smoke = makefile.split("\nproduction-smoke:\n", 1)[1]
+    normalized = " ".join(re.sub(r"\\\s*\n", " ", production_smoke).split())
+
+    release_logs = tuple(
+        f'"$$expected_root/logs/{name}/launchd.err.log"'
+        for name in ("frontend_gateway", "legacy_dashboard", "account_api")
+    )
+    runtime_log = '"$$expected_runtime_root/logs/prediction_service/launchd.err.log"'
+    required = (
+        "expected_runtime_root='$(EXPECTED_RUNTIME_ROOT)';" in normalized,
+        'case "$$expected_runtime_root" in /*) ;; *)' in normalized,
+        'if [ ! -d "$$expected_runtime_root" ]' in normalized,
+        'expected_runtime_root="$$(cd "$$expected_runtime_root" && pwd -P)"' in normalized,
+        'if (cd "$$expected_root" && PYTHONSAFEPATH=1 PYTHONPATH="$$expected_root:$$expected_root/src"' in normalized,
+        'if (cd "$$expected_root" && OPEN_TRADER_SMOKE_URL=' in normalized,
+        all(log in normalized for log in release_logs),
+        runtime_log in normalized,
+        '"$$expected_root/logs/prediction_service/launchd.err.log"' not in normalized,
+        '(cd "$(WORKTREE_ROOT)" && PYTHONSAFEPATH=1' not in normalized,
+        '(cd "$(WORKTREE_ROOT)" && OPEN_TRADER_SMOKE_URL=' not in normalized,
+    )
+    assert all(required)
 
 
 def test_acceptance_main_rejects_same_gateway_and_legacy_pid(
@@ -7520,6 +7551,7 @@ def test_check_tiger_tab_selects_tiger_and_shows_only_its_section() -> None:
     assert page.max_visible_account_sections == 1
 
 
+@pytest.mark.browser
 def test_trend_holding_tabs_accept_one_table_per_nonempty_origin_section() -> None:
     from playwright.sync_api import sync_playwright
 
@@ -9374,14 +9406,18 @@ def test_account_snapshot_refresh_rejects_persistent_503() -> None:
     assert calls["count"] == dashboard_acceptance.ACCOUNT_SNAPSHOT_REFRESH_ATTEMPTS
 
 
-def test_make_acceptance_allows_a_verified_shared_interpreter() -> None:
+def test_container_and_runtime_gates_keep_python_interpreter_selection_explicit() -> None:
     makefile = (Path(__file__).parents[1] / "Makefile").read_text(encoding="utf-8")
 
     assert (
         "PYTHON_BIN ?= $(if $(OPEN_TRADER_PYTHON),$(OPEN_TRADER_PYTHON),"
         "$(REPOSITORY_ROOT)/.venv/bin/python)"
     ) in makefile
-    assert 'OPEN_TRADER_PYTHON="$(PYTHON_BIN)"' in makefile
+    assert 'BACKEND_PYTEST := env PYTHONSAFEPATH=1 PYTHONPATH=/workspace:/workspace/src' in makefile
+    assert '$(DOCKER_RUN) $(BACKEND_PYTEST) $(TEST)' in makefile
+    assert '"$(PYTHON_BIN)" -m pytest -q -m pressure' in makefile
+    assert '"$(PYTHON_BIN)" -m open_trader' in makefile
+    assert 'OPEN_TRADER_PYTHON="$(PYTHON_BIN)"' not in makefile
 
 
 def test_account_cutover_runbook_verifies_shared_interpreter_and_final_gate() -> None:

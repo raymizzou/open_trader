@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import csv
 import json
+import os
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -9543,6 +9544,7 @@ def test_dashboard_caches_decision_plan_file_until_it_changes(
     assert first == second
 
     updated = dashboard_decision_plan("2026-07-14")
+    original_stat = latest_path.stat()
     publish_decision_plans(
         data_dir=data_dir,
         run_date="2026-07-14",
@@ -9550,6 +9552,13 @@ def test_dashboard_caches_decision_plan_file_until_it_changes(
         records=[updated],
         update_latest=True,
     )
+    replaced_stat = latest_path.stat()
+    assert replaced_stat.st_size == original_stat.st_size
+    os.utime(
+        latest_path,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    assert latest_path.stat().st_mtime_ns == original_stat.st_mtime_ns
     refreshed, _ = dashboard_module._latest_decision_plans_for_markets(
         data_dir, {"US"}
     )

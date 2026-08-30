@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from decimal import Decimal, getcontext
 from pathlib import Path
 
@@ -1306,6 +1307,12 @@ def test_recovery_restores_latest_sticky_pause_snapshot(tmp_path: Path) -> None:
         current_equity=Decimal("94"),
         observed_at="2026-07-21T16:00:00+08:00",
     )
+    snapshots = sorted((data_dir / "trend_drawdown/snapshots").glob("*.json"))
+    assert len(snapshots) == 2
+    same_mtime_ns = snapshots[0].stat().st_mtime_ns
+    for snapshot in snapshots:
+        os.utime(snapshot, ns=(same_mtime_ns, same_mtime_ns))
+    assert {snapshot.stat().st_mtime_ns for snapshot in snapshots} == {same_mtime_ns}
     state_path = data_dir / "trend_drawdown/state.json"
     state_path.unlink()
 

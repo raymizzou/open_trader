@@ -141,6 +141,59 @@ OPEN_TRADER_FUTU_PORT=11111
   --config config/daily_premarket.env
 ```
 
+## 开发与发布四阶段门禁
+
+四个阶段彼此独立；本地合并不等于部署：
+
+1. **Docker 开发**：`make test`（或 `make test TEST='tests/path.py::test_name'`）只构建
+   当前 worktree 专属的 Python/backend 镜像；镜像包含 Node 运行时和 `procps`，但不包含
+   npm、Python/JS Playwright、Chromium/浏览器资产，也没有宿主机挂载、网络、发布端口、
+   Docker socket、home 目录或凭据。容器运行 `-m 'not pressure and not browser'` backend
+   pytest，浏览器成本为零。
+2. **Candidate Acceptance**：`make candidate-acceptance` 只构建一次并运行 backend 目标，
+   依次执行排除 `pressure`、`browser` 的完整套件和同样排除这两类测试的
+   `acceptance/test_prediction_arbitrage_scenarios.py -k 'not LIVE'`。它绝不启动
+   Playwright、访问 macOS 或外部依赖，也不会把缺少 Keychain、Futu 或当前行情变成 skip
+   或 `BLOCKED`。成功以 `Candidate Acceptance: PASS` 结束，失败为
+   `Candidate Acceptance: FAIL`。`make acceptance` 是这个非变更目标的 Make 依赖别名，
+   绝不安装 launchd、做 outage 检查、读取生产或提交订单。
+3. **Host Readiness**：`make host-readiness` 只在宿主机组合既有 dry-run、status/
+   preflight、端口、存储和连接性读取，并检查 macOS 上仓库已有的
+   `node_modules/.bin/playwright` 与缓存 Chromium。它可以启动后立即关闭 headless Chromium，
+   但不会下载或安装任何内容；同时用 host Python Playwright 以
+   `channel='chrome'` 启动并关闭系统 Chrome，验证五个标记的 Python 浏览器回归用例所需的
+   浏览器。runner 或浏览器缺失即为 `BLOCKED`，最后输出 `READY` 或 `BLOCKED`，不会输出密钥。
+4. **精确 SHA 部署与 Smoke**：获得明确部署授权后，先保存提交基线，再按既有发布
+   runbook 部署完全相同的 accepted SHA，随后运行只读检查。它先核对 exact immutable
+   checkout 和已捕获的提交基线，然后运行五个标记的 host-Python 浏览器前置回归；接着
+   检查 health、PID/监听器、工作目录、提交基线和日志；只有这些运行时检查仍保持 clean，
+   才用
+   `OPEN_TRADER_SMOKE_URL="$DASHBOARD_URL"` 调用宿主机已有的 Playwright runner，且只运行
+   `tests/e2e/production-smoke.spec.ts`：
+
+   ```bash
+   curl -fsS http://127.0.0.1:8769/api/prediction-arbitrage/state |
+     .venv/bin/python -c 'import json,sys; p=json.load(sys.stdin); print(json.dumps({k:p.get(k) for k in ("current_execution","last_execution")}, sort_keys=True))' \
+     > /tmp/open-trader-submission-baseline.json
+
+   make production-smoke \
+     EXPECTED_SHA="$ACCEPTED_SHA" \
+     EXPECTED_ROOT=/absolute/path/to/immutable-detached-release \
+     EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime \
+     PRE_DEPLOY_SUBMISSION_BASELINE=/tmp/open-trader-submission-baseline.json
+   ```
+
+   `production-smoke` 强制要求 40 位十六进制 SHA、绝对路径的 clean detached immutable
+   checkout、已存在的绝对路径 shared runtime root，以及明确捕获的提交基线；host 测试和
+   Playwright spec 都从已验证的 release root 运行，prediction 错误日志从 shared runtime root
+   读取；浏览器导航前阻断写请求，Playwright 后再次核对提交基线。它读取 health、进程/监听器、
+   日志、当前执行和已部署 UI 证据，最后输出 `HEALTHY` 或 `ROLLBACK`；浏览器失败即为
+   `ROLLBACK`。它不会启动 fixture server、下载浏览器、部署、重启、回滚或下单。
+
+首次部署前，生产必须由人工一次性迁移到 clean、immutable 的 detached release
+checkout（例如在 accepted SHA 创建的 checkout）。这项一次性迁移是必需的，但不由
+`make`、验收、readiness 或 smoke 目标执行。
+
 ## 配置
 
 每日自动化的本地配置文件是：
@@ -486,19 +539,34 @@ curl -sS http://127.0.0.1:8766/api/dashboard | head -c 500
 ps aux | rg 'open_trader dashboard'
 ```
 
-Dashboard 行为改动不再在每次任务的本地合并或完成路径中同步运行统一验收门。
-完整验收由 `Open Trader acceptance guardian` cron job 在 clean local `main` 上每两小时
-定期执行；结果只适用于运行开始时的精确 Git SHA。现有完整验收命令仍为：
+Dashboard 行为改动不再触发宿主机统一验收门。`make acceptance` 现在只是
+Candidate Acceptance 的 Docker 别名：它只运行 Docker backend 的
+`-m 'not pressure and not browser'` 全量套件和同样排除这两类测试的固定预测场景套件，
+不启动 Playwright、不安装 launchd、不检查真实账户 outage、不读取生产，也不提交订单；成功
+输出 `Candidate Acceptance: PASS`，失败为 `Candidate Acceptance: FAIL`。五个真实 Python
+Chrome 回归用例由 macOS Smoke 的 `-m browser` 阶段负责。
+
+部署前必须先单独运行 `make host-readiness`，它只读既有 dry-run、status/preflight、
+端口、存储、连接性和缓存 Chromium 先决条件，并输出 `READY` 或 `BLOCKED`。本地 `main` 的
+`--ff-only` 合并不是部署，也不能用 curl 或单元测试替代这些阶段。
+
+第一次部署前，生产必须由人工一次性迁移到 clean、immutable 的 detached release
+checkout；该迁移不是本任务或任何 Make 目标执行的动作。明确授权后只部署
+Candidate 通过的精确 SHA，并先保存 `current_execution`/`last_execution` 的脱敏
+提交基线，再执行：
 
 ```bash
-make acceptance
+make production-smoke \
+  EXPECTED_SHA="$ACCEPTED_SHA" \
+  EXPECTED_ROOT=/absolute/path/to/immutable-detached-release \
+  EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime \
+  PRE_DEPLOY_SUBMISSION_BASELINE=/tmp/open-trader-submission-baseline.json
 ```
 
-它会运行全量测试，并检查真实 API 数据、一次真实账户与行情刷新、运行目录与
-Git SHA、错误日志，以及系统 Chrome 中的桌面和移动端 `A 股` / `东方财富`
-筛选流程。它不是合并到本地 `main` 或描述仓库改动完成的前置条件；但部署某个
-精确 SHA 仍必须先取得该 SHA 的 `PASS`，并获得显式部署授权。`FAIL` 或 `BLOCKED`
-会阻止 push/部署，不能用 curl 或单元测试替代。
+Production Smoke 要求已存在的绝对路径 shared runtime root；host 测试和 Playwright 从验证过的
+release root 运行，prediction 错误日志从 shared runtime root 读取，浏览器写请求会在导航前被阻断，
+并在 Playwright 后重新核对提交基线。它只读取 health、进程/监听器、日志和当前执行证据，最后输出
+`HEALTHY` 或 `ROLLBACK`；它不会部署、重启、回滚或下单。
 
 也可以用结构化检查确认 API 和 SOXX 决策事实是否存在：
 
@@ -687,9 +755,11 @@ PID、工作目录、Git SHA、phase、heartbeat、blocker 和 next check。回�
 停止全部趋势自动化，在自动化保持停止的状态下部署旧源码，用富途核对每个本地 intent；
 只有事实证明安全时，才能显式恢复旧 watcher。控制器可能仍存活时绝不能直接启动旧 watcher。
 
-最终 acceptance 返回 `PASS` 后，必须重新部署完全相同的 accepted SHA，不能把 acceptance
-进程本身当作部署。进入 accepted worktree，确认 SHA 和 clean 状态，再用共享配置重启三个
-控制器，并从完全相同的 worktree 重启仪表盘：
+Candidate Acceptance 返回 `PASS` 且 Host Readiness 返回 `READY` 后，才可在明确授权下部署
+完全相同的 accepted SHA；不能把验收进程本身当作部署。生产源码运行在 clean、immutable 的
+detached release checkout 中，因此 UI 缺陷由部署后的 Smoke 检出，稳定版本仍可独立回滚。
+进入该 checkout，确认 SHA 和 clean 状态，再用共享配置重启三个
+控制器，并从完全相同的 checkout 重启仪表盘：
 
 ```bash
 cd /Users/ray/projects/open_trader/.worktrees/trend-market-controller-spec

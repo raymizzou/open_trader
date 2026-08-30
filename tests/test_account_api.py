@@ -1147,18 +1147,21 @@ def test_live_parity_blocks_when_raw_publication_never_pins(
 ) -> None:
     data_dir = tmp_path / "data"
     _write_publication(data_dir)
-    real_read = Path.read_bytes
     counter = 0
 
-    def changing(path: Path) -> bytes:
-        nonlocal counter
-        body = real_read(path)
-        if path.name == "account_sync_state.json":
-            counter += 1
-            return body + str(counter).encode()
-        return body
+    snapshot = load_account_snapshot(data_dir, api_git_sha=SHA, now=NOW)
 
-    monkeypatch.setattr(account_api, "_read_parity_bytes", changing, raising=False)
+    def changing(_url: str) -> tuple[int, dict[str, object], str]:
+        nonlocal counter
+        counter += 1
+        state_path = data_dir / "latest/account_sync_state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert isinstance(state, dict)
+        state["parity_probe"] = counter
+        write_json_atomic(state_path, state)
+        return HTTPStatus.OK, snapshot.payload, snapshot.etag
+
+    monkeypatch.setattr(account_api, "_fetch_snapshot", changing, raising=False)
 
     result = account_api.check_account_api_parity(data_dir)
 

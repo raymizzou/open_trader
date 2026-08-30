@@ -44,4 +44,5 @@ testpaths = ["tests"]
 addopts = "-ra"
 markers = [
     "pressure: tests intentionally excluded from routine gates",
+    "browser: tests requiring a host browser during Production Smoke",
 ]

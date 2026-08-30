@@ -6700,10 +6700,10 @@ def test_build_report_rejects_any_injected_snapshot_parameter_drift(
 
 def test_build_report_upgrades_exact_repository_legacy_snapshot() -> None:
     legacy = json.loads(
-        Path("data/trend_review/daily/CN/2026-07-16.json").read_text(
+        Path("tests/fixtures/legacy_strategy_snapshots.json").read_text(
             encoding="utf-8"
         )
-    )["strategy_snapshot"]
+    )["CN"]
     pools = tuple(legacy["parameters"]["candidate_pool_ids"])
 
     built = build_report(

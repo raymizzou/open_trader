@@ -378,14 +378,16 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
     state_entered = threading.Event()
     preview_entered = threading.Event()
     preview_reentered = threading.Event()
-    release_slots = threading.Semaphore(0)
+    release_state = threading.Event()
+    release_preview = threading.Event()
+    release_replacement = threading.Event()
 
     def blocked_state_payload(**_kwargs: object) -> dict[str, object]:
         with counts_lock:
             counts["state"] += 1
             if counts["state"] == 4:
                 state_entered.set()
-        assert release_slots.acquire(timeout=60)
+        assert release_state.wait(timeout=60)
         return {"state": "blocked"}
 
     def blocked_preview(opportunity_id: str) -> dict[str, object]:
@@ -395,7 +397,8 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
                 preview_entered.set()
             if counts["preview"] == 5:
                 preview_reentered.set()
-        assert release_slots.acquire(timeout=60)
+            release = release_preview if counts["preview"] <= 4 else release_replacement
+        assert release.wait(timeout=60)
         return {
             "state": "previewed",
             "preview_id": "preview-1",
@@ -447,25 +450,20 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
                 ]
                 assert preview_entered.wait(timeout=15)
 
-                overflow_get = clients.submit(
-                    _response_with_headers,
-                    base + "/api/prediction-arbitrage/state",
-                    timeout=15,
-                )
-                overflow_post = clients.submit(
-                    _response_with_headers,
-                    _production_request(
-                        base,
-                        "/api/prediction-arbitrage/preview",
-                        data=b'{"opportunity_id":"opp-1"}',
-                    ),
-                    timeout=15,
-                )
                 assert server.http_load_snapshot()["active"] == 8  # type: ignore[attr-defined]
 
                 for status, payload, headers in (
-                    overflow_get.result(timeout=60),
-                    overflow_post.result(timeout=60),
+                    _response_with_headers(
+                        base + "/api/prediction-arbitrage/state", timeout=15
+                    ),
+                    _response_with_headers(
+                        _production_request(
+                            base,
+                            "/api/prediction-arbitrage/preview",
+                            data=b"",
+                        ),
+                        timeout=15,
+                    ),
                 ):
                     assert status == 503
                     assert payload == {"error": "prediction service busy"}
@@ -474,7 +472,11 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
                 assert counts == {"state": 4, "auth": 4, "body": 4, "preview": 4}
                 assert server.http_load_snapshot()["overload_rejections"] == 2  # type: ignore[attr-defined]
 
-                release_slots.release()
+                release_preview.set()
+                deadline = time.monotonic() + 5
+                while server.http_load_snapshot()["active"] != 4 and time.monotonic() < deadline:  # type: ignore[attr-defined]
+                    time.sleep(0.01)
+                assert server.http_load_snapshot()["active"] == 4  # type: ignore[attr-defined]
                 replacement = clients.submit(
                     _response,
                     _production_request(
@@ -485,8 +487,8 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
                 )
                 assert preview_reentered.wait(timeout=15)
 
-                for _ in range(8):
-                    release_slots.release()
+                release_state.set()
+                release_replacement.set()
                 assert [future.result(timeout=60)[0] for future in state_calls] == [200] * 4
                 assert [future.result(timeout=60)[0] for future in preview_calls] == [200] * 4
                 assert replacement.result(timeout=60)[0] == 200
@@ -505,8 +507,9 @@ def test_mixed_http_capacity_shares_slots_and_exposes_health_load(
                     "history_cache_misses": 0,
                 }
         finally:
-            for _ in range(16):
-                release_slots.release()
+            release_state.set()
+            release_preview.set()
+            release_replacement.set()
 
 
 def test_shadow_health_has_the_read_only_identity() -> None:
@@ -730,7 +733,7 @@ def test_history_wait_timeout_keeps_the_leader_running(
                     _response,
                     base + "/api/prediction-arbitrage/history?" + query,
                 )
-                assert follower.result(timeout=5) == (
+                assert follower.result(timeout=1) == (
                     503,
                     {"error": "prediction history unavailable"},
                 )

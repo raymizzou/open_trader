@@ -14839,9 +14839,9 @@ def strategy_snapshot(market: str = "CN", version: str = "v1") -> dict[str, obje
 def test_repository_legacy_snapshots_adapt_without_rewrite(
     market: str, trading_date: str,
 ) -> None:
-    path = Path(f"data/trend_review/daily/{market}/{trading_date}.json")
+    path = Path("tests/fixtures/legacy_strategy_snapshots.json")
     original = path.read_bytes()
-    snapshot = json.loads(original)["strategy_snapshot"]
+    snapshot = json.loads(original)[market]
 
     normalized = trend_review.normalize_trend_strategy_snapshot(
         snapshot, market
@@ -14859,10 +14859,10 @@ def test_separate_fact_legacy_snapshot_adapts_without_rewrite(
     tmp_path: Path,
 ) -> None:
     legacy = json.loads(
-        Path("data/trend_review/daily/CN/2026-07-16.json").read_text(
+        Path("tests/fixtures/legacy_strategy_snapshots.json").read_text(
             encoding="utf-8"
         )
-    )["strategy_snapshot"]
+    )["CN"]
     discipline_path = trend_review.freeze_discipline_fact(
         tmp_path, "CN", "2026-07-16", "100000", [], legacy
     )
@@ -14904,10 +14904,10 @@ def test_separate_fact_legacy_snapshot_adapts_without_rewrite(
 
 def test_legacy_snapshot_adapter_rejects_unapproved_parameter_drift() -> None:
     snapshot = json.loads(
-        Path("data/trend_review/daily/CN/2026-07-16.json").read_text(
+        Path("tests/fixtures/legacy_strategy_snapshots.json").read_text(
             encoding="utf-8"
         )
-    )["strategy_snapshot"]
+    )["CN"]
     snapshot["parameters"]["position_limit"] = 9
 
     with pytest.raises(ValueError, match="known legacy rules"):

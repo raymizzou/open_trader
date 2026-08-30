@@ -3591,7 +3591,12 @@ def test_auto_submit_safe_dust_emits_residual_event_without_success(
     accepted = service.notify_ready_opportunity(
         "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
     )
-    final = wait_until_terminal(service, str(accepted["execution_id"]))
+    execution_id = str(accepted["execution_id"])
+    final = wait_until_terminal(service, execution_id)
+    deadline = time.monotonic() + 3
+    while execution_id in service._threads and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert execution_id not in service._threads
 
     assert final["state"] == "holding_to_resolution"
     titles = [title for title, _message in feishu.messages]

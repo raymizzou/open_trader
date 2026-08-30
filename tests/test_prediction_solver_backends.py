@@ -1526,9 +1526,19 @@ def test_vipr_helper_maps_missing_certificate_and_checker_timeout_to_failure(tmp
 
     original = tmp_path / "original.vipr"
     original.write_bytes(b"corrupt")
-    comp = _write_executable(tmp_path / "viprcomp", "#!/usr/bin/env python3\nimport sys\n")
-    chk = _write_executable(tmp_path / "viprchk", "#!/usr/bin/env python3\nimport time\ntime.sleep(10)\n")
-    timed_out = check_vipr_certificate(original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=10)
+    comp = _write_executable(
+        tmp_path / "viprcomp",
+        "#!/usr/bin/env python3\nfrom pathlib import Path\nimport sys\n"
+        "source = Path(sys.argv[-1])\n"
+        "source.with_name(source.stem + '_complete' + source.suffix).write_bytes(source.read_bytes() + b' completed')\n",
+    )
+    chk = _write_executable(
+        tmp_path / "viprchk",
+        "#!/usr/bin/env python3\nimport time\ntime.sleep(2)\n",
+    )
+    timed_out = check_vipr_certificate(
+        original, tmp_path, viprcomp=str(comp), viprchk=str(chk), timeout_ms=1_000
+    )
     assert timed_out.checker_succeeded is False
     assert timed_out.checker_exit_code is None
     assert timed_out.error == "VIPR subprocess timed out"

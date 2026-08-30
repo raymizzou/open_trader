@@ -1,0 +1,66 @@
+FROM python:3.12-slim AS dev
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    OPENSSL_armcap=0 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TZ=Asia/Shanghai \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
+
+WORKDIR /workspace
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y bash git zsh make nodejs procps \
+    && printf '%s\n' \
+        '#!/usr/local/bin/python3' \
+        'import plistlib' \
+        'import sys' \
+        '' \
+        'if len(sys.argv) != 3 or sys.argv[1] != "-lint":' \
+        '    raise SystemExit(1)' \
+        'try:' \
+        '    with open(sys.argv[2], "rb") as stream:' \
+        '        plistlib.load(stream)' \
+        'except (OSError, plistlib.InvalidFileException, ValueError):' \
+        '    raise SystemExit(1)' \
+        'print(f"{sys.argv[2]}: OK")' \
+        > /usr/bin/plutil \
+    && chmod 0755 /usr/bin/plutil \
+    && mkdir -p /usr/libexec \
+    && printf '%s\n' \
+        '#!/usr/local/bin/python3' \
+        'import plistlib' \
+        'import sys' \
+        '' \
+        'if len(sys.argv) != 4 or sys.argv[1] != "-c" or sys.argv[2] != "Print :WorkingDirectory":' \
+        '    raise SystemExit(1)' \
+        'try:' \
+        '    with open(sys.argv[3], "rb") as stream:' \
+        '        value = plistlib.load(stream).get("WorkingDirectory")' \
+        'except (OSError, plistlib.InvalidFileException, ValueError):' \
+        '    raise SystemExit(1)' \
+        'if not isinstance(value, str):' \
+        '    raise SystemExit(1)' \
+        'print(value)' \
+        > /usr/libexec/PlistBuddy \
+    && chmod 0755 /usr/libexec/PlistBuddy \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install dependencies from stable metadata first; source edits only rebuild
+# the small editable-install layer below.
+COPY pyproject.toml /tmp/open-trader-metadata/pyproject.toml
+COPY src/open_trader/__init__.py /tmp/open-trader-metadata/src/open_trader/__init__.py
+RUN python -m venv "$VIRTUAL_ENV" \
+    && python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir -e "/tmp/open-trader-metadata" "pytest>=8.0"
+
+COPY . /workspace
+RUN python -m pip install --no-cache-dir --no-deps -e . \
+    && git init --quiet /workspace \
+    && git -C /workspace config user.name "open-trader-test" \
+    && git -C /workspace config user.email "open-trader-test@example.invalid" \
+    && git -C /workspace add -A \
+    && GIT_AUTHOR_DATE="2026-01-01T00:00:00+00:00" \
+       GIT_COMMITTER_DATE="2026-01-01T00:00:00+00:00" \
+       git -C /workspace commit --quiet --allow-empty -m "Synthetic test snapshot"

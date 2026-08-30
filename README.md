@@ -162,6 +162,73 @@ Run one real daily check for a market:
   --config config/daily_premarket.env
 ```
 
+## Development and release gates
+
+Use four explicit stages; a local merge is not a deployment:
+
+1. **Docker dev** — `make test` (or `make test TEST='tests/path.py::test_name'`) builds
+   the worktree-specific Python/backend image and runs the backend pytest suite
+   with `-m 'not pressure and not browser'`. The image includes the Node runtime
+   and `procps`, but excludes npm, Python/JS Playwright, Chromium/browser assets,
+   host mounts, network, published ports, Docker socket, home directory, and
+   credentials. It has zero browser cost.
+2. **Candidate Acceptance** — `make candidate-acceptance` builds once and runs
+   only the backend target: the full suite with `pressure` and `browser` excluded,
+   then `acceptance/test_prediction_arbitrage_scenarios.py -k 'not LIVE'` with
+   the same marker exclusions. It never
+   starts Playwright, accesses macOS or external dependencies, or converts
+   missing Keychain, Futu, or current-market state into a skip or `BLOCKED`.
+   A successful Candidate run ends with `Candidate Acceptance: PASS`; a failed
+   run is `Candidate Acceptance: FAIL`. `make acceptance` is a Make dependency
+   alias for this non-mutating target and performs no launchd install, outage
+   check, production read, or order submission.
+3. **Host Readiness** — `make host-readiness` is a separate host-only,
+   read-only collection of existing dry-runs, status/preflight diagnostics,
+   port/storage checks, connectivity reads, and a macOS browser prerequisite
+   check. The latter uses the existing `node_modules/.bin/playwright` package
+   and cached Chromium, may launch and immediately close headless Chromium, and
+   never downloads or installs anything. It also launches and closes host Python
+   Playwright with system Chrome (`channel='chrome'`) for the five marked browser
+   regressions. A missing runner/browser yields `BLOCKED`; the gate ends with
+   `READY` or `BLOCKED` and never prints secrets.
+4. **Exact-SHA deploy and Smoke** — after Host Readiness is `READY` and explicit deployment authorization,
+   capture the pre-deploy submission state and deploy the exact accepted SHA
+   using the existing release runbook. Then run the read-only smoke check. It
+   first validates the exact immutable checkout and captured submission
+   baseline, then runs the five marked host-Python browser prerequisites. It
+   next checks health, PID/listener, cwd, submission baseline, and logs; only
+   if those runtime checks remain clean does it run the host-only Playwright
+   check with
+   `OPEN_TRADER_SMOKE_URL="$DASHBOARD_URL"` against
+   `tests/e2e/production-smoke.spec.ts`:
+
+   ```bash
+   curl -fsS http://127.0.0.1:8769/api/prediction-arbitrage/state |
+     .venv/bin/python -c 'import json,sys; p=json.load(sys.stdin); print(json.dumps({k:p.get(k) for k in ("current_execution","last_execution")}, sort_keys=True))' \
+     > /tmp/open-trader-submission-baseline.json
+
+   make production-smoke \
+     EXPECTED_SHA="$ACCEPTED_SHA" \
+     EXPECTED_ROOT=/absolute/path/to/immutable-detached-release \
+     EXPECTED_RUNTIME_ROOT=/absolute/path/to/shared-runtime \
+     PRE_DEPLOY_SUBMISSION_BASELINE=/tmp/open-trader-submission-baseline.json
+   ```
+
+   `production-smoke` requires the exact 40-hex SHA, an absolute clean detached
+   checkout, an existing absolute shared runtime root, and that captured
+   baseline. It runs the host tests and Playwright spec from the validated
+   release root, reads the prediction error log from the shared runtime root,
+   blocks browser write requests before navigation, and rechecks the submission
+   baseline after Playwright. It only reads health, process/listener, log,
+   current-execution, and deployed UI evidence and ends with `HEALTHY` or
+   `ROLLBACK`; a browser failure sets `ROLLBACK`. It never starts the fixture
+   server, downloads a browser, deploys, restarts, rolls back, or submits.
+
+Before the first deployment, production must be moved once—manually—to a clean,
+immutable detached release checkout (for example, a checkout created at the
+accepted SHA). This one-time migration is required but is not performed by
+`make`, these checks, or this task.
+
 ## Configuration
 
 The local daily config file is:
@@ -513,7 +580,7 @@ scripts/install_dashboard_launchd.sh --mode single
 
 See [Frontend Gateway 双进程部署参考](docs/operations/frontend-gateway-deployment-reference.md)
 for cutover order, fail-closed/manual recovery, temporary-port smoke checks,
-exact-SHA acceptance, and complete uninstall instructions.
+exact-SHA deployment and smoke, and complete uninstall instructions.
 
 To generate intraday 做T signals for existing HK or US holdings:
 
@@ -754,10 +821,14 @@ automation still stopped, reconcile every local intent against Futu, and only
 then explicitly restore an old watcher if the facts prove it safe. Never start
 an old watcher directly while a controller may still be alive.
 
-After the final acceptance result is `PASS`, redeploy the exact accepted SHA;
-do not treat the acceptance process itself as the deployment. From the accepted
-worktree, confirm its SHA and clean state, restart all controllers with the
-shared config, then restart the Dashboard from that exact worktree:
+After Candidate Acceptance is `PASS` and Host Readiness is `READY`, and with
+explicit deployment authorization, deploy the exact accepted SHA; do not treat
+the acceptance process itself as the deployment. Production source runs from a
+clean immutable detached release checkout, so UI defects are detected by the
+post-deploy Smoke check while the stable release remains separately
+rollback-capable. From that checkout, confirm its SHA and clean state, restart
+all controllers with the shared config, then restart the Dashboard from that
+exact checkout:
 
 ```bash
 REPO_ROOT="$PWD"

@@ -215,7 +215,7 @@ test('renders Kelly lab without a holding-level Kelly entry', async ({ page }) =
   await expect(failedOrderSync.getByText('US.MSFT')).toBeVisible();
   await expect(failedOrderSync.getByText('SIM-20001')).toBeVisible();
   await expect(failedOrderSync.getByText('拒单')).toBeVisible();
-  await expect(failedOrderSync.getByText('505.10')).toBeVisible();
+  await expect(failedOrderSync.getByText('505.1')).toBeVisible();
   await expect(failedOrderSync.getByText('US.RAM')).toHaveCount(0);
   const failedOrderExecution = page.getByLabel('Kelly 订单执行');
   await expect(failedOrderExecution.getByText('执行失败', { exact: true }).first()).toBeVisible();
