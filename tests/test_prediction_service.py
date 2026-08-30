@@ -739,7 +739,12 @@ def test_history_wait_timeout_keeps_the_leader_running(
                 )
                 assert calls == 1
                 assert key in server._history_flights  # type: ignore[attr-defined]
-                assert server.http_load_snapshot()["active"] == 1  # type: ignore[attr-defined]
+                deadline = time.monotonic() + 5
+                active = server.http_load_snapshot()["active"]  # type: ignore[attr-defined]
+                while active != 1 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    active = server.http_load_snapshot()["active"]  # type: ignore[attr-defined]
+                assert active == 1
 
                 release_leader.set()
                 assert leader.result(timeout=5) == (200, {"call": 1})

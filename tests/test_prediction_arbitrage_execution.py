@@ -3329,7 +3329,12 @@ def test_auto_submit_cross_venue_runs_once_without_pretrade_notification(
     accepted = service.notify_ready_opportunity(
         "cross:public-pair:PREDICT_YES_POLYMARKET_NO", signal_id
     )
-    final = wait_until_terminal(service, str(accepted["execution_id"]))
+    execution_id = str(accepted["execution_id"])
+    final = wait_until_terminal(service, execution_id)
+    execution_thread = service._threads.get(execution_id)
+    if execution_thread is not None:
+        execution_thread.join(timeout=3)
+    assert execution_id not in service._threads
 
     assert final["state"] == "holding_to_resolution"
     assert (predict.submit_calls, trading.cross_submit_calls) == (1, 1)
