@@ -2171,6 +2171,7 @@ class PredictionExecutionService:
             return {"state": "locked", "reason": "incident_not_found", "incident_id": str(incident_id)}
         snapshot = self._account_snapshot()
         reasons: list[str] = []
+        holding_imbalances: dict[str, dict[str, object]] = {}
         incident_execution = next(
             (
                 row
@@ -2197,10 +2198,13 @@ class PredictionExecutionService:
                 reasons.append("open_orders")
             active = self._store.active_execution()
             intent = self._intent_from_payload(active.get("intent")) if active else None
-            totals = self._position_totals(snapshot, intent)
+            totals = self._position_totals(
+                snapshot, intent, known_tokens=self._known_holding_tokens()
+            )
+            holding_imbalances = self._holding_imbalances(snapshot)
             if totals["unknown"]:
                 reasons.append("unknown_external_state")
-            if totals["yes"] != 0 or totals["no"] != 0:
+            if (totals["yes"] != 0 or totals["no"] != 0) or holding_imbalances:
                 reasons.append("directional_imbalance")
             if self._pending_merge(active) or self._pending_merge_for_incident(incident, incident_execution):
                 reasons.append("pending_merge")
@@ -2211,32 +2215,22 @@ class PredictionExecutionService:
         if reasons:
             self._breaker_open = True
             reason = reasons[0]
-            active_id = str(incident.get("execution_id", ""))
             update_incident = getattr(self._store, "update_incident", None)
             if callable(update_incident):
+                denial: dict[str, object] = {
+                    "reason": reason,
+                    "blocking_reasons": reasons,
+                    "at": _timestamp(_utc_now()),
+                }
+                if holding_imbalances:
+                    denial["holding_imbalances"] = holding_imbalances
                 try:
                     update_incident(
                         str(incident_id),
-                        {
-                            "last_reset_denial": {
-                                "reason": reason,
-                                "blocking_reasons": reasons,
-                                "at": _timestamp(_utc_now()),
-                            }
-                        },
+                        {"last_reset_denial": denial},
                     )
                 except Exception:
                     pass
-            if active_id:
-                self._transition(
-                    active_id,
-                    "reset_denied",
-                    {
-                        "phase": "reset_denied",
-                        "incident_id": str(incident_id),
-                        "reason": reason,
-                    },
-                )
             return {
                 "state": "locked",
                 "reason": reason,
@@ -4824,6 +4818,77 @@ class PredictionExecutionService:
             elif isinstance(intent, PairIntent):
                 tokens.update((intent.yes_token_id, intent.no_token_id))
         return tokens
+
+    def _holding_imbalances(
+        self, snapshot: Mapping[str, object]
+    ) -> dict[str, dict[str, object]]:
+        """Known holdings whose hedge legs diverge without a redeemable winner."""
+        imbalances: dict[str, dict[str, object]] = {}
+        positions = snapshot.get("positions")
+        if not isinstance(positions, (list, tuple)):
+            return imbalances
+        for row in self._store.histories("executions"):
+            if row.get("state") != "holding_to_resolution":
+                continue
+            intent = self._intent_from_payload(row.get("intent"))
+            if isinstance(intent, ThresholdHedgeIntent):
+                legs = (
+                    ("leg_a", intent.leg_a.token_id),
+                    ("leg_b", intent.leg_b.token_id),
+                )
+            elif isinstance(intent, PairIntent):
+                legs = (
+                    ("yes", intent.yes_token_id),
+                    ("no", intent.no_token_id),
+                )
+            else:
+                continue
+            execution_id = str(row.get("execution_id", ""))
+            if not execution_id:
+                continue
+            quantities: dict[str, Decimal] = {}
+            redeemable_legs: dict[str, bool] = {}
+            for label, token in legs:
+                quantity = Decimal("0")
+                leg_redeemable = False
+                for position in positions:
+                    if not isinstance(position, Mapping):
+                        continue
+                    token_id = position.get(
+                        "token_id", position.get("tokenId", position.get("asset_id", ""))
+                    )
+                    if not isinstance(token_id, str) or token_id != token:
+                        continue
+                    redeemable = position.get("redeemable")
+                    if redeemable is True or str(redeemable).casefold() == "true":
+                        leg_redeemable = True
+                    current_value = _decimal(
+                        position.get("current_value", position.get("currentValue"))
+                    )
+                    if current_value == 0 and leg_redeemable:
+                        continue
+                    leg_quantity = _decimal(
+                        position.get(
+                            "size", position.get("quantity", position.get("shares"))
+                        )
+                    )
+                    if leg_quantity is None or leg_quantity < 0:
+                        continue
+                    quantity += leg_quantity
+                quantities[label] = quantity
+                redeemable_legs[label] = leg_redeemable
+            first, second = (label for label, _ in legs)
+            balanced = quantities[first] == quantities[second]
+            settled_winner = (
+                (quantities[first] > 0) != (quantities[second] > 0)
+                and redeemable_legs[first if quantities[first] > 0 else second]
+            )
+            if balanced or settled_winner:
+                continue
+            imbalances[execution_id] = {
+                label: format(quantities[label], "f") for label, _ in legs
+            }
+        return imbalances
 
     def _startup_incident(
         self,

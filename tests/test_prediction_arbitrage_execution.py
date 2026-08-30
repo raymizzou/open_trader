@@ -496,6 +496,35 @@ class IncidentTrading(FakeTrading):
                     "redeemable": "True",
                 },
             )
+        elif self.account_mode == "known_holding_pair":
+            positions = (
+                {"condition_id": "condition-a", "token_id": "a-token", "size": "10"},
+                {"condition_id": "condition-b", "token_id": "b-token", "size": "10"},
+            )
+        elif self.account_mode == "known_holding_imbalance":
+            positions = (
+                {"condition_id": "condition-a", "token_id": "a-token", "size": "10"},
+            )
+        elif self.account_mode == "known_holding_settled_winner":
+            positions = (
+                {
+                    "condition_id": "condition-a",
+                    "token_id": "a-token",
+                    "size": "10",
+                    "current_value": "10",
+                    "redeemable": "True",
+                },
+            )
+        elif self.account_mode == "known_holding_plus_unknown":
+            positions = (
+                {"condition_id": "condition-a", "token_id": "a-token", "size": "10"},
+                {"condition_id": "condition-b", "token_id": "b-token", "size": "10"},
+                {
+                    "condition_id": "condition-mystery",
+                    "token_id": "mystery-token",
+                    "size": "10",
+                },
+            )
         elif self.account_mode == "open_order":
             return AccountSnapshot(
                 wallet_address=base.wallet_address,
@@ -5968,6 +5997,163 @@ def test_reset_breaker_denies_directional_imbalance_without_orders(tmp_path: Pat
     assert trading.batch_calls == 0
 
 
+def seed_threshold_holding(service: object, store: object, request_key: str) -> str:
+    """Seed one holding_to_resolution threshold execution (a/b legs, 10 each)."""
+    payload = {
+        "opportunity_id": "historical-threshold",
+        "intent_type": "threshold_hedge",
+        "market_type": "threshold_hedge",
+        "intent": service._intent_payload(_threshold_intent()),  # type: ignore[attr-defined]
+    }
+    preview_id = store.create_preview(  # type: ignore[attr-defined]
+        payload, expires_at=(datetime.now(UTC) + timedelta(seconds=5)).isoformat()
+    )
+    execution = store.consume_preview_and_create_execution(  # type: ignore[attr-defined]
+        preview_id, request_key
+    )
+    execution_id = str(execution["execution_id"])
+    store.transition_execution(  # type: ignore[attr-defined]
+        execution_id,
+        state="holding_to_resolution",
+        evidence={"phase": "holding_to_resolution"},
+    )
+    return execution_id
+
+
+def test_reset_breaker_accepts_known_hedged_holdings(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
+    holding_execution_id = seed_threshold_holding(service, store, "reset-known-holding")
+    preview = service.preview("opp-1")
+    execution = store.consume_preview_and_create_execution(
+        str(preview["id"]), "reset-known-holding-incident"
+    )
+    incident_exec_id = str(execution["execution_id"])
+    incident_id = store.open_incident(incident_exec_id, {"state": "directional_incident"})
+    service._breaker_open = True  # type: ignore[attr-defined]
+    trading.account_mode = "known_holding_pair"
+
+    result = service.reset_breaker(incident_id)
+
+    assert result["state"] == "ready"
+    assert result["reason"] == "reset_confirmed"
+    incident = next(
+        row
+        for row in store.histories("incidents")
+        if str(row["incident_id"]) == str(incident_id)
+    )
+    assert isinstance(incident["acknowledgement"], Mapping)
+    assert incident["acknowledgement"]["reconciliation"] == "fresh_clean"
+    assert store.unacknowledged_incident() is None
+    assert service.execution(incident_exec_id)["state"] == "directional_incident"
+    assert store.active_execution() is None
+    assert service.execution(holding_execution_id)["state"] == "holding_to_resolution"
+    assert service.preview("opp-1")["state"] == "previewed"
+
+
+def test_reset_breaker_denies_known_holding_imbalance_as_directional(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
+    holding_execution_id = seed_threshold_holding(service, store, "reset-imbalance-holding")
+    preview = service.preview("opp-1")
+    execution = store.consume_preview_and_create_execution(
+        str(preview["id"]), "reset-imbalance-incident"
+    )
+    incident_exec_id = str(execution["execution_id"])
+    incident_id = store.open_incident(incident_exec_id, {"state": "directional_incident"})
+    service._breaker_open = True  # type: ignore[attr-defined]
+    trading.account_mode = "known_holding_imbalance"
+    before_state = service.execution(incident_exec_id)["state"]
+
+    result = service.reset_breaker(incident_id)
+
+    assert result["state"] == "locked"
+    assert result["reason"] == "directional_imbalance"
+    assert "unknown_external_state" not in result["blocking_reasons"]
+    incident = next(
+        row
+        for row in store.histories("incidents")
+        if str(row["incident_id"]) == str(incident_id)
+    )
+    denial = incident["last_reset_denial"]
+    assert denial["reason"] == "directional_imbalance"
+    assert denial["holding_imbalances"][holding_execution_id] == {
+        "leg_a": "10",
+        "leg_b": "0",
+    }
+    assert store.unacknowledged_incident() is not None
+    assert service._breaker_open is True  # type: ignore[attr-defined]
+    assert service.execution(incident_exec_id)["state"] == before_state
+
+
+def test_reset_breaker_accepts_known_holding_settled_winner(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
+    seed_threshold_holding(service, store, "reset-settled-winner-holding")
+    preview = service.preview("opp-1")
+    execution = store.consume_preview_and_create_execution(
+        str(preview["id"]), "reset-settled-winner-incident"
+    )
+    incident_id = store.open_incident(
+        str(execution["execution_id"]), {"state": "directional_incident"}
+    )
+    service._breaker_open = True  # type: ignore[attr-defined]
+    trading.account_mode = "known_holding_settled_winner"
+
+    result = service.reset_breaker(incident_id)
+
+    assert result["state"] == "ready"
+
+
+def test_reset_breaker_still_denies_unknown_token_positions(tmp_path: Path) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
+    seed_threshold_holding(service, store, "reset-unknown-holding")
+    preview = service.preview("opp-1")
+    execution = store.consume_preview_and_create_execution(
+        str(preview["id"]), "reset-unknown-incident"
+    )
+    incident_exec_id = str(execution["execution_id"])
+    incident_id = store.open_incident(incident_exec_id, {"state": "directional_incident"})
+    service._breaker_open = True  # type: ignore[attr-defined]
+    trading.account_mode = "known_holding_plus_unknown"
+    before_state = service.execution(incident_exec_id)["state"]
+
+    result = service.reset_breaker(incident_id)
+
+    assert result["state"] == "locked"
+    assert result["reason"] == "unknown_external_state"
+    assert service.execution(incident_exec_id)["state"] == before_state
+    incident = next(
+        row
+        for row in store.histories("incidents")
+        if str(row["incident_id"]) == str(incident_id)
+    )
+    assert incident["last_reset_denial"]["reason"] == "unknown_external_state"
+
+
+def test_reset_breaker_closes_legacy_reset_denied_execution_on_success(
+    tmp_path: Path,
+) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
+    seed_threshold_holding(service, store, "reset-legacy-holding")
+    preview = service.preview("opp-1")
+    execution = store.consume_preview_and_create_execution(
+        str(preview["id"]), "reset-legacy-incident"
+    )
+    incident_exec_id = str(execution["execution_id"])
+    store.transition_execution(
+        incident_exec_id,
+        state="reset_denied",
+        evidence={"phase": "legacy_reset_denied"},
+    )
+    incident_id = store.open_incident(incident_exec_id, {"state": "directional_incident"})
+    service._breaker_open = True  # type: ignore[attr-defined]
+    trading.account_mode = "known_holding_pair"
+
+    result = service.reset_breaker(incident_id)
+
+    assert result["state"] == "ready"
+    assert service.execution(incident_exec_id)["state"] == "directional_incident"
+    assert store.active_execution() is None
+
+
 def test_reset_breaker_requires_fresh_clean_account_and_acknowledges_incident(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -6012,6 +6198,32 @@ def test_startup_incident_without_local_execution_is_durable_and_resettable(tmp_
     trading.account_mode = "clean"
     reset = service.reset_breaker(incident_id)
     assert reset["state"] == "ready"
+
+
+def test_startup_incident_with_known_holdings_resets_without_db_hand_editing(
+    tmp_path: Path,
+) -> None:
+    service, trading, store, _ = incident_fixture(tmp_path, result="unsafe")
+    holding_execution_id = seed_threshold_holding(service, store, "gta-replay-holding")
+    trading.account_mode = "open_order"
+
+    locked = service.reconcile_startup()
+
+    assert locked["state"] == "locked"
+    incidents = store.histories("incidents")
+    assert len(incidents) == 1
+    incident = incidents[0]
+    incident_id = str(incident["incident_id"])
+    recovery_execution_id = str(incident["execution_id"])
+    trading.account_mode = "known_holding_pair"
+
+    result = service.reset_breaker(incident_id)
+
+    assert result["state"] == "ready"
+    assert result["reason"] == "reset_confirmed"
+    assert service.execution(recovery_execution_id)["state"] == "directional_incident"
+    assert store.active_execution() is None
+    assert service.execution(holding_execution_id)["state"] == "holding_to_resolution"
 
 
 def test_startup_does_not_unlock_with_existing_unacknowledged_terminal_incident(tmp_path: Path) -> None:
