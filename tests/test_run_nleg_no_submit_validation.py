@@ -1533,11 +1533,21 @@ def test_report_case_variant_of_existing_production_is_refused(
     report written there overwrites the production database; exact
     resolved-Path equality cannot see that, and macOS realpath does not
     case-normalize either.
+
+    Runs only where the scenario can exist: the volume must fold case
+    (``_volume_case_insensitive``).  On a case-sensitive volume the
+    upper-case spelling is a different, non-existing path, so this test
+    skips with a reason — the cross-platform refusal of that non-existing
+    variant is T2's contract.
     """
 
     import os
 
     import open_trader.prediction_n_leg_validation_books as books_module
+
+    skip_reason = _case_variant_skip_reason(tmp_path)
+    if skip_reason is not None:
+        pytest.skip(skip_reason)
 
     production = seed_production_stand_in(tmp_path / "prod")
     before = production.read_bytes()
@@ -1674,3 +1684,120 @@ def test_report_dot_path_is_refused_without_guard_crash(
     assert production.read_bytes() == before
     # The refusal fires inside the guard, before any filesystem work.
     assert not work_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# Review fix round 6: Docker/Linux portability of the T1 case-variant test.
+# T1's precondition — an upper-case spelling of the existing production file
+# denotes the SAME file — holds only on a case-insensitive volume.  On a
+# case-sensitive Linux volume (the Docker ``make test`` gate) the variant
+# path is a different, non-existing name, so the precondition assertions
+# cannot hold and the scenario physically does not exist.  T1 therefore
+# probes the volume first (``_volume_case_insensitive``) and skips with a
+# reason when the scenario cannot exist; the cross-platform refusal of a
+# non-existing casefold variant stays covered by T2 on every volume.
+# ---------------------------------------------------------------------------
+
+
+def _volume_case_insensitive(directory: Path) -> bool:
+    """True when *directory* sits on a case-insensitive volume.
+
+    Writes one probe file, then checks the upper-case spelling of the
+    same name: the two spellings denote one file (``os.path.samefile``)
+    only when the volume folds case — exactly the precondition T1's
+    samefile refusal assertions rely on.  Fail-closed — any probing
+    error reports False so T1 skips instead of failing on a
+    precondition it cannot verify.
+    """
+
+    import os
+
+    probe_lower = directory / "case-probe-a"
+    probe_upper = directory / "CASE-PROBE-A"
+    try:
+        probe_lower.write_bytes(b"case-probe")
+        if not probe_upper.exists():
+            return False
+        aliased = os.path.samefile(probe_lower, probe_upper)
+    except OSError:
+        return False
+    finally:
+        try:
+            probe_lower.unlink()
+        except OSError:
+            pass
+    return aliased
+
+
+def _case_variant_skip_reason(directory: Path) -> str | None:
+    """Skip reason when T1's scenario cannot exist on this volume, else None.
+
+    T1 asserts that an already-existing upper-case spelling of the
+    production file denotes the SAME file; on a case-sensitive volume that
+    path is a different, non-existing name, so the scenario is physically
+    impossible there and the refusal contract for a casefold variant is
+    T2's (``test_report_casefold_variant_of_missing_production_sibling_is_refused``),
+    which runs on every volume.
+    """
+
+    if _volume_case_insensitive(directory):
+        return None
+    return (
+        "case-sensitive volume: an upper-case spelling of the existing "
+        "production file denotes a different, non-existing path, so the "
+        "'existing variant = production file' scenario cannot exist here; "
+        "the cross-platform refusal of a non-existing casefold variant is "
+        "covered by "
+        "test_report_casefold_variant_of_missing_production_sibling_is_refused"
+    )
+
+
+def test_volume_case_probe_resolves_both_volume_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The T1 volume gate resolves both volume semantics portably.
+
+    Independent source of truth: T1 may run its samefile refusal
+    assertions only when the two case spellings of one name denote the
+    same file.  Both branches of the skip decision are locked by
+    substituting each probe verdict; the real probe is then cross-checked
+    against an independent read-back truth about this volume — bytes
+    written under one spelling read back through the upper-case spelling
+    exactly when the volume folds case — so the probe can never silently
+    disagree with the filesystem it probes.
+    """
+
+    real_probe = _volume_case_insensitive
+
+    # Probe verdict True (case-insensitive volume) → no skip reason: T1
+    # runs its full samefile refusal assertions.
+    monkeypatch.setattr(
+        f"{__name__}._volume_case_insensitive", lambda directory: True
+    )
+    assert _case_variant_skip_reason(tmp_path) is None
+
+    # Probe verdict False (the Docker/Linux case-sensitive semantics) →
+    # skip with a reason naming the volume and the T2 cross-coverage.
+    monkeypatch.setattr(
+        f"{__name__}._volume_case_insensitive", lambda directory: False
+    )
+    reason = _case_variant_skip_reason(tmp_path)
+    assert reason is not None
+    assert "case-sensitive volume" in reason
+    assert (
+        "test_report_casefold_variant_of_missing_production_sibling_is_refused"
+        in reason
+    )
+
+    # The real probe must agree with the read-back truth about this
+    # volume (different primitive than the probe's exists+samefile).
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    truth_dir = tmp_path / "truth"
+    truth_dir.mkdir()
+    (truth_dir / "read-probe").write_bytes(b"truth")
+    try:
+        volume_folds = (truth_dir / "READ-PROBE").read_bytes() == b"truth"
+    except OSError:
+        volume_folds = False
+    assert real_probe(real_dir) is volume_folds
