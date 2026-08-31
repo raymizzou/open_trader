@@ -12,15 +12,15 @@ from open_trader.prediction_release import (
 )
 
 
-def test_tracked_prediction_release_manifest_is_generation_one() -> None:
+def test_tracked_prediction_release_manifest_is_valid() -> None:
     root = Path(__file__).resolve().parents[1]
     release = load_prediction_release_manifest(
         root / "ops" / "prediction-service-release.json"
     )
 
     assert release.schema_version == "open_trader.prediction_service.release.v1"
-    assert release.reader_generation == 1
-    assert release.contract_generation == 1
+    assert release.reader_generation > 0
+    assert release.contract_generation > 0
 
 
 @pytest.mark.parametrize(

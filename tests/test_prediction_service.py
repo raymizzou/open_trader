@@ -1763,11 +1763,18 @@ def test_production_bind_failure_stops_runtime_and_uses_one_metadata_snapshot(
         assert kwargs["runtime_metadata"] == {
             **metadata,
             "release_schema_version": "open_trader.prediction_service.release.v1",
-            "reader_generation": 1,
-            "contract_generation": 1,
+            "reader_generation": manifest_payload["reader_generation"],
+            "contract_generation": manifest_payload["contract_generation"],
         }
         raise OSError("bind failed")
 
+    manifest_payload = {
+        "schema_version": "open_trader.prediction_service.release.v1",
+        "reader_generation": 7,
+        "contract_generation": 11,
+    }
+    manifest_path = tmp_path / "prediction-service-release.json"
+    manifest_path.write_text(json.dumps(manifest_payload), encoding="utf-8")
     monkeypatch.setattr(service, "PredictionRuntime", FakeRuntime)
     monkeypatch.setattr(service, "create_prediction_server", fail_bind)
     monkeypatch.setattr(service, "_runtime_metadata", lambda: metadata)
@@ -1781,13 +1788,11 @@ def test_production_bind_failure_stops_runtime_and_uses_one_metadata_snapshot(
             prediction_config_path=tmp_path / "prediction.json",
             port=0,
             mode="production",
-            release_manifest_path=Path(__file__).resolve().parents[1]
-            / "ops"
-            / "prediction-service-release.json",
+            release_manifest_path=manifest_path,
         )
 
     assert instances[0].kwargs["git_sha"] == "abc123"
-    assert instances[0].kwargs["reader_generation"] == 1
+    assert instances[0].kwargs["reader_generation"] == manifest_payload["reader_generation"]
     assert instances[0].state == "STOPPED"
     assert {
         signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)

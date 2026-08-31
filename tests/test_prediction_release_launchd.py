@@ -11,7 +11,10 @@ from pathlib import Path
 
 import pytest
 
-from open_trader.prediction_release import load_prediction_runtime_record
+from open_trader.prediction_release import (
+    load_prediction_release_manifest,
+    load_prediction_runtime_record,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -213,6 +216,9 @@ class ReleaseHarness:
             ROOT / "ops" / "prediction-service-release.json",
             path / "ops" / "prediction-service-release.json",
         )
+        release = load_prediction_release_manifest(
+            path / "ops" / "prediction-service-release.json"
+        )
         subprocess.run(["git", "init", "-q", str(path)], check=True)
         subprocess.run(["git", "-C", str(path), "add", "."], check=True)
         subprocess.run(
@@ -224,7 +230,12 @@ class ReleaseHarness:
             ["git", "-C", str(path), "rev-parse", "HEAD"],
             check=True, capture_output=True, text=True,
         ).stdout.strip()
-        return ReleaseCheckout(path=path, sha=sha)
+        return ReleaseCheckout(
+            path=path,
+            sha=sha,
+            reader_generation=release.reader_generation,
+            contract_generation=release.contract_generation,
+        )
 
     def _write_dispatcher(self) -> None:
         dispatcher = self.fake_bin / "fake-command"
@@ -461,8 +472,8 @@ def test_production_first_install_records_only_observed_ready_evidence(
         "checkout": str(release_harness.candidate.path),
         "git_sha": release_harness.sha,
         "source_state": "clean",
-        "reader_generation": 1,
-        "contract_generation": 1,
+        "reader_generation": release_harness.candidate.reader_generation,
+        "contract_generation": release_harness.candidate.contract_generation,
     }
     assert record["previous_release"] is None
     assert record["ready"]["pid"] == release_harness.pid
@@ -938,8 +949,8 @@ def test_checkout_release_direct_workflow(release_harness: ReleaseHarness) -> No
     assert evidence == {
         "states": ["ready", "ready", "ready", "stopped"],
         "candidate_shas": [old.sha, new.sha, old.sha],
-        "reader_generations": [1, 1, 1],
-        "contract_generations": [1, 1, 1],
+        "reader_generations": [old.reader_generation, new.reader_generation, old.reader_generation],
+        "contract_generations": [old.contract_generation, new.contract_generation, old.contract_generation],
         "max_simultaneous_managed_pids": 1,
         "final_listener": None,
         "final_owner_available": True,
