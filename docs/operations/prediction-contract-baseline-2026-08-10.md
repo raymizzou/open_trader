@@ -113,3 +113,11 @@ curl -fsS http://127.0.0.1:8767/healthz
 curl -fsS http://127.0.0.1:8766/api/prediction-arbitrage/state
 PYTHONPATH=src .venv/bin/python -m pytest -q tests/test_prediction_api_contract.py
 ```
+
+## 2026-08-31：#39 黄金契约适用范围（#60 切换后收窄）
+
+三策略黄金契约只约束服务迁移与 #60 之前的兼容阶段。自 #60 切换起（读侧栅栏
+`minimum_reader_generation >= N_LEG_READER_GENERATION=2`，契约 generation 2），冻结的
+legacy 变更集随之退役：五个 legacy 端点返回 HTTP 410 `legacy_strategy_removed`
+（见 `tests/test_prediction_legacy_retirement.py`）；Gateway 的
+`/api/prediction-arbitrage/*` 路径保持不变。

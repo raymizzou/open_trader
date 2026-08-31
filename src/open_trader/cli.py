@@ -1152,6 +1152,24 @@ def build_parser() -> argparse.ArgumentParser:
     prediction_nleg_validate.add_argument(
         "--report", type=Path, help="Write the JSON report to this path"
     )
+    prediction_nleg_terminal_check = prediction_commands.add_parser(
+        "nleg-terminal-check",
+        help=(
+            "Verify the frozen A8 terminal-state fixture against the canonical "
+            "N_LEG constraint model (read-only)"
+        ),
+    )
+    prediction_nleg_terminal_check.add_argument(
+        "--fixture",
+        type=Path,
+        required=True,
+        help="Frozen a8_samples fixture (JSON)",
+    )
+    prediction_nleg_terminal_check.add_argument(
+        "--report",
+        type=Path,
+        help="Write the JSON report to this path (default: fresh temp dir)",
+    )
     prediction_status = prediction_commands.add_parser(
         "status", help="Show safe local Dashboard prediction runtime facts"
     )
@@ -1567,6 +1585,16 @@ def main(argv: list[str] | None = None) -> int:
             if args.report is not None:
                 nleg_argv += ["--report", str(args.report)]
             return nleg_validate_main(nleg_argv)
+
+        if args.prediction_command == "nleg-terminal-check":
+            from open_trader.prediction_n_leg_terminal_check import (
+                main as nleg_terminal_check_main,
+            )
+
+            terminal_argv = ["--fixture", str(args.fixture)]
+            if args.report is not None:
+                terminal_argv += ["--report", str(args.report)]
+            return nleg_terminal_check_main(terminal_argv)
 
         if args.prediction_command == "monitor-once":
             try:

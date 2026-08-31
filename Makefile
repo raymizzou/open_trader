@@ -75,12 +75,16 @@ host-readiness:
 	check "account launchd dry-run" "$(WORKTREE_ROOT)/scripts/install_account_release.sh" --dry-run --repo-root "$(WORKTREE_ROOT)" --runtime-root "$(REPOSITORY_ROOT)" --python "$(PYTHON_BIN)"; \
 	check "dashboard launchd dry-run" "$(WORKTREE_ROOT)/scripts/install_dashboard_launchd.sh" --dry-run --mode stack --repo-root "$(WORKTREE_ROOT)" --runtime-root "$(REPOSITORY_ROOT)"; \
 	check "trend launchd dry-run" "$(WORKTREE_ROOT)/scripts/install_daily_premarket_launchd.sh" --dry-run --trend-only --market all --config "$(DAILY_CONFIG)"; \
+	nleg_replay_passes() { \
+		"$(PYTHON_BIN)" -m open_trader prediction-arb nleg-validate \
+			--replay "$(REPOSITORY_ROOT)/tests/fixtures/prediction_n_leg_validation_frozen_n3.json" \
+			--live-catalog /dev/null 2>/dev/null \
+			| "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); ok=(p.get("replay") or {}).get("status")=="PASS" and (p.get("live") or {}).get("reason")=="LIVE_CATALOG_UNAVAILABLE"; raise SystemExit(0 if ok else 1)'; \
+	}; \
 	check "account status" "$(PYTHON_BIN)" -m open_trader account-sync-status --account-url "$(ACCOUNT_API_URL)" --json; \
 	check "prediction status" "$(PYTHON_BIN)" -m open_trader prediction-arb status --url "$(DASHBOARD_URL)"; \
 	check "prediction wallet" "$(PYTHON_BIN)" -m open_trader prediction-arb wallet status --config "$(PREDICTION_CONFIG)"; \
-	check "prediction no-submit preflight" "$(PYTHON_BIN)" -m open_trader prediction-arb preflight --config "$(PREDICTION_CONFIG)" --no-submit; \
-	check "prediction monitor read" "$(PYTHON_BIN)" -m open_trader prediction-arb monitor-once --config "$(PREDICTION_CONFIG)" --data-dir "$(REPOSITORY_ROOT)/data"; \
-	check "prediction cross-auto status" "$(PYTHON_BIN)" -m open_trader prediction-arb cross-auto status --url "$(DASHBOARD_URL)"; \
+	if nleg_replay_passes >/dev/null 2>&1; then echo "prediction n-leg replay validation: PASS"; else echo "prediction n-leg replay validation: BLOCKED"; status=1; fi; \
 	check "Python Playwright Chrome" "$(PYTHON_BIN)" -c 'from playwright.sync_api import sync_playwright; p = sync_playwright().start(); browser = p.chromium.launch(channel="chrome", headless=True); browser.close(); p.stop()'; \
 	if [ -x "$(REPOSITORY_ROOT)/node_modules/.bin/playwright" ] && (cd "$(WORKTREE_ROOT)" && node -e 'const {chromium}=require("playwright"); (async()=>{const browser=await chromium.launch({headless:true}); await browser.close();})().catch(()=>process.exit(1));') >/dev/null 2>&1; then echo "Playwright Chromium: PASS"; else echo "Playwright Chromium: BLOCKED"; status=1; fi; \
 	check "loopback listeners" sh -c 'command -v lsof >/dev/null && for port in 8766 8767 8768 8769; do lsof -nP -iTCP:$$port -sTCP:LISTEN >/dev/null; done'; \
@@ -88,6 +92,10 @@ host-readiness:
 	check "Futu connectivity" "$(PYTHON_BIN)" -c 'import socket; s = socket.create_connection(("127.0.0.1", 11111), 2); s.close()'; \
 	if [ $$status -eq 0 ]; then echo READY; else echo BLOCKED; exit 2; fi
 
+# This target asserts the POST-#60-cutover world (reader fence 2): it is the
+# gate for the cutover release SHA. Legacy-era probes (preflight --no-submit,
+# monitor-once, cross-auto status) are retired together with the legacy
+# mutation set; state assertions below pin the N_LEG contract generation.
 production-smoke:
 	@set -u; \
 	status=0; \
@@ -122,6 +130,7 @@ production-smoke:
 	state_payload="$$(curl -fsS --max-time 10 "http://127.0.0.1:8769/api/prediction-arbitrage/state" 2>/dev/null || true)"; \
 	if [ -z "$$state_payload" ]; then echo "current execution: BLOCKED"; status=1; else if printf '%s' "$$state_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); raise SystemExit(0 if str(p.get("status", "")).lower() not in {"", "unavailable", "error"} and "current_execution" in p else 1)' >/dev/null 2>&1; then echo "current execution: PASS"; else echo "current execution: BLOCKED"; status=1; fi; fi; \
 	if submission_baseline_matches "$$state_payload"; then echo "submission baseline: PASS"; else echo "submission baseline: BLOCKED"; status=1; fi; \
+	if printf '%s' "$$state_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); n_leg=p.get("n_leg") or {}; scopes=n_leg.get("execution_scopes") or {}; scope=scopes.get("SAME_EVENT_SAME_VENUE") or {}; rows=p.get("opportunities") or []; ok=(n_leg.get("contract_generation")==2 and n_leg.get("mode")=="MANUAL" and scope.get("capability")=="OBSERVE_ONLY" and all(row.get("engine_owner")=="N_LEG" for row in rows if isinstance(row,dict))); raise SystemExit(0 if ok else 1)' >/dev/null 2>&1; then echo "n-leg state: PASS"; else echo "n-leg state: BLOCKED"; status=1; fi; \
 	for log in "$$expected_root/logs/frontend_gateway/launchd.err.log" "$$expected_root/logs/legacy_dashboard/launchd.err.log" "$$expected_root/logs/account_api/launchd.err.log" "$$expected_runtime_root/logs/prediction_service/launchd.err.log"; do if [ ! -f "$$log" ]; then echo "log missing: $$log"; status=1; elif [ ! "$$log" -nt "$$baseline" ]; then echo "log stale: $$log"; status=1; elif tail -n 200 "$$log" | rg -qi 'traceback|fatal|exception|error'; then echo "log error: $$log"; status=1; else echo "log clean: $$log"; fi; done; \
 	if [ $$status -eq 0 ]; then \
 		if (cd "$$expected_root" && OPEN_TRADER_SMOKE_URL="$(DASHBOARD_URL)" "$(REPOSITORY_ROOT)/node_modules/.bin/playwright" test tests/e2e/production-smoke.spec.ts --config=playwright.config.ts --project=chromium); then echo "browser smoke: PASS"; else echo "browser smoke: BLOCKED"; status=1; fi; \

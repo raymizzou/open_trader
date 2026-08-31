@@ -302,6 +302,13 @@ def _n_leg_enabled_scopes(raw: object) -> list[dict[str, object]]:
     return enabled
 
 
+#: Reader fence for issue #60's N_LEG cutover: once the migration publishes
+#: N_LEG capital units, readers below this generation would misread the
+#: ledger. Lives beside the schema_metadata DDL (seeded at 1) and only ever
+#: moves up via `advance_minimum_reader_generation`.
+N_LEG_READER_GENERATION = 2
+
+
 def read_minimum_reader_generation(data_dir: Path) -> int:
     path = Path(data_dir) / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
     if not path.exists():
@@ -2322,6 +2329,42 @@ class PredictionArbitrageStore:
         with self._read_connection() as connection:
             row = connection.execute("SELECT * FROM n_leg_controls WHERE singleton=1").fetchone()
         return self._n_leg_control_row(row)
+
+    def advance_minimum_reader_generation(
+        self, target: int, *, connection: sqlite3.Connection | None = None
+    ) -> int:
+        """Move the schema_metadata reader fence up to ``target``.
+
+        Idempotent when ``target`` equals the current fence, succeeds only for
+        ``target > current``, and refuses to lower the fence. Runs inside the
+        caller's transaction when ``connection`` is supplied (the N_LEG cutover
+        composes it into its single migration transaction); otherwise the
+        advance gets its own transaction.
+        """
+        if type(target) is not int or target < 1:
+            raise ValueError("minimum reader generation target must be a positive integer")
+
+        def _advance(sqlite_connection: sqlite3.Connection) -> int:
+            row = sqlite_connection.execute(
+                "SELECT minimum_reader_generation FROM schema_metadata WHERE singleton=1"
+            ).fetchone()
+            if row is None:
+                raise ValueError("prediction minimum reader generation is missing")
+            current = int(row[0])
+            if target == current:
+                return current
+            if target < current:
+                raise ValueError("minimum reader generation cannot be lowered")
+            sqlite_connection.execute(
+                "UPDATE schema_metadata SET minimum_reader_generation=? WHERE singleton=1",
+                (target,),
+            )
+            return target
+
+        if connection is not None:
+            return _advance(connection)
+        with self._transaction() as owned_connection:
+            return _advance(owned_connection)
 
     def n_leg_qualification_policy_latest(self) -> dict[str, object] | None:
         with self._read_connection() as connection:

@@ -261,6 +261,7 @@ class PredictionExecutionService:
         lock_path: Path,
         dashboard_url: str = "http://127.0.0.1:8766/",
         predict_trading: object | None = None,
+        legacy_retired: bool = False,
     ) -> None:
         self._store = store
         self._monitor = monitor
@@ -270,6 +271,10 @@ class PredictionExecutionService:
         self._notifier = notifier
         self._lock_path = Path(lock_path)
         self._dashboard_url = str(dashboard_url)
+        # Issue #60: once the reader fence reaches the N_LEG generation the
+        # legacy cross-auto submit path is observe-only regardless of the
+        # stored configured mode / armed flag.
+        self._legacy_strategy_retired = bool(legacy_retired)
         self._process_lock = _PROCESS_LOCK
         # A newly constructed process has not reconciled its dedicated wallet;
         # only a clean startup/reset path may clear this lock.
@@ -1158,6 +1163,8 @@ class PredictionExecutionService:
         )
 
     def _configured_cross_execution_mode(self) -> str:
+        if self._legacy_strategy_retired:
+            return "observe_only"
         try:
             return validate_cross_execution_mode(
                 self._store.cross_auto_state().get("configured_mode")
@@ -1220,6 +1227,10 @@ class PredictionExecutionService:
         latest = self._store.cross_auto_attempts(limit=1)
         effective = configured
         if configured == "auto_submit" and not (armed and ready):
+            effective = "observe_only"
+        if self._legacy_strategy_retired:
+            # Issue #60: N_LEG era — the legacy cross-auto effective mode is
+            # observe-only no matter what is configured or armed.
             effective = "observe_only"
         return {
             "configured_mode": configured,

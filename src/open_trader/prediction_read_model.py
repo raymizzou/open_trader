@@ -919,6 +919,47 @@ def _prediction_n_leg_solution_projection(
     return projected
 
 
+def _prediction_retired_opportunity_row(
+    item: Mapping[str, object],
+) -> dict[str, object]:
+    """Issue #60: one retired-fence opportunity row from an N_LEG projection.
+
+    Legacy signal-derived display fields (titles, venue scopes, eligibility
+    reasons) are not part of an N_LEG solution; the row flattens the
+    projection's market/execution display fields into the dashboard
+    vocabulary, carries the N_LEG owner label, and embeds the full projection
+    under ``n_leg_solution``.
+    """
+    market = (
+        dict(item.get("market")) if isinstance(item.get("market"), Mapping) else {}
+    )
+    execution = (
+        dict(item.get("execution"))
+        if isinstance(item.get("execution"), Mapping)
+        else {}
+    )
+    qualification = (
+        dict(item.get("qualification"))
+        if isinstance(item.get("qualification"), Mapping)
+        else {}
+    )
+    component_id = str(item.get("component_id") or "")
+    return {
+        "opportunity_id": f"nleg:{component_id}" if component_id else "",
+        "component_id": component_id,
+        "market_type": "n_leg",
+        "strategy_type": "N_LEG",
+        "engine_owner": "N_LEG",
+        "leg_count": len(market.get("legs") or []),
+        "annualized_yield": qualification.get("annualized_return"),
+        "remaining_days": qualification.get("capital_release_days"),
+        **market,
+        **execution,
+        "qualification": qualification,
+        "n_leg_solution": dict(item),
+    }
+
+
 def _prediction_nleg_labels(row: Mapping[str, object]) -> dict[str, object]:
     """Forward-project legacy current opportunities onto N_LEG taxonomy labels."""
 
@@ -1478,6 +1519,7 @@ def prediction_state_payload(
     relation_catalog: object | None = None,
     n_leg_solutions: Sequence[Mapping[str, object]] = (),
     n_leg_metrics: object = None,
+    legacy_retired: bool = False,
 ) -> dict[str, object]:
     if monitor is None and store is None and execution is None:
         return _prediction_unavailable_state(csrf_token)
@@ -1598,18 +1640,37 @@ def prediction_state_payload(
             predict_snapshot.get("available_usdt")
         ) if predict_snapshot.get("available_usdt") not in (None, "") else None,
     }
-    projected_opportunities: list[dict[str, object]] = []
-    for row in opportunity_rows:
-        projected = dict(row)
-        projected.update(_prediction_nleg_labels(projected))
-        projected["qualification"] = _prediction_qualification(
-            projected,
-            balances=balances,
-            breaker_open=breaker_open,
-            cross_breaker_open=cross_breaker_open,
-        )
-        projected_opportunities.append(projected)
-    opportunity_rows = projected_opportunities
+    # Issue #60: the N_LEG contract and solution projections drive both the
+    # retired-fence opportunities source and (at any fence) the n_leg block.
+    n_leg = _prediction_n_leg_contract(execution)
+    n_leg_projections = _prediction_n_leg_solution_projection(
+        n_leg_solutions,
+        n_leg=n_leg,
+        total_unsettled_capital_units=cross_unsettled_current,
+        now=datetime.now(UTC),
+        balance_snapshot=_prediction_n_leg_balance_snapshot(
+            readiness=readiness, execution=execution
+        ),
+    )
+    if legacy_retired:
+        # The opportunities list is N_LEG-owned: legacy signal-derived rows
+        # and cross-venue candidates never surface once the fence is retired.
+        opportunity_rows = [
+            _prediction_retired_opportunity_row(item) for item in n_leg_projections
+        ]
+    else:
+        projected_opportunities: list[dict[str, object]] = []
+        for row in opportunity_rows:
+            projected = dict(row)
+            projected.update(_prediction_nleg_labels(projected))
+            projected["qualification"] = _prediction_qualification(
+                projected,
+                balances=balances,
+                breaker_open=breaker_open,
+                cross_breaker_open=cross_breaker_open,
+            )
+            projected_opportunities.append(projected)
+        opportunity_rows = projected_opportunities
     qualified_opportunities = [
         row
         for row in opportunity_rows
@@ -1793,16 +1854,6 @@ def prediction_state_payload(
         except Exception:
             pass
     shadow_summary = _prediction_n_leg_shadow_summary(opportunity_rows)
-    n_leg = _prediction_n_leg_contract(execution)
-    n_leg_projections = _prediction_n_leg_solution_projection(
-        n_leg_solutions,
-        n_leg=n_leg,
-        total_unsettled_capital_units=cross_unsettled_current,
-        now=datetime.now(UTC),
-        balance_snapshot=_prediction_n_leg_balance_snapshot(
-            readiness=readiness, execution=execution
-        ),
-    )
     if n_leg_projections:
         by_component = {
             str(item.get("component_id") or ""): item

@@ -41,6 +41,7 @@ from .prediction_arbitrage_execution import (
 )
 from .prediction_arbitrage_store import (
     _CROSS_AUTO_DAILY_PRINCIPAL_CAP,
+    N_LEG_READER_GENERATION,
     PredictionArbitrageStore,
     read_minimum_reader_generation,
 )
@@ -378,6 +379,10 @@ class PredictionRuntime:
         self._mode = mode
         self._git_sha = str(git_sha)
         self._reader_generation = reader_generation
+        # Issue #60: the data dir seeds the reader fence at 1 and only the
+        # startup probe (release-manifest runtimes) can observe a higher
+        # fence; before start() the runtime is at fence-1 semantics.
+        self._minimum_reader_generation = 1
         self._enable_n_leg_background = bool(enable_n_leg_background)
         self._solver_server_factory = solver_server_factory or (
             lambda: SolverServerOwner(
@@ -419,6 +424,12 @@ class PredictionRuntime:
     @property
     def mode(self) -> Literal["production", "shadow"]:
         return self._mode
+
+    @property
+    def legacy_retired(self) -> bool:
+        """Issue #60: legacy strategy surface is retired at the N_LEG fence."""
+
+        return self._minimum_reader_generation >= N_LEG_READER_GENERATION
 
     @property
     def production_owner(self) -> bool:
@@ -524,6 +535,10 @@ class PredictionRuntime:
                 minimum_reader_generation = read_minimum_reader_generation(
                     self._data_dir
                 )
+                # Issue #60: remember the fence once, under the owner lock;
+                # this single read drives both the compatibility check and
+                # legacy retirement.
+                self._minimum_reader_generation = minimum_reader_generation
                 if self._reader_generation < minimum_reader_generation:
                     raise PredictionRuntimeCompatibilityError(
                         f"prediction reader generation {self._reader_generation} "
@@ -576,6 +591,7 @@ class PredictionRuntime:
                 / "execution.lock",
                 dashboard_url=self._dashboard_url,
                 predict_trading=self._predict_trading,
+                legacy_retired=self.legacy_retired,
             )
             self.monitor.set_ready_observer(
                 self.execution.notify_ready_opportunity
@@ -583,9 +599,12 @@ class PredictionRuntime:
             self.monitor.set_observation_observer(
                 self.execution.notify_observation
             )
-            self.monitor.set_auto_eat_observer(
-                self.execution.auto_eat_threshold
-            )
+            if not self.legacy_retired:
+                # Issue #60: the legacy auto-eat path must never arm once the
+                # reader fence has reached the N_LEG generation.
+                self.monitor.set_auto_eat_observer(
+                    self.execution.auto_eat_threshold
+                )
             self.monitor.set_failure_observer(
                 self.execution.notify_monitor_failure
             )

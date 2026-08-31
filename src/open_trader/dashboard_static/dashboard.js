@@ -2520,7 +2520,7 @@ function predictionNLegExecutionPlan(opportunity) {
   return `<div class="pm-execution-plan"><h4>下单计划 · would-submit</h4>${legRows ? `<div class="pm-order-legs">${legRows}</div>` : ""}<dl><dt>可下单</dt><dd>${ready ? "是" : "否"}</dd><dt>原因</dt><dd>${escapeHtml(predictionReasonLabel(execution.reason))}</dd><dt>方案指纹</dt><dd>${escapeHtml(shortFingerprint)}</dd><dt>预计占用</dt><dd>${escapeHtml(predictionNLegUnitsMoney(execution.projected_total_units))} / ${escapeHtml(predictionNLegUnitsMoney(execution.max_total_unsettled_capital_units))}</dd></dl></div>`;
 }
 
-function predictionUnifiedOpportunityCard(row, mode) {
+function predictionUnifiedOpportunityCard(row, mode, legacyRetired) {
   const opportunity = predictionOpportunityDisplay(row);
   const qualification = opportunity.qualification && typeof opportunity.qualification === "object" ? opportunity.qualification : {};
   const nLegSolution = opportunity.n_leg_solution && typeof opportunity.n_leg_solution === "object" ? opportunity.n_leg_solution : null;
@@ -2564,15 +2564,18 @@ function predictionUnifiedOpportunityCard(row, mode) {
       `<small style="color:var(--muted)">${escapeHtml(predictionValue(qualification.order_ready_reason, qualification.order_ready === true ? "MANUAL 模式 · 可人工确认" : ""))}</small>`,
     ),
   ].join("");
-  const action = orderReady && mode === "MANUAL"
+  const action = legacyRetired === true
+    ? `<div class="pm-opportunity-action"><p>旧系统人工确认入口已随 N_LEG 切换下线（HTTP 410）。</p></div>`
+    : orderReady && mode === "MANUAL"
     ? `<div class="pm-opportunity-action"><p>确认时重新读取两所 REST、盘口、余额与未结算额度。</p><button type="button" class="pm-button primary" data-action="participate" data-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id, ""))}">人工确认下单</button></div>`
     : `<div class="pm-opportunity-action"><p>order_ready=false · ${escapeHtml(predictionValue(nLegExecution?.reason ? predictionReasonLabel(nLegExecution.reason) : qualification.order_ready_reason, "不可下单"))} · 不可下单。</p></div>`;
-  return `<article class="pm-opportunity"><div class="pm-opportunity-title"><div><h3>${escapeHtml(predictionValue(opportunity.title || opportunity.question, "数据未返回"))}</h3><p>${subtitle}</p></div><span class="pm-pill ${statusClass}">${escapeHtml(status)}</span></div><div class="pm-tags">${tags}</div>${legs.length ? `<div class="pm-order-legs">${predictionUnifiedLegRows(opportunity)}</div>` : ""}<div class="pm-metrics">${metrics}</div>${predictionNLegExecutionPlan(opportunity)}${action}</article>`;
+  return `<article class="pm-opportunity"><div class="pm-opportunity-title"><div><h3>${escapeHtml(predictionValue(opportunity.title || opportunity.question, "数据未返回"))}</h3><p>${subtitle}</p></div><span class="pm-pill ${statusClass}">${escapeHtml(status)}</span></div><div class="pm-tags">${tags}</div>${legs.length && !nLegSolution ? `<div class="pm-order-legs">${predictionUnifiedLegRows(opportunity)}</div>` : ""}<div class="pm-metrics">${metrics}</div>${predictionNLegExecutionPlan(opportunity)}${action}</article>`;
 }
 
 function predictionUnifiedOpportunityList(payload, filter) {
   const rows = predictionUnifiedFilteredRows(payload, filter);
-  const cards = rows.map((row) => predictionUnifiedOpportunityCard(row, "MANUAL")).join("");
+  const legacyRetired = predictionLegacyControlsRetired(payload);
+  const cards = rows.map((row) => predictionUnifiedOpportunityCard(row, "MANUAL", legacyRetired)).join("");
   const empty = rows.length ? "" : `<div class="pm-empty"><strong>当前无更多合格机会</strong><p style="margin:4px 0 0">低于门槛的正收益、未经批准、证明未完成、UNKNOWN 和陈旧结果只进漏斗/历史。</p></div>`;
   return `<section class="pm-panel" aria-label="机会列表"><div class="pm-panel-heading"><div><h2>机会列表</h2><p>只读投影 · 前端不重算利润/年化/期限/安全状态。</p></div></div><div style="padding:0 14px">${predictionOpportunityFilter(payload, filter)}</div>${cards}${empty}</section>`;
 }
@@ -3596,6 +3599,14 @@ function predictionLlmHedgeWorkspace(payload, expandedRelationKeys) {
   return `${predictionRelationFunnel(payload)}<aside class="pm-policy"><strong>所有正收益候选都会展示</strong><p>低于 15% 年化的信号不展示；LLM 结论和程序复核全部通过后才出现人工确认入口；两腿属于不同 condition，不会 merge。</p></aside><section class="pm-panel"><header class="pm-panel-heading"><div><h2>候选标的</h2><p>按可参与 → 年化 → 结算期 → 利润排序；点击确认前会重新检查价格。</p></div><span class="pm-pill">显示 ${opportunities.length}</span></header>${candidates}</section>`;
 }
 
+function predictionLegacyControlsRetired(payload) {
+  // Issue #60: once the N_LEG contract reaches generation 2 the legacy
+  // strategy controls (validation mode, cross-auto, legacy preview/confirm)
+  // are retired; the backend answers 410 to their endpoints.
+  const generation = payload?.n_leg?.contract_generation ?? payload?.contract_generation ?? 1;
+  return Number(generation) >= 2;
+}
+
 function predictionModeBar(payload) {
   const nleg = payload?.n_leg && typeof payload.n_leg === "object" ? payload.n_leg : {};
   const gates = nleg.execution_gates && typeof nleg.execution_gates === "object" ? nleg.execution_gates : {};
@@ -3606,13 +3617,14 @@ function predictionModeBar(payload) {
   const breaker = breakerOpen ? "全局熔断开启" : "全局熔断关闭";
   const scopeCount = Array.isArray(nleg.enabled_execution_scope_version) ? nleg.enabled_execution_scope_version.length : 0;
   const scopeText = scopeCount > 0 ? `enabled scope ${scopeCount} 个` : "enabled scope 空";
-  const buttons = [["manual", "MANUAL"], ["auto", "AUTO"]].map(([value, label]) =>
+  const buttons = predictionLegacyControlsRetired(payload) ? "" : [["manual", "MANUAL"], ["auto", "AUTO"]].map(([value, label]) =>
     `<button type="button" class="pm-mode-button${active === label ? " active" : ""}" data-action="set-mode" data-mode="${value}">${label}</button>`
   ).join("");
   return `<div class="pm-mode-bar" aria-label="执行模式">${buttons}<span class="pm-mode-stats">#60 前只读预览 · ${breaker} · ${scopeText}</span></div>`;
 }
 
 function predictionCrossAutoStatus(payload) {
+  if (predictionLegacyControlsRetired(payload)) return "";
   const auto = payload?.cross_auto && typeof payload.cross_auto === "object" ? payload.cross_auto : {};
   if (auto.configured_mode !== "auto_submit") return "";
   const daily = auto.daily_principal && typeof auto.daily_principal === "object" ? auto.daily_principal : {};

@@ -45,6 +45,18 @@ _READ_ONLY_ERROR = {
     "code": "shadow_read_only",
     "message": "Shadow Prediction Service is read-only",
 }
+#: Issue #60: machine-checkable code carried by the 410 body once the runtime
+#: reports ``legacy_retired`` (reader fence >= ``N_LEG_READER_GENERATION``).
+LEGACY_STRATEGY_REMOVED = "legacy_strategy_removed"
+_LEGACY_STRATEGY_ENDPOINTS = frozenset(
+    {
+        "/api/prediction-arbitrage/preview",
+        "/api/prediction-arbitrage/executions",
+        "/api/prediction-arbitrage/mode",
+        "/api/prediction-arbitrage/circuit-breaker/reset",
+        "/api/prediction-arbitrage/cross-auto/pause",
+    }
+)
 
 
 class _PredictionHTTPServer(ThreadingHTTPServer):
@@ -462,6 +474,7 @@ def create_prediction_server(
                         n_leg_metrics=getattr(
                             runtime, "n_leg_metrics", lambda: {}
                         )(),
+                        legacy_retired=getattr(runtime, "legacy_retired", False) is True,
                     ),
                     set_session=mode == "production",
                 )
@@ -514,6 +527,24 @@ def create_prediction_server(
             path = urlparse(self.path).path
             if mode == "shadow" and path.startswith("/api/prediction-arbitrage/"):
                 self._send_json(HTTPStatus.FORBIDDEN, _READ_ONLY_ERROR)
+                return
+            # Issue #60 final-review P1-1: the retired-mode legacy POSTs
+            # answer 410 uniformly — including the cutover orchestrator's
+            # unauthenticated live probe — so this refusal runs BEFORE
+            # production auth. 410 is a refusal; endpoint existence is not
+            # sensitive. Every gated path is also in the POST whitelist
+            # below, so no unknown path can 410 instead of 404, and at
+            # fence 1 (legacy_retired falsy) the gate is inert.
+            if path in _LEGACY_STRATEGY_ENDPOINTS and (
+                getattr(runtime, "legacy_retired", False) is True
+            ):
+                self._send_json(
+                    HTTPStatus.GONE,
+                    {
+                        "error": "legacy strategy endpoints are retired",
+                        "error_code": LEGACY_STRATEGY_REMOVED,
+                    },
+                )
                 return
             if mode == "production" and path.startswith(
                 "/api/prediction-arbitrage/"

@@ -17,6 +17,14 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION = "open_trader.prediction_n_leg.mode_contract.v1"
 CAPABILITIES = ("OBSERVE_ONLY", "MANUAL_CANARY", "AUTO_ELIGIBLE")
 
+#: Contract generation written by the issue #60 cutover when it initializes
+#: the controls singleton. Positive integer everywhere (column CHECK,
+#: n_leg_mode_control_write validation, base_contract_generation equality).
+N_LEG_CONTRACT_GENERATION = 2
+#: Display/evidence naming ONLY (cutover audit payloads, evidence labels).
+#: Never a validation input, DB value, manifest field, or concurrency token.
+N_LEG_CONTRACT_GENERATION_LABEL = "N_LEG_v1"
+
 SAME_EVENT_SAME_VENUE_SCOPE_ID = "SAME_EVENT_SAME_VENUE"
 SAME_EVENT_SAME_VENUE_MEMBERS = {
     "relation_type": "complement",
