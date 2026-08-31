@@ -746,6 +746,188 @@ def test_fence2_runtime_runs_without_wiring_the_legacy_auto_eat_observer(
         runtime.stop()
 
 
+def _observer_wiring_runtime(
+    monkeypatch: object, tmp_path: object, *, fence: int
+) -> tuple[object, list[str]]:
+    """Shared harness of the #109 observer-wiring tests: a production
+    PredictionRuntime whose reader fence is `fence`, built exactly like the
+    auto-eat unwiring test above, whose monitor records every
+    ``set_*_observer`` call as ``<name>.bind``."""
+
+    import types
+
+    import open_trader.prediction_runtime as runtime_module
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        runtime_module,
+        "read_minimum_reader_generation",
+        lambda _data_dir: events.append("fence.read") or fence,
+        raising=False,
+    )
+
+    class FakeStore:
+        def __init__(self, _data_dir) -> None:
+            pass
+
+        def apply_safety_policy(self, _policy, *, git_sha):
+            return {"state": "baseline_enrolled"}
+
+        def n_leg_scope(self, _scope_id):
+            return None
+
+        def close(self) -> None:
+            pass
+
+    class FakeTrading:
+        def close(self) -> None:
+            pass
+
+    class FakeTradingClient:
+        @classmethod
+        def from_keychain(cls, _config):
+            return FakeTrading()
+
+    class FakeMonitor:
+        def __init__(self, **_) -> None:
+            pass
+
+        def set_ready_observer(self, _observer) -> None:
+            events.append("ready.bind")
+
+        def set_observation_observer(self, _observer) -> None:
+            events.append("observation.bind")
+
+        def set_auto_eat_observer(self, _observer) -> None:
+            events.append("auto_eat.bind")
+
+        def set_failure_observer(self, _observer) -> None:
+            events.append("failure.bind")
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    class FakeExecution:
+        def __init__(self, **_) -> None:
+            pass
+
+        def reconcile_startup(self):
+            return {"status": "ready"}
+
+        def notify_ready_opportunity(self, *_, **__):
+            pass
+
+        def notify_observation(self, *_, **__):
+            pass
+
+        def notify_monitor_failure(self, *_, **__):
+            pass
+
+        def auto_eat_threshold(self, *_, **__):
+            pass
+
+        def set_cross_venue_monitor(self, _monitor) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        runtime_module,
+        "load_trading_config",
+        lambda _path: types.SimpleNamespace(
+            signer_address="0x1111111111111111111111111111111111111111",
+            wallet_address="0x2222222222222222222222222222222222222222",
+            predict=None,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime_module, "PolymarketTradingClient", FakeTradingClient, raising=False
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "PredictTradingClient",
+        types.SimpleNamespace(from_keychain=lambda _config: None),
+        raising=False,
+    )
+    monkeypatch.setattr(runtime_module, "PredictionArbitrageStore", FakeStore, raising=False)
+    monkeypatch.setattr(runtime_module, "PolymarketMonitor", FakeMonitor, raising=False)
+    monkeypatch.setattr(
+        runtime_module, "PredictionExecutionService", FakeExecution, raising=False
+    )
+    monkeypatch.setattr(
+        runtime_module, "LlmRelationValidator", lambda *a, **k: object(), raising=False
+    )
+    monkeypatch.setattr(
+        runtime_module, "LlmTitleTranslator", lambda *a, **k: object(), raising=False
+    )
+
+    runtime = runtime_module.PredictionRuntime(
+        data_dir=tmp_path,
+        prediction_config_path=tmp_path / "prediction.json",
+        dashboard_url="http://127.0.0.1:8766/",
+        cross_venue_monitor=runtime_module._UnavailableCrossVenueMonitor(
+            "observer-wiring-test"
+        ),
+        git_sha="sha-1",
+        reader_generation=fence,
+        solver_server_factory=lambda: object(),
+        enable_n_leg_background=False,
+    )
+    return runtime, events
+
+
+def test_fence2_runtime_runs_without_wiring_the_legacy_notification_observers(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #109: at the N_LEG fence the legacy ready/observation alert
+    channels must be silent — no Feishu cards, no legacy opportunity alerts.
+    Mirrors the auto-eat unwiring test above: the production wiring must not
+    arm either observer once legacy_retired is true, while the failure
+    observer keeps its unconditional wiring."""
+
+    runtime, events = _observer_wiring_runtime(
+        monkeypatch, tmp_path, fence=2
+    )
+    runtime.start()
+    try:
+        assert runtime.state == "RUNNING"
+        assert runtime.legacy_retired is True
+        assert "ready.bind" not in events
+        assert "observation.bind" not in events
+        assert "auto_eat.bind" not in events
+        assert "failure.bind" in events
+        assert events.count("fence.read") == 1
+    finally:
+        runtime.stop()
+
+
+def test_fence1_runtime_still_wires_all_three_legacy_observers(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #109 fence-1 pin: below the N_LEG fence the ready, observation,
+    and auto-eat observers keep their exact pre-#109 wiring (one bind each),
+    alongside the unconditional failure observer."""
+
+    runtime, events = _observer_wiring_runtime(
+        monkeypatch, tmp_path, fence=1
+    )
+    runtime.start()
+    try:
+        assert runtime.state == "RUNNING"
+        assert runtime.legacy_retired is False
+        assert events.count("ready.bind") == 1
+        assert events.count("observation.bind") == 1
+        assert events.count("auto_eat.bind") == 1
+        assert events.count("failure.bind") == 1
+    finally:
+        runtime.stop()
+
+
 def test_fence2_cross_auto_is_observe_only_despite_armed_auto_submit(tmp_path) -> None:
     # Fixture pattern of tests/test_prediction_arbitrage_execution.py
     # (_cross_service / test_auto_submit_cross_venue_runs_once_...): a real

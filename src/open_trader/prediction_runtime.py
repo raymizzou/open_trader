@@ -593,13 +593,16 @@ class PredictionRuntime:
                 predict_trading=self._predict_trading,
                 legacy_retired=self.legacy_retired,
             )
-            self.monitor.set_ready_observer(
-                self.execution.notify_ready_opportunity
-            )
-            self.monitor.set_observation_observer(
-                self.execution.notify_observation
-            )
             if not self.legacy_retired:
+                # Issue #109: legacy ready/observation alerts retire with the
+                # legacy engine at the N_LEG fence; the monitor keeps both
+                # channels silent while no observer is set.
+                self.monitor.set_ready_observer(
+                    self.execution.notify_ready_opportunity
+                )
+                self.monitor.set_observation_observer(
+                    self.execution.notify_observation
+                )
                 # Issue #60: the legacy auto-eat path must never arm once the
                 # reader fence has reached the N_LEG generation.
                 self.monitor.set_auto_eat_observer(
