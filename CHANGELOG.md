@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-08-31
+
+- Fresh sessions now silently verify repository identity and bind gate/runtime claims to exact-SHA evidence; `git diff --check` passed, and a fresh ephemeral read-only Codex startup probe correctly reported all four gate locations, the five repository identity checks, and the exact-SHA/UNKNOWN rule. Documentation-only, with no runtime or test behavior changed.
+
 ## 2026-08-30
 
 - #108 backend concurrency tests now await their real execution-worker and HTTP request cleanup boundaries. Focused checks passed, each case repeated 20/20 in Docker, and make test passed (7631 passed, 5 skipped, 6 deselected); Candidate Acceptance was not run.

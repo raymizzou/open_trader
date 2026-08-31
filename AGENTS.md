@@ -1,5 +1,20 @@
 # Project Instructions
 
+## Session Bootstrap
+
+On the first repository action of every new session, without waiting for a user reminder:
+
+- Treat the Docker Dev, Candidate Acceptance, Host Readiness, Production Smoke,
+  merge, push, and deployment boundaries in this file as standing project rules.
+  Do not ask the user to restate or confirm them, and do not summarize them unless asked.
+  This does not replace the required concrete plan and explicit user approval for code or behavior changes.
+- Silently verify the repository root, current worktree, branch, HEAD SHA, and
+  working-tree status before planning or making current-state claims.
+- Before claiming PASS, READY, deployed, or healthy, verify evidence for the exact
+  current SHA. Results from another SHA or a previous conversation do not transfer.
+  If evidence is unavailable, report UNKNOWN; do not run an expensive or external
+  gate solely to fill the gap unless the current request requires it.
+
 ## Worktree Baseline
 
 Start every implementation or repository-change task from the current local `main` in an isolated branch and
