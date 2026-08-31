@@ -67,7 +67,7 @@ const state = {
     csrfToken: "",
     llmSwitchInFlight: "",
     activeExecutionId: "",
-    filter: {kind: "all", legs: null, scope: null},
+    filter: {engine: "all", kind: "all", legs: null, scope: null},
     relationReview: {open: false, view: "pending_approval", offset: 0, items: [], total: 0, pendingCount: 0, detail: null, loading: false},
   },
 };
@@ -2454,9 +2454,11 @@ function predictionOpportunityFilter(payload, filter) {
   const kindButtons = kinds.map(([key, label]) =>
     `<button type="button" data-prediction-filter-kind="${key}" aria-pressed="${kind === key}">${label}</button>`
   ).join("");
+  const engine = active.engine || "all";
+  const engineLabel = engine === "all" ? "引擎 ▾" : `${engine} ▾`;
   const legsLabel = active.legs !== null && active.legs !== undefined ? `${active.legs} 腿 ▾` : "腿数 ▾";
   const scopeLabel = active.scope === "cross_venue" ? "跨所 ▾" : active.scope === "same_venue" ? "同所 ▾" : "范围 ▾";
-  return `<nav class="pm-strategy-tabs" aria-label="机会筛选">${kindButtons}<button type="button" data-prediction-filter-legs aria-pressed="${active.legs !== null && active.legs !== undefined}">${legsLabel}</button><button type="button" data-prediction-filter-scope aria-pressed="${active.scope !== null && active.scope !== undefined}">${scopeLabel}</button></nav>`;
+  return `<nav class="pm-strategy-tabs" aria-label="机会筛选"><button type="button" data-prediction-filter-engine aria-pressed="${engine !== "all"}">${engineLabel}</button>${kindButtons}<button type="button" data-prediction-filter-legs aria-pressed="${active.legs !== null && active.legs !== undefined}">${legsLabel}</button><button type="button" data-prediction-filter-scope aria-pressed="${active.scope !== null && active.scope !== undefined}">${scopeLabel}</button></nav>`;
 }
 
 function predictionUnifiedFilteredRows(payload, filter) {
@@ -2479,6 +2481,11 @@ function predictionUnifiedFilteredRows(payload, filter) {
     }
     if (active.legs !== null && active.legs !== undefined && Number(item.leg_count) !== Number(active.legs)) return false;
     if (active.scope && item?.scope?.venue !== active.scope) return false;
+    const engine = active.engine || "all";
+    if (engine !== "all") {
+      const owners = String(item.engine_owner || "").split("/").map((part) => part.trim());
+      if (!owners.includes(engine)) return false;
+    }
     return true;
   });
 }
@@ -2516,12 +2523,13 @@ function predictionNLegExecutionPlan(opportunity) {
   const legRows = legs.map((leg, index) => {
     const venueRaw = String(leg.venue || "").toLowerCase();
     const venue = venueRaw === "predict.fun" ? "Predict.fun" : venueRaw === "polymarket" ? "Polymarket" : (leg.venue || "Polymarket");
-    return `<div class="pm-order-leg"><span>第 ${index + 1} 腿 · ${escapeHtml(venue)} · BUY ${escapeHtml(predictionValue(leg.outcome, ""))}</span><strong>${escapeHtml(predictionValue(leg.quantity_lots, "-"))} 份 · 最高 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(leg.max_cost))} · ${escapeHtml(predictionValue(leg.settlement_asset, "pUSD"))}</small></div>`;
+    const expiresAt = String(leg.expires_at || "").slice(0, 10);
+    return `<div class="pm-order-leg"><span>第 ${index + 1} 腿 · ${escapeHtml(venue)} · BUY ${escapeHtml(predictionValue(leg.outcome, ""))}</span><strong>${escapeHtml(predictionValue(leg.quantity_lots, "-"))} 份 · 最高 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionMoney(leg.max_cost))} · ${escapeHtml(predictionValue(leg.settlement_asset, "pUSD"))}</small><small>场所 <span class="pm-pill venue">${escapeHtml(venue)}</span> · 到期 <span style="white-space:nowrap">${escapeHtml(expiresAt || "-")}</span></small></div>`;
   }).join("");
   const ready = execution.order_ready === true;
   const fingerprint = String(execution.execution_solution_fingerprint || "");
   const shortFingerprint = fingerprint.startsWith("sha256:") ? `sha256:${fingerprint.slice(7, 9)}…` : predictionValue(fingerprint, "-");
-  return `<div class="pm-execution-plan"><h4>下单计划 · would-submit</h4>${legRows ? `<div class="pm-order-legs">${legRows}</div>` : ""}<dl><dt>可下单</dt><dd>${ready ? "是" : "否"}</dd><dt>原因</dt><dd>${escapeHtml(predictionReasonLabel(execution.reason))}</dd><dt>方案指纹</dt><dd>${escapeHtml(shortFingerprint)}</dd><dt>预计占用</dt><dd>${escapeHtml(predictionNLegUnitsMoney(execution.projected_total_units))} / ${escapeHtml(predictionNLegUnitsMoney(execution.max_total_unsettled_capital_units))}</dd></dl></div>`;
+  return `<div class="pm-execution-plan"><h4>下单计划 · would-submit</h4>${legRows ? `<div class="pm-order-legs">${legRows}</div>` : ""}<dl><dt>可下单</dt><dd>${ready ? "是" : "否"}</dd><dt>原因</dt><dd>${escapeHtml(predictionReasonLabel(execution.reason))}</dd><dt>成交证明</dt><dd>${escapeHtml(predictionValue(execution.partial_fill_proof, "-"))}</dd><dt>方案指纹</dt><dd>${escapeHtml(shortFingerprint)}</dd><dt>预计占用</dt><dd>${escapeHtml(predictionNLegUnitsMoney(execution.projected_total_units))} / ${escapeHtml(predictionNLegUnitsMoney(execution.max_total_unsettled_capital_units))}</dd></dl></div>`;
 }
 
 function predictionUnifiedOpportunityCard(row, mode, legacyRetired) {
@@ -2550,10 +2558,13 @@ function predictionUnifiedOpportunityCard(row, mode, legacyRetired) {
     ? "Predict.fun × Polymarket"
     : String(opportunity.venue || "Polymarket");
   const subtitle = `${escapeHtml(venueLabel)} · ${escapeHtml(predictionValue(opportunity.scope_label, ""))}`;
+  const episode = opportunity.episode && typeof opportunity.episode === "object" ? opportunity.episode : {};
+  const episodeLabel = predictionValue(episode.opportunity_episode_id, "") ? `Episode ${episode.opportunity_episode_id}` : "Episode —";
   const tags = [
     opportunity.relation_type,
     opportunity.discovery_source,
     opportunity.leg_count ? `${opportunity.leg_count} 腿` : "",
+    opportunity.qualification_policy_version ? `资格 ${opportunity.qualification_policy_version}` : "",
   ].filter(Boolean).map((tag, index) => `<span class="pm-pill${index === 0 ? " blue" : ""}">${escapeHtml(String(tag))}</span>`).join("");
   const metrics = [
     predictionUnifiedMetric("保证最低利润", escapeHtml(predictionSignedMoney(opportunity.profit)), "pm-positive"),
@@ -2573,7 +2584,7 @@ function predictionUnifiedOpportunityCard(row, mode, legacyRetired) {
     : orderReady && mode === "MANUAL"
     ? `<div class="pm-opportunity-action"><p>确认时重新读取两所 REST、盘口、余额与未结算额度。</p><button type="button" class="pm-button primary" data-action="participate" data-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id, ""))}">人工确认下单</button></div>`
     : `<div class="pm-opportunity-action"><p>order_ready=false · ${escapeHtml(predictionValue(nLegExecution?.reason ? predictionReasonLabel(nLegExecution.reason) : qualification.order_ready_reason, "不可下单"))} · 不可下单。</p></div>`;
-  return `<article class="pm-opportunity"><div class="pm-opportunity-title"><div><h3>${escapeHtml(predictionValue(opportunity.title || opportunity.question, "数据未返回"))}</h3><p>${subtitle}</p></div><span class="pm-pill ${statusClass}">${escapeHtml(status)}</span></div><div class="pm-tags">${tags}</div>${legs.length && !nLegSolution ? `<div class="pm-order-legs">${predictionUnifiedLegRows(opportunity)}</div>` : ""}<div class="pm-metrics">${metrics}</div>${predictionNLegExecutionPlan(opportunity)}${action}</article>`;
+  return `<article class="pm-opportunity"><div class="pm-opportunity-title"><div><h3>${escapeHtml(predictionValue(opportunity.title || opportunity.question, "数据未返回"))}</h3><p>${subtitle}</p><span class="pm-pill episode">${escapeHtml(episodeLabel)}</span></div><span class="pm-pill ${statusClass}">${escapeHtml(status)}</span></div><div class="pm-tags">${tags}</div>${legs.length && !nLegSolution ? `<div class="pm-order-legs">${predictionUnifiedLegRows(opportunity)}</div>` : ""}<div class="pm-metrics">${metrics}</div>${predictionNLegExecutionPlan(opportunity)}${action}</article>`;
 }
 
 function predictionUnifiedOpportunityList(payload, filter) {
@@ -2668,7 +2679,7 @@ function predictionUnifiedPageHeader(payload) {
 
 function predictionUnifiedPage(payload, filter) {
   const viewPayload = payload || {status: "loading", events: [], opportunities: []};
-  const filterState = state.predictionMarket.filter || {kind: "all", legs: null, scope: null};
+  const filterState = state.predictionMarket.filter || {engine: "all", kind: "all", legs: null, scope: null};
   return `${predictionUnifiedPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionNLegMetrics(viewPayload)}${predictionReadinessStrip(viewPayload)}${predictionCapitalUsage(viewPayload)}${predictionUnifiedOpportunityList(viewPayload, filterState)}${predictionRelationReview(viewPayload)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload)}${relationReviewDrawer()}`;
 }
 
@@ -4207,6 +4218,12 @@ async function handlePredictionMarketClick(event) {
       return;
     }
     await loadRelationDetail(relationRow.dataset.relationVersionId || "");
+    return;
+  }
+  if (event.target.closest("[data-prediction-filter-engine]")) {
+    const current = state.predictionMarket.filter.engine || "all";
+    state.predictionMarket.filter.engine = current === "all" ? "N_LEG" : "all";
+    renderPredictionMarket();
     return;
   }
   const filterKind = event.target.closest("[data-prediction-filter-kind]");

@@ -11,6 +11,7 @@ import pytest
 
 import open_trader.cli as cli
 from open_trader.relation_catalog import (
+    REVIEW_STATES,
     RelationCatalog,
     RelationConflictError,
     _derive_statement,
@@ -629,6 +630,88 @@ def test_list_filters_the_six_review_state_views_and_counts_them(tmp_path: Path)
         },
         "pending_count": 1,
     }
+
+
+def test_review_counts_are_generation_pure_per_identity(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+
+    # Identity X: v1 activated historically, then replaced in the generation
+    # by v2. The #60 cutover left such historical records APPROVED+ACTIVE
+    # even though the generation moved on, which is exactly the shape the
+    # generation-pure counts must stop double-counting.
+    x_v1 = catalog.ingest(_unique_discovery("gx"))["version_id"]
+    catalog.approve(x_v1, {"version_id": x_v1}, actor="op", git_sha="sha")
+    x_v2_payload = _unique_discovery("gx")
+    x_v2_payload["markets"][0]["title"] = "Market 0 (edited)"
+    x_v2 = catalog.ingest(x_v2_payload)["version_id"]
+    catalog.approve(x_v2, {"version_id": x_v2}, actor="op", git_sha="sha")
+    catalog.replace(
+        {"version_id": x_v1},
+        {"version_id": x_v2},
+        reason="rules_changed",
+        actor="op",
+        git_sha="sha",
+    )
+    _force_record(catalog, x_v1, status="APPROVED", activation_status="ACTIVE")
+
+    # Identity Y: an APPROVED+ACTIVE record that is not a generation member.
+    y_v1 = catalog.ingest(_unique_discovery("gy"))["version_id"]
+    _force_record(catalog, y_v1, status="APPROVED", activation_status="ACTIVE")
+
+    counts = catalog.review_counts()["counts"]
+    assert counts["ACTIVATED"] == 1
+    active_rows = catalog.list("approved_active")
+    assert len(active_rows) == 1
+    assert active_rows[0]["version_id"] == x_v2
+
+
+def test_review_counts_classify_only_the_latest_version_per_identity(
+    tmp_path: Path,
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+
+    # One identity: v1 activated, v2 approval blocked, v3 (latest) pending.
+    activated = catalog.ingest(_unique_discovery("gz"))["version_id"]
+    catalog.approve(activated, {"version_id": activated}, actor="op", git_sha="sha")
+    blocked_payload = _unique_discovery("gz")
+    blocked_payload["markets"][0]["title"] = "Market 0 (edited)"
+    blocked = catalog.ingest(blocked_payload)["version_id"]
+    blocked_result = catalog.approve(
+        blocked, {"version_id": blocked}, actor="op", git_sha="sha"
+    )
+    assert blocked_result["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+    relisted_payload = _unique_discovery("gz")
+    relisted_payload["markets"][0]["title"] = "Market 0 (relisted)"
+    catalog.ingest(relisted_payload)
+
+    counts = catalog.review_counts()["counts"]
+    assert counts["PENDING_APPROVAL"] == 1
+    assert counts["ACTIVATION_BLOCKED"] == 0
+    assert catalog.pending_count() == 1
+
+
+def test_review_counts_exclude_terminal_history_from_every_state(
+    tmp_path: Path,
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+
+    rejected = catalog.ingest(
+        _unique_discovery("gr", completeness="INCOMPLETE")
+    )["version_id"]
+    catalog.reject(
+        rejected, {"version_id": rejected}, reason="other", actor="op", git_sha="sha"
+    )
+    revoked = catalog.ingest(_unique_discovery("gv"))["version_id"]
+    catalog.approve(revoked, {"version_id": revoked}, actor="op", git_sha="sha")
+    catalog.revoke(
+        revoked, {"version_id": revoked}, reason="rules_changed", actor="op", git_sha="sha"
+    )
+    expired = catalog.ingest(_unique_discovery("ge"))["version_id"]
+    catalog.approve(expired, {"version_id": expired}, actor="op", git_sha="sha")
+    catalog.expire_stale_members(now="2027-01-01T00:00:00Z", actor="op", git_sha="sha")
+
+    assert catalog.review_counts()["counts"] == {state: 0 for state in REVIEW_STATES}
+    assert catalog.pending_count() == 0
 
 
 def test_list_legacy_view_aliases_keep_their_semantics(tmp_path: Path) -> None:

@@ -12,6 +12,8 @@ from open_trader.prediction_read_model import (
     prediction_history_payload,
     prediction_state_payload,
 )
+from open_trader.relation_catalog import RelationCatalog
+from test_relation_catalog import discovery
 
 
 class _Store:
@@ -820,6 +822,34 @@ def test_relation_review_empty_when_catalog_missing() -> None:
             "SOURCE_CHANGED_REAPPROVAL": 0,
         },
     }
+
+
+def _catalog_discovery(suffix: str) -> dict[str, object]:
+    payload = discovery()
+    for index, market in enumerate(payload["markets"]):
+        market["contract_id"] = f"condition-{index}-{suffix}"
+    return payload
+
+
+def test_relation_review_payload_equals_generation_pure_catalog_counts(
+    tmp_path,
+) -> None:
+    catalog = RelationCatalog(tmp_path)
+    active = catalog.ingest(_catalog_discovery("ga"))["version_id"]
+    catalog.approve(active, {"version_id": active}, actor="op", git_sha="sha")
+    catalog.ingest(_catalog_discovery("gp"))
+
+    state = prediction_state_payload(
+        store=_Store(),
+        monitor=_NlegMonitor([]),
+        execution=_NlegExecution(),
+        csrf_token="csrf",
+        relation_catalog=catalog,
+    )
+
+    assert state["relation_review"] == catalog.review_counts()
+    assert state["relation_review"]["counts"]["ACTIVATED"] == 1
+    assert state["relation_review"]["counts"]["PENDING_APPROVAL"] == 1
 
 
 class _NlegContractExecution(_NlegExecution):

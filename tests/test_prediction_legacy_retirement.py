@@ -23,6 +23,8 @@ from open_trader.prediction_market_solution import MarketSolution
 from open_trader.prediction_n_leg import ActionQuantity, canonical_payload, fingerprint
 from open_trader.prediction_read_model import prediction_state_payload
 from open_trader.prediction_service import create_prediction_server
+from open_trader.relation_catalog import RelationCatalog
+from test_relation_catalog import compiled_problem, discovery
 
 
 LEGACY_STRATEGY_REMOVED = "legacy_strategy_removed"
@@ -531,6 +533,233 @@ def test_fence2_state_payload_opportunities_are_empty_without_solutions() -> Non
     )
 
     assert state["opportunities"] == []
+
+
+TAXONOMY_RELEASE_AT = "2026-12-31T17:00:00Z"
+
+
+def _implies_relation_discovery(
+    contract_a: str = "cond-a", contract_b: str = "cond-b"
+) -> dict[str, object]:
+    """One IMPLIES relation over a same-venue, same-event contract pair."""
+    payload = discovery(
+        relation_type="IMPLIES",
+        n=2,
+        venues=("polymarket", "polymarket"),
+        event_bases=("event-btc-1", "event-btc-1"),
+        problem=compiled_problem(
+            [contract_a, contract_b],
+            {contract_a: "BUY_YES", contract_b: "BUY_NO"},
+            release_at=TAXONOMY_RELEASE_AT,
+        ),
+    )
+    payload["markets"][0]["contract_id"] = contract_a
+    payload["markets"][1]["contract_id"] = contract_b
+    payload["model"]["capital_release"] = TAXONOMY_RELEASE_AT
+    return payload
+
+
+def _native_complement_relation_discovery() -> dict[str, object]:
+    """One NATIVE_COMPLEMENT relation over cat-b/cat-c.
+
+    Shares the IMPLIES relation's event basis: the activation gate publishes
+    only same-event generations, which is exactly the merged display case.
+    """
+    payload = discovery(
+        relation_type="NATIVE_COMPLEMENT",
+        n=2,
+        venues=("polymarket", "polymarket"),
+        event_bases=("event-btc-1", "event-btc-1"),
+        problem=compiled_problem(
+            ["cat-b", "cat-c"],
+            # cat-b keeps the BUY_NO side of the cat implies relation: the
+            # activation gate merges compiled problems per action id, so a
+            # shared contract must not carry conflicting payouts.
+            {"cat-b": "BUY_NO", "cat-c": "BUY_YES"},
+            release_at=TAXONOMY_RELEASE_AT,
+        ),
+    )
+    payload["markets"][0]["contract_id"] = "cat-b"
+    payload["markets"][1]["contract_id"] = "cat-c"
+    payload["model"]["capital_release"] = TAXONOMY_RELEASE_AT
+    return payload
+
+
+def _taxonomy_component_solution(
+    component_id: str, contract_ids: list[str]
+) -> dict[str, object]:
+    market = canonical_payload(
+        MarketSolution(
+            component_id=component_id,
+            structure_fingerprint="sha256:struct",
+            quote_fingerprint="sha256:quote",
+            quantities=tuple(
+                ActionQuantity(f"polymarket:{contract_id}", 20)
+                for contract_id in contract_ids
+            ),
+            guaranteed_profit_units=8_400_000,
+            bounded_cost_units=31_200_000,
+            bounded_payout_units=39_600_000,
+            capital_release_at=datetime(2026, 12, 31, tzinfo=UTC),
+            global_search_closed=False,
+            verification_fingerprint="sha256:verify",
+        )
+    )
+    return {
+        "component_id": component_id,
+        "scope_id": "s1",
+        "market": market,
+        "execution": {
+            "market_solution_fingerprint": fingerprint(canonical_payload(market)),
+            "quantities": market["quantities"],
+            "capital_use_units": 31_200_000,
+            "reason": "EXECUTABLE",
+            "order_ready": False,
+            "partial_fill_proof": "PARTIAL_FILL_SAFE",
+        },
+    }
+
+
+class _ObserveOnlyContractExecution(_ContractExecution):
+    """Mode contract whose single scope is OBSERVE_ONLY: the would-submit
+    projection stays order_ready=false / SCOPE_OBSERVE_ONLY."""
+
+    def n_leg_mode_contract(self) -> dict[str, object]:
+        contract = super().n_leg_mode_contract()
+        contract["execution_scopes"] = {
+            "s1": {"scope_id": "s1", "capability": "OBSERVE_ONLY", "scope_version": 1},
+        }
+        return contract
+
+
+class _TaxonomyHttpRuntime(_FakeRuntime):
+    """Fence-2 runtime with one seeded taxonomy component and a real catalog
+    whose current generation holds matching relations (#105)."""
+
+    def __init__(self, *, legacy_retired: bool, catalog_dir, solutions) -> None:
+        super().__init__(legacy_retired=legacy_retired)
+        self.store = _RetiredStateStore()
+        self.monitor = _RetiredStateMonitor()
+        self.execution = _ObserveOnlyContractExecution()
+        catalog = RelationCatalog(catalog_dir)
+        for payload in (
+            _implies_relation_discovery("cond-a", "cond-b"),
+            _implies_relation_discovery("cat-a", "cat-b"),
+            _native_complement_relation_discovery(),
+        ):
+            version_id = catalog.ingest(payload)["version_id"]
+            catalog.approve(
+                version_id, {"version_id": version_id}, actor="op", git_sha="sha"
+            )
+        self.relation_catalog = catalog
+        self.n_leg_solutions = lambda: list(solutions)  # noqa: E731
+
+
+def test_fence2_retired_rows_carry_taxonomy_episode_and_leg_display(tmp_path) -> None:
+    solution = _taxonomy_component_solution(
+        "component:cond-a:cond-b", ["cond-a", "cond-b"]
+    )
+    with _serve(
+        _TaxonomyHttpRuntime(
+            legacy_retired=True, catalog_dir=tmp_path, solutions=[solution]
+        )
+    ) as base:
+        status, state = _get_state(base)
+
+    assert status == 200
+    opportunities = state["opportunities"]
+    assert [row["component_id"] for row in opportunities] == [
+        "component:cond-a:cond-b"
+    ]
+    row = opportunities[0]
+    assert row["opportunity_id"] == "nleg:component:cond-a:cond-b"
+    assert row["engine_owner"] == "N_LEG"
+    assert row["relation_type"] == "IMPLIES"
+    assert row["discovery_source"] == "LLM"
+    assert row["leg_count"] == 2
+    assert row["scope"] == {"event": "same_event", "venue": "same_venue"}
+    assert row["scope_label"] == "同所 · 同事件"
+    assert row["order_ready"] is False
+    assert row["reason"] == "SCOPE_OBSERVE_ONLY"
+    assert row["partial_fill_proof"] == "PARTIAL_FILL_SAFE"
+    assert row["episode"] == {
+        "opportunity_episode_id": None,
+        "episode_lineage_id": None,
+        "status": None,
+    }
+    assert [leg["venue"] for leg in row["legs"]] == ["polymarket", "polymarket"]
+    assert [leg["expires_at"] for leg in row["legs"]] == [
+        "2026-12-31",
+        "2026-12-31",
+    ]
+
+
+def test_fence2_duplicate_component_projections_surface_one_row(tmp_path) -> None:
+    solution = _taxonomy_component_solution(
+        "component:cond-a:cond-b", ["cond-a", "cond-b"]
+    )
+    with _serve(
+        _TaxonomyHttpRuntime(
+            legacy_retired=True,
+            catalog_dir=tmp_path,
+            solutions=[solution, dict(solution)],
+        )
+    ) as base:
+        status, state = _get_state(base)
+
+    assert status == 200
+    assert len(state["opportunities"]) == 1
+    assert state["opportunities"][0]["engine_owner"] == "N_LEG"
+
+
+def test_fence2_merged_component_joins_relation_taxonomy_sorted(tmp_path) -> None:
+    solution = _taxonomy_component_solution(
+        "component:cat-a:cat-b:cat-c", ["cat-a", "cat-b", "cat-c"]
+    )
+    with _serve(
+        _TaxonomyHttpRuntime(
+            legacy_retired=True, catalog_dir=tmp_path, solutions=[solution]
+        )
+    ) as base:
+        status, state = _get_state(base)
+
+    assert status == 200
+    row = state["opportunities"][0]
+    assert row["relation_type"] == "IMPLIES/NATIVE_COMPLEMENT"
+    assert row["discovery_source"] == "LLM/VENUE_METADATA"
+    assert row["leg_count"] == 3
+
+
+def test_fence2_component_without_catalog_match_keeps_empty_taxonomy(tmp_path) -> None:
+    solution = _taxonomy_component_solution(
+        "component:unmatched-1:unmatched-2", ["unmatched-1", "unmatched-2"]
+    )
+    with _serve(
+        _TaxonomyHttpRuntime(
+            legacy_retired=True, catalog_dir=tmp_path, solutions=[solution]
+        )
+    ) as base:
+        status, state = _get_state(base)
+
+    assert status == 200
+    opportunities = state["opportunities"]
+    assert [row["component_id"] for row in opportunities] == [
+        "component:unmatched-1:unmatched-2"
+    ]
+    row = opportunities[0]
+    assert row["engine_owner"] == "N_LEG"
+    assert row["relation_type"] is None
+    assert row["discovery_source"] is None
+    assert row["scope"] is None
+    assert row["scope_label"] is None
+    assert row["episode"] == {
+        "opportunity_episode_id": None,
+        "episode_lineage_id": None,
+        "status": None,
+    }
+    for leg in row["legs"]:
+        assert leg["venue"] is None
+        assert leg["expires_at"] is None
 
 
 def _seeded_n_leg_solution() -> dict[str, object]:

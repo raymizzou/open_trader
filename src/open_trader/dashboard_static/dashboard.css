@@ -6329,6 +6329,7 @@ button { cursor: pointer; }
 .pm-pill.venue { background: #e8f4ed; border-color: #b9dac6; color: #21623f; }
 .pm-pill.action { background: #e8f4ed; border-color: #b9dac6; color: #21623f; }
 .pm-pill.watch { background: #fff4df; border-color: #e5c98f; color: #704915; }
+.pm-pill.episode { border-style: dashed; color: var(--muted); font-weight: 700; }
 .pm-event-title { font-weight: 750; line-height: 1.35; min-width: 0; }
 .pm-event-title .pm-title-zh { font-weight: 800; }
 .pm-event-title .pm-title-en { color: var(--muted); font-size: 12px; margin-top: 3px; }

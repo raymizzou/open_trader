@@ -1051,13 +1051,29 @@ class RelationCatalog:
         return result
 
     def review_counts(self) -> dict[str, object]:
-        """Six-state counts plus the pending total for the read model payload."""
+        """Six-state counts plus the pending total for the read model payload.
 
+        Generation-pure (#105): only each identity's latest version is
+        classified, and ACTIVATED requires current-generation membership, so
+        historical APPROVED+ACTIVE records left behind by a generation change
+        count as ACTIVATION_BLOCKED instead of inflating the ACTIVATED total.
+        """
+
+        generation = self._current_generation()
         counts: dict[str, int] = {state: 0 for state in REVIEW_STATES}
-        for record in self._versions().values():
+        versions = self._versions()
+        for version_id in self._store.get("latest", {}).values():
+            record = versions.get(str(version_id))
+            if record is None:
+                continue
             state = review_state(record)
-            if state is not None:
-                counts[state] += 1
+            if state is None:
+                continue
+            if state == "ACTIVATED" and not self._in_generation(
+                str(version_id), generation
+            ):
+                state = "ACTIVATION_BLOCKED"
+            counts[state] += 1
         return {"counts": counts, "pending_count": counts["PENDING_APPROVAL"]}
 
     def review_rows(self) -> list[dict[str, object]]:
@@ -1068,6 +1084,17 @@ class RelationCatalog:
             for version_id, record in self._versions().items()
         ]
 
+    @staticmethod
+    def _in_generation(
+        version_id: str,
+        generation: Mapping[str, Mapping[str, object]],
+    ) -> bool:
+        """Whether one version is a member of the given generation snapshot."""
+
+        return any(
+            entry["version_id"] == version_id for entry in generation.values()
+        )
+
     def _in_view(
         self,
         view: str,
@@ -1077,14 +1104,16 @@ class RelationCatalog:
     ) -> bool:
         status = str(record.get("status", "PENDING"))
         activation = str(record.get("activation_status", "PENDING"))
-        active = any(
-            entry["version_id"] == version_id for entry in generation.values()
-        )
+        active = self._in_generation(version_id, generation)
         if view == "approved_active":
             return status == "APPROVED" and active
         return status in {"REJECTED", "REVOKED", "EXPIRED"} or activation == "SUPERSEDED"
 
     def pending_count(self) -> int:
+        # Queue depth for the review workflow: every pending version counts,
+        # including same-identity duplicates the dedup pass still needs to
+        # judge. The display-pure pending number is review_counts()'s
+        # ``pending_count`` key (latest version per identity only).
         return sum(
             1
             for record in self._versions().values()

@@ -3903,6 +3903,117 @@ console.log(JSON.stringify({
     assert "当前无更多合格机会" in rendered["empty"]
 
 
+def test_prediction_unified_filter_renders_engine_control_and_filters_by_owner() -> None:
+    output = run_dashboard_js(r'''
+const nlegRow = {
+  opportunity_id: "nleg:component:a:b",
+  engine_owner: "N_LEG",
+  strategy_type: "N_LEG",
+  market_type: "n_leg",
+  relation_type: "IMPLIES",
+  discovery_source: "LLM",
+  leg_count: 2,
+  scope: {event: "same_event", venue: "same_venue"},
+  scope_label: "同所 · 同事件",
+  qualification: {status: "QUALIFIED_VERIFIED", order_ready: false, checks: []},
+};
+const legacyRow = {
+  ...nlegRow,
+  opportunity_id: "legacy-1",
+  engine_owner: "yes_no",
+  relation_type: "NATIVE_COMPLEMENT",
+};
+const payload = {qualified_opportunities: [nlegRow, legacyRow]};
+const base = {kind: "all", legs: null, scope: null};
+console.log(JSON.stringify({
+  bar: predictionOpportunityFilter(payload, {}),
+  barNLeg: predictionOpportunityFilter(payload, {...base, engine: "N_LEG"}),
+  engineOnly: predictionUnifiedFilteredRows(payload, {...base, engine: "N_LEG"}).map((row) => row.opportunity_id),
+  engineAll: predictionUnifiedFilteredRows(payload, {...base, engine: "all"}).map((row) => row.opportunity_id),
+  combined: predictionUnifiedFilteredRows(payload, {...base, legs: 2, engine: "N_LEG"}).map((row) => row.opportunity_id),
+  combinedScope: predictionUnifiedFilteredRows(payload, {...base, scope: "same_venue", engine: "N_LEG"}).map((row) => row.opportunity_id),
+  combinedDrops: predictionUnifiedFilteredRows(payload, {...base, legs: 3, engine: "N_LEG"}).map((row) => row.opportunity_id),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert "引擎" in rendered["bar"]
+    assert rendered["bar"].index("data-prediction-filter-engine") < rendered["bar"].index("data-prediction-filter-kind")
+    assert 'aria-pressed="false"' in rendered["bar"]
+    assert "N_LEG" in rendered["barNLeg"]
+    assert 'aria-pressed="true"' in rendered["barNLeg"]
+    assert rendered["engineOnly"] == ["nleg:component:a:b"]
+    assert rendered["engineAll"] == ["nleg:component:a:b", "legacy-1"]
+    assert rendered["combined"] == ["nleg:component:a:b"]
+    assert rendered["combinedScope"] == ["nleg:component:a:b"]
+    assert rendered["combinedDrops"] == []
+
+
+def test_prediction_unified_card_renders_taxonomy_episode_and_leg_columns() -> None:
+    output = run_dashboard_js(r'''
+const legRows = [
+  {action_id: "polymarket:a", venue: "polymarket", expires_at: "2026-12-31", outcome: "YES", quantity_lots: 20, max_price: "0.42", max_cost: "16.80", settlement_asset: "pUSD"},
+  {action_id: "polymarket:b", venue: "polymarket", expires_at: "2026-12-31", outcome: "NO", quantity_lots: 20, max_price: "0.36", max_cost: "14.40", settlement_asset: "pUSD"},
+];
+const row = {
+  opportunity_id: "nleg:component:a:b",
+  title: "Bitcoin 在 12 月 31 日前高于 $120,000？",
+  engine_owner: "N_LEG",
+  strategy_type: "N_LEG",
+  market_type: "n_leg",
+  relation_type: "IMPLIES",
+  discovery_source: "LLM",
+  leg_count: 2,
+  scope: {event: "same_event", venue: "same_venue"},
+  scope_label: "同所 · 同事件",
+  qualification_policy_version: "v1",
+  episode: {opportunity_episode_id: null, episode_lineage_id: null, status: null},
+  profit: "8.40",
+  annualized_yield: "0.284",
+  remaining_days: "12",
+  legs: legRows,
+  qualification: {status: "QUALIFIED_VERIFIED", order_ready: false, checks: [{key: "net_edge", value: "0.2454", passed: true}]},
+  n_leg_solution: {
+    component_id: "component:a:b",
+    market: {minimum_profit: "8.40", maximum_cost: "31.20", legs: []},
+    execution: {
+      would_submit: true,
+      order_ready: false,
+      reason: "SCOPE_OBSERVE_ONLY",
+      partial_fill_proof: "PARTIAL_FILL_SAFE",
+      execution_solution_fingerprint: "sha256:4c1234567890abcdef",
+      projected_total_units: 31200000,
+      max_total_unsettled_capital_units: 60000000,
+      legs: legRows,
+    },
+  },
+};
+console.log(JSON.stringify({
+  card: predictionUnifiedOpportunityCard(row, "MANUAL", true),
+  plan: predictionNLegExecutionPlan(row),
+}));
+''')
+    rendered = json.loads(output)
+    card = rendered["card"]
+    plan = rendered["plan"]
+
+    assert "IMPLIES" in card
+    assert "LLM" in card
+    assert "同所 · 同事件" in card
+    assert "2 腿" in card
+    assert "资格 v1" in card
+    assert "Episode —" in card
+    assert "pm-pill episode" in card
+    assert "QUALIFIED_VERIFIED" in card
+    assert "PARTIAL_FILL_SAFE" in card
+    assert "当前范围只读 · 不可下单" in card
+    assert "场所" in plan
+    assert "到期" in plan
+    assert "Polymarket" in plan
+    assert "2026-12-31" in plan
+    assert 'class="pm-pill venue"' in plan
+
+
 def test_prediction_unified_page_renders_mock_blocks_and_filter_state() -> None:
     output = run_dashboard_js(r'''
 const payload = {
@@ -4080,6 +4191,34 @@ console.log(JSON.stringify({html}));
     assert "is-block" in rendered["html"]
     assert "is-ok" in rendered["html"]
     assert "六态状态计数" in rendered["html"]
+
+
+def test_prediction_relation_review_chips_render_generation_pure_counts() -> None:
+    output = run_dashboard_js(r'''
+const payload = {relation_review: {
+  pending_count: 56,
+  counts: {
+    PENDING_APPROVAL: 56,
+    APPROVED_MODEL_INCOMPLETE: 0,
+    COMPILED_PENDING_ACTIVATION: 0,
+    ACTIVATION_BLOCKED: 862,
+    ACTIVATED: 60,
+    SOURCE_CHANGED_REAPPROVAL: 0,
+  },
+}};
+console.log(JSON.stringify({html: predictionRelationReview(payload)}));
+''')
+    rendered = json.loads(output)
+    html = rendered["html"]
+
+    # Cutover evidence (#60): 60 published / 862 blocked / 56 pending after
+    # the generation-pure counts fix — chips read the payload verbatim.
+    assert ">60</span>" in html
+    assert ">862</span>" in html
+    assert ">56</span>" in html
+    assert "待批准 <strong>56</strong>" in html
+    assert "已激活" in html
+    assert "激活阻断" in html
 
 
 def test_relation_review_drawer_renders_tabs_pager_and_detail_roles() -> None:

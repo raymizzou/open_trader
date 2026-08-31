@@ -754,6 +754,12 @@ _NLEG_SCOPE_LABELS = {
     ("cross_venue", "same_event"): "跨所 · 同事件",
     ("cross_venue", "cross_event"): "跨所 · 跨事件",
 }
+_NLEG_SOURCE_BY_RELATION_TYPE = {
+    "NATIVE_COMPLEMENT": "VENUE_METADATA",
+    "IMPLIES": "LLM",
+    "MUTUALLY_EXCLUSIVE": "MANUAL",
+    "EXACTLY_ONE": "MANUAL",
+}
 _NLEG_UNITS_PER_DOLLAR = Decimal("1000000")
 
 
@@ -919,8 +925,177 @@ def _prediction_n_leg_solution_projection(
     return projected
 
 
+def _prediction_iso_date(value: object) -> str:
+    """The UTC date portion of an ISO timestamp; unparseable text keeps its
+    first ten characters so the display value stays a plain ISO date."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return text[:10]
+
+
+def _prediction_retired_catalog_index(
+    relation_catalog: object | None,
+) -> dict[str, list[Mapping[str, object]]]:
+    """Issue #105 read-only display lookup: contract_id → generation rows.
+
+    Only ``current_generation()`` rows participate, mirroring the review
+    counts fix: retired-fence rows describe the published relation view.
+    """
+
+    if relation_catalog is None:
+        return {}
+    current_generation = getattr(relation_catalog, "current_generation", None)
+    if not callable(current_generation):
+        return {}
+    try:
+        generation = current_generation()
+    except Exception:
+        return {}
+    if not isinstance(generation, Mapping):
+        return {}
+    by_contract: dict[str, list[Mapping[str, object]]] = {}
+    for row in generation.values():
+        if not isinstance(row, Mapping):
+            continue
+        endpoints = row.get("endpoints")
+        if not isinstance(endpoints, (list, tuple)):
+            continue
+        for endpoint in endpoints:
+            if not isinstance(endpoint, Mapping):
+                continue
+            contract_id = str(endpoint.get("contract_id") or "")
+            if contract_id:
+                by_contract.setdefault(contract_id, []).append(row)
+    return by_contract
+
+
+def _prediction_retired_taxonomy(
+    component_id: str,
+    catalog_index: Mapping[str, list[Mapping[str, object]]],
+) -> tuple[dict[str, object], dict[str, dict[str, str]], dict[str, str]]:
+    """Taxonomy fields plus per-contract display facts for one retired row.
+
+    A relation contributes when its endpoint contract_ids are a subset of the
+    component's contracts (the oracle names components
+    ``component:<contract>:...``). Merged components join their distinct
+    relation types (and mapped discovery sources) with a sorted ``/`` so the
+    display stays deterministic. Venue facts come from the catalog endpoints;
+    expiry is the contract's capital-release ISO date — the projection's leg
+    rows carry no close/end timestamp of their own (MarketSolution only has a
+    component-level ``capital_release_at``), so the catalog relation model's
+    per-contract terminal-atom ``capital_release_at`` (latest atom, else the
+    relation-level ``capital_release``) is the one deterministic source.
+    Returns ``(taxonomy, contract_facts, action_id → contract_id)``.
+    """
+
+    contracts = (
+        component_id.split(":")[1:] if component_id.startswith("component:") else []
+    )
+    contract_set = set(contracts)
+    matched: dict[str, Mapping[str, object]] = {}
+    for contract in contracts:
+        for row in catalog_index.get(contract, []):
+            identity = str(row.get("identity") or "")
+            if identity in matched:
+                continue
+            endpoint_contracts = {
+                str(endpoint.get("contract_id") or "")
+                for endpoint in (row.get("endpoints") or [])
+                if isinstance(endpoint, Mapping)
+            }
+            if endpoint_contracts and endpoint_contracts <= contract_set:
+                matched[identity] = row
+    taxonomy: dict[str, object] = {
+        "relation_type": None,
+        "discovery_source": None,
+        "scope": None,
+        "scope_label": None,
+    }
+    facts: dict[str, dict[str, str]] = {}
+    action_contracts: dict[str, str] = {}
+    if not matched:
+        return taxonomy, facts, action_contracts
+    relation_types = sorted({
+        str(row.get("relation_type") or "")
+        for row in matched.values()
+        if row.get("relation_type")
+    })
+    sources = sorted({
+        str(source)
+        for source in (
+            _NLEG_SOURCE_BY_RELATION_TYPE.get(relation_type)
+            for relation_type in relation_types
+        )
+        if source
+    })
+    taxonomy["relation_type"] = "/".join(relation_types) if relation_types else None
+    taxonomy["discovery_source"] = "/".join(sources) if sources else None
+    venues: set[str] = set()
+    events: set[str] = set()
+    for row in matched.values():
+        model = row.get("model") if isinstance(row.get("model"), Mapping) else {}
+        problem = (
+            model.get("problem")
+            if isinstance(model.get("problem"), Mapping)
+            else {}
+        )
+        releases_by_contract: dict[str, list[str]] = {}
+        state_sets = problem.get("terminal_state_sets")
+        for state_set in state_sets if isinstance(state_sets, (list, tuple)) else []:
+            if not isinstance(state_set, Mapping):
+                continue
+            contract = str(state_set.get("market_contract_id") or "")
+            atoms = state_set.get("atoms")
+            for atom in atoms if isinstance(atoms, (list, tuple)) else []:
+                if not isinstance(atom, Mapping):
+                    continue
+                date = _prediction_iso_date(atom.get("capital_release_at"))
+                if date:
+                    releases_by_contract.setdefault(contract, []).append(date)
+        actions = problem.get("actions")
+        for action in actions if isinstance(actions, (list, tuple)) else []:
+            if not isinstance(action, Mapping):
+                continue
+            action_id = str(action.get("action_id") or "")
+            contract = str(action.get("market_contract_id") or "")
+            if action_id and contract:
+                action_contracts[action_id] = contract
+        for endpoint in row.get("endpoints") or []:
+            if not isinstance(endpoint, Mapping):
+                continue
+            contract = str(endpoint.get("contract_id") or "")
+            if not contract:
+                continue
+            entry = facts.setdefault(contract, {})
+            venue = str(endpoint.get("venue") or "")
+            if venue:
+                venues.add(venue)
+                entry.setdefault("venue", venue)
+            basis = endpoint.get("event_identity_basis")
+            if basis not in (None, ""):
+                events.add(str(basis))
+            if "expires_at" not in entry:
+                dates = releases_by_contract.get(contract) or []
+                release_date = sorted(dates)[-1] if dates else _prediction_iso_date(
+                    model.get("capital_release")
+                )
+                if release_date:
+                    entry["expires_at"] = release_date
+    if venues and events:
+        venue_scope = "same_venue" if len(venues) == 1 else "cross_venue"
+        event_scope = "same_event" if len(events) == 1 else "cross_event"
+        taxonomy["scope"] = {"event": event_scope, "venue": venue_scope}
+        taxonomy["scope_label"] = _NLEG_SCOPE_LABELS[(venue_scope, event_scope)]
+    return taxonomy, facts, action_contracts
+
+
 def _prediction_retired_opportunity_row(
     item: Mapping[str, object],
+    catalog_index: Mapping[str, list[Mapping[str, object]]] | None = None,
 ) -> dict[str, object]:
     """Issue #60: one retired-fence opportunity row from an N_LEG projection.
 
@@ -928,7 +1103,10 @@ def _prediction_retired_opportunity_row(
     reasons) are not part of an N_LEG solution; the row flattens the
     projection's market/execution display fields into the dashboard
     vocabulary, carries the N_LEG owner label, and embeds the full projection
-    under ``n_leg_solution``.
+    under ``n_leg_solution``. Issue #105 adds the orthogonal relation
+    taxonomy (catalog generation lookup), the episode reservation slot
+    (#106 fills the values), and per-leg venue/expiry on the would-submit
+    display rows.
     """
     market = (
         dict(item.get("market")) if isinstance(item.get("market"), Mapping) else {}
@@ -944,6 +1122,28 @@ def _prediction_retired_opportunity_row(
         else {}
     )
     component_id = str(item.get("component_id") or "")
+    taxonomy, contract_facts, action_contracts = _prediction_retired_taxonomy(
+        component_id, catalog_index or {}
+    )
+    legs = execution.get("legs")
+    if isinstance(legs, (list, tuple)) and legs and contract_facts is not None:
+        enriched_legs: list[object] = []
+        for leg in legs:
+            if not isinstance(leg, Mapping):
+                enriched_legs.append(leg)
+                continue
+            facts = contract_facts.get(
+                action_contracts.get(str(leg.get("action_id") or ""), "")
+            ) or {}
+            row_leg = dict(leg)
+            if facts.get("venue"):
+                row_leg["venue"] = str(facts["venue"])
+            if facts.get("expires_at"):
+                row_leg["expires_at"] = str(facts["expires_at"])
+            row_leg.setdefault("venue", None)
+            row_leg.setdefault("expires_at", None)
+            enriched_legs.append(row_leg)
+        execution = {**execution, "legs": enriched_legs}
     return {
         "opportunity_id": f"nleg:{component_id}" if component_id else "",
         "component_id": component_id,
@@ -956,7 +1156,22 @@ def _prediction_retired_opportunity_row(
         **market,
         **execution,
         "qualification": qualification,
-        "n_leg_solution": dict(item),
+        "relation_type": taxonomy["relation_type"],
+        "discovery_source": taxonomy["discovery_source"],
+        "scope": taxonomy["scope"],
+        "scope_label": taxonomy["scope_label"],
+        # Mirrors the `_prediction_nleg_labels` default: the projection's
+        # qualification policy snapshot carries no version of its own.
+        "qualification_policy_version": str(
+            item.get("qualification_policy_version") or "v1"
+        ),
+        # Reservation slot only; #106 fills episode values from the store.
+        "episode": {
+            "opportunity_episode_id": None,
+            "episode_lineage_id": None,
+            "status": None,
+        },
+        "n_leg_solution": {**dict(item), "execution": execution},
     }
 
 
@@ -1655,9 +1870,15 @@ def prediction_state_payload(
     if legacy_retired:
         # The opportunities list is N_LEG-owned: legacy signal-derived rows
         # and cross-venue candidates never surface once the fence is retired.
-        opportunity_rows = [
-            _prediction_retired_opportunity_row(item) for item in n_leg_projections
-        ]
+        # Issue #105: rows carry the relation taxonomy/episode slot, and the
+        # resolver's one-solution-per-component contract is enforced here so
+        # duplicate projections can never duplicate a display row.
+        retired_index = _prediction_retired_catalog_index(relation_catalog)
+        retired_rows: dict[str, dict[str, object]] = {}
+        for item in n_leg_projections:
+            row = _prediction_retired_opportunity_row(item, catalog_index=retired_index)
+            retired_rows.setdefault(str(row.get("component_id") or ""), row)
+        opportunity_rows = list(retired_rows.values())
     else:
         projected_opportunities: list[dict[str, object]] = []
         for row in opportunity_rows:
