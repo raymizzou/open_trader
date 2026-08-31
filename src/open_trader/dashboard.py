@@ -8,7 +8,14 @@ import socket
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from decimal import Context, Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
+from decimal import (
+    Context,
+    Decimal,
+    InvalidOperation,
+    ROUND_FLOOR,
+    ROUND_HALF_UP,
+    localcontext,
+)
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -94,6 +101,13 @@ from .trend_api_stats import (
     load_trend_api_stats,
     read_trend_api_stats_snapshot,
     trend_statistics_disposition,
+)
+from .trend_kelly import (
+    KELLY_QUANTUM,
+    KELLY_MINIMUM_SAMPLES,
+    calculate_trend_kelly,
+    maximize_average_log_growth,
+    trend_kelly_rounds_from_payload,
 )
 from .tradingagents_summary import (
     index_tradingagents_summary_by_market_symbol,
@@ -3843,6 +3857,11 @@ def _project_broker_trend_report(
         if isinstance(raw_strategy_parameters, dict)
         else {}
     )
+    kelly_observation = _project_trend_kelly_observation(
+        data_dir,
+        market=market,
+        strategy_snapshot=strategy_snapshot,
+    )
     frozen_api_cost = payload.get("api_cost")
     if not isinstance(frozen_api_cost, dict):
         frozen_api_cost = None
@@ -3973,6 +3992,7 @@ def _project_broker_trend_report(
         "buy_actions": buy_actions,
         "risk_skips": risk_skips,
         "risk_summary": risk_summary,
+        "kelly_observation": kelly_observation,
         "drawdown_summary": payload.get("drawdown_summary", {}),
         "api_cost": frozen_api_cost,
         "allocation": projected_allocation,
@@ -4091,6 +4111,183 @@ def _trend_option_anomalies(
 
 def _decimal_text(value: Decimal) -> str:
     return format(value.normalize(), "f")
+
+
+def _project_trend_kelly_observation(
+    data_dir: Path,
+    *,
+    market: str,
+    strategy_snapshot: object,
+) -> dict[str, Any]:
+    def unavailable() -> dict[str, Any]:
+        return {
+            "available": False,
+            "status": "unavailable",
+            "status_text": "Kelly 统计暂不可用",
+        }
+
+    if not isinstance(strategy_snapshot, Mapping):
+        return unavailable()
+    strategy_id = str(strategy_snapshot.get("strategy_id") or "").strip()
+    strategy_version = str(strategy_snapshot.get("strategy_version") or "").strip()
+    timezone = TREND_MARKET_TIMEZONES.get(market)
+    if not strategy_id or not strategy_version or timezone is None:
+        return unavailable()
+    try:
+        payload = load_trend_api_stats(data_dir)
+        rounds = trend_kelly_rounds_from_payload(payload)
+        state = calculate_trend_kelly(
+            rounds,
+            market=market,
+            strategy_id=strategy_id,
+            opening_strategy_version=strategy_version,
+        )
+        raw_rounds = payload.get("rounds")
+        if not isinstance(raw_rounds, list):
+            return unavailable()
+        by_round_id = {
+            str(item["round_id"]): item
+            for item in raw_rounds
+            if isinstance(item, Mapping) and str(item.get("round_id") or "").strip()
+        }
+        selected: list[tuple[datetime, str, dict[str, Any], Decimal]] = []
+        for round_id in state.selected_round_ids:
+            raw = by_round_id.get(round_id)
+            if not isinstance(raw, Mapping):
+                return unavailable()
+            opened_at_raw = str(raw.get("opened_at") or "")
+            closed_at_raw = str(raw.get("closed_at") or "")
+            if not opened_at_raw or not closed_at_raw:
+                return unavailable()
+            opened_at = datetime.fromisoformat(opened_at_raw)
+            closed_at = datetime.fromisoformat(closed_at_raw)
+            if (
+                opened_at.tzinfo is None
+                or opened_at.utcoffset() is None
+                or closed_at.tzinfo is None
+                or closed_at.utcoffset() is None
+                or opened_at.isoformat() != opened_at_raw
+                or closed_at.isoformat() != closed_at_raw
+                or closed_at < opened_at
+            ):
+                return unavailable()
+            opened_local = opened_at.astimezone(timezone)
+            closed_local = closed_at.astimezone(timezone)
+            holding_days = (closed_local.date() - opened_local.date()).days
+            if holding_days < 0:
+                return unavailable()
+            net_return = Decimal(str(raw.get("net_return")))
+            if not net_return.is_finite() or net_return < -1:
+                return unavailable()
+            symbol = str(raw.get("symbol") or "").strip()
+            opening_version = str(raw.get("opening_strategy_version") or "").strip()
+            if not symbol or not opening_version:
+                return unavailable()
+            selected.append(
+                (
+                    closed_at,
+                    round_id,
+                    {
+                        "round_id": round_id,
+                        "symbol": symbol,
+                        "opened_at": opened_local.isoformat(),
+                        "closed_at": closed_local.isoformat(),
+                        "opening_strategy_version": opening_version,
+                        "net_return": _decimal_text(net_return),
+                        "holding_days": holding_days,
+                    },
+                    net_return,
+                )
+            )
+        selected.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        returns = [item[3] for item in selected]
+        if not returns:
+            return unavailable()
+        positive = [value for value in returns if value > 0]
+        negative = [value for value in returns if value < 0]
+        with localcontext(Context(prec=31)):
+            win_rate = Decimal(len(positive)) / Decimal(len(returns))
+            average_net_return = sum(returns, Decimal("0")) / Decimal(len(returns))
+            if positive and negative:
+                average_positive = sum(positive, Decimal("0")) / Decimal(len(positive))
+                average_negative = sum(negative, Decimal("0")) / Decimal(len(negative))
+                payoff_ratio = average_positive / abs(average_negative)
+            else:
+                payoff_ratio = None
+            win_rate_text = _decimal_text(win_rate)
+            average_net_return_text = _decimal_text(average_net_return)
+            payoff_ratio_text = (
+                _decimal_text(payoff_ratio) if payoff_ratio is not None else None
+            )
+        shadow_full_kelly = maximize_average_log_growth(returns)
+        shadow_quarter_kelly = (shadow_full_kelly / Decimal("4")).quantize(
+            KELLY_QUANTUM, rounding=ROUND_FLOOR
+        )
+        parameters = strategy_snapshot.get("parameters")
+        if not isinstance(parameters, Mapping):
+            return unavailable()
+        raw_target_weight = parameters.get("target_weight")
+        if isinstance(raw_target_weight, Mapping):
+            target_weights = [
+                Decimal(str(value)) for value in raw_target_weight.values()
+            ]
+            strategy_cap = max(target_weights, default=None)
+        else:
+            strategy_cap = Decimal(str(raw_target_weight))
+        if (
+            strategy_cap is None
+            or not strategy_cap.is_finite()
+            or strategy_cap <= 0
+            or strategy_cap > 1
+        ):
+            return unavailable()
+        suggested_position = min(shadow_quarter_kelly, strategy_cap)
+    except (
+        FileNotFoundError,
+        OSError,
+        UnicodeError,
+        ValueError,
+        InvalidOperation,
+        TypeError,
+    ):
+        return unavailable()
+
+    compatible_opening_versions: dict[str, int] = {}
+    for _, _, row, _ in selected:
+        version = row["opening_strategy_version"]
+        compatible_opening_versions[version] = (
+            compatible_opening_versions.get(version, 0) + 1
+        )
+    return {
+        "available": True,
+        "status": "available",
+        "target_market": market,
+        "target_strategy_id": strategy_id,
+        "target_strategy_version": strategy_version,
+        "eligible_sample_count": state.eligible_sample_count,
+        "selected_sample_count": state.selected_sample_count,
+        "minimum_sample_count": KELLY_MINIMUM_SAMPLES,
+        "selected_round_ids": list(state.selected_round_ids),
+        "compatible_opening_versions": compatible_opening_versions,
+        "exact_current_version_count": sum(
+            row["opening_strategy_version"] == strategy_version
+            for _, _, row, _ in selected
+        ),
+        "metrics": {
+            "win_rate": win_rate_text,
+            "payoff_ratio": payoff_ratio_text,
+            "payoff_ratio_status": "available" if payoff_ratio is not None else (
+                "no_wins" if not positive else "no_losses"
+            ),
+            "average_net_return": average_net_return_text,
+            "shadow_full_kelly": _decimal_text(shadow_full_kelly),
+            "shadow_quarter_kelly": _decimal_text(shadow_quarter_kelly),
+            "strategy_cap": _decimal_text(strategy_cap),
+            "suggested_position": _decimal_text(suggested_position),
+        },
+        "rounds": [row for _, _, row, _ in selected],
+        "kelly_enabled": state.enabled,
+    }
 
 
 def _project_trend_trade_stats(

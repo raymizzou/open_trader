@@ -22,6 +22,9 @@ const state = {
   trendSimulatePositions: {},
   trendReportHistories: {},
   trendHistoricalReports: {},
+  trendKellyObservationPages: new Map(),
+  trendKellyObservationPayloads: new Map(),
+  trendKellyObservationReports: new Map(),
   decisionDeepLinkRestored: false,
   detailLanguage: "zh",
   statementUpload: {broker: "", busy: false, message: "", error: false},
@@ -413,6 +416,7 @@ function bindEvents() {
   elements["trend-report-workspace"].addEventListener("click", (event) => {
     if (handleTrendOptionDialog(event)) return;
     if (handleTrendHoldingTab(event)) return;
+    if (handleTrendKellyObservationPagination(event)) return;
     if (event.target.closest("[data-close-trend-report]")) returnToPortfolio();
   });
   elements["trend-report-workspace"].addEventListener("keydown", handleTrendHoldingTabKeydown);
@@ -4894,41 +4898,6 @@ function trendRiskPercent(value) {
   return `${(number * 100).toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1")}%`;
 }
 
-function trendKellyPercent(value) {
-  if (!hasValue(value)) return "禁用（固定风险仓位）";
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "禁用（固定风险仓位）";
-  return `${(number * 100).toFixed(2).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1")}%`;
-}
-
-function renderTrendTradeStats(stats) {
-  if (!stats || typeof stats !== "object") return "";
-  if (stats.available !== true) {
-    return `<div><dt>交易统计</dt><dd>${escapeHtml(formatPlain(stats.status_text || "交易统计暂不可用"))}</dd></div>`;
-  }
-  const payoffLabels = {
-    no_wins: "无盈利样本",
-    no_losses: "无亏损样本",
-    zero_denominator: "亏损均值为零",
-  };
-  const row = (label, item) => {
-    const stat = item && typeof item === "object" ? item : {};
-    const winRate = hasValue(stat.win_rate) ? trendRiskPercent(stat.win_rate) : "—";
-    const payoff = hasValue(stat.payoff_ratio)
-      ? formatDisplayNumber(stat.payoff_ratio)
-      : (payoffLabels[stat.payoff_ratio_status] || "—");
-    const sample = hasValue(stat.eligible_sample_count)
-      ? formatDisplayNumber(stat.eligible_sample_count)
-      : "—";
-    return `<div><dt>${escapeHtml(label)}</dt><dd>胜率 ${escapeHtml(winRate)} · 盈亏比 ${escapeHtml(payoff)} · 样本 ${escapeHtml(sample)}</dd></div>`;
-  };
-  const actualLabel = hasValue(stats.actual_broker_label)
-    ? `${formatPlain(stats.actual_broker_label)}实盘交易统计`
-    : "实盘交易统计";
-  return `${row("富途模拟盘交易统计", stats.simulation)}
-      ${row(actualLabel, stats.actual)}`;
-}
-
 function renderTrendRiskSummary(summary, drawdown, reportDate) {
   const hasPlanRisk = summary && typeof summary === "object" && hasValue(summary.status);
   const hasDrawdown = drawdown && typeof drawdown === "object" && hasValue(drawdown.status);
@@ -4938,15 +4907,6 @@ function renderTrendRiskSummary(summary, drawdown, reportDate) {
   const single = hasPlanRisk ? `${formatDisplayNumber(summary.single_entry_risk_limit)}（${trendRiskPercent(summary.single_entry_risk_limit_pct)}）` : "";
   const buffer = hasPlanRisk ? `${formatDisplayNumber(summary.abnormal_loss_buffer)}（${trendRiskPercent(summary.abnormal_loss_buffer_pct)}）` : "";
   const status = hasPlanRisk ? summary.status : drawdown.status;
-  const kellyPhase = hasPlanRisk ? ({
-    cold_start: "冷启动",
-    active_all_samples: "全样本启用",
-    active_rolling_200: "最近 200 个样本启用",
-    unavailable: "统计不可用",
-  })[summary.kelly_phase] || "" : "";
-  const kellyRows = kellyPhase ? `
-        <div><dt>Kelly 阶段</dt><dd>${escapeHtml(`${kellyPhase} · ${formatPlain(summary.kelly_eligible_sample_count)} 个合格模拟闭环`)}</dd></div>
-        <div><dt>当前 Kelly 上限</dt><dd>${escapeHtml(trendKellyPercent(summary.kelly_cap))}</dd></div>` : "";
   const bootstrap = hasDrawdown && drawdown.bootstrap_event && typeof drawdown.bootstrap_event === "object"
     ? drawdown.bootstrap_event
     : null;
@@ -4990,12 +4950,7 @@ function renderTrendRiskSummary(summary, drawdown, reportDate) {
         <div><dt>组合剩余风险</dt><dd>${escapeHtml(remaining)}</dd></div>
         <div><dt>单笔风险上限</dt><dd>${escapeHtml(single)}</dd></div>
         <div><dt>异常损失缓冲</dt><dd>${escapeHtml(buffer)} · 不得用于开仓</dd></div>
-        ${kellyRows}
-        ${renderTrendTradeStats(summary.trade_stats)}
       </dl>
-      ${hasValue(summary.kelly_reason) ? `<p>${escapeHtml(formatPlain(summary.kelly_reason))}</p>` : ""}
-      ${hasValue(summary.kelly_source) ? `<p>${escapeHtml(formatPlain(summary.kelly_source))}</p>` : ""}
-      ${summary.trade_stats?.available === true && hasValue(summary.trade_stats.statistics_cutoff_at) ? `<p>统计截至 ${escapeHtml(formatPlain(summary.trade_stats.statistics_cutoff_at).replace(/\.\d+(?=(?:Z|[+-]\d{2}:\d{2})$)/, ""))}</p>` : ""}
       <p>${escapeHtml(formatPlain(summary.portfolio_remaining_risk_note))}</p>
       <p>${escapeHtml(formatPlain(summary.disclaimer))}</p>` : ""}
     ${hasDrawdown ? `<div class="trend-drawdown-summary"><header><strong>策略累计回撤</strong><span>${escapeHtml(formatPlain(drawdown.status_label))}</span></header>
@@ -5005,6 +4960,294 @@ function renderTrendRiskSummary(summary, drawdown, reportDate) {
       <div><dt>净值高点</dt><dd>${escapeHtml(formatDisplayNumber(drawdown.high_water_mark))}</dd></div></dl>${bootstrapRows}${recoveryRows}</div>` : ""}
     </div>
   </details>`;
+}
+
+function trendKellyObservationKey(observation, report) {
+  return [
+    report?.broker || "",
+    report?.artifact || "",
+    report?.report_sha256 || "",
+    report?.strategy_version || observation?.target_strategy_version || "",
+  ].join("|");
+}
+
+function trendKellyObservationTimestamp(value, market) {
+  const raw = formatPlain(value).trim();
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):\d{2}(?:\.\d+)?[+-]\d{2}:\d{2}$/);
+  if (!match || !Number.isFinite(new Date(raw).getTime())) return raw;
+  const suffix = ({US: "ET", HK: "HKT", CN: "北京时间"})[String(market || "").toUpperCase()];
+  return suffix ? `${match[2]}-${match[3]} ${match[4]}:${match[5]} ${suffix}` : raw;
+}
+
+function validTrendKellyObservation(observation, report = {}) {
+  if (!observation || typeof observation !== "object" || Array.isArray(observation)) return false;
+  if (typeof observation.kelly_enabled !== "boolean") return false;
+  const nonEmptyText = (value) => typeof value === "string" && value.trim() !== "";
+  const finiteNumber = (value) => (typeof value === "number" || typeof value === "string")
+    && String(value).trim() !== "" && Number.isFinite(Number(value));
+  const market = nonEmptyText(observation.target_market)
+    ? observation.target_market.toUpperCase() : "";
+  const reportMarket = nonEmptyText(report?.market) ? report.market.trim().toUpperCase() : "";
+  const targetVersion = nonEmptyText(observation.target_strategy_version)
+    ? observation.target_strategy_version.trim() : "";
+  const reportVersion = nonEmptyText(report?.strategy_version)
+    ? report.strategy_version.trim() : "";
+  if (!({US: true, HK: true, CN: true})[market]
+      || !reportMarket || market !== reportMarket
+      || !nonEmptyText(observation.target_strategy_id)
+      || !targetVersion || !reportVersion || targetVersion !== reportVersion) return false;
+  const marketTimezones = {US: "America/New_York", HK: "Asia/Hong_Kong", CN: "Asia/Shanghai"};
+  const canonicalTimestamp = (value) => {
+    const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?[+-]\d{2}:\d{2}$/);
+    const instant = new Date(value);
+    if (!match || !Number.isFinite(instant.getTime())) return false;
+    const localParts = Object.fromEntries(
+      new Intl.DateTimeFormat("en-US", {
+        timeZone: marketTimezones[market],
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+      }).formatToParts(instant)
+        .filter(({type}) => type !== "literal")
+        .map(({type, value: part}) => [type, part]),
+    );
+    return ["year", "month", "day", "hour", "minute", "second"]
+      .every((part, index) => localParts[part] === match[index + 1]);
+  };
+  const eligibleCount = observation.eligible_sample_count;
+  const selectedCount = observation.selected_sample_count;
+  const minimumSampleCount = observation.minimum_sample_count;
+  if (!Number.isInteger(eligibleCount) || eligibleCount < 0
+      || !Number.isInteger(selectedCount) || selectedCount < 1
+      || !Number.isInteger(minimumSampleCount) || minimumSampleCount < 1
+      || selectedCount > eligibleCount
+      || selectedCount !== Math.min(eligibleCount, 200)
+      || observation.kelly_enabled !== (eligibleCount >= minimumSampleCount)) return false;
+  const rows = observation.rounds;
+  const selectedRoundIds = observation.selected_round_ids;
+  if (!Array.isArray(rows) || rows.length !== selectedCount
+      || !Array.isArray(selectedRoundIds) || selectedRoundIds.length !== selectedCount) return false;
+  const rowIds = new Set();
+  const rowVersionCounts = Object.create(null);
+  const rowReturns = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return false;
+    const roundId = nonEmptyText(row.round_id) ? row.round_id.trim() : "";
+    if (!roundId || rowIds.has(roundId)
+        || !nonEmptyText(row.symbol) || !nonEmptyText(row.opening_strategy_version)
+        || !Number.isInteger(row.holding_days) || row.holding_days < 0) return false;
+    const openedAt = formatPlain(row.opened_at).trim();
+    const closedAt = formatPlain(row.closed_at).trim();
+    if (!canonicalTimestamp(openedAt) || !canonicalTimestamp(closedAt)) return false;
+    if (new Date(closedAt).getTime() < new Date(openedAt).getTime()) return false;
+    const calendarDay = (value) => {
+      const [year, month, day] = value.slice(0, 10).split("-").map(Number);
+      return Date.UTC(year, month - 1, day) / 86400000;
+    };
+    if (calendarDay(closedAt) - calendarDay(openedAt) !== row.holding_days) return false;
+    if (!finiteNumber(row.net_return) || Number(row.net_return) < -1) return false;
+    rowReturns.push(Number(row.net_return));
+    rowIds.add(roundId);
+    const openingVersion = row.opening_strategy_version.trim();
+    rowVersionCounts[openingVersion] = (rowVersionCounts[openingVersion] || 0) + 1;
+  }
+  const selectedIds = new Set();
+  for (const value of selectedRoundIds) {
+    const roundId = nonEmptyText(value) ? value.trim() : "";
+    if (!roundId || selectedIds.has(roundId)) return false;
+    selectedIds.add(roundId);
+  }
+  if (selectedIds.size !== rowIds.size || [...selectedIds].some((roundId) => !rowIds.has(roundId))) return false;
+  const compatibleVersions = observation.compatible_opening_versions;
+  if (!compatibleVersions || typeof compatibleVersions !== "object" || Array.isArray(compatibleVersions)) return false;
+  let compatibleCount = 0;
+  for (const [version, count] of Object.entries(compatibleVersions)) {
+    if (!nonEmptyText(version) || !Number.isInteger(count) || count < 1) return false;
+    compatibleCount += count;
+  }
+  const rowVersions = Object.keys(rowVersionCounts);
+  if (compatibleCount !== selectedCount || Object.keys(compatibleVersions).length !== rowVersions.length
+      || rowVersions.some((version) => !Object.prototype.hasOwnProperty.call(compatibleVersions, version)
+        || compatibleVersions[version] !== rowVersionCounts[version])
+      || !Number.isInteger(observation.exact_current_version_count)
+      || observation.exact_current_version_count < 0
+      || observation.exact_current_version_count !== (rowVersionCounts[targetVersion] || 0)) return false;
+  const metrics = observation.metrics;
+  if (!metrics || typeof metrics !== "object" || Array.isArray(metrics)) return false;
+  const boundedNumber = (value, minimum, maximum) => finiteNumber(value)
+    && Number(value) >= minimum && Number(value) <= maximum;
+  if (!boundedNumber(metrics.win_rate, 0, 1)
+      || !finiteNumber(metrics.average_net_return) || Number(metrics.average_net_return) < -1
+      || !boundedNumber(metrics.shadow_full_kelly, 0, 1)
+      || !boundedNumber(metrics.shadow_quarter_kelly, 0, 1)
+      || !boundedNumber(metrics.strategy_cap, 0, 1)
+      || !boundedNumber(metrics.suggested_position, 0, 1)) return false;
+  const metricTolerance = 1e-6;
+  const matchesMetric = (actual, expected) => Math.abs(Number(actual) - expected) <= metricTolerance;
+  const positiveReturns = rowReturns.filter((value) => value > 0);
+  const negativeReturns = rowReturns.filter((value) => value < 0);
+  const expectedWinRate = positiveReturns.length / rowReturns.length;
+  const expectedAverage = rowReturns.reduce((sum, value) => sum + value, 0) / rowReturns.length;
+  if (!matchesMetric(metrics.win_rate, expectedWinRate)
+      || !matchesMetric(metrics.average_net_return, expectedAverage)) return false;
+  if (positiveReturns.length && negativeReturns.length) {
+    const averagePositive = positiveReturns.reduce((sum, value) => sum + value, 0) / positiveReturns.length;
+    const averageNegative = negativeReturns.reduce((sum, value) => sum + value, 0) / negativeReturns.length;
+    const expectedPayoff = averagePositive / Math.abs(averageNegative);
+    if (!finiteNumber(metrics.payoff_ratio) || Number(metrics.payoff_ratio) < 0
+        || !matchesMetric(metrics.payoff_ratio, expectedPayoff)
+        || metrics.payoff_ratio_status !== "available") return false;
+  } else {
+    const expectedPayoffStatus = positiveReturns.length ? "no_losses" : "no_wins";
+    if (hasValue(metrics.payoff_ratio) || metrics.payoff_ratio_status !== expectedPayoffStatus) return false;
+  }
+  const maximizeAverageLogGrowth = (returns) => {
+    const sum = returns.reduce((total, value) => total + value, 0);
+    if (sum <= 0) return 0;
+    if (returns.every((value) => value >= 0)) return 1;
+    const derivative = (fraction) => {
+      let slope = 0;
+      for (const value of returns) {
+        const denominator = 1 + fraction * value;
+        if (denominator <= 0) return null;
+        slope += value / denominator;
+      }
+      return slope;
+    };
+    const boundaryDerivative = derivative(1);
+    if (boundaryDerivative !== null && boundaryDerivative >= 0) return 1;
+    let low = 0;
+    let high = 1;
+    for (let iteration = 0; iteration < 96; iteration += 1) {
+      const middle = (low + high) / 2;
+      const slope = derivative(middle);
+      if (slope !== null && slope > 0) low = middle;
+      else high = middle;
+    }
+    return Math.floor(low / 1e-6) * 1e-6;
+  };
+  const fullKelly = maximizeAverageLogGrowth(rowReturns);
+  const quarterKelly = Math.floor((fullKelly / 4) / 1e-6) * 1e-6;
+  const strategyCap = Number(metrics.strategy_cap);
+  if (strategyCap <= 0
+      || !matchesMetric(metrics.shadow_full_kelly, fullKelly)
+      || !matchesMetric(metrics.shadow_quarter_kelly, quarterKelly)
+      || !matchesMetric(metrics.suggested_position, Math.min(quarterKelly, strategyCap))) return false;
+  return true;
+}
+
+function handleTrendKellyObservationPagination(event) {
+  const button = event.target?.closest?.(
+    "[data-kelly-observation-previous], [data-kelly-observation-next]",
+  );
+  if (!button) return false;
+  const section = button.closest(".trend-kelly-observation");
+  const key = section?.dataset.kellyObservationKey || "";
+  const observation = state.trendKellyObservationPayloads.get(key);
+  if (!section || !observation) return false;
+  const rows = Array.isArray(observation.rounds) ? observation.rounds : [];
+  const pageCount = Math.max(1, Math.ceil(rows.length / 10));
+  const currentPage = Number(state.trendKellyObservationPages.get(key) || 0);
+  const nextPage = button.hasAttribute("data-kelly-observation-next")
+    ? currentPage + 1 : currentPage - 1;
+  if (nextPage < 0 || nextPage >= pageCount || nextPage === currentPage) return true;
+  state.trendKellyObservationPages.set(key, nextPage);
+  section.outerHTML = renderTrendKellyObservation(
+    observation,
+    state.trendKellyObservationReports.get(key) || {},
+  );
+  return true;
+}
+
+function renderTrendKellyObservation(observation, report = {}) {
+  if (!observation || typeof observation !== "object" || observation.available !== true) {
+    return `<section class="trend-kelly-observation unavailable" aria-label="Kelly 观察">
+      <h2>Kelly 观察</h2><p class="trend-kelly-observation-unavailable">${escapeHtml(formatPlain(observation?.status_text || "Kelly 统计暂不可用"))}</p>
+    </section>`;
+  }
+  const metrics = observation.metrics && typeof observation.metrics === "object"
+    ? observation.metrics : {};
+  const rows = Array.isArray(observation.rounds)
+    ? observation.rounds.filter((item) => item && typeof item === "object" && !Array.isArray(item))
+    : [];
+  if (!validTrendKellyObservation(observation, report)) {
+    return `<section class="trend-kelly-observation unavailable" aria-label="Kelly 观察">
+      <h2>Kelly 观察</h2><p class="trend-kelly-observation-unavailable">Kelly 统计暂不可用</p>
+    </section>`;
+  }
+  const observationKey = trendKellyObservationKey(observation, report);
+  const reportIdentity = {
+    broker: report?.broker || "",
+    artifact: report?.artifact || "",
+    report_sha256: report?.report_sha256 || "",
+    market: report?.market || "",
+    strategy_version: report?.strategy_version || "",
+  };
+  state.trendKellyObservationPayloads.set(observationKey, observation);
+  state.trendKellyObservationReports.set(observationKey, reportIdentity);
+  const pageCount = Math.max(1, Math.ceil(rows.length / 10));
+  const pageIndex = Math.min(
+    Math.max(Number(state.trendKellyObservationPages.get(observationKey) || 0), 0),
+    pageCount - 1,
+  );
+  state.trendKellyObservationPages.set(observationKey, pageIndex);
+  const eligibleCount = Number.isInteger(observation.eligible_sample_count)
+    ? observation.eligible_sample_count : null;
+  const selectedCount = Number.isInteger(observation.selected_sample_count)
+    ? observation.selected_sample_count : rows.length;
+  const minimumSampleCount = Number.isInteger(observation.minimum_sample_count)
+    ? observation.minimum_sample_count : null;
+  if (eligibleCount === null || minimumSampleCount === null || minimumSampleCount < 1) {
+    return `<section class="trend-kelly-observation unavailable" aria-label="Kelly 观察">
+      <h2>Kelly 观察</h2><p class="trend-kelly-observation-unavailable">Kelly 统计暂不可用</p>
+    </section>`;
+  }
+  const versionEntries = observation.compatible_opening_versions
+    && typeof observation.compatible_opening_versions === "object"
+    && !Array.isArray(observation.compatible_opening_versions)
+    ? Object.entries(observation.compatible_opening_versions)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([version, count]) => `${formatPlain(version)} × ${formatDisplayNumber(count)}`)
+    : [];
+  const currentVersionCount = formatDisplayNumber(observation.exact_current_version_count);
+  const targetVersion = formatPlain(observation.target_strategy_version);
+  const cap = decimalAsPercent(metrics.strategy_cap, "数据未提供");
+  const quarter = decimalAsPercent(metrics.shadow_quarter_kelly, "数据未提供");
+  const suggested = decimalAsPercent(metrics.suggested_position, "数据未提供");
+  const payoffStatusLabels = {no_wins: "无盈利样本", no_losses: "无亏损样本"};
+  const rowHtml = rows.slice(pageIndex * 10, (pageIndex + 1) * 10).map((row) => {
+    const holdingDays = Number(row.holding_days);
+    const holdingLabel = Number.isFinite(holdingDays)
+      ? holdingDays === 0 ? "当日" : `${formatDisplayNumber(holdingDays)} 天`
+      : "数据未提供";
+    return `<tr class="trend-kelly-observation-row" data-round-id="${escapeHtml(formatPlain(row.round_id))}">
+      <td data-label="标的">${escapeHtml(formatPlain(row.symbol))}</td>
+      <td data-label="建仓时间">${escapeHtml(trendKellyObservationTimestamp(row.opened_at, observation.target_market))}</td>
+      <td data-label="平仓时间">${escapeHtml(trendKellyObservationTimestamp(row.closed_at, observation.target_market))}</td>
+      <td data-label="持有天数">${escapeHtml(holdingLabel)}</td>
+      <td data-label="净收益" class="${pnlClass(row.net_return)}">${escapeHtml(formatSignedPnl(decimalAsPercent(row.net_return, "数据未提供")))}</td>
+    </tr>`;
+  }).join("");
+  return `<section class="trend-kelly-observation" data-kelly-observation-key="${escapeHtml(observationKey)}" aria-label="Kelly 闭环观察">
+    <header class="trend-kelly-observation-header">
+      <div><h2>Kelly 闭环观察</h2><p>样本进度 ${escapeHtml(formatDisplayNumber(eligibleCount))} / ${escapeHtml(formatDisplayNumber(minimumSampleCount))} · 影子计算，仅供观察，不用于交易</p></div>
+      <span class="trend-kelly-observation-status">${escapeHtml(observation.kelly_enabled === true ? "样本达标 · 影子计算" : "冷启动 · 影子计算")}</span>
+    </header>
+    <div class="trend-kelly-observation-metrics">
+      <article><h3>胜率</h3><strong>${escapeHtml(trendRiskPercent(metrics.win_rate))}</strong></article>
+      <article><h3>盈亏比</h3><strong>${escapeHtml(hasValue(metrics.payoff_ratio) ? formatDisplayNumber(metrics.payoff_ratio) : payoffStatusLabels[metrics.payoff_ratio_status] || "数据未提供")}</strong></article>
+      <article><h3>平均净收益</h3><strong>${escapeHtml(decimalAsPercent(metrics.average_net_return, "数据未提供"))}</strong></article>
+      <article><h3>Kelly 建议仓位</h3><strong>${escapeHtml(suggested)}</strong><small>四分之一 Kelly ${escapeHtml(quarter)} · 策略上限 ${escapeHtml(cap)}</small></article>
+    </div>
+    <p class="trend-kelly-observation-scope">目标版本 ${escapeHtml(targetVersion)} · 计入 ${escapeHtml(formatDisplayNumber(selectedCount))} 个样本 · 兼容版本 ${escapeHtml(versionEntries.join("、") || "数据未提供")} · 当前版本 ${escapeHtml(currentVersionCount)} 个</p>
+    <div class="trend-kelly-observation-rounds"><h3>全部计入闭环</h3>
+      <table class="trend-kelly-observation-table"><thead><tr><th scope="col">标的</th><th scope="col">建仓时间</th><th scope="col">平仓时间</th><th scope="col">持有天数</th><th scope="col">净收益</th></tr></thead><tbody>${rowHtml}</tbody></table>
+      <nav class="trend-kelly-observation-pagination" aria-label="Kelly 观察分页">
+        <button type="button" data-kelly-observation-previous aria-label="上一页"${pageIndex === 0 ? " disabled" : ""}>上一页</button>
+        <span data-kelly-observation-page>第 ${pageIndex + 1} / ${pageCount} 页</span>
+        <button type="button" data-kelly-observation-next aria-label="下一页"${pageIndex >= pageCount - 1 ? " disabled" : ""}>下一页</button>
+      </nav>
+    </div>
+  </section>`;
 }
 
 function renderCnTrendTable(title, kind, headings, rows, note = "") {
@@ -6225,6 +6468,7 @@ function renderCnTrendReportWorkspace(report, embedded = false, historical = fal
       </div>
     </header>
     ${readinessBanner}
+    ${renderTrendKellyObservation(report.kelly_observation, report)}
     ${renderTrendV2ExecutionStatus(report)}
     ${allocation}
     ${batchError}

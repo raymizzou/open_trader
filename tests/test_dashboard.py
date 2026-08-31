@@ -9578,3 +9578,203 @@ def test_dashboard_exposes_invalid_plan_as_failed_state(tmp_path: Path) -> None:
 
     assert plan["available"] is False
     assert plan["error"] == "decision_plans.json 无效"
+
+
+def _kelly_observation_fill(
+    fill_id: str,
+    *,
+    symbol: str,
+    side: str,
+    filled_at: str,
+    strategy_id: str = "trend_animals_warm_to_hot/US/v14",
+    strategy_version: str = "v14",
+    attribution_status: str = "attributed",
+    exclusion_reason: str = "",
+) -> dict[str, object]:
+    return {
+        "fill_id": fill_id,
+        "order_id": f"order-{fill_id}",
+        "source": "simulation",
+        "source_id": "simulation:futu:101",
+        "broker": "futu",
+        "account_id": "101",
+        "market": "US",
+        "symbol": symbol,
+        "currency": "USD",
+        "side": side,
+        "quantity": "1",
+        "price": "100" if side == "buy" else "100",
+        "fee": "0",
+        "costs_complete": True,
+        "filled_at": filled_at,
+        "strategy_id": strategy_id,
+        "strategy_version": strategy_version,
+        "attribution_status": attribution_status,
+        "exclusion_reason": exclusion_reason,
+        "normal_cost_rate": "0",
+        "normal_cost_model": "冻结模拟成本模型",
+        "report_sha256": "a" * 64,
+    }
+
+
+def test_dashboard_projects_all_kelly_input_rounds_with_holding_days(
+    tmp_path: Path,
+) -> None:
+    config = dashboard_config(tmp_path)
+    reports_dir = config.reports_dir / "trend_us_futu"
+    reports_dir.mkdir(parents=True)
+    report = _current_nominal_dashboard_payload(market="US", strategy_version="v14")
+    (reports_dir / "2026-08-05.json").write_text(
+        json.dumps(report), encoding="utf-8"
+    )
+    fills = [
+        _kelly_observation_fill(
+            "r2-buy", symbol="ROUND-2", side="buy",
+            filled_at="2026-08-01T13:00:00+00:00",
+            strategy_id="trend_animals_warm_to_hot/US/v4",
+            strategy_version="v4",
+        ),
+        {
+            **_kelly_observation_fill(
+                "r2-sell", symbol="ROUND-2", side="sell",
+                filled_at="2026-08-03T13:00:00+00:00",
+                strategy_id="trend_animals_warm_to_hot/US/v4",
+                strategy_version="v4",
+            ),
+            "price": "110",
+        },
+        _kelly_observation_fill(
+            "r1-buy", symbol="ROUND-1", side="buy",
+            filled_at="2026-08-02T13:00:00+00:00",
+            strategy_id="trend_animals_warm_to_hot/US/v4",
+            strategy_version="v4",
+        ),
+        {
+            **_kelly_observation_fill(
+                "r1-sell", symbol="ROUND-1", side="sell",
+                filled_at="2026-08-04T13:00:00+00:00",
+                strategy_id="trend_animals_warm_to_hot/US/v4",
+                strategy_version="v4",
+            ),
+            "price": "110",
+        },
+        _kelly_observation_fill(
+            "r0-buy", symbol="ROUND-0", side="buy",
+            filled_at="2026-08-04T20:00:00+00:00",
+            strategy_id="trend_animals_warm_to_hot/US/v7",
+            strategy_version="v7",
+        ),
+        {
+            **_kelly_observation_fill(
+                "r0-sell", symbol="ROUND-0", side="sell",
+                filled_at="2026-08-04T23:00:00+00:00",
+                strategy_id="trend_animals_warm_to_hot/US/v7",
+                strategy_version="v7",
+            ),
+            "price": "95",
+        },
+        _kelly_observation_fill(
+            "open-buy", symbol="OPEN", side="buy",
+            filled_at="2026-08-05T13:00:00+00:00",
+        ),
+        _kelly_observation_fill(
+            "excluded-buy", symbol="EXCLUDED", side="buy",
+            filled_at="2026-08-01T14:00:00+00:00",
+            attribution_status="outside_strategy",
+            exclusion_reason="no_matching_opening_strategy_action",
+        ),
+        _kelly_observation_fill(
+            "excluded-sell", symbol="EXCLUDED", side="sell",
+            filled_at="2026-08-02T14:00:00+00:00",
+            attribution_status="outside_strategy",
+            exclusion_reason="no_matching_opening_strategy_action",
+        ),
+        _kelly_observation_fill(
+            "incompatible-buy", symbol="INCOMPATIBLE", side="buy",
+            filled_at="2026-08-01T15:00:00+00:00",
+            strategy_id="trend_animals_warm_to_hot/US/v3",
+            strategy_version="v3",
+        ),
+        {
+            **_kelly_observation_fill(
+                "incompatible-sell", symbol="INCOMPATIBLE", side="sell",
+                filled_at="2026-08-02T15:00:00+00:00",
+                strategy_id="trend_animals_warm_to_hot/US/v3",
+                strategy_version="v3",
+            ),
+            "price": "120",
+        },
+    ]
+    stats = build_trend_api_stats_payload(
+        fills,
+        strategy_versions=[{
+            "market": "US",
+            "strategy_id": "trend_animals_warm_to_hot/US/v14",
+            "strategy_version": "v14",
+        }],
+        generated_at="2026-08-07T00:00:00+00:00",
+        statistics_cutoff_at="2026-08-06T00:00:00+00:00",
+    )
+    write_trend_api_stats(config.data_dir, stats)
+
+    observation = load_dashboard_state(config).to_dict()["trend_reports"]["futu"][
+        "kelly_observation"
+    ]
+
+    assert observation == {
+        "available": True,
+        "status": "available",
+        "target_market": "US",
+        "target_strategy_id": "trend_animals_warm_to_hot/US/v14",
+        "target_strategy_version": "v14",
+        "eligible_sample_count": 3,
+        "selected_sample_count": 3,
+        "minimum_sample_count": 30,
+        "selected_round_ids": [
+            "3165974ebedae39aa34911088155a2072abf54fc57450275a5e25794800be9c5",
+            "81b280984520b7ba504f5da3899ecdc5d2d971d595f928b58d707b071fae2197",
+            "8b90064e861bdcb729bb0fbd671066bdb9707a5794f262e4253843dd78b9ccaf",
+        ],
+        "compatible_opening_versions": {"v4": 2, "v7": 1},
+        "exact_current_version_count": 0,
+        "metrics": {
+            "win_rate": "0.6666666666666666666666666666667",
+            "payoff_ratio": "2",
+            "payoff_ratio_status": "available",
+            "average_net_return": "0.05",
+            "shadow_full_kelly": "1",
+            "shadow_quarter_kelly": "0.25",
+            "strategy_cap": "0.04",
+            "suggested_position": "0.04",
+        },
+        "rounds": [
+            {
+                "round_id": "8b90064e861bdcb729bb0fbd671066bdb9707a5794f262e4253843dd78b9ccaf",
+                "symbol": "ROUND-0",
+                "opened_at": "2026-08-04T16:00:00-04:00",
+                "closed_at": "2026-08-04T19:00:00-04:00",
+                "opening_strategy_version": "v7",
+                "net_return": "-0.05",
+                "holding_days": 0,
+            },
+            {
+                "round_id": "81b280984520b7ba504f5da3899ecdc5d2d971d595f928b58d707b071fae2197",
+                "symbol": "ROUND-1",
+                "opened_at": "2026-08-02T09:00:00-04:00",
+                "closed_at": "2026-08-04T09:00:00-04:00",
+                "opening_strategy_version": "v4",
+                "net_return": "0.1",
+                "holding_days": 2,
+            },
+            {
+                "round_id": "3165974ebedae39aa34911088155a2072abf54fc57450275a5e25794800be9c5",
+                "symbol": "ROUND-2",
+                "opened_at": "2026-08-01T09:00:00-04:00",
+                "closed_at": "2026-08-03T09:00:00-04:00",
+                "opening_strategy_version": "v4",
+                "net_return": "0.1",
+                "holding_days": 2,
+            },
+        ],
+        "kelly_enabled": False,
+    }

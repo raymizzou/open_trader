@@ -2055,6 +2055,162 @@ table {
   padding: 7px 9px;
 }
 
+.trend-kelly-observation {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  min-width: 0;
+  overflow: hidden;
+  padding: 14px;
+}
+
+.trend-kelly-observation h2,
+.trend-kelly-observation h3,
+.trend-kelly-observation p {
+  margin: 0;
+}
+
+.trend-kelly-observation-header {
+  align-items: flex-start;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.trend-kelly-observation-header p,
+.trend-kelly-observation-scope,
+.trend-kelly-observation-status,
+.trend-kelly-observation-metrics small {
+  color: var(--muted);
+}
+
+.trend-kelly-observation-header p,
+.trend-kelly-observation-scope {
+  line-height: 1.5;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
+.trend-kelly-observation-status {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  flex: 0 0 auto;
+  padding: 4px 8px;
+}
+
+.trend-kelly-observation-metrics {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-top: 12px;
+}
+
+.trend-kelly-observation-metrics article {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px;
+}
+
+.trend-kelly-observation-metrics h3 {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.trend-kelly-observation-metrics strong {
+  font-size: 20px;
+  overflow-wrap: anywhere;
+}
+
+.trend-kelly-observation-metrics small {
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.trend-kelly-observation-rounds {
+  margin-top: 14px;
+}
+
+.trend-kelly-observation-rounds > h3 {
+  font-size: 16px;
+}
+
+.trend-kelly-observation-table {
+  border-collapse: collapse;
+  table-layout: fixed;
+  margin-top: 8px;
+  width: 100%;
+}
+
+.trend-kelly-observation-table th,
+.trend-kelly-observation-table td {
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+  padding: 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.trend-kelly-observation-table th {
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.trend-kelly-observation-table th:nth-child(1) { width: 16%; }
+.trend-kelly-observation-table th:nth-child(2),
+.trend-kelly-observation-table th:nth-child(3) { width: 25%; }
+.trend-kelly-observation-table th:nth-child(4) { width: 14%; }
+.trend-kelly-observation-table th:nth-child(5) { width: 20%; }
+
+.trend-kelly-observation-table .pnl-profit { color: var(--ok); }
+.trend-kelly-observation-table .pnl-loss { color: var(--danger); }
+
+.trend-kelly-observation-pagination {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+.trend-kelly-observation-pagination button {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  min-height: 40px;
+  padding: 7px 11px;
+}
+
+.trend-kelly-observation-pagination button:disabled {
+  cursor: not-allowed;
+  opacity: 0.46;
+}
+
+.trend-kelly-observation-pagination button:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.trend-kelly-observation-pagination span {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 76px;
+  text-align: center;
+}
+
+.trend-kelly-observation-unavailable {
+  color: var(--muted);
+  margin-top: 8px !important;
+}
+
 .trend-report-cost {
   font-weight: 700;
 }
@@ -5218,6 +5374,9 @@ tbody tr.active-row,
 .trend-controller-status > summary small,
 .trend-risk-summary > summary small,
 .trend-industry-context-table thead th,
+.trend-kelly-observation-status,
+.trend-kelly-observation-metrics article,
+.trend-kelly-observation-table th,
 .pm-relation-chip,
 .pm-relation-tag {
   --muted: var(--text);
@@ -5461,6 +5620,72 @@ table {
 
   .cn-trend-stage {
     padding: 12px;
+  }
+
+  .trend-kelly-observation {
+    padding: 12px;
+  }
+
+  .trend-kelly-observation-header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trend-kelly-observation-status {
+    justify-self: start;
+  }
+
+  .trend-kelly-observation-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .trend-kelly-observation-table {
+    display: block;
+    max-width: 100%;
+  }
+
+  .trend-kelly-observation-table thead {
+    display: none;
+  }
+
+  .trend-kelly-observation-table tbody {
+    display: grid;
+    gap: 10px;
+  }
+
+  .trend-kelly-observation-table tr {
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    display: grid;
+    overflow: hidden;
+  }
+
+  .trend-kelly-observation-table td {
+    border-bottom: 1px solid var(--line);
+    display: grid;
+    gap: 4px;
+    grid-template-columns: minmax(92px, 0.55fr) minmax(0, 1fr);
+    min-width: 0;
+    padding: 8px;
+  }
+
+  .trend-kelly-observation-table td::before {
+    color: var(--muted);
+    content: attr(data-label);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .trend-kelly-observation-table tr > :last-child {
+    border-bottom: 0;
+  }
+
+  .trend-kelly-observation-pagination {
+    justify-content: space-between;
+  }
+
+  .trend-kelly-observation-pagination button {
+    min-height: 44px;
   }
 
   .trend-option-button {

@@ -1569,7 +1569,7 @@ console.log(JSON.stringify({fetches,messages}));
     }
 
 
-def test_failed_statement_upload_keeps_rendered_stats_cutoff_and_shows_reason() -> None:
+def test_failed_statement_upload_does_not_reload_removed_trade_stats() -> None:
     output = run_dashboard_js(r'''
 const tradeStats={available:true,statistics_cutoff_at:"2026-07-12T23:59:59+08:00",
   actual_label:"辉立实盘交易统计",
@@ -1594,7 +1594,7 @@ console.log(JSON.stringify({reason,reloads,same:before===after,kept:after.includ
         "reason": "辉立成交表格式无法识别",
         "reloads": 0,
         "same": True,
-        "kept": True,
+        "kept": False,
     }
 
 
@@ -9394,8 +9394,6 @@ const html = renderTrendReportWorkspace({
   hold_actions:[],review_actions:[],audit:{},
 });
 for (const text of ["组合计划风险","风险预算内",
-  "Kelly 阶段","全样本启用 · 30 个合格模拟闭环","当前 Kelly 上限","1.26%",
-  "合格的富途模拟闭环；实盘结果不参与计算",
   "策略累计回撤",
   "暂停新开仓","策略累计回撤已达到 5%，需人工解锁",
   "基准已自动建立","基准净值 100,000","快照日期 2026-07-14",
@@ -9406,6 +9404,7 @@ for (const text of ["组合计划风险","风险预算内",
   "组合剩余风险供本报告后续新仓共享，不等于单标的仓位上限。"]) {
   if (!html.includes(text)) throw new Error(text + "\n" + html);
 }
+if (html.includes("Kelly 阶段") || html.includes("当前 Kelly 上限")) throw new Error(html);
 if (html.includes("本次可用风险") || html.includes("<th scope=\"col\">目标仓位</th>")) {
   throw new Error(html);
 }
@@ -9525,7 +9524,7 @@ console.log(JSON.stringify(html));
     assert "2026-07-21" in rendered
 
 
-def test_dashboard_renders_api_trade_stats_inside_risk_summary() -> None:
+def test_dashboard_omits_api_trade_stats_and_kelly_from_risk_summary() -> None:
     output = run_dashboard_js(r'''
 const base={status:"active",status_label:"风险预算内",
   portfolio_planned_risk:"303",portfolio_planned_risk_pct:"0.00303",
@@ -9533,18 +9532,16 @@ const base={status:"active",status_label:"风险预算内",
   portfolio_remaining_risk_pct:"0.03697",single_entry_risk_limit:"400",
   single_entry_risk_limit_pct:"0.004",abnormal_loss_buffer:"1000",
   abnormal_loss_buffer_pct:"0.01",disclaimer:"风险提示",portfolio_remaining_risk_note:"说明"};
-const available=renderTrendRiskSummary({...base,trade_stats:{available:true,
+const available=renderTrendRiskSummary({...base,kelly_phase:"active_all_samples",kelly_cap:"0.0126",trade_stats:{available:true,
   statistics_cutoff_at:"2026-07-20T11:59:59.328859+08:00",
   actual_broker_label:"东方财富",
   simulation:{win_rate:"0.5",payoff_ratio:"1.25",payoff_ratio_status:"available",eligible_sample_count:4},
   actual:{win_rate:null,payoff_ratio:null,payoff_ratio_status:"no_wins",eligible_sample_count:0}}});
-for (const text of ["富途模拟盘交易统计","胜率 50% · 盈亏比 1.25 · 样本 4",
-  "东方财富实盘交易统计","胜率 — · 盈亏比 无盈利样本 · 样本 0",
-  "统计截至 2026-07-20T11:59:59+08:00"]) {
-  if (!available.includes(text)) throw new Error(text + "\n" + available);
+if (available.includes("交易统计") || available.includes("Kelly 阶段") || available.includes("当前 Kelly 上限")) {
+  throw new Error(available);
 }
 const unavailable=renderTrendRiskSummary({...base,trade_stats:{available:false,status_text:"交易统计暂不可用"}});
-if (!unavailable.includes("交易统计暂不可用")) throw new Error(unavailable);
+if (unavailable.includes("交易统计暂不可用")) throw new Error(unavailable);
 console.log("ok");
 ''')
 
@@ -9609,8 +9606,7 @@ console.log(JSON.stringify(renderTrendReportWorkspace({
         risk_text = page.locator(".trend-risk-summary").inner_text()
         assert "组合计划风险" in risk_text
         assert "风险预算内" in risk_text
-        assert "富途模拟盘交易统计" in risk_text
-        assert "东方财富实盘交易统计" in risk_text
+        assert "交易统计" not in risk_text
         assert "实盘执行辅助" not in risk_text
         assert "冻结参考价 CNY 10" not in risk_text
         assert page.locator(".cn-trend-card").count() == 1
@@ -15626,3 +15622,508 @@ console.log(JSON.stringify({green, amber, red, neutral, overview}));
     assert "<script>bad</script>" not in rendered["red"]
     for label in ("监控", "旧系统合格", "N_LEG 完成", "差异", "失败", "最近完成"):
         assert label in rendered["overview"]
+
+
+def test_dashboard_renders_compact_kelly_metrics_and_all_input_rounds() -> None:
+    output = run_dashboard_js(r'''
+const report = {
+  available:true, market:"US", broker:"futu", broker_label:"富途", market_label:"美股",
+  report_date:"2026-08-05", data_date:"2026-08-04", generated_at:"2026-08-05T20:00:00+08:00",
+  account_status:"已更新", ready_for_next_trading_day:true, strategy_version:"v14",
+  counts:{sell:0,buy:0,hold:0,review:0}, sell_actions:[], buy_actions:[], hold_actions:[], review_actions:[],
+  risk_skips:[], audit:{}, strategy_parameter_rows:[],
+  risk_summary:{status:"active",status_label:"风险预算内",portfolio_planned_risk:"0",portfolio_planned_risk_pct:"0",
+    portfolio_risk_limit_pct:"0.04",portfolio_remaining_risk:"4000",portfolio_remaining_risk_pct:"0.04",
+    single_entry_risk_limit:"400",single_entry_risk_limit_pct:"0.004",abnormal_loss_buffer:"1000",
+    abnormal_loss_buffer_pct:"0.01",kelly_phase:"cold_start",kelly_eligible_sample_count:3,kelly_cap:"0",
+    trade_stats:{available:true,simulation:{win_rate:"0.9",payoff_ratio:"9",eligible_sample_count:99},actual:{win_rate:"0.8",payoff_ratio:"8",eligible_sample_count:88}}},
+  drawdown_summary:{},
+  kelly_observation:{available:true,status:"available",target_market:"US",
+    target_strategy_id:"trend_animals_warm_to_hot/US/v14",target_strategy_version:"v14",
+    eligible_sample_count:3,selected_sample_count:3,minimum_sample_count:30,
+    selected_round_ids:["round-2","round-1","round-0"],compatible_opening_versions:{v4:2,v7:1},
+    exact_current_version_count:0,metrics:{win_rate:"0.6666666666666666666666666666667",payoff_ratio:"2",
+      payoff_ratio_status:"available",average_net_return:"0.05",shadow_full_kelly:"1",shadow_quarter_kelly:"0.25",
+      strategy_cap:"0.04",suggested_position:"0.04"},kelly_enabled:false,
+    rounds:[
+      {round_id:"round-0",symbol:"ROUND-0",opened_at:"2026-08-04T16:00:00-04:00",closed_at:"2026-08-04T19:00:00-04:00",opening_strategy_version:"v7",net_return:"-0.05",holding_days:0},
+      {round_id:"round-1",symbol:"ROUND-1",opened_at:"2026-08-02T09:00:00-04:00",closed_at:"2026-08-04T09:00:00-04:00",opening_strategy_version:"v4",net_return:"0.1",holding_days:2},
+      {round_id:"round-2",symbol:"ROUND-2",opened_at:"2026-08-01T09:00:00-04:00",closed_at:"2026-08-03T09:00:00-04:00",opening_strategy_version:"v4",net_return:"0.1",holding_days:2},
+    ]},
+};
+const html = renderTrendReportWorkspace(report);
+const readiness = html.indexOf("trend-readiness-banner");
+const observation = html.indexOf("trend-kelly-observation");
+const execution = html.indexOf("trend-execution-status");
+if (readiness < 0 || observation < 0 || execution < 0 || !(readiness < observation && observation < execution)) throw new Error(html);
+const observationSection = html.slice(observation, html.indexOf("</section>", observation) + 10);
+const riskSummary = html.slice(html.indexOf('<details class="trend-risk-summary"'), html.indexOf("</details>", html.indexOf('<details class="trend-risk-summary"')) + 10);
+for (const text of [
+  "胜率", "盈亏比", "平均净收益", "Kelly 建议仓位", "全部计入闭环",
+  "标的", "建仓时间", "平仓时间", "持有天数", "净收益",
+  "ROUND-0", "ROUND-1", "ROUND-2", "当日", "四分之一 Kelly", "4%", "不用于交易",
+  "目标版本 v14", "计入 3 个样本", "v4 × 2", "v7 × 1", "当前版本 0 个",
+]) if (!observationSection.includes(text)) throw new Error(`missing ${text}\n${html}`);
+for (const forbidden of [
+  "闭环完整性", "归因与成本", "数据新鲜度", "样本充分性", "发现候选", "尚未平仓", "排除", "当前判断", "交易统计",
+]) if (observationSection.includes(forbidden) || forbidden === "交易统计" && riskSummary.includes(forbidden)) throw new Error(`unexpected ${forbidden}\n${html}`);
+for (const expected of [
+  "冷启动 · 影子计算", "3 / 30", "08-04 16:00 ET", "08-04 19:00 ET", "+10%",
+]) if (!observationSection.includes(expected)) throw new Error(`missing ${expected}\n${html}`);
+if (observationSection.includes("已启用")) throw new Error(observationSection);
+const noLossesReport = {
+  ...report,
+  kelly_observation: {
+    ...report.kelly_observation,
+    metrics: {...report.kelly_observation.metrics, payoff_ratio:"2", payoff_ratio_status:"available"},
+  },
+};
+const noLossesHtml = renderTrendReportWorkspace(noLossesReport);
+const noLossesStart = noLossesHtml.indexOf("trend-kelly-observation");
+const noLossesSection = noLossesHtml.slice(noLossesStart, noLossesHtml.indexOf("</section>", noLossesStart) + 10);
+if (!noLossesSection.includes("<h3>盈亏比</h3><strong>2</strong>") || noLossesSection.includes("no_losses")) throw new Error(noLossesSection);
+console.log("ok");
+''')
+
+    assert "ok" in output
+
+
+def _kelly_semantic_report() -> dict[str, Any]:
+    return {
+        "available": True,
+        "market": "US",
+        "broker": "futu",
+        "broker_label": "富途",
+        "market_label": "美股",
+        "report_date": "2026-08-05",
+        "data_date": "2026-08-04",
+        "generated_at": "2026-08-05T20:00:00+08:00",
+        "account_status": "已更新",
+        "strategy_version": "v14",
+        "counts": {},
+        "sell_actions": [],
+        "buy_actions": [],
+        "hold_actions": [],
+        "review_actions": [],
+        "risk_skips": [],
+        "audit": {},
+        "kelly_observation": {
+            "available": True,
+            "status": "available",
+            "target_market": "US",
+            "target_strategy_id": "trend_animals_warm_to_hot/US/v14",
+            "target_strategy_version": "v14",
+            "eligible_sample_count": 3,
+            "selected_sample_count": 3,
+            "minimum_sample_count": 30,
+            "selected_round_ids": ["round-2", "round-1", "round-0"],
+            "compatible_opening_versions": {"v4": 2, "v7": 1},
+            "exact_current_version_count": 0,
+            "metrics": {
+                "win_rate": "0.6666666666666666666666666666667",
+                "payoff_ratio": "2",
+                "payoff_ratio_status": "available",
+                "average_net_return": "0.05",
+                "shadow_full_kelly": "1",
+                "shadow_quarter_kelly": "0.25",
+                "strategy_cap": "0.04",
+                "suggested_position": "0.04",
+            },
+            "kelly_enabled": False,
+            "rounds": [
+                {
+                    "round_id": "round-0",
+                    "symbol": "ROUND-0",
+                    "opened_at": "2026-08-04T16:00:00-04:00",
+                    "closed_at": "2026-08-04T19:00:00-04:00",
+                    "opening_strategy_version": "v7",
+                    "net_return": "-0.05",
+                    "holding_days": 0,
+                },
+                {
+                    "round_id": "round-1",
+                    "symbol": "ROUND-1",
+                    "opened_at": "2026-08-02T09:00:00-04:00",
+                    "closed_at": "2026-08-04T09:00:00-04:00",
+                    "opening_strategy_version": "v4",
+                    "net_return": "0.1",
+                    "holding_days": 2,
+                },
+                {
+                    "round_id": "round-2",
+                    "symbol": "ROUND-2",
+                    "opened_at": "2026-08-01T09:00:00-04:00",
+                    "closed_at": "2026-08-03T09:00:00-04:00",
+                    "opening_strategy_version": "v4",
+                    "net_return": "0.1",
+                    "holding_days": 2,
+                },
+            ],
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("variant", "field", "value"),
+    [
+        pytest.param("market", "target_market", "HK", id="market"),
+        pytest.param("version", "target_strategy_version", "v99", id="version"),
+        pytest.param("strategy-id-empty", "target_strategy_id", "", id="strategy-id-empty"),
+    ],
+)
+def test_dashboard_kelly_observation_rejects_report_identity_mismatches(
+    variant: str, field: str, value: str,
+) -> None:
+    report = _kelly_semantic_report()
+    report["kelly_observation"][field] = value
+    output = run_dashboard_js(
+        f"""
+const variant = {json.dumps(variant)};
+const html = renderTrendReportWorkspace({json.dumps(report, ensure_ascii=False)});
+const start = html.indexOf("trend-kelly-observation");
+const section = html.slice(start, html.indexOf("</section>", start) + 10);
+if (!section.includes("Kelly 统计暂不可用")) throw new Error(`${{variant}}\\n${{section}}`);
+for (const forbidden of [
+  "样本进度", "胜率", "盈亏比", "平均净收益", "Kelly 建议仓位", "目标版本", "兼容版本", "当前版本",
+  "<table", "trend-kelly-observation-row", "data-kelly-observation-previous", "data-kelly-observation-next",
+  "HKT", "v99",
+]) if (section.includes(forbidden)) throw new Error(`${{variant}} unexpected ${{forbidden}}\\n${{section}}`);
+console.log("ok");
+"""
+    )
+    assert "ok" in output
+
+
+@pytest.mark.parametrize(
+    ("variant", "timestamp", "forbidden_timestamp"),
+    [
+        pytest.param(
+            "invalid-calendar-date",
+            "2026-02-30T16:00:00-05:00",
+            "02-30 16:00 ET",
+            id="invalid-calendar-date",
+        ),
+        pytest.param(
+            "wrong-market-offset",
+            "2026-08-04T16:00:00+00:00",
+            "08-04 16:00 ET",
+            id="wrong-market-offset",
+        ),
+    ],
+)
+def test_dashboard_kelly_observation_rejects_noncanonical_market_local_timestamps(
+    variant: str, timestamp: str, forbidden_timestamp: str,
+) -> None:
+    report = _kelly_semantic_report()
+    first_round = report["kelly_observation"]["rounds"][0]
+    first_round["opened_at"] = timestamp
+    first_round["closed_at"] = timestamp
+    output = run_dashboard_js(
+        f"""
+const variant = {json.dumps(variant)};
+const forbiddenTimestamp = {json.dumps(forbidden_timestamp)};
+const html = renderTrendReportWorkspace({json.dumps(report, ensure_ascii=False)});
+const start = html.indexOf("trend-kelly-observation");
+const section = html.slice(start, html.indexOf("</section>", start) + 10);
+if (!section.includes("Kelly 统计暂不可用")) throw new Error(`${{variant}}\\n${{section}}`);
+for (const forbidden of [
+  "样本进度", "胜率", "盈亏比", "平均净收益", "Kelly 建议仓位", "目标版本", "兼容版本", "当前版本",
+  "<table", "trend-kelly-observation-row", "data-kelly-observation-previous", "data-kelly-observation-next",
+  forbiddenTimestamp,
+]) if (section.includes(forbidden)) throw new Error(`${{variant}} unexpected ${{forbidden}}\\n${{section}}`);
+console.log("ok");
+"""
+    )
+    assert "ok" in output
+
+
+def test_dashboard_kelly_observation_rejects_incomplete_selected_cohort() -> None:
+    report = _kelly_semantic_report()
+    report["kelly_observation"]["eligible_sample_count"] = 4
+    output = run_dashboard_js(
+        f"""
+const html = renderTrendReportWorkspace({json.dumps(report, ensure_ascii=False)});
+const start = html.indexOf("trend-kelly-observation");
+const section = html.slice(start, html.indexOf("</section>", start) + 10);
+if (!section.includes("Kelly 统计暂不可用")) throw new Error(section);
+for (const forbidden of [
+  "样本进度", "胜率", "盈亏比", "平均净收益", "Kelly 建议仓位", "目标版本", "兼容版本", "当前版本",
+  "<table", "trend-kelly-observation-row", "data-kelly-observation-previous", "data-kelly-observation-next",
+]) if (section.includes(forbidden)) throw new Error(`unexpected ${{forbidden}}\\n${{section}}`);
+console.log("ok");
+"""
+    )
+    assert "ok" in output
+
+
+def test_dashboard_kelly_observation_rejects_enabled_below_minimum() -> None:
+    report = _kelly_semantic_report()
+    report["kelly_observation"]["kelly_enabled"] = True
+    output = run_dashboard_js(
+        f"""
+const html = renderTrendReportWorkspace({json.dumps(report, ensure_ascii=False)});
+const start = html.indexOf("trend-kelly-observation");
+const section = html.slice(start, html.indexOf("</section>", start) + 10);
+if (!section.includes("Kelly 统计暂不可用")) throw new Error(section);
+for (const forbidden of [
+  "样本进度", "胜率", "盈亏比", "平均净收益", "Kelly 建议仓位", "目标版本", "兼容版本", "当前版本",
+  "<table", "trend-kelly-observation-row", "data-kelly-observation-previous", "data-kelly-observation-next",
+]) if (section.includes(forbidden)) throw new Error(`unexpected ${{forbidden}}\\n${{section}}`);
+console.log("ok");
+"""
+    )
+    assert "ok" in output
+
+
+def test_dashboard_kelly_observation_rejects_wrong_holding_days() -> None:
+    report = _kelly_semantic_report()
+    report["kelly_observation"]["rounds"][0]["holding_days"] = 99
+    output = run_dashboard_js(
+        f"""
+const html = renderTrendReportWorkspace({json.dumps(report, ensure_ascii=False)});
+const start = html.indexOf("trend-kelly-observation");
+const section = html.slice(start, html.indexOf("</section>", start) + 10);
+if (!section.includes("Kelly 统计暂不可用")) throw new Error(section);
+for (const forbidden of [
+  "样本进度", "胜率", "盈亏比", "平均净收益", "Kelly 建议仓位", "目标版本", "兼容版本", "当前版本",
+  "<table", "trend-kelly-observation-row", "data-kelly-observation-previous", "data-kelly-observation-next",
+]) if (section.includes(forbidden)) throw new Error(`unexpected ${{forbidden}}\\n${{section}}`);
+console.log("ok");
+"""
+    )
+    assert "ok" in output
+
+
+@pytest.mark.parametrize(
+    ("variant", "metric", "value"),
+    [
+        ("win-rate", "win_rate", "1"),
+        ("average-return", "average_net_return", "0.1"),
+        ("payoff-ratio", "payoff_ratio", "9"),
+    ],
+)
+def test_dashboard_kelly_observation_rejects_row_metric_mismatches(
+    variant: str, metric: str, value: str,
+) -> None:
+    report = _kelly_semantic_report()
+    report["kelly_observation"]["metrics"][metric] = value
+    output = run_dashboard_js(
+        f"""
+const variant = {json.dumps(variant)};
+const html = renderTrendReportWorkspace({json.dumps(report, ensure_ascii=False)});
+const start = html.indexOf("trend-kelly-observation");
+const section = html.slice(start, html.indexOf("</section>", start) + 10);
+if (!section.includes("Kelly 统计暂不可用")) throw new Error(`${{variant}}\\n${{section}}`);
+for (const forbidden of [
+  "样本进度", "胜率", "盈亏比", "平均净收益", "Kelly 建议仓位", "目标版本", "兼容版本", "当前版本",
+  "<table", "trend-kelly-observation-row", "data-kelly-observation-previous", "data-kelly-observation-next",
+]) if (section.includes(forbidden)) throw new Error(`${{variant}} unexpected ${{forbidden}}\\n${{section}}`);
+console.log("ok");
+"""
+    )
+    assert "ok" in output
+
+
+@pytest.mark.parametrize(
+    ("variant", "metric", "value"),
+    [
+        ("full-kelly", "shadow_full_kelly", "0.8"),
+        ("quarter-kelly", "shadow_quarter_kelly", "1"),
+        ("suggested-position", "suggested_position", "1"),
+    ],
+)
+def test_dashboard_kelly_observation_rejects_kelly_relationship_mismatches(
+    variant: str, metric: str, value: str,
+) -> None:
+    report = _kelly_semantic_report()
+    report["kelly_observation"]["metrics"][metric] = value
+    output = run_dashboard_js(
+        f"""
+const variant = {json.dumps(variant)};
+const html = renderTrendReportWorkspace({json.dumps(report, ensure_ascii=False)});
+const start = html.indexOf("trend-kelly-observation");
+const section = html.slice(start, html.indexOf("</section>", start) + 10);
+if (!section.includes("Kelly 统计暂不可用")) throw new Error(`${{variant}}\\n${{section}}`);
+for (const forbidden of [
+  "样本进度", "胜率", "盈亏比", "平均净收益", "Kelly 建议仓位", "目标版本", "兼容版本", "当前版本",
+  "<table", "trend-kelly-observation-row", "data-kelly-observation-previous", "data-kelly-observation-next",
+]) if (section.includes(forbidden)) throw new Error(`${{variant}} unexpected ${{forbidden}}\\n${{section}}`);
+console.log("ok");
+"""
+    )
+    assert "ok" in output
+
+
+@pytest.mark.browser
+def test_dashboard_kelly_observation_paginates_all_input_rounds_at_375px() -> None:
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    payload = json.loads(run_dashboard_js(r'''
+const rounds = Array.from({length:12}, (_, index) => {
+  const number = String(index + 1).padStart(2, "0");
+  return {round_id:`round-${number}`,symbol:`ROUND-${number}`,
+    opened_at:`2026-08-${String(index + 1).padStart(2, "0")}T09:00:00-04:00`,
+    closed_at:`2026-08-${String(index + 1).padStart(2, "0")}T10:00:00-04:00`,
+    opening_strategy_version:"v4",net_return:index % 3 === 0 ? "-0.05" : "0.1",holding_days:0};
+});
+const report = {available:true,market:"US",broker:"futu",broker_label:"富途",market_label:"美股",
+  report_date:"2026-08-12",data_date:"2026-08-11",generated_at:"2026-08-12T20:00:00+08:00",
+  account_status:"已更新",strategy_version:"v14",allocation:{version:2},counts:{},
+  sell_actions:[],buy_actions:[],hold_actions:[],review_actions:[],risk_skips:[],audit:{},
+  kelly_observation:{available:true,status:"available",target_market:"US",
+    target_strategy_id:"trend_animals_warm_to_hot/US/v14",target_strategy_version:"v14",
+    eligible_sample_count:12,selected_sample_count:12,minimum_sample_count:30,
+    selected_round_ids:rounds.map((round)=>round.round_id),compatible_opening_versions:{v4:12},exact_current_version_count:0,
+    metrics:{win_rate:"0.6666666666666666666666666666667",payoff_ratio:"2",payoff_ratio_status:"available",
+      average_net_return:"0.05",shadow_full_kelly:"1",shadow_quarter_kelly:"0.25",strategy_cap:"0.04",suggested_position:"0.04"},
+    kelly_enabled:false,rounds},
+};
+console.log(JSON.stringify({report}));
+'''))
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    errors: list[str] = []
+    expected_ids = [f"round-{index:02d}" for index in range(1, 13)]
+    with playwright_api.sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(channel="chrome", headless=True)
+        except Exception as exc:  # pragma: no cover - local browser availability
+            pytest.skip(f"Chrome is required for dashboard DOM checks: {exc}")
+        page = browser.new_page(viewport={"width": 375, "height": 844})
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.set_content(f"<style>{css}</style><div id=mount></div>")
+        page.add_script_tag(path=str(STATIC_DIR / "dashboard.js"))
+        page.evaluate(
+            """(report) => {
+              const mount = document.querySelector('#mount');
+              mount.innerHTML = renderTrendReportWorkspace(report);
+              mount.addEventListener('click', (event) => handleTrendKellyObservationPagination(event));
+            }""",
+            payload["report"],
+        )
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        observation = page.locator(".trend-kelly-observation")
+        assert observation.count() == 1
+        assert page.locator(".trend-kelly-observation-row").count() == 10
+        assert page.locator("[data-kelly-observation-page]").inner_text() == "第 1 / 2 页"
+        assert page.locator("[data-kelly-observation-previous]").is_disabled()
+        assert not page.locator("[data-kelly-observation-next]").is_disabled()
+        first_page_ids = page.locator(".trend-kelly-observation-row").evaluate_all(
+            "rows => rows.map(row => row.dataset.roundId)"
+        )
+        assert first_page_ids == expected_ids[:10]
+
+        page.locator("[data-kelly-observation-next]").click()
+        assert page.locator(".trend-kelly-observation-row").count() == 2
+        assert page.locator("[data-kelly-observation-page]").inner_text() == "第 2 / 2 页"
+        assert not page.locator("[data-kelly-observation-previous]").is_disabled()
+        assert page.locator("[data-kelly-observation-next]").is_disabled()
+        second_page_ids = page.locator(".trend-kelly-observation-row").evaluate_all(
+            "rows => rows.map(row => row.dataset.roundId)"
+        )
+        assert second_page_ids == expected_ids[10:]
+        assert set(first_page_ids + second_page_ids) == set(expected_ids)
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+        )
+        for label in ("标的", "建仓时间", "平仓时间", "持有天数", "净收益"):
+            assert page.locator(
+                f'.trend-kelly-observation-row [data-label="{label}"]'
+            ).count() == 2
+
+        page.locator("[data-kelly-observation-previous]").click()
+        assert page.locator(".trend-kelly-observation-row").count() == 10
+        assert page.locator("[data-kelly-observation-page]").inner_text() == "第 1 / 2 页"
+        assert page.locator("[data-kelly-observation-previous]").is_disabled()
+        assert not page.locator("[data-kelly-observation-next]").is_disabled()
+        assert page.locator(".trend-kelly-observation-row").evaluate_all(
+            "rows => rows.map(row => row.dataset.roundId)"
+        ) == expected_ids[:10]
+        assert errors == []
+        browser.close()
+
+
+def test_dashboard_kelly_observation_unavailable_state_hides_metrics_and_table() -> None:
+    output = run_dashboard_js(r'''
+const html = renderTrendReportWorkspace({
+  available:true, market:"US", broker:"futu", broker_label:"富途", market_label:"美股",
+  report_date:"2026-08-05", data_date:"2026-08-04", generated_at:"2026-08-05T20:00:00+08:00",
+  account_status:"已更新", strategy_version:"v14", counts:{}, sell_actions:[], buy_actions:[],
+  hold_actions:[], review_actions:[], risk_skips:[], audit:{},
+  kelly_observation:{available:false,status:"unavailable",status_text:"Kelly 统计暂不可用"},
+});
+const start = html.indexOf("trend-kelly-observation");
+const section = html.slice(start, html.indexOf("</section>", start) + 10);
+if (!section.includes("Kelly 统计暂不可用")) throw new Error(section);
+for (const forbidden of [
+  "样本进度", "胜率", "盈亏比", "平均净收益", "Kelly 建议仓位", "全部计入闭环",
+  "data-kelly-observation-previous", "data-kelly-observation-next", "<table",
+]) if (section.includes(forbidden)) throw new Error(`unexpected ${forbidden}\n${section}`);
+
+const inconsistentHtml = renderTrendReportWorkspace({
+  available:true, market:"US", broker:"futu", broker_label:"富途", market_label:"美股",
+  report_date:"2026-08-05", data_date:"2026-08-04", generated_at:"2026-08-05T20:00:00+08:00",
+  account_status:"已更新", strategy_version:"v14", counts:{}, sell_actions:[], buy_actions:[],
+  hold_actions:[], review_actions:[], risk_skips:[], audit:{},
+  kelly_observation:{available:true,status:"available",target_market:"US",
+    target_strategy_id:"trend_animals_warm_to_hot/US/v14",target_strategy_version:"v14",
+    kelly_enabled:false,
+    eligible_sample_count:2,selected_sample_count:2,minimum_sample_count:30,
+    selected_round_ids:["round-1","round-2"],compatible_opening_versions:{v4:2},
+    exact_current_version_count:0,
+    metrics:{win_rate:"0.5",average_net_return:"0.1",suggested_position:"0.04"},
+    rounds:[{round_id:"round-1"}]},
+});
+const inconsistentStart = inconsistentHtml.indexOf("trend-kelly-observation");
+const inconsistentSection = inconsistentHtml.slice(inconsistentStart, inconsistentHtml.indexOf("</section>", inconsistentStart) + 10);
+if (!inconsistentSection.includes("Kelly 统计暂不可用")) throw new Error(inconsistentSection);
+for (const forbidden of [
+  "样本进度", "胜率", "盈亏比", "平均净收益", "Kelly 建议仓位", "计入 2 个样本",
+  "<table", "trend-kelly-observation-row", "data-kelly-observation-previous", "data-kelly-observation-next",
+]) if (inconsistentSection.includes(forbidden)) throw new Error(`unexpected ${forbidden}\n${inconsistentSection}`);
+
+const versionMismatchHtml = renderTrendReportWorkspace({
+  available:true, market:"US", broker:"futu", broker_label:"富途", market_label:"美股",
+  report_date:"2026-08-05", data_date:"2026-08-04", generated_at:"2026-08-05T20:00:00+08:00",
+  account_status:"已更新", strategy_version:"v14", counts:{}, sell_actions:[], buy_actions:[],
+  hold_actions:[], review_actions:[], risk_skips:[], audit:{},
+  kelly_observation:{available:true,status:"available",target_market:"US",
+    target_strategy_id:"trend_animals_warm_to_hot/US/v14",target_strategy_version:"v14",
+    kelly_enabled:false, eligible_sample_count:1,selected_sample_count:1,minimum_sample_count:30,
+    selected_round_ids:["round-1"],compatible_opening_versions:{v14:1},exact_current_version_count:1,
+    metrics:{win_rate:"1",payoff_ratio:"2",payoff_ratio_status:"available",average_net_return:"0.1",
+      shadow_full_kelly:"0.1",shadow_quarter_kelly:"0.025",strategy_cap:"0.04",suggested_position:"0.025"},
+    rounds:[{round_id:"round-1",symbol:"ROUND-1",opened_at:"2026-08-04T16:00:00-04:00",
+      closed_at:"2026-08-04T19:00:00-04:00",opening_strategy_version:"v4",net_return:"0.1",holding_days:0}]},
+});
+const versionMismatchStart = versionMismatchHtml.indexOf("trend-kelly-observation");
+const versionMismatchSection = versionMismatchHtml.slice(versionMismatchStart, versionMismatchHtml.indexOf("</section>", versionMismatchStart) + 10);
+if (!versionMismatchSection.includes("Kelly 统计暂不可用")) throw new Error(versionMismatchSection);
+for (const forbidden of [
+  "样本进度", "胜率", "盈亏比", "平均净收益", "Kelly 建议仓位", "计入 1 个样本", "目标版本", "兼容版本", "当前版本",
+  "样本达标", "冷启动", "<table", "trend-kelly-observation-row", "data-kelly-observation-previous", "data-kelly-observation-next",
+]) if (versionMismatchSection.includes(forbidden)) throw new Error(`unexpected ${forbidden}\n${versionMismatchSection}`);
+
+const missingFlagHtml = renderTrendReportWorkspace({
+  available:true, market:"US", broker:"futu", broker_label:"富途", market_label:"美股",
+  report_date:"2026-08-05", data_date:"2026-08-04", generated_at:"2026-08-05T20:00:00+08:00",
+  account_status:"已更新", strategy_version:"v14", counts:{}, sell_actions:[], buy_actions:[],
+  hold_actions:[], review_actions:[], risk_skips:[], audit:{},
+  kelly_observation:{available:true,status:"available",target_market:"US",
+    target_strategy_id:"trend_animals_warm_to_hot/US/v14",target_strategy_version:"v14",
+    eligible_sample_count:1,selected_sample_count:1,minimum_sample_count:30,
+    selected_round_ids:["round-1"],compatible_opening_versions:{v4:1},exact_current_version_count:0,
+    metrics:{win_rate:"1",payoff_ratio:"2",payoff_ratio_status:"available",average_net_return:"0.1",
+      shadow_full_kelly:"0.1",shadow_quarter_kelly:"0.025",strategy_cap:"0.04",suggested_position:"0.025"},
+    rounds:[{round_id:"round-1",symbol:"ROUND-1",opened_at:"2026-08-04T16:00:00-04:00",
+      closed_at:"2026-08-04T19:00:00-04:00",opening_strategy_version:"v4",net_return:"0.1",holding_days:0}]},
+});
+const missingFlagStart = missingFlagHtml.indexOf("trend-kelly-observation");
+const missingFlagSection = missingFlagHtml.slice(missingFlagStart, missingFlagHtml.indexOf("</section>", missingFlagStart) + 10);
+if (!missingFlagSection.includes("Kelly 统计暂不可用")) throw new Error(missingFlagSection);
+for (const forbidden of [
+  "样本进度", "胜率", "盈亏比", "平均净收益", "Kelly 建议仓位", "计入 1 个样本", "目标版本", "兼容版本", "当前版本",
+  "样本达标", "冷启动", "<table", "trend-kelly-observation-row", "data-kelly-observation-previous", "data-kelly-observation-next",
+]) if (missingFlagSection.includes(forbidden)) throw new Error(`unexpected ${forbidden}\n${missingFlagSection}`);
+console.log("ok");
+''')
+
+    assert "ok" in output
