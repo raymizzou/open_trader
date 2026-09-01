@@ -217,6 +217,7 @@ def test_overlapping_relations_merge_into_one_component() -> None:
             ("contract-a", "contract-b", "contract-c"),
             ("contract-a", "contract-b", "contract-c"),
             ("r:contract-a->contract-b", "r:contract-b->contract-c"),
+            AS_OF,
         ),
     )
 
@@ -229,8 +230,8 @@ def test_disjoint_relations_form_separate_components() -> None:
         "r:cd": row("r:cd", compiled_problem=compiled(relation_problem("contract-c", "contract-d", key_b))),
     }
     assert relation_generation_components(generation) == (
-        RelationComponent("component:contract-a:contract-b", ("contract-a", "contract-b"), ("contract-a", "contract-b"), ("r:contract-a->contract-b",)),
-        RelationComponent("component:contract-c:contract-d", ("contract-c", "contract-d"), ("contract-c", "contract-d"), ("r:contract-c->contract-d",)),
+        RelationComponent("component:contract-a:contract-b", ("contract-a", "contract-b"), ("contract-a", "contract-b"), ("r:contract-a->contract-b",), AS_OF),
+        RelationComponent("component:contract-c:contract-d", ("contract-c", "contract-d"), ("contract-c", "contract-d"), ("r:contract-c->contract-d",), AS_OF),
     )
 
 

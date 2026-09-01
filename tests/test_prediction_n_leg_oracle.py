@@ -277,7 +277,7 @@ def test_components_join_actions_on_one_market_contract() -> None:
     )
 
     assert build_relation_components(built) == (
-        RelationComponent("component:contract-a", ("action-a", "action-z"), ("contract-a",), ()),
+        RelationComponent("component:contract-a", ("action-a", "action-z"), ("contract-a",), (), AS_OF),
     )
 
 
@@ -292,7 +292,7 @@ def test_components_join_exact_observation_keys_but_not_near_matches() -> None:
     )
 
     assert build_relation_components(built) == (
-        RelationComponent("component:contract-a:contract-b", ("action-a", "action-b"), ("contract-a", "contract-b"), ()),
+        RelationComponent("component:contract-a:contract-b", ("action-a", "action-b"), ("contract-a", "contract-b"), (), AS_OF),
     )
     assert {"title", "discovery_source", "llm_similarity"}.isdisjoint(CandidateAction.__slots__)
 
@@ -309,8 +309,8 @@ def test_components_join_exact_observation_keys_but_not_near_matches() -> None:
         )
 
         assert build_relation_components(separate) == (
-            RelationComponent("component:contract-a", ("action-a",), ("contract-a",), ()),
-            RelationComponent("component:contract-b", ("action-b",), ("contract-b",), ()),
+            RelationComponent("component:contract-a", ("action-a",), ("contract-a",), (), AS_OF),
+            RelationComponent("component:contract-b", ("action-b",), ("contract-b",), (), AS_OF),
         )
 
 
@@ -331,6 +331,7 @@ def test_components_join_explicit_versioned_relations_transitively_only() -> Non
             ("action-a", "action-b", "action-c"),
             ("contract-a", "contract-b", "contract-c"),
             ("relation-a", "relation-b"),
+            AS_OF,
         ),
     )
 
@@ -347,7 +348,7 @@ def test_components_join_cross_contract_forbidden_atom_constraints() -> None:
     )
 
     assert build_relation_components(built) == (
-        RelationComponent("component:contract-a:contract-b", ("action-a", "action-b"), ("contract-a", "contract-b"), ("forbid",)),
+        RelationComponent("component:contract-a:contract-b", ("action-a", "action-b"), ("contract-a", "contract-b"), ("forbid",), AS_OF),
     )
 
 def test_enumeration_selects_one_atom_per_contract_and_implies_only_normal_yes_no() -> None:

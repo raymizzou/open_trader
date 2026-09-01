@@ -98,8 +98,22 @@ def relation_generation_problem(
     )
     if not rows:
         return None, ()
-    problem = _compile(rows)
-    return problem, build_relation_components(problem)
+    problems = _member_problems(rows)
+    problem = _merge(problems)
+    # Issue #110: each component is judged on its own timeline. A contract
+    # shared by members with different as_of values takes the later one (the
+    # conservative direction); contract-disjoint members never see each
+    # other's cutoff dates.
+    as_of_by_contract: dict[str, datetime] = {}
+    for member in problems:
+        for state in member.terminal_state_sets:
+            contract_id = state.market_contract_id
+            current = as_of_by_contract.get(contract_id)
+            if current is None or member.as_of > current:
+                as_of_by_contract[contract_id] = member.as_of
+    return problem, build_relation_components(
+        problem, as_of_by_contract=as_of_by_contract
+    )
 
 
 def relation_row_admitted(row: Mapping[str, object]) -> bool:
@@ -123,8 +137,8 @@ def _model_complete(row: Mapping[str, object]) -> bool:
     )
 
 
-def _compile(rows: tuple[Mapping[str, object], ...]) -> ArbitrageProblem:
-    """Compile admissible rows into one N-leg problem for component building."""
+def _member_problems(rows: tuple[Mapping[str, object], ...]) -> list[ArbitrageProblem]:
+    """Decode each admissible row's compiled problem payload."""
     problems: list[ArbitrageProblem] = []
     for row in rows:
         model = row.get("model")
@@ -135,7 +149,7 @@ def _compile(rows: tuple[Mapping[str, object], ...]) -> ArbitrageProblem:
                 "problem payload; threshold enrichment must attach model.problem"
             )
         problems.append(problem_from_payload(payload))
-    return _merge(problems)
+    return problems
 
 
 def _merge(problems: list[ArbitrageProblem]) -> ArbitrageProblem:
@@ -250,7 +264,12 @@ def resolve_background_candidate(
 def problem_for_component(
     problem: ArbitrageProblem, component: RelationComponent
 ) -> ArbitrageProblem:
-    """Restrict one merged problem to a single canonical relation component."""
+    """Restrict one merged problem to a single canonical relation component.
+
+    The slice is judged on the component's own timeline (``component.as_of``,
+    issue #110): contract-disjoint components never inherit each other's
+    market cutoff dates.
+    """
     action_ids = set(component.action_ids)
     contract_ids = set(component.contract_ids)
     constraint_ids = set(component.constraint_ids)
@@ -275,7 +294,7 @@ def problem_for_component(
     return ArbitrageProblem(
         problem.schema_version,
         problem.problem_id,
-        problem.as_of,
+        component.as_of,
         problem.valuation_unit_id,
         actions,
         states,

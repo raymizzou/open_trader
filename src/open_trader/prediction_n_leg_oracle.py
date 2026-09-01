@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from itertools import chain, product
@@ -77,6 +77,7 @@ class RelationComponent:
     action_ids: tuple[str, ...]
     contract_ids: tuple[str, ...]
     constraint_ids: tuple[str, ...]
+    as_of: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,8 +128,61 @@ def _input_unknown_reason(problem: ArbitrageProblem) -> UnknownReason | None:
     return UnknownReason.INVALID_MODEL if issues else None
 
 
-def build_relation_components(problem: ArbitrageProblem) -> tuple[RelationComponent, ...]:
-    _require_valid(problem)
+def _component_slice(
+    problem: ArbitrageProblem, component: RelationComponent, as_of: datetime
+) -> ArbitrageProblem:
+    """Restrict one merged problem to one canonical relation component."""
+    action_ids = set(component.action_ids)
+    contract_ids = set(component.contract_ids)
+    constraint_ids = set(component.constraint_ids)
+    return ArbitrageProblem(
+        problem.schema_version,
+        f"{problem.problem_id}:{component.component_id}",
+        as_of,
+        problem.valuation_unit_id,
+        tuple(action for action in problem.actions if action.action_id in action_ids),
+        tuple(
+            state
+            for state in problem.terminal_state_sets
+            if state.market_contract_id in contract_ids
+        ),
+        ConstraintModel(
+            tuple(
+                relation
+                for relation in problem.constraint_model.relations
+                if relation.constraint_id in constraint_ids
+            ),
+            tuple(
+                forbidden
+                for forbidden in problem.constraint_model.forbidden_atom_combinations
+                if forbidden.constraint_id in constraint_ids
+            ),
+        ),
+        problem.qualification_constraints,
+    )
+
+
+def build_relation_components(
+    problem: ArbitrageProblem,
+    *,
+    as_of_by_contract: Mapping[str, datetime] | None = None,
+) -> tuple[RelationComponent, ...]:
+    """Split one merged problem into canonical relation components.
+
+    The union-find split (contracts joined by settlement-observation-key
+    fingerprint, explicit relations and forbidden-atom combinations) is
+    unchanged. Each component is judged on its own timeline: its ``as_of`` is
+    the maximum ``as_of_by_contract`` value among the component's contracts,
+    falling back to the whole problem's ``as_of`` when no mapping is supplied
+    or no contract hits it. Callers compiling heterogeneous problems (one
+    merged problem whose member problems carry different market cutoff dates)
+    must pass the per-contract mapping; without it every component inherits
+    the merged problem's ``as_of``, which wrongly makes component-disjoint
+    timelines block each other (issue #110). Each component slice is validated
+    on its own timeline with the shared ``validate_problem``; the first
+    invalid component raises ``ValueError("invalid problem: ...")`` in the
+    ``_require_valid`` message style.
+    """
     contract_ids = tuple(sorted(state.market_contract_id for state in problem.terminal_state_sets))
     parent = {contract_id: contract_id for contract_id in contract_ids}
 
@@ -186,15 +240,30 @@ def build_relation_components(problem: ArbitrageProblem) -> tuple[RelationCompon
                 ]
             )
         )
+        if as_of_by_contract is None:
+            component_as_of = problem.as_of
+        else:
+            mapped = [
+                as_of_by_contract[contract_id]
+                for contract_id in component_contracts
+                if contract_id in as_of_by_contract
+            ]
+            component_as_of = max(mapped) if mapped else problem.as_of
         components.append(
             RelationComponent(
                 f"component:{':'.join(component_contracts)}",
                 component_actions,
                 component_contracts,
                 component_constraints,
+                component_as_of,
             )
         )
-    return tuple(sorted(components, key=lambda component: component.component_id))
+    ordered = tuple(sorted(components, key=lambda component: component.component_id))
+    for component in ordered:
+        issues = validate_problem(_component_slice(problem, component, component.as_of))
+        if issues:
+            raise ValueError("invalid problem: " + "; ".join(issue.code for issue in issues))
+    return ordered
 
 
 def enumerate_allowed_scenarios(problem: ArbitrageProblem, budget: OracleBudget) -> ScenarioEnumeration:

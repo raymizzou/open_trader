@@ -1019,7 +1019,13 @@ def test_activation_gate_blocks_compile_conflict_candidate(tmp_path: Path) -> No
     assert rows[second_id]["status"] == "APPROVED"
 
 
-def test_activation_gate_blocks_stale_capital_release_candidate(tmp_path: Path) -> None:
+def test_activation_gate_admits_contract_disjoint_timeline_candidate(
+    tmp_path: Path,
+) -> None:
+    """Issue #110: a candidate on a later settlement timeline sharing no
+    contract and no observation key with the ACTIVE set is judged on its own
+    component timeline and publishes ACTIVE (previously the whole-set stale
+    aggregates blocked it with ACTIVATION_BLOCKED_INCONSISTENT)."""
     catalog = RelationCatalog(tmp_path)
     first = compiled_relation_discovery(
         ["condition-a", "condition-b", "condition-z"],
@@ -1035,11 +1041,12 @@ def test_activation_gate_blocks_stale_capital_release_candidate(tmp_path: Path) 
     )
     first_id = catalog.ingest_controlled(first)["version_id"]
     assert catalog.approve(first_id, {"version_id": first_id}, actor="op", git_sha="sha")["activation"] == "ACTIVE"
-    before = dict(catalog.current_generation())
     later_id = catalog.ingest_controlled(later)["version_id"]
-    blocked = catalog.approve(later_id, {"version_id": later_id}, actor="op", git_sha="sha")
-    assert blocked["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT"
-    assert catalog.current_generation() == before
+    approved = catalog.approve(later_id, {"version_id": later_id}, actor="op", git_sha="sha")
+    assert approved["activation"] == "ACTIVE"
+    generation = catalog.current_generation()
+    assert len(generation) == 2
+    assert all(row["activation"] == "ACTIVE" for row in generation.values())
 
 
 def test_activation_gate_accepts_compile_compatible_candidate(tmp_path: Path) -> None:
@@ -1647,7 +1654,13 @@ def test_r14_approve_many_batch_internal_visibility_matches_sequential_approve(t
             ),
             "error": 0,
         }, label
-        assert per_item[-1]["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT", label
+        # Issue #110: the disjoint-timeline stale_pair now approves both
+        # members in batch and sequential order alike; the unsatisfiable
+        # triple and the valuation-unit conflict still block their last item.
+        expected_last = (
+            "ACTIVE" if label == "stale_pair" else "ACTIVATION_BLOCKED_INCONSISTENT"
+        )
+        assert per_item[-1]["activation"] == expected_last, label
 
         def snapshot(catalog: RelationCatalog) -> dict[str, object]:
             versions = {

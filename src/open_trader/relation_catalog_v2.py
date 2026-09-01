@@ -799,22 +799,20 @@ class RelationCatalogV2:
         self.store: MutableMapping = store if store is not None else {}
         # Issue #98: in-process derived state (canonical contract -> set of
         # ACTIVE identities, compiled-problem observation key -> set of ACTIVE
-        # identities, and the ACTIVE-set aggregates max as_of / min terminal
-        # release / valuation units) built from the current generation's
-        # payloads, guarded by the store's membership watermark. The watermark
-        # is the max catalog_v2_generations rowid for SQLite stores (any
-        # process's membership change appends a row) and the bumped
-        # generation_number for plain-dict stores. The state is rebuilt from
-        # the transaction snapshot whenever the watermark moves and is
+        # identities, and the ACTIVE-set valuation-unit aggregate) built from
+        # the current generation's payloads, guarded by the store's membership
+        # watermark. The watermark is the max catalog_v2_generations rowid for
+        # SQLite stores (any process's membership change appends a row) and the
+        # bumped generation_number for plain-dict stores. The state is rebuilt
+        # from the transaction snapshot whenever the watermark moves and is
         # maintained incrementally after this process's own commits. One
-        # watermark token guards all of it (same lifecycle).
+        # watermark token guards all of it (same lifecycle). Issue #110: the
+        # former max-as_of/min-release aggregates are gone — the stale-capital
+        # comparison is a component predicate, judged by the compile seam's
+        # per-component validation, not a whole-set one.
         self._contract_index: dict[str, set[str]] = {}
         self._key_index: dict[str, set[str]] = {}
-        self._aggregates: dict[str, object] = {
-            "max_as_of": None,
-            "min_release": None,
-            "units": frozenset(),
-        }
+        self._aggregates: dict[str, object] = {"units": frozenset()}
         self._contract_index_token: object = None
         # Review R2: the in-process index/aggregate state above is shared
         # mutable state across service request threads (ThreadingHTTPServer).
@@ -1396,10 +1394,11 @@ class RelationCatalogV2:
                 reason = "ACTIVATION_BLOCKED_INCONSISTENT"
                 inconsistent = True
             elif not self._global_activation_ok(version_fields):
-                # Whole-set compile predicates a component-only compile cannot
-                # observe: stale capital release across contract-disjoint
-                # members and one shared valuation unit. replace()'s
-                # whole-set precheck blocks the same candidate with
+                # Whole-set compile predicate a component-only compile cannot
+                # observe: one shared valuation unit across the ACTIVE set
+                # (issue #110 scoped the stale-capital comparison down to the
+                # compile seam's components). replace()'s whole-set precheck
+                # blocks the same candidate with
                 # ACTIVATION_BLOCKED_INCONSISTENT.
                 reason = "ACTIVATION_BLOCKED_INCONSISTENT"
                 inconsistent = True
@@ -1644,17 +1643,19 @@ class RelationCatalogV2:
         return entries
 
     def _global_activation_ok(self, version_fields: dict) -> bool:
-        """Whole-set compile predicates a component-only compile cannot see.
+        """Whole-set compile predicate a component-only compile cannot see:
+        one shared valuation unit across the ACTIVE set.
 
-        The compile seam merges every ACTIVE problem and validates the merged
-        problem: a candidate whose as_of postdates any ACTIVE terminal release
-        (or whose earliest terminal release predates any ACTIVE as_of) makes
-        the merged problem stale (``STALE_CAPITAL_RELEASE_AT``), and a
-        candidate with a valuation unit different from the ACTIVE set fails
-        the merge ("compiled problems must share one valuation unit").
-        replace() blocks such candidates with
-        ACTIVATION_BLOCKED_INCONSISTENT via its whole-set precheck; here the
-        same judgment comes from the ACTIVE-set aggregates.
+        A candidate with a valuation unit different from the ACTIVE set fails
+        the merge ("compiled problems must share one valuation unit");
+        replace() blocks such candidates with ACTIVATION_BLOCKED_INCONSISTENT
+        via its whole-set precheck, and here the same judgment comes from the
+        ACTIVE-set unit aggregate. Issue #110: the stale-capital timeline
+        comparison is NOT a whole-set predicate — it is scoped to the compile
+        seam's components (contract/observation-key connected markets), where
+        the component compile precheck below rejects a candidate whose atoms
+        release before its own component's timeline. Contract-disjoint
+        components never block each other.
         """
         aggregate = _problem_aggregate(version_fields)
         if aggregate is _INVALID_PROBLEM_DATES:
@@ -1666,15 +1667,9 @@ class RelationCatalogV2:
             return False
         if aggregate is None:
             return True
-        candidate_as_of, candidate_min_release, candidate_unit = aggregate
+        candidate_unit = aggregate[2]
         state = self._aggregates
-        if state["units"] and candidate_unit not in state["units"]:
-            return False
-        if state["max_as_of"] is not None and state["max_as_of"] > candidate_min_release:
-            return False
-        if state["min_release"] is not None and candidate_as_of > state["min_release"]:
-            return False
-        return True
+        return not state["units"] or candidate_unit in state["units"]
 
     def _index_token(self) -> object:
         """Store membership watermark at this instant."""
@@ -1696,12 +1691,10 @@ class RelationCatalogV2:
 
     def _rebuild_contract_index(self) -> None:
         """Build contract/observation-key -> ACTIVE identities plus the ACTIVE
-        aggregates from the current generation payloads (one watermark guards
-        all of them). The caller holds ``_index_lock``."""
+        unit aggregate from the current generation payloads (one watermark
+        guards all of them). The caller holds ``_index_lock``."""
         index: dict[str, set[str]] = {}
         key_index: dict[str, set[str]] = {}
-        max_as_of: datetime | None = None
-        min_release: datetime | None = None
         units: set[str] = set()
         generation = self.store.get("generation", {})
         versions = self.store.get("versions", {})
@@ -1715,17 +1708,10 @@ class RelationCatalogV2:
             aggregate = _problem_aggregate(payload)
             if aggregate is None or aggregate is _INVALID_PROBLEM_DATES:
                 continue
-            as_of, release, unit = aggregate
-            max_as_of = as_of if max_as_of is None else max(max_as_of, as_of)
-            min_release = release if min_release is None else min(min_release, release)
-            units.add(unit)
+            units.add(aggregate[2])
         self._contract_index = index
         self._key_index = key_index
-        self._aggregates = {
-            "max_as_of": max_as_of,
-            "min_release": min_release,
-            "units": frozenset(units),
-        }
+        self._aggregates = {"units": frozenset(units)}
 
     def _apply_index_entry(
         self, identity: str, contracts: list[str], keys: set[str], aggregate: object
@@ -1734,26 +1720,22 @@ class RelationCatalogV2:
 
         Shared by the post-commit sync and the per-entry batch-internal
         publish in ``_activate_many_locked``; every contribution is
-        idempotent (set membership, max/min, unit union), so applying the
-        same entry twice is harmless. The caller holds ``_index_lock`` (the
-        read-modify-writes on the shared aggregates must be atomic).
+        idempotent (set membership, unit union), so applying the same entry
+        twice is harmless. The caller holds ``_index_lock`` (the
+        read-modify-writes on the shared aggregate must be atomic).
         """
         for contract in contracts:
             self._contract_index.setdefault(contract, set()).add(identity)
         for key in keys:
             self._key_index.setdefault(key, set()).add(identity)
         if aggregate is not None:
-            as_of, release, unit = aggregate
-            state = self._aggregates
-            state["max_as_of"] = (
-                as_of if state["max_as_of"] is None else max(state["max_as_of"], as_of)
+            # Issue #110: only the valuation unit remains a whole-set
+            # aggregate; as_of/min-release tracking was removed with the
+            # catalog-wide stale predicate.
+            unit = aggregate[2]
+            self._aggregates["units"] = frozenset(
+                self._aggregates["units"] | {unit}  # type: ignore[operator]
             )
-            state["min_release"] = (
-                release
-                if state["min_release"] is None
-                else min(state["min_release"], release)
-            )
-            state["units"] = frozenset(state["units"] | {unit})
 
     def _invalidate_contract_index(self) -> None:
         """Discard the in-process index after a rolled-back write transaction.

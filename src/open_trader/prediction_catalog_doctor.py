@@ -3,10 +3,14 @@
 ``report(catalog)`` replays the production compile seam
 (``relation_generation_problem``) over the current generation rows and
 iteratively attributes failures to merge conflicts or stale capital release
-rows, proposing the smallest deterministic removal set. Attribution runs
+rows, proposing the smallest deterministic removal set. Since issue #110 the
+stale attribution is component-scoped: each component (the oracle's contract
++ observation-key connectivity) is judged on its own timeline
+(``component_as_of``, the max member ``as_of``), so contract-disjoint
+components can never flag each other. Attribution runs
 only on the seam's admission set (ACTIVE and model-complete rows, see
-``relation_row_admitted``), so cause-marked UNKNOWN members never lift the
-merged ``as_of``, never contribute conflict holders, and never enter any
+``relation_row_admitted``), so cause-marked UNKNOWN members never lift any
+component timeline, never contribute conflict holders, and never enter any
 proposal; the report lists their count separately as ``excluded``. The
 module never writes anything; applying the proposal goes through
 ``RelationCatalog.rebuild_generation`` with an explicit identity list.
@@ -24,7 +28,7 @@ from collections.abc import Mapping
 from datetime import datetime
 
 from .prediction_monitor_selection import relation_generation_problem, relation_row_admitted
-from .prediction_n_leg import canonical_json, canonical_payload, problem_from_payload
+from .prediction_n_leg import canonical_json, canonical_payload, fingerprint, problem_from_payload
 
 #: Prefixes of the compile seam's merge-conflict messages, mapped to the
 #: collection inside the decoded problem that defines the conflicting key.
@@ -180,64 +184,139 @@ def _diagnose_conflict(
     return finding, removal
 
 
+def _component_groups(
+    rows: Mapping[str, Mapping[str, object]]
+) -> list[dict[str, object]]:
+    """Group admitted rows by the compile seam's component connectivity.
+
+    Mirrors ``build_relation_components``' join rules over the rows' decoded
+    problems: contracts join through shared settlement-observation-key
+    fingerprints, explicit relations and forbidden-atom combinations. The
+    observation-key join is cross-row: fingerprints are accumulated over every
+    admitted row's states before joining, matching the oracle's merged-state
+    grouping — the same observation key on different contracts in different
+    rows is one component (issue #110 review). Returns one entry per component
+    with its contracts and member identities; a row whose problem spans
+    several components is a member of each.
+    """
+    problems = {
+        identity: problem
+        for identity, row in rows.items()
+        if (problem := _problem_of(row)) is not None
+    }
+    parent: dict[str, str] = {}
+
+    def find(contract: str) -> str:
+        while parent[contract] != contract:
+            parent[contract] = parent[parent[contract]]
+            contract = parent[contract]
+        return contract
+
+    def join(contracts: list[str]) -> None:
+        for contract in contracts[1:]:
+            parent.setdefault(contract, contract)
+            head, tail = find(contracts[0]), find(contract)
+            if head != tail:
+                parent[tail] = head
+
+    key_contracts: dict[str, list[str]] = {}
+    for problem in problems.values():
+        for state in problem.terminal_state_sets:
+            parent.setdefault(state.market_contract_id, state.market_contract_id)
+            key_contracts.setdefault(
+                fingerprint(state.settlement_observation_key), []
+            ).append(state.market_contract_id)
+    for contracts in key_contracts.values():
+        join(sorted(contracts))
+    for problem in problems.values():
+        for relation in problem.constraint_model.relations:
+            join(list(relation.contract_ids))
+        atoms_to_contract = {
+            atom.atom_id: state.market_contract_id
+            for state in problem.terminal_state_sets
+            for atom in state.atoms
+        }
+        for forbidden in problem.constraint_model.forbidden_atom_combinations:
+            join(
+                sorted(
+                    {
+                        atoms_to_contract[atom_id]
+                        for atom_id in forbidden.atom_ids
+                        if atom_id in atoms_to_contract
+                    }
+                )
+            )
+    groups: dict[str, dict[str, object]] = {}
+    for identity, problem in problems.items():
+        for state in problem.terminal_state_sets:
+            root = find(state.market_contract_id)
+            group = groups.setdefault(root, {"contracts": set(), "identities": set()})
+            group["contracts"].add(state.market_contract_id)  # type: ignore[union-attr]
+            group["identities"].add(identity)  # type: ignore[union-attr]
+    return [groups[root] for root in sorted(groups)]
+
+
 def _diagnose_stale(
     rows: Mapping[str, Mapping[str, object]], message: str
 ) -> tuple[dict[str, object], list[str]] | None:
-    """Attribute a STALE validation error to rows holding a terminal atom
-    that releases capital strictly before the merged max ``as_of``.
+    """Attribute a STALE validation error to its own component's timeline.
 
-    Mirrors the oracle (prediction_n_leg.validate_problem) atom by atom: an
-    atom is stale only when ``capital_release_at < problem.as_of``, and the
-    merged problem's ``as_of`` is the max row ``as_of``, so a row is stale
-    iff at least one of its atoms releases before the merged ``as_of``;
-    equality is fresh. A row whose ``as_of`` is early but whose every atom
-    releases at or after the merged ``as_of`` is fresh and must never be
-    proposed for removal. Only admitted rows (ACTIVE and model-complete)
-    contribute to the merged ``as_of`` or to staleness, so a cause-marked
-    UNKNOWN row with a later ``as_of`` can never make an oracle-fresh row
-    look stale.
+    Issue #110: staleness is a component predicate. Each component (the
+    oracle's own contract + observation-key connectivity) is judged on its
+    own timeline — component ``as_of`` is the maximum member ``as_of`` — and
+    only a row with an atom releasing strictly before its component's
+    ``as_of`` is stale; equality is fresh. Contract-disjoint components can
+    never make each other stale, so the former whole-catalog attribution
+    (every early-settling row flagged against one late ``merged_as_of``) is
+    gone. Only admitted rows (ACTIVE and model-complete) contribute, so a
+    cause-marked UNKNOWN row can never lift a component's timeline.
     """
     if _STALE_CODE not in message:
         return None
     rows = _admitted_rows(rows)
-    merged_as_of: datetime | None = None
-    for row in rows.values():
-        problem = _problem_of(row)
-        if problem is None:
+    for group in _component_groups(rows):
+        component_as_of: datetime | None = None
+        member_problems: dict[str, object] = {}
+        for identity in sorted(group["identities"]):  # type: ignore[union-attr]
+            problem = _problem_of(rows[identity])
+            if problem is None:
+                continue
+            member_problems[identity] = problem
+            if component_as_of is None or problem.as_of > component_as_of:
+                component_as_of = problem.as_of
+        if component_as_of is None:
             continue
-        if merged_as_of is None or problem.as_of > merged_as_of:
-            merged_as_of = problem.as_of
-    stale: list[dict[str, object]] = []
-    for identity, row in rows.items():
-        problem = _problem_of(row)
-        if problem is None or merged_as_of is None:
-            continue
-        stale_releases = sorted(
-            {
-                atom.capital_release_at.isoformat()
-                for state in problem.terminal_state_sets
-                for atom in state.atoms
-                if atom.capital_release_at is not None
-                and atom.capital_release_at < merged_as_of
+        component_contracts = group["contracts"]
+        stale: list[dict[str, object]] = []
+        for identity, problem in member_problems.items():
+            stale_releases = sorted(
+                {
+                    atom.capital_release_at.isoformat()
+                    for state in problem.terminal_state_sets
+                    if state.market_contract_id in component_contracts
+                    for atom in state.atoms
+                    if atom.capital_release_at is not None
+                    and atom.capital_release_at < component_as_of
+                }
+            )
+            if stale_releases:
+                stale.append(
+                    {
+                        "identity": identity,
+                        "as_of": problem.as_of.isoformat(),
+                        "stale_releases": stale_releases,
+                    }
+                )
+        if stale:
+            finding = {
+                "component_as_of": component_as_of.isoformat(),
+                "contracts": sorted(component_contracts),
+                "identities": sorted(group["identities"]),
+                "stale_identities": stale,
             }
-        )
-        if not stale_releases:
-            continue
-        stale.append(
-            {
-                "identity": str(identity),
-                "as_of": problem.as_of.isoformat(),
-                "stale_releases": stale_releases,
-            }
-        )
-    if not stale:
-        return None
-    finding = {
-        "merged_as_of": merged_as_of.isoformat(),
-        "identities": stale,
-    }
-    removal = [str(item["identity"]) for item in stale]
-    return finding, removal
+            removal = [str(item["identity"]) for item in stale]
+            return finding, removal
+    return None
 
 
 def report(catalog: object) -> dict[str, object]:

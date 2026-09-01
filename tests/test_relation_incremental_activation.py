@@ -15,7 +15,6 @@ import sqlite3
 import statistics
 import threading
 import time
-from datetime import datetime
 
 import pytest
 
@@ -130,12 +129,13 @@ def _matrix_payloads(rng: random.Random, catalog: RelationCatalogV2) -> list[dic
     if case == "stale_as_of":
         # One relation activates first with an early as_of and a late capital
         # release; a later contract-disjoint candidate with a later as_of and
-        # the earliest release after its own as_of is globally stale: the
-        # whole-set compile seam merges as_of=max(...) and validates every
-        # terminal release against it, so the oracle blocks the candidate with
-        # ACTIVATION_BLOCKED_INCONSISTENT although the two relations share no
-        # contract and no observation key. Dedicated ids and rules keep both
-        # payloads isolated from the shared contract pool.
+        # the earliest release after its own as_of shares no contract and no
+        # observation key with it. Issue #110 scoped the stale-capital
+        # comparison to the compile seam's components, so the two disjoint
+        # timelines no longer block each other: both paths must now agree on
+        # APPROVING the candidate (previously both blocked it through the
+        # whole-set aggregates). Dedicated ids and rules keep both payloads
+        # isolated from the shared contract pool.
         early = _payload(
             relation_type="EXACTLY_ONE",
             endpoints=[
@@ -370,12 +370,13 @@ def test_r16_scan_generation_is_lazy_and_correct(tmp_path, monkeypatch) -> None:
     assert after - before <= n % 5 + 1  # deltas above the newest anchor + the anchor row
 
 
-def test_r12_batch_stale_pair_matches_sequential_and_read_path_compiles(tmp_path) -> None:
-    """R1.2 (review round 1): one batch with two contract-disjoint relations
-    whose as_of/release conflict globally (the second is stale against the
-    first's terminal release) judges the second exactly like a sequential
-    single batch: INCONSISTENT/BLOCKED, and the published generation compiles
-    on the read path (no STALE_CAPITAL_RELEASE_AT)."""
+def test_r12_batch_disjoint_timelines_match_sequential_and_compile(tmp_path) -> None:
+    """R1.2 (review round 1), reshaped by issue #110: one batch with two
+    contract-disjoint relations whose as_of/release timelines disagree used to
+    judge the second BLOCKED through the whole-set stale aggregates; with the
+    stale-capital comparison scoped to components, disjoint timelines are each
+    judged on their own and both activate — exactly like a sequential single
+    batch — and the published generation compiles on the read path."""
     early = _payload(
         relation_type="EXACTLY_ONE",
         endpoints=[
@@ -419,12 +420,13 @@ def test_r12_batch_stale_pair_matches_sequential_and_read_path_compiles(tmp_path
 
     assert outcome["results"] == sequential_results
     assert outcome["blocked"] == sequential_blocked
-    assert outcome["results"][_canonicalize(later)[0]]["status"] == "BLOCKED"
+    assert outcome["results"][_canonicalize(later)[0]]["status"] == "APPROVED"
+    assert outcome["status"] == "ACTIVE"
     assert batched.store["generation"] == sequential.store["generation"]
     assert batched.store["approved"] == sequential.store["approved"]
 
-    # Read path: the published generation compiles (the pre-fix batch left
-    # both members ACTIVE and the merged problem raised STALE_CAPITAL_RELEASE_AT).
+    # Read path: the published generation compiles per component (issue #110:
+    # disjoint timelines no longer raise STALE_CAPITAL_RELEASE_AT).
     problem, _ = relation_generation_problem(_compiled_rows(batched))
     assert problem is not None
 
@@ -499,10 +501,11 @@ def test_activate_many_matrix_matches_replace_oracle() -> None:
     derives action/state/constraint ids from the contract ids (action_id
     ``polymarket:{contract_id}``, terminal state sets keyed by
     ``market_contract_id``, per-contract rule identity), so the contract
-    closure covers id conflicts too and no global id index is needed; the
-    whole-set compile precheck of replace() then differs from the incremental
-    path only through the stale-capital and valuation-unit predicates, which
-    the aggregate guard reproduces.
+    closure covers id conflicts too and no global id index is needed; after
+    issue #110 the whole-set compile precheck of replace() differs from the
+    incremental path only through the valuation-unit predicate, which the
+    unit aggregate reproduces (staleness is judged per component by both
+    paths' shared compile seam).
     """
     catalog_a = RelationCatalogV2(store={})
     catalog_b = RelationCatalogV2(store={})
@@ -544,8 +547,10 @@ def test_activate_many_matrix_matches_replace_oracle() -> None:
 def test_activate_many_index_matches_generation_recompute() -> None:
     """T2.2: at intermediate points of the T2.1 path A, the in-process
     contract and compiled-problem-observation-key indexes plus the ACTIVE-set
-    aggregates (max as_of / min terminal release / valuation units) equal the
-    state recomputed from the current generation members' payloads."""
+    valuation-unit aggregate equal the state recomputed from the current
+    generation members' payloads. Issue #110: max as_of / min terminal
+    release are no longer catalog aggregates — staleness is judged per
+    component by the compile seam — so only the unit aggregate remains."""
     catalog = RelationCatalogV2(store={})
     rng = random.Random(SEED)
 
@@ -574,18 +579,15 @@ def test_activate_many_index_matches_generation_recompute() -> None:
                     index.setdefault(key, set()).add(identity)
         return index
 
-    def recomputed_aggregates() -> dict[str, object]:
-        max_as_of: datetime | None = None
-        min_release: datetime | None = None
+    def recomputed_units() -> dict[str, object]:
         units: set[str] = set()
         for identity, entry in catalog.store["generation"].items():
             payload = catalog.store["versions"][entry["version_id"]]["payload"]
             problem = payload.get("problem")
             if not isinstance(problem, dict):
                 continue
-            as_of = datetime.fromisoformat(str(problem["as_of"]).replace("Z", "+00:00"))
             releases = [
-                datetime.fromisoformat(str(atom["capital_release_at"]).replace("Z", "+00:00"))
+                atom
                 for state in problem.get("terminal_state_sets", [])
                 if isinstance(state, dict)
                 for atom in state.get("atoms", [])
@@ -593,16 +595,8 @@ def test_activate_many_index_matches_generation_recompute() -> None:
             ]
             if not releases:
                 continue
-            max_as_of = as_of if max_as_of is None else max(max_as_of, as_of)
-            min_release = (
-                min(releases) if min_release is None else min(min_release, min(releases))
-            )
             units.add(str(problem["valuation_unit_id"]))
-        return {
-            "max_as_of": max_as_of,
-            "min_release": min_release,
-            "units": frozenset(units),
-        }
+        return {"units": frozenset(units)}
 
     steps = 0
     while steps < 300:
@@ -612,7 +606,7 @@ def test_activate_many_index_matches_generation_recompute() -> None:
             if steps % 25 == 0:
                 assert catalog._contract_index == recomputed()
                 assert catalog._key_index == recomputed_keys()
-                assert catalog._aggregates == recomputed_aggregates()
+                assert catalog._aggregates == recomputed_units()
 
 
 def test_activate_many_cross_connection_rebuilds_index(tmp_path) -> None:
@@ -935,16 +929,17 @@ def test_r22_concurrent_approves_keep_guards_and_indexes_consistent(tmp_path) ->
 
     def relation(tag: str, index: int, kind: str) -> dict[str, object]:
         if kind == "stale":
-            # as_of after the ACTIVE-set min terminal release: always blocked.
+            # as_of after the baseline's terminal release: issue #110 makes
+            # this a disjoint-timeline APPROVAL (it used to be blocked).
             return _r2_payload(
                 f"{tag}-{index}-stale",
                 as_of="2027-06-15T00:00:00Z",
                 release="2027-12-01T17:00:00Z",
             )
         if kind == "marginal":
-            # as_of between the true ACTIVE min release (base 2026-12-31T17:00Z)
-            # and the smallest normal release (2027-01-01T17:00Z): blocked by
-            # the true aggregate, approvable only through a lost update.
+            # as_of between the baseline's terminal release and its smallest
+            # normal release: likewise an issue-110 disjoint-timeline
+            # APPROVAL in both the concurrent and sequential runs.
             return _r2_payload(
                 f"{tag}-{index}-marginal",
                 as_of="2027-01-01T12:00:00Z",
@@ -972,14 +967,13 @@ def test_r22_concurrent_approves_keep_guards_and_indexes_consistent(tmp_path) ->
     for tag in ("A", "B"):
         payloads[tag] = [relation(tag, index, kind) for index, kind in enumerate(kinds)]
     assert len(payloads["A"]) == 200 and len(payloads["B"]) == 200
-    # Final-pair shapes: B's final relation carries the smallest terminal
-    # release of the whole set (2026-09-01, below the ACTIVE baseline's
-    # 2026-12-31T17:00:00Z) and is ACTIVE, so the final aggregates must track
-    # it — a non-redundant min contribution the recompute assertion checks.
-    # A's final relation is ACTIVE in either judgment order and its own
-    # contribution is aggregate-redundant (the baseline already dominates
-    # min_release / max_as_of). The EUR unit shapes are blocked by the unit
-    # guard, so a blocked final entry would never reach the sync apply.
+    # Final-pair shapes: B's final relation is the earliest-settling of the
+    # whole set (2026-09-01, below the ACTIVE baseline's 2026-12-31T17:00:00Z)
+    # and is ACTIVE — after issue #110 it exercises exactly the disjoint-
+    # timeline approval the fix introduced (previously blocked against the
+    # baseline's min-release aggregate). A's final relation is ACTIVE in
+    # either judgment order. The EUR unit shapes are still blocked by the
+    # unit guard, so a blocked final entry would never reach the sync apply.
     payloads["A"][199] = _r2_payload(
         "A-199-final",
         as_of="2026-08-20T00:00:00Z",
@@ -1041,16 +1035,10 @@ def test_r22_concurrent_approves_keep_guards_and_indexes_consistent(tmp_path) ->
         for key in keys:
             self._key_index.setdefault(key, set()).add(identity)
         if aggregate is not None:
-            as_of, release, unit = aggregate
+            unit = aggregate[2]
             state = self._aggregates
-            stale_max = state["max_as_of"]
-            stale_min = state["min_release"]
             stale_units = state["units"]
             time.sleep(0.003)  # widen the read-modify-write window
-            state["max_as_of"] = as_of if stale_max is None else max(stale_max, as_of)
-            state["min_release"] = (
-                release if stale_min is None else min(stale_min, release)
-            )
             state["units"] = frozenset(stale_units | {unit})
         t1 = time.perf_counter()
         in_txn = getattr(self.store._local, "overlay", None) is not None
@@ -1118,20 +1106,14 @@ def _recomputed_keys(catalog: RelationCatalogV2) -> dict[str, set[str]]:
 
 
 def _recomputed_aggregates(catalog: RelationCatalogV2) -> dict[str, object]:
-    max_as_of: datetime | None = None
-    min_release: datetime | None = None
     units: set[str] = set()
     for identity, entry in catalog.store["generation"].items():
         payload = catalog.store["versions"][entry["version_id"]]["payload"]
         problem = payload.get("problem")
         if not isinstance(problem, dict):
             continue
-        as_of = problem.get("as_of")
-        if not isinstance(as_of, str):
-            continue
-        as_of_dt = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
         releases = [
-            datetime.fromisoformat(str(atom["capital_release_at"]).replace("Z", "+00:00"))
+            atom
             for state in problem.get("terminal_state_sets", ())
             if isinstance(state, dict)
             for atom in state.get("atoms", ())
@@ -1139,16 +1121,8 @@ def _recomputed_aggregates(catalog: RelationCatalogV2) -> dict[str, object]:
         ]
         if not releases:
             continue
-        max_as_of = as_of_dt if max_as_of is None else max(max_as_of, as_of_dt)
-        min_release = (
-            min(releases) if min_release is None else min(min_release, min(releases))
-        )
         units.add(str(problem["valuation_unit_id"]))
-    return {
-        "max_as_of": max_as_of,
-        "min_release": min_release,
-        "units": frozenset(units),
-    }
+    return {"units": frozenset(units)}
 
 
 def test_r23_facade_approve_bumps_generation_once_per_write_transaction(

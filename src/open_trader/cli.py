@@ -1818,11 +1818,11 @@ def main(argv: list[str] | None = None) -> int:
                         f"remove={len(conflict['removal'])}"
                     )
                 for finding in payload["stale"]:
-                    for item in finding["identities"]:
+                    for item in finding["stale_identities"]:
                         print(
                             f"stale: {item['identity']} "
                             f"as_of={item['as_of']} "
-                            f"merged_as_of={finding['merged_as_of']}"
+                            f"component_as_of={finding['component_as_of']}"
                         )
                 print(f"proposed_removal: {len(payload['proposed_removal'])}")
                 print(f"remaining: {payload['remaining']}")

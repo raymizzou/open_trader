@@ -471,7 +471,12 @@ def test_replace_blocks_compile_conflict_and_keeps_previous_generation(store) ->
     assert second_identity not in catalog.current_generation()
 
 
-def test_replace_blocks_stale_capital_release_and_keeps_generation(store) -> None:
+def test_replace_admits_contract_disjoint_timeline_candidate(store) -> None:
+    """Issue #110: two contract-disjoint relations on different settlement
+    timelines no longer block each other — staleness is judged per component
+    by the compile seam, so the later-timeline candidate publishes ACTIVE
+    alongside the earlier one (previously the whole-set stale aggregates
+    blocked it with ACTIVATION_BLOCKED_INCONSISTENT)."""
     catalog = _catalog(store)
     first = _payload_with_problem(
         ["cA", "cB"], {"cA": "BUY_YES", "cB": "BUY_YES"},
@@ -481,15 +486,20 @@ def test_replace_blocks_stale_capital_release_and_keeps_generation(store) -> Non
         ["cC", "cD"], {"cC": "BUY_YES", "cD": "BUY_YES"},
         as_of="2027-03-01T00:00:00Z", release="2027-06-01T17:00:00Z",
     )
+    # The production discovery pipeline attaches an event_identity_basis per
+    # market; without it the #102 event gate (not the stale gate) blocks.
+    for payload in (first, later):
+        for endpoint in payload["endpoints"]:
+            endpoint["event_identity_basis"] = "event-1"
     approved = _approve(catalog, first)
-    before = catalog.current_generation()
     result = catalog.replace([first, later], actor="auditor", git_sha="a" * 40)
-    assert result["status"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+    assert result["status"] == "ACTIVE"
     later_identity = _canonicalize(later)[0]
     blocked = {entry["identity"] for entry in result["blocked"]}
-    assert later_identity in blocked
-    assert catalog.current_generation() == before
-    assert catalog.current_generation()[approved["identity"]]["status"] == "ACTIVE"
+    assert later_identity not in blocked
+    generation = catalog.current_generation()
+    assert set(generation) == {approved["identity"], later_identity}
+    assert all(entry["status"] == "ACTIVE" for entry in generation.values())
 
 
 def test_replace_accepts_compile_compatible_generation(store) -> None:

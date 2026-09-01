@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import sqlite3
 from pathlib import Path
 
@@ -15,9 +16,12 @@ from test_relation_catalog import compiled_relation_discovery
 
 
 def _uncompilable_catalog(tmp_path: Path) -> tuple[RelationCatalog, list[dict[str, str]]]:
-    """A four-member generation that does not compile: a 2v1 action conflict on
-    ``condition-a`` plus one stale capital release row. Seeded through the v2
-    core (``approve`` bypasses the activation gate) to mirror a live-but-broken
+    """A four-member generation whose action identity conflicts: a 2v1
+    conflict on ``condition-a`` plus one unrelated early-settling row. Since
+    issue #110 the early row is fresh on its own component timeline
+    (contract/observation-key disjoint from the trio), so the only compile
+    failure left is the merge conflict. Seeded through the v2 core
+    (``approve`` bypasses the activation gate) to mirror a live-but-broken
     production generation.
     """
     catalog = RelationCatalog(tmp_path)
@@ -52,7 +56,9 @@ def _uncompilable_catalog(tmp_path: Path) -> tuple[RelationCatalog, list[dict[st
     return catalog, seeded
 
 
-def test_doctor_report_attributes_conflict_and_stale(tmp_path: Path) -> None:
+def test_doctor_report_attributes_conflict_and_spares_disjoint_timeline(
+    tmp_path: Path,
+) -> None:
     catalog, seeded = _uncompilable_catalog(tmp_path)
     payload = report(catalog)
 
@@ -73,19 +79,14 @@ def test_doctor_report_attributes_conflict_and_stale(tmp_path: Path) -> None:
     assert all(holder["payload"] for holder in conflict["holders"])
     assert conflict["removal"] == [seeded[1]["identity"]]
 
-    assert len(payload["stale"]) == 1
-    stale = payload["stale"][0]
-    assert stale["merged_as_of"] == "2026-08-15T00:00:00+00:00"
-    assert stale["identities"] == [
-        {
-            "identity": seeded[3]["identity"],
-            "as_of": "2026-07-01T00:00:00+00:00",
-            "stale_releases": ["2026-08-01T00:00:00+00:00"],
-        }
-    ]
+    # Issue #110: the early-settling row (condition-e/f/g) shares no contract
+    # and no observation key with the trio, so it is judged on its own
+    # component timeline (as_of 2026-07-01, release 2026-08-01) and is fresh —
+    # no stale finding, no removal proposal for it.
+    assert payload["stale"] == []
 
-    assert payload["proposed_removal"] == [seeded[1]["identity"], seeded[3]["identity"]]
-    assert payload["remaining"] == 2
+    assert payload["proposed_removal"] == [seeded[1]["identity"]]
+    assert payload["remaining"] == 3
     assert payload["error"] is None
 
     # End to end: after the proposed removal the remainder is non-empty and
@@ -95,7 +96,11 @@ def test_doctor_report_attributes_conflict_and_stale(tmp_path: Path) -> None:
         for identity, row in catalog.current_generation().items()
         if identity not in set(payload["proposed_removal"])
     }
-    assert set(remaining_rows) == {seeded[0]["identity"], seeded[2]["identity"]}
+    assert set(remaining_rows) == {
+        seeded[0]["identity"],
+        seeded[2]["identity"],
+        seeded[3]["identity"],
+    }
     problem, _ = relation_generation_problem(remaining_rows)
     assert problem is not None
 
@@ -127,9 +132,11 @@ def test_doctor_equality_as_of_is_not_stale(tmp_path: Path) -> None:
     assert result["error"] is None
 
 
-def test_doctor_mixed_batch_removes_only_older_row(tmp_path: Path) -> None:
-    """Mixed-batch generation removes only rows strictly older than the merged
-    as_of; the freshest row survives and the remainder compiles."""
+def test_doctor_mixed_batch_keeps_disjoint_timelines_fresh(tmp_path: Path) -> None:
+    """Mixed-batch generation: since issue #110 each disjoint component is
+    judged on its own timeline, so the early-settling row (as_of 2026-07-01,
+    release 2026-08-01) is fresh in its own component and nothing is proposed;
+    the whole generation compiles."""
     catalog = RelationCatalog(tmp_path)
     payloads = [
         compiled_relation_discovery(
@@ -155,30 +162,23 @@ def test_doctor_mixed_batch_removes_only_older_row(tmp_path: Path) -> None:
     payload = report(catalog)
     assert payload["compiles"] is True
     assert payload["conflicts"] == []
-    assert len(payload["stale"]) == 1
-    assert payload["stale"][0]["identities"] == [
-        {
-            "identity": seeded[1]["identity"],
-            "as_of": "2026-07-01T00:00:00+00:00",
-            "stale_releases": ["2026-08-01T00:00:00+00:00"],
-        }
-    ]
-    assert payload["proposed_removal"] == [seeded[1]["identity"]]
-    assert payload["remaining"] == 1
+    assert payload["stale"] == []
+    assert payload["proposed_removal"] == []
+    assert payload["remaining"] == 2
     assert payload["error"] is None
 
 
 def test_doctor_early_as_of_with_later_release_is_fresh(tmp_path: Path) -> None:
-    """Row-level staleness mirrors the oracle atom by atom: only a row with
-    at least one atom releasing strictly before the merged max as_of enters
-    proposed_removal.
+    """Row-level staleness mirrors the oracle atom by atom, per component:
+    only a row with an atom releasing strictly before its own component's
+    as_of enters proposed_removal (issue #110).
 
-    Review repro shape: X has an early ``problem.as_of`` (2026-07-01) but
-    every atom releases after the merged as_of (2026-12-31) — the oracle
-    judges it fresh and the old row-level ``as_of < merged_as_of`` predicate
-    must not propose it. S releases at its own as_of (2026-07-01), both
-    before newer row F's as_of (2026-08-15), so S is truly stale and must be
-    the only removal; {F, X} then compiles.
+    X has an early ``problem.as_of`` (2026-07-01) and every atom releases
+    after it — fresh on its own timeline. S shares X's observation key (same
+    as_of and rule), so X and S form one component whose timeline is
+    2026-07-01; S releases exactly at that timeline, and equality is fresh.
+    F is an unrelated disjoint component. Nothing is stale and the whole
+    generation compiles.
     """
     catalog = RelationCatalog(tmp_path)
     payloads = [
@@ -211,17 +211,9 @@ def test_doctor_early_as_of_with_later_release_is_fresh(tmp_path: Path) -> None:
     payload = report(catalog)
     assert payload["compiles"] is True
     assert payload["conflicts"] == []
-    assert len(payload["stale"]) == 1
-    assert payload["stale"][0]["merged_as_of"] == "2026-08-15T00:00:00+00:00"
-    assert payload["stale"][0]["identities"] == [
-        {
-            "identity": seeded[2]["identity"],
-            "as_of": "2026-07-01T00:00:00+00:00",
-            "stale_releases": ["2026-07-01T00:00:00+00:00"],
-        }
-    ]
-    assert payload["proposed_removal"] == [seeded[2]["identity"]]
-    assert payload["remaining"] == 2
+    assert payload["stale"] == []
+    assert payload["proposed_removal"] == []
+    assert payload["remaining"] == 3
     assert payload["error"] is None
 
     remaining_rows = {
@@ -229,7 +221,11 @@ def test_doctor_early_as_of_with_later_release_is_fresh(tmp_path: Path) -> None:
         for identity, row in catalog.current_generation().items()
         if identity not in set(payload["proposed_removal"])
     }
-    assert set(remaining_rows) == {seeded[0]["identity"], seeded[1]["identity"]}
+    assert set(remaining_rows) == {
+        seeded[0]["identity"],
+        seeded[1]["identity"],
+        seeded[2]["identity"],
+    }
     problem, _ = relation_generation_problem(remaining_rows)
     assert problem is not None
 
@@ -255,16 +251,17 @@ def test_doctor_report_on_healthy_generation(tmp_path: Path) -> None:
 def test_doctor_excludes_unknown_members_from_stale_attribution(
     tmp_path: Path,
 ) -> None:
-    """Review repro: a cause-marked UNKNOWN member U with a later as_of must
-    not lift merged_as_of nor enter any proposal.
+    """Review repro, reshaped by issue #110: a cause-marked UNKNOWN member U
+    must not lift any component timeline nor enter any proposal.
 
     U is revoked through the v2 cause ledger (facade ``current_generation()``
-    then reports it as UNKNOWN), F is an oracle-fresh ACTIVE row (early as_of,
-    every release after the admitted merged as_of) and S is a truly stale
-    ACTIVE row. The doctor must propose only S: merged_as_of comes from the
-    admitted rows alone (F's 2026-08-15, not U's 2027-01-01), F survives,
-    remaining/compiles follow the admitted caliber, and U is counted as
-    excluded.
+    then reports it as UNKNOWN), F and S are ACTIVE rows on disjoint
+    components, each fresh on its own timeline — so the doctor proposes
+    nothing (stale/proposal empty), counts U as excluded, and the remaining
+    admitted set compiles. The former epilogue expected the activation gate
+    to refuse the drop because U's late as_of poisoned the whole set; with
+    staleness scoped to components the gate admits the disjoint set and the
+    drop succeeds.
     """
     catalog = RelationCatalog(tmp_path)
 
@@ -323,40 +320,29 @@ def test_doctor_excludes_unknown_members_from_stale_attribution(
     payload = report(catalog)
     assert payload["compiles"] is True
     assert payload["conflicts"] == []
-    assert len(payload["stale"]) == 1
-    assert payload["stale"][0]["merged_as_of"] == "2026-08-15T00:00:00+00:00"
-    assert payload["stale"][0]["identities"] == [
-        {
-            "identity": s["identity"],
-            "as_of": "2026-07-01T00:00:00+00:00",
-            "stale_releases": ["2026-07-01T00:00:00+00:00"],
-        }
-    ]
-    assert payload["proposed_removal"] == [s["identity"]]
-    assert payload["remaining"] == 1
+    assert payload["stale"] == []
+    assert payload["proposed_removal"] == []
+    assert payload["remaining"] == 2
     assert payload["excluded"] == 1
     assert payload["error"] is None
 
-    # Rebuild precheck: the UNKNOWN row must not lift the post-drop precheck.
-    # Dropping the truly stale S leaves admitted {F}, which compiles, so the
-    # precheck must NOT raise "post-drop generation does not compile"; the
-    # activation gate (relation_catalog_v2.replace, out of issue-99 scope)
-    # still compiles the remaining U as ACTIVE and refuses the publish.
-    before = dict(catalog.current_generation())
-    with pytest.raises(ValueError, match="rejected by the activation gate"):
-        catalog.rebuild_generation(
-            [s["identity"]], actor="op", git_sha="sha", note="doctor apply"
-        )
-    assert catalog.current_generation() == before
+    # Rebuild precheck: the UNKNOWN row must not lift the post-drop precheck,
+    # and with staleness scoped to components the activation gate no longer
+    # refuses a disjoint post-drop set: dropping S succeeds (the gate used to
+    # block this exact drop because U's as_of poisoned the whole ACTIVE set).
+    result = catalog.rebuild_generation(
+        [s["identity"]], actor="op", git_sha="sha", note="doctor apply"
+    )
+    assert result["status"] == "ACTIVE"
+    assert set(result["remaining"]) == {u["identity"], f["identity"]}
 
-    # Dropping the healthy F (which the fixed doctor never proposes) leaves
-    # admitted {S}: the precheck passes and the gate refuses; the precheck is
-    # not fooled into claiming the post-drop set does not compile.
-    with pytest.raises(ValueError, match="rejected by the activation gate"):
-        catalog.rebuild_generation(
-            [f["identity"]], actor="op", git_sha="sha", note="doctor apply"
-        )
-    assert catalog.current_generation() == before
+    # Dropping the healthy F leaves admitted {U}, which also compiles per
+    # component; the precheck is not fooled into claiming otherwise.
+    result = catalog.rebuild_generation(
+        [f["identity"]], actor="op", git_sha="sha", note="doctor apply"
+    )
+    assert result["status"] == "ACTIVE"
+    assert set(result["remaining"]) == {u["identity"]}
 
 
 def _doctor_row(payload: dict[str, object], *, activation: str) -> dict[str, object]:
@@ -584,9 +570,12 @@ def test_cli_catalog_doctor_report_and_apply(
     assert code == 0
     out = capsys.readouterr().out
     assert "conflict: action 'polymarket:condition-a'" in out
-    assert "stale: " in out
-    assert "proposed_removal: 2" in out
-    assert "remaining: 2" in out
+    # Issue #110: the early-settling row is fresh on its own component
+    # timeline, so the report has no stale finding and proposes only the
+    # conflicting BUY_NO holder.
+    assert "stale: " not in out
+    assert "proposed_removal: 1" in out
+    assert "remaining: 3" in out
 
     code = cli.main(
         [
@@ -640,3 +629,189 @@ def test_cli_catalog_doctor_apply_requires_yes_and_drop(
     )
     assert code == 2
     assert "requires --drop" in capsys.readouterr().err
+
+
+# -- Issue #110 review fix: cross-row attribution and its positive coverage ---
+
+
+def _seed(catalog: RelationCatalog, payload: dict[str, object]) -> dict[str, str]:
+    """Seed one payload through the v2 core (approve bypasses the gate)."""
+    converted = catalog._converted(payload)
+    result = catalog._catalog.ingest(converted)
+    catalog._catalog.approve(result["version_id"], actor="doctor", git_sha="")
+    return {"identity": str(result["identity"]), "version_id": str(result["version_id"])}
+
+
+def _cross_key_payloads() -> tuple[dict[str, object], dict[str, object]]:
+    """The review sandbox topology (production #102 ``_event_component``): row
+    A = {xa, xb} with as_of 2026-07-01 / release 2026-08-01, row B = {ya, yb}
+    with as_of 2027-01-01 / release 2027-02-01, no shared contract, but every
+    contract carries the same settlement observation key K (A's key, injected
+    verbatim into B). The oracle merges both rows and joins xa/ya by fingerprint
+    into ONE component; a per-row grouping would keep two self-consistent
+    components and attribute nothing."""
+    early = compiled_relation_discovery(
+        ["xa", "xb"],
+        {"xa": "BUY_YES", "xb": "BUY_YES"},
+        as_of="2026-07-01T00:00:00Z",
+        release="2026-08-01T00:00:00Z",
+        rule="rules-110-cross-key",
+    )
+    late = compiled_relation_discovery(
+        ["ya", "yb"],
+        {"ya": "BUY_YES", "yb": "BUY_YES"},
+        as_of="2027-01-01T00:00:00Z",
+        release="2027-02-01T00:00:00Z",
+        rule="rules-110-cross-key",
+    )
+    shared_key = copy.deepcopy(
+        early["model"]["problem"]["terminal_state_sets"][0]["settlement_observation_key"]
+    )
+    late_problem = late["model"]["problem"]
+    for state in late_problem["terminal_state_sets"]:
+        state["settlement_observation_key"] = copy.deepcopy(shared_key)
+    for action in late_problem["actions"]:
+        action["settlement_observation_key"] = copy.deepcopy(shared_key)
+    return early, late
+
+
+def test_doctor_cross_row_observation_key_joins_one_component(
+    tmp_path: Path,
+) -> None:
+    """Same observation key on different contracts in different rows is ONE
+    component (the oracle's merged-state join), so the early-settling row A is
+    attributed stale against the component timeline 2027-01-01 and proposed
+    for removal; the remainder compiles."""
+    catalog = RelationCatalog(tmp_path)
+    early, late = _cross_key_payloads()
+    a = _seed(catalog, early)
+    b = _seed(catalog, late)
+
+    # The compile seam itself raises STALE for the merged cross-row component.
+    with pytest.raises(ValueError, match="STALE_CAPITAL_RELEASE_AT"):
+        relation_generation_problem(catalog.current_generation())
+
+    payload = report(catalog)
+    assert payload["compiles"] is True
+    assert payload["conflicts"] == []
+    assert len(payload["stale"]) == 1
+    finding = payload["stale"][0]
+    assert finding["component_as_of"] == "2027-01-01T00:00:00+00:00"
+    assert finding["contracts"] == ["xa", "xb", "ya", "yb"]
+    assert set(finding["identities"]) == {a["identity"], b["identity"]}
+    assert [item["identity"] for item in finding["stale_identities"]] == [
+        a["identity"]
+    ]
+    assert finding["stale_identities"][0]["as_of"] == "2026-07-01T00:00:00+00:00"
+    assert finding["stale_identities"][0]["stale_releases"] == [
+        "2026-08-01T00:00:00+00:00"
+    ]
+    assert payload["proposed_removal"] == [a["identity"]]
+    assert payload["remaining"] == 1
+    assert payload["error"] is None
+
+    # After the proposed removal the remainder compiles.
+    remaining_rows = {
+        identity: row
+        for identity, row in catalog.current_generation().items()
+        if identity != a["identity"]
+    }
+    problem, _ = relation_generation_problem(remaining_rows)
+    assert problem is not None
+
+
+def test_cli_catalog_doctor_prints_component_as_of_for_cross_row_stale(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """The doctor CLI prints the component timeline and the stale identity for
+    the cross-row observation-key topology (positive print assertions for the
+    #110 keys, per the current cli.py stale-line format)."""
+    catalog = RelationCatalog(tmp_path)
+    early, late = _cross_key_payloads()
+    a = _seed(catalog, early)
+    _seed(catalog, late)
+
+    code = cli.main(["prediction-arb", "catalog-doctor", "--data-dir", str(tmp_path)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "compiles: True" in out
+    assert f"stale: {a['identity']} " in out
+    assert "as_of=2026-07-01T00:00:00+00:00" in out
+    assert "component_as_of=2027-01-01T00:00:00+00:00" in out
+    assert "proposed_removal: 1" in out
+    assert "remaining: 1" in out
+
+
+def test_doctor_shared_contract_cross_row_stale_attributes_early_row(
+    tmp_path: Path,
+) -> None:
+    """Two rows sharing one contract under one consistent identity, timelines
+    crossing: the shared contract welds both rows into one component whose
+    timeline is 2027-01-01, so the early-settling row (x1/x2 releasing
+    2026-08-01) is attributed stale, the proposal is exactly that row, and the
+    confirmed drop applies and compiles."""
+    catalog = RelationCatalog(tmp_path)
+    donor = compiled_relation_discovery(
+        ["shared-sink"],
+        {"shared-sink": "BUY_YES"},
+        as_of="2026-07-01T00:00:00Z",
+        release="2027-02-01T00:00:00Z",
+        rule="rules-110-shared",
+    )
+    donor_state = copy.deepcopy(donor["model"]["problem"]["terminal_state_sets"][0])
+    donor_action = copy.deepcopy(donor["model"]["problem"]["actions"][0])
+    early = compiled_relation_discovery(
+        ["x1", "x2", "shared-sink"],
+        {"x1": "BUY_YES", "x2": "BUY_YES", "shared-sink": "BUY_YES"},
+        as_of="2026-07-01T00:00:00Z",
+        release="2026-08-01T00:00:00Z",
+        rule="rules-110-shared",
+    )
+    late = compiled_relation_discovery(
+        ["y1", "y2", "shared-sink"],
+        {"y1": "BUY_YES", "y2": "BUY_YES", "shared-sink": "BUY_YES"},
+        as_of="2027-01-01T00:00:00Z",
+        release="2027-02-01T00:00:00Z",
+        rule="rules-110-shared",
+    )
+    for payload in (early, late):
+        problem = payload["model"]["problem"]
+        problem["terminal_state_sets"] = [
+            copy.deepcopy(donor_state)
+            if state["market_contract_id"] == "shared-sink"
+            else state
+            for state in problem["terminal_state_sets"]
+        ]
+        problem["actions"] = [
+            copy.deepcopy(donor_action)
+            if action["market_contract_id"] == "shared-sink"
+            else action
+            for action in problem["actions"]
+        ]
+    x = _seed(catalog, early)
+    y = _seed(catalog, late)
+
+    payload = report(catalog)
+    assert payload["compiles"] is True
+    assert payload["conflicts"] == []
+    assert len(payload["stale"]) == 1
+    finding = payload["stale"][0]
+    assert finding["component_as_of"] == "2027-01-01T00:00:00+00:00"
+    assert finding["contracts"] == ["shared-sink", "x1", "x2", "y1", "y2"]
+    assert set(finding["identities"]) == {x["identity"], y["identity"]}
+    assert [item["identity"] for item in finding["stale_identities"]] == [
+        x["identity"]
+    ]
+    assert finding["stale_identities"][0]["stale_releases"] == [
+        "2026-08-01T00:00:00+00:00"
+    ]
+    assert payload["proposed_removal"] == [x["identity"]]
+    assert payload["remaining"] == 1
+    assert payload["error"] is None
+
+    result = catalog.rebuild_generation(
+        [x["identity"]], actor="op", git_sha="sha", note="doctor apply"
+    )
+    assert result["status"] == "ACTIVE"
+    assert set(result["remaining"]) == {y["identity"]}
+    assert report(catalog)["compiles"] is True

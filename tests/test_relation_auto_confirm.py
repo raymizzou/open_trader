@@ -212,24 +212,17 @@ def test_error_rate_breaker_halts_tier_and_alert_only_blocked_rounds(
 
     # (b) all-blocked, zero unexpected errors -> alert-only, tier keeps running
     pinned_catalog = RelationCatalog(tmp_path / "pinned")
-    pinned_member_id = pinned_catalog.ingest(compiled_relation_discovery(
-        ["pin-a", "pin-b"],
-        {"pin-a": "BUY_YES", "pin-b": "BUY_YES"},
-        as_of="2026-08-15T00:00:00Z",
-        release="2026-08-31T20:00:00Z",
-        rule="rules-pin",
-    ))["version_id"]
+    pinned_payload = venue_candidate("pin", release="2026-08-31T20:00:00Z")
+    pinned_member_id = pinned_catalog.ingest(pinned_payload)["version_id"]
     approved = pinned_catalog.approve(
         pinned_member_id, {"version_id": pinned_member_id}, actor="op", git_sha="sha"
     )
     assert approved["activation"] == "ACTIVE"
-    late_window = venue_candidate(
-        "late-window",
-        discovered_at="2026-07-01T00:00:00Z",
-        as_of="2026-11-01T00:00:00Z",
-        release="2026-12-24T17:00:00Z",
-    )
-    late_candidate = pinned_catalog.ingest(late_window)["version_id"]
+    # Issue #110: a disjoint-timeline candidate would now approve, so the
+    # blocked round uses the still-fatal supersession shape: a drifted
+    # rediscovery of the pinned member itself (same identity, new version).
+    drifted = _drifted(pinned_payload, "superseding the pinned member")
+    late_candidate = pinned_catalog.ingest(drifted)["version_id"]
 
     block_notifier = StubNotifier()
     block_runner = RelationAutoConfirmRunner(

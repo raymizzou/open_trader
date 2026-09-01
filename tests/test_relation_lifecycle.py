@@ -122,24 +122,26 @@ def test_expiry_rotation_drops_past_members_and_publishes_new_generation(
     assert catalog.generation_meta()["generation"] > 0
 
 
-def test_expiry_rotation_unblocks_the_timeline_deadlocked_candidate(tmp_path: Path) -> None:
-    """Case 2 (root cause): with stale members pinning the shared timeline, a
-    later-window Tier-1-style candidate is approved into
-    ACTIVATION_BLOCKED_INCONSISTENT; after ``expire_stale_members`` the same
-    candidate returns to PENDING and approving it publishes it ACTIVE."""
+def test_expiry_rotation_unblocks_the_supersession_deadlocked_candidate(
+    tmp_path: Path,
+) -> None:
+    """Case 2, reshaped by issue #110: a candidate deadlocked against an
+    expirable ACTIVE member through the same identity (a drifted discovery of
+    that member; a disjoint-timeline candidate would no longer block at all)
+    is approved into ACTIVATION_BLOCKED_INCONSISTENT; after
+    ``expire_stale_members`` drops the member the same candidate returns to
+    PENDING and approving it publishes it ACTIVE."""
     catalog = RelationCatalog(tmp_path)
-    stale_one = catalog.ingest(member("stale1", release="2026-08-31T20:00:00Z"))["version_id"]
+    stale_one_payload = member("stale1", release="2026-08-31T20:00:00Z")
+    stale_one = catalog.ingest(stale_one_payload)["version_id"]
     survivor = catalog.ingest(member("survivor", release="2026-12-31T17:00:00Z"))["version_id"]
     for version_id in (stale_one, survivor):
         approved = catalog.approve(version_id, {"version_id": version_id}, actor="op", git_sha="sha")
         assert approved["activation"] == "ACTIVE"
-    candidate_id = catalog.ingest(
-        member(
-            "december",
-            as_of="2026-11-01T00:00:00Z",
-            release="2026-12-24T17:00:00Z",
-        )
-    )["version_id"]
+    drifted = dict(stale_one_payload)
+    drifted["markets"] = [dict(market) for market in stale_one_payload["markets"]]
+    drifted["markets"][0]["title"] = "Market 0 (edited)"
+    candidate_id = catalog.ingest(drifted)["version_id"]
 
     blocked = catalog.approve_many([{"version_id": candidate_id}], actor="op", git_sha="sha")
     assert blocked["results"][0]["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT"
@@ -315,18 +317,19 @@ def test_expiry_rotation_is_all_or_nothing_when_the_reset_write_fails(
     ``expired`` rows; a mid-data failure leaves no partial state behind and
     a rerun fully recovers."""
     catalog = RelationCatalog(tmp_path)
-    stale_one = catalog.ingest(member("stale1", release="2026-08-31T20:00:00Z"))["version_id"]
+    stale_one_payload = member("stale1", release="2026-08-31T20:00:00Z")
+    stale_one = catalog.ingest(stale_one_payload)["version_id"]
     survivor = catalog.ingest(member("survivor", release="2026-12-31T17:00:00Z"))["version_id"]
     for version_id in (stale_one, survivor):
         approved = catalog.approve(version_id, {"version_id": version_id}, actor="op", git_sha="sha")
         assert approved["activation"] == "ACTIVE"
-    candidate_id = catalog.ingest(
-        member(
-            "december",
-            as_of="2026-11-01T00:00:00Z",
-            release="2026-12-24T17:00:00Z",
-        )
-    )["version_id"]
+    # Issue #110: a disjoint-timeline candidate no longer deadlocks, so the
+    # blocked candidate is a drifted rediscovery of the expirable member
+    # itself (same identity, new version) — the supersession deadlock.
+    drifted = dict(stale_one_payload)
+    drifted["markets"] = [dict(market) for market in stale_one_payload["markets"]]
+    drifted["markets"][0]["title"] = "Market 0 (edited)"
+    candidate_id = catalog.ingest(drifted)["version_id"]
     blocked = catalog.approve_many([{"version_id": candidate_id}], actor="op", git_sha="sha")
     assert blocked["results"][0]["activation"] == "ACTIVATION_BLOCKED_INCONSISTENT"
 
