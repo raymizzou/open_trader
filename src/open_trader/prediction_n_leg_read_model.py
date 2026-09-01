@@ -51,6 +51,20 @@ BLOCKED_FUNDING_UNKNOWN = "FUNDING_UNKNOWN"
 OPTIMAL = "OPTIMAL"
 QUALIFIED_FEASIBLE = "QUALIFIED_FEASIBLE"
 
+
+def would_submit_predicate(
+    execution_reason: object | None, qualification_status: object | None
+) -> bool:
+    """Shared #104/#106 would-submit semantics: an execution solution exists
+    (a non-None reason carrier) whose reason is EXECUTABLE and whose
+    qualification status is QUALIFIED_VERIFIED. Read-time funding gates stay
+    out of it (they only shape the funding/executable blocks)."""
+    return (
+        execution_reason is not None
+        and str(execution_reason) == EXECUTABLE_REASON
+        and str(qualification_status) == QUALIFIED_VERIFIED
+    )
+
 _MICROSECONDS_PER_DAY = 86_400_000_000
 
 
@@ -479,10 +493,9 @@ def project_n_leg_solution(
     # #104: would_submit applies the same qualification policy as the future
     # real execution path; read-time funding gates stay out of it (they only
     # shape the funding/executable blocks).
-    would_submit = (
-        execution_payload is not None
-        and str(execution_payload.get("reason") or "") == EXECUTABLE_REASON
-        and qualification["status"] == QUALIFIED_VERIFIED
+    would_submit = would_submit_predicate(
+        execution_payload.get("reason") if execution_payload is not None else None,
+        qualification["status"],
     )
     projected_total_units = int(execution_payload.get("capital_use_units") or 0) if execution_payload is not None else 0
     projected_with_unsettled = projected_total_units + int(total_unsettled_capital_units or 0)

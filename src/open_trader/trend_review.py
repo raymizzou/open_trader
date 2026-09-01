@@ -193,9 +193,11 @@ def _read_current_long_term_benchmark_failure(
     market: str,
     *,
     latest_completed_at: str | None = None,
+    now: datetime | None = None,
 ) -> dict[str, object] | None:
     market = _market(market)
-    month = datetime.now(MARKET_TIMEZONES[market]).strftime("%Y-%m")
+    effective = now if now is not None else datetime.now(MARKET_TIMEZONES[market])
+    month = effective.astimezone(MARKET_TIMEZONES[market]).strftime("%Y-%m")
     candidates: list[tuple[datetime, dict[str, object]]] = []
     for path in (
         _long_term_benchmark_attempt_path(data_dir, market, month),
@@ -14486,7 +14488,7 @@ def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
 
 
 def build_trend_review_projection(
-    data_dir: Path, market: str
+    data_dir: Path, market: str, *, now: datetime | None = None
 ) -> dict[str, object]:
     market = _market(market)
     effective_from = TREND_V1_EFFECTIVE_FROM[market]
@@ -14576,6 +14578,7 @@ def build_trend_review_projection(
             if long_term_snapshot is not None
             else None
         ),
+        now=now,
     )
     if not discipline_by_date and not actual_by_date and not benchmark_by_date:
         raise ValueError(f"no trend review facts for {market}")

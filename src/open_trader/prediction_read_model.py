@@ -1075,6 +1075,9 @@ def _prediction_retired_taxonomy(
             if venue:
                 venues.add(venue)
                 entry.setdefault("venue", venue)
+            title = str(endpoint.get("title") or "")
+            if title:
+                entry.setdefault("title", title)
             basis = endpoint.get("event_identity_basis")
             if basis not in (None, ""):
                 events.add(str(basis))
@@ -1096,6 +1099,7 @@ def _prediction_retired_taxonomy(
 def _prediction_retired_opportunity_row(
     item: Mapping[str, object],
     catalog_index: Mapping[str, list[Mapping[str, object]]] | None = None,
+    episodes: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """Issue #60: one retired-fence opportunity row from an N_LEG projection.
 
@@ -1144,9 +1148,29 @@ def _prediction_retired_opportunity_row(
             row_leg.setdefault("expires_at", None)
             enriched_legs.append(row_leg)
         execution = {**execution, "legs": enriched_legs}
+    episode = (
+        dict(episodes.get(component_id) or {})
+        if isinstance(episodes, Mapping)
+        else {}
+    )
+    # Issue #106 B5: display title from the catalog rows' per-market question
+    # text (joined with " × " for multi-leg), falling back to the contract
+    # identity string; the title is never empty.
+    contracts = (
+        component_id.split(":")[1:]
+        if component_id.startswith("component:")
+        else []
+    )
+    titles = [
+        str((contract_facts.get(contract) or {}).get("title") or "")
+        for contract in contracts
+    ]
+    titles = [title for title in titles if title]
+    title = " × ".join(titles) if titles else " × ".join(contracts) or component_id
     return {
         "opportunity_id": f"nleg:{component_id}" if component_id else "",
         "component_id": component_id,
+        "title": title,
         "market_type": "n_leg",
         "strategy_type": "N_LEG",
         "engine_owner": "N_LEG",
@@ -1165,11 +1189,19 @@ def _prediction_retired_opportunity_row(
         "qualification_policy_version": str(
             item.get("qualification_policy_version") or "v1"
         ),
-        # Reservation slot only; #106 fills episode values from the store.
+        # Reservation slot filled from the #106 episode projection when the
+        # runtime tracks one for this component; keys always exist.
         "episode": {
-            "opportunity_episode_id": None,
-            "episode_lineage_id": None,
-            "status": None,
+            "opportunity_episode_id": episode.get("opportunity_episode_id"),
+            "episode_lineage_id": episode.get("episode_lineage_id"),
+            "status": episode.get("status"),
+            "opened_at": episode.get("opened_at"),
+            "duration_seconds": episode.get("duration_seconds"),
+            "would_submit_ready_seconds": episode.get(
+                "would_submit_ready_seconds"
+            ),
+            "best_guaranteed_profit": episode.get("best_guaranteed_profit"),
+            "close_reason": episode.get("close_reason"),
         },
         "n_leg_solution": {**dict(item), "execution": execution},
     }
@@ -1733,6 +1765,7 @@ def prediction_state_payload(
     cross_venue_monitor: PredictCrossVenueMonitor | None = None,
     relation_catalog: object | None = None,
     n_leg_solutions: Sequence[Mapping[str, object]] = (),
+    n_leg_episodes: Mapping[str, Mapping[str, object]] | None = None,
     n_leg_metrics: object = None,
     legacy_retired: bool = False,
 ) -> dict[str, object]:
@@ -1876,7 +1909,9 @@ def prediction_state_payload(
         retired_index = _prediction_retired_catalog_index(relation_catalog)
         retired_rows: dict[str, dict[str, object]] = {}
         for item in n_leg_projections:
-            row = _prediction_retired_opportunity_row(item, catalog_index=retired_index)
+            row = _prediction_retired_opportunity_row(
+                item, catalog_index=retired_index, episodes=n_leg_episodes
+            )
             retired_rows.setdefault(str(row.get("component_id") or ""), row)
         opportunity_rows = list(retired_rows.values())
     else:

@@ -1031,3 +1031,221 @@ def test_read_model_returns_empty_without_direct_predict_client_fallback() -> No
     assert _prediction_predict_account_snapshot(execution) == {}
     assert execution._predict_trading.calls == 0
     assert _prediction_predict_account_snapshot(_NlegExecution()) != {}
+
+
+def test_t16_retired_rows_carry_filled_or_null_episode_slots() -> None:
+    """#106: the retired opportunity row's episode slot is filled from the
+    runtime episode projection keyed by component id; rows without an
+    episode keep all eight keys as None."""
+
+    class ContractExecution(_NlegExecution):
+        def n_leg_mode_contract(self) -> dict[str, object]:
+            return {
+                "schema_version": "open_trader.prediction_n_leg.mode_contract.v1",
+                "contract_generation": 2,
+                "mode": "MANUAL",
+                "qualification_policy_version": 1,
+                "qualification_policy": {},
+                "safety_config_version": 1,
+                "safety_config": {},
+                "execution_scopes": {
+                    "s1": {"scope_id": "s1", "capability": "MANUAL_CANARY", "scope_version": 1},
+                },
+                "enabled_execution_scope_version": [{"scope_id": "s1", "scope_version": 1}],
+                "execution_gates": {
+                    "breaker_open": False,
+                    "incident_active": False,
+                    "batch_active": False,
+                },
+            }
+
+    market = canonical_payload(
+        MarketSolution(
+            component_id="component:x:y",
+            structure_fingerprint="sha256:struct",
+            quote_fingerprint="sha256:quote",
+            quantities=(ActionQuantity("a-yes", 20), ActionQuantity("a-no", 20)),
+            guaranteed_profit_units=8_400_000,
+            bounded_cost_units=31_200_000,
+            bounded_payout_units=39_600_000,
+            capital_release_at=datetime(2026, 8, 30, tzinfo=UTC),
+            global_search_closed=False,
+            verification_fingerprint="sha256:verify",
+        )
+    )
+    solution = {
+        "component_id": "component:x:y",
+        "scope_id": "s1",
+        "market": market,
+        "execution": {
+            "market_solution_fingerprint": fingerprint(canonical_payload(market)),
+            "quantities": market["quantities"],
+            "capital_use_units": 31_200_000,
+            "reason": "EXECUTABLE",
+            "order_ready": False,
+            "partial_fill_proof": "PARTIAL_FILL_SAFE",
+        },
+    }
+    episode_projection = {
+        "component:x:y": {
+            "opportunity_episode_id": "7f3a2c1b" + "0" * 24,
+            "episode_lineage_id": "lineage-1",
+            "status": "ONGOING",
+            "opened_at": "2026-09-01T09:23:00+00:00",
+            "duration_seconds": 2220,
+            "would_submit_ready_seconds": 720,
+            "best_guaranteed_profit": "9.60",
+            "close_reason": None,
+        }
+    }
+
+    state = prediction_state_payload(
+        store=_Store(),
+        monitor=_NlegMonitor([]),
+        execution=ContractExecution(),
+        csrf_token="csrf",
+        n_leg_solutions=[solution],
+        n_leg_episodes=episode_projection,
+        legacy_retired=True,
+    )
+    filled = state["opportunities"][0]["episode"]
+    assert filled["opportunity_episode_id"] == "7f3a2c1b" + "0" * 24
+    assert filled["episode_lineage_id"] == "lineage-1"
+    assert filled["status"] == "ONGOING"
+    assert filled["opened_at"] == "2026-09-01T09:23:00+00:00"
+    assert filled["duration_seconds"] == 2220
+    assert filled["would_submit_ready_seconds"] == 720
+    assert filled["best_guaranteed_profit"] == "9.60"
+    assert filled["close_reason"] is None
+
+    empty_state = prediction_state_payload(
+        store=_Store(),
+        monitor=_NlegMonitor([]),
+        execution=ContractExecution(),
+        csrf_token="csrf",
+        n_leg_solutions=[solution],
+        legacy_retired=True,
+    )
+    empty_slot = empty_state["opportunities"][0]["episode"]
+    assert set(empty_slot) == {
+        "opportunity_episode_id",
+        "episode_lineage_id",
+        "status",
+        "opened_at",
+        "duration_seconds",
+        "would_submit_ready_seconds",
+        "best_guaranteed_profit",
+        "close_reason",
+    }
+    assert all(value is None for value in empty_slot.values())
+
+
+def test_t19_retired_row_title_prefers_catalog_and_never_empty() -> None:
+    """#106 B5: the row builder's title comes from the catalog rows'
+    per-market question text joined with " × ", falling back to the contract
+    identity string; the title is never empty."""
+
+    class CatalogWithTitles:
+        def current_generation(self) -> dict[str, object]:
+            return {
+                "rel:1": {
+                    "identity": "rel:1",
+                    "relation_type": "IMPLIES",
+                    "activation": "ACTIVE",
+                    "endpoints": [
+                        {
+                            "venue": "polymarket",
+                            "contract_id": "cond-a",
+                            "title": "Bitcoin above $120k?",
+                        },
+                        {
+                            "venue": "polymarket",
+                            "contract_id": "cond-b",
+                            "title": "Bitcoin close above $120k?",
+                        },
+                    ],
+                    "model": {},
+                },
+            }
+
+    class ContractExecution(_NlegExecution):
+        def n_leg_mode_contract(self) -> dict[str, object]:
+            return {
+                "schema_version": "open_trader.prediction_n_leg.mode_contract.v1",
+                "contract_generation": 2,
+                "mode": "MANUAL",
+                "qualification_policy_version": 1,
+                "qualification_policy": {},
+                "safety_config_version": 1,
+                "safety_config": {},
+                "execution_scopes": {
+                    "s1": {"scope_id": "s1", "capability": "MANUAL_CANARY", "scope_version": 1},
+                },
+                "enabled_execution_scope_version": [{"scope_id": "s1", "scope_version": 1}],
+                "execution_gates": {
+                    "breaker_open": False,
+                    "incident_active": False,
+                    "batch_active": False,
+                },
+            }
+
+    def solution(component_id: str) -> dict[str, object]:
+        market = canonical_payload(
+            MarketSolution(
+                component_id=component_id,
+                structure_fingerprint="sha256:struct",
+                quote_fingerprint="sha256:quote",
+                quantities=tuple(
+                    ActionQuantity(f"polymarket:{part}", 20)
+                    for part in component_id.split(":")[1:]
+                ),
+                guaranteed_profit_units=8_400_000,
+                bounded_cost_units=31_200_000,
+                bounded_payout_units=39_600_000,
+                capital_release_at=datetime(2026, 12, 31, tzinfo=UTC),
+                global_search_closed=False,
+                verification_fingerprint="sha256:verify",
+            )
+        )
+        return {
+            "component_id": component_id,
+            "scope_id": "s1",
+            "market": market,
+            "execution": {
+                "market_solution_fingerprint": fingerprint(
+                    canonical_payload(market)
+                ),
+                "quantities": market["quantities"],
+                "capital_use_units": 31_200_000,
+                "reason": "EXECUTABLE",
+                "order_ready": False,
+                "partial_fill_proof": "PARTIAL_FILL_SAFE",
+            },
+        }
+
+    state = prediction_state_payload(
+        store=_Store(),
+        monitor=_NlegMonitor([]),
+        execution=ContractExecution(),
+        csrf_token="csrf",
+        n_leg_solutions=[solution("component:cond-a:cond-b")],
+        relation_catalog=CatalogWithTitles(),
+        legacy_retired=True,
+    )
+    assert state["opportunities"][0]["title"] == (
+        "Bitcoin above $120k? × Bitcoin close above $120k?"
+    )
+
+    fallback_state = prediction_state_payload(
+        store=_Store(),
+        monitor=_NlegMonitor([]),
+        execution=ContractExecution(),
+        csrf_token="csrf",
+        n_leg_solutions=[solution("component:unmatched-1:unmatched-2")],
+        relation_catalog=CatalogWithTitles(),
+        legacy_retired=True,
+    )
+    assert (
+        fallback_state["opportunities"][0]["title"]
+        == "unmatched-1 × unmatched-2"
+    )

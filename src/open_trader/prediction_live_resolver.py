@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -50,10 +50,15 @@ from open_trader.prediction_n_leg import (
     canonical_payload,
     fingerprint,
 )
+from open_trader.prediction_n_leg_episodes import (
+    EpisodeTracker,
+)
 from open_trader.prediction_n_leg_execution import (
     PartialFillProofRecord,
     partial_fill_proof_from_payload,
 )
+from open_trader.prediction_n_leg_mode import DEFAULT_SAFETY_CONFIG
+from open_trader.prediction_n_leg_read_model import would_submit_predicate
 from open_trader.prediction_partial_fill import (
     PARTIAL_FILL_UNKNOWN,
     fill_adversary_problem_from_market_solution,
@@ -65,6 +70,7 @@ from open_trader.prediction_snapshot_scheduler import (
     LegBook,
     SnapshotLeg,
     SnapshotScheduler,
+    order_ready,
 )
 from open_trader.prediction_solver import BenchmarkLimits
 from open_trader.prediction_solver_verified import (
@@ -73,6 +79,7 @@ from open_trader.prediction_solver_verified import (
     CandidateEvidence,
     ProofInput,
     VerificationResult,
+    VerificationStatus,
     model_fingerprint,
     quote_fingerprint,
     solver_evidence_from_payload,
@@ -98,6 +105,9 @@ LIVE_LIMITS = BenchmarkLimits(
 # fingerprint and never retries within this process.
 LIVE_PROOF_TIME_LIMIT_MS = 1_000
 USD_UNITS_PER_DOLLAR = 1_000_000
+# #83/#106: shared snapshot freshness for scheduler qualification and the
+# episode tick-level quote check.
+SNAPSHOT_FRESHNESS = timedelta(seconds=30)
 
 
 def normalize_problem(problem: ArbitrageProblem) -> ArbitrageProblem:
@@ -213,6 +223,10 @@ class PredictionLiveResolver:
         budget: OracleBudget = LIVE_BUDGET,
         limits: BenchmarkLimits = LIVE_LIMITS,
         proof_time_limit_ms: int = LIVE_PROOF_TIME_LIMIT_MS,
+        # #106: optional opportunity-episode tracker (pure state machine) and
+        # an injectable clock so tests can drive episode timing.
+        episode_tracker: EpisodeTracker | None = None,
+        now_fn: Callable[[], datetime] | None = None,
     ) -> None:
         if not isinstance(poll_interval, (int, float)) or poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
@@ -241,6 +255,11 @@ class PredictionLiveResolver:
         self._budget = budget
         self._limits = limits
         self._proof_time_limit_ms = proof_time_limit_ms
+        self._episode_tracker = episode_tracker
+        self._now_fn: Callable[[], datetime] = now_fn or (
+            lambda: datetime.now(UTC)
+        )
+        self._lineage_by_component: dict[str, str] = {}
         self._tracking = _OutcomeTrackingServer(solver_server)
         self._graph = RuntimeRelationGraph(
             generation_source=relation_catalog.current_generation,
@@ -252,6 +271,7 @@ class PredictionLiveResolver:
             self._tracking,
             snapshot_for=self._snapshot_for,
             build_solve_request=self._build_solve_request,
+            freshness=SNAPSHOT_FRESHNESS,
         )
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -274,6 +294,10 @@ class PredictionLiveResolver:
         self._applied_generation: tuple[int, str] | None = None
         self._account_view_cache: AccountView | None = None
         self._account_view_cached_at: datetime | None = None
+        # #106: qualification policy version for episode records, cached at
+        # the same cadence as the controls-reading account view so episode
+        # reporting adds no per-tick store query.
+        self._policy_version_cache: tuple[str | None, datetime] | None = None
 
     def start(self) -> None:
         with self._lock:
@@ -364,6 +388,11 @@ class PredictionLiveResolver:
             cached = self._fill_proofs.get(proof_fingerprint)
             return cached[0].to_payload() if cached is not None else None
 
+    def n_leg_episodes(self) -> dict[str, dict[str, object]]:
+        """#106 read seam: episode projections keyed by component id."""
+        tracker = self._episode_tracker
+        return {} if tracker is None else tracker.project()
+
     def _loop(self) -> None:
         while not self._stop_event.wait(self._poll_interval):
             try:
@@ -383,12 +412,48 @@ class PredictionLiveResolver:
         self._scheduler.refresh(tuple(self._selection.values()))
         for request, outcome in self._tracking.consume_ready():
             self._handle_outcome(request, outcome)
+        self._observe_open_episodes()
+
+    def _observe_open_episodes(self) -> None:
+        """#106 tick pass over open episodes: quote freshness plus the
+        shared would-submit predicate on the current solution state."""
+        tracker = self._episode_tracker
+        if tracker is None:
+            return
+        for component_id in tracker.open_component_ids():
+            now = self._now_fn()
+            if not self._episode_quote_fresh(component_id, now):
+                tracker.mark_quote_stale(component_id, now=now)
+            with self._lock:
+                entry = self._solutions.get(component_id)
+                verification = self._verifications.get(component_id)
+            execution = None if entry is None else entry[1]
+            tracker.observe_would_submit(
+                component_id,
+                would_submit=would_submit_predicate(
+                    None if execution is None else execution.reason,
+                    None if verification is None else str(verification.status),
+                ),
+                now=now,
+            )
 
     def _reconcile(self) -> None:
         rows = dict(self._relation_catalog.current_generation())
         problem, components = relation_generation_problem(rows)
         problem_map: dict[str, ArbitrageProblem] = {}
         raw_problems: dict[str, ArbitrageProblem] = {}
+        # #106: map oracle component ids ("component:<contract>:...") onto the
+        # runtime graph's episode lineage so episode rows carry real lineage.
+        lineage_map: dict[str, str] = {}
+        for component in self._graph.components().values():
+            raw_contracts = sorted(
+                contract.split(":", 1)[1] if ":" in contract else contract
+                for contract in component.contract_ids
+            )
+            lineage_map[f"component:{':'.join(raw_contracts)}"] = (
+                component.lineage_id
+            )
+        self._lineage_by_component = lineage_map
         for component in components:
             raw = problem_for_component(problem, component)
             raw_problems[component.component_id] = raw
@@ -418,6 +483,14 @@ class PredictionLiveResolver:
                     == selected.terminal_fingerprint
                 )
             }
+            # #106: pruned components retire their open episode immediately
+            # with its own close cause.
+            if self._episode_tracker is not None:
+                now = self._now_fn()
+                for component_id in sorted(set(persisted) - set(kept)):
+                    self._episode_tracker.component_retired(
+                        component_id, now=now
+                    )
             self._problem_map = problem_map
             self._selection = kept
             self._solutions = {
@@ -584,10 +657,159 @@ class PredictionLiveResolver:
         if market is None:
             with self._lock:
                 self._solutions.pop(component_id, None)
+            # #106: negative/unknown outcomes carry no market solution but
+            # still drive the episode state machine.
+            self._report_episode_outcome(component_id, resolution, verification)
             return
         execution = self._execution_solution(component_id, market, problem)
         with self._lock:
             self._solutions[component_id] = (market, execution)
+        self._report_episode_outcome(
+            component_id, resolution, verification, execution=execution
+        )
+
+    def _episode_quote_fresh(self, component_id: str, now: datetime) -> bool:
+        """#106 freshness gate: the component's current book must be fresh."""
+        selected = self._selection.get(component_id)
+        if selected is None:
+            return False
+        snapshot = self._snapshot_for(selected)
+        if snapshot is None:
+            return False
+        return order_ready(
+            snapshot, now=now, freshness=SNAPSHOT_FRESHNESS
+        )
+
+    def _episode_gap_seconds(self) -> float:
+        """The caller-supplied rearm gap, read from the safety config."""
+        try:
+            latest = self._store.n_leg_safety_config_latest() or {}
+            config = latest.get("config") or {}
+            return float(
+                config.get(
+                    "episode_rearm_gap_seconds",
+                    DEFAULT_SAFETY_CONFIG["episode_rearm_gap_seconds"],
+                )
+            )
+        except (TypeError, ValueError, RuntimeError, AttributeError):
+            return float(DEFAULT_SAFETY_CONFIG["episode_rearm_gap_seconds"])
+
+    def _episode_policy_version(self) -> str | None:
+        """#106 qualification policy version, cached at controls cadence.
+
+        Reads the ``qualification_policy_version`` of the same ``n_leg_control``
+        row the hot path already consults (the account view), refreshed at the
+        account-freshness cadence instead of once per episode event.
+        """
+        now = self._now_fn()
+        with self._lock:
+            cached = self._policy_version_cache
+            if cached is not None and now - cached[1] <= self._account_freshness:
+                return cached[0]
+        try:
+            raw = self._store.n_leg_control().get("qualification_policy_version")
+        except (TypeError, ValueError, RuntimeError, AttributeError):
+            return None
+        version = None if raw is None else str(raw)
+        with self._lock:
+            self._policy_version_cache = (version, now)
+        return version
+
+    def _report_episode_outcome(
+        self,
+        component_id: str,
+        resolution: ComponentResolution,
+        verification: VerificationResult,
+        *,
+        execution: ExecutionSolution | None = None,
+    ) -> None:
+        """Map one verification outcome onto the #106 episode tracker.
+
+        The tracker stays a pure state machine: this adapter turns the
+        VerificationResult plus current quote freshness into tracker events.
+        """
+        tracker = self._episode_tracker
+        if tracker is None:
+            return
+        now = self._now_fn()
+        status = resolution.status
+        if status is VerificationStatus.NO_QUALIFIED_OPPORTUNITY:
+            # resolution_from_verification only yields this status when
+            # negative_proof_matches bound the proof exactly, so the tracker
+            # acceptance check reduces to quote freshness.
+            proof = verification.negative_proof
+            tracker.observe_negative(
+                component_id,
+                proof_fingerprint=fingerprint(canonical_payload(proof)),
+                generation=int(verification.current_generation),
+                model_fingerprint=str(verification.model_fingerprint),
+                quote_fingerprint=str(verification.quote_fingerprint),
+                qualification_fingerprint=(
+                    getattr(proof, "qualification_fingerprint", None)
+                ),
+                binding_matches=True,
+                quote_fresh=self._episode_quote_fresh(component_id, now),
+                gap_seconds=self._episode_gap_seconds(),
+                now=now,
+                qualification_policy_version=self._episode_policy_version(),
+            )
+            return
+        if (
+            status is VerificationStatus.UNKNOWN
+            and resolution.reason == "NEGATIVE_PROOF_MISMATCH"
+        ):
+            # A negative arrived but binds to another model/quote/generation:
+            # a reset event, never a no-arbitrage signal.
+            tracker.observe_negative(
+                component_id,
+                proof_fingerprint="",
+                generation=int(verification.current_generation),
+                model_fingerprint=str(verification.model_fingerprint),
+                quote_fingerprint=str(verification.quote_fingerprint),
+                qualification_fingerprint=(
+                    getattr(
+                        getattr(verification, "negative_proof", None),
+                        "qualification_fingerprint",
+                        None,
+                    )
+                ),
+                binding_matches=False,
+                quote_fresh=self._episode_quote_fresh(component_id, now),
+                gap_seconds=self._episode_gap_seconds(),
+                now=now,
+                qualification_policy_version=self._episode_policy_version(),
+            )
+            return
+        if status is not VerificationStatus.QUALIFIED_VERIFIED:
+            tracker.observe_unknown(component_id, now=now)
+            return
+        market = resolution.market_solution
+        if market is None:
+            return
+        solution_proof = getattr(market, "payout_proof", None)
+        fingerprints = {
+            "component_generation": int(verification.current_generation),
+            "model_fingerprint": str(verification.model_fingerprint),
+            "quote_fingerprint": str(verification.quote_fingerprint),
+            "qualification_fingerprint": (
+                getattr(solution_proof, "qualification_fingerprint", None)
+            ),
+            "qualification_policy_version": self._episode_policy_version(),
+        }
+        profit = Decimal(market.guaranteed_profit_units).scaleb(-6)
+        would_submit = would_submit_predicate(
+            None if execution is None else execution.reason,
+            str(status),
+        )
+        tracker.observe_qualified(
+            component_id,
+            self._lineage_by_component.get(component_id, component_id),
+            profit,
+            would_submit,
+            None,
+            fingerprints,
+            self._now_fn(),
+        )
 
     def _execution_solution(
         self,

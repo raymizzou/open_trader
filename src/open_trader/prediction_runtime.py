@@ -53,6 +53,7 @@ from .relation_auto_confirm import (
 from .prediction_live_resolver import PredictionLiveResolver
 from .prediction_monitor_selection import MonitorSelectionStore
 from .prediction_monitor_selection_driver import PredictionMonitorSelectionDriver
+from .prediction_n_leg_episodes import EpisodeStore, EpisodeTracker
 from .prediction_n_leg_mode import ensure_same_event_same_venue_scope
 from .prediction_predict_snapshot_refresher import PredictAccountSnapshotRefresher
 from .prediction_read_only import (
@@ -687,6 +688,11 @@ class PredictionRuntime:
             if self._enable_n_leg_background:
                 selection_store = MonitorSelectionStore(self._data_dir)
                 selection_lock = threading.RLock()
+                # #106: the episode store owns the shared SQLite tables; the
+                # tracker resumes open episodes across restarts.
+                episode_store = EpisodeStore(self._data_dir)
+                episode_tracker = EpisodeTracker(store=episode_store)
+                episode_tracker.load_open()
                 self.live_resolver = PredictionLiveResolver(
                     data_dir=self._data_dir,
                     relation_catalog=self.relation_catalog,
@@ -696,6 +702,7 @@ class PredictionRuntime:
                     selection_lock=selection_lock,
                     store=self.store,
                     execution=self.execution,
+                    episode_tracker=episode_tracker,
                 )
                 self.live_resolver.start()
                 self.monitor_selection_driver = PredictionMonitorSelectionDriver(
@@ -858,6 +865,10 @@ class PredictionRuntime:
     def n_leg_solutions(self) -> list[dict[str, object]]:
         resolver = self.live_resolver
         return [] if resolver is None else resolver.solutions()
+
+    def n_leg_episodes(self) -> dict[str, dict[str, object]]:
+        resolver = self.live_resolver
+        return {} if resolver is None else resolver.n_leg_episodes()
 
     def n_leg_metrics(self) -> dict[str, object]:
         driver = self.monitor_selection_driver

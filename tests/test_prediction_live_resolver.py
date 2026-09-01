@@ -34,15 +34,23 @@ from open_trader.prediction_n_leg import (
     ActionSide,
     ArbitrageProblem,
     CandidateAction,
+    Comparison,
     ConstraintModel,
     ExecutableCostSlice,
     OracleBudget,
+    QualificationConstraint,
+    QualificationMetric,
     SettlementObservationKey,
     TerminalAtom,
     TerminalKind,
     TerminalStateSet,
     canonical_payload,
     fingerprint,
+)
+from open_trader.prediction_n_leg_episodes import (
+    CLOSE_COMPONENT_RETIRED,
+    CLOSE_NO_QUALIFIED_OPPORTUNITY,
+    EpisodeTracker,
 )
 from open_trader.prediction_n_leg_oracle import evaluate_fixed_portfolio
 from open_trader.prediction_solver import (
@@ -93,27 +101,33 @@ def raw_action(
     )
 
 
-def raw_problem(*, venue: str = "polymarket") -> ArbitrageProblem:
-    yes = raw_action("a-yes", "contract-a", ActionSide.BUY_YES, venue=venue)
-    no = raw_action("a-no", "contract-a", ActionSide.BUY_NO, venue=venue)
+def raw_problem(
+    *,
+    venue: str = "polymarket",
+    contract: str = "contract-a",
+    yes_id: str = "a-yes",
+    no_id: str = "a-no",
+) -> ArbitrageProblem:
+    yes = raw_action(yes_id, contract, ActionSide.BUY_YES, venue=venue)
+    no = raw_action(no_id, contract, ActionSide.BUY_NO, venue=venue)
     states = (
         TerminalStateSet(
-            "contract-a",
-            observation("contract-a"),
+            contract,
+            observation(contract),
             "v1",
             (
                 TerminalAtom(
-                    "contract-a:yes",
+                    f"{contract}:yes",
                     TerminalKind.NORMAL_YES,
                     "v1",
-                    (ActionPayout("a-yes", 1), ActionPayout("a-no", 0)),
+                    (ActionPayout(yes_id, 1), ActionPayout(no_id, 0)),
                     AS_OF,
                 ),
                 TerminalAtom(
-                    "contract-a:no",
+                    f"{contract}:no",
                     TerminalKind.NORMAL_NO,
                     "v1",
-                    (ActionPayout("a-yes", 0), ActionPayout("a-no", 1)),
+                    (ActionPayout(yes_id, 0), ActionPayout(no_id, 1)),
                     AS_OF,
                 ),
             ),
@@ -197,12 +211,21 @@ class FakeExecution:
 
 
 class FakeStore:
-    def __init__(self, unsettled: int = 0, max_unsettled: int = 5_000_000) -> None:
+    def __init__(
+        self,
+        unsettled: int = 0,
+        max_unsettled: int = 5_000_000,
+        qualification_policy_version: int = 1,
+    ) -> None:
         self.unsettled = unsettled
         self.max_unsettled = max_unsettled
+        self.qualification_policy_version = qualification_policy_version
 
     def n_leg_control(self) -> dict[str, object]:
-        return {"total_unsettled_capital_units": self.unsettled}
+        return {
+            "total_unsettled_capital_units": self.unsettled,
+            "qualification_policy_version": self.qualification_policy_version,
+        }
 
     def n_leg_safety_config_latest(self) -> dict[str, object]:
         return {
@@ -223,9 +246,16 @@ class FakeServer:
         return future
 
 
-def live_book(token_id: str, *, price: str = "0.49") -> ThresholdOrderBook:
+def live_book(
+    token_id: str,
+    *,
+    price: str = "0.49",
+    confirmed_at: datetime | None = None,
+) -> ThresholdOrderBook:
     level = (BookLevel(Decimal(price), Decimal("2")),)
-    return ThresholdOrderBook(token_id, level, level, datetime.now(UTC))
+    return ThresholdOrderBook(
+        token_id, level, level, confirmed_at or datetime.now(UTC)
+    )
 
 
 def selected_component(
@@ -233,14 +263,16 @@ def selected_component(
     *,
     relation_fingerprint: str = "r",
     terminal_fingerprint: str = "t",
+    contract_ids: tuple[str, ...] = ("contract-a",),
+    action_ids: tuple[str, ...] = ("a-yes", "a-no"),
 ) -> SelectedComponent:
     return SelectedComponent(
         component_id=component_id,
-        contract_ids=("contract-a",),
+        contract_ids=contract_ids,
         constraint_ids=(),
-        action_ids=("a-yes", "a-no"),
+        action_ids=action_ids,
         admission_score=20_000,
-        portfolio=(ActionQuantity("a-yes", 1), ActionQuantity("a-no", 1)),
+        portfolio=tuple(ActionQuantity(action_id, 1) for action_id in action_ids),
         relation_fingerprint=relation_fingerprint,
         terminal_fingerprint=terminal_fingerprint,
         portfolio_fingerprint="p",
@@ -272,7 +304,12 @@ def resolver(
     return resolver_instance, server, catalog
 
 
-def valid_selected(rows: dict[str, object]) -> SelectedComponent:
+def valid_selected(
+    rows: dict[str, object],
+    *,
+    contract_ids: tuple[str, ...] = ("contract-a",),
+    action_ids: tuple[str, ...] = ("a-yes", "a-no"),
+) -> SelectedComponent:
     problem, components = relation_generation_problem(rows)
     component = components[0]
     raw = problem_for_component(problem, component)
@@ -282,7 +319,51 @@ def valid_selected(rows: dict[str, object]) -> SelectedComponent:
         terminal_fingerprint=fingerprint(
             {"terminal_state_sets": raw.terminal_state_sets}
         ),
+        contract_ids=contract_ids,
+        action_ids=action_ids,
     )
+
+
+def negative_raw_problem(
+    *, contract: str = "contract-n", yes_id: str = "n-yes", no_id: str = "n-no"
+) -> ArbitrageProblem:
+    """One contract whose every non-zero portfolio fails the $3 min-profit
+    gate at 0.49 book prices: the exact component negative the oracle closes
+    exhaustively (candidate=None evidence -> component proof request)."""
+    problem = raw_problem(contract=contract, yes_id=yes_id, no_id=no_id)
+    constraint = QualificationConstraint(
+        constraint_id="q-min-profit",
+        rule_version="v1",
+        metric=QualificationMetric.GUARANTEED_PROFIT_UNITS,
+        comparison=Comparison.GREATER_THAN_OR_EQUAL,
+        threshold_numerator=3_000_000,
+        threshold_denominator=1,
+    )
+    return replace(
+        problem, qualification_constraints=(constraint,)
+    )
+
+
+def negative_evidence(problem: ArbitrageProblem) -> dict[str, object]:
+    """Worker evidence with no candidate: the resolver must run the exact
+    component proof request (the oracle negative path)."""
+    evidence = SolverEvidence(
+        native_status="INFEASIBLE",
+        candidate=None,
+        objective_bounds=ObjectiveBounds(None, None, None, False),
+        worst_scenario=None,
+        payout_lower_bound_units=None,
+        cost_upper_bound_units=None,
+        guaranteed_profit_units=None,
+        conservative_capital_release_at=None,
+        fixed_portfolio_closed=False,
+        global_search_closed=False,
+        master_rounds=0,
+        adversary_rounds=0,
+        cuts=(),
+        certificate=None,
+    )
+    return canonical_payload(evidence)
 
 
 def test_normalize_problem_maps_micro_units_and_payouts() -> None:
@@ -351,8 +432,12 @@ def test_tick_dispatches_solve_request_through_tracking_wrapper(tmp_path: Path) 
     assert instance._request_components[request.request_id][0] == component_id
 
 
-def worker_evidence(problem: ArbitrageProblem) -> dict[str, object]:
-    quantities = (ActionQuantity("a-yes", 1), ActionQuantity("a-no", 1))
+def worker_evidence(
+    problem: ArbitrageProblem,
+    *,
+    action_ids: tuple[str, ...] = ("a-yes", "a-no"),
+) -> dict[str, object]:
+    quantities = tuple(ActionQuantity(action_id, 1) for action_id in action_ids)
     evaluation = evaluate_fixed_portfolio(problem, quantities, BUDGET)
     evidence = SolverEvidence(
         native_status="FEASIBLE",
@@ -682,6 +767,357 @@ def conflicting_rows() -> dict[str, object]:
         ),
     )
     return {"r:one": row("r:one", base), "r:two": row("r:two", conflicting)}
+
+
+class EpisodeClock:
+    """Mutable injected clock for episode timing tests."""
+
+    def __init__(self) -> None:
+        self.now = datetime.now(UTC)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> datetime:
+        self.now = self.now + timedelta(seconds=seconds)
+        return self.now
+
+
+def episode_resolver(
+    tmp_path: Path,
+    rows: dict[str, object],
+    clock: EpisodeClock,
+    tracker: EpisodeTracker,
+    monitor: FakeMonitor | None = None,
+) -> tuple[PredictionLiveResolver, FakeServer, FakeCatalog]:
+    server = FakeServer()
+    catalog = FakeCatalog(rows)
+    instance = PredictionLiveResolver(
+        data_dir=tmp_path,
+        relation_catalog=catalog,
+        monitor=monitor or FakeMonitor(),
+        solver_server=server,
+        selection_store=MonitorSelectionStore(tmp_path),
+        store=FakeStore(),
+        execution=FakeExecution(AccountView(1_000_000, 1_000_000, 0)),
+        poll_interval=0.01,
+        now_fn=clock,
+        episode_tracker=tracker,
+    )
+    return instance, server, catalog
+
+
+class RecordingEpisodeTracker(EpisodeTracker):
+    """EpisodeTracker that records the outcomes the resolver reports to it."""
+
+    def __init__(self, *, now_fn) -> None:
+        super().__init__(now_fn=now_fn)
+        self.qualified_reports: list[dict[str, object]] = []
+        self.negative_reports: list[dict[str, object]] = []
+
+    def observe_qualified(
+        self, component_id, lineage_id, profit, would_submit,
+        plan_snapshot, fingerprints, now,
+    ) -> None:
+        self.qualified_reports.append(dict(fingerprints))
+        super().observe_qualified(
+            component_id, lineage_id, profit, would_submit,
+            plan_snapshot, fingerprints, now,
+        )
+
+    def observe_negative(
+        self,
+        component_id,
+        *,
+        proof_fingerprint,
+        generation,
+        model_fingerprint,
+        quote_fingerprint,
+        qualification_fingerprint,
+        binding_matches,
+        quote_fresh,
+        gap_seconds,
+        now,
+        qualification_policy_version=None,
+    ) -> None:
+        self.negative_reports.append(
+            {
+                "generation": generation,
+                "qualification_policy_version": qualification_policy_version,
+            }
+        )
+        super().observe_negative(
+            component_id,
+            proof_fingerprint=proof_fingerprint,
+            generation=generation,
+            model_fingerprint=model_fingerprint,
+            quote_fingerprint=quote_fingerprint,
+            qualification_fingerprint=qualification_fingerprint,
+            binding_matches=binding_matches,
+            quote_fresh=quote_fresh,
+            gap_seconds=gap_seconds,
+            now=now,
+            qualification_policy_version=qualification_policy_version,
+        )
+
+
+def test_t12_qualified_outcome_opens_an_ongoing_episode(tmp_path: Path) -> None:
+    rows = {"r:a": row("r:a", raw_problem())}
+    clock = EpisodeClock()
+    tracker = EpisodeTracker(now_fn=clock)
+    instance, server, _ = episode_resolver(
+        tmp_path,
+        rows,
+        clock,
+        tracker,
+        monitor=FakeMonitor({"contract-a": live_book("contract-a")}),
+    )
+    valid = valid_selected(rows)
+    instance._selection_store.save({valid.component_id: valid})
+    instance._tick()
+    request = server.requests[0]
+    server.futures[0].set_result(
+        worker_outcome(request, worker_evidence(request.request.problem))
+    )
+    instance._tick()
+
+    episodes = instance.n_leg_episodes()
+    assert episodes[valid.component_id]["status"] == "ONGOING"
+
+
+def test_t15_stale_quote_on_quiet_book_resets_the_close_timer(
+    tmp_path: Path,
+) -> None:
+    rows = {"r:a": row("r:a", raw_problem())}
+    clock = EpisodeClock()
+    tracker = EpisodeTracker(now_fn=clock)
+    monitor = FakeMonitor(
+        {"contract-a": live_book("contract-a", confirmed_at=clock.now)}
+    )
+    instance, server, catalog = episode_resolver(
+        tmp_path, rows, clock, tracker, monitor=monitor
+    )
+    valid = valid_selected(rows)
+    component_id = valid.component_id
+    instance._selection_store.save({component_id: valid})
+    instance._tick()
+    request = server.requests[0]
+    server.futures[0].set_result(
+        worker_outcome(request, worker_evidence(request.request.problem))
+    )
+    instance._tick()
+    assert instance.n_leg_episodes()[component_id]["status"] == "ONGOING"
+
+    # Generation 2 tightens qualification; the structure is unchanged, so the
+    # same component now proves negative.
+    catalog.rows = {
+        "r:a": row(
+            "r:a",
+            negative_raw_problem(
+                contract="contract-a", yes_id="a-yes", no_id="a-no"
+            ),
+        )
+    }
+    catalog.generation = 2
+
+    # One accepted negative starts the close window at +60.
+    clock.now = clock.now + timedelta(seconds=60)
+    monitor.books["contract-a"] = live_book(
+        "contract-a", price="0.50", confirmed_at=clock.now
+    )
+    instance._tick()
+    negative_request = server.requests[-1]
+    server.futures[-1].set_result(
+        worker_outcome(negative_request, negative_evidence(negative_request.request.problem))
+    )
+    instance._tick()
+    assert (
+        tracker.episode(component_id).negative_close_started_at == clock.now
+    )
+
+    # The book goes quiet and ages out: the tick-level freshness check must
+    # clear the window without any new evidence events.
+    stale_at = clock.advance(240)
+    instance._tick()
+    episode = tracker.episode(component_id)
+    assert episode.status == "ONGOING"
+    assert episode.negative_close_started_at is None
+
+    # A fresh negative right after the clear cannot close (it restarts the
+    # window at its own timestamp).
+    clock.now = stale_at + timedelta(seconds=60)
+    monitor.books["contract-a"] = live_book(
+        "contract-a", price="0.51", confirmed_at=clock.now
+    )
+    instance._tick()
+    fresh_request = server.requests[-1]
+    server.futures[-1].set_result(
+        worker_outcome(fresh_request, negative_evidence(fresh_request.request.problem))
+    )
+    instance._tick()
+    projection = instance.n_leg_episodes()[component_id]
+    assert projection["status"] == "ONGOING"
+
+
+def test_t14_reconcile_removal_closes_the_episode_as_retired(
+    tmp_path: Path,
+) -> None:
+    rows = {"r:a": row("r:a", raw_problem())}
+    clock = EpisodeClock()
+    tracker = EpisodeTracker(now_fn=clock)
+    instance, _, catalog = episode_resolver(tmp_path, rows, clock, tracker)
+    valid = valid_selected(rows)
+    instance._selection_store.save({valid.component_id: valid})
+    instance._reconcile()
+    tracker.observe_qualified(
+        valid.component_id,
+        "L1",
+        Decimal("1.20"),
+        False,
+        None,
+        {
+            "component_generation": 1,
+            "model_fingerprint": "sha256:model",
+            "quote_fingerprint": "sha256:quote",
+            "qualification_fingerprint": "sha256:qual",
+            "qualification_policy_version": "v1",
+        },
+        clock.now,
+    )
+    catalog.rows = {}
+    catalog.generation = 2
+    retire_at = clock.advance(30)
+    instance._reconcile()
+    projection = instance.n_leg_episodes()[valid.component_id]
+    assert projection["status"] == "CLOSED"
+    assert projection["close_reason"] == CLOSE_COMPONENT_RETIRED
+    assert tracker.episode(valid.component_id).closed_at == retire_at
+
+
+def test_t13_five_minutes_of_fresh_negatives_close_the_episode(
+    tmp_path: Path,
+) -> None:
+    rows = {"r:n": row("r:n", raw_problem(contract="contract-n", yes_id="n-yes", no_id="n-no"))}
+    clock = EpisodeClock()
+    tracker = EpisodeTracker(now_fn=clock)
+    monitor = FakeMonitor(
+        {"contract-n": live_book("contract-n", confirmed_at=clock.now)}
+    )
+    instance, server, catalog = episode_resolver(
+        tmp_path, rows, clock, tracker, monitor=monitor
+    )
+    valid = valid_selected(
+        rows, contract_ids=("contract-n",), action_ids=("n-yes", "n-no")
+    )
+    component_id = valid.component_id
+    instance._selection_store.save({component_id: valid})
+
+    def qualified_cycle() -> None:
+        instance._tick()
+        request = server.requests[-1]
+        server.futures[-1].set_result(
+            worker_outcome(request, worker_evidence(request.request.problem))
+        )
+        instance._tick()
+
+    def negative_cycle(price: str, at: datetime) -> None:
+        clock.now = at
+        monitor.books["contract-n"] = live_book(
+            "contract-n", price=price, confirmed_at=at
+        )
+        instance._tick()
+        request = server.requests[-1]
+        server.futures[-1].set_result(
+            worker_outcome(request, negative_evidence(request.request.problem))
+        )
+        instance._tick()
+
+    instance._tick()
+    request = server.requests[0]
+    server.futures[0].set_result(
+        worker_outcome(
+            request,
+            worker_evidence(
+                request.request.problem, action_ids=("n-yes", "n-no")
+            ),
+        )
+    )
+    instance._tick()
+    assert instance.n_leg_episodes()[component_id]["status"] == "ONGOING"
+
+    # Generation 2 tightens the qualification policy: same structure, so the
+    # selection is kept and the same component now proves negative.
+    catalog.rows = {"r:n": row("r:n", negative_raw_problem())}
+    catalog.generation = 2
+    opened_at = clock.now
+    negative_cycle("0.50", opened_at + timedelta(seconds=60))
+    assert (
+        tracker.episode(component_id).negative_close_started_at
+        == opened_at + timedelta(seconds=60)
+    )
+    negative_cycle("0.51", opened_at + timedelta(seconds=240))
+    assert instance.n_leg_episodes()[component_id]["status"] == "ONGOING"
+    negative_cycle("0.52", opened_at + timedelta(seconds=300))
+    assert instance.n_leg_episodes()[component_id]["status"] == "ONGOING"
+    negative_cycle("0.53", opened_at + timedelta(seconds=360))
+    projection = instance.n_leg_episodes()[component_id]
+    assert projection["status"] == "CLOSED"
+    assert projection["close_reason"] == CLOSE_NO_QUALIFIED_OPPORTUNITY
+
+
+def test_t21_resolver_reports_the_real_qualification_policy_version(
+    tmp_path: Path,
+) -> None:
+    rows = {"r:n": row("r:n", raw_problem(contract="contract-n", yes_id="n-yes", no_id="n-no"))}
+    clock = EpisodeClock()
+    tracker = RecordingEpisodeTracker(now_fn=clock)
+    monitor = FakeMonitor(
+        {"contract-n": live_book("contract-n", confirmed_at=clock.now)}
+    )
+    instance, server, catalog = episode_resolver(
+        tmp_path, rows, clock, tracker, monitor=monitor
+    )
+    valid = valid_selected(
+        rows, contract_ids=("contract-n",), action_ids=("n-yes", "n-no")
+    )
+    component_id = valid.component_id
+    instance._selection_store.save({component_id: valid})
+
+    instance._tick()
+    request = server.requests[0]
+    server.futures[0].set_result(
+        worker_outcome(
+            request,
+            worker_evidence(
+                request.request.problem, action_ids=("n-yes", "n-no")
+            ),
+        )
+    )
+    instance._tick()
+
+    # The qualified report carries the version from the controls row (the
+    # FakeStore's n_leg_control qualification_policy_version=1), not a
+    # hardcoded None.
+    assert tracker.qualified_reports
+    assert tracker.qualified_reports[-1]["qualification_policy_version"] == "1"
+
+    # The negative report carries the same real version.
+    catalog.rows = {"r:n": row("r:n", negative_raw_problem())}
+    catalog.generation = 2
+    clock.now = clock.now + timedelta(seconds=60)
+    monitor.books["contract-n"] = live_book(
+        "contract-n", price="0.50", confirmed_at=clock.now
+    )
+    instance._tick()
+    negative_request = server.requests[-1]
+    server.futures[-1].set_result(
+        worker_outcome(
+            negative_request, negative_evidence(negative_request.request.problem)
+        )
+    )
+    instance._tick()
+    assert tracker.negative_reports
+    assert tracker.negative_reports[-1]["qualification_policy_version"] == "1"
 
 
 def test_start_survives_startup_reconcile_conflict(

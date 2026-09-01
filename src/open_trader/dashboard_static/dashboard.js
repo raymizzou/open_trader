@@ -2508,8 +2508,13 @@ function predictionUnifiedLegRows(row) {
   return `${yes}${no}`;
 }
 
-function predictionUnifiedMetric(label, value, className = "", extra = "") {
-  return `<div class="pm-metric"><span>${escapeHtml(label)}</span><strong class="${className}">${value}</strong>${extra}</div>`;
+function predictionUnifiedMetric(label, value, className = "", extra = "", hint = "") {
+  // Issue #106: small "!" badge beside the label; hovering/focus shows the
+  // plain-language meaning above the tile.
+  const hintNode = hint
+    ? `<span class="pm-metric-hint" tabindex="0" role="note" aria-label="${escapeHtml(hint)}">!<span class="pm-metric-tip">${escapeHtml(hint)}</span></span>`
+    : "";
+  return `<div class="pm-metric"><span class="pm-metric-label">${escapeHtml(label)}${hintNode}</span><strong class="${className}">${value}</strong>${extra}</div>`;
 }
 
 function predictionNLegExecutionPlan(opportunity) {
@@ -2544,9 +2549,17 @@ function predictionUnifiedOpportunityCard(row, mode, legacyRetired) {
     const item = checks.find((entry) => entry && entry.key === key);
     return item ? item.value : undefined;
   };
+  const checkThreshold = (key) => {
+    const item = checks.find((entry) => entry && entry.key === key);
+    return item ? item.threshold : undefined;
+  };
+  const thresholdPercent = (key, fallback) => {
+    const num = Number(checkThreshold(key));
+    return Number.isFinite(num) ? `${Math.round(num * 1000) / 10}%` : fallback;
+  };
   const statusClass = qualification.status === "QUALIFIED_VERIFIED" ? "ok" : "warn";
   const status = predictionValue(qualification.status, "UNKNOWN");
-  const edge = Number(checkValue("net_edge"));
+  const edge = Number(checkValue("net_margin") ?? checkValue("net_edge"));
   const edgePercent = Number.isFinite(edge) ? `${(Math.trunc(edge * 100 * 10) / 10).toFixed(1)}%` : "-";
   const remaining = Number(opportunity.remaining_days);
   const tenor = Number.isFinite(remaining) && remaining > 0
@@ -2559,32 +2572,64 @@ function predictionUnifiedOpportunityCard(row, mode, legacyRetired) {
     : String(opportunity.venue || "Polymarket");
   const subtitle = `${escapeHtml(venueLabel)} · ${escapeHtml(predictionValue(opportunity.scope_label, ""))}`;
   const episode = opportunity.episode && typeof opportunity.episode === "object" ? opportunity.episode : {};
-  const episodeLabel = predictionValue(episode.opportunity_episode_id, "") ? `Episode ${episode.opportunity_episode_id}` : "Episode —";
-  const tags = [
+  // Issue #106: live episode badge — short id, status, and elapsed duration.
+  const episodeId = predictionValue(episode.opportunity_episode_id, "");
+  const episodeOngoing = Boolean(episodeId) && episode.status === "ONGOING";
+  const episodeMinutes = (value) => {
+    const total = Math.max(0, Math.floor(Number(value || 0) / 60));
+    return total >= 60 ? `${Math.floor(total / 60)} 小时 ${total % 60} 分钟` : `${total} 分钟`;
+  };
+  const episodeDurationText = episodeMinutes(episode.duration_seconds);
+  const episodeLabel = episodeId
+    ? `Episode #${String(episodeId).replace(/-/g, "").slice(0, 8)} · ${episodeOngoing ? "进行中" : "已结束"} · ${episodeDurationText}`
+    : "Episode —";
+  const episodePill = episodeId
+    ? `<span class="pm-pill episode${episodeOngoing ? " live" : ""}">${episodeOngoing ? '<span class="dot"></span>' : ""}${escapeHtml(episodeLabel)}</span>`
+    : "";
+  const plainTagLabels = [
     opportunity.relation_type,
     opportunity.discovery_source,
     opportunity.leg_count ? `${opportunity.leg_count} 腿` : "",
     opportunity.qualification_policy_version ? `资格 ${opportunity.qualification_policy_version}` : "",
-  ].filter(Boolean).map((tag, index) => `<span class="pm-pill${index === 0 ? " blue" : ""}">${escapeHtml(String(tag))}</span>`).join("");
+  ].filter(Boolean);
+  // Issue #106: the episode badge rides the tag row as one more pill —
+  // no extra line in the title block, layout stays the #105 shape.
+  const tags = [
+    episodePill,
+    ...plainTagLabels.map((tag, index) => `<span class="pm-pill${index === 0 ? " blue" : ""}">${escapeHtml(String(tag))}</span>`),
+  ].filter(Boolean).join("");
   const metrics = [
-    predictionUnifiedMetric("保证最低利润", escapeHtml(predictionSignedMoney(opportunity.profit)), "pm-positive"),
-    predictionUnifiedMetric("1% 净边际", escapeHtml(edgePercent)),
-    predictionUnifiedMetric("15% 年化", escapeHtml(predictionAnnualizedPercent(opportunity.annualized_yield, 1))),
-    predictionUnifiedMetric("30 天资本释放", escapeHtml(tenor)),
-    predictionUnifiedMetric("极端风险", escapeHtml(predictionSignedMoney(opportunity.extreme_loss)), "pm-negative"),
     predictionUnifiedMetric(
-      "order_ready",
-      qualification.order_ready === true ? "是" : "否",
-      "",
-      `<small style="color:var(--muted)">${escapeHtml(predictionValue(qualification.order_ready_reason, qualification.order_ready === true ? "MANUAL 模式 · 可人工确认" : ""))}</small>`,
+      "保证最低利润",
+      escapeHtml(predictionSignedMoney(opportunity.profit)),
+      "pm-positive",
+      // Issue #106: episode best/would-submit ride as the first tile's
+      // sub-line; metrics stay exactly one 4-tile row.
+      episodeId
+        ? `<small style="color:var(--muted)">Episode 最佳 ${escapeHtml(predictionMoney(episode.best_guaranteed_profit))} · would-submit 累计 ${escapeHtml(episodeMinutes(episode.would_submit_ready_seconds))}</small>`
+        : "",
+      "按当前盘口锁定下单后，无论行情如何走都至少赚到的金额（绝对值）。",
     ),
+    predictionUnifiedMetric("净边际", escapeHtml(edgePercent), "", `<small style="color:var(--muted)">门槛 ≥${thresholdPercent("net_margin", "1%")}</small>`, "保证利润 ÷ 总赔付额：每经手 $100 盘口稳赚多少。衡量利润厚度与抗波动能力；门槛 ≥1% 淘汰薄利润机会。"),
+    predictionUnifiedMetric("年化收益", escapeHtml(predictionAnnualizedPercent(opportunity.annualized_yield, 1)), "", `<small style="color:var(--muted)">门槛 ≥${thresholdPercent("annualized_return", "15%")}</small>`, "把保证利润按资金占用时长折算成一年的收益率；资本释放越近，年化越高。"),
+    predictionUnifiedMetric("资本释放", escapeHtml(tenor), "", `<small style="color:var(--muted)">上限 ${escapeHtml(String(checkThreshold("capital_release") ?? "30"))} 天</small>`, "本金最晚多少天后收回；上限 30 天是资格门槛之一，越近越安全。"),
   ].join("");
+  // Issue #106: the 极端风险 tile is gone (N_LEG rows carry no extreme-loss
+  // source) and order_ready moved into the single unified action line
+  // instead of duplicating tile + footer. The retired branch renders the
+  // same unified line (the 410 notice is gone); only a non-retired
+  // order-ready MANUAL row keeps the manual-confirm button.
+  const orderReadyReason = predictionValue(
+    nLegExecution?.reason ? predictionReasonLabel(nLegExecution.reason) : qualification.order_ready_reason,
+    "不可下单",
+  );
+  const unifiedActionLine = `<div class="pm-opportunity-action"><p>order_ready ${orderReady ? "是" : "否"} · ${escapeHtml(orderReadyReason)} · ${orderReady ? "可人工确认" : "不可下单"}。</p></div>`;
   const action = legacyRetired === true
-    ? `<div class="pm-opportunity-action"><p>旧系统人工确认入口已随 N_LEG 切换下线（HTTP 410）。</p></div>`
+    ? unifiedActionLine
     : orderReady && mode === "MANUAL"
     ? `<div class="pm-opportunity-action"><p>确认时重新读取两所 REST、盘口、余额与未结算额度。</p><button type="button" class="pm-button primary" data-action="participate" data-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id, ""))}">人工确认下单</button></div>`
-    : `<div class="pm-opportunity-action"><p>order_ready=false · ${escapeHtml(predictionValue(nLegExecution?.reason ? predictionReasonLabel(nLegExecution.reason) : qualification.order_ready_reason, "不可下单"))} · 不可下单。</p></div>`;
-  return `<article class="pm-opportunity"><div class="pm-opportunity-title"><div><h3>${escapeHtml(predictionValue(opportunity.title || opportunity.question, "数据未返回"))}</h3><p>${subtitle}</p><span class="pm-pill episode">${escapeHtml(episodeLabel)}</span></div><span class="pm-pill ${statusClass}">${escapeHtml(status)}</span></div><div class="pm-tags">${tags}</div>${legs.length && !nLegSolution ? `<div class="pm-order-legs">${predictionUnifiedLegRows(opportunity)}</div>` : ""}<div class="pm-metrics">${metrics}</div>${predictionNLegExecutionPlan(opportunity)}${action}</article>`;
+    : unifiedActionLine;
+  return `<article class="pm-opportunity"><div class="pm-opportunity-title"><div><h3>${escapeHtml(predictionValue(opportunity.title || opportunity.question, "数据未返回"))}</h3><p>${subtitle}</p></div><span class="pm-pill ${statusClass}">${escapeHtml(status)}</span></div><div class="pm-tags">${tags}</div>${legs.length && !nLegSolution ? `<div class="pm-order-legs">${predictionUnifiedLegRows(opportunity)}</div>` : ""}<div class="pm-metrics">${metrics}</div>${predictionNLegExecutionPlan(opportunity)}${action}</article>`;
 }
 
 function predictionUnifiedOpportunityList(payload, filter) {

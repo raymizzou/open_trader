@@ -686,6 +686,11 @@ def test_fence2_retired_rows_carry_taxonomy_episode_and_leg_display(tmp_path) ->
         "opportunity_episode_id": None,
         "episode_lineage_id": None,
         "status": None,
+        "opened_at": None,
+        "duration_seconds": None,
+        "would_submit_ready_seconds": None,
+        "best_guaranteed_profit": None,
+        "close_reason": None,
     }
     assert [leg["venue"] for leg in row["legs"]] == ["polymarket", "polymarket"]
     assert [leg["expires_at"] for leg in row["legs"]] == [
@@ -756,6 +761,11 @@ def test_fence2_component_without_catalog_match_keeps_empty_taxonomy(tmp_path) -
         "opportunity_episode_id": None,
         "episode_lineage_id": None,
         "status": None,
+        "opened_at": None,
+        "duration_seconds": None,
+        "would_submit_ready_seconds": None,
+        "best_guaranteed_profit": None,
+        "close_reason": None,
     }
     for leg in row["legs"]:
         assert leg["venue"] is None
@@ -1456,3 +1466,51 @@ console.log(JSON.stringify(predictionUnifiedOpportunityCard(
     assert "第 2 腿 · Polymarket · BUY NO" in card
     assert "20 份 · 最高 $0.480" in card
     assert "pm-execution-plan" not in card
+
+
+def test_fence2_state_endpoint_carries_episode_projection(tmp_path) -> None:
+    """#106: a runtime exposing n_leg_episodes fills the retired row's
+    episode slot through the HTTP state endpoint."""
+    solution = _taxonomy_component_solution(
+        "component:cond-a:cond-b", ["cond-a", "cond-b"]
+    )
+    episode_projection = {
+        "component:cond-a:cond-b": {
+            "opportunity_episode_id": "e" * 32,
+            "episode_lineage_id": "lineage-1",
+            "status": "ONGOING",
+            "opened_at": "2026-09-01T09:23:00+00:00",
+            "duration_seconds": 2220,
+            "would_submit_ready_seconds": 720,
+            "best_guaranteed_profit": "9.60",
+            "close_reason": None,
+        }
+    }
+
+    class EpisodeRuntime(_TaxonomyHttpRuntime):
+        def __init__(self, *, legacy_retired: bool, catalog_dir, solutions) -> None:
+            super().__init__(
+                legacy_retired=legacy_retired,
+                catalog_dir=catalog_dir,
+                solutions=solutions,
+            )
+            self.n_leg_episodes = lambda: dict(episode_projection)  # noqa: E731
+
+    with _serve(
+        EpisodeRuntime(
+            legacy_retired=True, catalog_dir=tmp_path, solutions=[solution]
+        )
+    ) as base:
+        status, state = _get_state(base)
+
+    assert status == 200
+    row = state["opportunities"][0]
+    episode = row["episode"]
+    assert episode["opportunity_episode_id"] == "e" * 32
+    assert episode["episode_lineage_id"] == "lineage-1"
+    assert episode["status"] == "ONGOING"
+    assert episode["opened_at"] == "2026-09-01T09:23:00+00:00"
+    assert episode["duration_seconds"] == 2220
+    assert episode["would_submit_ready_seconds"] == 720
+    assert episode["best_guaranteed_profit"] == "9.60"
+    assert episode["close_reason"] is None

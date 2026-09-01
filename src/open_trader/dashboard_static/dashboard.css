@@ -6330,6 +6330,13 @@ button { cursor: pointer; }
 .pm-pill.action { background: #e8f4ed; border-color: #b9dac6; color: #21623f; }
 .pm-pill.watch { background: #fff4df; border-color: #e5c98f; color: #704915; }
 .pm-pill.episode { border-style: dashed; color: var(--muted); font-weight: 700; }
+.pm-pill.episode.live { align-items: center; background: #f6ede2; border-color: #d9bfa4; border-style: solid; color: var(--accent); font-weight: 800; gap: 6px; }
+.pm-pill.episode.live .dot { background: var(--accent); border-radius: 50%; display: inline-block; height: 7px; width: 7px; }
+.pm-metric .pm-metric-label { align-items: center; display: flex; gap: 6px; }
+.pm-metric .pm-metric-hint { align-items: center; border: 1px solid var(--line); border-radius: 50%; color: var(--muted); cursor: help; display: inline-flex; font-size: 10px; font-weight: 800; height: 14px; justify-content: center; position: relative; width: 14px; }
+.pm-metric .pm-metric-hint:hover, .pm-metric .pm-metric-hint:focus-visible { border-color: var(--accent); color: var(--accent); }
+.pm-metric .pm-metric-tip { background: var(--primary); border-radius: 8px; box-shadow: var(--shadow); color: var(--on-primary); display: none; font-size: 12px; font-weight: 500; left: 0; line-height: 1.6; max-width: 300px; padding: 10px 12px; position: absolute; top: auto; bottom: calc(100% + 8px); width: max-content; z-index: 40; }
+.pm-metric .pm-metric-hint:hover .pm-metric-tip, .pm-metric .pm-metric-hint:focus-visible .pm-metric-tip { display: block; }
 .pm-event-title { font-weight: 750; line-height: 1.35; min-width: 0; }
 .pm-event-title .pm-title-zh { font-weight: 800; }
 .pm-event-title .pm-title-en { color: var(--muted); font-size: 12px; margin-top: 3px; }

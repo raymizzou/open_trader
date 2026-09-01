@@ -17380,6 +17380,7 @@ def test_projection_rejects_corrupt_long_term_benchmark_without_losing_simulatio
 def test_projection_marks_current_month_benchmark_failure_with_prior_snapshot(
     tmp_path: Path,
 ) -> None:
+    now = datetime(2026, 8, 9, tzinfo=UTC)
     write_projection_metric_history(
         tmp_path, "US", discipline_days=4, actual_days=0, benchmark_days=4
     )
@@ -17388,11 +17389,12 @@ def test_projection_marks_current_month_benchmark_failure_with_prior_snapshot(
         tmp_path,
         "US",
         FiveYearQuote(),
-        now=datetime(2026, 8, 9, tzinfo=UTC),
+        now=now,
         process_git_sha="snapshot-sha",
     )
+    month = now.astimezone(trend_review.MARKET_TIMEZONES["US"]).strftime("%Y-%m")
     attempt_path = trend_review._long_term_benchmark_attempt_path(
-        tmp_path, "US", "2026-08"
+        tmp_path, "US", month
     )
     attempt_path.parent.mkdir(parents=True, exist_ok=True)
     attempt_path.write_text(
@@ -17400,7 +17402,7 @@ def test_projection_marks_current_month_benchmark_failure_with_prior_snapshot(
             "schema_version": "open_trader.trend_review.long_term_benchmark.attempt.v1",
             "status": "failed",
             "market": "US",
-            "month": "2026-08",
+            "month": month,
             "attempt_count": 1,
             "attempted_at": "2026-08-10T01:00:00+08:00",
             "process_git_sha": "failed-sha",
@@ -17409,7 +17411,7 @@ def test_projection_marks_current_month_benchmark_failure_with_prior_snapshot(
         encoding="utf-8",
     )
 
-    projection = trend_review.build_trend_review_projection(tmp_path, "US")
+    projection = trend_review.build_trend_review_projection(tmp_path, "US", now=now)
 
     refresh = projection["benchmark_refresh"]
     assert refresh["status"] == "failed"
@@ -17427,6 +17429,7 @@ def test_projection_marks_current_month_benchmark_failure_with_prior_snapshot(
 def test_projection_clears_stale_failure_after_same_month_success(
     tmp_path: Path,
 ) -> None:
+    now = datetime(2026, 8, 9, tzinfo=UTC)
     write_projection_metric_history(
         tmp_path, "US", discipline_days=4, actual_days=0, benchmark_days=4
     )
@@ -17435,17 +17438,18 @@ def test_projection_clears_stale_failure_after_same_month_success(
         tmp_path,
         "US",
         FiveYearQuote(),
-        now=datetime(2026, 8, 9, tzinfo=UTC),
+        now=now,
         process_git_sha="snapshot-sha",
     )
+    month = now.astimezone(trend_review.MARKET_TIMEZONES["US"]).strftime("%Y-%m")
     attempt_path = trend_review._long_term_benchmark_attempt_path(
-        tmp_path, "US", "2026-08"
+        tmp_path, "US", month
     )
     attempt_path.parent.mkdir(parents=True, exist_ok=True)
     attempt_path.write_text(
         json.dumps({
             "schema_version": "open_trader.trend_review.long_term_benchmark.attempt.v1",
-            "status": "failed", "market": "US", "month": "2026-08",
+            "status": "failed", "market": "US", "month": month,
             "attempt_count": 1, "attempted_at": "2026-08-08T01:00:00+08:00",
             "process_git_sha": "stale-failed-sha", "reason": "旧失败",
             "refresh": {"force": False, "actor": None, "reason": None},
@@ -17453,7 +17457,7 @@ def test_projection_clears_stale_failure_after_same_month_success(
         encoding="utf-8",
     )
 
-    projection = trend_review.build_trend_review_projection(tmp_path, "US")
+    projection = trend_review.build_trend_review_projection(tmp_path, "US", now=now)
 
     assert projection["benchmark_refresh"]["status"] == "available"
 

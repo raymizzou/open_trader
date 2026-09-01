@@ -3887,18 +3887,25 @@ console.log(JSON.stringify({
     assert "VENUE_METADATA" in rendered["ready"]
     assert "2 腿" in rendered["ready"]
     assert "跨所 · 同事件" in rendered["ready"]
-    for label in ("保证最低利润", "1% 净边际", "15% 年化", "30 天资本释放", "极端风险", "order_ready"):
+    # Issue #106 B1/B2/B3: plain-language metric labels with threshold small
+    # text; the 极端风险 and order_ready tiles are gone.
+    for label in ("保证最低利润", "净边际", "年化收益", "资本释放"):
         assert label in rendered["ready"]
+    assert "极端风险" not in rendered["ready"]
+    assert "门槛 ≥1%" in rendered["ready"]
+    assert "门槛 ≥15%" in rendered["ready"]
+    assert "上限 30 天" in rendered["ready"]
     assert "+$8.40" in rendered["ready"]
     assert "24.5%" in rendered["ready"]
     assert "28.4%" in rendered["ready"]
     assert "12 天" in rendered["ready"]
-    assert "−$0.80" in rendered["ready"] or "-$0.80" in rendered["ready"]
     assert "人工确认下单" in rendered["ready"]
     assert 'data-action="participate"' in rendered["ready"]
     assert "第 1 腿 · Predict.fun · BUY YES" in rendered["ready"]
     assert "第 2 腿 · Polymarket · BUY NO" in rendered["ready"]
     assert "人工确认下单" not in rendered["blocked"]
+    # Issue #106 B3: order_ready lives in the unified action line.
+    assert "order_ready 否" in rendered["blocked"]
     assert "余额不足" in rendered["blocked"]
     assert "当前无更多合格机会" in rendered["empty"]
 
@@ -4002,8 +4009,11 @@ console.log(JSON.stringify({
     assert "同所 · 同事件" in card
     assert "2 腿" in card
     assert "资格 v1" in card
-    assert "Episode —" in card
-    assert "pm-pill episode" in card
+    # Issue #106: rows without an episode render no badge and no sub-line
+    # (backward compatible), instead of the old placeholder pill.
+    assert "pm-pill episode" not in card
+    assert "Episode" not in card
+    assert "pm-metric-hint" in card
     assert "QUALIFIED_VERIFIED" in card
     assert "PARTIAL_FILL_SAFE" in card
     assert "当前范围只读 · 不可下单" in card
@@ -4012,6 +4022,140 @@ console.log(JSON.stringify({
     assert "Polymarket" in plan
     assert "2026-12-31" in plan
     assert 'class="pm-pill venue"' in plan
+
+
+def test_t18_episode_badge_and_metric_small_text_render() -> None:
+    output = run_dashboard_js(r'''
+const row = {
+  opportunity_id: "nleg:component:a:b",
+  title: "Bitcoin 在 12 月 31 日前高于 $120,000？",
+  engine_owner: "N_LEG",
+  strategy_type: "N_LEG",
+  market_type: "n_leg",
+  relation_type: "IMPLIES",
+  discovery_source: "LLM",
+  leg_count: 2,
+  scope_label: "同所 · 同事件",
+  qualification_policy_version: "v1",
+  episode: {
+    opportunity_episode_id: "7f3a2c1bd6e5f4091827364554aabbcc",
+    episode_lineage_id: "lineage-1",
+    status: "ONGOING",
+    opened_at: "2026-09-01T09:23:00Z",
+    duration_seconds: 2220,
+    would_submit_ready_seconds: 720,
+    best_guaranteed_profit: "9.60",
+    close_reason: null,
+  },
+  profit: "8.40",
+  annualized_yield: "0.284",
+  remaining_days: "12",
+  legs: [],
+  qualification: {status: "QUALIFIED_VERIFIED", order_ready: false, checks: []},
+};
+const withoutEpisode = {...row, episode: {
+  opportunity_episode_id: null, episode_lineage_id: null, status: null,
+  opened_at: null, duration_seconds: null, would_submit_ready_seconds: null,
+  best_guaranteed_profit: null, close_reason: null,
+}};
+console.log(JSON.stringify({
+  card: predictionUnifiedOpportunityCard(row, "MANUAL", true),
+  plain: predictionUnifiedOpportunityCard(withoutEpisode, "MANUAL", true),
+}));
+''')
+    rendered = json.loads(output)
+    card = rendered["card"]
+    plain = rendered["plain"]
+
+    # Issue #106 episode UI: first pill in the tag row, live dot, short id,
+    # status and duration text.
+    assert "Episode #7f3a2c1b · 进行中 · 37 分钟" in card
+    assert card.index("pm-pill episode live") < card.index("pm-pill blue")
+    assert '<span class="dot"></span>' in card
+    # First metric tile carries the episode best / would-submit sub-line.
+    assert "Episode 最佳 $9.60 · would-submit 累计 12 分钟" in card
+    # Rows without an episode stay backward compatible: no badge, no small
+    # text.
+    assert "pm-pill episode" not in plain
+    assert "Episode 最佳" not in plain
+
+
+def test_t19_card_six_fixes_render() -> None:
+    output = run_dashboard_js(r'''
+const row = {
+  opportunity_id: "nleg:component:a:b",
+  title: "Bitcoin above $120k? × Bitcoin close above $120k?",
+  engine_owner: "N_LEG",
+  strategy_type: "N_LEG",
+  market_type: "n_leg",
+  relation_type: "IMPLIES",
+  discovery_source: "LLM",
+  leg_count: 2,
+  scope_label: "同所 · 同事件",
+  qualification_policy_version: "v1",
+  profit: "8.40",
+  annualized_yield: "0.284",
+  remaining_days: "45",
+  legs: [],
+  qualification: {
+    status: "QUALIFIED_FEASIBLE",
+    order_ready: false,
+    checks: [
+      {key: "net_margin", value: "0.2121212121212121212121212121", passed: true, threshold: "0.012"},
+      {key: "annualized_return", value: "0.2", passed: true, threshold: "0.15"},
+      {key: "capital_release", value: "45", passed: true, threshold: 45},
+    ],
+  },
+};
+console.log(JSON.stringify({card: predictionUnifiedOpportunityCard(row, "MANUAL", true)}));
+''')
+    card = json.loads(output)["card"]
+
+    # B1: plain-language labels with thresholds read from checks.threshold.
+    assert "净边际" in card
+    # Issue #106 fix3: the net margin tile reads the N_LEG `net_margin` check
+    # (ratio string, same dimension as legacy `net_edge`): 0.212121… → 21.2%.
+    assert "21.2%" in card
+    assert "门槛 ≥1.2%" in card
+    assert "年化收益" in card
+    assert "门槛 ≥15%" in card
+    assert "资本释放" in card
+    assert "上限 45 天" in card
+    # B2: the 极端风险 tile is gone.
+    assert "极端风险" not in card
+    # B3: order_ready moved into the unified bottom action line.
+    assert "order_ready 否" in card
+    # B4: the legacy 410 notice is gone.
+    assert "410" not in card
+    assert "旧系统人工确认入口" not in card
+    # B6: every metric label carries its "!" hover explanation.
+    assert card.count("pm-metric-hint") == 4
+    assert "保证利润 ÷ 总赔付额" in card
+    # B5 front side: the backend title (never empty) is what renders.
+    assert "Bitcoin above $120k? × Bitcoin close above $120k?" in card
+
+
+def test_dashboard_metric_hint_tooltip_rules_scope_under_pm_metric() -> None:
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    # The hint/tip selectors must be scoped under .pm-metric (0,2,0) so the
+    # generic `.pm-metric span` rule (0,1,1) cannot override them: the tip
+    # stays display:none until hover/focus and keeps its on-primary colors,
+    # and the hint keeps its 14px inline-flex badge shape.
+    assert ".pm-metric .pm-metric-hint {" in css
+    assert ".pm-metric .pm-metric-tip {" in css
+    assert ".pm-metric .pm-metric-hint:hover .pm-metric-tip" in css
+    assert ".pm-metric .pm-metric-hint:focus-visible .pm-metric-tip" in css
+    tip = css.split(".pm-metric .pm-metric-tip {", 1)[1].split("}", 1)[0]
+    assert "display: none;" in tip
+    assert "color: var(--on-primary);" in tip
+    hint = css.split(".pm-metric .pm-metric-hint {", 1)[1].split("}", 1)[0]
+    assert "display: inline-flex;" in hint
+    assert "font-size: 10px;" in hint
+    # No unscoped hint/tip rule remains for `.pm-metric span` to beat.
+    assert not any(
+        line.startswith((".pm-metric-hint", ".pm-metric-tip"))
+        for line in css.splitlines()
+    )
 
 
 def test_prediction_unified_page_renders_mock_blocks_and_filter_state() -> None:
