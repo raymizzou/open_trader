@@ -3,6 +3,7 @@
 WORKTREE_ROOT := $(CURDIR)
 REPOSITORY_ROOT := $(shell git rev-parse --path-format=absolute --git-common-dir)/..
 PYTHON_BIN ?= $(if $(OPEN_TRADER_PYTHON),$(OPEN_TRADER_PYTHON),$(REPOSITORY_ROOT)/.venv/bin/python)
+PLAYWRIGHT_NODE_PATH ?= $(REPOSITORY_ROOT)/node_modules
 
 DOCKER ?= docker
 DOCKERFILE ?= Dockerfile.dev
@@ -46,7 +47,7 @@ test-pressure:
 
 browser-test:
 	PYTHONSAFEPATH=1 PYTHONPATH="$(WORKTREE_ROOT):$(WORKTREE_ROOT)/src" "$(PYTHON_BIN)" -m pytest -q -m browser
-	"$(REPOSITORY_ROOT)/node_modules/.bin/playwright" test tests/e2e/dashboard-warm-ledger.spec.ts tests/e2e/kelly-lab.spec.ts tests/e2e/prediction-market.spec.ts --config=playwright.config.ts --project=chromium
+	NODE_PATH="$(PLAYWRIGHT_NODE_PATH)" "$(REPOSITORY_ROOT)/node_modules/.bin/playwright" test tests/e2e/dashboard-warm-ledger.spec.ts tests/e2e/kelly-lab.spec.ts tests/e2e/prediction-market.spec.ts --config=playwright.config.ts --project=chromium
 
 prediction-solver-envs:
 	PYTHON_BIN="$(PYTHON_BIN)" ./scripts/build_prediction_solver_envs.sh
@@ -86,7 +87,7 @@ host-readiness:
 	check "prediction wallet" "$(PYTHON_BIN)" -m open_trader prediction-arb wallet status --config "$(PREDICTION_CONFIG)"; \
 	if nleg_replay_passes >/dev/null 2>&1; then echo "prediction n-leg replay validation: PASS"; else echo "prediction n-leg replay validation: BLOCKED"; status=1; fi; \
 	check "Python Playwright Chrome" "$(PYTHON_BIN)" -c 'from playwright.sync_api import sync_playwright; p = sync_playwright().start(); browser = p.chromium.launch(channel="chrome", headless=True); browser.close(); p.stop()'; \
-	if [ -x "$(REPOSITORY_ROOT)/node_modules/.bin/playwright" ] && (cd "$(WORKTREE_ROOT)" && node -e 'const {chromium}=require("playwright"); (async()=>{const browser=await chromium.launch({headless:true}); await browser.close();})().catch(()=>process.exit(1));') >/dev/null 2>&1; then echo "Playwright Chromium: PASS"; else echo "Playwright Chromium: BLOCKED"; status=1; fi; \
+	if [ -x "$(REPOSITORY_ROOT)/node_modules/.bin/playwright" ] && (cd "$(WORKTREE_ROOT)" && NODE_PATH="$(PLAYWRIGHT_NODE_PATH)" node -e 'const {chromium}=require("playwright"); (async()=>{const browser=await chromium.launch({headless:true}); await browser.close();})().catch(()=>process.exit(1));' && NODE_PATH="$(PLAYWRIGHT_NODE_PATH)" OPEN_TRADER_SMOKE_URL="$(DASHBOARD_URL)" "$(REPOSITORY_ROOT)/node_modules/.bin/playwright" test tests/e2e/production-smoke.spec.ts --config=playwright.config.ts --project=chromium --list) >/dev/null 2>&1; then echo "Playwright Chromium: PASS"; else echo "Playwright Chromium: BLOCKED"; status=1; fi; \
 	check "loopback listeners" sh -c 'command -v lsof >/dev/null && for port in 8766 8767 8768 8769; do lsof -nP -iTCP:$$port -sTCP:LISTEN >/dev/null; done'; \
 	check "storage" df -P "$(REPOSITORY_ROOT)"; \
 	check "Futu connectivity" "$(PYTHON_BIN)" -c 'import socket; s = socket.create_connection(("127.0.0.1", 11111), 2); s.close()'; \
@@ -133,7 +134,7 @@ production-smoke:
 	if printf '%s' "$$state_payload" | "$(PYTHON_BIN)" -c 'import json,sys; p=json.load(sys.stdin); n_leg=p.get("n_leg") or {}; scopes=n_leg.get("execution_scopes") or {}; scope=scopes.get("SAME_EVENT_SAME_VENUE") or {}; rows=p.get("opportunities") or []; ok=(n_leg.get("contract_generation")==2 and n_leg.get("mode")=="MANUAL" and scope.get("capability")=="OBSERVE_ONLY" and all(row.get("engine_owner")=="N_LEG" for row in rows if isinstance(row,dict))); raise SystemExit(0 if ok else 1)' >/dev/null 2>&1; then echo "n-leg state: PASS"; else echo "n-leg state: BLOCKED"; status=1; fi; \
 	for log in "$$expected_root/logs/frontend_gateway/launchd.err.log" "$$expected_root/logs/legacy_dashboard/launchd.err.log" "$$expected_root/logs/account_api/launchd.err.log" "$$expected_runtime_root/logs/prediction_service/launchd.err.log"; do if [ ! -f "$$log" ]; then echo "log missing: $$log"; status=1; elif [ ! "$$log" -nt "$$baseline" ]; then echo "log stale: $$log"; status=1; elif tail -n 200 "$$log" | rg -qi 'traceback|fatal|exception|error'; then echo "log error: $$log"; status=1; else echo "log clean: $$log"; fi; done; \
 	if [ $$status -eq 0 ]; then \
-		if (cd "$$expected_root" && OPEN_TRADER_SMOKE_URL="$(DASHBOARD_URL)" "$(REPOSITORY_ROOT)/node_modules/.bin/playwright" test tests/e2e/production-smoke.spec.ts --config=playwright.config.ts --project=chromium); then echo "browser smoke: PASS"; else echo "browser smoke: BLOCKED"; status=1; fi; \
+		if (cd "$$expected_root" && NODE_PATH="$(PLAYWRIGHT_NODE_PATH)" OPEN_TRADER_SMOKE_URL="$(DASHBOARD_URL)" "$(REPOSITORY_ROOT)/node_modules/.bin/playwright" test tests/e2e/production-smoke.spec.ts --config=playwright.config.ts --project=chromium); then echo "browser smoke: PASS"; else echo "browser smoke: BLOCKED"; status=1; fi; \
 	fi; \
 	post_browser_state="$$(curl -fsS --max-time 10 "http://127.0.0.1:8769/api/prediction-arbitrage/state" 2>/dev/null || true)"; \
 	if submission_baseline_matches "$$post_browser_state"; then echo "submission baseline: PASS"; else echo "submission baseline: BLOCKED"; status=1; fi; \
