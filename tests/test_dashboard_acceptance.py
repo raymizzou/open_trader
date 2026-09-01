@@ -1164,13 +1164,23 @@ def test_production_smoke_binds_checks_to_release_and_runtime_roots() -> None:
         for name in ("frontend_gateway", "legacy_dashboard", "account_api")
     )
     runtime_log = '"$$expected_runtime_root/logs/prediction_service/launchd.err.log"'
+    browser_smoke_prefixes = (
+        'if (cd "$$expected_root" && NODE_PATH="$(PLAYWRIGHT_NODE_PATH)" '
+        'OPEN_TRADER_SMOKE_URL="$(DASHBOARD_URL)" '
+        '"$(REPOSITORY_ROOT)/node_modules/.bin/playwright" '
+        'test tests/e2e/production-smoke.spec.ts',
+        'if (cd "$$expected_root" && OPEN_TRADER_SMOKE_URL="$(DASHBOARD_URL)" '
+        'NODE_PATH="$(PLAYWRIGHT_NODE_PATH)" '
+        '"$(REPOSITORY_ROOT)/node_modules/.bin/playwright" '
+        'test tests/e2e/production-smoke.spec.ts',
+    )
     required = (
         "expected_runtime_root='$(EXPECTED_RUNTIME_ROOT)';" in normalized,
         'case "$$expected_runtime_root" in /*) ;; *)' in normalized,
         'if [ ! -d "$$expected_runtime_root" ]' in normalized,
         'expected_runtime_root="$$(cd "$$expected_runtime_root" && pwd -P)"' in normalized,
         'if (cd "$$expected_root" && PYTHONSAFEPATH=1 PYTHONPATH="$$expected_root:$$expected_root/src"' in normalized,
-        'if (cd "$$expected_root" && OPEN_TRADER_SMOKE_URL=' in normalized,
+        any(prefix in normalized for prefix in browser_smoke_prefixes),
         all(log in normalized for log in release_logs),
         runtime_log in normalized,
         '"$$expected_root/logs/prediction_service/launchd.err.log"' not in normalized,
