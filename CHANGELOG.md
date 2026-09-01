@@ -6,6 +6,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-09-01
 
 - #106 最小机会 Episode + 统一卡片修正:机会从「每快照一行」升级为生命周期记录 —— 首个合格快照开启 Episode(表 `opportunity_episodes`/`opportunity_episode_proofs`,共享 SQLite,expand-only),关闭须自第一个被接受负证明起连续 5 分钟新鲜 NO_QUALIFIED_OPPORTUNITY(`episode_rearm_gap_seconds` 首个消费者);再次合格/UNKNOWN/绑定不匹配/超预算/陈旧行情/generation·资格版本变化/重启一律清空计时、不计「无套利」;组件下架立即关档(独立死因 COMPONENT_RETIRED);would-submit-ready 转换累计(停机不计);重启 `load_open()` 恢复;统一列表行内显示 episode 徽标(标签行首位)与「保证最低利润」tile 小字。卡片六项修正(用户评审):指标白话标签+门槛小字(读 checks.threshold)、净边际取值键修正(N_LEG 行读 `net_margin`,legacy `net_edge` 兜底,修 #105 遗留恒 `-`)、删无数据源的「极端风险」、order_ready 并入底部行动行、删 410 过渡提示、行构建器补 title(catalog 市场问题文本,身份串兜底)、「!」悬停指标说明(纯 CSS)。OBSERVE_ONLY,无下单路径。验证:新增 `test_prediction_n_leg_episodes.py` 13 用例红→绿;live_resolver 17、read_model 24、legacy_retirement 25、dashboard_web 417 全绿;全量 Docker `7764 passed, 5 skipped, 7 deselected`,当时唯一失败为既有无关时间炸弹 `test_trend_review.py::test_projection_marks_current_month_benchmark_failure_with_prior_snapshot`(硬编码 2026-08,当日 09 月触发;经用户批准随本票一并修复)。修复:trend_review 投影构建器贯通时钟注入(`build_trend_review_projection`/`_read_current_long_term_benchmark_failure` 加 keyword-only `now`,默认真实时钟、生产行为不变;月份统一转市场时区推导),两个时间炸弹测试改为注入时钟+推导月份,50 处调用逐一排查无其它同款;全量 Docker 升为 7770 passed / 0 failed。
+- Dashboard 富途账户嵌入式趋势报告的 Kelly 观察分页现已复用真实账户视图事件入口；375px 全页回归覆盖下一页/上一页、12 个样本行和无横向溢出，独立趋势报告分页回归保持通过。
 
 ## 2026-08-31
 

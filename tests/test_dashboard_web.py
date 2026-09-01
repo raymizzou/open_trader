@@ -16324,6 +16324,191 @@ console.log(JSON.stringify({report}));
         browser.close()
 
 
+@pytest.mark.browser
+def test_dashboard_embedded_kelly_observation_paginates_through_account_view_at_375px() -> None:
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    js = (STATIC_DIR / "dashboard.js").read_text(encoding="utf-8")
+    rounds = [
+        {
+            "round_id": "round-01", "symbol": "ROUND-01",
+            "opened_at": "2026-08-01T09:00:00-04:00",
+            "closed_at": "2026-08-01T10:00:00-04:00",
+            "opening_strategy_version": "v4", "net_return": "-0.05", "holding_days": 0,
+        },
+        {
+            "round_id": "round-02", "symbol": "ROUND-02",
+            "opened_at": "2026-08-02T09:00:00-04:00",
+            "closed_at": "2026-08-02T10:00:00-04:00",
+            "opening_strategy_version": "v4", "net_return": "0.1", "holding_days": 0,
+        },
+        {
+            "round_id": "round-03", "symbol": "ROUND-03",
+            "opened_at": "2026-08-03T09:00:00-04:00",
+            "closed_at": "2026-08-03T10:00:00-04:00",
+            "opening_strategy_version": "v4", "net_return": "0.1", "holding_days": 0,
+        },
+        {
+            "round_id": "round-04", "symbol": "ROUND-04",
+            "opened_at": "2026-08-04T09:00:00-04:00",
+            "closed_at": "2026-08-04T10:00:00-04:00",
+            "opening_strategy_version": "v4", "net_return": "-0.05", "holding_days": 0,
+        },
+        {
+            "round_id": "round-05", "symbol": "ROUND-05",
+            "opened_at": "2026-08-05T09:00:00-04:00",
+            "closed_at": "2026-08-05T10:00:00-04:00",
+            "opening_strategy_version": "v4", "net_return": "0.1", "holding_days": 0,
+        },
+        {
+            "round_id": "round-06", "symbol": "ROUND-06",
+            "opened_at": "2026-08-06T09:00:00-04:00",
+            "closed_at": "2026-08-06T10:00:00-04:00",
+            "opening_strategy_version": "v4", "net_return": "0.1", "holding_days": 0,
+        },
+        {
+            "round_id": "round-07", "symbol": "ROUND-07",
+            "opened_at": "2026-08-07T09:00:00-04:00",
+            "closed_at": "2026-08-07T10:00:00-04:00",
+            "opening_strategy_version": "v4", "net_return": "-0.05", "holding_days": 0,
+        },
+        {
+            "round_id": "round-08", "symbol": "ROUND-08",
+            "opened_at": "2026-08-08T09:00:00-04:00",
+            "closed_at": "2026-08-08T10:00:00-04:00",
+            "opening_strategy_version": "v4", "net_return": "0.1", "holding_days": 0,
+        },
+        {
+            "round_id": "round-09", "symbol": "ROUND-09",
+            "opened_at": "2026-08-09T09:00:00-04:00",
+            "closed_at": "2026-08-09T10:00:00-04:00",
+            "opening_strategy_version": "v4", "net_return": "0.1", "holding_days": 0,
+        },
+        {
+            "round_id": "round-10", "symbol": "ROUND-10",
+            "opened_at": "2026-08-10T09:00:00-04:00",
+            "closed_at": "2026-08-10T10:00:00-04:00",
+            "opening_strategy_version": "v4", "net_return": "-0.05", "holding_days": 0,
+        },
+        {
+            "round_id": "round-11", "symbol": "ROUND-11",
+            "opened_at": "2026-08-11T09:00:00-04:00",
+            "closed_at": "2026-08-11T10:00:00-04:00",
+            "opening_strategy_version": "v4", "net_return": "0.1", "holding_days": 0,
+        },
+        {
+            "round_id": "round-12", "symbol": "ROUND-12",
+            "opened_at": "2026-08-12T09:00:00-04:00",
+            "closed_at": "2026-08-12T10:00:00-04:00",
+            "opening_strategy_version": "v4", "net_return": "0.1", "holding_days": 0,
+        },
+    ]
+    report = {
+        "available": True, "market": "US", "broker": "futu", "broker_label": "富途", "market_label": "美股",
+        "report_date": "2026-08-12", "data_date": "2026-08-11", "generated_at": "2026-08-12T20:00:00+08:00",
+        "account_status": "已更新", "strategy_version": "v14", "allocation": {"version": 2}, "counts": {},
+        "sell_actions": [], "buy_actions": [], "hold_actions": [], "review_actions": [], "risk_skips": [], "audit": {},
+        "kelly_observation": {
+            "available": True, "status": "available", "target_market": "US",
+            "target_strategy_id": "trend_animals_warm_to_hot/US/v14", "target_strategy_version": "v14",
+            "eligible_sample_count": 12, "selected_sample_count": 12, "minimum_sample_count": 30,
+            "selected_round_ids": [round["round_id"] for round in rounds], "compatible_opening_versions": {"v4": 12},
+            "exact_current_version_count": 0,
+            "metrics": {
+                "win_rate": "0.6666666666666666666666666666667", "payoff_ratio": "2", "payoff_ratio_status": "available",
+                "average_net_return": "0.05", "shadow_full_kelly": "1", "shadow_quarter_kelly": "0.25",
+                "strategy_cap": "0.04", "suggested_position": "0.04",
+            },
+            "kelly_enabled": False, "rounds": rounds,
+        },
+    }
+    broker_summaries = [
+        {
+            "broker": broker, "portfolio_value_hkd": "1000", "holding_value_hkd": "700",
+            "cash_like_value_hkd": "300", "holding_count": "0",
+        }
+        for broker in ("futu", "tiger", "phillips", "eastmoney")
+    ]
+    dashboard = {
+        "summary": {"portfolio_value_hkd": "4000", "holding_value_hkd": "2800", "cash_like_value_hkd": "1200"},
+        "broker_summaries": broker_summaries, "cash_rows": [], "holdings": [], "source_statuses": [], "poll_seconds": 0,
+        "trend_reports": {"futu": report}, "trend_reviews": {},
+    }
+    account_snapshot = {
+        "status": "healthy", "stale": False, "summary": dashboard["summary"],
+        "broker_summaries": broker_summaries, "positions": [], "cash_balances": [],
+        "sources": {"account": {"brokers": {
+            broker: {"status": "ok", "display": "同步正常"}
+            for broker in ("futu", "tiger", "phillips", "eastmoney")
+        }}},
+    }
+    bootstrap = f'''<script>
+const dashboardPayload={json.dumps(dashboard, ensure_ascii=False)};
+const accountSnapshotPayload={json.dumps(account_snapshot, ensure_ascii=False)};
+window.fetch=async (input)=>{{
+  const url=String(input);
+  const payload=url==="/api/dashboard"?dashboardPayload:accountSnapshotPayload;
+  return {{ok:true,status:200,headers:{{get:()=>null}},json:async()=>structuredClone(payload)}};
+}};
+</script>'''
+    page_html = html.replace(
+        '<link rel="stylesheet" href="/static/dashboard.css">', f"<style>{css}</style>",
+    ).replace(
+        '<script src="/static/dashboard.js" defer></script>', f"{bootstrap}<script>{js}</script>",
+    )
+    errors: list[str] = []
+    expected_first_page_ids = [
+        "round-01", "round-02", "round-03", "round-04", "round-05",
+        "round-06", "round-07", "round-08", "round-09", "round-10",
+    ]
+    expected_second_page_ids = ["round-11", "round-12"]
+    with playwright_api.sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(channel="chrome", headless=True)
+        except Exception as exc:  # pragma: no cover - local browser availability
+            pytest.skip(f"Chrome is required for dashboard DOM checks: {exc}")
+        page = browser.new_page(viewport={"width": 375, "height": 844})
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.route(
+            "http://dashboard.test/",
+            lambda route: route.fulfill(status=200, content_type="text/html", body=page_html),
+        )
+        page.goto("http://dashboard.test/", wait_until="load")
+        page.locator("#account-tab-futu").wait_for()
+        page.locator("#account-tab-futu").click()
+        page.locator("#account-futu-view-report").click()
+        observation = page.locator("#account-futu .trend-kelly-observation")
+        observation.wait_for()
+
+        assert observation.locator("[data-kelly-observation-page]").inner_text() == "第 1 / 2 页"
+        assert observation.locator("[data-kelly-observation-previous]").is_disabled()
+        assert not observation.locator("[data-kelly-observation-next]").is_disabled()
+        assert observation.locator(".trend-kelly-observation-row").evaluate_all(
+            "rows => rows.map(row => row.dataset.roundId)"
+        ) == expected_first_page_ids
+
+        observation.locator("[data-kelly-observation-next]").click()
+        assert observation.locator("[data-kelly-observation-page]").inner_text() == "第 2 / 2 页"
+        assert observation.locator(".trend-kelly-observation-row").count() == 2
+        assert not observation.locator("[data-kelly-observation-previous]").is_disabled()
+        assert observation.locator("[data-kelly-observation-next]").is_disabled()
+        assert observation.locator(".trend-kelly-observation-row").evaluate_all(
+            "rows => rows.map(row => row.dataset.roundId)"
+        ) == expected_second_page_ids
+
+        observation.locator("[data-kelly-observation-previous]").click()
+        assert observation.locator("[data-kelly-observation-page]").inner_text() == "第 1 / 2 页"
+        assert observation.locator(".trend-kelly-observation-row").evaluate_all(
+            "rows => rows.map(row => row.dataset.roundId)"
+        ) == expected_first_page_ids
+        assert errors == []
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+        )
+        browser.close()
+
+
 def test_dashboard_kelly_observation_unavailable_state_hides_metrics_and_table() -> None:
     output = run_dashboard_js(r'''
 const html = renderTrendReportWorkspace({

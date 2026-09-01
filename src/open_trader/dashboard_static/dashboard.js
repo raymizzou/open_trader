@@ -303,6 +303,7 @@ function bindEvents() {
   elements["account-holdings"].addEventListener("click", (event) => {
     if (handleTrendOptionDialog(event)) return;
     if (handleTrendHoldingTab(event)) return;
+    if (handleTrendKellyObservationPagination(event)) return;
     const industryMetric = event.target.closest?.("[data-trend-industry-help]");
     if (industryMetric) {
       if (industryMetric.dataset.trendIndustryHelpOpen === "pinned") {
