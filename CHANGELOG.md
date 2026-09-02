@@ -6,6 +6,7 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-09-02
 
 - #113 服务实际加载代码路径可见可验:四服务 healthz 及 account worker 发布新增 `code_root`/`worker_code_root`(取自被 import 的 open_trader 包路径,非 cwd);production-smoke 的 `check_health` 断言其位于 EXPECTED_ROOT 之下(收口 2026-09-02 #110 部署事故:plist 漏改 PYTHONPATH/--release-manifest/--static-dir 致服务跑旧代码而冒烟全绿,此为收口)。新增 `ops/release-deployment.md` 五步发布清单,launchd plist 只许经 install 脚本整体重写,禁止手工按下标改。验证:聚焦门 395+94+527 passed;全量 Docker `make test` 7804 passed、5 skipped、8 deselected(exit 0)。
+- 发布清单修正为先捕获部署前提交基线、再执行 install，并为全部安装示例显式指定共享运行时 Python 与 production/stack 模式。验证：Markdown/diff inspection + `git diff --check`。
 - Candidate 进程测试（仅测试）现将 spawn 就绪与业务 deadline 分离，并使用 5 秒 worker 成功预算；验证：聚焦 Docker 68 passed/36.27s，0.25 CPU worker 文件 66 passed/126.79s、Trend exactly-once 2 passed/78.18s。
 
 ## 2026-09-01

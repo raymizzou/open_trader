@@ -36,48 +36,10 @@ git rev-parse HEAD                              # 必须等于 <SHA>
 
 发布目录一经建好即为不可变:后续所有步骤只读它,不再有任何写操作。
 
-### 第 2 步:按序运行 install 脚本,把五个服务指到新发布
+### 第 2 步:捕获部署前基线 JSON
 
-每个脚本先 `--dry-run` 核对输出,确认无误后去掉 `--dry-run` 正式执行。
-以脚本实际参数为准(先读脚本 usage);不要凭记忆抄参数。
-
-1. Prediction Service(8769):
-
-   ```bash
-   scripts/install_prediction_service_launchd.sh --dry-run \
-     --repo-root <新发布> \
-     --runtime-root <运行时根> \
-     --release-manifest <新发布>/ops/prediction-service-release.json \
-     --expected-sha <SHA>
-   scripts/install_prediction_service_launchd.sh \
-     --repo-root <新发布> \
-     --runtime-root <运行时根> \
-     --release-manifest <新发布>/ops/prediction-service-release.json \
-     --expected-sha <SHA>
-   ```
-
-2. Frontend Gateway(8766)+ Legacy Dashboard(8767)stack:
-
-   ```bash
-   scripts/install_dashboard_launchd.sh --dry-run --repo-root <新发布> --runtime-root <运行时根>
-   scripts/install_dashboard_launchd.sh --repo-root <新发布> --runtime-root <运行时根>
-   ```
-
-3. Account API(8768)与 account-sync worker:
-
-   ```bash
-   scripts/install_account_api_launchd.sh --dry-run --repo-root <新发布> --runtime-root <运行时根>
-   scripts/install_account_api_launchd.sh --repo-root <新发布> --runtime-root <运行时根>
-   scripts/install_account_sync_launchd.sh --dry-run --repo-root <新发布> --runtime-root <运行时根>
-   scripts/install_account_sync_launchd.sh --repo-root <新发布> --runtime-root <运行时根>
-   ```
-
-install 脚本会从 `<新发布>/ops/launchd/*.plist.template` 整体重写
-`~/Library/LaunchAgents` 下的 plist——这正是红线所要求的唯一改法。
-
-### 第 3 步:捕获部署前基线 JSON
-
-在部署动作(bootout/bootstrap)之前,从当前 Prediction 只读状态接口导出
+正式 install 脚本可能重启服务,因此必须先捕获基线。在部署动作(bootout/bootstrap)之前,
+从当前 Prediction 只读状态接口导出
 `current_execution`/`last_execution` 基线并妥善保存(脱敏后归档):
 
 ```bash
@@ -87,6 +49,73 @@ curl -fsS http://127.0.0.1:8769/api/prediction-arbitrage/state \
 
 第 5 步的 `PRE_DEPLOY_SUBMISSION_BASELINE` 指向该文件;冒烟会在浏览器压测前后
 各比对一次,防止发布窗口内发生计划外提交。
+
+### 第 3 步:按序运行 install 脚本,把五个服务指到新发布
+
+每个脚本先 `--dry-run` 核对输出,确认无误后去掉 `--dry-run` 正式执行。
+以脚本实际参数为准(先读脚本 usage);不要凭记忆抄参数。
+克隆出的不可变发布目录不包含自身 `.venv`,而 Prediction 与 Account API 默认是
+`shadow` 模式,不适用于本次生产流程;因此以下示例都显式指定共享运行时 Python 与所需模式。
+
+1. Prediction Service(8769):
+
+   ```bash
+   scripts/install_prediction_service_launchd.sh --dry-run \
+     --repo-root <新发布> \
+     --runtime-root <运行时根> \
+     --python <运行时根>/.venv/bin/python \
+     --mode production \
+     --release-manifest <新发布>/ops/prediction-service-release.json \
+     --expected-sha <SHA>
+   scripts/install_prediction_service_launchd.sh \
+     --repo-root <新发布> \
+     --runtime-root <运行时根> \
+     --python <运行时根>/.venv/bin/python \
+     --mode production \
+     --release-manifest <新发布>/ops/prediction-service-release.json \
+     --expected-sha <SHA>
+   ```
+
+2. Frontend Gateway(8766)+ Legacy Dashboard(8767)stack:
+
+   ```bash
+   scripts/install_dashboard_launchd.sh --dry-run \
+     --repo-root <新发布> \
+     --runtime-root <运行时根> \
+     --python <运行时根>/.venv/bin/python \
+     --mode stack
+   scripts/install_dashboard_launchd.sh \
+     --repo-root <新发布> \
+     --runtime-root <运行时根> \
+     --python <运行时根>/.venv/bin/python \
+     --mode stack
+   ```
+
+3. Account API(8768)与 account-sync worker:
+
+   ```bash
+   scripts/install_account_api_launchd.sh --dry-run \
+     --repo-root <新发布> \
+     --runtime-root <运行时根> \
+     --python <运行时根>/.venv/bin/python \
+     --mode production
+   scripts/install_account_api_launchd.sh \
+     --repo-root <新发布> \
+     --runtime-root <运行时根> \
+     --python <运行时根>/.venv/bin/python \
+     --mode production
+   scripts/install_account_sync_launchd.sh --dry-run \
+     --repo-root <新发布> \
+     --runtime-root <运行时根> \
+     --python <运行时根>/.venv/bin/python
+   scripts/install_account_sync_launchd.sh \
+     --repo-root <新发布> \
+     --runtime-root <运行时根> \
+     --python <运行时根>/.venv/bin/python
+   ```
+
+install 脚本会从 `<新发布>/ops/launchd/*.plist.template` 整体重写
+`~/Library/LaunchAgents` 下的 plist——这正是红线所要求的唯一改法。
 
 ### 第 4 步:bootout / bootstrap 五个服务
 
