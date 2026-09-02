@@ -226,6 +226,52 @@ def _service(
     )
 
 
+def test_simulated_positions_ignore_terminal_fill_reconciliation_proof(
+    tmp_path: Path,
+) -> None:
+    proof_path = (
+        tmp_path
+        / "data"
+        / "trend_review"
+        / "ledgers"
+        / "US"
+        / "actions"
+        / "2026-07-20"
+        / "proof"
+        / "terminal-fill-reconciliation.json"
+    )
+    proof_path.parent.mkdir(parents=True)
+    proof_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "open_trader.trend_review.reconciliation.v1",
+                "kind": "terminal_fill_reconciled",
+                "market": "US",
+                "date": "2026-07-20",
+                "execution_id": "execution-1",
+                "account_id": 102,
+                "futu_code": "US.TRV",
+                "side": "buy",
+                "terminal_observed_at": "2026-07-20T10:00:00-04:00",
+                "snapshot_observed_at": "2026-07-20T10:01:00-04:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    clients = FakeClientFactory(positions=[_position()])
+
+    payload = _service(tmp_path, clients).load("futu")
+
+    assert (
+        payload["available"],
+        payload["error"],
+        [
+            (row["market"], row["symbol"], row["quantity"])
+            for row in payload["positions"]
+        ],
+    ) == (True, "", [("US", "TRV", "9")])
+
+
 def test_simulated_positions_route_account_and_link_exact_filled_report(
     tmp_path: Path,
 ) -> None:

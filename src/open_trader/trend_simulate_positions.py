@@ -400,6 +400,12 @@ def _action_events(
             raise ValueError(f"action event {path} is unreadable") from None
         if not isinstance(event, Mapping):
             raise ValueError(f"action event {path} is invalid")
+        if (
+            event.get("schema_version")
+            == "open_trader.trend_review.reconciliation.v1"
+            and event.get("kind") == "terminal_fill_reconciled"
+        ):
+            continue
         event_date = str(event.get("date") or "")
         recorded_at = str(event.get("recorded_at") or "")
         symbol = event.get("symbol")
