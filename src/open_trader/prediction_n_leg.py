@@ -828,6 +828,119 @@ def _sorted_problem(problem: ArbitrageProblem) -> ArbitrageProblem:
     return replace(problem, actions=actions, terminal_state_sets=state_sets, constraint_model=ConstraintModel(relations, forbidden), qualification_constraints=tuple(sorted(problem.qualification_constraints, key=lambda item: item.constraint_id)))
 
 
+#: Per-kind USD-per-lot payouts to the canonical BUY_YES/BUY_NO pair. This is
+#: the Polymarket settlement truth: a market settling YES pays 1 USD per lot
+#: to YES tokens and 0 to NO tokens, settling NO is symmetric, VOID pays 0.
+_DIRECTIONAL_PAYOUTS: dict[TerminalKind, tuple[int, int]] = {
+    TerminalKind.NORMAL_YES: (1, 0),
+    TerminalKind.NORMAL_NO: (0, 1),
+    TerminalKind.VOID: (0, 0),
+}
+
+
+def canonicalize_directional_actions(problem: ArbitrageProblem) -> ArbitrageProblem:
+    """Normalize IMPLIES-class problems to direction-aware action identities.
+
+    A threshold IMPLIES problem compiled before issue #111 carried one action
+    per contract whose id was only ``{venue}:{contract}``, so the same contract
+    inside one chained family compiled to colliding action ids with different
+    sides and the merge seam failed closed. The canonical action identity is
+    ``{venue}:{contract}:{side}``. This pure function is the single
+    normalization point shared by the threshold compiler and the read path
+    (``_member_problems``), so legacy stored payloads upgrade lazily at decode
+    time and both paths produce identical canonical problems.
+
+    Exactly-one-class problems pass through unchanged: their NATIVE_COMPLEMENT
+    actions are already distinct contracts and their negRisk groups are one
+    BUY_YES per market, so no direction identity conflict can arise there.
+    """
+    if not any(
+        relation.kind == RelationKind.IMPLIES
+        for relation in problem.constraint_model.relations
+    ):
+        return problem
+    groups: dict[str, list[CandidateAction]] = {}
+    for action in problem.actions:
+        groups.setdefault(action.market_contract_id, []).append(action)
+    canonical: dict[str, dict[ActionSide, CandidateAction]] = {}
+    passthrough: list[CandidateAction] = []
+    for contract_id, group in groups.items():
+        if len(group) == 1:
+            action = group[0]
+            prefix = f"{action.venue_id}:{contract_id}"
+            if action.action_id in (prefix, f"{prefix}:{action.side.value}"):
+                canonical[contract_id] = {
+                    side: replace(
+                        action,
+                        action_id=f"{prefix}:{side.value}",
+                        side=side,
+                    )
+                    for side in ActionSide
+                }
+            elif action.action_id.startswith(f"{prefix}:"):
+                raise ValueError(
+                    f"action {action.action_id!r} on contract {contract_id!r} "
+                    "uses a direction-suffixed id whose side does not match "
+                    f"{action.side.value}"
+                )
+            else:
+                # Not a threshold-compiled identity (action_id conventions
+                # outside {venue}:{contract}[:{side}]); leave it untouched.
+                passthrough.append(action)
+            continue
+        pair: dict[ActionSide, CandidateAction] = {}
+        for action in group:
+            suffix = f"{action.venue_id}:{contract_id}:"
+            side = next(
+                (candidate for candidate in ActionSide if action.action_id == f"{suffix}{candidate.value}"),
+                None,
+            )
+            if side is None or action.side != side or side in pair:
+                raise ValueError(
+                    f"contract {contract_id!r} has {len(group)} actions without "
+                    f"a canonical BUY_YES/BUY_NO direction pair: "
+                    f"{sorted(action.action_id for action in group)}"
+                )
+            pair[side] = action
+        canonical[contract_id] = pair
+    actions = [
+        action
+        for pair in canonical.values()
+        for action in (pair[ActionSide.BUY_YES], pair[ActionSide.BUY_NO])
+    ] + passthrough
+    state_sets = []
+    for state_set in problem.terminal_state_sets:
+        pair = canonical.get(state_set.market_contract_id)
+        if pair is None:
+            state_sets.append(state_set)
+            continue
+        atoms = []
+        for atom in state_set.atoms:
+            units = _DIRECTIONAL_PAYOUTS.get(atom.kind)
+            if units is None:
+                raise ValueError(
+                    f"terminal atom {atom.atom_id!r} on contract "
+                    f"{state_set.market_contract_id!r} has non-settlement kind "
+                    f"{atom.kind.value}"
+                )
+            yes_units, no_units = units
+            atoms.append(
+                replace(
+                    atom,
+                    payouts=(
+                        ActionPayout(pair[ActionSide.BUY_YES].action_id, yes_units),
+                        ActionPayout(pair[ActionSide.BUY_NO].action_id, no_units),
+                    ),
+                )
+            )
+        state_sets.append(replace(state_set, atoms=tuple(atoms)))
+    return replace(
+        problem,
+        actions=tuple(sorted(actions, key=lambda action: action.action_id)),
+        terminal_state_sets=tuple(state_sets),
+    )
+
+
 def problem_from_payload(payload: Mapping[str, object], *, allow_unknown_data: bool = False) -> ArbitrageProblem:
     value = _object(payload, "problem", {"schema_version", "problem_id", "as_of", "valuation_unit_id", "actions", "terminal_state_sets", "constraint_model", "qualification_constraints"})
     schema_version = _string(value["schema_version"], "schema_version")

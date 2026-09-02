@@ -15,8 +15,11 @@ from open_trader.relation_catalog import (
     RelationCatalog,
     RelationConflictError,
     _derive_statement,
+    _digest,
+    _mechanical_complete_model,
     _threshold_complete_model,
     _threshold_discovery_payload,
+    _utc,
     default_catalog_path,
 )
 from open_trader.relation_catalog_v2 import RelationCatalogV2, SqliteCatalogStore
@@ -36,8 +39,112 @@ from open_trader.prediction_n_leg import (
     TerminalKind,
     TerminalStateSet,
     canonical_payload,
+    canonicalize_directional_actions,
+    problem_from_payload,
 )
 from test_prediction_arbitrage import threshold_relation
+from test_mechanical_relations import complement_relation
+
+
+def legacy_threshold_problem(relation: object) -> ArbitrageProblem:
+    """The pre-#111 threshold compilation, rebuilt independently.
+
+    Mirrors ``_threshold_complete_model`` before the canonical dual-action
+    upgrade: one ``polymarket:{contract}`` action and one single-payout state
+    set per contract, with the relation direction carried only by the sides.
+    """
+    markets = (getattr(relation, "market_a"), getattr(relation, "market_b"))
+    legs = (getattr(relation, "buy_leg_a"), getattr(relation, "buy_leg_b"))
+    rules_hashes = (getattr(relation, "rules_hash_a"), getattr(relation, "rules_hash_b"))
+    direction = str(getattr(relation, "relation"))
+    order = (1, 0) if direction in {"B_IMPLIES_A", "B_TO_A"} else (0, 1)
+    contracts: list[str] = []
+    actions: list[CandidateAction] = []
+    states: list[TerminalStateSet] = []
+    release_dates: list[datetime] = []
+    for index in order:
+        market, leg, rules_hash = markets[index], legs[index], rules_hashes[index]
+        condition_id = str(getattr(market, "condition_id"))
+        if str(getattr(leg, "outcome")) == "YES":
+            side = ActionSide.BUY_YES
+        else:
+            side = ActionSide.BUY_NO
+        observation_window = _utc(str(getattr(market, "end_date")))
+        release_dates.append(observation_window)
+        key = SettlementObservationKey(
+            OBSERVATION_SCHEMA_V1,
+            str(getattr(market, "resolution_source")),
+            condition_id,
+            observation_window,
+            observation_window,
+            "UTC",
+            rules_hash,
+        )
+        action_id = f"polymarket:{condition_id}"
+        contracts.append(condition_id)
+        actions.append(CandidateAction(
+            action_id,
+            venue_id="polymarket",
+            account_id="catalog-v2",
+            chain_id="polymarket",
+            market_contract_id=condition_id,
+            settlement_observation_key=key,
+            side=side,
+            lot_step_units=1,
+            quantity_scale=1,
+            min_quantity_lots=1,
+            max_quantity_lots=1,
+            settlement_asset_id="USD",
+            valuation_unit_id="USD",
+            asset_valuation_rule_id="usd-1:1-v1",
+            cost_slices=(ExecutableCostSlice(1, 1, 0),),
+        ))
+        yes_payout = 1 if side == ActionSide.BUY_YES else 0
+        no_payout = 0 if side == ActionSide.BUY_YES else 1
+        states.append(TerminalStateSet(
+            condition_id,
+            key,
+            rules_hash,
+            (
+                TerminalAtom(
+                    f"{condition_id}:NORMAL_YES", TerminalKind.NORMAL_YES, rules_hash,
+                    (ActionPayout(action_id, yes_payout),), observation_window,
+                ),
+                TerminalAtom(
+                    f"{condition_id}:NORMAL_NO", TerminalKind.NORMAL_NO, rules_hash,
+                    (ActionPayout(action_id, no_payout),), observation_window,
+                ),
+                TerminalAtom(
+                    f"{condition_id}:VOID", TerminalKind.VOID, rules_hash,
+                    (ActionPayout(action_id, 0),), observation_window,
+                ),
+            ),
+        ))
+    rule_digest = _digest({
+        "direction": direction,
+        "rules_hash_a": rules_hashes[0],
+        "rules_hash_b": rules_hashes[1],
+    })
+    return ArbitrageProblem(
+        PROBLEM_SCHEMA_V1,
+        f"threshold:{rule_digest}",
+        min(release_dates),
+        "USD",
+        tuple(actions),
+        tuple(states),
+        ConstraintModel(
+            (
+                RelationConstraint(
+                    f"imply:{contracts[0]}->{contracts[1]}",
+                    RelationKind.IMPLIES,
+                    tuple(contracts),
+                    rule_digest,
+                ),
+            ),
+            (),
+        ),
+        (),
+    )
 
 
 PROBLEM = _threshold_complete_model(threshold_relation())["problem"]
@@ -56,10 +163,11 @@ def compiled_problem(
 
     Mirrors ``_threshold_complete_model``: one EXACTLY_ONE constraint over the
     contracts, NORMAL_YES/NORMAL_NO/VOID atoms per contract releasing at
-    ``release_at``, and a BUY_YES/BUY_NO action per contract at
-    ``polymarket:{contract_id}``. ``rule`` may be a shared string or a
-    per-contract dict, so tests can give each contract its own settlement
-    observation key (disjoint observations within one explicit relation).
+    ``release_at``, and one action per contract at the issue-#111 canonical
+    identity ``polymarket:{contract_id}:{side}``. ``rule`` may be a shared
+    string or a per-contract dict, so tests can give each contract its own
+    settlement observation key (disjoint observations within one explicit
+    relation).
     """
     as_of_dt = datetime.fromisoformat(as_of.replace("Z", "+00:00")).astimezone(UTC)
     release_dt = datetime.fromisoformat(release_at.replace("Z", "+00:00")).astimezone(UTC)
@@ -78,7 +186,7 @@ def compiled_problem(
             contract_rule,
         )
         side = ActionSide(sides[contract_id])
-        action_id = f"polymarket:{contract_id}"
+        action_id = f"polymarket:{contract_id}:{side.value}"
         yes_payout = 1 if side == ActionSide.BUY_YES else 0
         no_payout = 0 if side == ActionSide.BUY_YES else 1
         actions.append(CandidateAction(
@@ -1723,3 +1831,36 @@ def test_r15_duplicate_version_in_batch_is_entry_conflict(tmp_path: Path) -> Non
         sequential.approve(control_id, {"version_id": control_id}, actor="op", git_sha="sha")
 
     assert batched.current_generation() == sequential.current_generation()
+
+
+# -- Issue #111: the compiler and the legacy read path share one canonicalizer
+
+
+def test_threshold_complete_model_emits_canonical_dual_action_problem() -> None:
+    """The threshold compiler's problem is exactly the legacy single-action
+    compilation upgraded through the shared canonicalizer: one authoritative
+    identity, so the new compile path and the old stored payloads converge."""
+    relation = threshold_relation()
+
+    model = _threshold_complete_model(relation)
+    legacy = canonicalize_directional_actions(legacy_threshold_problem(relation))
+
+    assert model is not None
+    assert model["problem"] == canonical_payload(legacy)
+    actions = model["problem"]["actions"]
+    assert {action["action_id"] for action in actions} == {
+        "polymarket:condition-a:BUY_YES",
+        "polymarket:condition-a:BUY_NO",
+        "polymarket:condition-b:BUY_YES",
+        "polymarket:condition-b:BUY_NO",
+    }
+
+
+def test_mechanical_complete_model_is_untouched_by_canonicalizer() -> None:
+    """NATIVE_COMPLEMENT problems (EXACTLY_ONE class) pass through the
+    canonicalizer unchanged: their two actions are already distinct contracts."""
+    model = _mechanical_complete_model(complement_relation())
+
+    assert model is not None
+    problem = problem_from_payload(model["problem"])
+    assert canonicalize_directional_actions(problem) is problem

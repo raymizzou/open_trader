@@ -35,8 +35,9 @@ ACTOR = "auditor"
 GIT_SHA = "a" * 40
 
 # Fixed-seed matrix: every relation over a contract must agree on that
-# contract's side, rule, as_of and release (otherwise the whole-set compile
-# seam raises merge conflicts and the oracle blocks everything); rules are
+# contract's side (for these EXACTLY_ONE-class problems the side is baked into
+# both the action id and the per-contract state payouts, so disagreeing sides
+# still raise merge conflicts), rule, as_of and release; rules are
 # per-contract so the compile seam joins contracts only via relations, and
 # each contract carries one stable event_identity_basis from two pools so
 # cross-event components are constructible.
@@ -498,14 +499,14 @@ def test_activate_many_matrix_matches_replace_oracle() -> None:
     and the per-entry blocked reason sequence must be identical.
 
     The matrix relies on one equivalence assumption: every production codec
-    derives action/state/constraint ids from the contract ids (action_id
-    ``polymarket:{contract_id}``, terminal state sets keyed by
-    ``market_contract_id``, per-contract rule identity), so the contract
-    closure covers id conflicts too and no global id index is needed; after
-    issue #110 the whole-set compile precheck of replace() differs from the
-    incremental path only through the valuation-unit predicate, which the
-    unit aggregate reproduces (staleness is judged per component by both
-    paths' shared compile seam).
+    derives action/state/constraint ids from the contract ids and per-contract
+    direction (action_id ``polymarket:{contract_id}:{side}`` since issue
+    #111, terminal state sets keyed by ``market_contract_id``, per-contract
+    rule identity), so the contract closure covers id conflicts too and no
+    global id index is needed; after issue #110 the whole-set compile precheck
+    of replace() differs from the incremental path only through the
+    valuation-unit predicate, which the unit aggregate reproduces (staleness
+    is judged per component by both paths' shared compile seam).
     """
     catalog_a = RelationCatalogV2(store={})
     catalog_b = RelationCatalogV2(store={})

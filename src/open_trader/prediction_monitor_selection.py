@@ -55,6 +55,7 @@ from open_trader.prediction_n_leg import (
     ArbitrageProblem,
     ConstraintModel,
     canonical_payload,
+    canonicalize_directional_actions,
     fingerprint,
     problem_from_payload,
 )
@@ -138,7 +139,16 @@ def _model_complete(row: Mapping[str, object]) -> bool:
 
 
 def _member_problems(rows: tuple[Mapping[str, object], ...]) -> list[ArbitrageProblem]:
-    """Decode each admissible row's compiled problem payload."""
+    """Decode each admissible row's compiled problem payload.
+
+    Issue #111: every decoded problem passes through the shared
+    ``canonicalize_directional_actions`` normalization, so legacy stored
+    payloads (one direction-less action id per contract) upgrade lazily to the
+    canonical ``{venue}:{contract}:{side}`` identities exactly like freshly
+    compiled threshold problems, and the merge seam below can no longer
+    fail-closed a chained family over direction alone. This decode hook is the
+    single write-free normalization point; stored payloads are never rewritten.
+    """
     problems: list[ArbitrageProblem] = []
     for row in rows:
         model = row.get("model")
@@ -148,7 +158,9 @@ def _member_problems(rows: tuple[Mapping[str, object], ...]) -> list[ArbitragePr
                 f"COMPLETE relation {row.get('identity', '?')} has no compiled "
                 "problem payload; threshold enrichment must attach model.problem"
             )
-        problems.append(problem_from_payload(payload))
+        problems.append(
+            canonicalize_directional_actions(problem_from_payload(payload))
+        )
     return problems
 
 

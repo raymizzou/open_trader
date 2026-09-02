@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import sqlite3
 from pathlib import Path
 
@@ -17,26 +18,31 @@ from test_relation_catalog import compiled_relation_discovery
 
 def _uncompilable_catalog(tmp_path: Path) -> tuple[RelationCatalog, list[dict[str, str]]]:
     """A four-member generation whose action identity conflicts: a 2v1
-    conflict on ``condition-a`` plus one unrelated early-settling row. Since
-    issue #110 the early row is fresh on its own component timeline
-    (contract/observation-key disjoint from the trio), so the only compile
-    failure left is the merge conflict. Seeded through the v2 core
-    (``approve`` bypasses the activation gate) to mirror a live-but-broken
-    production generation.
+    settlement-rules conflict on ``condition-a`` (same side, different
+    rules_hash — issue #111 removed direction-only conflicts, so the doctor
+    attribution path is exercised with a non-direction conflict) plus one
+    unrelated early-settling row. Since issue #110 the early row is fresh on
+    its own component timeline (contract/observation-key disjoint from the
+    trio), so the only compile failure left is the merge conflict. Seeded
+    through the v2 core (``approve`` bypasses the activation gate) to mirror a
+    live-but-broken production generation.
     """
     catalog = RelationCatalog(tmp_path)
     payloads = [
         compiled_relation_discovery(
             ["condition-a", "condition-b", "condition-z"],
             {"condition-a": "BUY_YES", "condition-b": "BUY_YES", "condition-z": "BUY_YES"},
+            rule={"condition-a": "rules-doctor-a", "condition-b": "rules-issue-99", "condition-z": "rules-issue-99"},
         ),
         compiled_relation_discovery(
             ["condition-a", "condition-c", "condition-w"],
-            {"condition-a": "BUY_NO", "condition-c": "BUY_YES", "condition-w": "BUY_YES"},
+            {"condition-a": "BUY_YES", "condition-c": "BUY_YES", "condition-w": "BUY_YES"},
+            rule={"condition-a": "rules-doctor-b", "condition-c": "rules-issue-99", "condition-w": "rules-issue-99"},
         ),
         compiled_relation_discovery(
             ["condition-a", "condition-d", "condition-v"],
             {"condition-a": "BUY_YES", "condition-d": "BUY_YES", "condition-v": "BUY_YES"},
+            rule={"condition-a": "rules-doctor-a", "condition-d": "rules-issue-99", "condition-v": "rules-issue-99"},
         ),
         compiled_relation_discovery(
             ["condition-e", "condition-f", "condition-g"],
@@ -65,7 +71,7 @@ def test_doctor_report_attributes_conflict_and_spares_disjoint_timeline(
     assert payload["compiles"] is True
     assert len(payload["conflicts"]) == 1
     conflict = payload["conflicts"][0]
-    assert conflict["key"] == "polymarket:condition-a"
+    assert conflict["key"] == "polymarket:condition-a:BUY_YES"
     assert conflict["label"] == "action"
     holders = {holder["identity"]: holder for holder in conflict["holders"]}
     assert set(holders) == {
@@ -74,7 +80,7 @@ def test_doctor_report_attributes_conflict_and_spares_disjoint_timeline(
         seeded[2]["identity"],
     }
     assert holders[seeded[0]["identity"]]["side"] == "BUY_YES"
-    assert holders[seeded[1]["identity"]]["side"] == "BUY_NO"
+    assert holders[seeded[1]["identity"]]["side"] == "BUY_YES"
     assert holders[seeded[2]["identity"]]["side"] == "BUY_YES"
     assert all(holder["payload"] for holder in conflict["holders"])
     assert conflict["removal"] == [seeded[1]["identity"]]
@@ -361,20 +367,26 @@ def test_doctor_conflict_holders_exclude_unknown_rows() -> None:
 
     A revoked member U holding the same conflicting action payload as ACTIVE
     row a1 must not turn the 1v1 ACTIVE tie into a 2v1 majority: with U
-    excluded the tie-break keeps the BUY_NO holder and proposes the BUY_YES
-    row a1; counting U would instead propose a2 (the review's parity flip).
+    excluded the tie-break keeps the smaller-serializing holder (a2, the
+    ``rules-doctor-1`` settlement rules) and proposes row a1; counting U would
+    instead propose a2 (the review's parity flip). Since issue #111 removed
+    direction-only conflicts, the shared-contract conflict is a settlement
+    rules difference on the same canonical BUY_YES action.
     """
     a1_payload = compiled_relation_discovery(
         ["condition-a", "condition-b", "condition-z"],
         {"condition-a": "BUY_YES", "condition-b": "BUY_YES", "condition-z": "BUY_YES"},
+        rule={"condition-a": "rules-doctor-2", "condition-b": "rules-issue-99", "condition-z": "rules-issue-99"},
     )
     a2_payload = compiled_relation_discovery(
         ["condition-a", "condition-c", "condition-w"],
-        {"condition-a": "BUY_NO", "condition-c": "BUY_YES", "condition-w": "BUY_YES"},
+        {"condition-a": "BUY_YES", "condition-c": "BUY_YES", "condition-w": "BUY_YES"},
+        rule={"condition-a": "rules-doctor-1", "condition-c": "rules-issue-99", "condition-w": "rules-issue-99"},
     )
     u_payload = compiled_relation_discovery(
         ["condition-a", "condition-u1", "condition-u2"],
         {"condition-a": "BUY_YES", "condition-u1": "BUY_YES", "condition-u2": "BUY_YES"},
+        rule={"condition-a": "rules-doctor-2", "condition-u1": "rules-issue-99", "condition-u2": "rules-issue-99"},
     )
     rows = {
         "a1": _doctor_row(a1_payload, activation="ACTIVE"),
@@ -388,14 +400,14 @@ def test_doctor_conflict_holders_exclude_unknown_rows() -> None:
     else:
         pytest.fail("ACTIVE pair should conflict on condition-a")
     assert (
-        "action 'polymarket:condition-a' conflicts across compiled relations"
+        "action 'polymarket:condition-a:BUY_YES' conflicts across compiled relations"
         in message
     )
 
     finding, removal = _diagnose_conflict(rows, message)
     holders = {holder["identity"]: holder for holder in finding["holders"]}
     assert set(holders) == {"a1", "a2"}
-    assert removal == ["a1"]  # tie-break: BUY_NO serializes smaller, kept
+    assert removal == ["a1"]  # tie-break: rules-doctor-1 serializes smaller, kept
 
     # The UNKNOWN row changes nothing: with only the two ACTIVE rows the
     # verdict is identical.
@@ -569,10 +581,10 @@ def test_cli_catalog_doctor_report_and_apply(
     code = cli.main(["prediction-arb", "catalog-doctor", "--data-dir", str(tmp_path)])
     assert code == 0
     out = capsys.readouterr().out
-    assert "conflict: action 'polymarket:condition-a'" in out
+    assert "conflict: action 'polymarket:condition-a:BUY_YES'" in out
     # Issue #110: the early-settling row is fresh on its own component
     # timeline, so the report has no stale finding and proposes only the
-    # conflicting BUY_NO holder.
+    # minority conflicting holder.
     assert "stale: " not in out
     assert "proposed_removal: 1" in out
     assert "remaining: 3" in out
@@ -815,3 +827,89 @@ def test_doctor_shared_contract_cross_row_stale_attributes_early_row(
     assert result["status"] == "ACTIVE"
     assert set(result["remaining"]) == {y["identity"]}
     assert report(catalog)["compiles"] is True
+
+
+# -- Issue #111 review fix: legacy stored payloads keep conflict attribution --
+
+
+_FIXTURE_110 = Path(__file__).parent / "fixtures" / "issue_110_incident_payloads.json"
+
+
+def _legacy_implies_catalog(tmp_path: Path) -> tuple[RelationCatalog, list[str]]:
+    """Two verbatim issue-#110 incident IMPLIES payloads (old-format stored
+    problems: one bare ``polymarket:{contract}`` action id per contract)
+    sharing contract ``0x0630…3a71``, seeded through the v2 core because the
+    fixture carries the verbatim v2 production shape (model fields at the top
+    level). The shared action's ``account_id`` diverges on one side, so the
+    seam fails on a NON-direction conflict under the canonical
+    ``{venue}:{contract}:{side}`` identity while the stored ids stay bare."""
+    data = json.loads(_FIXTURE_110.read_text())
+    early, late = copy.deepcopy(data["blocked"][0]), copy.deepcopy(data["blocked"][1])
+    shared = "0x0630fc3f77c2db5ecc473cf4f782e58143a16db6440e714805c8619aa8073a71"
+    action = next(
+        item
+        for item in late["problem"]["actions"]
+        if item["market_contract_id"] == shared
+    )
+    action["account_id"] = "catalog-v1"
+    catalog = RelationCatalog(tmp_path)
+    identities: list[str] = []
+    for entry in (early, late):
+        result = catalog._catalog.ingest(entry)
+        catalog._catalog.approve(result["version_id"], actor="doctor", git_sha="")
+        identities.append(str(result["identity"]))
+    return catalog, identities
+
+
+def test_doctor_attributes_legacy_payload_conflict_with_proposed_removal(
+    tmp_path: Path,
+) -> None:
+    """Old-format stored payloads keep full conflict attribution (issue #111
+    review P2).
+
+    The merge seam canonicalizes every decoded member problem, so a
+    non-direction conflict over old-format rows is raised under the canonical
+    ``{venue}:{contract}:{side}`` action id while the stored payloads carry
+    only bare ids. The doctor decodes through the same canonicalization, so
+    ``report`` must still name the canonical conflict key, attribute holders
+    to both identities, and propose the minority removal — not degrade to an
+    unattributed error."""
+    catalog, (early_id, late_id) = _legacy_implies_catalog(tmp_path)
+
+    # The seam itself fails on the canonical BUY_NO clone of the shared action.
+    with pytest.raises(
+        ValueError,
+        match=(
+            "action 'polymarket:0x0630fc3f77c2db5ecc473cf4f782e58143a16db6440e"
+            "714805c8619aa8073a71:BUY_NO' conflicts across compiled relations"
+        ),
+    ):
+        relation_generation_problem(catalog.current_generation())
+
+    payload = report(catalog)
+    assert payload["compiles"] is True
+    assert len(payload["conflicts"]) == 1
+    conflict = payload["conflicts"][0]
+    assert conflict["label"] == "action"
+    assert (
+        conflict["key"]
+        == "polymarket:0x0630fc3f77c2db5ecc473cf4f782e58143a16db6440e714805c8619aa8073a71:BUY_NO"
+    )
+    holders = {holder["identity"]: holder for holder in conflict["holders"]}
+    assert set(holders) == {early_id, late_id}
+    assert all(holder["side"] == "BUY_NO" for holder in holders.values())
+
+    # 1v1 tie: exactly one minority identity is proposed for removal, and the
+    # remaining generation compiles end to end.
+    assert len(payload["proposed_removal"]) == 1
+    assert set(payload["proposed_removal"]) <= {early_id, late_id}
+    assert payload["remaining"] == 1
+    assert payload["error"] is None
+
+    remaining_rows = {
+        identity: row
+        for identity, row in catalog.current_generation().items()
+        if identity not in set(payload["proposed_removal"])
+    }
+    problem, _ = relation_generation_problem(remaining_rows)
+    assert problem is not None

@@ -585,6 +585,15 @@ def _native_complement_relation_discovery() -> dict[str, object]:
     return payload
 
 
+_TAXONOMY_SIDES = {
+    "cond-a": "BUY_YES",
+    "cond-b": "BUY_NO",
+    "cat-a": "BUY_YES",
+    "cat-b": "BUY_NO",
+    "cat-c": "BUY_YES",
+}
+
+
 def _taxonomy_component_solution(
     component_id: str, contract_ids: list[str]
 ) -> dict[str, object]:
@@ -594,7 +603,13 @@ def _taxonomy_component_solution(
             structure_fingerprint="sha256:struct",
             quote_fingerprint="sha256:quote",
             quantities=tuple(
-                ActionQuantity(f"polymarket:{contract_id}", 20)
+                ActionQuantity(
+                    # Issue #111 canonical action identities, matching the
+                    # sides the seeded catalog relations compile per contract.
+                    f"polymarket:{contract_id}:"
+                    f"{_TAXONOMY_SIDES.get(contract_id, 'BUY_YES')}",
+                    20,
+                )
                 for contract_id in contract_ids
             ),
             guaranteed_profit_units=8_400_000,

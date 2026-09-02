@@ -41,6 +41,7 @@ from .prediction_n_leg import (
     TerminalKind,
     TerminalStateSet,
     canonical_payload,
+    canonicalize_directional_actions,
     problem_from_payload,
     validate_problem,
 )
@@ -495,6 +496,11 @@ def _threshold_complete_model(relation: object) -> dict[str, object] | None:
         ),
         (),
     )
+    # Issue #111: action identity is {venue}:{contract}:{side}. The compiled
+    # problem carries the canonical BUY_YES/BUY_NO pair per contract so chained
+    # families can never collide on one direction-less action id; the
+    # top-level ``payouts`` summary stays a read-model field, untouched.
+    problem = canonicalize_directional_actions(problem)
     capital_release = max(release_dates)
     return {
         "completeness": "COMPLETE",

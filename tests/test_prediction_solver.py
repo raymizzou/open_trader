@@ -1819,3 +1819,141 @@ def test_solver_run_certificate_and_unknown_classifications_stay_fail_closed() -
             classification=BenchmarkClassification.MEASUREMENT_ONLY,
             proof_status=ProofStatus.PROVEN,
         )
+
+
+# -- Issue #111: the solver compiles canonical dual-action IMPLIES problems --
+
+
+def dual_action_implies_problem() -> ArbitrageProblem:
+    """Two threshold contracts with the canonical BUY_YES/BUY_NO action pair
+    per contract (issue #111 identities) and dual-payout settlement atoms."""
+    actions: list[CandidateAction] = []
+    states: list[TerminalStateSet] = []
+    release_at = AS_OF + timedelta(days=1)
+    for contract_id in ("contract-a", "contract-b"):
+        key = SettlementObservationKey(
+            OBSERVATION_SCHEMA_V1,
+            f"oracle-{contract_id}",
+            f"indicator-{contract_id}",
+            AS_OF,
+            AS_OF,
+            "UTC",
+            "v1",
+        )
+        for side in (ActionSide.BUY_YES, ActionSide.BUY_NO):
+            actions.append(
+                CandidateAction(
+                    f"polymarket:{contract_id}:{side.value}",
+                    "polymarket",
+                    "catalog-v2",
+                    "polymarket",
+                    contract_id,
+                    key,
+                    side,
+                    1,
+                    1,
+                    1,
+                    3,
+                    "usd-cents",
+                    "usd-cents",
+                    "usd-cents-v1",
+                    (ExecutableCostSlice(1, 3, 0),),
+                )
+            )
+        states.append(
+            TerminalStateSet(
+                contract_id,
+                key,
+                "v1",
+                tuple(
+                    TerminalAtom(
+                        f"{contract_id}:{kind.value}",
+                        kind,
+                        "v1",
+                        (
+                            ActionPayout(
+                                f"polymarket:{contract_id}:BUY_YES", yes_units
+                            ),
+                            ActionPayout(
+                                f"polymarket:{contract_id}:BUY_NO", no_units
+                            ),
+                        ),
+                        release_at,
+                    )
+                    for kind, yes_units, no_units in (
+                        (TerminalKind.NORMAL_YES, 1, 0),
+                        (TerminalKind.NORMAL_NO, 0, 1),
+                        (TerminalKind.VOID, 0, 0),
+                    )
+                )
+            )
+        )
+    return ArbitrageProblem(
+        PROBLEM_SCHEMA_V1,
+        "dual-action-implies",
+        AS_OF,
+        "usd-cents",
+        tuple(actions),
+        tuple(states),
+        ConstraintModel(
+            (
+                RelationConstraint(
+                    "implies", RelationKind.IMPLIES, ("contract-a", "contract-b"), "v1"
+                ),
+            ),
+            (),
+        ),
+        (),
+    )
+
+
+def test_master_compiles_dual_quantity_and_selection_variables_per_contract() -> None:
+    problem = dual_action_implies_problem()
+    component = build_relation_components(problem)[0]
+    scenario = SettlementScenario(
+        (
+            SelectedAtom("contract-a", "contract-a:NORMAL_YES"),
+            SelectedAtom("contract-b", "contract-b:NORMAL_YES"),
+        )
+    )
+    release_at = AS_OF + timedelta(days=1)
+    action_ids = tuple(action_id for action_id in sorted(component.action_ids))
+
+    compiled = compile_master(
+        problem,
+        component,
+        ReleaseProfile(86_400, 1, release_at, action_ids, action_ids),
+        (cut_from_scenario(problem, scenario),),
+        (),
+    )
+
+    assert dict(compiled.quantity_variables) == {
+        action_id: f"q:{action_id}" for action_id in action_ids
+    }
+    assert dict(compiled.selected_variables) == {
+        action_id: f"b:{action_id}" for action_id in action_ids
+    }
+    model_variables = {variable.name for variable in compiled.model.variables}
+    assert {f"q:{action_id}" for action_id in action_ids} | {
+        f"b:{action_id}" for action_id in action_ids
+    } <= model_variables
+
+
+def test_adversary_dual_action_normal_yes_coefficients_are_one_and_zero() -> None:
+    problem = dual_action_implies_problem()
+    # Distinct per-direction quantities turn the compiled coefficient into the
+    # payout vector itself: NORMAL_YES = 2*1 + 3*0 = 2, NORMAL_NO = 2*0 + 3*1 = 3.
+    quantities = (
+        ActionQuantity("polymarket:contract-a:BUY_YES", 2),
+        ActionQuantity("polymarket:contract-a:BUY_NO", 3),
+        ActionQuantity("polymarket:contract-b:BUY_YES", 2),
+        ActionQuantity("polymarket:contract-b:BUY_NO", 3),
+    )
+
+    compiled = compile_adversary(problem, quantities)
+
+    coefficients = dict(compiled.model.objective.coefficients)
+    for contract_id in ("contract-a", "contract-b"):
+        assert coefficients[f"z:{contract_id}:NORMAL_YES"] == 2
+        assert coefficients[f"z:{contract_id}:NORMAL_NO"] == 3
+        assert coefficients[f"z:{contract_id}:VOID"] == 0

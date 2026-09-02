@@ -11,10 +11,13 @@ Fixtures under ``tests/fixtures/issue_110_incident_payloads.json`` are the
 verbatim production payloads of the incident: the one ACTIVE poison relation
 (settling 2027-01-01T05:00Z) and the 51 blocked payloads (45 IMPLIES + 6
 NATIVE_COMPLEMENT). The IMPLIES payloads come in four contract-connected
-families whose members assign conflicting action identities to shared markets,
-so the full set legitimately fails the fail-closed merge (``_merge_one``);
-the conflict-free subset used for the heterogeneous-compile case is derived
-in fixture order with the merge seam's own per-key equality semantics.
+families whose members used to assign conflicting direction-less action ids
+to shared markets, so the full set failed the fail-closed merge
+(``_merge_one``). Since issue #111 the compile seam normalizes every IMPLIES
+problem to canonical ``{venue}:{contract}:{side}`` actions, so the families
+merge conflict-free and all 51 payloads activate; the conflict-free subset
+used for the heterogeneous-compile case is derived in fixture order with the
+merge seam's own per-key equality semantics over the canonicalized problems.
 """
 
 from __future__ import annotations
@@ -30,9 +33,14 @@ from open_trader.prediction_monitor_selection import (
     problem_for_component,
     relation_generation_problem,
 )
-from open_trader.prediction_n_leg import validate_problem
+from open_trader.prediction_n_leg import (
+    canonical_json,
+    canonicalize_directional_actions,
+    problem_from_payload,
+    validate_problem,
+)
 from open_trader.relation_catalog_v2 import RelationCatalogV2, _canonicalize
-from test_relation_catalog import compiled_relation_discovery
+from test_relation_catalog import compiled_problem, compiled_relation_discovery
 
 FIXTURE = Path(__file__).parent / "fixtures" / "issue_110_incident_payloads.json"
 POISON_AS_OF = datetime(2027, 1, 1, 5, 0, tzinfo=UTC)
@@ -74,29 +82,32 @@ def _natives(data: dict) -> list[dict]:
 def _conflict_free_implies(impls: list[dict]) -> list[int]:
     """Fixture-order IMPLIES indexes whose merged models never conflict.
 
-    Applies the compile seam's own merge semantics (``_merge_one``: per-key
-    canonical equality over actions, terminal state sets and relations) so the
-    selected payloads co-exist in one compiled generation. Mirrors the
-    production activation order exactly (verified: the same 24 indexes the
-    post-fix catalog approves sequentially).
+    Applies the compile seam's own semantics exactly: each stored problem is
+    decoded and passed through ``canonicalize_directional_actions`` (the
+    issue-#111 read-hook normalization) before ``_merge_one``-style per-key
+    canonical equality over actions, terminal state sets and relations. With
+    direction-aware action identities every fixture IMPLIES payload
+    co-exists in one compiled generation (all 45).
     """
     actions: dict[str, str] = {}
     states: dict[str, str] = {}
     relations: dict[str, str] = {}
     chosen: list[int] = []
     for index, payload in enumerate(impls):
-        problem = payload["problem"]
+        problem = canonicalize_directional_actions(
+            problem_from_payload(payload["problem"])
+        )
         candidate_actions = {
-            action["action_id"]: json.dumps(action, sort_keys=True)
-            for action in problem["actions"]
+            action.action_id: canonical_json(action)
+            for action in problem.actions
         }
         candidate_states = {
-            state["market_contract_id"]: json.dumps(state, sort_keys=True)
-            for state in problem["terminal_state_sets"]
+            state.market_contract_id: canonical_json(state)
+            for state in problem.terminal_state_sets
         }
         candidate_relations = {
-            relation["constraint_id"]: json.dumps(relation, sort_keys=True)
-            for relation in problem["constraint_model"]["relations"]
+            relation.constraint_id: canonical_json(relation)
+            for relation in problem.constraint_model.relations
         }
         if (
             all(actions.get(key, raw) == raw for key, raw in candidate_actions.items())
@@ -255,7 +266,9 @@ def test_b1_heterogeneous_generation_compiles_into_disjoint_components() -> None
     data = _fixture()
     implies = _implies(data)
     conflict_free = _conflict_free_implies(implies)
-    assert len(conflict_free) == 24
+    # Issue #111: direction-aware action identities dissolve the old
+    # cross-relation action conflicts, so all 45 IMPLIES payloads merge.
+    assert len(conflict_free) == 45
     rows = {"poison": _row(data["poison"])}
     for index in conflict_free:
         rows[f"impl-{index}"] = _row(implies[index])
@@ -299,10 +312,12 @@ def test_a1_incident_implies_activates_after_poison_is_active() -> None:
 # -- A2: deterministic batch replay of the exact 51 blocked payloads ---------
 
 
-def test_a2_batch_replay_approves_conflict_free_and_blocks_merge_conflicts() -> None:
+def test_a2_batch_replay_activates_direction_families() -> None:
+    """Issue #111: canonical {venue}:{contract}:{side} action identities let
+    the full 45-payload IMPLIES families merge conflict-free, so the verbatim
+    incident replay activates all 51 blocked payloads on top of the poison."""
     data = _fixture()
     catalog = RelationCatalogV2(store={})
-    poison_id = _canonicalize(data["poison"])[0]
     catalog.activate_many([data["poison"]], actor="op", git_sha="sha")
 
     payloads = _activation_payloads(data)
@@ -311,37 +326,15 @@ def test_a2_batch_replay_approves_conflict_free_and_blocks_merge_conflicts() -> 
     result = catalog.activate_many(payloads, actor="op", git_sha="sha")
 
     statuses = [result["results"][identity]["status"] for identity in identities]
-    assert statuses.count("APPROVED") == 30
+    assert statuses.count("APPROVED") == 51
     blocked = [
         result["results"][identity]
         for identity in identities
         if result["results"][identity]["status"] == "BLOCKED"
     ]
-    assert len(blocked) == 21
-    assert all(
-        item["reason"] == "ACTIVATION_BLOCKED_INCONSISTENT" for item in blocked
-    )
-    assert result["status"] == "ACTIVATION_BLOCKED_INCONSISTENT"
-    assert len(catalog.store["generation"]) == 31
-
-    # The approved set is exactly the conflict-free IMPLIES subset plus the
-    # six native complements (the poison is already ACTIVE).
-    implies = _implies(data)
-    conflict_free = set(_conflict_free_implies(implies))
-    expected = {
-        _canonicalize(payload)[0]
-        for index, payload in enumerate(payloads[: len(implies)])
-        if index in conflict_free
-    }
-    expected |= {
-        _canonicalize(payload)[0] for payload in payloads[len(implies) :]
-    }
-    approved = {
-        identity
-        for identity in identities
-        if result["results"][identity]["status"] == "APPROVED"
-    }
-    assert approved == expected
+    assert blocked == []
+    assert result["status"] == "ACTIVE"
+    assert len(catalog.store["generation"]) == 52
 
 
 # -- A3: shared-contract cross-timeline candidates stay blocked --------------
@@ -375,7 +368,7 @@ def test_a3_shared_contract_cross_timeline_candidate_still_blocked() -> None:
     as_of = "2026-12-31T23:59:00Z"
     new_action = copy.deepcopy(donor_action)
     new_action["market_contract_id"] = new_contract
-    new_action["action_id"] = f"polymarket:{new_contract}"
+    new_action["action_id"] = f"polymarket:{new_contract}:BUY_YES"
     new_state = copy.deepcopy(donor)
     new_state["market_contract_id"] = new_contract
     new_state["rule_version"] = "rules-110-construction"
@@ -384,7 +377,7 @@ def test_a3_shared_contract_cross_timeline_candidate_still_blocked() -> None:
         atom["rule_version"] = "rules-110-construction"
         atom["capital_release_at"] = as_of
         for payout in atom["payouts"]:
-            payout["action_id"] = f"polymarket:{new_contract}"
+            payout["action_id"] = f"polymarket:{new_contract}:BUY_YES"
     observation_key = new_state["settlement_observation_key"]
     observation_key["indicator_id"] = new_contract
     observation_key["observation_start"] = as_of
@@ -446,3 +439,64 @@ def test_a3_shared_contract_cross_timeline_candidate_still_blocked() -> None:
 
     assert result["results"][identity]["status"] == "BLOCKED"
     assert result["results"][identity]["reason"] == "ACTIVATION_BLOCKED_INCONSISTENT"
+
+
+# -- T4a: non-direction conflicts still fail closed (issue #111 red line) ----
+
+
+def _t4a_payload(shared_rule: str, other_contract: str, other_rule: str) -> dict:
+    """One v2 payload over a fixed shared contract plus its own market."""
+    contracts = ["t4a-shared", other_contract]
+    sides = {contract: "BUY_YES" for contract in contracts}
+    return {
+        "relation_type": "EXACTLY_ONE",
+        "endpoints": [
+            {
+                "venue": "polymarket",
+                "contract_id": contract,
+                "event_identity_basis": "event-t4a",
+            }
+            for contract in contracts
+        ],
+        "terminal_states": ["NORMAL_YES", "NORMAL_NO", "VOID"],
+        "payouts": {
+            contract: {"NORMAL_YES": 1, "NORMAL_NO": 0, "VOID": 0}
+            for contract in contracts
+        },
+        "capital_release": "2026-12-31T17:00:00.000000Z",
+        "problem": compiled_problem(
+            contracts,
+            sides,
+            rule={"t4a-shared": shared_rule, other_contract: other_rule},
+        ),
+        "statement": "t4a: rules change on a shared contract",
+        "discovery_source": "exchange_metadata",
+        "discovered_at": "2026-09-01T00:00:00Z",
+    }
+
+
+def test_shared_contract_rules_change_still_blocked_as_inconsistent() -> None:
+    """Two relations sharing one contract with different rules_hash (sides and
+    every other compile field equal) still conflict after the issue-#111
+    direction normalization: the settlement observation keys differ, so the
+    canonical action payloads can never agree and the gate blocks."""
+    first = _t4a_payload("rules-t4a-1", "t4a-a", "rules-t4a-1")
+    second = _t4a_payload("rules-t4a-2", "t4a-b", "rules-t4a-2")
+
+    catalog = RelationCatalogV2(store={})
+    first_identity = _canonicalize(first)[0]
+    assert (
+        catalog.activate_many([first], actor="op", git_sha="sha")["results"][
+            first_identity
+        ]["status"]
+        == "APPROVED"
+    )
+    second_identity = _canonicalize(second)[0]
+    result = catalog.activate_many([second], actor="op", git_sha="sha")
+
+    assert result["results"][second_identity]["status"] == "BLOCKED"
+    assert (
+        result["results"][second_identity]["reason"]
+        == "ACTIVATION_BLOCKED_INCONSISTENT"
+    )
+    assert len(catalog.store["generation"]) == 1

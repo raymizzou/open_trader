@@ -45,6 +45,7 @@ from open_trader.prediction_n_leg import (
     TerminalStateSet,
     UnknownReason,
     canonical_payload,
+    canonicalize_directional_actions,
     fingerprint,
     request_from_payload,
     result_from_payload,
@@ -1805,3 +1806,104 @@ def test_oracle_rejects_malformed_action_containers_without_dereferencing_them(m
 
     assert result.business_status == BusinessStatus.UNKNOWN
     assert result.unknown_reason == UnknownReason.INVALID_MODEL
+
+
+# -- Issue #111: dual-action IMPLIES problems through the oracle --------------
+
+
+def _dual_action_implies_problem() -> ArbitrageProblem:
+    """A legacy threshold problem over two contracts, upgraded to the
+    canonical {venue}:{contract}:{side} dual actions by the shared #111
+    normalizer (each atom then pays both directions per settlement kind)."""
+    key = observation()
+
+    def legacy_action(contract_id: str) -> CandidateAction:
+        return replace(
+            action(contract_id, f"polymarket:{contract_id}", key),
+            venue_id="polymarket",
+        )
+
+    def legacy_state(contract_id: str) -> TerminalStateSet:
+        return state(
+            contract_id,
+            key,
+            f"polymarket:{contract_id}",
+            (
+                (f"{contract_id}:NORMAL_YES", TerminalKind.NORMAL_YES, 1),
+                (f"{contract_id}:NORMAL_NO", TerminalKind.NORMAL_NO, 0),
+                (f"{contract_id}:VOID", TerminalKind.VOID, 0),
+            ),
+        )
+
+    legacy = problem(
+        (legacy_action("contract-a"), legacy_action("contract-b")),
+        (legacy_state("contract-a"), legacy_state("contract-b")),
+        (
+            RelationConstraint(
+                "implies", RelationKind.IMPLIES, ("contract-a", "contract-b"), "v1"
+            ),
+        ),
+    )
+    return canonicalize_directional_actions(legacy)
+
+
+def test_dual_action_implies_component_carries_both_direction_ids() -> None:
+    components = build_relation_components(_dual_action_implies_problem())
+
+    assert len(components) == 1
+    assert components[0].action_ids == (
+        "polymarket:contract-a:BUY_NO",
+        "polymarket:contract-a:BUY_YES",
+        "polymarket:contract-b:BUY_NO",
+        "polymarket:contract-b:BUY_YES",
+    )
+
+
+def test_dual_action_cut_pays_one_per_lot_in_both_normal_scenarios() -> None:
+    problem = _dual_action_implies_problem()
+    yes_scenario = SettlementScenario(
+        (
+            SelectedAtom("contract-a", "contract-a:NORMAL_YES"),
+            SelectedAtom("contract-b", "contract-b:NORMAL_YES"),
+        )
+    )
+    no_scenario = SettlementScenario(
+        (
+            SelectedAtom("contract-a", "contract-a:NORMAL_NO"),
+            SelectedAtom("contract-b", "contract-b:NORMAL_NO"),
+        )
+    )
+    quantities = {
+        "polymarket:contract-a:BUY_YES": 1,
+        "polymarket:contract-a:BUY_NO": 1,
+        "polymarket:contract-b:BUY_YES": 1,
+        "polymarket:contract-b:BUY_NO": 1,
+    }
+
+    def combined_per_contract_worst_payout(cut: object, contract_id: str) -> int:
+        # q_yes = q_no = 1: NORMAL_YES pays 1*1 + 0*1 = 1 per lot and
+        # NORMAL_NO pays 0*1 + 1*1 = 1 per lot (Polymarket settlement truth).
+        return sum(
+            payout.payout_lower_bound_per_lot_units * quantities[payout.action_id]
+            for payout in cut.payout_per_lot
+            if payout.action_id.startswith(f"polymarket:{contract_id}:")
+        )
+
+    yes_cut = cut_from_scenario(problem, yes_scenario)
+    no_cut = cut_from_scenario(problem, no_scenario)
+
+    assert yes_cut.payout_per_lot == (
+        ActionPayout("polymarket:contract-a:BUY_NO", 0),
+        ActionPayout("polymarket:contract-a:BUY_YES", 1),
+        ActionPayout("polymarket:contract-b:BUY_NO", 0),
+        ActionPayout("polymarket:contract-b:BUY_YES", 1),
+    )
+    assert no_cut.payout_per_lot == (
+        ActionPayout("polymarket:contract-a:BUY_NO", 1),
+        ActionPayout("polymarket:contract-a:BUY_YES", 0),
+        ActionPayout("polymarket:contract-b:BUY_NO", 1),
+        ActionPayout("polymarket:contract-b:BUY_YES", 0),
+    )
+    for contract_id in ("contract-a", "contract-b"):
+        assert combined_per_contract_worst_payout(yes_cut, contract_id) == 1
+        assert combined_per_contract_worst_payout(no_cut, contract_id) == 1

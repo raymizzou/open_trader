@@ -28,7 +28,13 @@ from collections.abc import Mapping
 from datetime import datetime
 
 from .prediction_monitor_selection import relation_generation_problem, relation_row_admitted
-from .prediction_n_leg import canonical_json, canonical_payload, fingerprint, problem_from_payload
+from .prediction_n_leg import (
+    canonical_json,
+    canonical_payload,
+    canonicalize_directional_actions,
+    fingerprint,
+    problem_from_payload,
+)
 
 #: Prefixes of the compile seam's merge-conflict messages, mapped to the
 #: collection inside the decoded problem that defines the conflicting key.
@@ -88,6 +94,17 @@ def _holders_for(problem: object, label: str, key: str) -> list[object]:
 
 
 def _problem_of(row: Mapping[str, object]) -> object | None:
+    """Decode one row's stored problem payload exactly like the merge seam.
+
+    Issue #111: the decode passes through the shared
+    ``canonicalize_directional_actions`` normalization (the seam's single
+    decode hook, ``prediction_monitor_selection._member_problems``), so legacy
+    stored payloads yield the same canonical ``{venue}:{contract}:{side}``
+    action identities the seam's conflict messages name, and holder lookups
+    stay aligned with the conflict keys. Rows whose payload cannot be decoded
+    or normalized contribute no holders — the seam fails closed on them
+    before any attribution could apply.
+    """
     model = row.get("model")
     if not isinstance(model, Mapping):
         return None
@@ -95,7 +112,7 @@ def _problem_of(row: Mapping[str, object]) -> object | None:
     if not isinstance(payload, Mapping):
         return None
     try:
-        return problem_from_payload(payload)
+        return canonicalize_directional_actions(problem_from_payload(payload))
     except ValueError:
         return None
 
