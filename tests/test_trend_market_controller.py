@@ -433,7 +433,7 @@ def test_concurrent_controller_retries_send_feishu_once(tmp_path: Path) -> None:
         }),
         encoding="utf-8",
     )
-    start = context.Event()
+    start = context.Barrier(4)
     processes = [
         context.Process(
             target=_retry_pending_feishu_notifications_in_process,
@@ -443,10 +443,10 @@ def test_concurrent_controller_retries_send_feishu_once(tmp_path: Path) -> None:
     ]
     for process in processes:
         process.start()
-    start.set()
-    assert entered.wait(timeout=5)
-    deadline = time.monotonic() + 5
     try:
+        start.wait(timeout=60)
+        assert entered.wait(timeout=5)
+        deadline = time.monotonic() + 5
         while finished.value < 2 and time.monotonic() < deadline:
             time.sleep(0.01)
         assert attempts.value == 1
@@ -500,14 +500,12 @@ def test_direct_notification_retry_and_scanner_send_feishu_once(
             BlockingProcessFeishu(attempts, release)
         ]),
     )
-    start = context.Event()
+    start = context.Barrier(2)
     scanner = context.Process(
         target=_retry_pending_feishu_notifications_in_process,
         args=(config, start, finished, attempts, release, entered),
     )
     scanner.start()
-    start.set()
-    assert entered.wait(timeout=5)
     direct_finished = threading.Event()
     direct_results: list[bool] = []
     key = (
@@ -527,10 +525,13 @@ def test_direct_notification_retry_and_scanner_send_feishu_once(
         )
         direct_finished.set()
 
-    direct = threading.Thread(target=retry_directly)
-    direct.start()
-    deadline = time.monotonic() + 5
+    direct: threading.Thread | None = None
     try:
+        start.wait(timeout=30)
+        assert entered.wait(timeout=5)
+        direct = threading.Thread(target=retry_directly)
+        direct.start()
+        deadline = time.monotonic() + 5
         while (
             attempts.value < 2
             and not direct_finished.is_set()
@@ -542,7 +543,8 @@ def test_direct_notification_retry_and_scanner_send_feishu_once(
         assert direct_results == [False]
     finally:
         release.set()
-        direct.join(timeout=5)
+        if direct is not None:
+            direct.join(timeout=5)
         scanner.join(timeout=5)
 
     assert scanner.exitcode == 0

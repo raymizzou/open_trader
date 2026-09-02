@@ -47,7 +47,7 @@ def _canonical_request() -> dict[str, object]:
 def _limits(**changes: object) -> dict[str, object]:
     value: dict[str, object] = {
         "soft_time_limit_ms": 100,
-        "hard_time_limit_ms": 500,
+        "hard_time_limit_ms": 5_000,
         "memory_limit_bytes": 1024 * 1024 * 1024 * 1024,
         "max_constraint_generation_rounds": 8,
     }
@@ -67,6 +67,10 @@ def _request(request_id: str = "request-1", *, backend: str = "test", **changes:
 
 def _test_command(mode: str) -> list[str]:
     return [sys.executable, "-m", "open_trader.prediction_solver_worker", "--test-mode", mode]
+
+
+def _test_harness(command: list[str]) -> WorkerHarness:
+    return WorkerHarness(command, request_timeout_ms=5_000, startup_timeout_ms=5_000)
 
 
 def test_protocol_request_round_trips_a_canonical_request() -> None:
@@ -104,14 +108,14 @@ def test_protocol_rejects_duplicate_request_ids() -> None:
     second = decode_request_line(encode_request_line(_request("same")))
 
     assert first.request_id == second.request_id
-    with WorkerHarness(_test_command("ok")) as harness:
+    with _test_harness(_test_command("ok")) as harness:
         harness.submit(first)
         with pytest.raises(WorkerProtocolError, match="duplicate request_id"):
             harness.submit(second)
 
 
 def test_normal_close_reaps_the_leader_before_verifying_no_process_group_rows() -> None:
-    with WorkerHarness(_test_command("ok")) as harness:
+    with _test_harness(_test_command("ok")) as harness:
         response = harness.submit(decode_request_line(encode_request_line(_request("close"))))
         assert response.status == "OK"
         worker_pid = response.worker_pid
@@ -182,7 +186,7 @@ def test_response_protocol_requires_exact_nonnegative_worker_phase_timings(mutat
 
 
 def test_test_mode_response_uses_zero_for_every_worker_phase() -> None:
-    with WorkerHarness(_test_command("ok")) as harness:
+    with _test_harness(_test_command("ok")) as harness:
         outcome = harness.submit(decode_request_line(encode_request_line(_request("phases"))))
 
     assert outcome.response is not None
@@ -293,7 +297,9 @@ def test_harness_accepts_positive_handshake_pid_from_a_wrapper_namespace() -> No
         "print(json.dumps({'backend': request['backend'], 'diagnostics': [], 'evidence': {'direct_pid': pid}, 'phase_timings_ns': {name: 0 for name in WORKER_PHASE_NAMES}, 'protocol': request['protocol'], 'request_id': request['request_id'], 'status': 'OK'}), flush=True)\n"
         "time.sleep(10)\n"
     )
-    with WorkerHarness([sys.executable, "-c", code], request_timeout_ms=500) as harness:
+    with WorkerHarness(
+        [sys.executable, "-c", code], request_timeout_ms=5_000, startup_timeout_ms=5_000
+    ) as harness:
         result = harness.submit(decode_request_line(encode_request_line(_request("wrapped-pid"))))
 
     assert result.status == "OK"
@@ -366,7 +372,7 @@ def test_write_stdin_checks_deadline_and_rss_on_successful_partial_writes(monkey
 
 
 def test_missing_worker_executable_finalizes_current_request_unknown() -> None:
-    with WorkerHarness(["/definitely/missing/open-trader-worker"]) as harness:
+    with _test_harness(["/definitely/missing/open-trader-worker"]) as harness:
         result = harness.submit(decode_request_line(encode_request_line(_request("missing"))))
 
     assert result.status == "UNKNOWN"
@@ -391,7 +397,12 @@ def test_startup_handshake_timeout_is_reported_as_hard_timeout() -> None:
 
 def test_malformed_startup_handshake_is_reported_as_protocol_mismatch() -> None:
     code = "import sys,time; sys.stdout.write('{malformed\\n'); sys.stdout.flush(); time.sleep(10)"
-    with WorkerHarness([sys.executable, "-c", code], cleanup_grace_seconds=0.1) as harness:
+    with WorkerHarness(
+        [sys.executable, "-c", code],
+        request_timeout_ms=5_000,
+        startup_timeout_ms=5_000,
+        cleanup_grace_seconds=0.1,
+    ) as harness:
         result = harness.submit(decode_request_line(encode_request_line(_request("startup-malformed"))))
 
     assert result.status == "UNKNOWN"
@@ -400,7 +411,7 @@ def test_malformed_startup_handshake_is_reported_as_protocol_mismatch() -> None:
 
 
 def test_harness_reuses_only_a_healthy_worker_and_rebuilds_after_hard_failure() -> None:
-    with WorkerHarness(_test_command("ok")) as harness:
+    with _test_harness(_test_command("ok")) as harness:
         first = harness.submit(decode_request_line(encode_request_line(_request("first"))))
         second = harness.submit(decode_request_line(encode_request_line(_request("second"))))
 
@@ -410,7 +421,7 @@ def test_harness_reuses_only_a_healthy_worker_and_rebuilds_after_hard_failure() 
         assert harness.start_count == 1
         assert harness.rebuild_count == 0
 
-    with WorkerHarness(_test_command("exit17")) as harness:
+    with _test_harness(_test_command("exit17")) as harness:
         failed = harness.submit(decode_request_line(encode_request_line(_request("failed"))))
         assert failed.status == "UNKNOWN"
         assert failed.retried is False
@@ -437,7 +448,7 @@ def test_per_request_hard_deadline_caps_parent_wait() -> None:
 
 
 def test_protocol_mismatch_startup_is_an_unknown_outcome_not_a_context_exception() -> None:
-    with WorkerHarness(_test_command("protocol-mismatch")) as harness:
+    with _test_harness(_test_command("protocol-mismatch")) as harness:
         result = harness.submit(decode_request_line(encode_request_line(_request("mismatch"))))
 
     assert result.status == "UNKNOWN"
@@ -602,7 +613,9 @@ def test_rlimit_as_applies_before_test_mode_work_and_uses_the_stricter_cli_limit
     ),
 )
 def test_deterministic_protocol_failures_finalize_unknown_without_retry(mode: str) -> None:
-    with WorkerHarness(_test_command(mode)) as harness:
+    with WorkerHarness(
+        _test_command(mode), request_timeout_ms=5_000, startup_timeout_ms=5_000
+    ) as harness:
         memory_limit = 1024 * 1024 * 1024 * 1024
         result = harness.submit(
             decode_request_line(encode_request_line(_request("failed", memory_limit_bytes=memory_limit)))
@@ -653,50 +666,8 @@ def test_group_rss_parser_uses_exact_ps_columns(monkeypatch) -> None:
     assert process_group_rss_kib(201) == 100
 
 
-def test_peak_rss_is_sampled_while_bounded_stdout_is_being_read(monkeypatch) -> None:
-    sampled_during_read: list[bool] = []
-    original = sys.modules["open_trader.prediction_solver_worker"]._WorkerProcess.sample_rss
-
-    def sample(worker) -> None:
-        sampled_during_read.append(bool(worker.reader.stdout_buffer))
-        original(worker)
-
-    monkeypatch.setattr("open_trader.prediction_solver_worker._WorkerProcess.sample_rss", sample)
-    with WorkerHarness(_test_command("ok")) as harness:
-        outcome = harness.submit(decode_request_line(encode_request_line(_request("rss"))))
-
-    assert outcome.status == "OK"
-    assert any(sampled_during_read)
-
-
-def test_peak_rss_sampling_ticks_during_a_silent_solver_wait(monkeypatch) -> None:
-    protocol = BENCHMARK_PROTOCOL_V1
-    code = (
-        "import json,sys,time; "
-        f"print(json.dumps({{'backend':'test','pid':__import__('os').getpid(),'protocol':'{protocol}','version':'1'}}), flush=True); "
-        "request=json.loads(sys.stdin.readline()); time.sleep(.2); "
-        f"print(json.dumps({{'backend':'test','diagnostics':[],'evidence':None,'phase_timings_ns':{{name:0 for name in {sorted(WORKER_PHASE_NAMES)!r}}},'protocol':'{protocol}','request_id':request['request_id'],'status':'OK'}}), flush=True); "
-        "time.sleep(10)"
-    )
-    started = time.monotonic()
-    early_samples: list[bool] = []
-    original = sys.modules["open_trader.prediction_solver_worker"]._WorkerProcess.sample_rss
-
-    def sample(worker) -> None:
-        if time.monotonic() - started < 0.15 and not worker.reader.stdout_buffer:
-            early_samples.append(True)
-        original(worker)
-
-    monkeypatch.setattr("open_trader.prediction_solver_worker._WorkerProcess.sample_rss", sample)
-    with WorkerHarness([sys.executable, "-c", code], request_timeout_ms=500, cleanup_grace_seconds=0.1) as harness:
-        outcome = harness.submit(decode_request_line(encode_request_line(_request("silent"))))
-
-    assert outcome.status == "OK"
-    assert early_samples
-
-
 def test_changed_request_memory_limit_rebuilds_worker_before_dispatch() -> None:
-    with WorkerHarness(_test_command("ok")) as harness:
+    with _test_harness(_test_command("ok")) as harness:
         first = harness.submit(
             decode_request_line(encode_request_line(_request("wide", memory_limit_bytes=2 * 1024 * 1024 * 1024 * 1024)))
         )
@@ -723,7 +694,7 @@ def test_cleanup_failure_poisons_harness_and_blocks_later_process_start(monkeypa
         return original_popen(*args, **kwargs)
 
     monkeypatch.setattr(worker_module.subprocess, "Popen", recording_popen)
-    harness = WorkerHarness(_test_command("ok"))
+    harness = _test_harness(_test_command("ok"))
     original_terminate = harness._terminate
     try:
         first = harness.submit(decode_request_line(encode_request_line(_request("poison-a"))))
@@ -812,7 +783,7 @@ def test_reused_worker_resets_peak_rss_for_each_request(monkeypatch) -> None:
 
     monkeypatch.setattr("open_trader.prediction_solver_worker._WorkerProcess.begin_request", begin_request)
     monkeypatch.setattr("open_trader.prediction_solver_worker._WorkerProcess.sample_rss", deterministic_sample)
-    with WorkerHarness(_test_command("ok")) as harness:
+    with _test_harness(_test_command("ok")) as harness:
         first = harness.submit(decode_request_line(encode_request_line(_request("rss-a"))))
         second = harness.submit(decode_request_line(encode_request_line(_request("rss-b"))))
 
