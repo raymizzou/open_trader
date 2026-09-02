@@ -19,6 +19,7 @@ import urllib.request
 
 import pytest
 
+import open_trader
 import open_trader.account_api as account_api
 import open_trader.account_snapshot as account_snapshot
 from open_trader.account_snapshot import (
@@ -159,6 +160,7 @@ def _write_publication(
             "started_at": account_as_of,
             "working_directory": "/tmp/open-trader",
             "git_sha": worker_sha,
+            "code_root": str(Path(open_trader.__file__).resolve().parent.parent),
             "heartbeat_at": quote_as_of,
             "phase": "idle",
             "account_loop": {"status": "ok"},
@@ -197,6 +199,12 @@ def test_account_api_health_snapshot_etag_and_not_found(tmp_path: Path) -> None:
         assert health["module"] == "account_api"
         assert health["mode"] == "shadow"
         assert health["release_match"] is True
+        # code_root 必须来自 api 进程被 import 的 open_trader 包实际路径,
+        # worker_code_root 经 worker 发布(controller_status.json)透传同一事实;
+        # 两者都不随注入的 runtime_metadata cwd(/tmp/open-trader)走。
+        expected_code_root = str(Path(open_trader.__file__).resolve().parent.parent)
+        assert health["code_root"] == expected_code_root
+        assert health["worker_code_root"] == expected_code_root
         with urllib.request.urlopen(base + "/api/v1/account/snapshot") as response:
             payload = json.load(response)
             etag = response.headers["ETag"]

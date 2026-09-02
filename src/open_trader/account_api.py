@@ -18,7 +18,11 @@ import urllib.request
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
-from .account_snapshot import load_account_snapshot, load_worker_git_sha
+from .account_snapshot import (
+    load_account_snapshot,
+    load_worker_code_root,
+    load_worker_git_sha,
+)
 from .account_sync_state import (
     ACCOUNT_STALE_SECONDS,
     REQUIRED_BROKERS,
@@ -109,6 +113,7 @@ def create_account_api(
             path = urlsplit(self.path).path
             if path == "/healthz":
                 worker_sha = load_worker_git_sha(data_dir)
+                worker_code_root = load_worker_code_root(data_dir)
                 api_sha = str(runtime["api_git_sha"])
                 self._send_json(
                     {
@@ -120,6 +125,8 @@ def create_account_api(
                         "started_at": runtime["started_at"],
                         "api_git_sha": api_sha,
                         "worker_git_sha": worker_sha,
+                        "code_root": str(Path(__file__).resolve().parent.parent),
+                        "worker_code_root": worker_code_root,
                         "release_match": bool(worker_sha) and worker_sha == api_sha,
                         "source": "account_sync_worker_publication",
                     }

@@ -294,6 +294,7 @@ def create_dashboard_server(
                         "schema_version": "open_trader.legacy_dashboard.health.v1",
                         "module": "legacy_dashboard",
                         **health_runtime,
+                        "code_root": str(Path(__file__).resolve().parent.parent),
                     }
                 )
                 return

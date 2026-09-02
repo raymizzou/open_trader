@@ -79,6 +79,7 @@ class AccountSyncWorker:
             "started_at": self._started_at,
             "working_directory": str(Path.cwd()),
             "git_sha": _git_sha(),
+            "code_root": str(Path(__file__).resolve().parent.parent),
         }
 
     def account_due(self, now: float) -> bool:

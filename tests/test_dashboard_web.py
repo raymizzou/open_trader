@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+import open_trader
 from open_trader.dashboard_quotes import QuoteRefreshResult
 from open_trader import dashboard_acceptance
 from open_trader.dashboard_web import STATIC_DIR
@@ -15132,6 +15133,8 @@ def test_dashboard_healthz_reports_legacy_module_runtime(tmp_path: Path) -> None
     assert payload["cwd"] == str(Path.cwd().resolve())
     assert payload["git_sha"]
     assert payload["source_state"] in {"clean", "dirty"}
+    # code_root 必须来自被 import 的 open_trader 包实际路径,而非 cwd。
+    assert payload["code_root"] == str(Path(open_trader.__file__).resolve().parent.parent)
     assert payload["started_at"]
 
 
@@ -15144,6 +15147,7 @@ def test_dashboard_healthz_reuses_startup_runtime_metadata(tmp_path: Path) -> No
         "cwd": "/srv/open_trader",
         "git_sha": "accepted-sha",
         "source_state": "clean",
+        "code_root": "/nonexistent-open-trader",
     }
     server = create_dashboard_server(
         config=dashboard_config(tmp_path),
@@ -15167,6 +15171,9 @@ def test_dashboard_healthz_reuses_startup_runtime_metadata(tmp_path: Path) -> No
     assert payload["cwd"] == "/srv/open_trader"
     assert payload["git_sha"] == "accepted-sha"
     assert payload["source_state"] == "clean"
+    # 注入的 runtime_metadata 携带无关 cwd/code_root 时,healthz 的 code_root
+    # 仍必须反映本进程被 import 的 open_trader 包实际路径。
+    assert payload["code_root"] == str(Path(open_trader.__file__).resolve().parent.parent)
 
 
 def test_dashboard_dual_runtime_requires_loopback_host() -> None:

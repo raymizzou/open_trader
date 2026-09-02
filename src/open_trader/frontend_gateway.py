@@ -158,6 +158,7 @@ def create_frontend_gateway(
                         "schema_version": "open_trader.frontend_gateway.health.v1",
                         "module": "frontend_gateway",
                         **runtime,
+                        "code_root": str(Path(__file__).resolve().parent.parent),
                         "upstream_status": legacy_upstream_status,
                         "legacy_upstream_status": legacy_upstream_status,
                         "account_upstream_status": self._account_upstream_status(),

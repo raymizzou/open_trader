@@ -15,6 +15,7 @@ import urllib.request
 
 import pytest
 
+import open_trader
 from open_trader.frontend_gateway import (
     FrontendGatewayConfig,
     create_frontend_gateway,
@@ -551,6 +552,8 @@ def test_gateway_health_reports_runtime_and_upstream_status(tmp_path: Path) -> N
     assert payload["upstream_status"] == "ok"
     assert isinstance(payload["pid"], int)
     assert payload["cwd"]
+    # code_root 必须来自被 import 的 open_trader 包实际路径,而非 cwd。
+    assert payload["code_root"] == str(Path(open_trader.__file__).resolve().parent.parent)
     assert upstream.requests[0]["path"] == "/healthz"
 
 

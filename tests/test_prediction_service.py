@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+import open_trader
 import open_trader.prediction_service as prediction_service
 from open_trader.llm_providers import PROVIDER_IDS, resolve_provider
 from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
@@ -533,6 +534,8 @@ def test_shadow_health_has_the_read_only_identity() -> None:
     assert isinstance(payload["pid"], int)
     assert isinstance(payload["started_at"], str)
     assert payload["source_state"] in {"clean", "dirty"}
+    # code_root 必须来自被 import 的 open_trader 包实际路径,而非 cwd。
+    assert payload["code_root"] == str(Path(open_trader.__file__).resolve().parent.parent)
     assert "release_schema_version" not in payload
     assert "reader_generation" not in payload
     assert "contract_generation" not in payload

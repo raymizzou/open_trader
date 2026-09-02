@@ -380,6 +380,7 @@ def create_prediction_server(
                         "mutations": "prohibited" if mode == "shadow" else "enabled",
                         "runtime_state": str(getattr(runtime, "state", "")),
                         **metadata,
+                        "code_root": str(Path(__file__).resolve().parent.parent),
                         "codex": evidence.get("codex", {}),
                         "first_violation": evidence.get("first_violation"),
                         "guard_attempts": evidence.get("guard_attempts", []),

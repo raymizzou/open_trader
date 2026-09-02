@@ -49,6 +49,15 @@ def load_worker_git_sha(data_dir: Path) -> str:
         return ""
 
 
+def load_worker_code_root(data_dir: Path) -> str:
+    try:
+        return _worker_code_root(
+            _read_bytes(data_dir / "account_sync/controller_status.json")
+        )
+    except (OSError, PublicationUnavailable):
+        return ""
+
+
 def load_account_snapshot(
     data_dir: Path, *, api_git_sha: str, now: datetime
 ) -> SnapshotResult:
@@ -288,16 +297,27 @@ def _is_valid_quote_price_time(market: object, value: object) -> bool:
 
 
 def _worker_sha(raw: bytes) -> str:
+    git_sha = _worker_publication_value(raw, "git_sha")
+    if not _is_git_sha(git_sha):
+        raise PublicationUnavailable("account_release_mismatch")
+    return git_sha
+
+
+def _worker_code_root(raw: bytes) -> str:
+    return _worker_publication_value(raw, "code_root")
+
+
+def _worker_publication_value(raw: bytes, field: str) -> str:
     try:
         heartbeat = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise PublicationUnavailable("account_release_mismatch") from error
     if not _is_valid_heartbeat(heartbeat):
         raise PublicationUnavailable("account_release_mismatch")
-    git_sha = heartbeat.get("git_sha")
-    if not _is_git_sha(git_sha):
+    value = heartbeat.get(field)
+    if not isinstance(value, str):
         raise PublicationUnavailable("account_release_mismatch")
-    return git_sha
+    return value
 
 
 def _is_valid_heartbeat(value: object) -> bool:

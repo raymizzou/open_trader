@@ -1186,6 +1186,14 @@ def test_production_smoke_binds_checks_to_release_and_runtime_roots() -> None:
         '"$$expected_root/logs/prediction_service/launchd.err.log"' not in normalized,
         '(cd "$(WORKTREE_ROOT)" && PYTHONSAFEPATH=1' not in normalized,
         '(cd "$(WORKTREE_ROOT)" && OPEN_TRADER_SMOKE_URL=' not in normalized,
+        # code_root 必须存在且位于 EXPECTED_ROOT 之下(prediction/gateway/legacy);
+        # account 额外要求 worker_code_root 同样位于 EXPECTED_ROOT 之下。
+        'p.get("api_git_sha")==sha and p.get("worker_git_sha")==sha'
+        ' and under_root(p.get("code_root")) and under_root(p.get("worker_code_root"))'
+        in normalized,
+        'p.get("cwd")==root and p.get("source_state")=="clean" and p.get("git_sha")==sha'
+        ' and under_root(p.get("code_root"))'
+        in normalized,
     )
     assert all(required)
 

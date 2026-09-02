@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import open_trader
 from open_trader.account_sync_state import (
     BrokerAccountCandidate,
     accept_candidate,
@@ -506,6 +507,8 @@ def test_run_account_sync_worker_writes_independent_loop_results_and_heartbeat(
     assert status["pid"] > 0
     assert status["working_directory"]
     assert status["git_sha"]
+    # 心跳里的 code_root 必须是 worker 进程被 import 的 open_trader 包实际路径。
+    assert status["code_root"] == str(Path(open_trader.__file__).resolve().parent.parent)
 
 
 def _config(data_dir: Path, portfolio_path: Path) -> AccountSyncWorkerConfig:
