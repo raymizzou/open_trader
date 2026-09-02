@@ -632,6 +632,11 @@ def _taxonomy_component_solution(
             "order_ready": False,
             "partial_fill_proof": "PARTIAL_FILL_SAFE",
         },
+        "fee": {
+            "status": "fee_free",
+            "charging_contracts": [],
+            "unknown_contracts": [],
+        },
     }
 
 

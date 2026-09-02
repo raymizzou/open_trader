@@ -917,6 +917,7 @@ def _prediction_n_leg_solution_projection(
                 now=now,
                 qualification_policy=qualification_policy,
                 balance_snapshot=balance_snapshot,
+                fee=entry.get("fee"),
             )
         except Exception:
             item = None

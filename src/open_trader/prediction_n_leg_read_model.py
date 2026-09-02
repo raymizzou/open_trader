@@ -48,8 +48,28 @@ BLOCKED_NOT_QUALIFIED = "NOT_QUALIFIED"
 BLOCKED_QUALIFICATION_UNKNOWN = "QUALIFICATION_UNKNOWN"
 BLOCKED_FUNDING_UNKNOWN = "FUNDING_UNKNOWN"
 
+# Issue #112: per-component fee states reported by the live resolver on each
+# solution entry's "fee" block. Anything that is not a proven fee-free market
+# fails closed: a missing/shapeless block reads as fee_unknown forever.
+FEE_STATE_FREE = "fee_free"
+FEE_STATE_CHARGING = "fee_charging"
+FEE_STATE_UNKNOWN = "fee_unknown"
+
+FEE_CHARGING_UNMODELED = "FEE_CHARGING_UNMODELED"
+FEE_UNKNOWN = "FEE_UNKNOWN"
+
 OPTIMAL = "OPTIMAL"
 QUALIFIED_FEASIBLE = "QUALIFIED_FEASIBLE"
+
+
+def _fee_state(fee: Mapping[str, object] | None) -> str:
+    """Fee state of one solution entry; unknown unless proven fee-free."""
+    if not isinstance(fee, Mapping):
+        return FEE_STATE_UNKNOWN
+    status = str(fee.get("status") or "")
+    if status in (FEE_STATE_FREE, FEE_STATE_CHARGING, FEE_STATE_UNKNOWN):
+        return status
+    return FEE_STATE_UNKNOWN
 
 
 def would_submit_predicate(
@@ -154,8 +174,14 @@ def _qualification_projection(
     *,
     now: datetime | None,
     policy: Mapping[str, object],
+    fee_state: str = FEE_STATE_UNKNOWN,
 ) -> dict[str, object]:
-    """#104 qualification profile: fixed-point checks, worst case, optimality."""
+    """#104 qualification profile: fixed-point checks, worst case, optimality.
+
+    Issue #112 adds the fifth ``fee_status`` check: only a proven fee-free
+    component passes; a charging or unknown fee state stays undecidable
+    (``passed=None``), which keeps the whole qualification UNKNOWN.
+    """
     profit_units = _units_or_none(market.get("guaranteed_profit_units"))
     payout_units = _units_or_none(market.get("bounded_payout_units"))
     cost_units = _units_or_none(market.get("bounded_cost_units"))
@@ -229,7 +255,16 @@ def _qualification_projection(
             except InvalidOperation:
                 annualized_return = None
 
-    passed_values = (min_profit_passed, net_margin_passed, annualized_passed, capital_release_passed)
+    # Fee check (#112): only a proven fee-free component passes; charging or
+    # unknown stays undecidable (None), which keeps the qualification UNKNOWN.
+    fee_passed: bool | None = True if fee_state == FEE_STATE_FREE else None
+    passed_values = (
+        min_profit_passed,
+        net_margin_passed,
+        annualized_passed,
+        capital_release_passed,
+        fee_passed,
+    )
     if any(passed is None for passed in passed_values) or cost_units is None:
         # Missing bounded cost leaves worst-case cost unknowable; qualification
         # stays UNKNOWN even though the margin ratios do not consume it.
@@ -266,6 +301,13 @@ def _qualification_projection(
             "passed": capital_release_passed,
             "value": capital_release_days,
             "threshold": policy.get("max_capital_release_days"),
+        },
+        {
+            "key": "fee_status",
+            "label": "Fee status",
+            "passed": fee_passed,
+            "value": fee_state,
+            "threshold": FEE_STATE_FREE,
         },
     ]
     return {
@@ -427,6 +469,7 @@ def project_n_leg_solution(
     now: datetime | None = None,
     qualification_policy: Mapping[str, object] | None = None,
     balance_snapshot: Mapping[str, Mapping[str, object]] | None = None,
+    fee: Mapping[str, object] | None = None,
 ) -> dict[str, object] | None:
     """Project one solution into dashboard market/execution fields.
 
@@ -434,11 +477,14 @@ def project_n_leg_solution(
     plus ``order_ready``/``reason``/``action`` from ``n_leg_order_readiness``.
     ``partial_fill_proof`` is the optional #74 proof record payload; when
     absent the projection falls back to the ``partial_fill_proof`` status
-    string carried by the execution payload.  Returns ``None`` when no
+    string carried by the execution payload.  ``fee`` is the #112 fee block
+    carried by the resolver's solution entry; a missing block (or one without
+    a usable status) is a permanent fee_unknown.  Returns ``None`` when no
     MarketSolution exists.
     """
     if not isinstance(market, Mapping):
         return None
+    fee_state = _fee_state(fee)
     scope = dict(scope) if isinstance(scope, Mapping) else {}
     capability = str(scope.get("capability") or SCOPE_OBSERVE_ONLY)
     scope_ready = bool(scope.get("order_ready"))
@@ -461,6 +507,7 @@ def project_n_leg_solution(
         market,
         now=now,
         policy=_normalized_policy(qualification_policy),
+        fee_state=fee_state,
     )
     funding = _funding_projection(market_legs, balance_snapshot)
     main_list = qualification["status"] == QUALIFIED_VERIFIED
@@ -519,7 +566,16 @@ def project_n_leg_solution(
 
     order_ready = False
     reason = ""
-    if scope_blocked:
+    if fee_state != FEE_STATE_FREE:
+        # Issue #112: the fee veto is the first gate of the chain -- a
+        # charging or fee-unknown component never unlocks ordering, ahead of
+        # even the scope capability block.
+        reason = (
+            FEE_CHARGING_UNMODELED
+            if fee_state == FEE_STATE_CHARGING
+            else FEE_UNKNOWN
+        )
+    elif scope_blocked:
         reason = SCOPE_OBSERVE_ONLY
     elif execution_payload is None:
         reason = PARTIAL_FILL_PROOF_REQUIRED

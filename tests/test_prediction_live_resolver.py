@@ -386,6 +386,155 @@ def test_normalize_problem_maps_micro_units_and_payouts() -> None:
     assert payouts == {"a-yes": {1_000_000, 0}, "a-no": {0, 1_000_000}}
 
 
+# --------------------------------------------------------------------------
+# Issue #112 (S3): the resolver aggregates per-contract fee states from the
+# catalog generation endpoints and reports a per-solution "fee" block; fees
+# stay out of the solver cost slice (taker_fee_bps stays 0), the gate lives in
+# the qualification layer.
+# --------------------------------------------------------------------------
+
+
+def fee_endpoint(
+    contract_id: str,
+    *,
+    fees_enabled: object = None,
+    fee_rate: object = None,
+    include_fees: bool = True,
+) -> dict[str, object]:
+    endpoint: dict[str, object] = {
+        "venue": "polymarket",
+        "contract_id": contract_id,
+    }
+    if include_fees:
+        endpoint["fees_enabled"] = fees_enabled
+        endpoint["fee_rate"] = fee_rate
+    return endpoint
+
+
+def fee_row(
+    identity: str,
+    endpoints: list[dict[str, object]],
+) -> dict[str, object]:
+    base = row(identity, raw_problem())
+    base["endpoints"] = endpoints
+    return base
+
+
+def resolved_solutions(
+    tmp_path: Path,
+    rows: dict[str, object],
+    *,
+    contract_ids: tuple[str, ...] = ("contract-a",),
+) -> list[dict[str, object]]:
+    instance, server, _ = resolver(
+        tmp_path,
+        rows=rows,
+        monitor=FakeMonitor({"contract-a": live_book("contract-a")}),
+        execution=FakeExecution(AccountView(1_000_000, 1_000_000, 0)),
+    )
+    valid = valid_selected(rows, contract_ids=contract_ids)
+    instance._selection_store.save({valid.component_id: valid})
+    instance._tick()
+    request = server.requests[0]
+    server.futures[0].set_result(
+        worker_outcome(request, worker_evidence(request.request.problem))
+    )
+    instance._tick()
+    return instance.solutions()
+
+
+def test_solutions_report_fee_free_from_endpoint_facts(tmp_path: Path) -> None:
+    rows = {
+        "r:a": fee_row(
+            "r:a",
+            [fee_endpoint("contract-a", fees_enabled=False)],
+        )
+    }
+
+    (entry,) = resolved_solutions(tmp_path, rows)
+
+    assert entry["fee"] == {
+        "status": "fee_free",
+        "charging_contracts": [],
+        "unknown_contracts": [],
+    }
+
+
+def test_solutions_report_fee_charging_when_enabled_or_rate_positive(
+    tmp_path: Path,
+) -> None:
+    enabled = {
+        "r:a": fee_row(
+            "r:a",
+            [fee_endpoint("contract-a", fees_enabled=True, fee_rate="0.04")],
+        )
+    }
+    (entry,) = resolved_solutions(tmp_path, enabled)
+    assert entry["fee"]["status"] == "fee_charging"
+    assert entry["fee"]["charging_contracts"] == ["contract-a"]
+    assert entry["fee"]["unknown_contracts"] == []
+
+    positive_rate = {
+        "r:a": fee_row(
+            "r:a",
+            [fee_endpoint("contract-a", fees_enabled=False, fee_rate="0.04")],
+        )
+    }
+    (entry,) = resolved_solutions(tmp_path, positive_rate)
+    assert entry["fee"]["status"] == "fee_charging"
+    assert entry["fee"]["charging_contracts"] == ["contract-a"]
+
+
+def test_solutions_fail_closed_fee_unknown_when_missing_or_unparseable(
+    tmp_path: Path,
+) -> None:
+    missing = {
+        "r:a": fee_row("r:a", [fee_endpoint("contract-a", include_fees=False)])
+    }
+    (entry,) = resolved_solutions(tmp_path, missing)
+    assert entry["fee"]["status"] == "fee_unknown"
+    assert entry["fee"]["unknown_contracts"] == ["contract-a"]
+    assert entry["fee"]["charging_contracts"] == []
+
+    unparseable = {
+        "r:a": fee_row(
+            "r:a",
+            [fee_endpoint("contract-a", fees_enabled=False, fee_rate="abc")],
+        )
+    }
+    (entry,) = resolved_solutions(tmp_path, unparseable)
+    assert entry["fee"]["status"] == "fee_unknown"
+    assert entry["fee"]["unknown_contracts"] == ["contract-a"]
+
+    # a component contract absent from the generation endpoints never maps to
+    # fee_free: the block fails closed instead
+    foreign = {
+        "r:a": fee_row(
+            "r:a",
+            [fee_endpoint("contract-other", fees_enabled=False)],
+        )
+    }
+    (entry,) = resolved_solutions(tmp_path, foreign)
+    assert entry["fee"]["status"] == "fee_unknown"
+    assert entry["fee"]["unknown_contracts"] == ["contract-a"]
+
+
+def test_conflicting_fee_facts_merge_to_fee_unknown(tmp_path: Path) -> None:
+    rows = {
+        "r:a": fee_row(
+            "r:a", [fee_endpoint("contract-a", fees_enabled=False)]
+        ),
+        "r:b": fee_row(
+            "r:b", [fee_endpoint("contract-a", fees_enabled=True)]
+        ),
+    }
+
+    (entry,) = resolved_solutions(tmp_path, rows)
+
+    assert entry["fee"]["status"] == "fee_unknown"
+    assert entry["fee"]["unknown_contracts"] == ["contract-a"]
+
+
 def test_snapshot_assembly_and_missing_leg_fail_closed(tmp_path: Path) -> None:
     rows = {"r:a": row("r:a", raw_problem())}
     instance, _, _ = resolver(tmp_path, rows=rows)

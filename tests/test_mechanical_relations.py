@@ -4,6 +4,8 @@ NegRisk exhaustive groups) compiled to EXACTLY_ONE terminal-state models."""
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -341,8 +343,13 @@ def mechanical_market(
     rules: str = "official index",
     source: str = "Binance",
     end_date: str = "2026-12-31T17:00:00Z",
+    fees_enabled: bool | None = False,
 ) -> dict[str, object]:
-    """One official Polymarket snapshot market with YES/NO outcome tokens."""
+    """One official Polymarket snapshot market with YES/NO outcome tokens.
+
+    Issue #112: gamma rows carry the fee fields; the default fixture is a
+    proven fee-free market and tests can override or drop the flag.
+    """
     payload: dict[str, object] = {
         "id": market_id,
         "conditionId": condition_id or f"condition-{market_id}",
@@ -352,6 +359,8 @@ def mechanical_market(
         "endDate": end_date,
         "outcomes": '["Yes", "No"]',
     }
+    if fees_enabled is not None:
+        payload["trading"] = {"feesEnabled": fees_enabled}
     if yes_token is not None and no_token is not None:
         payload["clobTokenIds"] = json.dumps([yes_token, no_token])
     return payload
@@ -704,3 +713,78 @@ def test_mechanical_catalog_dedupes_duplicate_condition_in_negrisk_group(
     assert report["status"] == "PREPARED"
     assert report["prepared"] == 1
     assert report["components"][0]["relation_type"] == "EXACTLY_ONE"
+
+
+# --------------------------------------------------------------------------
+# Issue #112 (S2): the catalog payload carries the per-market fee facts so the
+# live resolver can gate on them; a fee-only change must rotate the version
+# (otherwise the new payload would collide with the old version and never land).
+# --------------------------------------------------------------------------
+
+
+def test_mechanical_ingest_endpoints_carry_fee_fields(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    relation = replace(
+        complement_relation(),
+        market=replace(complement_relation().market, fees_enabled=False),
+    )
+    result = catalog.ingest_mechanical_relation(relation)
+    approved = catalog.approve(
+        result["version_id"],
+        {"version_id": result["version_id"]},
+        actor="tester",
+        git_sha="test",
+    )
+    assert approved["activation"] == "ACTIVE"
+
+    endpoints = catalog.current_generation()[result["identity"]]["endpoints"]
+    assert len(endpoints) == 2
+    for endpoint in endpoints:
+        assert endpoint["fees_enabled"] is False
+        assert endpoint["fee_rate"] is None
+
+
+def test_mechanical_fee_only_change_rotates_the_version(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    free = complement_relation()
+    charging = replace(
+        free,
+        market=replace(
+            free.market, fees_enabled=True, fee_rate=Decimal("0.04")
+        ),
+    )
+    first = catalog.ingest_mechanical_relation(free)
+    second = catalog.ingest_mechanical_relation(charging)
+
+    assert second["created"] is True
+    assert second["version_id"] != first["version_id"]
+
+
+def test_mechanical_group_endpoints_carry_fee_fields(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    base = group_relation(2)
+    charging, free = base.markets
+    relation = replace(
+        base,
+        markets=(
+            replace(charging, fees_enabled=True, fee_rate=Decimal("0.04")),
+            replace(free, fees_enabled=False, fee_rate=None),
+        ),
+    )
+    result = catalog.ingest_mechanical_relation(relation)
+    approved = catalog.approve(
+        result["version_id"],
+        {"version_id": result["version_id"]},
+        actor="tester",
+        git_sha="test",
+    )
+    assert approved["activation"] == "ACTIVE"
+
+    by_contract = {
+        endpoint["contract_id"]: endpoint
+        for endpoint in catalog.current_generation()[result["identity"]]["endpoints"]
+    }
+    assert by_contract["condition-0"]["fees_enabled"] is True
+    assert by_contract["condition-0"]["fee_rate"] == "0.04"
+    assert by_contract["condition-1"]["fees_enabled"] is False
+    assert by_contract["condition-1"]["fee_rate"] is None

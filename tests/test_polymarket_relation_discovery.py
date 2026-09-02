@@ -29,6 +29,7 @@ from open_trader.polymarket_relation_discovery import (
     _RELATION_SCHEMA,
     _relation_cache_payload,
     assess_threshold_relation_activity,
+    discover_mechanical_relation_catalog,
     discover_threshold_relation_catalog,
     discover_threshold_relations,
     legacy_relation_cache_keys,
@@ -1937,3 +1938,132 @@ def test_relation_prompt_states_output_contract() -> None:
         "uncertainties",
     ):
         assert key in prompt
+
+
+# --------------------------------------------------------------------------
+# Issue #112 (S1): the mechanical codecs parse the gamma fee fields exactly
+# like the threshold codec -- top-level feesEnabled/feeSchedule with the
+# trading-container fallback -- into NativeComplementMarket/NegriskGroupMarket
+# so per-market fee facts can ride the catalog into the fail-closed gate.
+# --------------------------------------------------------------------------
+
+
+def mechanical_fee_market(
+    market_id: str,
+    *,
+    fee_fields: dict[str, object] | None = None,
+    condition_id: str | None = None,
+) -> dict[str, object]:
+    """One official gamma snapshot market (flat keys, like the SDK dumps)."""
+    payload: dict[str, object] = {
+        "id": market_id,
+        "conditionId": condition_id or f"condition-{market_id}",
+        "question": f"Will {market_id} happen?",
+        "description": "official index",
+        "resolutionSource": "Binance",
+        "endDate": "2026-12-31T17:00:00Z",
+        "outcomes": '["Yes", "No"]',
+        "clobTokenIds": json.dumps([f"yes-{market_id}", f"no-{market_id}"]),
+    }
+    if fee_fields is not None:
+        payload.update(fee_fields)
+    return payload
+
+
+def test_mechanical_complement_codec_parses_gamma_fee_fields() -> None:
+    charging = discover_mechanical_relation_catalog(
+        [
+            {
+                "id": "event-1",
+                "title": "Which outcome resolves?",
+                "active": True,
+                "closed": False,
+                "ended": False,
+                "markets": [
+                    mechanical_fee_market(
+                        "m1",
+                        fee_fields={
+                            "feesEnabled": True,
+                            "feeSchedule": {"rate": 0.04},
+                        },
+                    ),
+                ],
+            }
+        ]
+    )
+    (complement,) = charging.complements
+    assert complement.market.fees_enabled is True
+    assert complement.market.fee_rate == Decimal("0.04")
+
+    disabled = discover_mechanical_relation_catalog(
+        [
+            {
+                "id": "event-1",
+                "title": "Which outcome resolves?",
+                "active": True,
+                "closed": False,
+                "ended": False,
+                "markets": [
+                    mechanical_fee_market("m1", fee_fields={"feesEnabled": False}),
+                ],
+            }
+        ]
+    )
+    (complement,) = disabled.complements
+    assert complement.market.fees_enabled is False
+    assert complement.market.fee_rate is None
+
+    missing = discover_mechanical_relation_catalog(
+        [
+            {
+                "id": "event-1",
+                "title": "Which outcome resolves?",
+                "active": True,
+                "closed": False,
+                "ended": False,
+                "markets": [mechanical_fee_market("m1")],
+            }
+        ]
+    )
+    (complement,) = missing.complements
+    assert complement.market.fees_enabled is None
+    assert complement.market.fee_rate is None
+
+
+def test_mechanical_group_codec_parses_gamma_fee_fields() -> None:
+    result = discover_mechanical_relation_catalog(
+        [
+            {
+                "id": "event-group-1",
+                "title": "Which outcome resolves?",
+                "active": True,
+                "closed": False,
+                "ended": False,
+                "negRisk": True,
+                "markets": [
+                    mechanical_fee_market(
+                        "m0",
+                        condition_id="condition-m0",
+                        fee_fields={
+                            "feesEnabled": True,
+                            "feeSchedule": {"rate": 0.04},
+                        },
+                    ),
+                    mechanical_fee_market(
+                        "m1",
+                        condition_id="condition-m1",
+                        fee_fields={"feesEnabled": False},
+                    ),
+                    mechanical_fee_market("m2", condition_id="condition-m2"),
+                ],
+            }
+        ]
+    )
+    (group,) = result.groups
+    by_condition = {market.condition_id: market for market in group.markets}
+    assert by_condition["condition-m0"].fees_enabled is True
+    assert by_condition["condition-m0"].fee_rate == Decimal("0.04")
+    assert by_condition["condition-m1"].fees_enabled is False
+    assert by_condition["condition-m1"].fee_rate is None
+    assert by_condition["condition-m2"].fees_enabled is None
+    assert by_condition["condition-m2"].fee_rate is None

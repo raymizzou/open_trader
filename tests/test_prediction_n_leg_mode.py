@@ -501,6 +501,11 @@ def test_n_leg_solution_projection_passes_policy_and_balances(tmp_path: Path) ->
                 "scope_id": "s1",
                 "market": market,
                 "execution": execution,
+                "fee": {
+                    "status": "fee_free",
+                    "charging_contracts": [],
+                    "unknown_contracts": [],
+                },
                 "legs": [
                     {
                         "action_id": "a-yes",

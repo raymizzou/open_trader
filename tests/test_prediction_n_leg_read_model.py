@@ -12,6 +12,8 @@ from open_trader.prediction_market_solution import (
 from open_trader.prediction_n_leg import ActionQuantity, canonical_payload, fingerprint
 from open_trader.prediction_n_leg_read_model import (
     EXECUTION_FINGERPRINT_MISMATCH,
+    FEE_CHARGING_UNMODELED,
+    FEE_UNKNOWN,
     PARTIAL_FILL_PROOF_REQUIRED,
     SCOPE_OBSERVE_ONLY,
     UNSETTLED_CAP_EXCEEDED,
@@ -20,6 +22,8 @@ from open_trader.prediction_n_leg_read_model import (
 
 
 _NOW = datetime(2026, 9, 1, tzinfo=UTC)
+
+_FEE_FREE = {"status": "fee_free", "charging_contracts": [], "unknown_contracts": []}
 
 
 def _market(
@@ -309,6 +313,7 @@ def test_projection_fully_qualified_and_would_submit() -> None:
         scope=_manual_canary_scope(),
         max_total_unsettled_capital_units=1000,
         now=_NOW,
+        fee=_FEE_FREE,
     )
 
     assert item is not None
@@ -330,6 +335,7 @@ def test_projection_fully_qualified_and_would_submit() -> None:
         scope=_manual_canary_scope(),
         max_total_unsettled_capital_units=1000,
         now=_NOW,
+        fee=_FEE_FREE,
     )
 
     assert item is not None
@@ -342,6 +348,7 @@ def test_projection_fully_qualified_and_would_submit() -> None:
         scope=None,
         max_total_unsettled_capital_units=1000,
         now=_NOW,
+        fee=_FEE_FREE,
     )
 
     assert item is not None
@@ -368,6 +375,7 @@ def _qualified_item(
         max_total_unsettled_capital_units=1000,
         now=_NOW,
         balance_snapshot=balance_snapshot,
+        fee=_FEE_FREE,
         legs=[
             {"action_id": "a-yes", "venue": "polymarket", "max_cost": "10.00"},
             {"action_id": "a-no", "venue": "predict.fun", "max_cost": "5.00"},
@@ -462,6 +470,7 @@ def test_projection_not_qualified_composition() -> None:
             "polymarket": {"available": "50.00", "allowance": "50.00"},
             "predict.fun": {"available": "50.00", "allowance": "50.00"},
         },
+        fee=_FEE_FREE,
         legs=[
             {"action_id": "a-yes", "venue": "polymarket", "max_cost": "10.00"},
             {"action_id": "a-no", "venue": "predict.fun", "max_cost": "5.00"},
@@ -532,6 +541,7 @@ def test_projection_manual_canary_is_order_ready() -> None:
         scope=_manual_canary_scope(),
         max_total_unsettled_capital_units=1000,
         now=datetime(2026, 8, 1, tzinfo=UTC),
+        fee=_FEE_FREE,
     )
 
     assert item is not None
@@ -550,6 +560,7 @@ def test_projection_without_execution_is_not_order_ready() -> None:
         execution=None,
         scope=_manual_canary_scope(),
         max_total_unsettled_capital_units=1000,
+        fee=_FEE_FREE,
     )
 
     assert item is not None
@@ -566,6 +577,7 @@ def test_projection_observe_only_scope_blocks_ready() -> None:
         execution=_execution(market),
         scope={"capability": "OBSERVE_ONLY", "order_ready": False, "reason": "SCOPE_OBSERVE_ONLY", "action": None},
         max_total_unsettled_capital_units=1000,
+        fee=_FEE_FREE,
     )
 
     assert item is not None
@@ -580,6 +592,7 @@ def test_projection_fingerprint_mismatch_invalidates_qualification() -> None:
         execution=_execution(market, market_solution_fingerprint="sha256:stale"),
         scope=_manual_canary_scope(),
         max_total_unsettled_capital_units=1000,
+        fee=_FEE_FREE,
     )
 
     assert item is not None
@@ -595,6 +608,7 @@ def test_projection_non_executable_execution_reason_blocks_ready() -> None:
         execution=_execution(market, reason=INSUFFICIENT_FUNDS_REASON),
         scope=_manual_canary_scope(),
         max_total_unsettled_capital_units=1000,
+        fee=_FEE_FREE,
     )
 
     assert item is not None
@@ -610,6 +624,7 @@ def test_projection_over_unsettled_cap_blocks_ready_but_keeps_market() -> None:
         scope=_manual_canary_scope(),
         max_total_unsettled_capital_units=100,
         total_unsettled_capital_units=0,
+        fee=_FEE_FREE,
     )
 
     assert item is not None
@@ -628,6 +643,7 @@ def test_projection_within_cap_includes_unsettled_units() -> None:
         scope=_manual_canary_scope(),
         max_total_unsettled_capital_units=1000,
         total_unsettled_capital_units=50,
+        fee=_FEE_FREE,
     )
 
     assert item is not None
@@ -642,11 +658,155 @@ def test_projection_scope_ready_false_keeps_execution_reason() -> None:
         execution=_execution(market),
         scope={"capability": "AUTO_ELIGIBLE", "order_ready": False, "reason": "SCOPE_NOT_ENABLED", "action": None},
         max_total_unsettled_capital_units=1000,
+        fee=_FEE_FREE,
     )
 
     assert item is not None
     assert item["execution"]["order_ready"] is False
     assert item["execution"]["reason"] == "SCOPE_NOT_ENABLED"
+
+
+# --------------------------------------------------------------------------
+# Issue #112 (S4): the fail-closed fee gate. The fee state rides the solution
+# entry's "fee" block; a missing block (or one without a status) is treated as
+# fee_unknown forever, a charging/unknown component is qualification UNKNOWN
+# and never order-ready, and fee_free keeps the existing chain byte-identical.
+# --------------------------------------------------------------------------
+
+
+def test_projection_fee_constants_carry_exact_reason_values() -> None:
+    assert FEE_CHARGING_UNMODELED == "FEE_CHARGING_UNMODELED"
+    assert FEE_UNKNOWN == "FEE_UNKNOWN"
+
+
+def test_projection_without_fee_block_defaults_to_fee_unknown_and_blocks() -> None:
+    market = _market()
+    item = project_n_leg_solution(
+        market=market,
+        execution=_execution(market),
+        scope=_manual_canary_scope(),
+        max_total_unsettled_capital_units=1000,
+    )
+
+    assert item is not None
+    checks = {row["key"]: row for row in item["qualification"]["checks"]}
+    assert checks["fee_status"]["label"] == "Fee status"
+    assert checks["fee_status"]["passed"] is None
+    assert checks["fee_status"]["value"] == "fee_unknown"
+    assert checks["fee_status"]["threshold"] == "fee_free"
+    assert item["qualification"]["status"] == "UNKNOWN"
+    assert item["execution"]["order_ready"] is False
+    assert item["execution"]["reason"] == FEE_UNKNOWN
+
+
+def test_projection_fee_block_without_status_is_fee_unknown() -> None:
+    market = _market()
+    item = project_n_leg_solution(
+        market=market,
+        execution=_execution(market),
+        scope=_manual_canary_scope(),
+        max_total_unsettled_capital_units=1000,
+        fee={"charging_contracts": [], "unknown_contracts": []},
+    )
+
+    assert item is not None
+    assert item["execution"]["order_ready"] is False
+    assert item["execution"]["reason"] == FEE_UNKNOWN
+
+
+def test_projection_fee_charging_is_unknown_and_never_order_ready() -> None:
+    market = _market(
+        profit_units=2_000_000,
+        cost_units=95_000_000,
+        payout_units=100_000_000,
+        capital_release_at=_NOW + timedelta(days=20),
+        global_search_closed=True,
+    )
+    item = project_n_leg_solution(
+        market=market,
+        execution=_execution(market),
+        scope=_manual_canary_scope(),
+        max_total_unsettled_capital_units=1000,
+        now=_NOW,
+        fee={
+            "status": "fee_charging",
+            "charging_contracts": ["cond-a"],
+            "unknown_contracts": [],
+        },
+    )
+
+    assert item is not None
+    checks = {row["key"]: row for row in item["qualification"]["checks"]}
+    assert checks["fee_status"]["passed"] is None
+    assert checks["fee_status"]["value"] == "fee_charging"
+    assert checks["fee_status"]["threshold"] == "fee_free"
+    for key in ("min_profit", "net_margin", "annualized_return", "capital_release"):
+        assert checks[key]["passed"] is True, key
+    assert item["qualification"]["status"] == "UNKNOWN"
+    assert item["execution"]["would_submit"] is False
+    assert item["execution"]["order_ready"] is False
+    assert item["execution"]["reason"] == FEE_CHARGING_UNMODELED
+
+
+def test_projection_fee_unknown_reason_for_unknown_status() -> None:
+    market = _market()
+    item = project_n_leg_solution(
+        market=market,
+        execution=_execution(market),
+        scope=_manual_canary_scope(),
+        max_total_unsettled_capital_units=1000,
+        fee={
+            "status": "fee_unknown",
+            "charging_contracts": [],
+            "unknown_contracts": ["cond-a"],
+        },
+    )
+
+    assert item is not None
+    checks = {row["key"]: row for row in item["qualification"]["checks"]}
+    assert checks["fee_status"]["passed"] is None
+    assert checks["fee_status"]["value"] == "fee_unknown"
+    assert item["execution"]["order_ready"] is False
+    assert item["execution"]["reason"] == FEE_UNKNOWN
+
+
+def test_projection_fee_free_keeps_the_existing_chain() -> None:
+    market = _market(
+        profit_units=2_000_000,
+        cost_units=95_000_000,
+        payout_units=100_000_000,
+        capital_release_at=_NOW + timedelta(days=20),
+        global_search_closed=True,
+    )
+    item = project_n_leg_solution(
+        market=market,
+        execution=_execution(market),
+        scope=_manual_canary_scope(),
+        max_total_unsettled_capital_units=1000,
+        now=_NOW,
+        fee=_FEE_FREE,
+    )
+
+    assert item is not None
+    assert item["qualification"]["status"] == "QUALIFIED_VERIFIED"
+    assert all(row["passed"] is True for row in item["qualification"]["checks"])
+    assert item["execution"]["would_submit"] is True
+    assert item["execution"]["order_ready"] is True
+    assert item["execution"]["reason"] == "MANUAL_CANARY"
+
+
+def test_projection_fee_veto_precedes_the_scope_block() -> None:
+    market = _market()
+    item = project_n_leg_solution(
+        market=market,
+        execution=_execution(market),
+        scope={"capability": "OBSERVE_ONLY", "order_ready": False, "reason": "SCOPE_OBSERVE_ONLY", "action": None},
+        max_total_unsettled_capital_units=1000,
+    )
+
+    assert item is not None
+    assert item["execution"]["order_ready"] is False
+    assert item["execution"]["reason"] == FEE_UNKNOWN
 
 
 def test_projection_unknown_proof_requires_proof() -> None:
@@ -656,6 +816,7 @@ def test_projection_unknown_proof_requires_proof() -> None:
         execution=_execution(market, proof_status="UNKNOWN"),
         scope=_manual_canary_scope(),
         max_total_unsettled_capital_units=1000,
+        fee=_FEE_FREE,
     )
 
     assert item is not None
@@ -681,6 +842,7 @@ def test_projection_unsafe_proof_blocks_ready() -> None:
         scope=_manual_canary_scope(),
         max_total_unsettled_capital_units=1000,
         partial_fill_proof=proof_payload,
+        fee=_FEE_FREE,
     )
 
     assert item is not None

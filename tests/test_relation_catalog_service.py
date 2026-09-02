@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+from decimal import Decimal
 import json
 import threading
 from pathlib import Path
@@ -313,6 +314,56 @@ def test_threshold_relation_fingerprint_is_stable_across_discovery_times(tmp_pat
     assert first["version_id"] == second["version_id"]
     assert second["occurrence_count"] == 2
     assert [row["version_id"] for row in catalog.review_rows()] == [first["version_id"]]
+
+
+# --------------------------------------------------------------------------
+# Issue #112 (S2): the threshold payload carries the per-market fee facts
+# (JSON string or null), the active generation row exposes them on its
+# endpoints, and a fee-only change rotates the version id.
+# --------------------------------------------------------------------------
+
+
+def test_threshold_ingest_endpoints_carry_fee_fields(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    result = catalog.ingest_threshold_relation(threshold_relation())
+    catalog.approve(
+        result["version_id"], {"version_id": result["version_id"]},
+        actor="operator", git_sha="sha",
+    )
+
+    endpoints = catalog.current_generation()[result["identity"]]["endpoints"]
+    assert len(endpoints) == 2
+    for endpoint in endpoints:
+        assert endpoint["fees_enabled"] is False
+        assert endpoint["fee_rate"] == "0"
+
+
+def test_threshold_fee_only_change_rotates_the_version(tmp_path: Path) -> None:
+    base = threshold_relation()
+    charging = replace(
+        base,
+        market_a=replace(
+            base.market_a, fees_enabled=True, fee_rate=Decimal("0.04")
+        ),
+    )
+    catalog = RelationCatalog(tmp_path)
+    first = catalog.ingest_threshold_relation(base)
+    second = catalog.ingest_threshold_relation(charging)
+
+    assert second["created"] is True
+    assert second["version_id"] != first["version_id"]
+
+
+def test_legacy_ingest_payload_without_fee_keys_reads_back_clean(tmp_path: Path) -> None:
+    catalog = RelationCatalog(tmp_path)
+    result = catalog.ingest(discovery())
+
+    endpoints = catalog.review_rows()[0]["endpoints"]
+    assert len(endpoints) == 2
+    for endpoint in endpoints:
+        assert endpoint.get("fees_enabled") is None
+        assert endpoint.get("fee_rate") is None
+    assert result["status"] == "PENDING"
 
 
 def _distinct_discovery(prefix: str, *, complete: bool) -> dict[str, object]:

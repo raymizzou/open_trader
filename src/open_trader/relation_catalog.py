@@ -355,11 +355,22 @@ def _normalise_discovery(value: Mapping[str, object]) -> dict[str, object]:
             "event_identity_basis", "settlement_observation_key", "settlement_rules",
             "cancellation_rules",
         }
-        if set(market) != required:
+        # Issue #112: the per-market fee facts ride alongside the required
+        # fields (absent on legacy rows, which decode to a fee-unknown gate).
+        fee_fields = {"fees_enabled", "fee_rate"}
+        if not required <= set(market) <= required | fee_fields:
             raise ValueError("market fields are invalid")
         clean = {name: _string(market[name], f"market.{name}") for name in required - {"market_date", "expires_at"}}
         clean["market_date"] = _timestamp(market["market_date"], "market.market_date")
         clean["expires_at"] = _timestamp(market["expires_at"], "market.expires_at")
+        fees_enabled = market.get("fees_enabled")
+        if fees_enabled is not None and type(fees_enabled) is not bool:
+            raise ValueError("market.fees_enabled must be a boolean or null")
+        fee_rate = market.get("fee_rate")
+        if fee_rate is not None and not isinstance(fee_rate, str):
+            raise ValueError("market.fee_rate must be a string or null")
+        clean["fees_enabled"] = fees_enabled
+        clean["fee_rate"] = fee_rate
         markets.append(clean)
     endpoints = sorted((str(item["venue"]).casefold(), str(item["contract_id"])) for item in markets)
     if len(set(endpoints)) != len(endpoints):
@@ -517,12 +528,15 @@ def _threshold_discovery_payload(
     """One deterministic Polymarket threshold relation as a v1 discovery payload."""
     def market(value: object) -> dict[str, object]:
         end_date = _string(getattr(value, "end_date"), "threshold end_date")
+        fee_rate = getattr(value, "fee_rate")
         return {
             "venue": "Polymarket", "contract_id": _string(getattr(value, "condition_id"), "condition_id"),
             "title": _string(getattr(value, "question"), "question"), "market_date": end_date,
             "expires_at": end_date, "event_identity_basis": _string(getattr(value, "event_id"), "event_id"),
             "settlement_observation_key": _string(getattr(value, "resolution_source") or getattr(value, "condition_id"), "resolution_source"),
             "settlement_rules": _string(getattr(value, "rules"), "rules"), "cancellation_rules": "not supplied by threshold discovery",
+            "fees_enabled": getattr(value, "fees_enabled"),
+            "fee_rate": str(fee_rate) if fee_rate is not None else None,
         }
     relation_direction = str(getattr(relation, "relation"))
     endpoints = [market(getattr(relation, "market_a")), market(getattr(relation, "market_b"))]
@@ -722,6 +736,8 @@ def _mechanical_discovery_payload(
         end_date = _string(getattr(market, "end_date"), "end_date")
         rules = _string(getattr(market, "rules"), "rules")
         rules_hash = _string(getattr(market, "rules_hash"), "rules_hash")
+        fees_enabled = getattr(market, "fees_enabled")
+        fee_rate = getattr(market, "fee_rate")
         markets = []
         for token_id in (
             getattr(market, "yes_token_id"),
@@ -737,6 +753,8 @@ def _mechanical_discovery_payload(
                 "settlement_observation_key": f"{condition_id}|{source}|{end_date}|{rules_hash}",
                 "settlement_rules": rules,
                 "cancellation_rules": "not supplied by mechanical discovery",
+                "fees_enabled": fees_enabled,
+                "fee_rate": str(fee_rate) if fee_rate is not None else None,
             })
     elif relation_type == "EXACTLY_ONE":
         markets = []
@@ -749,6 +767,8 @@ def _mechanical_discovery_payload(
             end_date = _string(getattr(market, "end_date"), "end_date")
             rules = _string(getattr(market, "rules"), "rules")
             rules_hash = _string(getattr(market, "rules_hash"), "rules_hash")
+            fees_enabled = getattr(market, "fees_enabled")
+            fee_rate = getattr(market, "fee_rate")
             markets.append({
                 "venue": "Polymarket",
                 "contract_id": condition_id,
@@ -759,6 +779,8 @@ def _mechanical_discovery_payload(
                 "settlement_observation_key": f"{condition_id}|{source}|{end_date}|{rules_hash}",
                 "settlement_rules": rules,
                 "cancellation_rules": "not supplied by mechanical discovery",
+                "fees_enabled": fees_enabled,
+                "fee_rate": str(fee_rate) if fee_rate is not None else None,
             })
     else:
         raise ValueError("mechanical relation_type is invalid")
@@ -802,6 +824,8 @@ class RelationCatalog:
                 "settlement_observation_key": market["settlement_observation_key"],
                 "settlement_rules": market["settlement_rules"],
                 "cancellation_rules": market["cancellation_rules"],
+                "fees_enabled": market.get("fees_enabled"),
+                "fee_rate": market.get("fee_rate"),
             }
             for market in payload["markets"]
         ]

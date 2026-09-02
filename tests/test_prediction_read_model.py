@@ -656,6 +656,13 @@ def test_nleg_solution_projection_is_exposed_and_attached_to_opportunities() -> 
                 "scope_id": "s1",
                 "market": market,
                 "execution": execution_payload,
+                # Issue #112: the resolver now always attaches the fee block;
+                # this non-fee fixture pins the proven fee-free state.
+                "fee": {
+                    "status": "fee_free",
+                    "charging_contracts": [],
+                    "unknown_contracts": [],
+                },
             }
         ],
     )

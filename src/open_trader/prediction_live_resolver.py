@@ -22,7 +22,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import sqlite3
 
@@ -58,7 +58,12 @@ from open_trader.prediction_n_leg_execution import (
     partial_fill_proof_from_payload,
 )
 from open_trader.prediction_n_leg_mode import DEFAULT_SAFETY_CONFIG
-from open_trader.prediction_n_leg_read_model import would_submit_predicate
+from open_trader.prediction_n_leg_read_model import (
+    FEE_STATE_CHARGING,
+    FEE_STATE_FREE,
+    FEE_STATE_UNKNOWN,
+    would_submit_predicate,
+)
 from open_trader.prediction_partial_fill import (
     PARTIAL_FILL_UNKNOWN,
     fill_adversary_problem_from_market_solution,
@@ -152,6 +157,101 @@ def _normalize_atom(atom: TerminalAtom) -> TerminalAtom:
             raise ValueError(f"unsupported payout scale: {value}")
         payouts.append(ActionPayout(payout.action_id, scaled))
     return replace(atom, payouts=tuple(payouts))
+
+
+# Issue #112: per-contract fee states aggregated from the catalog generation
+# endpoints (state vocabulary lives in prediction_n_leg_read_model, which also
+# owns the fail-closed gate). Anything that is not a proven fee-free market --
+# a charging market, a missing/unparseable fee fact, or conflicting facts for
+# one contract -- fails closed; the fee gate itself lives in the qualification
+# layer, not in the solver cost slice.
+
+
+def _fee_rate_value(value: object) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        rate = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return rate if rate.is_finite() else None
+
+
+def _endpoint_fee_state(endpoint: object) -> str:
+    """Fee state of one catalog endpoint; unknown unless proven fee-free."""
+    if not isinstance(endpoint, Mapping):
+        return FEE_STATE_UNKNOWN
+    fees_enabled = endpoint.get("fees_enabled")
+    if fees_enabled is True:
+        return FEE_STATE_CHARGING
+    if fees_enabled is not False:
+        return FEE_STATE_UNKNOWN
+    rate_raw = endpoint.get("fee_rate")
+    if rate_raw is None:
+        return FEE_STATE_FREE
+    rate = _fee_rate_value(rate_raw)
+    if rate is None:
+        return FEE_STATE_UNKNOWN
+    if rate > 0:
+        return FEE_STATE_CHARGING
+    if rate == 0:
+        return FEE_STATE_FREE
+    return FEE_STATE_UNKNOWN
+
+
+def _fee_state_by_contract(
+    rows: Mapping[str, Mapping[str, object]],
+) -> dict[str, str]:
+    """Contract -> fee state over one generation batch, conflicting -> unknown."""
+    states: dict[str, str] = {}
+    for row in rows.values():
+        endpoints = row.get("endpoints")
+        if not isinstance(endpoints, Sequence):
+            continue
+        for endpoint in endpoints:
+            if not isinstance(endpoint, Mapping):
+                continue
+            contract_id = str(endpoint.get("contract_id") or "")
+            if not contract_id:
+                continue
+            state = _endpoint_fee_state(endpoint)
+            existing = states.setdefault(contract_id, state)
+            if existing != state:
+                states[contract_id] = FEE_STATE_UNKNOWN
+    return states
+
+
+def _fee_block(
+    selected: SelectedComponent | None,
+    fee_by_contract: Mapping[str, str],
+) -> dict[str, object]:
+    """Per-solution fee summary: the worst state over the component contracts.
+
+    A contract missing from the generation map (or a component with no
+    contracts at all) counts as unknown, never as fee-free.
+    """
+    contracts = sorted(selected.contract_ids) if selected is not None else []
+    charging: list[str] = []
+    unknown: list[str] = []
+    for contract_id in contracts:
+        state = fee_by_contract.get(contract_id, FEE_STATE_UNKNOWN)
+        if state == FEE_STATE_CHARGING:
+            charging.append(contract_id)
+        elif state != FEE_STATE_FREE:
+            unknown.append(contract_id)
+    if unknown:
+        status: str = FEE_STATE_UNKNOWN
+    elif charging:
+        status = FEE_STATE_CHARGING
+    elif contracts:
+        status = FEE_STATE_FREE
+    else:
+        status = FEE_STATE_UNKNOWN
+    return {
+        "status": status,
+        "charging_contracts": charging,
+        "unknown_contracts": unknown,
+    }
 
 
 class _OutcomeTrackingServer:
@@ -277,6 +377,8 @@ class PredictionLiveResolver:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._problem_map: dict[str, ArbitrageProblem] = {}
+        # Issue #112: contract -> fee state from the last reconciled batch.
+        self._fee_by_contract: dict[str, str] = {}
         self._selection: dict[str, SelectedComponent] = {}
         self._solutions: dict[
             str, tuple[MarketSolution, ExecutionSolution | None]
@@ -340,6 +442,7 @@ class PredictionLiveResolver:
         with self._lock:
             selection = dict(self._selection)
             solutions = dict(self._solutions)
+            fee_by_contract = dict(self._fee_by_contract)
         ordered = sorted(
             solutions,
             key=lambda component_id: (
@@ -359,6 +462,9 @@ class PredictionLiveResolver:
                     canonical_payload(execution)
                     if execution is not None
                     else None
+                ),
+                "fee": _fee_block(
+                    selection.get(component_id), fee_by_contract
                 ),
             }
             for component_id in ordered
@@ -454,6 +560,9 @@ class PredictionLiveResolver:
                 component.lineage_id
             )
         self._lineage_by_component = lineage_map
+        # Issue #112: the fee map is built from the same generation batch as
+        # the problem compilation and stored under the solutions lock.
+        fee_by_contract = _fee_state_by_contract(rows)
         for component in components:
             raw = problem_for_component(problem, component)
             raw_problems[component.component_id] = raw
@@ -491,6 +600,8 @@ class PredictionLiveResolver:
                     self._episode_tracker.component_retired(
                         component_id, now=now
                     )
+            with self._lock:
+                self._fee_by_contract = fee_by_contract
             self._problem_map = problem_map
             self._selection = kept
             self._solutions = {
@@ -566,7 +677,9 @@ class PredictionLiveResolver:
         problem = self._problem_map.get(selected.component_id)
         if problem is None:
             raise ValueError(f"no live problem for component {selected.component_id}")
-        # ponytail: fee/haircut/tick stay zero; real fee/tick policy is #74/#85.
+        # ponytail: fee stays 0 in the cost slice (#117 owns fee-aware
+        # economics); since #112 charging/unknown fees are gated at the
+        # qualification layer, and tick/haircut policy remains #74/#85.
         request = build_solve_request(
             problem,
             snapshot,

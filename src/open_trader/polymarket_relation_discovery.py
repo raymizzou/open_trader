@@ -289,6 +289,8 @@ class NativeComplementMarket:
     yes_token_id: str
     no_token_id: str
     rules_hash: str
+    fees_enabled: bool | None = None
+    fee_rate: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,6 +314,8 @@ class NegriskGroupMarket:
     resolution_source: str
     end_date: str
     rules_hash: str
+    fees_enabled: bool | None = None
+    fee_rate: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -879,6 +883,25 @@ def _end_date_parseable(value: str) -> bool:
     return parsed.tzinfo is not None
 
 
+def _mechanical_fee_fields(market: object) -> tuple[bool | None, Decimal | None]:
+    """Gamma fee facts of one mechanical market, read like the threshold codec.
+
+    The official gamma rows carry ``feesEnabled`` and ``feeSchedule.rate`` on
+    the market object itself (with the ``trading`` container as the legacy
+    fallback); a missing or non-boolean flag and an unparseable rate decode to
+    ``None`` so downstream consumers can fail closed on fee-unknown.
+    """
+    fees_enabled_value = _nested(
+        market, "trading", "feesEnabled", "fees_enabled", default=None
+    )
+    fees_enabled = (
+        fees_enabled_value if isinstance(fees_enabled_value, bool) else None
+    )
+    schedule = _nested(market, "trading", "feeSchedule", "fee_schedule", default=None)
+    fee_rate = _decimal(_value(schedule, "rate", default=None))
+    return fees_enabled, fee_rate
+
+
 def discover_mechanical_relation_catalog(
     events: Sequence[object],
 ) -> MechanicalRelationDiscoveryResult:
@@ -969,6 +992,7 @@ def discover_mechanical_relation_catalog(
                 rejection_counts["duplicate_token"] += 1
                 continue
             seen_token_pairs.add(token_pair)
+            fees_enabled, fee_rate = _mechanical_fee_fields(market)
             complements.append(
                 NativeComplementRelation(
                     event_id=event_id,
@@ -983,6 +1007,8 @@ def discover_mechanical_relation_catalog(
                         yes_token_id=tokens["yes"],
                         no_token_id=tokens["no"],
                         rules_hash=_hash(_normalized(rules)),
+                        fees_enabled=fees_enabled,
+                        fee_rate=fee_rate,
                     ),
                 )
             )
@@ -1031,6 +1057,7 @@ def discover_mechanical_relation_catalog(
                 rejection_counts["duplicate_condition"] += 1
                 continue
             group_conditions.add(condition_id)
+            fees_enabled, fee_rate = _mechanical_fee_fields(market)
             group_markets.append(
                 NegriskGroupMarket(
                     event_id=event_id,
@@ -1043,6 +1070,8 @@ def discover_mechanical_relation_catalog(
                     resolution_source=source,
                     end_date=end_date,
                     rules_hash=_hash(_normalized(rules)),
+                    fees_enabled=fees_enabled,
+                    fee_rate=fee_rate,
                 )
             )
         if group_unparseable:

@@ -2100,6 +2100,8 @@ function predictionReasonLabel(value) {
     manual_canary: "手动模式 · 可人工确认下单",
     manual_canary_requires_manual: "手动模式 · 当前范围不可下单",
     insufficient_depth: "盘口深度不足",
+    fee_charging_unmodeled: "收费市场，费用未建模，禁止下单",
+    fee_unknown: "费率未知，禁止下单",
   };
   return labels[key] || raw.replaceAll("_", " ");
 }
