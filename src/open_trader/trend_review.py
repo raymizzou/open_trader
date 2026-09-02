@@ -15322,6 +15322,13 @@ def rebuild_trend_report_from_evidence(
         real_positions: list[AccountPosition] = []
         real_snapshots: dict[str, HoldingSnapshot | None] = {}
         real_bars: dict[str, tuple[DailyKlineBar, ...] | None] = {}
+        real_events = real_raw.get("events", [])
+        if not isinstance(real_events, list) or not all(
+            isinstance(event, Mapping) for event in real_events
+        ):
+            raise TrendReplayIncompleteError(
+                "invalid original input: real_holdings"
+            )
         real_prior_state = real_raw.get("prior_state")
         if real_status == "available":
             raw_positions = real_raw.get("positions")
@@ -15431,6 +15438,7 @@ def rebuild_trend_report_from_evidence(
                 str(key): str(value)
                 for key, value in blocked_instruments.items()
             },
+            events=tuple(dict(event) for event in real_events),
         )
     process_version = str(evidence.get("process_version") or "")
     normalize_trend_strategy_snapshot(snapshot, str(inputs["market"]))

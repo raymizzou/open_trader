@@ -16,16 +16,22 @@ from tempfile import NamedTemporaryFile
 from time import sleep
 from zoneinfo import ZoneInfo
 
+from .account_http import fetch_account_snapshot
 from .a_share_trend import (
     STOP_RISK_AUDIT_ONLY_LABEL,
     _process_version,
     load_futu_simulate_trend_account,
+    load_real_holding_input,
     read_delivery_receipt,
     run_a_share_trend_report,
     valid_serialized_account,
     valid_frozen_report_contract,
 )
-from .a_share_trend_watch import cn_session, watch_a_share_protection
+from .a_share_trend_watch import (
+    AShareWatchResult,
+    cn_session,
+    watch_a_share_protection,
+)
 from .daily_premarket import (
     DailyPremarketConfig,
     RunLock,
@@ -1597,9 +1603,10 @@ def _run_protection_pass(
             once=True,
             account_loader=account_loader,
             on_protection_trigger=callback,
+            send_trigger_feishu=False,
         )
     paths = market_paths(config.data_dir, config.reports_dir, market)
-    return watch_market_protection(
+    simulated_result = watch_market_protection(
         market=market,
         data_dir=config.data_dir,
         portfolio_path=config.portfolio,
@@ -1615,6 +1622,127 @@ def _run_protection_pass(
         reconnect_seconds=5,
         once=True,
         on_protection_trigger=callback,
+        send_trigger_feishu=False,
+    )
+    if market != "US":
+        return simulated_result
+
+    real_events_path = paths.root / "real_watch_events.jsonl"
+    try:
+        account_snapshot = fetch_account_snapshot()
+        real_account = load_real_holding_input(
+            account_snapshot,
+            market,
+            state_path=paths.real_state,
+        )
+    except Exception:
+        return _combine_protection_results(
+            (simulated_result, _abnormal_protection_result(real_events_path)),
+            events_path=paths.events,
+        )
+    account_sources = account_snapshot.get("sources")
+    account_source = (
+        account_sources.get("account")
+        if isinstance(account_sources, Mapping)
+        else None
+    )
+    broker_sources = (
+        account_source.get("brokers")
+        if isinstance(account_source, Mapping)
+        else None
+    )
+    futu_source = (
+        broker_sources.get("futu")
+        if isinstance(broker_sources, Mapping)
+        else None
+    )
+    quote_source = (
+        account_sources.get("quotes")
+        if isinstance(account_sources, Mapping)
+        else None
+    )
+    real_source = getattr(real_account, "source", {})
+    if not (
+        isinstance(futu_source, Mapping)
+        and futu_source.get("source_kind") in {"live", "live_account"}
+        and futu_source.get("status") == "healthy"
+        and isinstance(quote_source, Mapping)
+        and quote_source.get("status") == "healthy"
+        and getattr(real_account, "status", None) == "available"
+        and isinstance(real_source, Mapping)
+        and real_source.get("broker") == "futu"
+        and real_source.get("source_kind") in {"live", "live_account"}
+        and not getattr(real_account, "blocked_instrument_ids", {})
+    ):
+        return _combine_protection_results(
+            (simulated_result, _abnormal_protection_result(real_events_path)),
+            events_path=paths.events,
+        )
+
+    real_result = watch_market_protection(
+        market=market,
+        data_dir=config.data_dir,
+        portfolio_path=config.portfolio,
+        account_loader=lambda *_args, **_kwargs: real_account,
+        state_path=paths.real_state,
+        events_path=real_events_path,
+        report_lock_path=paths.report_lock,
+        quote_client=quote_client,
+        close_quote_client=quote_client is None,
+        quote_client_factory=quote_factory,
+        notifier=notifier,
+        poll_seconds=5,
+        reconnect_seconds=5,
+        once=True,
+        on_protection_trigger=None,
+        send_trigger_feishu=True,
+    )
+    return _combine_protection_results(
+        (simulated_result, real_result), events_path=paths.events
+    )
+
+
+def _abnormal_protection_result(events_path: Path) -> AShareWatchResult:
+    return AShareWatchResult(
+        status="abnormal",
+        watched_symbol_count=0,
+        trigger_count=0,
+        exception_count=1,
+        unknown_quote_count=0,
+        events_path=events_path,
+    )
+
+
+def _combine_protection_results(
+    results: Sequence[object], *, events_path: Path
+) -> AShareWatchResult:
+    statuses = [str(getattr(result, "status", "") or "") for result in results]
+    status = (
+        "holiday"
+        if statuses and all(value == "holiday" for value in statuses)
+        else "completed"
+        if statuses and all(value in {"completed", "holiday"} for value in statuses)
+        else "abnormal"
+    )
+    return AShareWatchResult(
+        status=status,
+        watched_symbol_count=sum(
+            int(getattr(result, "watched_symbol_count", 0) or 0)
+            for result in results
+        ),
+        trigger_count=sum(
+            int(getattr(result, "trigger_count", 0) or 0)
+            for result in results
+        ),
+        exception_count=sum(
+            int(getattr(result, "exception_count", 0) or 0)
+            for result in results
+        ),
+        unknown_quote_count=sum(
+            int(getattr(result, "unknown_quote_count", 0) or 0)
+            for result in results
+        ),
+        events_path=events_path,
     )
 
 

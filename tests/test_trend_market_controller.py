@@ -14,15 +14,19 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from open_trader import a_share_trend as a_share_trend
+from open_trader import a_share_trend_watch as share_watch
+from open_trader import market_trend_watch as market_watch
 from open_trader import trend_market_controller as controller
 from open_trader import trend_review
 from open_trader.account_http import AccountHttpError
 from open_trader.daily_premarket import DailyPremarketConfig, RunLock
 from open_trader.futu_symbols import to_futu_symbol
+from open_trader.futu_watch import QuoteSnapshot
 from open_trader.kelly_order_execution import FutuOrderExecutionError
 from open_trader.notifications import (
     CompositeNotifier,
@@ -8803,6 +8807,503 @@ def test_run_protection_pass_returns_watcher_result(
     )
 
     assert controller._run_protection_pass(config, "CN", "2026-07-20") is expected
+
+
+def test_protection_pass_sends_feishu_only_for_live_real_positions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "require_trend_executor", lambda *_args, **_kwargs: None)
+    simulated_account = SimpleNamespace(
+        positions=(SimpleNamespace(symbol="PLTR", name="Palantir"),),
+    )
+    real_account = SimpleNamespace(
+        status="available",
+        reason="",
+        source={"broker": "futu", "source_kind": "live"},
+        positions=(SimpleNamespace(symbol="NVDA", name="NVIDIA"),),
+        blocked_instrument_ids={},
+        instrument_ids_by_symbol={"NVDA": "instrument-nvda"},
+    )
+    account_snapshot = {
+        "status": "stale",
+        "sources": {
+            "account": {
+                "status": "stale",
+                "brokers": {
+                    "futu": {"source_kind": "live", "status": "healthy"},
+                    "eastmoney": {"source_kind": "statement", "status": "stale"},
+                },
+            },
+            "quotes": {"status": "healthy"},
+        },
+    }
+    feishu_messages: list[tuple[str, str]] = []
+
+    def post_json(_url: str, payload: dict[str, object], _timeout: float) -> dict[str, object]:
+        content = payload["content"]
+        assert isinstance(content, dict)
+        feishu_messages.append((str(content["text"]).split("\n", 1)[0], str(content["text"])))
+        return {"code": 0}
+
+    notifier = FeishuWebhookNotifier(
+        webhook_url="https://example.test/webhook",
+        post_json=post_json,
+    )
+    monkeypatch.setattr(controller, "build_notifier", lambda _config: notifier)
+    monkeypatch.setattr(
+        controller, "fetch_account_snapshot", lambda: account_snapshot,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "load_real_holding_input",
+        lambda snapshot, market, *, state_path: real_account,
+        raising=False,
+    )
+    paths = controller.market_paths(config.data_dir, config.reports_dir, "US")
+    a_share_trend.write_protection_state(
+        paths.state,
+        {
+            "schema_version": 1,
+            "positions": {
+                "PLTR": {"active_line": "100", "updated_for": "2026-08-03"},
+            },
+        },
+    )
+    a_share_trend.write_protection_state(
+        paths.real_state,
+        {
+            "schema_version": 1,
+            "positions": {
+                "NVDA": {"active_line": "100", "updated_for": "2026-08-03"},
+            },
+        },
+    )
+
+    class Quote:
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-08-04"]
+
+        def get_snapshots(
+            self, futu_symbols: tuple[str, ...] | list[str]
+        ) -> dict[str, QuoteSnapshot]:
+            return {
+                symbol: QuoteSnapshot(symbol, Decimal("90"))
+                for symbol in futu_symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    callback_events: list[dict[str, object]] = []
+
+    def run_stop(
+        _config: DailyPremarketConfig,
+        _market: str,
+        event: dict[str, object],
+        *,
+        quote_client: object | None = None,
+    ) -> dict[str, object]:
+        del quote_client
+        callback_events.append(dict(event))
+        return {"status": "completed"}
+
+    monkeypatch.setattr(controller, "_run_stop", run_stop)
+    real_watch = market_watch.watch_market_protection
+    fixed_now = datetime(2026, 8, 4, 9, 31, tzinfo=ZoneInfo("America/New_York"))
+
+    def deterministic_watch(**kwargs: object) -> object:
+        return real_watch(
+            **kwargs,
+            now_fn=lambda: fixed_now,
+            sleep_fn=lambda _seconds: None,
+        )
+
+    monkeypatch.setattr(controller, "watch_market_protection", deterministic_watch)
+
+    result = controller._run_protection_pass(
+        config,
+        "US",
+        "2026-08-04",
+        quote_client=Quote(),
+        account_loader=lambda *_args, **_kwargs: SimpleNamespace(
+            positions=simulated_account.positions,
+        ),
+    )
+
+    assert result.status == "completed"
+    assert [event["symbol"] for event in callback_events] == ["PLTR"]
+    assert [title for title, _message in feishu_messages] == [
+        "【紧急｜富途｜美股保护线触发｜NVDA】",
+    ]
+    simulated_events = a_share_trend.load_watch_events(paths.events)
+    real_events = a_share_trend.load_watch_events(
+        paths.root / "real_watch_events.jsonl"
+    )
+    assert any(
+        event.get("symbol") == "PLTR"
+        and event.get("event_type") == "protection_triggered"
+        for event in simulated_events
+    )
+    assert not any(
+        event.get("symbol") == "PLTR"
+        and event.get("event_type")
+        == "protection_triggered_notification_delivered_feishu"
+        for event in simulated_events
+    )
+    assert any(
+        event.get("symbol") == "NVDA"
+        and event.get("event_type")
+        == "protection_triggered_notification_delivered_feishu"
+        for event in real_events
+    )
+
+
+def test_protection_pass_blocks_stale_real_account_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "require_trend_executor", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(controller, "build_notifier", lambda _config: object())
+    account_snapshot = {
+        "status": "stale",
+        "sources": {
+            "account": {
+                "status": "stale",
+                "brokers": {
+                    "futu": {"source_kind": "live", "status": "stale"},
+                },
+            },
+            "quotes": {"status": "healthy"},
+        },
+    }
+    monkeypatch.setattr(
+        controller, "fetch_account_snapshot", lambda: account_snapshot,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "load_real_holding_input",
+        lambda snapshot, market, *, state_path: SimpleNamespace(
+            status="available",
+            source={"broker": "futu", "source_kind": "live"},
+            positions=(SimpleNamespace(symbol="NVDA", name="NVIDIA"),),
+            blocked_instrument_ids={"instrument-nvda": "account_broker_stale:futu"},
+        ),
+        raising=False,
+    )
+    calls: list[dict[str, object]] = []
+
+    def watch(**kwargs: object) -> object:
+        calls.append(kwargs)
+        if kwargs["events_path"].name == "real_watch_events.jsonl":
+            raise AssertionError("stale real account reached protection watcher")
+        return protection_success()
+
+    monkeypatch.setattr(controller, "watch_market_protection", watch)
+
+    result = controller._run_protection_pass(
+        config,
+        "US",
+        "2026-08-04",
+        quote_client=object(),
+        account_loader=lambda *_args, **_kwargs: SimpleNamespace(
+            positions=(SimpleNamespace(symbol="PLTR", name="Palantir"),),
+        ),
+    )
+
+    assert (
+        result.status,
+        controller._protection_blocker(result) is not None,
+        len(calls),
+        calls[0]["events_path"].name,
+        calls[0]["send_trigger_feishu"],
+    ) == ("abnormal", True, 1, "watch_events.jsonl", False)
+
+
+def test_protection_pass_blocks_stale_real_quote_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = controller_config(tmp_path)
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "require_trend_executor", lambda *_args, **_kwargs: None)
+    account_snapshot = {
+        "status": "stale",
+        "sources": {
+            "account": {
+                "status": "healthy",
+                "brokers": {
+                    "futu": {"source_kind": "live", "status": "healthy"},
+                },
+            },
+            "quotes": {"status": "stale"},
+        },
+        "positions": [{
+            "broker": "futu",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "NVDA",
+            "name": "NVIDIA",
+            "currency": "USD",
+            "quantity": "10",
+            "cost_price": "100",
+            "market_value": "1200",
+            "instrument_id": "instrument-nvda",
+        }],
+        "cash_balances": [{
+            "broker": "futu",
+            "currency": "USD",
+            "available_balance": "10000",
+        }],
+    }
+    feishu_messages: list[str] = []
+
+    def post_json(_url: str, payload: dict[str, object], _timeout: float) -> dict[str, object]:
+        content = payload["content"]
+        assert isinstance(content, dict)
+        feishu_messages.append(str(content["text"]))
+        return {"code": 0}
+
+    notifier = FeishuWebhookNotifier(
+        webhook_url="https://example.test/webhook",
+        post_json=post_json,
+    )
+    monkeypatch.setattr(controller, "build_notifier", lambda _config: notifier)
+    monkeypatch.setattr(
+        controller, "fetch_account_snapshot", lambda: account_snapshot,
+        raising=False,
+    )
+    paths = controller.market_paths(config.data_dir, config.reports_dir, "US")
+    a_share_trend.write_protection_state(
+        paths.state,
+        {
+            "schema_version": 1,
+            "positions": {
+                "PLTR": {"active_line": "100", "updated_for": "2026-08-03"},
+            },
+        },
+    )
+    a_share_trend.write_protection_state(
+        paths.real_state,
+        {
+            "schema_version": 1,
+            "positions": {
+                "NVDA": {"active_line": "100", "updated_for": "2026-08-03"},
+            },
+        },
+    )
+
+    class Quote:
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-08-04"]
+
+        def get_snapshots(
+            self, futu_symbols: tuple[str, ...] | list[str]
+        ) -> dict[str, QuoteSnapshot]:
+            return {
+                symbol: QuoteSnapshot(symbol, Decimal("90"))
+                for symbol in futu_symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    callback_events: list[dict[str, object]] = []
+
+    def run_stop(
+        _config: DailyPremarketConfig,
+        _market: str,
+        event: dict[str, object],
+        *,
+        quote_client: object | None = None,
+    ) -> dict[str, object]:
+        del quote_client
+        callback_events.append(dict(event))
+        return {"status": "completed"}
+
+    monkeypatch.setattr(controller, "_run_stop", run_stop)
+    real_watch = market_watch.watch_market_protection
+    fixed_now = datetime(2026, 8, 4, 9, 31, tzinfo=ZoneInfo("America/New_York"))
+
+    def deterministic_watch(**kwargs: object) -> object:
+        return real_watch(
+            **kwargs,
+            now_fn=lambda: fixed_now,
+            sleep_fn=lambda _seconds: None,
+        )
+
+    monkeypatch.setattr(controller, "watch_market_protection", deterministic_watch)
+
+    result = controller._run_protection_pass(
+        config,
+        "US",
+        "2026-08-04",
+        quote_client=Quote(),
+        account_loader=lambda *_args, **_kwargs: SimpleNamespace(
+            positions=(SimpleNamespace(symbol="PLTR", name="Palantir"),),
+        ),
+    )
+
+    simulated_events = a_share_trend.load_watch_events(paths.events)
+    real_events = a_share_trend.load_watch_events(
+        paths.root / "real_watch_events.jsonl"
+    )
+    assert (
+        result.status,
+        controller._protection_blocker(result) is not None,
+        [event["symbol"] for event in callback_events],
+        feishu_messages,
+        any(
+            event.get("symbol") == "PLTR"
+            and event.get("event_type") == "protection_triggered"
+            for event in simulated_events
+        ),
+        any(
+            event.get("symbol") == "NVDA"
+            and event.get("event_type") in {
+                "protection_triggered",
+                "protection_triggered_notification_delivered_feishu",
+            }
+            for event in real_events
+        ),
+    ) == ("abnormal", True, ["PLTR"], [], True, False)
+
+
+@pytest.mark.parametrize(
+    ("market", "symbol"),
+    [("CN", "600900"), ("HK", "00700")],
+)
+def test_protection_pass_suppresses_feishu_for_cn_and_hk_without_real_fetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    market: str,
+    symbol: str,
+) -> None:
+    config = controller_config(tmp_path)
+    monkeypatch.setattr(socket, "gethostname", lambda: "executor")
+    monkeypatch.setattr(controller, "require_trend_executor", lambda *_args, **_kwargs: None)
+
+    def fail_fetch() -> object:
+        raise AssertionError(f"{market} real account fetch reached")
+
+    monkeypatch.setattr(controller, "fetch_account_snapshot", fail_fetch)
+    feishu_messages: list[str] = []
+
+    def post_json(_url: str, payload: dict[str, object], _timeout: float) -> dict[str, object]:
+        content = payload["content"]
+        assert isinstance(content, dict)
+        feishu_messages.append(str(content["text"]))
+        return {"code": 0}
+
+    notifier = FeishuWebhookNotifier(
+        webhook_url="https://example.test/webhook",
+        post_json=post_json,
+    )
+    monkeypatch.setattr(controller, "build_notifier", lambda _config: notifier)
+    if market == "CN":
+        state_path = config.data_dir / "trend_a_share/protection_state.json"
+        events_path = config.data_dir / "trend_a_share/watch_events.jsonl"
+    else:
+        paths = controller.market_paths(config.data_dir, config.reports_dir, market)
+        state_path = paths.state
+        events_path = paths.events
+    a_share_trend.write_protection_state(
+        state_path,
+        {
+            "schema_version": 1,
+            "positions": {
+                symbol: {"active_line": "100", "updated_for": "2026-08-03"},
+            },
+        },
+    )
+
+    class Quote:
+        def get_cn_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-08-04"]
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return ["2026-08-04"]
+
+        def get_snapshots(
+            self, futu_symbols: tuple[str, ...] | list[str]
+        ) -> dict[str, QuoteSnapshot]:
+            return {
+                futu_symbol: QuoteSnapshot(futu_symbol, Decimal("90"))
+                for futu_symbol in futu_symbols
+            }
+
+        def close(self) -> None:
+            pass
+
+    callback_symbols: list[str] = []
+
+    def run_stop(
+        _config: DailyPremarketConfig,
+        _market: str,
+        event: dict[str, object],
+        *,
+        quote_client: object | None = None,
+    ) -> dict[str, object]:
+        del quote_client
+        callback_symbols.append(str(event["symbol"]))
+        return {"status": "completed"}
+
+    monkeypatch.setattr(controller, "_run_stop", run_stop)
+    fixed_now = datetime(
+        2026,
+        8,
+        4,
+        9,
+        31,
+        tzinfo=ZoneInfo("Asia/Shanghai" if market == "CN" else "Asia/Hong_Kong"),
+    )
+    if market == "CN":
+        real_watch = share_watch.watch_a_share_protection
+
+        def deterministic_watch(**kwargs: object) -> object:
+            return real_watch(
+                **kwargs,
+                now_fn=lambda: fixed_now,
+                sleep_fn=lambda _seconds: None,
+            )
+
+        monkeypatch.setattr(controller, "watch_a_share_protection", deterministic_watch)
+    else:
+        real_watch = market_watch.watch_market_protection
+
+        def deterministic_watch(**kwargs: object) -> object:
+            return real_watch(
+                **kwargs,
+                now_fn=lambda: fixed_now,
+                sleep_fn=lambda _seconds: None,
+            )
+
+        monkeypatch.setattr(controller, "watch_market_protection", deterministic_watch)
+
+    result = controller._run_protection_pass(
+        config,
+        market,
+        "2026-08-04",
+        quote_client=Quote(),
+        account_loader=lambda *_args, **_kwargs: SimpleNamespace(
+            positions=(SimpleNamespace(symbol=symbol, name="Test position"),),
+        ),
+    )
+    events = a_share_trend.load_watch_events(events_path)
+    assert (
+        result.status,
+        callback_symbols,
+        feishu_messages,
+        [event["event_type"] for event in events],
+        any(
+            event.get("event_type")
+            == "protection_triggered_notification_delivered_feishu"
+            for event in events
+        ),
+    ) == ("completed", [symbol], [], ["protection_triggered"], False)
 
 
 def test_run_stop_returns_uncertain_upgrade_and_notifies_once(

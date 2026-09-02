@@ -126,6 +126,7 @@ def watch_a_share_protection(
     account_loader: Callable[..., AccountSnapshot],
     on_session_open: Callable[[str], None] | None = None,
     on_protection_trigger: Callable[[Mapping[str, object]], None] | None = None,
+    send_trigger_feishu: bool = True,
 ) -> AShareWatchResult:
     client = quote_client
     if quote_client_factory is None and client is not None:
@@ -385,6 +386,7 @@ def watch_a_share_protection(
                     delivered_feishu=delivered_alerts_feishu,
                     delivered_macos=delivered_alerts_macos,
                     replay=True,
+                    send_feishu=send_trigger_feishu,
                     market_label=market_label,
                     broker_label=broker_label,
                 )
@@ -516,6 +518,7 @@ def watch_a_share_protection(
                         delivered_feishu=delivered_alerts_feishu,
                         delivered_macos=delivered_alerts_macos,
                         replay=False,
+                        send_feishu=send_trigger_feishu,
                         market_label=market_label,
                         broker_label=broker_label,
                     )
@@ -1005,6 +1008,7 @@ def _deliver_trigger_notification(
     delivered_feishu: set[str],
     delivered_macos: set[str],
     replay: bool,
+    send_feishu: bool = True,
     market_label: str = "A股",
     broker_label: str = "东方财富",
 ) -> None:
@@ -1018,7 +1022,7 @@ def _deliver_trigger_notification(
             f"最新价 {last_price} <= 活动保护线 {active_line}\n"
             "建议动作：全部卖出（人工执行）"
         )
-    for channels, event_type, delivered, title, body in (
+    trigger_notifications = (
         (
             {"feishu", "feishu_app"},
             "protection_triggered_notification_delivered_feishu",
@@ -1031,6 +1035,9 @@ def _deliver_trigger_notification(
                 active_line=active_line,
             ),
         ),
+    ) if send_feishu else ()
+    for channels, event_type, delivered, title, body in (
+        *trigger_notifications,
         (
             {"macos"},
             "protection_triggered_notification_delivered_macos",

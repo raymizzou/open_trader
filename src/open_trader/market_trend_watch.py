@@ -98,6 +98,7 @@ def watch_market_protection(
     sleep_fn: Callable[[float], None] = time_module.sleep,
     on_session_open: Callable[[str], None] | None = None,
     on_protection_trigger: Callable[[Mapping[str, object]], None] | None = None,
+    send_trigger_feishu: bool = True,
 ) -> AShareWatchResult:
     market = _market(market)
     timezone = MARKET_TIMEZONES[market]
@@ -237,4 +238,5 @@ def watch_market_protection(
         account_loader=account_loader,
         on_session_open=on_session_open,
         on_protection_trigger=on_protection_trigger,
+        send_trigger_feishu=send_trigger_feishu,
     )

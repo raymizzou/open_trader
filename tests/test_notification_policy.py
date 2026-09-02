@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from open_trader.notification_policy import (
     brief_zh_detail,
     group_order_alerts,
@@ -46,7 +48,7 @@ def test_fixed_feishu_title_levels() -> None:
     )
     assert render_protection_alert("富途", "美股", "HIG", last_price="133.90", active_line="134.1650") == (
         "【紧急｜富途｜美股保护线触发｜HIG】",
-        "最新价：133.90\n活动保护线：134.1650\n现在做：人工确认并全部卖出",
+        "最新价：133.90\n活动保护线：134.17\n现在做：人工确认并全部卖出",
     )
     assert brief_zh_detail("failed at /Users/ray/secret.json") == "详见控制器日志"
     assert brief_zh_detail("行情连接超时\ntraceback") == "行情连接超时"
@@ -136,3 +138,25 @@ def test_protection_alert_normalizes_symbol_and_hides_unsafe_title_detail() -> N
     assert "/Users/" not in unsafe_title
     assert "Traceback" not in unsafe_title
     assert title == "【紧急｜富途｜美股保护线触发｜B1】"
+
+
+def test_protection_alert_rounds_prices_to_two_decimals() -> None:
+    _, rounded = render_protection_alert(
+        "富途",
+        "美股",
+        "NVDA",
+        last_price=Decimal("173.21"),
+        active_line=Decimal("173.2360285714285714285714286"),
+    )
+    _, fallback = render_protection_alert(
+        "富途",
+        "美股",
+        "NVDA",
+        last_price=Decimal("NaN"),
+        active_line="not-a-price",
+    )
+
+    assert (rounded, fallback) == (
+        "最新价：173.21\n活动保护线：173.24\n现在做：人工确认并全部卖出",
+        "最新价：详见控制器日志\n活动保护线：详见控制器日志\n现在做：人工确认并全部卖出",
+    )

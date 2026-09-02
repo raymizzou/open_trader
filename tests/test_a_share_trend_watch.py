@@ -896,6 +896,52 @@ def test_watcher_alerts_once_per_symbol_per_day(tmp_path: Path) -> None:
     }
 
 
+def test_simulated_trigger_suppresses_feishu_but_keeps_callback_and_local_alerts(
+    tmp_path: Path,
+) -> None:
+    feishu = RecordingNotifier()
+    macos = RecordingMacOSNotifier()
+    xiaoai = RecordingXiaoaiNotifier()
+    callbacks: list[Mapping[str, object]] = []
+    events_path = tmp_path / "events.jsonl"
+
+    result = watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path),
+        state_path=state(tmp_path, active_line="27.31"),
+        events_path=events_path,
+        quote_client=SequenceQuote([{"SH.600900": Decimal("27.30")}]),
+        notifier=CompositeNotifier([feishu, macos, xiaoai]),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=SequenceClock(["2026-07-15T09:30:00+08:00"]),
+        sleep_fn=lambda _seconds: None,
+        send_trigger_feishu=False,
+        on_protection_trigger=callbacks.append,
+    )
+
+    events = read_events(events_path)
+    assert (
+        result.trigger_count,
+        len(callbacks),
+        len(feishu.messages),
+        len(macos.messages),
+        len(xiaoai.messages),
+        [event["event_type"] for event in events],
+    ) == (
+        1,
+        1,
+        0,
+        1,
+        1,
+        [
+            "protection_triggered",
+            "protection_triggered_notification_delivered_macos",
+            "protection_triggered_notification_queued_xiaoai",
+        ],
+    )
+
+
 def test_feishu_policy_keeps_only_b1_and_preserves_other_channels(tmp_path: Path) -> None:
     feishu = RecordingNotifier()
     macos = RecordingMacOSNotifier()
@@ -1618,6 +1664,61 @@ def test_trigger_notification_replays_after_price_rebounds(tmp_path: Path) -> No
         "protection_triggered_notification_delivered_feishu",
         "protection_triggered_notification_delivered_macos",
     ]
+
+
+def test_simulated_trigger_replay_suppresses_feishu_but_keeps_local_alert(
+    tmp_path: Path,
+) -> None:
+    events_path = tmp_path / "events.jsonl"
+    first_feishu = RecordingNotifier()
+    first_macos = FlakyMacOSNotifier(failures=1)
+    first = watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path),
+        state_path=state(tmp_path),
+        events_path=events_path,
+        quote_client=SequenceQuote([{"SH.600900": Decimal("27.30")}]),
+        notifier=CompositeNotifier([first_feishu, first_macos]),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=SequenceClock(["2026-07-15T09:30:00+08:00"]),
+        sleep_fn=lambda _seconds: None,
+        send_trigger_feishu=False,
+    )
+    restarted_feishu = RecordingNotifier()
+    restarted_macos = RecordingMacOSNotifier()
+    restarted = watch_a_share_protection(
+        portfolio_path=portfolio(tmp_path),
+        state_path=state(tmp_path),
+        events_path=events_path,
+        quote_client=SequenceQuote([{"SH.600900": Decimal("28.00")}]),
+        notifier=CompositeNotifier([restarted_feishu, restarted_macos]),
+        poll_seconds=5,
+        reconnect_seconds=60,
+        once=True,
+        now_fn=SequenceClock(["2026-07-15T09:30:00+08:00"]),
+        sleep_fn=lambda _seconds: None,
+        send_trigger_feishu=False,
+    )
+
+    assert (
+        first.trigger_count,
+        restarted.trigger_count,
+        first_feishu.messages,
+        restarted_feishu.messages,
+        len(restarted_macos.messages),
+        [event["event_type"] for event in read_events(events_path)],
+    ) == (
+        1,
+        0,
+        [],
+        [],
+        1,
+        [
+            "protection_triggered",
+            "protection_triggered_notification_delivered_macos",
+        ],
+    )
 
 
 def test_trigger_notification_replays_before_quote_unknown_handling(

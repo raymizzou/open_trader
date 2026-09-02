@@ -3115,6 +3115,7 @@ class RealHoldingInput:
     instrument_ids_by_symbol: Mapping[str, str] = field(default_factory=dict)
     blocked_instrument_ids: Mapping[str, str] = field(default_factory=dict)
     account_exceptions: tuple[str, ...] = ()
+    events: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3357,6 +3358,7 @@ def load_real_holding_input(
     }
     try:
         prior_state = load_protection_state(state_path)
+        events = load_watch_events(state_path.with_name("real_watch_events.jsonl"))
     except ValueError as exc:
         return RealHoldingInput(
             status="unavailable",
@@ -3527,6 +3529,7 @@ def load_real_holding_input(
         position_count=len(positions),
         instrument_ids_by_symbol=instrument_ids_by_symbol,
         blocked_instrument_ids=blocked_instrument_ids,
+        events=events,
     )
 
 
@@ -6564,9 +6567,17 @@ def _protection_was_triggered(
     symbol: str,
     old_state: Mapping[str, object],
     watch_events: Sequence[Mapping[str, object]],
+    *,
+    max_event_date: str | None = None,
 ) -> bool:
     if not old_state:
         return False
+    report_date: date | None = None
+    if max_event_date is not None:
+        try:
+            report_date = date.fromisoformat(max_event_date)
+        except ValueError:
+            return False
     started_for = old_state.get("position_started_for")
     for event in watch_events:
         if event.get("event_type") != "protection_triggered" or str(
@@ -6577,6 +6588,14 @@ def _protection_was_triggered(
         if not isinstance(event_date, str):
             occurred_at = event.get("occurred_at")
             event_date = occurred_at[:10] if isinstance(occurred_at, str) else ""
+        if report_date is not None:
+            try:
+                event_day = date.fromisoformat(event_date)
+            except ValueError:
+                continue
+            if event_day > report_date:
+                continue
+            event_date = event_day.isoformat()
         if not isinstance(started_for, str) or not started_for or not event_date:
             return True
         if event_date >= started_for:
@@ -6693,7 +6712,12 @@ def _evaluate_holding_positions(
         )
         triggered = (
             {symbol}
-            if _protection_was_triggered(symbol, old_state, watch_events)
+            if _protection_was_triggered(
+                symbol,
+                old_state,
+                watch_events,
+                max_event_date=as_of_date if read_only_real else None,
+            )
             else set()
         )
         action, reason = _holding_action(
@@ -7174,7 +7198,7 @@ def build_report(
             holding_snapshots=real_holdings.holding_snapshots,
             bars_by_symbol=real_holdings.bars_by_symbol,
             prior_state=real_holdings.prior_state,
-            watch_events=(),
+            watch_events=real_holdings.events,
             as_of_date=as_of_date,
             market=market,
             lot_sizes=lot_sizes,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 
 MARKET_LABELS = {"CN": "A股", "HK": "港股", "US": "美股"}
@@ -133,7 +133,13 @@ def brief_zh_detail(value: object) -> str:
 def _numeric_detail(value: object) -> str:
     text = str(value).strip()
     try:
-        return text if len(text) <= 64 and Decimal(text).is_finite() else "详见控制器日志"
+        numeric = Decimal(text)
+        if len(text) > 64 or not numeric.is_finite():
+            return "详见控制器日志"
+        return format(
+            numeric.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+            "f",
+        )
     except InvalidOperation:
         return "详见控制器日志"
 

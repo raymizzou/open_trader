@@ -20,11 +20,13 @@ from open_trader.a_share_trend import (
     AccountPosition,
     AccountSnapshot,
     CandidateInput,
+    HoldingSnapshot,
     RealHoldingInput,
     _report_payload,
     build_report as _build_report,
     live_trend_strategy_snapshot,
     trend_strategy_snapshot,
+    load_real_holding_input,
     load_protection_state,
     write_protection_state,
 )
@@ -1205,6 +1207,260 @@ def test_rebuild_preserves_excluded_real_holding_reason(tmp_path: Path) -> None:
     assert rebuilt["strategy_judgments"]["real_holding_decisions"][0][
         "reason"
     ] == "holding_trend_excluded"
+
+
+def test_rebuild_preserves_real_protection_trigger(tmp_path: Path) -> None:
+    account_snapshot = {
+        "status": "healthy",
+        "sources": {
+            "account": {
+                "status": "healthy",
+                "brokers": {
+                    "futu": {
+                        "source_kind": "live",
+                        "status": "healthy",
+                        "data_as_of": "2026-08-03T16:00:00+00:00",
+                    },
+                },
+            },
+            "quotes": {"status": "healthy"},
+        },
+        "positions": [{
+            "broker": "futu",
+            "market": "US",
+            "asset_class": "stock",
+            "symbol": "NVDA",
+            "name": "NVIDIA",
+            "currency": "USD",
+            "quantity": "10",
+            "cost_price": "100",
+            "market_value": "1200",
+            "instrument_id": "instrument-nvda",
+        }],
+        "cash_balances": [{
+            "broker": "futu",
+            "currency": "USD",
+            "available_balance": "10000",
+        }],
+    }
+    state_path = tmp_path / "trend_us_futu/real_protection_state.json"
+    write_protection_state(
+        state_path,
+        {
+            "schema_version": 1,
+            "positions": {
+                "NVDA": {
+                    "initial_line": "90",
+                    "active_line": "95",
+                    "atr14": "5",
+                    "position_started_for": "2026-08-01",
+                    "tracking_active": False,
+                    "updated_for": "2026-08-03",
+                },
+            },
+        },
+    )
+    (state_path.parent / "real_watch_events.jsonl").write_text(
+        json.dumps({
+            "symbol": "NVDA",
+            "trading_date": "2026-08-03",
+            "event_type": "protection_triggered",
+            "occurred_at": "2026-08-03T15:30:00+00:00",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    real_input = load_real_holding_input(
+        account_snapshot,
+        "US",
+        state_path=state_path,
+    )
+    future_data_dir = tmp_path / "future"
+    future_state_path = future_data_dir / "trend_us_futu/real_protection_state.json"
+    write_protection_state(
+        future_state_path,
+        {
+            "schema_version": 1,
+            "positions": {
+                "NVDA": {
+                    "initial_line": "90",
+                    "active_line": "95",
+                    "atr14": "5",
+                    "position_started_for": "2026-08-01",
+                    "tracking_active": False,
+                    "updated_for": "2026-08-03",
+                },
+            },
+        },
+    )
+    (future_state_path.parent / "real_watch_events.jsonl").write_text(
+        "\n".join(
+            (
+                json.dumps({
+                    "symbol": "NVDA",
+                    "trading_date": "2026-08-04",
+                    "event_type": "protection_triggered",
+                }),
+                json.dumps({
+                    "symbol": "NVDA",
+                    "event_type": "protection_triggered",
+                }),
+            )
+        ) + "\n",
+        encoding="utf-8",
+    )
+    future_real_input = replace(
+        load_real_holding_input(
+            account_snapshot,
+            "US",
+            state_path=future_state_path,
+        ),
+        holding_snapshots={
+            "NVDA": HoldingSnapshot(
+                tm_id=2,
+                symbol="NVDA",
+                exchange="US",
+                name="NVIDIA",
+                as_of_date="2026-08-03",
+                right_side=True,
+                danger=False,
+                boiling=False,
+                champagne=False,
+            ),
+        },
+    )
+    simulated_position = AccountPosition(
+        symbol="PLTR",
+        name="Palantir",
+        asset_class="stock",
+        quantity=Decimal("10"),
+        avg_cost_price=Decimal("100"),
+        market_value=Decimal("1200"),
+    )
+    simulated_snapshot = HoldingSnapshot(
+        tm_id=1,
+        symbol="PLTR",
+        exchange="US",
+        name="Palantir",
+        as_of_date="2026-08-03",
+        right_side=True,
+        danger=False,
+        boiling=False,
+        champagne=False,
+    )
+    simulated_account = AccountSnapshot(
+        source_date="2026-08-03",
+        fresh=True,
+        net_value=Decimal("10000"),
+        available_cash=Decimal("8800"),
+        positions=(simulated_position,),
+        exceptions=(),
+        position_count=1,
+    )
+    prior_state = {
+        "schema_version": 1,
+        "positions": {
+            "PLTR": {
+                "initial_line": "90",
+                "active_line": "95",
+                "atr14": "5",
+                "position_started_for": "2026-08-01",
+                "tracking_active": False,
+                "updated_for": "2026-08-03",
+            },
+        },
+    }
+    strategy = trend_strategy_snapshot("US", "oldsha", (1,))
+
+    def freeze_and_rebuild(
+        real_holdings: RealHoldingInput,
+        *,
+        data_dir: Path = tmp_path,
+        as_of_date: str = "2026-08-03",
+        execution_date: str = "2026-08-04",
+    ) -> object:
+        report = build_report(
+            as_of_date=as_of_date,
+            execution_date=execution_date,
+            account=simulated_account,
+            candidates=(),
+            holding_snapshots={"PLTR": simulated_snapshot},
+            bars_by_symbol={},
+            prior_state=prior_state,
+            watch_events=(),
+            generated_at=f"{as_of_date}T17:00:00+00:00",
+            metadata={"market": "US", "broker": "futu", "process_version": "oldsha"},
+            market="US",
+            process_version="oldsha",
+            candidate_pool_ids=(1,),
+            strategy_snapshot=strategy,
+            real_holdings=real_holdings,
+        )
+        frozen = trend_review.freeze_report_evidence(
+            data_dir=data_dir,
+            report=report,
+            candidates=(),
+            holding_snapshots={"PLTR": simulated_snapshot},
+            bars_by_symbol={},
+            prior_state=prior_state,
+            watch_events=(),
+            query={"component_pool_ids": [1]},
+            responses={},
+            candidate_pool_ids=(1,),
+            lot_sizes={},
+            price_fx_to_account_currency=Decimal("1"),
+            previous_attention_rows=[],
+            option_attention_broker_label="富途",
+            real_holdings_input=real_holdings,
+            account_snapshot=account_snapshot,
+        )
+        evidence = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
+        return trend_review.rebuild_trend_report_from_evidence(
+            evidence,
+            _return_report=True,
+        )
+
+    rebuilt = freeze_and_rebuild(real_input)
+    rebuilt_payload = _report_payload(rebuilt)
+    real_decision = rebuilt_payload["strategy_judgments"]["real_holding_decisions"][0]
+    simulated_decision = rebuilt_payload["strategy_judgments"]["holding_decisions"][0]
+
+    future_report = freeze_and_rebuild(
+        future_real_input,
+        data_dir=future_data_dir,
+    )
+    future_payload = _report_payload(future_report)
+    future_decision = future_payload["strategy_judgments"]["real_holding_decisions"][0]
+
+    disappeared_snapshot = copy.deepcopy(account_snapshot)
+    disappeared_snapshot["positions"] = []
+    disappeared = load_real_holding_input(
+        disappeared_snapshot,
+        "US",
+        state_path=state_path,
+    )
+    disappeared_report = freeze_and_rebuild(
+        disappeared,
+        as_of_date="2026-08-04",
+        execution_date="2026-08-05",
+    )
+
+    assert (
+        real_decision["action"],
+        real_decision["reason"],
+        simulated_decision["action"],
+        simulated_decision["reason"],
+        future_decision["action"],
+        future_decision["reason"],
+        disappeared_report.real_protection_state,
+    ) == (
+        "SELL_ALL",
+        "protection_line_already_triggered",
+        "HOLD",
+        "trend_intact",
+        "HOLD",
+        "trend_intact",
+        {"schema_version": 1, "positions": {}},
+    )
 
 
 @pytest.mark.parametrize("strategy_version", ["v4", "v9"])
