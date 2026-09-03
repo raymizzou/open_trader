@@ -14,6 +14,8 @@ import re
 import subprocess
 import threading
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
@@ -84,6 +86,42 @@ class PolymarketTradingError(RuntimeError):
         safe_code = error_code if error_code in _SAFE_ERROR_CODES else "sdk_error"
         self.error_code = safe_code
         super().__init__(f"polymarket trading error: {safe_code}")
+
+
+#: Issue #64: the N-leg unit scale (units per $1.00) shared with the #117
+#: economics pipeline; FOK bounds and prices convert through this divisor.
+_NLEG_UNITS_PER_DOLLAR = 1_000_000
+
+
+def _interpret_fok_response(response: object) -> dict[str, object]:
+    """Map one FOK BUY response to a conservative terminal outcome.
+
+    Only an explicit positive acknowledgement (``success``/``status``
+    indicating the FOK matched) books a FILLED leg, at the conservative
+    ``max_cost_units`` bound the caller supplied. An explicit failure books a
+    clean REJECTED (FOK either fills fully or not at all, nothing rests).
+    Everything else — model shapes this adapter does not recognize — is
+    UNKNOWN so the driver opens an incident instead of guessing.
+    """
+    success = _field(response, "success", None)
+    status = _field(response, "status", None)
+    if success is None and isinstance(response, Mapping):
+        success = response.get("success")
+    if status is None and isinstance(response, Mapping):
+        status = response.get("status")
+    status_text = str(status or "").strip().upper()
+    if success is True or status_text in {"MATCHED", "FILLED", "MATCHED_CONFIRMED"}:
+        return {"state": "FILLED", "error_code": None}
+    if success is False or status_text in {
+        "REJECTED",
+        "CANCELLED",
+        "EXPIRED",
+        "UNFILLED",
+        "NOT_PLACED",
+        "FAILED",
+    }:
+        return {"state": "REJECTED", "error_code": None}
+    return {"state": "UNKNOWN", "error_code": "unrecognized_receipt"}
 
 
 class KeychainError(RuntimeError):
@@ -732,6 +770,54 @@ class PolymarketTradingClient:
             max_price=max_price,
             order_type="FOK",
         )
+
+    def submit_n_leg_leg_once(
+        self,
+        *,
+        client_order_id: str,
+        token_id: str,
+        quantity_lots: int,
+        max_cost_units: int,
+        timeout_seconds: int = 15,
+    ) -> dict[str, object]:
+        """Issue #64: ONE FOK BUY attempt for one N-leg batch leg.
+
+        Exactly one attempt is made — a timeout, exception or unrecognized
+        receipt is reported as ``UNKNOWN`` and the caller must open an
+        incident; this adapter never retries. Units follow the N-leg
+        convention (1,000,000 units per $); the whole FOK fill is bounded by
+        ``max_cost_units``, so a successful fill books that conservative
+        upper bound as the cumulative cost.
+        """
+        if type(quantity_lots) is not int or quantity_lots <= 0:
+            return {"state": "UNKNOWN", "error_code": "invalid_quantity"}
+        if type(max_cost_units) is not int or max_cost_units <= 0:
+            return {"state": "UNKNOWN", "error_code": "invalid_cost_bound"}
+        max_price = Decimal(max_cost_units) / (
+            Decimal(quantity_lots) * _NLEG_UNITS_PER_DOLLAR
+        )
+        amount = Decimal(quantity_lots)
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(
+                self._sign_leg,
+                token_id=str(token_id),
+                amount=amount,
+                max_price=max_price,
+                max_spend=Decimal(max_cost_units) / _NLEG_UNITS_PER_DOLLAR,
+            )
+            try:
+                response = future.result(timeout=max(1, int(timeout_seconds)))
+            except FuturesTimeoutError:
+                future.cancel()
+                return {"state": "UNKNOWN", "error_code": "timeout"}
+        except Exception as exc:
+            code = _safe_error_code(exc)
+            del exc
+            return {"state": "UNKNOWN", "error_code": code or "submit_error"}
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        return _interpret_fok_response(response)
 
     @staticmethod
     def _field_alias(value: object, *names: str, default: object = None) -> object:

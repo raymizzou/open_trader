@@ -16841,3 +16841,197 @@ console.log("ok");
 ''')
 
     assert "ok" in output
+
+
+# ---------------------------------------------------------------------------
+# Issue #64: the four manual-confirm UI surfaces, driven through the real
+# dashboard.js in the node vm harness.
+# ---------------------------------------------------------------------------
+
+
+def test_issue64_card_confirm_button_only_for_ready_nleg_rows() -> None:
+    output = run_dashboard_js(r'''
+const row = {
+  opportunity_id: "nleg:component:a:b",
+  title: "Bitcoin 在 12 月 31 日前高于 $120,000？",
+  engine_owner: "N_LEG",
+  strategy_type: "N_LEG",
+  market_type: "n_leg",
+  relation_type: "IMPLIES",
+  discovery_source: "LLM",
+  leg_count: 2,
+  scope: {event: "same_event", venue: "same_venue"},
+  scope_label: "同所 · 同事件",
+  qualification_policy_version: "v1",
+  qualification: {status: "QUALIFIED_VERIFIED", order_ready: false, checks: []},
+  n_leg_solution: {
+    component_id: "component:a:b",
+    market: {minimum_profit: "3.76", maximum_cost: "16.24", legs: []},
+    execution: {
+      would_submit: true, order_ready: true, reason: "MANUAL_CANARY",
+      partial_fill_proof: "PARTIAL_FILL_SAFE",
+      execution_solution_fingerprint: "sha256:4c1234567890abcdef",
+      projected_total_units: 16240000,
+      max_total_unsettled_capital_units: 60000000,
+      legs: [],
+    },
+  },
+};
+const blocked = JSON.parse(JSON.stringify(row));
+blocked.n_leg_solution.execution.order_ready = false;
+blocked.n_leg_solution.execution.reason = "SCOPE_OBSERVE_ONLY";
+console.log(JSON.stringify({
+  ready: predictionUnifiedOpportunityCard(row, "MANUAL", true),
+  blocked: predictionUnifiedOpportunityCard(blocked, "MANUAL", true),
+}));
+''')
+    rendered = json.loads(output)
+    assert "人工确认下单" in rendered["ready"]
+    assert 'data-action="nleg-confirm"' in rendered["ready"]
+    assert "可人工确认" in rendered["ready"]
+    assert "data-action=\"nleg-confirm\"" not in rendered["blocked"]
+
+
+def test_issue64_queue_line_renders_real_payload_and_caps() -> None:
+    output = run_dashboard_js(r'''
+const metrics = {selection_pending: 0};
+const payload = {
+  n_leg_metrics: metrics,
+  n_leg_orders: {
+    queue: [
+      {position: 1, component_id: "component:a:b", state: "PENDING", enqueued_at: "2026-09-03T08:05:00Z"},
+      {position: 2, component_id: "component:c:d", state: "PENDING", enqueued_at: "2026-09-03T08:06:00Z"},
+    ],
+    caps: {configured: true, acknowledged_version: 3, safety_config_version: 3, values: {}},
+  },
+};
+const withoutQueue = {n_leg_metrics: metrics};
+console.log(JSON.stringify({
+  metrics: predictionNLegMetrics(payload),
+  none: predictionNLegMetrics(withoutQueue),
+}));
+''')
+    rendered = json.loads(output)
+    assert "下单队列 2" in rendered["metrics"]
+    assert "#1 等待发单预检" in rendered["metrics"]
+    assert "#2 等待发单预检" in rendered["metrics"]
+    assert "四上限已确认 v3" in rendered["metrics"]
+    assert "下单队列" not in rendered["none"]
+
+
+def test_issue64_incident_panel_flips_queue_line_and_cards() -> None:
+    output = run_dashboard_js(r'''
+const incident = {
+  execution_batch_id: "nleg-b-64a1",
+  reason: "PARTIAL_FILL",
+  happened_at: "2026-09-03T09:41:00Z",
+  paid_cash_units: 8120000,
+  legs: [
+    {index: 1, title: "Will BTC close above $100k?", direction: "BUY_YES", quantity: 20, filled_quantity: 20, cost_units: 8120000, state: "FILLED"},
+    {index: 2, title: "Will BTC close below $100k?", direction: "BUY_NO", quantity: 20, filled_quantity: 0, cost_units: 0, state: "REJECTED"},
+  ],
+};
+const payload = {n_leg_metrics: {selection_pending: 0}, n_leg_incident: incident, n_leg_orders: {queue: [], caps: null}};
+console.log(JSON.stringify({
+  panel: predictionNLegIncidentPanel(payload),
+  metrics: predictionNLegMetrics(payload),
+  none: predictionNLegIncidentPanel({}),
+}));
+''')
+    rendered = json.loads(output)
+    panel = rendered["panel"]
+    assert "N_LEG 执行事故 · 已停止全部新订单" in panel
+    assert "部分成交" in panel
+    assert "批次 nleg-b-64a1" in panel
+    assert "已成交 20/20 份" in panel
+    assert "未成交（FOK 全撤，未花钱）" in panel
+    assert "已付现金" in panel
+    assert 'data-action="nleg-incident-unlock"' in panel
+    # the queue line flips to the incident state
+    assert "事故处理中（批次 nleg-b-64a1）" in rendered["metrics"]
+    assert "下单队列已清空" in rendered["metrics"]
+    assert rendered["none"] == ""
+
+
+def test_issue64_confirm_modal_renders_frozen_leg_details_and_caps() -> None:
+    output = run_dashboard_js(r'''
+const data = {
+  title: "Bitcoin 在 12 月 31 日前高于 $120,000？",
+  qualification_policy_version: "v1",
+  n_leg_caps: {configured: true, acknowledged_version: 3, safety_config_version: 3,
+    values: {max_per_trade_cost_units: 25000000, max_total_unsettled_capital_units: 100000000,
+      max_partial_fill_loss_units: 1000000, max_auto_repair_loss_units: 1000000}},
+  n_leg_solution: {
+    component_id: "component:a:b",
+    market: {minimum_profit: "3.76", maximum_cost: "16.24", maximum_payout: "20.00",
+      capital_release_at: "2026-09-23T00:00:00Z",
+      fee: {status: "fee_charging", modeled: true, taker_fee_rate_bps: 500}},
+    execution: {
+      order_ready: true, reason: "MANUAL_CANARY", partial_fill_proof: "PARTIAL_FILL_SAFE",
+      execution_solution_fingerprint: "sha256:4c1234567890abcdef",
+      projected_total_units: 16240000,
+      leg_details: [
+        {index: 1, title: "Will BTC close above?", direction: "BUY_YES", quantity: 20, max_price: "0.40", max_cost_units: 8240000, taker_fee_units: 240000},
+        {index: 2, title: "Will BTC close below?", direction: "BUY_NO", quantity: 20, max_price: "0.40", max_cost_units: 8000000, taker_fee_units: 0},
+      ],
+    },
+  },
+};
+console.log(JSON.stringify({modal: predictionModalHtml("nleg_order", data)}));
+''')
+    rendered = json.loads(output)
+    modal = rendered["modal"]
+    assert "确认 N 腿真实订单" in modal
+    assert "第 1 腿" in modal and "第 2 腿" in modal
+    assert "BUY_YES" in modal
+    assert "20 份 @ 成本上限" in modal
+    assert "最低赔付" in modal
+    assert "PARTIAL_FILL_SAFE" in modal
+    assert "部分成交会立即触发事故" in modal
+    assert "确认入队 · 单笔上限" in modal
+    assert 'data-modal-action="nleg-confirm"' in modal
+
+
+def test_issue64_unlock_modal_renders_incident_facts() -> None:
+    output = run_dashboard_js(r'''
+const incident = {
+  execution_batch_id: "nleg-b-64a1",
+  reason: "PARTIAL_FILL",
+  paid_cash_units: 8120000,
+  legs: [
+    {index: 1, direction: "BUY_YES", quantity: 20, filled_quantity: 20, cost_units: 8120000, state: "FILLED"},
+    {index: 2, direction: "BUY_NO", quantity: 20, filled_quantity: 0, cost_units: 0, state: "REJECTED"},
+  ],
+};
+console.log(JSON.stringify({modal: predictionModalHtml("nleg_incident", incident)}));
+''')
+    rendered = json.loads(output)
+    modal = rendered["modal"]
+    assert "解除 N_LEG 事故门" in modal
+    assert "nleg-b-64a1" in modal
+    assert "保留（该机会族不会再有第二笔真实批次）" in modal
+    assert "解除不会恢复自动交易" in modal
+    assert 'data-modal-action="nleg-incident-unlock"' in modal
+
+
+def test_issue64_confirm_modal_freezes_button_against_double_click() -> None:
+    output = run_dashboard_js(r'''
+let fetchCount = 0;
+globalThis.fetch = async () => { fetchCount += 1; return {ok: true, json: async () => ({state: "PENDING", request_id: "r1"})}; };
+document.body = {style: {}};
+elements["prediction-market-modal-root"] = {innerHTML: "", querySelectorAll: () => [], querySelector: () => null};
+state.predictionMarket.csrfToken = "csrf";
+predictionModal = {kind: "nleg_order", previousFocus: null, busy: false, data: {
+  n_leg_solution: {component_id: "component:a:b", execution: {execution_solution_fingerprint: "sha256:abc"}},
+}};
+const button = {closest: () => ({dataset: {modalAction: "nleg-confirm"}})};
+const event = {target: {closest: (selector) => String(selector).includes("data-modal-action") ? {dataset: {modalAction: "nleg-confirm"}} : null}};
+const first = handlePredictionModalClick(event);
+const busyDuringSecondCall = predictionModal.busy;
+const second = handlePredictionModalClick(event);
+await Promise.all([first.catch(() => {}), second.catch(() => {})]);
+console.log(JSON.stringify({fetchCount, busyDuringSecondCall}));
+''')
+    rendered = json.loads(output)
+    assert rendered["fetchCount"] == 1
+    assert rendered["busyDuringSecondCall"] is True

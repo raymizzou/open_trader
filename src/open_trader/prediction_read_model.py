@@ -2195,7 +2195,168 @@ def prediction_state_payload(
     if shadow_summary["monitoring"]:
         result["n_leg_shadow"] = shadow_summary
     result["relation_review"] = _prediction_relation_review(relation_catalog)
+    n_leg_orders = _prediction_n_leg_orders(store)
+    if n_leg_orders is not None:
+        result["n_leg_orders"] = n_leg_orders
+    n_leg_incident = _prediction_n_leg_incident(store)
+    if n_leg_incident is not None:
+        result["n_leg_incident"] = n_leg_incident
     return result
+
+
+def _prediction_n_leg_incident(
+    store: PredictionArbitrageStore | None,
+) -> dict[str, object] | None:
+    """Issue #64: the read-only incident banner payload, read from the
+    unacknowledged N_LEG incident batch (never mock-injected)."""
+    if store is None:
+        return None
+    try:
+        batch = store.n_leg_incident_batch()
+    except Exception:
+        return None
+    if not isinstance(batch, Mapping):
+        return None
+    incident = (
+        batch.get("incident")
+        if isinstance(batch.get("incident"), Mapping)
+        else {}
+    )
+    legs: list[dict[str, object]] = []
+    paid_cash = 0
+    raw_legs = batch.get("legs")
+    for index, leg in enumerate(
+        raw_legs if isinstance(raw_legs, (list, tuple)) else [], start=1
+    ):
+        if not isinstance(leg, Mapping):
+            continue
+        receipt = (
+            leg.get("receipt")
+            if isinstance(leg.get("receipt"), Mapping)
+            else {}
+        )
+        filled = int(receipt.get("cumulative_filled_quantity") or 0)
+        cost = int(receipt.get("cumulative_cost_units") or 0) + int(
+            receipt.get("cumulative_fee_units") or 0
+        )
+        paid_cash += cost
+        legs.append(
+            {
+                "index": index,
+                "title": leg.get("title"),
+                "direction": str(leg.get("side") or ""),
+                "quantity": int(leg.get("submitted_quantity") or 0),
+                "filled_quantity": filled,
+                "cost_units": cost,
+                "state": str(receipt.get("state") or "STOPPED_UNSENT"),
+            }
+        )
+    return {
+        "execution_batch_id": batch.get("execution_batch_id"),
+        "component_id": batch.get("component_id"),
+        "episode_lineage_id": batch.get("episode_lineage_id"),
+        "reason": incident.get("reason"),
+        "happened_at": batch.get("updated_at"),
+        "legs": legs,
+        "paid_cash_units": paid_cash,
+    }
+
+
+def _prediction_n_leg_orders(
+    store: PredictionArbitrageStore | None,
+) -> dict[str, object] | None:
+    """Issue #64: the real manual-confirm queue, caps acknowledgement and
+    active batch, read from the store (never mock-injected)."""
+    if store is None:
+        return None
+    try:
+        control = store.n_leg_control()
+        rows = store.n_leg_requests()
+        safety = store.n_leg_safety_config_latest()
+        active_batch_id = control.get("active_batch_id")
+        batch = (
+            store.n_leg_batch(str(active_batch_id))
+            if active_batch_id
+            else None
+        )
+    except Exception:
+        return None
+    config = (
+        safety.get("config") if isinstance(safety, Mapping) else None
+    )
+    if not isinstance(config, Mapping):
+        config = {}
+    configured = config.get("caps_configured") is True
+    try:
+        safety_version = (
+            int(safety.get("version")) if isinstance(safety, Mapping) else 1
+        )
+    except (TypeError, ValueError):
+        safety_version = 1
+
+    def _cap(name: str) -> int:
+        try:
+            return int(config.get(name) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    pending = [
+        row
+        for row in rows
+        if isinstance(row, Mapping) and row.get("state") == "PENDING"
+    ]
+    queue: list[dict[str, object]] = []
+    for index, row in enumerate(pending):
+        payload = row.get("payload")
+        audit = (
+            payload.get("audit")
+            if isinstance(payload, Mapping)
+            and isinstance(payload.get("audit"), Mapping)
+            else {}
+        )
+        queue.append(
+            {
+                "position": index + 1,
+                "request_id": str(row.get("request_id") or ""),
+                "component_id": str(row.get("component_id") or ""),
+                "state": str(row.get("state") or ""),
+                "enqueued_at": str(row.get("created_at") or ""),
+                "execution_solution_fingerprint": (
+                    payload.get("execution_solution_fingerprint")
+                    if isinstance(payload, Mapping)
+                    else None
+                ),
+                "rotated": audit.get("rotated"),
+            }
+        )
+    return {
+        "queue": queue,
+        "caps": {
+            "configured": configured,
+            "acknowledged_version": safety_version if configured else None,
+            "safety_config_version": safety_version,
+            "values": {
+                "max_per_trade_cost_units": _cap("max_per_trade_cost_units"),
+                "max_total_unsettled_capital_units": _cap(
+                    "max_total_unsettled_capital_units"
+                ),
+                "max_partial_fill_loss_units": _cap(
+                    "max_partial_fill_loss_units"
+                ),
+                "max_auto_repair_loss_units": _cap(
+                    "max_auto_repair_loss_units"
+                ),
+            },
+        },
+        "batch": {
+            "execution_batch_id": active_batch_id,
+            "state": (
+                str(batch.get("state"))
+                if isinstance(batch, Mapping) and batch.get("state") is not None
+                else None
+            ),
+        },
+    }
 
 
 def prediction_history_payload(

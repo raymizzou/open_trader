@@ -712,6 +712,65 @@ class PredictionRuntime:
                     idle_check=self.live_resolver.is_idle,
                 )
                 self.monitor_selection_driver.start()
+                # Issue #64: the manual-confirm FIFO queue driver. It is a
+                # no-op until a confirmed queue row exists; the source
+                # factory fails closed until the resolver retains the frozen
+                # solve inputs needed for faithful re-decode.
+                from .prediction_n_leg_driver import (
+                    NLegOrderQueueDriver,
+                    trading_reconciliation_context_factory,
+                )
+
+                _queue_resolver = self.live_resolver
+
+                def _queue_books_provider(component_id: str):
+                    accessor = getattr(
+                        _queue_resolver, "driver_books_snapshot", None
+                    )
+                    return (
+                        accessor(component_id) if callable(accessor) else None
+                    )
+
+                def _n_leg_source_factory(frozen):
+                    # Issue #64: the resolver retains each frozen solution's
+                    # heavy #51 source material; the factory hands it to the
+                    # admission unchanged. N_LEG_SOURCE_UNAVAILABLE remains
+                    # only as the defensive fail-closed for missing material
+                    # (component rotated out / process restarted), never the
+                    # normal path.
+                    accessor = getattr(
+                        _queue_resolver, "driver_execution_source", None
+                    )
+                    material = (
+                        accessor(str(frozen.get("component_id") or ""))
+                        if callable(accessor)
+                        else None
+                    )
+                    if material is None:
+                        raise ValueError("N_LEG_SOURCE_UNAVAILABLE")
+                    return material["source"]
+
+                # Review round 2 (issue #64 P1): production reconciliation —
+                # without a factory an all-filled batch could never complete
+                # and the queue wedged silently on the first successful order.
+                # The factory builds the ReconciliationContext from fresh
+                # venue reads (the trading client's account snapshot).
+                _trading_client = getattr(self, "_prediction_trading", None)
+                reconciliation_factory = (
+                    trading_reconciliation_context_factory(
+                        self.store, _trading_client
+                    )
+                    if _trading_client is not None
+                    else None
+                )
+                self.n_leg_order_queue_driver = NLegOrderQueueDriver(
+                    self.store,
+                    books_provider=_queue_books_provider,
+                    source_factory=_n_leg_source_factory,
+                    trading=_trading_client,
+                    reconciliation_context_factory=reconciliation_factory,
+                )
+                self.n_leg_order_queue_driver.start()
             self._state = "RUNNING"
             logger.info(
                 "prediction_runtime_state state=RUNNING pid=%s data_dir=%s",
@@ -866,6 +925,26 @@ class PredictionRuntime:
         resolver = self.live_resolver
         return [] if resolver is None else resolver.solutions()
 
+    def n_leg_execution_source(
+        self, component_id: str
+    ) -> dict[str, object] | None:
+        """Issue #64: the resolver's retained admission-grade execution
+        material for one component (heavy #51 source + payloads + bound
+        proof), or None when unavailable — the confirm endpoint's freeze
+        source."""
+        resolver = self.live_resolver
+        accessor = getattr(resolver, "driver_execution_source", None)
+        if not callable(accessor):
+            return None
+        try:
+            return accessor(component_id)
+        except Exception:
+            logger.exception(
+                "n_leg_execution_source build failed component=%s",
+                component_id,
+            )
+            return None
+
     def n_leg_episodes(self) -> dict[str, dict[str, object]]:
         resolver = self.live_resolver
         return {} if resolver is None else resolver.n_leg_episodes()
@@ -899,6 +978,13 @@ class PredictionRuntime:
                 errors.append(exc)
             finally:
                 self.live_resolver = None
+        driver = getattr(self, "n_leg_order_queue_driver", None)
+        if driver is not None:
+            try:
+                driver.stop()
+            except Exception:
+                pass
+            self.n_leg_order_queue_driver = None
         if self.predict_snapshot_refresher is not None:
             try:
                 self.predict_snapshot_refresher.stop()

@@ -476,6 +476,52 @@ def _first_insufficient_reason(funding: Mapping[str, object]) -> str | None:
     return None
 
 
+def _leg_details(
+    execution_payload: Mapping[str, object] | None,
+    display_legs: Sequence[Mapping[str, object]] | None,
+) -> list[dict[str, object]]:
+    """#64 confirm-modal leg rows derived from the frozen execution legs;
+    titles join the optional per-leg display facts when present."""
+    rows = (
+        execution_payload.get("execution_legs")
+        if isinstance(execution_payload, Mapping)
+        else None
+    )
+    if not isinstance(rows, (list, tuple)):
+        return []
+    by_id: dict[str, Mapping[str, object]] = {}
+    for leg in display_legs or ():
+        if isinstance(leg, Mapping):
+            key = str(leg.get("leg_id") or leg.get("action_id") or "")
+            if key:
+                by_id.setdefault(key, leg)
+    details: list[dict[str, object]] = []
+    for index, leg in enumerate(rows, start=1):
+        if not isinstance(leg, Mapping):
+            continue
+        display = by_id.get(str(leg.get("action_id") or ""), {})
+        try:
+            units = Decimal(str(leg.get("price_units_per_quote_unit") or 0))
+            protected = Decimal(str(leg.get("protected_price_units") or 0))
+            max_price = (
+                format(protected / units, "f") if units > 0 else None
+            )
+        except (InvalidOperation, ValueError):
+            max_price = None
+        details.append(
+            {
+                "index": index,
+                "title": display.get("title"),
+                "direction": str(leg.get("side") or ""),
+                "quantity": int(leg.get("quantity_lots") or 0),
+                "max_price": max_price,
+                "max_cost_units": int(leg.get("max_cost_units") or 0),
+                "taker_fee_units": int(leg.get("max_fee_units") or 0),
+            }
+        )
+    return details
+
+
 def project_n_leg_solution(
     *,
     market: Mapping[str, object] | None,
@@ -527,6 +573,8 @@ def project_n_leg_solution(
         "legs": market_legs,
         # #119: pass the frozen fee block through for the card fee line.
         "fee": dict(fee) if isinstance(fee, Mapping) else None,
+        # #64: the frozen payout bound for the confirm modal's minimum-payout tile.
+        "maximum_payout": _units_to_dollars(market.get("bounded_payout_units")),
     }
     qualification = _qualification_projection(
         market,
@@ -660,6 +708,9 @@ def project_n_leg_solution(
             if execution_payload is not None
             else []
         ),
+        # #64: per-leg frozen bounds (direction, quantity, max price/cost,
+        # fee) for the confirm modal, generated from the frozen execution.
+        "leg_details": _leg_details(execution_payload, legs),
     }
     return {
         "component_id": str(

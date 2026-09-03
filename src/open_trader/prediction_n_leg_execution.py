@@ -453,6 +453,7 @@ class NLegExecutionService:
         partial_fill_proof: PartialFillProofRecord,
         mode: Literal["MANUAL", "AUTO"],
         cap_config_version: str,
+        expected_versions: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         for name, value in (("opportunity_episode_id", opportunity_episode_id), ("episode_lineage_id", episode_lineage_id), ("execution_batch_id", execution_batch_id)):
             _text(value, name)
@@ -535,7 +536,7 @@ class NLegExecutionService:
             "execution_batch_id": execution_batch_id, "execution_solution": execution_solution.fingerprint,
             "proof": partial_fill_proof.fingerprint, "mode": mode, "cap_config_version": cap_config_version,
         })
-        return self._store.n_leg_create_batch(payload)
+        return self._store.n_leg_create_batch(payload, expected_versions=expected_versions)
 
     def state(self, execution_batch_id: str) -> dict[str, object] | None:
         return self._store.n_leg_batch(execution_batch_id)

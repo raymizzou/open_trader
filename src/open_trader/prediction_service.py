@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import Future
 from http.cookies import SimpleCookie
-from datetime import datetime
+from datetime import UTC, datetime
 import ipaddress
 import json
 import os
@@ -27,6 +27,7 @@ from .prediction_read_model import (
     prediction_history_payload,
     prediction_state_payload,
 )
+from .prediction_n_leg_confirm import NLegConfirmRejected, confirm_enqueue
 from .prediction_n_leg_mode import NLegVersionConflict
 from .prediction_release import load_prediction_release_manifest
 from .prediction_runtime import PredictionRuntime
@@ -668,6 +669,9 @@ def create_prediction_server(
                 "/api/prediction-arbitrage/n-leg/mode",
                 "/api/prediction-arbitrage/n-leg/config",
                 "/api/prediction-arbitrage/n-leg/scope",
+                "/api/prediction-arbitrage/n-leg/orders/confirm",
+                "/api/prediction-arbitrage/n-leg/incidents/acknowledge",
+                "/api/prediction-arbitrage/n-leg/circuit-breaker/reset",
                 "/api/prediction-arbitrage/llm-provider",
             }:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -755,6 +759,91 @@ def create_prediction_server(
                             ),
                             audit=audit,
                         )
+                elif path == "/api/prediction-arbitrage/n-leg/orders/confirm":
+                    # Issue #64: manual confirmation enqueues one re-verified
+                    # ExecutionSolution. The server fetches the component's
+                    # CURRENT solution here; a rotation that stays qualified
+                    # binds the current solution, a drop-out rejects.
+                    self._require_schema(
+                        payload,
+                        {"component_id", "displayed_fingerprint", "idempotency_key"},
+                    )
+                    store = getattr(runtime, "store", None)
+                    if store is None:
+                        raise RuntimeError("prediction store is unavailable")
+                    solutions = getattr(runtime, "n_leg_solutions", lambda: [])()
+                    # Issue #64: prefer the resolver's retained admission-
+                    # grade material (heavy #51 payloads + the #74 proof bound
+                    # to exactly that execution solution) for the freeze; the
+                    # pointer proof is the fallback when none is retained.
+                    material = None
+                    source_provider = getattr(
+                        runtime, "n_leg_execution_source", None
+                    )
+                    if callable(source_provider):
+                        try:
+                            material = source_provider(
+                                payload["component_id"]
+                            )
+                        except Exception:
+                            material = None
+                    proof = self._partial_fill_proof_for(
+                        runtime, payload["component_id"]
+                    )
+                    if isinstance(material, Mapping) and isinstance(
+                        material.get("partial_fill_proof"), Mapping
+                    ):
+                        proof = dict(material["partial_fill_proof"])
+                    execution_source = None
+                    if isinstance(material, Mapping):
+                        execution_source = {
+                            "market": material.get("market"),
+                            "execution": material.get("execution"),
+                        }
+                    result = confirm_enqueue(
+                        store,
+                        solutions,
+                        component_id=self._required_string(
+                            payload, "component_id"
+                        ),
+                        displayed_fingerprint=self._required_string(
+                            payload, "displayed_fingerprint"
+                        ),
+                        idempotency_key=self._required_string(
+                            payload, "idempotency_key"
+                        ),
+                        now=datetime.now(UTC),
+                        partial_fill_proof=proof,
+                        execution_source=execution_source,
+                    )
+                elif path == "/api/prediction-arbitrage/n-leg/incidents/acknowledge":
+                    # Issue #64 Slice 6: incident-gate unlock. The store
+                    # re-checks batch receipts + ledger atomically before it
+                    # releases; any inconsistency keeps the incident state.
+                    self._require_schema(
+                        payload,
+                        {"execution_batch_id", "actor", "reconciliation"},
+                    )
+                    store = getattr(runtime, "store", None)
+                    if store is None:
+                        raise RuntimeError("prediction store is unavailable")
+                    result = store.n_leg_acknowledge_incident(
+                        self._required_string(payload, "execution_batch_id"),
+                        acknowledgement={
+                            "actor": self._required_string(payload, "actor"),
+                            "reconciliation": self._required_string(
+                                payload, "reconciliation"
+                            ),
+                            "reason": str(payload.get("reason") or ""),
+                            "git_sha": str(audit.get("git_sha") or ""),
+                        },
+                    )
+                elif path == "/api/prediction-arbitrage/n-leg/circuit-breaker/reset":
+                    self._require_schema(payload, {})
+                    store = getattr(runtime, "store", None)
+                    if store is None:
+                        raise RuntimeError("prediction store is unavailable")
+                    result = store.n_leg_breaker_reset(audit=audit)
                 elif path == "/api/prediction-arbitrage/n-leg/scope":
                     scope_id = self._required_string(payload, "scope_id")
                     if "enable" in payload:
@@ -823,6 +912,10 @@ def create_prediction_server(
                 self._send_error(HTTPStatus.FORBIDDEN, exc)
             except NLegVersionConflict as exc:
                 self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+            except NLegConfirmRejected as exc:
+                self._send_json(
+                    exc.http_status, {"error": str(exc), "reason": exc.reason}
+                )
             except OverflowError as exc:
                 self._send_json(
                     HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": str(exc)}
@@ -831,6 +924,17 @@ def create_prediction_server(
                 self._send_error(HTTPStatus.BAD_REQUEST, exc)
             except (sqlite3.Error, OSError, RuntimeError) as exc:
                 self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+
+        def _partial_fill_proof_for(self, runtime: object, component_id: object):
+            """The bound #74 proof record cached on the live resolver."""
+            provider = getattr(runtime, "latest_partial_fill_proof", None)
+            if not callable(provider):
+                return None
+            try:
+                proof = provider(component_id)
+            except Exception:
+                return None
+            return dict(proof) if isinstance(proof, Mapping) else None
 
         def _listener_host_header(self) -> str:
             bound_host = str(host)

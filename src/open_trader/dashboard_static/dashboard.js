@@ -2638,7 +2638,9 @@ function predictionUnifiedOpportunityCard(row, mode, legacyRetired) {
   );
   const unifiedActionLine = `<div class="pm-opportunity-action"><p>order_ready ${orderReady ? "是" : "否"} · ${escapeHtml(orderReadyReason)} · ${orderReady ? "可人工确认" : "不可下单"}。</p></div>`;
   const action = legacyRetired === true
-    ? unifiedActionLine
+    ? (nLegReady
+      ? `<div class="pm-opportunity-action"><p>order_ready ${orderReady ? "是" : "否"} · ${escapeHtml(orderReadyReason)} · ${orderReady ? "可人工确认" : "不可下单"}。</p><button type="button" class="pm-button primary" data-action="nleg-confirm" data-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id, ""))}">人工确认下单</button></div>`
+      : unifiedActionLine)
     : orderReady && mode === "MANUAL"
     ? `<div class="pm-opportunity-action"><p>确认时重新读取两所 REST、盘口、余额与未结算额度。</p><button type="button" class="pm-button primary" data-action="participate" data-opportunity-id="${escapeHtml(predictionValue(opportunity.opportunity_id, ""))}">人工确认下单</button></div>`
     : unifiedActionLine;
@@ -2701,7 +2703,23 @@ function predictionNLegMetrics(payload) {
     predictionUnifiedMetric("超时 / 陈旧拒绝", escapeHtml(`${predictionValue(metrics.timeout, "-")} / ${predictionValue(metrics.stale_reject, "-")}`)),
     predictionUnifiedMetric("机会存活时间", escapeHtml(`p95 ${survivalP95}`), "", "<small>内存 / 线程 / 队列有界</small>"),
   ].join("");
-  return `<section class="pm-metrics pm-n-leg-metrics-overview" aria-label="N_LEG 性能指标">${cards}</section>`;
+  // #64: the manual-confirm FIFO queue + caps acknowledgement ride as one
+  // small line under the metrics grid — no new tile, no layout change.
+  const ordersPayload = payload?.n_leg_orders && typeof payload.n_leg_orders === "object" ? payload.n_leg_orders : null;
+  const queueRows = Array.isArray(ordersPayload?.queue) ? ordersPayload.queue : [];
+  const caps = ordersPayload?.caps && typeof ordersPayload.caps === "object" ? ordersPayload.caps : null;
+  const capsState = caps
+    ? caps.configured === true && Number(caps.acknowledged_version) === Number(caps.safety_config_version)
+      ? `四上限已确认 v${escapeHtml(predictionValue(caps.acknowledged_version, "-"))}`
+      : "四上限未确认"
+    : "四上限未确认";
+  const incident = payload?.n_leg_incident && typeof payload.n_leg_incident === "object" ? payload.n_leg_incident : null;
+  const queueLine = incident
+    ? `<p class="pm-n-leg-order-queue">事故处理中（批次 ${escapeHtml(predictionValue(incident.execution_batch_id))}）· 下单队列已清空 · 解除后恢复</p>`
+    : ordersPayload
+    ? `<p class="pm-n-leg-order-queue">下单队列 ${queueRows.length} · ${queueRows.map((row, index) => `#${index + 1} ${row.state === "PENDING" ? "等待发单预检" : escapeHtml(String(row.state))}`).join(" · ")} · ${capsState}</p>`
+    : "";
+  return `<section class="pm-metrics pm-n-leg-metrics-overview" aria-label="N_LEG 性能指标">${cards}${queueLine}</section>`;
 }
 
 const PREDICTION_RELATION_REVIEW_STATES = {
@@ -2735,10 +2753,22 @@ function predictionUnifiedPageHeader(payload) {
   return `<header class="pm-page-head"><div><h1>预测套利 · 机会</h1><p>单一 N_LEG 机会 read model；历史 YES_NO / LLM_RELATION 只读保留。</p></div><div class="pm-updated"><button class="pm-relation-badge" type="button" data-action="open-relation-review">关系审核 <strong>${Number.isFinite(pending) ? pending : 0}</strong></button><span class="pm-status-line"><i class="pm-status-dot ${tone === "danger" ? "danger" : ""}"></i>${health}</span><br>${predictionClock("Watcher 数据时间", heartbeat)}${contract}</div></header>`;
 }
 
+function predictionNLegIncidentPanel(payload) {
+  // #64: read-only incident banner + unlock entry. The panel shows what
+  // happened and what was paid; the actual position fix happens out-of-band,
+  // then the unlock button asks the server to re-check batch receipts and
+  // the ledger before it re-opens the gate.
+  const incident = payload?.n_leg_incident;
+  if (!incident || typeof incident !== "object") return "";
+  const legs = Array.isArray(incident.legs) ? incident.legs : [];
+  const legRows = legs.map((leg) => `<div class="pm-check"><span>第 ${Number(leg.index)} 腿 · ${leg.direction === "BUY_YES" ? "买 YES" : "买 NO"} · ${escapeHtml(predictionValue(leg.title, "市场未返回"))}</span><strong>${leg.state === "FILLED" ? `已成交 ${escapeHtml(String(leg.filled_quantity))}/${escapeHtml(String(leg.quantity))} 份 · 成本 ${escapeHtml(predictionNLegUnitsMoney(leg.cost_units))}` : leg.state === "REJECTED" ? "未成交（FOK 全撤，未花钱）" : escapeHtml(String(leg.state))}</strong></div>`).join("");
+  return `<section class="pm-alert danger" role="alert" aria-label="N_LEG 执行事故"><div class="pm-alert-body"><strong>N_LEG 执行事故 · 已停止全部新订单</strong><p>${incident.reason === "PARTIAL_FILL" ? "部分成交" : escapeHtml(String(incident.reason ?? "-"))} · 批次 ${escapeHtml(predictionValue(incident.execution_batch_id))} · 发生时间 ${escapeHtml(predictionValue(incident.happened_at))}</p>${legRows}<div class="pm-check"><span>已付现金</span><strong>${escapeHtml(predictionNLegUnitsMoney(incident.paid_cash_units))}</strong></div><small>处置：在系统外（Polymarket）处理未对冲敞口——补买另一腿或等待结算；完成后回此解除事故门。下单队列已清空，解除后恢复。</small></div><button class="pm-button danger" type="button" data-action="nleg-incident-unlock">对账完成，解除事故门</button></section>`;
+}
+
 function predictionUnifiedPage(payload, filter) {
   const viewPayload = payload || {status: "loading", events: [], opportunities: []};
   const filterState = state.predictionMarket.filter || {engine: "all", kind: "all", legs: null, scope: null};
-  return `${predictionUnifiedPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionNLegMetrics(viewPayload)}${predictionReadinessStrip(viewPayload)}${predictionCapitalUsage(viewPayload)}${predictionUnifiedOpportunityList(viewPayload, filterState)}${predictionRelationReview(viewPayload)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload)}${relationReviewDrawer()}`;
+  return `${predictionUnifiedPageHeader(viewPayload)}${predictionModeBar(viewPayload)}${predictionNLegIncidentPanel(viewPayload)}${predictionNLegMetrics(viewPayload)}${predictionReadinessStrip(viewPayload)}${predictionCapitalUsage(viewPayload)}${predictionUnifiedOpportunityList(viewPayload, filterState)}${predictionRelationReview(viewPayload)}${predictionErrorAlert()}${predictionExecutionAlert(viewPayload)}${relationReviewDrawer()}`;
 }
 
 function predictionAnnualizedPercent(value, digits = 1) {
@@ -4054,6 +4084,34 @@ function predictionPreviewIsComplete(value) {
 }
 
 function predictionModalHtml(kind, data = {}) {
+  if (kind === "nleg_incident") {
+    // #64 (Q6=A): incident-gate unlock. Server re-checks batch receipts and
+    // ledger consistency before actually releasing; the modal only asks.
+    const incident = data && typeof data === "object" ? data : {};
+    const legs = Array.isArray(incident.legs) ? incident.legs : [];
+    const legRows = legs.map((leg) => `<div class="pm-check"><span>第 ${Number(leg.index)} 腿 · ${leg.direction === "BUY_YES" ? "买 YES" : "买 NO"}</span><strong>${leg.state === "FILLED" ? `已成交 ${escapeHtml(String(leg.filled_quantity))}/${escapeHtml(String(leg.quantity))} 份 · ${escapeHtml(predictionNLegUnitsMoney(leg.cost_units))}` : "未成交（FOK 全撤）"}</strong></div>`).join("");
+    return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1"><header class="pm-modal-header"><h2 id="pm-dialog-title">解除 N_LEG 事故门</h2><p>仅在你已在系统外完成仓位处置并对账一致后使用；点击后服务端会重新核对批次回执与账本，任何不一致都会保持事故态。</p></header><div class="pm-check-list"><div class="pm-check"><span>事故原因</span><strong>${incident.reason === "PARTIAL_FILL" ? "部分成交" : escapeHtml(String(incident.reason ?? "-"))}</strong></div><div class="pm-check"><span>批次</span><strong>${escapeHtml(predictionValue(incident.execution_batch_id))}</strong></div>${legRows}<div class="pm-check"><span>已付现金</span><strong>${escapeHtml(predictionNLegUnitsMoney(incident.paid_cash_units))}</strong></div><div class="pm-check"><span>谱系执行锁</span><strong>保留（该机会族不会再有第二笔真实批次）</strong></div></div><div class="pm-risk-note" role="note"><strong>解除不会恢复自动交易</strong><p>解除只重新开放人工确认下单；若全局熔断已打开需另行解除。事故记录永久保留，供审计。</p></div><footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">保持事故态</button><button class="pm-button danger" type="button" data-modal-action="nleg-incident-unlock">对账完成，解除事故门</button></footer></section>`;
+  }
+  if (kind === "nleg_order") {
+    // #64: manual confirmation of one frozen N-leg ExecutionSolution. The
+    // displayed facts come from the server's frozen projection only.
+    const solution = data.n_leg_solution && typeof data.n_leg_solution === "object" ? data.n_leg_solution : {};
+    const market = solution.market && typeof solution.market === "object" ? solution.market : {};
+    const execution = solution.execution && typeof solution.execution === "object" ? solution.execution : {};
+    const fee = market.fee && typeof market.fee === "object" ? market.fee : {};
+    const legs = Array.isArray(execution.leg_details) ? execution.leg_details : [];
+    const caps = data.n_leg_caps && typeof data.n_leg_caps === "object" ? data.n_leg_caps : {};
+    const capValues = caps.values && typeof caps.values === "object" ? caps.values : {};
+    const maxCost = market.maximum_cost ?? predictionNLegUnitsMoney(execution.projected_total_units);
+    const fingerprint = String(execution.execution_solution_fingerprint || "");
+    const feeLabel = fee.status === "fee_charging"
+      ? `收费 ${Number(fee.taker_fee_rate_bps) / 100}% · 已建模`
+      : fee.status === "fee_free" ? "免费市场" : "未知";
+    const maxCostMoney = predictionMoney(Number(maxCost), String(maxCost));
+    const payoutMoney = predictionMoney(Number(market.maximum_payout), String(market.maximum_payout ?? "-"));
+    const profitMoney = predictionSignedMoney(Number(market.minimum_profit), String(market.minimum_profit ?? "-"));
+    return `<section class="pm-modal" role="dialog" aria-modal="true" aria-labelledby="pm-dialog-title" tabindex="-1"><header class="pm-modal-header"><h2 id="pm-dialog-title">确认 N 腿真实订单</h2><p>确认后进入统一 FIFO 队列；确认与发单前都会取最新盘口复核——方案随行情轮转时，只要仍满足利润门槛与全部安全闸，就按最新合格方案入队并执行（上方数字为点开时参考）；价格超出已证明边界则自动作废退回监控，不会临时改方向或数量。</p></header><div class="pm-order-market"><span>Polymarket · 同所 · 同事件 · 资格 ${escapeHtml(predictionValue(data.qualification_policy_version, "v1"))} · 方案指纹 ${escapeHtml(fingerprint.slice(0, 14) || "-")}</span><strong>${escapeHtml(predictionValue(data.title, "数据未返回"))}</strong></div><div class="pm-order-legs">${legs.map((leg, index) => `<article class="pm-order-leg"><span>第 ${index + 1} 腿 · ${escapeHtml(predictionValue(leg.title, "市场未返回"))} · ${escapeHtml(predictionValue(leg.direction, "BUY"))} · FOK</span><strong>${escapeHtml(String(leg.quantity ?? "-"))} 份 @ 成本上限 ${escapeHtml(predictionPrice(leg.max_price))}</strong><small>最大成本 ${escapeHtml(predictionNLegUnitsMoney(leg.max_cost_units))} · taker 费 ${escapeHtml(predictionNLegUnitsMoney(leg.taker_fee_units))}</small></article>`).join("") || "<div class=\"pm-empty compact\">腿数据未返回</div>"}</div><div class="pm-order-summary"><div><span>含费最大成本</span><strong>${escapeHtml(maxCostMoney)}</strong></div><div><span>最低赔付</span><strong>${escapeHtml(payoutMoney)}</strong></div><div><span>保证最低利润（扣费后）</span><strong class="pm-positive">${escapeHtml(profitMoney)}</strong></div><div><span>资本释放</span><strong>${escapeHtml(String(market.capital_release_at || "-").slice(0, 10))}</strong></div></div><div class="pm-check-list"><div class="pm-check"><span>单笔资金上限</span><strong>${escapeHtml(predictionNLegUnitsMoney(capValues.max_per_trade_cost_units))} · 本次 ${escapeHtml(maxCostMoney)}</strong></div><div class="pm-check"><span>未清资本上限</span><strong>${escapeHtml(predictionNLegUnitsMoney(capValues.max_total_unsettled_capital_units))} · 预留后 ${escapeHtml(predictionNLegUnitsMoney(execution.projected_total_units))}</strong></div><div class="pm-check"><span>部分成交损失上限</span><strong>${escapeHtml(predictionNLegUnitsMoney(capValues.max_partial_fill_loss_units))}</strong></div><div class="pm-check"><span>自动修复损失上限</span><strong>${escapeHtml(predictionNLegUnitsMoney(capValues.max_auto_repair_loss_units))} · 上限确认 v${escapeHtml(predictionValue(caps.acknowledged_version, "-"))}</strong></div><div class="pm-check"><span>成交证明</span><strong>${escapeHtml(predictionValue(execution.partial_fill_proof, "-"))}</strong></div><div class="pm-check"><span>费用状态</span><strong>${escapeHtml(feeLabel)}</strong></div></div><div class="pm-risk-note" role="note"><strong>部分成交会立即触发事故</strong><p>各腿并发提交但不跨交易所原子；任一腿部分成交或回执未知时，全线停止新订单、保持事故态并转为人工处置（自动修复未启用），最坏损失由部分成交损失上限约束。重复点击不会生成第二组订单。</p></div><footer class="pm-modal-actions"><button class="pm-button" type="button" data-modal-action="cancel">取消</button><button class="pm-button primary" type="button" data-modal-action="nleg-confirm">确认入队 · 单笔上限 ${escapeHtml(predictionNLegUnitsMoney(capValues.max_per_trade_cost_units))}</button></footer></section>`;
+  }
   const reset = kind === "reset";
   const cleanup = kind === "allowance_cleanup";
   const title = cleanup ? "确认清理 Predict 残余授权" : reset ? "确认解除交易熔断" : "确认真实下单";
@@ -4261,6 +4319,30 @@ async function handlePredictionMarketClick(event) {
     await switchPredictionLlmProvider(llmProviderButton.dataset.llmProvider || "");
     return;
   }
+  const nlegUnlock = event.target.closest("[data-action='nleg-incident-unlock']");
+  if (nlegUnlock && !nlegUnlock.disabled) {
+    openPredictionModal("nleg_incident", nlegUnlock, state.predictionMarket.payload?.n_leg_incident || {});
+    return;
+  }
+  const nlegConfirm = event.target.closest("[data-action='nleg-confirm']");
+  if (nlegConfirm && !nlegConfirm.disabled) {
+    const opportunityId = String(nlegConfirm.dataset.opportunityId || "");
+    const row = predictionUnifiedFilteredRows(state.predictionMarket.payload, state.predictionMarket.filter)
+      .find((item) => String(predictionOpportunityDisplay(item).opportunity_id || "") === opportunityId);
+    if (!row) {
+      state.predictionMarket.error = "机会已变化或已失效，请刷新后重新确认。";
+      renderPredictionMarket();
+      return;
+    }
+    const opportunity = predictionOpportunityDisplay(row);
+    openPredictionModal("nleg_order", nlegConfirm, {
+      n_leg_solution: opportunity.n_leg_solution,
+      n_leg_caps: state.predictionMarket.payload?.n_leg_orders?.caps,
+      title: opportunity.title,
+      qualification_policy_version: opportunity.qualification_policy_version,
+    });
+    return;
+  }
   if (event.target.closest("[data-action='open-relation-review']")) { state.predictionMarket.relationReview.open = true; await loadRelationReview("pending_approval", 0); return; }
   if (event.target.closest("[data-action='close-relation-review']")) { state.predictionMarket.relationReview.open = false; state.predictionMarket.relationReview.detail = null; renderPredictionMarket(); return; }
   const openRelationView = event.target.closest("[data-open-relation-view]");
@@ -4403,6 +4485,34 @@ async function handlePredictionModalClick(event) {
       if (!result || ["locked", "busy", "rejected"].includes(String(result.state || "").toLowerCase())) {
         throw new Error("授权清零未完成，系统继续保持只读。");
       }
+      closePredictionModal();
+      await fetchPredictionState();
+      return;
+    }
+    if (action === "nleg-confirm") {
+      const solution = predictionModal.data?.n_leg_solution;
+      const fingerprint = String(solution?.execution?.execution_solution_fingerprint || "");
+      if (!fingerprint) throw new Error("方案指纹未返回，未入队。");
+      const result = await predictionPost("/api/prediction-arbitrage/n-leg/orders/confirm", {
+        component_id: String(solution?.component_id || ""),
+        displayed_fingerprint: fingerprint,
+        idempotency_key: predictionIdempotencyKey(),
+      });
+      if (!result || String(result.state || "") !== "PENDING") {
+        throw new Error("确认未入队，请刷新后重试。");
+      }
+      closePredictionModal();
+      await fetchPredictionState();
+      return;
+    }
+    if (action === "nleg-incident-unlock") {
+      // Server re-checks batch receipts + ledger before actually releasing;
+      // any inconsistency keeps the incident state.
+      await predictionPost("/api/prediction-arbitrage/n-leg/incidents/acknowledge", {
+        execution_batch_id: String(predictionModal.data?.execution_batch_id || ""),
+        actor: "operator",
+        reconciliation: "fresh_clean",
+      });
       closePredictionModal();
       await fetchPredictionState();
       return;

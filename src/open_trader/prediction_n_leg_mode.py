@@ -42,10 +42,40 @@ DEFAULT_QUALIFICATION_POLICY = {
 
 DEFAULT_SAFETY_CONFIG = {
     "episode_rearm_gap_seconds": 300,
+    "max_per_trade_cost_units": 0,
     "max_total_unsettled_capital_units": 0,
     "max_partial_fill_loss_units": 0,
     "max_auto_repair_loss_units": 0,
+    "max_quote_age_seconds": 10,
+    "max_cross_leg_skew_seconds": 5,
+    # Review round 2 (ruling 8): the per-leg FOK submit timeout and the
+    # reconciliation-visibility window are versioned config, not caps.
+    "max_leg_submit_seconds": 15,
+    "reconciliation_timeout_seconds": 60,
 }
+
+#: Keys a safety write must carry explicitly (ruling 5: the four caps always
+#: arrive together in one exact write). The preflight thresholds below are
+#: versioned config too, but a write without them reads as the defaults —
+#: same for the submit timeout and reconciliation window (review round 2).
+_REQUIRED_SAFETY_KEYS = frozenset(DEFAULT_SAFETY_CONFIG) - {
+    "max_quote_age_seconds",
+    "max_cross_leg_skew_seconds",
+    "max_leg_submit_seconds",
+    "reconciliation_timeout_seconds",
+}
+_OPTIONAL_SAFETY_DEFAULTS = {
+    "max_quote_age_seconds": 10,
+    "max_cross_leg_skew_seconds": 5,
+    "max_leg_submit_seconds": 15,
+    "reconciliation_timeout_seconds": 60,
+}
+
+#: Issue #64: the caps-confirmation marker lives inside the stored safety
+#: config JSON. It is never client-writable directly: the write path sets it
+#: (the four caps must always arrive together in one explicit write), and the
+#: manual-confirm order gate reads only this marker.
+CAPS_CONFIGURED_KEY = "caps_configured"
 
 
 class NLegVersionConflict(Exception):
@@ -104,11 +134,17 @@ def _validated_policy(policy: object) -> dict[str, object]:
 
 def _validated_safety_config(config: object) -> dict[str, object]:
     expected = set(DEFAULT_SAFETY_CONFIG)
-    if not isinstance(config, dict) or set(config) != expected:
+    if not isinstance(config, dict) or not set(config) <= expected:
         raise ValueError("safety config fields are invalid")
-    return {
+    if not _REQUIRED_SAFETY_KEYS <= set(config):
+        raise ValueError("safety config fields are invalid")
+    validated = {
         "episode_rearm_gap_seconds": _positive_int(
             config["episode_rearm_gap_seconds"], "episode_rearm_gap_seconds"
+        ),
+        "max_per_trade_cost_units": _nonnegative_int(
+            config["max_per_trade_cost_units"],
+            "max_per_trade_cost_units",
         ),
         "max_total_unsettled_capital_units": _nonnegative_int(
             config["max_total_unsettled_capital_units"],
@@ -121,6 +157,41 @@ def _validated_safety_config(config: object) -> dict[str, object]:
             config["max_auto_repair_loss_units"], "max_auto_repair_loss_units"
         ),
     }
+    for key, default in _OPTIONAL_SAFETY_DEFAULTS.items():
+        validated[key] = (
+            _positive_int(config[key], key)
+            if key in config
+            else default
+        )
+    return validated
+
+
+def _stored_safety_config(config: object) -> dict[str, object]:
+    """Read-path validation of one stored safety config JSON.
+
+    The #64 ``caps_configured`` marker is stripped before validation and
+    re-attached when true; legacy rows written before the per-trade cap
+    existed read with that cap failed closed to its default 0.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("safety config fields are invalid")
+    marker = config.get(CAPS_CONFIGURED_KEY)
+    if marker is not None and type(marker) is not bool:
+        raise ValueError("safety config fields are invalid")
+    client_fields = {
+        key: value
+        for key, value in config.items()
+        if key != CAPS_CONFIGURED_KEY
+    }
+    for key, default in _OPTIONAL_SAFETY_DEFAULTS.items():
+        client_fields.setdefault(key, default)
+    client_fields.setdefault(
+        "max_per_trade_cost_units", DEFAULT_SAFETY_CONFIG["max_per_trade_cost_units"]
+    )
+    validated = _validated_safety_config(client_fields)
+    if marker is True:
+        validated[CAPS_CONFIGURED_KEY] = True
+    return validated
 
 
 def _validated_members(members: object) -> dict[str, object]:
@@ -145,8 +216,20 @@ def _current_safety_config(store: object) -> dict[str, object]:
         return {"version": 1, "config": dict(DEFAULT_SAFETY_CONFIG)}
     return {
         "version": _positive_int(stored["version"], "safety version"),
-        "config": _validated_safety_config(stored["config"]),
+        "config": _stored_safety_config(stored["config"]),
     }
+
+
+def n_leg_caps_gate(store: object) -> tuple[bool, str]:
+    """Issue #64 manual-confirm caps gate: the four caps count as confirmed
+    only when one explicit write stored the ``caps_configured`` marker."""
+    stored = store.n_leg_safety_config_latest()
+    if stored is None:
+        return False, "CAPS_NOT_CONFIGURED"
+    config = _stored_safety_config(stored["config"])
+    if config.get(CAPS_CONFIGURED_KEY) is not True:
+        return False, "CAPS_NOT_CONFIGURED"
+    return True, "CAPS_CONFIGURED"
 
 
 def n_leg_mode_contract(store: object) -> dict[str, object]:
@@ -175,7 +258,12 @@ def n_leg_mode_contract(store: object) -> dict[str, object]:
         ),
         "execution_gates": {
             "breaker_open": bool(control["breaker_open"]),
-            "incident_active": store.unacknowledged_incident() is not None,
+            # Issue #64: an unacknowledged N_LEG execution-incident batch
+            # holds the incident gate just like a legacy incident.
+            "incident_active": (
+                store.unacknowledged_incident() is not None
+                or store.n_leg_incident_batch() is not None
+            ),
             "batch_active": control["active_batch_id"] is not None,
         },
     }
@@ -470,11 +558,22 @@ def n_leg_update_safety_config(
 ) -> dict[str, object]:
     validated = _validated_safety_config(config)
     current = _current_safety_config(store)
+    # Direction is judged on client-writable values only; the stored marker
+    # is not a risk knob and never tilts loosen/tighten.
+    before = {
+        key: value
+        for key, value in current["config"].items()
+        if key != CAPS_CONFIGURED_KEY
+    }
     if current["version"] != base_version:
         raise NLegVersionConflict("safety config version mismatch")
-    direction = _safety_direction(current["config"], validated)
+    direction = _safety_direction(before, validated)
     next_version = current["version"] + 1
-    store.n_leg_safety_config_write(next_version, validated)
+    # Issue #64 ruling 5: the four caps always arrive together in one exact
+    # write (enforced by validation), so this write marks them confirmed.
+    store.n_leg_safety_config_write(
+        next_version, {**validated, CAPS_CONFIGURED_KEY: True}
+    )
     control = store.n_leg_control()
     if direction == "loosen" and control["mode"] == "AUTO":
         _downgrade(

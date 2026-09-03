@@ -18,6 +18,7 @@ from open_trader.prediction_n_leg_mode import (
     n_leg_set_mode,
     n_leg_update_qualification_policy,
     n_leg_update_safety_config,
+    n_leg_caps_gate,
     n_leg_upsert_scope,
 )
 
@@ -556,3 +557,150 @@ def test_invalid_policy_and_safety_payloads_fail_closed(tmp_path: Path) -> None:
         )
     assert n_leg_mode_contract(store)["qualification_policy_version"] == 1
     assert n_leg_mode_contract(store)["safety_config_version"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #64 Slice 1: the four caps must be written in one explicit shot; the
+# stored config JSON carries a caps_configured marker and the order gate reads
+# only that marker. A1/A2/A3 are the approved acceptance cases.
+# ---------------------------------------------------------------------------
+
+
+def _caps_config_override() -> dict[str, object]:
+    return {
+        "episode_rearm_gap_seconds": 300,
+        "max_per_trade_cost_units": 25_000_000,
+        "max_total_unsettled_capital_units": 100_000_000,
+        "max_partial_fill_loss_units": 1_000_000,
+        "max_auto_repair_loss_units": 1_000_000,
+    }
+
+
+def test_a1_full_caps_write_marks_caps_configured_and_gate_opens(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    assert n_leg_caps_gate(store) == (False, "CAPS_NOT_CONFIGURED")
+
+    contract = n_leg_update_safety_config(
+        store, config=_caps_config_override(), base_version=1
+    )
+
+    assert contract["safety_config"]["caps_configured"] is True
+    stored = store.n_leg_safety_config_latest()
+    assert stored is not None
+    assert stored["config"]["caps_configured"] is True
+    ok, reason = n_leg_caps_gate(store)
+    assert ok is True
+    assert reason == "CAPS_CONFIGURED"
+
+
+def test_a2_partial_caps_write_is_rejected_and_config_unchanged(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    partial = {
+        "episode_rearm_gap_seconds": 300,
+        "max_per_trade_cost_units": 25_000_000,
+        "max_total_unsettled_capital_units": 100_000_000,
+    }
+
+    with pytest.raises(ValueError):
+        n_leg_update_safety_config(store, config=partial, base_version=1)
+
+    assert store.n_leg_safety_config_latest() is None
+    assert n_leg_mode_contract(store)["safety_config_version"] == 1
+    assert n_leg_caps_gate(store) == (False, "CAPS_NOT_CONFIGURED")
+
+
+def test_a3_default_v1_all_zero_caps_gate_stays_closed(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    ok, reason = n_leg_caps_gate(store)
+
+    assert ok is False
+    assert reason == "CAPS_NOT_CONFIGURED"
+    assert n_leg_mode_contract(store)["safety_config"] == DEFAULT_SAFETY_CONFIG
+
+
+def test_a4_preflight_threshold_defaults_are_versioned_config(tmp_path: Path) -> None:
+    """Ruling 7: the quote-age and skew thresholds ride the versioned safety
+    config with defaults 10/5; a write without them reads as the defaults."""
+    store = _store(tmp_path)
+    contract = n_leg_update_safety_config(
+        store,
+        config={
+            "episode_rearm_gap_seconds": 300,
+            "max_per_trade_cost_units": 25_000_000,
+            "max_total_unsettled_capital_units": 100_000_000,
+            "max_partial_fill_loss_units": 1_000_000,
+            "max_auto_repair_loss_units": 1_000_000,
+        },
+        base_version=1,
+    )
+    assert contract["safety_config"]["max_quote_age_seconds"] == 10
+    assert contract["safety_config"]["max_cross_leg_skew_seconds"] == 5
+
+
+def test_p3_submit_timeout_and_reconciliation_window_are_versioned_config(
+    tmp_path: Path,
+) -> None:
+    """Ruling 8 (review round 2): ``max_leg_submit_seconds`` (default 15) and
+    ``reconciliation_timeout_seconds`` (default 60) ride the versioned safety
+    config as NON-cap keys — writable alongside the four caps without
+    extending the four-together rule, marker semantics unchanged, defaults
+    when not written, and a non-positive value is rejected."""
+    store = _store(tmp_path)
+    contract = n_leg_update_safety_config(
+        store,
+        config={
+            "episode_rearm_gap_seconds": 300,
+            "max_per_trade_cost_units": 25_000_000,
+            "max_total_unsettled_capital_units": 100_000_000,
+            "max_partial_fill_loss_units": 1_000_000,
+            "max_auto_repair_loss_units": 1_000_000,
+            "max_leg_submit_seconds": 2,
+            "reconciliation_timeout_seconds": 90,
+        },
+        base_version=1,
+    )
+    assert contract["safety_config"]["max_leg_submit_seconds"] == 2
+    assert contract["safety_config"]["reconciliation_timeout_seconds"] == 90
+    # the caps marker rides the four caps, exactly as before
+    assert contract["safety_config"]["caps_configured"] is True
+    assert n_leg_caps_gate(store) == (True, "CAPS_CONFIGURED")
+
+    # a write without them reads as the defaults (15 / 60)
+    fresh = _store(tmp_path / "defaults")
+    contract = n_leg_update_safety_config(
+        fresh,
+        config={
+            "episode_rearm_gap_seconds": 300,
+            "max_per_trade_cost_units": 0,
+            "max_total_unsettled_capital_units": 0,
+            "max_partial_fill_loss_units": 0,
+            "max_auto_repair_loss_units": 0,
+        },
+        base_version=1,
+    )
+    assert contract["safety_config"]["max_leg_submit_seconds"] == 15
+    assert contract["safety_config"]["reconciliation_timeout_seconds"] == 60
+
+    # non-positive values are rejected and change nothing
+    with pytest.raises(ValueError):
+        n_leg_update_safety_config(
+            store,
+            config={
+                "episode_rearm_gap_seconds": 300,
+                "max_per_trade_cost_units": 25_000_000,
+                "max_total_unsettled_capital_units": 100_000_000,
+                "max_partial_fill_loss_units": 1_000_000,
+                "max_auto_repair_loss_units": 1_000_000,
+                "max_leg_submit_seconds": 0,
+            },
+            base_version=2,
+        )
+    assert (
+        store.n_leg_safety_config_latest()["config"]["max_leg_submit_seconds"]
+        == 2
+    )

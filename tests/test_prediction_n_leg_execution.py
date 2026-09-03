@@ -858,3 +858,154 @@ def test_partial_incident_can_close_only_after_eventual_full_and_reconciliation(
     assert closed["incident"] is None
     assert closed["state"] == "RECONCILED_FULL"
     assert current.control()["mode"] == "MANUAL"
+
+
+# ---------------------------------------------------------------------------
+# Issue #64 Slice 4: atomic admission — version comparison (CAS) and the
+# unsettled-capital cap inside n_leg_create_batch's single transaction.
+# Zero side effects on rejection: no batch row, no lineage claim, ledger and
+# admission version untouched.
+# ---------------------------------------------------------------------------
+
+
+def _db(tmp_path) -> str:
+    return str(
+        tmp_path / "data" / "prediction_arbitrage" / "prediction_arbitrage.sqlite3"
+    )
+
+
+def _minimal_batch_payload(name: str, *, reservation: int = 1) -> dict[str, object]:
+    return {
+        "execution_batch_id": f"batch-{name}",
+        "opportunity_episode_id": f"episode-{name}",
+        "episode_lineage_id": f"lineage-{name}",
+        "mode": "MANUAL",
+        "state": "ACTIVE",
+        "entry_fingerprint": f"fingerprint-{name}",
+        "execution_solution_fingerprint": f"solution-{name}",
+        "total_unsettled_capital_units": reservation,
+    }
+
+
+def test_d1_stale_contract_generation_admission_has_zero_side_effects(
+    tmp_path,
+) -> None:
+    import sqlite3
+
+    svc = service(tmp_path)
+    source, execution = source_and_solution()
+    # Freeze-time view of the contract generation...
+    frozen_generation = svc.control()["contract_generation"]
+    # ...then the contract advances before admission.
+    svc._store.n_leg_mode_control_write(contract_generation=frozen_generation + 1)
+
+    with pytest.raises(ValueError, match="N_LEG_ADMISSION_VERSION_STALE"):
+        svc.enter(
+            opportunity_episode_id="episode-1",
+            episode_lineage_id="lineage-1",
+            execution_batch_id="batch-1",
+            source=source,
+            partial_fill_proof=proof(execution),
+            mode="MANUAL",
+            cap_config_version="caps-v1",
+            expected_versions={"contract_generation": frozen_generation},
+        )
+
+    assert svc.state("batch-1") is None
+    control = svc.control()
+    assert control["active_batch_id"] is None
+    assert control["total_unsettled_capital_units"] == 0
+    with sqlite3.connect(_db(tmp_path)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM n_leg_lineage_claims").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT total_unsettled_capital_version FROM n_leg_controls"
+        ).fetchone()[0] == 0
+
+
+def test_d2_unsettled_cap_exceeded_abandons_and_keeps_ledger(tmp_path) -> None:
+    import sqlite3
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    store.n_leg_mode_control_write(mode="MANUAL")
+    with sqlite3.connect(_db(tmp_path)) as connection:
+        connection.execute(
+            "UPDATE n_leg_controls SET total_unsettled_capital_units=800000"
+        )
+    store.n_leg_safety_config_write(
+        1,
+        {
+            "episode_rearm_gap_seconds": 300,
+            "max_per_trade_cost_units": 25_000_000,
+            "max_total_unsettled_capital_units": 1_000_000,
+            "max_partial_fill_loss_units": 1_000_000,
+            "max_auto_repair_loss_units": 1_000_000,
+        },
+    )
+    # Hand math: 800,000 current + 500,000 reservation = 1,300,000 > 1,000,000.
+
+    with pytest.raises(ValueError, match="N_LEG_ADMISSION_UNSETTLED_CAP"):
+        store.n_leg_create_batch(_minimal_batch_payload("cap", reservation=500_000))
+
+    control = store.n_leg_control()
+    assert control["total_unsettled_capital_units"] == 800_000
+    assert control["active_batch_id"] is None
+    with sqlite3.connect(_db(tmp_path)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM n_leg_batches").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM n_leg_lineage_claims").fetchone()[0] == 0
+
+
+def test_d3_active_batch_and_lineage_lock_reject_admission(tmp_path) -> None:
+    svc = service(tmp_path)
+    store = svc._store
+    enter(svc)
+    with pytest.raises(ValueError, match="N_LEG_ACTIVE_BATCH_EXISTS"):
+        store.n_leg_create_batch(_minimal_batch_payload("second"))
+
+    # Free the batch, then reuse the claimed lineage: the family can never
+    # run a second real batch.
+    svc.apply_receipt(receipt(leg="a", filled=0, state="REJECTED", sequence=1))
+    svc.apply_receipt(receipt(leg="b", filled=0, state="REJECTED", sequence=1))
+    svc.complete_reconciliation("batch-1", context=reconciliation_context())
+    reused_lineage = dict(_minimal_batch_payload("third"))
+    reused_lineage["episode_lineage_id"] = "lineage-1"
+    with pytest.raises(ValueError, match="N_LEG_LINEAGE_ALREADY_CLAIMED"):
+        store.n_leg_create_batch(reused_lineage)
+
+
+def test_d4_concurrent_admissions_exactly_one_wins_version_bumps_once(
+    tmp_path,
+) -> None:
+    import sqlite3
+    import threading
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    store.n_leg_mode_control_write(mode="MANUAL")
+    barrier = threading.Barrier(2)
+    outcomes: dict[str, str] = {}
+
+    def attempt(name: str) -> None:
+        barrier.wait()
+        try:
+            store.n_leg_create_batch(_minimal_batch_payload(name))
+            outcomes[name] = "ok"
+        except ValueError as exc:
+            outcomes[name] = str(exc)
+
+    threads = [
+        threading.Thread(target=attempt, args=(name,)) for name in ("a", "b")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes.values()) == sorted(["ok", "N_LEG_ACTIVE_BATCH_EXISTS"]) or sorted(
+        outcomes.values()
+    ) == sorted(["ok", "N_LEG_LINEAGE_ALREADY_CLAIMED"])
+    winners = [name for name, outcome in outcomes.items() if outcome == "ok"]
+    assert len(winners) == 1
+    with sqlite3.connect(_db(tmp_path)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM n_leg_batches").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT total_unsettled_capital_version FROM n_leg_controls"
+        ).fetchone()[0] == 1

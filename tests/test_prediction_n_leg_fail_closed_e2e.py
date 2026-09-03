@@ -2233,3 +2233,404 @@ def test_d2_complement_pair_at_forty_nine_cents_not_qualified_post_fee(
         assert row["order_ready"] is False
     finally:
         resolver.stop()
+
+
+# ---------------------------------------------------------------------------
+# Issue #64: the manual-confirm full chain (confirm -> preflight -> admit ->
+# submit -> receipts) and its fail-closed gate matrix, driven with fakes
+# through the same seams the production runtime wires (queue driver, fake
+# trading client, real store).
+# ---------------------------------------------------------------------------
+
+
+def _issue64_full_chain(tmp_path: Path, *, outcome: dict[str, object]):
+    from test_prediction_n_leg_confirm import (  # type: ignore[import-not-found]
+        _caps_store,
+        _e2e_driver,
+        _enqueued_e2e_store,
+        _FakeTrading,
+        _solution_entry,
+        _confirm,
+    )
+
+    store, row, base_source = _enqueued_e2e_store(tmp_path)
+    trading = _FakeTrading([outcome, {"state": "FILLED", "error_code": None, "cost_units": 400}])
+    driver = _e2e_driver(store, trading, base_source, recon=True)
+    return store, row, base_source, trading, driver
+
+
+def test_issue64_full_chain_confirm_admit_submit_complete(tmp_path: Path) -> None:
+    store, row, _base, trading, driver = _issue64_full_chain(
+        tmp_path,
+        outcome={"state": "FILLED", "error_code": None, "cost_units": 400},
+    )
+    summary = driver.tick(now=_E2E_AS_OF)
+    assert "abandoned" not in summary, summary
+    assert len(trading.calls) == 2
+    batch = store.n_leg_batch(summary["submitted"])
+    assert str(batch["state"]).startswith("RECONCILED")
+    stored = next(
+        r for r in store.n_leg_requests() if r["request_id"] == row["request_id"]
+    )
+    assert stored["state"] == "SUBMITTED"
+
+
+def test_issue64_gate_matrix_fails_closed_before_any_submit(tmp_path: Path) -> None:
+    from open_trader.prediction_n_leg_confirm import (  # type: ignore[import-not-found]
+        NLegConfirmRejected,
+    )
+    from test_prediction_n_leg_confirm import (  # type: ignore[import-not-found]
+        _confirm,
+        _solution_entry,
+    )
+
+    # OBSERVE_ONLY scope (fresh store, no caps): hard reject, no row.
+    from test_prediction_n_leg_confirm import (  # type: ignore[import-not-found]
+        _store as _fresh_store,
+    )
+
+    observe_store = _fresh_store(tmp_path / "observe")
+    with pytest.raises(NLegConfirmRejected) as observe:
+        _confirm(observe_store, [_solution_entry()], idempotency_key="m1")
+    assert observe.value.reason == "SCOPE_OBSERVE_ONLY"
+
+    # Caps not configured with a ready scope: rejected, no row.
+    from test_prediction_n_leg_confirm import (  # type: ignore[import-not-found]
+        _store as _fresh_store2,
+    )
+    from open_trader.prediction_n_leg_mode import (  # type: ignore[import-not-found]
+        ensure_same_event_same_venue_scope,
+        n_leg_upsert_scope,
+    )
+
+    nocaps = _fresh_store2(tmp_path / "nocaps")
+    ensure_same_event_same_venue_scope(nocaps)
+    n_leg_upsert_scope(
+        nocaps,
+        scope_id="SAME_EVENT_SAME_VENUE",
+        capability="MANUAL_CANARY",
+        members={"relation_type": "complement", "same_event": True, "same_venue": True, "venues": ["polymarket"]},
+        base_scope_version=1,
+    )
+    with pytest.raises(NLegConfirmRejected) as caps:
+        _confirm(nocaps, [_solution_entry()], idempotency_key="m2")
+    assert caps.value.reason == "CAPS_NOT_CONFIGURED"
+
+    # Queue rules: duplicate component + full queue (reuses B5 coverage at
+    # the chain level) and incident stop-the-world (E2) are enforced upstream
+    # of any submission; here prove a driver tick with an empty gate-free
+    # queue is a no-op on a caps-configured store with no rows.
+    from test_prediction_n_leg_confirm import (  # type: ignore[import-not-found]
+        _caps_store,
+        _e2e_driver,
+        _FakeTrading,
+    )
+
+    empty = _caps_store(tmp_path / "empty")
+    trading = _FakeTrading([])
+    driver = _e2e_driver(empty, trading, _solution_entry and None or trading)
+    assert driver.tick(now=_E2E_AS_OF) == {"skipped": "QUEUE_EMPTY"}
+    assert trading.calls == []
+
+
+from test_prediction_n_leg_execution import AS_OF as _E2E_AS_OF  # noqa: E402  (fixture clock)
+
+
+# --------------------------------------------------------------------------
+# Issue #64 repair round 1: the REAL production chain. A real
+# PredictionLiveResolver (real v2 catalog, real CP-SAT solve, real #74
+# prover, real store) produces the opportunity; the resolver-retained frozen
+# #51 ExecutionSolutionSource carries confirm -> queue-head admission; a
+# fake trading client submits; receipts fold through the durable reducer;
+# the batch completes. No fixture solution entries, no injected source
+# factory material: the payloads crossing every seam are the resolver's own.
+# This chain is also the live evidence that the projection's order_ready
+# gate chain HOLDS for real resolver payloads (the prior round's
+# EXECUTION_FINGERPRINT_MISMATCH "known boundary" was a misreport).
+# --------------------------------------------------------------------------
+
+
+class _HealthyAccountExecution:
+    """Resolver account seam with healthy Predict balances."""
+
+    def n_leg_account_view(self):
+        from open_trader.prediction_market_solution import AccountView
+
+        return AccountView(500_000_000, 500_000_000, 0)
+
+
+def _issue64_real_chain(tmp_path: Path):
+    """The real live resolver over a two-leg EXACTLY_ONE group, wired to a
+    real caps-configured store (MANUAL_CANARY scope, ruling-5 caps write with
+    loss caps that honestly bound the ~$8 worst one-leg partial fill of this
+    chain so the real #74 prover closes PARTIAL_FILL_SAFE)."""
+    from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
+    from open_trader.prediction_monitor_selection import (
+        MonitorSelectionStore,
+        SelectedComponent,
+        problem_for_component,
+        relation_generation_problem,
+    )
+    from open_trader.prediction_n_leg import fingerprint
+    from open_trader.prediction_n_leg_mode import (
+        ensure_same_event_same_venue_scope,
+        n_leg_update_safety_config,
+        n_leg_upsert_scope,
+    )
+
+    contract_ids = ["real-a", "real-b"]
+    release = datetime.now(UTC) + timedelta(days=20)
+    payload = _exactly_one_payload(contract_ids, ["0.40", "0.40"], release_at=release)
+    catalog, _ = _activate_relation(tmp_path / "catalog", payload)
+
+    store = PredictionArbitrageStore(tmp_path / "data")
+    ensure_same_event_same_venue_scope(store)
+    n_leg_upsert_scope(
+        store,
+        scope_id="SAME_EVENT_SAME_VENUE",
+        capability="MANUAL_CANARY",
+        members={
+            "relation_type": "complement",
+            "same_event": True,
+            "same_venue": True,
+            "venues": ["polymarket"],
+        },
+        base_scope_version=1,
+    )
+    n_leg_update_safety_config(
+        store,
+        config={
+            "episode_rearm_gap_seconds": 300,
+            "max_per_trade_cost_units": 50_000_000,
+            "max_total_unsettled_capital_units": 200_000_000,
+            "max_partial_fill_loss_units": 100_000_000,
+            "max_auto_repair_loss_units": 100_000_000,
+        },
+        base_version=1,
+    )
+
+    problem, components = relation_generation_problem(catalog.current_generation())
+    component = components[0]
+    sub = problem_for_component(problem, component)
+    selection_store = MonitorSelectionStore(tmp_path / "selection")
+    selection_store.save(
+        {
+            component.component_id: SelectedComponent(
+                component_id=component.component_id,
+                contract_ids=component.contract_ids,
+                constraint_ids=component.constraint_ids,
+                action_ids=component.action_ids,
+                admission_score=0,
+                portfolio=(),
+                relation_fingerprint=fingerprint(
+                    {"constraint_model": sub.constraint_model}
+                ),
+                terminal_fingerprint=fingerprint(
+                    {"terminal_state_sets": sub.terminal_state_sets}
+                ),
+                portfolio_fingerprint=fingerprint({"quantities": ()}),
+                status="ACTIVE",
+            )
+        }
+    )
+    monitor = _LiveBooksMonitor(
+        {c: _live_book(c, "0.40") for c in contract_ids}
+    )
+    resolver = PredictionLiveResolver(
+        data_dir=tmp_path / "resolver",
+        relation_catalog=catalog,
+        monitor=monitor,
+        solver_server=_RealSolverServer(),
+        selection_store=selection_store,
+        store=store,
+        execution=_HealthyAccountExecution(),
+        poll_interval=0.01,
+        budget=LIVE_TEST_BUDGET,
+        limits=LIVE_TEST_LIMITS,
+    )
+    resolver._tick()
+    resolver._tick()
+    return store, resolver, monitor, component.component_id
+
+
+def test_issue64_real_resolver_chain_confirm_admit_submit_complete(
+    tmp_path: Path,
+) -> None:
+    store, resolver, monitor, component_id = _issue64_real_chain(tmp_path)
+    try:
+        from open_trader.prediction_executable_cost import (
+            execution_solution_from_payload,
+        )
+        from open_trader.prediction_n_leg_confirm import confirm_enqueue
+        from open_trader.prediction_n_leg_driver import NLegOrderQueueDriver
+        from open_trader.prediction_n_leg_execution import (
+            ConfirmedHolding,
+            ReconciliationContext,
+            SettlementCashFlow,
+        )
+        from open_trader.prediction_n_leg_read_model import (
+            project_n_leg_solution,
+        )
+        from test_prediction_n_leg_confirm import (  # type: ignore[import-not-found]
+            _FakeTrading,
+        )
+
+        entries = resolver.solutions()
+        assert [str(e["component_id"]) for e in entries] == [component_id]
+        entry = entries[0]
+        # The real light payload: verified, executable, really proven SAFE.
+        assert entry["execution"]["reason"] == "EXECUTABLE"
+        assert entry["execution"]["partial_fill_proof"] == "PARTIAL_FILL_SAFE"
+
+        # Goal 2 evidence: the projection's order_ready gate chain HOLDS for
+        # the real resolver payload -- no EXECUTION_FINGERPRINT_MISMATCH.
+        projection = project_n_leg_solution(
+            market=entry["market"],
+            execution=entry["execution"],
+            scope={
+                "capability": "MANUAL_CANARY",
+                "order_ready": True,
+                "reason": "MANUAL_CANARY",
+                "action": "manual_confirm",
+            },
+            component_id=component_id,
+            max_total_unsettled_capital_units=200_000_000,
+            total_unsettled_capital_units=0,
+            now=datetime.now(UTC),
+            fee=entry["fee"],
+        )
+        assert projection is not None
+        assert projection["execution"]["order_ready"] is True
+        assert projection["execution"]["reason"] != "EXECUTION_FINGERPRINT_MISMATCH"
+
+        # The retained frozen #51 source exists and re-decodes faithfully.
+        material = resolver.driver_execution_source(component_id)
+        assert material is not None, "resolver retained no execution source"
+        assert material["partial_fill_proof"]["status"] == "PARTIAL_FILL_SAFE"
+        source = material["source"]
+        market = source.decode_market()
+        execution = execution_solution_from_payload(
+            dict(source.execution_solution_payload),
+            market_solution=market,
+            account_snapshot=source.account_snapshot,
+            now=source.now,
+        )
+        assert execution.fingerprint == material["execution"]["fingerprint"]
+        # Hand math for the heavy admission economics: tick 1 makes each
+        # protected price 400,001; 20 lots x 2 legs -> 16,000,040 units.
+        assert execution.capital_use_units == 16_000_040
+
+        displayed = fingerprint(canonical_payload(entry["execution"]))
+        result = confirm_enqueue(
+            store,
+            entries,
+            component_id=component_id,
+            displayed_fingerprint=displayed,
+            idempotency_key="real-chain-1",
+            now=datetime.now(UTC),
+            partial_fill_proof=material["partial_fill_proof"],
+            execution_source={
+                "market": material["market"],
+                "execution": material["execution"],
+            },
+        )
+        assert result["state"] == "PENDING"
+        # Audit block semantics (locked by B2): bound = whole-payload
+        # fingerprint of the frozen heavy execution; the admission identity
+        # (the solution's own fingerprint field) is re-checked on the batch.
+        assert result["bound_fingerprint"] == fingerprint(
+            canonical_payload(material["execution"])
+        )
+
+        def source_factory(frozen):
+            material = resolver.driver_execution_source(
+                str(frozen["component_id"])
+            )
+            if material is None:
+                raise ValueError("N_LEG_SOURCE_UNAVAILABLE")
+            return material["source"]
+
+        def recon_factory(batch_id):
+            batch = store.n_leg_batch(batch_id)
+            now = datetime.now(UTC)
+            account = replace(source.account_snapshot, captured_at=now)
+            flows, holdings = [], []
+            for leg in batch["legs"]:
+                receipt = leg["receipt"]
+                flows.append(
+                    SettlementCashFlow(
+                        leg["client_order_id"],
+                        receipt.get("venue_order_id"),
+                        leg["venue_id"],
+                        leg["account_id"],
+                        leg["settlement_asset_id"],
+                        int(receipt["cumulative_cost_units"]),
+                        int(receipt["cumulative_fee_units"]),
+                        now,
+                        now,
+                        (
+                            receipt.get("rest_observation_version")
+                            if receipt.get("rest_confirmed")
+                            else receipt.get("sequence")
+                        ),
+                        bool(receipt["rest_confirmed"]),
+                    )
+                )
+                if int(receipt["cumulative_filled_quantity"]) > 0:
+                    holdings.append(
+                        ConfirmedHolding(
+                            leg["venue_id"],
+                            leg["account_id"],
+                            leg["asset_id"],
+                            int(receipt["cumulative_filled_quantity"]),
+                            now,
+                            now,
+                        )
+                    )
+            return ReconciliationContext(
+                f"{batch_id}:v1",
+                account,
+                tuple(holdings),
+                tuple(flows),
+                now,
+                now,
+                now,
+            )
+
+        trading = _FakeTrading(
+            [
+                {"state": "FILLED", "error_code": None, "cost_units": 8_000_000},
+                {"state": "FILLED", "error_code": None, "cost_units": 8_000_000},
+            ]
+        )
+        driver = NLegOrderQueueDriver(
+            store,
+            books_provider=lambda cid: resolver.driver_books_snapshot(cid),
+            source_factory=source_factory,
+            trading=trading,
+            reconciliation_context_factory=recon_factory,
+        )
+        # A fresh book refresh before the driver tick mirrors production.
+        monitor.books = {
+            c: _live_book(c, "0.40") for c in ("real-a", "real-b")
+        }
+        summary = driver.tick(now=datetime.now(UTC))
+
+        assert "abandoned" not in summary, summary
+        assert len(trading.calls) == 2
+        batch = store.n_leg_batch(summary["submitted"])
+        assert str(batch["state"]).startswith("RECONCILED")
+        # The admitted batch carries exactly the frozen heavy solution.
+        assert (
+            batch["execution_solution_fingerprint"]
+            == material["execution"]["fingerprint"]
+        )
+        rows = store.n_leg_requests()
+        assert [r["state"] for r in rows] == ["SUBMITTED"]
+        assert all(r["abandon_reason"] is None for r in rows)
+        control = store.n_leg_control()
+        assert control["active_batch_id"] is None
+        # The ledger keeps the conservative heavy bound (8,000,020/leg).
+        assert control["total_unsettled_capital_units"] == 16_000_040
+    finally:
+        resolver.stop()

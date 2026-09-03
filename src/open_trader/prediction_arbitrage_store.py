@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from open_trader.llm_providers import DEFAULT_PROVIDER, PROVIDER_IDS
 from open_trader.prediction_arbitrage import MAX_CROSS_UNSETTLED_PRINCIPAL
-
+from open_trader.prediction_n_leg import fingerprint as canonical_fingerprint
 
 StoreHistoryKind = Literal["signals", "executions", "incidents"]
 SignalHistoryWindow = Literal["24h", "7d", "30d", "all"]
@@ -613,6 +613,7 @@ class PredictionArbitrageStore:
                 breaker_reason TEXT,
                 active_batch_id TEXT,
                 total_unsettled_capital_units INTEGER NOT NULL CHECK (total_unsettled_capital_units >= 0),
+                total_unsettled_capital_version INTEGER NOT NULL DEFAULT 0,
                 contract_generation INTEGER NOT NULL DEFAULT 1
                     CHECK (contract_generation >= 1),
                 qualification_policy_version INTEGER NOT NULL DEFAULT 1
@@ -682,6 +683,22 @@ class PredictionArbitrageStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS n_leg_execution_requests (
+                fifo_index INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                component_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                state TEXT NOT NULL
+                    CHECK (state IN ('PENDING', 'ADMITTED', 'ABANDONED', 'SUBMITTED')),
+                abandon_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS n_leg_execution_requests_state
+            ON n_leg_execution_requests(state, fifo_index);
             """
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -759,6 +776,25 @@ class PredictionArbitrageStore:
         if version < 10:
             connection.execute("PRAGMA user_version=10")
             version = 10
+        if version < 11:
+            # Issue #64: manual-confirm FIFO execution requests (expand-only;
+            # the table itself is CREATE IF NOT EXISTS above).
+            connection.execute("PRAGMA user_version=11")
+            version = 11
+        if version < 12:
+            # Issue #64 Slice 4: atomic-admission CAS counter for the
+            # unsettled-capital ledger; every unit-writing transaction bumps
+            # it in the same transaction.
+            columns = {
+                str(column[1])
+                for column in connection.execute("PRAGMA table_info(n_leg_controls)")
+            }
+            if "total_unsettled_capital_version" not in columns:
+                connection.execute(
+                    "ALTER TABLE n_leg_controls ADD COLUMN total_unsettled_capital_version INTEGER NOT NULL DEFAULT 0"
+                )
+            connection.execute("PRAGMA user_version=12")
+            version = 12
 
     @staticmethod
     def _execution_fields(row: sqlite3.Row) -> dict[str, object]:
@@ -2412,6 +2448,162 @@ class PredictionArbitrageStore:
                 (version, _dump_payload(config), now),
             )
 
+    @staticmethod
+    def _n_leg_request_row(row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "request_id": str(row["request_id"]),
+            "fifo_index": int(row["fifo_index"]),
+            "idempotency_key": str(row["idempotency_key"]),
+            "component_id": str(row["component_id"]),
+            "state": str(row["state"]),
+            "abandon_reason": row["abandon_reason"],
+            "payload": _load_payload(str(row["payload"])),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def n_leg_request_enqueue(
+        self,
+        *,
+        component_id: str,
+        idempotency_key: str,
+        payload: Mapping[str, object],
+        max_pending: int = 5,
+    ) -> dict[str, object]:
+        """Insert one FIFO execution request; the idempotency key is the
+        replay identity, so a repeated key returns the existing row unchanged
+        and never enqueues a second entry.
+
+        Review round 2 (ruling 3): the FIFO queue rules are enforced inside
+        this BEGIN IMMEDIATE transaction — one PENDING row per component
+        (``QUEUE_DUPLICATE``) and at most ``max_pending`` PENDING rows in
+        total (``QUEUE_FULL``) — so concurrent confirms with different
+        idempotency keys cannot both insert."""
+        if not isinstance(component_id, str) or not component_id:
+            raise ValueError("component id must be non-empty text")
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise ValueError("idempotency key must be non-empty text")
+        if type(max_pending) is not int or max_pending < 1:
+            raise ValueError("max_pending must be a positive integer")
+        encoded = _dump_payload(dict(payload))
+        now = _utc_now()
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM n_leg_execution_requests WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                return self._n_leg_request_row(existing)
+            pending_rows = connection.execute(
+                "SELECT component_id FROM n_leg_execution_requests WHERE state='PENDING'"
+            ).fetchall()
+            if any(
+                str(row["component_id"]) == component_id
+                for row in pending_rows
+            ):
+                raise ValueError("QUEUE_DUPLICATE")
+            if len(pending_rows) >= max_pending:
+                raise ValueError("QUEUE_FULL")
+            request_id = _new_id()
+            connection.execute(
+                "INSERT INTO n_leg_execution_requests(request_id, idempotency_key, component_id, payload, state, abandon_reason, created_at, updated_at) VALUES (?, ?, ?, ?, 'PENDING', NULL, ?, ?)",
+                (request_id, idempotency_key, component_id, encoded, now, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM n_leg_execution_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            return self._n_leg_request_row(row)
+
+    def n_leg_request_by_idempotency_key(
+        self, idempotency_key: str
+    ) -> dict[str, object] | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM n_leg_execution_requests WHERE idempotency_key=?",
+                (str(idempotency_key),),
+            ).fetchone()
+        return None if row is None else self._n_leg_request_row(row)
+
+    def n_leg_requests(self) -> list[dict[str, object]]:
+        """All execution request rows in FIFO order (queue display)."""
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM n_leg_execution_requests ORDER BY fifo_index"
+            ).fetchall()
+        return [self._n_leg_request_row(row) for row in rows]
+
+    def n_leg_request_head(self) -> dict[str, object] | None:
+        """The lowest FIFO-index PENDING request, or None when idle."""
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM n_leg_execution_requests WHERE state='PENDING' ORDER BY fifo_index LIMIT 1"
+            ).fetchone()
+        return None if row is None else self._n_leg_request_row(row)
+
+    def n_leg_request_update(
+        self,
+        request_id: str,
+        *,
+        state: str | None = None,
+        abandon_reason: str | None = None,
+        payload_merge: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Transition one execution request row (state machine guarded)."""
+        if state is not None and state not in {
+            "PENDING",
+            "ADMITTED",
+            "ABANDONED",
+            "SUBMITTED",
+        }:
+            raise ValueError("invalid n-leg execution request state")
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM n_leg_execution_requests WHERE request_id=?",
+                (str(request_id),),
+            ).fetchone()
+            if row is None:
+                raise ValueError("N_LEG_REQUEST_NOT_FOUND")
+            current = self._n_leg_request_row(row)
+            next_state = current["state"] if state is None else state
+            next_reason = (
+                current["abandon_reason"]
+                if abandon_reason is None
+                else abandon_reason
+            )
+            payload = current["payload"]
+            if payload_merge:
+                payload = {**payload, **dict(payload_merge)}
+            connection.execute(
+                "UPDATE n_leg_execution_requests SET state=?, abandon_reason=?, payload=?, updated_at=? WHERE request_id=?",
+                (
+                    str(next_state),
+                    next_reason,
+                    _dump_payload(payload),
+                    now,
+                    str(request_id),
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM n_leg_execution_requests WHERE request_id=?",
+                (str(request_id),),
+            ).fetchone()
+            return self._n_leg_request_row(updated)
+
+    def n_leg_requests_abandon_pending(self, reason: str) -> int:
+        """Abandon every PENDING request (incident stop-the-world) and return
+        how many rows changed."""
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("abandon reason must be non-empty text")
+        now = _utc_now()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE n_leg_execution_requests SET state='ABANDONED', abandon_reason=?, updated_at=? WHERE state='PENDING'",
+                (reason, now),
+            )
+            return int(cursor.rowcount)
+
     def partial_fill_proof_save(
         self,
         proof: object,
@@ -2612,8 +2804,23 @@ class PredictionArbitrageStore:
             ).fetchone()
         return None if row is None else _load_payload(str(row["payload"]))
 
-    def n_leg_create_batch(self, payload: Mapping[str, object]) -> dict[str, object]:
-        """Atomically claim a lineage and the single active N-leg batch."""
+    def n_leg_create_batch(
+        self,
+        payload: Mapping[str, object],
+        *,
+        expected_versions: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Atomically claim a lineage and the single active N-leg batch.
+
+        Issue #64 Slice 4: when ``expected_versions`` is provided, every
+        listed fact is compared against the CURRENT state inside this one
+        transaction (contract generation, policy/mode/scope versions,
+        breaker, solution/account fingerprints, caps fingerprint). Any
+        mismatch raises ``N_LEG_ADMISSION_VERSION_STALE`` and the unsettled
+        cap is enforced as ``N_LEG_ADMISSION_UNSETTLED_CAP`` — both before
+        any write, so a rejection leaves no batch row, no lineage claim and
+        an untouched ledger.
+        """
         batch_id = payload.get("execution_batch_id")
         opportunity_id = payload.get("opportunity_episode_id")
         lineage_id = payload.get("episode_lineage_id")
@@ -2649,6 +2856,17 @@ class PredictionArbitrageStore:
                 "SELECT 1 FROM n_leg_lineage_claims WHERE episode_lineage_id=?", (lineage_id,)
             ).fetchone() is not None:
                 raise ValueError("N_LEG_LINEAGE_ALREADY_CLAIMED")
+            if expected_versions is not None and self._admission_version_mismatch(
+                connection, control, payload, expected_versions
+            ):
+                raise ValueError("N_LEG_ADMISSION_VERSION_STALE")
+            unsettled_cap = self._n_leg_unsettled_cap(connection)
+            if (
+                unsettled_cap > 0
+                and int(control["total_unsettled_capital_units"]) + int(reservation)
+                > unsettled_cap
+            ):
+                raise ValueError("N_LEG_ADMISSION_UNSETTLED_CAP")
             stored_payload = dict(payload)
             stored_payload["prior_unsettled_capital_units"] = int(control["total_unsettled_capital_units"])
             encoded = _dump_execution_payload(stored_payload)
@@ -2661,7 +2879,7 @@ class PredictionArbitrageStore:
                 (batch_id, opportunity_id, lineage_id, str(payload.get("state")), 0, encoded, now, now),
             )
             connection.execute(
-                "INSERT INTO n_leg_controls(singleton, mode, breaker_open, breaker_reason, active_batch_id, total_unsettled_capital_units, contract_generation, qualification_policy_version, safety_config_version, enabled_execution_scope_version, updated_at) VALUES (1, ?, 0, NULL, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET mode=excluded.mode, active_batch_id=excluded.active_batch_id, total_unsettled_capital_units=excluded.total_unsettled_capital_units, contract_generation=excluded.contract_generation, qualification_policy_version=excluded.qualification_policy_version, safety_config_version=excluded.safety_config_version, enabled_execution_scope_version=excluded.enabled_execution_scope_version, updated_at=excluded.updated_at",
+                "INSERT INTO n_leg_controls(singleton, mode, breaker_open, breaker_reason, active_batch_id, total_unsettled_capital_units, total_unsettled_capital_version, contract_generation, qualification_policy_version, safety_config_version, enabled_execution_scope_version, updated_at) VALUES (1, ?, 0, NULL, ?, ?, 1, ?, ?, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET mode=excluded.mode, active_batch_id=excluded.active_batch_id, total_unsettled_capital_units=excluded.total_unsettled_capital_units, total_unsettled_capital_version=total_unsettled_capital_version+1, contract_generation=excluded.contract_generation, qualification_policy_version=excluded.qualification_policy_version, safety_config_version=excluded.safety_config_version, enabled_execution_scope_version=excluded.enabled_execution_scope_version, updated_at=excluded.updated_at",
                 (
                     mode,
                     batch_id,
@@ -2674,6 +2892,239 @@ class PredictionArbitrageStore:
                 ),
             )
         return _load_payload(encoded)
+
+    @staticmethod
+    def _n_leg_unsettled_cap(connection: sqlite3.Connection) -> int:
+        row = connection.execute(
+            "SELECT config FROM n_leg_safety_config ORDER BY version DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            config = _load_payload(str(row["config"]))
+            return max(0, int(config.get("max_total_unsettled_capital_units") or 0))
+        except (ValueError, TypeError):
+            return 0
+
+    def _admission_version_mismatch(
+        self,
+        connection: sqlite3.Connection,
+        control: Mapping[str, object],
+        payload: Mapping[str, object],
+        expected: Mapping[str, object],
+    ) -> bool:
+        """Compare each expected fact against current in-transaction state."""
+        scope_id = str(expected.get("scope_id") or "")
+        scope = None
+        if scope_id:
+            scope = connection.execute(
+                "SELECT capability, scope_version FROM n_leg_execution_scopes WHERE scope_id=?",
+                (scope_id,),
+            ).fetchone()
+        caps_fingerprint = None
+        caps_row = connection.execute(
+            "SELECT config FROM n_leg_safety_config ORDER BY version DESC LIMIT 1"
+        ).fetchone()
+        if caps_row is not None:
+            try:
+                config = _load_payload(str(caps_row["config"]))
+                caps_fingerprint = canonical_fingerprint(
+                    {
+                        key: int(config.get(key) or 0)
+                        for key in (
+                            "max_per_trade_cost_units",
+                            "max_total_unsettled_capital_units",
+                            "max_partial_fill_loss_units",
+                            "max_auto_repair_loss_units",
+                        )
+                    }
+                )
+            except (ValueError, TypeError):
+                caps_fingerprint = None
+        comparisons = (
+            ("contract_generation", int(control["contract_generation"])),
+            ("qualification_policy_version", int(control["qualification_policy_version"])),
+            ("mode", str(control["mode"])),
+            ("breaker_closed", not bool(control["breaker_open"])),
+            (
+                "enabled_execution_scope_version",
+                control["enabled_execution_scope_version"],
+            ),
+            (
+                "execution_solution_fingerprint",
+                payload.get("execution_solution_fingerprint"),
+            ),
+            ("account_snapshot_fingerprint", payload.get("account_fingerprint")),
+            (
+                "capability",
+                str(scope["capability"]) if scope is not None else None,
+            ),
+            (
+                "scope_version",
+                int(scope["scope_version"]) if scope is not None else None,
+            ),
+            ("caps_fingerprint", caps_fingerprint),
+        )
+        for key, current in comparisons:
+            if key not in expected:
+                continue
+            if expected.get(key) != current:
+                return True
+        return False
+
+    def n_leg_incident_batch(self) -> dict[str, object] | None:
+        """The unacknowledged N_LEG execution-incident batch, if any."""
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM n_leg_batches WHERE state='INCIDENT' ORDER BY updated_at DESC LIMIT 1"
+            ).fetchone()
+        return None if row is None else _load_payload(str(row["payload"]))
+
+    def n_leg_acknowledge_incident(
+        self,
+        execution_batch_id: str,
+        *,
+        acknowledgement: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Issue #64 Slice 6: the four-step atomic incident unlock.
+
+        (1) every leg receipt is terminal and consistent — no UNKNOWN state,
+        no unresolved conflicts; (2) the ledger recomputes to the stored
+        total; (3) the acknowledgement (actor/time/batch/reason) is recorded
+        as an immutable transition; (4) the gate releases by leaving the
+        INCIDENT state. Any violated step raises before any write.
+        """
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT payload FROM n_leg_batches WHERE execution_batch_id=?",
+                (str(execution_batch_id),),
+            ).fetchone()
+            if row is None:
+                raise ValueError("N_LEG_BATCH_NOT_FOUND")
+            batch = _load_payload(str(row["payload"]))
+            if batch.get("state") != "INCIDENT":
+                raise ValueError("N_LEG_INCIDENT_NOT_ACTIVE")
+            legs = batch.get("legs")
+            if not isinstance(legs, list) or not legs:
+                raise ValueError("N_LEG_INCIDENT_UNKNOWABLE")
+            for leg in legs:
+                receipt = (
+                    leg.get("receipt")
+                    if isinstance(leg, dict) and isinstance(leg.get("receipt"), dict)
+                    else None
+                )
+                if not isinstance(receipt, dict) or receipt.get("state") not in {
+                    "FILLED",
+                    "REJECTED",
+                    "CANCELLED",
+                }:
+                    raise ValueError("N_LEG_INCIDENT_UNKNOWN_RECEIPT")
+            unresolved = batch.get("unresolved_conflicts")
+            if isinstance(unresolved, list) and unresolved:
+                raise ValueError("N_LEG_INCIDENT_UNRESOLVED_CONFLICT")
+            reservations = batch.get("reservations")
+            if isinstance(reservations, list):
+                occupancy = sum(
+                    int(row.get("remaining_units", 0))
+                    + int(row.get("holding_units", 0))
+                    for row in reservations
+                    if isinstance(row, dict)
+                )
+                stored = int(batch.get("total_unsettled_capital_units", -1))
+                if occupancy != stored:
+                    raise ValueError("N_LEG_INCIDENT_LEDGER_MISMATCH")
+            acknowledged = dict(batch.get("incident") or {})
+            acknowledged["acknowledgement"] = dict(acknowledgement)
+            acknowledged["acknowledged_at"] = now
+            acknowledged["repair_status"] = "ACKNOWLEDGED"
+            batch["incident"] = acknowledged
+            batch["state"] = "INCIDENT_ACKNOWLEDGED"
+            encoded = _dump_execution_payload(batch)
+            connection.execute(
+                "UPDATE n_leg_batches SET state=?, payload=?, updated_at=? WHERE execution_batch_id=?",
+                ("INCIDENT_ACKNOWLEDGED", encoded, now, str(execution_batch_id)),
+            )
+            # Gate release: a batch that held the single-active-batch slot
+            # from the control releases it here (step 4).
+            connection.execute(
+                "UPDATE n_leg_controls SET active_batch_id=NULL, updated_at=? WHERE singleton=1 AND active_batch_id=?",
+                (now, str(execution_batch_id)),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO n_leg_transitions(transition_id, execution_batch_id, kind, idempotency_key, payload, created_at) VALUES (?, ?, 'INCIDENT_ACKNOWLEDGED', ?, ?, ?)",
+                (
+                    _new_id(),
+                    str(execution_batch_id),
+                    f"incident-acknowledge:{execution_batch_id}",
+                    _dump_execution_payload(
+                        {
+                            "batch": str(execution_batch_id),
+                            **dict(acknowledgement),
+                            "acknowledged_at": now,
+                        }
+                    ),
+                    now,
+                ),
+            )
+        return batch
+
+    def n_leg_breaker_reset(self, *, audit: Mapping[str, object] | None = None) -> dict[str, object]:
+        """Issue #64 Slice 6: clear the N_LEG global breaker only when the
+        latest incident acknowledgement records a fresh_clean reconciliation
+        (mirrors the legacy reset_breaker discipline)."""
+        with self._transaction() as connection:
+            control = self._n_leg_control_row(
+                connection.execute("SELECT * FROM n_leg_controls WHERE singleton=1").fetchone()
+            )
+            if not control["breaker_open"]:
+                return {"state": "ready", "reason": "breaker_not_open"}
+            row = connection.execute(
+                "SELECT payload FROM n_leg_transitions WHERE kind='INCIDENT_ACKNOWLEDGED' ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                raise ValueError("N_LEG_BREAKER_INCIDENT_NOT_ACKNOWLEDGED")
+            payload = _load_payload(str(row["payload"]))
+            if payload.get("reconciliation") != "fresh_clean":
+                raise ValueError("N_LEG_BREAKER_RECONCILIATION_REQUIRED")
+            connection.execute(
+                "UPDATE n_leg_controls SET breaker_open=0, breaker_reason=NULL, updated_at=? WHERE singleton=1",
+                (_utc_now(),),
+            )
+        return {"state": "ready", "reason": "reset_confirmed"}
+
+    def n_leg_transition_append(
+        self,
+        execution_batch_id: str,
+        *,
+        kind: str,
+        idempotency_key: str,
+        payload: Mapping[str, object],
+    ) -> bool:
+        """Append one N-leg transition; returns False when the exact
+        (batch, idempotency key) pair was already recorded (no double write)."""
+        if not isinstance(kind, str) or not kind:
+            raise ValueError("invalid n-leg transition kind")
+        now = _utc_now()
+        with self._transaction() as connection:
+            batch = connection.execute(
+                "SELECT 1 FROM n_leg_batches WHERE execution_batch_id=?",
+                (str(execution_batch_id),),
+            ).fetchone()
+            if batch is None:
+                raise ValueError("N_LEG_BATCH_NOT_FOUND")
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO n_leg_transitions(transition_id, execution_batch_id, kind, idempotency_key, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    _new_id(),
+                    str(execution_batch_id),
+                    kind,
+                    str(idempotency_key),
+                    _dump_execution_payload(dict(payload)),
+                    now,
+                ),
+            )
+            return int(cursor.rowcount) > 0
 
     def n_leg_reduce(
         self,
@@ -2717,7 +3168,7 @@ class PredictionArbitrageStore:
                 (str(next_batch.get("state")), encoded, now, str(execution_batch_id)),
             )
             connection.execute(
-                "INSERT INTO n_leg_controls(singleton, mode, breaker_open, breaker_reason, active_batch_id, total_unsettled_capital_units, contract_generation, qualification_policy_version, safety_config_version, enabled_execution_scope_version, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET mode=excluded.mode, breaker_open=excluded.breaker_open, breaker_reason=excluded.breaker_reason, active_batch_id=excluded.active_batch_id, total_unsettled_capital_units=excluded.total_unsettled_capital_units, contract_generation=excluded.contract_generation, qualification_policy_version=excluded.qualification_policy_version, safety_config_version=excluded.safety_config_version, enabled_execution_scope_version=excluded.enabled_execution_scope_version, updated_at=excluded.updated_at",
+                "INSERT INTO n_leg_controls(singleton, mode, breaker_open, breaker_reason, active_batch_id, total_unsettled_capital_units, contract_generation, qualification_policy_version, safety_config_version, enabled_execution_scope_version, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET mode=excluded.mode, breaker_open=excluded.breaker_open, breaker_reason=excluded.breaker_reason, active_batch_id=excluded.active_batch_id, total_unsettled_capital_units=excluded.total_unsettled_capital_units, total_unsettled_capital_version=total_unsettled_capital_version+1, contract_generation=excluded.contract_generation, qualification_policy_version=excluded.qualification_policy_version, safety_config_version=excluded.safety_config_version, enabled_execution_scope_version=excluded.enabled_execution_scope_version, updated_at=excluded.updated_at",
                 (
                     next_control["mode"],
                     int(bool(next_control["breaker_open"])),

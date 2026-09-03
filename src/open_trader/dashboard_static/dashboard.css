@@ -6607,3 +6607,13 @@ button { cursor: pointer; }
 .pm-manual-card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; display: grid; gap: 8px; padding: 12px; }
 .pm-manual-card-head { align-items: start; display: flex; gap: 10px; justify-content: space-between; }
 .pm-manual-title { font-weight: 800; overflow-wrap: anywhere; }
+
+/* #64: manual-confirm FIFO queue line rides under the N_LEG metrics grid. */
+.pm-n-leg-order-queue {
+  grid-column: 1 / -1;
+  margin: 2px 0 0;
+  padding: 6px 10px;
+  border-top: 1px solid var(--border, #e6dfd4);
+  color: var(--muted, #8a8177);
+  font-size: 12px;
+}

@@ -26,6 +26,17 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import sqlite3
 
+from open_trader.prediction_arbitrage import ThresholdOrderBook
+from open_trader.prediction_executable_cost import (
+    AccountBalance,
+    AccountSnapshot,
+    BookBinding,
+    ImmutableBook,
+    ResolutionStatus,
+    VerifiedComponent,
+    component_fingerprint,
+    resolve_component,
+)
 from open_trader.prediction_market_solution import (
     EXECUTABLE_REASON,
     AccountView,
@@ -57,7 +68,9 @@ from open_trader.prediction_n_leg_episodes import (
     EpisodeTracker,
 )
 from open_trader.prediction_n_leg_execution import (
+    ExecutionSolutionSource,
     PartialFillProofRecord,
+    execution_solution_binding,
     partial_fill_proof_from_payload,
 )
 from open_trader.prediction_n_leg_mode import DEFAULT_SAFETY_CONFIG
@@ -69,7 +82,11 @@ from open_trader.prediction_n_leg_read_model import (
 )
 from open_trader.prediction_partial_fill import (
     PARTIAL_FILL_UNKNOWN,
+    FillLeg,
+    default_order_type,
+    fill_adversary_problem,
     fill_adversary_problem_from_market_solution,
+    order_semantics_lookup,
     prove_partial_fill,
 )
 from open_trader.prediction_runtime_graph import RuntimeRelationGraph
@@ -443,10 +460,17 @@ class PredictionLiveResolver:
         self._leg_tokens: dict[str, dict[str, object]] = {}
         self._selection: dict[str, SelectedComponent] = {}
         # #117: each stored solution carries the fee block frozen at its
-        # request-build time; solutions() replays it verbatim.
+        # request-build time; solutions() replays it verbatim. Review round
+        # 2 (#64 P3) adds the solve-request's frozen sequence baselines as
+        # the fourth tuple element.
         self._solutions: dict[
             str,
-            tuple[MarketSolution, ExecutionSolution | None, dict[str, object]],
+            tuple[
+                MarketSolution,
+                ExecutionSolution | None,
+                dict[str, object],
+                dict[str, int],
+            ],
         ] = {}
         self._resolutions: dict[str, ComponentResolution] = {}
         self._verifications: dict[str, VerificationResult] = {}
@@ -460,6 +484,19 @@ class PredictionLiveResolver:
             str, tuple[PartialFillProofRecord, dict[str, object] | None]
         ] = {}
         self._fill_proof_components: dict[str, str] = {}
+        # Issue #64: the heavy #51 source inputs retained per component for
+        # the manual-confirm admission source — the solve request's own
+        # snapshot legs rebuilt as canonical books (replaced at every
+        # dispatch, latest-snapshot-wins) — and the lazily built
+        # ExecutionSolutionSource plus its bound #74 proof. A None entry
+        # caches a failed build for this frozen generation (fail-closed, no
+        # retry), exactly like the UNKNOWN #74 proof cache; both dicts share
+        # the _solutions lifecycle (rotation / negative proof / cleanup).
+        self._source_books: dict[str, tuple[ImmutableBook, ...]] = {}
+        self._sources: dict[
+            str,
+            tuple[ExecutionSolutionSource, dict[str, object]] | None,
+        ] = {}
         self._applied_generation: tuple[int, str] | None = None
         self._account_view_cache: AccountView | None = None
         self._account_view_cached_at: datetime | None = None
@@ -505,6 +542,224 @@ class PredictionLiveResolver:
     def is_idle(self) -> bool:
         return self._tracking.pending_count() == 0
 
+    def driver_books_snapshot(self, component_id: str):
+        """Issue #64: the current fresh book snapshot for one component, or
+        None when the component is not currently selected (the queue driver's
+        books_provider seam)."""
+        with self._lock:
+            selected = self._selection.get(component_id)
+        if selected is None:
+            return None
+        return self._snapshot_for(selected)
+
+    def driver_execution_source(
+        self, component_id: str
+    ) -> dict[str, object] | None:
+        """Issue #64: the retained admission-grade execution material for one
+        component's current frozen solution, or None (the queue driver's
+        source_factory seam; ``N_LEG_SOURCE_UNAVAILABLE`` is the defensive
+        fail-closed for exactly this None).
+
+        The heavy #51 ``ExecutionSolutionSource`` is built at most once per
+        frozen solution from the solve request's retained snapshot legs, so
+        admission's ``enter`` re-decode replays the same books at the same
+        quote instant and reproduces the frozen solution faithfully. The
+        returned mapping carries the source, its market/execution payloads
+        (the confirm freeze), and the #74 proof record bound to exactly that
+        execution solution.
+        """
+        with self._lock:
+            cached = self._sources.get(component_id)
+            # The generation marker for the build below: the retained books
+            # tuple this component is frozen at right now.
+            books_at_start = self._source_books.get(component_id)
+        if cached is None and component_id not in self._sources:
+            built = self._build_execution_source(component_id)
+            with self._lock:
+                # Issue #64 repair round 3 (P3): the build ran outside the
+                # lock; a frozen-solution rotation that swapped the retained
+                # books to a new generation (and invalidated cached sources)
+                # during the build must not be defeated by re-inserting the
+                # stale build. Discard it — the next access rebuilds from the
+                # new generation; caching None keeps its fail-closed
+                # semantics.
+                if self._source_books.get(component_id) is books_at_start:
+                    cached = self._sources.setdefault(component_id, built)
+        if cached is None:
+            return None
+        source, proof_payload = cached
+        return {
+            "source": source,
+            "market": dict(source.market_solution_payload),
+            "execution": dict(source.execution_solution_payload),
+            "partial_fill_proof": dict(proof_payload),
+        }
+
+    def _build_execution_source(
+        self, component_id: str
+    ) -> tuple[ExecutionSolutionSource, dict[str, object]] | None:
+        """Build the frozen #51 source plus its bound #74 proof from the
+        retained solve inputs; None (fail-closed) whenever any step cannot
+        reproduce a verified, executable, fully funded handoff."""
+        try:
+            books = self._source_books.get(component_id)
+            problem = self._problem_map.get(component_id)
+            if not books or problem is None:
+                return None
+            bindings = tuple(
+                BookBinding(
+                    action_id=book.action_id,
+                    venue_id=book.venue_id,
+                    native_id=book.native_id,
+                    book_kind="polymarket",
+                    fee_rule_id=book.fee_rule_id,
+                    fee_ppm=book.fee_ppm,
+                    tick_units=book.tick_units,
+                    haircut_ppm=book.haircut_ppm,
+                    price_units_per_quote_unit=(
+                        book.price_units_per_quote_unit
+                    ),
+                )
+                for book in books
+            )
+            component = VerifiedComponent(
+                problem,
+                component_fingerprint(
+                    problem, bindings, USD_UNITS_PER_DOLLAR
+                ),
+                USD_UNITS_PER_DOLLAR,
+                bindings,
+            )
+            # The frozen quote instant: the newest retained book timestamp.
+            # Re-decode replays with this same instant, so book freshness is
+            # deterministic forever and never depends on wall-clock drift.
+            now = max(book.book.confirmed_at for book in books)
+            account = self._account_view()
+            if account is None:
+                return None
+            safety = self._store.n_leg_safety_config_latest() or {}
+            config = safety.get("config") or {}
+            snapshot = AccountSnapshot(
+                captured_at=now,
+                balances=tuple(
+                    AccountBalance(
+                        venue_id,
+                        account_id,
+                        settlement_asset_id,
+                        account.available_units,
+                        account.allowance_units,
+                    )
+                    for venue_id, account_id, settlement_asset_id in sorted(
+                        {
+                            (
+                                action.venue_id,
+                                action.account_id,
+                                action.settlement_asset_id,
+                            )
+                            for action in problem.actions
+                        }
+                    )
+                ),
+                max_per_trade_cost_units=int(
+                    config.get("max_per_trade_cost_units", 0)
+                ),
+                unsettled_capital_units=account.unsettled_capital_units,
+                max_total_unsettled_capital_units=int(
+                    config.get("max_total_unsettled_capital_units", 0)
+                ),
+            )
+            result = resolve_component(
+                component,
+                books,
+                snapshot,
+                self._limits,
+                self._budget,
+                now=now,
+            )
+            if (
+                result.status is not ResolutionStatus.EXECUTION_SOLUTION
+                or result.market_solution is None
+                or result.execution_solution is None
+            ):
+                return None
+            record = self._prove_frozen_execution(
+                result.execution_solution,
+                result.market_solution,
+                config,
+                int(safety.get("version", 1)),
+            )
+            if record is None:
+                return None
+            source = ExecutionSolutionSource(
+                canonical_payload(result.execution_solution),
+                canonical_payload(result.market_solution),
+                component,
+                books,
+                snapshot,
+                now,
+            )
+            return source, record.to_payload()
+        except (
+            TypeError,
+            ValueError,
+            RuntimeError,
+            OverflowError,
+            InvalidOperation,
+        ):
+            return None
+
+    def _prove_frozen_execution(
+        self,
+        execution: object,
+        market: object,
+        config: Mapping[str, object],
+        config_version: int,
+    ) -> PartialFillProofRecord | None:
+        """Run the #74 prover against one frozen heavy execution. The
+        adversary binds the six ``execution_solution_binding`` facts of that
+        exact solution, so admission's re-bind can only pass for it; an
+        UNKNOWN/UNSAFE record is returned as-is and fails the build closed."""
+        try:
+            legs = tuple(
+                FillLeg(
+                    leg.action_id,
+                    leg.venue_id,
+                    leg.quantity_lots,
+                    order_type,
+                    order_semantics_lookup(leg.venue_id, order_type).value,
+                    leg.max_cost_units,
+                    leg.max_fee_units,
+                )
+                for leg in execution.execution_legs
+                for order_type in (
+                    default_order_type(leg.venue_id) or "UNKNOWN",
+                )
+            )
+            adversary = fill_adversary_problem(
+                **execution_solution_binding(execution),
+                cap_config_version=f"caps-v{config_version or 1}",
+                max_partial_fill_loss=int(
+                    config.get("max_partial_fill_loss_units", 0)
+                ),
+                max_auto_repair_loss=int(
+                    config.get("max_auto_repair_loss_units", 0)
+                ),
+                legs=legs,
+                source_problem=market.problem,
+            )
+            record, _counterexample = prove_partial_fill(
+                adversary, time_limit_ms=self._proof_time_limit_ms
+            )
+            return record
+        except (
+            TypeError,
+            ValueError,
+            RuntimeError,
+            OverflowError,
+            InvalidOperation,
+        ):
+            return None
+
     def solutions(self) -> list[dict[str, object]]:
         with self._lock:
             selection = dict(self._selection)
@@ -533,9 +788,14 @@ class PredictionLiveResolver:
                     else None
                 ),
                 "fee": dict(fee_block),
+                # Review round 2 (#64 P3): the solve-request's per-leg
+                # sequence baselines, frozen at dispatch time.
+                "sequences": dict(sequences),
             }
             for component_id in ordered
-            for market, execution, fee_block in (solutions[component_id],)
+            for market, execution, fee_block, sequences in (
+                solutions[component_id],
+            )
         ]
 
     def latest_resolution(self, component_id: str) -> ComponentResolution | None:
@@ -684,6 +944,16 @@ class PredictionLiveResolver:
                 for component_id, solution in self._solutions.items()
                 if component_id in kept
             }
+            self._source_books = {
+                component_id: books
+                for component_id, books in self._source_books.items()
+                if component_id in kept
+            }
+            self._sources = {
+                component_id: source
+                for component_id, source in self._sources.items()
+                if component_id in kept
+            }
             self._resolutions = {
                 component_id: resolution
                 for component_id, resolution in self._resolutions.items()
@@ -802,13 +1072,82 @@ class PredictionLiveResolver:
         # stamping and request build can never split the block from the
         # solved economics.
         fee_block = self._freeze_fee_block(selected, problem, snapshot)
+        # Review round 2 (issue #64 P3, ruling 7): the per-leg sequence
+        # baselines are frozen from the SAME snapshot legs, so the queue-head
+        # preflight's monotonicity check compares fresh books against the
+        # exact solve-request book versions.
+        sequences = {
+            leg.leg_id: leg.sequence
+            for leg in snapshot.legs
+            if type(leg.sequence) is int and leg.sequence >= 0
+        }
+        # Issue #64: retain the solve request's own snapshot legs, rebuilt as
+        # canonical #51 books; the manual-confirm admission source re-decodes
+        # against exactly these frozen facts (the accessor build replays the
+        # same quote instant, so the decode is deterministic and faithful).
+        source_books = self._frozen_source_books(problem, snapshot)
         with self._lock:
+            if source_books is not None:
+                self._source_books[selected.component_id] = source_books
+            else:
+                self._source_books.pop(selected.component_id, None)
             self._request_components[request.request_id] = (
                 selected.component_id,
                 model_fingerprint(problem),
                 fee_block,
+                sequences,
             )
         return request
+
+    def _frozen_source_books(
+        self, problem: ArbitrageProblem, snapshot: ComponentSnapshot
+    ) -> tuple[ImmutableBook, ...] | None:
+        """Issue #64: the snapshot legs of one solve request as canonical
+        #51 books. The tick floor is 1 (binding validation), which only ever
+        rounds the protected price UP, and the live pipeline carries no
+        maker-fee/haircut facts, so those bind at zero — the heavy chain's
+        own economics stay conservative and self-consistent.
+
+        Review round 2 (#64 P2): the books carry the snapshot legs' modeled
+        taker fee as ``fee_ppm`` (1 bp = 100 ppm), so a charging market's
+        frozen admission decode and its reservation bounds include the fee
+        the #117 preflight/solve economics also charge. A book whose bps is
+        not a finite non-negative Decimal is unmodelable: the build is
+        abandoned fail-closed (None), never silently priced fee-free.
+        """
+        legs = {leg.leg_id: leg for leg in snapshot.legs}
+        books: list[ImmutableBook] = []
+        for action in sorted(problem.actions, key=lambda item: item.action_id):
+            leg = legs.get(action.action_id)
+            if leg is None:
+                return None
+            token = resolve_leg_token(action, self._leg_tokens)
+            bps = getattr(leg.book, "taker_fee_bps", None)
+            if (
+                not isinstance(bps, Decimal)
+                or not bps.is_finite()
+                or bps < 0
+            ):
+                return None
+            books.append(
+                ImmutableBook(
+                    action_id=action.action_id,
+                    native_id=token,
+                    book=ThresholdOrderBook(
+                        token,
+                        leg.book.asks,
+                        leg.book.bids,
+                        leg.received_at,
+                    ),
+                    fee_ppm=int(bps * 100),
+                    tick_units=1,
+                    haircut_ppm=0,
+                    price_units_per_quote_unit=USD_UNITS_PER_DOLLAR,
+                    venue_id=action.venue_id,
+                    fee_rule_id="live-clob-v1",
+                )
+            )
+        return tuple(books)
 
     def _freeze_fee_block(
         self,
@@ -919,7 +1258,7 @@ class PredictionLiveResolver:
         entry = self._request_components.pop(request.request_id, None)
         if entry is None:
             return
-        component_id, dispatched_fingerprint, fee_block = entry
+        component_id, dispatched_fingerprint, fee_block, sequences = entry
         problem = request.request.problem
         if (
             outcome is None
@@ -989,13 +1328,26 @@ class PredictionLiveResolver:
         if market is None:
             with self._lock:
                 self._solutions.pop(component_id, None)
+                # No frozen solution: the retained source material has no
+                # consumer and its books are stale for the next generation.
+                self._source_books.pop(component_id, None)
+                self._sources.pop(component_id, None)
             # #106: negative/unknown outcomes carry no market solution but
             # still drive the episode state machine.
             self._report_episode_outcome(component_id, resolution, verification)
             return
         execution = self._execution_solution(component_id, market, problem)
         with self._lock:
-            self._solutions[component_id] = (market, execution, fee_block)
+            self._solutions[component_id] = (
+                market,
+                execution,
+                fee_block,
+                sequences,
+            )
+            # Issue #64: a freshly frozen solution invalidates any previously
+            # built admission source; the next accessor call rebuilds from
+            # the newest retained solve inputs.
+            self._sources.pop(component_id, None)
         self._report_episode_outcome(
             component_id, resolution, verification, execution=execution
         )
@@ -1283,6 +1635,8 @@ class PredictionLiveResolver:
     def _drop_solution(self, component_id: str) -> None:
         with self._lock:
             self._solutions.pop(component_id, None)
+            self._source_books.pop(component_id, None)
+            self._sources.pop(component_id, None)
             self._resolutions.pop(component_id, None)
             self._verifications.pop(component_id, None)
             proof_fingerprint = self._fill_proof_components.pop(
