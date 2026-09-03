@@ -242,7 +242,7 @@ def test_collect_portfolio_uses_every_eligible_holding_and_local_mapping(
 
 
 def test_collect_portfolio_excludes_blacklisted_holding_before_mapping(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     portfolio = tmp_path / "portfolio.csv"
     portfolio.write_text(
@@ -254,6 +254,20 @@ def test_collect_portfolio_excludes_blacklisted_holding_before_mapping(
     mappings_root = tmp_path / "symbol_mappings"
     mapping_directory = mappings_root / "US"
     mapping_directory.mkdir(parents=True)
+    exclusion_file = tmp_path / "config" / "trend_curve_portfolio_exclusions.json"
+    exclusion_file.parent.mkdir(parents=True)
+    exclusion_file.write_text(
+        json.dumps(
+            {
+                "US.AGRZ": (
+                    "Trend Animals history begins with a point missing rps; "
+                    "the user chose exclusion on 2026-09-03."
+                )
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
     (mapping_directory / "US.ESTC.json").write_text(
         json.dumps(
             {
@@ -306,6 +320,64 @@ def test_collect_portfolio_excludes_blacklisted_holding_before_mapping(
             }
         ],
         [("US", "ESTC", "2026-09-02")],
+    )
+
+
+def test_collect_portfolio_fails_closed_when_exclusion_file_is_malformed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    exclusion_file = tmp_path / "config" / "trend_curve_portfolio_exclusions.json"
+    exclusion_file.parent.mkdir(parents=True)
+    exclusion_file.write_text("{not-json", encoding="utf-8")
+    portfolio = tmp_path / "portfolio.csv"
+    portfolio.write_text(
+        "market,asset_class,symbol,analysis_symbol,ai_eligible\n"
+        "US,stock,ESTC,ESTC,true\n",
+        encoding="utf-8",
+    )
+    mappings_root = tmp_path / "symbol_mappings"
+    mapping_directory = mappings_root / "US"
+    mapping_directory.mkdir(parents=True)
+    (mapping_directory / "US.ESTC.json").write_text(
+        json.dumps(
+            {
+                "asset": "美股",
+                "futu_symbol": "US.ESTC",
+                "market": "US",
+                "schema_version": "open_trader.trend_symbol_mapping.v1",
+                "trend_animals_symbol": "ESTC",
+                "trend_animals_tm_id": 334101,
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[bytes] = []
+
+    def transport(
+        _url: str, body: bytes, _headers: dict[str, str]
+    ) -> dict[str, object]:
+        calls.append(body)
+        return {
+            "success": True,
+            "code": "00000",
+            "data": {"encryptedData": FOUR_SECTION_ENCRYPTED},
+        }
+
+    database = tmp_path / "history.sqlite3"
+    with pytest.raises(ValueError) as raised:
+        collect_trend_curves(
+            portfolio=portfolio,
+            mappings_root=mappings_root,
+            database=database,
+            credentials=("fake-token", 123456789),
+            transport=transport,
+        )
+
+    assert (str(raised.value), calls, database.exists()) == (
+        "portfolio trend-curve exclusions are unreadable or malformed",
+        [],
+        False,
     )
 
 

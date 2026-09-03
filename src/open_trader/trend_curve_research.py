@@ -39,7 +39,9 @@ CURVE_GROUP_IDS = {
 CURVE_CURRENCY_IDS = {"CNY": 100, "USD": 101, "HKD": 104}
 PORTFOLIO_MARKETS = frozenset({"CN", "HK", "US"})
 PORTFOLIO_CURRENCIES = {"CN": "CNY", "HK": "HKD", "US": "USD"}
-PORTFOLIO_TREND_CURVE_EXCLUSIONS = frozenset({("US", "AGRZ")})
+DEFAULT_PORTFOLIO_TREND_CURVE_EXCLUSIONS = Path(
+    "config/trend_curve_portfolio_exclusions.json"
+)
 CURVE_ASSETS_BY_MARKET = {
     "CN": frozenset({"A股", "ETF基金"}),
     "HK": frozenset({"港股", "香港ETF"}),
@@ -281,6 +283,7 @@ def _load_portfolio_targets(
 ) -> list[dict[str, object]]:
     if not isinstance(portfolio, (str, Path)):
         raise ValueError("portfolio must be a CSV path")
+    exclusions = _load_portfolio_trend_curve_exclusions()
     selected: dict[tuple[str, str], str] = {}
     invalid_currency: set[str] = set()
     try:
@@ -300,7 +303,7 @@ def _load_portfolio_targets(
                 if not symbol:
                     invalid_currency.add(identity)
                     continue
-                if (market, symbol) in PORTFOLIO_TREND_CURVE_EXCLUSIONS:
+                if (market, symbol) in exclusions:
                     continue
                 currency = str(row.get("currency") or "").strip().upper()
                 expected_currency = PORTFOLIO_CURRENCIES[market]
@@ -351,6 +354,36 @@ def _load_portfolio_targets(
     if not targets:
         raise ValueError("portfolio has no eligible CN/HK/US holdings")
     return targets
+
+
+def _load_portfolio_trend_curve_exclusions() -> frozenset[tuple[str, str]]:
+    try:
+        payload = json.loads(
+            DEFAULT_PORTFOLIO_TREND_CURVE_EXCLUSIONS.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "portfolio trend-curve exclusions are unreadable or malformed"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError("portfolio trend-curve exclusions are unreadable or malformed")
+    exclusions: set[tuple[str, str]] = set()
+    for identity, reason in payload.items():
+        if not isinstance(identity, str) or not isinstance(reason, str):
+            raise ValueError(
+                "portfolio trend-curve exclusions are unreadable or malformed"
+            )
+        if identity != identity.strip().upper() or not reason.strip():
+            raise ValueError(
+                "portfolio trend-curve exclusions are unreadable or malformed"
+            )
+        parts = identity.split(".", 1)
+        if len(parts) != 2 or parts[0] not in PORTFOLIO_MARKETS or not parts[1]:
+            raise ValueError(
+                "portfolio trend-curve exclusions are unreadable or malformed"
+            )
+        exclusions.add((parts[0], parts[1]))
+    return frozenset(exclusions)
 
 
 def _load_symbol_mappings(mappings_root: Path) -> list[dict[str, object]]:

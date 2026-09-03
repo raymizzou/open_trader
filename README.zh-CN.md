@@ -180,7 +180,8 @@ watchlist 使用市场、标的和 Trend Animals 业务标识：
 ```
 
 `--mappings-root` 默认值为 `data/trend_animals/cache/symbol_mappings`，只使用其中按市场保存的
-本地 Trend Animals 符号映射；组合模式当前按显式黑名单排除 `US.AGRZ`，watchlist 模式不受影响。
+本地 Trend Animals 符号映射；组合模式的权威排除清单为
+`config/trend_curve_portfolio_exclusions.json`，当前按显式黑名单排除 `US.AGRZ`，watchlist 模式不受影响。
 需要在采集失败时发飞书时，可追加
 `--notify-failure --config config/daily_premarket.env`；该选项只通知配置中的 `feishu`/
 `feishu_app` 渠道，并保留采集失败退出码。此命令仍是独立的手动 CLI，也可由外部调度器调用；

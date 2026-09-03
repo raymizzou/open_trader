@@ -6,7 +6,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
 ## 2026-09-03
 
 - 扩展手动 `trend-curve collect` 支持从 `portfolio.csv` 读取全部 `ai_eligible=true` 的 CN/HK/US
-  持仓并通过本地符号映射构建曲线请求（组合模式当前显式排除 `US.AGRZ`），新增失败时
+  持仓并通过本地符号映射构建曲线请求（组合模式由
+  `config/trend_curve_portfolio_exclusions.json` 显式排除 `US.AGRZ`），新增失败时
   Feishu-only 通知选项；兼容四段曲线响应。
   聚焦验证：`make test-trend-curve`。
 
