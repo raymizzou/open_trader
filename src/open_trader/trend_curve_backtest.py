@@ -128,15 +128,6 @@ def _run_trend_curve_backtest(
     ]
     if not bars:
         raise ValueError("price CSV has no rows in requested range")
-    ohlc_dates = {bar.date for bar in bars}
-    missing_curve_dates = [
-        point.date for point in curve_points if point.date not in ohlc_dates
-    ]
-    if missing_curve_dates:
-        raise ValueError(
-            "trend-curve date has no matching OHLC row: "
-            + ", ".join(missing_curve_dates)
-        )
 
     trades, equity_curve, completed_rounds, decisions = _simulate(
         curve_points,
@@ -310,6 +301,14 @@ def _simulate(
 
         point = points_by_date.get(day)
         if point is not None:
+            if (
+                quantity == 0
+                and pending is not None
+                and pending[0] == "BUY"
+                and pending[1] > day
+                and point.temperature not in {"热", "沸"}
+            ):
+                pending = None
             held = quantity > 0 or (pending is not None and pending[0] == "BUY")
             decision = decide_temperature_transition(
                 previous_temperature,

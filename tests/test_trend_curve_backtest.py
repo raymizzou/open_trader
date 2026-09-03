@@ -173,6 +173,59 @@ def test_strict_warm_to_hot_entry_ablation_changes_only_prior_temperature(
     ) == ([ ("2026-01-02", "BUY") ], [])
 
 
+def test_non_trading_day_warm_to_hot_executes_at_first_later_open(tmp_path: Path) -> None:
+    database = tmp_path / "history.sqlite3"
+    prices = tmp_path / "prices.csv"
+    _write_curve_database(
+        database,
+        [
+            ("2026-05-22", "温"),
+            ("2026-05-25", "热"),
+            ("2026-05-26", "热"),
+            ("2026-05-27", "平"),
+        ],
+    )
+    with prices.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("date", "open", "high", "low", "close"))
+        writer.writeheader()
+        writer.writerows(
+            [
+                {"date": "2026-05-22", "open": "9", "high": "9", "low": "9", "close": "9"},
+                {"date": "2026-05-26", "open": "10", "high": "10", "low": "10", "close": "10"},
+                {"date": "2026-05-27", "open": "11", "high": "11", "low": "11", "close": "11"},
+                {"date": "2026-05-28", "open": "12", "high": "12", "low": "12", "close": "12"},
+            ]
+        )
+
+    result = run_trend_curve_backtest(
+        database=database,
+        ohlc_csv=prices,
+        market="US",
+        symbol="TEST",
+        start_date="2026-05-22",
+        end_date="2026-05-28",
+        initial_cash=Decimal("1000"),
+        commission_bps=Decimal("0"),
+        slippage_bps=Decimal("0"),
+    )
+
+    assert (
+        [(trade["action"], trade["date"]) for trade in result["trades"]],
+        [
+            (decision["date"], decision["reason"])
+            for decision in result["decisions"]
+            if decision["action"] == "BUY"
+        ],
+        result["trades"][-1]["cash_after"],
+        result["metrics"]["final_equity"],
+    ) == (
+        [("BUY", "2026-05-26"), ("EXIT", "2026-05-28")],
+        [("2026-05-25", "warm_to_hot")],
+        "1200",
+        "1200",
+    )
+
+
 def test_open_position_is_closed_at_last_close_with_end_of_data_reason(
     tmp_path: Path,
 ) -> None:
@@ -232,9 +285,7 @@ def test_open_position_is_closed_at_last_close_with_end_of_data_reason(
     )
 
 
-def test_curve_date_without_ohlc_is_rejected_before_stale_pending_buy_can_execute(
-    tmp_path: Path,
-) -> None:
+def test_flat_before_execution_cancels_pending_buy(tmp_path: Path) -> None:
     database = tmp_path / "history.sqlite3"
     prices = tmp_path / "prices.csv"
     _write_curve_database(
@@ -256,18 +307,33 @@ def test_curve_date_without_ohlc_is_rejected_before_stale_pending_buy_can_execut
             ]
         )
 
-    with pytest.raises(ValueError, match="2026-01-03"):
-        run_trend_curve_backtest(
-            database=database,
-            ohlc_csv=prices,
-            market="US",
-            symbol="TEST",
-            start_date="2026-01-01",
-            end_date="2026-01-05",
-            initial_cash=Decimal("1000"),
-            commission_bps=Decimal("0"),
-            slippage_bps=Decimal("0"),
-        )
+    result = run_trend_curve_backtest(
+        database=database,
+        ohlc_csv=prices,
+        market="US",
+        symbol="TEST",
+        start_date="2026-01-01",
+        end_date="2026-01-05",
+        initial_cash=Decimal("1000"),
+        commission_bps=Decimal("0"),
+        slippage_bps=Decimal("0"),
+    )
+
+    assert (
+        [
+            (decision["date"], decision["action"], decision["reason"])
+            for decision in result["decisions"]
+            if decision["date"] == "2026-01-02"
+        ],
+        result["trades"],
+        result["completed_rounds"],
+        result["metrics"]["final_equity"],
+    ) == (
+        [("2026-01-02", "BUY", "warm_to_hot")],
+        [],
+        [],
+        "1000",
+    )
 
 
 def test_backtest_result_is_independent_of_process_decimal_precision(tmp_path: Path) -> None:

@@ -3,6 +3,10 @@
 Every push to `main` must add one dated entry here. Keep entries short and
 operator-facing: what changed, which workflow is affected, and what was verified.
 
+## 2026-09-04
+
+- 修复离线 `trend-curve backtest` 对合法非交易日曲线观测的对齐：信号在首个后续 OHLC 开盘执行；较新平/非 `{热, 沸}` 观测会在执行前取消排队 BUY，避免过期买入。专用验证：`make test-trend-curve`（26 passed）。
+
 ## 2026-09-03
 
 - 扩展手动 `trend-curve collect` 支持从 `portfolio.csv` 读取全部 `ai_eligible=true` 的 CN/HK/US
