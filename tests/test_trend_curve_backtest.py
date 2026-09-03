@@ -1,0 +1,331 @@
+from __future__ import annotations
+
+import csv
+import sqlite3
+from decimal import Decimal, ROUND_DOWN, ROUND_UP, localcontext
+from pathlib import Path
+
+import pytest
+
+from open_trader.trend_curve_backtest import run_trend_curve_backtest
+
+
+def _write_curve_database(path: Path, temperatures: list[tuple[str, str]]) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE trend_curve_points (
+                market TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                curve_date TEXT NOT NULL,
+                price TEXT NOT NULL,
+                temperature TEXT NOT NULL,
+                strength TEXT NOT NULL,
+                mom TEXT,
+                yoy TEXT,
+                bar TEXT,
+                asset_id INTEGER NOT NULL,
+                group_id INTEGER NOT NULL,
+                tm_id INTEGER NOT NULL,
+                ccy_id INTEGER NOT NULL,
+                PRIMARY KEY (market, symbol, curve_date)
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO trend_curve_points
+            (market, symbol, curve_date, price, temperature, strength,
+             mom, yoy, bar, asset_id, group_id, tm_id, ccy_id)
+            VALUES ('US', 'TEST', ?, '10', ?, '80', NULL, NULL, NULL,
+                    1, 2, 3, 4)
+            """,
+            temperatures,
+        )
+
+
+def _write_ohlc(path: Path) -> None:
+    rows = []
+    execution_opens = {
+        "2026-01-03": "10",
+        "2026-01-05": "12",
+        "2026-01-08": "12",
+        "2026-01-10": "10.8",
+        "2026-01-13": "10.8",
+        "2026-01-15": "10.8",
+    }
+    for day in range(1, 16):
+        trading_date = f"2026-01-{day:02d}"
+        opening = execution_opens.get(trading_date, "99")
+        rows.append(
+            {
+                "date": trading_date,
+                "open": opening,
+                "high": opening,
+                "low": opening,
+                "close": opening,
+            }
+        )
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("date", "open", "high", "low", "close"))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def test_backtest_strict_warm_to_hot_rounds_use_next_open_and_trend_metric_semantics(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "history.sqlite3"
+    prices = tmp_path / "prices.csv"
+    _write_curve_database(
+        database,
+        [
+            (f"2026-01-{day:02d}", temperature)
+            for day, temperature in enumerate(
+                ["温", "热", "热", "平", "平", "温", "热", "热", "平", "平", "温", "热", "热", "平", "平"],
+                start=1,
+            )
+        ],
+    )
+    _write_ohlc(prices)
+
+    result = run_trend_curve_backtest(
+        database=database,
+        ohlc_csv=prices,
+        market="US",
+        symbol="TEST",
+        start_date="2026-01-01",
+        end_date="2026-01-15",
+        initial_cash=Decimal("1000"),
+        commission_bps=Decimal("0"),
+        slippage_bps=Decimal("0"),
+    )
+
+    assert {
+        "execution_dates": [trade["date"] for trade in result["trades"]],
+        "round_cash_after_exit": [
+            trade["cash_after"] for trade in result["trades"] if trade["side"] == "EXIT"
+        ],
+        "final_equity": result["metrics"]["final_equity"],
+        "total_return_pct": result["metrics"]["total_return_pct"],
+        "win_rate": result["metrics"]["win_rate"],
+        "payoff_ratio": result["metrics"]["payoff_ratio"],
+    } == {
+        "execution_dates": [
+            "2026-01-03",
+            "2026-01-05",
+            "2026-01-08",
+            "2026-01-10",
+            "2026-01-13",
+            "2026-01-15",
+        ],
+        "round_cash_after_exit": ["1200", "1080", "1080"],
+        "final_equity": "1080",
+        "total_return_pct": "8",
+        "win_rate": "0.3333333333333333333333333333",
+        "payoff_ratio": "2",
+    }
+
+
+def test_strict_warm_to_hot_entry_ablation_changes_only_prior_temperature(
+    tmp_path: Path,
+) -> None:
+    prices = tmp_path / "prices.csv"
+    _write_ohlc(prices)
+    baseline_database = tmp_path / "baseline.sqlite3"
+    variant_database = tmp_path / "variant.sqlite3"
+    _write_curve_database(
+        baseline_database,
+        [("2026-01-01", "温"), ("2026-01-02", "热")],
+    )
+    _write_curve_database(
+        variant_database,
+        [("2026-01-01", "平"), ("2026-01-02", "热")],
+    )
+
+    def run(database: Path) -> dict[str, object]:
+        return run_trend_curve_backtest(
+            database=database,
+            ohlc_csv=prices,
+            market="US",
+            symbol="TEST",
+            start_date="2026-01-01",
+            end_date="2026-01-03",
+            initial_cash=Decimal("1000"),
+            commission_bps=Decimal("0"),
+            slippage_bps=Decimal("0"),
+        )
+
+    baseline = run(baseline_database)
+    variant = run(variant_database)
+
+    assert (
+        [
+            (decision["date"], decision["action"])
+            for decision in baseline["decisions"]
+            if decision["action"] == "BUY"
+        ],
+        [
+            (decision["date"], decision["action"])
+            for decision in variant["decisions"]
+            if decision["action"] == "BUY"
+        ],
+    ) == ([ ("2026-01-02", "BUY") ], [])
+
+
+def test_open_position_is_closed_at_last_close_with_end_of_data_reason(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "history.sqlite3"
+    prices = tmp_path / "prices.csv"
+    _write_curve_database(
+        database,
+        [
+            ("2026-01-01", "温"),
+            ("2026-01-02", "热"),
+            ("2026-01-03", "热"),
+            ("2026-01-04", "热"),
+        ],
+    )
+    with prices.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("date", "open", "high", "low", "close"))
+        writer.writeheader()
+        writer.writerows(
+            [
+                {"date": "2026-01-01", "open": "99", "high": "99", "low": "99", "close": "10"},
+                {"date": "2026-01-02", "open": "99", "high": "99", "low": "99", "close": "10"},
+                {"date": "2026-01-03", "open": "10", "high": "10", "low": "10", "close": "10"},
+                {"date": "2026-01-04", "open": "99", "high": "99", "low": "99", "close": "11"},
+            ]
+        )
+
+    result = run_trend_curve_backtest(
+        database=database,
+        ohlc_csv=prices,
+        market="US",
+        symbol="TEST",
+        start_date="2026-01-01",
+        end_date="2026-01-04",
+        initial_cash=Decimal("1000"),
+        commission_bps=Decimal("10"),
+        slippage_bps=Decimal("5"),
+    )
+    exit_trade = result["trades"][-1]
+    final_equity_row = result["equity_curve"][-1]
+
+    assert (
+        exit_trade["date"],
+        exit_trade["price"],
+        exit_trade["fees"],
+        exit_trade["cash_after"],
+        exit_trade["reason"],
+        final_equity_row["drawdown_pct"],
+        result["metrics"]["max_drawdown_pct"],
+    ) == (
+        "2026-01-04",
+        "10.9945",
+        "1.0884555",
+        "1095.8815495",
+        "end_of_data",
+        "0.1487866896119063137119996423",
+        "0.1487866896119063137119996423",
+    )
+
+
+def test_curve_date_without_ohlc_is_rejected_before_stale_pending_buy_can_execute(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "history.sqlite3"
+    prices = tmp_path / "prices.csv"
+    _write_curve_database(
+        database,
+        [
+            ("2026-01-01", "温"),
+            ("2026-01-02", "热"),
+            ("2026-01-03", "平"),
+        ],
+    )
+    with prices.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("date", "open", "high", "low", "close"))
+        writer.writeheader()
+        writer.writerows(
+            [
+                {"date": "2026-01-01", "open": "10", "high": "10", "low": "10", "close": "10"},
+                {"date": "2026-01-02", "open": "10", "high": "10", "low": "10", "close": "10"},
+                {"date": "2026-01-05", "open": "10", "high": "10", "low": "10", "close": "10"},
+            ]
+        )
+
+    with pytest.raises(ValueError, match="2026-01-03"):
+        run_trend_curve_backtest(
+            database=database,
+            ohlc_csv=prices,
+            market="US",
+            symbol="TEST",
+            start_date="2026-01-01",
+            end_date="2026-01-05",
+            initial_cash=Decimal("1000"),
+            commission_bps=Decimal("0"),
+            slippage_bps=Decimal("0"),
+        )
+
+
+def test_backtest_result_is_independent_of_process_decimal_precision(tmp_path: Path) -> None:
+    database = tmp_path / "history.sqlite3"
+    prices = tmp_path / "prices.csv"
+    _write_curve_database(
+        database,
+        [
+            (f"2026-01-{day:02d}", temperature)
+            for day, temperature in enumerate(
+                ["温", "热", "热", "平", "平", "温", "热", "热", "平", "平", "温", "热", "热", "平", "平"],
+                start=1,
+            )
+        ],
+    )
+    _write_ohlc(prices)
+    inputs = {
+        "database": database,
+        "ohlc_csv": prices,
+        "market": "US",
+        "symbol": "TEST",
+        "start_date": "2026-01-01",
+        "end_date": "2026-01-15",
+        "initial_cash": Decimal("1000"),
+        "commission_bps": Decimal("10"),
+        "slippage_bps": Decimal("5"),
+    }
+
+    with localcontext() as context:
+        context.prec = 6
+        context.rounding = ROUND_DOWN
+        low_precision_result = run_trend_curve_backtest(**inputs)
+    with localcontext() as context:
+        context.prec = 28
+        context.rounding = ROUND_UP
+        high_precision_result = run_trend_curve_backtest(**inputs)
+
+    assert low_precision_result == high_precision_result
+
+
+def test_slippage_at_or_above_one_hundred_percent_is_rejected(tmp_path: Path) -> None:
+    database = tmp_path / "history.sqlite3"
+    prices = tmp_path / "prices.csv"
+    _write_curve_database(
+        database,
+        [("2026-01-01", "温"), ("2026-01-02", "热")],
+    )
+    _write_ohlc(prices)
+
+    with pytest.raises(ValueError, match="slippage_bps.*10000"):
+        run_trend_curve_backtest(
+            database=database,
+            ohlc_csv=prices,
+            market="US",
+            symbol="TEST",
+            start_date="2026-01-01",
+            end_date="2026-01-03",
+            initial_cash=Decimal("1000"),
+            commission_bps=Decimal("0"),
+            slippage_bps=Decimal("10000"),
+        )

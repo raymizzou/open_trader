@@ -11,6 +11,8 @@ operator-facing: what changed, which workflow is affected, and what was verified
   Feishu-only 通知选项；兼容四段曲线响应。
   聚焦验证：`make test-trend-curve`。
 
+- 新增离线 `trend-curve backtest`：从现有 SQLite 趋势曲线与固定 OHLC CSV 回测 US 单标的严格 `温→热` 入场、`温/热/沸→平` 退出，次日开盘执行、区间末收盘平仓；输出版本化 JSON，不写结果库。验证：`make test-trend-curve`。
+
 - 新增手动 `trend-curve collect`：使用 MMKV helper 读取临时凭据，将 Trend Animals 曲线以
   `(market, symbol, curve_date)` 单行键写入 SQLite，重复采集幂等、提供方修订只覆盖匹配日期；与 UI、后台、调度和交易链路隔离。聚焦验证：6 passed。
 

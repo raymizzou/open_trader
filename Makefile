@@ -30,7 +30,7 @@ test:
 	$(DOCKER_RUN) $(BACKEND_PYTEST) $(TEST)
 
 test-trend-curve:
-	$(MAKE) test TEST='tests/test_trend_curve_research.py tests/test_trend_curve_cli.py'
+	$(MAKE) test TEST='$(if $(TEST),$(TEST),tests/test_trend_curve_research.py tests/test_trend_curve_backtest.py tests/test_trend_curve_cli.py)'
 
 candidate-acceptance:
 	@status=0; \
