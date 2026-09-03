@@ -150,6 +150,7 @@ from .trend_allocation import (
     load_trend_allocation_status,
     run_trend_allocation_controller,
 )
+from .trend_curve_research import collect_trend_curves
 from .strategy_drawdown import manual_unlock_strategy_drawdown
 from .drawdown_preflight import (
     DrawdownMarketInput,
@@ -513,6 +514,21 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_benchmark_parser.add_argument(
         "--config", type=Path, default=Path("config/daily_premarket.env")
     )
+
+    trend_curve = subparsers.add_parser(
+        "trend-curve", help="Collect Trend Animals temperature curves"
+    )
+    trend_curve_commands = trend_curve.add_subparsers(
+        dest="trend_curve_command", required=True
+    )
+    trend_curve_collect_parser = trend_curve_commands.add_parser(
+        "collect", help="Collect Trend Animals temperature curves"
+    )
+    trend_curve_collect_parser.add_argument("--watchlist", type=Path, required=True)
+    trend_curve_collect_parser.add_argument(
+        "--database", type=Path, default=Path("data/trend_curve/history.sqlite3")
+    )
+    trend_curve_collect_parser.add_argument("--mmkv-helper", type=Path)
 
     test_notification_parser = subparsers.add_parser(
         "test-notification",
@@ -2233,6 +2249,22 @@ def main(argv: list[str] | None = None) -> int:
             return 1 if result["status"] == "failed" else 0
         print(json.dumps(result, ensure_ascii=False))
         return 0
+
+    if args.command == "trend-curve":
+        if args.trend_curve_command == "collect":
+            try:
+                result = collect_trend_curves(
+                    watchlist=args.watchlist,
+                    database=args.database,
+                    mmkv_helper=args.mmkv_helper,
+                )
+            except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
+                parser.error(str(exc))
+            print(f"database: {result.database_path}")
+            print(f"targets: {result.target_count}")
+            print(f"points: {result.point_count}")
+            return 0
+        parser.error(f"unknown trend-curve command: {args.trend_curve_command}")
 
     if args.command == "import-statements":
         if args.phillips is not None and args.usd_hkd is None:

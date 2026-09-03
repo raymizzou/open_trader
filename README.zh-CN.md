@@ -141,6 +141,37 @@ OPEN_TRADER_FUTU_PORT=11111
   --config config/daily_premarket.env
 ```
 
+## 趋势动物曲线采集（手动）
+
+这是独立的手动采集命令，不接入 Dashboard、后台服务、调度、日报、Feishu、控制器或任何交易链路。
+采集前需准备可执行的 MMKV 解码 helper，默认位置为
+`~/.local/bin/open-trader-mmkv-dump`，也可以用 `--mmkv-helper` 指定；程序只把微信小程序
+MMKV 快照的临时副本交给 helper，凭据仅在内存中使用。
+
+watchlist 使用市场、标的和 Trend Animals 业务标识：
+
+```json
+[
+  {"market": "US", "symbol": "SLB", "asset_id": 10002,
+   "group_id": 332171, "tm_id": 337127, "ccy_id": 101}
+]
+```
+
+手动运行：
+
+```bash
+.venv/bin/python -m open_trader trend-curve collect \
+  --watchlist data/trend_curve/watchlist.json
+
+.venv/bin/python -m open_trader trend-curve collect \
+  --watchlist data/trend_curve/watchlist.json \
+  --database data/trend_curve/history.sqlite3 \
+  --mmkv-helper ~/.local/bin/open-trader-mmkv-dump
+```
+
+默认 SQLite 路径为 `data/trend_curve/history.sqlite3`。每个
+`(market, symbol, curve_date)` 只有一行；相同采集不会重复，提供方修订只覆盖匹配日期的当前值。
+
 ## 开发与发布四阶段门禁
 
 四个阶段彼此独立；本地合并不等于部署：
