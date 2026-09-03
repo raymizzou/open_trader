@@ -44,7 +44,9 @@ from open_trader.prediction_arbitrage_store import PredictionArbitrageStore
 from open_trader.prediction_live_resolver import (
     PredictionLiveResolver,
     USD_UNITS_PER_DOLLAR,
+    _leg_token_by_contract,
     normalize_problem,
+    resolve_leg_token,
 )
 from open_trader.prediction_market_solution import (
     EXECUTABLE_REASON,
@@ -875,6 +877,9 @@ def run_live(
     catalog: Mapping[str, object] | None = None,
     solver_server: object | None = None,
     poll_timeout_seconds: float = 15.0,
+    # Issue #114: optional contract -> {"yes_token_id", "no_token_id"} for
+    # legacy catalog rows; rows that already carry tokens win per contract.
+    leg_token_map: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     data_dir = Path(data_dir)
     execution = execution or FailClosedExecution()
@@ -909,7 +914,20 @@ def run_live(
         )
     monitor = _MonitorAdapter(book_source)
     raw = problem_for_component(problem, component)
-    token_ids = tuple(action.market_contract_id for action in raw.actions)
+    # Issue #114: resolve each action's book read to its direction's CLOB
+    # token; generation rows win over the injected map, unmapped contracts
+    # fall back to their market_contract_id (mechanical contract-is-token).
+    merged_leg_tokens: dict[str, dict[str, object]] = {
+        **{
+            str(contract): dict(entry)
+            for contract, entry in (leg_token_map or {}).items()
+            if isinstance(entry, Mapping)
+        },
+        **_leg_token_by_contract(catalog_rows),
+    }
+    token_ids = tuple(
+        resolve_leg_token(action, merged_leg_tokens) for action in raw.actions
+    )
     try:
         books = monitor.cross_venue_books(token_ids)
     except (TypeError, ValueError, OverflowError) as exc:
@@ -963,6 +981,7 @@ def run_live(
             budget=budget,
             limits=limits,
             code_version=code_version,
+            leg_token_map=merged_leg_tokens,
         )
         resolver.start()
         deadline = time.monotonic() + poll_timeout_seconds

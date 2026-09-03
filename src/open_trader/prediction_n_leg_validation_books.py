@@ -108,63 +108,25 @@ def live_books(
     return asyncio.run(_fetch_books(requested, client_factory=client_factory))
 
 
-#: In-process registry of conditionId -> YES clobTokenId, injected by the
-#: orchestrator from the derived group's venue metadata before it calls the
-#: harness.  Real mechanical relations key their actions by conditionId
-#: (0x-prefixed) while the CLOB book endpoint is keyed by numeric
-#: clobTokenId, so the contract-keyed wrapper translates through this table.
-_CONTRACT_TOKEN_MAP: dict[str, str] = {}
+#: In-process registry of conditionId -> {"yes_token_id", "no_token_id"},
+#: injected by the orchestrator from the derived group's venue metadata.
+#: Issue #114 retired the contract-keyed book wrapper: the harness itself
+#: resolves each action's read to its direction's clobTokenId (the tokens
+#: persist on the activated replica endpoints via the leg token map), so the
+#: registry is orchestrator-side run state and a diagnostics surface only.
+_CONTRACT_TOKEN_MAP: dict[str, dict[str, str]] = {}
 
 
-def set_contract_token_map(mapping: Mapping[str, str]) -> None:
-    """Replace the in-process conditionId -> YES clobTokenId registry."""
+def set_contract_token_map(mapping: Mapping[str, Mapping[str, str]]) -> None:
+    """Replace the in-process conditionId -> YES/NO clobTokenId registry."""
 
     _CONTRACT_TOKEN_MAP.clear()
     _CONTRACT_TOKEN_MAP.update(
-        (str(contract), str(token)) for contract, token in mapping.items()
+        (str(contract), dict(tokens)) for contract, tokens in mapping.items()
     )
 
 
-def contract_token_map() -> Mapping[str, str]:
-    """Read-only snapshot of the current conditionId -> YES token registry."""
+def contract_token_map() -> Mapping[str, Mapping[str, str]]:
+    """Read-only snapshot of the current conditionId -> token pair registry."""
 
-    return dict(_CONTRACT_TOKEN_MAP)
-
-
-def contract_keyed_live_books(
-    token_ids: Sequence[str],
-    *,
-    client_factory: Callable[[], object] | None = None,
-) -> Mapping[str, ThresholdOrderBook]:
-    """Live books for conditionId-keyed requests (read-only, monitor-shaped).
-
-    Each requested conditionId is translated to its registered YES
-    clobTokenId, fetched through the same ``live_books`` read-only seam
-    (zero-write contract inherited verbatim), and returned keyed by the
-    requested conditionId.  Unmapped conditionIds are skipped — they never
-    reach the client and never raise; unknown/unfetched tokens stay absent.
-    ``client_factory`` is forwarded to ``live_books`` only when explicitly
-    given, so a replaced module-level ``live_books`` (test seam) keeps its
-    own signature; production uses its default read-only client.
-    """
-
-    requested = tuple(str(token) for token in token_ids)
-    translated = tuple(
-        dict.fromkeys(
-            _CONTRACT_TOKEN_MAP[contract]
-            for contract in requested
-            if contract in _CONTRACT_TOKEN_MAP
-        )
-    )
-    if not translated:
-        return {}
-    if client_factory is None:
-        fetched = live_books(translated)
-    else:
-        fetched = live_books(translated, client_factory=client_factory)
-    keyed: dict[str, ThresholdOrderBook] = {}
-    for contract in requested:
-        book = fetched.get(_CONTRACT_TOKEN_MAP.get(contract, ""))
-        if book is not None:
-            keyed[contract] = book
-    return keyed
+    return {contract: dict(tokens) for contract, tokens in _CONTRACT_TOKEN_MAP.items()}

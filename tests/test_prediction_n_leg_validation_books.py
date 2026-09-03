@@ -13,15 +13,8 @@ from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
 
-import pytest
-
 from open_trader.prediction_arbitrage import BookLevel, ThresholdOrderBook
-from open_trader.prediction_n_leg_validation_books import (
-    contract_keyed_live_books,
-    contract_token_map,
-    live_books,
-    set_contract_token_map,
-)
+from open_trader.prediction_n_leg_validation_books import live_books
 
 
 # Raw SDK-shaped CLOB books: aliases the monitor accepts (asset_id), price
@@ -135,105 +128,8 @@ def test_live_books_omits_unknown_tokens_without_raising() -> None:
 
 
 # ---------------------------------------------------------------------------
-# C1: conditionId-keyed wrapper over the same live book seam.
-#
-# Real mechanical relations key their actions by conditionId (0x-prefixed)
-# while the CLOB get_order_books endpoint is keyed by numeric clobTokenId;
-# the wrapper translates through an in-process registry the orchestrator
-# injects from the derived group's venue metadata.
+# Issue #114: the conditionId-keyed wrapper (contract_keyed_live_books) is
+# retired.  The harness resolves each action's read to its direction's
+# clobTokenId itself, so the default book source is the token-keyed
+# live_books seam below — BUY_NO legs now read the NO token's book.
 # ---------------------------------------------------------------------------
-
-CONTRACT_RAW_BOOKS = {
-    "yes-a": {
-        "asset_id": "yes-a",
-        "asks": [{"price": "0.33", "size": "10"}],
-        "bids": [],
-        "timestamp": 1755295200000,
-    },
-    "yes-b": {
-        "token_id": "yes-b",
-        "asks": [
-            {"price": "0.32", "size": "20"},
-            {"price": "0.31", "size": "5"},
-        ],
-        "bids": [{"price": "0.30", "size": "7"}],
-        "timestamp": "2026-08-16T02:00:00Z",
-    },
-}
-
-
-def make_contract_fake() -> RecordingFakeClobClient:
-    return RecordingFakeClobClient(dict(CONTRACT_RAW_BOOKS))
-
-
-@pytest.fixture()
-def clean_contract_registry():
-    """Leave the module-level registry empty before and after each test."""
-
-    set_contract_token_map({})
-    yield
-    set_contract_token_map({})
-
-
-def test_contract_keyed_live_books_returns_books_keyed_by_requested_condition_id(
-    clean_contract_registry,
-) -> None:
-    fake = make_contract_fake()
-    set_contract_token_map({"cond-a": "yes-a", "cond-b": "yes-b"})
-
-    books = contract_keyed_live_books(
-        ("cond-a", "cond-b", "cond-x"),
-        client_factory=lambda: fake,
-    )
-
-    assert isinstance(books, Mapping)
-    # Returned keys are the requested conditionIds; the unmapped cond-x is
-    # simply absent and never raises.
-    assert set(books) == {"cond-a", "cond-b"}
-    assert "cond-x" not in books
-    # Book shape identical to the V1 live_books assertions.
-    book = books["cond-a"]
-    assert isinstance(book, ThresholdOrderBook)
-    assert book.asks == (BookLevel(Decimal("0.33"), Decimal("10")),)
-    assert book.bids == ()
-    assert isinstance(book.confirmed_at, datetime)
-    deep = books["cond-b"]
-    assert deep.asks == (
-        BookLevel(Decimal("0.32"), Decimal("20")),
-        BookLevel(Decimal("0.31"), Decimal("5")),
-    )
-    assert deep.bids == (BookLevel(Decimal("0.30"), Decimal("7")),)
-    assert isinstance(deep.confirmed_at, datetime)
-
-
-def test_contract_keyed_live_books_fetches_only_mapped_yes_tokens_zero_write(
-    clean_contract_registry,
-) -> None:
-    fake = make_contract_fake()
-    set_contract_token_map({"cond-a": "yes-a", "cond-b": "yes-b"})
-
-    contract_keyed_live_books(
-        ("cond-a", "cond-b", "cond-x"),
-        client_factory=lambda: fake,
-    )
-
-    # The CLOB client only ever sees the translated YES token ids.
-    book_calls = [call for call in fake.calls if call[0] == "get_order_books"]
-    assert len(book_calls) == 1
-    assert book_calls[0][1] == ("yes-a", "yes-b")
-    # Zero-write contract inherited from live_books: read endpoints only.
-    assert {call[0] for call in fake.calls} <= ALLOWED_CALLS
-
-
-def test_contract_keyed_live_books_empty_registry_returns_empty_mapping(
-    clean_contract_registry,
-) -> None:
-    fake = make_contract_fake()
-
-    books = contract_keyed_live_books(
-        ("cond-a", "cond-b"),
-        client_factory=lambda: fake,
-    )
-
-    assert books == {}
-    assert fake.calls == []

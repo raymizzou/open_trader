@@ -420,6 +420,48 @@ def fee_row(
     return base
 
 
+def token_row(
+    identity: str,
+    contract_id: str,
+    yes_token_id: str,
+    no_token_id: str,
+) -> dict[str, object]:
+    """A generation row whose endpoint carries handwritten token literals."""
+    base = row(identity, raw_problem())
+    base["endpoints"] = [
+        {
+            "venue": "polymarket",
+            "contract_id": contract_id,
+            "yes_token_id": yes_token_id,
+            "no_token_id": no_token_id,
+        }
+    ]
+    return base
+
+
+class RecordingMonitor(FakeMonitor):
+    """FakeMonitor that records every cross-venue token request."""
+
+    def __init__(self, books: dict[str, ThresholdOrderBook] | None = None) -> None:
+        super().__init__(books)
+        self.requested: list[tuple[str, ...]] = []
+
+    def cross_venue_books(self, token_ids: tuple[str, ...]) -> dict[str, ThresholdOrderBook]:
+        self.requested.append(tuple(token_ids))
+        return super().cross_venue_books(token_ids)
+
+
+class SubscriptionMonitor(RecordingMonitor):
+    """RecordingMonitor that also records N-leg share seeding (B4)."""
+
+    def __init__(self, books: dict[str, ThresholdOrderBook] | None = None) -> None:
+        super().__init__(books)
+        self.subscriptions: list[set[str]] = []
+
+    def set_n_leg_tokens(self, token_ids: object) -> None:
+        self.subscriptions.append({str(token) for token in token_ids})
+
+
 def resolved_solutions(
     tmp_path: Path,
     rows: dict[str, object],
@@ -556,6 +598,101 @@ def test_snapshot_assembly_and_missing_leg_fail_closed(tmp_path: Path) -> None:
     instance._problem_map[component_id] = raw_problem()
     instance._monitor = FakeMonitor()
     assert instance._snapshot_for(valid_selected(rows)) is None
+
+
+def test_snapshot_resolves_leg_tokens_by_action_direction(tmp_path: Path) -> None:
+    """B1: one contract with BUY_YES+BUY_NO actions and a token map reads each
+    leg's own direction token; the request set is exactly the handwritten
+    {yes,no} literals and the two legs of the same market differ."""
+    rows = {"r:a": token_row("r:a", "contract-a", "yes-token-a", "no-token-a")}
+    monitor = RecordingMonitor({
+        "yes-token-a": live_book("yes-token-a", price="0.49"),
+        "no-token-a": live_book("no-token-a", price="0.61"),
+    })
+    instance, _, _ = resolver(tmp_path, rows=rows, monitor=monitor)
+    instance._reconcile()
+
+    snapshot = instance._snapshot_for(valid_selected(rows))
+
+    assert snapshot is not None
+    assert {leg.leg_id for leg in snapshot.legs} == {"a-yes", "a-no"}
+    requested = {token for call in monitor.requested for token in call}
+    assert requested == {"yes-token-a", "no-token-a"}
+    prices = {leg.leg_id: leg.book.asks[0].price for leg in snapshot.legs}
+    assert prices == {"a-yes": Decimal("0.49"), "a-no": Decimal("0.61")}
+
+
+def test_snapshot_without_leg_map_fails_closed_for_implies(tmp_path: Path) -> None:
+    """B2: an IMPLIES action with no token mapping falls back to the condition
+    id, finds no book under that key, and the snapshot fails closed None."""
+    rows = {"r:a": row("r:a", raw_problem())}
+    monitor = RecordingMonitor({"unrelated-token": live_book("unrelated-token")})
+    instance, _, _ = resolver(tmp_path, rows=rows, monitor=monitor)
+    instance._reconcile()
+
+    snapshot = instance._snapshot_for(valid_selected(rows))
+
+    assert snapshot is None
+    requested = {token for call in monitor.requested for token in call}
+    assert requested == {"contract-a"}
+
+
+def test_snapshot_without_leg_map_requests_contract_ids(tmp_path: Path) -> None:
+    """B3: with no token mapping the request token stays market_contract_id —
+    the mechanical contract-is-token invariant does not regress."""
+    rows = {"r:a": row("r:a", raw_problem())}
+    monitor = RecordingMonitor({"contract-a": live_book("contract-a")})
+    instance, _, _ = resolver(tmp_path, rows=rows, monitor=monitor)
+    instance._reconcile()
+
+    snapshot = instance._snapshot_for(valid_selected(rows))
+
+    assert snapshot is not None
+    assert {leg.leg_id for leg in snapshot.legs} == {"a-yes", "a-no"}
+    requested = {token for call in monitor.requested for token in call}
+    assert requested == {"contract-a"}
+
+
+def test_reconcile_seeds_monitor_cross_venue_subscription(tmp_path: Path) -> None:
+    """B4: after reconcile the resolver seeds its monitor's N-leg share
+    (`set_n_leg_tokens` — parallel to the cross-venue engine's share on a
+    shared monitor, #114 P1) with the full resolved token set."""
+    rows = {"r:a": token_row("r:a", "contract-a", "yes-token-a", "no-token-a")}
+    monitor = SubscriptionMonitor({
+        "yes-token-a": live_book("yes-token-a"),
+        "no-token-a": live_book("no-token-a"),
+    })
+    instance, _, _ = resolver(tmp_path, rows=rows, monitor=monitor)
+
+    instance._reconcile()
+
+    assert monitor.subscriptions == [{"yes-token-a", "no-token-a"}]
+
+
+def test_conflicting_token_facts_drop_the_contract_mapping(tmp_path: Path) -> None:
+    """Issue #114 decision 8: two generation rows disagreeing about one
+    contract's tokens drop that mapping entirely — the resolver then falls
+    back to the contract id and finds no book (never guesses a direction)."""
+
+    conflicting = token_row("r:b", "contract-a", "other-yes", "other-no")
+    rows = {
+        "r:a": token_row("r:a", "contract-a", "yes-token-a", "no-token-a"),
+        "r:b": conflicting,
+    }
+    monitor = RecordingMonitor({
+        "yes-token-a": live_book("yes-token-a"),
+        "no-token-a": live_book("no-token-a"),
+    })
+    instance, _, _ = resolver(tmp_path, rows=rows, monitor=monitor)
+    instance._reconcile()
+
+    # Both rows compile into one component over contract-a; the mapping for
+    # contract-a is dropped, so the request falls back to the condition id.
+    selected = valid_selected(rows)
+    assert instance._snapshot_for(selected) is None
+    requested = {token for call in monitor.requested for token in call}
+    assert "contract-a" in requested
+    assert "yes-token-a" not in requested
 
 
 def test_tick_dispatches_solve_request_through_tracking_wrapper(tmp_path: Path) -> None:

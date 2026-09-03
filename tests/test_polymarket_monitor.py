@@ -1013,6 +1013,92 @@ def test_cross_venue_token_replacement_drops_removed_books(
     }
 
 
+def test_cross_venue_and_n_leg_shares_do_not_evict_each_other(tmp_path: Path) -> None:
+    """Issue #114 P1: the resolver and the cross-venue engine share one
+    PolymarketMonitor in production, so each writer owns its own token share
+    (`set_n_leg_tokens` vs `set_cross_venue_tokens`).  Replacing one share
+    never evicts the other share's tokens or cached books."""
+    setup_public([])
+    FakePublicClient.books.update(
+        {
+            "engine-a": threshold_book("engine-a", ask="0.40", bid="0.39"),
+            "nleg-b": threshold_book("nleg-b", ask="0.50", bid="0.49"),
+            "engine-a2": threshold_book("engine-a2", ask="0.60", bid="0.59"),
+        }
+    )
+    monitor = make_monitor(tmp_path)
+
+    monitor.set_cross_venue_tokens(("engine-a",))
+    monitor.set_n_leg_tokens(("nleg-b",))
+    # Place one cached book per share through the confirm seam (same
+    # technique as the overlapping-refresh test above).
+    assert set(asyncio.run(monitor._confirm_cross_venue_books(("nleg-b",)))) == {
+        "nleg-b"
+    }
+    assert set(asyncio.run(monitor._confirm_cross_venue_books(("engine-a",)))) == {
+        "engine-a"
+    }
+
+    # The engine replaces its own share: the N-leg share's tokens and cached
+    # book survive; the engine's own removed book is still pruned.
+    monitor.set_cross_venue_tokens(("engine-a2",))
+    assert monitor._n_leg_tokens == {"nleg-b"}
+    assert set(monitor.cross_venue_books(("nleg-b",))) == {"nleg-b"}
+    assert set(monitor.cross_venue_books(("engine-a",))) == set()
+
+    # The N-leg resolver replaces its own share: symmetrically the engine
+    # share's tokens and cached book survive; the N-leg's own removed book is
+    # still pruned.
+    assert set(asyncio.run(monitor._confirm_cross_venue_books(("engine-a2",)))) == {
+        "engine-a2"
+    }
+    monitor.set_n_leg_tokens(("nleg-b2",))
+    assert monitor._cross_venue_tokens == {"engine-a2"}
+    assert set(monitor.cross_venue_books(("engine-a2",))) == {"engine-a2"}
+    assert set(monitor.cross_venue_books(("nleg-b",))) == set()
+
+    # Diagnostics report the union and the N-leg share separately.
+    diagnostics = monitor.snapshot()["diagnostics"]
+    assert diagnostics["cross_venue_token_count"] == 2
+    assert diagnostics["n_leg_cross_venue_token_count"] == 1
+
+
+def test_cross_venue_and_n_leg_shares_subscribe_and_refresh_on_union(
+    tmp_path: Path,
+) -> None:
+    """Issue #114 P1: with both shares set, subscriptions and the cross-venue
+    REST snapshot operate on the union of the engine and N-leg shares."""
+    setup_public([])
+    FakePublicClient.books.update(
+        {
+            "cross-a": threshold_book("cross-a", ask="0.40", bid="0.39"),
+            "nleg-b": threshold_book("nleg-b", ask="0.50", bid="0.49"),
+        }
+    )
+    monitor = make_monitor(tmp_path)
+    monitor._market_by_token = {"standard": "market-1"}
+    monitor._relation_by_token = {"threshold": {"relation-1"}}
+    client = FakePublicClient()
+
+    monitor.set_cross_venue_tokens(("cross-a",))
+    monitor.set_n_leg_tokens(("nleg-b",))
+    asyncio.run(monitor._refresh_subscription_if_dirty(client))
+    asyncio.run(monitor._refresh_subscription_if_dirty(client))
+
+    assert len(FakePublicClient.subscribe_specs) == 1
+    assert set(FakePublicClient.subscribe_specs[0].token_ids) == {
+        "standard",
+        "threshold",
+        "cross-a",
+        "nleg-b",
+    }
+    assert FakePublicClient.book_calls == [["cross-a", "nleg-b"]]
+    assert set(monitor.cross_venue_books(("cross-a", "nleg-b"))) == {
+        "cross-a",
+        "nleg-b",
+    }
+
+
 def test_restart_loads_fresh_relation_catalog_without_full_scan(tmp_path: Path) -> None:
     relation = discover_threshold_relations([threshold_event()])[0]
     setup_public([])
@@ -1485,6 +1571,26 @@ def test_bounded_top_twenty_refresh_does_not_wait_for_relation_activity(
 
     assert time.monotonic() - started < 0.1
     assert monitor.snapshot()["diagnostics"]["last_error"] is None
+
+
+def test_diagnostics_report_cross_venue_token_count(tmp_path: Path) -> None:
+    """Issue #114: the monitor diagnostics expose the current cross-venue
+    subscription sizes so operators can see the union of the engine and
+    N-leg shares, and the N-leg share alone."""
+    monitor = make_monitor(tmp_path)
+
+    assert monitor.snapshot()["diagnostics"]["cross_venue_token_count"] == 0
+    assert monitor.snapshot()["diagnostics"]["n_leg_cross_venue_token_count"] == 0
+
+    # Replacement semantics on the N-leg share: duplicates collapse, the
+    # count tracks the set.
+    monitor.set_n_leg_tokens(["tok-yes", "tok-no", "tok-yes"])
+    assert monitor.snapshot()["diagnostics"]["cross_venue_token_count"] == 2
+    assert monitor.snapshot()["diagnostics"]["n_leg_cross_venue_token_count"] == 2
+
+    monitor.set_n_leg_tokens(["tok-yes"])
+    assert monitor.snapshot()["diagnostics"]["cross_venue_token_count"] == 1
+    assert monitor.snapshot()["diagnostics"]["n_leg_cross_venue_token_count"] == 1
 
 
 def test_background_monitor_prioritizes_top_twenty_before_bulk_scans(

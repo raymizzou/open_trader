@@ -117,9 +117,6 @@ from open_trader.relation_catalog_v2 import (  # noqa: E402
 
 DEFAULT_PRODUCTION_DB = Path("data/prediction_arbitrage/prediction_arbitrage.sqlite3")
 DEFAULT_BOOK_SOURCE = "open_trader.prediction_n_leg_validation_books:live_books"
-CONTRACT_KEYED_BOOK_SOURCE = (
-    "open_trader.prediction_n_leg_validation_books:contract_keyed_live_books"
-)
 DEFAULT_REPLAY_FIXTURE = _REPO / "tests" / "fixtures" / "prediction_n_leg_validation_frozen_n3.json"
 DEFAULT_ACTOR = "nleg-orchestrator"
 CATALOG_DIR_NAME = "catalog"
@@ -239,31 +236,33 @@ def derive_n3_group(events: Sequence[object]) -> NegriskGroupRelation:
 
 
 def build_contract_token_map(
-    events: Sequence[object], group: NegriskGroupRelation
-) -> dict[str, str]:
-    """conditionId -> YES clobTokenId for the derived group's markets.
+    events: Sequence[object],
+) -> dict[str, dict[str, str]]:
+    """conditionId -> {"yes_token_id", "no_token_id"} from venue metadata.
 
     Built from the same venue metadata the group was derived from and parsed
     by the discovery module's own outcome-token codec, so the mapping can
-    never disagree with the mechanical relation (the group members carry the
-    conditionId; the clobTokenIds live on the raw event markets).  Markets
-    whose tokens did not parse are simply absent — the contract-keyed book
-    wrapper skips unmapped ids without raising.
+    never disagree with the mechanical relation.  Issue #114: both directions
+    are kept so the harness can resolve BUY_NO legs to the NO token instead of
+    reading the YES book.  Markets whose tokens did not parse are simply
+    absent.
     """
 
-    wanted = {market.condition_id for market in group.markets}
-    mapping: dict[str, str] = {}
+    mapping: dict[str, dict[str, str]] = {}
     for event in events:
         for raw_market in _items(_value(event, "markets", default=())):
             market = _json_model(raw_market)
             condition_id = _text(
                 _value(market, "conditionId", "condition_id", default="")
             )
-            if condition_id not in wanted or condition_id in mapping:
+            if not condition_id or condition_id in mapping:
                 continue
             tokens = _outcome_tokens(market)
             if tokens is not None:
-                mapping[condition_id] = tokens["yes"]
+                mapping[condition_id] = {
+                    "yes_token_id": tokens["yes"],
+                    "no_token_id": tokens["no"],
+                }
     return mapping
 
 
@@ -347,6 +346,7 @@ def activate_replica_catalog(
     actor: str,
     git_sha: str,
     qualification_constraints: Sequence[Mapping[str, object]] = (),
+    leg_token_map: Mapping[str, Mapping[str, str]] | None = None,
 ) -> dict[str, object]:
     """Ingest, approve and activate one derived relation inside the replica.
 
@@ -391,6 +391,27 @@ def activate_replica_catalog(
         group, _mechanical_complete_model(group)
     )
     converted = facade._converted(discovery_payload)
+    if leg_token_map:
+        # Issue #114: persist the derived YES/NO clobTokenIds on the stored
+        # endpoints so the harness's rows-token extraction covers every leg
+        # (the derived group's own market objects carry no token facts).
+        endpoints = converted.get("endpoints")
+        if not isinstance(endpoints, list):
+            raise RuntimeError(
+                "cannot wire the leg token map: converted payload has no endpoints"
+            )
+        converted = {
+            **converted,
+            "endpoints": [
+                {
+                    **endpoint,
+                    **(
+                        leg_token_map.get(str(endpoint.get("contract_id"))) or {}
+                    ),
+                }
+                for endpoint in endpoints
+            ],
+        }
     if qualification_constraints:
         problem = converted.get("problem")
         if not isinstance(problem, Mapping):
@@ -787,7 +808,7 @@ def main(argv: list[str] | None = None) -> int:
 
     checksum_before = md5sum(production_db)
     activated: dict[str, object] = {}
-    contract_map: dict[str, str] = {}
+    contract_map: dict[str, dict[str, str]] = {}
     step = "backup"
     code = 0
     failure: str | None = None
@@ -828,7 +849,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"derived {group.relation_type} group over {len(group.markets)} "
                 f"markets of event {group.event_id}"
             )
-            contract_map = build_contract_token_map(events, group)
+            contract_map = build_contract_token_map(events)
             set_contract_token_map(contract_map)
             step = "activate"
             activated = activate_replica_catalog(
@@ -837,6 +858,7 @@ def main(argv: list[str] | None = None) -> int:
                 actor=args.actor,
                 git_sha=args.git_sha,
                 qualification_constraints=args.qualification_constraints,
+                leg_token_map=contract_map,
             )
             _log(f"activated in replica: {activated['identity']}")
             _log(
@@ -850,22 +872,12 @@ def main(argv: list[str] | None = None) -> int:
                 + "]"
             )
 
-        # Explicit --book-source always passes through verbatim; the default
-        # resolves to the contract-keyed wrapper when the derived group produced
-        # a conditionId -> YES token mapping (real-run gap B: harness actions are
-        # keyed by conditionId while get_order_books is keyed by clobTokenId),
-        # else to the token-keyed default.
+        # Explicit --book-source always passes through verbatim; the default is
+        # the token-keyed live_books seam: since #114 the harness resolves each
+        # action's read to its direction's clobTokenId itself (tokens persist
+        # on the activated replica endpoints via the derived leg token map).
         if args.book_source is None:
-            args.book_source = (
-                CONTRACT_KEYED_BOOK_SOURCE
-                if contract_map
-                else DEFAULT_BOOK_SOURCE
-            )
-            if contract_map:
-                _log(
-                    "no --book-source given; using contract-keyed live books "
-                    "(conditionId -> YES clobTokenId from derived venue metadata)"
-                )
+            args.book_source = DEFAULT_BOOK_SOURCE
 
         from open_trader.prediction_n_leg_validation import main as harness_main
 

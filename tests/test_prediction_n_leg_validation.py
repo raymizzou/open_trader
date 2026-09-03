@@ -337,6 +337,124 @@ def test_live_missing_books_is_blocked(tmp_path: Path) -> None:
     assert server.submit_calls == 0
 
 
+def leg_token_problem_rows(
+    *, include_endpoint_tokens: bool
+) -> dict[str, dict[str, object]]:
+    """Issue #114 rows over the frozen N3 problem with its c leg flipped to
+    BUY_NO, exercising direction-aware book reads on one contract."""
+
+    fixture = load_fixture()
+    problem = dict(fixture["problem"])
+    actions = [dict(action) for action in problem["actions"]]
+    for action in actions:
+        if action["action_id"] == "buy-yes-c":
+            action["side"] = "BUY_NO"
+    problem["actions"] = actions
+    tokens = {
+        "a": {"yes_token_id": "tok-yes-a"},
+        "b": {"yes_token_id": "tok-yes-b"},
+        "c": {"yes_token_id": "tok-yes-c", "no_token_id": "tok-no-c"},
+    }
+    endpoints = []
+    for contract in ("a", "b", "c"):
+        endpoint: dict[str, object] = {
+            "venue": "polymarket",
+            "contract_id": contract,
+        }
+        if include_endpoint_tokens:
+            endpoint.update(tokens[contract])
+        endpoints.append(endpoint)
+    return {
+        "validation:exactly-one-n3": {
+            "version_id": "v-1",
+            "status": "APPROVED",
+            "activation": "ACTIVE",
+            "endpoints": endpoints,
+            "model": {
+                "terminal_states": [{}],
+                "payouts": [{}],
+                "capital_release": "2026-08-16T06:00:00Z",
+                "problem": problem,
+            },
+        }
+    }
+
+
+def token_books(requested: list[tuple[str, ...]]) -> dict[str, ThresholdOrderBook]:
+    now = datetime(2026, 8, 16, 2, 0, tzinfo=UTC)
+    prices = {
+        "tok-yes-a": "0.33",
+        "tok-yes-b": "0.32",
+        "tok-no-c": "0.31",
+    }
+    assert requested  # the seam must be consulted at least once
+    return {
+        token: ThresholdOrderBook(
+            token,
+            (BookLevel(Decimal(prices[token]), Decimal("10")),),
+            (),
+            now,
+        )
+        for token in prices
+    }
+
+
+def test_live_resolves_book_requests_by_action_direction(tmp_path: Path) -> None:
+    """C1: the book seam sees exactly the direction-resolved CLOB tokens —
+    the BUY_NO leg reads the NO token's book and the YES legs read their YES
+    tokens; raw contract ids never reach the seam."""
+
+    rows = leg_token_problem_rows(include_endpoint_tokens=True)
+    requested: list[tuple[str, ...]] = []
+    server = FakeSolverServer()
+
+    live = run_live(
+        rows,
+        book_source=lambda token_ids: (
+            requested.append(tuple(token_ids)) or token_books(requested)
+        ),
+        data_dir=tmp_path / "run",
+        catalog={"generation": 1},
+        solver_server=server,
+    )
+
+    assert requested, "book seam was never consulted"
+    assert {token for call in requested for token in call} == {
+        "tok-yes-a", "tok-yes-b", "tok-no-c",
+    }
+    assert live.get("reason") != "MISSING_BOOKS"
+
+
+def test_live_leg_token_map_injection_covers_legacy_rows(tmp_path: Path) -> None:
+    """C1: legacy rows without token fields still reach the direction-resolved
+    book query when the caller injects the contract -> token map."""
+
+    rows = leg_token_problem_rows(include_endpoint_tokens=False)
+    requested: list[tuple[str, ...]] = []
+    server = FakeSolverServer()
+
+    live = run_live(
+        rows,
+        book_source=lambda token_ids: (
+            requested.append(tuple(token_ids)) or token_books(requested)
+        ),
+        data_dir=tmp_path / "run",
+        catalog={"generation": 1},
+        solver_server=server,
+        leg_token_map={
+            "a": {"yes_token_id": "tok-yes-a"},
+            "b": {"yes_token_id": "tok-yes-b"},
+            "c": {"yes_token_id": "tok-yes-c", "no_token_id": "tok-no-c"},
+        },
+    )
+
+    assert requested, "book seam was never consulted"
+    assert {token for call in requested for token in call} == {
+        "tok-yes-a", "tok-yes-b", "tok-no-c",
+    }
+    assert live.get("reason") != "MISSING_BOOKS"
+
+
 def test_fail_closed_seam_blocks_mutation() -> None:
     seam = FailClosedExecution()
 

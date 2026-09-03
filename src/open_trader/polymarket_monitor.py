@@ -376,6 +376,11 @@ class PolymarketMonitor:
         self._relation_book_timestamps: dict[str, datetime | None] = {}
         self._relation_book_received_at: dict[str, datetime] = {}
         self._cross_venue_tokens: set[str] = set()
+        # Issue #114 P1: the N-leg resolver's own share.  In production the
+        # resolver and the cross-venue engine share one monitor instance, so
+        # the effective cross-venue token set is the union of both shares;
+        # neither writer ever evicts the other's tokens or cached books.
+        self._n_leg_tokens: set[str] = set()
         self._cross_venue_books: dict[str, ThresholdOrderBook] = {}
         self._cross_venue_book_timestamps: dict[str, datetime] = {}
         self._cross_venue_refresh_required = False
@@ -524,8 +529,18 @@ class PolymarketMonitor:
         except Exception:
             return
 
+    def _cross_venue_effective_tokens(self) -> set[str]:
+        """Union of both shares (callers hold ``self._lock``); #114 P1."""
+
+        return self._cross_venue_tokens | self._n_leg_tokens
+
     def set_cross_venue_tokens(self, token_ids: Sequence[str]) -> None:
-        """Replace the externally requested token set and force a fresh subscription."""
+        """Replace the cross-venue engine's share and force a fresh subscription.
+
+        Issue #114 P1: this replaces only the engine's own share; the N-leg
+        resolver's share (`set_n_leg_tokens`) is untouched and cached books
+        are pruned to the union of both shares.
+        """
 
         requested = {
             token.strip() for token in token_ids if isinstance(token, str) and token.strip()
@@ -535,18 +550,44 @@ class PolymarketMonitor:
                 return
             self._cross_venue_generation += 1
             self._cross_venue_tokens = requested
-            self._cross_venue_books = {
-                token: book
-                for token, book in self._cross_venue_books.items()
-                if token in requested
-            }
-            self._cross_venue_book_timestamps = {
-                token: timestamp
-                for token, timestamp in self._cross_venue_book_timestamps.items()
-                if token in requested
-            }
-            self._cross_venue_refresh_required = True
-            self._subscription_dirty = True
+            self._prune_cross_venue_books()
+
+    def set_n_leg_tokens(self, token_ids: Sequence[str]) -> None:
+        """Replace the N-leg resolver's token share (#114 P1).
+
+        Mirrors `set_cross_venue_tokens` line for line, but owns only the
+        N-leg share: the two shares take effect as a union at every consumer,
+        so the N-leg writer and the cross-venue engine writer never evict
+        each other's tokens or cached books.  An empty generation clears only
+        the N-leg share.
+        """
+
+        requested = {
+            token.strip() for token in token_ids if isinstance(token, str) and token.strip()
+        }
+        with self._lock:
+            if requested == self._n_leg_tokens:
+                return
+            self._cross_venue_generation += 1
+            self._n_leg_tokens = requested
+            self._prune_cross_venue_books()
+
+    def _prune_cross_venue_books(self) -> None:
+        """Prune cached books/timestamps to the union of both shares."""
+
+        keep = self._cross_venue_effective_tokens()
+        self._cross_venue_books = {
+            token: book
+            for token, book in self._cross_venue_books.items()
+            if token in keep
+        }
+        self._cross_venue_book_timestamps = {
+            token: timestamp
+            for token, timestamp in self._cross_venue_book_timestamps.items()
+            if token in keep
+        }
+        self._cross_venue_refresh_required = True
+        self._subscription_dirty = True
 
     def cross_venue_books(
         self, token_ids: Sequence[str]
@@ -556,11 +597,12 @@ class PolymarketMonitor:
         now = self._now()
         requested = {str(token) for token in token_ids}
         with self._lock:
+            effective = self._cross_venue_effective_tokens()
             return {
                 token: book
                 for token, book in self._cross_venue_books.items()
                 if token in requested
-                and token in self._cross_venue_tokens
+                and token in effective
                 and 0 <= (now - book.confirmed_at).total_seconds() <= BOOK_FRESHNESS_SECONDS
             }
 
@@ -699,7 +741,16 @@ class PolymarketMonitor:
                 "events": events,
                 "opportunities": opportunities,
                 "signals_24h": self._signals_24h_cache,
-                "diagnostics": copy.deepcopy(self._diagnostics),
+                # Issue #114: operator diagnostics expose the cross-venue
+                # subscription sizes (read under the lock): the union of the
+                # engine and N-leg shares, and the N-leg share alone.
+                "diagnostics": {
+                    **copy.deepcopy(self._diagnostics),
+                    "cross_venue_token_count": len(
+                        self._cross_venue_effective_tokens()
+                    ),
+                    "n_leg_cross_venue_token_count": len(self._n_leg_tokens),
+                },
                 "heartbeat_at": self._heartbeat_at,
                 "universe_refreshed_at": self._universe_at,
                 "readiness": copy.deepcopy(self._readiness),
@@ -990,7 +1041,7 @@ class PolymarketMonitor:
             previous_union = (
                 set(self._market_by_token)
                 | set(self._relation_by_token)
-                | self._cross_venue_tokens
+                | self._cross_venue_effective_tokens()
             )
             previous = self._markets.get(market_id, {})
             for token in (
@@ -1006,7 +1057,7 @@ class PolymarketMonitor:
             current_union = (
                 set(self._market_by_token)
                 | set(self._relation_by_token)
-                | self._cross_venue_tokens
+                | self._cross_venue_effective_tokens()
             )
             if current_union != previous_union:
                 self._subscription_dirty = True
@@ -1402,10 +1453,10 @@ class PolymarketMonitor:
             token_ids = sorted(
                 set(self._market_by_token)
                 | set(self._relation_by_token)
-                | self._cross_venue_tokens
+                | self._cross_venue_effective_tokens()
             )
             refresh_cross_venue = self._cross_venue_refresh_required
-            cross_venue_tokens = tuple(sorted(self._cross_venue_tokens))
+            cross_venue_tokens = tuple(sorted(self._cross_venue_effective_tokens()))
             cross_venue_generation = self._cross_venue_generation
         if not token_ids:
             await self._close_stream()
@@ -1440,7 +1491,7 @@ class PolymarketMonitor:
             current_tokens = (
                 set(self._market_by_token)
                 | set(self._relation_by_token)
-                | self._cross_venue_tokens
+                | self._cross_venue_effective_tokens()
             )
             if (
                 cross_venue_generation != self._cross_venue_generation
@@ -1463,7 +1514,7 @@ class PolymarketMonitor:
                 != (
                     set(self._market_by_token)
                     | set(self._relation_by_token)
-                    | self._cross_venue_tokens
+                    | self._cross_venue_effective_tokens()
                 )
             )
             if not subscription_changed:
@@ -1544,7 +1595,7 @@ class PolymarketMonitor:
             previous_union = (
                 set(self._market_by_token)
                 | set(self._relation_by_token)
-                | self._cross_venue_tokens
+                | self._cross_venue_effective_tokens()
             )
         explicitly_ineligible = bool(markets) and all(
             row.get("fees_enabled") is True or row.get("neg_risk") is True
@@ -1564,7 +1615,7 @@ class PolymarketMonitor:
             current_union = (
                 set(self._market_by_token)
                 | set(self._relation_by_token)
-                | self._cross_venue_tokens
+                | self._cross_venue_effective_tokens()
             )
             if current_union != previous_union:
                 self._subscription_dirty = True
@@ -2192,7 +2243,7 @@ class PolymarketMonitor:
         previous_tokens = (
             set(self._market_by_token)
             | set(self._relation_by_token)
-            | self._cross_venue_tokens
+            | self._cross_venue_effective_tokens()
         )
         token_map: dict[str, set[str]] = {}
         for relation_id in self._realtime_relation_ids:
@@ -2211,7 +2262,7 @@ class PolymarketMonitor:
         current_tokens = (
             set(self._market_by_token)
             | set(self._relation_by_token)
-            | self._cross_venue_tokens
+            | self._cross_venue_effective_tokens()
         )
         if current_tokens != previous_tokens:
             self._subscription_dirty = True
@@ -2486,7 +2537,7 @@ class PolymarketMonitor:
     ) -> bool:
         with self._lock:
             if tokens is None:
-                tokens = tuple(sorted(self._cross_venue_tokens))
+                tokens = tuple(sorted(self._cross_venue_effective_tokens()))
             else:
                 tokens = tuple(tokens)
             if generation is None:
@@ -2495,7 +2546,7 @@ class PolymarketMonitor:
         with self._lock:
             if (
                 generation != self._cross_venue_generation
-                or set(tokens) != self._cross_venue_tokens
+                or set(tokens) != self._cross_venue_effective_tokens()
             ):
                 return False
             self._cross_venue_books = books
@@ -2508,7 +2559,7 @@ class PolymarketMonitor:
         self, token_ids: Sequence[str]
     ) -> dict[str, ThresholdOrderBook]:
         with self._lock:
-            requested = sorted(set(token_ids) & self._cross_venue_tokens)
+            requested = sorted(set(token_ids) & self._cross_venue_effective_tokens())
             generation = self._cross_venue_generation
         if not requested:
             return {}
@@ -2525,10 +2576,11 @@ class PolymarketMonitor:
         with self._lock:
             if generation != self._cross_venue_generation:
                 return {}
+            effective = self._cross_venue_effective_tokens()
             books = {
                 token: book
                 for token, book in books.items()
-                if token in self._cross_venue_tokens
+                if token in effective
             }
             self._cross_venue_books.update(books)
             self._cross_venue_book_timestamps.update(
@@ -3925,7 +3977,7 @@ class PolymarketMonitor:
         self, message_type: object, payload: object, tokens: Sequence[str]
     ) -> None:
         with self._lock:
-            affected = set(tokens) & self._cross_venue_tokens
+            affected = set(tokens) & self._cross_venue_effective_tokens()
             if not affected:
                 return
             timestamp = _timestamp_or_none(_value(payload, "timestamp", default=None))

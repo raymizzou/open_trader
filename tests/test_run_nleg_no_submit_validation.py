@@ -761,17 +761,18 @@ def test_fresh_replica_refuses_combination_with_replica_ready(
 
 
 # ---------------------------------------------------------------------------
-# C3: the orchestrator builds the conditionId -> YES clobTokenId mapping from
-# the derived group's venue metadata, injects it into the books module before
-# calling the harness (real-run gap B: actions are keyed by conditionId while
-# get_order_books is keyed by clobTokenId -> MISSING_BOOKS), and resolves the
-# default --book-source to the contract-keyed wrapper when a mapping exists.
-# Explicit --book-source always passes through verbatim.
+# C3: the orchestrator builds the conditionId -> {"yes_token_id", "no_token_id"}
+# mapping from the derived group's venue metadata, injects it into the books
+# registry and the replica activation (so the persisted endpoints carry the
+# clobTokenIds), and resolves the default --book-source to the token-keyed
+# live_books seam (#114: the harness resolves directions itself, so the
+# contract-keyed wrapper is retired).  Explicit --book-source passes through
+# verbatim.
 # ---------------------------------------------------------------------------
 
 
-CONTRACT_KEYED_BOOK_SOURCE = (
-    "open_trader.prediction_n_leg_validation_books:contract_keyed_live_books"
+DEFAULT_BOOK_SOURCE = (
+    "open_trader.prediction_n_leg_validation_books:live_books"
 )
 
 
@@ -796,11 +797,24 @@ def _write_events(tmp_path: Path) -> Path:
     return events_file
 
 
+def test_build_contract_token_map_is_direction_aware() -> None:
+    """C2: the orchestrator map is conditionId -> {"yes_token_id", "no_token_id"}
+    built from the venue metadata's clobTokenIds (both directions)."""
+
+    mapping = orchestrator.build_contract_token_map([neg_risk_event()])
+
+    assert mapping == {
+        "condition-0": {"yes_token_id": "yes-0", "no_token_id": "no-0"},
+        "condition-1": {"yes_token_id": "yes-1", "no_token_id": "no-1"},
+        "condition-2": {"yes_token_id": "yes-2", "no_token_id": "no-2"},
+    }
+
+
 def test_orchestrator_injects_contract_map_and_resolves_default_book_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Both derive modes inject the mapping; the default --book-source
-    resolves to the contract-keyed wrapper when the mapping is non-empty."""
+    resolves to the token-keyed live_books seam."""
 
     import open_trader.prediction_n_leg_validation_books as books_module
 
@@ -808,9 +822,9 @@ def test_orchestrator_injects_contract_map_and_resolves_default_book_source(
     events_file = _write_events(tmp_path)
     captured = _stub_harness(monkeypatch)
     expected_map = {
-        "condition-0": "yes-0",
-        "condition-1": "yes-1",
-        "condition-2": "yes-2",
+        "condition-0": {"yes_token_id": "yes-0", "no_token_id": "no-0"},
+        "condition-1": {"yes_token_id": "yes-1", "no_token_id": "no-1"},
+        "condition-2": {"yes_token_id": "yes-2", "no_token_id": "no-2"},
     }
 
     # Fresh mode.
@@ -828,7 +842,7 @@ def test_orchestrator_injects_contract_map_and_resolves_default_book_source(
     assert exit_code == 0
     assert books_module.contract_token_map() == expected_map
     argv = captured["argv"]
-    assert argv[argv.index("--book-source") + 1] == CONTRACT_KEYED_BOOK_SOURCE
+    assert argv[argv.index("--book-source") + 1] == DEFAULT_BOOK_SOURCE
 
     # Default production-replica mode injects the same way.
     exit_code = orchestrator.main(
@@ -844,7 +858,7 @@ def test_orchestrator_injects_contract_map_and_resolves_default_book_source(
     assert exit_code == 0
     assert books_module.contract_token_map() == expected_map
     argv = captured["argv"]
-    assert argv[argv.index("--book-source") + 1] == CONTRACT_KEYED_BOOK_SOURCE
+    assert argv[argv.index("--book-source") + 1] == DEFAULT_BOOK_SOURCE
 
 
 def test_explicit_book_source_is_passed_through_verbatim(

@@ -44,6 +44,7 @@ from open_trader.prediction_monitor_selection import (
 )
 from open_trader.prediction_n_leg import (
     ActionPayout,
+    ActionSide,
     ArbitrageProblem,
     OracleBudget,
     TerminalAtom,
@@ -221,6 +222,60 @@ def _fee_state_by_contract(
     return states
 
 
+# Issue #114: per-contract YES/NO CLOB token maps aggregated from the catalog
+# generation endpoints.  The live CLOB channel (order books, subscription,
+# orders) is keyed by clob token id while threshold/negRisk relations key
+# their actions by condition id, so the resolver resolves each action's book
+# read by its direction.  Contract -> {"yes_token_id": ..., "no_token_id": ...}
+# over one generation batch; conflicting facts for one contract drop the
+# mapping (the #112 fee-unknown pattern), never guess a direction.
+
+
+def _leg_token_by_contract(
+    rows: Mapping[str, Mapping[str, object]],
+) -> dict[str, dict[str, str]]:
+    """Contract -> YES/NO token pair over one generation batch, conflicting -> dropped."""
+    tokens: dict[str, dict[str, str]] = {}
+    for row in rows.values():
+        endpoints = row.get("endpoints")
+        if not isinstance(endpoints, Sequence):
+            continue
+        for endpoint in endpoints:
+            if not isinstance(endpoint, Mapping):
+                continue
+            contract_id = str(endpoint.get("contract_id") or "")
+            if not contract_id:
+                continue
+            entry = {
+                name: str(endpoint[name])
+                for name in ("yes_token_id", "no_token_id")
+                if isinstance(endpoint.get(name), str) and str(endpoint[name]).strip()
+            }
+            if not entry:
+                continue
+            existing = tokens.get(contract_id)
+            if existing is None:
+                tokens[contract_id] = entry
+            elif existing != entry:
+                tokens[contract_id] = {}
+    return tokens
+
+
+def resolve_leg_token(action: object, leg_token_map: Mapping[str, Mapping[str, object]]) -> str:
+    """The CLOB token to read for one action: the direction token when the
+    contract is mapped, else the market_contract_id itself (the mechanical
+    contract-is-token invariant; a legacy IMPLIES condition id then finds no
+    book and the snapshot fails closed)."""
+    contract_id = str(getattr(action, "market_contract_id"))
+    entry = leg_token_map.get(contract_id) if isinstance(leg_token_map, Mapping) else None
+    if isinstance(entry, Mapping):
+        name = "yes_token_id" if getattr(action, "side") == ActionSide.BUY_YES else "no_token_id"
+        token = entry.get(name)
+        if isinstance(token, str) and token.strip():
+            return token
+    return contract_id
+
+
 def _fee_block(
     selected: SelectedComponent | None,
     fee_by_contract: Mapping[str, str],
@@ -327,6 +382,10 @@ class PredictionLiveResolver:
         # an injectable clock so tests can drive episode timing.
         episode_tracker: EpisodeTracker | None = None,
         now_fn: Callable[[], datetime] | None = None,
+        # Issue #114: optional injected contract -> YES/NO token pairs.  The
+        # map extracted from the catalog generation rows always wins on a
+        # conflicting contract; the injection only fills gaps (legacy rows).
+        leg_token_map: Mapping[str, Mapping[str, object]] | None = None,
     ) -> None:
         if not isinstance(poll_interval, (int, float)) or poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
@@ -379,6 +438,14 @@ class PredictionLiveResolver:
         self._problem_map: dict[str, ArbitrageProblem] = {}
         # Issue #112: contract -> fee state from the last reconciled batch.
         self._fee_by_contract: dict[str, str] = {}
+        # Issue #114: contract -> {"yes_token_id", "no_token_id"} used to key
+        # book reads by action direction (generation rows win over injection).
+        self._injected_leg_tokens: dict[str, dict[str, object]] = {
+            str(contract): dict(entry)
+            for contract, entry in (leg_token_map or {}).items()
+            if isinstance(entry, Mapping)
+        }
+        self._leg_tokens: dict[str, dict[str, object]] = {}
         self._selection: dict[str, SelectedComponent] = {}
         self._solutions: dict[
             str, tuple[MarketSolution, ExecutionSolution | None]
@@ -563,6 +630,12 @@ class PredictionLiveResolver:
         # Issue #112: the fee map is built from the same generation batch as
         # the problem compilation and stored under the solutions lock.
         fee_by_contract = _fee_state_by_contract(rows)
+        # Issue #114: the direction token map comes from the same batch; the
+        # injected map only fills gaps because generation rows win per key.
+        leg_tokens: dict[str, dict[str, object]] = {
+            **self._injected_leg_tokens,
+            **_leg_token_by_contract(rows),
+        }
         for component in components:
             raw = problem_for_component(problem, component)
             raw_problems[component.component_id] = raw
@@ -602,6 +675,7 @@ class PredictionLiveResolver:
                     )
             with self._lock:
                 self._fee_by_contract = fee_by_contract
+                self._leg_tokens = leg_tokens
             self._problem_map = problem_map
             self._selection = kept
             self._solutions = {
@@ -639,16 +713,35 @@ class PredictionLiveResolver:
             }
             if set(kept) != set(persisted):
                 self._selection_store.save(kept)
+        # Issue #114 (P1 fix): the resolver owns the N-leg-dedicated share of
+        # its monitor's cross-venue subscription (`set_n_leg_tokens`) and
+        # re-seeds it from the full resolved token set at the end of every
+        # reconcile.  In production the resolver and the cross-venue engine
+        # share one monitor instance, so this share runs in parallel with the
+        # engine's `set_cross_venue_tokens` share: the two take effect as a
+        # union at every consumer and neither writer ever evicts the other.
+        # Monitors without the seam (validation adapters) are skipped; an
+        # empty generation correctly clears only this share, never the
+        # engine's.  Set changes still trigger the monitor's own REST
+        # snapshot + resubscribe.
+        if hasattr(self._monitor, "set_n_leg_tokens"):
+            resolved = {
+                resolve_leg_token(action, leg_tokens)
+                for problem in problem_map.values()
+                for action in problem.actions
+            }
+            self._monitor.set_n_leg_tokens(sorted(resolved))
 
     def _snapshot_for(self, selected: SelectedComponent) -> ComponentSnapshot | None:
         problem = self._problem_map.get(selected.component_id)
         if problem is None:
             return None
+        leg_tokens = self._leg_tokens
         legs: list[SnapshotLeg] = []
         for action in problem.actions:
             if action.venue_id != "polymarket":
                 return None
-            token = action.market_contract_id
+            token = resolve_leg_token(action, leg_tokens)
             book = self._monitor.cross_venue_books((token,)).get(token)
             if book is None:
                 return None

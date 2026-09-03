@@ -5,7 +5,9 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,11 +19,13 @@ from open_trader.relation_catalog import (
     _derive_statement,
     _digest,
     _mechanical_complete_model,
+    _normalise_discovery,
     _threshold_complete_model,
     _threshold_discovery_payload,
     _utc,
     default_catalog_path,
 )
+from open_trader.polymarket_relation_discovery import NegriskGroupRelation
 from open_trader.relation_catalog_v2 import RelationCatalogV2, SqliteCatalogStore
 from open_trader.prediction_n_leg import (
     OBSERVATION_SCHEMA_V1,
@@ -1864,3 +1868,95 @@ def test_mechanical_complete_model_is_untouched_by_canonicalizer() -> None:
     assert model is not None
     problem = problem_from_payload(model["problem"])
     assert canonicalize_directional_actions(problem) is problem
+
+
+# -- Issue #114: YES/NO CLOB token ids ride the payload market dictionaries
+
+
+def test_normalise_discovery_accepts_legacy_payload_without_token_fields() -> None:
+    """A3 compat lock: a legacy payload whose market dictionaries carry no
+    token fields still normalizes without raising, and the normalized market
+    keys stay exactly the pre-#114 set (required fields + the #112 fee pair)."""
+    payload = discovery()
+    normalized = _normalise_discovery(payload)
+
+    assert len(normalized["markets"]) == 3
+    for market in normalized["markets"]:
+        assert set(market) == {
+            "venue", "contract_id", "title", "market_date", "expires_at",
+            "event_identity_basis", "settlement_observation_key",
+            "settlement_rules", "cancellation_rules",
+            "fees_enabled", "fee_rate",
+        }
+        assert "yes_token_id" not in market
+        assert "no_token_id" not in market
+
+
+def test_threshold_ingest_persists_yes_and_no_tokens_per_market(
+    tmp_path: Path,
+) -> None:
+    """A1: one threshold IMPLIES ingest persists each endpoint's handwritten
+    YES/NO clob token ids alongside the market facts."""
+    relation = threshold_relation()
+    catalog = RelationCatalog(tmp_path)
+    catalog.ingest_threshold_relation(relation)
+
+    (row,) = catalog.list("pending")
+    endpoints = {str(item["contract_id"]): item for item in row["endpoints"]}
+    assert endpoints["condition-a"]["yes_token_id"] == "yes-a"
+    assert endpoints["condition-a"]["no_token_id"] == "no-a"
+    assert endpoints["condition-b"]["yes_token_id"] == "yes-b"
+    assert endpoints["condition-b"]["no_token_id"] == "no-b"
+
+
+def neg_risk_relation_with_tokens() -> NegriskGroupRelation:
+    """A2 fixture: negRisk EXACTLY_ONE whose markets carry handwritten token
+    literals (the catalog adapters read relation objects via getattr)."""
+    markets = tuple(
+        SimpleNamespace(
+            condition_id=f"condition-{index}",
+            question=f"Which outcome {index}?",
+            rules="official index",
+            resolution_source="Binance",
+            end_date="2026-12-31T17:00:00Z",
+            rules_hash=f"rules-{index}",
+            fees_enabled=False,
+            fee_rate=Decimal("0"),
+            yes_token_id=f"yes-{index}",
+            no_token_id=f"no-{index}",
+        )
+        for index in range(3)
+    )
+    return NegriskGroupRelation(event_id="event-group-1", markets=markets)
+
+
+def test_negrisk_exactly_one_ingest_persists_yes_and_no_tokens_per_market(
+    tmp_path: Path,
+) -> None:
+    """A2: one negRisk EXACTLY_ONE ingest persists each market's handwritten
+    YES/NO clob token ids alongside the market facts."""
+    catalog = RelationCatalog(tmp_path)
+    catalog.ingest_mechanical_relation(neg_risk_relation_with_tokens())
+
+    (row,) = catalog.list("pending")
+    endpoints = {str(item["contract_id"]): item for item in row["endpoints"]}
+    for index in range(3):
+        assert endpoints[f"condition-{index}"]["yes_token_id"] == f"yes-{index}"
+        assert endpoints[f"condition-{index}"]["no_token_id"] == f"no-{index}"
+
+
+def test_native_complement_ingest_keeps_contract_as_token_invariant(
+    tmp_path: Path,
+) -> None:
+    """A2b: NATIVE_COMPLEMENT ingest writes NO token fields — the contract id
+    is already the CLOB token id, and that invariant stays locked."""
+    catalog = RelationCatalog(tmp_path)
+    catalog.ingest_mechanical_relation(complement_relation())
+
+    (row,) = catalog.list("pending")
+    assert {str(item["contract_id"]) for item in row["endpoints"]} == {
+        "yes-1", "no-1",
+    }
+    for endpoint in row["endpoints"]:
+        assert "yes_token_id" not in endpoint
+        assert "no_token_id" not in endpoint

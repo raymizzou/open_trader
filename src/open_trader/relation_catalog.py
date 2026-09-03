@@ -358,7 +358,10 @@ def _normalise_discovery(value: Mapping[str, object]) -> dict[str, object]:
         # Issue #112: the per-market fee facts ride alongside the required
         # fields (absent on legacy rows, which decode to a fee-unknown gate).
         fee_fields = {"fees_enabled", "fee_rate"}
-        if not required <= set(market) <= required | fee_fields:
+        # Issue #114: the per-market YES/NO CLOB token ids ride the same way
+        # (absent on legacy rows, which decode to the contract-id fallback).
+        token_fields = {"yes_token_id", "no_token_id"}
+        if not required <= set(market) <= required | fee_fields | token_fields:
             raise ValueError("market fields are invalid")
         clean = {name: _string(market[name], f"market.{name}") for name in required - {"market_date", "expires_at"}}
         clean["market_date"] = _timestamp(market["market_date"], "market.market_date")
@@ -371,6 +374,15 @@ def _normalise_discovery(value: Mapping[str, object]) -> dict[str, object]:
             raise ValueError("market.fee_rate must be a string or null")
         clean["fees_enabled"] = fees_enabled
         clean["fee_rate"] = fee_rate
+        # Issue #114: optional CLOB token ids (str). Unlike the fee pair they
+        # are pass-through only: absent/null stays absent so legacy normalized
+        # markets keep their exact pre-#114 key set.
+        for name in ("yes_token_id", "no_token_id"):
+            if name not in market or market[name] is None:
+                continue
+            if not isinstance(market[name], str):
+                raise ValueError(f"market.{name} must be a string or null")
+            clean[name] = market[name]
         markets.append(clean)
     endpoints = sorted((str(item["venue"]).casefold(), str(item["contract_id"])) for item in markets)
     if len(set(endpoints)) != len(endpoints):
@@ -529,6 +541,8 @@ def _threshold_discovery_payload(
     def market(value: object) -> dict[str, object]:
         end_date = _string(getattr(value, "end_date"), "threshold end_date")
         fee_rate = getattr(value, "fee_rate")
+        # Issue #114: the YES/NO CLOB token ids persist with the market facts
+        # so the live resolver can key order-book reads by action direction.
         return {
             "venue": "Polymarket", "contract_id": _string(getattr(value, "condition_id"), "condition_id"),
             "title": _string(getattr(value, "question"), "question"), "market_date": end_date,
@@ -537,6 +551,8 @@ def _threshold_discovery_payload(
             "settlement_rules": _string(getattr(value, "rules"), "rules"), "cancellation_rules": "not supplied by threshold discovery",
             "fees_enabled": getattr(value, "fees_enabled"),
             "fee_rate": str(fee_rate) if fee_rate is not None else None,
+            "yes_token_id": str(getattr(value, "yes_token_id")),
+            "no_token_id": str(getattr(value, "no_token_id")),
         }
     relation_direction = str(getattr(relation, "relation"))
     endpoints = [market(getattr(relation, "market_a")), market(getattr(relation, "market_b"))]
@@ -769,7 +785,10 @@ def _mechanical_discovery_payload(
             rules_hash = _string(getattr(market, "rules_hash"), "rules_hash")
             fees_enabled = getattr(market, "fees_enabled")
             fee_rate = getattr(market, "fee_rate")
-            markets.append({
+            # Issue #114: write the YES/NO CLOB token ids whenever the market
+            # object carries them; getattr (not attribute access) keeps
+            # token-less group markets on the legacy null (absent) path.
+            entry = {
                 "venue": "Polymarket",
                 "contract_id": condition_id,
                 "title": _string(getattr(market, "question"), "question"),
@@ -781,7 +800,10 @@ def _mechanical_discovery_payload(
                 "cancellation_rules": "not supplied by mechanical discovery",
                 "fees_enabled": fees_enabled,
                 "fee_rate": str(fee_rate) if fee_rate is not None else None,
-            })
+                "yes_token_id": getattr(market, "yes_token_id", None),
+                "no_token_id": getattr(market, "no_token_id", None),
+            }
+            markets.append(entry)
     else:
         raise ValueError("mechanical relation_type is invalid")
     return {
@@ -813,8 +835,9 @@ class RelationCatalog:
     def _converted(self, discovery: Mapping[str, object]) -> dict[str, object]:
         """Map a v1 discovery payload to the clean v2 canonical payload shape."""
         payload = _normalise_discovery(discovery)
-        endpoints = [
-            {
+        endpoints = []
+        for market in payload["markets"]:
+            endpoint = {
                 "venue": str(market["venue"]).casefold(),
                 "contract_id": str(market["contract_id"]),
                 "title": market["title"],
@@ -827,8 +850,12 @@ class RelationCatalog:
                 "fees_enabled": market.get("fees_enabled"),
                 "fee_rate": market.get("fee_rate"),
             }
-            for market in payload["markets"]
-        ]
+            # Issue #114: pass-through only — NATIVE_COMPLEMENT endpoints
+            # (contract id == token id) keep their exact pre-#114 key set.
+            for name in ("yes_token_id", "no_token_id"):
+                if market.get(name) is not None:
+                    endpoint[name] = market[name]
+            endpoints.append(endpoint)
         direction = str(payload["semantics"].get("direction", ""))
         if direction in {"B_IMPLIES_A", "B_TO_A"}:
             endpoints = list(reversed(endpoints))
