@@ -343,6 +343,7 @@ class TrendAnimalsClient:
         tm_ids: Sequence[int],
         fields: Sequence[str],
         expected_date: str,
+        allow_older: bool = False,
     ) -> list[dict[str, object]]:
         if (
             not isinstance(tm_ids, Sequence)
@@ -382,6 +383,7 @@ class TrendAnimalsClient:
                             "fields": ",".join(unique_fields),
                         },
                         expected_date,
+                        allow_older=allow_older,
                     )
                 )
                 batch = [tm_id]
@@ -397,6 +399,7 @@ class TrendAnimalsClient:
                     "fields": ",".join(unique_fields),
                 },
                 expected_date,
+                allow_older=allow_older,
             )
         )
         return rows
@@ -432,6 +435,7 @@ class TrendAnimalsClient:
         expected_date: str,
         *,
         ignore_older: bool = False,
+        allow_older: bool = False,
     ) -> list[dict[str, object]]:
         cache_identity = {
             "date": expected_date,
@@ -458,8 +462,9 @@ class TrendAnimalsClient:
             rows = self._get(endpoint, params)
         if self._contains_secret(rows):
             raise TrendAnimalsError(f"{endpoint} returned unsafe data")
-        current_rows: list[dict[str, object]] = []
+        accepted_rows: list[dict[str, object]] = []
         ignored_rows: list[dict[str, str]] = []
+        older_rows: list[dict[str, object]] = []
         try:
             expected_day = date.fromisoformat(expected_date)
         except ValueError:
@@ -485,21 +490,27 @@ class TrendAnimalsClient:
                 and actual_is_canonical
                 and actual_date == expected_date
             ):
-                current_rows.append(row)
+                accepted_rows.append(row)
                 continue
             symbol = row.get("tickerSymbol")
             if (
-                ignore_older
-                and expected_is_canonical
+                expected_is_canonical
                 and actual_is_canonical
                 and actual_day < expected_day
-                and isinstance(symbol, str)
-                and symbol.strip()
             ):
-                ignored_rows.append(
-                    {"tickerSymbol": symbol.strip(), "asOfDate": actual_date}
-                )
-                continue
+                if allow_older:
+                    accepted_rows.append(row)
+                    older_rows.append(row)
+                    continue
+                if (
+                    ignore_older
+                    and isinstance(symbol, str)
+                    and symbol.strip()
+                ):
+                    ignored_rows.append(
+                        {"tickerSymbol": symbol.strip(), "asOfDate": actual_date}
+                    )
+                    continue
             safe_actual = (
                 self._redact(actual_date)
                 if isinstance(actual_date, str)
@@ -510,14 +521,14 @@ class TrendAnimalsClient:
                 f"expected {self._redact(expected_date)}"
             )
         self._ignored_stale_components.extend(ignored_rows)
-        if ignore_older and not current_rows:
+        if ignore_older and not accepted_rows:
             tm_id = self._redact(str(params.get("tmId", "")))
             raise TrendAnimalsNoCurrentRowsError(
                 f"{endpoint} tmId={tm_id} returned no current-date rows"
             )
-        if cached is None and not ignored_rows:
-            self._write_cache(cache_path, current_rows)
-        return current_rows
+        if cached is None and not ignored_rows and not older_rows:
+            self._write_cache(cache_path, accepted_rows)
+        return accepted_rows
 
     def _read_cache(self, path: Path) -> object | None:
         try:

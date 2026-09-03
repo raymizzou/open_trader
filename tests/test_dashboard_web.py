@@ -1357,6 +1357,245 @@ def test_cn_trend_secondary_text_keeps_muted_tone_on_main_surface() -> None:
     assert "color: var(--muted);" in price_sources
 
 
+def test_dashboard_renders_stale_holding_as_colored_carried_forward_review() -> None:
+    output = run_dashboard_js(r'''
+const report = {
+  available: true,
+  market: "CN",
+  broker: "eastmoney",
+  broker_label: "东方财富",
+  market_label: "A股",
+  report_date: "2026-07-14",
+  data_date: "2026-07-14",
+  generated_at: "2026-07-14T20:00:00+08:00",
+  account_status: "已更新",
+  counts: {sell: 0, buy: 0, hold: 0, review: 1},
+  sell_actions: [],
+  buy_actions: [],
+  hold_actions: [],
+  review_actions: [{
+    symbol: "600001",
+    name: "模拟旧快照持仓",
+    action: "MANUAL_REVIEW",
+    reason: "holding_signal_unknown",
+    signal_as_of_date: "2026-07-13",
+    active_line: "8.5",
+    entry_hints: ["沿用 2026-07-13", "旧值仅展示，不参与当天决策"],
+  }],
+  real_position_actions: [{
+    symbol: "600002",
+    name: "实盘旧快照持仓",
+    action: "MANUAL_REVIEW",
+    reason: "holding_signal_unknown",
+    signal_as_of_date: "2026-07-13",
+    active_line: "8.5",
+    entry_hints: ["沿用 2026-07-13", "旧值仅展示，不参与当天决策"],
+  }],
+  real_position_status: "available",
+  real_position_source: {
+    broker_label: "东方财富",
+    snapshot_period: "2026-07-14",
+    source_kind: "live_account",
+    freshness_text: "只读快照",
+    read_only_text: "只读，不自动下单",
+  },
+  audit: {},
+};
+const html = renderTrendReportWorkspace(report);
+const staleRows = [...html.matchAll(/<tr class="cn-trend-card[^"]*">[\s\S]*?<\/tr>/g)]
+  .map(([row]) => row)
+  .filter((row) => row.includes("600001") || row.includes("600002"));
+console.log(JSON.stringify({
+  carriedForward: staleRows.map((row) => row.includes("trend-holding-carried-forward")),
+  oldDate: html.includes("沿用 2026-07-13"),
+  displayOnly: html.includes("旧值仅展示，不参与当天决策"),
+  protection: html.includes("8.5"),
+}));
+''')
+    rendered = json.loads(output)
+
+    assert (
+        rendered,
+    ) == (
+        {
+            "carriedForward": [True, True],
+            "oldDate": True,
+            "displayOnly": True,
+            "protection": True,
+        },
+    )
+
+
+@pytest.mark.browser
+def test_dashboard_stale_holding_warning_has_computed_amber_treatment() -> None:
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    rendered = json.loads(run_dashboard_js(r'''
+const report = {
+  available: true,
+  market: "CN",
+  broker: "eastmoney",
+  broker_label: "东方财富",
+  market_label: "A股",
+  report_date: "2026-07-14",
+  data_date: "2026-07-14",
+  generated_at: "2026-07-14T20:00:00+08:00",
+  account_status: "已更新",
+  counts: {sell: 0, buy: 0, hold: 0, review: 1},
+  sell_actions: [],
+  buy_actions: [],
+  hold_actions: [],
+  review_actions: [{
+    symbol: "600001",
+    name: "模拟旧快照持仓",
+    action: "MANUAL_REVIEW",
+    reason: "holding_signal_unknown",
+    signal_as_of_date: "2026-07-13",
+    active_line: "8.5",
+    entry_hints: ["沿用 2026-07-13", "旧值仅展示，不参与当天决策"],
+  }],
+  real_position_actions: [{
+    symbol: "600002",
+    name: "实盘旧快照持仓",
+    action: "MANUAL_REVIEW",
+    reason: "holding_signal_unknown",
+    signal_as_of_date: "2026-07-13",
+    active_line: "8.5",
+    entry_hints: ["沿用 2026-07-13", "旧值仅展示，不参与当天决策"],
+  }],
+  real_position_status: "available",
+  real_position_source: {
+    broker_label: "东方财富",
+    snapshot_period: "2026-07-14",
+    source_kind: "live_account",
+    freshness_text: "只读快照",
+    read_only_text: "只读，不自动下单",
+  },
+  audit: {},
+};
+const usReport = {
+  available: true,
+  market: "US",
+  broker: "futu",
+  broker_label: "富途",
+  market_label: "美股",
+  strategy_version: "v14",
+  allocation: {version: 2},
+  report_date: "2026-07-14",
+  data_date: "2026-07-14",
+  generated_at: "2026-07-14T20:00:00+08:00",
+  account_status: "已更新",
+  counts: {sell: 1, buy: 0, hold: 0, review: 0},
+  sell_actions: [{
+    symbol: "US-V2-STALE-SELL",
+    name: "v2旧保护线持仓",
+    action: "SELL_ALL",
+    reason: "protection_line_already_triggered",
+    signal_as_of_date: "2026-07-13",
+    active_line: "8.5",
+    entry_hints: ["沿用 2026-07-13", "旧值仅展示，不参与当天决策"],
+  }],
+  real_position_actions: [],
+  buy_actions: [],
+  real_buy_actions: [],
+  hold_actions: [],
+  review_actions: [],
+  simulate_rotation_pairs: [],
+  real_rotation_pairs: [],
+  plan_availability: {
+    simulated_account: {status: "available", reason: "", executable: true},
+    real_account: {status: "available", reason: "", executable: false},
+  },
+  audit: {},
+};
+console.log(JSON.stringify(
+  renderTrendReportWorkspace(report) + renderTrendReportWorkspace(usReport)
+));
+'''))
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+
+    with playwright_api.sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(channel="chrome", headless=True)
+        except Exception as exc:  # pragma: no cover - local browser availability
+            pytest.skip(f"Chrome is required for dashboard DOM checks: {exc}")
+        page = browser.new_page()
+        page.set_content(f"<style>{css}</style>{rendered}")
+        rows = page.locator(".trend-holding-carried-forward")
+        observed = rows.evaluate_all(
+            """nodes => ({
+              count: nodes.length,
+              text: nodes.map(node => node.textContent.includes("沿用 2026-07-13")
+                && node.textContent.includes("旧值仅展示，不参与当天决策")
+                && node.textContent.includes("8.5")),
+              styles: nodes.map(node => {
+                const cell = node.querySelector("td");
+                const style = getComputedStyle(cell);
+                return {
+                  background: style.backgroundColor,
+                  color: style.color,
+                  borderLeftWidth: style.borderLeftWidth,
+                  borderLeftColor: style.borderLeftColor,
+                };
+              }),
+            })"""
+        )
+        v2_sell = page.locator("tr").filter(has_text="US-V2-STALE-SELL")
+        v2_observed = v2_sell.evaluate(
+            """node => ({
+              carriedForward: node.classList.contains("trend-holding-carried-forward"),
+              warnings: node.textContent.includes("沿用 2026-07-13")
+                && node.textContent.includes("旧值仅展示，不参与当天决策"),
+              protection: node.textContent.includes("8.5"),
+            })"""
+        )
+        v2_count = v2_sell.count()
+        visible_text = page.locator("body").inner_text()
+        browser.close()
+
+    assert (
+        observed,
+        v2_count,
+        v2_observed,
+        "沿用 2026-07-13" in visible_text,
+        "旧值仅展示，不参与当天决策" in visible_text,
+        "8.5" in visible_text,
+    ) == (
+        {
+            "count": 3,
+            "text": [True, True, True],
+            "styles": [
+                {
+                    "background": "rgb(255, 247, 230)",
+                    "color": "rgb(122, 75, 0)",
+                    "borderLeftWidth": "3px",
+                    "borderLeftColor": "rgb(139, 94, 52)",
+                },
+                {
+                    "background": "rgb(255, 247, 230)",
+                    "color": "rgb(122, 75, 0)",
+                    "borderLeftWidth": "3px",
+                    "borderLeftColor": "rgb(139, 94, 52)",
+                },
+                {
+                    "background": "rgb(255, 247, 230)",
+                    "color": "rgb(122, 75, 0)",
+                    "borderLeftWidth": "3px",
+                    "borderLeftColor": "rgb(139, 94, 52)",
+                },
+            ],
+        },
+        1,
+        {
+            "carriedForward": True,
+            "warnings": True,
+            "protection": True,
+        },
+        True,
+        True,
+        True,
+    )
+
+
 def test_dashboard_account_tabs_register_roving_keyboard_and_panel_semantics() -> None:
     output = run_dashboard_js(r'''
 let focused="";

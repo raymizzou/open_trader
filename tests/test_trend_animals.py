@@ -260,6 +260,55 @@ def test_snapshot_cache_normalizes_id_and_field_order(tmp_path: Path) -> None:
     assert second_transport.calls == []
 
 
+def test_snapshots_allow_older_rows_only_when_opted_in_without_caching_mixed_response(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        {"tmId": 7, "tickerSymbol": "600025.SH", "asOfDate": "2026-09-01"},
+        {"tmId": 8, "tickerSymbol": "600026.SH", "asOfDate": "2026-08-31"},
+    ]
+    transport = FakeTransport({"getTickerSnapshot": success(rows)})
+    client = TrendAnimalsClient(
+        api_key="secret-value", cache_dir=tmp_path, transport=transport
+    )
+
+    assert client.get_snapshots(
+        tm_ids=[7, 8],
+        fields=("tmId", "tickerSymbol", "asOfDate"),
+        expected_date="2026-09-01",
+        allow_older=True,
+    ) == rows
+    assert not list((tmp_path / "responses").glob("*.json"))
+    with pytest.raises(TrendAnimalsError, match="returned data for"):
+        client.get_snapshots(
+            tm_ids=[7, 8],
+            fields=("tmId", "tickerSymbol", "asOfDate"),
+            expected_date="2026-09-01",
+        )
+
+    transport.responses["getTickerSnapshot"] = success(
+        [{"tmId": 7, "tickerSymbol": "600025.SH", "asOfDate": "2026-09-02"}]
+    )
+    with pytest.raises(TrendAnimalsError, match="returned data for"):
+        client.get_snapshots(
+            tm_ids=[7],
+            fields=("tmId", "tickerSymbol", "asOfDate"),
+            expected_date="2026-09-01",
+            allow_older=True,
+        )
+
+    transport.responses["getTickerSnapshot"] = success(
+        [{"tmId": 7, "tickerSymbol": "600025.SH", "asOfDate": "20260901"}]
+    )
+    with pytest.raises(TrendAnimalsError, match="returned data for"):
+        client.get_snapshots(
+            tm_ids=[7],
+            fields=("tmId", "tickerSymbol", "asOfDate"),
+            expected_date="2026-09-01",
+            allow_older=True,
+        )
+
+
 def test_snapshots_split_requests_before_the_url_is_too_large(
     tmp_path: Path,
 ) -> None:

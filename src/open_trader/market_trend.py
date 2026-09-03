@@ -34,6 +34,7 @@ from .a_share_trend import (
     _is_systemic_futu_error,
     _json_value,
     _optional_int,
+    _partition_snapshot_rows,
     _process_version,
     _remember_verified_symbol_row,
     _supports_symbol_mapping_contract,
@@ -1394,19 +1395,20 @@ def _attempt_market_report(
                 tm_ids=requested_ids,
                 fields=UNIFIED_TREND_FIELDS,
                 expected_date=as_of_date,
+                allow_older=True,
             )
             if requested_ids
             else []
         )
-        returned_ids = [_row_tm_id(row) for row in snapshot_rows]
-        if (
-            sorted(returned_ids) != requested_ids
-            or len(returned_ids) != len(set(returned_ids))
-        ):
-            raise ValueError("getTickerSnapshot returned mismatched tmIds")
-        if any(row.get("asOfDate") != as_of_date for row in snapshot_rows):
-            raise ValueError("getTickerSnapshot returned a stale data date")
-        rows_by_id = {_row_tm_id(row): row for row in snapshot_rows}
+        current_rows_by_id, older_rows_by_id = _partition_snapshot_rows(
+            snapshot_rows,
+            requested_ids=requested_ids,
+            expected_date=as_of_date,
+            allowed_older_ids=holding_snapshot_ids,
+        )
+        rows_by_id = {**current_rows_by_id, **older_rows_by_id}
+        if not individual_global_ranking:
+            candidate_ids &= set(current_rows_by_id)
         start = (date.fromisoformat(as_of_date) - timedelta(days=90)).isoformat()
         bars_by_symbol: dict[str, object] = {}
         industry_rows: list[Mapping[str, object]] = []

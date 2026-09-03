@@ -2195,6 +2195,189 @@ def test_corrupt_statistics_do_not_weaken_current_market_industry_gate(
     assert mapping_calls[0]["row"]["tickerSymbol"] == wire_symbol
 
 
+@pytest.mark.parametrize("market", ["HK", "US"])
+def test_market_report_generates_with_one_stale_simulated_holding(
+    tmp_path: Path, market: str,
+) -> None:
+    cfg = config(tmp_path)
+    unlock_live_drawdown(cfg.data_dir, market)
+    paths = market_paths(cfg.data_dir, cfg.reports_dir, market)
+    symbol = "00700" if market == "HK" else "VIXY"
+    write_protection_state(
+        paths.state,
+        {
+            "schema_version": 1,
+            "positions": {
+                symbol: {
+                    "initial_line": "9.6",
+                    "active_line": "9.6",
+                    "atr14": "0.2",
+                    "updated_for": "2026-07-14",
+                }
+            },
+        },
+    )
+    as_of_date = "2026-07-15" if market == "HK" else "2026-07-14"
+    execution_date = "2026-07-16" if market == "HK" else "2026-07-15"
+    wire_symbol = "0700.HK" if market == "HK" else "VIXY.US"
+    stale_date = "2026-07-14" if market == "HK" else "2026-07-13"
+
+    def holding_row(tm_id: int) -> dict[str, object]:
+        return {
+            "tmId": tm_id,
+            "tickerName": "旧快照持仓",
+            "tickerSymbol": wire_symbol,
+            "asset": "港股" if market == "HK" else "美股",
+            "asOfDate": stale_date,
+            "tradableFlag": True,
+            "industryName": "科技",
+            "industryTmId": 700001,
+            "priceIndex": "10",
+            "marketCap": "200",
+            "amount1d": "3",
+            "isTrendRightSide": False,
+            "daysSinceTrendEntry": 3,
+            "trendStrengthLocalCurr": "96",
+            "trendTemperaturePrev": "温",
+            "trendTemperatureCurr": "热",
+            "trendPhaseCurr": "立夏",
+            "stopwinFlagByDangerSignal": True,
+            "stopwinFlagByBoilingTemperature": False,
+            "stopwinFlagByPopChampagne": False,
+        }
+
+    class Api:
+        ignored_stale_components: tuple[object, ...] = ()
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_update_status(self) -> list[dict[str, object]]:
+            assets = MARKET_UPDATE_ASSETS[market]
+            return [{"asset": asset, "asOfDate": as_of_date} for asset in assets]
+
+        def get_account_balance(self) -> dict[str, object]:
+            return {"balance": "100"}
+
+        def get_components(
+            self, *, tm_id: int, expected_date: str,
+        ) -> list[dict[str, object]]:
+            return []
+
+        def get_favorites_tickers(self) -> list[dict[str, object]]:
+            return []
+
+        def search_exact_symbol(
+            self, _symbol: str, *, market: str, expected_date: str,
+        ) -> int:
+            assert (market, expected_date) == (self_market, as_of_date)
+            return 2
+
+        def get_snapshot_billing(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "field": field,
+                    "priceCost": "0.071" if field == "tickerName" else "0",
+                }
+                for field in UNIFIED_TREND_FIELDS + A_SHARE_INDUSTRY_FIELDS
+            ]
+
+        def get_snapshots(self, **kwargs: object) -> list[dict[str, object]]:
+            fields = tuple(kwargs["fields"])
+            tm_ids = [int(item) for item in kwargs["tm_ids"]]  # type: ignore[union-attr]
+            expected_date = str(kwargs["expected_date"])
+            if fields == A_SHARE_INDUSTRY_FIELDS:
+                return [
+                    {
+                        "tmId": tm_id,
+                        "asOfDate": expected_date,
+                        "trendTemperatureCurr": "热",
+                    }
+                    for tm_id in tm_ids
+                ]
+            return [holding_row(tm_id) for tm_id in tm_ids]
+
+        def remember_symbol_row(self, **_kwargs: object) -> None:
+            pass
+
+        def symbol_mapping(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    self_market = market
+
+    class Quote:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_trading_days(self, **_kwargs: object) -> list[str]:
+            return [as_of_date, execution_date]
+
+        def get_daily_kline(
+            self, _symbol: str, **_kwargs: object,
+        ) -> list[DailyKlineBar]:
+            end = datetime.fromisoformat(as_of_date)
+            return [
+                DailyKlineBar(
+                    date=(end - timedelta(days=14 - index)).date().isoformat(),
+                    open=10,
+                    high=10.1,
+                    low=9.9,
+                    close=10,
+                    volume=100,
+                )
+                for index in range(15)
+            ]
+
+        def get_lot_sizes(self, symbols: list[str]) -> dict[str, int]:
+            return {item: 100 for item in symbols}
+
+        def close(self) -> None:
+            pass
+
+    notifier = RecordingFeishu()
+    result = run_market_trend_report(
+        config=cfg,
+        market=market,
+        run_date="2026-07-15",
+        notifier=notifier,
+        api_factory=Api,
+        quote_factory=Quote,
+        account_factory=simulation_account_with_positions(f"{market}.{symbol}"),
+    )
+
+    assert result.report_path is not None
+    assert result.json_path is not None
+    markdown = result.report_path.read_text(encoding="utf-8")
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    decision = payload["strategy_judgments"]["holding_decisions"][0]
+    delivered = "\n".join(message for _, message in notifier.messages)
+    assert (
+        result.status,
+        decision["action"],
+        decision["reason"],
+        decision["signal_as_of_date"],
+        decision["active_line"],
+        payload["strategy_judgments"]["formal_actions"],
+        all(
+            text in artifact
+            for artifact in (markdown, delivered)
+            for text in (
+                f"沿用 {stale_date}",
+                "旧值仅展示，不参与当天决策",
+                "9.6",
+            )
+        ),
+    ) == (
+        "generated",
+        "MANUAL_REVIEW",
+        "holding_signal_unknown",
+        stale_date,
+        "9.6",
+        [],
+        True,
+    )
+
+
 @pytest.mark.parametrize(
     ("lookup_fails", "returned_symbol"),
     [
@@ -3353,7 +3536,12 @@ def test_allocation_market_runner_ledger_excludes_real_only_candidates(
             ]
 
         def get_snapshots(
-            self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str,
+            self,
+            *,
+            tm_ids: list[int],
+            fields: tuple[str, ...],
+            expected_date: str,
+            allow_older: bool = False,
         ) -> list[dict[str, object]]:
             api_expected_dates.append(expected_date)
             if fields == INDUSTRY_MEMBER_FIELDS:

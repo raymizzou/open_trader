@@ -17,6 +17,8 @@
   --on-primary: #ffffff;
   --panel-soft: var(--surface-soft);
   --warning: var(--accent);
+  --warning-surface: #fff7e6;
+  --warning-text: #7a4b00;
   --trend-hold: #b7791f;
   --trend-info: #39738d;
 }
@@ -3178,6 +3180,15 @@ table {
 
 .cn-trend-table .cn-trend-card.trend-holding-blacklisted td {
   background: var(--surface-soft);
+}
+
+.cn-trend-table .cn-trend-card.trend-holding-carried-forward td {
+  background: var(--warning-surface);
+  color: var(--warning-text);
+}
+
+.cn-trend-table .cn-trend-card.trend-holding-carried-forward td:first-child {
+  border-left: 3px solid var(--warning);
 }
 
 .trend-discipline {

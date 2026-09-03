@@ -5,7 +5,7 @@ import json
 import re
 import subprocess
 from collections import Counter, defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
@@ -3083,6 +3083,7 @@ class HoldingDecision:
     active_line: Decimal | None
     atr: Decimal | None
     historical: bool
+    signal_as_of_date: str | None = None
     close: Decimal | None = None
     temperature_prev: str | None = None
     temperature_curr: str | None = None
@@ -3619,15 +3620,15 @@ def enrich_real_holding_input(
                 tm_ids=real_only_ids,
                 fields=UNIFIED_TREND_FIELDS,
                 expected_date=as_of_date,
+                allow_older=True,
             )
-            response_ids = [_row_tm_id(row) for row in response]
-            if (
-                len(response_ids) != len(set(response_ids))
-                or sorted(response_ids) != real_only_ids
-                or any(row.get("asOfDate") != as_of_date for row in response)
-            ):
-                raise ValueError("真实持仓快照日期或 tmId 不一致")
-            real_rows = {_row_tm_id(row): row for row in response}
+            current_rows, older_rows = _partition_snapshot_rows(
+                response,
+                requested_ids=real_only_ids,
+                expected_date=as_of_date,
+                allowed_older_ids=real_only_ids,
+            )
+            real_rows = {**current_rows, **older_rows}
         except Exception as exc:
             degraded = replace(
                 real_input,
@@ -6523,6 +6524,42 @@ def _holding_entry_hints(snapshot: HoldingSnapshot | None) -> tuple[str, ...]:
     return tuple(hints)
 
 
+def _is_carried_forward_signal(
+    signal_as_of_date: object, as_of_date: object
+) -> bool:
+    if not isinstance(signal_as_of_date, str) or not isinstance(as_of_date, str):
+        return False
+    try:
+        signal_day = date.fromisoformat(signal_as_of_date)
+        target_day = date.fromisoformat(as_of_date)
+    except (TypeError, ValueError):
+        return False
+    return (
+        signal_day.isoformat() == signal_as_of_date
+        and target_day.isoformat() == as_of_date
+        and signal_day < target_day
+    )
+
+
+def _holding_display_hints(
+    snapshot: HoldingSnapshot | None,
+    *,
+    as_of_date: str,
+    include_entry_hints: bool = True,
+) -> tuple[str, ...]:
+    hints = list(_holding_entry_hints(snapshot)) if include_entry_hints else []
+    if snapshot is not None and _is_carried_forward_signal(
+        snapshot.as_of_date, as_of_date
+    ):
+        hints.extend(
+            (
+                f"沿用 {snapshot.as_of_date}",
+                "旧值仅展示，不参与当天决策",
+            )
+        )
+    return tuple(hints)
+
+
 def _protection_was_triggered(
     symbol: str,
     old_state: Mapping[str, object],
@@ -6635,12 +6672,13 @@ def _evaluate_holding_positions(
     for position in positions:
         symbol = position.symbol
         returned_snapshot = holding_snapshots.get(symbol)
-        snapshot = (
+        decision_snapshot = (
             returned_snapshot
             if returned_snapshot is not None
             and returned_snapshot.as_of_date == as_of_date
             else None
         )
+        display_snapshot = returned_snapshot
         old = old_positions.get(symbol)
         old_state = old if isinstance(old, Mapping) else {}
         state_started_for = old_state.get("position_started_for")
@@ -6660,7 +6698,7 @@ def _evaluate_holding_positions(
         )
         action, reason = _holding_action(
             symbol=symbol,
-            snapshot=snapshot,
+            snapshot=decision_snapshot,
             triggered=triggered,
             market=market,
             overheat_trim_terminal=overheat_trim_terminal,
@@ -6670,8 +6708,8 @@ def _evaluate_holding_positions(
         active_line = _state_decimal(old_state, "active_line")
         old_atr = _state_decimal(old_state, "atr14")
         tracking_active = old_state.get("tracking_active") is True
-        if not current_exit_discipline and snapshot is not None and (
-            snapshot.boiling is True or snapshot.champagne is True
+        if not current_exit_discipline and decision_snapshot is not None and (
+            decision_snapshot.boiling is True or decision_snapshot.champagne is True
         ):
             tracking_active = True
         if current_exit_discipline:
@@ -6682,19 +6720,19 @@ def _evaluate_holding_positions(
             daily_bars, before=as_of_date, expected_date=as_of_date
         )
         stale_kline = bool(daily_bars) and daily_bars[-1].date != as_of_date
-        signal_complete = snapshot is not None and all(
+        signal_complete = decision_snapshot is not None and all(
             value is not None
             for value in (
-                snapshot.right_side,
-                snapshot.danger,
-                snapshot.boiling,
-                snapshot.champagne,
+                decision_snapshot.right_side,
+                decision_snapshot.danger,
+                decision_snapshot.boiling,
+                decision_snapshot.champagne,
             )
         ) and (
             market != "CN"
             or (
-                snapshot.temperature_prev in KNOWN_TEMPERATURES
-                and snapshot.temperature_curr in KNOWN_TEMPERATURES
+                decision_snapshot.temperature_prev in KNOWN_TEMPERATURES
+                and decision_snapshot.temperature_curr in KNOWN_TEMPERATURES
             )
         )
         can_build_line = (
@@ -6771,21 +6809,21 @@ def _evaluate_holding_positions(
                 overheat_signals = tuple(
                     signal
                     for signal in OVERHEAT_TRIM_SIGNALS
-                    if getattr(snapshot, signal) is True
+                    if getattr(decision_snapshot, signal) is True
                 )
-                signal_unknown = snapshot is None or any(
+                signal_unknown = decision_snapshot is None or any(
                     signal is None
                     for signal in (
-                        snapshot.right_side,
-                        snapshot.danger,
-                        snapshot.boiling,
-                        snapshot.champagne,
+                        decision_snapshot.right_side,
+                        decision_snapshot.danger,
+                        decision_snapshot.boiling,
+                        decision_snapshot.champagne,
                     )
                 ) or (
                     market == "CN"
                     and (
-                        snapshot.temperature_prev not in KNOWN_TEMPERATURES
-                        or snapshot.temperature_curr not in KNOWN_TEMPERATURES
+                        decision_snapshot.temperature_prev not in KNOWN_TEMPERATURES
+                        or decision_snapshot.temperature_curr not in KNOWN_TEMPERATURES
                     )
                 )
                 kline_unavailable = (
@@ -6802,7 +6840,7 @@ def _evaluate_holding_positions(
                     )
                     if present
                 )
-        industry = snapshot.industry if snapshot else ""
+        industry = display_snapshot.industry if display_snapshot else ""
         if industry:
             industries[industry] += 1
             industry_values[industry] += position.market_value
@@ -6816,13 +6854,22 @@ def _evaluate_holding_positions(
                 initial_line=initial_line,
                 active_line=active_line,
                 atr=effective_atr,
+                signal_as_of_date=(
+                    display_snapshot.as_of_date if display_snapshot else None
+                ),
                 close=close,
-                temperature_prev=snapshot.temperature_prev if snapshot else None,
-                temperature_curr=snapshot.temperature_curr if snapshot else None,
-                strength=snapshot.strength if snapshot else None,
-                phase=snapshot.phase if snapshot else None,
-                entry_hints=(
-                    _holding_entry_hints(snapshot) if market == "CN" else ()
+                temperature_prev=(
+                    display_snapshot.temperature_prev if display_snapshot else None
+                ),
+                temperature_curr=(
+                    display_snapshot.temperature_curr if display_snapshot else None
+                ),
+                strength=display_snapshot.strength if display_snapshot else None,
+                phase=display_snapshot.phase if display_snapshot else None,
+                entry_hints=_holding_display_hints(
+                    display_snapshot,
+                    as_of_date=as_of_date,
+                    include_entry_hints=market == "CN",
                 ),
                 historical=historical,
                 position_started_for=(
@@ -8151,7 +8198,9 @@ def _append_feishu_action_sections(
     reviews: Sequence[Mapping[str, object]],
     *,
     market: str,
+    as_of_date: str,
     current_exit_discipline: bool = False,
+    review_heading: str = "人工复核",
 ) -> None:
     if sells:
         lines.extend(["", "卖出"])
@@ -8187,6 +8236,12 @@ def _append_feishu_action_sections(
                 line += f"｜{_action_label('SELL_ALL')}"
             if item.get("active_line") not in {None, ""}:
                 line += f"｜保护线 {_feishu_money(item['active_line'])}"
+            if _is_carried_forward_signal(item.get("signal_as_of_date"), as_of_date):
+                hints = item.get("entry_hints")
+                if isinstance(hints, Sequence) and not isinstance(hints, (str, bytes)):
+                    values = [str(value) for value in hints if str(value).strip()]
+                    if values:
+                        line += f"｜持仓提示 {'；'.join(values)}"
             lines.append(line)
     if buys:
         lines.extend(["", "买入"])
@@ -8203,12 +8258,21 @@ def _append_feishu_action_sections(
                 )
             )
     if reviews:
-        lines.extend(["", "人工复核"])
-        lines.extend(
-            f"{index}. {_feishu_identity(item)}｜"
-            f"{_feishu_reason(item, current_exit_discipline=current_exit_discipline)}"
-            for index, item in enumerate(reviews, 1)
-        )
+        lines.extend(["", review_heading])
+        for index, item in enumerate(reviews, 1):
+            line = (
+                f"{index}. {_feishu_identity(item)}｜"
+                f"{_feishu_reason(item, current_exit_discipline=current_exit_discipline)}"
+            )
+            if item.get("active_line") not in {None, ""}:
+                line += f"｜保护线 {_feishu_money(item['active_line'])}"
+            if _is_carried_forward_signal(item.get("signal_as_of_date"), as_of_date):
+                hints = item.get("entry_hints")
+                if isinstance(hints, Sequence) and not isinstance(hints, (str, bytes)):
+                    values = [str(value) for value in hints if str(value).strip()]
+                    if values:
+                        line += f"｜持仓提示 {'；'.join(values)}"
+            lines.append(line)
 
 
 def _serialized_api_cost_label(payload: Mapping[str, object]) -> str | None:
@@ -8262,6 +8326,11 @@ def render_trend_feishu_text(
         for item in judgments.get("holding_decisions", [])
         if isinstance(item, dict)
     ]
+    real_holdings = [
+        item
+        for item in judgments.get("real_holding_decisions", [])
+        if isinstance(item, dict)
+    ]
     formal = [
         item
         for item in judgments.get("formal_actions", [])
@@ -8296,6 +8365,12 @@ def render_trend_feishu_text(
     for item in formal + holdings:
         if _trend_action_needs_review(item) and item not in reviews:
             reviews.append(item)
+    real_reviews = [
+        item
+        for item in real_holdings
+        if item.get("action") == "MANUAL_REVIEW"
+        and _is_carried_forward_signal(item.get("signal_as_of_date"), as_of_date)
+    ]
     title = render_daily_title(broker_label, market_label, execution_date)
     status = (
         "已更新"
@@ -8329,6 +8404,7 @@ def render_trend_feishu_text(
         (),
         (),
         market=market,
+        as_of_date=as_of_date,
         current_exit_discipline=current_exit_discipline,
     )
     if allocation is not None:
@@ -8397,7 +8473,18 @@ def render_trend_feishu_text(
         buys,
         reviews,
         market=market,
+        as_of_date=as_of_date,
         current_exit_discipline=current_exit_discipline,
+    )
+    _append_feishu_action_sections(
+        lines,
+        (),
+        (),
+        real_reviews,
+        market=market,
+        as_of_date=as_of_date,
+        current_exit_discipline=current_exit_discipline,
+        review_heading="实盘持仓人工复核",
     )
     lines.extend(["", "请人工确认，不自动下单。"])
     return title, "\n".join(lines)
@@ -8782,6 +8869,10 @@ def render_markdown(report: TrendReport) -> str:
                     line += f"｜提示 {'、'.join(warnings)}"
             if item.active_line is not None:
                 line += f"｜活动保护线 {_money(item.active_line)}"
+            if item.entry_hints and _is_carried_forward_signal(
+                item.signal_as_of_date, report.as_of_date
+            ):
+                line += f"｜持仓提示 {'；'.join(item.entry_hints)}"
             lines.append(line)
     else:
         lines.append("- 无需卖出。")
@@ -8905,11 +8996,33 @@ def render_markdown(report: TrendReport) -> str:
                 f"｜温度 {item.temperature_prev or '未知'}→{item.temperature_curr or '未知'}"
                 f"｜强度 {item.strength if item.strength is not None else '不可用'}"
             )
-            if item.entry_hints:
-                line += f"｜持仓提示 {'；'.join(item.entry_hints)}"
+        if item.entry_hints:
+            line += f"｜持仓提示 {'；'.join(item.entry_hints)}"
         lines.append(line)
     if not holds and not reviews and not others:
         lines.append("- 无。")
+
+    real_reviews = [
+        item
+        for item in report.real_holdings
+        if item.action == "MANUAL_REVIEW"
+        and _is_carried_forward_signal(item.signal_as_of_date, report.as_of_date)
+    ]
+    if real_reviews:
+        lines.extend(["", "## 实盘持仓人工复核", ""])
+        for item in real_reviews:
+            reason = _holding_reason_label(
+                asdict(item), current_exit_discipline=current_exit_discipline
+            )
+            line = (
+                f"- {item.symbol} {item.name}｜{_action_label(item.action)}｜"
+                f"{reason}"
+            )
+            if item.active_line is not None:
+                line += f"｜活动保护线 {_money(item.active_line)}"
+            if item.entry_hints:
+                line += f"｜持仓提示 {'；'.join(item.entry_hints)}"
+            lines.append(line)
 
     lines.extend(["", "## 中文附录", "", "### 前 10 名候选", ""])
     if report.candidates:
@@ -11399,6 +11512,56 @@ def _merge_exact_snapshot_stage(
         rows_by_id.setdefault(_row_tm_id(row), {}).update(row)
 
 
+def _partition_snapshot_rows(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    requested_ids: Sequence[int],
+    expected_date: str,
+    allowed_older_ids: Collection[int] = (),
+) -> tuple[dict[int, Mapping[str, object]], dict[int, Mapping[str, object]]]:
+    returned_ids = [_row_tm_id(row) for row in rows]
+    if (
+        len(returned_ids) != len(set(returned_ids))
+        or sorted(returned_ids) != sorted(requested_ids)
+    ):
+        raise TrendAnimalsError("getTickerSnapshot returned mismatched tmIds")
+    try:
+        expected_day = date.fromisoformat(expected_date)
+    except ValueError:
+        raise TrendAnimalsError("getTickerSnapshot expected date is invalid") from None
+    if expected_day.isoformat() != expected_date:
+        raise TrendAnimalsError("getTickerSnapshot expected date is noncanonical")
+    current: dict[int, Mapping[str, object]] = {}
+    older: dict[int, Mapping[str, object]] = {}
+    for row in rows:
+        tm_id = _row_tm_id(row)
+        actual_date = row.get("asOfDate")
+        if actual_date == expected_date:
+            current[tm_id] = row
+            continue
+        try:
+            actual_day = (
+                date.fromisoformat(actual_date)
+                if isinstance(actual_date, str)
+                else None
+            )
+        except ValueError:
+            actual_day = None
+        if (
+            tm_id in allowed_older_ids
+            and actual_day is not None
+            and actual_day.isoformat() == actual_date
+            and actual_day < expected_day
+        ):
+            older[tm_id] = row
+            continue
+        raise TrendAnimalsError(
+            f"getTickerSnapshot returned data for {actual_date!r}; "
+            f"expected {expected_date}"
+        )
+    return current, older
+
+
 def _holding_industry_ids(holding_snapshots: object) -> set[int]:
     result: set[int] = set()
     if isinstance(holding_snapshots, Mapping):
@@ -11732,21 +11895,23 @@ def _attempt_report(
                 tm_ids=requested_ids,
                 fields=fields,
                 expected_date=run_date,
+                allow_older=True,
             )
             if requested_ids
             else []
         )
-        returned_ids = [_row_tm_id(row) for row in snapshot_rows]
-        if len(returned_ids) != len(set(returned_ids)) or sorted(
-            returned_ids
-        ) != requested_ids:
-            raise TrendAnimalsError("getTickerSnapshot returned mismatched tmIds")
-        if any(row.get("asOfDate") != run_date for row in snapshot_rows):
-            raise TrendAnimalsError("getTickerSnapshot returned a stale data date")
+        current_rows_by_tm_id, older_rows_by_tm_id = _partition_snapshot_rows(
+            snapshot_rows,
+            requested_ids=requested_ids,
+            expected_date=run_date,
+            allowed_older_ids=holding_snapshot_ids,
+        )
         holding_snapshots: dict[str, HoldingSnapshot | None] = {
             position.symbol: None for position in account.positions
         }
-        rows_by_tm_id = {_row_tm_id(row): row for row in snapshot_rows}
+        rows_by_tm_id = {**current_rows_by_tm_id, **older_rows_by_tm_id}
+        if not individual_global_ranking:
+            candidate_ids &= set(current_rows_by_tm_id)
         kline_start = (run_day - timedelta(days=90)).isoformat()
         bars_by_symbol: dict[str, Sequence[DailyKlineBar] | None] = {}
         industry_rows: list[Mapping[str, object]] = []

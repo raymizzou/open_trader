@@ -9955,19 +9955,225 @@ def test_unknown_holding_signal_keeps_exact_precedence_without_kline() -> None:
 
 
 def test_stale_holding_snapshot_is_an_unknown_signal() -> None:
+    stale = replace(
+        holding(
+            "600001",
+            right_side=False,
+            danger=True,
+            temperature_prev="温",
+            temperature_curr="热",
+            strength="94",
+            phase="大暑",
+            industry="银行",
+            industry_temperature="凉",
+            market_cap="99",
+        ),
+        as_of_date="2026-07-13",
+    )
     built = build_report(
         as_of_date="2026-07-14",
         execution_date="2026-07-15",
         account=account("600001"),
         candidates=(),
-        holding_snapshots={
-            "600001": replace(holding("600001"), as_of_date="2026-07-13")
-        },
+        holding_snapshots={"600001": stale},
         bars_by_symbol={"600001": bars()},
+        prior_state={
+            "schema_version": 1,
+            "positions": {
+                "600001": {
+                    "initial_line": "8",
+                    "active_line": "8.5",
+                    "atr14": "1",
+                    "updated_for": "2026-07-13",
+                }
+            },
+        },
     )
-    assert (built.holdings[0].action, built.holdings[0].reason) == (
+    decision = built.holdings[0]
+    assert (decision.action, decision.reason) == (
         "MANUAL_REVIEW",
         "holding_signal_unknown",
+    )
+    assert (
+        decision.signal_as_of_date,
+        decision.temperature_prev,
+        decision.temperature_curr,
+        decision.strength,
+        decision.phase,
+        decision.industry,
+        decision.active_line,
+        decision.entry_hints,
+        built.signal_snapshots["holdings"]["600001"]["right_side"],
+        built.signal_snapshots["holdings"]["600001"]["danger"],
+    ) == (
+        "2026-07-13",
+        "温",
+        "热",
+        Decimal("94"),
+        "大暑",
+        "银行",
+        Decimal("8.5"),
+        (
+            "强度 94，低于入场线 95",
+            "行业温度为凉，未达到温、热或沸",
+            "节气已到大暑",
+            "市值 99 亿元，低于入场线 100",
+            "沿用 2026-07-13",
+            "旧值仅展示，不参与当天决策",
+        ),
+        False,
+        True,
+    )
+    assert built.buy_actions == ()
+
+
+def test_stale_holding_with_pending_protection_event_keeps_durable_sell(
+    tmp_path: Path,
+) -> None:
+    stale = replace(holding("600001"), as_of_date="2026-07-13")
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": stale},
+        bars_by_symbol={"600001": bars()},
+        prior_state={
+            "schema_version": 1,
+            "positions": {
+                "600001": {
+                    "initial_line": "8",
+                    "active_line": "8.5",
+                    "atr14": "1",
+                    "position_started_for": "2026-07-01",
+                    "updated_for": "2026-07-13",
+                }
+            },
+        },
+        watch_events=(
+            {
+                "symbol": "600001",
+                "event_type": "protection_triggered",
+                "trading_date": "2026-07-14",
+            },
+        ),
+    )
+    markdown_path, json_path = write_frozen_report(built, tmp_path)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    markdown = markdown_path.read_text(encoding="utf-8")
+    _, feishu = render_trend_feishu_text(
+        payload,
+        broker_label="富途",
+        market_label="A股",
+    )
+    decision = payload["strategy_judgments"]["holding_decisions"][0]
+    formal = payload["strategy_judgments"]["formal_actions"]
+
+    assert (
+        (decision["action"], decision["reason"]),
+        [(item["action"], item["reason"]) for item in formal],
+        decision["signal_as_of_date"],
+        decision["active_line"],
+        all(
+            text in document
+            for document in (markdown, feishu)
+            for text in (
+                "沿用 2026-07-13",
+                "旧值仅展示，不参与当天决策",
+                "8.5",
+            )
+        ),
+    ) == (
+        ("SELL_ALL", "protection_line_already_triggered"),
+        [("SELL_ALL", "protection_line_already_triggered")],
+        "2026-07-13",
+        "8.5",
+        True,
+    )
+
+
+def test_report_runner_generates_with_one_stale_simulated_holding(
+    tmp_path: Path,
+) -> None:
+    config = trend_config(tmp_path)
+    unlock_live_drawdown(config.data_dir)
+    write_protection_state(
+        config.data_dir / "trend_a_share/protection_state.json",
+        {
+            "schema_version": 1,
+            "positions": {
+                "600001": {
+                    "initial_line": "8",
+                    "active_line": "8.5",
+                    "atr14": "1",
+                    "updated_for": "2026-07-13",
+                }
+            },
+        },
+    )
+    api = ReadyApi(
+        [],
+        snapshot_overrides={
+            600001: {
+                "asOfDate": "2026-07-13",
+                "isTrendRightSide": False,
+                "stopwinFlagByDangerSignal": True,
+                "tickerName": "旧快照股票",
+                "industryName": "银行",
+                "trendTemperaturePrev": "温",
+                "trendTemperatureCurr": "热",
+                "trendStrengthLocalCurr": "94",
+                "trendPhaseCurr": "大暑",
+            }
+        },
+    )
+    result = run_a_share_trend_report(
+        config=config,
+        run_date="2026-07-14",
+        api_factory=lambda **kwargs: api,
+        quote_factory=lambda **kwargs: ReadyQuote([]),
+        account_factory=simulation_account_with_positions("SH.600001"),
+        notifier=RecordingFeishu(),
+    )
+
+    assert result.status == "generated"
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    stale = next(
+        item
+        for item in payload["strategy_judgments"]["holding_decisions"]
+        if item["symbol"] == "600001"
+    )
+    assert (
+        stale["action"],
+        stale["reason"],
+        stale["signal_as_of_date"],
+        stale["temperature_prev"],
+        stale["temperature_curr"],
+        stale["strength"],
+        stale["phase"],
+        stale["industry"],
+        stale["active_line"],
+        stale["entry_hints"][-2:],
+    ) == (
+        "MANUAL_REVIEW",
+        "holding_signal_unknown",
+        "2026-07-13",
+        "温",
+        "热",
+        "94",
+        "大暑",
+        "银行",
+        "8.5",
+        ["沿用 2026-07-13", "旧值仅展示，不参与当天决策"],
+    )
+    assert all(
+        item["action"] != "SELL_ALL" and item["action"] != "SELL_PARTIAL"
+        for item in payload["strategy_judgments"]["formal_actions"]
+        if item["symbol"] == "600001"
+    )
+    assert all(
+        item["as_of_date"] == "2026-07-14"
+        for item in payload["signal_snapshots"]["candidates"]
     )
 
 
@@ -10192,6 +10398,331 @@ def test_real_missing_signal_does_not_invent_a_protection_line() -> None:
     )
     assert built.real_holdings[0].active_line is None
     assert built.real_protection_state["positions"]["600001"].get("active_line") is None
+
+
+def test_stale_real_only_holding_keeps_real_tab_available() -> None:
+    stale_row = {
+        "tmId": 2,
+        "tickerName": "旧真实持仓",
+        "tickerSymbol": "600002.SH",
+        "asset": "A股",
+        "asOfDate": "2026-07-13",
+        "isTrendRightSide": True,
+        "stopwinFlagByDangerSignal": False,
+        "stopwinFlagByBoilingTemperature": False,
+        "stopwinFlagByPopChampagne": False,
+        "industryName": "银行",
+        "industryTmId": 700001,
+        "trendTemperaturePrev": "温",
+        "trendTemperatureCurr": "热",
+        "trendStrengthLocalCurr": "96",
+        "trendPhaseCurr": "立夏",
+    }
+
+    class Api:
+        def search_exact_symbol(
+            self, _symbol: str, *, market: str, expected_date: str,
+        ) -> int:
+            assert (market, expected_date) == ("CN", "2026-07-14")
+            return 2
+
+        def get_snapshots(self, **_kwargs: object) -> list[dict[str, object]]:
+            return [stale_row]
+
+    class Quote:
+        def get_daily_kline(
+            self, _symbol: str, *, start: str, end: str,
+        ) -> list[DailyKlineBar]:
+            return bars(end_date=end)
+
+    position = AccountPosition(
+        "600002", "真实持仓", "stock", Decimal("100"), Decimal("10"), Decimal("1000")
+    )
+    real_input = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "eastmoney"},
+        positions=(position,),
+        holding_snapshots={},
+        bars_by_symbol={},
+        prior_state={
+            "schema_version": 1,
+            "positions": {
+                "600002": {
+                    "initial_line": "8",
+                    "active_line": "8.5",
+                    "atr14": "1",
+                    "updated_for": "2026-07-13",
+                }
+            },
+        },
+    )
+
+    enriched, rows, _, _ = trend_module.enrich_real_holding_input(
+        real_input,
+        api=Api(),
+        quote=Quote(),
+        market="CN",
+        as_of_date="2026-07-14",
+        kline_start="2026-04-16",
+        existing_holding_ids={},
+        existing_rows_by_tm_id={},
+        existing_holding_snapshots={},
+        existing_bars_by_symbol={},
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        real_holdings=enriched,
+    )
+    decision = built.real_holdings[0] if built.real_holdings else None
+
+    assert (
+        enriched.status,
+        rows,
+        built.real_holdings_status,
+        decision.action if decision is not None else None,
+        decision.reason if decision is not None else None,
+    ) == (
+        "available",
+        {2: stale_row},
+        "available",
+        "MANUAL_REVIEW",
+        "holding_signal_unknown",
+    )
+
+
+def test_stale_real_holding_warnings_render_in_feishu_and_markdown(
+    tmp_path: Path,
+) -> None:
+    stale = replace(holding("600002"), as_of_date="2026-07-13")
+    real = RealHoldingInput(
+        status="available",
+        reason="",
+        source={"broker": "eastmoney"},
+        positions=(
+            AccountPosition(
+                "600002",
+                "真实持仓",
+                "stock",
+                Decimal("100"),
+                Decimal("9.5"),
+                Decimal("1000"),
+            ),
+        ),
+        holding_snapshots={"600002": stale},
+        bars_by_symbol={"600002": bars()},
+        prior_state={
+            "schema_version": 1,
+            "positions": {
+                "600002": {
+                    "initial_line": "8",
+                    "active_line": "8.5",
+                    "atr14": "1",
+                    "position_started_for": "2026-07-01",
+                    "updated_for": "2026-07-13",
+                }
+            },
+        },
+        net_value=Decimal("100000"),
+        available_cash=Decimal("50000"),
+        position_count=1,
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account(),
+        candidates=(),
+        holding_snapshots={},
+        bars_by_symbol={},
+        real_holdings=real,
+    )
+    markdown_path, json_path = write_frozen_report(built, tmp_path)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    markdown = markdown_path.read_text(encoding="utf-8")
+    _, feishu = render_trend_feishu_text(
+        payload,
+        broker_label="东方财富",
+        market_label="A股",
+    )
+    decision = payload["strategy_judgments"]["real_holding_decisions"][0]
+    simulated_symbols = {
+        item["symbol"] for item in payload["strategy_judgments"]["holding_decisions"]
+    }
+    formal_symbols = {
+        item["symbol"] for item in payload["strategy_judgments"]["formal_actions"]
+    }
+
+    assert (
+        (decision["action"], decision["reason"]),
+        "600002" not in simulated_symbols,
+        "600002" not in formal_symbols,
+        "实盘持仓人工复核" in markdown,
+        "实盘持仓人工复核" in feishu,
+        all(
+            text in artifact
+            for artifact in (markdown, feishu)
+            for text in (
+                "沿用 2026-07-13",
+                "旧值仅展示，不参与当天决策",
+                "8.5",
+            )
+        ),
+    ) == (
+        ("MANUAL_REVIEW", "holding_signal_unknown"),
+        True,
+        True,
+        True,
+        True,
+        True,
+    )
+
+
+def test_carried_forward_warning_sections_do_not_expand_to_current_holdings(
+    tmp_path: Path,
+) -> None:
+    current_sell = holding("600001", right_side=False, strength="94")
+    current_review = holding("600002", right_side=None, strength="94")
+    prior_state = {
+        "schema_version": 1,
+        "positions": {
+            "600001": {
+                "initial_line": "8",
+                "active_line": "8.5",
+                "atr14": "1",
+                "position_started_for": "2026-07-01",
+                "updated_for": "2026-07-14",
+            },
+            "600002": {
+                "initial_line": "8",
+                "active_line": "8.5",
+                "atr14": "1",
+                "position_started_for": "2026-07-01",
+                "updated_for": "2026-07-14",
+            },
+        },
+    }
+    real = RealHoldingInput(
+        status="available",
+        reason="",
+        source={
+            "broker": "eastmoney",
+            "broker_label": "东方财富",
+            "snapshot_period": "2026-07-14",
+            "source_kind": "statement",
+            "freshness_text": "非实时",
+            "read_only_text": "只读，不自动下单",
+        },
+        positions=(
+            AccountPosition(
+                "600002",
+                "真实持仓",
+                "stock",
+                Decimal("100"),
+                Decimal("9.5"),
+                Decimal("1000"),
+            ),
+        ),
+        holding_snapshots={"600002": current_review},
+        bars_by_symbol={"600002": bars()},
+        prior_state=prior_state,
+        net_value=Decimal("100000"),
+        available_cash=Decimal("50000"),
+        position_count=1,
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": current_sell},
+        bars_by_symbol={"600001": bars()},
+        prior_state=prior_state,
+        real_holdings=real,
+    )
+    markdown_path, json_path = write_frozen_report(built, tmp_path)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    markdown = markdown_path.read_text(encoding="utf-8")
+    _, feishu = render_trend_feishu_text(
+        payload,
+        broker_label="东方财富",
+        market_label="A股",
+    )
+    sell_line = next(
+        line for line in markdown.splitlines() if line.startswith("- 600001 ")
+    )
+    feishu_sell_line = next(
+        line for line in feishu.splitlines() if line.startswith("1. 600001 ")
+    )
+
+    assert (
+        "活动保护线 8.50" in sell_line,
+        "持仓提示" not in sell_line,
+        "保护线 8.5" in feishu_sell_line,
+        "持仓提示" not in feishu_sell_line,
+        all(
+            text not in artifact
+            for artifact in (markdown, feishu)
+            for text in ("沿用 2026-07-13", "旧值仅展示，不参与当天决策")
+        ),
+        "实盘持仓人工复核" not in markdown,
+        "实盘持仓人工复核" not in feishu,
+        "600002" not in markdown,
+        "600002" not in feishu,
+    ) == (True, True, True, True, True, True, True, True, True)
+
+
+def test_feishu_review_labels_carried_forward_holding_snapshot() -> None:
+    stale = replace(
+        holding(
+            "600001",
+            right_side=False,
+            danger=True,
+            temperature_prev="温",
+            temperature_curr="热",
+            strength="94",
+            phase="大暑",
+            industry="银行",
+            industry_temperature="凉",
+            market_cap="99",
+        ),
+        as_of_date="2026-07-13",
+    )
+    built = build_report(
+        as_of_date="2026-07-14",
+        execution_date="2026-07-15",
+        account=account("600001"),
+        candidates=(),
+        holding_snapshots={"600001": stale},
+        bars_by_symbol={"600001": bars()},
+        prior_state={
+            "schema_version": 1,
+            "positions": {
+                "600001": {
+                    "initial_line": "8",
+                    "active_line": "8.5",
+                    "atr14": "1",
+                    "updated_for": "2026-07-13",
+                }
+            },
+        },
+    )
+    _, message = render_trend_feishu_text(
+        trend_module._report_payload(built),
+        broker_label="富途",
+        market_label="A股",
+    )
+
+    assert (
+        "人工复核" in message,
+        "沿用 2026-07-13" in message,
+        "旧值仅展示，不参与当天决策" in message,
+        "保护线 8.5" in message,
+    ) == (True, True, True, True)
 
 
 def test_real_symbol_misses_are_per_position_and_agrz_skips_trend_lookup() -> None:
@@ -12586,7 +13117,14 @@ class ReadyApi:
             for field in catalog_fields
         ]
 
-    def get_snapshots(self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str) -> list[dict[str, object]]:
+    def get_snapshots(
+        self,
+        *,
+        tm_ids: list[int],
+        fields: tuple[str, ...],
+        expected_date: str,
+        allow_older: bool = False,
+    ) -> list[dict[str, object]]:
         self.calls.append("api.snapshots")
         self.snapshot_requests.append((tm_ids, fields))
         if fields == A_SHARE_INDUSTRY_FIELDS:
@@ -13521,7 +14059,12 @@ def test_current_cn_runner_ledger_excludes_real_only_candidates(
             ]
 
         def get_snapshots(
-            self, *, tm_ids: list[int], fields: tuple[str, ...], expected_date: str,
+            self,
+            *,
+            tm_ids: list[int],
+            fields: tuple[str, ...],
+            expected_date: str,
+            allow_older: bool = False,
         ) -> list[dict[str, object]]:
             if fields == trend_module.INDUSTRY_MEMBER_FIELDS:
                 industry_member_snapshot_calls.append(list(tm_ids))
@@ -15847,9 +16390,13 @@ def test_report_runner_freezes_simulated_buy_plan_in_report_evidence(
             tm_ids: list[int],
             fields: tuple[str, ...],
             expected_date: str,
+            allow_older: bool = False,
         ) -> list[dict[str, object]]:
             rows = super().get_snapshots(
-                tm_ids=tm_ids, fields=fields, expected_date=expected_date
+                tm_ids=tm_ids,
+                fields=fields,
+                expected_date=expected_date,
+                allow_older=allow_older,
             )
             if "trendStrengthGlobalCurr" in fields:
                 for row in rows:

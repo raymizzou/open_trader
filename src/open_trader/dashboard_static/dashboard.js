@@ -5385,7 +5385,8 @@ function trendV2PlanSellRows(items, pairs, report) {
       ...((Array.isArray(item.entry_hints) ? item.entry_hints : []).map(formatPlain)),
       ...(overlap || item.clearance_note === "同时符合轮换清仓" ? ["同时符合轮换清仓"] : []),
     ].join("；") || null;
-    return `<tr class="cn-trend-card">
+    const carriedForwardClass = trendHoldingCarriedForwardClass(item, report);
+    return `<tr class="cn-trend-card${carriedForwardClass ? ` ${carriedForwardClass}` : ""}">
       ${renderTrendCell("标的", trendIdentity(item))}
       ${renderTrendCell("动作", trendSellActionLabel(item))}
       ${renderTrendCell("卖出类型", clearanceDisplay)}
@@ -5542,17 +5543,30 @@ function trendRealHoldingSource(report) {
   return source && typeof source === "object" ? source : {};
 }
 
-function trendHoldingRowClass(item) {
-  return {
+function trendHoldingCarriedForwardClass(item, report) {
+  const signalDate = formatPlain(item?.signal_as_of_date);
+  const reportDate = formatPlain(report?.data_date || report?.as_of_date);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(signalDate)
+      && /^\d{4}-\d{2}-\d{2}$/.test(reportDate)
+      && signalDate < reportDate) {
+    return "trend-holding-carried-forward";
+  }
+  return "";
+}
+
+function trendHoldingRowClass(item, report) {
+  const classes = {
     included: "trend-holding-included",
     excluded: "trend-holding-excluded",
     blacklisted: "trend-holding-blacklisted",
   }[item?.trend_report_state] || "trend-holding-excluded";
+  const carriedForwardClass = trendHoldingCarriedForwardClass(item, report);
+  return carriedForwardClass ? `${classes} ${carriedForwardClass}` : classes;
 }
 
 function renderTrendHoldingRows(items, report) {
   const optionMarket = ["US", "HK"].includes(String(report?.market || "").toUpperCase());
-  return cnTrendRows(items).map((item) => `<tr class="cn-trend-card ${trendHoldingRowClass(item)}">
+  return cnTrendRows(items).map((item) => `<tr class="cn-trend-card ${trendHoldingRowClass(item, report)}">
     ${optionMarket ? renderTrendOptionIdentityCell(item) : renderTrendCell("标的", trendIdentity(item))}
     ${renderTrendCell("动作", trendHoldingActionLabel(item))}
     ${renderTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : null)}
@@ -5715,7 +5729,7 @@ function renderTrendSellOrHoldStage(title, items, kind, report) {
     ...(showClearanceType ? ["清仓类型"] : []),
     reasonHeading, "活动保护线", "持仓提示",
   ];
-  const rows = cnTrendRows(items).map((item) => `<tr class="cn-trend-card">
+  const rows = cnTrendRows(items).map((item) => `<tr class="cn-trend-card${trendHoldingCarriedForwardClass(item, report) ? ` ${trendHoldingCarriedForwardClass(item, report)}` : ""}">
     ${kind === "hold" && optionMarket ? renderTrendOptionIdentityCell(item) : renderTrendCell("标的", trendIdentity(item))}
     ${renderTrendCell("动作", action(item))}
     ${renderTrendCell("执行参考价", hasValue(item.close) ? formatDisplayNumber(item.close) : null)}
